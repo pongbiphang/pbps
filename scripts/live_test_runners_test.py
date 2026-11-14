@@ -1783,11 +1783,14 @@ elif command[0] != 'sleep':
             self.assertEqual(calls[i][:6], ["docker", "exec", "-i", name, "sh", "-s"], calls[i])
             self.assertNotIn("apt-get", " ".join(calls[i]))
         # Every fixture server, the supplied scratch included, is made
-        # non-durable once it is ready and before any client runs (#2864).
+        # non-durable before any test runs, and only after its pinned identity
+        # was checked: the setting persists in whatever container it reaches (#2864).
         nondurable = self.nondurable_steps(calls)
         self.assertCountEqual([name for _, name in nondurable],
                               ["pbps-test-pg", "pbps-test-pg16", "pbps-test-pg-scratch"])
-        self.assertTrue(all(last_probe < i < first_client for i, _ in nondurable), nondurable)
+        last_check = max(i for i, c in enumerate(calls)
+                         if c[:2] == ["python3", "scripts/check-live-fixture.py"])
+        self.assertTrue(all(last_check < i < first_client for i, _ in nondurable), nondurable)
         self.assertEqual([c for c in calls if c[0] in ("cargo", "python3")], [
             ["python3", "scripts/check-live-fixture.py", "--cell", "pg18", "--container", "pbps-test-pg", "--port", "54320"],
             ["python3", "scripts/check-live-fixture.py", "--cell", "pg16", "--container", "pbps-test-pg16", "--port", "54321"],
@@ -1840,9 +1843,15 @@ elif command[0] != 'sleep':
                 result, calls = self.local_pg_script("nondurable-failed-" + failing)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("settings did not take effect", result.stderr)
-                self.assertFalse(any(c[0] in ("cargo", "python3") for c in calls))
-                self.assertFalse(any("partman" in " ".join(c) for c in calls))
+                self.assertFalse(any(c[0] == "cargo" for c in calls))
                 self.assertFalse(any(c[:2] == ["docker", "rm"] for c in calls))
+
+    def test_a_container_that_is_not_the_pinned_fixture_keeps_its_durability(self):
+        # Negative: a container that only has a fixture's name is rejected by
+        # the identity check, and nothing was changed in it before that.
+        result, calls = self.local_pg_script("wrong-identity")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.nondurable_steps(calls), [])
 
     def test_the_runner_pipes_the_checked_in_script_and_nothing_else(self):
         text = (ROOT / "scripts" / "live-tests-pg.sh").read_text()

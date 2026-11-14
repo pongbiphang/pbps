@@ -86,16 +86,6 @@ for name in "$NAME" "$OLD_NAME" "$SCRATCH_NAME"; do
     fi
 done
 
-# Test-only speed (#2864, DEC-2864.1): no durability is asked of a fixture
-# whose data is disposable. Through scripts/live-pg-nondurable.sh, as ci.yml
-# applies it to its service containers, which accept no server arguments. Every
-# fixture gets it, the supplied scratch included, and a setting that did not
-# take effect stops the run. The scratch containers the product itself starts
-# are untouched: that is shipped behaviour, not test set-up.
-for name in "$NAME" "$OLD_NAME" "$SCRATCH_NAME"; do
-    docker exec -i "$name" sh -s < scripts/live-pg-nondurable.sh
-done
-
 # pg_partman for `partitions: external` (#1533), as ci.yml installs it: the
 # cases create the extension in a database of their own.
 # Both at once, each waited on so either failing stops the run.
@@ -111,6 +101,18 @@ for pid in "${partman_pids[@]}"; do wait "$pid"; done
 python3 scripts/check-live-fixture.py --cell pg18 --container "$NAME" --port "$PORT"
 python3 scripts/check-live-fixture.py --cell pg16 --container "$OLD_NAME" --port "$OLD_PORT"
 python3 scripts/check-live-fixture.py --cell pg18 --container "$SCRATCH_NAME" --port "$SCRATCH_PORT"
+
+# Test-only speed (#2864, DEC-2864.1): no durability is asked of a fixture
+# whose data is disposable. Through scripts/live-pg-nondurable.sh, as ci.yml
+# applies it to its service containers, which accept no server arguments. Every
+# fixture gets it, the supplied scratch included, and a setting that did not
+# take effect stops the run. Only after each fixture's pinned identity was
+# checked: `ALTER SYSTEM` persists, and a container that merely has a fixture's
+# name must not be left without durability. The scratch containers the product itself starts
+# are untouched: that is shipped behaviour, not test set-up.
+for name in "$NAME" "$OLD_NAME" "$SCRATCH_NAME"; do
+    docker exec -i "$name" sh -s < scripts/live-pg-nondurable.sh
+done
 
 # A SQL-only extension with real forward/reverse updates for the catalog-history
 # witness. Install only after each fixture's pinned identity was checked.

@@ -261,7 +261,8 @@ The live PostgreSQL fixtures run with `fsync`, `synchronous_commit` and
 `scripts/live-pg-nondurable.sh` sets them with `ALTER SYSTEM` and a reload,
 reads the three values back, and exits non-zero when one did not take effect.
 `scripts/live-tests-pg.sh` pipes it into each of its three servers (PostgreSQL
-18, 16 and the supplied scratch) once they are ready, and the `live-pg` job in
+18, 16 and the supplied scratch) once `check-live-fixture.py` has admitted
+them, so a container that only has a fixture's name is never changed, and the `live-pg` job in
 `ci.yml` does the same to its three service containers before any test; a
 service container takes no server arguments, so one mechanism serves both. The
 product's own scratch containers (`--dev docker://`, the resolver's Docker
