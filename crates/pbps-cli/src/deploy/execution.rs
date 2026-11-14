@@ -36,7 +36,7 @@ pub(super) async fn run_probes(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn run_probes_observed(
+pub(crate) async fn run_probes_observed(
     conn: &mut Conn,
     admission: &pbps_pg::admission::Admission,
     dialect: &dyn pbps_dialect::Dialect,

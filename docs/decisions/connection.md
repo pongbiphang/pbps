@@ -1363,3 +1363,84 @@ Rejected:
 
 Pinned by `plan_session::tests` (each default, with its negative case) and by
 the live tests that already exercise the positions of both engines.
+
+<a id="dec-2798-4"></a>
+
+**DEC-2798.4. The steps after the planning transaction are ten more positions
+of `PlanSession`, and the site admission is the engine state's (#2798).**
+DEC-2798.3 moved the steps inside the transaction. This entry moves the ones
+after its rollback to the seal: the vetting of the sites that run code as the
+deployer, the plan-time probes, the support rows, the server's limits, the
+cost, the pins, the declared domain code and types, the package seals and the
+proofs at the end. Of the twenty-nine engine steps after the transaction,
+twenty-three became ten new methods; the second rebuild check is PR 2's `require_transactional_rebuilds`
+called again; and the role-name gate, the dropped-role ownership read, the
+resolver's recheck, the rehearsal and the extension guard stay where they are.
+
+- **Positions.** `vet_plan_sites` (a drop's requirement, a recorded
+  conversion, the table expressions, with the note callback), `probe_stranded_rows`,
+  `support_rows` (permission, generation, owned targets, unrevocable grants),
+  `server_limits` (the edition verdict and the temporal tables), `operational_cost`,
+  `seal_plan_facts` (the type and class prerequisites, the reviewed routines,
+  the routine pins), `declared_domain_code`, `declared_types` (the declared
+  type pins, the tightened-domain row and the deferred-domain-code row),
+  `extension_seals` and `prove_plan_pins`, and the provided pair
+  `site_admission` and `begin_site_review`, which are not positions. Neutral code stays between them:
+  the key-alias gate, the policy gate, the consumption of the edition and
+  temporal answers, the resolver's recheck and seal, the rehearsal and the
+  extension guard.
+- **The admission is state.** `PlanSession::State` is bounded by
+  `AsRef<SiteAdmission> + AsMut<SiteAdmission>`, so neutral code reads and sets
+  the one rule of every site that runs code the plan holds (DEC-2563.2)
+  without naming an engine's type; each engine's state holds one, and SQL
+  Server's never admits anything into it. The positions that vet read it from
+  the state they are handed, which removes the parameter PR 2's `schedule` and
+  `check_final_order` took. The alias `SiteAdmission` still names the `pbps-pg`
+  type, because the shared functions apply and bootstrap call (`run_probes_observed`,
+  the `vet_*` family) take it; it moves with them.
+- **Typed answers, not a callback to the pipeline.** `declared_domain_code`
+  returns a `DomainCode` (`NotAsked`, `Passed(row)`, `Refused(finding)`,
+  `Unavailable{row, finding}`), because a refusal ends the plan with a finding
+  after the scratch is confirmed gone, and a warning is written back into the
+  plan: both are the pipeline's. The rows carry the engine's own label, so no
+  engine's name is left in neutral code, and the deferred-domain-code row is
+  returned by `declared_types`. `probe_stranded_rows` returns the probes'
+  result as a value, so the pipeline records the notes the probes made before
+  it raises the refusal, as it did.
+- **The row order is the pipeline's.** `CONNECTED_CHECK_ORDER` lists the row
+  names in the order `plan` prints and saves them (a test pins the first row
+  on SQL Server), and `in_contract_order` restores it, stably, from whatever
+  order the positions produced the rows in; a row the list does not name goes
+  last. The table rebuild's row takes the schedule's slot.
+- **Defaults select with the steps' own selectors.** Each refuses naming the
+  engine and what the plan asks, by the functions or helpers the steps select
+  with (`drop_guard`, `table_expressions::carries`, `enum_retype_strands_rows`,
+  `column_edit`, `edition::online_requests`, `edition::rewrites_every_row_on_standard`,
+  `temporal::needs_the_question`, `type_refs::external_references`,
+  `class_pins::uses_providers`, `resolution::domain::needed`,
+  `type_refs::declared::seal`, `tightens_a_domain`, `change_family!(extensions)`),
+  extracted where a step had them inline, so a default cannot be narrower than
+  its step. The cost's default is an unavailable report naming the engine, since
+  a failure to measure is never a refusal (ADR-0012 §3). Where a selector is
+  the step's first pass and the step then narrows by what the catalog says, the
+  default takes the superset.
+- **Left where they are.** The role-name gate (`names_alike`,
+  `principals_holding`) and the dropped-role ownership read are called by apply,
+  staged apply and bootstrap through the same routed functions, so they move
+  with those commands; `engine` keeps its routed functions for apply, bootstrap
+  and tests (`permission_support`, `generation_support`, `owned_targets`,
+  `unrevocable_grants`, `edition_verdict`, `unsupported_temporal`,
+  `check_domain_alterations`, and the `vet_*` family) and delegates each to the
+  engine's body; the ones only `plan --db` called (`seal_plan_type_pins`,
+  `table_expression_notes`) are deleted.
+
+Rejected:
+- **Two positions for the role-name gate.** They would be reachable only from
+  `plan --db` while apply called the routed functions, so a third engine would
+  answer twice.
+- **Folding the cost into the seal.** It reads nothing the seal reads and
+  never fails; its own method has its own default.
+
+Pinned by `plan_session::tests` (each default with its negative case, and a
+mutation of each selector fails one) and by the existing connected-plan tests,
+which exercise the positions of both engines unchanged.

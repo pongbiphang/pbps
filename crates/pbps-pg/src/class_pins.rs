@@ -334,6 +334,14 @@ impl PinKind for ClassPins {
     }
 }
 
+/// Whether the desired schema names a class, or a package operator an exclusion
+/// constraint uses: the selection [`seal`] reads. An engine that cannot read them
+/// must refuse such a schema rather than seal nothing.
+#[must_use]
+pub fn uses_providers(schemas: &[&Schema]) -> bool {
+    !uses(schemas).is_empty() || !crate::operator_pins::uses(schemas).is_empty()
+}
+
 /// Reads and checks every class the desired schema names, and every package operator an
 /// exclusion constraint names, which are pinned beside them (DEC-2447.14, #2448 C1b): one list
 /// in the plan, one set of calls for the engine.

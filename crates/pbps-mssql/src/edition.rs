@@ -107,6 +107,14 @@ pub fn online_not_supported(changes: &ChangeSet, edition: &Edition) -> Vec<Strin
     if edition.supports_online() {
         return Vec::new();
     }
+    online_requests(changes)
+}
+
+/// The changes whose statements carry `ONLINE = ON`, named as the plan names
+/// them: the selection [`online_not_supported`] refuses on an edition without
+/// online operations, and which an engine that has no editions to ask must
+/// refuse too, rather than pass.
+pub fn online_requests(changes: &ChangeSet) -> Vec<String> {
     changes
         .changes
         .iter()
@@ -129,21 +137,7 @@ pub fn size_of_data_warnings(changes: &ChangeSet, edition: &Edition) -> Vec<Stri
     }
     let mut out = Vec::new();
     for p in &changes.changes {
-        if let Change::AddColumn {
-            table,
-            name,
-            column,
-            ..
-        } = &p.change
-            && !column.nullable
-            && (match &column.value_source {
-                ValueSource::Default(_) => true,
-                ValueSource::None
-                | ValueSource::Identity(_)
-                | ValueSource::Sequence(_)
-                | ValueSource::Generated(_) => false,
-            })
-        {
+        if let Some((table, name)) = rewrites_every_row_on_standard(&p.change) {
             out.push(format!(
                 "{table}.{name}: adding a NOT NULL column with a DEFAULT rewrites every row on \
                  {} (it is metadata-only on Enterprise)",
@@ -154,6 +148,34 @@ pub fn size_of_data_warnings(changes: &ChangeSet, edition: &Edition) -> Vec<Stri
         }
     }
     out
+}
+
+/// The column a change adds as NOT NULL with a DEFAULT: the addition that
+/// rewrites every row on an edition without online operations. The selection
+/// of [`size_of_data_warnings`], shared with an engine that has no edition to
+/// ask.
+pub fn rewrites_every_row_on_standard(
+    change: &Change,
+) -> Option<(&pbps_model::TableName, &pbps_model::ColumnName)> {
+    if let Change::AddColumn {
+        table,
+        name,
+        column,
+        ..
+    } = change
+        && !column.nullable
+        && (match &column.value_source {
+            ValueSource::Default(_) => true,
+            ValueSource::None
+            | ValueSource::Identity(_)
+            | ValueSource::Sequence(_)
+            | ValueSource::Generated(_) => false,
+        })
+    {
+        Some((table, name))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

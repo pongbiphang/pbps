@@ -924,20 +924,22 @@ pub(super) async fn plan_db_selected(
         // The one admission rule of every site that runs code the plan holds
         // (DEC-2563.2). Review admits routines into it as the sites vet; the plan
         // shows and pins them when it seals.
-        let site_admission = crate::pins::admission(project);
+        dialect.begin_site_review(&mut plan_state, crate::pins::admission(project));
+        // What the positions inside the transaction and after it read of the
+        // plan, besides its changes.
+        let frame = crate::engine::Frame {
+            label: &target.label,
+            recorded: pbps_diff::Side { schema: &recorded_snapshot.schema, ids: &recorded_ids },
+            written: pbps_diff::Side { schema: &loaded.schema, ids: &resolved.ids },
+            base: pbps_diff::Side { schema: &base, ids: &recorded_ids },
+            declared: pbps_diff::Side { schema: &declared, ids: &resolved.ids },
+            hints: &hints,
+            baseline: &entry.snapshot,
+        };
         conn.begin(&dialect.transaction_framing(&pin_zone(&conn)))
             .await?;
         let checks = async {
             // In the read-only planning transaction, with everything below.
-            let frame = crate::engine::Frame {
-                label: &target.label,
-                recorded: pbps_diff::Side { schema: &recorded_snapshot.schema, ids: &recorded_ids },
-                written: pbps_diff::Side { schema: &loaded.schema, ids: &resolved.ids },
-                base: pbps_diff::Side { schema: &base, ids: &recorded_ids },
-                declared: pbps_diff::Side { schema: &declared, ids: &resolved.ids },
-                hints: &hints,
-                baseline: &entry.snapshot,
-            };
             dialect
                 .check_names_against_catalog(&mut plan_state, &mut conn, &mut cs, frame, staged)
                 .await?;
@@ -992,7 +994,6 @@ pub(super) async fn plan_db_selected(
                 .schedule(
                     &mut plan_state,
                     &mut conn,
-                    &site_admission,
                     cs,
                     frame,
                     reads.role_members.as_ref(),
@@ -1030,7 +1031,7 @@ pub(super) async fn plan_db_selected(
             #[cfg(not(debug_assertions))]
             let _ = (ordered.verified, ordered.facts);
             let checks = dialect
-                .check_final_order(&mut conn, &site_admission, cs.changes(), frame)
+                .check_final_order(&plan_state, &mut conn, cs.changes(), frame)
                 .await?;
             Ok::<_, anyhow::Error>((
                 cs,
@@ -1050,22 +1051,12 @@ pub(super) async fn plan_db_selected(
             checks?;
         rollback?;
         let requirement_names = pbps_model::plan_names::PlanNames::of(&cs.changes().changes, &resolved.ids)?;
-        crate::engine::vet_drop_requirements(&mut conn, &site_admission, &requirement_names)
-            .await?;
-        // A conversion is judged at apply, before its first evaluation
-        // (DEC-2331.1). Here it only tells which routines the review admits, so
-        // the plan can show and pin them; a refusal waits for apply, which
-        // judges it again, and a routine missed here fails closed there.
-        let _ = crate::engine::vet_conversions(&mut conn, &site_admission, requirement_names.changes())
-            .await;
-        // The expressions a table gains are bound the same way, to learn which
-        // routines the review admits; one that uses an object this plan creates
-        // cannot be bound yet and is said so, then judged at apply (DEC-2563.4).
-        crate::engine::table_expression_notes(
-            &mut conn,
-            &site_admission,
-            requirement_names.changes(),
-            |note| {
+        // The expressions the plan introduces that run as the deployer are
+        // vetted now, to learn which routines the review admits, so the plan
+        // can show and pin them (DEC-2563.2); a refusal that waits for apply is
+        // the engine's to say.
+        dialect
+            .vet_plan_sites(&plan_state, &mut conn, &requirement_names, &mut |note| {
                 if !json {
                     eprintln!("warning: {note}");
                 }
@@ -1073,29 +1064,16 @@ pub(super) async fn plan_db_selected(
                     "plan.table-expression-unbound",
                     &note,
                 ));
-            },
-        )
-        .await;
+            })
+            .await?;
         // Rows that hold a label an enum rebuild removes, or that a domain's
         // narrower base cannot hold, are counted now, by the same probes the
         // apply runs, so the plan is refused by name and with a count before
         // anything is written (DEC-1635.7, DEC-1635.9).
-        if crate::engine::counts_rows_an_enum_retype_strands(conn.driver(), cs.changes()) {
-            let names = pbps_model::plan_names::PlanNames::of(&cs.changes().changes, &resolved.ids)?;
-            let result = run_probes_observed(
-                &mut conn,
-                &site_admission,
-                dialect.as_ref(),
-                &names,
-                &probe_partitions(&recorded_snapshot.schema, &names),
-                Some(pbps_model::operation::Snapshot {
-                    schema: &recorded_snapshot.schema,
-                    ids: &recorded_ids,
-                }),
-                None,
-                owned,
-            )
-            .await;
+        if let Some(result) = dialect
+            .probe_stranded_rows(&plan_state, &mut conn, cs.changes(), frame, owned)
+            .await?
+        {
             if let Some(owned) = owned {
                 findings.extend(owned.findings.take());
             }
@@ -1104,7 +1082,7 @@ pub(super) async fn plan_db_selected(
         }
         // Again, over what the dependents added: a rebuild the plan now
         // synthesizes needs the transaction as much as one it was given.
-        crate::engine::require_transactional_rebuilds(conn.driver(), &cs, staged)?;
+        dialect.require_transactional_rebuilds(&cs, staged)?;
 
         // The keys were matched to the rows under the type the key column has
         // now (71); a plan that changes that type would carry the mapping
@@ -1207,40 +1185,32 @@ pub(super) async fn plan_db_selected(
         }
 
         findings.extend(policy);
-        let permission_support = crate::engine::permission_support(&mut conn, &cs, &resolved.ids).await?;
-        let generation_support =
-            crate::engine::generation_support(&mut conn, &cs, &resolved.ids).await?;
-        // Asked of the read this plan was built from, not of the connection
-        // again: the owners came out of the same statement snapshot as the
-        // schema, so the two cannot disagree (DECISIONS 174).
-        let owned_targets = crate::engine::owned_targets(
-            conn.driver(),
-            &cs,
-            &resolved.ids,
-            &scoped.owners,
-            &scoped.session_role,
-        )?;
-        // The other half of the same read, and the other direction: a grant
-        // this connection could see and could not take away is refused only
-        // when the plan actually revokes it (#251).
-        let unrevocable_grants = crate::engine::unrevocable_grants(
-            conn.driver(),
-            &cs,
-            &resolved.ids,
-            &managed.unrevocable,
-        )?;
+        let crate::engine::SupportRows {
+            permission_support,
+            generation_support,
+            owned_targets,
+            unrevocable_grants,
+        } = dialect
+            .support_rows(
+                &mut conn,
+                &cs,
+                &resolved.ids,
+                crate::engine::SupportReads {
+                    owners: &scoped.owners,
+                    session_role: &scoped.session_role,
+                    unrevocable: &managed.unrevocable,
+                },
+            )
+            .await?;
 
         // The edition is a connection-time fact, and it is the only place the
         // two edition-dependent questions of ADR-0003 can be answered
-        // honestly: whether ONLINE will be accepted at all, and whether an
-        // addition that is metadata-only on Enterprise rewrites every row
-        // here. An offline plan has to assume the conservative answer.
-        let verdict = crate::engine::edition_verdict(&mut conn, &cs).await?;
-        // A server fact like the edition: 2016 has no history retention and
-        // no cascading key from a system-versioned table (#1502). Answered,
-        // it is a finding, as the edition's below is; a failure to ask stays
-        // an error (#1630).
-        let temporal = crate::engine::unsupported_temporal(&mut conn, &cs).await?;
+        // honestly; a temporal table the server cannot take is answered with
+        // it (#1502). Both are read here; what to do with them is below.
+        let crate::engine::ServerLimits {
+            edition: verdict,
+            temporal,
+        } = dialect.server_limits(&mut conn, &cs).await?;
         crate::engine::refuse_answered_temporal(&temporal, json, &mut findings)?;
         if !verdict.refused_online.is_empty() {
             let refusal = format!(
@@ -1297,69 +1267,60 @@ pub(super) async fn plan_db_selected(
             &entry.snapshot.schema,
         )?;
         let baseline = pbps_model::drift_checksum(&pinned, &recorded_ids);
-        let cost = crate::engine::operational_cost(&mut conn, &cs, &resolved.ids).await;
-        let crate::engine::Prerequisites {
-            types: type_pins,
-            providers: provider_pins,
-        } = crate::engine::seal_plan_type_pins(
-            &mut conn,
-            pbps_diff::Side { schema: &entry.snapshot.schema, ids: &recorded_ids },
-            pbps_diff::Side { schema: &loaded.schema, ids: &resolved.ids },
-            &cs,
-            &project.config.trusted_roles,
-            project.config.pin_type_routines,
-        )
-        .await?;
-        let reviewed =
-            crate::pins::seal_selected(&mut conn, project, target, &type_pins, &site_admission)
-                .await?;
-        // Last, so that the routines are sealed as close to the gate as the
-        // plan can get them. The managed set is the one `apply` rebuilds from
-        // the ledger and the plan: what was recorded, and what is declared.
-        let routine_pins = crate::pins::seal(
-            &mut conn,
-            project,
-            target,
-            &managed_modules(Some(&entry.snapshot), Some(&loaded.schema)),
-        )
-        .await?;
+        let cost = dialect.operational_cost(&mut conn, &cs, &resolved.ids).await;
+        let crate::engine::SealedFacts {
+            type_pins,
+            provider_pins,
+            reviewed,
+            routine_pins,
+        } = dialect
+            .seal_plan_facts(
+                &plan_state,
+                &mut conn,
+                project,
+                target,
+                frame,
+                &cs,
+                &managed_modules(Some(&entry.snapshot), Some(&loaded.schema)),
+            )
+            .await?;
         let mut domain_vet_unavailable = false;
         let mut domain_code = None;
-        if crate::engine::vets_declared_domain_code(conn.driver())
-            && crate::resolution::domain::needed(cs.changes())
-            && let Some(entry) = scratch.as_mut()
+        match dialect
+            .declared_domain_code(
+                scratch.as_mut(),
+                &mut conn,
+                target,
+                project,
+                desired_side,
+                cs.changes(),
+            )
+            .await?
         {
-            match crate::resolution::domain::vet(entry, &mut conn, target, project, desired_side).await {
-                crate::resolution::domain::Verdict::Passed => {
-                    domain_code = Some(crate::engine::ConnectedCheck {
-                        name: "declared-domain-code", engine: "PostgreSQL", status: "checked",
-                        message: "Declared domain CHECK and DEFAULT code passed the advisory scratch vet; apply repeats its own in-transaction vet.".into(),
-                    });
-                }
-                crate::resolution::domain::Verdict::Refused(finding) => {
+            crate::engine::DomainCode::NotAsked => {}
+            crate::engine::DomainCode::Passed(row) => domain_code = Some(row),
+            crate::engine::DomainCode::Refused(finding) => {
+                if let Some(entry) = scratch.as_mut() {
                     entry.finish().await.map_err(|refused| match refused {
                         crate::resolution::Refused::Unanswerable(error) => error,
                         crate::resolution::Refused::Finding(finding) => anyhow::anyhow!(finding.message),
                     })?;
-                    return Ok(Connected::Refused { finding, findings });
                 }
-                crate::resolution::domain::Verdict::Unavailable(finding) => {
-                    domain_vet_unavailable = true;
-                    domain_code = Some(crate::engine::ConnectedCheck {
-                        name: "declared-domain-code", engine: "PostgreSQL", status: "deferred",
-                        message: "Scratch could not answer the advisory domain-code vet; apply vets CHECK and DEFAULT code in its transaction.".into(),
-                    });
-                    if let Some(finding) = finding {
-                        // Keep the warning with the approved typed change as
-                        // well as in the command's findings envelope.
-                        pbps_diff::order::writebacks::findings(&mut cs, &[(0, finding.clone())]);
-                        let finding = crate::policy_finding(&finding);
-                        if finding.severity == crate::output::Severity::Error {
-                            return Ok(Connected::Refused { finding, findings });
-                        }
-                        if !json { eprintln!("{}: {}", finding.severity_word(), finding.message); }
-                        findings.push(finding);
+                return Ok(Connected::Refused { finding, findings });
+            }
+            crate::engine::DomainCode::Unavailable { row, finding } => {
+                domain_vet_unavailable = true;
+                domain_code = Some(row);
+                if let Some(finding) = finding {
+                    // Keep the warning with the approved typed change as
+                    // well as in the command's findings envelope.
+                    pbps_diff::order::writebacks::findings(&mut cs, &[(0, finding.clone())]);
+                    let finding = crate::policy_finding(&finding);
+                    if finding.severity == crate::output::Severity::Error {
+                        return Ok(Connected::Refused { finding, findings });
                     }
+                    if !json { eprintln!("{}: {}", finding.severity_word(), finding.message); }
+                    findings.push(finding);
                 }
             }
         }
@@ -1408,9 +1369,20 @@ pub(super) async fn plan_db_selected(
                 })
             }
         };
-        let declared_type_pins = pbps_pg::type_refs::declared::seal(&read_back, &recorded_ids, &declared, &resolved.ids);
-        let domain_validation =
-            crate::engine::check_domain_alterations(&mut conn, &cs, &recorded_ids).await?;
+        let crate::engine::DeclaredTypes {
+            pins: declared_type_pins,
+            validation: domain_validation,
+            deferred_domain_code,
+        } = dialect
+            .declared_types(
+                &mut conn,
+                &read_back,
+                &recorded_ids,
+                &declared,
+                &resolved.ids,
+                cs.changes(),
+            )
+            .await?;
         // The rehearsal, last: it runs the plan as it will be written, on the
         // scratch the resolver used or would have used (#2379).
         let course = crate::rehearsal::connected::course(
@@ -1487,9 +1459,13 @@ pub(super) async fn plan_db_selected(
         {
             return Err(error);
         }
-        let extension_changes = extension_change_pins(&mut conn, &cs, &manifests, &declared).await?;
-        let extension_pins = extension_pins(&cs, manifests, &declared, &resolved.ids)?;
-        let extension_drops = extension_drop_pins(&mut conn, &cs).await?;
+        let crate::engine::ExtensionSeals {
+            changes: extension_changes,
+            pins: extension_pins,
+            drops: extension_drops,
+        } = dialect
+            .extension_seals(&mut conn, &cs, manifests, &declared, &resolved.ids)
+            .await?;
         Ok(Connected::Ordinary(Box::new((
             cs,
             // The zone this session started in: what every offset-less
@@ -1526,7 +1502,7 @@ pub(super) async fn plan_db_selected(
             reviewed,
             resolver_assessment,
             resolution,
-            (rehearsal, extension_pins, extension_drops, extension_changes),
+            (rehearsal, extension_pins, extension_drops, extension_changes, deferred_domain_code),
         ))))
     }).await?;
         let (
@@ -1543,7 +1519,7 @@ pub(super) async fn plan_db_selected(
             reviewed,
             resolver_assessment,
             resolution,
-            (rehearsal, extension_pins, extension_drops, extension_changes),
+            (rehearsal, extension_pins, extension_drops, extension_changes, deferred_domain_code),
         ) = match connected {
             Connected::Ordinary(planned) => *planned,
             Connected::Refused {
@@ -1607,13 +1583,14 @@ pub(super) async fn plan_db_selected(
             risks: cs.risks().iter().map(|risk| risk.as_str()).collect(),
             connected_checks: {
                 let mut checks = connected_checks;
-                if !checks.iter().any(|check| check.name == "declared-domain-code") && declared_type_pins.iter().any(|pin| matches!(&pin.definition, pbps_model::ManagedType::Domain { default, checks, .. } if default.is_some() || !checks.is_empty())) {
-                    checks.push(crate::engine::ConnectedCheck {
-                        name: "declared-domain-code", engine: "PostgreSQL", status: "deferred",
-                        message: "Declared domain checks and defaults are vetted inside apply, immediately after their type statements.".into(),
-                    });
+                if !checks
+                    .iter()
+                    .any(|check| check.name == "declared-domain-code")
+                    && let Some(row) = deferred_domain_code
+                {
+                    checks.push(row);
                 }
-                checks
+                crate::engine::in_contract_order(checks)
             },
             type_routines: reviewed.0.clone(),
             type_routine_approval: (!reviewed.0.is_empty())
@@ -1718,18 +1695,14 @@ pub(super) async fn plan_db_selected(
         plan.extension_changes = extension_changes;
         // A type the plan expects its own package to bring must be one the
         // rehearsal found in that package (DEC-2447.12).
-        pbps_pg::type_refs::provider_proof(
-            &plan.type_pins,
-            &plan.extension_pins,
-            &plan.extension_changes,
-        )
-        .map_err(anyhow::Error::msg)?;
-        pbps_pg::class_pins::proof(
-            &plan.provider_pins,
-            &plan.extension_pins,
-            &plan.extension_changes,
-        )
-        .map_err(anyhow::Error::msg)?;
+        dialect
+            .prove_plan_pins(
+                &plan.type_pins,
+                &plan.provider_pins,
+                &plan.extension_pins,
+                &plan.extension_changes,
+            )
+            .map_err(anyhow::Error::msg)?;
         if let Some(resolution) = resolution {
             plan = plan.with_resolution(resolution.evidence).map_err(|e| {
             anyhow::anyhow!(
