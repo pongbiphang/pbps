@@ -19,6 +19,87 @@ use crate::certified_fixture::FixtureEmission as _;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+/// One of the two live PostgreSQL servers a live test runs on.
+///
+/// A test that must hold on both majors is one `#[test]` per server
+/// ([`on_both_servers!`]) rather than a loop over both: the shards assign whole
+/// test functions, so a function that visits both servers cannot be balanced
+/// below the time of both.
+#[derive(Clone, Copy)]
+enum Pg {
+    /// The oldest qualified major, `PBPS_TEST_PG_OLD_DB`.
+    Old,
+    /// The current major, `PBPS_TEST_PG_DB`.
+    Current,
+}
+
+impl Pg {
+    /// The connection string of this server.
+    fn url(self) -> String {
+        match self {
+            Pg::Old => old_server(),
+            Pg::Current => server(),
+        }
+    }
+
+    /// The variable holding the connection string, which fixtures use to tell
+    /// their databases apart.
+    fn variable(self) -> &'static str {
+        match self {
+            Pg::Old => "PBPS_TEST_PG_OLD_DB",
+            Pg::Current => "PBPS_TEST_PG_DB",
+        }
+    }
+
+    /// The major version, which fixtures assert before trusting the server.
+    fn major(self) -> i64 {
+        match self {
+            Pg::Old => 16,
+            Pg::Current => 18,
+        }
+    }
+
+    /// Runs `check` on this server with its connection string and variable.
+    fn run(self, check: impl FnOnce(&str, &str)) {
+        check(&self.url(), self.variable());
+    }
+}
+
+/// Runs `check` on each live server in turn, the older first, for the tests
+/// that still visit both in one function.
+fn on_each_server(mut check: impl FnMut(&str, &str)) {
+    for pg in [Pg::Old, Pg::Current] {
+        pg.run(&mut check);
+    }
+}
+
+/// Declares, for each `name => body`, a module `name` holding one ignored test
+/// per server (`name::pg16`, `name::pg18`). `body` is any expression that
+/// coerces to `fn(Pg)`: the test's original function, which keeps its name, or
+/// a closure that fixes one case. Each case is its own test so the shards can
+/// balance them; none of them shares state with another (each makes its own
+/// database), so the split proves what the loop did (#2863).
+macro_rules! on_both_servers {
+    ($($name:ident => $body:expr),* $(,)?) => {$(
+        mod $name {
+            #[allow(unused_imports)]
+            use super::*;
+            #[test]
+            #[ignore = "needs live PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+            fn pg16() {
+                let body: fn(crate::Pg) = $body;
+                body(crate::Pg::Old)
+            }
+            #[test]
+            #[ignore = "needs live PostgreSQL 18; set PBPS_TEST_PG_DB"]
+            fn pg18() {
+                let body: fn(crate::Pg) = $body;
+                body(crate::Pg::Current)
+            }
+        }
+    )*};
+}
+
 #[path = "support/catalog_warnings1739.rs"]
 mod catalog_warnings1739;
 
@@ -5234,12 +5315,10 @@ fn an_attached_partition_takes_its_serial_parents_default_on_both_servers() {
 /// A standing parent's serial edits recurse into declared, plan-attached and
 /// external partitions on both servers; own defaults survive the parent's
 /// recursion, and a source put on continues past rows in every partition.
-#[test]
-#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
-fn a_standing_parents_serial_changes_reach_every_partition_on_both_servers() {
-    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
-    for (version, server) in [(16, old), (18, server())] {
-        let own = OwnDatabase::new(&server, "serial-parent-changes");
+fn a_standing_parents_serial_changes_reach_every_partition_on_both_servers(pg: Pg) {
+    let version = pg.major();
+    pg.run(|server, _| {
+        let own = OwnDatabase::new(server, "serial-parent-changes");
         let connection = own.connection();
         assert_eq!(
             scalar(
@@ -5553,7 +5632,11 @@ fn a_standing_parents_serial_changes_reach_every_partition_on_both_servers() {
             write(column, true);
             apply();
         }
-    }
+    });
+}
+
+on_both_servers! {
+    a_standing_parents_serial_changes_reach_every_partition_on_both_servers => a_standing_parents_serial_changes_reach_every_partition_on_both_servers,
 }
 
 /// `verify` compares two reads, and each knows the sequence name it leaves
@@ -36356,11 +36439,21 @@ fn late_dependent_descriptions_are_shown_once_in_plan_and_apply() {
     }
 }
 
-#[test]
-#[ignore = "needs both live PostgreSQL versions"]
-fn a_resolved_plan_builds_declared_enums_and_domains_on_scratch() {
-    for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
-        resolver_publication::declared_types(&std::env::var(variable).unwrap());
+/// One test per variant and server: each variant makes its own database and
+/// scratch, so they share no state (#2863).
+mod a_resolved_plan_builds_declared_enums_and_domains_on_scratch {
+    use super::*;
+
+    on_both_servers! {
+        control => |pg| resolver_publication::declared_types(&pg.url(), "control"),
+        enum_type => |pg| resolver_publication::declared_types(&pg.url(), "enum"),
+        domain_type => |pg| resolver_publication::declared_types(&pg.url(), "domain"),
+        enum_existing => |pg| resolver_publication::declared_types(&pg.url(), "enum_existing"),
+        own_schema => |pg| resolver_publication::declared_types(&pg.url(), "own_schema"),
+        external => |pg| resolver_publication::declared_types(&pg.url(), "external"),
+        label_added => |pg| resolver_publication::declared_types(&pg.url(), "label_added"),
+        rebuilt => |pg| resolver_publication::declared_types(&pg.url(), "rebuilt"),
+        keyword => |pg| resolver_publication::declared_types(&pg.url(), "keyword"),
     }
 }
 
@@ -36755,15 +36848,29 @@ fn a_pending_column_meeting_keeps_unrelated_renamed_default_sources() {
 #[path = "support/partition_moves.rs"]
 mod partition_moves;
 
-#[test]
-#[ignore = "needs live pg"]
-fn all_measured_partition_move_d_profiles_have_live_product_dispositions() {
-    partition_moves::measured(&server());
+/// One test per group of the measured profiles, on one server, so no test
+/// runs all the profiles of its major (35 or 37, in two orders each) at once.
+/// Six groups keep each test near a sixth of the former 220 s, and the six
+/// listed here are all the groups `measured` is told of (#2863).
+macro_rules! measured_partition_move_groups {
+    ($pg:expr, $reason:literal) => {
+        measured_partition_move_groups!(@each $pg, $reason, [group_0 0, group_1 1, group_2 2, group_3 3, group_4 4, group_5 5]);
+    };
+    (@each $pg:expr, $reason:literal, [$($group:ident $at:literal),*]) => {$(
+        #[test]
+        #[ignore = $reason]
+        fn $group() {
+            partition_moves::measured(&$pg.url(), $at, 6);
+        }
+    )*};
 }
-#[test]
-#[ignore = "needs live pg16"]
-fn all_measured_partition_move_d_profiles_have_live_product_dispositions_before_postgres_17() {
-    partition_moves::measured(&std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG16 fixture"));
+mod all_measured_partition_move_d_profiles_have_live_product_dispositions {
+    use super::*;
+    measured_partition_move_groups!(Pg::Current, "needs live pg");
+}
+mod all_measured_partition_move_d_profiles_have_live_product_dispositions_before_postgres_17 {
+    use super::*;
+    measured_partition_move_groups!(Pg::Old, "needs live pg16");
 }
 #[test]
 #[ignore = "needs live pg16 and pg18"]

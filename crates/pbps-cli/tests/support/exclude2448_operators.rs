@@ -5,14 +5,8 @@
 //! commutative boolean operator of its GiST class) on a confined scratch.
 
 use super::rehearsal2379::{Fixture, Kind, Options};
-use super::{code, on_server, scalar, stderr, stdout, succeeds};
+use super::{Pg, code, on_server, scalar, stderr, stdout, succeeds};
 use std::process::Output;
-
-fn servers(mut check: impl FnMut(&str, &str)) {
-    for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
-        check(&std::env::var(variable).unwrap(), variable);
-    }
-}
 
 fn said(output: &Output) -> String {
     format!("{}{}", stdout(output), stderr(output))
@@ -86,10 +80,10 @@ fn constraints(f: &Fixture) -> i64 {
 /// refused by name and nothing is written; the next plan is empty. Negatives: an operator no
 /// package owns, though it stands in the package's schema, is refused at plan by name; the
 /// engine's own operator needs no pin.
-#[test]
-#[ignore = "needs live PostgreSQL 16 and 18"]
-fn an_exclusion_on_a_package_operator_is_pinned_applied_and_refused_when_the_operator_changes() {
-    servers(|server, slug| {
+fn an_exclusion_on_a_package_operator_is_pinned_applied_and_refused_when_the_operator_changes(
+    pg: Pg,
+) {
+    pg.run(|server, slug| {
         let f = fixture(server, &format!("exclude2448-operator-{slug}"));
         adopted(&f);
         std::fs::write(table_path(&f), with_exclusion(&f, "ext.%")).unwrap();
@@ -168,4 +162,8 @@ fn an_exclusion_on_a_package_operator_is_pinned_applied_and_refused_when_the_ope
         );
         assert!(!g.artifact().exists(), "a refused plan writes no file");
     });
+}
+
+on_both_servers! {
+    an_exclusion_on_a_package_operator_is_pinned_applied_and_refused_when_the_operator_changes => an_exclusion_on_a_package_operator_is_pinned_applied_and_refused_when_the_operator_changes,
 }

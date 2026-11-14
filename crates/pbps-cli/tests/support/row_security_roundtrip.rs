@@ -2,34 +2,42 @@
 //! bootstrap. Catalog-only equality cannot prove that a policy enforces access.
 
 use crate::{
-    Demo, OwnDatabase, approved_apply, code, connected_artifact, latest_snapshot, on_server,
+    Demo, OwnDatabase, Pg, approved_apply, code, connected_artifact, latest_snapshot, on_server,
     psql_script_in, scalar, stderr, stdout, succeeds, try_on_server,
 };
 use pbps_db::{Conn, DbError, Driver};
 use pbps_model::{PolicyCommand, PolicyRoles, RowSecurity, TableName};
 use std::time::Instant;
 
+/// Runs `check` on the one server `pg` with its connection string and the
+/// variable naming its container, after confirming the server is the major the
+/// fixture claims.
+pub(super) fn on_version(pg: Pg, check: impl FnOnce(&str, &str)) {
+    let container = match pg {
+        Pg::Old => "PBPS_TEST_PG_OLD_CONTAINER",
+        Pg::Current => "PBPS_TEST_PG_CONTAINER",
+    };
+    let base = pg.url();
+    let version = scalar(
+        &base,
+        "SELECT current_setting('server_version_num')::bigint",
+    );
+    assert_eq!(version / 10000, pg.major());
+    let started = Instant::now();
+    check(&base, container);
+    eprintln!("row-security PostgreSQL {version}: {:?}", started.elapsed());
+}
+
 pub(super) fn versions(mut check: impl FnMut(&str, &str)) {
     let mut failed = Vec::new();
-    for (variable, container, expected) in [
-        ("PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_OLD_CONTAINER", 16),
-        ("PBPS_TEST_PG_DB", "PBPS_TEST_PG_CONTAINER", 18),
-    ] {
-        let base = std::env::var(variable).expect("both live PostgreSQL fixtures are required");
-        let version = scalar(
-            &base,
-            "SELECT current_setting('server_version_num')::bigint",
-        );
-        assert_eq!(version / 10000, expected);
-        let started = Instant::now();
+    for pg in [Pg::Old, Pg::Current] {
         // Keep the other engine observable when an acceptance case fails;
         // unwinding the closure first also exercises fixture cleanup.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            check(&base, container);
+            on_version(pg, &mut check);
         }));
-        eprintln!("row-security PostgreSQL {version}: {:?}", started.elapsed());
         if result.is_err() {
-            failed.push(version);
+            failed.push(pg.major());
         }
     }
     assert!(
