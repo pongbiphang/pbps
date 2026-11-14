@@ -1930,7 +1930,10 @@ allow-list; the live runners and everything they read keep the full gate.**
 A pull request that changed only a test of the PostgreSQL runner still waited
 for the single gate slot and ran both live suites (#2859). `scripts/local_gate_scope.py`
 now prints `non-live` or `full` and its reason for a base and a head, over
-`git diff <merge-base> <head>` with renames counted on both sides. `non-live`
+the diff against the merge base with renames counted on both sides. The listing is
+read with plumbing (`git diff-tree -r --no-renames -z --ignore-submodules=none`),
+so `diff.ignoreSubmodules`, `submodule.<name>.ignore` and `diff.relative` cannot
+hide a submodule pointer or make a path relative to the working directory. `non-live`
 is the Python checks, `fmt`, `clippy` and `cargo test --workspace --all-targets
 --no-fail-fast`, with no live suite. It exits 0 only for `non-live`.
 

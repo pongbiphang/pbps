@@ -8,13 +8,13 @@ the Python checks, `fmt`, `clippy` and
 `full`. The merge group runs every job either way, so this saves local time and
 never the final proof.
 
-The rule is an allow-list. A head is `non-live` only if every path of
-`git diff <merge-base> <head>` is in a class named in FREE. A path in no class
-is `full`: unknown is not unaffected (as in ci_release_scope.py). So are an
-unreadable ref, a head with no merge base, an empty diff and a directory that
-is not a repository. A symlink or a submodule (mode 120000 or 160000, before or
-after) is `full` too: what it points at is not its name. Exit 0 only for
-`non-live`.
+The rule is an allow-list. A head is `non-live` only if every path of the
+listing of `<merge-base>` against `<head>` is in a class named in FREE. A path
+in no class is `full`: unknown is not unaffected (as in ci_release_scope.py).
+So are an unreadable ref, a head with no merge base, an empty diff and a
+directory that is not a repository. A symlink or a submodule (mode 120000 or
+160000, before or after) is `full` too: what it points at is not its name.
+Exit 0 only for `non-live`.
 
 KEEP_FULL lists the files under `scripts/` that a live run reads, executes,
 sources, copies or imports, beside code and build input. It is checked first,
@@ -32,8 +32,6 @@ import os
 import re
 import subprocess
 import sys
-
-from ci_release_scope import diff_paths
 
 # Paths that keep the full gate. Under `scripts/` they are the files a live run
 # reads, executes, sources, copies or imports, measured from the two live
@@ -103,12 +101,24 @@ def git(repo, *args):
     return result.stdout.decode().strip()
 
 
-def indirect_paths(repo, base, head):
-    """Paths whose mode is a symlink (120000) or a gitlink (160000) before or after."""
-    out = subprocess.run(["git", "diff", "--raw", "--no-renames", "-z", base, head],
+def changed(repo, base, head):
+    """Return (paths, indirect) of one listing: every path on either side of the diff
+    and those that are a symlink (120000) or a gitlink (160000) before or after.
+
+    Plumbing with `--ignore-submodules=none`, not `git diff`: `diff.ignoreSubmodules`,
+    `submodule.<name>.ignore` and `diff.relative` change what `git diff` lists, and a
+    hidden submodule pointer or a path made relative to the working directory would
+    read as a free path. `--no-renames` lists both names of a rename, and `-z` keeps
+    a name with non-ASCII bytes unquoted. Paths and modes come from this one output,
+    so they cannot disagree."""
+    out = subprocess.run(["git", "diff-tree", "-r", "--no-renames", "-z", "--ignore-submodules=none", base, head],
                          check=True, capture_output=True, cwd=repo).stdout.split(b"\0")
-    return {os.fsdecode(path) for meta, path in zip(out[0::2], out[1::2])
-            if {meta.split()[0][1:], meta.split()[1]} & {b"120000", b"160000"}}
+    paths, indirect = [], set()
+    for meta, name in zip(out[0::2], out[1::2]):
+        paths.append(os.fsdecode(name))
+        if {meta.split()[0][1:], meta.split()[1]} & {b"120000", b"160000"}:
+            indirect.add(os.fsdecode(name))
+    return paths, indirect
 
 
 def verdict(repo, base, head):
@@ -119,8 +129,7 @@ def verdict(repo, base, head):
         head_sha = git(repo, "rev-parse", "--verify", "--quiet", head + "^{commit}")
         merge_base = git(repo, "merge-base", base_sha, head_sha)
         result.update(head=head_sha, merge_base=merge_base)
-        scope, reason, classes = decide(diff_paths(merge_base, head_sha, repo),
-                                        indirect_paths(repo, merge_base, head_sha))
+        scope, reason, classes = decide(*changed(repo, merge_base, head_sha))
     except (ValueError, OSError, subprocess.SubprocessError) as error:
         scope, reason, classes = "full", f"unknown is not unaffected: {error}", {}
     result.update(verdict=scope, reason=reason)
