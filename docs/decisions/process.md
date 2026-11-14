@@ -1922,3 +1922,73 @@ a quarter whatever the runner does. After it, `resolver-mssql` and
 `live-pg (dialect)`, at 35 to 43 minutes, bound the run together with the
 slowest share. The rule that assigns each listed test to exactly one share
 (DEC-2434.1) is unchanged; only the share count is.
+
+<a id="dec-2859-1"></a>
+
+**DEC-2859.1. The local gate's scope follows the changed paths, by an
+allow-list; the live runners and everything they read keep the full gate.**
+A pull request that changed only a test of the PostgreSQL runner still waited
+for the single gate slot and ran both live suites (#2859). `scripts/local_gate_scope.py`
+now prints `non-live` or `full` and its reason for a base and a head, over
+the diff against the merge base with renames counted on both sides. The listing is
+read with plumbing (`git diff-tree -r --no-renames -z --ignore-submodules=none`),
+so `diff.ignoreSubmodules`, `submodule.<name>.ignore` and `diff.relative` cannot
+hide a submodule pointer or make a path relative to the working directory. `non-live`
+is the Python checks, `fmt`, `clippy` and `cargo test --workspace --all-targets
+--no-fail-fast`, with no live suite. It exits 0 only for `non-live`.
+
+*Why an allow-list.* The rule names three classes no live run reads:
+documentation, `.github/`, and a top-level file of `scripts/` that the live
+closure does not name. Any other path is `full`, so a new top-level file, a
+crate, a manifest, a lockfile, the toolchain, `schemas/`, `deny.toml` or a
+directory the rule never heard of takes the full gate without a line of code.
+An unreadable ref, a head with no merge base, an empty diff and a directory
+that is not a repository are `full` too (unknown is not unaffected, as in
+`ci_release_scope.py`). A deny-list would fail the other way: each new input
+would be free until someone remembered it.
+
+*Why the live inputs keep the full gate.* Measured from `live-tests.sh`,
+`live-tests-pg.sh`, `live-shards.py` and the Rust tests they start. A live run
+reads: the two runners, `live-test-status.sh`, `live-transport.py`,
+`check-live-fixture.py`, `compatibility-matrix.json` (by admission and by
+`include_str!` in `support/compatibility.rs`), `resolver-mssql-fixtures.sh`,
+`install-pg-partman.sh`, `scripts/fixtures/pg-history695/` (copied into the
+containers), `gate_rerun.py` and `known_flakes.py` (imported by the driver), and
+`schemas/envelope.schema.json` (read by ignored tests in `flow.rs` and
+`flow_pg.rs`). #2835 and #2847 both came from edits to `live-tests-pg.sh`, so
+they stay `full`. A test of a script (`*_test.py`) is a Python check, not an
+input: `live_test_runners_test.py` is freed, `live-tests-pg.sh` is not. A drift
+test walks the runners and fails when they name a `scripts/` file the rule
+frees, so a new helper cannot slip in.
+
+*What no live run reads.* `.github/`: the driver reads `ci.yml` only to derive
+the Python and Cargo suites (`gate_rerun.python_checks`, `cargo_check`), never
+for `shard mssql` or `shard pg`, and no Rust test reads it. The Python checks
+that parse `ci.yml` run in the non-live gate. `known-flakes.json`: the driver
+reads the register from `--flakes-ref`, default `origin/master`, so the head's
+copy is never read by its own live run (DEC-2553.2). Docs: two Rust tests read a doc
+at run time (`docs/STATUS.md`, `docs/ORDERING.md`), each through an ordinary
+`#[test]` the non-live gate runs, so the predicate that would fail live fails
+there first. A doc compiled into a test binary is different: `docs/measurements/`
+reaches `flow_pg` by `include_str!` (`partition_moves/manifest.rs`), so it keeps
+`full`, like every `include_str!` or `include_bytes!` target outside `crates/`
+(`scripts/compatibility-matrix.json`, `schemas/`, `Cargo.toml`). A `*.md` under
+`crates/` is a crate file, not documentation. A symlink or a submodule (mode
+120000 or 160000 on either side of the diff) is `full` under any name.
+
+*What the rule does not prove.* That no live test is affected by a freed path.
+It proves only that none of the measured readers can be. A path built from
+variables in a Rust test is invisible to the scan. The merge group still runs
+every job (DEC-1835.1), so a miss costs one ejection, as for DEC-2553.3. The
+rule's own files (`local_gate_scope.py`, `gate_scope.py`, `ci_release_scope.py`)
+are `full`, so a change to the rule is not judged by the changed rule. The
+docs-only push rule (DEC-1838.1) and the unchanged-patch rule (DEC-2553.3) are
+unchanged; `non-live` is the gate for a head that is neither.
+
+*Numbers.* Replayed over the 70 pull requests merged 2026-11-07..14, each at
+its own head against the first parent of its merge commit: 6 are `non-live`
+(#2769, #2821, #2848, #2834 and the two documentation-only #2824, #2844) and 64
+are `full`. Of the six scripts-only pull requests the issue names, #2771
+(`live-shards.py`) and #2836 (`live-tests-pg.sh`, `install-pg-partman.sh`) keep
+the full gate. The verdict's JSON line goes in the pull-request body, as
+`gate_scope.py`'s does, and the primary agent reruns it before enqueueing.
