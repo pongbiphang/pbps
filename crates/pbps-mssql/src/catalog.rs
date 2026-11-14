@@ -923,10 +923,10 @@ pub struct FilegroupRow {
     pub name: String,
     pub is_default: bool,
     pub is_read_only: bool,
-    /// How many of the database's filegroups have this name once ASCII case is
-    /// ignored. Above one only on a case-sensitive database that holds `fgx`
-    /// and `FGX` together, which the model, comparing names without case,
-    /// cannot tell apart.
+    /// How many of the database's filegroups the model cannot tell from this
+    /// one, that is, have this name once ASCII case is ignored (the rule of
+    /// [`pbps_model::Filegroup`]; `Éast` and `éast` are two). Above one only on
+    /// a case-sensitive database that holds `fgx` and `FGX` together.
     pub alike: usize,
 }
 
@@ -952,24 +952,78 @@ pub async fn filegroups_named(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT v.i, f.name, f.is_default, f.is_read_only,
-                (SELECT COUNT(*) FROM sys.filegroups g
-                  WHERE g.type = N'FG' AND LOWER(g.name) = LOWER(f.name)) AS alike
+        "SELECT v.i, f.name, f.is_default, f.is_read_only
            FROM (VALUES {values}) AS v(i, n)
            JOIN sys.filegroups f
              ON f.type = N'FG' AND f.name = v.n COLLATE CATALOG_DEFAULT
           ORDER BY v.i;"
     );
+    let mut matched = Vec::new();
     for row in conn.query(&sql).await? {
-        let i = get::<i32>(&row, "i")? as usize;
+        matched.push((
+            get::<i32>(&row, "i")? as usize,
+            get::<&str>(&row, "name")?.to_owned(),
+            get::<bool>(&row, "is_default")?,
+            get::<bool>(&row, "is_read_only")?,
+        ));
+    }
+    if matched.is_empty() {
+        return Ok(out);
+    }
+    // The twins are counted with the model's own equality, in Rust: SQL's
+    // `LOWER` folds more than ASCII (`Éast` and `éast`, two filegroups the
+    // model tells apart, would read as one), and the collation's equality
+    // folds accents and widths besides.
+    let mut all = Vec::new();
+    for row in conn
+        .query("SELECT name FROM sys.filegroups WHERE type = N'FG';")
+        .await?
+    {
+        all.push(get::<&str>(&row, "name")?.to_owned());
+    }
+    for (i, name, is_default, is_read_only) in matched {
         out[i] = Some(FilegroupRow {
-            name: get::<&str>(&row, "name")?.to_owned(),
-            is_default: get(&row, "is_default")?,
-            is_read_only: get(&row, "is_read_only")?,
-            alike: get::<i32>(&row, "alike")? as usize,
+            alike: filegroups_alike(&all, &name),
+            name,
+            is_default,
+            is_read_only,
         });
     }
     Ok(out)
+}
+
+/// How many of `all` the model reads as the filegroup `name`: its own equality
+/// (ASCII case only), not the database collation's and not SQL's `LOWER`.
+fn filegroups_alike(all: &[String], name: &str) -> usize {
+    let this = pbps_model::Filegroup::new(name);
+    all.iter()
+        .filter(|other| pbps_model::Filegroup::new(other.as_str()) == this)
+        .count()
+}
+
+#[cfg(test)]
+mod filegroup_alike_tests {
+    use super::filegroups_alike;
+
+    fn names(all: &[&str]) -> Vec<String> {
+        all.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    /// Only names the model conflates are twins: ASCII case, and nothing more.
+    /// `Éast` and `éast` are two filegroups to the model, as to a
+    /// case-sensitive database; `fgx` and `FGX` are one to the model.
+    #[test]
+    fn only_ascii_case_makes_two_filegroups_twins() {
+        let all = names(&["PRIMARY", "fgx", "FGX", "Éast", "éast"]);
+        assert_eq!(filegroups_alike(&all, "fgx"), 2);
+        assert_eq!(filegroups_alike(&all, "FGX"), 2);
+        // Negative: a non-ASCII case difference is not a twin.
+        assert_eq!(filegroups_alike(&all, "Éast"), 1);
+        assert_eq!(filegroups_alike(&all, "éast"), 1);
+        assert_eq!(filegroups_alike(&all, "PRIMARY"), 1);
+        // Negative: an accent difference is not a twin.
+        assert_eq!(filegroups_alike(&names(&["cafe", "café"]), "cafe"), 1);
+    }
 }
 
 pub async fn matching_table_names(

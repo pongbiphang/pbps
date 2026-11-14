@@ -2969,6 +2969,88 @@ fn a_filegroup_is_resolved_under_the_target_databases_collation() {
     assert!(!has("t=", twins.connection()), "nothing was built");
 }
 
+/// Issue #2813 (review round 2): the engine finds a filegroup by its
+/// collation's equality, which folds more than the model's (ASCII case only),
+/// so the model decides and the engine only confirms. Under an accent-
+/// insensitive collation a declared `cafe` finds the filegroup `café` (and
+/// `ON [cafe]` would place the table there), but reads back as `café`, a name
+/// the model holds to be another; it is refused naming the stored one. Under a
+/// case-sensitive collation `Éast` and `éast` are two filegroups, and the model
+/// tells them apart as well, so neither is taken for the other's twin.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn the_model_and_not_the_collation_decides_which_filegroup_a_name_is() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let accents = OwnDatabase::collated(&server, "fg2813_ai", "Latin1_General_100_CI_AI");
+    let first = OwnDatabase::collated(&server, "fg2813_e1", "Latin1_General_100_CS_AS");
+    let second = OwnDatabase::collated(&server, "fg2813_e2", "Latin1_General_100_CS_AS");
+    let add = |own: &OwnDatabase, names: &[&str]| {
+        for (n, name) in names.iter().enumerate() {
+            on_server(
+                own.connection(),
+                &format!(
+                    "ALTER DATABASE [{db}] ADD FILEGROUP [{name}];
+                     ALTER DATABASE [{db}] ADD FILE (NAME='{db}_f{n}',
+                         FILENAME='/var/opt/mssql/data/{db}_f{n}.ndf') TO FILEGROUP [{name}];",
+                    db = own.name
+                ),
+            );
+        }
+    };
+    add(&accents, &["café"]);
+    // Both spellings sit in each database, so that a lookup that folded them
+    // would find two where the model finds one.
+    add(&first, &["Éast", "éast"]);
+    add(&second, &["Éast", "éast"]);
+    let has = |prefix: &str, connection: &str| {
+        placements(connection)
+            .split(';')
+            .any(|entry| entry.starts_with(prefix))
+    };
+    let declare = |name: &str, filegroup: &str| {
+        let d = Demo::new(name);
+        std::fs::write(
+            d.dir.join("schema/dbo.t.yml"),
+            format!("table: dbo.t\ncolumns:\n  id: {{type: int, nullable: false}}\nfilegroup: {filegroup}\n"),
+        )
+        .unwrap();
+        let o = d.run(&["plan"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        d.commit();
+        d
+    };
+
+    let o = declare("filegroup2813-ai-folded", "cafe").run(&[
+        "bootstrap",
+        "--db",
+        accents.connection(),
+    ]);
+    assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("names the filegroup `cafe`, but the database's filegroup is `café`; declare it as stored"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!has("t=", accents.connection()), "nothing was built");
+    let o = declare("filegroup2813-ai-stored", "café").run(&[
+        "bootstrap",
+        "--db",
+        accents.connection(),
+    ]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(has("t=café", accents.connection()));
+
+    for (own, spelling) in [(&first, "Éast"), (&second, "éast")] {
+        let o = declare(&format!("filegroup2813-cs-{spelling}"), spelling).run(&[
+            "bootstrap",
+            "--db",
+            own.connection(),
+        ]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        assert!(has(&format!("t={spelling}"), own.connection()));
+    }
+}
+
 /// Issue #902, on this engine: the reader leaves the ledger's tables out of
 /// the pull but read a trigger on one of them (#891), and the pull wrote that
 /// trigger's declaration — which `validate` refuses, because its table is

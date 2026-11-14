@@ -9755,3 +9755,19 @@ That is refused at plan instead of being left to go unseen: a declared name that
 more than one filegroup has, once case is ignored, is refused with the reason.
 The apply guard holds a planned nonclustered key's, unique constraint's and
 index's filegroup to its `CREATE`, as it holds the table's rows (DEC-1774.1).
+
+*The model's equality decides (review round 2, measured).* The engine's lookup
+follows the database collation, which folds more than the model's equality
+(ASCII case only). On a `Latin1_General_100_CI_AI` database holding `café`,
+`WHERE name = N'cafe'` finds it and `ON [cafe]` places the table on it, but the
+read-back is `café`, a name the model holds to be another, so the declaration
+would plan a change forever. The connected check therefore accepts a found row
+only if its stored name equals the declared one under `Filegroup`'s equality, and
+otherwise refuses by name ("declared `cafe`, but the database's filegroup is
+`café`; declare it as stored"); the lookup only confirms the filegroup is there,
+for accent-, width- and kana-insensitive collations alike. The same equality
+counts the twins: on a `Latin1_General_100_CS_AS` database holding `Éast` and
+`éast`, SQL's `LOWER` folded the two into one and refused both, although the
+model, like the engine, has two filegroups. Twins are counted in Rust with the
+model's own function (`catalog::filegroups_alike`), so only `fgx` and `FGX` are
+twins.

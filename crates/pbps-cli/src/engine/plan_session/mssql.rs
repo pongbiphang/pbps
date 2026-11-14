@@ -164,7 +164,18 @@ fn filegroup_problems(
             ));
             continue;
         };
-        if found.alike > 1 {
+        // The engine's lookup is by its collation, which may fold accents,
+        // widths or kana the model does not: the model's equality decides, and
+        // the lookup only confirms that the filegroup is there. A filegroup
+        // found under another spelling would read back as a change forever.
+        let stored = pbps_model::Filegroup::new(found.name.as_str());
+        if stored != **fg {
+            problems.push(format!(
+                "{what} names the filegroup `{name}`, but the database's filegroup is `{}`; \
+                 declare it as stored",
+                pbps_model::escape::Escaped(stored.as_str())
+            ));
+        } else if found.alike > 1 {
             problems.push(format!(
                 "{what} names the filegroup `{name}`, but this database holds several that differ \
                  only in case; pbps compares filegroup names without case and cannot tell them \
@@ -1314,6 +1325,41 @@ mod filegroup_tests {
             &[("fgx", false, false, 1), ("FGX", false, false, 1)],
         );
         assert_eq!(case_insensitive, "");
+    }
+
+    /// The engine's lookup follows the database's collation, which may fold
+    /// accents or widths the model does not, so a filegroup it returns under
+    /// another spelling is refused by both names; the model's equality (ASCII
+    /// case only) decides, and the lookup only confirms.
+    #[test]
+    fn a_filegroup_the_engine_found_under_another_spelling_is_refused_as_stored() {
+        let stored = |asked: &'static str, name: &str| {
+            let mut held = BTreeMap::new();
+            held.insert(
+                asked,
+                FilegroupRow {
+                    name: name.to_owned(),
+                    is_default: false,
+                    is_read_only: false,
+                    alike: 1,
+                },
+            );
+            filegroup_problems(&declared_filegroups(&table_with(Some(asked), None)), &held)
+                .join("\n")
+        };
+        let said = stored("cafe", "café");
+        assert!(
+            said.contains(
+                "table `dbo.t` names the filegroup `cafe`, but the database's filegroup is `café`; declare it as stored"
+            ),
+            "{said}"
+        );
+        // Negative: the same spelling, or one that differs only in ASCII case,
+        // is the model's own equality and passes.
+        assert_eq!(stored("café", "café"), "");
+        assert_eq!(stored("FGX", "fgx"), "");
+        // Negative: a non-ASCII case difference is a different name to the model.
+        assert!(stored("éast", "Éast").contains("declare it as stored"));
     }
 
     /// A case-sensitive database may hold `fgx` and `FGX`; the model, which
