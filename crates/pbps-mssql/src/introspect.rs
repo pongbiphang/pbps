@@ -30,6 +30,7 @@ use pbps_model::{
 };
 
 use crate::types;
+use pbps_db::pull::{group, record_limitation};
 
 // The shapes a pull returns are `pbps-db`'s, filled here from `sys.*` and
 // re-exported under the paths this crate's callers and tests have always used
@@ -167,10 +168,7 @@ impl RawBase {
 /// not a key, but part of its table's answer.
 fn temporal_tables(raw: &RawCatalog) -> BTreeMap<i32, Result<pbps_model::SystemTime, String>> {
     let by_id: BTreeMap<i32, &RawTable> = raw.tables.iter().map(|t| (t.object_id, t)).collect();
-    let mut columns: BTreeMap<i32, Vec<&RawColumn>> = BTreeMap::new();
-    for c in &raw.columns {
-        columns.entry(c.object_id).or_default().push(c);
-    }
+    let columns = group(&raw.columns, |c| c.object_id);
     let mut out = BTreeMap::new();
     for t in &raw.tables {
         // The ledger is refused before this is asked, and a history is
@@ -889,13 +887,8 @@ fn push_limitation(
     table: Option<&TableName>,
     detail: String,
 ) {
-    warnings.push(detail.clone());
-    if let Some(table) = table {
-        limitations.push(Limitation {
-            target: LimitationTarget::Relation(table.clone()),
-            detail,
-        });
-    }
+    let target = table.map(|table| LimitationTarget::Relation(table.clone()));
+    record_limitation(warnings, limitations, target, detail);
 }
 
 /// Splits a stored definition back into the body a declaration carries.

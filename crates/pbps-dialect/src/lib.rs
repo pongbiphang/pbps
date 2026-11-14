@@ -2217,8 +2217,13 @@ pub fn after_string_gap(mut text: &str) -> (&str, bool) {
 }
 
 /// The length of the `"…"` at the front of `text`, a doubled quote being a
-/// quote inside the name; `None` where it never closes.
-fn quoted_identifier_len(text: &str) -> Option<usize> {
+/// quote inside the name; `None` where it never closes. `text` must start with
+/// the opening quote.
+///
+/// Public because `pbps-pg` steps over a deparsed name with it, and a second
+/// spelling of the doubled-quote rule is how two readers come to disagree.
+#[must_use]
+pub fn quoted_identifier_len(text: &str) -> Option<usize> {
     let mut at = 1;
     loop {
         let close = at + text[at..].find('"')?;
