@@ -1603,9 +1603,9 @@ Four rules, one per cause (#2806, #2816, #2817).
   writes of the same file could share one. The digest keeps that, at a constant
   length, and `<n>` still tells apart names taken on disk or in the write. Two
   writes of the same file are still not told apart; that was so before and is
-  not closed here. The reader's rule is unchanged (`*.json` is an identity
-  file), so the first two are still refused or skipped as before and the third
-  is still read.
+  not closed here (DEC-2820.1 gives each write its own names). The reader's
+  rule is unchanged (`*.json` is an identity file), so the first two are still
+  refused or skipped as before and the third is still read.
 - **A dropped object's aside is bounded like `pull`'s names.** When
   `<object name>.<uid>.json` would pass 240 bytes (the budget of
   `declaration_file`), the name is `~pbps-<hash>.<uid>.json`, with the hash of
@@ -1737,3 +1737,47 @@ empty directory outside it).
   starts, not entries of a directory, so neither can be a link. Windows cannot
   look at a verbatim prefix alone (`\\?\C:`), and `canonicalize` spells every
   path with one. The Windows job runs `init` and `pull` through this.
+
+<a id="dec-2820-1"></a>
+
+**DEC-2820.1. A transient name carries a random token, and a temp file is created exclusively, so two writers of one file never share a name.**
+One rule, from #2820. It adds to DEC-2817.1; nothing there is withdrawn.
+
+- **The rule.** `unused_sibling` builds `.pbps-<kind><n>-<digest>-<token><tail>`
+  for the staging file, the aside and the respelling step. `<token>` is 16
+  lowercase hex digits of a fresh random 64-bit value, drawn once per call. The
+  counter, the digest and the set of reserved names are as before. A name is
+  still skipped when it is on disk or reserved.
+- **Why the test was not enough.** "The name does not exist" reserves nothing.
+  Two processes that write one file both tested `.pbps-tmp0-<digest>`, both found
+  it free, both opened it with a truncating write and both renamed it. One could
+  install the other's bytes, the file could be torn, and a failing writer's undo
+  removed the other's live temp.
+- **Why a token and not an exclusive create for all three kinds.** An exclusive
+  create can claim a staging file only. An aside and a respelling step are
+  rename targets whose source can be a directory, and a placeholder file or
+  directory cannot be renamed over by one on every platform. A name that is
+  unique by construction needs no claim, so one change covers all three kinds and
+  every caller, and no call site changed.
+- **The exclusive create is a backstop.** The two writers of bytes
+  (`write_staged`, `write_atomic`) open the temp with `create_new`. A name that is
+  taken is a refusal that names the path; it never truncates. The undo of a
+  failed write does not remove a file that was not created by that write.
+- **Why random.** A pid or a clock can agree between two processes (pid
+  namespaces over one checkout, a coarse clock). Eight random bytes
+  (the `rand` crate's default generator) do not, for this purpose.
+- **Why no lock and no sweep.** A lock file would be a new untracked file in the
+  checkout and a new platform surface, and would need a guard around every
+  command that writes. A sweep cannot tell a dead writer's leftover from a live
+  one's temp, and an aside can hold the only copy of a file. A leftover is still
+  refused and named by the reader, and a person decides. A leftover from another
+  token no longer blocks a new write, because the names differ.
+- **Length and reader rules.** The name is still of constant length (at most 72
+  bytes: 6 + 7 + 20 + 1 + 16 + 1 + 16 + 5) and far below 255. `tmp` and `aside`
+  names still do not end in `.json`; the respelling name still does.
+- **Not claimed.** Two whole syncs at once are still not made safe: the later
+  rename wins. Only "one write installs another's bytes" is closed. The names of
+  the case probe (`.PbpsCaseProbe<pid>`) are not changed here.
+- **Test seam.** Under `cfg(test)` the token is `0000000000000000` unless a test
+  sets another, and a hook runs inside `unused_sibling` after a name is judged
+  free and before the caller claims it. Production builds carry neither.
