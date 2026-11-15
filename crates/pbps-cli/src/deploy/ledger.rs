@@ -327,14 +327,27 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
         crate::engine::lock(&mut conn, &operator).await?;
         let result = async {
             let ids = crate::engine::installation_ids(&mut conn, &ids).await?;
-            let scoped = managed_state(
+            // Read before the database is: the read is compared with this record,
+            // so it keeps what the record names as well as what the declarations
+            // do. Kept to the declarations alone, a recorded text search object
+            // whose declaration was removed would read as gone from a database
+            // that still holds it, and an unchanged database would be refused
+            // (DEC-2855.1).
+            let previous = crate::engine::latest(&mut conn).await;
+            let compared_as = match &previous {
+                Ok(Some(previous)) => loaded
+                    .schema
+                    .naming_also_what_is_recorded(&previous.snapshot.schema),
+                _ => loaded.schema.clone(),
+            };
+            let mut scoped = managed_state(
                 &mut conn,
                 &ids,
                 &declared_modules,
                 &pbps_diff::external_parents(&loaded.schema),
                 target.catalog_policy(project.config.unmanaged),
                 &declared_data,
-                &loaded.schema,
+                &compared_as,
                 crate::engine::Read::Snapshot,
                 CatalogWarnings::Human,
             )
@@ -345,7 +358,7 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
             // Comparing against the recorded state is the whole guard. A snapshot
             // that overwrites a state it differs from is exactly "somebody SSHed in
             // and changed the schema" being quietly adopted by a pipeline.
-            match crate::engine::latest(&mut conn).await {
+            match previous {
                 Ok(Some(previous)) if !previous.snapshot.matches(&scoped.schema) && !force => {
                     bail!(
                         "`{}` differs from the state recorded at {} (entry #{}).\n\
@@ -370,6 +383,10 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
                 Ok(None) => {}
                 Err(e) => return Err(e.into()),
             }
+
+            // The comparison is done; what is recorded names only what the
+            // declarations do.
+            scoped.schema = scoped.schema.as_recorded(&loaded.schema);
 
             // What the database holds, not every uid the ids file names: a
             // missing table or role recorded as held is one the next plan

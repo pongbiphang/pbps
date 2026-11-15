@@ -390,3 +390,47 @@ fn an_undeclared_text_search_object_does_not_stop_a_rehearsal() {
         );
     });
 }
+
+/// A recorded object whose declaration is removed while the database keeps it is no
+/// difference to `snapshot`: the database equals the record, as `verify` says. The new
+/// record then stops naming it, so dropping it afterwards is no drift. Changed in the
+/// database first, it is the difference `snapshot` exists to refuse.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_snapshot_after_a_declaration_is_removed_compares_the_unchanged_database_as_equal() {
+    servers(|server, slug| {
+        let f = fixture(server, &format!("search2855-undeclare-{slug}"));
+        on_server(f.target(), MADE);
+        pull(&f);
+        f.d.commit();
+        baseline(&f, "adopt the text search objects");
+        let file = f.d.dir.join("schema/app.russian.textsearch-dictionary.yml");
+        std::fs::remove_file(&file).unwrap();
+        succeeds(f.d.run(&["verify", "--db", f.target()]));
+
+        // Negative: changed outside pbps, it differs from the record whatever is declared.
+        on_server(
+            f.target(),
+            "DROP TEXT SEARCH DICTIONARY app.russian; \
+             CREATE TEXT SEARCH DICTIONARY app.russian (TEMPLATE = pg_catalog.simple, ACCEPT = false)",
+        );
+        let refused = f.d.run(&["snapshot", "--db", f.target()]);
+        assert_ne!(code(&refused), 0, "{}", said(&refused));
+        assert!(
+            said(&refused).contains("differs from the state recorded"),
+            "{}",
+            said(&refused)
+        );
+        on_server(
+            f.target(),
+            "DROP TEXT SEARCH DICTIONARY app.russian; \
+             CREATE TEXT SEARCH DICTIONARY app.russian (TEMPLATE = pg_catalog.simple)",
+        );
+
+        succeeds(f.d.run(&["snapshot", "--db", f.target()]));
+        // The record no longer names it.
+        on_server(f.target(), "DROP TEXT SEARCH DICTIONARY app.russian");
+        succeeds(f.d.run(&["verify", "--db", f.target()]));
+        succeeds(f.d.run(&["snapshot", "--db", f.target()]));
+    });
+}

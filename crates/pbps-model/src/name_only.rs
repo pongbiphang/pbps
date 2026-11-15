@@ -145,6 +145,18 @@ impl NameOnly {
         }
     }
 
+    /// These and the objects `other` names that these do not: the names of both.
+    /// For a name both hold, this side's definition is kept.
+    #[must_use]
+    pub fn or_named_by(self, other: &Self) -> Self {
+        let Self { mut search } = self;
+        let Self { search: named } = other;
+        for (name, object) in named {
+            search.entry(name.clone()).or_insert_with(|| object.clone());
+        }
+        Self { search }
+    }
+
     /// Recorded objects that are gone from `live` or hold another definition. An
     /// object only `live` holds is not here: it was never recorded, and so it is not
     /// this state's to call drift (DEC-2728.1).
@@ -284,6 +296,24 @@ impl Schema {
             return self == live;
         }
         self == &live.clone().with_name_only_restricted_to(self)
+    }
+
+    /// What a re-recording reads for: every name-only object the declarations name
+    /// or the previous record holds. The read is compared with that record before it
+    /// replaces it, and a read kept only to the declarations would show a recorded
+    /// object whose declaration was since removed as gone from a database that still
+    /// holds it. The comparison done, [`Schema::as_recorded`] gives what is recorded.
+    #[must_use]
+    pub fn naming_also_what_is_recorded(&self, recorded: &Schema) -> Schema {
+        let Classified {
+            plannable,
+            name_only,
+        } = self.clone().classify();
+        Classified {
+            plannable,
+            name_only: name_only.or_named_by(&recorded.name_only()),
+        }
+        .into_schema()
     }
 
     /// The recorded form of a read: a state records for a name-only kind only what

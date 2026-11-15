@@ -214,3 +214,46 @@ fn a_record_matches_the_database_unless_a_recorded_object_moved() {
         assert!(!recorded.recorded_matches(&moved), "{}: table", row.label);
     }
 }
+
+/// `snapshot` compares its read with the previous record before replacing it. The read
+/// keeps what that record names beside what the declarations do, so an object whose
+/// declaration was removed, and which the database still holds unchanged, is no
+/// difference; what is then recorded names only the declarations.
+#[test]
+fn a_re_recording_reads_what_the_record_names_and_records_what_is_declared() {
+    for row in ROWS {
+        let recorded = merged(table("int"), (row.holding)("app.undeclared_since", 0));
+        let declared = merged(table("int"), (row.holding)("app.declared", 0));
+        let reads_for = declared.naming_also_what_is_recorded(&recorded);
+        let live = |variant| {
+            let held = merged(table("int"), (row.holding)("app.undeclared_since", variant));
+            let held = merged(held, (row.holding)("app.declared", 0));
+            merged(held, (row.holding)("app.nobodys", 0))
+        };
+        let read = live(0).as_recorded(&reads_for);
+        assert!(recorded.recorded_matches(&read), "{}", row.label);
+        assert_eq!(read.as_recorded(&declared), declared, "{}", row.label);
+        // Kept to the declarations alone, the unchanged database reads as drifted.
+        assert!(
+            !recorded.recorded_matches(&live(0).as_recorded(&declared)),
+            "{}: the read this replaces",
+            row.label
+        );
+        // Negative: the object changed or gone is still a difference, declared or not.
+        assert!(
+            !recorded.recorded_matches(&live(1).as_recorded(&reads_for)),
+            "{}: altered",
+            row.label
+        );
+        assert!(
+            !recorded.recorded_matches(&declared.clone().as_recorded(&reads_for)),
+            "{}: gone",
+            row.label
+        );
+        // The plannable kinds are the declarations', and a name both hold keeps the
+        // declared definition.
+        let both = merged(table("bigint"), (row.holding)("app.declared", 1));
+        let named = declared.naming_also_what_is_recorded(&both);
+        assert_eq!(named, declared, "{}", row.label);
+    }
+}
