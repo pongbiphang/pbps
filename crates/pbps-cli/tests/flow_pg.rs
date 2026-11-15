@@ -36023,13 +36023,11 @@ fn state_history_requires_readable_snapshots_but_no_database_write_privileges() 
     }
 }
 
+// One test per server, so the shards can place the two majors apart.
 #[cfg(unix)]
-#[test]
-#[ignore = "needs live PostgreSQL"]
-fn forced_state_export2348_keeps_the_mode_of_the_declaration_it_replaces() {
-    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
-        state_history::forced_export_keeps_declaration_modes(&server, true);
-    }
+on_both_servers! {
+    forced_state_export2348_keeps_the_mode_of_the_declaration_it_replaces =>
+        |pg| state_history::forced_export_keeps_declaration_modes(&pg.url(), true),
 }
 
 #[test]
