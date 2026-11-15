@@ -148,19 +148,22 @@ pub fn a_sequence_annotation_holds_the_create_table_group(server: &str) {
 pub fn policy_and_row_security_annotations_order_the_policy_install_and_refuse_the_reverse(
     server: &str,
 ) {
-    let table = |using: &str| {
+    let table = |using: &str, depends_on: &str| {
         format!(
-            "table: app.t\ndepends_on:\n  \"policy::app.t.p\": [\"{f}\"]\n  \"row_security::app.t\": [\"{f}\"]\ncolumns:\n  id: {{type: int, nullable: false}}\nrow_security: {{enabled: true}}\nrow_policies:\n  p: {{using: \"{using}\"}}\n",
-            f = target(true)
+            "table: app.t\n{depends_on}columns:\n  id: {{type: int, nullable: false}}\nrow_security: {{enabled: true}}\nrow_policies:\n  p: {{using: \"{using}\"}}\n"
         )
     };
+    let annotated = format!(
+        "depends_on:\n  \"policy::app.t.p\": [\"{f}\"]\n  \"row_security::app.t\": [\"{f}\"]\n",
+        f = target(true)
+    );
     let (d, own, script) = build(
         true,
         server,
         "dep-policy",
         &[
             ("app.f.yml", function(true, "")),
-            ("app.t.yml", table("true")),
+            ("app.t.yml", table("true", &annotated)),
         ],
     );
     assert!(
@@ -188,14 +191,16 @@ pub fn policy_and_row_security_annotations_order_the_policy_install_and_refuse_t
         ),
         1
     );
-    // The reverse: the function follows the policy. Both change, so both are
+    // The reverse: the function follows the policy, and the table no longer
+    // says the policy follows the function (the two together would be a
+    // declared cycle, which is another refusal). Both change, so both are
     // steps, and the plan names the two that wait on one another.
     std::fs::write(
         d.dir.join("schema/app.f.yml"),
         function(true, "depends_on: [\"policy::app.t.p\"]\n").replace("SELECT 1", "SELECT 2"),
     )
     .unwrap();
-    std::fs::write(d.dir.join("schema/app.t.yml"), table("false")).unwrap();
+    std::fs::write(d.dir.join("schema/app.t.yml"), table("false", "")).unwrap();
     let refused = d.run(&["plan", "--db", connection]);
     assert_ne!(code(&refused), 0, "{}", said(&refused));
     let text = said(&refused);
@@ -267,7 +272,8 @@ pub fn a_view_index_annotation_holds_the_whole_view_group(server: &str) {
         scalar(
             false,
             own.connection(),
-            "SELECT count(*) FROM sys.indexes WHERE name = 'ix' AND object_id = OBJECT_ID('dbo.v')"
+            // `count(*)` is an `int` on SQL Server, and the helper reads a `bigint`.
+            "SELECT COUNT_BIG(*) FROM sys.indexes WHERE name = 'ix' AND object_id = OBJECT_ID('dbo.v')"
         ),
         1
     );
