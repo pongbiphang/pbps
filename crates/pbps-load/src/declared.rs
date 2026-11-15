@@ -63,16 +63,7 @@ impl Loaded {
     pub fn declared_paths(&self, schema_dir: &Path) -> Result<DeclaredPaths, DeclaredPathError> {
         let mut out = DeclaredPaths::default();
         for (declaration, source) in &self.sources {
-            let kind_has_ids = match declaration {
-                Declaration::Table(_)
-                | Declaration::Role(_)
-                | Declaration::Type(_)
-                | Declaration::Search(_)
-                | Declaration::Extension(_) => true,
-                // Sequences take identities with the part that creates one (#2721).
-                Declaration::Sequence(_) | Declaration::Module(_) => false,
-            };
-            if !kind_has_ids {
+            if declaration.identity().is_none() {
                 continue;
             }
             if let Declaration::Table(name) = declaration
