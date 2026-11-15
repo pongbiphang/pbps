@@ -55,20 +55,32 @@ fn maker_gone(base: &Path, boot: &str) -> Result<bool, String> {
     ))
 }
 
+/// The directories directly under `base`, links not followed. A directory that
+/// cannot be listed, an entry that cannot be read and an entry whose type cannot
+/// be read are errors, never an absence.
+fn subdirs(base: &Path) -> Result<Vec<PathBuf>, String> {
+    let failed = |path: &Path, e: std::io::Error| format!("{}: {e}", path.display());
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(base).map_err(|e| failed(base, e))? {
+        let entry = entry.map_err(|e| failed(base, e))?;
+        let kind = entry.file_type().map_err(|e| failed(&entry.path(), e))?;
+        if kind.is_dir() {
+            found.push(entry.path());
+        }
+    }
+    Ok(found)
+}
+
 /// Whether a state directory under `base` holds a record, or cannot be read:
 /// a live test that leaves one keeps its directory for the next run to find.
 pub(super) fn holds_runs(base: &Path) -> bool {
-    let Ok(read) = std::fs::read_dir(base) else {
-        return true;
-    };
-    read.flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .any(|sub| {
+    subdirs(base).map_or(true, |subs| {
+        subs.into_iter().any(|sub| {
             StateDir::open(sub)
                 .and_then(|dir| dir.runs())
                 .map_or(true, |runs| !runs.is_empty())
         })
+    })
 }
 
 /// Reconciles every state directory under `root` that a dead process made,
@@ -113,25 +125,14 @@ pub(super) async fn sweep(
             }
         }
         let mut kept = false;
-        let subs = match std::fs::read_dir(&base) {
+        let subs = match subdirs(&base) {
             Ok(subs) => subs,
-            Err(e) => {
-                problems.push(format!("{}: {e}", base.display()));
+            Err(why) => {
+                problems.push(why);
                 continue;
             }
         };
         for sub in subs {
-            let sub = match sub {
-                Ok(sub) => sub.path(),
-                Err(e) => {
-                    problems.push(format!("{}: {e}", base.display()));
-                    kept = true;
-                    continue;
-                }
-            };
-            if !sub.is_dir() {
-                continue;
-            }
             let dir = match StateDir::open(sub.clone()) {
                 Ok(dir) => dir,
                 Err(e) => {
@@ -331,6 +332,24 @@ mod tests {
         let problems = swept(&root, &runtime_with(&run('b'))).await;
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert_eq!(dir.runs().unwrap(), [run('b')]);
+        // A directory that can be entered but not listed cannot be shown empty.
+        let (unlisted, _) = leftover(&root, Some(dead()), &run('d'));
+        std::fs::set_permissions(&unlisted, std::fs::Permissions::from_mode(0o300)).unwrap();
+        assert!(
+            holds_runs(&unlisted),
+            "an unlistable directory keeps its records"
+        );
+        let rt = runtime_with(&run('d'));
+        let problems = swept(&root, &rt).await;
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains(unlisted.to_str().unwrap())),
+            "{problems:?}"
+        );
+        assert!(rt.removed.borrow().is_empty());
+        std::fs::set_permissions(&unlisted, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(unlisted.exists());
         // So is a state directory this user cannot show to be private.
         let (open, dir) = leftover(&root, Some(dead()), &run('c'));
         std::fs::set_permissions(
