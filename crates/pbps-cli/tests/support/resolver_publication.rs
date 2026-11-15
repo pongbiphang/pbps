@@ -2345,3 +2345,262 @@ pub fn partition_own_default_bindings(server: &str) {
     assert_eq!(scalar(connection, "SELECT n::bigint FROM app.q"), 4);
     successful(run(&d, &["verify", "--env", "prod"], Some(&targets)));
 }
+
+/// A reference table the project has not managed yet, which the revision
+/// renames and takes over (`mode: exact`) in the same plan the resolver
+/// answers.
+const UNMANAGED_HOLDINGS: (&str, &str) = (
+    "app.takeover.yml",
+    "table: app.takeover\ncolumns:\n  code: {type: varchar(8), nullable: false}\n  \
+     note: {type: varchar(20), nullable: false}\n\
+     primary_key: {name: pk_takeover, columns: [code]}\n",
+);
+
+const TAKEN_OVER_HOLDINGS: (&str, &str) = (
+    "app.takeover.yml",
+    "table: app.holdings\nrenamed_from: app.takeover\ncolumns:\n  \
+     code: {type: varchar(8), nullable: false}\n  \
+     note: {type: varchar(20), nullable: false}\n\
+     primary_key: {name: pk_takeover, columns: [code]}\n\
+     data:\n  mode: exact\n  rows:\n    a: {note: one}\n",
+);
+
+/// The zero-SQL scope changes a published plan carries, in plan order, with
+/// the whole plan's resolver evidence checked first: the plan is the
+/// resolver's (`resolved_database`), and its SQL holds the routine the
+/// binding change adds, so a plan that merely skipped the resolver cannot
+/// pass for one that kept the scope.
+fn scope_changes(sealed: &Sealed) -> (Vec<pbps_model::Change>, pbps_model::SavedPlan) {
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sealed.artifact).unwrap()).unwrap();
+    assert_eq!(saved["origin"], "resolved_database", "{saved}");
+    let script = std::fs::read_to_string(sealed.d.dir.join("plan.sql")).unwrap();
+    assert!(
+        script.contains(r#"DROP VIEW "app"."v""#)
+            && script.contains("RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1"),
+        "the resolver's own statements are in the plan: {script}"
+    );
+    let typed: pbps_model::SavedPlan = serde_json::from_value(saved).unwrap();
+    let scope: Vec<_> = typed
+        .changes
+        .changes
+        .iter()
+        .map(|planned| planned.change.clone())
+        .filter(|change| {
+            matches!(
+                change,
+                pbps_model::Change::SetDataMode { .. } | pbps_model::Change::SetEnsureKeys { .. }
+            )
+        })
+        .collect();
+    // They follow every change the resolver ordered, where the ordinary plan
+    // keeps them, so the sealed order is the one the checksum approved.
+    let tail = typed.changes.changes.len() - scope.len();
+    assert!(
+        typed.changes.changes[tail..].iter().all(|planned| matches!(
+            planned.change,
+            pbps_model::Change::SetDataMode { .. } | pbps_model::Change::SetEnsureKeys { .. }
+        )),
+        "{typed:?}"
+    );
+    (scope, typed)
+}
+
+fn verify_code(sealed: &Sealed) -> (i32, String) {
+    let output = run(
+        &sealed.d,
+        &["verify", "--env", "prod", "--format", "json"],
+        Some(&Targets {
+            target: sealed.connection(),
+            scratch: &sealed._scratch.connection,
+        }),
+    );
+    (code(&output), stdout(&output))
+}
+
+fn next_plan_changes(sealed: &Sealed) -> serde_json::Value {
+    let next = successful(run(
+        &sealed.d,
+        &["plan", "--env", "prod", "--format", "json"],
+        Some(&Targets {
+            target: sealed.connection(),
+            scratch: &sealed._scratch.connection,
+        }),
+    ));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&next)).unwrap();
+    value["data"]["changes"].clone()
+}
+
+/// A plan the resolver must answer keeps a first data takeover and an ensure
+/// key transition, under their final names, and applying it records both
+/// (#1879). The revision adds `app.f(integer)`, which forces resolution (the
+/// ordinary re-derivation the resolver does cannot see a scope, because its
+/// base already carries the declared mode and the union of observed rows),
+/// renames the unmanaged `app.takeover` to `app.holdings` while taking it
+/// over, and adds `JP`, a row the target already holds, to `app.country`'s
+/// ensure keys.
+pub fn scope_survives_resolution(server: &str) {
+    let sealed = Sealed::revised(
+        server,
+        "scope1879",
+        Revision {
+            bootstrapped: &[UNMANAGED_HOLDINGS],
+            files: &[
+                TAKEN_OVER_HOLDINGS,
+                (
+                    "app.country.yml",
+                    &country("\n    TW: {label: Taiwan}\n    JP: {label: Japan}"),
+                ),
+            ],
+            target_only: Some(
+                "INSERT INTO app.takeover VALUES ('a', 'one'); \
+                 INSERT INTO app.country VALUES ('JP', 'Japan')",
+            ),
+            ..Revision::default()
+        },
+    );
+    let (scope, typed) = scope_changes(&sealed);
+    let takeovers: Vec<_> = scope
+        .iter()
+        .filter_map(|change| {
+            if let pbps_model::Change::SetDataMode { table, from, to } = change {
+                Some((table.raw().to_string(), *from, *to))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        takeovers,
+        vec![(
+            "app.holdings".to_owned(),
+            None,
+            Some(pbps_model::data::DataMode::Exact)
+        )],
+        "exactly one takeover, at the table's final name: {scope:?}"
+    );
+    let transitions: Vec<_> = scope
+        .iter()
+        .filter_map(|change| {
+            if let pbps_model::Change::SetEnsureKeys { table, from, to } = change {
+                Some((table.raw().to_string(), from.clone(), to.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        transitions,
+        vec![(
+            "app.country".to_owned(),
+            ["TW"].into_iter().map(Into::into).collect(),
+            ["TW", "JP"].into_iter().map(Into::into).collect()
+        )],
+        "exactly one key transition: {scope:?}"
+    );
+    assert!(
+        typed.changes.changes.iter().any(|planned| matches!(
+            &planned.change,
+            pbps_model::Change::RenameTable { to, .. } if to.raw().to_string() == "app.holdings"
+        )),
+        "the plan renames the table the takeover names: {typed:?}"
+    );
+
+    successful(sealed.apply(&sealed.artifact));
+    assert_eq!(
+        verify_code(&sealed).0,
+        0,
+        "the applied scope matches the target"
+    );
+    assert_eq!(next_plan_changes(&sealed), 0, "the recorded scope is final");
+
+    // The takeover is recorded: a managed row that changes afterwards is
+    // drift, at the final name.
+    on_server(
+        sealed.connection(),
+        "UPDATE app.holdings SET note = 'changed' WHERE code = 'a'",
+    );
+    let (drifted, said) = verify_code(&sealed);
+    assert_eq!(drifted, 2, "{said}");
+    assert!(said.contains("state.drift"), "{said}");
+    on_server(
+        sealed.connection(),
+        "UPDATE app.holdings SET note = 'one' WHERE code = 'a'",
+    );
+    // So is the key the transition added; a row outside the keys is not
+    // managed (ensure mode) and stays quiet.
+    on_server(
+        sealed.connection(),
+        "INSERT INTO app.country VALUES ('KR', 'Korea')",
+    );
+    assert_eq!(verify_code(&sealed).0, 0, "an unlisted row is not managed");
+    on_server(
+        sealed.connection(),
+        "UPDATE app.country SET label = 'Changed' WHERE code = 'JP'",
+    );
+    let (drifted, said) = verify_code(&sealed);
+    assert_eq!(drifted, 2, "{said}");
+    assert!(said.contains("state.drift"), "{said}");
+}
+
+/// The other direction of the same boundary: a key leaving an ensure table's
+/// scope while the resolver answers is kept as a transition, and the row it
+/// stops managing no longer drifts once the plan applies (#1879).
+pub fn removed_ensure_key_survives_resolution(server: &str) {
+    let sealed = Sealed::revised(
+        server,
+        "unkey1879",
+        Revision {
+            files: &[("app.country.yml", &country("{}"))],
+            ..Revision::default()
+        },
+    );
+    let (scope, _) = scope_changes(&sealed);
+    let transitions: Vec<_> = scope
+        .iter()
+        .filter_map(|change| {
+            assert!(
+                !matches!(change, pbps_model::Change::SetDataMode { .. }),
+                "no takeover is declared: {scope:?}"
+            );
+            if let pbps_model::Change::SetEnsureKeys { table, from, to } = change {
+                Some((table.raw().to_string(), from.clone(), to.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        transitions,
+        vec![(
+            "app.country".to_owned(),
+            ["TW"].into_iter().map(Into::into).collect(),
+            Default::default()
+        )],
+        "{scope:?}"
+    );
+    on_server(
+        sealed.connection(),
+        "UPDATE app.country SET label = 'Changed' WHERE code = 'TW'",
+    );
+    let (before, said) = verify_code(&sealed);
+    assert_eq!(
+        before, 2,
+        "while the key is managed the edit drifts: {said}"
+    );
+    on_server(
+        sealed.connection(),
+        "UPDATE app.country SET label = 'Taiwan' WHERE code = 'TW'",
+    );
+    successful(sealed.apply(&sealed.artifact));
+    on_server(
+        sealed.connection(),
+        "UPDATE app.country SET label = 'Changed' WHERE code = 'TW'",
+    );
+    assert_eq!(
+        verify_code(&sealed).0,
+        0,
+        "the removed key no longer drifts"
+    );
+    assert_eq!(next_plan_changes(&sealed), 0);
+}
