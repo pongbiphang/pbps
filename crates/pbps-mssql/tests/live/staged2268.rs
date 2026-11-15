@@ -921,6 +921,7 @@ async fn managed_aliases_are_rejected_as_overlap() {
             name: Some("T_PK".into()),
             columns: vec!["a".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         let Err(StageError::Refused(findings)) = capture::compare_staged(
             &mut f.scratch,

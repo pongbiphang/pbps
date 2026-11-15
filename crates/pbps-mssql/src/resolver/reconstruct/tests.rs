@@ -265,6 +265,7 @@ fn a_key_over_a_computed_column_follows_the_column_and_other_keys_stay_with_the_
                 pbps_model::UniqueConstraint {
                     columns: vec!["c".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             t.unique.insert(
@@ -272,6 +273,7 @@ fn a_key_over_a_computed_column_follows_the_column_and_other_keys_stay_with_the_
                 pbps_model::UniqueConstraint {
                     columns: vec!["id".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
         }),
@@ -485,6 +487,7 @@ fn primary_key(column: &str) -> pbps_model::PrimaryKey {
         name: Some(format!("pk_{column}").into()),
         columns: vec![column.into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     }
 }
 
@@ -826,6 +829,7 @@ fn a_key_over_two_computed_columns_follows_both() {
                 pbps_model::UniqueConstraint {
                     columns: vec!["c1".into(), "c2".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
         })];
@@ -1066,6 +1070,7 @@ fn a_composite_key_over_a_late_and_an_inline_looking_column_follows_both() {
                 pbps_model::UniqueConstraint {
                     columns: vec!["c1".into(), "c2".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
         }),
@@ -1190,6 +1195,7 @@ fn a_seed_row_for_a_table_with_a_split_computed_column_makes_no_cycle() {
                 pbps_model::UniqueConstraint {
                     columns: vec!["c".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
         });

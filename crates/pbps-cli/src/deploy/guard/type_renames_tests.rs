@@ -37,6 +37,7 @@ fn observed(ty: &str) -> Schema {
                 filter: Some(check.clone()),
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         )]
         .into(),

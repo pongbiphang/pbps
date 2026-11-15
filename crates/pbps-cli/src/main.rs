@@ -2736,6 +2736,7 @@ mod consumer_contract_tests {
                         name: Some("PK__generated".into()),
                         columns: vec!["old".into()],
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     })
                 }
                 Part::Unique => {
@@ -2744,6 +2745,7 @@ mod consumer_contract_tests {
                         UniqueConstraint {
                             columns: vec!["old".into()],
                             storage_parameters: Default::default(),
+                            filegroup: None,
                         },
                     );
                 }
@@ -2777,6 +2779,7 @@ mod consumer_contract_tests {
                             filter: None,
                             method: Default::default(),
                             storage_parameters: Default::default(),
+                            filegroup: None,
                         },
                     );
                 }
@@ -2790,6 +2793,7 @@ mod consumer_contract_tests {
                 name: None,
                 columns: vec!["old".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             let before = Schema {
                 tables: [(table.clone(), shape.clone()), (parent.clone(), referenced)].into(),
@@ -5173,6 +5177,12 @@ fn cmd_plan(
                 "plan.policy-bindings-unchecked",
                 notice,
             ));
+        }
+        for notice in engine::unchecked_filegroups(&loaded.schema) {
+            if !json {
+                eprintln!("warning: {notice}");
+            }
+            findings.push(output::Finding::warning("plan.filegroup-unchecked", notice));
         }
 
         // A `--base` that is missing, malformed or of an unsupported version is a

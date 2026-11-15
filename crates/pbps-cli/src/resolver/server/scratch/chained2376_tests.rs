@@ -18,6 +18,7 @@ fn declared() -> Declared {
             name: Some("managed_pk".into()),
             columns: vec!["i".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         }),
         ..Default::default()
     };
@@ -608,6 +609,7 @@ async fn mssql_chained_views_wait_only_for_the_foreign_keys_actual_key() {
                     filter: None,
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 };
                 table.indexes.insert("unrelated_d".into(), index(false));
                 match kind {
@@ -620,6 +622,7 @@ async fn mssql_chained_views_wait_only_for_the_foreign_keys_actual_key() {
                             UniqueConstraint {
                                 columns: vec!["d".into()],
                                 storage_parameters: Default::default(),
+                                filegroup: None,
                             },
                         );
                     }
@@ -628,6 +631,7 @@ async fn mssql_chained_views_wait_only_for_the_foreign_keys_actual_key() {
                             name: (kind == "primary").then(|| "required_d".into()),
                             columns: vec!["d".into()],
                             storage_parameters: Default::default(),
+                            filegroup: None,
                         });
                     }
                     _ => unreachable!(),

@@ -1225,6 +1225,7 @@ mod tests {
             filter: filter.map(str::to_owned),
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         }
     }
 

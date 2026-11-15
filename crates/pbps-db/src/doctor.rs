@@ -241,6 +241,7 @@ mod tests {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         table.data = Some(TableData {
             mode: DataMode::Ensure,

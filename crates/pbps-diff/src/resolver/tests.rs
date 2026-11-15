@@ -976,6 +976,7 @@ fn splitting_table_creation_preserves_the_declared_index_layout() {
                     filter: None,
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             table.clustered = clustered.then(|| Clustered::Index("ix".into()));
@@ -1045,6 +1046,7 @@ fn splitting_table_creation_sets_an_index_identity_after_its_index() {
                     filter: None,
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             table.replica_identity = Some(identity.clone());
@@ -1115,6 +1117,7 @@ fn a_replica_identity_keeps_its_order_against_its_tables_indexes() {
         filter: None,
         method: Default::default(),
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let with = |index: &str, identity: Option<ReplicaIdentity>| {
         let mut schema = tables();
@@ -1204,6 +1207,7 @@ fn new_table_indexes_are_offline_while_existing_table_indexes_keep_the_requested
                         filter: None,
                         method: Default::default(),
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     },
                 );
                 hints.strategies.insert(name.clone(), Strategy { online });
@@ -1651,6 +1655,7 @@ mod generated_surface_coverage {
                 name: None,
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             table.checks.insert(
                 "ck".into(),
@@ -1782,6 +1787,7 @@ mod generated_surface_coverage {
                     filter: Some("a > app.f(1)".into()),
                     method: Default::default(),
                     storage_parameters: [("fillfactor".to_owned(), fillfactor.to_owned())].into(),
+                    filegroup: None,
                 },
             );
             table
@@ -4581,6 +4587,7 @@ fn a_parents_new_index_precedes_its_partitions_own_under_the_resolver() {
         filter: None,
         method: Default::default(),
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let add = |table: &TableName, name: &str| {
         PlannedChange::new(Change::AddIndex {
@@ -4794,6 +4801,7 @@ mod operations {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         (Schema::default(), desired)
@@ -5183,6 +5191,7 @@ fn two_reference_tables_referencing_each_other_plan_and_settle_in_the_differs_or
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         table
             .foreign_keys
@@ -5512,6 +5521,7 @@ fn a_filtered_index_is_a_surface_only_where_its_filter_can_bind() {
         filter: filter.map(str::to_owned),
         method: Default::default(),
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let mut table = Table::default();
     table.indexes.insert(

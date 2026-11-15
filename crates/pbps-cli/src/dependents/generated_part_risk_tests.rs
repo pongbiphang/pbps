@@ -26,6 +26,7 @@ fn fixture(kind: &str, writer: &str, late: bool) -> SavedPlan {
             name: Some("a_pk".into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
     }
     let create = PlannedChange::new(Change::CreateTable {
@@ -71,6 +72,7 @@ fn fixture(kind: &str, writer: &str, late: bool) -> SavedPlan {
                 name: Some("a_pk".into()),
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             nonclustered: false,
         },
@@ -80,6 +82,7 @@ fn fixture(kind: &str, writer: &str, late: bool) -> SavedPlan {
             constraint: UniqueConstraint {
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
             clustered: false,
         },
@@ -98,6 +101,7 @@ fn fixture(kind: &str, writer: &str, late: bool) -> SavedPlan {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             clustered: false,
         },

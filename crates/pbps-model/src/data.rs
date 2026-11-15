@@ -1083,6 +1083,7 @@ mod tests {
                 name: None,
                 columns: c.into_iter().map(crate::ColumnName::from).collect(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             data: Some(TableData {
                 mode: DataMode::Exact,

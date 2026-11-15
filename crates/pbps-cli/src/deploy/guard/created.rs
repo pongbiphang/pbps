@@ -457,6 +457,13 @@ impl Created<'_> {
                 now_name = now_name.shown()
             ));
         }
+        // In the `CREATE` itself, as the persistence is (#2813).
+        if declared.filegroup.as_ref() != now.filegroup.as_ref() {
+            moved.push(format!(
+                "{now_name} is not on the filegroup this plan's `CREATE TABLE` declares",
+                now_name = now_name.shown()
+            ));
+        }
         // In the `CREATE` itself, so held from the first read that finds
         // the table (#1443).
         if declared.unlogged != now.unlogged {

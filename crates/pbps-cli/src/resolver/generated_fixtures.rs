@@ -58,12 +58,14 @@ pub(crate) fn shape(case: &str) -> Schema {
             name: Some("a_pk".into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         a.unique.insert(
             "a_z".into(),
             pbps_model::UniqueConstraint {
                 columns: vec!["z".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         a.checks.insert(

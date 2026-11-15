@@ -303,7 +303,10 @@ use crate::zone::SessionZone;
 // 73 adds `SetExclusion`, the add and alter side of an exclusion constraint (DEC-2448.3):
 // an older build would not know the change and would drop a table's `exclude` from a payload;
 // 72 belongs to another change.
-pub const CURRENT_VERSION: u32 = 73;
+// 76 adds a SQL Server table's, key's and index's `filegroup` (DEC-2813.1), which a plan
+// carries inside the table, key or index it creates: an older build would reject the field
+// as unknown instead of as a newer plan; 74 and 75 belong to other changes.
+pub const CURRENT_VERSION: u32 = 76;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -1591,7 +1594,7 @@ mod tests {
             Default::default(),
             Default::default(),
         );
-        assert_eq!(plan.version, 73);
+        assert_eq!(plan.version, 76);
         let bare = serde_json::to_value(&plan).unwrap();
         assert!(bare.get("extension_drops").is_none(), "{bare}");
         assert!(bare.get("extension_changes").is_none(), "{bare}");

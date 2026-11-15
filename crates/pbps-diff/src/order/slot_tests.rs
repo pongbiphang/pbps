@@ -490,6 +490,7 @@ fn a_name_two_objects_keep_is_contested_not_misordered() {
                 constraint: pbps_model::UniqueConstraint {
                     columns: Vec::new(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
                 clustered: false,
             },
@@ -597,6 +598,7 @@ fn a_column_and_an_index_of_one_table_do_not_share_a_name() {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         },
     );
     plan.before_ids
@@ -648,6 +650,7 @@ fn a_key_waits_for_the_index_whose_name_it_takes() {
                 constraint: pbps_model::UniqueConstraint {
                     columns: Vec::new(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
                 clustered: false,
             },
@@ -667,6 +670,7 @@ fn a_key_waits_for_the_index_whose_name_it_takes() {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
     // `Slotted` answers as SQL Server does: indexes per table, constraints

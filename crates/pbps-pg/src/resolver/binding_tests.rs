@@ -384,6 +384,7 @@ async fn related_tables_compile_on_scratch_with_their_foreign_key() {
             name: Some("p_pk".into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         let mut child = pbps_model::Table::default();
         child.columns.insert(
@@ -752,6 +753,7 @@ async fn every_covered_expression_surface_gets_the_engines_answer() {
                     filter: Some("c > f(1)".into()),
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             numeric_f()
@@ -1437,6 +1439,7 @@ async fn a_module_naming_an_index_is_refused_for_its_oid_alias_constant() {
                     filter: None,
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             Declared::default()
@@ -1849,6 +1852,7 @@ async fn a_later_object_of_another_kind_is_no_candidate() {
                     filter: Some("c > 0".into()),
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             Declared::default()
@@ -2145,6 +2149,7 @@ async fn a_later_object_outside_the_path_is_no_candidate() {
                     filter: Some("id > 0".into()),
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             Declared::default()
@@ -2530,6 +2535,7 @@ async fn a_managed_index_does_not_account_for_a_same_named_type() {
                     filter: None,
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             Declared::default()

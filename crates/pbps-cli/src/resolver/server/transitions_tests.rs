@@ -163,6 +163,7 @@ fn a_child_dropped_after_its_tables_rename_keeps_its_opening_inventory() {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         },
     );
     let mut base = Schema::default();

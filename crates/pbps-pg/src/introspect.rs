@@ -3289,6 +3289,7 @@ fn add_constraint(
                     name: Some(raw.name.clone()),
                     columns,
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 });
                 true
             }
@@ -3305,6 +3306,7 @@ fn add_constraint(
                     UniqueConstraint {
                         columns,
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     },
                 );
                 true
@@ -3945,6 +3947,7 @@ fn read_index(raw: &RawIndex, parts: &Parts, table: &Table, pulled: &mut Pulled)
         filter: raw.filter.clone(),
         method,
         storage_parameters: Default::default(),
+        filegroup: None,
     })
 }
 

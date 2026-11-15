@@ -400,6 +400,7 @@ fn removing_a_predicate_can_retain_the_plain_index_catalog_record() {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         }),
     }));
     evidence.transitions[0].after = evidence.transitions[0].before.clone();
@@ -1964,6 +1965,7 @@ mod inline_binding_floor {
                     filter,
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
         }

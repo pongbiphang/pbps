@@ -13,6 +13,7 @@ fn qualified_index_claims_and_constraint_reads_preserve_raw_local_names() {
         filter: None,
         method: Default::default(),
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let changes = ChangeSet {
         changes: vec![
@@ -23,6 +24,7 @@ fn qualified_index_claims_and_constraint_reads_preserve_raw_local_names() {
                     name: Some(format!("pk{RAW}").into()),
                     columns: vec!["id".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 }),
                 nonclustered: false,
             }),
@@ -32,6 +34,7 @@ fn qualified_index_claims_and_constraint_reads_preserve_raw_local_names() {
                 constraint: pbps_model::UniqueConstraint {
                     columns: vec!["id".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
                 clustered: false,
             }),

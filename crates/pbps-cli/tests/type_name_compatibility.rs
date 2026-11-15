@@ -316,6 +316,14 @@ where
         .as_object_mut()
         .unwrap()
         .shift_remove("description");
+    // #2813 adds a SQL Server `filegroup:` to a table and to its keys and indexes (schema set
+    // 107); the captured entry predates it.
+    for dto in ["TableDto", "PrimaryKeySpecDto", "UniqueSpecDto", "IndexDto"] {
+        declaration_schema["$defs"][dto]["properties"]
+            .as_object_mut()
+            .unwrap()
+            .shift_remove("filegroup");
+    }
     declaration_schema["description"] = serde_json::json!(
         "One pbps declaration file: a table, one view, procedure, function or\ntrigger, or a database role. The leading key is both the kind and the name."
     );
@@ -328,7 +336,9 @@ where
     );
     let changes_debug = format!("{:?}", plan.changes)
         .replace(", drop_guard: None", "")
-        .replace(" exclude: {},", "");
+        .replace(" exclude: {},", "")
+        // SQL Server's `filegroup` (#2813), empty on every captured object.
+        .replace(", filegroup: None", "");
     let outputs = [
         ("schema.json", serde_json::to_string(&schema).unwrap()),
         (
@@ -433,6 +443,7 @@ fn type_refusals_escape_once_at_whole_and_individual_boundaries() {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         }),
         data: Some(TableData {
             mode: DataMode::Exact,

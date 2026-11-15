@@ -392,6 +392,7 @@ fn constraints_restrict_writers_but_not_readers_or_unrelated_tables() {
     let key = pbps_model::UniqueConstraint {
         columns: vec!["old".into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let cases = vec![
         Change::AddUnique {

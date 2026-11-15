@@ -159,6 +159,8 @@ pub(crate) struct Expected<'a> {
     /// The comment the plan sets, where it sets one (#2729); otherwise not compared.
     pub(super) comment: Req<Option<&'a str>>,
     pub(super) system_time: Req<Option<&'a SystemTime>>,
+    /// Kept: no plan moves a table between filegroups (#2813, DEC-2813.1).
+    pub(super) filegroup: Req<Option<&'a pbps_model::Filegroup>>,
     pub(super) place: Req<Place>,
 }
 
@@ -608,6 +610,7 @@ impl<'a> TableChanges<'a> {
             persistence,
             comment,
             system_time: Req::Keep(was.system_time.as_ref()),
+            filegroup: Req::Keep(was.filegroup.as_ref()),
             place: Req::Keep(place),
         }
     }

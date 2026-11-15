@@ -18,10 +18,12 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
         name: Some(format!("{text}pk").into()),
         columns: vec!["id".into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let unique = UniqueConstraint {
         columns: vec!["code".into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let foreign = ForeignKey {
         columns: vec!["code".into()],
@@ -40,6 +42,7 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
         filter: Some("code > 0".into()),
         method: Default::default(),
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let mut table = Table {
         columns: [
@@ -78,6 +81,7 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
                         name: None,
                         columns: vec!["id".into()],
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     }),
                     ..Default::default()
                 },
@@ -380,6 +384,14 @@ where
         .as_object_mut()
         .unwrap()
         .shift_remove("description");
+    // #2813 adds a SQL Server `filegroup:` to a table and to its keys and indexes (schema set
+    // 107); the captured entry predates it.
+    for dto in ["TableDto", "PrimaryKeySpecDto", "UniqueSpecDto", "IndexDto"] {
+        declaration_schema["$defs"][dto]["properties"]
+            .as_object_mut()
+            .unwrap()
+            .shift_remove("filegroup");
+    }
     declaration_schema["description"] = serde_json::json!(
         "One pbps declaration file: a table, one view, procedure, function or\ntrigger, or a database role. The leading key is both the kind and the name."
     );
@@ -393,7 +405,9 @@ where
     let changes_debug = format!("{:?}", plan.changes)
         .replace(", drop_guard: None", "")
         .replace(", collation: None }", " }")
-        .replace(" exclude: {},", "");
+        .replace(" exclude: {},", "")
+        // SQL Server's `filegroup` (#2813), empty on every captured object.
+        .replace(", filegroup: None", "");
     let outputs = [
         ("schema.json", serde_json::to_string(&schema).unwrap()),
         (
@@ -450,6 +464,7 @@ fn local_refusals_escape_names_once_at_whole_and_individual_boundaries() {
                 filter: None,
                 method: IndexMethod::Gin,
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         )]
         .into(),
@@ -487,6 +502,7 @@ fn namespace_claims_distinguish_raw_names_from_their_shown_lookalikes() {
         filter: None,
         method: Default::default(),
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let owner = TableName::new("app", "owner");
     let mut postgres = Schema {

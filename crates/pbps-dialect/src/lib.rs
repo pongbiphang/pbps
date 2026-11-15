@@ -6900,6 +6900,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         table
@@ -6910,6 +6911,7 @@ mod tests {
             name: Some(name.into()),
             columns: vec!["n".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         table
     }
@@ -6920,6 +6922,7 @@ mod tests {
             UniqueConstraint {
                 columns: vec!["n".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         table

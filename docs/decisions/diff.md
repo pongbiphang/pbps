@@ -9676,3 +9676,113 @@ filegroup row the login cannot see is unreadable, not the default. A declared
 No format version moves: no `Change` kind, plan, state or declaration field is
 added; the omissions are limitations of the pull, and the notice is a
 report-only string.
+
+
+<a id="dec-2813-1"></a>
+
+**DEC-2813.1. A SQL Server table, key, unique constraint and index hold the
+filegroup they sit on; the filegroup must exist beforehand (#2813; replaces
+DEC-1227.1's notice for these objects).**
+
+*Declaration.* `filegroup:` on a table (where its heap or clustered index is),
+and on a primary key, a unique constraint and an index (that object's own).
+Absent on the table is the database's default filegroup. Absent on a
+nonclustered object is *beside the table's rows*, which is the engine's own rule
+for an object that names none, so the one thing the declarations cannot leave
+implicit is an object on the default filegroup under a table elsewhere: it names
+the default's name. The clustered object (a clustered key, unique constraint or
+index) has none of its own, because its rows are the table's; `validate` refuses
+one, and refuses a nonclustered object that names its table's filegroup, since
+the read-back writes the shorter and the two spellings would differ for ever. A
+name is a SQL Server identifier and is compared without ASCII case, as a
+collation is. An indexed view's indexes and a system-versioned table's history
+table stay unheld and keep DEC-1227.1's notice, since the engine builds the
+history and the view's indexes are a module's. PostgreSQL refuses the key: its
+counterpart is a tablespace, which the model does not hold.
+
+*Existence.* **pbps never creates or drops a filegroup.** One takes files and
+server paths, a host decision outside the schema, as PostgreSQL tablespaces are.
+Against a database (`plan --db`, and `bootstrap`) the plan refuses, by name and
+before any statement runs, a filegroup the database does not hold, one that is
+read-only, and the database's default filegroup where the declaration would read
+back as none (the table, or an object under a table that is on the default
+too). Offline, the name is accepted and the plan prints one advisory per
+filegroup (`plan.filegroup-unchecked`) saying it is checked against a database.
+
+*Pull.* A table writes `filegroup` only where its rows are off the default
+(`sys.filegroups.is_default = 0`), and only when the declarations keep the base
+(a left-out clustered columnstore or disabled clustered index places nothing). A
+nonclustered key or index writes its own filegroup's name when it differs from
+the filegroup its table's rows are on, and nothing when they agree. The notice
+of DEC-1227.1 is no longer drawn for a table's rows, keys and indexes.
+
+*Plan.* `create` writes `ON [fg]` after the column list of a table (before
+`WITH`), at the end of a key or unique constraint, and after the `WITH` of an
+index. The read-back compares the field like any other, and **a changed
+filegroup, on the table or on a key or index that stays, is refused by name**
+(`FilegroupChangeRefused`): moving data between filegroups is a rebuild of the
+object under the user's rows, and there is no design for it. That includes a
+declaration that names none where the database has one, which is what an
+existing database adopted before this change shows until it is pulled again.
+
+*Formats.* Declarations gain a field: published schema set 107. State records it
+(a snapshot is `deny_unknown_fields`): state 46. A plan carries the table, key or
+index it creates, so a plan with a filegroup would be unreadable to an older
+build: plan 76. A table with none writes the same bytes as before.
+
+*Measured (SQL Server container, 2026-11-14).* An inline `ON [fg]` on a primary
+key or unique constraint places that index on the filegroup. A clustered key
+declared with `ON [fg]` carries the table's rows with it, so the clustered
+object has no filegroup of its own. A nonclustered key or index declared
+without `ON` sits beside the table's rows, and a heap reports the filegroup its
+`ON` named. `sys.indexes.data_space_id` joined to `sys.data_spaces` (type `FG`)
+reads all of these back, and a name with spaces or punctuation round-trips.
+
+*Collation (review round 1, measured on a case-sensitive and a case-insensitive
+database).* `sys.filegroups.name` is compared under the database's collation:
+on a `_CS_` database holding `FGX`, `WHERE name = N'fgx'` finds nothing and
+`CREATE TABLE … ON [fgx]` is refused (Msg 1921, `Invalid filegroup 'fgx'`),
+while `ON [FGX]` works; on a `_CI_` database both spellings find it. So the
+connected check does not apply a case rule of its own: the engine resolves each
+declared name in the target database (`catalog::filegroups_named`), and what it
+does not match is refused as missing, by name. The model still compares
+filegroup names without ASCII case, which is right for the common
+case-insensitive database (a pulled `FGX` and a declared `fgx` are one
+filegroup there) and only wrong where a case-sensitive database holds two
+filegroups differing only in case: a `_CS_` database accepts both `fgx` and
+`FGX`, and the model cannot tell an object on one from an object on the other.
+That is refused at plan instead of being left to go unseen: a declared name that
+more than one filegroup has, once case is ignored, is refused with the reason.
+The apply guard holds a planned nonclustered key's, unique constraint's and
+index's filegroup to its `CREATE`, as it holds the table's rows (DEC-1774.1).
+
+*The model's equality decides (review round 2, measured).* The engine's lookup
+follows the database collation, which folds more than the model's equality
+(ASCII case only). On a `Latin1_General_100_CI_AI` database holding `café`,
+`WHERE name = N'cafe'` finds it and `ON [cafe]` places the table on it, but the
+read-back is `café`, a name the model holds to be another, so the declaration
+would plan a change forever. The connected check therefore accepts a found row
+only if its stored name equals the declared one under `Filegroup`'s equality, and
+otherwise refuses by name ("declared `cafe`, but the database's filegroup is
+`café`; declare it as stored"); the lookup only confirms the filegroup is there,
+for accent-, width- and kana-insensitive collations alike. The same equality
+counts the twins: on a `Latin1_General_100_CS_AS` database holding `Éast` and
+`éast`, SQL's `LOWER` folded the two into one and refused both, although the
+model, like the engine, has two filegroups. Twins are counted in Rust with the
+model's own function (`catalog::filegroups_alike`), so only `fgx` and `FGX` are
+twins.
+
+*An index is beside its rows by identity (review of the rebased head,
+measured).* Pull wrote no `filegroup` for a nonclustered object whose name
+matched its table's rows' under ASCII case. On a `_CS_` database holding `fgx`
+and `FGX`, a table on one and its index on the other were taken for the same
+place, the index's placement was dropped, and a later rebuild put it on the
+table's. Both names come from the one catalog, which spells a filegroup one way
+under every collation (on a `_CI_` database `ON [FGX]` reads back as the stored
+`fgx`), so `own_filegroup` compares them exactly: that is right under each
+collation, and the model's equality is untouched. Such a pair is still outside
+what the model can hold (a name two filegroups share is refused at plan above),
+and `validate` refuses a declaration whose index names the table's filegroup,
+by the model's equality; so the pull now leaves that table out and names the
+index and the filegroup, where it used to write a table that quietly lost the
+placement. A second pull says the same and writes nothing new.

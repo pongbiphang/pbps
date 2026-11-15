@@ -17,6 +17,7 @@ fn index(unique: bool, filtered: bool) -> Change {
             filter: filtered.then(|| "id IS NOT NULL".into()),
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         }),
         clustered: false,
     }
@@ -90,6 +91,7 @@ fn unspellable_constraint_values_and_check_predicates_are_reported() {
             constraint: UniqueConstraint {
                 columns: vec!["value".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
             clustered: false,
         },
@@ -100,6 +102,7 @@ fn unspellable_constraint_values_and_check_predicates_are_reported() {
                 name: Some("pk".into()),
                 columns: vec!["value".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             nonclustered: false,
         },

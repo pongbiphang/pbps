@@ -977,6 +977,7 @@ mod tests {
             filter: None,
             method: IndexMethod::Gin,
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let docs = TableName::new("app", "docs");
         let build = || {
@@ -1035,6 +1036,7 @@ mod tests {
                         filter: None,
                         method: pbps_model::IndexMethod::Gin,
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     },
                 );
             };
@@ -1111,6 +1113,7 @@ mod tests {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         t
     }
@@ -1328,6 +1331,7 @@ mod tests {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         for (name, of, column) in [
             ("bad_1", "bad", "nope"),

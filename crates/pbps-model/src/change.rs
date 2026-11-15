@@ -3951,6 +3951,7 @@ mod tests {
                     filter: None,
                     method: IndexMethod::Btree,
                     storage_parameters: BTreeMap::new(),
+                    filegroup: None,
                 }),
                 clustered: false,
             },
@@ -4551,6 +4552,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             clustered: false,
         };

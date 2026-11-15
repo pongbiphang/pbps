@@ -153,7 +153,9 @@ fn dependent_meetings_keep_the_complete_canonical_changes_order_and_spellings() 
                                     .replace("options: ModuleOptions { schemabinding: false, indexes: {}, clustered: None }, ", "")
                                     .replace(", using: None", "")
                                     // And this one, with the exclusion constraints (#2448).
-                                    .replace(" exclude: {},", ""))
+                                    .replace(" exclude: {},", "")
+                                    // And this one, SQL Server's `filegroup` (#2813).
+                                    .replace(", filegroup: None", ""))
                                 .collect();
                             let spellings: Vec<String> = ordered
                                 .operations()

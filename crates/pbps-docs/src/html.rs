@@ -630,6 +630,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         let out = render(&s, &IdsFile::default(), "Schema");

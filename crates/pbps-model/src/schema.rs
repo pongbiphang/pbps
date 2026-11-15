@@ -491,6 +491,15 @@ pub struct Table {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub computed: BTreeMap<ColumnName, ComputedColumn>,
 
+    /// The SQL Server filegroup that holds the table's rows, its heap or its
+    /// clustered index (#2813, DEC-2813.1). Absent is the database's default
+    /// filegroup. It must exist beforehand: pbps neither creates nor drops
+    /// one, since that takes files and server paths. A nonclustered key or
+    /// index that declares none sits where its table does, which is the
+    /// engine's own rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filegroup: Option<Filegroup>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_key: Option<PrimaryKey>,
 
@@ -1308,6 +1317,42 @@ impl std::fmt::Display for Collation {
     }
 }
 
+/// A SQL Server filegroup's name (#2813, DEC-2813.1).
+///
+/// Kept as written and compared without ASCII case, as a [`Collation`] is: the
+/// engine takes the name in any case under the usual database collation and
+/// reads it back in its own spelling, so a declaration spelled one way and a
+/// read-back spelled the other are one placement and not a change planned
+/// forever. A database whose collation is case-sensitive and holds two
+/// filegroups that differ only in case is not a case this tells apart.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct Filegroup(String);
+
+impl Filegroup {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq for Filegroup {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq_ignore_ascii_case(&other.0)
+    }
+}
+
+impl Eq for Filegroup {}
+
+impl std::fmt::Display for Filegroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Identity {
@@ -1448,6 +1493,12 @@ pub struct PrimaryKey {
     /// its default.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub storage_parameters: BTreeMap<String, String>,
+
+    /// The SQL Server filegroup of this key's own index (#2813,
+    /// DEC-2813.1); absent sits where the table does. Refused on the clustered
+    /// one, whose rows are the table's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filegroup: Option<Filegroup>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
@@ -1461,6 +1512,12 @@ pub struct UniqueConstraint {
     /// its default.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub storage_parameters: BTreeMap<String, String>,
+
+    /// The SQL Server filegroup of this constraint's own index (#2813,
+    /// DEC-2813.1); absent sits where the table does. Refused on the clustered
+    /// one, whose rows are the table's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filegroup: Option<Filegroup>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
@@ -1535,6 +1592,12 @@ pub struct Index {
     /// its default.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub storage_parameters: BTreeMap<String, String>,
+
+    /// The SQL Server filegroup of this index's own index (#2813,
+    /// DEC-2813.1); absent sits where the table does. Refused on the clustered
+    /// one, whose rows are the table's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filegroup: Option<Filegroup>,
 }
 
 impl Index {
@@ -1952,6 +2015,7 @@ mod tests {
                 name: Some("pk_customer".into()),
                 columns: vec!["customer_id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             ..Default::default()
         }
@@ -2139,6 +2203,7 @@ mod tests {
             UniqueConstraint {
                 columns: vec!["email".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         for fine in [
@@ -2191,6 +2256,7 @@ mod tests {
             filter: filter.map(Into::into),
             method: IndexMethod::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let column = |c: &str| IndexKey::Column(c.into());
         t.unique.insert(
@@ -2198,6 +2264,7 @@ mod tests {
             UniqueConstraint {
                 columns: vec!["customer_id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         t.unique.insert(
@@ -2205,6 +2272,7 @@ mod tests {
             UniqueConstraint {
                 columns: vec!["email".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         t.indexes
@@ -2305,6 +2373,7 @@ mod tests {
             filter: None,
             method: IndexMethod::Gin,
             storage_parameters: [("fastupdate".to_owned(), "false".to_owned())].into(),
+            filegroup: None,
         };
         t.indexes.insert("ix_gin".into(), gin);
         t.primary_key.as_mut().unwrap().storage_parameters =
@@ -2340,6 +2409,44 @@ mod tests {
         let json = serde_json::to_string(&heap).unwrap();
         assert!(json.contains(r#""clustered":"heap""#), "{json}");
         assert_eq!(serde_json::from_str::<Table>(&json).unwrap(), heap);
+    }
+
+    /// A filegroup compares without ASCII case, as the engine takes the name,
+    /// and an absent one is not a named one: a declaration that names the
+    /// default filegroup is a different declaration from one that names none
+    /// (#2813). Its bytes are written only when it is declared, so a table
+    /// saved before the field existed reads back unchanged.
+    #[test]
+    fn filegroups_compare_without_case_and_an_absent_one_is_not_a_named_one() {
+        assert_eq!(Filegroup::new("FGX"), Filegroup::new("fgx"));
+        assert_ne!(Filegroup::new("fgx"), Filegroup::new("fgy"));
+        let plain = sample();
+        let mut placed = sample();
+        placed.filegroup = Some(Filegroup::new("fgx"));
+        assert_ne!(plain, placed);
+        let mut named = sample();
+        named.filegroup = Some(Filegroup::new("PRIMARY"));
+        assert_ne!(plain, named);
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("filegroup"), "{json}");
+        let json = serde_json::to_string(&placed).unwrap();
+        assert!(json.contains(r#""filegroup":"fgx""#), "{json}");
+        assert_eq!(serde_json::from_str::<Table>(&json).unwrap(), placed);
+        // The same on a key and an index.
+        let key = PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+            filegroup: Some(Filegroup::new("fgx")),
+        };
+        let json = serde_json::to_string(&key).unwrap();
+        assert!(json.contains(r#""filegroup":"fgx""#), "{json}");
+        assert_eq!(serde_json::from_str::<PrimaryKey>(&json).unwrap(), key);
+        let bare = r#"{"columns":["id"]}"#;
+        assert_eq!(
+            serde_json::from_str::<PrimaryKey>(bare).unwrap().filegroup,
+            None
+        );
     }
 
     /// A collation name compares the way the engine resolves one, without
@@ -2381,6 +2488,7 @@ mod tests {
             UniqueConstraint {
                 columns: vec!["email".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         let mut child = Table::default();

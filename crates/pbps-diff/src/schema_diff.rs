@@ -46,6 +46,13 @@ pub enum DiffError {
         method: &'static str,
         parameter: String,
     },
+    #[error("{target} on `{}`: its filegroup would change from {was} to {now}; moving data between filegroups is a rebuild, and no plan does that yet (DEC-2813.1)", .table.shown())]
+    FilegroupChangeRefused {
+        table: TableName,
+        target: String,
+        was: String,
+        now: String,
+    },
     #[error("exclusion constraint `{}` on `{}`: {reason} (DEC-2448.3)", .name.shown(), .table.shown())]
     ExclusionRefused {
         table: TableName,
@@ -1671,6 +1678,7 @@ pub(crate) fn diff_partial_rebuilding(
                 renames.apply(base_table, base_name).into_owned(),
             );
         }
+        diff_filegroups(declared_name, base_table, declared_table, &mut errs);
         diff_constraints(
             declared_name,
             &renames.apply(base_table, base_name),
@@ -5124,6 +5132,7 @@ fn attached(
         filter: None,
         method: Default::default(),
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let contested =
         |columns: &[ColumnName]| parents_indexes.values().any(|i| *i == backing(columns));
@@ -6704,6 +6713,62 @@ fn parameter_edit(
         (ParameterChange::Refuse, parameter) => ParameterEdit::Refuse {
             parameter: parameter.unwrap_or_default().to_owned(),
         },
+    }
+}
+
+/// A SQL Server table's, key's and index's filegroup, for each that stays
+/// (#2813, DEC-2813.1). **Every change is refused here, by name.** Moving the
+/// data is a rebuild of the object, and the plan holds no design for moving
+/// it, so a plan that would silently leave an object where it is, or drop and
+/// create it elsewhere under a user's rows, is refused instead. An object the
+/// plan adds is built where its declaration says; one it removes has nothing
+/// to compare.
+fn diff_filegroups(name: &TableName, base: &Table, declared: &Table, errs: &mut Vec<DiffError>) {
+    let mut check = |target: String,
+                     was: Option<&pbps_model::Filegroup>,
+                     now: Option<&pbps_model::Filegroup>| {
+        if was != now {
+            let show = |f: Option<&pbps_model::Filegroup>| match f {
+                Some(f) => format!("`{}`", pbps_model::escape::Escaped(f.as_str())),
+                None => "none declared".to_owned(),
+            };
+            errs.push(DiffError::FilegroupChangeRefused {
+                table: name.clone(),
+                target,
+                was: show(was),
+                now: show(now),
+            });
+        }
+    };
+    check(
+        "the table".to_owned(),
+        base.filegroup.as_ref(),
+        declared.filegroup.as_ref(),
+    );
+    if let (Some(was), Some(now)) = (&base.primary_key, &declared.primary_key) {
+        check(
+            "the primary key".to_owned(),
+            was.filegroup.as_ref(),
+            now.filegroup.as_ref(),
+        );
+    }
+    for (n, was) in &base.unique {
+        if let Some(now) = declared.unique.get(n) {
+            check(
+                format!("unique constraint {}", n.shown()),
+                was.filegroup.as_ref(),
+                now.filegroup.as_ref(),
+            );
+        }
+    }
+    for (n, was) in &base.indexes {
+        if let Some(now) = declared.indexes.get(n) {
+            check(
+                format!("index {}", n.shown()),
+                was.filegroup.as_ref(),
+                now.filegroup.as_ref(),
+            );
+        }
     }
 }
 
@@ -8896,6 +8961,7 @@ mod tests {
                 name: None,
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             data: Some(pbps_model::TableData {
                 mode: DataMode::Ensure,
@@ -9053,6 +9119,94 @@ mod tests {
         s
     }
 
+    /// A SQL Server table's, key's and index's filegroup: a change of any is
+    /// refused by name and plans nothing; the same one, and an object the plan
+    /// adds with its own, are not (#2813, DEC-2813.1).
+    #[test]
+    fn a_changed_filegroup_is_refused_by_name_and_an_unchanged_or_added_one_is_not() {
+        use pbps_model::Filegroup;
+        let fg = |n: &str| Some(Filegroup::new(n));
+        let world = |table_fg: Option<&str>, key_fg: Option<&str>, index_fg: Option<&str>| {
+            let mut t = table(&[
+                ("id", Column::new(ty("int")).not_null()),
+                ("v", Column::new(ty("int"))),
+            ]);
+            t.filegroup = table_fg.and_then(fg);
+            t.primary_key = Some(pbps_model::PrimaryKey {
+                name: Some("pk_t".into()),
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+                filegroup: key_fg.and_then(fg),
+            });
+            t.indexes.insert(
+                "ix_v".into(),
+                Index {
+                    columns: vec![pbps_model::IndexColumn::column("v")],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                    method: Default::default(),
+                    storage_parameters: Default::default(),
+                    filegroup: index_fg.and_then(fg),
+                },
+            );
+            schema_of("dbo.t", t)
+        };
+        let errors = |base: &Schema, declared: &Schema| {
+            let ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            diff(
+                Side {
+                    schema: base,
+                    ids: &ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .map_err(|e| {
+                e.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        };
+        let base = world(Some("fgx"), Some("fgk"), Some("fgi"));
+        // Unchanged: nothing to plan, nothing refused.
+        assert_eq!(errors(&base, &base.clone()).unwrap().changes.len(), 0);
+        for (declared, named) in [
+            (world(Some("fgy"), Some("fgk"), Some("fgi")), "the table"),
+            (
+                world(Some("fgx"), Some("fgz"), Some("fgi")),
+                "the primary key",
+            ),
+            (world(Some("fgx"), Some("fgk"), Some("fgz")), "index ix_v"),
+            // Declaring none where the database has one is a change too.
+            (world(None, Some("fgk"), Some("fgi")), "the table"),
+        ] {
+            let said = errors(&base, &declared).unwrap_err();
+            assert!(said.contains(named), "{named}: {said}");
+            assert!(said.contains("dbo.t"), "{said}");
+            assert!(said.contains("DEC-2813.1"), "{said}");
+        }
+        let said = errors(&base, &world(Some("fgy"), Some("fgk"), Some("fgi"))).unwrap_err();
+        assert!(said.contains("`fgx`") && said.contains("`fgy`"), "{said}");
+        // A different spelling of the same name is no change.
+        assert!(errors(&base, &world(Some("FGX"), Some("fgk"), Some("fgi"))).is_ok());
+        // An object the plan adds names its filegroup freely: nothing to compare.
+        let mut declared = world(Some("fgx"), Some("fgk"), Some("fgi"));
+        let t = declared.tables.get_mut(&"dbo.t".parse().unwrap()).unwrap();
+        let mut more = t.indexes["ix_v"].clone();
+        more.filegroup = fg("fgn");
+        t.indexes.insert("ix_new".into(), more);
+        let changes = errors(&base, &declared).unwrap();
+        assert_eq!(kinds(&changes), ["AddIndex"]);
+    }
+
     /// The domain `app.code` of a table `app.t` that uses it, as a schema.
     fn domain_world(domain: pbps_model::ManagedType, extra_column: bool, rows: bool) -> Schema {
         let mut t = table(&[
@@ -9073,6 +9227,7 @@ mod tests {
                 name: None,
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             u.data = Some(pbps_model::TableData {
                 mode: pbps_model::DataMode::Ensure,
@@ -10113,6 +10268,7 @@ mod tests {
                     filter: None,
                     method: IndexMethod::Gin,
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             t
@@ -10467,6 +10623,7 @@ mod tests {
                     filter: None,
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             schema_of("dbo.t", t)
@@ -10778,6 +10935,7 @@ mod tests {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let shaped = |nullable: bool, v: &str| {
             let col = |t: &str| {
@@ -10807,6 +10965,7 @@ mod tests {
                 UniqueConstraint {
                     columns: vec!["u".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             t.checks.insert(
@@ -10866,12 +11025,14 @@ mod tests {
                 name: Some("pk_t".into()),
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             t.unique.insert(
                 "uq_code".into(),
                 UniqueConstraint {
                     columns: vec!["code".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             t.checks.insert(
@@ -11103,6 +11264,7 @@ mod tests {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         t.data = Some(pbps_model::TableData {
             mode: pbps_model::DataMode::Exact,
@@ -11411,6 +11573,7 @@ mod tests {
                         filter: None,
                         method,
                         storage_parameters: parameters_of(parameters),
+                        filegroup: None,
                     },
                 );
                 t
@@ -11471,6 +11634,7 @@ mod tests {
                     filter: None,
                     method: IndexMethod::Btree,
                     storage_parameters: parameters_of(parameters),
+                    filegroup: None,
                 },
             );
             t
@@ -11562,6 +11726,7 @@ mod tests {
                     filter: None,
                     method,
                     storage_parameters: parameters_of(parameters),
+                    filegroup: None,
                 },
             );
             if partitioned {
@@ -11659,6 +11824,7 @@ mod tests {
                 name: Some("t_pkey".into()),
                 columns: vec!["id".into()],
                 storage_parameters: map(pk_params),
+                filegroup: None,
             });
             t.indexes.insert(
                 "ix_v".into(),
@@ -11674,6 +11840,7 @@ mod tests {
                     filter: None,
                     method: Default::default(),
                     storage_parameters: map(ix_params),
+                    filegroup: None,
                 },
             );
             schema_of("public.t", t)
@@ -11739,6 +11906,7 @@ mod tests {
                 name: Some(format!("{t}_pkey").into()),
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             s.tables
                 .insert(format!("public.{t}").parse().unwrap(), table);
@@ -12026,6 +12194,7 @@ mod tests {
                 name: Some("pa_pkey".into()),
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             parent.unlogged = unlogged;
             let mut child = table(&[("pa", Column::new(ty("int")))]);
@@ -12135,6 +12304,7 @@ mod tests {
             filter: filter.map(Into::into),
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let tree = |parent_indexes: &[(&str, Index)], own: &[(&str, Index)], created: bool| {
             let mut parent = table(&[
@@ -12672,6 +12842,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         assert_eq!(
@@ -12814,6 +12985,7 @@ mod tests {
                     name: None,
                     columns: key(&["id"]),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 });
                 t
             });
@@ -12877,6 +13049,7 @@ mod tests {
                     name: None,
                     columns: key(columns),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 });
             }
         };
@@ -12887,6 +13060,7 @@ mod tests {
                     UniqueConstraint {
                         columns: key(columns),
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     },
                 );
             }
@@ -13622,6 +13796,7 @@ mod tests {
                         filter: None,
                         method: Default::default(),
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     },
                 );
         };
@@ -14131,6 +14306,7 @@ mod tests {
                 name: None,
                 columns: vec!["m".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             t.data = Some(data);
             let mut schema = schema_of("app.lookup", t);
@@ -14645,6 +14821,7 @@ mod tests {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let fk = pbps_model::ForeignKey {
             columns: vec!["n".into()],
@@ -14660,6 +14837,7 @@ mod tests {
             name: Some(name.into()),
             columns: columns.iter().map(|c| (*c).into()).collect(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let columns = || {
             table(&[
@@ -14680,6 +14858,7 @@ mod tests {
                 .map(|f| ("fillfactor".to_owned(), f.to_owned()))
                 .into_iter()
                 .collect(),
+            filegroup: None,
         };
         parent.unique.insert("ev_u".into(), unique(None));
         parent.partition_by = Some(PartitionBy {
@@ -15333,6 +15512,7 @@ mod tests {
                         pbps_model::UniqueConstraint {
                             columns: vec!["n".into()],
                             storage_parameters: Default::default(),
+                            filegroup: None,
                         },
                     );
                 }),
@@ -15791,6 +15971,7 @@ mod tests {
             name: Some("ev_pk".into()),
             columns: vec!["id".into(), "ts".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         parent.checks.insert(
             "ev_n_ck".into(),
@@ -15812,6 +15993,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         parent.foreign_keys.insert(
@@ -15835,6 +16017,7 @@ mod tests {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         tree.tables.insert("app.r".parse().unwrap(), referenced);
         tree.tables.insert(
@@ -16084,6 +16267,7 @@ mod tests {
                         UniqueConstraint {
                             columns: vec!["n".into()],
                             storage_parameters: Default::default(),
+                            filegroup: None,
                         },
                     );
                 }),
@@ -16761,6 +16945,7 @@ mod tests {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let check = |expression: &str| pbps_model::CheckConstraint {
             expression: expression.into(),
@@ -16985,6 +17170,7 @@ mod tests {
             name: Some("s_pk".into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         let p: TableName = "app.p".parse().unwrap();
         let mut tree = schema_of("app.ev", parent.clone());
@@ -17184,6 +17370,7 @@ mod tests {
             name: Some("s_pk".into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         let t: TableName = "app.t".parse().unwrap();
         let mut base = schema_of("app.ev", parent);
@@ -17471,6 +17658,7 @@ mod tests {
                 name: None,
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             t.system_time = Some(pbps_model::SystemTime {
                 start: "vf".into(),
@@ -17763,6 +17951,7 @@ mod tests {
                     name: None,
                     columns: vec!["id".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 });
                 t.foreign_keys
                     .insert(format!("{}_other", &name[7..]).into(), fk(other, "other"));
@@ -17881,6 +18070,7 @@ mod tests {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let mut t = table(&[
             ("id", Column::new(ty("int")).not_null()),
@@ -17997,12 +18187,14 @@ mod tests {
             name: Some("pk_t".into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         t.unique.insert(
             "uq_code".into(),
             UniqueConstraint {
                 columns: vec!["code".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         t.indexes.insert(
@@ -18019,6 +18211,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         t.clustered = layout;
@@ -18363,6 +18556,7 @@ mod tests {
             name: None,
             columns: vec!["code".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         t.data = Some(pbps_model::TableData {
             mode,
@@ -18501,6 +18695,7 @@ mod tests {
                 UniqueConstraint {
                     columns: vec!["label".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             t.checks.insert(
@@ -19001,6 +19196,7 @@ mod tests {
                     filter: Some("n > 0".to_owned()),
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             t
@@ -19328,6 +19524,7 @@ mod tests {
             name: None,
             columns: vec!["label".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         // The rows now key on `label`, and say nothing about `code`.
         declared_t.columns.get_mut("code").unwrap().nullable = true;
@@ -19379,6 +19576,7 @@ mod tests {
             name: None,
             columns: vec!["kode".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         declared_t.data.as_mut().unwrap().rows = [(
             pbps_model::RowKey::from("new"),
@@ -22273,6 +22471,7 @@ mod tests {
             name: Some("pk_t".into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         let base = schema_of("dbo.t", base_t);
         let declared = schema_of("dbo.t", table(&[("id", Column::new(ty("int")))]));
@@ -22402,6 +22601,7 @@ mod tests {
             name: Some("pk_t".into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         let base = schema_of("dbo.t", base_t);
         // The declaration replaces the key, adds the column the new key names,
@@ -22415,6 +22615,7 @@ mod tests {
             name: Some("pk_t".into()),
             columns: vec!["other".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         let declared = schema_of("dbo.t", declared_t);
 
@@ -22728,6 +22929,7 @@ mod tests {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let mut base_t = table(&[("a", Column::new(ty("int"))), ("b", Column::new(ty("int")))]);
         base_t.indexes.insert("ix_t".into(), ix("a"));
@@ -22764,6 +22966,7 @@ mod tests {
         UniqueConstraint {
             columns: columns.iter().map(|c| (*c).into()).collect(),
             storage_parameters: Default::default(),
+            filegroup: None,
         }
     }
 
@@ -22786,6 +22989,7 @@ mod tests {
                     name: Some("old_key".into()),
                     columns: vec!["id".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 });
             } else if kind == "index" {
                 parent.indexes.insert(
@@ -22802,6 +23006,7 @@ mod tests {
                         filter: None,
                         method: Default::default(),
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     },
                 );
             } else {
@@ -22896,6 +23101,7 @@ mod tests {
                 name: Some("parent_pk".into()),
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             parent.indexes.insert(
                 "old_index".into(),
@@ -22911,6 +23117,7 @@ mod tests {
                     filter: filter.map(str::to_owned),
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             let mut child = sku_table();
@@ -23120,6 +23327,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         let mut order_line = sku_table();
@@ -23219,6 +23427,7 @@ mod tests {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         let mut want_t = table(&[
             ("cust_id", Column::new(ty("int"))),
@@ -23228,6 +23437,7 @@ mod tests {
             name: None,
             columns: vec!["cust_id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
 
         let cs = run(
@@ -23270,6 +23480,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         base_t.unique.insert("uq_t_old".into(), unique(&["old"]));
@@ -23293,6 +23504,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         want_t.unique.insert("uq_t_old".into(), unique(&["new"]));
@@ -23480,6 +23692,7 @@ mod tests {
             filter: Some(format!("[{column}] IS NOT NULL")),
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let mut base_t = table(&[
             ("id", Column::new(ty("int"))),
@@ -23743,6 +23956,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         let base = two_tables(("app.old", old_t.clone()), ("app.other", other_base));
@@ -23844,6 +24058,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         let bare = table(&[("id", Column::new(ty("int")))]);
@@ -24257,6 +24472,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         let base = schema_of("app.old", old_t);
@@ -24308,6 +24524,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         let base = two_tables(("s1.old", old_t.clone()), ("s2.sibling", sibling_base));
@@ -24353,6 +24570,7 @@ mod tests {
                 filter: Some("id > 0".into()),
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         let base = schema_of("s1.old", old_t);
@@ -24417,6 +24635,7 @@ mod tests {
                     name: Some("target".into()),
                     columns: vec!["id".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 });
             } else {
                 owner.unique.insert("target".into(), unique(&["id"]));
@@ -24577,6 +24796,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         let want_t = table(&[("new", Column::new(ty("int")))]);
@@ -27662,12 +27882,14 @@ mod tests {
             name: Some("PK__t__357D4CF8312E0151".into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         let mut declared_t = base_t.clone();
         declared_t.primary_key = Some(pbps_model::PrimaryKey {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         let mut changes = Vec::new();
         diff_constraints(
@@ -27684,6 +27906,7 @@ mod tests {
             name: None,
             columns: vec!["other".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         let mut changes = Vec::new();
         diff_constraints(
@@ -27707,6 +27930,7 @@ mod tests {
             name: Some("pk_t".into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         let mut changes = Vec::new();
         diff_constraints(
@@ -27869,6 +28093,7 @@ mod tests {
                         name: Some("PK__generated".into()),
                         columns: vec!["old".into()],
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     })
                 }
                 Part::Unique => {
@@ -27877,6 +28102,7 @@ mod tests {
                         UniqueConstraint {
                             columns: vec!["old".into()],
                             storage_parameters: Default::default(),
+                            filegroup: None,
                         },
                     );
                 }
@@ -27910,6 +28136,7 @@ mod tests {
                             filter: None,
                             method: Default::default(),
                             storage_parameters: Default::default(),
+                            filegroup: None,
                         },
                     );
                 }
@@ -27923,6 +28150,7 @@ mod tests {
                 name: None,
                 columns: vec!["old".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             let before = Schema {
                 tables: [(table.clone(), shape.clone()), (parent.clone(), referenced)].into(),

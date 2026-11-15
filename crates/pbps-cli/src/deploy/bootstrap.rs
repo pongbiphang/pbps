@@ -527,6 +527,8 @@ pub(super) async fn bootstrap_async(
             // by the `CREATE TABLE` that names it after the ones before it ran
             // (#1175).
             crate::engine::refuse_unknown_collations(&mut conn, &loaded.schema).await?;
+            // A filegroup the server lacks, likewise (#2813).
+            crate::engine::refuse_unknown_filegroups(&mut conn, &loaded.schema).await?;
             // A key to a declared history under another spelling (#1625).
             crate::engine::refuse_history_references_alike(
                 &mut conn,

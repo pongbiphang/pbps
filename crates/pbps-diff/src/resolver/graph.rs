@@ -548,6 +548,7 @@ fn named_dependency_effects_keep_raw_check_and_index_surfaces_distinct_from_show
                     filter: None,
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 }),
             },
             Change::DropIndex {

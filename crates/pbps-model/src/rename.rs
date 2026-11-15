@@ -153,6 +153,7 @@ mod tests {
                 name: None,
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             ..Default::default()
         };
@@ -161,6 +162,7 @@ mod tests {
             UniqueConstraint {
                 columns: vec!["tag".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         table.indexes.insert(
@@ -177,6 +179,7 @@ mod tests {
                 filter: Some("[tag] IS NOT NULL".into()),
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         table.foreign_keys.insert(
@@ -298,6 +301,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         let out = r.apply(&indexed, &t("app.ev_rest"));

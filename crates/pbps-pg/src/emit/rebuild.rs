@@ -42,6 +42,7 @@ pub(super) fn build_partitioned_index(pg: &Postgres, recipe: &BuildPartitionedIn
                 filter: None,
                 method: pbps_model::IndexMethod::Btree,
                 storage_parameters: parameters.clone(),
+                filegroup: None,
             };
             (index, Some(clause), Some(kind))
         }

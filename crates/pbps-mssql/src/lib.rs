@@ -1035,6 +1035,7 @@ mod tests {
                 name: None,
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             table.system_time = Some(pbps_model::SystemTime {
                 start: "vf".into(),

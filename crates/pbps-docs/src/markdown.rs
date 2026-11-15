@@ -597,6 +597,7 @@ mod tests {
             name: Some("pk_customer".into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         let mut s = Schema::default();
         s.tables.insert(TableName::new("dbo", "customer"), t);
@@ -776,6 +777,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         s

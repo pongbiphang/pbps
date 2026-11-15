@@ -64,7 +64,7 @@ fn full_catalog() -> RawCatalog {
                 object_id: 1,
                 constraint_name: "pk_customer".into(),
                 is_primary: true,
-                column: "id".into(), placement: Placement::Filegroup,
+                column: "id".into(), placement: Placement::Filegroup, filegroup: None,
             },
             RawKeyColumn {
             is_disabled: false,
@@ -73,7 +73,7 @@ fn full_catalog() -> RawCatalog {
                 object_id: 1,
                 constraint_name: "uq_customer_email".into(),
                 is_primary: false,
-                column: "email".into(), placement: Placement::Filegroup,
+                column: "email".into(), placement: Placement::Filegroup, filegroup: None,
             },
             RawKeyColumn {
             is_disabled: false,
@@ -82,7 +82,7 @@ fn full_catalog() -> RawCatalog {
                 object_id: 2,
                 constraint_name: "pk_region".into(),
                 is_primary: true,
-                column: "region_id".into(), placement: Placement::Filegroup,
+                column: "region_id".into(), placement: Placement::Filegroup, filegroup: None,
             },
         ],
         foreign_key_columns: vec![RawForeignKeyColumn {
@@ -132,7 +132,7 @@ fn full_catalog() -> RawCatalog {
                 filter: Some("([email] IS NOT NULL)".into()),
                 column: "email".into(),
                 is_included: false,
-                is_descending: true, placement: Placement::Filegroup,
+                is_descending: true, placement: Placement::Filegroup, filegroup: None,
             },
             RawIndexColumn {
             is_disabled: false,
@@ -144,7 +144,7 @@ fn full_catalog() -> RawCatalog {
                 filter: Some("([email] IS NOT NULL)".into()),
                 column: "status".into(),
                 is_included: true,
-                is_descending: false, placement: Placement::Filegroup,
+                is_descending: false, placement: Placement::Filegroup, filegroup: None,
             },
         ],
         modules: vec![

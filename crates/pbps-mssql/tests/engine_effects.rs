@@ -133,6 +133,7 @@ fn rows_written_while_a_foreign_key_is_rebuilt_do_not_wait_for_it() {
                 name: None,
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             ..Table::default()
         };
@@ -397,6 +398,7 @@ fn retyped(a: &str, b: &str) -> Schema {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         },
     );
     table.unique.insert(
@@ -404,6 +406,7 @@ fn retyped(a: &str, b: &str) -> Schema {
         UniqueConstraint {
             columns: vec!["a".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         },
     );
     table.checks.insert(
@@ -547,6 +550,7 @@ fn an_index_over_a_computed_column_follows_its_addition() {
         filter: None,
         method: Default::default(),
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let mut after = schema.clone();
     let table = after.tables.get_mut(&t()).unwrap();
@@ -1457,6 +1461,7 @@ fn a_views_indexes_are_compared_and_survive_a_rebuild() {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         view.options.indexes.insert("ux".into(), index("id", true));
         view.options.clustered = Some("ux".into());

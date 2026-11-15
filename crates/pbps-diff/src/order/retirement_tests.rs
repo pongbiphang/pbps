@@ -12,6 +12,7 @@ fn fragment() -> (Operations, Vec<Effects>, Baseline, ChangeSet) {
         name: Some("p_pk".into()),
         columns: vec!["k".into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let fk = ForeignKey {
         columns: vec!["k".into()],
@@ -422,6 +423,7 @@ fn ordinary_same_name_replacement_with_a_new_uid_keeps_its_existing_order() {
         name: Some("p_pk".into()),
         columns: vec!["k".into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     });
     let restore = ops.as_slice()[6].planned().clone();
     let mut before = Schema::default();

@@ -12,6 +12,7 @@ fn without_types() -> (Schema, IdsFile) {
             name: Some("pk_customer".into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         }),
         ..Default::default()
     };

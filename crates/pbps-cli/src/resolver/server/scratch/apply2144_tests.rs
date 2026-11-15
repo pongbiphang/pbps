@@ -622,6 +622,7 @@ async fn mssql_a_plan_that_creates_unnamed_keys_and_defaults_applies_and_closes(
                 name: None,
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             let (child_name, mut child) = super::reconstruct2374::table("dbo.c2144");
             child
@@ -634,6 +635,7 @@ async fn mssql_a_plan_that_creates_unnamed_keys_and_defaults_applies_and_closes(
                 name: None,
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             child.foreign_keys.insert(
                 "fk_c2144_p".into(),

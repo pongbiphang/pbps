@@ -175,6 +175,7 @@ mod tests {
             filter: Some("id > 0".into()),
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         }
     }
 

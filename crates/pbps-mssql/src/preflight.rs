@@ -2524,6 +2524,7 @@ mod tests {
             constraint: UniqueConstraint {
                 columns: vec!["code".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
             clustered: false,
         });
@@ -2573,6 +2574,7 @@ mod tests {
                     constraint: UniqueConstraint {
                         columns: vec!["code".into()],
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     },
                     clustered: false,
                 }),
@@ -2667,6 +2669,7 @@ mod tests {
                     constraint: UniqueConstraint {
                         columns: vec!["email".into()],
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     },
                     clustered: false,
                 }),
@@ -3101,6 +3104,7 @@ mod tests {
             constraint: UniqueConstraint {
                 columns: vec!["email".into(), "tenant".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
             clustered: false,
         });
@@ -3476,6 +3480,7 @@ mod tests {
             constraint: pbps_model::UniqueConstraint {
                 columns: vec!["code".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
             clustered: false,
         };
@@ -3540,6 +3545,7 @@ mod tests {
                 filter: filter.map(str::to_owned),
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             clustered: false,
         }
@@ -3835,6 +3841,7 @@ mod tests {
             constraint: pbps_model::UniqueConstraint {
                 columns: vec!["seq".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
             clustered: false,
         };
@@ -3858,6 +3865,7 @@ mod tests {
             constraint: pbps_model::UniqueConstraint {
                 columns: vec!["label".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
             clustered: false,
         };
@@ -4008,6 +4016,7 @@ mod tests {
             constraint: pbps_model::UniqueConstraint {
                 columns: vec!["region_id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
             clustered: false,
         };
@@ -4101,6 +4110,7 @@ mod tests {
                 name: Some("pk_customer".into()),
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             nonclustered: false,
         });
@@ -4142,6 +4152,7 @@ mod tests {
                     name: None,
                     columns: vec!["id".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 }),
                 to: None,
                 nonclustered: false,
@@ -4726,6 +4737,7 @@ mod tests {
                 constraint: UniqueConstraint {
                     columns: vec!["email".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
                 clustered: false,
             },
@@ -4815,6 +4827,7 @@ mod tests {
             constraint: UniqueConstraint {
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
             clustered: false,
         };

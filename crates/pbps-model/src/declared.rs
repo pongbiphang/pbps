@@ -1297,6 +1297,7 @@ mod tests {
                 filter: Some("n > 0".to_owned()),
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         table.indexes.insert(
@@ -1313,6 +1314,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         table
@@ -1365,6 +1367,7 @@ mod tests {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let mut declared = schema();
         declared
@@ -1465,6 +1468,7 @@ mod tests {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         ordinary
             .tables

@@ -113,6 +113,7 @@ fn index(method: IndexMethod, columns: Vec<IndexColumn>) -> Index {
         filter: None,
         method,
         storage_parameters: BTreeMap::new(),
+        filegroup: None,
     }
 }
 

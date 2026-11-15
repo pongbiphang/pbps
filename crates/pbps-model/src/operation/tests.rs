@@ -378,6 +378,7 @@ fn a_step_defines_only_what_its_own_payload_holds() {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         },
     );
     let mut bare = full.clone();

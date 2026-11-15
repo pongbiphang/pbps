@@ -115,8 +115,8 @@ fn pinned(plan: &serde_json::Value) -> serde_json::Value {
     })
 }
 
-const MSSQL: &str = r#"{"version":73,"module_deps":{"dbo.a_first":["dbo.z_last"],"dbo.fresh":["dbo.keep"],"dbo.keep":["dbo.base"]},"changes":[["drop_module","dbo.old",null],["create_table",null,"dbo.t"],["create_module","dbo.z_last",null],["create_module","dbo.a_first",null],["create_module","dbo.fresh",null]]}"#;
-const POSTGRES: &str = r#"{"version":73,"module_deps":{"dbo.a_first":["dbo.z_last"],"dbo.fresh":["dbo.keep"],"dbo.keep":["dbo.base"]},"changes":[["drop_module","dbo.old",null],["create_table",null,"dbo.t"],["alter_module","dbo.base",null],["create_module","dbo.z_last",null],["create_module","dbo.a_first",null],["alter_module","dbo.keep",null],["create_module","dbo.fresh",null]]}"#;
+const MSSQL: &str = r#"{"version":76,"module_deps":{"dbo.a_first":["dbo.z_last"],"dbo.fresh":["dbo.keep"],"dbo.keep":["dbo.base"]},"changes":[["drop_module","dbo.old",null],["create_table",null,"dbo.t"],["create_module","dbo.z_last",null],["create_module","dbo.a_first",null],["create_module","dbo.fresh",null]]}"#;
+const POSTGRES: &str = r#"{"version":76,"module_deps":{"dbo.a_first":["dbo.z_last"],"dbo.fresh":["dbo.keep"],"dbo.keep":["dbo.base"]},"changes":[["drop_module","dbo.old",null],["create_table",null,"dbo.t"],["alter_module","dbo.base",null],["create_module","dbo.z_last",null],["create_module","dbo.a_first",null],["alter_module","dbo.keep",null],["create_module","dbo.fresh",null]]}"#;
 
 fn expected(text: &str) -> serde_json::Value {
     serde_json::from_str(text).unwrap()

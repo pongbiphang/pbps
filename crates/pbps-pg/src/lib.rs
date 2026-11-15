@@ -3312,6 +3312,7 @@ mod tests {
             name: None,
             columns: vec!["id".into(), "ts".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         assert!(problems(&ok).is_empty(), "{:?}", problems(&ok));
         let partition = pbps_model::Table {
@@ -3377,6 +3378,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         // And its persistence and storage parameters (#1580).
@@ -3650,6 +3652,7 @@ mod tests {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let check = |expression: &str| pbps_model::CheckConstraint {
             expression: expression.into(),
@@ -3865,6 +3868,7 @@ mod tests {
                     filter: None,
                     method: pbps_model::IndexMethod::Gin,
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             t
@@ -3903,6 +3907,7 @@ mod tests {
                 name: None,
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             if rows {
                 t.data = Some(pbps_model::TableData {
@@ -4056,6 +4061,7 @@ mod tests {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         let pg = super::Postgres::new();
         let name = TableName::new("app", &long);
@@ -4091,6 +4097,7 @@ mod tests {
                 name: None,
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             if let Some(n) = index_name {
                 t.indexes.insert(
@@ -4107,6 +4114,7 @@ mod tests {
                         filter: None,
                         method: Default::default(),
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     },
                 );
             }
@@ -4197,6 +4205,7 @@ mod tests {
                 name: None,
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             if let Some(n) = index_name {
                 t.indexes.insert(
@@ -4213,6 +4222,7 @@ mod tests {
                         filter: None,
                         method: Default::default(),
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     },
                 );
             }
@@ -4293,6 +4303,7 @@ mod tests {
                     name: None,
                     columns: vec!["id".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 });
                 if k == 0 {
                     t.indexes.insert(
@@ -4309,6 +4320,7 @@ mod tests {
                             filter: None,
                             method: Default::default(),
                             storage_parameters: Default::default(),
+                            filegroup: None,
                         },
                     );
                 }
@@ -4533,6 +4545,7 @@ mod tests {
                     filter: None,
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             )
         };
@@ -4552,6 +4565,7 @@ mod tests {
                     name: None,
                     columns: vec!["id".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 });
             }
             t.indexes.extend(index_name.map(index));
@@ -4662,6 +4676,7 @@ mod tests {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let table = |pk_name: Option<&str>, identity: bool, index_name: Option<&str>| {
             let mut t = Table::default();
@@ -4678,6 +4693,7 @@ mod tests {
                 name: pk_name.map(Into::into),
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             if let Some(n) = index_name {
                 t.indexes.insert(n.into(), index("id"));
@@ -4932,6 +4948,7 @@ mod tests {
                 name: None,
                 columns: vec!["code".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             table.data = Some(TableData {
                 mode: DataMode::Ensure,
@@ -5035,6 +5052,7 @@ mod tests {
                 name: None,
                 columns: vec!["code".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             r.foreign_keys.insert(
                 "r_t".into(),
@@ -6533,6 +6551,7 @@ mod tests {
                     filter: Some(expression.into()),
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             let errors = structural_errors(&table);
@@ -6551,12 +6570,14 @@ mod tests {
             name: None,
             columns: vec!["missing".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         table.unique.insert(
             "empty".into(),
             pbps_model::UniqueConstraint {
                 columns: vec![],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         table.unique.insert(
@@ -6564,6 +6585,7 @@ mod tests {
             pbps_model::UniqueConstraint {
                 columns: vec!["a".into(), "a".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         table.indexes.insert(
@@ -6580,6 +6602,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         let errors = structural_errors(&table);
@@ -6616,6 +6639,7 @@ mod tests {
                         name: None,
                         columns,
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     });
                 } else {
                     table.unique.insert(
@@ -6623,6 +6647,7 @@ mod tests {
                         pbps_model::UniqueConstraint {
                             columns,
                             storage_parameters: Default::default(),
+                            filegroup: None,
                         },
                     );
                 }
@@ -6758,6 +6783,7 @@ mod tests {
                     filter: None,
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             let errors = structural_errors(&table);
@@ -6796,6 +6822,7 @@ mod tests {
                             name: None,
                             columns,
                             storage_parameters: Default::default(),
+                            filegroup: None,
                         })
                     }
                     "unique" => {
@@ -6804,6 +6831,7 @@ mod tests {
                             pbps_model::UniqueConstraint {
                                 columns,
                                 storage_parameters: Default::default(),
+                                filegroup: None,
                             },
                         );
                     }
@@ -6842,6 +6870,7 @@ mod tests {
                                 filter: None,
                                 method: Default::default(),
                                 storage_parameters: Default::default(),
+                                filegroup: None,
                             },
                         );
                     }
@@ -6874,6 +6903,7 @@ mod tests {
             name: None,
             columns: vec!["a".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         assert!(structural_errors(&table).is_empty());
         table.clustered = Some(pbps_model::Clustered::Heap);
@@ -6889,6 +6919,7 @@ mod tests {
             name: None,
             columns: vec!["missing".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         table.checks.insert(
             "ck".into(),
@@ -6910,6 +6941,7 @@ mod tests {
                 filter: Some(" \t".into()),
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         let errors = structural_errors(&table);
@@ -6963,6 +6995,7 @@ mod tests {
                     filter: Some(expression.into()),
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             let errors = structural_errors(&table);
@@ -7015,6 +7048,7 @@ mod tests {
                     filter: Some(expression.into()),
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             assert!(
@@ -7043,12 +7077,14 @@ mod tests {
             name: Some(long.clone().into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         table.unique.insert(
             format!("uq_{long}").into(),
             pbps_model::UniqueConstraint {
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         table.checks.insert(
@@ -7643,6 +7679,7 @@ mod tests {
                 name: Some("t_pkey".into()),
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             let refused = found(&keyed);
             assert!(
@@ -7656,6 +7693,7 @@ mod tests {
                 pbps_model::UniqueConstraint {
                     columns: vec!["v".into(), "id".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             let refused = found(&unique);
@@ -7682,6 +7720,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             };
             let noted = |table: &Table| {
                 let mut schema = pbps_model::Schema::default();
@@ -8088,6 +8127,7 @@ mod tests {
                                 name: Some(name.into()),
                                 columns: vec!["id".into()],
                                 storage_parameters: Default::default(),
+                                filegroup: None,
                             })
                         }
                         1 => {
@@ -8096,6 +8136,7 @@ mod tests {
                                 UniqueConstraint {
                                     columns: vec!["id".into()],
                                     storage_parameters: Default::default(),
+                                    filegroup: None,
                                 },
                             );
                         }
@@ -8141,6 +8182,7 @@ mod tests {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         table.checks.insert(
             "same".into(),
@@ -8162,6 +8204,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         assert!(
@@ -8915,6 +8958,7 @@ mod enum_partition_key_tests {
             columns: vec![key.into()],
             name: None,
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         table.data = Some(pbps_model::TableData {
             mode: pbps_model::DataMode::Exact,

@@ -1833,8 +1833,18 @@ pub(crate) fn collate_clause(collation: Option<&Collation>) -> Result<String, Di
     Ok(format!(" COLLATE {name}"))
 }
 
+/// ` ON [filegroup]` for a declared one, and nothing for none (#2813,
+/// DEC-2813.1). Quoted like every other name, so a filegroup called `default`
+/// is that filegroup and not the engine's `"default"` keyword.
+fn on_filegroup(filegroup: Option<&pbps_model::Filegroup>) -> Result<String, DialectError> {
+    filegroup
+        .map(|fg| Ok(format!(" ON {}", quote(fg.as_str())?)))
+        .unwrap_or_else(|| Ok(String::new()))
+}
+
 fn primary_key_clause(pk: &PrimaryKey, clustered: bool) -> Result<String, DialectError> {
     let cols = column_list(&pk.columns)?;
+    let on = on_filegroup(pk.filegroup.as_ref())?;
     let layout = if clustered {
         "CLUSTERED"
     } else {
@@ -1842,12 +1852,12 @@ fn primary_key_clause(pk: &PrimaryKey, clustered: bool) -> Result<String, Dialec
     };
     Ok(match &pk.name {
         Some(n) => format!(
-            "CONSTRAINT {} PRIMARY KEY {layout} ({cols})",
+            "CONSTRAINT {} PRIMARY KEY {layout} ({cols}){on}",
             quote(n.raw())?
         ),
         // Unnamed leaves the server to invent one. That is a real choice a user
         // can make, so it is emitted faithfully rather than named on their behalf.
-        None => format!("PRIMARY KEY {layout} ({cols})"),
+        None => format!("PRIMARY KEY {layout} ({cols}){on}"),
     })
 }
 
@@ -1860,10 +1870,11 @@ fn unique_clause(
     clustered: bool,
 ) -> Result<String, DialectError> {
     Ok(format!(
-        "CONSTRAINT {} UNIQUE {}({})",
+        "CONSTRAINT {} UNIQUE {}({}){}",
         quote(name)?,
         if clustered { "CLUSTERED " } else { "" },
-        column_list(&u.columns)?
+        column_list(&u.columns)?,
+        on_filegroup(u.filegroup.as_ref())?
     ))
 }
 
@@ -1961,6 +1972,8 @@ fn create_index(
         s.push_str(&format!(" WHERE ({})", verbatim(filter)));
     }
     s.push_str(online(strategy));
+    // After `WITH (...)`, where the engine's grammar puts it.
+    s.push_str(&on_filegroup(index.filegroup.as_ref())?);
     s.push(';');
     Ok(s)
 }
@@ -2105,8 +2118,10 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
         }
     }
 
+    // Before `WITH`: the table's rows, or its clustered inline key's, go there.
+    let on = on_filegroup(table.filegroup.as_ref())?;
     let create = format!(
-        "CREATE TABLE {qualified_name} (\n    {}\n){with};",
+        "CREATE TABLE {qualified_name} (\n    {}\n){on}{with};",
         body.join(",\n    ")
     );
     // The renames and the `CREATE` stand or fall together: a staged apply
@@ -2484,6 +2499,7 @@ mod tests {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let mut options = pbps_model::ModuleOptions {
             schemabinding: true,
@@ -2679,6 +2695,7 @@ mod tests {
             name: Some("pk_customer".into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         let sql = sql_of(&Change::CreateTable {
             uid: uid("t_k7x2mq"),
@@ -2836,6 +2853,95 @@ mod tests {
         );
     }
 
+    /// A declared filegroup is spelled `ON [name]` where the engine's grammar
+    /// puts it: after the table's column list and before its `WITH`, at the end
+    /// of a constraint, and after an index's `WITH`. Quoted like any name, so a
+    /// `]` in it is doubled. One that is not declared writes nothing, and the
+    /// statements of a table with none are the ones it always had (#2813).
+    #[test]
+    fn a_declared_filegroup_is_spelled_on_a_table_a_key_and_an_index() {
+        use pbps_model::Filegroup;
+        let fg = |n: &str| Some(Filegroup::new(n));
+        let mut t = Table::default();
+        t.columns
+            .insert("id".into(), Column::new(ty("int")).not_null());
+        t.columns
+            .insert("code".into(), Column::new(ty("int")).not_null());
+        t.primary_key = Some(PrimaryKey {
+            name: Some("pk_t".into()),
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        });
+        t.unique.insert(
+            "uq_code".into(),
+            UniqueConstraint {
+                columns: vec!["code".into()],
+                storage_parameters: Default::default(),
+                filegroup: fg("fgy"),
+            },
+        );
+        let index = Index {
+            columns: vec![IndexColumn {
+                key: pbps_model::IndexKey::Column("code".into()),
+                descending: false,
+                opclass: None,
+                collation: None,
+            }],
+            include: vec![],
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+            filegroup: fg("a]b"),
+        };
+        t.indexes.insert("ix_code".into(), index.clone());
+        let create = |t: &Table| {
+            sql_of(&Change::CreateTable {
+                uid: uid("t_k7x2mq"),
+                name: tname("dbo.t"),
+                table: Box::new(t.clone()),
+                beside_default: None,
+                moves_at_most: None,
+            })
+        };
+        // No filegroup on the table: nothing after its column list.
+        let plain = create(&t);
+        assert!(plain[0].ends_with("\n);"), "{}", plain[0]);
+        assert_eq!(
+            plain[1],
+            "ALTER TABLE [dbo].[t] ADD CONSTRAINT [uq_code] UNIQUE ([code]) ON [fgy];"
+        );
+        assert_eq!(
+            plain[2],
+            "CREATE INDEX [ix_code] ON [dbo].[t] ([code] ASC) ON [a]]b];"
+        );
+        // On the table: after the column list, where the rows go.
+        t.filegroup = fg("fgx");
+        let placed = create(&t);
+        assert!(placed[0].ends_with("\n) ON [fgx];"), "{}", placed[0]);
+        // A nonclustered key takes its own, in its constraint.
+        t.primary_key.as_mut().unwrap().filegroup = fg("fgz");
+        t.clustered = Some(pbps_model::Clustered::Heap);
+        let keyed = create(&t);
+        assert!(
+            keyed[0].contains("CONSTRAINT [pk_t] PRIMARY KEY NONCLUSTERED ([id]) ON [fgz]"),
+            "{}",
+            keyed[0]
+        );
+        // After `WITH (ONLINE = ON)`, where the grammar has it.
+        let online = online_sql_of(&Change::AddIndex {
+            table: tname("dbo.t"),
+            name: "ix_code".into(),
+            index: Box::new(index),
+            clustered: false,
+        });
+        assert_eq!(
+            online[0],
+            "CREATE INDEX [ix_code] ON [dbo].[t] ([code] ASC) WITH (ONLINE = ON) ON [a]]b];"
+        );
+    }
+
     /// A key's layout is always spelled, because a bare `PRIMARY KEY` beside
     /// an existing clustered index is silently nonclustered; a UNIQUE
     /// constraint or index spells `CLUSTERED` only when it is the one; and
@@ -2852,6 +2958,7 @@ mod tests {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         for n in ["uq_a", "uq_b"] {
             t.unique.insert(
@@ -2859,6 +2966,7 @@ mod tests {
                 UniqueConstraint {
                     columns: vec!["code".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
         }
@@ -2877,6 +2985,7 @@ mod tests {
                     filter: None,
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
         }
@@ -2981,6 +3090,7 @@ mod tests {
             name: Some("pk_t".into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let index = Index {
             columns: vec![IndexColumn {
@@ -2994,6 +3104,7 @@ mod tests {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         for build in [
             Change::SetPrimaryKey {
@@ -3014,6 +3125,7 @@ mod tests {
                 constraint: UniqueConstraint {
                     columns: vec!["id".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
                 clustered: true,
             },
@@ -3808,6 +3920,7 @@ mod tests {
                 name: None,
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             to: None,
             nonclustered: false,
@@ -3820,6 +3933,7 @@ mod tests {
                 name: Some("pk_t".into()),
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             to: None,
             nonclustered: false,
@@ -3909,6 +4023,7 @@ mod tests {
                 filter: Some("a IS NOT NULL -- only the live ones".into()),
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             clustered: false,
         });
@@ -3945,6 +4060,7 @@ mod tests {
                 filter: Some("a IS NOT NULL".into()),
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             clustered: false,
         });
@@ -4023,6 +4139,7 @@ mod tests {
                 name: None,
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             to: None,
             nonclustered: false,
@@ -4106,6 +4223,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             clustered: false,
         }
@@ -4142,6 +4260,7 @@ mod tests {
                 constraint: UniqueConstraint {
                     columns: vec!["order_id".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
                 clustered: false,
             }),
@@ -4236,6 +4355,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         let sql = online_sql_of(&Change::CreateTable {

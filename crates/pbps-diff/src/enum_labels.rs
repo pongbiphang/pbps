@@ -2690,6 +2690,7 @@ mod tests {
             name: None,
             columns: vec!["m".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         schema.tables.insert("app.t".parse().unwrap(), table);
     }

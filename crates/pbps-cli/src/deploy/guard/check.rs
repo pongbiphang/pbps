@@ -26,6 +26,8 @@ pub(crate) struct Fields<'a> {
     pub(crate) indexes: &'a BTreeMap<pbps_model::ObjectLocalName, Index>,
     pub(crate) exclude: &'a BTreeMap<pbps_model::ObjectLocalName, pbps_model::ExclusionConstraint>,
     pub(crate) clustered: &'a Option<Clustered>,
+    /// A SQL Server table's rows' filegroup, which no plan changes (#2813).
+    pub(crate) filegroup: &'a Option<pbps_model::Filegroup>,
     pub(crate) replica_identity: &'a Option<ReplicaIdentity>,
     pub(crate) storage_parameters: &'a BTreeMap<String, String>,
     pub(crate) unlogged: bool,
@@ -51,6 +53,7 @@ impl<'a> Fields<'a> {
             checks,
             indexes,
             exclude,
+            filegroup,
             clustered,
             replica_identity,
             storage_parameters,
@@ -72,6 +75,7 @@ impl<'a> Fields<'a> {
             indexes,
             exclude,
             clustered,
+            filegroup,
             replica_identity,
             storage_parameters,
             unlogged: *unlogged,
@@ -269,6 +273,13 @@ pub(crate) fn table(
         moved.push(format!(
             "{name} is {} and this plan does not leave it so",
             if now.unlogged { "unlogged" } else { "logged" },
+            name = name.shown()
+        ));
+    }
+    if !expected.filegroup.accepts(&now.filegroup.as_ref()) {
+        moved.push(format!(
+            "{name} is on a filegroup other than the one it was approved on, and no plan moves a \
+             table between filegroups",
             name = name.shown()
         ));
     }

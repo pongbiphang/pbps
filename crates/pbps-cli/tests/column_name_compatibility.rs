@@ -25,12 +25,14 @@ fn artifacts(text: &str, dialect: &dyn FixtureEmission) -> (Schema, SavedPlan, S
             name: Some("pk_child".into()),
             columns: vec![text.into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         }),
         unique: [(
             "uq_child".into(),
             UniqueConstraint {
                 columns: vec![payload.clone().into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         )]
         .into(),
@@ -43,6 +45,7 @@ fn artifacts(text: &str, dialect: &dyn FixtureEmission) -> (Schema, SavedPlan, S
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         )]
         .into(),
@@ -321,6 +324,7 @@ fn column_validation_shows_each_name_once() {
                 name: None,
                 columns: vec![NAME.into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             ..Default::default()
         };
@@ -363,6 +367,7 @@ fn replica_identity_column_diagnostics_escape_once_at_dialect_validation() {
                     UniqueConstraint {
                         columns: vec![column.into()],
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     },
                 );
                 table.replica_identity = Some(ReplicaIdentity::Unique("ri".into()));
@@ -376,6 +381,7 @@ fn replica_identity_column_diagnostics_escape_once_at_dialect_validation() {
                         filter: None,
                         method: Default::default(),
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     },
                 );
                 table.replica_identity = Some(ReplicaIdentity::Index("ri".into()));
@@ -416,6 +422,7 @@ fn row_read_refusals_escape_column_names_once() {
             name: None,
             columns: vec![NAME.into(), "ordinary".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         }),
         ..Default::default()
     };
@@ -491,6 +498,7 @@ fn cycling_expression_notes_show_column_identities_once_in_every_format() {
                         filter: None,
                         method: Default::default(),
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     },
                 )]
                 .into(),

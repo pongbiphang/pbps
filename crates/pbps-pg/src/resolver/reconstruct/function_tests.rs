@@ -36,6 +36,7 @@ fn schema(reference: bool, local_prefix: &str) -> Schema {
             name: Some(format!("{local_prefix}{name}_pk").into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         table.checks.insert(
             format!("{local_prefix}{name}_positive").into(),

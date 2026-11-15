@@ -646,6 +646,43 @@ pub async fn refuse_unknown_collations(conn: &mut Conn, schema: &Schema) -> anyh
     }
 }
 
+/// Refuses a declared filegroup the target cannot place an object on
+/// (#2813). PostgreSQL declares none: `validate` refuses the field there.
+pub async fn refuse_unknown_filegroups(conn: &mut Conn, schema: &Schema) -> anyhow::Result<()> {
+    match conn.driver() {
+        Driver::Mssql => plan_session::mssql::refuse_unknown_filegroups(conn, schema).await,
+        Driver::Postgres => Ok(()),
+    }
+}
+
+/// One advisory per declared filegroup, for a plan made without a database
+/// (#2813, DEC-2813.1). The name is accepted as a name: whether the target
+/// holds it is a fact about a database, and `plan --db` or `bootstrap` refuses
+/// one it does not, by name. PostgreSQL declares none (`validate` refuses it).
+pub fn unchecked_filegroups(schema: &Schema) -> Vec<String> {
+    let mut by_name: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for (what, fg, _) in plan_session::mssql::declared_filegroups(schema) {
+        by_name
+            .entry(fg.as_str().to_ascii_lowercase())
+            .or_default()
+            .push(format!(
+                "{what} (`{}`)",
+                pbps_model::escape::Escaped(fg.as_str())
+            ));
+    }
+    by_name
+        .into_values()
+        .map(|uses| {
+            format!(
+                "{}: the filegroup is not checked offline; pbps never creates one, so it must \
+                 exist in the database, and a plan against the database (`plan --db`) refuses \
+                 it by name when it does not",
+                uses.join(", ")
+            )
+        })
+        .collect()
+}
+
 /// Refuses a foreign key to a declared history the database reads as one
 /// name with it (#1625). Offline the check compares names as written
 /// (`check_history_references`), since the collation is the server's

@@ -919,6 +919,7 @@ mod tests {
             name: None,
             columns: vec![],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         std::fs::create_dir(project.schema_dir()).unwrap();
         let file = project.schema_dir().join("keep.yml");
