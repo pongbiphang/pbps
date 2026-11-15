@@ -147,6 +147,7 @@ jobs:
       - run: python3 scripts/ci_gate_verdict_test.py
       - run: python3 scripts/ci_release_scope_test.py
       - run: python3 scripts/gate_scope_test.py
+      - run: python3 scripts/local_gate_scope_test.py
       - run: python3 scripts/known_flakes_test.py
       - run: python3 scripts/live_shards_resume_test.py
       - run: python3 scripts/pr_size_test.py

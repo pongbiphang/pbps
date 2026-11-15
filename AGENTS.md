@@ -108,6 +108,18 @@ Read before changing things:
   - A round fix that breaks something it did not touch is found by the full
     gate before ready.
 - A docs-only push runs only the two decision checks.
+- **Scope the full gate by path** (DEC-2859.1). Run
+  `python3 scripts/local_gate_scope.py --base origin/master --head HEAD` before
+  a full gate.
+  - `non-live` (exit 0) means every changed path is documentation, a workflow
+    or a script no live run reads. Run the Python checks, `fmt`, `clippy` and
+    `cargo test --workspace --all-targets --no-fail-fast`, and no live suite.
+  - `full` (exit 1) is everything else: crates, manifests, live runners and
+    their inputs, a path in no named class, and any ref the script cannot
+    read. Run the full gate.
+  - Put the JSON line in the PR body. The primary agent reruns it before
+    enqueueing. The merge group still runs every job.
+  - The docs-only and unchanged-patch rules keep their lighter gates.
 - **Complete a stopped gate; do not repeat it** (DEC-2553.1). When a sharded
   run stops on an infrastructure fault, or fails only on tests registered in
   `scripts/known-flakes.json` (DEC-2553.2), finish it on the same head with
