@@ -484,6 +484,27 @@ pub fn ids_at(project: &Project, rev: &str) -> anyhow::Result<ValidIds> {
     ids_from(&project.root, rev, &ids_rel, &ids_dir_rel, rev)
 }
 
+/// What a person can do about identity history Git cannot read (#1814).
+///
+/// The remedy forbids the one "fix" within reach: regenerating the identity
+/// files from the declarations, which reads every renamed object as a drop
+/// and a create. Absent history is not this case; it is a first run.
+const IDENTITY_READ_REMEDY: &str = "Restore the Git object (`git fsck` names what is damaged; \
+    `git fetch` it from the remote or copy it from another clone) or make `git` run here, then \
+    run this again. Do not regenerate the identity files: that would give every object a new \
+    identity.";
+
+/// A failed read of identity history, with the revision it was read at and
+/// the remedy. `what` is the action that failed, in the words of
+/// "cannot <what> at `<revision>`". The revision is whatever the caller
+/// typed, so it is shown escaped like every other name in a message.
+fn identity_read_failed(what: &str, label: &str, cause: &anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "cannot {what} at `{label}`: {cause:#}\n{IDENTITY_READ_REMEDY}",
+        label = pbps_model::escape::Escaped(label)
+    )
+}
+
 /// The identities at `rev`, under paths already resolved for that revision.
 ///
 /// The tree under `ids_dir` if the revision has one, otherwise the legacy
@@ -507,16 +528,16 @@ fn ids_from(
         return Ok(IdsFile::default().validated()?);
     }
     let tree = crate::ids_store::tree_at(root, rev, ids_dir_rel)
-        .with_context(|| format!("cannot read the identity tree at `{label}`"))?;
+        .map_err(|e| identity_read_failed("read the identity tree", label, &e))?;
     // `--full-tree`: `ids_rel` is as git names it from the repository root.
     let listed = git(root, &["ls-tree", "--full-tree", "-z", rev, "--", ids_rel])
-        .with_context(|| format!("cannot look for the identity file at `{label}`"))?;
+        .map_err(|e| identity_read_failed("look for the identity file", label, &e))?;
     let legacy = if listed.is_empty() {
         None
     } else {
         Some(
             git(root, &["show", &format!("{rev}:{ids_rel}")])
-                .with_context(|| format!("cannot read the identity file at `{label}`"))?,
+                .map_err(|e| identity_read_failed("read the identity file", label, &e))?,
         )
     };
     match (legacy, tree.is_empty()) {
