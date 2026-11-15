@@ -36023,6 +36023,15 @@ fn state_history_requires_readable_snapshots_but_no_database_write_privileges() 
     }
 }
 
+#[cfg(unix)]
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn forced_state_export2348_keeps_the_mode_of_the_declaration_it_replaces() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        state_history::forced_export_keeps_declaration_modes(&server, true);
+    }
+}
+
 #[test]
 #[ignore = "needs live postgres"]
 fn state_history_keeps_raw_names_in_declarations_and_json_and_shows_them_once() {

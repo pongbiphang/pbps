@@ -434,7 +434,8 @@
         "forced_pull2311_protects_config_and_identities_from_output_and_stale_aliases",
         "forced_pull2311_preserves_restrictive_permissions_when_replacing_data",
         "forced_pull2311_dangling_output_parent_failure_restores_the_project",
-        "publication2351_pull_and_export_restore_failures_and_keep_restricted_hardlink_replacements"
+        "publication2351_pull_and_export_restore_failures_and_keep_restricted_hardlink_replacements",
+        "forced_state_export2348_keeps_the_mode_of_the_declaration_it_replaces"
       ]
     },
     {
@@ -447,7 +448,8 @@
         "forced_pull2311_protects_config_and_identities_from_output_and_stale_aliases",
         "forced_pull2311_preserves_restrictive_permissions_when_replacing_data",
         "forced_pull2311_dangling_output_parent_failure_restores_the_project",
-        "publication2351_pull_and_export_restore_failures_and_keep_restricted_hardlink_replacements"
+        "publication2351_pull_and_export_restore_failures_and_keep_restricted_hardlink_replacements",
+        "forced_state_export2348_keeps_the_mode_of_the_declaration_it_replaces"
       ]
     },
     {
