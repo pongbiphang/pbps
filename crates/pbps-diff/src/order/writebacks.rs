@@ -191,3 +191,77 @@ impl ScopeInput {
         super::plan::state(input)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pbps_model::data::DataMode;
+
+    fn takeover() -> PlannedChange {
+        PlannedChange::new(Change::SetDataMode {
+            table: TableName::new("app", "holdings"),
+            from: None,
+            to: Some(DataMode::Exact),
+        })
+    }
+
+    fn keys() -> PlannedChange {
+        PlannedChange::new(Change::SetEnsureKeys {
+            table: TableName::new("app", "country"),
+            from: ["TW"].into_iter().map(Into::into).collect(),
+            to: ["TW", "JP"].into_iter().map(Into::into).collect(),
+        })
+    }
+
+    fn role() -> PlannedChange {
+        PlannedChange::new(Change::CreateRole {
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Role),
+            name: "reader".into(),
+        })
+    }
+
+    #[test]
+    fn scope_input_admits_exactly_the_two_zero_sql_scope_kinds() {
+        assert!(ScopeInput::new(vec![]).is_some());
+        assert!(ScopeInput::new(vec![takeover(), keys()]).is_some());
+        // A change with SQL would reach the resolver's sealed plan without
+        // the stages that order and check it.
+        assert!(ScopeInput::new(vec![role()]).is_none());
+        // One foreign change refuses the whole input, wherever it stands.
+        assert!(ScopeInput::new(vec![takeover(), role(), keys()]).is_none());
+        assert!(ScopeInput::new(vec![role(), takeover()]).is_none());
+    }
+
+    #[test]
+    fn scope_changes_follow_the_resolvers_changes_in_the_order_given() {
+        let resolved = crate::order::plan::canonical(
+            crate::order::propose(pbps_model::ChangeSet {
+                changes: vec![role()],
+            }),
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap();
+        let scope = ScopeInput::new(vec![takeover(), keys()]).unwrap();
+        let appended = scope.append_to(resolved, &pbps_dialect::MinimalDialect);
+        let kinds: Vec<_> = appended
+            .payload
+            .changes
+            .iter()
+            .map(|planned| {
+                (
+                    matches!(planned.change, Change::CreateRole { .. }),
+                    matches!(planned.change, Change::SetDataMode { .. }),
+                    matches!(planned.change, Change::SetEnsureKeys { .. }),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (true, false, false),
+                (false, true, false),
+                (false, false, true)
+            ]
+        );
+    }
+}

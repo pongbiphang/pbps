@@ -1668,6 +1668,20 @@ fn a_resolved_plan_is_refused_before_ddl_when_a_sealed_input_moved() {
 
 #[test]
 #[ignore = "needs live postgres"]
+fn a_resolved_plan_keeps_first_data_takeovers_and_ensure_key_transitions() {
+    resolver_publication::scope_survives_resolution(&server());
+    resolver_publication::scope_survives_resolution(&old_server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn a_resolved_plan_keeps_a_removed_ensure_key() {
+    resolver_publication::removed_ensure_key_survives_resolution(&server());
+    resolver_publication::removed_ensure_key_survives_resolution(&old_server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
 fn a_resolved_plan_closes_over_what_it_newly_reaches() {
     resolver_publication::newly_reached(&server());
     resolver_publication::newly_reached(&old_server());
