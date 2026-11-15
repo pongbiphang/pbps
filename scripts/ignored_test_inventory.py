@@ -1146,8 +1146,8 @@ def validate(root, inventory, targets, platform, rules=None):
 #
 # The Windows `quick` job lists the ignored tests of the Windows build and refuses
 # a rule-only case whose owner does not run on win32. A Linux run only lists the
-# Linux binaries, so it cannot see that. Whether the Windows build compiles a test and
-# still lists it as ignored is answered here from source, from the attributes of the test
+# Linux binaries, so it cannot see that. Whether the Windows build compiles a test, still has it
+# as a test and lists it as ignored is answered here from source, from the attributes of the test
 # function and of every enclosing module (inline or file), each read once as one list (see
 # "Attributes" below): outer attributes plus leading inner attributes, `cfg_attr` expanded.
 # The module files are found by rustc's own path rule (see `RustModules`). Whatever the
@@ -1234,25 +1234,24 @@ def split_arguments(tokens):
 def effective_attributes(attributes, applies=True):
     """Expand `cfg_attr` in attributes into [(attribute tokens, applies on Windows)].
 
-    `applies` is True, or None when the guarding predicate is undecidable; an attribute whose
-    guard is False on Windows is not there at all."""
+    `applies` is True, False (its guard fails on Windows: the attribute is not there, but the
+    test-ness question needs to know it was spelled) or None (the guard is undecidable)."""
     result = []
     for tokens in attributes:
         if tokens[:1] != ["cfg_attr"]:
             result.append((tokens, applies)); continue
+        unreadable = (UNCLASSIFIED, tri_all([applies, None]))
         if tokens[1:2] != ["("] or tokens[-1:] != [")"]:
-            result.append((UNCLASSIFIED, None)); continue
+            result.append(unreadable); continue
         try:
             predicate, i = parse_cfg(tokens, 2)
         except InventoryError:
-            result.append((UNCLASSIFIED, None)); continue
+            result.append(unreadable); continue
         if i == len(tokens) - 1:
             continue   # cfg_attr(predicate): no attribute at all
         if tokens[i] != ",":
-            result.append((UNCLASSIFIED, None)); continue
-        guard = tri_all([applies, predicate])
-        if guard is not False:
-            result += effective_attributes(split_arguments(tokens[i + 1:-1]), guard)
+            result.append(unreadable); continue
+        result += effective_attributes(split_arguments(tokens[i + 1:-1]), tri_all([applies, predicate]))
     return result
 
 
@@ -1301,10 +1300,65 @@ def path_of(effective):
     return found
 
 
+# Attributes that do not make a function a test: the built-in attributes of the Rust Reference
+# that apply to a function (and the registered tools), spelled exactly, unqualified, with
+# `unsafe(...)` around them where Rust 2024 asks for it. Any other attribute may be a test macro.
+INERT_ATTRIBUTES = {
+    "ignore", "should_panic", "cfg", "doc", "allow", "warn", "deny", "forbid", "expect", "deprecated", "must_use",
+    "inline", "cold", "track_caller", "coverage", "target_feature", "instruction_set", "optimize", "no_sanitize",
+    "no_mangle", "export_name", "link_section", "used", "naked", "no_builtins", "patchable_function_entry",
+    "link_name", "automatically_derived", "cfi_encoding", "debugger_visualizer", "rustc_align", "align"}
+INERT_TOOLS = {"rustfmt", "clippy", "rust_analyzer", "diagnostic"}
+
+
+def inert(tokens):
+    """Is the attribute known not to make a function a test?"""
+    head = attribute_head(tokens)
+    if head == ["unsafe"] and tokens[1:2] == ["("] and tokens[-1:] == [")"]:
+        return inert(tokens[2:-1])
+    if len(head) == 1:
+        return head[0] in INERT_ATTRIBUTES
+    return len(head) == 4 and head[0] in INERT_TOOLS and head[1:3] == [":", ":"]
+
+
+def attribute_head(tokens):
+    """The tokens of an attribute's name, up to its arguments: `tokio::test(flavor = "x")` is tokio : : test."""
+    for i, token in enumerate(tokens):
+        if token in ("(", "=", "[", "{"): return tokens[:i]
+    return tokens
+
+
+def attribute_path(tokens):
+    """The path segments of an attribute's name: `tokio::test(flavor = "x")` is ["tokio", "test"]."""
+    return [token for token in attribute_head(tokens) if token != ":"]
+
+
+def test_of(everything):
+    """Is the function still a test on Windows: True/False, or None if undecidable?
+
+    A `test` attribute (any path ending in `test`) that applies makes it one. It is certainly not
+    one only if every such attribute is guarded off and nothing else could be a test macro."""
+    named, other = [], False
+    for tokens, applies in everything:
+        if tokens == UNCLASSIFIED:
+            if applies is not False: other = True
+        elif inert(tokens):
+            continue   # a built-in or a registered tool's attribute never marks a test, whatever its last segment
+        elif attribute_path(tokens)[-1:] == ["test"]:
+            named.append(applies)
+        elif applies is not False:
+            other = True
+    if any(applies is True for applies in named): return True
+    if other or any(applies is None for applies in named) or not named: return None
+    return False
+
+
 def attribute_facts(outer, inner=()):
-    """(compiled, ignored, path) of one item on Windows, from its outer and leading inner attributes together."""
+    """(compiled, ignored, path, test) of one item on Windows, from its outer and leading inner attributes together."""
     everything = effective_attributes([*outer, *inner])
-    return cfg_of(everything), ignored_of(everything), path_of(effective_attributes(outer))
+    live = [pair for pair in everything if pair[1] is not False]
+    return (cfg_of(live), ignored_of(live), path_of([pair for pair in effective_attributes(outer) if pair[1] is not False]),
+            test_of(everything))
 
 
 def leading_inner_attributes(tokens, i, end):
@@ -1471,10 +1525,10 @@ class RustModules:
             return None   # generated by a macro, or outside what this reads: undecided
         results = []
         for _, _, attributes, body in found:
-            compiled, ignored, path_attribute = attribute_facts(attributes)
+            compiled, ignored, path_attribute, is_test = attribute_facts(attributes)
             here = tri_all([value, compiled])
             if kind == "fn":
-                results.append(tri_all([here, ignored])); continue
+                results.append(tri_all([here, ignored, is_test])); continue
             if here is False:
                 results.append(here); continue
             if path_attribute is UNDECIDED:
