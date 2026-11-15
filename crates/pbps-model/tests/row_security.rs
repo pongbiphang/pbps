@@ -120,7 +120,16 @@ fn row_security_absence_in_legacy_states_is_disabled_without_policies() {
     );
     for version in 6..pbps_model::state::CURRENT_VERSION {
         state.version = version;
-        let json = historical(&state);
+        // A row from before `object_deps` does not carry it; one from that version on
+        // must (DEC-2469.7).
+        let as_written = |state: &StateSnapshot| {
+            if version < pbps_model::state::OBJECT_DEPS_VERSION {
+                historical(state)
+            } else {
+                serde_json::to_string(state).unwrap()
+            }
+        };
+        let json = as_written(&state);
         assert!(!json.contains("row_security"));
         assert!(!json.contains("row_policies"));
         let back = StateSnapshot::from_json(&json).unwrap();
@@ -133,7 +142,7 @@ fn row_security_absence_in_legacy_states_is_disabled_without_policies() {
                 .unwrap()
                 .has_row_security()
         );
-        assert_eq!(historical(&back), json);
+        assert_eq!(as_written(&back), json);
     }
     // A version newer than this build's is refused, not read partially.
     state.version = pbps_model::state::CURRENT_VERSION + 1;

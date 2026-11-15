@@ -42,7 +42,7 @@ pub enum SchemaKind {
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
 pub const SCHEMA_VERSION: u32 = 109;
-// 109: the `sequence:` file in declarations, and `sequences` in state (#2721 PR A); 108 belongs to another change.
+// 109: the `sequence:` file in declarations, and `sequences` in state (#2721 PR A); 108 was reserved and never used.
 // 107: a SQL Server table's, key's, unique constraint's and index's `filegroup` in declarations, plans and state (#2813); 106 belongs to another change.
 // 105: `doctor`'s `identity_file` becomes `identity_dir`: the identity tree's directory replaces the single identity file (#2600 PR 5a).
 // 104: a partition entry's own `description:` (#2729 PR A); 103 belongs to another change.

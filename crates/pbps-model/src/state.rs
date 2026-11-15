@@ -166,7 +166,7 @@ use schemars::JsonSchema;
 /// is converted on read, see [`OBJECT_DEPS_VERSION`]. 44 and 45 were reserved and never
 /// used; 46 belongs to another change.
 /// Version 49 records standalone sequences (DEC-2721.1); every older snapshot truthfully
-/// holds none. 48 belongs to another change.
+/// holds none. 48 was reserved and never used.
 pub const CURRENT_VERSION: u32 = 49;
 
 /// The first version that records `object_deps` and no longer `module_deps`.
@@ -1006,6 +1006,8 @@ mod tests {
         );
         let mut value = serde_json::to_value(&recorded).unwrap();
         value["version"] = 43.into();
+        // A row that old carries no `object_deps` either (DEC-2469.7).
+        value.as_object_mut().unwrap().shift_remove("object_deps");
         assert!(value["schema"].get("sequences").is_none());
         let old = StateSnapshot::from_json(&value.to_string()).unwrap();
         let mut live = schema_with("nvarchar(255)");
