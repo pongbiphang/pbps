@@ -66,6 +66,7 @@ pub mod ids_check;
 pub mod ids_merge;
 pub mod ids_tree;
 pub mod intent;
+pub mod kinds;
 pub mod managed_type;
 pub mod module;
 pub mod name;
