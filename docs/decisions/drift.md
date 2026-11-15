@@ -184,6 +184,6 @@ collation projections are not comparers, recorders or builders and are left alon
 `apply` itself does not run the drift report: a plan is pinned to a baseline the
 `plan --db` gate has already held to it.
 
-Adding a second name-only kind (sequences) is a field of `NameOnly`, a line in each
-of its functions (the compiler lists them) and one row of the table-driven test in
-`name_only/tests.rs`.
+Adding a name-only kind is a field of `NameOnly`, a line in each of its functions
+(the compiler lists them) and one row of the table-driven test in
+`name_only/tests.rs`. Standalone sequences (DEC-2721.1) were the second.

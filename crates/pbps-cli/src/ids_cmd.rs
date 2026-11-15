@@ -405,8 +405,9 @@ pub(crate) fn declared_placement(
             Source::Role(n) => roles.get(n),
             Source::Type(n) => types.get(n),
             Source::Extension(n) => extensions.get(n),
-            // Text search objects take identities with the next part (#2728).
-            Source::Module(_) | Source::Search(_) => None,
+            // Text search objects take identities with the next part (#2728), and
+            // sequences with the part that creates one (#2721).
+            Source::Module(_) | Source::Search(_) | Source::Sequence(_) => None,
         };
         // A declaration the old file never knew gets its identity from `plan`.
         let Some(uid) = uid else { continue };
@@ -613,7 +614,7 @@ fn named(source: &Source) -> Option<(UidKind, String)> {
         Source::Role(n) => Some((UidKind::Role, n.raw().to_owned())),
         Source::Type(n) => Some((UidKind::Type, n.raw().to_string())),
         Source::Extension(n) => Some((UidKind::Extension, n.raw().to_owned())),
-        Source::Module(_) | Source::Search(_) => None,
+        Source::Module(_) | Source::Search(_) | Source::Sequence(_) => None,
     }
 }
 

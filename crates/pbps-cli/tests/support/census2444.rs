@@ -547,11 +547,13 @@ fn census_excludes_owned_sequences_used_types_and_extension_members() {
         );
         on_server(
             connection,
-            "CREATE TYPE app.r AS RANGE (subtype=integer,multirange_type_name=app.mr); CREATE TABLE app.held(id serial,span app.r,spans app.r[],multiple app.mr); CREATE EXTENSION hstore WITH SCHEMA app",
+            "CREATE TYPE app.r AS RANGE (subtype=integer,multirange_type_name=app.mr); CREATE TABLE app.held(id serial,span app.r,spans app.r[],multiple app.mr); CREATE EXTENSION hstore WITH SCHEMA app; CREATE SEQUENCE app.held_standalone",
         );
         let found = both_paths(&d, connection);
         for excluded in [
             "standalone sequence `app.held_id_seq`",
+            // A plain standalone sequence is held by the model (#2721), not unheld.
+            "standalone sequence `app.held_standalone`",
             "range type `app.r`",
             "multirange type `app.mr`",
             "base type `app._r`",

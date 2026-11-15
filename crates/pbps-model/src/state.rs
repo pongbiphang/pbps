@@ -165,7 +165,9 @@ use schemars::JsonSchema;
 /// pairs, in place of the module-only `module_deps` (DEC-2469.7); an older snapshot
 /// is converted on read, see [`OBJECT_DEPS_VERSION`]. 44 and 45 were reserved and never
 /// used; 46 belongs to another change.
-pub const CURRENT_VERSION: u32 = 47;
+/// Version 49 records standalone sequences (DEC-2721.1); every older snapshot truthfully
+/// holds none. 48 was reserved and never used.
+pub const CURRENT_VERSION: u32 = 49;
 
 /// The first version that records `object_deps` and no longer `module_deps`.
 ///
@@ -980,6 +982,58 @@ mod tests {
         assert!(
             !snap.matches(&Schema::default()),
             "a vanished table is drift"
+        );
+    }
+
+    /// An older snapshot holds no sequences, and a database that has one nobody declared or
+    /// recorded is not drifted from it (DEC-2721.1): the guard that refuses to record over a
+    /// different state compares the same managed projection `verify` does. A recorded
+    /// sequence that changed, or went, is still a difference, and so is anything else.
+    #[test]
+    fn a_sequence_nobody_recorded_is_not_drift_and_a_recorded_one_that_changed_is() {
+        let sequence = |start| crate::Sequence {
+            ty: crate::ColumnType::simple("bigint"),
+            start,
+            increment: 1,
+            options: Default::default(),
+        };
+        // A version 43 snapshot, as it is read: no `sequences` key at all.
+        let recorded = StateSnapshot::new(
+            StateKind::Apply,
+            schema_with("nvarchar(255)"),
+            IdsFile::default(),
+            "leon",
+        );
+        let mut value = serde_json::to_value(&recorded).unwrap();
+        value["version"] = 43.into();
+        // A row that old carries no `object_deps` either (DEC-2469.7).
+        value.as_object_mut().unwrap().shift_remove("object_deps");
+        assert!(value["schema"].get("sequences").is_none());
+        let old = StateSnapshot::from_json(&value.to_string()).unwrap();
+        let mut live = schema_with("nvarchar(255)");
+        live.sequences
+            .insert("app.made_later".parse().unwrap(), sequence(1));
+        assert!(old.matches(&live), "an undeclared, unrecorded sequence");
+        // Negative: other drift is still drift beside it.
+        let mut moved = schema_with("nvarchar(100)");
+        moved.sequences = live.sequences.clone();
+        assert!(!old.matches(&moved));
+        // A recorded sequence is compared: changed, and gone, are both differences.
+        let mut holds = recorded.clone();
+        holds
+            .schema
+            .sequences
+            .insert("app.kept".parse().unwrap(), sequence(1));
+        let mut same = schema_with("nvarchar(255)");
+        same.sequences
+            .insert("app.kept".parse().unwrap(), sequence(1));
+        assert!(holds.matches(&same));
+        same.sequences
+            .insert("app.kept".parse().unwrap(), sequence(50));
+        assert!(!holds.matches(&same), "a recorded sequence that changed");
+        assert!(
+            !holds.matches(&schema_with("nvarchar(255)")),
+            "and one that went"
         );
     }
 

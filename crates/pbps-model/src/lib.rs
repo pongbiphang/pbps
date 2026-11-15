@@ -90,6 +90,7 @@ pub mod role;
 pub mod role_mapping;
 pub mod schema;
 pub mod search;
+pub mod sequence;
 pub mod state;
 pub mod storage;
 pub mod strategy;
@@ -156,6 +157,7 @@ pub use schema::{
     SequenceOptions, SystemTime, SystemVersioning, Table, UniqueConstraint, ValueSource,
 };
 pub use search::{SearchKind, SearchObject, SearchRef};
+pub use sequence::Sequence;
 pub use state::{StagedProgress, StateKind, StateSnapshot, Unreadable, check_readable_version};
 pub use strategy::{Strategies, Strategy};
 pub use target_assertion::{AssertionOutcome, TargetAssertion};

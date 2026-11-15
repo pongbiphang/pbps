@@ -53,6 +53,7 @@ pub mod extension_provider;
 mod index_policy;
 pub mod resolver;
 pub mod search;
+pub mod sequence;
 
 /// This engine's lexis, for the definition scanners (ADR-0011 Amendment 2):
 /// `"` quotes an identifier and `[` does not, `E'…'` is an escape string and
@@ -463,7 +464,7 @@ fn identity_problems(
         message,
     };
     found.extend(options_problems(
-        column,
+        &format!("column `{}`", pbps_model::escape::Escaped(column)),
         "its `identity:`",
         &declared.ty,
         identity.increment,
@@ -551,7 +552,7 @@ fn sequence_problems(
     };
     let mut found = Vec::new();
     found.extend(options_problems(
-        column,
+        &format!("column `{}`", pbps_model::escape::Escaped(column)),
         "its sequence",
         &declared.ty,
         sequence.increment,
@@ -646,7 +647,7 @@ fn sequence_problems(
 /// the type, a bound spelled as its own default (read back as none, so the
 /// next plan would differ), bounds that cross, and a cache below one.
 fn options_problems(
-    column: &str,
+    subject: &str,
     what: &str,
     ty: &pbps_model::ColumnType,
     increment: i64,
@@ -671,19 +672,17 @@ fn options_problems(
         let Some(value) = value else { continue };
         if !held.contains(&value) {
             found.push(invalid(format!(
-                "column `{column}`: {what} has `{name}: {value}`, outside `{ty}`'s \
+                "{subject}: {what} has `{name}: {value}`, outside `{ty}`'s \
                  {}..={}: the engine refuses it",
                 held.start(),
                 held.end(),
                 ty = ty.shown(),
-                column = pbps_model::escape::Escaped(column),
             )));
         } else if value == own {
             found.push(invalid(format!(
-                "column `{column}`: {what} has `{name}: {value}`, which is already the \
+                "{subject}: {what} has `{name}: {value}`, which is already the \
                  engine's {name} for `{ty}` counting by {increment}; leave out `{name}:`",
                 ty = ty.shown(),
-                column = pbps_model::escape::Escaped(column),
             )));
         }
     }
@@ -691,23 +690,20 @@ fn options_problems(
     let high = options.max.unwrap_or(*default.end());
     if low >= high {
         found.push(invalid(format!(
-            "column `{column}`: {what} runs {low}..={high}, and its minimum must be below its \
+            "{subject}: {what} runs {low}..={high}, and its minimum must be below its \
              maximum: the engine refuses MINVALUE ({low}) must be less than MAXVALUE ({high})",
-            column = pbps_model::escape::Escaped(column),
         )));
     }
     if let Some(cache) = options.cache {
         if cache < 1 {
             found.push(invalid(format!(
-                "column `{column}`: {what} has `cache: {cache}`, and a cache holds at least \
+                "{subject}: {what} has `cache: {cache}`, and a cache holds at least \
                  one number: the engine refuses CACHE ({cache}) must be greater than zero",
-                column = pbps_model::escape::Escaped(column),
             )));
         } else if cache == 1 {
             found.push(invalid(format!(
-                "column `{column}`: {what} has `cache: 1`, which is already the engine's; \
+                "{subject}: {what} has `cache: 1`, which is already the engine's; \
                  leave out `cache:`",
-                column = pbps_model::escape::Escaped(column),
             )));
         }
     }
@@ -2935,6 +2931,15 @@ impl Dialect for Postgres {
         schema: &Schema,
     ) -> Vec<DialectError> {
         search::validate(name, definition, schema)
+    }
+
+    fn validate_sequence(
+        &self,
+        name: &pbps_model::ObjectName,
+        definition: &pbps_model::Sequence,
+        schema: &Schema,
+    ) -> Vec<DialectError> {
+        sequence::validate(name, definition, schema)
     }
 
     fn intermediate_tables(

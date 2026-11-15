@@ -334,6 +334,35 @@ fn bootstrap_extensions_are_exact_prerequisites_but_ordinary_objects_must_be_abs
     assert!(refuse_nonempty_bootstrap(&schema, &[], &pg, "target").is_err());
 }
 
+/// A sequence the declarations do not name does not make a bootstrap target non-empty, and one
+/// they name does (DEC-2721.1, DEC-2855.1): the target is asked through `refuse_occupied_bootstrap`.
+#[test]
+fn an_undeclared_sequence_does_not_make_a_bootstrap_target_non_empty_and_a_declared_one_does() {
+    let sequence = pbps_model::Sequence {
+        ty: pbps_model::ColumnType::simple("bigint"),
+        start: 1,
+        increment: 1,
+        options: Default::default(),
+    };
+    let pg = pbps_pg::Postgres::new();
+    let mut existing = Schema::default();
+    existing
+        .sequences
+        .insert("app.theirs".parse().unwrap(), sequence.clone());
+    let declared = Schema::default();
+    refuse_occupied_bootstrap(&existing, &declared, &[], &pg, "target").unwrap();
+    // Negative: the one the declarations name stands, and is a reason to refuse.
+    let mut named = Schema::default();
+    named
+        .sequences
+        .insert("app.theirs".parse().unwrap(), sequence);
+    let error = refuse_occupied_bootstrap(&existing, &named, &[], &pg, "target").unwrap_err();
+    assert!(
+        error.to_string().contains("sequence `app.theirs`"),
+        "{error}"
+    );
+}
+
 #[test]
 fn bootstrap_schema_spelling_checks_include_unreferenced_types() {
     for yaml in [

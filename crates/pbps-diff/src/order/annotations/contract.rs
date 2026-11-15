@@ -66,6 +66,13 @@ fn containing(declaration: &Declaration) -> Result<ObjectRef, String> {
                 name.shown()
             ));
         }
+        // Nor do standalone sequences (#2721).
+        Declaration::Sequence(name) => {
+            return Err(format!(
+                "sequence `{}` has no dependency annotation address yet",
+                name.shown()
+            ));
+        }
         Declaration::Table(n) => Root::Table(n.clone()),
         Declaration::Module(n) => Root::Module(n.clone()),
         Declaration::Type(n) => Root::Type(n.clone()),

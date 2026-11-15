@@ -471,6 +471,7 @@ mod tests {
             include_str!("partman.rs"),
             include_str!("extension_provider.rs"),
             include_str!("search.rs"),
+            include_str!("sequence.rs"),
         ]
         .join("\n");
         let word = |token: &str| {

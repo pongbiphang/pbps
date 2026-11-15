@@ -22,6 +22,7 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
         tables,
         types,
         search,
+        sequences,
         modules,
         roles,
         extensions,
@@ -62,6 +63,7 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
     }
     types_section(&mut s, types);
     search_section(&mut s, search);
+    sequences_section(&mut s, sequences);
     modules_section(&mut s, modules);
     roles_section(&mut s, roles);
     deprecated_section(&mut s, schema);
@@ -88,6 +90,52 @@ fn search_section(
             code_cell(&detail)
         );
     }
+}
+
+/// Standalone sequences: a row each, with where a restart would begin. Never the
+/// counter's position, which the model does not hold (#2721).
+fn sequences_section(
+    s: &mut String,
+    sequences: &BTreeMap<pbps_model::ObjectName, pbps_model::Sequence>,
+) {
+    if sequences.is_empty() {
+        return;
+    }
+    s.push_str("\n## Sequences\n\n| Sequence | Type | Start | Increment | Options |\n|---|---|---|---|---|\n");
+    for (name, sequence) in sequences {
+        let (ty, start, increment, detail) = sequence_row(sequence);
+        let _ = writeln!(
+            s,
+            "| {} | {} | {start} | {increment} | {} |",
+            code_cell(&name.raw().to_string()),
+            code_cell(&ty),
+            code_cell(&detail)
+        );
+    }
+}
+
+/// The type, start, increment and set options of one sequence, as text.
+pub(crate) fn sequence_row(sequence: &pbps_model::Sequence) -> (String, i64, i64, String) {
+    let options = &sequence.options;
+    let mut detail = Vec::new();
+    if let Some(min) = options.min {
+        detail.push(format!("min = {min}"));
+    }
+    if let Some(max) = options.max {
+        detail.push(format!("max = {max}"));
+    }
+    if options.cycle {
+        detail.push("cycle".to_owned());
+    }
+    if let Some(cache) = options.cache {
+        detail.push(format!("cache = {cache}"));
+    }
+    (
+        sequence.ty.raw().to_string(),
+        sequence.start,
+        sequence.increment,
+        detail.join("; "),
+    )
 }
 
 /// The kind, parser or template, and mappings or options of one text search object, as text.

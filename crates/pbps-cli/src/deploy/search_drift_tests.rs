@@ -74,3 +74,42 @@ fn a_recorded_text_search_object_that_is_gone_or_changed_is_named_once_and_an_un
     let (named, other) = found(&recorded, &live);
     assert!((named.is_empty(), other) == (true, 0), "{named:?} {other}");
 }
+
+/// The same report names a recorded standalone sequence (DEC-2721.1, DEC-2855.1): gone or
+/// changed once, an unrecorded one not at all, and the counter, which no field holds, can
+/// never be the difference.
+#[test]
+fn a_recorded_sequence_that_is_gone_or_changed_is_named_once_and_an_unrecorded_one_is_not() {
+    let sequence = |start| pbps_model::Sequence {
+        ty: pbps_model::ColumnType::simple("bigint"),
+        start,
+        increment: 1,
+        options: Default::default(),
+    };
+    let held = |objects: &[(&str, i64)]| {
+        let mut schema = Schema::default();
+        for (object, start) in objects {
+            schema
+                .sequences
+                .insert(object.parse().unwrap(), sequence(*start));
+        }
+        schema
+    };
+    let recorded = held(&[("app.kept", 1)]);
+    let (named, other) = found(&recorded, &recorded);
+    assert!((named.is_empty(), other) == (true, 0), "{named:?} {other}");
+
+    let (named, other) = found(&recorded, &Schema::default());
+    assert_eq!(named.len(), 1, "{named:?}");
+    assert!(named[0].contains("sequence `app.kept` was recorded and is no longer"));
+    assert_eq!(other, 0, "the differ adds nothing of its own for it");
+
+    let (named, other) = found(&recorded, &held(&[("app.kept", 50)]));
+    assert_eq!(named.len(), 1, "{named:?}");
+    assert!(named[0].contains("sequence `app.kept` differs from the definition recorded"));
+    assert_eq!(other, 0, "not also refused by the differ as a later part");
+
+    // Negative: one the record never held, beside the recorded one, is not drift.
+    let (named, other) = found(&recorded, &held(&[("app.kept", 1), ("app.made_later", 1)]));
+    assert!((named.is_empty(), other) == (true, 0), "{named:?} {other}");
+}

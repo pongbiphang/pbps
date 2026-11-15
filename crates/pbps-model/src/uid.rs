@@ -26,7 +26,7 @@ const LEN: usize = 6;
 /// held (DEC-2032.1, #2035).
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum UidError {
-    #[error("UID `{}` is missing the `t_`, `c_`, `r_`, `y_` or `e_` prefix", crate::escape::Escaped(.0))]
+    #[error("UID `{}` is missing the `t_`, `c_`, `r_`, `y_`, `e_` or `q_` prefix", crate::escape::Escaped(.0))]
     BadPrefix(String),
 
     #[error(
@@ -51,6 +51,9 @@ pub enum UidKind {
     /// identity format is the most expensive thing in this project to change
     /// late.
     Role,
+    /// A standalone sequence (#2721). Recorded intent for a rename keeps the counter that
+    /// a drop plus a create would lose.
+    Sequence,
 }
 
 impl UidKind {
@@ -61,6 +64,7 @@ impl UidKind {
             UidKind::Table => "t_",
             UidKind::Column => "c_",
             UidKind::Role => "r_",
+            UidKind::Sequence => "q_",
         }
     }
 }
@@ -140,6 +144,8 @@ impl Uid {
             UidKind::Table
         } else if self.0.starts_with("r_") {
             UidKind::Role
+        } else if self.0.starts_with("q_") {
+            UidKind::Sequence
         } else {
             UidKind::Column
         }
@@ -166,6 +172,7 @@ impl FromStr for Uid {
             .or_else(|| s.strip_prefix("c_"))
             .or_else(|| s.strip_prefix("r_"))
             .or_else(|| s.strip_prefix("y_"))
+            .or_else(|| s.strip_prefix("q_"))
             .ok_or_else(|| UidError::BadPrefix(s.to_owned()))?;
 
         if rest.len() != LEN {
@@ -288,6 +295,7 @@ mod tests {
             UidKind::Role,
             UidKind::Type,
             UidKind::Extension,
+            UidKind::Sequence,
         ] {
             let u = Uid::generate(kind);
             assert_eq!(u.kind(), kind);
@@ -322,6 +330,7 @@ mod tests {
     #[test]
     fn malformed_uids_are_rejected() {
         assert!("k7x2mq".parse::<Uid>().is_err(), "missing prefix");
+        assert!("s_k7x2mq".parse::<Uid>().is_err(), "`s_` names no kind");
         assert!("c_k7x2m".parse::<Uid>().is_err(), "too short");
         assert!("c_k7x2mqq".parse::<Uid>().is_err(), "too long");
         assert!(

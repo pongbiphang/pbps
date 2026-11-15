@@ -1361,3 +1361,107 @@ table, which would change pinned output and add no information.
 
 Not tied mechanically: that an engine marked `refused` for a declaration
 really refuses it. Each dialect's validation tests pin that separately.
+
+<a id="dec-2721-1"></a>
+
+**DEC-2721.1. A standalone sequence is held, declared and pulled, its current value is never schema, and nothing plans one yet.**
+A sequence no column owns was named by the census and left out of the pull, and a column
+defaulting from one was refused as a limitation, so a pulled project could not be
+bootstrapped: its table's default named an object the declarations did not hold (#2721).
+This part reads and declares them; the limitation on a table default stays until a plan can
+create the sequence before the table that calls it. Creating, dropping, altering and renaming
+one arrive in the parts that follow, and SQL Server's sequences in the last.
+
+- **A model kind of its own.** `Schema.sequences` is keyed by the sequence's name and holds
+  `Sequence { ty, start, increment, options }`, with the `SequenceOptions` a column's sequence
+  already has: a bound is `None` where it is the engine's for the type and direction. One
+  file per sequence, `<schema>.<name>.sequence.yml`, leading key `sequence:`. A sequence and a
+  table share PostgreSQL's relation namespace, so `validate` refuses a table or a view of the
+  same name, and the file name cannot collide with a table's (a dot inside a name is encoded).
+  There is no owner field: role ownership is not modelled anywhere.
+- **The current value is not schema.** `last_value` and `is_called` change on every `nextval`;
+  anything that read them into the model, an identity, a checksum or a comparison would make
+  each insert a change. The pull reads `pg_sequence` only, never `pg_sequences`, and its query is
+  tested to name neither column. `start` is where a restart would begin, which a later plan will
+  state without a `RESTART`; no part of a plan moves a counter. A test advances the sequence and
+  requires an empty plan.
+- **What is held.** A permanent sequence in a project's schema, owned by no column and by no
+  package, with no `.` in its schema or name. One a column owns (`OWNED BY`, an identity, a
+  `serial`) is part of that column, as before. An `UNLOGGED` sequence and a package's are not
+  held and stay named by the census; a temporary sequence belongs to one session and is already
+  outside the census (DEC-2681.1). One SQL text decides "held" for the pull and the census, so
+  a sequence is named exactly when it is not read.
+- **What goes away, and what stays.** For a held sequence the census notice is gone, in the
+  catalog read: the sequence is read and declared. It is not conditional on the declarations,
+  because the catalog read is one function of the database that every connected command
+  shares, and the declarations are known to none of them; a held sequence the project does not
+  declare is, like a text search object (DEC-2728.1), not this project's. **The limitation on
+  a table default stays.** "Defaults from the sequence ..., which it does not own" is still
+  raised for a column whose default calls a standalone sequence, held or not, because nothing
+  yet orders the sequence's creation before the table that calls it. A first cut lifted it for
+  a held sequence, and a rehearsal then rebuilt the table on a scratch that lacked the
+  sequence (which the differ cannot yet create) and refused a plan that was valid: behaviour
+  must be as before wherever something is built from nothing. The part that creates a
+  sequence lifts the limitation, with the ordering edge that makes it true. The table is
+  carried with the limitation as before, and a managed table with it refuses plans by name.
+- **Validation** (`pbps-pg`, offline): a smallint, integer or bigint, with the engine's own
+  rules for the start, the increment and the options as a column's sequence has them (a bound
+  spelled as its default is refused so each sequence has one spelling), and a name the engine
+  would not truncate, in a schema the pull reads (the table's and the type's check, and
+  nothing a dotted name could spell). **What the pull reads always validates**: held means
+  held, and nothing between the read and the written files drops a sequence silently. The one
+  rule the first cut had that the engine does not share, a step larger than the type's span
+  (the engine accepts `smallint INCREMENT BY 40000`; it hands out its start and then
+  refuses), is not made for a standalone sequence: refusing it would have made a pulled
+  declaration fail `validate`. A
+  declaration the dialect does refuse is still left out of a pull by name, with the consequence
+  for the defaults that call it, as for any object. SQL Server refuses the file by name
+  (`validate_sequence`), so it is never ignored.
+- **The differ refuses every difference by name**, attribute by attribute, as it did for
+  exclusions and text search: a declared sequence the target lacks, or holds with another type,
+  start, increment, bound, cycle or cache. There is no `Change` and no plan bump. A sequence the
+  target has and the declarations do not is left alone.
+- **No identity record yet, so no drift.** A new `UidKind::Sequence` (`q_`) exists so that a
+  rename can be recorded intent, but the section of the identity mapping and the tree file that
+  hold it arrive with the part that creates a sequence: until something can mint one, an
+  identity would be dead state. The scoped read therefore keeps every sequence the database
+  holds, and the state checksum leaves them out, for the reason DEC-2728.1 gives: one the
+  recorded state does not hold would otherwise read as drift on every database that had a
+  sequence before they were held. The snapshot records the ones the declarations name (state 49).
+- **What "managed" means for a sequence.** A sequence is a kind held by name only
+  (DEC-2855.1), so the one rule in `pbps-model` (`name_only.rs`) decides every consumer: a
+  held sequence that is neither declared nor recorded is not this project's. It is left out of
+  the compared form (`Schema::compared_with`, `recorded_matches`), out of the recorded form
+  (`as_recorded` for a recording from a read, `as_recorded_after_apply` for an apply, which
+  carries the previous record forward because no plan can change one) and out of the buildable
+  form (`buildable`, for a rehearsal, a resolver run and the differ from nothing), and a
+  recorded one that is gone or changed is one sentence of the one drift report
+  (`Schema::name_only_drift`: "sequence `app.x` was recorded and is no longer in the
+  database", "... differs from the definition recorded for it"). The differ walks the new side
+  only, which is why the report is not the differ's. A sequence names an integer type, which
+  `NameOnly::spelled` puts in the dialect's spelling so a declaration's `int` and a catalog's
+  `integer` are one compared form. **This replaces a first cut with its own projection**
+  (`keep_only_named_unidentified`, `unidentified_drift`, `carry_unidentified_from`,
+  `without_unplanned_kinds`), which review rounds on this issue showed to be the same
+  mistake text search had made, at fourteen call sites. One difference followed from taking
+  the common rule: a changed recorded sequence is reported as differing from its recorded
+  definition and no longer attribute by attribute, since the one report carries no
+  per-kind detail; `pbps plan` still says which attribute differs when the declarations and
+  the target disagree.
+- **One namespace.** A sequence shares its schema's relation namespace with tables, views,
+  indexes and the indexes behind named keys, so its name is claimed in the one rule that
+  compares those (`pbps_dialect::check_index_names`), not in a rule of its own. A sequence
+  and an index or key of one name in one schema are refused with that rule's message; in two
+  schemas they are not.
+- **One predicate, with the namespace in it.** The exclusion of system and `pg_*` schemas is
+  in the predicate the pull and the census share, and the pull's
+  query carries no filter of its own, so neither can call a sequence model-owned that
+  the pull does not declare. `validate` asks the same question of a declaration's schema in Rust
+  (`schema_is_held`, the table's `a_projects_schema` and no dot), and a live test puts the two
+  to the engine side by side on every schema the cluster has.
+- **Coverage (#168).** `pg_sequence` was already held per column; the census row for a
+  standalone sequence is now held by the same macro the pull uses.
+
+Formats: state moves to 49 (a snapshot may hold `sequences`; an older one truthfully holds
+none), and schema set 109 gains the `sequence:` file kind in the declaration schema. The plan
+does not move, and neither does the identity file.
