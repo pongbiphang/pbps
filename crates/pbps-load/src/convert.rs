@@ -150,6 +150,8 @@ pub(crate) fn convert_depends_on(
         }
     }
     spelled.extend(keys);
+    // One order for one meaning: a file and its formatted copy load alike.
+    deps.0.sort();
     Written { deps, spelled }
 }
 

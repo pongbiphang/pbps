@@ -2120,6 +2120,8 @@ mod dependency_remedy_tests {
 
 #[cfg(test)]
 mod object_ref_tests;
+#[cfg(test)]
+mod depends_on_tests;
 
 pub use declared::{DeclaredFile, DeclaredPathError, DeclaredPaths};
 pub use project::{

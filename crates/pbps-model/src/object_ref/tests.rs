@@ -1181,3 +1181,39 @@ fn an_edge_is_extended_by_its_endpoints_not_by_which_reference_failed() {
     };
     assert!(modules_only.extended_problems(&schema).is_empty());
 }
+
+#[test]
+fn exclusion_shorthand_round_trips_and_the_registry_declares_it() {
+    let mut schema = fixture();
+    schema
+        .tables
+        .get_mut(&"app.t".parse().unwrap())
+        .unwrap()
+        .exclude
+        .insert(
+            "e".into(),
+            serde_json::from_str(r#"{"method":"btree","keys":[{"key":{"name":"x"},"operator":"="}]}"#)
+                .unwrap(),
+        );
+    let registry = Registry::new(&schema);
+    let exclusion = reference("exclusion::app.t.e");
+    // The shorthand is the spelling now, not the structured fallback.
+    assert_eq!(exclusion.raw(), "exclusion::app.t.e");
+    assert_eq!(reference(&exclusion.raw()), exclusion);
+    assert_eq!(
+        registry.declaration(&exclusion).unwrap(),
+        &Declaration::Table("app.t".parse().unwrap())
+    );
+    assert_eq!(registry.render(&exclusion).unwrap(), "exclusion::app.t.e");
+    // Negative: a member is required, an undeclared one is a missing part, and
+    // a root that has no exclusions takes the selector as the wrong one.
+    assert!("exclusion::app.t".parse::<ObjectRef>().is_err());
+    assert!(matches!(
+        registry.declaration(&reference("exclusion::app.t.nope")),
+        Err(Problem::MissingPart(_))
+    ));
+    assert!(matches!(
+        registry.declaration(&reference("exclusion::module::app.v.e")),
+        Err(Problem::WrongSelector(_))
+    ));
+}
