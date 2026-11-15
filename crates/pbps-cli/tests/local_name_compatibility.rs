@@ -414,6 +414,29 @@ where
             .unwrap()
             .shift_remove("filegroup");
     }
+    // #2469 PR D adds `depends_on:` to a table, a type and a role, and widens a module's
+    // from a list of names to a list or an owner map (schema set 110); the captured
+    // branches predate it.
+    for dto in ["TableDto", "RoleDto", "EnumTypeDto", "DomainTypeDto"] {
+        // `get_mut`, not an index: indexing a missing definition would insert it.
+        if let Some(properties) = declaration_schema["$defs"]
+            .get_mut(dto)
+            .and_then(|definition| definition.get_mut("properties"))
+            .and_then(|properties| properties.as_object_mut())
+        {
+            properties.shift_remove("depends_on");
+        }
+    }
+    declaration_schema["$defs"]["ModuleDto"]["properties"]["depends_on"] = serde_json::json!({
+        "description": "Modules that must be created first, where the identifier scan cannot see\nthe dependency. Persistent, like `strategy:`, and preserved by `fmt`.",
+        "type": "array",
+        "items": {"type": "string"},
+        "default": []
+    });
+    declaration_schema["$defs"]
+        .as_object_mut()
+        .unwrap()
+        .shift_remove("DependsOn");
     declaration_schema["description"] = serde_json::json!(
         "One pbps declaration file: a table, one view, procedure, function or\ntrigger, or a database role. The leading key is both the kind and the name."
     );
