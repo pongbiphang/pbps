@@ -2462,11 +2462,12 @@ pub fn scope_survives_resolution(server: &str) {
     let (scope, typed) = scope_changes(&sealed);
     let takeovers: Vec<_> = scope
         .iter()
-        .filter_map(|change| match change {
-            pbps_model::Change::SetDataMode { table, from, to } => {
+        .filter_map(|change| {
+            if let pbps_model::Change::SetDataMode { table, from, to } = change {
                 Some((table.raw().to_string(), *from, *to))
+            } else {
+                None
             }
-            _ => None,
         })
         .collect();
     assert_eq!(
@@ -2480,11 +2481,12 @@ pub fn scope_survives_resolution(server: &str) {
     );
     let transitions: Vec<_> = scope
         .iter()
-        .filter_map(|change| match change {
-            pbps_model::Change::SetEnsureKeys { table, from, to } => {
+        .filter_map(|change| {
+            if let pbps_model::Change::SetEnsureKeys { table, from, to } = change {
                 Some((table.raw().to_string(), from.clone(), to.clone()))
+            } else {
+                None
             }
-            _ => None,
         })
         .collect();
     assert_eq!(
@@ -2556,12 +2558,16 @@ pub fn removed_ensure_key_survives_resolution(server: &str) {
     let (scope, _) = scope_changes(&sealed);
     let transitions: Vec<_> = scope
         .iter()
-        .filter_map(|change| match change {
-            pbps_model::Change::SetEnsureKeys { table, from, to } => {
+        .filter_map(|change| {
+            assert!(
+                !matches!(change, pbps_model::Change::SetDataMode { .. }),
+                "no takeover is declared: {scope:?}"
+            );
+            if let pbps_model::Change::SetEnsureKeys { table, from, to } = change {
                 Some((table.raw().to_string(), from.clone(), to.clone()))
+            } else {
+                None
             }
-            pbps_model::Change::SetDataMode { .. } => panic!("no takeover is declared: {scope:?}"),
-            _ => None,
         })
         .collect();
     assert_eq!(
