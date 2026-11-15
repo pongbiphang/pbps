@@ -231,6 +231,149 @@ async fn mssql_an_unmanaged_reference_is_matched_by_the_engines_own_lookup_path(
     both(case).await;
 }
 
+/// Collations that differ in one thing only: whether `e` and `é` are one
+/// letter. SQL Server compares object and schema names under the database
+/// collation, so the same two spellings are one name under the first and two
+/// under the second (#2663).
+const ACCENT_BLIND: &str = "Latin1_General_100_CI_AI";
+const ACCENT_AWARE: &str = "Latin1_General_100_CI_AS";
+
+/// What the run said: the refusal's text, or `None` when a plan was sealed.
+async fn refusal_under(
+    target: &str,
+    scratch: &str,
+    collation: &str,
+    setup: &[&str],
+    created: &str,
+) -> Option<String> {
+    exec(
+        target,
+        &[&format!("ALTER DATABASE CURRENT COLLATE {collation};")],
+    )
+    .await;
+    exec(target, setup).await;
+    let mut declared = declared(&[]);
+    creates(&mut declared, created);
+    declared_plan(target, scratch, &declared, None)
+        .await
+        .err()
+        .map(|error| error.to_string())
+}
+
+/// The unmanaged module reads `cafe`; the plan creates `dbo.café`.
+const OBJECT_SETUP: &[&str] = &["CREATE PROCEDURE dbo.outside2663 AS SELECT 1 AS id FROM cafe;"];
+
+/// The unmanaged module spells the schema `cafe`; the target's schema is
+/// `café`, and the plan creates a table in it.
+const SCHEMA_SETUP: &[&str] = &[
+    "CREATE SCHEMA [café];",
+    "CREATE PROCEDURE dbo.outside2663 AS SELECT 1 AS id FROM cafe.ghost;",
+];
+
+/// The positive: where the database collation makes `cafe` and `café` one
+/// name, the unresolved reference binds the created object, so the run
+/// refuses and names the module. A Rust ASCII comparison dropped this row.
+#[tokio::test]
+#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+async fn mssql_an_accent_insensitive_collation_matches_a_created_object_name_to_an_unmanaged_reference()
+ {
+    fn case<'a>(
+        target: &'a str,
+        scratch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let text = refusal_under(target, scratch, ACCENT_BLIND, OBJECT_SETUP, "dbo.café")
+                .await
+                .expect("a plan sealed over a module the collation says it rebinds");
+            assert!(
+                text.contains("outside2663") && text.contains("café"),
+                "{text}"
+            );
+        })
+    }
+    both(case).await;
+}
+
+/// The same pair under a collation that tells the accents apart is two
+/// names, so nothing is rebound and the plan seals.
+#[tokio::test]
+#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+async fn mssql_an_accent_sensitive_collation_does_not_match_a_created_object_name_to_the_reference()
+{
+    fn case<'a>(
+        target: &'a str,
+        scratch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let refusal =
+                refusal_under(target, scratch, ACCENT_AWARE, OBJECT_SETUP, "dbo.café").await;
+            assert_eq!(refusal, None, "the names are two under this collation");
+        })
+    }
+    both(case).await;
+}
+
+/// A name that differs by more than the accent is no match under any
+/// collation: the engine's comparison is not a prefix or a fold-everything.
+#[tokio::test]
+#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+async fn mssql_an_accent_insensitive_collation_does_not_match_a_different_created_object_name() {
+    fn case<'a>(
+        target: &'a str,
+        scratch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let refusal =
+                refusal_under(target, scratch, ACCENT_BLIND, OBJECT_SETUP, "dbo.cafés").await;
+            assert_eq!(refusal, None, "`cafés` is not `cafe` in any collation");
+        })
+    }
+    both(case).await;
+}
+
+/// The schema-name variant: a two-part reference spelled `cafe.ghost` reaches
+/// the created `café.ghost` where the collation makes the schemas one name.
+#[tokio::test]
+#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+async fn mssql_an_accent_insensitive_collation_matches_a_created_schema_name_to_an_unmanaged_reference()
+ {
+    fn case<'a>(
+        target: &'a str,
+        scratch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let text = refusal_under(target, scratch, ACCENT_BLIND, SCHEMA_SETUP, "café.ghost")
+                .await
+                .expect("a plan sealed over a module the collation says it rebinds");
+            // The reverse read selects the module by the engine's match, and
+            // the module's own capture then stops on its unresolved
+            // two-part reference. Either way the run names the module, and
+            // only the engine's match puts it in front of the capture: the
+            // accent-sensitive twin below seals.
+            assert!(text.contains("outside2663"), "{text}");
+        })
+    }
+    both(case).await;
+}
+
+/// The schema pair under an accent-sensitive collation is two schemas.
+#[tokio::test]
+#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+async fn mssql_an_accent_sensitive_collation_does_not_match_a_created_schema_name_to_the_reference()
+{
+    fn case<'a>(
+        target: &'a str,
+        scratch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let refusal =
+                refusal_under(target, scratch, ACCENT_AWARE, SCHEMA_SETUP, "café.ghost").await;
+            assert_eq!(refusal, None, "the schemas are two under this collation");
+        })
+    }
+    both(case).await;
+}
+
 /// A managed table the target and the plan both hold, with the id column the
 /// fixtures use, so that the plan keeps it.
 fn kept(declared: &mut Declared, name: &str) {
