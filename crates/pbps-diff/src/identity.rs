@@ -59,6 +59,12 @@ pub enum Blocker {
     DropSearchNeedsReason {
         name: pbps_model::SearchRef,
     },
+    /// An exclusion constraint vanished from a declared table with no recorded
+    /// reason for giving its guarantee up (DEC-2448.4).
+    DropExclusionNeedsReason {
+        table: TableName,
+        name: pbps_model::ObjectLocalName,
+    },
     /// A later diagnosis depends on this contested table rename having won.
     /// Keep the diagnosis visible without presenting declaration order as intent.
     ProvisionalTableIdentity {
@@ -237,7 +243,7 @@ pub fn resolve(
     intents: &[Intent],
     ctx: &Context,
 ) -> Result<Resolution, Vec<Blocker>> {
-    resolve_with_provenance(declared, ids, intents, 0, ctx).map_err(|blocked| blocked.0)
+    resolve_with_provenance(declared, ids, intents, 0, None, ctx).map_err(|blocked| blocked.0)
 }
 
 /// Resolves a pulled schema without publishing an orphaned type identity.
@@ -282,8 +288,34 @@ pub fn resolve_with_annotations(
         annotation_count <= intents.len(),
         "annotation count cannot exceed the intent count"
     );
-    resolve_with_provenance(declared, ids, intents, annotation_count, ctx)
+    resolve_with_provenance(declared, ids, intents, annotation_count, None, ctx)
         .map_err(|blocked| blocked.0)
+}
+
+/// [`resolve_with_annotations`] that can read what the baseline holds: an
+/// exclusion's retirement keeps the definition it retires (DEC-2448.4), and
+/// only the baseline has it once the declarations no longer do.
+pub fn resolve_with_annotations_against(
+    declared: &Schema,
+    ids: &IdsFile,
+    intents: &[Intent],
+    annotation_count: usize,
+    baseline: crate::Side<'_>,
+    ctx: &Context,
+) -> Result<Resolution, Vec<Blocker>> {
+    assert!(
+        annotation_count <= intents.len(),
+        "annotation count cannot exceed the intent count"
+    );
+    resolve_with_provenance(
+        declared,
+        ids,
+        intents,
+        annotation_count,
+        Some(baseline),
+        ctx,
+    )
+    .map_err(|blocked| blocked.0)
 }
 
 /// Resolve against both the reviewed checkout and what the baseline holds.
@@ -302,9 +334,12 @@ pub fn resolve_with_baseline(
     // again to learn the package's or the search object's. A blocked resolution
     // still says which packages and search objects it forgot (it forgets them
     // before it blocks), but its other identities are provisional, so only those
-    // two kinds, which no resolver blocker covers, are read from it.
+    // two kinds, which no resolver blocker covers, and the exclusion drops the
+    // baseline holds (their retirements are recorded before it blocks), are read
+    // from it.
     let (resolved, mut blockers, partial) =
-        match resolve_with_provenance(declared, ids, intents, annotation_count, ctx) {
+        match resolve_with_provenance(declared, ids, intents, annotation_count, Some(baseline), ctx)
+        {
             Ok(r) => (Some(r), Vec::new(), None),
             Err(blocked) => (None, blocked.0, Some(blocked.1)),
         };
@@ -315,6 +350,17 @@ pub fn resolve_with_baseline(
         .filter_map(|removal| {
             use removals::Removal;
             let (uid, blocker) = match removal {
+                // Retired by a record of its own, not a tombstone: a table's
+                // uid with the name and the definition it had.
+                Removal::Exclusion {
+                    uid,
+                    table,
+                    name,
+                    was,
+                } => {
+                    return (!local.exclusion_retired(&uid, &name, &was))
+                        .then_some(Blocker::DropExclusionNeedsReason { table, name });
+                }
                 Removal::Table { uid, name } => {
                     (uid, Blocker::DropTableNeedsReason { table: name })
                 }
@@ -354,6 +400,7 @@ fn resolve_with_provenance(
     ids: &IdsFile,
     intents: &[Intent],
     annotation_count: usize,
+    baseline: Option<crate::Side<'_>>,
     ctx: &Context,
 ) -> Result<Resolution, Box<(Vec<Blocker>, IdsFile)>> {
     let mut r = Resolution {
@@ -528,6 +575,7 @@ fn resolve_with_provenance(
     );
 
     resolve_moves(declared, intents, ctx, &mut r, &mut blockers, &mut used);
+    resolve_exclusion_drops(intents, baseline, ctx, &mut r, &mut used);
 
     // A column the identities no longer hold takes its recorded conversion
     // with it, as a dropped table takes its move (#2331): the record is
@@ -597,6 +645,7 @@ fn resolve_with_provenance(
             | Intent::DropRole { .. }
             | Intent::DropExtension { .. }
             | Intent::DropSearch { .. }
+            | Intent::DropExclusion { .. }
             | Intent::MoveRows { .. } => None,
         };
         // The identities are read in the namespace this annotation was written
@@ -642,6 +691,7 @@ fn resolve_with_provenance(
             | Intent::DropRole { .. }
             | Intent::DropExtension { .. }
             | Intent::DropSearch { .. }
+            | Intent::DropExclusion { .. }
             | Intent::MoveRows { .. } => {
                 intent_is_absorbed(original_intent.as_ref().unwrap_or(intent), ids, source)
             }
@@ -684,6 +734,7 @@ fn resolve_with_provenance(
                     | Intent::DropRole { .. }
                     | Intent::DropExtension { .. }
                     | Intent::DropSearch { .. }
+                    | Intent::DropExclusion { .. }
                     | Intent::MoveRows { .. } => None,
                 },
                 Blocker::RenameTargetExists { target } if column_blockers.contains(&index) => {
@@ -701,6 +752,7 @@ fn resolve_with_provenance(
                 | Blocker::DropRoleNeedsReason { .. }
                 | Blocker::DropExtensionNeedsReason { .. }
                 | Blocker::DropSearchNeedsReason { .. }
+                | Blocker::DropExclusionNeedsReason { .. }
                 | Blocker::RenameTargetExists { .. }
                 | Blocker::UnrepresentableName { .. }
                 | Blocker::MissingType { .. }
@@ -890,6 +942,12 @@ pub fn intent_is_absorbed(intent: &Intent, ids: &IdsFile, source: RenameSource) 
         Intent::DropSearch { name, .. } => {
             ids.search_uid(name).is_none() && retired(UidKind::Search, &name.raw().to_string())
         }
+        // Recorded already: the retirement stays after the constraint is gone,
+        // so a command repeated once the drop has been applied converges.
+        Intent::DropExclusion { table, name, .. } => ids
+            .table_uid(table)
+            .and_then(|uid| ids.exclusions.get(uid))
+            .is_some_and(|named| named.contains_key(name)),
         // Recorded already, with this bound.
         Intent::MoveRows {
             table, max_rows, ..
@@ -951,6 +1009,10 @@ impl RenameSource {
             Intent::DropRole { role, .. } => declared.roles.contains_key(role),
             Intent::DropExtension { name, .. } => declared.extensions.contains_key(name),
             Intent::DropSearch { name, .. } => declared.search.contains_key(name),
+            Intent::DropExclusion { table, name, .. } => declared
+                .tables
+                .get(table)
+                .is_some_and(|t| t.exclude.contains_key(name)),
             Intent::MoveRows { .. } => false,
         };
         if redeclared {
@@ -1783,6 +1845,65 @@ fn resolve_moves(
     }
 }
 
+/// Records each retired exclusion constraint (DEC-2448.4) against its table's
+/// uid, with the definition the baseline holds: that is the one the plan drops,
+/// and the record authorises exactly it.
+///
+/// An exclusion has no identity of its own, so this reads the table's uid from
+/// the identities (minted by now for a table declared this run) and the
+/// definition from the baseline's table of the same uid, which a rename since
+/// does not move. With no baseline, or a baseline that does not hold the
+/// constraint, there is nothing to record and the intent stays unused, which
+/// names it as the likely typo it is; one already recorded converges. The same
+/// retirement again keeps the date it has.
+fn resolve_exclusion_drops(
+    intents: &[Intent],
+    baseline: Option<crate::Side<'_>>,
+    ctx: &Context,
+    r: &mut Resolution,
+    used: &mut BTreeSet<usize>,
+) {
+    for (i, intent) in intents.iter().enumerate() {
+        let Intent::DropExclusion {
+            table,
+            name,
+            reason,
+        } = intent
+        else {
+            continue;
+        };
+        let Some(uid) = r.ids.table_uid(table).cloned() else {
+            continue;
+        };
+        let held = baseline.and_then(|side| {
+            let was = side.ids.tables.get(&uid)?;
+            side.schema.tables.get(was)?.exclude.get(name)
+        });
+        let Some(held) = held else {
+            continue;
+        };
+        used.insert(i);
+        let was = held.canonical_text();
+        let kept = r
+            .ids
+            .exclusions
+            .get(&uid)
+            .and_then(|named| named.get(name))
+            .is_some_and(|rec| rec.was == was && rec.reason == reason.as_ref());
+        if !kept {
+            r.ids.exclusions.entry(uid).or_default().insert(
+                name.clone(),
+                pbps_model::ExclusionRetirement {
+                    was,
+                    reason: reason.to_string(),
+                    operator: ctx.operator.clone(),
+                    dropped_at: ctx.today.clone(),
+                },
+            );
+        }
+    }
+}
+
 fn drop_table_in_ids(
     ids: &mut IdsFile,
     uid: &Uid,
@@ -1800,6 +1921,7 @@ fn drop_table_in_ids(
 
     ids.tables.remove(uid);
     ids.moves.remove(uid);
+    ids.exclusions.remove(uid);
     ids.tombstones
         .insert(uid.clone(), make(table.raw().to_string()));
 
@@ -2737,5 +2859,220 @@ mod drop_intent2414_tests {
         );
         assert_eq!(result.added_columns.len(), 1);
         assert!(result.ids.tombstones.is_empty());
+    }
+}
+
+/// The retirement of an exclusion constraint (DEC-2448.4): a blocker where the
+/// baseline holds one the declarations no longer do, and a record that keeps
+/// the definition the baseline held.
+#[cfg(test)]
+mod drop_exclusion_tests {
+    use super::*;
+    use pbps_model::{Column, Table};
+
+    fn context() -> Context {
+        Context {
+            operator: "operator".into(),
+            today: "2026-11-15".into(),
+        }
+    }
+
+    fn exclusion(operator: &str) -> pbps_model::ExclusionConstraint {
+        pbps_model::ExclusionConstraint {
+            method: pbps_model::IndexMethod::Gist,
+            keys: vec![pbps_model::ExclusionKey {
+                key: pbps_model::IndexColumn {
+                    key: pbps_model::IndexKey::Expression("int4range(a, b)".into()),
+                    descending: false,
+                    opclass: None,
+                    collation: None,
+                },
+                operator: pbps_model::OperatorRef::symbol(operator).unwrap(),
+            }],
+            include: Vec::new(),
+            filter: None,
+            storage_parameters: Default::default(),
+            timing: pbps_model::ExclusionTiming::Immediate,
+        }
+    }
+
+    fn world(table: &str, constraints: &[(&str, &str)]) -> Schema {
+        let mut t = Table::default();
+        for column in ["a", "b"] {
+            t.columns
+                .insert(column.into(), Column::new("int".parse().unwrap()));
+        }
+        for (name, operator) in constraints {
+            t.exclude.insert((*name).into(), exclusion(operator));
+        }
+        let mut schema = Schema::default();
+        schema.tables.insert(table.parse().unwrap(), t);
+        schema
+    }
+
+    fn drop_intent(table: &str, name: &str) -> Intent {
+        Intent::DropExclusion {
+            table: table.parse().unwrap(),
+            name: name.into(),
+            reason: "the service enforces it".parse().unwrap(),
+        }
+    }
+
+    fn resolved(
+        base: &Schema,
+        base_ids: &IdsFile,
+        declared: &Schema,
+        ids: &IdsFile,
+        intents: &[Intent],
+    ) -> Result<Resolution, Vec<Blocker>> {
+        resolve_with_baseline(
+            declared,
+            ids,
+            intents,
+            0,
+            crate::Side {
+                schema: base,
+                ids: base_ids,
+            },
+            &context(),
+        )
+    }
+
+    #[test]
+    fn a_dropped_exclusion_is_a_blocker_until_its_definition_is_retired_and_then_converges() {
+        let base = world("app.booking", &[("no_overlap", "&&")]);
+        let declared = world("app.booking", &[]);
+        let ids = resolve(&base, &IdsFile::default(), &[], &context())
+            .unwrap()
+            .ids;
+        let uid = ids
+            .table_uid(&"app.booking".parse().unwrap())
+            .unwrap()
+            .clone();
+        // No intent: a blocker naming the table and the constraint.
+        assert_eq!(
+            resolved(&base, &ids, &declared, &ids, &[]).unwrap_err(),
+            vec![Blocker::DropExclusionNeedsReason {
+                table: "app.booking".parse().unwrap(),
+                name: "no_overlap".into(),
+            }]
+        );
+        // The intent records the baseline's definition under the table's uid.
+        let intent = [drop_intent("app.booking", "no_overlap")];
+        let done = resolved(&base, &ids, &declared, &ids, &intent).unwrap();
+        let record = &done.ids.exclusions[&uid]["no_overlap"];
+        assert_eq!(
+            record.was,
+            base.tables[&"app.booking".parse::<TableName>().unwrap()].exclude["no_overlap"]
+                .canonical_text()
+        );
+        assert_eq!(
+            (
+                record.reason.as_str(),
+                record.operator.as_str(),
+                record.dropped_at.as_str()
+            ),
+            ("the service enforces it", "operator", "2026-11-15")
+        );
+        // Run again over the file it wrote: the same ids, and no blocker.
+        let again = resolved(&base, &ids, &declared, &done.ids, &intent).unwrap();
+        assert_eq!(again.ids, done.ids);
+        // Once the drop is applied the baseline lacks it, and the command repeated
+        // is absorbed by the record that stays.
+        let applied = resolved(&declared, &done.ids, &declared, &done.ids, &intent).unwrap();
+        assert_eq!(applied.ids, done.ids);
+        // Negative: with no record, an intent against a baseline that lacks the
+        // constraint is a likely typo, not a silent success.
+        let typo = resolved(&declared, &ids, &declared, &ids, &intent).unwrap_err();
+        assert!(
+            matches!(typo.as_slice(), [Blocker::UnusedIntent { .. }]),
+            "{typo:?}"
+        );
+        // Negative: another constraint's name, and a table that is not declared.
+        for wrong in [
+            drop_intent("app.booking", "another"),
+            drop_intent("app.elsewhere", "no_overlap"),
+        ] {
+            let said = resolved(&base, &ids, &declared, &ids, &[wrong]).unwrap_err();
+            assert!(
+                said.iter()
+                    .any(|b| matches!(b, Blocker::UnusedIntent { .. })),
+                "{said:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_retirement_follows_its_table_through_a_rename_and_goes_with_a_drop_of_it() {
+        let base = world("app.booking", &[("no_overlap", "&&")]);
+        let ids = resolve(&base, &IdsFile::default(), &[], &context())
+            .unwrap()
+            .ids;
+        let uid = ids
+            .table_uid(&"app.booking".parse().unwrap())
+            .unwrap()
+            .clone();
+        // Renamed in the same revision: the baseline's definition is found by uid.
+        let renamed = world("app.reservation", &[]);
+        let intents = [
+            Intent::RenameTable {
+                from: "app.booking".parse().unwrap(),
+                to: "app.reservation".parse().unwrap(),
+            },
+            drop_intent("app.reservation", "no_overlap"),
+        ];
+        let done = resolved(&base, &ids, &renamed, &ids, &intents).unwrap();
+        assert!(done.ids.exclusions[&uid].contains_key("no_overlap"));
+        assert_eq!(
+            done.ids.table_uid(&"app.reservation".parse().unwrap()),
+            Some(&uid)
+        );
+        // The table's own drop takes its retirements with it.
+        let mut recorded = done.ids.clone();
+        recorded.exclusions.entry(uid.clone()).or_default();
+        let gone = Schema::default();
+        let dropped = resolve(
+            &gone,
+            &recorded,
+            &[Intent::DropTable {
+                table: "app.reservation".parse().unwrap(),
+                reason: "retired".parse().unwrap(),
+            }],
+            &context(),
+        )
+        .unwrap();
+        assert!(dropped.ids.exclusions.is_empty());
+        dropped.ids.validated().unwrap();
+    }
+
+    #[test]
+    fn the_removal_inventory_names_a_constraint_only_on_a_table_that_stays() {
+        use removals::{Removal, inventory};
+        let base = world("app.booking", &[("kept", "&&"), ("dropped", "&&")]);
+        let ids = resolve(&base, &IdsFile::default(), &[], &context())
+            .unwrap()
+            .ids;
+        let side = crate::Side {
+            schema: &base,
+            ids: &ids,
+        };
+        let declared = world("app.booking", &[("kept", "&&")]);
+        let found = inventory(side, &ids, &declared, &[]);
+        assert!(
+            matches!(found.as_slice(), [Removal::Exclusion { name, .. }] if name.raw() == "dropped"),
+            "{found:?}"
+        );
+        assert_eq!(
+            found[0].to_string(),
+            "exclusion constraint dropped on app.booking"
+        );
+        // Negative: the same declaration is nothing, and a table that goes is the
+        // table's own removal, not its constraints'.
+        assert!(inventory(side, &ids, &base, &[]).is_empty());
+        let gone = inventory(side, &IdsFile::default(), &Schema::default(), &[]);
+        assert!(
+            gone.iter().all(|r| !matches!(r, Removal::Exclusion { .. })),
+            "{gone:?}"
+        );
     }
 }

@@ -93,6 +93,19 @@ pub(crate) fn sample() -> (IdsFile, Placement) {
             conversions: BTreeMap::new(),
         },
     );
+    f.exclusions.insert(
+        uid("t_aaaaaa"),
+        [(
+            ObjectLocalName::new("no_overlap"),
+            ExclusionRetirement {
+                was: "{\"method\":\"gist\"}".into(),
+                reason: "the service enforces it".into(),
+                operator: "leon".into(),
+                dropped_at: "2026-11-15".into(),
+            },
+        )]
+        .into(),
+    );
     f.roles.insert(uid("r_aaaaaa"), RoleName::new("app_reader"));
     f.tombstones.insert(uid("r_bbbbbb"), tomb("old_role"));
     f.types
@@ -200,6 +213,13 @@ fn a_table_file_has_the_canonical_bytes_with_the_tombstone_in_place() {
 
     "_end": true
 
+  }},
+  "exclusions": {{
+
+    "no_overlap": {{"was": "{{\"method\":\"gist\"}}", "reason": "the service enforces it", "operator": "leon", "dropped_at": "2026-11-15"}},
+
+    "_end": true
+
   }}
 }}
 "#
@@ -281,9 +301,89 @@ fn partitions_moves_and_rebuilds_land_in_the_file_that_owns_them() {
 }
 
 #[test]
+fn an_exclusion_retirement_is_keyed_by_name_in_its_tables_file() {
+    let t = tree();
+    let customer = &t["dbo/customer.json"];
+    assert!(customer.contains("\"exclusions\": {\n\n    \"no_overlap\": {\"was\": "));
+    assert!(customer.find("\"conversions\"").unwrap() < customer.find("\"exclusions\"").unwrap());
+    // No other file holds it, and the table's uid is not repeated in the section.
+    assert!(!t["app/events.json"].contains("exclusions"));
+    assert!(!customer.contains("\"t_aaaaaa\": {\"was\""));
+}
+
+#[test]
+fn an_exclusion_retirement_in_a_file_without_a_table_name_or_with_a_blank_name_is_refused() {
+    let t = tree();
+    let blank = edit(
+        &t["dbo/customer.json"],
+        "    \"no_overlap\": {\"was\"",
+        "    \"\": {\"was\"",
+    );
+    assert!(matches!(
+        refuses("dbo/customer.json", blank),
+        TreeError::BadName { .. }
+    ));
+    let unfinished = edit(
+        &t["dbo/customer.json"],
+        "\"dropped_at\": \"2026-11-15\"},\n\n    \"_end\": true",
+        "\"dropped_at\": \"2026-11-15\"}",
+    );
+    assert!(matches!(
+        refuses("dbo/customer.json", unfinished),
+        TreeError::SentinelMissing {
+            section: "exclusions",
+            ..
+        }
+    ));
+    // Only a table file has the section, and a dropped table keeps none.
+    let role = edit(
+        &t["roles/app_reader.json"],
+        "\"role\": \"app_reader\"",
+        "\"role\": \"app_reader\",\n  \"exclusions\": {\"_end\": true}",
+    );
+    assert!(matches!(
+        refuses("roles/app_reader.json", role),
+        TreeError::Malformed { .. }
+    ));
+    let dropped = edit(
+        &t["dbo/legacy.json"],
+        "  }\n}\n",
+        "  },\n  \"exclusions\": {\"no_overlap\": {\"was\": \"x\", \"reason\": \"x\", \"operator\": \"x\", \"dropped_at\": \"x\"}, \"_end\": true}\n}\n",
+    );
+    assert_eq!(
+        refuses("dbo/legacy.json", dropped),
+        TreeError::DroppedWithLive {
+            path: "dbo/legacy.json".into()
+        }
+    );
+}
+
+#[test]
+fn an_exclusion_retirement_for_a_partition_has_no_file_and_is_refused_on_split() {
+    // A partition child has a uid but no file of its own, and an exclusion on one
+    // is refused (DEC-2448.3), so a record for one cannot be placed.
+    let (mut ids, p) = sample();
+    ids.exclusions.insert(
+        uid("t_bbbbb1"),
+        [(
+            ObjectLocalName::new("x"),
+            ids.exclusions[&uid("t_aaaaaa")]["no_overlap"].clone(),
+        )]
+        .into(),
+    );
+    assert!(matches!(split(&ids, &p), Err(TreeError::NoPath { .. })));
+}
+
+#[test]
 fn optional_sections_are_absent_when_empty() {
     let t = tree();
-    for key in ["partitions", "moves", "conversions", "rebuilds"] {
+    for key in [
+        "partitions",
+        "moves",
+        "conversions",
+        "rebuilds",
+        "exclusions",
+    ] {
         assert!(!t["dbo/legacy.json"].contains(key), "{key}");
     }
 }

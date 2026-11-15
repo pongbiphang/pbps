@@ -9819,3 +9819,75 @@ Formats: published schema set 112, for the wording alone: the two descriptions o
 `method: gin` in the declaration schema now name `tsvector` and its default class.
 No saved plan or state changes, and no schema property or enum does.
 
+<a id="dec-2448-4"></a>
+
+**DEC-2448.4. EXCLUDE constraints: drop, replace and retire (#2448 PR C2).**
+An exclusion has no uid, so its retirement is not a tombstone. The record is
+`IdsFile.exclusions`, keyed by the owning **table's uid** and then the constraint's
+name, and holds `was` (the canonical text of the definition retired), `reason`,
+`operator` and `dropped_at`. The table's uid keeps it through a table rename or
+move and keeps a new table of the same spelling from inheriting it; a table's drop
+takes its records with it, and a state keeps only those of tables it holds. It is a
+compatible evolution of identity version 1, like `moves`: `IdsFile` and the tree's
+file are `deny_unknown_fields`, so a reader that does not know the section refuses
+the file and never drops a record; the tree's layout `FORMAT` is unchanged. On disk
+it is a section `exclusions` of the table's own file, keyed by name (the file is the
+table), with the `_end` sentinel, placed after `rebuilds`; a dropped table's file
+holds none, and a partition, which has no file, cannot hold one (an exclusion on a
+partition is refused, DEC-2448.3). Merge is by record, so two branches retiring
+different constraints both keep theirs and one retired two ways conflicts under the
+table's uid.
+
+`was` is `ExclusionConstraint::canonical_text`, the model's own compact JSON. A SQL
+rendering would have to quote every name and expression to stay injective, which is
+what a serializer already does, and a record that authorised two definitions because
+their spellings met would be the one defect the text exists to prevent. It is the
+declaration's own shape, so an auditor reads what was given up in the terms it was
+written in. A later field that always serialises would stop old records matching,
+which refuses a drop and never authorises one.
+
+**The gate.** A constraint a declared table no longer holds is dropped only with a
+record for *this* table, *this* name and a `was` equal to the before-definition
+(`IdsFile::exclusion_retired`). It is asked twice, because it has two jobs. At
+identity resolution it is a blocker, `DropExclusionNeedsReason`, from the removal
+inventory against the baseline: the report names `pbps drop-exclusion TABLE NAME
+--reason ""`, the finding id is `identity.drop-exclusion-needs-reason`, and the
+prompt offers the drop and asks why. In the differ it is a refusal naming the same
+command, so a plan built without that pass (a library caller, a saved plan's
+rebuild) cannot drop one unrecorded. A rename is a drop and an add and needs the
+record, which the refusal says. The table's own drop never asks: its intent covers
+its parts.
+
+**The command** `pbps drop-exclusion TABLE NAME --reason WHY` is `Intent::DropExclusion`
+and resolves like the other drops, except that the record keeps the definition, which
+only the baseline holds once the declarations dropped it: it resolves against the
+checked-in `HEAD` baseline (as `convert` and `rebuild-table` do) and records the
+baseline's definition under the table's uid, found by uid so a rename in the same
+revision does not hide it. With no baseline holding the constraint the intent is
+unused and says so; repeated, it keeps its date; once the drop is applied the record
+absorbs it. It has no `pbps intent` spelling, because a table and a name do not fit
+the batch's pairs, and counts as no decision in a batch of the others.
+
+**Replace and options.** A changed definition at one name is a replacement, two
+changes (the old one's `from: Some, to: None`, then the new one's `from: None, to:
+Some`), each in the ordering class its direction needs; it needs no record, because
+the name keeps its logical member and the plan states the drop and the validation.
+Only a difference in storage parameters leaves the constraint standing: `ALTER INDEX
+.. SET/RESET` on the backing index, named by the constraint (`IndexPart::Exclusion`),
+under the method's per-parameter verdicts and locks (DEC-2448.1, DEC-2448.2; measured
+on 16.15 and 18.6: constraint and index oids and `convalidated` unchanged). A drop is
+`ALTER TABLE .. DROP CONSTRAINT`, never `DROP INDEX` (2BP01). Risk is `destructive`
+on a drop, `constraint` on an add, both on a replacement.
+
+**Column drops.** A key column the plan drops is allowed where the same plan drops
+that constraint (a recorded drop, or a replacement that states it): the engine's
+silent loss of the guarantee (M16) is then a statement of the plan. Alone it stays
+refused by name. A retype stays refused whatever else the plan says: it is the
+teardown and restoration of PR D.
+
+Formats: plan 80 (an older build does not know `IndexPart::Exclusion`), state 48 (a
+snapshot embeds the identities), published schema set 108, which differs from 107 only
+in its version: no published document names a plan part or an identity record. Ids
+version 1 and the tree's layout version are unchanged; a file with no retirement
+serialises exactly as before. SQL Server has no such constraint and refuses every
+form by name.

@@ -122,7 +122,8 @@ pub use extension_provider::{
 };
 pub use finding::{Finding, Severity};
 pub use ids::{
-    Conversion, DropGuard, DropRequirement, IdsFile, IdsIndex, Move, Tombstone, ValidIds,
+    Conversion, DropGuard, DropRequirement, ExclusionRetirement, IdsFile, IdsIndex, Move,
+    Tombstone, ValidIds,
 };
 pub use intent::Intent;
 pub use managed_type::{DomainDelta, DomainHalf, EnumPlacement, EnumRebuildStep, ManagedType};

@@ -1726,6 +1726,8 @@ pub(crate) fn diff_partial_rebuilding(
             declared_name,
             &renames.apply(base_table, base_name),
             declared_table,
+            declared.ids,
+            uid,
             &mut changes,
             &mut errs,
         );
@@ -7026,54 +7028,116 @@ fn sequence_differences(
     out
 }
 
-/// A table's exclusion constraints, by name (DEC-2448.3). Adding one is a
-/// change of its own. **Dropping or replacing one is refused here**: that takes
-/// the retirement record of the next PR, and a refusal is better than a plan
-/// that gives a guarantee up without the reason an auditor asks for.
+/// A table's exclusion constraints, by name (DEC-2448.3, DEC-2448.4).
+///
+/// - **Added**: a change of its own.
+/// - **Options only** (storage parameters): `ALTER INDEX .. SET/RESET` on the
+///   backing index, the constraint standing (measured on 16.15 and 18.6), as an
+///   index's are, under the method's per-parameter verdicts.
+/// - **Any other difference at one name**: a replacement, as two changes (the
+///   old one's drop and the new one's add) so each takes the ordering class its
+///   direction needs. It needs no reason: the name keeps its logical member,
+///   and the plan states the drop and the validation.
+/// - **Gone from the declaration** (which a rename is, with an add beside it):
+///   a drop, and it needs the retirement a human recorded for *this*
+///   definition, else it is refused with the command that records it. The
+///   table's own drop never gets here: its intent covers its parts.
 fn diff_exclusions(
     name: &TableName,
     base: &Table,
     declared: &Table,
+    retired: &pbps_model::IdsFile,
+    uid: &pbps_model::Uid,
     changes: &mut Vec<Change>,
     errs: &mut Vec<DiffError>,
 ) {
+    let drop_half = |key: &pbps_model::ObjectLocalName, was: &pbps_model::ExclusionConstraint| {
+        Change::SetExclusion {
+            table: name.clone(),
+            name: key.clone(),
+            from: Some(Box::new(was.clone())),
+            to: None,
+        }
+    };
+    let add_half = |key: &pbps_model::ObjectLocalName, now: &pbps_model::ExclusionConstraint| {
+        Change::SetExclusion {
+            table: name.clone(),
+            name: key.clone(),
+            from: None,
+            to: Some(Box::new(now.clone())),
+        }
+    };
     for (key, was) in &base.exclude {
         match declared.exclude.get(key) {
             Some(now) if now == was => {}
-            Some(_) => errs.push(DiffError::ExclusionRefused {
-                table: name.clone(),
-                name: key.clone(),
-                reason: "replacing one arrives with the retirement record in the next PR; \
-                         for now it stands as it is read"
-                    .to_owned(),
-            }),
+            Some(now) => {
+                let bare = |x: &pbps_model::ExclusionConstraint| {
+                    let mut x = x.clone();
+                    x.storage_parameters.clear();
+                    x
+                };
+                let edit = (bare(was) == bare(now)).then(|| {
+                    parameter_edit(
+                        was.method.policy(),
+                        &was.storage_parameters,
+                        &now.storage_parameters,
+                    )
+                });
+                match edit {
+                    Some(ParameterEdit::Alter { set, reset }) => {
+                        changes.push(Change::SetIndexStorageParameters {
+                            table: name.clone(),
+                            target: IndexPart::Exclusion(key.clone()),
+                            method: was.method,
+                            set,
+                            reset,
+                        });
+                    }
+                    Some(ParameterEdit::Refuse { parameter }) => {
+                        errs.push(DiffError::IndexParameterRefused {
+                            table: name.clone(),
+                            target: format!("exclusion constraint {}", key.shown()),
+                            method: was.method.as_str(),
+                            parameter,
+                        });
+                    }
+                    Some(ParameterEdit::Unchanged) | Some(ParameterEdit::Rebuild) | None => {
+                        changes.push(drop_half(key, was));
+                        changes.push(add_half(key, now));
+                    }
+                }
+            }
+            None if retired.exclusion_retired(uid, key, was) => changes.push(drop_half(key, was)),
             None => errs.push(DiffError::ExclusionRefused {
                 table: name.clone(),
                 name: key.clone(),
-                reason: "dropping one (and renaming one, which is a drop and an add) arrives \
-                         with the retirement record in the next PR; for now it stands"
-                    .to_owned(),
+                reason: format!(
+                    "dropping it (a rename is a drop and an add) needs a recorded reason: run \
+                     `pbps drop-exclusion {} {} --reason \"..\"` and commit the identity file \
+                     (`--since REV` names the revision that still declares it, if the \
+                     declarations that dropped it are committed already)",
+                    name.shown(),
+                    key.shown()
+                ),
             }),
         }
     }
     for (key, now) in &declared.exclude {
         if !base.exclude.contains_key(key) {
-            changes.push(Change::Constraint(ConstraintChange::SetExclusion {
-                table: name.clone(),
-                name: key.clone(),
-                from: None,
-                to: Some(Box::new(now.clone())),
-            }));
+            changes.push(add_half(key, now));
         }
     }
 }
 
 /// A column change under a standing exclusion constraint, refused by name
-/// (DEC-2448.3). The engine drops an exclusion silently when a plain key column
-/// is dropped, and silently rebuilds it, under an exclusive lock, when one is
-/// retyped (measured on 16.15 and 18.6): a guarantee given up, or a rebuild,
-/// that no plan states. The first needs the retirement record, the second the
-/// teardown and restoration of PR D, so both arrive there. A key that is an
+/// (DEC-2448.3, DEC-2448.4). The engine drops an exclusion silently when a plain
+/// key column is dropped, and silently rebuilds it, under an exclusive lock,
+/// when one is retyped (measured on 16.15 and 18.6): a guarantee given up, or a
+/// rebuild, that no plan states. A drop is allowed where the same plan drops the
+/// constraint, which is the statement the engine would otherwise have made
+/// unseen (a pure drop has passed the retirement gate, a replacement states the
+/// drop and the validation); a retype needs the teardown and restoration of PR
+/// D, so it is refused whatever else the plan says. A key that is an
 /// expression, or a predicate, names its columns in text this model does not
 /// parse, so a column its text mentions counts as one it holds.
 #[allow(clippy::wildcard_enum_match_arm)]
@@ -7087,7 +7151,14 @@ fn exclusion_hazards<'a>(
     if base.exclude.is_empty() {
         return;
     }
-    for change in changes {
+    let changes: Vec<&Change> = changes.into_iter().collect();
+    let released = |key: &pbps_model::ObjectLocalName| {
+        changes.iter().any(|c| {
+            matches!(c, Change::SetExclusion { table, name: n, to: None, .. }
+                if table == name && n == key)
+        })
+    };
+    for change in changes.iter().copied() {
         let (column, what) = match change {
             Change::Column(ColumnChange::DropColumn { column, .. }) => (column, "dropped"),
             Change::Column(ColumnChange::AlterColumnType { column, .. })
@@ -7101,15 +7172,19 @@ fn exclusion_hazards<'a>(
             _ => continue,
         };
         for (key, x) in &base.exclude {
-            if exclusion_names(x, &column.name, dialect) {
+            if exclusion_names(x, &column.name, dialect) && !(what == "dropped" && released(key)) {
+                let fix = if what == "dropped" {
+                    "drop the constraint in the same plan (`pbps drop-exclusion`), or the \
+                     engine would drop it without a plan saying so"
+                } else {
+                    "that arrives with the rebuild of a later PR, and the engine would \
+                     otherwise rebuild the constraint without a plan saying so"
+                };
                 errs.push(DiffError::ExclusionRefused {
                     table: name.clone(),
                     name: key.clone(),
                     reason: format!(
-                        "column `{}` is {what} while the constraint holds it; that arrives \
-                         with the retirement record and the rebuild of the next PRs, and the \
-                         engine would otherwise drop or rebuild the constraint without a plan \
-                         saying so",
+                        "column `{}` is {what} while the constraint holds it; {fix}",
                         column.name.shown()
                     ),
                 });
@@ -7191,6 +7266,7 @@ fn diff_constraints_by(
                         IndexPart::Unique(n) | IndexPart::Index(n) => {
                             format!("index {}", n.shown())
                         }
+                        IndexPart::Exclusion(n) => format!("exclusion constraint {}", n.shown()),
                     },
                     method: method.as_str(),
                     parameter,
@@ -11885,47 +11961,257 @@ mod tests {
         );
     }
 
-    /// Negative: dropping, replacing and renaming one is refused by name until the
-    /// retirement record exists, and the engine's silent drop or rebuild under a
-    /// column change is refused too (DEC-2448.3, measured on 16.15 and 18.6).
+    fn retirement(was: String) -> pbps_model::ExclusionRetirement {
+        pbps_model::ExclusionRetirement {
+            was,
+            reason: "the service enforces it".into(),
+            operator: "leon".into(),
+            dropped_at: "2026-11-15".into(),
+        }
+    }
+
+    /// Plans `base` to `declared`, with the declared identities `edit`ed after
+    /// they resolve (it is handed the table's uid). `Err` is every refusal, as
+    /// text.
+    fn exclusion_plan_with(
+        base: &Schema,
+        declared: &Schema,
+        edit: impl FnOnce(&mut IdsFile, &pbps_model::Uid),
+    ) -> Result<ChangeSet, Vec<String>> {
+        let table: TableName = "app.booking".parse().unwrap();
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        // A column the declaration lost is dropped for a stated reason.
+        let dropped: Vec<Intent> = base.tables[&table]
+            .columns
+            .keys()
+            .filter(|c| !declared.tables[&table].columns.contains_key(*c))
+            .map(|c| Intent::DropColumn {
+                column: table.column(c.raw()),
+                reason: "not needed".parse().unwrap(),
+            })
+            .collect();
+        let mut declared_ids = crate::resolve(declared, &base_ids, &dropped, &ctx())
+            .unwrap()
+            .ids;
+        let uid = declared_ids.table_uid(&table).unwrap().clone();
+        edit(&mut declared_ids, &uid);
+        diff(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .map(|plan| plan.changes().clone())
+        .map_err(|errs| errs.iter().map(ToString::to_string).collect())
+    }
+
+    /// [`exclusion_plan_with`], with each of `records` retired as `pbps
+    /// drop-exclusion` writes it: for the definition the base holds at the name.
+    fn exclusion_plan(
+        base: &Schema,
+        declared: &Schema,
+        records: &[&str],
+    ) -> Result<ChangeSet, Vec<String>> {
+        let table: TableName = "app.booking".parse().unwrap();
+        exclusion_plan_with(base, declared, |ids, uid| {
+            for name in records {
+                let held = &base.tables[&table].exclude[*name];
+                ids.exclusions
+                    .entry(uid.clone())
+                    .or_default()
+                    .insert((*name).into(), retirement(held.canonical_text()));
+            }
+        })
+    }
+
+    /// Dropping one needs the retirement of *this* definition; a rename is a drop
+    /// and an add and needs it too (DEC-2448.4).
     #[test]
-    fn dropping_replacing_or_changing_a_column_under_an_exclusion_is_refused_by_name() {
+    fn a_dropped_exclusion_needs_a_record_of_that_definition() {
         let held = booking(&[("no_overlap", exclusion("int4range(a, b)", "&&"))]);
-        let refusals = |declared: &Schema| -> Vec<String> {
-            let table: TableName = "app.booking".parse().unwrap();
-            let mut errs = Vec::new();
-            let mut changes = Vec::new();
-            diff_exclusions(
-                &table,
-                &held.tables[&table],
-                &declared.tables[&table],
-                &mut changes,
-                &mut errs,
-            );
-            errs.iter().map(ToString::to_string).collect()
-        };
-        // Dropped.
-        let said = refusals(&booking(&[]));
+        let table: TableName = "app.booking".parse().unwrap();
+        // No record: refused, naming the command that records it.
+        let said = exclusion_plan(&held, &booking(&[]), &[]).unwrap_err();
         assert!(
-            said.len() == 1 && said[0].contains("retirement record"),
+            said.len() == 1
+                && said[0].contains("pbps drop-exclusion app.booking no_overlap --reason"),
             "{said:?}"
         );
-        // Replaced (another operator), and renamed (a drop and an add).
-        let said = refusals(&booking(&[(
-            "no_overlap",
-            exclusion("int4range(a, b)", "-|-"),
-        )]));
-        assert!(said.len() == 1 && said[0].contains("replacing"), "{said:?}");
-        let said = refusals(&booking(&[("renamed", exclusion("int4range(a, b)", "&&"))]));
+        // Recorded: one drop, `destructive`, and no constraint risk.
+        let cs = exclusion_plan(&held, &booking(&[]), &["no_overlap"]).unwrap();
+        let [
+            Change::SetExclusion {
+                from: Some(_),
+                to: None,
+                ..
+            },
+        ] = cs
+            .changes
+            .iter()
+            .map(|p| &p.change)
+            .collect::<Vec<_>>()
+            .as_slice()
+        else {
+            panic!("{:?}", kinds(&cs));
+        };
+        assert!(cs.risks().contains(&RiskClass::Destructive));
+        assert!(!cs.risks().contains(&RiskClass::Constraint));
+        // Negative: a record of another definition at the name is no authority.
+        let other = exclusion("int4range(a, b)", "-|-").canonical_text();
+        let said = exclusion_plan_with(&held, &booking(&[]), |ids, uid| {
+            ids.exclusions
+                .entry(uid.clone())
+                .or_default()
+                .insert("no_overlap".into(), retirement(other));
+        });
+        assert!(said.is_err());
+        // Negative: nor is the same record under another table's uid, or at
+        // another name.
+        let was = held.tables[&table].exclude["no_overlap"].canonical_text();
+        let elsewhere = was.clone();
+        let said = exclusion_plan_with(&held, &booking(&[]), |ids, _| {
+            ids.exclusions.insert(
+                "t_zzzzzz".parse().unwrap(),
+                [("no_overlap".into(), retirement(elsewhere))].into(),
+            );
+        });
+        assert!(said.is_err());
+        let said = exclusion_plan_with(&held, &booking(&[]), |ids, uid| {
+            ids.exclusions
+                .entry(uid.clone())
+                .or_default()
+                .insert("another".into(), retirement(was));
+        });
+        assert!(said.is_err());
+        // Renamed: a drop of the old name and an add of the new one, and the
+        // drop needs its record.
+        let renamed = booking(&[("renamed", exclusion("int4range(a, b)", "&&"))]);
+        let said = exclusion_plan(&held, &renamed, &[]).unwrap_err();
         assert!(
             said.len() == 1 && said[0].contains("no_overlap"),
             "{said:?}"
         );
-        // Unchanged, or only another table's change: nothing.
-        assert!(refusals(&held).is_empty());
-        // A column the constraint holds, by key text or by predicate, is held
-        // against a drop or a retype; one it does not hold is free.
+        let cs = exclusion_plan(&held, &renamed, &["no_overlap"]).unwrap();
+        assert_eq!(kinds(&cs), ["SetExclusion", "SetExclusion"]);
+        // Unchanged: nothing to refuse and nothing to plan.
+        assert!(exclusion_plan(&held, &held, &[]).unwrap().is_empty());
+    }
+
+    /// A changed definition at one name is a replacement, as a drop and an add
+    /// that need no reason; only the options changing leaves the constraint
+    /// standing (DEC-2448.4).
+    #[test]
+    fn a_replaced_exclusion_needs_no_record_and_an_option_only_change_keeps_it() {
+        let held = booking(&[("no_overlap", exclusion("int4range(a, b)", "&&"))]);
+        let replaced = booking(&[("no_overlap", exclusion("int4range(a, b)", "-|-"))]);
+        let cs = exclusion_plan(&held, &replaced, &[]).unwrap();
+        let halves: Vec<_> = cs
+            .changes
+            .iter()
+            .map(|p| match &p.change {
+                Change::SetExclusion { from, to, .. } => (from.is_some(), to.is_some()),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(halves, [(true, false), (false, true)]);
+        assert!(cs.risks().contains(&RiskClass::Destructive));
+        assert!(cs.risks().contains(&RiskClass::Constraint));
+        // Options only: one `ALTER INDEX` on the constraint's index.
+        let mut tuned = replaced.clone();
         let table: TableName = "app.booking".parse().unwrap();
+        let x = tuned
+            .tables
+            .get_mut(&table)
+            .unwrap()
+            .exclude
+            .get_mut("no_overlap")
+            .unwrap();
+        *x = exclusion("int4range(a, b)", "&&");
+        x.storage_parameters
+            .insert("fillfactor".into(), "70".into());
+        let cs = exclusion_plan(&held, &tuned, &[]).unwrap();
+        let [
+            Change::SetIndexStorageParameters {
+                target: IndexPart::Exclusion(n),
+                set,
+                reset,
+                ..
+            },
+        ] = cs
+            .changes
+            .iter()
+            .map(|p| &p.change)
+            .collect::<Vec<_>>()
+            .as_slice()
+        else {
+            panic!("{:?}", kinds(&cs));
+        };
+        assert_eq!(n.raw(), "no_overlap");
+        assert_eq!(set.get("fillfactor").map(String::as_str), Some("70"));
+        assert!(reset.is_empty());
+        // Negative: the options and the operator together are a replacement.
+        let mut both = tuned.clone();
+        both.tables
+            .get_mut(&table)
+            .unwrap()
+            .exclude
+            .get_mut("no_overlap")
+            .unwrap()
+            .keys[0]
+            .operator = pbps_model::OperatorRef::symbol("-|-").unwrap();
+        let cs = exclusion_plan(&held, &both, &[]).unwrap();
+        assert_eq!(kinds(&cs), ["SetExclusion", "SetExclusion"]);
+    }
+
+    /// The engine's silent loss of a guarantee under a column change is refused
+    /// by name: a drop of a key column is allowed only where the same plan drops
+    /// the constraint, and a retype never is (DEC-2448.3, DEC-2448.4).
+    #[test]
+    fn a_column_change_under_an_exclusion_is_refused_unless_the_plan_drops_it() {
+        let held = booking(&[("no_overlap", exclusion("int4range(a, b)", "&&"))]);
+        let table: TableName = "app.booking".parse().unwrap();
+        let mut gone = booking(&[]);
+        gone.tables
+            .get_mut(&table)
+            .unwrap()
+            .columns
+            .shift_remove("a");
+        // The column goes and the constraint stays: refused.
+        let mut still = held.clone();
+        still
+            .tables
+            .get_mut(&table)
+            .unwrap()
+            .columns
+            .shift_remove("a");
+        let said = exclusion_plan(&held, &still, &[]).unwrap_err();
+        assert!(
+            said.iter()
+                .any(|m| m.contains("`a`") && m.contains("while the constraint holds it")),
+            "{said:?}"
+        );
+        // The constraint goes with its record: allowed, in one plan.
+        let cs = exclusion_plan(&held, &gone, &["no_overlap"]).unwrap();
+        assert!(
+            kinds(&cs).contains(&"SetExclusion".to_owned()),
+            "{:?}",
+            kinds(&cs)
+        );
+        assert!(
+            kinds(&cs).contains(&"DropColumn".to_owned()),
+            "{:?}",
+            kinds(&cs)
+        );
+        // Negative: both the column and the constraint go, with no record.
+        assert!(exclusion_plan(&held, &gone, &[]).is_err());
         let drop = |column: &str| {
             Change::Column(ColumnChange::DropColumn {
                 uid: "c_aaaaaa".parse().unwrap(),
@@ -11946,6 +12232,30 @@ mod tests {
                 using: None,
             })
         };
+        // The drop is released by a drop in the plan; the retype is not.
+        let released = Change::SetExclusion {
+            table: table.clone(),
+            name: "no_overlap".into(),
+            from: Some(Box::new(exclusion("int4range(a, b)", "&&"))),
+            to: None,
+        };
+        let mut errs = Vec::new();
+        exclusion_hazards(
+            &table,
+            &held.tables[&table],
+            &[drop("a"), released.clone()],
+            &MinimalDialect,
+            &mut errs,
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        exclusion_hazards(
+            &table,
+            &held.tables[&table],
+            &[retype("a"), released],
+            &MinimalDialect,
+            &mut errs,
+        );
+        assert_eq!(errs.len(), 1, "{errs:?}");
         let mut with_filter = held.tables[&table].clone();
         with_filter.exclude.get_mut("no_overlap").unwrap().filter = Some("c > 0".into());
         type Edit<'a> = &'a dyn Fn(&str) -> Change;

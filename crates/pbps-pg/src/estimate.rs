@@ -536,6 +536,9 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
                 pbps_model::IndexPart::Unique(n) | pbps_model::IndexPart::Index(n) => {
                     format!("index {n}", n = n.shown(),)
                 }
+                pbps_model::IndexPart::Exclusion(n) => {
+                    format!("exclusion constraint {n}", n = n.shown())
+                }
             };
             e(
                 format!(
@@ -1504,6 +1507,20 @@ mod tests {
             set.insert("buffering".to_owned(), "off".to_owned());
         }
         let e = estimate(&both, Strategy::default()).unwrap();
+        assert!(matches!(e.lock, Lock::AccessExclusive));
+        // An exclusion constraint's index takes the same per-parameter lock, and
+        // the estimate names the constraint, not an index of the user's (DEC-2448.4).
+        let mut tuned = change(pbps_model::IndexMethod::Gist);
+        if let Change::SetIndexStorageParameters { target, .. } = &mut tuned {
+            *target = pbps_model::IndexPart::Exclusion("x".into());
+        }
+        let e = estimate(&tuned, Strategy::default()).unwrap();
+        assert!(matches!(e.lock, Lock::ShareUpdateExclusive));
+        assert!(e.about.contains("exclusion constraint x"), "{e:?}");
+        if let Change::SetIndexStorageParameters { set, .. } = &mut tuned {
+            set.insert("buffering".to_owned(), "off".to_owned());
+        }
+        let e = estimate(&tuned, Strategy::default()).unwrap();
         assert!(matches!(e.lock, Lock::AccessExclusive));
     }
 

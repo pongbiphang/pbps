@@ -301,3 +301,54 @@ fn merging_a_file_with_itself_or_with_its_base_changes_nothing() {
         );
     }
 }
+
+fn retirement(reason: &str) -> crate::ExclusionRetirement {
+    crate::ExclusionRetirement {
+        was: "{}".into(),
+        reason: reason.into(),
+        operator: "o".into(),
+        dropped_at: "2026-11-15".into(),
+    }
+}
+
+fn with_exclusions(mut f: TreeFile, records: &[(&str, &str)]) -> TreeFile {
+    let Body::Table(t) = &mut f.body else {
+        unreachable!()
+    };
+    t.exclusions = records
+        .iter()
+        .map(|(name, reason)| ((*name).to_owned(), retirement(reason)))
+        .collect();
+    f
+}
+
+/// DEC-2448.4: a retirement is a record of its own in the table's file, so two
+/// branches retiring different constraints both keep theirs, and two retiring
+/// one with different reasons conflict under the table's uid.
+#[test]
+fn retirements_of_different_constraints_merge_and_the_same_one_differently_conflicts() {
+    let none = YamlView::default();
+    let base = base();
+    let ours = with_exclusions(base.clone(), &[("a", "r")]);
+    let theirs = with_exclusions(base.clone(), &[("b", "r")]);
+    let merged = merge(Some(&base), Some(&ours), Some(&theirs), &none)
+        .unwrap()
+        .unwrap();
+    let Body::Table(t) = &merged.body else {
+        unreachable!()
+    };
+    let names: Vec<_> = t.exclusions.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["a", "b"]);
+    let theirs = with_exclusions(base.clone(), &[("a", "another reason")]);
+    let conflicts = merge(Some(&base), Some(&ours), Some(&theirs), &none).unwrap_err();
+    assert_eq!(conflicts[0].section, "exclusions");
+    assert_eq!(conflicts[0].uid, uid("t_aaaaaa"));
+    // A record one side deleted and the other left alone is gone.
+    let merged = merge(Some(&ours), Some(&base), Some(&ours), &none)
+        .unwrap()
+        .unwrap();
+    let Body::Table(t) = &merged.body else {
+        unreachable!()
+    };
+    assert!(t.exclusions.is_empty());
+}

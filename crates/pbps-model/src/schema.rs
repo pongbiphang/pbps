@@ -1689,6 +1689,22 @@ impl ExclusionTiming {
 }
 
 impl ExclusionConstraint {
+    /// The definition as one line of text, the same for equal definitions and
+    /// different for different ones: what a retirement record keeps as `was`
+    /// and a drop is matched against (DEC-2448.4).
+    ///
+    /// The model's own compact JSON, not a rendering of SQL: a rendering has to
+    /// quote every name and expression to stay injective, which is the work a
+    /// serializer already does, and a record that authorised two definitions
+    /// because their spellings met would be the one defect this text exists to
+    /// prevent. It is also the shape a declaration reads, so an auditor sees
+    /// what was given up in the terms it was written in.
+    #[must_use]
+    pub fn canonical_text(&self) -> String {
+        // Plain data with string keys: it cannot fail.
+        serde_json::to_string(self).expect("an exclusion constraint serializes")
+    }
+
     /// The texts of this constraint that are expressions: its predicate and
     /// its expression keys, as [`Index`] reads them for the ordering that
     /// puts a function ahead of what calls it.

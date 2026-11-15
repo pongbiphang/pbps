@@ -1480,6 +1480,9 @@ pub enum IndexPart {
     PrimaryKey,
     Unique(ObjectLocalName),
     Index(ObjectLocalName),
+    /// The backing index of an exclusion constraint (DEC-2448.4): its options
+    /// change in place, the constraint staying as it is.
+    Exclusion(ObjectLocalName),
 }
 
 /// One named part of a table, and what this plan leaves there.

@@ -38,6 +38,16 @@ pub enum Removal {
         uid: Uid,
         name: pbps_model::SearchRef,
     },
+    /// An exclusion constraint the declarations no longer hold on a table they
+    /// still do (DEC-2448.4). It has no uid of its own: the table's, the name
+    /// and the definition it had say which, and a retirement is matched on all
+    /// three.
+    Exclusion {
+        uid: Uid,
+        table: TableName,
+        name: ObjectLocalName,
+        was: Box<pbps_model::ExclusionConstraint>,
+    },
 }
 
 impl std::fmt::Display for Removal {
@@ -51,6 +61,14 @@ impl std::fmt::Display for Removal {
             Self::Type { name, .. } => write!(f, "type {}", name.shown()),
             Self::Extension { name, .. } => write!(f, "extension {}", name.shown()),
             Self::Search { name, .. } => write!(f, "{}", name.shown()),
+            Self::Exclusion { table, name, .. } => {
+                write!(
+                    f,
+                    "exclusion constraint {} on {}",
+                    name.shown(),
+                    table.shown()
+                )
+            }
         }
     }
 }
@@ -210,6 +228,35 @@ pub fn inventory(
                         name: name.column(column.clone()),
                     });
                 }
+            }
+        }
+    }
+    // An exclusion constraint has no uid, so a table that stays is read for the
+    // constraints it no longer declares. A table that goes takes them with it:
+    // its own drop covers its parts.
+    for (uid, old) in &recorded.tables {
+        let Some(held) = recorded_schema
+            .tables
+            .get(old)
+            .filter(|t| !t.exclude.is_empty() && !removed_tables.contains(old))
+        else {
+            continue;
+        };
+        let Some((name, now)) = names
+            .tables
+            .get(uid)
+            .and_then(|name| Some((name, schema.tables.get(name)?)))
+        else {
+            continue;
+        };
+        for (key, was) in &held.exclude {
+            if !now.exclude.contains_key(key) {
+                removed.push(Removal::Exclusion {
+                    uid: uid.clone(),
+                    table: name.clone(),
+                    name: key.clone(),
+                    was: Box::new(was.clone()),
+                });
             }
         }
     }

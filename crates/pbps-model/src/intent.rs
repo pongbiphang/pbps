@@ -88,6 +88,15 @@ pub enum Intent {
         name: crate::SearchRef,
         reason: Reason,
     },
+    /// Drop an exclusion constraint. It has no identity of its own, so the
+    /// table and the constraint's name say which, and the record this becomes
+    /// is what lets a plan drop it (DEC-2448.4). "Why was this guarantee given
+    /// up" is the question an auditor asks of it.
+    DropExclusion {
+        table: TableName,
+        name: crate::ObjectLocalName,
+        reason: Reason,
+    },
     /// Allow the DEFAULT partition's rows inside a new range partition's
     /// range to move into it, at most `max_rows` of them (#1788).
     MoveRows {
@@ -104,6 +113,7 @@ impl Intent {
             Intent::RenameTable { from, to } => from == t || to == t,
             Intent::RenameColumn { table, .. }
             | Intent::DropTable { table, .. }
+            | Intent::DropExclusion { table, .. }
             | Intent::MoveRows { table, .. } => table == t,
             Intent::DropColumn { column, .. } => &column.table == t,
             Intent::RenameType { .. }
@@ -150,6 +160,26 @@ mod tests {
             let valid = serde_json::json!({"intent": kind, target: name, "reason": "approved"});
             assert!(serde_json::from_value::<Intent>(valid).is_ok());
         }
+    }
+
+    #[test]
+    fn serialized_drop_exclusion_intent_cannot_bypass_nonblank_reasons() {
+        let value = |reason: &str| {
+            serde_json::json!({
+                "intent": "drop_exclusion", "table": "app.booking",
+                "name": "no_overlap", "reason": reason
+            })
+        };
+        for reason in ["", " ", "\t\n", "\u{3000}"] {
+            assert!(
+                serde_json::from_value::<Intent>(value(reason)).is_err(),
+                "accepted a blank exclusion reason: {reason:?}"
+            );
+        }
+        let intent: Intent = serde_json::from_value(value("approved")).unwrap();
+        assert!(intent.concerns_table(&t("app.booking")));
+        assert!(!intent.concerns_table(&t("app.other")));
+        assert_eq!(serde_json::to_value(&intent).unwrap(), value("approved"));
     }
 
     #[test]

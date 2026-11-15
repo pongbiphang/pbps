@@ -273,72 +273,352 @@ fn a_declaration_this_tool_cannot_hold_is_refused_and_an_unreadable_exclusion_is
     });
 }
 
-/// What the next PR delivers is refused by name while an exclusion stands: its
-/// drop and replacement (which need the retirement record), and a column change
-/// under it, which the engine would otherwise answer by dropping or rebuilding
-/// the constraint without any plan saying so (measured on 16.15 and 18.6).
+/// Dropping an exclusion needs its recorded reason, for that definition; with
+/// it, the plan drops the constraint and its index in one statement behind the
+/// `destructive` gate, and a pull afterwards writes none and plans nothing
+/// (DEC-2448.4).
 #[test]
 #[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
-fn a_standing_exclusion_is_not_dropped_replaced_or_stripped_of_a_column_by_a_plan() {
+fn a_dropped_exclusion_needs_its_recorded_reason_and_a_pull_after_it_round_trips() {
     let _ = server();
     servers(|url| {
-        let own = OwnDatabase::new(url, "exclude-standing");
+        let own = OwnDatabase::new(url, "exclude-drop");
         let connection = own.connection();
         on_server(connection, SETUP);
-        let d = Demo::new("exclude-standing");
+        let d = Demo::new("exclude-drop");
         succeeds(d.run(&["pull", "--db", connection]));
         d.commit();
         succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
         let path = d.dir.join("schema/app.booking.yml");
         let held = std::fs::read_to_string(&path).unwrap();
-        let refused = |text: String, expected: &str| {
-            std::fs::write(&path, text).unwrap();
-            d.commit();
-            let out = d.run(&["plan", "--db", connection]);
-            assert_ne!(code(&out), 0, "{expected}: {}", said(&out));
-            assert!(said(&out).contains(expected), "{expected}: {}", said(&out));
-            assert_eq!(constraints(connection, "no_overlap"), 1);
-        };
-        // Replaced: another operator on the same name.
-        refused(
-            held.replacen("operator: \"&&\"", "operator: \"-|-\"", 1),
-            "replacing",
+        let dropped = remove_exclusion(&held, "no_overlap");
+        assert_ne!(dropped, held, "{held}");
+        std::fs::write(&path, &dropped).unwrap();
+        // No record: refused at identity, naming the command, and nothing runs.
+        let out = d.run(&["plan", "--db", connection]);
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        assert!(
+            said(&out).contains("pbps drop-exclusion app.booking no_overlap --reason"),
+            "{}",
+            said(&out)
         );
-        // Dropped, or renamed (a drop and an add): the name leaves the file.
-        refused(
-            held.replace("no_overlap:", "no_touching:"),
-            "retirement record",
+        assert_eq!(constraints(connection, "no_overlap"), 1);
+        // A name the baseline does not hold is a typo, not a silent success.
+        let out = d.run(&["drop-exclusion", "app.booking", "nope", "--reason", "x"]);
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        // Recorded: the reason is kept, and saying it twice changes nothing.
+        let recorded = succeeds(d.run(&[
+            "drop-exclusion",
+            "app.booking",
+            "no_overlap",
+            "--reason",
+            "the booking service enforces it now",
+        ]));
+        assert!(said(&recorded).contains("updated"), "{}", said(&recorded));
+        let again = succeeds(d.run(&[
+            "drop-exclusion",
+            "app.booking",
+            "no_overlap",
+            "--reason",
+            "the booking service enforces it now",
+        ]));
+        assert!(said(&again).contains("unchanged"), "{}", said(&again));
+        d.commit();
+        let plan = d.dir.join("plan.json");
+        let sql = d.dir.join("plan.sql");
+        succeeds(d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--out",
+            plan.to_str().unwrap(),
+            "--sql",
+            sql.to_str().unwrap(),
+        ]));
+        let script = std::fs::read_to_string(&sql).unwrap();
+        assert!(
+            script.contains("DROP CONSTRAINT \"no_overlap\"") && !script.contains("DROP INDEX"),
+            "{script}"
         );
-        // A column the constraint holds is retyped: the engine would rebuild
-        // the constraint under an exclusive lock and say nothing. (A drop of
-        // one is refused the same way; the unit test of the differ holds it.)
-        refused(
-            held.replacen(
-                "  room:\n    type: integer\n",
-                "  room:\n    type: bigint\n",
-                1,
+        let refused = approved_apply(&d, connection, &plan, &[]);
+        assert_ne!(code(&refused), 0, "{}", said(&refused));
+        assert!(said(&refused).contains("destructive"), "{}", said(&refused));
+        assert_eq!(constraints(connection, "no_overlap"), 1);
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &plan,
+            &["--allow", "destructive"],
+        ));
+        assert_eq!(constraints(connection, "no_overlap"), 0);
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_class WHERE relname = 'no_overlap'"
             ),
-            "while the constraint holds it",
+            0,
+            "the backing index went with the constraint"
         );
-        // Control: a change that holds none of them is planned. The refused
-        // edits are put back and committed first, so the new column is the only
-        // difference, and its identity is minted offline and committed.
+        assert_eq!(constraints(connection, "one_per_room"), 1);
+        let next = succeeds(d.run(&["plan", "--db", connection]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+        succeeds(d.run(&["verify", "--db", connection]));
+        // A pull of the database as it is now writes none of it: the declarations
+        // are what the database holds, and the record stays in the identity files.
+        let fresh = Demo::new("exclude-drop-pull");
+        succeeds(fresh.run(&["pull", "--db", connection]));
+        let pulled = std::fs::read_to_string(fresh.dir.join("schema/app.booking.yml")).unwrap();
+        assert!(
+            !pulled.contains("no_overlap") && pulled.contains("one_per_room"),
+            "{pulled}"
+        );
+        // Declared again, the name is added like any new constraint: the record
+        // that stays is no obstacle, since it only ever authorises a drop.
         std::fs::write(&path, &held).unwrap();
         d.commit();
-        std::fs::write(
-            &path,
-            held.replacen(
-                "  ip:\n    type: inet\n",
-                "  ip:\n    type: inet\n  extra:\n    type: integer\n",
-                1,
-            ),
-        )
-        .unwrap();
-        succeeds(d.run(&["plan"]));
-        d.commit();
-        let out = succeeds(d.run(&["plan", "--db", connection]));
-        assert!(!said(&out).contains("exclusion"), "{}", said(&out));
+        let script = succeed_plan(&d, connection, &plan, &sql);
+        assert!(script.contains("ADD CONSTRAINT \"no_overlap\""), "{script}");
     });
+}
+
+/// A changed definition at one name replaces the constraint, behind both risks
+/// and with no reason; a change of its storage parameters alone leaves the
+/// constraint and its index standing (DEC-2448.4, measured on 16.15 and 18.6).
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_replaced_exclusion_is_rebuilt_and_an_option_only_change_keeps_it_standing() {
+    let _ = server();
+    servers(|url| {
+        let own = OwnDatabase::new(url, "exclude-replace");
+        let connection = own.connection();
+        on_server(connection, SETUP);
+        let d = Demo::new("exclude-replace");
+        succeeds(d.run(&["pull", "--db", connection]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+        let path = d.dir.join("schema/app.booking.yml");
+        let held = std::fs::read_to_string(&path).unwrap();
+        let oid = |name: &str| {
+            scalar(
+                connection,
+                &format!("SELECT oid::bigint FROM pg_constraint WHERE conname = '{name}'"),
+            )
+        };
+        let plan = d.dir.join("plan.json");
+        let sql = d.dir.join("plan.sql");
+        let plan_to = |text: &str| -> String {
+            std::fs::write(&path, text).unwrap();
+            d.commit();
+            succeed_plan(&d, connection, &plan, &sql)
+        };
+        // Options only: an `ALTER INDEX`, with no flag, and the constraint's own
+        // identity is the same afterwards.
+        let tuned = held.replacen("fillfactor: 70", "fillfactor: 60", 1);
+        assert_ne!(tuned, held, "{held}");
+        let before = oid("no_overlap");
+        let script = plan_to(&tuned);
+        assert!(
+            script.contains("ALTER INDEX \"app\".\"no_overlap\" SET (fillfactor = '60')")
+                && !script.contains("DROP")
+                && !script.contains("ADD CONSTRAINT"),
+            "{script}"
+        );
+        succeeds(approved_apply(&d, connection, &plan, &[]));
+        assert_eq!(oid("no_overlap"), before, "the constraint stands");
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_class WHERE relname = 'no_overlap' \
+                 AND reloptions @> ARRAY['fillfactor=60']"
+            ),
+            1
+        );
+        let next = succeeds(d.run(&["plan", "--db", connection]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+        // A structural change at the name replaces it: the drop, then the add,
+        // behind `destructive` and `constraint`, and no reason is asked.
+        let replaced = tuned.replacen("    include:\n      - note\n", "", 1);
+        let replaced = if replaced == tuned {
+            tuned.replacen("include: [note]", "", 1)
+        } else {
+            replaced
+        };
+        assert_ne!(replaced, tuned, "{tuned}");
+        let script = plan_to(&replaced);
+        let drop = script
+            .find("DROP CONSTRAINT \"no_overlap\"")
+            .expect(&script);
+        let add = script.find("ADD CONSTRAINT \"no_overlap\"").expect(&script);
+        assert!(drop < add && !script.contains("DROP INDEX"), "{script}");
+        let refused = approved_apply(&d, connection, &plan, &["--allow", "destructive"]);
+        assert_ne!(code(&refused), 0, "{}", said(&refused));
+        assert!(said(&refused).contains("constraint"), "{}", said(&refused));
+        assert_eq!(oid("no_overlap"), before, "a refused apply changes nothing");
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &plan,
+            &["--allow", "destructive", "--allow", "constraint"],
+        ));
+        assert_ne!(oid("no_overlap"), before, "the constraint was built again");
+        let next = succeeds(d.run(&["plan", "--db", connection]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+        succeeds(d.run(&["verify", "--db", connection]));
+        // It still enforces.
+        assert!(
+            try_on_server(
+                connection,
+                "INSERT INTO app.booking VALUES (3, 2, 1, 5, 'c', true, NULL)"
+            )
+            .is_err()
+        );
+    });
+}
+
+/// A key column of an exclusion is dropped only in a plan that drops the
+/// constraint with its record; alone, the engine would drop the constraint and
+/// say nothing, so the plan is refused by name, and a retype is refused whatever
+/// else the plan holds (DEC-2448.4, measured on 16.15 and 18.6).
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_key_column_drop_under_an_exclusion_is_refused_alone_and_planned_with_its_drop() {
+    let _ = server();
+    servers(|url| {
+        let own = OwnDatabase::new(url, "exclude-column");
+        let connection = own.connection();
+        on_server(connection, SETUP);
+        let d = Demo::new("exclude-column");
+        succeeds(d.run(&["pull", "--db", connection]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+        let path = d.dir.join("schema/app.booking.yml");
+        let held = std::fs::read_to_string(&path).unwrap();
+        // `room` is `one_per_room`'s key. A declaration cannot keep the constraint
+        // without the column (`validate` refuses it), so the column goes with it,
+        // and without the constraint's record the plan is refused at identity,
+        // naming the command: the engine would otherwise have dropped the
+        // constraint with the column and said nothing.
+        let no_room = remove_exclusion(&remove_column(&held, "room"), "one_per_room");
+        assert_ne!(no_room, held, "{held}");
+        std::fs::write(&path, &no_room).unwrap();
+        succeeds(d.run(&["drop", "app.booking.room", "--reason", "retired"]));
+        d.commit();
+        let out = d.run(&["plan", "--db", connection]);
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        assert!(
+            said(&out).contains("pbps drop-exclusion app.booking one_per_room --reason"),
+            "{}",
+            said(&out)
+        );
+        assert_eq!(constraints(connection, "one_per_room"), 1);
+        // With its record, the constraint leaves first and the column after:
+        // planned, and applied.
+        // HEAD no longer declares it: the baseline is the revision before.
+        let out = d.run(&[
+            "drop-exclusion",
+            "app.booking",
+            "one_per_room",
+            "--reason",
+            "the column is retired",
+        ]);
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        succeeds(d.run(&[
+            "drop-exclusion",
+            "app.booking",
+            "one_per_room",
+            "--reason",
+            "the column is retired",
+            "--since",
+            "HEAD~1",
+        ]));
+        d.commit();
+        let plan = d.dir.join("plan.json");
+        let sql = d.dir.join("plan.sql");
+        let script = succeed_plan(&d, connection, &plan, &sql);
+        let constraint = script
+            .find("DROP CONSTRAINT \"one_per_room\"")
+            .expect(&script);
+        let column = script.find("DROP COLUMN \"room\"").expect(&script);
+        assert!(constraint < column, "{script}");
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &plan,
+            &["--allow", "destructive"],
+        ));
+        assert_eq!(constraints(connection, "one_per_room"), 0);
+        assert_eq!(constraints(connection, "no_overlap"), 1);
+        let next = succeeds(d.run(&["plan", "--db", connection]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+        succeeds(d.run(&["verify", "--db", connection]));
+    });
+}
+
+/// The plan's SQL for the declarations as they stand, which must plan.
+fn succeed_plan(
+    d: &Demo,
+    connection: &str,
+    plan: &std::path::Path,
+    sql: &std::path::Path,
+) -> String {
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    std::fs::read_to_string(sql).unwrap()
+}
+
+/// `text` without the `exclude:` entry `name`: the entry's own lines, up to the
+/// next one at its indent. A pulled file indents an entry two spaces under
+/// `exclude:`.
+fn remove_exclusion(text: &str, name: &str) -> String {
+    let mut out = Vec::new();
+    let mut skipping = false;
+    for line in text.lines() {
+        if line == format!("  {name}:") {
+            skipping = true;
+            continue;
+        }
+        if skipping {
+            if line.starts_with("    ") {
+                continue;
+            }
+            skipping = false;
+        }
+        out.push(line);
+    }
+    let mut out = out.join("\n") + "\n";
+    // The map is left empty when its last entry went: drop the key too.
+    if out.contains("exclude:\n") && !out.contains("exclude:\n  ") {
+        out = out.replace("exclude:\n", "");
+    }
+    out
+}
+
+/// `text` without the column `name`: its lines under `columns:`, at the
+/// indent a pulled file writes them.
+fn remove_column(text: &str, name: &str) -> String {
+    let mut out = Vec::new();
+    let mut skipping = false;
+    for line in text.lines() {
+        if line == format!("  {name}:") {
+            skipping = true;
+            continue;
+        }
+        if skipping {
+            if line.starts_with("    ") {
+                continue;
+            }
+            skipping = false;
+        }
+        out.push(line);
+    }
+    out.join("\n") + "\n"
 }
 
 /// A retype of a column an exclusion's expression holds is refused by name

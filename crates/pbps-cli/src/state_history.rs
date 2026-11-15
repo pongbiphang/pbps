@@ -244,6 +244,8 @@ fn historical_ids(
     ids.moves.retain(|uid, _| observed.tables.contains_key(uid));
     ids.conversions
         .retain(|uid, _| observed.columns.contains_key(uid));
+    ids.exclusions
+        .retain(|uid, _| observed.tables.contains_key(uid));
     pbps_model::IdsFile {
         version: ids.version,
         tables: observed.tables,
@@ -256,6 +258,7 @@ fn historical_ids(
         moves: ids.moves,
         rebuilds: ids.rebuilds,
         conversions: ids.conversions,
+        exclusions: ids.exclusions,
     }
 }
 
@@ -1446,6 +1449,20 @@ mod tests {
             conversions: ["c_aaaaaa", "c_bbbbbb"]
                 .map(|uid| (uid.parse().unwrap(), conversion.clone()))
                 .into(),
+            exclusions: ["t_aaaaaa", "t_bbbbbb"]
+                .map(|uid| {
+                    let retired = pbps_model::ExclusionRetirement {
+                        was: "{}".into(),
+                        reason: "selected".into(),
+                        operator: "selected".into(),
+                        dropped_at: "2026-11-15".into(),
+                    };
+                    (
+                        uid.parse().unwrap(),
+                        [("no_overlap".into(), retired)].into(),
+                    )
+                })
+                .into(),
         };
         recorded.clone().validated().unwrap();
         let mut other = recorded.clone();
@@ -1465,6 +1482,11 @@ mod tests {
             .conversions
             .values_mut()
             .for_each(|entry| entry.using = "other".into());
+        other
+            .exclusions
+            .values_mut()
+            .flat_map(|named| named.values_mut())
+            .for_each(|entry| entry.reason = "other".into());
         let selected = recorded.clone();
         recorded.tables.remove(&"t_bbbbbb".parse().unwrap());
         recorded.columns.remove(&"c_bbbbbb".parse().unwrap());
@@ -1473,6 +1495,7 @@ mod tests {
         recorded.extensions.remove(&"e_bbbbbb".parse().unwrap());
         recorded.moves.remove(&"t_bbbbbb".parse().unwrap());
         recorded.conversions.remove(&"c_bbbbbb".parse().unwrap());
+        recorded.exclusions.remove(&"t_bbbbbb".parse().unwrap());
         assert_eq!(historical_ids(&schema, &selected, &other), recorded);
         assert_eq!(
             historical_ids(&schema, &selected, &Default::default()),
@@ -1501,6 +1524,10 @@ mod tests {
         assert!(
             completed.conversions.is_empty(),
             "borrowed names do not grant a conversion"
+        );
+        assert!(
+            completed.exclusions.is_empty(),
+            "borrowed names do not retire an exclusion constraint"
         );
         completed.validated().unwrap();
         selected.validated().unwrap();
@@ -1554,6 +1581,7 @@ mod tests {
             .into(),
             moves: BTreeMap::new(),
             conversions: BTreeMap::new(),
+            exclusions: BTreeMap::new(),
             rebuilds: [(
                 table_collision.clone(),
                 pbps_model::Rebuild {

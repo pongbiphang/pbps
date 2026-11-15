@@ -307,7 +307,13 @@ impl<'a> Allocation<'a> {
                     .chain(index.include.iter().cloned())
                     .collect()
             }
-            (IndexPart::PrimaryKey | IndexPart::Unique(_) | IndexPart::Index(_), _) => {
+            (
+                IndexPart::PrimaryKey
+                | IndexPart::Unique(_)
+                | IndexPart::Index(_)
+                | IndexPart::Exclusion(_),
+                _,
+            ) => {
                 return Err(format!(
                     "{}: partition index kind disagrees",
                     self.root.table.shown()

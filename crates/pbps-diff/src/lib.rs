@@ -29,7 +29,7 @@ pub mod schema_diff;
 
 pub use identity::{
     Blocker, Context, RenameSide, RenameSource, Resolution, intent_is_absorbed, resolve,
-    resolve_pulled, resolve_with_annotations,
+    resolve_pulled, resolve_with_annotations, resolve_with_annotations_against,
 };
 pub use managed::{
     Scoped, external_parents, observed_ids, observed_ids_reserving, own_parts, scope,

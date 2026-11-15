@@ -18,6 +18,7 @@ pub fn clone_name(
         IndexPart::PrimaryKey => "pkey",
         IndexPart::Unique(_) => "key",
         IndexPart::Index(_) => "idx",
+        IndexPart::Exclusion(_) => "excl",
     };
     let mut addition = String::new();
     if !matches!(part, IndexPart::PrimaryKey) {

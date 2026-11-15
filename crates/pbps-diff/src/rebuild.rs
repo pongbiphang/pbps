@@ -522,6 +522,7 @@ fn restored(ids: &IdsFile, key: &Uid, record: &Rebuild) -> IdsFile {
     for uid in record.replacement.tables.keys() {
         out.tables.remove(uid);
         out.moves.remove(uid);
+        out.exclusions.remove(uid);
     }
     // A conversion recorded for a replacement column went with the column, as
     // a move went with its table; left behind it would orphan the file.
@@ -565,6 +566,7 @@ fn restored_chain<'a>(ids: &IdsFile, links: impl Iterator<Item = &'a Rebuild>) -
             out.tables.remove(uid);
             out.columns.remove(uid);
             out.moves.remove(uid);
+            out.exclusions.remove(uid);
             out.conversions.remove(uid);
         }
     }
@@ -893,6 +895,8 @@ pub(crate) fn lineage_errors(
             | pbps_model::ids::IdsError::KindMismatch { .. }
             | pbps_model::ids::IdsError::OrphanColumn { .. }
             | pbps_model::ids::IdsError::OrphanMove { .. }
+            | pbps_model::ids::IdsError::OrphanExclusion { .. }
+            | pbps_model::ids::IdsError::InvalidExclusion { .. }
             | pbps_model::ids::IdsError::OrphanConversion { .. }
             | pbps_model::ids::IdsError::InvalidDropRequirement { .. }
             | pbps_model::ids::IdsError::InvalidConversion { .. }

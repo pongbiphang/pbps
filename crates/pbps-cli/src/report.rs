@@ -32,6 +32,11 @@ use pbps_model::{Change, ChangeSet, DriftReport, Intent, RiskClass, TableName};
 pub(crate) const DROP_EXTENSION: &str = "drop-extension";
 pub(crate) const DROP_SEARCH: &str = "drop-search";
 
+/// The command that retires an exclusion constraint (DEC-2448.4). It has no
+/// batch spelling: its target is a table and a name, which the batch's pairs
+/// cannot carry.
+pub(crate) const DROP_EXCLUSION: &str = "drop-exclusion";
+
 /// One intent in the user's own vocabulary.
 ///
 /// An intent retains its meaning, not where it was supplied (SPEC §6). Describe
@@ -79,6 +84,15 @@ pub fn intent(i: &Intent) -> String {
         Intent::DropSearch { name, reason } => {
             format!("drop {} (reason: {reason})", name.shown())
         }
+        Intent::DropExclusion {
+            table,
+            name,
+            reason,
+        } => format!(
+            "drop exclusion constraint {} on {} (reason: {reason})",
+            name.shown(),
+            table.shown()
+        ),
         Intent::MoveRows {
             table,
             max_rows,
@@ -140,6 +154,9 @@ fn decision_count(blocker: &Blocker) -> Option<usize> {
         | Blocker::DropExtensionNeedsReason { .. }
         | Blocker::DropSearchNeedsReason { .. }
         | Blocker::DropRoleNeedsReason { .. } => Some(1),
+        // Answered by its own command only: counted as no decision, so it
+        // neither forms nor prevents a batch of the others.
+        Blocker::DropExclusionNeedsReason { .. } => Some(0),
         Blocker::ProvisionalTableIdentity { blocker, .. } => decision_count(blocker),
         Blocker::UnusedIntent { .. }
         | Blocker::ConflictingRenameIntents { .. }
@@ -223,9 +240,9 @@ fn supplied_flag(intent: &Intent) -> Option<String> {
             reason.as_ref(),
             "why",
         ),
-        // MoveRows remains a separate command (SPEC §6.5); do not advertise an
-        // option the identity batch does not accept.
-        Intent::MoveRows { .. } => return None,
+        // MoveRows and DropExclusion remain separate commands (SPEC §6.5); do
+        // not advertise an option the identity batch does not accept.
+        Intent::DropExclusion { .. } | Intent::MoveRows { .. } => return None,
     })
 }
 
@@ -376,7 +393,8 @@ fn batch_flags(blocker: &Blocker, fixed: &mut Vec<String>, choices: &mut Vec<Str
             batch_flags(blocker, &mut conditional, choices);
             choices.extend(conditional.into_iter().map(|flag| format!("      {flag}")));
         }
-        Blocker::UnusedIntent { .. }
+        Blocker::DropExclusionNeedsReason { .. }
+        | Blocker::UnusedIntent { .. }
         | Blocker::ConflictingRenameIntents { .. }
         | Blocker::RenameTargetExists { .. }
         | Blocker::UnrepresentableName { .. }
@@ -632,6 +650,56 @@ mod batch_tests {
         );
     }
 
+    /// A retired exclusion constraint reads as a decision in the report, as a drop
+    /// does, with a command a person can run; it cannot join a batch, so it neither
+    /// forms one nor hides one (DEC-2448.4).
+    #[test]
+    fn an_exclusion_drop_reads_as_a_decision_with_its_own_command() {
+        let missing = Blocker::DropExclusionNeedsReason {
+            table: "app.booking".parse().unwrap(),
+            name: "no_overlap".into(),
+        };
+        let human = super::blockers(std::slice::from_ref(&missing));
+        assert!(
+            human.contains("pbps drop-exclusion app.booking no_overlap --reason \"\""),
+            "{human}"
+        );
+        assert!(human.contains("a drop must record why"), "{human}");
+        assert!(human.contains("a rename is a drop and an add"), "{human}");
+        assert_eq!(
+            blocker_finding(&missing).id,
+            "identity.drop-exclusion-needs-reason"
+        );
+        // Counted as no decision: alone it makes no batch, and beside a batch it
+        // does not break it.
+        assert!(batch_remedy(std::slice::from_ref(&missing), &[]).is_none());
+        let mixed = batch_remedy(
+            &[
+                missing.clone(),
+                Blocker::DropColumnNeedsReason {
+                    column: "app.t.a".parse().unwrap(),
+                },
+                Blocker::DropColumnNeedsReason {
+                    column: "app.t.b".parse().unwrap(),
+                },
+            ],
+            &[],
+        )
+        .unwrap();
+        assert!(!mixed.contains("no_overlap"), "{mixed}");
+        let supplied = Intent::DropExclusion {
+            table: "app.booking".parse().unwrap(),
+            name: "no_overlap".into(),
+            reason: "retired".parse().unwrap(),
+        };
+        assert_eq!(
+            intent(&supplied),
+            "drop exclusion constraint no_overlap on app.booking (reason: retired)"
+        );
+        // Negative: nothing advertises a batch option that does not exist.
+        assert_eq!(supplied_flag(&supplied), None);
+    }
+
     #[test]
     fn every_missing_identity_reason_is_an_empty_double_quoted_argument() {
         for blocker in [
@@ -756,6 +824,7 @@ pub fn blocker_finding(b: &Blocker) -> crate::output::Finding {
             Blocker::DropRoleNeedsReason { .. } => "identity.drop-role-needs-reason",
             Blocker::DropExtensionNeedsReason { .. } => "identity.drop-extension-needs-reason",
             Blocker::DropSearchNeedsReason { .. } => "identity.drop-search-needs-reason",
+            Blocker::DropExclusionNeedsReason { .. } => "identity.drop-exclusion-needs-reason",
             Blocker::UnusedIntent { .. } => "identity.unused-intent",
             Blocker::ConflictingRenameIntents { .. } => "identity.conflicting-rename-intents",
             Blocker::RenameTargetExists { .. } => "identity.rename-target-exists",
@@ -956,6 +1025,15 @@ fn one_blocker(b: &Blocker) -> String {
              pbps {DROP_SEARCH} {argument} --reason {why}\n",
             argument = shell_arg(&name.raw().to_string()).unwrap_or_else(|| placeholder("object")),
             name = name.shown(),
+        ),
+        Blocker::DropExclusionNeedsReason { table, name } => format!(
+            "  exclusion constraint {name} disappeared from {table}, but a drop must record why — \
+             the guarantee it enforced is given up, and a rename is a drop and an add\n\n    \
+             pbps {DROP_EXCLUSION} {table_arg} {name_arg} --reason {why}\n",
+            table_arg = shell_arg(&table.raw().to_string()).unwrap_or_else(|| placeholder("table")),
+            name_arg = shell_arg(name.raw()).unwrap_or_else(|| placeholder("constraint")),
+            name = name.shown(),
+            table = table.shown(),
         ),
         Blocker::UnusedIntent { intent: i } => {
             format!(
@@ -1985,6 +2063,9 @@ pub fn describe(c: &Change) -> String {
                     format!("unique constraint {n}", n = n.shown(),)
                 }
                 pbps_model::IndexPart::Index(n) => format!("index {n}", n = n.shown(),),
+                pbps_model::IndexPart::Exclusion(n) => {
+                    format!("exclusion constraint {n}", n = n.shown())
+                }
             };
             format!("~ storage parameters of {of}: {}", parts.join(", "))
         }

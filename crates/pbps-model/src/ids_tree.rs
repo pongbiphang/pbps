@@ -18,7 +18,7 @@ use std::marker::PhantomData;
 use crate::escape::Escaped;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{Conversion, IdsError, IdsFile, Move, Tombstone};
+use crate::ids::{Conversion, ExclusionRetirement, IdsError, IdsFile, Move, Tombstone};
 use crate::name::{ColumnRef, ObjectLocalName, RoleName, TableName};
 use crate::uid::{Uid, UidKind};
 use crate::{Rebuild, TypeRef};
@@ -121,6 +121,10 @@ pub struct TableBody {
     pub moves: Vec<(Uid, Move)>,
     pub conversions: Vec<(Uid, Conversion)>,
     pub rebuilds: Vec<(Uid, Rebuild)>,
+    /// The exclusion constraints of this table that a human retired, by the
+    /// constraint's name: the table is the file, so its uid is not repeated
+    /// (DEC-2448.4).
+    pub exclusions: Vec<(String, ExclusionRetirement)>,
 }
 
 /// One parsed file: the object it identifies, what it holds, and, for a
@@ -179,9 +183,16 @@ fn line<T: Serialize + ?Sized>(value: &T) -> String {
 }
 
 fn section<V: Serialize>(name: &str, records: &[(Uid, V)]) -> String {
+    section_keyed(name, records.iter().map(|(uid, v)| (uid.as_str(), v)))
+}
+
+fn section_keyed<'a, V: Serialize + 'a>(
+    name: &str,
+    records: impl Iterator<Item = (&'a str, &'a V)>,
+) -> String {
     let mut s = format!("  \"{name}\": {{\n\n");
-    for (uid, value) in records {
-        s.push_str(&format!("    {}: {},\n\n", line(uid.as_str()), line(value)));
+    for (key, value) in records {
+        s.push_str(&format!("    {}: {},\n\n", line(key), line(value)));
     }
     s.push_str("    \"_end\": true\n\n  }");
     s
@@ -219,6 +230,12 @@ pub fn render(file: &TreeFile) -> String {
         }
         if !t.rebuilds.is_empty() {
             top.push(section("rebuilds", &t.rebuilds));
+        }
+        if !t.exclusions.is_empty() {
+            top.push(section_keyed(
+                "exclusions",
+                t.exclusions.iter().map(|(name, r)| (name.as_str(), r)),
+            ));
         }
     }
     format!("{{\n{}\n}}\n", top.join(",\n"))
@@ -304,6 +321,7 @@ struct Raw {
     moves: Option<Section<Move>>,
     conversions: Option<Section<Conversion>>,
     rebuilds: Option<Section<Rebuild>>,
+    exclusions: Option<Section<ExclusionRetirement>>,
 }
 
 fn malformed(path: &str, message: impl Into<String>) -> TreeError {
@@ -386,6 +404,42 @@ fn keyed<V>(
         .collect()
 }
 
+/// Unwraps a section keyed by a name instead of a uid, with the same checks of
+/// the sentinel and of duplicates.
+fn by_name<V>(
+    path: &str,
+    name: &'static str,
+    section: Option<Section<V>>,
+) -> Result<Vec<(String, V)>, TreeError> {
+    // The checks are the uid reader's; only the key differs, so one
+    // reads the other's output through the uid-free parts of it.
+    let Some(section) = section else {
+        return Ok(Vec::new());
+    };
+    match section.end {
+        End::Missing => {
+            return Err(TreeError::SentinelMissing {
+                path: path.to_owned(),
+                section: name,
+            });
+        }
+        End::NotLast => {
+            return Err(TreeError::SentinelNotLast {
+                path: path.to_owned(),
+                section: name,
+            });
+        }
+        End::Last => {}
+    }
+    if let Some(key) = section.duplicate {
+        return Err(TreeError::DuplicateKey {
+            path: path.to_owned(),
+            key,
+        });
+    }
+    Ok(section.records)
+}
+
 /// What an entry of the identity tree must be, said the same way by every reader
 /// (the working tree, a revision, git's index): a regular file named `*.json`.
 /// `parse` does not look at names, so each reader asks this first, and a
@@ -430,6 +484,7 @@ pub fn parse(path: &str, text: &str) -> Result<TreeFile, TreeError> {
             moves: keyed(path, "moves", raw.moves, UidKind::Table, false)?,
             conversions: keyed(path, "conversions", raw.conversions, UidKind::Column, false)?,
             rebuilds: keyed(path, "rebuilds", raw.rebuilds, UidKind::Table, false)?,
+            exclusions: by_name(path, "exclusions", raw.exclusions)?,
         })
     } else {
         if raw.columns.is_some()
@@ -437,6 +492,7 @@ pub fn parse(path: &str, text: &str) -> Result<TreeFile, TreeError> {
             || raw.moves.is_some()
             || raw.conversions.is_some()
             || raw.rebuilds.is_some()
+            || raw.exclusions.is_some()
         {
             return Err(malformed(path, "only a table file has sections"));
         }
@@ -486,7 +542,8 @@ fn check(path: &str, file: &TreeFile) -> Result<(), TreeError> {
         && !(columns.is_empty()
             && partitions.is_empty()
             && t.moves.is_empty()
-            && t.conversions.is_empty())
+            && t.conversions.is_empty()
+            && t.exclusions.is_empty())
     {
         return Err(TreeError::DroppedWithLive {
             path: path.to_owned(),
@@ -577,6 +634,9 @@ fn check_names(path: &str, file: &TreeFile) -> Result<(), TreeError> {
                     Rec::Dead(tomb) => nonempty(&tomb.was)?,
                 }
             }
+            for (name, _) in &t.exclusions {
+                nonempty(name)?;
+            }
         }
     }
     Ok(())
@@ -665,6 +725,17 @@ pub fn assemble(files: &BTreeMap<String, String>) -> Result<IdsFile, TreeError> 
                 for (uid, r) in &t.rebuilds {
                     claim("rebuilds", uid, path)?;
                     ids.rebuilds.insert(uid.clone(), r.clone());
+                }
+                // The file's own uid owns every record in its section, so
+                // another file cannot claim the same table's records.
+                if !t.exclusions.is_empty() {
+                    ids.exclusions.insert(
+                        file.uid.clone(),
+                        t.exclusions
+                            .iter()
+                            .map(|(name, r)| (ObjectLocalName::new(name.as_str()), r.clone()))
+                            .collect(),
+                    );
                 }
             }
             Body::Role(_) | Body::Type(_) | Body::Search(_) | Body::Extension(_) => {}
@@ -877,6 +948,20 @@ pub fn split(ids: &IdsFile, placement: &Placement) -> Result<BTreeMap<String, St
             .push((uid.clone(), r.clone()));
     }
 
+    let mut exclusions: BTreeMap<Uid, Vec<(String, ExclusionRetirement)>> = BTreeMap::new();
+    for (uid, named) in &ids.exclusions {
+        // A partition has no file of its own, and an exclusion on one is
+        // refused (DEC-2448.3), so the owner is always a table that has one.
+        table_file(uid, &mut files)?;
+        exclusions.insert(
+            uid.clone(),
+            named
+                .iter()
+                .map(|(name, r)| (name.raw().to_owned(), r.clone()))
+                .collect(),
+        );
+    }
+
     let mut out = BTreeMap::new();
     let mut owner_of_path: BTreeMap<String, Uid> = BTreeMap::new();
     for (uid, mut file) in files {
@@ -897,6 +982,7 @@ pub fn split(ids: &IdsFile, placement: &Placement) -> Result<BTreeMap<String, St
             t.moves = ordered(moves.remove(&uid).unwrap_or_default(), None);
             t.conversions = ordered(conversions.remove(&uid).unwrap_or_default(), None);
             t.rebuilds = ordered(rebuilds.remove(&uid).unwrap_or_default(), None);
+            t.exclusions = exclusions.remove(&uid).unwrap_or_default();
         }
         check(path, &file)?;
         out.insert(path.clone(), render(&file));

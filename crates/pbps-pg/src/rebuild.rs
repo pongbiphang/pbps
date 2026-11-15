@@ -130,7 +130,9 @@ pub async fn plan<S: pbps_diff::order::RouteState<D>, D: pbps_dialect::Dialect>(
                         PartitionIndexDefinition::Index(_)
                         | PartitionIndexDefinition::Unique(_) => match &part {
                             IndexPart::Index(n) | IndexPart::Unique(n) => n.clone(),
-                            IndexPart::PrimaryKey => unreachable!(),
+                            // An exclusion is refused on a partitioned table, so
+                            // none is ever a part of a partitioned index.
+                            IndexPart::PrimaryKey | IndexPart::Exclusion(_) => unreachable!(),
                         },
                     };
                     Ok(BuildPartitionedIndex {

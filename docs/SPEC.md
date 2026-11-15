@@ -577,9 +577,14 @@ indexes:
   and the optional `include:`, `where:`, `storage_parameters:`, `deferrable:` and
   `initially:`. It is added by its own change after the table's rows, behind the
   `constraint` risk, and takes an exclusive lock while it checks every row. There
-  is no `NOT VALID` or `NOT ENFORCED` for it. Dropping, replacing or renaming one,
-  a change to a column it holds, and a partitioned table's are refused by name until
-  the parts that deliver them (DEC-2448.3). SQL Server has no such constraint.
+  is no `NOT VALID` or `NOT ENFORCED` for it. Dropping one (a rename is a drop and
+  an add) needs the retirement `pbps drop-exclusion TABLE NAME --reason WHY` records
+  for that definition, behind the `destructive` risk; a changed definition at one
+  name is a replacement of two changes and needs none, and a change of its storage
+  parameters alone is an `ALTER INDEX` that leaves it standing. Dropping a column it
+  holds is allowed only in a plan that drops the constraint; a retype and a
+  partitioned table's constraint are refused by name until the parts that deliver
+  them (DEC-2448.3, DEC-2448.4). SQL Server has no such constraint.
 - **A stored generated column is `generated: {expression: "a * 2", stored:
   true}`** (PostgreSQL): computed on every write, never a default, and its
   kind always said. Its expression changes in place on PostgreSQL 17 and
@@ -1786,7 +1791,7 @@ An invalid, conflicting, or incomplete batch writes nothing; no partial answers
 are saved. The existing single-intent commands use the same path with one
 decision (DEC-1791.1). Compose's existing single-intent input is unchanged.
 
-For `drop`, `drop-table`, `drop-role`, `move-rows` and `rebuild-table`,
+For `drop`, `drop-table`, `drop-role`, `drop-exclusion`, `move-rows` and `rebuild-table`,
 `--reason -` reads UTF-8 from stdin to EOF. Exactly one final LF or CRLF is
 removed; all other characters, including surrounding whitespace and embedded
 newlines, are recorded verbatim. Empty, whitespace-only or non-UTF-8 input is
@@ -2798,7 +2803,7 @@ recorded structure and declared reference data, not lost business rows (14.3).
 | `pbps plan --check` | CI mode: fail only when intent is missing or the identity files are not what `plan` would write (6.2), never prompt, and never connect |
 | `pbps fmt` / `fmt --check` | Canonicalize the declaration format |
 | `pbps partitions extend <table> --every <step> --until <end> [--from <start>]` | Declare a PostgreSQL RANGE-partitioned table's next partitions in its file, from the last declared range to an end the user states; reads no clock and no database, writes no identity (see 4.3) |
-| `pbps rename` / `rename-table` / `rename-role` / `drop` / `drop-table` / `drop-role` / `move-rows` / `convert` | Record intent into the identity files |
+| `pbps rename` / `rename-table` / `rename-role` / `drop` / `drop-table` / `drop-role` / `drop-exclusion` / `move-rows` / `convert` | Record intent into the identity files |
 | `pbps ids migrate` | Move a project's identities from the single file `schema.ids.json` into the identity files, replace `ids_file` by `ids_dir` in `pbps.yml` and delete the old file (5.4). It checks that the files read back to the same mapping, stages nothing, and finishes the work if run again after an interruption |
 | `pbps ids fmt` / `ids fmt --check` | Rewrite every identity file to its canonical bytes without changing its meaning; if any file cannot be read, none is rewritten. `--check` lists the files that differ and exits non-zero without writing |
 | `pbps ids resolve` | After the YAML conflicts are resolved, merge the identity files git left unmerged, by uid, and write canonical bytes. It never picks a side, refuses what the resolved YAML cannot decide, and stages nothing (5.3) |

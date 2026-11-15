@@ -73,11 +73,25 @@ fn records<V: Clone + PartialEq + Serialize>(
     decide: &dyn Fn(&V, &V) -> Option<V>,
     conflicts: &mut Vec<Conflict>,
 ) -> Vec<(Uid, V)> {
-    let index = |side: &[(Uid, V)]| side.iter().cloned().collect::<BTreeMap<_, _>>();
+    records_by(section, base, ours, theirs, decide, conflicts, &Uid::clone)
+}
+
+/// One section by any key. A conflict names a uid, so `uid_of` says which one a
+/// key's conflict is reported under (a table's records are named by the table).
+fn records_by<K: Clone + Ord, V: Clone + PartialEq + Serialize>(
+    section: &'static str,
+    base: &[(K, V)],
+    ours: &[(K, V)],
+    theirs: &[(K, V)],
+    decide: &dyn Fn(&V, &V) -> Option<V>,
+    conflicts: &mut Vec<Conflict>,
+    uid_of: &dyn Fn(&K) -> Uid,
+) -> Vec<(K, V)> {
+    let index = |side: &[(K, V)]| side.iter().cloned().collect::<BTreeMap<_, _>>();
     let (b, o, t) = (index(base), index(ours), index(theirs));
     // Ours first, in its order, then what only theirs holds: a stable base for
     // the order the caller restores from the YAML.
-    let mut uids: Vec<&Uid> = ours.iter().map(|(u, _)| u).collect();
+    let mut uids: Vec<&K> = ours.iter().map(|(u, _)| u).collect();
     uids.extend(
         theirs
             .iter()
@@ -95,7 +109,7 @@ fn records<V: Clone + PartialEq + Serialize>(
             }
             .or_else(|| {
                 conflicts.push(Conflict {
-                    uid: uid.clone(),
+                    uid: uid_of(uid),
                     section,
                     ours: show(ov),
                     theirs: show(tv),
@@ -235,7 +249,7 @@ pub fn merge(
                 Some(Body::Table(b)) => b.clone(),
                 _ => TableBody::default(),
             };
-            Body::Table(merge_table(&name, &b, o, t, yaml, &mut conflicts))
+            Body::Table(merge_table(uid, &name, &b, o, t, yaml, &mut conflicts))
         }
         _ => match kind {
             "role" => Body::Role(name),
@@ -270,6 +284,7 @@ fn show_file(file: &TreeFile) -> String {
 }
 
 fn merge_table(
+    uid: &Uid,
     name: &str,
     base: &TableBody,
     ours: &TableBody,
@@ -329,6 +344,18 @@ fn merge_table(
         &never,
         conflicts,
     );
+    // Keyed by the constraint's name inside this table's file; a conflict is
+    // named by the table's uid.
+    let mut exclusions = records_by(
+        "exclusions",
+        &base.exclusions,
+        &ours.exclusions,
+        &theirs.exclusions,
+        &never,
+        conflicts,
+        &|_| uid.clone(),
+    );
+    exclusions.sort_by(|a, b| a.0.cmp(&b.0));
     // Back to the YAML's order (design §2.4 rule 1), through the one rule the
     // writer uses. With no YAML view there is no order to restore, and the
     // order the sides agree on stands.
@@ -342,6 +369,7 @@ fn merge_table(
         moves: sorted(moves),
         conversions: sorted(conversions),
         rebuilds: sorted(rebuilds),
+        exclusions,
     }
 }
 
