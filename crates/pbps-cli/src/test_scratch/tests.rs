@@ -23,12 +23,16 @@ struct Dir {
 
 impl Dir {
     fn new() -> Self {
+        Self::at(
+            std::env::temp_dir().join(format!("pbps-test-scratch-{:032x}", rand::random::<u128>())),
+        )
+    }
+
+    fn at(base: PathBuf) -> Self {
         static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let serial = SERIAL
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let base =
-            std::env::temp_dir().join(format!("pbps-test-scratch-{:032x}", rand::random::<u128>()));
         let dir = StateDir::open(base.join("test-runs")).unwrap();
         Self {
             base,
@@ -1234,6 +1238,8 @@ mod recovery {
     }
 }
 
+mod stranded2858;
+
 /// Against a real runtime, on the pinned PostgreSQL scratch image.
 mod live {
     use super::super::runtime::Docker;
@@ -1242,6 +1248,7 @@ mod live {
     use pbps_config::resolver::PullPolicy;
     use pbps_db::Driver;
 
+    mod killed2858;
     mod sweep2471;
 
     fn image() -> String {
@@ -1278,7 +1285,7 @@ mod live {
     }
 
     pub(super) async fn recorded_and_finished(driver: Driver, image: &str) {
-        let d = Dir::new();
+        let d = Dir::live().await;
         let scratch = Box::pin(start_on(&d, driver, image)).await;
         pbps_db::Conn::connect(driver, scratch.connection())
             .await
@@ -1447,7 +1454,7 @@ mod live {
     }
 
     pub(super) async fn killed_and_live(driver: Driver, image: &str) {
-        let d = Dir::new();
+        let d = Dir::live().await;
         let (dead, alive) = (
             Box::pin(start_on(&d, driver, image)).await,
             Box::pin(start_on(&d, driver, image)).await,
@@ -1496,7 +1503,7 @@ mod live {
                 Err(vec![format!("the container {id}")])
             }
         }
-        let d = Dir::new();
+        let d = Dir::live().await;
         let scratch = Box::pin(start_on(&d, driver, image)).await;
         let foreign_dir = StateDir::open(d.base.join("foreign-runs")).unwrap();
         let foreign = Box::pin(TestScratch::start(
@@ -1627,6 +1634,16 @@ mod live {
 
     #[path = "swap2505.rs"]
     mod swap2505;
+
+    #[tokio::test]
+    #[ignore = "needs docker and the pinned PostgreSQL scratch image"]
+    async fn a_killed_live_tests_scratch_is_removed_by_the_next_one_and_a_live_ones_is_not() {
+        if std::env::var_os(killed2858::CHILD).is_some() {
+            killed2858::child().await;
+        } else {
+            killed2858::exercise().await;
+        }
+    }
 
     #[tokio::test]
     #[ignore = "needs docker and the pinned PostgreSQL scratch image"]
