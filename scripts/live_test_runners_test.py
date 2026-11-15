@@ -1297,7 +1297,12 @@ class LiveExecution(unittest.TestCase):
                 self.assertEqual(self.started_names(calls), expected)
                 self.assertEqual({container_of(c) for c in calls if c[:2] == ["docker", "exec"]},
                                  set(expected))
-                validators = [c for c in calls if c[:2] == ["python3", "scripts/check-live-fixture.py"]]
+                checker = [c for c in calls if c[:2] == ["python3", "scripts/check-live-fixture.py"]]
+                validators = [c for c in checker if "--cell" in c]
+                # Each SQL Server fixture the runner starts is held through
+                # its survival window; no other runner does that (#2875).
+                held = [c[c.index("--container") + 1] for c in checker if "--survive" in c]
+                self.assertEqual(held, expected[:2] if runner == "mssql" else [])
                 checked = [c[c.index("--container") + 1] for c in validators]
                 self.assertEqual(checked, expected if runner != "mssql" else
                                  [expected[0], expected[1], expected[0], expected[2]])
@@ -1640,8 +1645,14 @@ elif command[:2] == ['docker', 'exec']:
                and 'Latin1_General_100_CS_AS' in query and 'THROW' in query)
     # The old SELECT 1 succeeds immediately, despite the wrong identity.
     sys.exit(1 if guarded and (count < 3 or os.environ['PBPS_COLLATION_MODE'] == 'never-ready') else 0)
+elif command[:2] == ['docker', 'inspect']:
+    # The readiness polls ask whether the fixture is still running.
+    print('true')
 elif command[:2] == ['docker', 'logs']:
     print('controlled collation change pending', file=sys.stderr)
+elif command[:3] == ['python3', 'scripts/check-live-fixture.py', '--survive']:
+    # The survival window of a fixture that stays up.
+    pass
 elif command[:2] == ['python3', '-c']:
     sys.exit(subprocess.run([sys.executable, *command[1:]]).returncode)
 elif command[0] in ('cargo', 'python3'):
@@ -2121,6 +2132,183 @@ class NondurableFixtures(unittest.TestCase):
         result, log = self.run_script(FAIL_ALTER="1")
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(any("pg_reload_conf" in line or "FROM pg_settings" in line for line in log), log)
+
+
+SQL_SERVER_STAND_IN = r"""
+import json, os, sys
+from pathlib import Path
+root = Path(os.environ["PBPS_SQL_CONTROL"])
+matrix = json.loads(Path(os.environ["PBPS_SQL_MATRIX"]).read_text())["mssql2025"]
+args = sys.argv[1:]
+with (root / "calls").open("a") as log:
+    log.write(json.dumps(["docker", *args]) + "\n")
+state_path = root / "state.json"
+state = json.loads(state_path.read_text()) if state_path.exists() else {"runs": [], "queries": {}, "gone": []}
+plan = json.loads(os.environ["PBPS_SQL_PLAN"])
+
+
+def save():
+    state_path.write_text(json.dumps(state))
+
+
+def outcome(name):
+    # The primary's n-th start follows the plan; every other container stays up.
+    if name != os.environ["PBPS_SQL_PRIMARY"]:
+        return "stay"
+    return plan[min(state["runs"].count(name) - 1, len(plan) - 1)]
+
+
+def running(name, count):
+    kind = outcome(name)
+    if kind in ("early", "exit") or name in state["gone"]:
+        return False
+    if kind == "crash":
+        n = state["queries"].get(name, 0)
+        if count:
+            state["queries"][name] = n + 1
+        return n < 2
+    return True
+
+
+if args[:2] == ["ps", "-a"]:
+    print("\n".join(os.environ["PBPS_SQL_EXISTING"].split() + [n for n in dict.fromkeys(state["runs"]) if n not in state["gone"]]))
+elif args[0] == "run":
+    name = args[args.index("--name") + 1]
+    port = next(a for a in args if a.endswith(":1433")).split(":")[-2]
+    state["runs"].append(name)
+    state.setdefault("ports", {})[name] = port
+    if name in state["gone"]:
+        state["gone"].remove(name)
+    state["queries"][name] = 0
+    print("id-" + name)
+elif args[0] == "rm":
+    name = args[-1]
+    state["gone"].append(name)
+elif args[0] == "exec":
+    name = next(a for a in args[1:] if not a.startswith("-"))
+    query = args[args.index("-Q") + 1]
+    if outcome(name) in ("early", "exit"):
+        sys.exit(1)
+    if "ProductVersion" in query:
+        print("|".join([matrix["version"], matrix["edition"], str(matrix["engine_edition"]), matrix["collation"]]))
+    elif "SERVERPROPERTY('Collation')" in query:
+        print(matrix["collation"])
+elif "inspect" in args[:2] and "--format" in args:
+    name = args[-1]
+    print("true" if running(name, True) else "false")
+elif args[:2] == ["container", "inspect"]:
+    name = args[2]
+    print(json.dumps([{"Id": "id-" + name, "State": {"Running": running(name, False)}, "Image": "sha256:pinned",
+                       "NetworkSettings": {"Ports": {"1433/tcp": [
+                           {"HostIp": "0.0.0.0", "HostPort": state.get("ports", {}).get(name, "14330")}]}}}]))
+elif args[:2] == ["image", "inspect"]:
+    print(json.dumps([{"Id": "sha256:pinned", "Os": "linux", "Architecture": "amd64"}]))
+elif args[0] == "logs":
+    name = args[-1]
+    kind = outcome(name)
+    if kind in ("crash", "early"):
+        print("This program has encountered a fatal error and cannot continue.")
+        print("Dump already generated: /var/opt/mssql/log/core.sqlservr.11_15_2026_0_44_48.8")
+    elif kind == "exit":
+        print("Login failed for user 'sa'.")
+    else:
+        print("SQL Server is now ready for client connections.")
+else:
+    raise SystemExit("unexpected docker command: " + repr(args))
+save()
+"""
+
+
+class SqlServerStartRetry(unittest.TestCase):
+    """The SQL Server fixtures `live-tests.sh` starts survive a start-up crash (#2875).
+
+    A stand-in `docker` plays the engine: `crash` stays up through the first
+    two polls of the survival window and then exits with a `core.sqlservr`
+    dump in its log, `early` exits before it ever answers, `exit` stops with an
+    ordinary login failure and `stay` never stops. The real `live-tests.sh`,
+    helper and `check-live-fixture.py` run against it; only Docker and Cargo
+    are not real.
+    """
+
+    PRIMARY = "pbps-test-mssql"
+
+    def run_runner(self, plan, existing=()):
+        with tempfile.TemporaryDirectory(prefix="pbps-sql-retry-") as directory:
+            root = Path(directory)
+            fake = root / "docker"
+            fake.write_text(f"#!{sys.executable}\n" + SQL_SERVER_STAND_IN)
+            fake.chmod(0o755)
+            cargo = root / "cargo"
+            cargo.write_text(f"#!{sys.executable}\nimport json,os,sys\n"
+                             "from pathlib import Path\n"
+                             "with (Path(os.environ['PBPS_SQL_CONTROL']) / 'cargo-calls').open('a') as f:\n"
+                             "    f.write(json.dumps(sys.argv[1:]) + '\\n')\n")
+            cargo.chmod(0o755)
+            env = fixture_environment(
+                PATH=str(root) + os.pathsep + os.environ["PATH"],
+                PBPS_SQL_CONTROL=str(root), PBPS_SQL_PLAN=json.dumps(plan),
+                PBPS_SQL_PRIMARY=self.PRIMARY, PBPS_SQL_EXISTING=" ".join(existing),
+                PBPS_SQL_MATRIX=str(ROOT / "scripts/compatibility-matrix.json"),
+                # Shard 1 of 2 starts only the primary fixture; the survival
+                # window is short so that the whole matrix of cases stays fast.
+                PBPS_LIVE_SHARD="1/2", PBPS_LIVE_ACTIVE="1",
+                PBPS_TEST_MSSQL_SURVIVAL_SECONDS="4")
+            started = time.monotonic()
+            result = subprocess.run(["bash", "scripts/live-tests.sh"], cwd=ROOT, env=env,
+                                    capture_output=True, text=True, timeout=60)
+            elapsed = time.monotonic() - started
+            calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
+            clients = ((root / "cargo-calls").read_text().splitlines()
+                       if (root / "cargo-calls").exists() else [])
+            return result, calls, clients, elapsed
+
+    def starts(self, calls):
+        return [c[c.index("--name") + 1] for c in calls if c[:2] == ["docker", "run"]]
+
+    def removals(self, calls):
+        return [c for c in calls if c[:2] == ["docker", "rm"]]
+
+    def test_a_crash_after_ready_is_reported_removed_and_started_again(self):
+        result, calls, clients, _ = self.run_runner(["crash", "stay"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.starts(calls).count(self.PRIMARY), 2)
+        self.assertEqual(self.removals(calls), [["docker", "rm", "-f", "-v", self.PRIMARY]])
+        self.assertIn("core.sqlservr", result.stdout, "the crash is on record before the removal")
+        self.assertIn("attempt 1 of 3", result.stderr)
+        self.assertTrue(clients, "the tests ran against the fresh fixture")
+
+    def test_an_exit_before_the_first_answer_is_retried_without_polling_for_two_minutes(self):
+        result, calls, clients, elapsed = self.run_runner(["early", "stay"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.starts(calls).count(self.PRIMARY), 2)
+        self.assertEqual(len(self.removals(calls)), 1)
+        self.assertLess(elapsed, 30, "a stopped container is not polled for the full two minutes")
+        self.assertTrue(clients)
+
+    def test_three_crashes_fail_with_the_stopped_fixture_message_and_no_client(self):
+        result, calls, clients, _ = self.run_runner(["crash", "crash", "crash"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.starts(calls).count(self.PRIMARY), 3)
+        self.assertEqual(len(self.removals(calls)), 2, "the third crash is left in place")
+        self.assertIn("not starting it again", result.stderr)
+        self.assertIn("fixture is not running", result.stderr)
+        self.assertEqual(clients, [])
+
+    def test_another_exit_reason_is_never_retried(self):
+        result, calls, clients, _ = self.run_runner(["exit", "stay"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.starts(calls).count(self.PRIMARY), 1)
+        self.assertEqual(self.removals(calls), [])
+        self.assertNotIn("attempt", result.stderr)
+        self.assertIn("fixture is not running", result.stderr)
+        self.assertEqual(clients, [])
+
+    def test_a_fixture_that_was_already_there_is_not_held_or_restarted(self):
+        result, calls, clients, _ = self.run_runner(["stay"], existing=[self.PRIMARY])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(self.PRIMARY, self.starts(calls))
+        self.assertEqual(self.removals(calls), [])
+        self.assertTrue(clients)
 
 
 if __name__ == "__main__":

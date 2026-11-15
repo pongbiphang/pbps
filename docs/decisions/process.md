@@ -465,6 +465,39 @@ next occurrence readable. It is not a fix for the crash itself.
 Pinned by `scripts/live_resolver_server_test.py`, which runs in the `lint`
 job.
 
+<a id="dec-2875-1"></a>
+
+**DEC-2875.1. The live-suite SQL Server fixtures start once or twice more after a
+startup core dump, and only there.** This extends the rule of
+[DEC-958.1](#dec-958-1) from the dedicated-server fixture to the primary and
+Express containers `scripts/live-tests.sh` starts. Five times in two days a
+shard's server dumped core at or just after start-up (twice on one machine and
+three times on another), and each one emptied that shard's receipts
+(`shard is empty for the whole suite`) and failed a gate for a reason no code
+under test could have caused. One of them came five seconds after the fixture
+had answered its readiness probe, so readiness is not proof of survival.
+
+A fixture this run started is held for a survival window after it is ready
+(15 s, `PBPS_TEST_MSSQL_SURVIVAL_SECONDS`). The retry needs the same conditions
+as DEC-958.1: the container has exited and its log names a `core.sqlservr`
+dump. Then the crash is printed with the container's log, the container is
+removed with its volumes and a fresh one is started, at most twice, so three
+starts in all. These fail as before: any other exit, a log that cannot be read,
+a third crash (the stopped container stays, and the fixture admission refuses it
+with its usual message), a fixture that was already there (its owner decides)
+and everything on PostgreSQL. A poll for readiness stops at once when the
+daemon says the container is not running, instead of waiting two minutes for an
+engine that has exited. Nothing is retried after the tests have started.
+
+The cause is still unproven (DEC-958.1). This turns a crash that costs a whole
+gate into one that costs one start, and leaves the first occurrence on record.
+It does not cover the scratch server `scripts/resolver-mssql-fixtures.sh`
+starts, the CI service containers or an in-test start; each keeps its own rule.
+
+Pinned by `scripts/live_test_runners_test.py` (`SqlServerStartRetry`, with a
+stand-in `docker` in place of the engine) and `scripts/check_live_fixture_test.py`
+(`Survival`), which run in the `lint` job.
+
 <a id="dec-1208-1"></a>
 
 **DEC-1208.1. CPU-heavy engine fixtures use an optimized test profile with all
