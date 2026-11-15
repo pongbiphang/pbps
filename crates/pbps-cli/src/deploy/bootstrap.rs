@@ -269,7 +269,7 @@ pub(super) fn bootstrap_record(
     // name only only where `loaded` names it (`managed_state_once`, DEC-2855.1).
     let mut snapshot = StateSnapshot::new(StateKind::Bootstrap, built.schema, held, operator);
     snapshot.baseline_evidence = built.baseline_evidence;
-    snapshot.module_deps = loaded
+    snapshot.object_deps = loaded
         .hints
         .annotations
         .wire()

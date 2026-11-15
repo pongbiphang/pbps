@@ -18,9 +18,9 @@ fn legacy_module_targets_keep_their_loader_formatter_and_json_bytes() {
         let owner = load_module_str(Path::new("v.yaml"), &text).unwrap();
         let original = [(owner.id.clone(), owner.depends_on.clone())].into();
         let references = ObjectDeps::from_legacy(&original);
-        assert_eq!(references.to_legacy().unwrap(), original);
+        assert_eq!(references.modules(), original);
         assert_eq!(
-            serde_json::to_vec(&references.to_legacy().unwrap()).unwrap(),
+            serde_json::to_vec(&references.modules()).unwrap(),
             serde_json::to_vec(&original).unwrap()
         );
         let rendered = render_module(

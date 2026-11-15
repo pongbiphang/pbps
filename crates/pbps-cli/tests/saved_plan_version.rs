@@ -144,6 +144,25 @@ fn old_wire_shape_names_the_version_and_replan_remedy_before_any_target_contact(
     }
 }
 
+/// The plan format before `object_deps` carried its edges as `module_deps`.
+/// A plan is never migrated: it is refused by its version with the replan
+/// remedy, as every older format is (DEC-2469.7). The capture is a real plan of
+/// that format, not a current one with its number changed.
+#[test]
+fn a_plan_with_module_deps_is_refused_by_its_version_and_not_translated() {
+    let raw = include_str!("fixtures/name-compatibility/routines/postgres/plan.json");
+    assert!(raw.contains("\"module_deps\""));
+    for command in ["text", "json", "apply"] {
+        let diagnostic = refused(&Artifact::new(raw).run(command, &"00".repeat(32)));
+        assert!(
+            diagnostic.contains("version 42 plan"),
+            "{command}: {diagnostic}"
+        );
+        assert!(diagnostic.contains("pbps plan --db"), "{diagnostic}");
+        assert!(!diagnostic.contains("not a pbps plan"), "{diagnostic}");
+    }
+}
+
 #[test]
 fn future_wire_changes_still_report_the_unsupported_version() {
     let raw = V11

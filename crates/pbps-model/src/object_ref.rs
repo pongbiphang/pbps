@@ -1,6 +1,8 @@
 //! Declaration addresses and their recorded identities, outside Schema (DEC-2469.1).
 
+mod edges;
 mod registry;
+pub use edges::{ObjectEdge, ObjectEdges};
 pub use registry::{Annotations, BoundRoot, ObjectDeps, Problem, Registry};
 
 use crate::operation::PartKey;
@@ -9,6 +11,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
+/// The variant order is the sort order of a saved edge list: reordering these
+/// variants reorders `object_deps` on disk (`ObjectEdges`).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Root {
@@ -30,7 +34,8 @@ pub enum Selector {
 }
 
 /// The same address type is used for named declarations and bound UID roots.
-/// Its JSON codec is only a lossless *reference spelling*, not a saved-plan field.
+/// Its JSON codec is the spelling of a reference in the saved plan and the
+/// state (`ObjectEdges`), so a change to it is a change to those formats.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectRef<R = Root> {

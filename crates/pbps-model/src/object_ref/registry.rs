@@ -1,4 +1,4 @@
-use super::{ObjectRef, Root, Selector};
+use super::{ObjectEdges, ObjectRef, Root, Selector};
 use crate::diagnostic::Declaration;
 use crate::escape::Escaped;
 use crate::operation::{Owners, PartKey, Spelling};
@@ -82,8 +82,8 @@ impl ObjectDeps {
         )
     }
 
-    /// Whether every reference is module to module, the only shape the saved
-    /// plan and the state can write today.
+    /// Whether every reference is module to module, the only shape the
+    /// ordering passes read (`modules`).
     pub fn is_legacy(&self) -> bool {
         let module = |r: &ObjectRef| r.module_id().is_some();
         self.0
@@ -132,29 +132,6 @@ impl ObjectDeps {
                 .map(|(owner, targets)| (map(owner), targets.iter().map(map).collect()))
                 .collect(),
         )
-    }
-
-    /// This is the only write adapter until non-module persistence is enabled.
-    pub fn to_legacy(&self) -> Result<ModuleDeps, Problem> {
-        let mut out = ModuleDeps::new();
-        for (owner, targets) in &self.0 {
-            let id = owner
-                .module_id()
-                .ok_or_else(|| Problem::WrongSelector(owner.clone()))?;
-            if out.contains_key(id) {
-                return Err(Problem::DuplicateOwner(owner.clone()));
-            }
-            let targets = targets
-                .iter()
-                .map(|r| {
-                    r.module_id()
-                        .cloned()
-                        .ok_or_else(|| Problem::WrongSelector(r.clone()))
-                })
-                .collect::<Result<_, _>>()?;
-            out.insert(id.clone(), targets);
-        }
-        Ok(out)
     }
 }
 
@@ -223,30 +200,10 @@ impl Annotations {
     }
 
     /// The declared annotations as the saved plan and the state write them.
-    /// Both persist `module_deps` until a PR changes the wire (#2469 C3b), so
-    /// a reference that cannot be written that way is refused here, by name,
-    /// rather than dropped: a plan that silently lost an edge would order
-    /// differently when it is applied.
-    pub fn wire(&self) -> Result<ModuleDeps, String> {
-        self.declared.to_legacy().map_err(|problem| {
-            // `to_legacy` fails only on these two; any other would be a bug
-            // in it, and its own text still names the reference.
-            let named = match &problem {
-                Problem::WrongSelector(r) | Problem::DuplicateOwner(r) => r.shown().to_string(),
-                Problem::UnknownOwner(_)
-                | Problem::UnknownTarget(_)
-                | Problem::MissingPart(_)
-                | Problem::Ambiguous(_)
-                | Problem::SelfDependency(_)
-                | Problem::Cycle(_)
-                | Problem::OutsideDatabase(_)
-                | Problem::Unrecorded { .. } => problem.to_string(),
-            };
-            format!(
-                "`{named}` cannot be saved in a plan or the state yet: they record module-to-module \
-                 `depends_on` annotations only"
-            )
-        })
+    /// Only a duplicate owner is refused: it has no wire form, and merging it
+    /// would hide which entry was meant.
+    pub fn wire(&self) -> Result<ObjectEdges, String> {
+        ObjectEdges::from_deps(&self.declared).map_err(|problem| problem.to_string())
     }
 
     /// What the registry finds wrong with the declared annotations that the
@@ -503,6 +460,11 @@ impl<'a> Registry<'a> {
         } else {
             Problem::WrongSelector(reference.clone())
         })
+    }
+
+    /// Whether the schema declares this reference, selector included.
+    pub fn contains(&self, reference: &ObjectRef) -> bool {
+        self.entry(reference).is_ok()
     }
 
     /// Context can make otherwise valid shorthand collide with a legacy module.

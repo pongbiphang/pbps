@@ -95,6 +95,18 @@ fn row_security_state_changes_the_checksum_but_default_fields_keep_old_bytes() {
     assert_eq!(StateSnapshot::from_json(&json).unwrap(), snap);
 }
 
+/// The row an older build wrote: a snapshot writes `object_deps` now, and a row
+/// below `OBJECT_DEPS_VERSION` may not hold it (DEC-2469.7). These states have
+/// no edges, so removing the empty list gives the old bytes.
+fn historical(state: &StateSnapshot) -> String {
+    let mut row = serde_json::to_value(state).unwrap();
+    assert_eq!(
+        row.as_object_mut().unwrap().shift_remove("object_deps"),
+        Some(serde_json::json!([]))
+    );
+    row.to_string()
+}
+
 #[test]
 fn row_security_absence_in_legacy_states_is_disabled_without_policies() {
     let mut state = StateSnapshot::new(
@@ -108,7 +120,7 @@ fn row_security_absence_in_legacy_states_is_disabled_without_policies() {
     );
     for version in 6..pbps_model::state::CURRENT_VERSION {
         state.version = version;
-        let json = serde_json::to_string(&state).unwrap();
+        let json = historical(&state);
         assert!(!json.contains("row_security"));
         assert!(!json.contains("row_policies"));
         let back = StateSnapshot::from_json(&json).unwrap();
@@ -121,7 +133,7 @@ fn row_security_absence_in_legacy_states_is_disabled_without_policies() {
                 .unwrap()
                 .has_row_security()
         );
-        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        assert_eq!(historical(&back), json);
     }
     // A version newer than this build's is refused, not read partially.
     state.version = pbps_model::state::CURRENT_VERSION + 1;

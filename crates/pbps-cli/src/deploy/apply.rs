@@ -165,6 +165,12 @@ pub(super) fn failed_apply_snapshot(
     error: &anyhow::Error,
 ) -> StateSnapshot {
     let is_staged_checkpoint = current.staged.is_some();
+    // This build writes the row, so the row is in this build's format. The
+    // newest state may have been read from an older row, and it still carries
+    // that row's version. Written under it, the row would hold `object_deps`
+    // below the version that introduced the field, and every later read
+    // refuses such a row (DEC-2469.7).
+    current.version = pbps_model::state::CURRENT_VERSION;
     current.kind = StateKind::Failed;
     current.data_work = None;
     // The newest row's assertions passed for the plan that wrote it; this row
@@ -622,7 +628,7 @@ pub(super) async fn apply_under_lock<D: crate::emission::Engine>(
             operator,
         );
         snapshot.baseline_evidence = after.baseline_evidence;
-        snapshot.module_deps = plan.module_deps.clone();
+        snapshot.object_deps = plan.object_deps.clone();
         snapshot.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
         snapshot.plan_checksum = Some(plan_checksum.to_owned());
         snapshot.target_assertions = plan.target_assertions.clone();

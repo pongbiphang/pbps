@@ -203,29 +203,36 @@ fn bootstrap_requires_each_declared_type_identity() {
 }
 
 #[test]
-fn bootstrap_refuses_to_record_an_annotation_the_state_cannot_hold() {
+fn bootstrap_records_an_annotation_that_is_not_module_to_module() {
+    let built = || {
+        pbps_diff::scope(
+            &Schema::default(),
+            &IdsFile::default(),
+            &Default::default(),
+            &Default::default(),
+        )
+    };
     let mut loaded = pbps_load::Loaded::default();
     loaded.hints.annotations.declared = pbps_model::object_ref::ObjectDeps(vec![(
         "module::app.v".parse().unwrap(),
         ["table::app.t".parse().unwrap()].into(),
     )]);
-    let built = pbps_diff::scope(
-        &Schema::default(),
-        &IdsFile::default(),
-        &Default::default(),
-        &Default::default(),
+    let state = bootstrap_record(built(), IdsFile::default(), &loaded, "operator").unwrap();
+    assert_eq!(
+        state.object_deps.to_deps(),
+        loaded.hints.annotations.declared
     );
-    let why = bootstrap_record(built, IdsFile::default(), &loaded, "operator").unwrap_err();
-    assert!(why.to_string().contains("table::app.t"), "{why}");
-    // Negative: the same call without the extended reference records.
+    // Negative: no annotation records an empty list, and a duplicate owner,
+    // which has no wire form, is refused by name.
     loaded.hints.annotations = Default::default();
-    let built = pbps_diff::scope(
-        &Schema::default(),
-        &IdsFile::default(),
-        &Default::default(),
-        &Default::default(),
-    );
-    assert!(bootstrap_record(built, IdsFile::default(), &loaded, "operator").is_ok());
+    let state = bootstrap_record(built(), IdsFile::default(), &loaded, "operator").unwrap();
+    assert!(state.object_deps.is_empty());
+    loaded.hints.annotations.declared = pbps_model::object_ref::ObjectDeps(vec![
+        ("module::app.v".parse().unwrap(), Default::default()),
+        ("module::app.v".parse().unwrap(), Default::default()),
+    ]);
+    let why = bootstrap_record(built(), IdsFile::default(), &loaded, "operator").unwrap_err();
+    assert!(why.to_string().contains("module::app.v"), "{why}");
 }
 
 #[test]
