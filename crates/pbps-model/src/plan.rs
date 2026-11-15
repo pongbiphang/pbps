@@ -305,7 +305,7 @@ use crate::zone::SessionZone;
 // 72 belongs to another change.
 // 76 adds a SQL Server table's, key's and index's `filegroup` (DEC-2813.1), which a plan
 // carries inside the table, key or index it creates: an older build would reject the field
-// as unknown instead of as a newer plan; 74 and 75 belong to other changes.
+// as unknown instead of as a newer plan.
 // 78 carries the annotations as `object_deps`, a flat sorted list of reference pairs, in place
 // of the module-only `module_deps` (DEC-2469.7): an older build would reject the field as
 // unknown; 74 and 75 were reserved and never used, and 76 and 77 belong to other changes.

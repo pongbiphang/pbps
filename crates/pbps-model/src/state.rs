@@ -160,8 +160,7 @@ use schemars::JsonSchema;
 /// that provides it (DEC-2447.14); an older build would refuse the snapshot, and every older
 /// snapshot truthfully holds only operators of `pg_catalog`.
 /// Version 46 records a SQL Server table's, key's and index's `filegroup` (DEC-2813.1); every
-/// older snapshot truthfully holds none, and an older build would reject the field. 44 and 45
-/// belong to other changes.
+/// older snapshot truthfully holds none, and an older build would reject the field.
 /// Version 47 records the annotations as `object_deps`, a flat list of reference
 /// pairs, in place of the module-only `module_deps` (DEC-2469.7); an older snapshot
 /// is converted on read, see [`OBJECT_DEPS_VERSION`]. 44 and 45 were reserved and never
