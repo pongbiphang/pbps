@@ -79,6 +79,22 @@ pub(crate) fn read_opt(project: &Project) -> anyhow::Result<Option<IdsFile>> {
     }
 }
 
+/// A readable identity tree that holds something this reader does not
+/// support (a symlink, a submodule, a file that is not `.json` text, bytes that
+/// are not UTF-8). It is typed so a caller can tell it from a failure to read
+/// Git at all: the first is a fact about the commit, which no repair of the
+/// repository changes, and the second is the case a repair advice is for.
+#[derive(Debug)]
+pub(crate) struct UnsupportedIdentityEntry(String);
+
+impl std::fmt::Display for UnsupportedIdentityEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UnsupportedIdentityEntry {}
+
 /// Every file git has under `ids_dir_rel` (as git names it) at `rev`, by path
 /// relative to it, for reading history. A symlink, submodule or file that is
 /// not a `.json` text file is refused, as the working-tree reader refuses it.
@@ -99,17 +115,20 @@ pub(crate) fn tree_at(
         |path, _mode| path == ids_dir_rel || path.starts_with(&below),
         |path, mode, bytes| {
             let shown = pbps_model::Text::new(path.to_owned()).shown().to_string();
-            anyhow::ensure!(
-                path != ids_dir_rel,
-                "`{shown}` at `{rev}` is not a directory of identity files (git mode {mode})"
-            );
-            anyhow::ensure!(
-                matches!(mode, "100644" | "100755") && ids_tree::is_identity_file(path),
-                "`{shown}` at `{rev}` is not {}",
-                ids_tree::IDENTITY_FILE_RULE
-            );
+            let unsupported = |detail: String| anyhow::Error::new(UnsupportedIdentityEntry(detail));
+            if path == ids_dir_rel {
+                return Err(unsupported(format!(
+                    "`{shown}` at `{rev}` is not a directory of identity files (git mode {mode})"
+                )));
+            }
+            if !(matches!(mode, "100644" | "100755") && ids_tree::is_identity_file(path)) {
+                return Err(unsupported(format!(
+                    "`{shown}` at `{rev}` is not {}",
+                    ids_tree::IDENTITY_FILE_RULE
+                )));
+            }
             let text = std::str::from_utf8(bytes)
-                .with_context(|| format!("`{shown}` at `{rev}` is not UTF-8"))?;
+                .map_err(|e| unsupported(format!("`{shown}` at `{rev}` is not UTF-8: {e}")))?;
             files.insert(path[below.len()..].to_owned(), text.to_owned());
             Ok(())
         },
