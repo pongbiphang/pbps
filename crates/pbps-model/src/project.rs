@@ -199,13 +199,7 @@ impl UidReservations {
     }
 }
 fn ids_uids(ids: &IdsFile) -> impl Iterator<Item = &Uid> {
-    ids.tables
-        .keys()
-        .chain(ids.columns.keys())
-        .chain(ids.roles.keys())
-        .chain(ids.types.keys())
-        .chain(ids.extensions.keys())
-        .chain(ids.tombstones.keys())
+    ids.held_uids()
 }
 
 #[cfg(test)]
