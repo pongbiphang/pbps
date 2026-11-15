@@ -5711,15 +5711,17 @@ fn cmd_plan(
             )?
         };
         if let Some(spec) = dev_spec {
-            output::or_unanswerable("plan", json, "plan.unrenderable", unsealed())?;
+            // The two refusals below also stop the rehearsal after `--out` was
+            // written, so they name the file like any other (DEC-1920.1).
+            dev::unverified_on_failure(json, &written, "plan.unrenderable", unsealed())?;
             // Rendered first, and wrapped in its own right. As an argument it was
             // evaluated *before* the wrapper was entered, so an emitter refusal
             // here escaped exactly the envelope the call around it was added to
             // guarantee. A `?` inside an argument list is invisible at a glance,
             // which is why this is a separate statement now.
-            let statements = output::or_unanswerable(
-                "plan",
+            let statements = dev::unverified_on_failure(
                 json,
+                &written,
                 "plan.unrenderable",
                 statements(&ordered, &dialect),
             )?;
