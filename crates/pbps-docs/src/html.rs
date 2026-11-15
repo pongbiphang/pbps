@@ -66,6 +66,7 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
         tables,
         types,
         search,
+        sequences,
         modules,
         roles,
         extensions,
@@ -114,6 +115,7 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
     }
     types_section(&mut s, types);
     search_section(&mut s, search);
+    sequences_section(&mut s, sequences);
     modules_section(&mut s, modules);
     roles_section(&mut s, roles);
     deprecated_section(&mut s, schema);
@@ -140,6 +142,28 @@ fn search_section(
             "<tr><td>{}</td><td>{kind}</td><td>{}</td><td>{}</td></tr>",
             code(&name.name.raw().to_string()),
             code(&base),
+            code(&detail)
+        );
+    }
+    s.push_str("</table>\n");
+}
+
+/// Standalone sequences: a row each, never the counter's position (#2721).
+fn sequences_section(
+    s: &mut String,
+    sequences: &BTreeMap<pbps_model::ObjectName, pbps_model::Sequence>,
+) {
+    if sequences.is_empty() {
+        return;
+    }
+    s.push_str("<h2>Sequences</h2>\n<table><tr><th>Sequence</th><th>Type</th><th>Start</th><th>Increment</th><th>Options</th></tr>\n");
+    for (name, sequence) in sequences {
+        let (ty, start, increment, detail) = crate::markdown::sequence_row(sequence);
+        let _ = writeln!(
+            s,
+            "<tr><td>{}</td><td>{}</td><td>{start}</td><td>{increment}</td><td>{}</td></tr>",
+            code(&name.raw().to_string()),
+            code(&ty),
             code(&detail)
         );
     }

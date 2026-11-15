@@ -1,5 +1,5 @@
-//! One table of rows per name-only kind: adding a kind (sequences are next) adds a row
-//! here, and every property below runs over it.
+//! One table of rows per name-only kind: adding a kind adds a row here, and every
+//! property below runs over it.
 
 use super::*;
 use crate::{Column, SearchKind, Table, TableName};
@@ -28,11 +28,31 @@ fn text_search(name: &str, variant: u8) -> Schema {
     schema
 }
 
+fn sequence(name: &str, variant: u8) -> Schema {
+    let mut schema = Schema::default();
+    schema.sequences.insert(
+        name.parse().unwrap(),
+        Sequence {
+            ty: ColumnType::simple("bigint"),
+            start: i64::from(variant) + 1,
+            increment: 1,
+            options: Default::default(),
+        },
+    );
+    schema
+}
+
 /// Every kind a `Schema` holds by name only.
-const ROWS: &[Row] = &[Row {
-    label: "text search",
-    holding: text_search,
-}];
+const ROWS: &[Row] = &[
+    Row {
+        label: "text search",
+        holding: text_search,
+    },
+    Row {
+        label: "sequence",
+        holding: sequence,
+    },
+];
 
 fn table(ty: &str) -> Schema {
     let mut schema = Schema::default();
@@ -46,6 +66,7 @@ fn table(ty: &str) -> Schema {
 
 fn merged(mut base: Schema, other: Schema) -> Schema {
     base.search.extend(other.search);
+    base.sequences.extend(other.sequences);
     base.tables.extend(other.tables);
     base
 }
@@ -61,6 +82,7 @@ fn classify_splits_the_kinds_and_joins_them_back() {
         let whole = merged(table("int"), (row.holding)("app.x", 0));
         let split = whole.clone().classify();
         assert!(split.plannable.search.is_empty(), "{}", row.label);
+        assert!(split.plannable.sequences.is_empty(), "{}", row.label);
         assert!(!split.name_only.is_empty(), "{}", row.label);
         assert_eq!(split.plannable.tables, whole.tables, "{}", row.label);
         assert_eq!(split.into_schema(), whole, "{}", row.label);
@@ -256,4 +278,26 @@ fn a_re_recording_reads_what_the_record_names_and_records_what_is_declared() {
         let named = declared.naming_also_what_is_recorded(&both);
         assert_eq!(named, declared, "{}", row.label);
     }
+}
+
+/// A sequence names its integer type, which the catalog spells in full and a declaration
+/// may abbreviate: both reach one compared form, and a different type does not (DEC-2721.1).
+#[test]
+fn a_sequences_type_is_spelled_like_a_columns() {
+    let typed = |ty: &str| {
+        let mut schema = sequence("app.s", 0);
+        schema.sequences.values_mut().next().unwrap().ty = ty.parse().unwrap();
+        schema
+    };
+    let (declared, catalog) = (typed("int"), typed("integer"));
+    assert_ne!(declared, catalog, "raw spellings differ");
+    assert_eq!(
+        declared.compared_with(&catalog, &long_spelling),
+        catalog.compared_with(&declared, &long_spelling)
+    );
+    // Negative: another type is a difference whatever the spelling.
+    assert_ne!(
+        declared.compared_with(&typed("bigint"), &long_spelling),
+        typed("bigint").compared_with(&declared, &long_spelling)
+    );
 }

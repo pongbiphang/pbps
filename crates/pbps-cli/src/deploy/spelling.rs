@@ -353,6 +353,7 @@ pub(crate) fn schemas_declared(schema: &Schema) -> BTreeMap<String, String> {
         tables,
         types,
         search,
+        sequences,
         modules,
         roles,
         extensions,
@@ -361,6 +362,10 @@ pub(crate) fn schemas_declared(schema: &Schema) -> BTreeMap<String, String> {
     for name in search.keys() {
         out.entry(name.name.schema().to_owned())
             .or_insert_with(|| format!("the schema of {}", name.shown()));
+    }
+    for name in sequences.keys() {
+        out.entry(name.schema.clone())
+            .or_insert_with(|| format!("the schema of sequence `{}`", name.shown()));
     }
     for (name, definition) in extensions {
         out.entry(definition.schema.clone())

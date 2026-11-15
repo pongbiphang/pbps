@@ -61,6 +61,7 @@ macro_rules! schema_kinds {
             Extensions => extensions: $crate::name::ObjectLocalName => $crate::Extension, "extension";
             Types => types: $crate::TypeRef => $crate::ManagedType, "type";
             Search => search: $crate::SearchRef => $crate::SearchObject, "text search object";
+            Sequences => sequences: $crate::ObjectName => $crate::Sequence, "sequence";
             Tables => tables: $crate::name::TableName => $crate::Table, "table";
             Modules => modules: $crate::ModuleId => $crate::Module, "module";
             Roles => roles: $crate::RoleName => $crate::Role, "role";
@@ -179,6 +180,7 @@ mod tests {
     impl Count for Extensions {}
     impl Count for Types {}
     impl Count for Search {}
+    impl Count for Sequences {}
     impl Count for Tables {}
     impl Count for Modules {}
     impl Count for Roles {}
@@ -226,6 +228,7 @@ mod tests {
                 (KindTag::Extensions, 1),
                 (KindTag::Types, 0),
                 (KindTag::Search, 0),
+                (KindTag::Sequences, 0),
                 (KindTag::Tables, 2),
                 (KindTag::Modules, 0),
                 (KindTag::Roles, 1),

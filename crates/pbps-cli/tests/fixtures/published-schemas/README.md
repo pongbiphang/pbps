@@ -88,3 +88,4 @@ DECISIONS 465).
 - `104/` adds a partition entry's own `description:`, its comment (#2729 PR A).
 - `105/` renames `doctor`'s `identity_file` to `identity_dir`: the identity tree's directory replaces the single identity file (#2600 PR 5a, DEC-2600.9).
 - `107/` adds a SQL Server table's, key's, unique constraint's and index's `filegroup:` to declarations (#2813); 106 belongs to another change.
+- `109/` adds the `sequence:` declaration file: a standalone sequence's type, start, increment and options (#2721 PR A); 108 belongs to another change.

@@ -1,7 +1,8 @@
 //! Kinds a [`Schema`] holds by name only (#2855, DEC-2855.1).
 //!
 //! Some objects are read, held and declared but have no identity record and no
-//! plan can create, alter or drop them yet (today: text search objects, DEC-2728.1).
+//! plan can create, alter or drop them yet (today: text search objects, DEC-2728.1,
+//! and standalone sequences, DEC-2721.1).
 //! Every consumer of a whole schema used to decide for itself what to do with
 //! such a kind, and the default of "treat it like a table" was wrong at nine of
 //! them. The rule now lives here, in a few functions that are the only place
@@ -25,7 +26,7 @@
 //! Moving a kind from here to the planned kinds is one edit in [`Schema::classify`]
 //! and its inverse, and every consumer follows.
 
-use crate::{ColumnType, ManagedType, Schema, SearchObject, SearchRef};
+use crate::{ColumnType, ManagedType, ObjectName, Schema, SearchObject, SearchRef, Sequence};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -43,6 +44,8 @@ pub type Spell<'a> = &'a dyn Fn(&ColumnType) -> Option<ColumnType>;
 pub struct NameOnly {
     /// Text search configurations and dictionaries (DEC-2728.1).
     pub search: BTreeMap<SearchRef, SearchObject>,
+    /// Standalone sequences, by their name in the relation namespace (DEC-2721.1).
+    pub sequences: BTreeMap<ObjectName, Sequence>,
 }
 
 /// A [`Schema`] split by [`Schema::classify`].
@@ -57,9 +60,10 @@ impl Classified {
     /// The schema these halves were split from.
     #[must_use]
     pub fn into_schema(self) -> Schema {
-        let NameOnly { search } = self.name_only;
+        let NameOnly { search, sequences } = self.name_only;
         Schema {
             search,
+            sequences,
             ..self.plannable
         }
     }
@@ -129,8 +133,8 @@ fn restricted<K: Ord, V>(held: BTreeMap<K, V>, named: &BTreeMap<K, V>) -> BTreeM
 impl NameOnly {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        let Self { search } = self;
-        search.is_empty()
+        let Self { search, sequences } = self;
+        search.is_empty() && sequences.is_empty()
     }
 
     /// Only the objects `named_by` names, by key and not by definition: an object
@@ -138,10 +142,14 @@ impl NameOnly {
     /// visible to the comparison it is for.
     #[must_use]
     pub fn restricted_to(self, named_by: &Self) -> Self {
-        let Self { search } = self;
-        let Self { search: named } = named_by;
+        let Self { search, sequences } = self;
+        let Self {
+            search: named_search,
+            sequences: named_sequences,
+        } = named_by;
         Self {
-            search: restricted(search, named),
+            search: restricted(search, named_search),
+            sequences: restricted(sequences, named_sequences),
         }
     }
 
@@ -149,12 +157,23 @@ impl NameOnly {
     /// For a name both hold, this side's definition is kept.
     #[must_use]
     pub fn or_named_by(self, other: &Self) -> Self {
-        let Self { mut search } = self;
-        let Self { search: named } = other;
-        for (name, object) in named {
+        let Self {
+            mut search,
+            mut sequences,
+        } = self;
+        let Self {
+            search: named_search,
+            sequences: named_sequences,
+        } = other;
+        for (name, object) in named_search {
             search.entry(name.clone()).or_insert_with(|| object.clone());
         }
-        Self { search }
+        for (name, object) in named_sequences {
+            sequences
+                .entry(name.clone())
+                .or_insert_with(|| object.clone());
+        }
+        Self { search, sequences }
     }
 
     /// Recorded objects that are gone from `live` or hold another definition. An
@@ -162,19 +181,42 @@ impl NameOnly {
     /// this state's to call drift (DEC-2728.1).
     #[must_use]
     pub fn drift(&self, live: &Self) -> Vec<NameOnlyDrift> {
-        let Self { search } = self;
-        let Self { search: live } = live;
+        let Self { search, sequences } = self;
+        let Self {
+            search: live_search,
+            sequences: live_sequences,
+        } = live;
         let mut out = Vec::new();
-        drift_of(search, live, |name| name.shown().to_string(), &mut out);
+        drift_of(
+            search,
+            live_search,
+            |name| name.shown().to_string(),
+            &mut out,
+        );
+        drift_of(
+            sequences,
+            live_sequences,
+            |name| format!("sequence `{}`", name.shown()),
+            &mut out,
+        );
         out
     }
 
-    /// Type spellings: no name-only kind names a column type today. A kind that
-    /// does (a sequence's type) is spelled here, so every comparer spells it.
+    /// Type spellings: a sequence names its integer type, which a read spells as the
+    /// catalog does and a declaration as its author did. It is spelled here, so every
+    /// comparer spells it.
     #[must_use]
-    pub fn spelled(self, _spell: Spell<'_>) -> Self {
-        let Self { search } = self;
-        Self { search }
+    pub fn spelled(self, spell: Spell<'_>) -> Self {
+        let Self {
+            search,
+            mut sequences,
+        } = self;
+        for sequence in sequences.values_mut() {
+            if let Some(ty) = spell(&sequence.ty) {
+                sequence.ty = ty;
+            }
+        }
+        Self { search, sequences }
     }
 }
 
@@ -187,6 +229,7 @@ impl Schema {
             tables,
             types,
             search,
+            sequences,
             extensions,
             modules,
             roles,
@@ -196,11 +239,12 @@ impl Schema {
                 tables,
                 types,
                 search: BTreeMap::new(),
+                sequences: BTreeMap::new(),
                 extensions,
                 modules,
                 roles,
             },
-            name_only: NameOnly { search },
+            name_only: NameOnly { search, sequences },
         }
     }
 
@@ -211,12 +255,14 @@ impl Schema {
             tables: _,
             types: _,
             search,
+            sequences,
             extensions: _,
             modules: _,
             roles: _,
         } = self;
         NameOnly {
             search: search.clone(),
+            sequences: sequences.clone(),
         }
     }
 

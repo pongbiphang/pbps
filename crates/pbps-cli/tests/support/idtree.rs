@@ -215,8 +215,10 @@ fn declared(project: &Path) -> BTreeMap<(UidKind, String), String> {
                 Declaration::Role(n) => (UidKind::Role, n.raw().to_string()),
                 Declaration::Type(n) => (UidKind::Type, n.raw().to_string()),
                 Declaration::Extension(n) => (UidKind::Extension, n.raw().to_string()),
-                // A module and a text search object keep no identity file.
-                Declaration::Module(_) | Declaration::Search(_) => return None,
+                // A module, a text search object and a sequence keep no identity file.
+                Declaration::Module(_) | Declaration::Search(_) | Declaration::Sequence(_) => {
+                    return None;
+                }
             };
             Some((key, file.path))
         })

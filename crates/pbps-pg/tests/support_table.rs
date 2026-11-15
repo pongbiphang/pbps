@@ -134,7 +134,12 @@ fn every_declaration_the_loader_accepts_is_held_by_an_engine() {
         }
     }
     // Negative: a key no engine declares, and an engine that refuses one.
-    assert_eq!(support::declared_tier(Engine::Postgres, "sequence"), None);
+    assert_eq!(support::declared_tier(Engine::Postgres, "synonym"), None);
+    assert_eq!(
+        support::declared_tier(Engine::Postgres, "sequence"),
+        Some(Tier::Partly)
+    );
+    assert_eq!(support::declared_tier(Engine::SqlServer, "sequence"), None);
     assert_eq!(support::declared_tier(Engine::SqlServer, "enum"), None);
     assert_eq!(
         support::declared_tier(Engine::Postgres, "enum"),

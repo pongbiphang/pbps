@@ -42,6 +42,12 @@ pub struct Schema {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub search: BTreeMap<crate::SearchRef, crate::SearchObject>,
 
+    /// Standalone sequences, keyed by their name in the relation namespace (#2721,
+    /// DEC-2721.1). Held and pulled; planning them arrives with later parts. Their current
+    /// value is in no field of this model.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sequences: BTreeMap<crate::ObjectName, crate::Sequence>,
+
     /// Database-global PostgreSQL packages, pinned exactly (DEC-2447.1).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extensions: BTreeMap<ObjectLocalName, Extension>,

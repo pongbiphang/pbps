@@ -426,6 +426,10 @@ fn load_from_git(
                 schema.search.insert(s.name, s.definition);
                 count += 1;
             }
+            Ok(pbps_load::LoadedFile::Sequence(s)) => {
+                schema.sequences.insert(s.name, s.definition);
+                count += 1;
+            }
             // Dependencies describe assumptions, never baseline schema state.
             Ok(pbps_load::LoadedFile::Dependency(_)) => {}
             Err(errs) => {

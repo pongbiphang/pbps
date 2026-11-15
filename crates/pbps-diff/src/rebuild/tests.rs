@@ -2062,6 +2062,40 @@ fn a_text_search_object_only_one_side_holds_is_not_an_unrelated_edit() {
     assert!(error.why.contains("unrelated schema edits"), "{error}");
 }
 
+/// A sequence only one side holds is nobody's edit beside a rebuild, as a text search object
+/// is not (DEC-2721.1, DEC-2855.1): a read-only kind must not stop a plan that was valid before
+/// it was read. One both sides name and differ on still is an edit.
+#[test]
+fn a_sequence_only_one_side_holds_is_not_an_unrelated_edit_beside_a_rebuild() {
+    let (start, _, away, first, back) = there_and_back(false);
+    let sequence = |start: i64| pbps_model::Sequence {
+        ty: pbps_model::ColumnType::simple("bigint"),
+        start,
+        increment: 1,
+        options: Default::default(),
+    };
+    let mut theirs = away.clone();
+    theirs
+        .sequences
+        .insert("app.theirs".parse().unwrap(), sequence(1));
+    qualify(side(&theirs, &first), side(&start, &back), &table()).unwrap();
+    let mut declared = start.clone();
+    declared
+        .sequences
+        .insert("app.mine".parse().unwrap(), sequence(1));
+    qualify(side(&away, &first), side(&declared, &back), &table()).unwrap();
+    // Negative: both sides name it and differ, and that is an edit outside the tree.
+    let mut held = away.clone();
+    held.sequences
+        .insert("app.mine".parse().unwrap(), sequence(1));
+    let mut changed = start.clone();
+    changed
+        .sequences
+        .insert("app.mine".parse().unwrap(), sequence(50));
+    let error = qualify(side(&held, &first), side(&changed, &back), &table()).unwrap_err();
+    assert!(error.why.contains("unrelated schema edits"), "{error}");
+}
+
 #[test]
 fn a_composed_rebuild_without_a_net_change_still_meets_every_other_rule() {
     let (start, ids, away, first, back) = there_and_back(false);

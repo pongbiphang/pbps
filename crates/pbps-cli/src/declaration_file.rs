@@ -149,6 +149,26 @@ pub fn search_path(dir: &Path, name: &pbps_model::SearchRef) -> anyhow::Result<P
     Ok(dir.join(file))
 }
 
+/// The file a standalone sequence is written to: `<schema>.<name>.sequence.yml` (#2721).
+/// A table of the same name would be `<schema>.<name>.yml`, and the dot inside a name is
+/// encoded, so no table and no sequence can be written to one path.
+pub fn sequence_path(dir: &Path, name: &ObjectName) -> anyhow::Result<PathBuf> {
+    let readable = format!(
+        "{}.{}.sequence.yml",
+        escape_reserved_stem(component(&name.schema)),
+        component(&name.name)
+    );
+    let file = if readable.len() <= 240 {
+        readable
+    } else {
+        let mut hasher = Sha256::new();
+        hasher.update(name.raw().to_string().as_bytes());
+        hasher.update(b"\0sequence");
+        format!("~pbps-{:x}.sequence.yml", hasher.finalize())
+    };
+    Ok(dir.join(file))
+}
+
 /// The file a module is written to, under its whole identity.
 ///
 /// The whole identity, because anything less lets `pull` write one
@@ -289,6 +309,22 @@ impl Files for kinds::Search {
     ) -> anyhow::Result<()> {
         for name in objects.keys() {
             out.push((name.shown().to_string(), search_path(directory, name)?));
+        }
+        Ok(())
+    }
+}
+
+impl Files for kinds::Sequences {
+    fn files(
+        directory: &Path,
+        objects: &BTreeMap<Self::Key, Self::Value>,
+        out: &mut Vec<(String, PathBuf)>,
+    ) -> anyhow::Result<()> {
+        for name in objects.keys() {
+            out.push((
+                format!("sequence {}", name.shown()),
+                sequence_path(directory, name)?,
+            ));
         }
         Ok(())
     }
@@ -618,6 +654,28 @@ mod tests {
         assert_ne!(hashed, readable);
         assert!(readable.starts_with("%7E"), "{readable}");
     }
+    /// A sequence is written beside a table of its name under a path of its own, and a name
+    /// too long for a file is hashed to a name that is still a sequence's (#2721).
+    #[test]
+    fn a_sequence_is_written_to_a_path_no_table_of_its_name_shares() {
+        let dir = Path::new("schema");
+        let name: ObjectName = "app.order_no".parse().unwrap();
+        let sequence = sequence_path(dir, &name).unwrap();
+        assert_eq!(sequence, dir.join("app.order_no.sequence.yml"));
+        assert_ne!(sequence, path(dir, &name, None).unwrap());
+        // Negative: a table whose own name ends in `.sequence` is another file, because the
+        // dot inside a name is encoded.
+        let table: ObjectName = ObjectName::new("app", "order_no.sequence");
+        assert_ne!(path(dir, &table, None).unwrap(), sequence);
+        let long: ObjectName = ObjectName::new("app", "n".repeat(240));
+        let hashed = sequence_path(dir, &long).unwrap();
+        assert!(
+            hashed.to_string_lossy().ends_with(".sequence.yml"),
+            "{hashed:?}"
+        );
+        assert!(hashed.file_name().unwrap().len() <= 240);
+    }
+
     /// A configuration and a dictionary of one name are two files, the kind in the name, and a
     /// name too long for a file is hashed to a name that still tells the kinds apart (#2728).
     #[test]
