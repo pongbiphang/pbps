@@ -2082,8 +2082,12 @@ maker is provably gone: each claims itself with its process identity
 a process still running is not judged. Without that, one live test process could
 sweep the directory of another that has rewritten a record to look dead on
 purpose (`kill` in the live tests does), and the run whose lock is held stays as
-`reconcile` already leaves it. A cleanup that cannot be confirmed is printed and
-retried by the next run; it does not fail the test that found it. The product
+`reconcile` already leaves it. A live test's own directory is removed when it
+ends only if no record is left in it: a failed `finish` leaves its run for the
+next live test. A cleanup that cannot be confirmed is printed and retried by the
+next run; it does not fail the test that found it. Only a path that is not
+there is an empty scan: an unreadable root, directory or claim is unknown, is
+reported, and keeps what it could not read. The product
 cleanup contract, DEC-2471.1 and the sweep's verdicts are unchanged.
 
 The two look-alike tests start their containers with `docker run --detach --rm`

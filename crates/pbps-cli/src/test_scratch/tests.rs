@@ -18,6 +18,8 @@ use super::{FailureKind, TestScratch, settle_failed_start, state_dir};
 struct Dir {
     base: PathBuf,
     dir: StateDir,
+    /// A directory a live test made keeps its records (#2858).
+    keep: bool,
     _serial: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -37,6 +39,7 @@ impl Dir {
         Self {
             base,
             dir,
+            keep: false,
             _serial: serial,
         }
     }
@@ -44,6 +47,9 @@ impl Dir {
 
 impl Drop for Dir {
     fn drop(&mut self) {
+        if self.keep && stranded2858::holds_runs(&self.base) {
+            return;
+        }
         let _ = std::fs::remove_dir_all(&self.base);
     }
 }

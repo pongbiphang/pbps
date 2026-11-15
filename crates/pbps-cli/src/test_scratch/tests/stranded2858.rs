@@ -37,25 +37,45 @@ pub(super) fn claim(base: &Path) {
     std::fs::rename(temporary, base.join(MAKER)).unwrap();
 }
 
-/// Whether the process that made `base` is provably gone. A directory with no
-/// readable claim has not been shown to be anybody's leftover.
-fn maker_gone(base: &Path, boot: &str) -> bool {
-    let Ok(bytes) = std::fs::read(base.join(MAKER)) else {
-        return false;
+/// Whether the process that made `base` is provably gone. `Ok(false)` is "not
+/// shown to be": no claim at all, or a maker that lives or cannot be told from
+/// one. A claim that cannot be read is unknown and reported, never taken for
+/// either.
+fn maker_gone(base: &Path, boot: &str) -> Result<bool, String> {
+    let bytes = match std::fs::read(base.join(MAKER)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("{}: {e}", base.display())),
     };
-    let Ok(maker) = serde_json::from_slice::<Process>(&bytes) else {
-        return false;
-    };
-    matches!(
+    let maker = serde_json::from_slice::<Process>(&bytes)
+        .map_err(|e| format!("{}: its claim cannot be read: {e}", base.display()))?;
+    Ok(matches!(
         owner::judge(&maker, true, boot, owner::lookup(maker.pid)),
         Owner::Dead(_)
-    )
+    ))
+}
+
+/// Whether a state directory under `base` holds a record, or cannot be read:
+/// a live test that leaves one keeps its directory for the next run to find.
+pub(super) fn holds_runs(base: &Path) -> bool {
+    let Ok(read) = std::fs::read_dir(base) else {
+        return true;
+    };
+    read.flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .any(|sub| {
+            StateDir::open(sub)
+                .and_then(|dir| dir.runs())
+                .map_or(true, |runs| !runs.is_empty())
+        })
 }
 
 /// Reconciles every state directory under `root` that a dead process made,
 /// except `mine`, and removes the ones left empty. A run whose owner holds its
 /// lock stays, and so does a directory that still holds a record. Returns what
-/// could not be cleaned: the caller reports it, and the next run tries again.
+/// could not be cleaned or read: the caller reports it, and the next run tries
+/// again. Only a path that is not there is an empty scan.
 pub(super) async fn sweep(
     root: &Path,
     mine: &Path,
@@ -64,20 +84,54 @@ pub(super) async fn sweep(
     deadline: Instant,
 ) -> Vec<String> {
     let mut problems = Vec::new();
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return problems;
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return problems,
+        Err(e) => return vec![format!("{}: {e}", root.display())],
     };
     let boot = match owner::boot_id() {
         Ok(boot) => boot,
         Err(e) => return vec![e.to_string()],
     };
-    for base in entries.flatten().map(|entry| entry.path()) {
-        if base == mine || !maker_gone(&base, &boot) {
+    for entry in entries {
+        let base = match entry {
+            Ok(entry) => entry.path(),
+            Err(e) => {
+                problems.push(format!("{}: {e}", root.display()));
+                continue;
+            }
+        };
+        if base == mine {
             continue;
         }
+        match maker_gone(&base, &boot) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(why) => {
+                problems.push(why);
+                continue;
+            }
+        }
         let mut kept = false;
-        let subs = std::fs::read_dir(&base).map(|read| read.flatten().map(|e| e.path()));
-        for sub in subs.into_iter().flatten().filter(|path| path.is_dir()) {
+        let subs = match std::fs::read_dir(&base) {
+            Ok(subs) => subs,
+            Err(e) => {
+                problems.push(format!("{}: {e}", base.display()));
+                continue;
+            }
+        };
+        for sub in subs {
+            let sub = match sub {
+                Ok(sub) => sub.path(),
+                Err(e) => {
+                    problems.push(format!("{}: {e}", base.display()));
+                    kept = true;
+                    continue;
+                }
+            };
+            if !sub.is_dir() {
+                continue;
+            }
             let dir = match StateDir::open(sub.clone()) {
                 Ok(dir) => dir,
                 Err(e) => {
@@ -123,12 +177,21 @@ pub(super) async fn sweep_docker(root: &Path, mine: &Path) {
 }
 
 impl Dir {
+    /// A state directory at `base` that this process claims, and that is kept
+    /// when it goes out of scope while it still holds a record: a failed
+    /// `finish` leaves its run for the next live test to recover.
+    pub(super) fn claimed(base: PathBuf) -> Self {
+        let mut this = Self::at(base);
+        claim(&this.base);
+        this.keep = true;
+        this
+    }
+
     /// A state directory for a test that starts a real scratch: kept under
     /// [`root`], and made after the leftovers of dead makers there are cleaned.
     pub(super) async fn live() -> Self {
         let root = root();
-        let this = Self::at(root.join(format!("{:032x}", rand::random::<u128>())));
-        claim(&this.base);
+        let this = Self::claimed(root.join(format!("{:032x}", rand::random::<u128>())));
         Box::pin(sweep_docker(&root, &this.base)).await;
         this
     }
@@ -219,6 +282,76 @@ mod tests {
         assert!(swept(&root, &rt).await.is_empty());
         assert!(rt.removed.borrow().is_empty());
         assert!(unclaimed.exists() && own.exists());
+    }
+
+    #[test]
+    fn a_live_directory_goes_when_empty_and_stays_while_it_holds_a_record() {
+        let outer =
+            std::env::temp_dir().join(format!("pbps-stranded2858-{:032x}", rand::random::<u128>()));
+        let (kept, gone) = (outer.join("kept"), outer.join("gone"));
+        {
+            let d = Dir::claimed(kept.clone());
+            d.dir
+                .write(&record(&run('a'), State::Created, Some(&id('a'))))
+                .unwrap();
+        }
+        assert_eq!(
+            StateDir::open(kept.join("test-runs"))
+                .unwrap()
+                .runs()
+                .unwrap(),
+            [run('a')],
+            "a failed finish's record is left for the next live test"
+        );
+        assert!(kept.join(MAKER).exists());
+        drop(Dir::claimed(gone.clone()));
+        assert!(!gone.exists(), "nothing is left to keep");
+        let _ = std::fs::remove_dir_all(outer);
+    }
+
+    #[tokio::test]
+    async fn a_scan_that_cannot_read_is_reported_and_keeps_what_it_could_not_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = Dir::new();
+        // Only a path that is not there is an empty scan.
+        let rt = Fake::default();
+        let missing = d.base.join("no-such-root");
+        assert!(
+            sweep(&missing, &missing, &rt, &daemon(), soon())
+                .await
+                .is_empty()
+        );
+        let file = d.base.join("a-file");
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(sweep(&file, &file, &rt, &daemon(), soon()).await.len(), 1);
+        // A claim that does not parse is unknown: reported, and nothing is judged.
+        let root = d.base.join("live-root");
+        let (garbled, dir) = leftover(&root, Some(dead()), &run('b'));
+        std::fs::write(garbled.join(MAKER), b"not a claim").unwrap();
+        let problems = swept(&root, &runtime_with(&run('b'))).await;
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(dir.runs().unwrap(), [run('b')]);
+        // So is a state directory this user cannot show to be private.
+        let (open, dir) = leftover(&root, Some(dead()), &run('c'));
+        std::fs::set_permissions(
+            open.join("test-runs"),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+        let rt = runtime_with(&run('c'));
+        let problems = swept(&root, &rt).await;
+        assert!(
+            problems.iter().any(|p| p.contains("test-runs")),
+            "{problems:?}"
+        );
+        assert!(rt.removed.borrow().is_empty());
+        assert!(open.exists());
+        std::fs::set_permissions(
+            open.join("test-runs"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        drop(dir);
     }
 
     #[tokio::test]
