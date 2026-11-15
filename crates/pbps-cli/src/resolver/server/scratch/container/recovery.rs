@@ -940,8 +940,13 @@ mod tests {
         assert_eq!((outcome.unwrap_err(), asked), (Liveness::Dead, 2));
     }
 
-    #[tokio::test]
+    /// Runs on a paused clock: the polls and the bound are counted in the
+    /// runtime's own time, so a test thread that the host starves for a
+    /// while cannot see fewer polls than the interval and the bound allow
+    /// (#2873).
+    #[tokio::test(start_paused = true)]
     async fn a_stop_that_does_not_end_is_kept_once_its_bound_has_passed() {
+        let began = tokio::time::Instant::now();
         let (outcome, asked) =
             settled_by(Duration::from_millis(250), &[Ok(state("stopping"))]).await;
         assert_eq!(
@@ -949,10 +954,13 @@ mod tests {
             Liveness::Unprovable("its stop did not finish within 250ms".into()),
             "the reason names what was waited for"
         );
-        assert!((2..=4).contains(&asked), "polled every 100ms: {asked}");
+        // Reads at 0, 100 and 200 ms; the bound ends the wait at 250 ms.
+        assert_eq!(asked, 3, "polled every 100ms");
+        assert_eq!(began.elapsed(), Duration::from_millis(250));
         // A runtime that stalls inside a read is bounded too.
         let mut containers = Containers::new("reader");
         containers.stopping = Duration::from_millis(250);
+        let began = tokio::time::Instant::now();
         let stalled = tokio::time::timeout(
             Duration::from_secs(2),
             containers.settled(&state("stopping"), state("stopping"), || async {
@@ -963,6 +971,7 @@ mod tests {
         .await
         .expect("the bound includes a stalled read");
         assert!(matches!(stalled, Err(Liveness::Unprovable(why)) if why.contains("within 250ms")));
+        assert_eq!(began.elapsed(), Duration::from_millis(250));
     }
 
     #[tokio::test]
