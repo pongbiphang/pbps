@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 112;
+pub const SCHEMA_VERSION: u32 = 114;
+// 114: an exclusion constraint's retirement in the identities a state embeds, and `IndexPart::Exclusion` in a plan (#2448 PR C2); no document changes beyond the version, and 113 belongs to another change.
 // 112: the `method: gin` descriptions name `tsvector` beside `jsonb` (#1984); 110 and 111 belong to other changes.
 // 109: the `sequence:` file in declarations, and `sequences` in state (#2721 PR A); 108 was reserved and never used.
 // 107: a SQL Server table's, key's, unique constraint's and index's `filegroup` in declarations, plans and state (#2813); 106 belongs to another change.

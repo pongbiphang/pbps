@@ -9885,8 +9885,8 @@ silent loss of the guarantee (M16) is then a statement of the plan. Alone it sta
 refused by name. A retype stays refused whatever else the plan says: it is the
 teardown and restoration of PR D.
 
-Formats: plan 80 (an older build does not know `IndexPart::Exclusion`), state 48 (a
-snapshot embeds the identities), published schema set 108, which differs from 107 only
+Formats: plan 80 (an older build does not know `IndexPart::Exclusion`), state 50 (a
+snapshot embeds the identities), published schema set 114, which differs from 109 only
 in its version: no published document names a plan part or an identity record. Ids
 version 1 and the tree's layout version are unchanged; a file with no retirement
 serialises exactly as before. SQL Server has no such constraint and refuses every
