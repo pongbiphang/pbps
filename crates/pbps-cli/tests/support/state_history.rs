@@ -518,12 +518,12 @@ pub fn refusals(server: &str, pg: bool) {
         );
         set_record(connection, pg, *id, text);
     }
-    // A row one version back, as the build that wrote it wrote it: that build
+    // A row from before `object_deps`, as the build that wrote it wrote it: that build
     // had no `object_deps`, and a project with no module edges had no
     // `module_deps` either (DEC-2469.7). Lowering only the version would make
     // a row no build ever wrote, which the reader rightly refuses.
     let mut old: serde_json::Value = serde_json::from_str(text).unwrap();
-    old["version"] = (pbps_model::state::CURRENT_VERSION - 1).into();
+    old["version"] = (pbps_model::state::OBJECT_DEPS_VERSION - 1).into();
     let mixed = old.to_string();
     let edges = old.as_object_mut().unwrap().shift_remove("object_deps");
     assert_eq!(
