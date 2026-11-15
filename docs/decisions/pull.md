@@ -1487,9 +1487,17 @@ reach an empty database in one plan.
   this): a managed object that changed after a plan was approved fails apply's
   baseline guard, and one only the database holds is not drift. A state that
   recorded no search identity hashes as it did, so no recorded checksum moves and
-  no format number is needed. The verify comparison keeps the same set. A NUL in a
-  dictionary option name or value, the only free text these objects emit, is
-  refused at validation by name.
+  no format number is needed. A NUL in a dictionary option name or value, the only
+  free text these objects emit, is refused at validation by name.
+- **Held by name.** The kind stays in `NameOnly` (DEC-2855.1): no plan alters one,
+  and the record, the compared form and the drift report are the ones the
+  kind already has, so this change keeps no copy of them. What a plan does to one
+  joins that path in two places only. An apply's record carries the previous one
+  forward, less the objects the plan drops and with the objects it creates as the
+  database holds them (`as_recorded_after_apply` takes the plan's changes), and
+  the buildable form keeps the objects an identity names, where it left out every
+  one before (`buildable` takes the identities). The kind leaves `NameOnly` when a
+  plan can alter one, and `refuse_pinned_movement` gains its rule then.
 - **Changes.** `CreateSearch` and `DropSearch` carry the whole definition, as
   `CreateType` does, in the `search` family of `change_family!`; they join
   `catalog_change!` (`CatalogObject::Search`). A create is none in risk class; a

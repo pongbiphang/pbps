@@ -218,7 +218,7 @@ pub fn lower_from_empty<D: crate::emission::Engine>(
         .cloned()
         .collect();
     let ids = &ids.without_types(&absent);
-    let schema = &pbps_diff::without_unmanaged_search(schema, ids);
+    let schema = &*schema.buildable(ids);
     let (prerequisites, prerequisite_ids) =
         pbps_diff::bootstrap_base(pbps_diff::Side { schema, ids });
     lower_between(
@@ -244,9 +244,12 @@ pub fn lower_between<D: crate::emission::Engine>(
     pbps_model::operation::Operations,
 )> {
     let dialect = selected.as_ref();
-    // The buildable form of both ends (DEC-2855.1): a kind no plan can build, a text search
-    // object, is not built, and a held one no longer makes the differ refuse the base.
-    let (before_schema, after_schema) = (before.schema.buildable(), after.schema.buildable());
+    // The buildable form of both ends (DEC-2855.1): a text search object no identity names
+    // is not built, and a held one no longer makes the differ refuse the base.
+    let (before_schema, after_schema) = (
+        before.schema.buildable(before.ids),
+        after.schema.buildable(after.ids),
+    );
     let before = pbps_diff::Side {
         schema: &before_schema,
         ids: before.ids,

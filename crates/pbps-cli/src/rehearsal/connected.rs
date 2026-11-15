@@ -330,14 +330,14 @@ pub(crate) fn base_bootstrap<D: crate::emission::Engine>(
     plan: &Plan<'_, D>,
 ) -> anyhow::Result<pbps_diff::order::DiffPlan> {
     let (prerequisites, prerequisite_ids) = pbps_diff::bootstrap_base(plan.base);
-    let managed = pbps_diff::without_unmanaged_search(plan.base.schema, plan.base.ids);
+    let managed = plan.base.schema.buildable(plan.base.ids);
     pbps_diff::bootstrap(
         pbps_diff::Side {
             schema: &prerequisites,
             ids: &prerequisite_ids,
         },
         pbps_diff::Side {
-            schema: &managed,
+            schema: &*managed,
             ids: plan.base.ids,
         },
         plan.dialect.as_ref(),

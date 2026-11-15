@@ -512,7 +512,7 @@ pub(super) async fn apply_under_lock<D: crate::emission::Engine>(
             &externals_under(&externals, &plan.ids),
             target.catalog_policy(project.config.unmanaged),
             &plan.data,
-            &Schema::default(),
+            &Schema::naming_what_a_plan_creates(&plan.changes),
             crate::engine::Read::InsideOwnTransaction,
             CatalogWarnings::for_progress(d.progress),
         )
@@ -541,7 +541,7 @@ pub(super) async fn apply_under_lock<D: crate::emission::Engine>(
                 &externals_under(&externals, &plan.ids),
                 target.catalog_policy(project.config.unmanaged),
                 &plan.data,
-                &Schema::default(),
+                &Schema::naming_what_a_plan_creates(&plan.changes),
                 crate::engine::Read::InsideOwnTransaction,
                 CatalogWarnings::for_progress(d.progress),
             )
@@ -618,10 +618,12 @@ pub(super) async fn apply_under_lock<D: crate::emission::Engine>(
         }
         let mut snapshot = pbps_model::StateSnapshot::new(
             pbps_model::StateKind::Apply,
-            // No plan creates, alters or drops a text search object, so the record carries
-            // the previous one forward: what the read-back holds of them is not this
-            // plan's result (DEC-2855.1).
-            after.schema.as_recorded_after_apply(&entry.snapshot.schema),
+            // No plan alters a text search object, so the record carries the previous one
+            // forward, less what the plan drops and with what it creates: what the
+            // read-back holds of any other is not this plan's result (DEC-2855.1).
+            after
+                .schema
+                .as_recorded_after_apply(&entry.snapshot.schema, &plan.changes),
             // The plan's mapping, not the baseline's: after a rename the two
             // disagree, and recording the old one would say the rename never
             // happened — leaving the next plan to propose it all over again.

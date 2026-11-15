@@ -1,7 +1,8 @@
 //! Kinds a [`Schema`] holds by name only (#2855, DEC-2855.1).
 //!
-//! Some objects are read, held and declared but have no identity record and no
-//! plan can create, alter or drop them yet (today: text search objects, DEC-2728.1,
+//! Some objects are read, held and declared but no plan can alter them yet: a plan
+//! creates or drops a text search object by its identity and nothing more, and none
+//! touches a standalone sequence (today: text search objects, DEC-2728.1, DEC-2728.2,
 //! and standalone sequences, DEC-2721.1).
 //! Every consumer of a whole schema used to decide for itself what to do with
 //! such a kind, and the default of "treat it like a table" was wrong at nine of
@@ -16,9 +17,10 @@
 //!   for every kind, and a name-only kind kept only where the other side names it;
 //! - the **recorded form** ([`Schema::as_recorded`], [`Schema::as_recorded_after_apply`]):
 //!   a state records for a name-only kind only what the declarations name, and an
-//!   apply carries the previous record forward, since no plan can change one;
-//! - the **buildable form** ([`Schema::buildable`]): without the kinds no plan can
-//!   build, for the builds from empty;
+//!   apply carries the previous record forward, less what the plan drops and with
+//!   what it creates, since no plan alters one;
+//! - the **buildable form** ([`Schema::buildable`]): without the objects no identity
+//!   names, for the builds from empty;
 //! - one **drift report** ([`Schema::name_only_drift`]) for recorded objects that are
 //!   gone or changed, which no checksum sees (the checksums stay as they are, so no
 //!   format version moves).
@@ -26,7 +28,10 @@
 //! Moving a kind from here to the planned kinds is one edit in [`Schema::classify`]
 //! and its inverse, and every consumer follows.
 
-use crate::{ColumnType, ManagedType, ObjectName, Schema, SearchObject, SearchRef, Sequence};
+use crate::{
+    Change, ChangeSet, ColumnType, IdsFile, ManagedType, ObjectName, Schema, SearchObject, SearchRef,
+    Sequence,
+};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -202,6 +207,67 @@ impl NameOnly {
         out
     }
 
+    /// What a plan leaves of these: the objects it creates are those the database now
+    /// holds (`read`), and the objects it drops are gone. Nothing else moves: no plan
+    /// alters one, so what the read-back holds of any other object is not the plan's
+    /// result, and a record that took it would bless a change made outside the plan.
+    #[must_use]
+    pub fn after_applying(self, read: &Self, applied: &ChangeSet) -> Self {
+        let Self {
+            mut search,
+            sequences,
+        } = self;
+        let Self { search: read, .. } = read;
+        for planned in &applied.changes {
+            if let Change::CreateSearch { name, .. } = &planned.change
+                && let Some(made) = read.get(name)
+            {
+                search.insert(name.clone(), made.clone());
+            }
+            if let Change::DropSearch { name, .. } = &planned.change {
+                search.remove(name);
+            }
+        }
+        // No plan touches a sequence, so the previous record's are carried as they were.
+        Self { search, sequences }
+    }
+
+    /// The objects `applied` creates, as it carries them.
+    #[must_use]
+    pub fn created_by(applied: &ChangeSet) -> Self {
+        let search = applied
+            .changes
+            .iter()
+            .filter_map(|planned| {
+                if let Change::CreateSearch {
+                    name, definition, ..
+                } = &planned.change
+                {
+                    Some((name.clone(), (**definition).clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Self {
+            search,
+            sequences: BTreeMap::new(),
+        }
+    }
+
+    /// Only the objects an identity names. The others are not this project's, and a
+    /// build from nothing may make only what is. A sequence has no identity yet
+    /// (DEC-2721.1), so none is built.
+    #[must_use]
+    pub fn identified_by(self, ids: &IdsFile) -> Self {
+        let Self { mut search, .. } = self;
+        search.retain(|name, _| ids.search_uid(name).is_some());
+        Self {
+            search,
+            sequences: BTreeMap::new(),
+        }
+    }
+
     /// Type spellings: a sequence names its integer type, which a read spells as the
     /// catalog does and a declaration as its author did. It is spelled here, so every
     /// comparer spells it.
@@ -370,28 +436,57 @@ impl Schema {
         self.with_name_only_restricted_to(declared)
     }
 
-    /// The recorded form after an apply: the previous record's name-only objects,
-    /// carried forward as they were. A plan can not create, alter or drop one, so
-    /// what the read-back holds of them is not the plan's result, and a record that
-    /// took it would bless a change made outside the plan.
+    /// What an apply's read-back is kept to, in place of the declarations (they name
+    /// what a recording from them keeps): the name-only objects the plan creates. An
+    /// apply carries the rest of the previous record forward, and a read kept to nothing
+    /// would lose the objects the plan made.
     #[must_use]
-    pub fn as_recorded_after_apply(self, previous: &Schema) -> Schema {
-        let Classified { plannable, .. } = self.classify();
+    pub fn naming_what_a_plan_creates(applied: &ChangeSet) -> Schema {
         Classified {
-            plannable,
-            name_only: previous.name_only(),
+            plannable: Schema::default(),
+            name_only: NameOnly::created_by(applied),
         }
         .into_schema()
     }
 
-    /// The buildable form: without the kinds no plan can build, for a build from
-    /// nothing. Borrowed when nothing is held by name only.
+    /// The recorded form after an apply: the previous record's name-only objects,
+    /// carried forward as they were, less what `applied` drops and with what it
+    /// creates as the read-back holds it. No plan alters one, so what the read-back
+    /// holds of any other is not the plan's result, and a record that took it would
+    /// bless a change made outside the plan (DEC-2728.2).
     #[must_use]
-    pub fn buildable(&self) -> Cow<'_, Schema> {
-        if self.name_only().is_empty() {
+    pub fn as_recorded_after_apply(self, previous: &Schema, applied: &ChangeSet) -> Schema {
+        let Classified {
+            plannable,
+            name_only: read,
+        } = self.classify();
+        Classified {
+            plannable,
+            name_only: previous.name_only().after_applying(&read, applied),
+        }
+        .into_schema()
+    }
+
+    /// The buildable form, for a build from nothing: a name-only object is built
+    /// only where an identity names it, as a type or a table is. One no identity
+    /// names is the database's, not the project's, and the differ would refuse it
+    /// as having none. Borrowed when there is nothing to leave out.
+    #[must_use]
+    pub fn buildable(&self, ids: &IdsFile) -> Cow<'_, Schema> {
+        if self.name_only().identified_by(ids) == self.name_only() {
             Cow::Borrowed(self)
         } else {
-            Cow::Owned(self.clone().classify().plannable)
+            let Classified {
+                plannable,
+                name_only,
+            } = self.clone().classify();
+            Cow::Owned(
+                Classified {
+                    plannable,
+                    name_only: name_only.identified_by(ids),
+                }
+                .into_schema(),
+            )
         }
     }
 

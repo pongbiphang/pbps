@@ -2,7 +2,9 @@
 //! property below runs over it.
 
 use super::*;
-use crate::{Column, SearchKind, Table, TableName};
+use crate::{
+    Change, ChangeSet, Column, IdsFile, PlannedChange, SearchKind, Table, TableName, Uid, UidKind,
+};
 
 /// One name-only kind: how to make a schema that holds one object of it.
 struct Row {
@@ -173,21 +175,108 @@ fn an_apply_carries_the_previous_record_and_not_what_the_database_holds() {
             merged(table("bigint"), (row.holding)("app.kept", 1)),
             (row.holding)("app.outside", 0),
         );
-        let recorded = read_back.clone().as_recorded_after_apply(&previous);
+        let recorded = read_back
+            .clone()
+            .as_recorded_after_apply(&previous, &ChangeSet::default());
         assert_eq!(recorded.name_only(), previous.name_only(), "{}", row.label);
         // The plan's own result is what the read-back says of everything else.
         assert_eq!(recorded.tables, read_back.tables, "{}", row.label);
     }
 }
 
+fn planned(changes: impl IntoIterator<Item = Change>) -> ChangeSet {
+    ChangeSet {
+        changes: changes.into_iter().map(PlannedChange::new).collect(),
+    }
+}
+
+fn created(name: &str) -> Change {
+    let object = text_search(name, 0).search.into_iter().next().unwrap();
+    Change::CreateSearch {
+        uid: Uid::generate(UidKind::Search),
+        name: object.0,
+        definition: Box::new(object.1),
+        unresolved: Vec::new(),
+    }
+}
+
+fn dropped(name: &str) -> Change {
+    let object = text_search(name, 0).search.into_iter().next().unwrap();
+    Change::DropSearch {
+        uid: Uid::generate(UidKind::Search),
+        name: object.0,
+        definition: Box::new(object.1),
+    }
+}
+
 #[test]
-fn the_buildable_form_has_no_name_only_kind_and_borrows_when_there_is_none() {
+fn an_apply_records_the_objects_it_creates_and_leaves_out_the_ones_it_drops() {
+    let previous = merged(
+        text_search("app.kept", 0),
+        merged(text_search("app.retired", 0), table("int")),
+    );
+    let read_back = merged(
+        text_search("app.kept", 1),
+        merged(
+            text_search("app.made", 0),
+            merged(text_search("app.outside", 0), table("int")),
+        ),
+    );
+    let applied = planned([created("app.made"), dropped("app.retired")]);
+    let recorded = read_back
+        .clone()
+        .as_recorded_after_apply(&previous, &applied);
+    let names: Vec<_> = recorded
+        .search
+        .keys()
+        .map(|n| n.shown().to_string())
+        .collect();
+    // The created one is in as the database holds it, the dropped one is out, the one the
+    // plan left alone keeps the recorded definition, and one made outside it is not in.
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert_eq!(
+        recorded.search,
+        merged(text_search("app.kept", 0), text_search("app.made", 0)).search
+    );
+    // The read-back of an apply is kept to the objects the plan creates, so it holds the
+    // created one and neither the one made outside the plan nor a dropped one.
+    let reference = Schema::naming_what_a_plan_creates(&applied);
+    assert_eq!(reference.search.len(), 1, "{:?}", reference.search);
+    assert!(reference.tables.is_empty());
+    let kept = read_back.clone().as_recorded(&reference);
+    assert_eq!(kept.search.len(), 1, "{:?}", kept.search);
+    // Negative: a creation the read-back does not hold (a staged checkpoint before it ran)
+    // records nothing, and a drop of an object the record never held changes nothing.
+    let none = table("int").as_recorded_after_apply(
+        &previous,
+        &planned([created("app.made"), dropped("app.never")]),
+    );
+    assert_eq!(none.search.len(), 2, "{:?}", none.search);
+}
+
+#[test]
+fn the_buildable_form_has_only_the_objects_an_identity_names_and_borrows_when_there_is_none_to_leave_out()
+ {
     for row in ROWS {
         let whole = merged(table("int"), (row.holding)("app.x", 0));
-        let built = whole.buildable();
+        let built = whole.buildable(&IdsFile::default());
         assert!(built.name_only().is_empty(), "{}", row.label);
         assert_eq!(built.tables, whole.tables, "{}", row.label);
-        assert!(matches!(table("int").buildable(), Cow::Borrowed(_)));
+        assert!(matches!(
+            table("int").buildable(&IdsFile::default()),
+            Cow::Borrowed(_)
+        ));
+        // Negative: one an identity names is built.
+        let mut ids = IdsFile::default();
+        for name in whole.search.keys() {
+            ids.search
+                .insert(Uid::generate(UidKind::Search), name.clone());
+        }
+        assert!(
+            matches!(whole.buildable(&ids), Cow::Borrowed(_)),
+            "{}",
+            row.label
+        );
     }
 }
 

@@ -233,8 +233,8 @@ pub(super) async fn managed_state_once(
     scoped.unmanaged.sort();
     scoped.unmanaged.dedup();
     // The recorded form: a kind held by name only is kept only where `reference` names it
-    // (the declarations, for a recording from them; nothing, for an apply, which carries
-    // the previous record forward instead). Done here, at the one read every recorder and
+    // (the declarations, for a recording from them; what the plan creates, for an apply,
+    // which carries the previous record forward instead). Done here, at the one read every recorder and
     // the stability comparison below go through, so none of them has to remember it.
     scoped.schema = scoped
         .schema
@@ -605,16 +605,6 @@ pub(super) fn moved_time_zone(
             label = pbps_model::escape::Escaped(label),
         )),
     }
-}
-
-/// A drift comparison cannot tell a project's text search object from another's except by
-/// its identity: one the database holds that no recorded identity names is not drift (as an
-/// unmanaged type is not), and the differ would otherwise read it as a creation it cannot
-/// express. Only the objects a recorded identity names are compared, so one of them that
-/// changed is still reported by name, as the fingerprint sees it (DEC-2728.1, DEC-2728.2).
-pub(super) fn only_managed_search_objects(recorded: &IdsFile, live: &mut Schema) {
-    live.search
-        .retain(|name, _| recorded.search_uid(name).is_some());
 }
 
 /// The informational line that ends a plan when the database holds comments no declaration

@@ -568,11 +568,13 @@ pub fn bootstrap(
     dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
 ) -> Result<crate::order::DiffPlan, Vec<DiffError>> {
-    // The buildable form of both sides: a kind no plan can build (a text search object)
-    // is not built, so the differ does not refuse a held one, declared or not, as "arriving
-    // with a later part" and stop a rehearsal or a resolver run before it starts (#2855,
-    // DEC-2855.1).
-    let (base_schema, declared_schema) = (base.schema.buildable(), declared.schema.buildable());
+    // The buildable form of both sides: a text search object no identity names is not built,
+    // so the differ does not refuse a held one as having none and stop a rehearsal or a
+    // resolver run before it starts (#2855, DEC-2855.1).
+    let (base_schema, declared_schema) = (
+        base.schema.buildable(base.ids),
+        declared.schema.buildable(declared.ids),
+    );
     rebuilding_by(
         Side {
             schema: &base_schema,
