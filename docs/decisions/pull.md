@@ -1569,7 +1569,7 @@ reach an empty database in one plan.
   dictionary is refused by the existing "which is in the managed set" rule of
   `staged::compare`, now that `Managed` names the two catalogs.
 
-Formats: plan 77 (an older build refuses the new changes); ids file: the
+Formats: plan 79 (an older build refuses the new changes); ids file: the
 compatible `search` section, version unchanged; state: none, since A's state 42
 already serialises `Schema.search`; schema set: none, since a plan's changes are not in
 the published schemas (regenerated, only the version stamp differed).
