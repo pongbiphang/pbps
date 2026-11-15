@@ -7,10 +7,12 @@
 //! inside quoted identifiers; joining either spelling directly would let a pull
 //! or init write outside `schema/`.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::bail;
+use pbps_model::kinds::{self, SchemaKind};
 use pbps_model::{ModuleKind, ObjectName};
 use sha2::{Digest as _, Sha256};
 
@@ -233,6 +235,118 @@ pub fn path(
     Ok(path)
 }
 
+/// Where the declarations of one kind are written, and what a human calls
+/// each of them.
+///
+/// Answered once per kind, so that [`paths_of`] walks every kind a schema
+/// holds: a kind with no answer here does not compile, where a loop that was
+/// not told about it wrote its files without checking their names (#2878).
+trait Files: SchemaKind {
+    fn files(
+        directory: &Path,
+        objects: &BTreeMap<Self::Key, Self::Value>,
+        out: &mut Vec<(String, PathBuf)>,
+    ) -> anyhow::Result<()>;
+}
+
+impl Files for kinds::Extensions {
+    fn files(
+        directory: &Path,
+        objects: &BTreeMap<Self::Key, Self::Value>,
+        out: &mut Vec<(String, PathBuf)>,
+    ) -> anyhow::Result<()> {
+        for name in objects.keys() {
+            out.push((
+                format!("extension {}", name.shown()),
+                extension_path(directory, name),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Files for kinds::Types {
+    fn files(
+        directory: &Path,
+        objects: &BTreeMap<Self::Key, Self::Value>,
+        out: &mut Vec<(String, PathBuf)>,
+    ) -> anyhow::Result<()> {
+        for name in objects.keys() {
+            out.push((
+                format!("type {}", name.shown()),
+                type_path(directory, name)?,
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Files for kinds::Search {
+    fn files(
+        directory: &Path,
+        objects: &BTreeMap<Self::Key, Self::Value>,
+        out: &mut Vec<(String, PathBuf)>,
+    ) -> anyhow::Result<()> {
+        for name in objects.keys() {
+            out.push((name.shown().to_string(), search_path(directory, name)?));
+        }
+        Ok(())
+    }
+}
+
+impl Files for kinds::Tables {
+    fn files(
+        directory: &Path,
+        objects: &BTreeMap<Self::Key, Self::Value>,
+        out: &mut Vec<(String, PathBuf)>,
+    ) -> anyhow::Result<()> {
+        // A partition is written in its parent's file, not one of its own
+        // (#1170).
+        for (name, table) in objects {
+            if table.partition_of.is_some() {
+                continue;
+            }
+            out.push((
+                name.shown().to_string(),
+                path(directory, &name.clone(), None)?,
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Files for kinds::Modules {
+    fn files(
+        directory: &Path,
+        objects: &BTreeMap<Self::Key, Self::Value>,
+        out: &mut Vec<(String, PathBuf)>,
+    ) -> anyhow::Result<()> {
+        for (id, module) in objects {
+            out.push((
+                format!("{id} ({})", module.kind.as_str(), id = id.shown()),
+                module_path(directory, id, module.kind)?,
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Files for kinds::Roles {
+    fn files(
+        directory: &Path,
+        objects: &BTreeMap<Self::Key, Self::Value>,
+        out: &mut Vec<(String, PathBuf)>,
+    ) -> anyhow::Result<()> {
+        for name in objects.keys() {
+            out.push((
+                format!("role {name}", name = name.shown(),),
+                role_path(directory, name)?,
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Every file a schema's declarations are written to, each under the name a
 /// human calls the thing.
 pub fn paths_of(
@@ -240,44 +354,7 @@ pub fn paths_of(
     schema: &pbps_model::Schema,
 ) -> anyhow::Result<Vec<(String, PathBuf)>> {
     let mut out = Vec::new();
-    for name in schema.extensions.keys() {
-        out.push((
-            format!("extension {}", name.shown()),
-            extension_path(directory, name),
-        ));
-    }
-    for name in schema.types.keys() {
-        out.push((
-            format!("type {}", name.shown()),
-            type_path(directory, name)?,
-        ));
-    }
-    for name in schema.search.keys() {
-        out.push((name.shown().to_string(), search_path(directory, name)?));
-    }
-    // A partition is written in its parent's file, not one of its own
-    // (#1170).
-    for (name, table) in &schema.tables {
-        if table.partition_of.is_some() {
-            continue;
-        }
-        out.push((
-            name.shown().to_string(),
-            path(directory, &name.clone(), None)?,
-        ));
-    }
-    for (id, module) in &schema.modules {
-        out.push((
-            format!("{id} ({})", module.kind.as_str(), id = id.shown()),
-            module_path(directory, id, module.kind)?,
-        ));
-    }
-    for name in schema.roles.keys() {
-        out.push((
-            format!("role {name}", name = name.shown(),),
-            role_path(directory, name)?,
-        ));
-    }
+    pbps_model::each_kind!(|K| <K as Files>::files(directory, K::of(schema), &mut out)?);
     Ok(out)
 }
 
@@ -399,6 +476,46 @@ mod tests {
 
     /// `app_reader.role` is a legal table name whose file used to be the
     /// role `app_reader`'s file; `pull` then wrote one over the other.
+    /// The walk is over every kind and in the order a schema is written
+    /// out, so the labels of a collision read in that order (#2878).
+    #[test]
+    fn the_files_of_every_kind_are_listed_in_the_order_a_schema_is_written() {
+        let dir = Path::new("schema");
+        let mut schema = pbps_model::Schema::default();
+        schema
+            .roles
+            .insert("reader".to_owned().into(), pbps_model::Role::default());
+        schema
+            .tables
+            .insert("dbo.t".parse().unwrap(), pbps_model::Table::default());
+        schema.types.insert(
+            "app.mood".parse().unwrap(),
+            pbps_model::ManagedType::Enum { values: vec![] },
+        );
+        schema.extensions.insert(
+            pbps_model::name::ObjectLocalName::new("citext"),
+            pbps_model::Extension {
+                schema: "public".into(),
+                version: "1.6".into(),
+            },
+        );
+        let labels: Vec<String> = paths_of(dir, &schema)
+            .unwrap()
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(
+            labels,
+            ["extension citext", "type app.mood", "dbo.t", "role reader"]
+        );
+        // A kind with nothing in it lists nothing, and an empty schema no file.
+        assert!(
+            paths_of(dir, &pbps_model::Schema::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn a_role_file_cannot_share_a_path_with_any_table_file() {
         let dir = Path::new("schema");

@@ -5902,3 +5902,46 @@ members wherever one differs, and not to use it in `matches!` or `if let`.
 This entry adds the vocabulary and converts `Change::catalog_object` only;
 consumers move to it, to a projection in `change.rs`, or to the effects table
 case by case, each shown equal to the listing it replaces.
+
+<a id="dec-2878-1"></a>
+
+**DEC-2878.1. The kinds a schema holds are listed once, and a whole-schema
+consumer walks the list (#2878).** `Schema` is a struct of maps. A consumer of
+a whole schema wrote its own walk over the maps it knew, so a kind added to
+`Schema` compiled in every such walk and was silently left out of each one
+that was not told about it. Measured on `4deb4a916`: a throwaway kind fails
+the build at seven sites (the exhaustive destructures in the two docs
+renderers, `main.rs`, twice in `bootstrap.rs`, and `spelling.rs`), while a
+sweep finds more than two hundred walks and membership predicates that keep
+compiling. #2818, #2831, #2846, #2851 and the eight review rounds behind #2855
+are each one of them missed; the kinds added in #2728, #2448, #2447 and #2729
+touched 45 to 75 files apiece.
+
+`pbps_model::kinds` holds the list (`schema_kinds!`), a marker type per kind
+implementing `SchemaKind`, the `KindTag` values, and `each_kind!`. A consumer
+states its question as a trait bounded on `SchemaKind`, answers it per kind,
+and walks with `each_kind!(|K| <K as Question>::answer(..))`. A kind with no
+answer is a missing implementation, so the consumer does not compile until it
+answers, even with "nothing". A guard destructures `Schema` against the list,
+so a field the list leaves out does not compile either. The list is in the
+order a schema is written out and built, not in `Schema`'s field order, which
+is the serialized order and does not move.
+
+A macro over marker types and not a visitor trait: a visitor's method cannot
+be generic over the consumer's own bound, so it would either take a fixed
+shape per kind (one more list to keep) or erase the types. The macro compiles
+its body once per kind in the caller's scope, so `?` and early returns behave
+as in a loop.
+
+Rejected: finishing DEC-2790.1's direction and stopping, because a kind that
+adds no `Change` variant (text search, as first held) gains nothing from it;
+and replacing `Schema` and `Change` with a universal object-and-attribute
+graph, which lists fewer files per kind but moves "did every consumer answer"
+from the compiler to tests, the opposite of what DEC-2790.1 and ORDERING keep.
+
+What it costs, deliberately: lines. A converted walk becomes one answer per
+kind. What stays as it is: `Change`, its families, the operation effects, the
+SQL lowering and the wire formats remain exhaustive matches and typed DTOs;
+registration is static, and nothing registers itself at run time (SPEC 14.3).
+This entry adds the list and converts `declaration_file::paths_of` only.
+Consumers move to it step by step, each shown equal to the walk it replaces.
