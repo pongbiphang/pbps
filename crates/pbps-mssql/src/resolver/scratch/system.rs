@@ -11,10 +11,18 @@ use std::collections::BTreeSet;
 const ROLE_MEMBERSHIPS: &str = "SELECT USER_NAME(role_principal_id) AS role \
     FROM sys.database_role_members WHERE member_principal_id=USER_ID(N'guest');";
 
+// A metadata function is paid once per row, and master has thousands of
+// public grants (measured: this read was 131 ms there, 73 ms as written
+// now), on every one of a run's sandbox checks. So the grantee, which the
+// filter already limits to two principals, is named by comparing its id, and
+// the schema name is resolved only for the class that reports it. The three
+// object functions stay: hidden system views are absent from
+// sys.all_objects, so a join cannot replace them.
 const PERMISSIONS: &str = "SELECT p.class,p.class_desc,p.permission_name,p.state_desc,\
-    p.major_id,p.minor_id, USER_NAME(p.grantee_principal_id) AS grantee,\
+    p.major_id,p.minor_id, CASE p.grantee_principal_id WHEN USER_ID(N'guest') THEN N'guest' \
+    WHEN USER_ID(N'public') THEN N'public' END AS grantee,\
     OBJECT_SCHEMA_NAME(p.major_id) AS schema_name, OBJECT_NAME(p.major_id) AS object_name,\
-    SCHEMA_NAME(p.major_id) AS on_schema, CONVERT(int,\
+    CASE WHEN p.class=3 THEN SCHEMA_NAME(p.major_id) END AS on_schema, CONVERT(int,\
     OBJECTPROPERTYEX(p.major_id,N'IsMSShipped')) AS shipped FROM sys.database_permissions p \
     WHERE p.grantee_principal_id IN(USER_ID(N'guest'),USER_ID(N'public'));";
 
