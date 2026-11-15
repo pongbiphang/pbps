@@ -731,6 +731,126 @@ pub fn permissions(server: &str, pg: bool) {
     assert_eq!(records(connection, pg), original);
 }
 
+/// A forced export replaces a restricted declaration without widening access to
+/// it, whether the output is the file itself or a link to it (#2348).
+#[cfg(unix)]
+pub fn forced_export_keeps_declaration_modes(server: &str, pg: bool) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let own = OwnDatabase::new(server, "history_modes2348");
+    let connection = own.connection();
+    if pg {
+        on_server(connection, "CREATE SCHEMA app");
+    }
+    let d = prepared(pg, "history-modes2348");
+    ok(d.run(&["bootstrap", "--db", connection]));
+    let id = records(connection, pg)[0].0.to_string();
+    let schema = if pg { "app" } else { "dbo" };
+    let dir = d.dir.join("schema");
+    let output = dir.join(format!("{schema}.product.yml"));
+    let target = dir.join("legacy.yml");
+    // A link's replacement takes the mode of the file the link names, because
+    // that is the access the operator restricted.
+    let mode_of = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let ids = crate::idtree::snapshot(&d.dir);
+    // The unrestricted file is the control the restricted cases must equal.
+    let mut control: Option<Vec<u8>> = None;
+    for (mode, linked) in [(0o644, false), (0o600, false), (0o640, true)] {
+        for as_json in [false, true] {
+            let case = format!("mode {mode:o} linked {linked} json {as_json}");
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if !path.is_dir() {
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+            // The stale declaration differs from the recorded snapshot, so a
+            // forced export that kept it would fail the content check.
+            let stale = if linked { &target } else { &output };
+            std::fs::write(stale, table(schema, true)).unwrap();
+            std::fs::set_permissions(stale, std::fs::Permissions::from_mode(mode)).unwrap();
+            if linked {
+                std::os::unix::fs::symlink("legacy.yml", &output).unwrap();
+            }
+            let before = (mode_of(&output), std::fs::read(&output).unwrap());
+            // Without --force the existing declaration is refused and untouched.
+            refused(
+                &d,
+                connection,
+                &["state", "export", &id],
+                "state.export-overwrite",
+                "overwrite",
+            );
+            assert_eq!(
+                (mode_of(&output), std::fs::read(&output).unwrap()),
+                before,
+                "{case}: a refused export changed the declaration"
+            );
+            assert_eq!(
+                std::fs::symlink_metadata(&output).unwrap().is_symlink(),
+                linked,
+                "{case}: a refused export changed the link"
+            );
+
+            let mut args = vec!["state", "export", &id, "--db", connection, "--force"];
+            if as_json {
+                args.extend(["--format", "json"]);
+            }
+            let out = ok(d.run(&args));
+            if as_json {
+                let report = json(out);
+                let named = |list: &serde_json::Value, name: &str| {
+                    list.as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|f| f.as_str().unwrap().ends_with(name))
+                };
+                assert!(
+                    named(&report["data"]["files"], &format!("{schema}.product.yml")),
+                    "{case}: {report}"
+                );
+                assert_eq!(
+                    named(&report["data"]["removed"], "legacy.yml"),
+                    linked,
+                    "{case}: {report}"
+                );
+            } else {
+                assert!(
+                    stdout(&out).contains("the identity files are unchanged"),
+                    "{case}: {}",
+                    stdout(&out)
+                );
+            }
+            assert_eq!(
+                mode_of(&output),
+                mode,
+                "{case}: forced export changed declaration access"
+            );
+            assert!(
+                !std::fs::symlink_metadata(&output).unwrap().is_symlink(),
+                "{case}: the output is still a link"
+            );
+            assert!(!target.exists(), "{case}: the stale link target remains");
+            assert!(
+                !dir.join(".pbps-publication-backup").exists(),
+                "{case}: a publication backup remains"
+            );
+            let bytes = std::fs::read(&output).unwrap();
+            let text = String::from_utf8(bytes.clone()).unwrap();
+            assert!(text.contains("Old row"), "{case}: {text}");
+            assert!(!text.contains("New row"), "{case}: {text}");
+            assert_eq!(
+                control.get_or_insert_with(|| bytes.clone()),
+                &bytes,
+                "{case}: content differs from the unrestricted export"
+            );
+            assert_eq!(crate::idtree::snapshot(&d.dir), ids, "{case}");
+            // The identity files stay for `plan` to re-point at the new
+            // filename, so only the declarations' own format is checked here.
+            ok(d.run(&["fmt", "--check"]));
+        }
+    }
+}
+
 pub fn hostile_names(server: &str, pg: bool) {
     let own = OwnDatabase::new(server, "history_hostile2289");
     let connection = own.connection();

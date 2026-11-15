@@ -24571,6 +24571,16 @@ fn state_history_requires_readable_snapshots_but_no_database_write_privileges() 
     state_history::permissions(&std::env::var("PBPS_TEST_DB").unwrap(), false);
 }
 
+#[cfg(unix)]
+#[test]
+#[ignore = "needs live SQL Server"]
+fn forced_state_export2348_keeps_the_mode_of_the_declaration_it_replaces() {
+    state_history::forced_export_keeps_declaration_modes(
+        &std::env::var("PBPS_TEST_DB").unwrap(),
+        false,
+    );
+}
+
 #[test]
 #[ignore = "needs live mssql"]
 fn state_history_keeps_raw_names_in_declarations_and_json_and_shows_them_once() {

@@ -36023,6 +36023,13 @@ fn state_history_requires_readable_snapshots_but_no_database_write_privileges() 
     }
 }
 
+// One test per server, so the shards can place the two majors apart.
+#[cfg(unix)]
+on_both_servers! {
+    forced_state_export2348_keeps_the_mode_of_the_declaration_it_replaces =>
+        |pg| state_history::forced_export_keeps_declaration_modes(&pg.url(), true),
+}
+
 #[test]
 #[ignore = "needs live postgres"]
 fn state_history_keeps_raw_names_in_declarations_and_json_and_shows_them_once() {
