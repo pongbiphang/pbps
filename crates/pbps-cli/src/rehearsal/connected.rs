@@ -337,7 +337,7 @@ pub(crate) fn base_bootstrap<D: crate::emission::Engine>(
             ids: &prerequisite_ids,
         },
         pbps_diff::Side {
-            schema: &*managed,
+            schema: &managed,
             ids: plan.base.ids,
         },
         plan.dialect.as_ref(),
