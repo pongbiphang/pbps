@@ -165,6 +165,12 @@ pub(super) fn failed_apply_snapshot(
     error: &anyhow::Error,
 ) -> StateSnapshot {
     let is_staged_checkpoint = current.staged.is_some();
+    // This build writes the row, so the row is in this build's format. The
+    // newest state may have been read from an older row, and it still carries
+    // that row's version. Written under it, the row would hold `object_deps`
+    // below the version that introduced the field, and every later read
+    // refuses such a row (DEC-2469.7).
+    current.version = pbps_model::state::CURRENT_VERSION;
     current.kind = StateKind::Failed;
     current.data_work = None;
     // The newest row's assertions passed for the plan that wrote it; this row
