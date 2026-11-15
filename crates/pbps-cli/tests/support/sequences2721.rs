@@ -332,8 +332,8 @@ fn a_rehearsed_plan_beside_a_held_sequence_converges_on_the_scratch() {
 }
 
 /// Drift in a recorded sequence is reported by name (DEC-2721.1): one dropped or renamed away
-/// out of band, and one altered, each make `verify` say so; a sequence nobody recorded, made
-/// beside them, is not looked at.
+/// out of band, and one altered, each make `verify`, `status` and the drift gate of
+/// `plan --db` say so (#2846); a sequence nobody recorded, made beside them, is not looked at.
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn a_recorded_sequence_that_was_dropped_renamed_or_altered_is_drift_by_name_and_an_unrecorded_one_is_not()
@@ -351,6 +351,17 @@ fn a_recorded_sequence_that_was_dropped_renamed_or_altered_is_drift_by_name_and_
             on_server(f.target(), sql);
             let out = f.d.run(&["verify", "--db", f.target()]);
             assert_eq!(code(&out), 2, "{}", said(&out));
+            // `status` and the drift gate of `plan --db` agree with `verify`: no checksum
+            // sees the kind, and both read clean where `verify` did not (#2846).
+            let status = said(&f.d.run_with_env(&["status"], &[("PBPS_REH_TARGET", f.target())]));
+            assert!(status.contains("drift"), "status: {status}");
+            let plan = f.d.run(&["plan", "--db", f.target()]);
+            assert_ne!(code(&plan), 0, "{}", said(&plan));
+            assert!(
+                said(&plan).contains("has drifted from the state recorded"),
+                "{}",
+                said(&plan)
+            );
             said(&out)
         };
         let text = drifted("ALTER SEQUENCE app.order_no INCREMENT BY 7");
