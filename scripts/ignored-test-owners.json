@@ -3282,7 +3282,10 @@
         "dev587::supplied_scratch_refuses_nonfresh_options_before_setup",
         "dev587::inherited_model_objects_refuse_run_owned_rehearsal_and_release_resources",
         "dev587::rehearsal_signals_empty_supplied_scratch_and_remove_owned_databases_only",
-        "rehearsal_refusals1920::a_statement_the_engine_rejects_is_reported_once_and_is_not_a_convergence_failure"
+        "rehearsal_refusals1920::a_statement_the_engine_rejects_is_reported_once_and_is_not_a_convergence_failure",
+        "rehearsal_refusals1920::a_rehearsal_that_does_not_converge_names_the_written_file_in_both_formats",
+        "rehearsal_refusals1920::a_rehearsal_that_does_not_converge_without_output_flags_names_no_file",
+        "rehearsal_refusals1920::a_rehearsal_that_converges_names_no_written_file"
       ]
     },
     {

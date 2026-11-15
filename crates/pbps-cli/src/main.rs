@@ -5697,12 +5697,15 @@ fn cmd_plan(
         // does not answer — is unanswerable, distinct from one that ran and found
         // the plan does not converge (a finding, below). Confusing the two would
         // tell CI the plan is wrong when the rehearsal never happened.
+        // The files written above stay written; a rehearsal that does not pass
+        // names them as unverified (DEC-1920.1).
+        let written: Vec<&std::path::Path> = out.iter().chain(sql.iter()).copied().collect();
         let dev_spec = if check || no_dev {
             None
         } else {
-            output::or_unanswerable(
-                "plan",
+            dev::unverified_on_failure(
                 json,
+                &written,
                 "rehearsal.unavailable",
                 dev::spec(project, dev),
             )?
@@ -5720,9 +5723,9 @@ fn cmd_plan(
                 "plan.unrenderable",
                 statements(&ordered, &dialect),
             )?;
-            let rehearsal = output::or_unanswerable(
-                "plan",
+            let rehearsal = dev::unverified_on_failure(
                 json,
+                &written,
                 "rehearsal.unavailable",
                 dev::rehearse(
                     &spec,
@@ -5769,14 +5772,18 @@ fn cmd_plan(
                     .remedy("rewrite the declaration in the form shown"),
                 );
                 }
+                if !rehearsal.converged() {
+                    findings.extend(dev::output_unverified(&written));
+                }
             } else {
                 print!("{}", report::rehearsal(&rehearsal));
                 if !rehearsal.converged() {
-                    return Err(Found::new(
-                    "the plan does not converge on the declarations (SPEC §11.5 invariant 3); the \
-                     differences above are what would be left behind",
-                )
-                .into());
+                    return Err(Found::new(dev::with_unverified_lines(
+                        "the plan does not converge on the declarations (SPEC §11.5 invariant 3); the \
+                         differences above are what would be left behind",
+                        &written,
+                    ))
+                    .into());
                 }
             }
         }

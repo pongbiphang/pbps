@@ -6520,3 +6520,38 @@ text, the absorption test fails; restored from a file copy and the four pass.
 The real-engine proof of the interval itself is the Windows CI of the PR
 (`resolver-pg-windows`). Formats: none. No sealed bytes, plan, state or evidence
 change.
+
+<a id="dec-1920-1"></a>
+
+**DEC-1920.1. A rehearsal that does not pass names the files `plan` wrote
+before it as unverified; it does not withhold them (#1920).** When `plan --dev`
+(or a configured `dev:`) is refused or cannot run (`rehearsal.unavailable`), or
+runs and does not converge (`rehearsal.does-not-converge`), and `--sql` or
+`--out` was written in the same run, the command says by name that each such
+file exists and did **not** pass the rehearsal. In human output that is one
+`warning:` line per file after the refusal text, on the stream the text uses
+(stderr); in JSON it is one `rehearsal.output-unverified` warning per file,
+located at the file, in the same envelope after the refusal or the
+non-convergence findings. One helper (`dev::output_unverified`) builds the
+wording for both outcomes and both formats, and the path is shown through the
+escaping for raw text. Exit codes, the order of the gates and every existing
+message are unchanged; a run with neither flag, a converging rehearsal and a
+run that skips the rehearsal (`--no-dev`, `--check`) say nothing of the kind.
+
+**Why the files are not withheld.** `plan` produces its outputs with no engine
+in the room, and they must be identical whether or not a dev database is
+available (SPEC §9.3); the comment above the rehearsal in `cmd_plan` says the
+same. Withholding `--sql` or `--out` on a refusal would make the outputs depend
+on `--dev`.
+
+**Rejected.** Writing the files only after a rehearsal passes, and deleting or
+truncating a file already written when it fails: both make the outputs depend on
+an optional engine, and the second destroys a file the person may have just
+produced on purpose. A bare note that "the rehearsal failed" without the file
+names was also rejected, because it leaves a reader of the files' directory with
+no way to tell which of them was checked.
+
+Pinned by the offline refusal tests (both files, one file, neither flag, a run
+that skips the rehearsal) and the live SQL Server tests (a non-converging
+computed column, with and without `--sql`; a converging run). Formats: none.
+No sealed bytes, plan, state or evidence change.

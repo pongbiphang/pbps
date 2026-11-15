@@ -198,6 +198,74 @@ pub fn rehearse<D: crate::emission::Engine>(
     })
 }
 
+/// What `plan` says about the files it wrote before a rehearsal that did not
+/// pass: each exists, and none of them was verified.
+///
+/// The files are written first and stay written, because the offline part of a
+/// plan is identical with or without an engine (SPEC §9.3, DEC-1920.1); so the
+/// only honest way to keep a refused or non-converging rehearsal from reading as
+/// a verification of them is to say so by name. One function yields both the
+/// JSON findings and the human lines, so the wording cannot drift between the two
+/// outcomes (refused, and ran without converging) or the two formats.
+pub fn output_unverified(written: &[&std::path::Path]) -> Vec<crate::output::Finding> {
+    written
+        .iter()
+        .map(|path| {
+            let text = pbps_model::Text::new(path.display().to_string());
+            crate::output::Finding::warning(
+                "rehearsal.output-unverified",
+                format!(
+                    "{} was written, and did NOT pass the dev rehearsal",
+                    text.shown()
+                ),
+            )
+            .at(path, None)
+        })
+        .collect()
+}
+
+/// `message` followed by one line per written file, and unchanged when none was
+/// written, so a run without `--sql` and `--out` prints exactly what it did.
+pub fn with_unverified_lines(message: &str, written: &[&std::path::Path]) -> String {
+    let mut text = message.to_owned();
+    for finding in output_unverified(written) {
+        text.push_str(&format!("\nwarning: {}", finding.message));
+    }
+    text
+}
+
+/// A rehearsal step that failed, with the files written before it named.
+///
+/// In JSON the findings go beside the failure in its `unanswerable` envelope;
+/// in human mode the lines follow the error text on the stream it already uses.
+/// The error is flattened once for the human text instead of wrapped in context,
+/// which would print its top message twice under `{:#}` (DEC-1726.1). Nothing
+/// is added when no file was written, and the exit code is untouched.
+pub fn unverified_on_failure<T>(
+    json: bool,
+    written: &[&std::path::Path],
+    id: &'static str,
+    step: anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    match step {
+        Ok(value) => Ok(value),
+        Err(error) if written.is_empty() => {
+            crate::output::or_unanswerable("plan", json, id, Err(error))
+        }
+        Err(error) if json => crate::output::or_unanswerable_beside(
+            "plan",
+            true,
+            id,
+            Err(error),
+            output_unverified(written),
+        ),
+        Err(error) => Err(anyhow::anyhow!(
+            "{}",
+            with_unverified_lines(&format!("{error:#}"), written)
+        )),
+    }
+}
+
 enum Source {
     Server(String),
     Docker(String, pbps_config::resolver::PullPolicy),
@@ -209,6 +277,41 @@ mod tests {
 
     /// The scheme is what tells a container apart from a server that is already
     /// running; a connection string must never be mistaken for an image name.
+    #[test]
+    fn each_written_file_is_named_once_and_no_file_means_no_statement() {
+        let out = std::path::Path::new("plan.json");
+        let sql = std::path::Path::new("plan.sql");
+        let lines = with_unverified_lines("refused", &[out, sql]);
+        assert_eq!(lines.matches("did NOT pass the dev rehearsal").count(), 2);
+        assert_eq!(lines.matches("plan.json").count(), 1);
+        assert_eq!(lines.matches("plan.sql").count(), 1);
+        assert!(output_unverified(&[]).is_empty());
+        assert_eq!(with_unverified_lines("refused", &[]), "refused");
+    }
+
+    #[test]
+    fn a_path_with_a_line_break_cannot_start_a_line_of_its_own() {
+        let lines = with_unverified_lines("refused", &[std::path::Path::new("a\nerror: forged")]);
+        assert_eq!(lines.lines().count(), 2, "{lines}");
+    }
+
+    #[test]
+    fn a_failed_step_keeps_its_error_and_gains_one_line_per_file() {
+        let sql = std::path::Path::new("plan.sql");
+        let failed: anyhow::Result<()> = Err(anyhow::anyhow!("no engine"));
+        let error = unverified_on_failure(false, &[sql], "rehearsal.unavailable", failed)
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("no engine\n"), "{error}");
+        assert_eq!(error.matches("plan.sql").count(), 1, "{error}");
+        let failed: anyhow::Result<()> = Err(anyhow::anyhow!("no engine"));
+        let error = unverified_on_failure(false, &[], "rehearsal.unavailable", failed)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "no engine");
+        assert!(unverified_on_failure(false, &[sql], "x", Ok(1)).is_ok());
+    }
+
     #[test]
     fn the_docker_scheme_selects_a_container() {
         assert_eq!(
