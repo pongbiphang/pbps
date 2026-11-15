@@ -140,14 +140,19 @@ fn an_owner_key_must_be_declared_in_the_same_file() {
 fn a_typed_spelling_naming_a_declared_module_is_refused_as_ambiguous() {
     let module = "view: table::app.t\ndefinition: SELECT 1\n".to_owned();
     let table = "table: app.t\ncolumns:\n  x: {type: int}\n".to_owned();
-    let owner = |target: &str| format!("view: app.v\ndepends_on: [{target}]\ndefinition: SELECT 1\n");
+    let owner =
+        |target: &str| format!("view: app.v\ndepends_on: [{target}]\ndefinition: SELECT 1\n");
     let errors = project(&[
         ("m.yml", module.clone()),
         ("t.yml", table.clone()),
         ("v.yml", owner("table::app.t")),
     ])
     .unwrap_err();
-    assert!(problems(&errors).contains("ambiguous"), "{}", problems(&errors));
+    assert!(
+        problems(&errors).contains("ambiguous"),
+        "{}",
+        problems(&errors)
+    );
     // The `module::` escape and the structured form say which was meant.
     for target in [
         "module::table::app.t",
@@ -201,7 +206,12 @@ fn fmt_keeps_depends_on_on_every_root_kind_and_is_idempotent() {
             &t.value_renames,
             &t.depends_on.deps,
         ),
-        _ => unreachable!(),
+        LoadedFile::Extension(_)
+        | LoadedFile::Dependency(_)
+        | LoadedFile::Search(_)
+        | LoadedFile::Sequence(_) => {
+            unreachable!("these roots take no depends_on")
+        }
     };
     let lists = "depends_on: [table::app.u, app.z(), app.f()]\n";
     let mapped = "depends_on:\n  \"role::reader\": [app.f()]\n  \"table::app.t\": [app.g()]\n";

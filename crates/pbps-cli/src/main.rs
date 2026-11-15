@@ -3853,7 +3853,11 @@ fn declaration_problems_with_sources(
     }
     // And a third: a `depends_on:` that names nothing declared or closes a
     // cycle (the checks are in `annotation_findings`).
-    out.extend(annotation_findings(schema, &loaded.hints.annotations, dialect));
+    out.extend(annotation_findings(
+        schema,
+        &loaded.hints.annotations,
+        dialect,
+    ));
     // Reference data (ADR-0004). Model rules, not engine rules — a row's
     // key is its identity in every dialect — so they come from the model
     // rather than from `validate_table`.
@@ -7144,8 +7148,12 @@ mod tests {
             "{ghost:?}"
         );
         assert!(
-            annotation_findings(&schema, &deps(&[("module::app.v", "module::app.w")]), pg.as_ref())
-                .is_empty()
+            annotation_findings(
+                &schema,
+                &deps(&[("module::app.v", "module::app.w")]),
+                pg.as_ref()
+            )
+            .is_empty()
         );
         // A table that depends on a missing module is nobody's module edge:
         // the registry reports it, once, under the same code.
@@ -7171,10 +7179,7 @@ mod tests {
             "exclusion::app.t.x",
             "check::type::app.d.c",
         ] {
-            for rows in [
-                [("module::app.v", foreign)],
-                [(foreign, "module::app.v")],
-            ] {
+            for rows in [[("module::app.v", foreign)], [(foreign, "module::app.v")]] {
                 let found = annotation_findings(&schema, &deps(&rows), ms.as_ref());
                 assert!(
                     matches!(found.as_slice(), [("schema.unknown-dependency", why)]
@@ -7195,7 +7200,9 @@ mod tests {
             pg.as_ref(),
         );
         assert!(
-            !on_postgres.iter().any(|(_, why)| why.contains("only PostgreSQL has")),
+            !on_postgres
+                .iter()
+                .any(|(_, why)| why.contains("only PostgreSQL has")),
             "{on_postgres:?}"
         );
     }

@@ -1157,8 +1157,8 @@ mod tests {
                 &partitions,
                 &t.intents,
                 t.strategy.as_ref(),
-            &Default::default(),
-)
+                &Default::default(),
+            )
         };
         let out = render_all(a);
         let b = crate::load_table_str(Path::new("t.yml"), &out).unwrap_or_else(|e| {
@@ -1539,10 +1539,18 @@ mod tests {
                 description: Some(s.as_str().into()),
                 ..Default::default()
             };
-            let out = render_role(&pbps_model::RoleName::from("reader"), &role, &[], &Default::default());
+            let out = render_role(
+                &pbps_model::RoleName::from("reader"),
+                &role,
+                &[],
+                &Default::default(),
+            );
             let back = crate::load_role_str(Path::new("r.yml"), &out).unwrap();
             assert_eq!(back.role, role, "role description: {s:?}");
-            assert_eq!(render_role(&back.name, &back.role, &back.intents, &Default::default()), out);
+            assert_eq!(
+                render_role(&back.name, &back.role, &back.intents, &Default::default()),
+                out
+            );
         }
     }
 
@@ -1586,11 +1594,19 @@ mod tests {
             from: "old\rrole".into(),
             to: "role\nname".into(),
         }];
-        let out = render_role(&pbps_model::RoleName::from("role\nname"), &role, &pending, &Default::default());
+        let out = render_role(
+            &pbps_model::RoleName::from("role\nname"),
+            &role,
+            &pending,
+            &Default::default(),
+        );
         let back = crate::load_role_str(Path::new("r.yml"), &out).unwrap();
         assert_eq!(back.name, "role\nname".into());
         assert_eq!(back.intents, pending);
-        assert_eq!(render_role(&back.name, &back.role, &back.intents, &Default::default()), out);
+        assert_eq!(
+            render_role(&back.name, &back.role, &back.intents, &Default::default()),
+            out
+        );
     }
 
     fn module_round_trip(yaml: &str) -> String {
@@ -1625,8 +1641,8 @@ mod tests {
                 &pbps_model::RoleName::from(name),
                 &pbps_model::Role::default(),
                 &[],
-            &Default::default(),
-);
+                &Default::default(),
+            );
             let back = crate::load_role_str(Path::new("r.yml"), &out)
                 .unwrap_or_else(|e| panic!("the rendered file failed to load: {e:?}\n{out}"));
             assert_eq!(back.name, name.into(), "output:\n{out}");
@@ -1642,8 +1658,8 @@ mod tests {
                 from: " was ".into(),
                 to: "kept".into(),
             }],
-        &Default::default(),
-);
+            &Default::default(),
+        );
         let back = crate::load_role_str(Path::new("r.yml"), &out)
             .unwrap_or_else(|e| panic!("the rendered file failed to load: {e:?}\n{out}"));
         assert_eq!(
@@ -1660,8 +1676,8 @@ mod tests {
             &pbps_model::RoleName::from("   "),
             &pbps_model::Role::default(),
             &[],
-        &Default::default(),
-);
+            &Default::default(),
+        );
         assert!(
             crate::load_role_str(Path::new("r.yml"), &out).is_err(),
             "output:\n{out}"
@@ -1690,7 +1706,12 @@ mod tests {
             .into(),
             ..Role::default()
         };
-        let out = render_role(&pbps_model::RoleName::from("writer"), &role, &[], &Default::default());
+        let out = render_role(
+            &pbps_model::RoleName::from("writer"),
+            &role,
+            &[],
+            &Default::default(),
+        );
         assert!(!out.contains("serial-sequences"), "{out}");
         assert!(!out.contains("hidden"), "{out}");
         let loaded = crate::load_role_str(Path::new("r.yml"), &out).unwrap();
@@ -1711,7 +1732,12 @@ mod tests {
             ..Role::default()
         };
         assert_eq!(
-            render_role(&pbps_model::RoleName::from("writer"), &only, &[], &Default::default()),
+            render_role(
+                &pbps_model::RoleName::from("writer"),
+                &only,
+                &[],
+                &Default::default()
+            ),
             "role: writer\n"
         );
         assert!(
@@ -1737,7 +1763,12 @@ mod tests {
             one(pbps_model::Permission::Insert),
         );
 
-        let out = render_role(&pbps_model::RoleName::from("r"), &role, &[], &Default::default());
+        let out = render_role(
+            &pbps_model::RoleName::from("r"),
+            &role,
+            &[],
+            &Default::default(),
+        );
         let back = crate::load_role_str(Path::new("r.yml"), &out)
             .unwrap_or_else(|e| panic!("the rendered file failed to load: {e:?}\n{out}"));
         assert_eq!(back.role.grants, role.grants, "output:\n{out}");
@@ -2563,7 +2594,14 @@ indexes:
         );
         // A partition with nothing of its own stays on one line.
         let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
-        let out = render_partitioned(&t.name, &t.table, &partitions, &[], None, &Default::default());
+        let out = render_partitioned(
+            &t.name,
+            &t.table,
+            &partitions,
+            &[],
+            None,
+            &Default::default(),
+        );
         assert!(
             out.contains("\n  ev_plain: {from: [\"2025-01-01\"], to: [MAXVALUE]}\n"),
             "{out}"
@@ -2604,7 +2642,14 @@ indexes:
             ["ev_u_fk"]
         );
         let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
-        let out = render_partitioned(&t.name, &t.table, &partitions, &[], None, &Default::default());
+        let out = render_partitioned(
+            &t.name,
+            &t.table,
+            &partitions,
+            &[],
+            None,
+            &Default::default(),
+        );
         assert!(
             out.contains("\n  ev_plain: {from: [\"2025-01-01\"], to: [MAXVALUE]}\n"),
             "{out}"
@@ -2659,7 +2704,14 @@ indexes:
         assert!(!own("ev_plain").unlogged && own("ev_plain").storage_parameters.is_empty());
         assert!(!t.table.unlogged && t.table.storage_parameters.is_empty());
         let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
-        let out = render_partitioned(&t.name, &t.table, &partitions, &[], None, &Default::default());
+        let out = render_partitioned(
+            &t.name,
+            &t.table,
+            &partitions,
+            &[],
+            None,
+            &Default::default(),
+        );
         assert!(
             out.contains("\n  ev_plain: {from: [\"2025-01-01\"], to: [MAXVALUE]}\n"),
             "{out}"
@@ -2715,7 +2767,14 @@ indexes:
         // The partition declares no column of its own.
         assert!(t.partitions.iter().all(|(_, p)| p.columns.is_empty()));
         let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
-        let out = render_partitioned(&t.name, &t.table, &partitions, &[], None, &Default::default());
+        let out = render_partitioned(
+            &t.name,
+            &t.table,
+            &partitions,
+            &[],
+            None,
+            &Default::default(),
+        );
         assert!(
             out.contains("\n    to: [\"2025-01-01\"]\n    columns:\n      v: {default: \"7\", nullable: false}\n"),
             "{out}"
@@ -2834,7 +2893,14 @@ indexes:
             ]
         );
         let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
-        let out = render_partitioned(&t.name, &t.table, &partitions, &[], None, &Default::default());
+        let out = render_partitioned(
+            &t.name,
+            &t.table,
+            &partitions,
+            &[],
+            None,
+            &Default::default(),
+        );
         assert!(
             out.contains("\npartition_by: [ts]\n\npartitions:\n  ev_old: {from: [MINVALUE], to: [\"2025-01-01\"]}\n  ev_rest: default\n  hist.ev_2026: {from: [\"2026-01-01\"], to: [MAXVALUE]}\n"),
             "{out}"
@@ -2895,8 +2961,8 @@ indexes:
                 &[(&child, &table)],
                 &[],
                 None,
-            &Default::default(),
-);
+                &Default::default(),
+            );
             let back = crate::load_table_str(Path::new("t.yml"), &out)
                 .unwrap_or_else(|e| panic!("{v:?}: {e:?}\n{out}"));
             assert_eq!(back.partitions, [(child, table)], "{v:?}\n{out}");
@@ -3001,7 +3067,14 @@ indexes:
         assert_eq!(written.partitions, reordered.partitions);
         let render_of = |t: &crate::LoadedTable| {
             let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
-            render_partitioned(&t.name, &t.table, &partitions, &[], None, &Default::default())
+            render_partitioned(
+                &t.name,
+                &t.table,
+                &partitions,
+                &[],
+                None,
+                &Default::default(),
+            )
         };
         assert_eq!(render_of(&written), render_of(&reordered));
         // Negative: another value is another bound.

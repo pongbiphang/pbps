@@ -1192,8 +1192,10 @@ fn exclusion_shorthand_round_trips_and_the_registry_declares_it() {
         .exclude
         .insert(
             "e".into(),
-            serde_json::from_str(r#"{"method":"btree","keys":[{"key":{"name":"x"},"operator":"="}]}"#)
-                .unwrap(),
+            serde_json::from_str(
+                r#"{"method":"btree","keys":[{"key":{"name":"x"},"operator":"="}]}"#,
+            )
+            .unwrap(),
         );
     let registry = Registry::new(&schema);
     let exclusion = reference("exclusion::app.t.e");

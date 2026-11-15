@@ -33,79 +33,83 @@ pub fn load_type_str(path: &Path, text: &str) -> Result<LoadedType, Vec<LoadErro
     };
     let probe: KindProbe = serde_saphyr::from_str(text).map_err(|e| fail(e.to_string()))?;
     let mut value_renames = BTreeMap::new();
-    let (name, definition, renamed_from, depends_on): (_, _, _, DependsOnDto) = match (probe.enumeration, probe.domain) {
-        (Some(_), None) => {
-            let dto: EnumTypeDto = serde_saphyr::from_str(text).map_err(|e| fail(e.to_string()))?;
-            let mut seen = BTreeSet::new();
-            let mut sources = BTreeSet::new();
-            let mut values = Vec::new();
-            for entry in dto.values {
-                let (value, from) = match entry {
-                    crate::dto::EnumValueDto::Label(value) => (value, None),
-                    crate::dto::EnumValueDto::Renamed(value) => (value.name, value.renamed_from),
-                };
-                if let Some(from) = from {
-                    if !sources.insert(from.clone()) {
+    let (name, definition, renamed_from, depends_on): (_, _, _, DependsOnDto) =
+        match (probe.enumeration, probe.domain) {
+            (Some(_), None) => {
+                let dto: EnumTypeDto =
+                    serde_saphyr::from_str(text).map_err(|e| fail(e.to_string()))?;
+                let mut seen = BTreeSet::new();
+                let mut sources = BTreeSet::new();
+                let mut values = Vec::new();
+                for entry in dto.values {
+                    let (value, from) = match entry {
+                        crate::dto::EnumValueDto::Label(value) => (value, None),
+                        crate::dto::EnumValueDto::Renamed(value) => {
+                            (value.name, value.renamed_from)
+                        }
+                    };
+                    if let Some(from) = from {
+                        if !sources.insert(from.clone()) {
+                            return Err(fail(format!(
+                                "enum `{}`: two labels claim renamed_from `{}`",
+                                pbps_model::escape::Escaped(&dto.name),
+                                pbps_model::escape::Escaped(&from)
+                            )));
+                        }
+                        value_renames.insert(value.clone(), from);
+                    }
+                    if !seen.insert(value.clone()) {
                         return Err(fail(format!(
-                            "enum `{}`: two labels claim renamed_from `{}`",
+                            "enum `{}` declares value `{}` twice",
                             pbps_model::escape::Escaped(&dto.name),
-                            pbps_model::escape::Escaped(&from)
+                            pbps_model::escape::Escaped(&value)
                         )));
                     }
-                    value_renames.insert(value.clone(), from);
+                    values.push(value);
                 }
-                if !seen.insert(value.clone()) {
-                    return Err(fail(format!(
-                        "enum `{}` declares value `{}` twice",
-                        pbps_model::escape::Escaped(&dto.name),
-                        pbps_model::escape::Escaped(&value)
-                    )));
-                }
-                values.push(value);
+                (
+                    dto.name,
+                    ManagedType::Enum { values },
+                    dto.renamed_from,
+                    dto.depends_on,
+                )
             }
-            (
-                dto.name,
-                ManagedType::Enum { values },
-                dto.renamed_from,
-                dto.depends_on,
-            )
-        }
-        (None, Some(_)) => {
-            let dto: DomainTypeDto =
-                serde_saphyr::from_str(text).map_err(|e| fail(e.to_string()))?;
-            let base = dto
-                .base
-                .parse::<ColumnType>()
-                .map_err(|e| fail(e.to_string()))?;
-            let checks = dto
-                .checks
-                .into_iter()
-                .map(|(name, expression)| (name.into(), expression))
-                .collect();
-            let collation = dto
-                .collation
-                .map(|name| name.parse())
-                .transpose()
-                .map_err(|e: pbps_model::TypeParseError| fail(e.to_string()))?;
-            (
-                dto.name,
-                ManagedType::Domain {
-                    base,
-                    not_null: dto.not_null,
-                    default: dto.default,
-                    checks,
-                    collation,
-                },
-                dto.renamed_from,
-                dto.depends_on,
-            )
-        }
-        _ => {
-            return Err(fail(
-                "a type file declares exactly one of `enum:` or `domain:`".into(),
-            ));
-        }
-    };
+            (None, Some(_)) => {
+                let dto: DomainTypeDto =
+                    serde_saphyr::from_str(text).map_err(|e| fail(e.to_string()))?;
+                let base = dto
+                    .base
+                    .parse::<ColumnType>()
+                    .map_err(|e| fail(e.to_string()))?;
+                let checks = dto
+                    .checks
+                    .into_iter()
+                    .map(|(name, expression)| (name.into(), expression))
+                    .collect();
+                let collation = dto
+                    .collation
+                    .map(|name| name.parse())
+                    .transpose()
+                    .map_err(|e: pbps_model::TypeParseError| fail(e.to_string()))?;
+                (
+                    dto.name,
+                    ManagedType::Domain {
+                        base,
+                        not_null: dto.not_null,
+                        default: dto.default,
+                        checks,
+                        collation,
+                    },
+                    dto.renamed_from,
+                    dto.depends_on,
+                )
+            }
+            _ => {
+                return Err(fail(
+                    "a type file declares exactly one of `enum:` or `domain:`".into(),
+                ));
+            }
+        };
     let name: TypeRef = name
         .parse()
         .map_err(|e: pbps_model::TypeParseError| fail(e.to_string()))?;
@@ -230,8 +234,8 @@ mod tests {
             &loaded.definition,
             &[],
             &loaded.value_renames,
-        &Default::default(),
-);
+            &Default::default(),
+        );
         assert_eq!(
             load_type_str(Path::new("enum.yml"), &rendered).unwrap(),
             loaded

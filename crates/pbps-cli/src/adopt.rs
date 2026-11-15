@@ -748,7 +748,9 @@ pub(crate) fn write_declarations_with_deps(
     }
     for (name, definition) in &schema.types {
         let path = declaration_file::type_path(dir, name)?;
-        std::fs::write(&path, pbps_load::render_type_with_value_renames(
+        std::fs::write(
+            &path,
+            pbps_load::render_type_with_value_renames(
                 name,
                 definition,
                 &[],
@@ -756,7 +758,7 @@ pub(crate) fn write_declarations_with_deps(
                 of(&Declaration::Type(name.clone())),
             ),
         )
-            .with_context(|| format!("cannot write `{}`", path.display()))?;
+        .with_context(|| format!("cannot write `{}`", path.display()))?;
         written.insert(path);
     }
     for (name, definition) in &schema.search {
@@ -820,14 +822,11 @@ pub(crate) fn write_declarations_with_deps(
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create `{}`", parent.display()))?;
         }
-        std::fs::write(&path, pbps_load::render_role(
-                name,
-                role,
-                &[],
-                of(&Declaration::Role(name.clone())),
-            ),
+        std::fs::write(
+            &path,
+            pbps_load::render_role(name, role, &[], of(&Declaration::Role(name.clone()))),
         )
-            .with_context(|| format!("cannot write `{}`", path.display()))?;
+        .with_context(|| format!("cannot write `{}`", path.display()))?;
         written.insert(path);
     }
     Ok(written)

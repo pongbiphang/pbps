@@ -75,7 +75,8 @@ impl Project {
         if code != Some(0) {
             return Err(text);
         }
-        let plan: serde_json::Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+        let plan: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
         let steps = plan["changes"]["changes"]
             .as_array()
             .unwrap()
@@ -121,7 +122,8 @@ struct Case {
 }
 
 /// A PostgreSQL project: a function nobody names, a table `app.t`.
-const PG_F: &str = "function: app.f()\n{dep}definition: |-\n  () RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$\n";
+const PG_F: &str =
+    "function: app.f()\n{dep}definition: |-\n  () RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$\n";
 /// The same for SQL Server, which names a function without its arguments.
 const MS_F: &str = "function: dbo.f\n{dep}definition: |-\n  () RETURNS int AS BEGIN RETURN 1 END\n";
 
@@ -144,7 +146,14 @@ fn part(schema: &str, key: &str, f: &str, x: &str, rest: &str) -> (String, Strin
     )
 }
 
-fn pg(name: &'static str, plain: &'static [&'static str], key: &str, x: &str, rest: &str, then: &'static [&'static str]) -> Case {
+fn pg(
+    name: &'static str,
+    plain: &'static [&'static str],
+    key: &str,
+    x: &str,
+    rest: &str,
+    then: &'static [&'static str],
+) -> Case {
     let (plain_table, annotated) = part("app", key, "app.f()", x, rest);
     Case {
         name,
@@ -159,7 +168,14 @@ fn pg(name: &'static str, plain: &'static [&'static str], key: &str, x: &str, re
     }
 }
 
-fn ms(name: &'static str, plain: &'static [&'static str], key: &str, x: &str, rest: &str, then: &'static [&'static str]) -> Case {
+fn ms(
+    name: &'static str,
+    plain: &'static [&'static str],
+    key: &str,
+    x: &str,
+    rest: &str,
+    then: &'static [&'static str],
+) -> Case {
     let (plain_table, annotated) = part("dbo", key, "dbo.f", x, rest);
     Case {
         name,
@@ -191,15 +207,114 @@ fn pg_cases() -> Vec<Case> {
             ),
             ..pg("table", PG_BASE, "", "", "", &[])
         },
-        pg("column", PG_BASE, "column::app.t.x", "", "", &["create_table app.t", "create_module app.f()", "add_column x"]),
-        pg("default", PG_BASE, "default::app.t.x", ", default: \"0\"", "", &["create_table app.t", "create_module app.f()", "alter_column_default"]),
-        pg("generation", PG_BASE, "generation::app.t.x", ", generated: {expression: \"id + 1\", stored: true}", "", &["create_table app.t", "create_module app.f()", "add_column x"]),
-        pg("not_null", PG_BASE, "not_null::app.t.x", ", nullable: false", "", &["create_table app.t", "create_module app.f()", "alter_column_nullability"]),
-        pg("index", PG_BASE, "index::app.t.ix", "", "indexes:\n  ix: {columns: [x]}\n", &["create_table app.t", "create_module app.f()", "add_index ix"]),
-        pg("unique", PG_BASE, "unique::app.t.u", "", "unique:\n  u: {columns: [x]}\n", &["create_table app.t", "create_module app.f()", "add_unique u"]),
-        pg("check", PG_BASE, "check::app.t.c", "", "checks:\n  c: \"x > 0\"\n", &["create_table app.t", "create_module app.f()", "add_check c"]),
-        pg("primary_key", PG_BASE, "primary_key::app.t", "", "primary_key: [id]\n", &["create_table app.t", "create_module app.f()", "set_primary_key"]),
-        pg("exclusion", &["create_table app.t", "set_exclusion e", "create_module app.f()"], "exclusion::app.t.e", "", "exclude:\n  e:\n    method: btree\n    keys:\n      - {column: x, operator: \"=\"}\n", &["create_table app.t", "create_module app.f()", "set_exclusion e"]),
+        pg(
+            "column",
+            PG_BASE,
+            "column::app.t.x",
+            "",
+            "",
+            &[
+                "create_table app.t",
+                "create_module app.f()",
+                "add_column x",
+            ],
+        ),
+        pg(
+            "default",
+            PG_BASE,
+            "default::app.t.x",
+            ", default: \"0\"",
+            "",
+            &[
+                "create_table app.t",
+                "create_module app.f()",
+                "alter_column_default",
+            ],
+        ),
+        pg(
+            "generation",
+            PG_BASE,
+            "generation::app.t.x",
+            ", generated: {expression: \"id + 1\", stored: true}",
+            "",
+            &[
+                "create_table app.t",
+                "create_module app.f()",
+                "add_column x",
+            ],
+        ),
+        pg(
+            "not_null",
+            PG_BASE,
+            "not_null::app.t.x",
+            ", nullable: false",
+            "",
+            &[
+                "create_table app.t",
+                "create_module app.f()",
+                "alter_column_nullability",
+            ],
+        ),
+        pg(
+            "index",
+            PG_BASE,
+            "index::app.t.ix",
+            "",
+            "indexes:\n  ix: {columns: [x]}\n",
+            &[
+                "create_table app.t",
+                "create_module app.f()",
+                "add_index ix",
+            ],
+        ),
+        pg(
+            "unique",
+            PG_BASE,
+            "unique::app.t.u",
+            "",
+            "unique:\n  u: {columns: [x]}\n",
+            &[
+                "create_table app.t",
+                "create_module app.f()",
+                "add_unique u",
+            ],
+        ),
+        pg(
+            "check",
+            PG_BASE,
+            "check::app.t.c",
+            "",
+            "checks:\n  c: \"x > 0\"\n",
+            &["create_table app.t", "create_module app.f()", "add_check c"],
+        ),
+        pg(
+            "primary_key",
+            PG_BASE,
+            "primary_key::app.t",
+            "",
+            "primary_key: [id]\n",
+            &[
+                "create_table app.t",
+                "create_module app.f()",
+                "set_primary_key",
+            ],
+        ),
+        pg(
+            "exclusion",
+            &[
+                "create_table app.t",
+                "set_exclusion e",
+                "create_module app.f()",
+            ],
+            "exclusion::app.t.e",
+            "",
+            "exclude:\n  e:\n    method: btree\n    keys:\n      - {column: x, operator: \"=\"}\n",
+            &[
+                "create_table app.t",
+                "create_module app.f()",
+                "set_exclusion e",
+            ],
+        ),
     ];
     // A serial column's sequence is created with its table: the annotation
     // holds the whole CREATE TABLE group (decision 8.4 = A).
@@ -213,14 +328,24 @@ fn pg_cases() -> Vec<Case> {
         ],
         annotated: (
             "app.t.yml",
-            serial.replace("{dep}", "depends_on:\n  \"sequence::app.t.id\": [\"module::app.f()\"]\n"),
+            serial.replace(
+                "{dep}",
+                "depends_on:\n  \"sequence::app.t.id\": [\"module::app.f()\"]\n",
+            ),
         ),
         plain: PG_BASE,
         then: Then::Order(function_first),
     });
     // A foreign key needs the table it points at.
-    let parent = "table: app.p\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n".to_owned();
-    let (plain_table, annotated) = part("app", "foreign_key::app.t.fk", "app.f()", "", "foreign_keys:\n  fk: {columns: [x], references: app.p(id)}\n");
+    let parent = "table: app.p\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n"
+        .to_owned();
+    let (plain_table, annotated) = part(
+        "app",
+        "foreign_key::app.t.fk",
+        "app.f()",
+        "",
+        "foreign_keys:\n  fk: {columns: [x], references: app.p(id)}\n",
+    );
     cases.push(Case {
         name: "foreign_key",
         dialect: "postgres",
@@ -230,8 +355,18 @@ fn pg_cases() -> Vec<Case> {
             ("app.t.yml", plain_table),
         ],
         annotated: ("app.t.yml", annotated),
-        plain: &["create_table app.p", "create_table app.t", "add_foreign_key fk", "create_module app.f()"],
-        then: Then::Order(&["create_table app.p", "create_table app.t", "create_module app.f()", "add_foreign_key fk"]),
+        plain: &[
+            "create_table app.p",
+            "create_table app.t",
+            "add_foreign_key fk",
+            "create_module app.f()",
+        ],
+        then: Then::Order(&[
+            "create_table app.p",
+            "create_table app.t",
+            "create_module app.f()",
+            "add_foreign_key fk",
+        ]),
     });
     // An enum and a domain, whole and by part.
     let enumeration = "enum: app.mood\n{dep}values: [a, b]\n";
@@ -242,7 +377,10 @@ fn pg_cases() -> Vec<Case> {
             ("app.f.yml", PG_F.replace("{dep}", "")),
             ("app.mood.yml", enumeration.replace("{dep}", "")),
         ],
-        annotated: ("app.mood.yml", enumeration.replace("{dep}", "depends_on: [\"module::app.f()\"]\n")),
+        annotated: (
+            "app.mood.yml",
+            enumeration.replace("{dep}", "depends_on: [\"module::app.f()\"]\n"),
+        ),
         plain: &["create_type app.mood", "create_module app.f()"],
         then: Then::Order(&["create_module app.f()", "create_type app.mood"]),
     });
@@ -254,11 +392,18 @@ fn pg_cases() -> Vec<Case> {
             ("app.f.yml", PG_F.replace("{dep}", "")),
             ("app.d.yml", domain.replace("{dep}", "")),
         ],
-        annotated: ("app.d.yml", domain.replace("{dep}", "depends_on: [\"module::app.f()\"]\n")),
+        annotated: (
+            "app.d.yml",
+            domain.replace("{dep}", "depends_on: [\"module::app.f()\"]\n"),
+        ),
         plain: &["create_type app.d", "create_module app.f()"],
         then: Then::Order(&["create_module app.f()", "create_type app.d"]),
     });
-    for key in ["check::type::app.d.c", "default::type::app.d", "not_null::type::app.d"] {
+    for key in [
+        "check::type::app.d.c",
+        "default::type::app.d",
+        "not_null::type::app.d",
+    ] {
         cases.push(Case {
             name: Box::leak(format!("type (domain part) {key}").into_boxed_str()),
             dialect: "postgres",
@@ -268,17 +413,32 @@ fn pg_cases() -> Vec<Case> {
             ],
             annotated: (
                 "app.d.yml",
-                domain.replace("{dep}", &format!("depends_on:\n  \"{key}\": [\"module::app.f()\"]\n")),
+                domain.replace(
+                    "{dep}",
+                    &format!("depends_on:\n  \"{key}\": [\"module::app.f()\"]\n"),
+                ),
             ),
             plain: &["create_type app.d", "create_module app.f()"],
-            then: Then::Order(&["create_type app.d", "create_module app.f()", "alter_domain app.d"]),
+            then: Then::Order(&[
+                "create_type app.d",
+                "create_module app.f()",
+                "alter_domain app.d",
+            ]),
         });
     }
     // A policy and row-level security are installed after every module, so a
     // module cannot be made to follow one: that is refused, with its legs.
     for (name, key, rest) in [
-        ("policy", "policy::app.t.p", "row_security: {enabled: true}\nrow_policies:\n  p: {using: \"true\"}\n"),
-        ("row_security", "row_security::app.t", "row_security: {enabled: true}\n"),
+        (
+            "policy",
+            "policy::app.t.p",
+            "row_security: {enabled: true}\nrow_policies:\n  p: {using: \"true\"}\n",
+        ),
+        (
+            "row_security",
+            "row_security::app.t",
+            "row_security: {enabled: true}\n",
+        ),
     ] {
         let function = PG_F.replace("{dep}", &format!("depends_on: [\"{key}\"]\n"));
         cases.push(Case {
@@ -290,9 +450,18 @@ fn pg_cases() -> Vec<Case> {
             ],
             annotated: ("app.f.yml", function),
             plain: if name == "policy" {
-                &["create_table app.t", "create_module app.f()", "create_policy p", "set_row_security"]
+                &[
+                    "create_table app.t",
+                    "create_module app.f()",
+                    "create_policy p",
+                    "set_row_security",
+                ]
             } else {
-                &["create_table app.t", "create_module app.f()", "set_row_security"]
+                &[
+                    "create_table app.t",
+                    "create_module app.f()",
+                    "set_row_security",
+                ]
             },
             then: Then::Refuse("these steps wait on one another"),
         });
@@ -308,7 +477,10 @@ fn pg_cases() -> Vec<Case> {
             ("app.t.yml", table("app", "", "", "")),
             ("r1.yml", role.replace("{dep}", "")),
         ],
-        annotated: ("r1.yml", role.replace("{dep}", "depends_on: [\"module::app.f()\"]\n")),
+        annotated: (
+            "r1.yml",
+            role.replace("{dep}", "depends_on: [\"module::app.f()\"]\n"),
+        ),
         plain: &["create_table app.t", "create_module app.f()", "grant"],
         then: Then::Refuse("provision the role before the baseline"),
     });
@@ -326,18 +498,97 @@ fn ms_cases() -> Vec<Case> {
             then: Then::Order(function_first),
             ..ms("table", MS_BASE, "", "", "", &[])
         },
-        ms("column", MS_BASE, "column::dbo.t.x", "", "", &["create_table dbo.t", "create_module dbo.f", "add_column x"]),
-        ms("default", MS_BASE, "default::dbo.t.x", ", default: \"0\"", "", &["create_table dbo.t", "create_module dbo.f", "alter_column_default"]),
-        ms("not_null", MS_BASE, "not_null::dbo.t.x", ", nullable: false", "", &["create_table dbo.t", "create_module dbo.f", "alter_column_nullability"]),
-        ms("index", MS_BASE, "index::dbo.t.ix", "", "indexes:\n  ix: {columns: [x]}\n", &["create_table dbo.t", "create_module dbo.f", "add_index ix"]),
-        ms("unique", MS_BASE, "unique::dbo.t.u", "", "unique:\n  u: {columns: [x]}\n", &["create_table dbo.t", "create_module dbo.f", "add_unique u"]),
-        ms("check", MS_BASE, "check::dbo.t.c", "", "checks:\n  c: \"x > 0\"\n", &["create_table dbo.t", "create_module dbo.f", "add_check c"]),
-        ms("primary_key", MS_BASE, "primary_key::dbo.t", "", "primary_key: [id]\n", &["create_table dbo.t", "create_module dbo.f", "set_primary_key"]),
+        ms(
+            "column",
+            MS_BASE,
+            "column::dbo.t.x",
+            "",
+            "",
+            &["create_table dbo.t", "create_module dbo.f", "add_column x"],
+        ),
+        ms(
+            "default",
+            MS_BASE,
+            "default::dbo.t.x",
+            ", default: \"0\"",
+            "",
+            &[
+                "create_table dbo.t",
+                "create_module dbo.f",
+                "alter_column_default",
+            ],
+        ),
+        ms(
+            "not_null",
+            MS_BASE,
+            "not_null::dbo.t.x",
+            ", nullable: false",
+            "",
+            &[
+                "create_table dbo.t",
+                "create_module dbo.f",
+                "alter_column_nullability",
+            ],
+        ),
+        ms(
+            "index",
+            MS_BASE,
+            "index::dbo.t.ix",
+            "",
+            "indexes:\n  ix: {columns: [x]}\n",
+            &["create_table dbo.t", "create_module dbo.f", "add_index ix"],
+        ),
+        ms(
+            "unique",
+            MS_BASE,
+            "unique::dbo.t.u",
+            "",
+            "unique:\n  u: {columns: [x]}\n",
+            &["create_table dbo.t", "create_module dbo.f", "add_unique u"],
+        ),
+        ms(
+            "check",
+            MS_BASE,
+            "check::dbo.t.c",
+            "",
+            "checks:\n  c: \"x > 0\"\n",
+            &["create_table dbo.t", "create_module dbo.f", "add_check c"],
+        ),
+        ms(
+            "primary_key",
+            MS_BASE,
+            "primary_key::dbo.t",
+            "",
+            "primary_key: [id]\n",
+            &[
+                "create_table dbo.t",
+                "create_module dbo.f",
+                "set_primary_key",
+            ],
+        ),
         // SQL Server's generated column is a computed one.
-        ms("generation (computed)", MS_BASE, "generation::dbo.t.y", "", "computed:\n  y: {expression: \"x * 2\"}\n", &["create_table dbo.t", "create_module dbo.f", "add_computed_column y"]),
+        ms(
+            "generation (computed)",
+            MS_BASE,
+            "generation::dbo.t.y",
+            "",
+            "computed:\n  y: {expression: \"x * 2\"}\n",
+            &[
+                "create_table dbo.t",
+                "create_module dbo.f",
+                "add_computed_column y",
+            ],
+        ),
     ];
-    let parent = "table: dbo.p\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n".to_owned();
-    let (plain_table, annotated) = part("dbo", "foreign_key::dbo.t.fk", "dbo.f", "", "foreign_keys:\n  fk: {columns: [x], references: dbo.p(id)}\n");
+    let parent = "table: dbo.p\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n"
+        .to_owned();
+    let (plain_table, annotated) = part(
+        "dbo",
+        "foreign_key::dbo.t.fk",
+        "dbo.f",
+        "",
+        "foreign_keys:\n  fk: {columns: [x], references: dbo.p(id)}\n",
+    );
     cases.push(Case {
         name: "foreign_key",
         dialect: "mssql",
@@ -347,8 +598,18 @@ fn ms_cases() -> Vec<Case> {
             ("dbo.t.yml", plain_table),
         ],
         annotated: ("dbo.t.yml", annotated),
-        plain: &["create_table dbo.p", "create_table dbo.t", "add_foreign_key fk", "create_module dbo.f"],
-        then: Then::Order(&["create_table dbo.p", "create_table dbo.t", "create_module dbo.f", "add_foreign_key fk"]),
+        plain: &[
+            "create_table dbo.p",
+            "create_table dbo.t",
+            "add_foreign_key fk",
+            "create_module dbo.f",
+        ],
+        then: Then::Order(&[
+            "create_table dbo.p",
+            "create_table dbo.t",
+            "create_module dbo.f",
+            "add_foreign_key fk",
+        ]),
     });
     // An indexed view's index is held with the whole view (decision 8.4 = A).
     // The function sorts after the view, so only the annotation puts it first.
@@ -357,16 +618,30 @@ fn ms_cases() -> Vec<Case> {
         name: "index (view)",
         dialect: "mssql",
         files: vec![
-            ("dbo.zf.yml", MS_F.replace("{dep}", "").replace("dbo.f", "dbo.zf")),
+            (
+                "dbo.zf.yml",
+                MS_F.replace("{dep}", "").replace("dbo.f", "dbo.zf"),
+            ),
             ("dbo.t.yml", table("dbo", "", "", "")),
             ("dbo.v.yml", view.replace("{dep}", "")),
         ],
         annotated: (
             "dbo.v.yml",
-            view.replace("{dep}", "depends_on:\n  \"index::module::dbo.v.ix\": [\"module::dbo.zf\"]\n"),
+            view.replace(
+                "{dep}",
+                "depends_on:\n  \"index::module::dbo.v.ix\": [\"module::dbo.zf\"]\n",
+            ),
         ),
-        plain: &["create_table dbo.t", "create_module dbo.v", "create_module dbo.zf"],
-        then: Then::Order(&["create_table dbo.t", "create_module dbo.zf", "create_module dbo.v"]),
+        plain: &[
+            "create_table dbo.t",
+            "create_module dbo.v",
+            "create_module dbo.zf",
+        ],
+        then: Then::Order(&[
+            "create_table dbo.t",
+            "create_module dbo.zf",
+            "create_module dbo.v",
+        ]),
     });
     // A role is created by a step here, so the function can be put behind it.
     let role = "role: r1\ngrants:\n  dbo.t: [select]\n";
@@ -378,9 +653,22 @@ fn ms_cases() -> Vec<Case> {
             ("dbo.t.yml", table("dbo", "", "", "")),
             ("r1.yml", role.to_owned()),
         ],
-        annotated: ("dbo.f.yml", MS_F.replace("{dep}", "depends_on: [\"role::r1\"]\n")),
-        plain: &["create_table dbo.t", "create_module dbo.f", "create_role r1", "grant"],
-        then: Then::Order(&["create_table dbo.t", "create_role r1", "create_module dbo.f", "grant"]),
+        annotated: (
+            "dbo.f.yml",
+            MS_F.replace("{dep}", "depends_on: [\"role::r1\"]\n"),
+        ),
+        plain: &[
+            "create_table dbo.t",
+            "create_module dbo.f",
+            "create_role r1",
+            "grant",
+        ],
+        then: Then::Order(&[
+            "create_table dbo.t",
+            "create_role r1",
+            "create_module dbo.f",
+            "grant",
+        ]),
     });
     cases
 }
@@ -401,21 +689,29 @@ fn run_case(case: &Case) -> Result<(), String> {
         .plan()
         .map_err(|why| format!("{name}: the project without the annotation is refused: {why}"))?;
     if plain != case.plain || no_edges != 0 {
-        return Err(format!("{name}: without the annotation: {plain:?}, {no_edges} edges"));
+        return Err(format!(
+            "{name}: without the annotation: {plain:?}, {no_edges} edges"
+        ));
     }
     match (&case.then, at(true).plan()) {
         (Then::Order(order), Ok((steps, edges))) => {
             if steps != *order || edges != 1 {
-                return Err(format!("{name}: with the annotation: {steps:?}, {edges} edges"));
+                return Err(format!(
+                    "{name}: with the annotation: {steps:?}, {edges} edges"
+                ));
             }
             // The two orders differ: that is what shows the annotation did it.
             assert_ne!(steps, plain, "{name}");
             Ok(())
         }
         (Then::Refuse(said), Err(why)) if why.contains(said) => Ok(()),
-        (Then::Refuse(said), Err(why)) => Err(format!("{name}: refused, but not for `{said}`: {why}")),
+        (Then::Refuse(said), Err(why)) => {
+            Err(format!("{name}: refused, but not for `{said}`: {why}"))
+        }
         (Then::Order(_), Err(why)) => Err(format!("{name}: refused: {why}")),
-        (Then::Refuse(said), Ok((steps, _))) => Err(format!("{name}: planned {steps:?}, not `{said}`")),
+        (Then::Refuse(said), Ok((steps, _))) => {
+            Err(format!("{name}: planned {steps:?}, not `{said}`"))
+        }
     }
 }
 
@@ -445,11 +741,16 @@ fn a_prefix_that_only_postgresql_has_is_refused_on_sql_server_for_that_reason() 
         let (code, text) = p.said(&["validate"]);
         assert_eq!(code, Some(2), "{reference}: {text}");
         assert!(
-            text.contains(&format!("`{reference}` names an object only PostgreSQL has")),
+            text.contains(&format!(
+                "`{reference}` names an object only PostgreSQL has"
+            )),
             "{reference}: {text}"
         );
         // Negative: the portable spelling of the same project is accepted.
-        p.file("dbo.f.yml", &MS_F.replace("{dep}", "depends_on: [\"table::dbo.t\"]\n"));
+        p.file(
+            "dbo.f.yml",
+            &MS_F.replace("{dep}", "depends_on: [\"table::dbo.t\"]\n"),
+        );
         let (code, text) = p.said(&["validate"]);
         assert_eq!(code, Some(0), "{reference}: {text}");
     }
@@ -496,7 +797,10 @@ fn validate_names_each_typed_dependency_problem_from_yaml() {
         let (code, text) = p.said(&["validate"]);
         assert_eq!(code, Some(2), "{dependency}: {text}");
         for said in expected {
-            assert!(text.contains(said), "{dependency}: missing `{said}`: {text}");
+            assert!(
+                text.contains(said),
+                "{dependency}: missing `{said}`: {text}"
+            );
         }
         // Negative: the same project without the line is valid.
         let ok = with_default_after_function("");
@@ -555,7 +859,10 @@ fn a_routine_target_is_spelled_as_the_dialect_spells_it() {
     let (code, text) = p.said(&["validate"]);
     assert_eq!(code, Some(0), "{text}");
     let (steps, edges) = p.plan().unwrap();
-    assert_eq!(steps, ["create_module app.f(integer)", "create_table app.t"]);
+    assert_eq!(
+        steps,
+        ["create_module app.f(integer)", "create_table app.t"]
+    );
     assert_eq!(edges, 1);
     // Negative: a signature that names no declared function is refused.
     p.file(
@@ -569,7 +876,8 @@ fn a_routine_target_is_spelled_as_the_dialect_spells_it() {
 
 #[test]
 fn the_structured_escape_loads_formats_to_the_shorthand_and_plans_alike() {
-    let escaped = "depends_on: ['object::{\"root\":{\"module\":\"app.f()\"},\"part\":\"whole\"}']\n";
+    let escaped =
+        "depends_on: ['object::{\"root\":{\"module\":\"app.f()\"},\"part\":\"whole\"}']\n";
     let p = Project::new("postgres");
     p.file("app.f.yml", &PG_F.replace("{dep}", ""));
     p.file("app.t.yml", &table("app", escaped, "", ""));

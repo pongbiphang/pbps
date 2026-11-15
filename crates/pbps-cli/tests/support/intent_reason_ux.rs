@@ -228,7 +228,14 @@ fn partition_reasons() {
             .iter()
             .filter(|(name, _)| *name != &root)
             .collect();
-        pbps_load::render_partitioned(&root, &schema.tables[&root], &members, &[], None, &Default::default())
+        pbps_load::render_partitioned(
+            &root,
+            &schema.tables[&root],
+            &members,
+            &[],
+            None,
+            &Default::default(),
+        )
     };
     let path = d.dir.join("schema/app.p.yml");
     std::fs::write(&path, declaration(&member_cases::source())).unwrap();

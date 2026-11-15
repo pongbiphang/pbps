@@ -340,12 +340,39 @@ indexes:
     where: legacy_code IS NULL
 ```
 
+A table takes `depends_on:` for what the identifier scan cannot see, in the two
+shapes of §4.3: a list for the table itself, or a map from one of its parts to
+what that part follows. A partition's parts are written in its parent's file.
+
+```yaml
+depends_on:
+  "default::app.customer.score": [module::app.default_score()]
+  "check::app.customer.ck_region": [module::app.valid_region(text)]
+```
+
 ### 4.3 Format rules
 
 - **Formatting preserves scalar text exactly**, including line breaks and
   control characters, using double-quoted YAML escapes wherever needed.
   A bare string is emitted only when the YAML loader reads it back as the
   same text, including its type (DEC-1801.1).
+- **`depends_on:` is one key, on every declaration that has an address**: a
+  table, a module, a role, an enum and a domain (DEC-2469.8). A list names what
+  the declaration itself follows. A map names a part the file declares and the
+  list that part follows, so a default that must follow a function while its
+  table need not is statable. A bare name is a module; every other reference
+  has a prefix from one closed list: `table::`, `column::`, `default::`,
+  `generation::`, `sequence::`, `not_null::`, `type::`, `index::`, `unique::`,
+  `check::`, `exclusion::`, `foreign_key::`, `primary_key::`, `policy::`,
+  `row_security::`, `role::` and `module::`. `module::` is the explicit spelling
+  of a module, and the only one for a schema whose name holds `::`;
+  `object::<canonical JSON>` is the lossless escape. A spelling with `::` and
+  another prefix is refused, and a typed spelling that also names a declared
+  module is refused as ambiguous, never reinterpreted. A map key must be
+  declared by the file that holds it. References bind to existing identities,
+  so a rename keeps the edge. An extension, a text-search object, a
+  standalone sequence and a dependency file take no `depends_on:`. `pbps fmt`
+  keeps it, in the order of the saved plan.
 - **`columns` is a map, not a list**, and the key is the column name. One less
   level of nesting, and duplicate names become impossible to express.
 - **`nullable` defaults to `true`** and is written only when needed. The field
@@ -739,10 +766,16 @@ Three more rules, all consequences of the model rather than choices:
 - **`depends_on:` is an annotation, not state.** Creation order is invisible in
   the database, so it lives beside the model exactly as `strategy:` does. It is
   needed only where the identifier scan of ADR-0002 cannot see a dependency.
-  The saved plan and the state record the declared annotations as `object_deps`,
-  a sorted list of `{owner, target}` reference pairs, beside the schema and
-  outside drift comparison. The state always writes the list; the plan omits it
-  when empty, like its other collections (DEC-2469.7).
+  A module's list reads as it always did; its items may also be typed
+  references to a table, a column's default or any other part (§4.3). A
+  view's index is held with the whole view, and a serial column's sequence
+  with its table. On SQL Server a reference only PostgreSQL has (`type::`,
+  `sequence::`, `policy::`, `row_security::`, `exclusion::`) is refused by
+  `validate` for that reason. The saved plan and the state record the declared
+  annotations as `object_deps`, a sorted list of `{owner, target}` reference
+  pairs, beside the schema and outside drift comparison. The state always
+  writes the list; the plan omits it when empty, like its other collections
+  (DEC-2469.7, DEC-2469.8).
 - **`public_execute:` is an annotation too, and its absence is the closed
   answer.** On an engine whose `CREATE` hands every new routine to `PUBLIC` —
   PostgreSQL does; SQL Server does not — a plan that creates a procedure or a
@@ -925,6 +958,9 @@ grants:
   schema::app:      [execute]
 ```
 
+- **A role takes `depends_on:` (§4.3).** On SQL Server the role is created by a
+  step, so an edge orders it. PostgreSQL provisions roles outside the plan, so
+  an edge to or from one is refused with that reason (DEC-2469.8).
 - **What is managed is the role and its grants; membership is not.** Who holds
   a role is each environment's own reality, never declared, compared or
   touched. Logins and users are server-level and out of scope.
@@ -993,6 +1029,10 @@ continues to name it with `type: app.mood` (DEC-1635.1).
 enum: app.mood
 values: [sad, ok, happy]
 ```
+
+Either kind takes `depends_on:` (§4.3): a list for the type, or a map from a
+domain's `default::type::app.phone`, `not_null::type::app.phone` or
+`check::type::app.phone.<name>` to what that part follows.
 
 ```yaml
 # schema/app.phone.type.yml

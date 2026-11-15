@@ -1901,7 +1901,10 @@ indexes:
         assert!(customer.contains(&pbps_model::Permission::ViewDefinition));
         assert!(r.intents.is_empty());
         // Sorted on the way out, so declaration order never shows as a diff.
-        assert_eq!(render_role(&r.name, &r.role, &[], &Default::default()), A_ROLE);
+        assert_eq!(
+            render_role(&r.name, &r.role, &[], &Default::default()),
+            A_ROLE
+        );
     }
 
     #[test]
@@ -1919,8 +1922,14 @@ indexes:
             }]
         );
         assert_eq!(r.role, pbps_model::Role::default());
-        assert_eq!(render_role(&r.name, &r.role, &r.intents, &Default::default()), text);
-        assert_eq!(render_role(&r.name, &r.role, &[], &Default::default()), "role: app_reader\n");
+        assert_eq!(
+            render_role(&r.name, &r.role, &r.intents, &Default::default()),
+            text
+        );
+        assert_eq!(
+            render_role(&r.name, &r.role, &[], &Default::default()),
+            "role: app_reader\n"
+        );
     }
 
     /// A `sequence:` file is told by its leading key, loads into `Schema.sequences` with its
@@ -2119,9 +2128,9 @@ mod dependency_remedy_tests {
 }
 
 #[cfg(test)]
-mod object_ref_tests;
-#[cfg(test)]
 mod depends_on_tests;
+#[cfg(test)]
+mod object_ref_tests;
 
 pub use declared::{DeclaredFile, DeclaredPathError, DeclaredPaths};
 pub use project::{

@@ -66,7 +66,12 @@ fn target(pg: bool) -> &'static str {
 
 /// An empty database and a project built into it by `bootstrap`; returns what
 /// the build ran, in order.
-fn build(pg: bool, server: &str, slug: &str, files: &[(&str, String)]) -> (Demo, OwnDatabase, String) {
+fn build(
+    pg: bool,
+    server: &str,
+    slug: &str,
+    files: &[(&str, String)],
+) -> (Demo, OwnDatabase, String) {
     let own = OwnDatabase::new(server, slug);
     if pg {
         on_server(own.connection(), "CREATE SCHEMA app");
@@ -96,9 +101,8 @@ fn at(script: &str, text: &str) -> usize {
 /// the sequence holds the whole CREATE TABLE group behind the function
 /// (decision 8.4 = A).
 pub fn a_sequence_annotation_holds_the_create_table_group(server: &str) {
-    let table = |depends_on: &str| {
-        format!("table: app.t\n{depends_on}columns:\n  id: {{type: serial}}\n")
-    };
+    let table =
+        |depends_on: &str| format!("table: app.t\n{depends_on}columns:\n  id: {{type: serial}}\n");
     let annotated = table(&format!(
         "depends_on:\n  \"sequence::app.t.id\": [\"{}\"]\n",
         target(true)
@@ -109,10 +113,20 @@ pub fn a_sequence_annotation_holds_the_create_table_group(server: &str) {
         "dep-sequence",
         &[("app.f.yml", function(true, "")), ("app.t.yml", annotated)],
     );
-    assert!(at(&script, "CREATE FUNCTION") < at(&script, "CREATE SEQUENCE"), "{script}");
-    assert!(at(&script, "CREATE SEQUENCE") < at(&script, "CREATE TABLE"), "{script}");
+    assert!(
+        at(&script, "CREATE FUNCTION") < at(&script, "CREATE SEQUENCE"),
+        "{script}"
+    );
+    assert!(
+        at(&script, "CREATE SEQUENCE") < at(&script, "CREATE TABLE"),
+        "{script}"
+    );
     assert_eq!(
-        scalar(true, own.connection(), "SELECT count(*) FROM pg_class WHERE relkind = 'S' AND relname = 't_id_seq'"),
+        scalar(
+            true,
+            own.connection(),
+            "SELECT count(*) FROM pg_class WHERE relkind = 'S' AND relname = 't_id_seq'"
+        ),
         1
     );
     // Negative: without the annotation the table is first.
@@ -122,13 +136,18 @@ pub fn a_sequence_annotation_holds_the_create_table_group(server: &str) {
         "dep-sequence-plain",
         &[("app.f.yml", function(true, "")), ("app.t.yml", table(""))],
     );
-    assert!(at(&plain, "CREATE TABLE") < at(&plain, "CREATE FUNCTION"), "{plain}");
+    assert!(
+        at(&plain, "CREATE TABLE") < at(&plain, "CREATE FUNCTION"),
+        "{plain}"
+    );
 }
 
 /// A policy and row-level security are installed after every module, so an
 /// owner annotation holds nothing back, and asking a module to follow one is
 /// refused naming both legs.
-pub fn policy_and_row_security_annotations_order_the_policy_install_and_refuse_the_reverse(server: &str) {
+pub fn policy_and_row_security_annotations_order_the_policy_install_and_refuse_the_reverse(
+    server: &str,
+) {
     let table = |using: &str| {
         format!(
             "table: app.t\ndepends_on:\n  \"policy::app.t.p\": [\"{f}\"]\n  \"row_security::app.t\": [\"{f}\"]\ncolumns:\n  id: {{type: int, nullable: false}}\nrow_security: {{enabled: true}}\nrow_policies:\n  p: {{using: \"{using}\"}}\n",
@@ -139,13 +158,36 @@ pub fn policy_and_row_security_annotations_order_the_policy_install_and_refuse_t
         true,
         server,
         "dep-policy",
-        &[("app.f.yml", function(true, "")), ("app.t.yml", table("true"))],
+        &[
+            ("app.f.yml", function(true, "")),
+            ("app.t.yml", table("true")),
+        ],
     );
-    assert!(at(&script, "CREATE FUNCTION") < at(&script, "CREATE POLICY"), "{script}");
-    assert!(at(&script, "CREATE POLICY") < at(&script, "ENABLE ROW LEVEL SECURITY"), "{script}");
+    assert!(
+        at(&script, "CREATE FUNCTION") < at(&script, "CREATE POLICY"),
+        "{script}"
+    );
+    assert!(
+        at(&script, "CREATE POLICY") < at(&script, "ENABLE ROW LEVEL SECURITY"),
+        "{script}"
+    );
     let connection = own.connection();
-    assert_eq!(scalar(true, connection, "SELECT count(*) FROM pg_policies WHERE policyname = 'p'"), 1);
-    assert_eq!(scalar(true, connection, "SELECT count(*) FROM pg_class WHERE relname = 't' AND relrowsecurity"), 1);
+    assert_eq!(
+        scalar(
+            true,
+            connection,
+            "SELECT count(*) FROM pg_policies WHERE policyname = 'p'"
+        ),
+        1
+    );
+    assert_eq!(
+        scalar(
+            true,
+            connection,
+            "SELECT count(*) FROM pg_class WHERE relname = 't' AND relrowsecurity"
+        ),
+        1
+    );
     // The reverse: the function follows the policy. Both change, so both are
     // steps, and the plan names the two that wait on one another.
     std::fs::write(
@@ -157,7 +199,10 @@ pub fn policy_and_row_security_annotations_order_the_policy_install_and_refuse_t
     let refused = d.run(&["plan", "--db", connection]);
     assert_ne!(code(&refused), 0, "{}", said(&refused));
     let text = said(&refused);
-    assert!(text.contains("wait on one another") && text.contains("app.f()"), "{text}");
+    assert!(
+        text.contains("wait on one another") && text.contains("app.f()"),
+        "{text}"
+    );
 }
 
 /// An exclusion constraint is added by a step of its own, after its table's
@@ -173,10 +218,20 @@ pub fn an_exclusion_annotation_orders_the_extracted_constraint(server: &str) {
         "dep-exclusion",
         &[("app.f.yml", function(true, "")), ("app.t.yml", table)],
     );
-    assert!(at(&script, "CREATE FUNCTION") < at(&script, "EXCLUDE USING btree"), "{script}");
-    assert!(at(&script, "CREATE TABLE") < at(&script, "EXCLUDE USING btree"), "{script}");
+    assert!(
+        at(&script, "CREATE FUNCTION") < at(&script, "EXCLUDE USING btree"),
+        "{script}"
+    );
+    assert!(
+        at(&script, "CREATE TABLE") < at(&script, "EXCLUDE USING btree"),
+        "{script}"
+    );
     assert_eq!(
-        scalar(true, own.connection(), "SELECT count(*) FROM pg_constraint WHERE conname = 'e' AND contype = 'x'"),
+        scalar(
+            true,
+            own.connection(),
+            "SELECT count(*) FROM pg_constraint WHERE conname = 'e' AND contype = 'x'"
+        ),
         1
     );
 }
@@ -204,7 +259,10 @@ pub fn a_view_index_annotation_holds_the_whole_view_group(server: &str) {
             ("dbo.v.yml", annotated),
         ],
     );
-    assert!(at(&script, "FUNCTION [dbo].[zf]") < at(&script, "VIEW [dbo].[v]"), "{script}");
+    assert!(
+        at(&script, "FUNCTION [dbo].[zf]") < at(&script, "VIEW [dbo].[v]"),
+        "{script}"
+    );
     assert_eq!(
         scalar(
             false,
@@ -225,7 +283,10 @@ pub fn a_view_index_annotation_holds_the_whole_view_group(server: &str) {
             ("dbo.v.yml", view("")),
         ],
     );
-    assert!(at(&plain, "VIEW [dbo].[v]") < at(&plain, "FUNCTION [dbo].[zf]"), "{plain}");
+    assert!(
+        at(&plain, "VIEW [dbo].[v]") < at(&plain, "FUNCTION [dbo].[zf]"),
+        "{plain}"
+    );
 }
 
 /// The ordinary deployment route as well as the build: a table already in the
@@ -273,13 +334,31 @@ pub fn a_project_with_typed_depends_on_applies_in_the_declared_order(server: &st
         sql.to_str().unwrap(),
     ]));
     let script = std::fs::read_to_string(&sql).unwrap();
-    let function_at = at(&script, if pg { "CREATE FUNCTION" } else { "FUNCTION [dbo].[zf]" });
+    let function_at = at(
+        &script,
+        if pg {
+            "CREATE FUNCTION"
+        } else {
+            "FUNCTION [dbo].[zf]"
+        },
+    );
     for part in [
         if pg { "SET DEFAULT" } else { "DEFAULT (0" },
-        if pg { "ADD CONSTRAINT \"c\" CHECK" } else { "ADD CONSTRAINT [c] CHECK" },
-        if pg { "ADD CONSTRAINT \"u\" UNIQUE" } else { "ADD CONSTRAINT [u] UNIQUE" },
+        if pg {
+            "ADD CONSTRAINT \"c\" CHECK"
+        } else {
+            "ADD CONSTRAINT [c] CHECK"
+        },
+        if pg {
+            "ADD CONSTRAINT \"u\" UNIQUE"
+        } else {
+            "ADD CONSTRAINT [u] UNIQUE"
+        },
     ] {
-        assert!(function_at < at(&script, part), "`{part}` is before the function:\n{script}");
+        assert!(
+            function_at < at(&script, part),
+            "`{part}` is before the function:\n{script}"
+        );
     }
     let applied = d.run(&[
         "apply",

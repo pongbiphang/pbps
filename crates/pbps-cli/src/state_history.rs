@@ -520,12 +520,8 @@ fn export(
     let schema = entry.snapshot.declared.overlay(&entry.snapshot.schema);
     let (stage, copies, files, removed, mut findings) = (|| -> anyhow::Result<_> {
         let stage = adopt::Stage::new("state-export")?;
-        let staged = adopt::write_declarations_with_deps(
-            stage.path(),
-            &schema,
-            &Default::default(),
-            &deps,
-        )?;
+        let staged =
+            adopt::write_declarations_with_deps(stage.path(), &schema, &Default::default(), &deps)?;
         let loaded = adopt::check_staged(stage.path(), dialect)?;
         let findings = adopt::refuse_policy_errors(project, &loaded, dialect)?;
         let copies: Vec<_> = staged
@@ -857,7 +853,10 @@ mod tests {
             .unwrap()
             .map(|file| std::fs::read_to_string(file.unwrap().path()).unwrap())
             .collect();
-        assert!(files.contains("depends_on: [table::dbo.product]"), "{files}");
+        assert!(
+            files.contains("depends_on: [table::dbo.product]"),
+            "{files}"
+        );
         let loaded = pbps_load::load_schema_dir(&project.schema_dir()).unwrap();
         let mut back = loaded.hints.annotations.declared.0;
         back.sort();
@@ -867,10 +866,11 @@ mod tests {
         // Negative: an edge no declaration holds has no file to be written in,
         // and is refused rather than dropped.
         let (_stage, project, mut entry) = fixture("history-object-deps-orphan");
-        entry.snapshot.object_deps = pbps_model::object_ref::ObjectEdges::from_deps(
-            &pbps_model::object_ref::ObjectDeps(vec![edge("module::dbo.gone", "table::dbo.product")]),
-        )
-        .unwrap();
+        entry.snapshot.object_deps =
+            pbps_model::object_ref::ObjectEdges::from_deps(&pbps_model::object_ref::ObjectDeps(
+                vec![edge("module::dbo.gone", "table::dbo.product")],
+            ))
+            .unwrap();
         assert!(export(&project, &entry, true, dialect.as_ref()).is_err());
         assert!(!project.schema_dir().exists());
     }

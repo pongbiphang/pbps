@@ -24953,22 +24953,29 @@ fn test_cleanup_refuses_an_unsupported_ownership_platform_with_an_envelope() {
 // The typed `depends_on:` prefixes the engine path of which only a live run
 // shows (#2469 D). The PostgreSQL cases are run by `flow_pg`.
 #[path = "support/depends_on2469.rs"]
-#[allow(dead_code, reason = "the PostgreSQL cases are run by the `flow_pg` target")]
+#[allow(
+    dead_code,
+    reason = "the PostgreSQL cases are run by the `flow_pg` target"
+)]
 mod depends_on2469;
 
-#[test]
-#[ignore = "needs live mssql"]
-fn a_view_index_annotation_holds_the_whole_view_group_on_mssql() {
-    depends_on2469::a_view_index_annotation_holds_the_whole_view_group(
-        &std::env::var("PBPS_TEST_DB").unwrap(),
-    );
-}
+mod typed_depends_on2469 {
+    use super::*;
 
-#[test]
-#[ignore = "needs live mssql"]
-fn a_project_with_typed_depends_on_applies_in_the_declared_order_on_mssql() {
-    depends_on2469::a_project_with_typed_depends_on_applies_in_the_declared_order(
-        &std::env::var("PBPS_TEST_DB").unwrap(),
-        false,
-    );
+    #[test]
+    #[ignore = "needs live mssql"]
+    fn a_view_index_annotation_holds_the_whole_view_group_on_mssql() {
+        depends_on2469::a_view_index_annotation_holds_the_whole_view_group(
+            &std::env::var("PBPS_TEST_DB").unwrap(),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live mssql"]
+    fn a_project_with_typed_depends_on_applies_in_the_declared_order_on_mssql() {
+        depends_on2469::a_project_with_typed_depends_on_applies_in_the_declared_order(
+            &std::env::var("PBPS_TEST_DB").unwrap(),
+            false,
+        );
+    }
 }

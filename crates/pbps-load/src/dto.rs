@@ -58,9 +58,7 @@ impl<'de> serde::Deserialize<'de> for DependsOnDto {
                 mut map: A,
             ) -> Result<DependsOnDto, A::Error> {
                 let mut parts: Vec<(String, Vec<Spanned<String>>)> = Vec::new();
-                while let Some((key, items)) =
-                    map.next_entry::<String, Vec<Spanned<String>>>()?
-                {
+                while let Some((key, items)) = map.next_entry::<String, Vec<Spanned<String>>>()? {
                     // A repeated key is the same part written twice, and the
                     // second list would silently replace the first.
                     if parts.iter().any(|(seen, _)| *seen == key) {

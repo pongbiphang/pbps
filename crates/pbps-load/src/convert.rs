@@ -16,8 +16,8 @@ use pbps_model::{
 };
 
 use crate::dto::{
-    ClusteredDto, DataDto, DependsOnDto, ModuleDto, PrimaryKeyDto, ReplicaIdentityDto, RoleDto, StorageValueDto,
-    SystemTimeDto, TableDto, UniqueDto, ValueDto,
+    ClusteredDto, DataDto, DependsOnDto, ModuleDto, PrimaryKeyDto, ReplicaIdentityDto, RoleDto,
+    StorageValueDto, SystemTimeDto, TableDto, UniqueDto, ValueDto,
 };
 use crate::error::{LoadError, SourceFile, to_span};
 
@@ -1686,12 +1686,8 @@ pub fn convert_module(src: &SourceFile, dto: ModuleDto) -> Result<LoadedModule, 
         (_, declared, _) => declared,
     };
 
-    let depends_on = convert_depends_on(
-        src,
-        dto.depends_on,
-        id.clone().map(Root::Module),
-        &mut errs,
-    );
+    let depends_on =
+        convert_depends_on(src, dto.depends_on, id.clone().map(Root::Module), &mut errs);
 
     // Only a routine has an `EXECUTE` privilege to leave standing: a view is
     // selected from and a trigger is not invoked by anyone at all, so the key

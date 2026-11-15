@@ -762,7 +762,10 @@ mod tests {
         for root in &roots {
             for (depends_on, accepted) in [
                 (serde_json::json!(["app.f()", "table::app.t"]), true),
-                (serde_json::json!({"default::app.t.x": ["module::app.f()"]}), true),
+                (
+                    serde_json::json!({"default::app.t.x": ["module::app.f()"]}),
+                    true,
+                ),
                 (serde_json::json!([]), true),
                 (serde_json::json!("app.f()"), false),
                 (serde_json::json!({"default::app.t.x": "app.f()"}), false),
