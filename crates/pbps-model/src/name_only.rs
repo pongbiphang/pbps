@@ -29,8 +29,8 @@
 //! and its inverse, and every consumer follows.
 
 use crate::{
-    Change, ChangeSet, ColumnType, IdsFile, ManagedType, ObjectName, Schema, SearchObject, SearchRef,
-    Sequence,
+    Change, ChangeSet, ColumnType, IdsFile, ManagedType, ObjectName, Schema, SearchObject,
+    SearchRef, Sequence,
 };
 use std::borrow::Cow;
 use std::collections::BTreeMap;

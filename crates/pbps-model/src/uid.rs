@@ -338,7 +338,7 @@ mod tests {
     #[test]
     fn malformed_uids_are_rejected() {
         assert!("k7x2mq".parse::<Uid>().is_err(), "missing prefix");
-        assert!("s_k7x2mq".parse::<Uid>().is_err(), "`s_` names no kind");
+        assert!("z_k7x2mq".parse::<Uid>().is_err(), "`z_` names no kind");
         assert!("c_k7x2m".parse::<Uid>().is_err(), "too short");
         assert!("c_k7x2mqq".parse::<Uid>().is_err(), "too long");
         assert!(

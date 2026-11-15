@@ -266,18 +266,19 @@ fn the_buildable_form_has_only_the_objects_an_identity_names_and_borrows_when_th
             table("int").buildable(&IdsFile::default()),
             Cow::Borrowed(_)
         ));
-        // Negative: one an identity names is built.
-        let mut ids = IdsFile::default();
-        for name in whole.search.keys() {
-            ids.search
-                .insert(Uid::generate(UidKind::Search), name.clone());
-        }
-        assert!(
-            matches!(whole.buildable(&ids), Cow::Borrowed(_)),
-            "{}",
-            row.label
-        );
     }
+    // Negative: a text search object an identity names is built, and is not left out.
+    let whole = merged(table("int"), text_search("app.x", 0));
+    let mut ids = IdsFile::default();
+    for name in whole.search.keys() {
+        ids.search
+            .insert(Uid::generate(UidKind::Search), name.clone());
+    }
+    assert!(matches!(whole.buildable(&ids), Cow::Borrowed(_)));
+    // A sequence has no identity yet (DEC-2721.1), so none is built whatever the file holds.
+    let with_sequence = merged(whole, sequence("app.s", 0));
+    let built = with_sequence.buildable(&ids);
+    assert!(built.sequences.is_empty() && built.search.len() == 1);
 }
 
 #[test]
