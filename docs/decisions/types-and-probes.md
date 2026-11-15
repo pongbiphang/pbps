@@ -5903,6 +5903,8 @@ This entry adds the vocabulary and converts `Change::catalog_object` only;
 consumers move to it, to a projection in `change.rs`, or to the effects table
 case by case, each shown equal to the listing it replaces.
 
+<a id="dec-2878-1"></a>
+
 **DEC-2878.1. The kinds a schema holds are listed once, and a whole-schema
 consumer walks the list (#2878).** `Schema` is a struct of maps. A consumer of
 a whole schema wrote its own walk over the maps it knew, so a kind added to
