@@ -1,7 +1,9 @@
 //! An ordinary `plan` whose Git baseline holds identity history Git cannot
 //! read refuses, with the repair; it never reads that history as empty
 //! (#1814). Absent history stays a first run. Everything here is offline: the
-//! damage is made in a disposable repository.
+//! damage is made in a disposable repository. The two tests that inject a
+//! failing `git` need a `/bin/sh` stand-in, so they are Unix-only; the rest run
+//! everywhere.
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -70,11 +72,18 @@ impl Project {
         let oid = self.git(&["rev-parse", &format!("HEAD:{path}")]);
         let object = self.0.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
         assert!(object.is_file(), "{path} is not a loose object");
+        // Git writes loose objects read-only, which Windows will not delete.
+        let mut permissions = std::fs::metadata(&object).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&object, permissions).unwrap();
         std::fs::remove_file(object).unwrap();
     }
     /// A directory holding a `git` that runs the real one except where
     /// `refuse` (a shell `case` pattern over the whole argument line) matches,
-    /// where it exits 128 as a git that cannot do its job would.
+    /// where it exits 128 as a git that cannot do its job would. Unix-only: the
+    /// stand-in is a `/bin/sh` script.
+    #[cfg(unix)]
     fn git_that_fails_on(&self, refuse: &str) -> PathBuf {
         let real = std::env::split_paths(&std::env::var_os("PATH").unwrap())
             .map(|dir| dir.join("git"))
@@ -231,6 +240,7 @@ fn a_plan_whose_legacy_identity_blob_is_unreadable_refuses_with_the_repair() {
     assert_refused_with_the_repair(&p, &out, &written, "cannot read the identity file");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_git_process_that_fails_while_reading_the_identity_tree_refuses_with_the_repair() {
     let p = committed_with_the_identity_tree();
@@ -244,6 +254,7 @@ fn a_git_process_that_fails_while_reading_the_identity_tree_refuses_with_the_rep
     assert_eq!(ok.status.code(), Some(0), "{}", text(&ok));
 }
 
+#[cfg(unix)]
 #[test]
 fn a_git_process_that_fails_while_reading_the_legacy_identity_file_refuses_with_the_repair() {
     let p = committed_with_the_legacy_identity_file();
@@ -312,4 +323,42 @@ fn a_failure_outside_the_identity_history_is_not_given_the_identity_repair() {
     let (out, _) = plan_with_output(&p, None, "HEAD");
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
     assert!(!text(&out).contains("Do not regenerate"), "{}", text(&out));
+}
+
+#[test]
+fn an_unsupported_entry_in_the_identity_tree_is_refused_without_the_git_repair() {
+    // The tree is readable; the commit just holds a file that is not an
+    // identity file. Restoring Git objects cannot fix that, so the refusal
+    // keeps its own words and the revision, and carries no repair advice.
+    let p = committed_with_the_identity_tree();
+    p.write(".pbps/ids/dbo/notes.txt", "not an identity file\n");
+    p.git(&["add", "-A"]);
+    p.git(&["commit", "-q", "-m", "stray file in the identity tree"]);
+    std::fs::remove_file(p.0.join(".pbps/ids/dbo/notes.txt")).unwrap();
+    let (out, written) = plan_with_output(&p, None, "HEAD");
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    let report = report(&out);
+    let message = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "baseline.unreadable")
+        .unwrap_or_else(|| panic!("no baseline.unreadable finding: {report}"))["message"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(message.contains("at `HEAD`"), "{message}");
+    assert!(message.contains("notes.txt"), "{message}");
+    for advice in [
+        "git fsck",
+        "git fetch",
+        "make `git` run",
+        "Do not regenerate",
+    ] {
+        assert!(!message.contains(advice), "{advice:?} in: {message}");
+    }
+    assert_eq!(
+        written, b"existing reviewed plan\n",
+        "the output was written"
+    );
 }
