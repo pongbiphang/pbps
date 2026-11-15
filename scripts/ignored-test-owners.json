@@ -3281,7 +3281,8 @@
         "dev587::supplied_scratch_refuses_foreign_contents_without_creating_or_cleaning_them",
         "dev587::supplied_scratch_refuses_nonfresh_options_before_setup",
         "dev587::inherited_model_objects_refuse_run_owned_rehearsal_and_release_resources",
-        "dev587::rehearsal_signals_empty_supplied_scratch_and_remove_owned_databases_only"
+        "dev587::rehearsal_signals_empty_supplied_scratch_and_remove_owned_databases_only",
+        "rehearsal_refusals1920::a_statement_the_engine_rejects_is_reported_once_and_is_not_a_convergence_failure"
       ]
     },
     {
@@ -3298,6 +3299,7 @@
       "ignored_on": ["linux", "win32", "darwin"],
       "cases": [
         "engine::mssql_live_tests::creation2469::checked_generation_edges_use_complete_catalog_collation_facts",
+        "engine::mssql_live_tests::rehearsal_refusal1920::a_convergence_refusal_keeps_every_reason_once_and_the_scratch_is_released",
         "engine::mssql_live_tests::module_only_callers_use_catalog_collation_and_reversed_order_is_refused",
         "engine::mssql_live_tests::the_connected_settlement_of_a_resolver_plan_keeps_the_bindings_that_ordered_it"
       ]
