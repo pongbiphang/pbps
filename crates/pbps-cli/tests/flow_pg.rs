@@ -37285,3 +37285,20 @@ fn parent_column_and_address_moves_apply_at_their_proved_boundaries() {
         partition_moves::issue_cases(&db);
     }
 }
+
+// The typed `depends_on:` prefixes the engine path of which only a live run
+// shows (#2469 D). The view-index case is SQL Server's, run by `flow`.
+#[path = "support/depends_on2469.rs"]
+#[allow(dead_code, reason = "the SQL Server case is run by the `flow` target")]
+mod depends_on2469;
+
+mod typed_depends_on2469 {
+    use super::*;
+
+    on_both_servers! {
+        a_sequence_annotation_holds_the_create_table_group => |pg| depends_on2469::a_sequence_annotation_holds_the_create_table_group(&pg.url()),
+        policy_and_row_security_annotations_order_the_policy_install_and_refuse_the_reverse => |pg| depends_on2469::policy_and_row_security_annotations_order_the_policy_install_and_refuse_the_reverse(&pg.url()),
+        an_exclusion_annotation_orders_the_extracted_constraint => |pg| depends_on2469::an_exclusion_annotation_orders_the_extracted_constraint(&pg.url()),
+        a_project_with_typed_depends_on_applies_in_the_declared_order => |pg| depends_on2469::a_project_with_typed_depends_on_applies_in_the_declared_order(&pg.url(), true),
+    }
+}
