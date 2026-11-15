@@ -183,7 +183,9 @@ where
         after_capture().await?;
         let checked = request.capture(conn).await?;
         // An unrelated unmanaged object is outside SPEC §8.2. Compare the
-        // facts that can enter this recording, not the ambient inventory.
+        // facts that can enter this recording, not the ambient inventory: both
+        // reads are already in the recorded form (`managed_state_once`), so a
+        // text search object nothing names is in neither (DEC-2855.1).
         if captured.schema != checked.schema
             || captured.missing != checked.missing
             || captured.missing_roles != checked.missing_roles
@@ -230,9 +232,14 @@ pub(super) async fn managed_state_once(
     scoped.unmanaged.extend(managed.unmanaged_relations);
     scoped.unmanaged.sort();
     scoped.unmanaged.dedup();
+    // The recorded form: a kind held by name only is kept only where `reference` names it
+    // (the declarations, for a recording from them; nothing, for an apply, which carries
+    // the previous record forward instead). Done here, at the one read every recorder and
+    // the stability comparison below go through, so none of them has to remember it.
     scoped.schema = scoped
         .schema
-        .with_observed_rows(&managed.rows, scopes, reference)?;
+        .with_observed_rows(&managed.rows, scopes, reference)?
+        .as_recorded(reference);
     Ok(scoped)
 }
 
@@ -600,16 +607,6 @@ pub(super) fn moved_time_zone(
     }
 }
 
-/// Text search objects have no identity yet, so a drift comparison cannot tell a project's
-/// object from another's: one the database holds that the recorded state does not is not
-/// drift (as an unmanaged type is not), and the differ would otherwise read it as a creation
-/// it cannot express. Only the objects the record holds are compared, so one of them that
-/// changed is still reported by name (DEC-2728.1).
-pub(super) fn only_recorded_search_objects(recorded: &Schema, live: &mut Schema) {
-    live.search
-        .retain(|name, _| recorded.search.contains_key(name));
-}
-
 /// The informational line that ends a plan when the database holds comments no declaration
 /// manages (DEC-2729.1): a note, not a change.
 pub(super) fn undeclared_comments_note(count: usize) -> String {
@@ -619,6 +616,44 @@ pub(super) fn undeclared_comments_note(count: usize) -> String {
         ("are", "comments in the database")
     };
     format!("{count} {comments} {are} not declared; pbps leaves them as they are.")
+}
+
+/// The two sides of a drift comparison as the differ is given them, and what the differ
+/// cannot say (DEC-2855.1).
+pub(super) struct DriftComparison {
+    pub(super) recorded: Schema,
+    pub(super) live: Schema,
+    /// Recorded objects of a kind held by name only that are gone from the database or
+    /// changed, one sentence each. The kind has no plan, so no `Change` can carry them;
+    /// it is the one report `verify`, `status` and the `plan --db` gate share.
+    pub(super) name_only: Vec<String>,
+}
+
+/// `recorded` and `live`, both reads, prepared for the differ: the sequence names each
+/// read knows (compared unnamed, a renamed sequence would take the other side's name and
+/// read as no change, #1631) and no comments. A kind held by name only is taken out of
+/// both sides and reported on its own: left in, the differ would name a changed one as
+/// "arriving with a later part" and say nothing at all of a recorded one that is gone.
+pub(super) fn drift_comparison(
+    recorded: &Schema,
+    live: &Schema,
+    dialect: &dyn pbps_dialect::Dialect,
+) -> DriftComparison {
+    let mut recorded = recorded.clone();
+    pbps_dialect::name_read_sequences(&mut recorded, dialect);
+    let mut live = live.clone();
+    pbps_dialect::name_read_sequences(&mut live, dialect);
+    let name_only = Schema::name_only_drift(&recorded, &live)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let (mut recorded, mut live) = (recorded.classify().plannable, live.classify().plannable);
+    without_comments(&mut recorded, &mut live);
+    DriftComparison {
+        recorded,
+        live,
+        name_only,
+    }
 }
 
 /// Both sides of a drift comparison without the comments of their tables and columns: a

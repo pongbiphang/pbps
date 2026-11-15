@@ -243,6 +243,17 @@ pub fn lower_between<D: crate::emission::Engine>(
     pbps_model::operation::Operations,
 )> {
     let dialect = selected.as_ref();
+    // The buildable form of both ends (DEC-2855.1): a kind no plan can build, a text search
+    // object, is not built, and a held one no longer makes the differ refuse the base.
+    let (before_schema, after_schema) = (before.schema.buildable(), after.schema.buildable());
+    let before = pbps_diff::Side {
+        schema: &before_schema,
+        ids: before.ids,
+    };
+    let after = pbps_diff::Side {
+        schema: &after_schema,
+        ids: after.ids,
+    };
     let (schema, ids) = (after.schema, after.ids);
     let build = pbps_diff::diff(
         before, after, dialect,
@@ -1021,6 +1032,58 @@ mod tests {
             planned.changes().changes.as_slice(),
             [p] if matches!(p.change, pbps_model::Change::CreateExtension { .. })
         ));
+    }
+
+    /// A text search object no plan can create is not built, held or not: the differ from
+    /// nothing refused it by name ("the baseline cannot be expressed"), so a database that
+    /// held one stopped every rehearsal and resolver run before it began (#2855,
+    /// DEC-2855.1). What is built beside it is unchanged.
+    #[test]
+    fn a_held_text_search_object_does_not_stop_a_base_building() {
+        let pg = pbps_pg::Postgres::new();
+        let mut held = Schema::default();
+        held.search.insert(
+            pbps_model::SearchRef::new(
+                pbps_model::SearchKind::Dictionary,
+                "app.d".parse().unwrap(),
+            ),
+            pbps_model::SearchObject::Dictionary {
+                template: "pg_catalog.simple".parse().unwrap(),
+                options: Default::default(),
+            },
+        );
+        let (lowered, _) =
+            lower_from_empty(&pg, &held, &IdsFile::default(), &Default::default()).unwrap();
+        assert!(
+            lowered.statements().is_empty(),
+            "{:?}",
+            lowered.statements()
+        );
+        // Negative: a table beside it is still built.
+        let mut table = pbps_model::Table::default();
+        table.columns.insert(
+            "id".into(),
+            pbps_model::Column::new("integer".parse().unwrap()),
+        );
+        held.tables
+            .insert(pbps_model::TableName::new("app", "t"), table);
+        let ids = {
+            let mut ids = IdsFile::default();
+            ids.tables.insert(
+                pbps_model::Uid::generate(pbps_model::uid::UidKind::Table),
+                pbps_model::TableName::new("app", "t"),
+            );
+            ids
+        };
+        let (lowered, _) = lower_from_empty(&pg, &held, &ids, &Default::default()).unwrap();
+        assert!(
+            lowered
+                .statements()
+                .iter()
+                .any(|s| s.sql.contains("CREATE TABLE")),
+            "{:?}",
+            lowered.statements()
+        );
     }
 
     #[test]

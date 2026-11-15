@@ -2036,6 +2036,32 @@ fn a_chain_that_ends_where_it_began_is_qualified_as_one_composed_rebuild() {
     }
 }
 
+/// A text search object only one side holds is nobody's edit: the catalog read holds every
+/// one the database has and the declarations name only theirs, so comparing the sides whole
+/// refused a rebuild for "unrelated schema edits" (#2855, DEC-2855.1).
+#[test]
+fn a_text_search_object_only_one_side_holds_is_not_an_unrelated_edit() {
+    let (start, ids, _, _, back) = there_and_back(false);
+    let dictionary = |template: &str| pbps_model::SearchObject::Dictionary {
+        template: template.parse().unwrap(),
+        options: Default::default(),
+    };
+    let name =
+        pbps_model::SearchRef::new(pbps_model::SearchKind::Dictionary, "app.d".parse().unwrap());
+    let mut held = start.clone();
+    held.search
+        .insert(name.clone(), dictionary("pg_catalog.simple"));
+    qualify(side(&held, &ids), side(&start, &back), &table()).unwrap();
+    qualify(side(&start, &ids), side(&held, &back), &table()).unwrap();
+    // Negative: both sides name it and differ, and that is an edit outside the tree.
+    let mut changed = start.clone();
+    changed
+        .search
+        .insert(name, dictionary("pg_catalog.synonym"));
+    let error = qualify(side(&held, &ids), side(&changed, &back), &table()).unwrap_err();
+    assert!(error.why.contains("unrelated schema edits"), "{error}");
+}
+
 #[test]
 fn a_composed_rebuild_without_a_net_change_still_meets_every_other_rule() {
     let (start, ids, away, first, back) = there_and_back(false);
