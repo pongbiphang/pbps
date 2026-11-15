@@ -854,7 +854,7 @@ mod tests {
             .map(|file| std::fs::read_to_string(file.unwrap().path()).unwrap())
             .collect();
         assert!(
-            files.contains("depends_on: [table::dbo.product]"),
+            files.contains("depends_on: [\"table::dbo.product\"]"),
             "{files}"
         );
         let loaded = pbps_load::load_schema_dir(&project.schema_dir()).unwrap();
