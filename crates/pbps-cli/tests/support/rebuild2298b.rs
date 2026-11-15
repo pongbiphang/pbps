@@ -23,7 +23,7 @@ fn write_tree(d: &Demo, schema: &pbps_model::Schema) {
         .collect();
     std::fs::write(
         d.dir.join("schema/app.p.yml"),
-        pbps_load::render_partitioned(&root, &schema.tables[&root], &partitions, &[], None),
+        pbps_load::render_partitioned(&root, &schema.tables[&root], &partitions, &[], None, &Default::default()),
     )
     .unwrap();
 }

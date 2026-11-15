@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 116;
+pub const SCHEMA_VERSION: u32 = 117;
+// 117: `depends_on:` on a table, an enum or domain type and a role, and a module's `depends_on:` as a list or an owner map (#2469 PR D).
 // 116: a key's `opclass_parameters` in declarations, plans and state, and BRIN's minmax-multi and Bloom classes (#2449 PR R2); 113 and 115 belong to other changes.
 // 114: an exclusion constraint's retirement in the identities a state embeds, and `IndexPart::Exclusion` in a plan (#2448 PR C2); no document changes beyond the version, and 113 belongs to another change.
 // 112: the `method: gin` descriptions name `tsvector` beside `jsonb` (#1984); 110 and 111 belong to other changes.

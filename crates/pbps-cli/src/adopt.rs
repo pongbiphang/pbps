@@ -14,7 +14,7 @@
 //! [`crate::declaration_problems`] every other command uses (DECISIONS 141,
 //! DEC-902.1).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
@@ -703,13 +703,34 @@ pub(crate) fn write_declarations(
 }
 
 /// Historical exports also retain the ordering annotations recorded beside
-/// the schema. Pull has no such annotations and continues to pass an empty map.
+/// the schema. Pull has no such annotations and continues to pass none.
+///
+/// Each file gets the edges whose owner it declares, the same rule the loader
+/// holds a file to, so what is written loads back to what was exported
+/// (DEC-2469.8). An owner no declaration holds has no file to go in: that is
+/// refused by name, never written as if there were nothing to write.
 pub(crate) fn write_declarations_with_deps(
     dir: &Path,
     schema: &Schema,
     public_execute: &pbps_model::PublicExecute,
-    module_deps: &pbps_model::ModuleDeps,
+    deps: &pbps_model::object_ref::ObjectDeps,
 ) -> anyhow::Result<BTreeSet<PathBuf>> {
+    use pbps_model::diagnostic::Declaration;
+    use pbps_model::object_ref::{ObjectDeps, Registry};
+    let registry = Registry::new(schema);
+    let mut owned: BTreeMap<Declaration, ObjectDeps> = BTreeMap::new();
+    for (owner, targets) in &deps.0 {
+        let declaration = registry
+            .declaration(owner)
+            .map_err(|problem| anyhow::anyhow!("an annotation cannot be written: {problem}"))?;
+        owned
+            .entry(declaration.clone())
+            .or_default()
+            .0
+            .push((owner.clone(), targets.clone()));
+    }
+    let none = ObjectDeps::default();
+    let of = |declaration: &Declaration| owned.get(declaration).unwrap_or(&none);
     // Before the first file: two declarations whose names differ only in case
     // encode to filenames that differ only in case, and a filesystem that
     // ignores case would keep one of each — the second silently written over
@@ -727,7 +748,14 @@ pub(crate) fn write_declarations_with_deps(
     }
     for (name, definition) in &schema.types {
         let path = declaration_file::type_path(dir, name)?;
-        std::fs::write(&path, pbps_load::render_type(name, definition))
+        std::fs::write(&path, pbps_load::render_type_with_value_renames(
+                name,
+                definition,
+                &[],
+                &BTreeMap::new(),
+                of(&Declaration::Type(name.clone())),
+            ),
+        )
             .with_context(|| format!("cannot write `{}`", path.display()))?;
         written.insert(path);
     }
@@ -754,9 +782,15 @@ pub(crate) fn write_declarations_with_deps(
             .filter(|(_, t)| t.partition_of.as_ref().is_some_and(|p| &p.parent == name))
             .collect();
         let path = declaration_file::path(dir, name, None)?;
+        // The parent's file also holds the edges its partitions own (#1170).
+        let mut own = of(&Declaration::Table(name.clone())).clone();
+        for (child, _) in &partitions {
+            own.0
+                .extend(of(&Declaration::Table((*child).clone())).0.iter().cloned());
+        }
         std::fs::write(
             &path,
-            pbps_load::render_partitioned(name, table, &partitions, &[], None),
+            pbps_load::render_partitioned(name, table, &partitions, &[], None, &own),
         )
         .with_context(|| format!("cannot write `{}`", path.display()))?;
         written.insert(path);
@@ -771,7 +805,7 @@ pub(crate) fn write_declarations_with_deps(
             pbps_load::render_module(
                 id,
                 module,
-                module_deps.get(id).unwrap_or(&Default::default()),
+                of(&Declaration::Module(id.clone())),
                 public_execute.contains(id),
             ),
         )
@@ -786,7 +820,13 @@ pub(crate) fn write_declarations_with_deps(
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create `{}`", parent.display()))?;
         }
-        std::fs::write(&path, pbps_load::render_role(name, role, &[]))
+        std::fs::write(&path, pbps_load::render_role(
+                name,
+                role,
+                &[],
+                of(&Declaration::Role(name.clone())),
+            ),
+        )
             .with_context(|| format!("cannot write `{}`", path.display()))?;
         written.insert(path);
     }
@@ -1681,6 +1721,7 @@ mod tests {
             &pbps_model::RoleName::from("writer"),
             &pulled.schema.roles["writer"],
             &[],
+            &Default::default(),
         );
         assert!(!written.contains("serial-sequences"), "{written}");
         assert!(written.contains("insert"), "{written}");

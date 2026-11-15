@@ -10,7 +10,7 @@ fn declaration(schema: &pbps_model::Schema) -> String {
         .iter()
         .filter(|(name, _)| *name != &root)
         .collect();
-    pbps_load::render_partitioned(&root, &schema.tables[&root], &partitions, &[], None)
+    pbps_load::render_partitioned(&root, &schema.tables[&root], &partitions, &[], None, &Default::default())
 }
 
 pub(super) fn check(connection: Option<&str>) {

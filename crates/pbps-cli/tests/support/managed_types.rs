@@ -817,7 +817,7 @@ fn pulled_type_files_converge_and_type_attribute_changes_are_refused_without_sql
         );
         std::fs::write(
             &table_path,
-            pbps_load::render_partitioned(&table.name, &table.table, &[], &[], None),
+            pbps_load::render_partitioned(&table.name, &table.table, &[], &[], None, &Default::default()),
         )
         .unwrap();
         succeeds(d.run(&["plan", "--no-dev"]));

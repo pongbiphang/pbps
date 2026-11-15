@@ -236,6 +236,11 @@ impl Annotations {
             .collect()
     }
 
+    /// Declares what one file's `depends_on:` says, whatever kind of owner.
+    pub fn declare(&mut self, deps: ObjectDeps) {
+        self.declared.0.extend(deps.0);
+    }
+
     /// Declares the targets of one module, as its file lists them.
     pub fn declare_module(&mut self, owner: ModuleId, targets: BTreeSet<ModuleId>) {
         self.declared.insert_module(owner, targets);
@@ -292,6 +297,7 @@ impl<'a> Registry<'a> {
                 .map(PartKey::Unique)
                 .chain(table.foreign_keys.keys().cloned().map(PartKey::ForeignKey))
                 .chain(table.checks.keys().cloned().map(PartKey::Check))
+                .chain(table.exclude.keys().cloned().map(PartKey::Exclusion))
                 .chain(table.indexes.keys().cloned().map(PartKey::Index))
                 .chain(table.row_policies.keys().cloned().map(PartKey::Policy))
             {

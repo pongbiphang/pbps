@@ -208,6 +208,25 @@ impl ObjectRef {
         input.parse().map(|id| Self::whole(Root::Module(id)))
     }
 
+    /// The words of the closed prefix list this reference is made of: its
+    /// root's, and its selector's when it has one. `check::type::app.d.c` is
+    /// made of `type` and `check`. One list of words is how a caller asks what
+    /// a reference is about without a match over every shape of it.
+    pub fn words(&self) -> impl Iterator<Item = &'static str> {
+        let root = match &self.root {
+            Root::Table(_) => "table",
+            Root::Column(_) => "column",
+            Root::Type(_) => "type",
+            Root::Module(_) => "module",
+            Root::Role(_) => "role",
+        };
+        let part = match self.part.fields().0 {
+            "whole" => None,
+            word => Some(word),
+        };
+        std::iter::once(root).chain(part)
+    }
+
     pub fn module_id(&self) -> Option<&ModuleId> {
         match (&self.root, &self.part) {
             (Root::Module(id), Selector::Whole) => Some(id),
@@ -305,7 +324,7 @@ impl FromStr for ObjectRef {
                     part: Selector::parse(kind, None).map_err(error)?,
                 });
             }
-            "index" | "unique" | "check" | "foreign_key" | "policy" => {
+            "index" | "unique" | "check" | "exclusion" | "foreign_key" | "policy" => {
                 let (scope, value) = if let Some(v) = value.strip_prefix("type::") {
                     ("type", v)
                 } else if let Some(v) = value.strip_prefix("module::") {

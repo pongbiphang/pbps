@@ -25,7 +25,7 @@ use std::path::Path;
 
 use pbps_model::{Hints, Schema, TableName};
 
-pub use convert::{LoadedModule, LoadedRole, LoadedTable};
+pub use convert::{LoadedModule, LoadedRole, LoadedTable, Written};
 pub use dependencies::{LoadedDependency, load_dependency_str, render_dependency};
 pub use error::{LoadError, Semantic, SourceFile};
 pub use fmt::{render, render_module, render_partitioned, render_role};
@@ -112,6 +112,26 @@ pub enum LoadedFile {
     Table(Box<LoadedTable>),
     Module(Box<LoadedModule>),
     Role(Box<LoadedRole>),
+}
+
+impl LoadedFile {
+    /// The `depends_on:` of the file, whatever its kind: the one place a
+    /// consumer reads it, so the merge and the baseline reader cannot differ.
+    /// A kind with no address for an annotation (an extension, a text-search
+    /// object, a dependency) cannot carry one: its DTO has no such field.
+    pub fn depends_on(&self) -> &Written {
+        static NONE: Written = Written {
+            deps: pbps_model::object_ref::ObjectDeps(Vec::new()),
+            spelled: Vec::new(),
+        };
+        match self {
+            Self::Table(t) => &t.depends_on,
+            Self::Module(m) => &m.depends_on,
+            Self::Role(r) => &r.depends_on,
+            Self::Type(t) => &t.depends_on,
+            Self::Extension(_) | Self::Dependency(_) | Self::Search(_) | Self::Sequence(_) => &NONE,
+        }
+    }
 }
 
 /// Loads one table from a string. `path` is used only in diagnostics.
@@ -310,6 +330,11 @@ fn collect_files(
         std::path::PathBuf,
     > = std::collections::BTreeMap::new();
 
+    // Each file's annotations wait for the whole project: whether an owner is
+    // this file's to name needs every declaration. A file refused below leaves
+    // `errs` non-empty, so what waits here is never used then.
+    let mut annotated: Vec<(std::path::PathBuf, Written)> = Vec::new();
+
     for path in files {
         let file = match load(&path) {
             Ok(f) => f,
@@ -318,6 +343,9 @@ fn collect_files(
                 continue;
             }
         };
+        if !file.depends_on().spelled.is_empty() {
+            annotated.push((path.clone(), file.depends_on().clone()));
+        }
 
         let file = match file {
             LoadedFile::Dependency(d) => {
@@ -480,12 +508,6 @@ fn collect_files(
             }
             LoadedFile::Module(m) => {
                 let m = *m;
-                if !m.depends_on.is_empty() {
-                    loaded
-                        .hints
-                        .annotations
-                        .declare_module(m.id.clone(), m.depends_on);
-                }
                 if m.public_execute {
                     loaded.hints.public_execute.insert(m.id.clone());
                 }
@@ -502,9 +524,64 @@ fn collect_files(
     }
 
     if errs.is_empty() {
+        declare_annotations(&mut loaded, annotated, &mut errs);
+    }
+    if errs.is_empty() {
         Ok(loaded)
     } else {
         Err(errs)
+    }
+}
+
+/// Puts every file's `depends_on:` into the project's declared annotations,
+/// once the project is whole (DEC-2469.8).
+///
+/// A file may only give an owner it declares: the owner of a table's
+/// column, default or partition is found through the declaration the registry
+/// names for it, and that declaration's file is compared with this one. The
+/// source index already maps a partition to its parent's file, so one test
+/// covers a table, a partition, a domain part and a view index without a rule
+/// per kind. An owner nobody declares is not refused here: validation names it
+/// with the code every other unknown reference has.
+///
+/// These errors carry no span, because the text of the file is gone by now;
+/// they are reported like a duplicate declaration is.
+fn declare_annotations(
+    loaded: &mut Loaded,
+    annotated: Vec<(std::path::PathBuf, Written)>,
+    errs: &mut Vec<LoadError>,
+) {
+    let registry = pbps_model::object_ref::Registry::new(&loaded.schema);
+    for (path, written) in annotated {
+        let before = errs.len();
+        for spelling in &written.spelled {
+            if let Err(message) = registry.parse(spelling, &loaded.dependencies) {
+                errs.push(LoadError::Yaml {
+                    path: path.clone(),
+                    message: format!("`depends_on` item `{spelling}`: {message}"),
+                });
+            }
+        }
+        for (owner, _) in &written.deps.0 {
+            let Ok(declaration) = registry.declaration(owner) else {
+                continue;
+            };
+            match loaded.sources.get(declaration) {
+                Some(file) if *file == path => {}
+                other => errs.push(LoadError::Yaml {
+                    path: path.clone(),
+                    message: format!(
+                        "`depends_on` key `{}` is not declared in this file{}; \
+                         write it in the file that declares it",
+                        owner.shown(),
+                        other.map_or_else(String::new, |f| format!(" but in `{}`", f.display())),
+                    ),
+                }),
+            }
+        }
+        if errs.len() == before {
+            loaded.hints.annotations.declare(written.deps);
+        }
     }
 }
 
@@ -553,7 +630,7 @@ mod tests {
             from: before.clone(),
             to: name.clone(),
         }];
-        let yaml = fmt::render_role(&name, &role, &intents);
+        let yaml = fmt::render_role(&name, &role, &intents, &Default::default());
         let LoadedFile::Role(loaded) = load_file_str(Path::new("role.yml"), &yaml).unwrap() else {
             panic!("expected role")
         };
@@ -1824,7 +1901,7 @@ indexes:
         assert!(customer.contains(&pbps_model::Permission::ViewDefinition));
         assert!(r.intents.is_empty());
         // Sorted on the way out, so declaration order never shows as a diff.
-        assert_eq!(render_role(&r.name, &r.role, &[]), A_ROLE);
+        assert_eq!(render_role(&r.name, &r.role, &[], &Default::default()), A_ROLE);
     }
 
     #[test]
@@ -1842,8 +1919,8 @@ indexes:
             }]
         );
         assert_eq!(r.role, pbps_model::Role::default());
-        assert_eq!(render_role(&r.name, &r.role, &r.intents), text);
-        assert_eq!(render_role(&r.name, &r.role, &[]), "role: app_reader\n");
+        assert_eq!(render_role(&r.name, &r.role, &r.intents, &Default::default()), text);
+        assert_eq!(render_role(&r.name, &r.role, &[], &Default::default()), "role: app_reader\n");
     }
 
     /// A `sequence:` file is told by its leading key, loads into `Schema.sequences` with its
@@ -2023,7 +2100,7 @@ mod dependency_remedy_tests {
         let mut schema = pbps_model::Schema::default();
         schema.modules.insert(owner.id.clone(), owner.module);
         schema.modules.insert(target.id, target.module);
-        let deps = [(owner.id, owner.depends_on)].into();
+        let deps = owner.depends_on.deps.modules();
         assert!(pbps_model::module::check_dependencies(&schema, &deps).is_empty());
         assert!(
             super::load_module_str(

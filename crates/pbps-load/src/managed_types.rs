@@ -4,12 +4,13 @@ use std::{
     path::Path,
 };
 
+use pbps_model::object_ref::{ObjectDeps, Root};
 use pbps_model::{ColumnType, ManagedType, TypeRef};
 
 use crate::{
-    LoadError,
-    dto::{DomainTypeDto, EnumTypeDto, KindProbe},
-    fmt::scalar,
+    LoadError, SourceFile, Written,
+    dto::{DependsOnDto, DomainTypeDto, EnumTypeDto, KindProbe},
+    fmt::{render_depends_on, scalar},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +19,9 @@ pub struct LoadedType {
     pub definition: ManagedType,
     pub renamed_from: Option<TypeRef>,
     pub value_renames: BTreeMap<String, String>,
+    /// What this file's `depends_on:` says, kept out of `definition` like a
+    /// table's: creation order is invisible in the database (ADR-0002).
+    pub depends_on: Written,
 }
 
 pub fn load_type_str(path: &Path, text: &str) -> Result<LoadedType, Vec<LoadError>> {
@@ -29,7 +33,7 @@ pub fn load_type_str(path: &Path, text: &str) -> Result<LoadedType, Vec<LoadErro
     };
     let probe: KindProbe = serde_saphyr::from_str(text).map_err(|e| fail(e.to_string()))?;
     let mut value_renames = BTreeMap::new();
-    let (name, definition, renamed_from) = match (probe.enumeration, probe.domain) {
+    let (name, definition, renamed_from, depends_on): (_, _, _, DependsOnDto) = match (probe.enumeration, probe.domain) {
         (Some(_), None) => {
             let dto: EnumTypeDto = serde_saphyr::from_str(text).map_err(|e| fail(e.to_string()))?;
             let mut seen = BTreeSet::new();
@@ -59,7 +63,12 @@ pub fn load_type_str(path: &Path, text: &str) -> Result<LoadedType, Vec<LoadErro
                 }
                 values.push(value);
             }
-            (dto.name, ManagedType::Enum { values }, dto.renamed_from)
+            (
+                dto.name,
+                ManagedType::Enum { values },
+                dto.renamed_from,
+                dto.depends_on,
+            )
         }
         (None, Some(_)) => {
             let dto: DomainTypeDto =
@@ -88,6 +97,7 @@ pub fn load_type_str(path: &Path, text: &str) -> Result<LoadedType, Vec<LoadErro
                     collation,
                 },
                 dto.renamed_from,
+                dto.depends_on,
             )
         }
         _ => {
@@ -96,18 +106,29 @@ pub fn load_type_str(path: &Path, text: &str) -> Result<LoadedType, Vec<LoadErro
             ));
         }
     };
-    let name = name
+    let name: TypeRef = name
         .parse()
         .map_err(|e: pbps_model::TypeParseError| fail(e.to_string()))?;
     let renamed_from = renamed_from
         .map(|name| name.parse::<TypeRef>())
         .transpose()
         .map_err(|e| fail(e.to_string()))?;
+    let mut errs = Vec::new();
+    let depends_on = crate::convert::convert_depends_on(
+        &SourceFile::new(path, text),
+        depends_on,
+        Some(Root::Type(name.clone())),
+        &mut errs,
+    );
+    if !errs.is_empty() {
+        return Err(errs);
+    }
     Ok(LoadedType {
         name,
         definition,
         renamed_from,
         value_renames,
+        depends_on,
     })
 }
 
@@ -122,7 +143,13 @@ pub fn render_type_with_intents(
     definition: &ManagedType,
     pending: &[pbps_model::Intent],
 ) -> String {
-    render_type_with_value_renames(name, definition, pending, &BTreeMap::new())
+    render_type_with_value_renames(
+        name,
+        definition,
+        pending,
+        &BTreeMap::new(),
+        &ObjectDeps::default(),
+    )
 }
 
 pub fn render_type_with_value_renames(
@@ -130,6 +157,7 @@ pub fn render_type_with_value_renames(
     definition: &ManagedType,
     pending: &[pbps_model::Intent],
     value_renames: &BTreeMap<String, String>,
+    depends_on: &ObjectDeps,
 ) -> String {
     let mut out = format!(
         "{}: {}\n",
@@ -143,6 +171,7 @@ pub fn render_type_with_value_renames(
             let _ = writeln!(out, "renamed_from: {}", scalar(&from.raw().to_string()));
         }
     }
+    render_depends_on(&mut out, &Root::Type(name.clone()), depends_on);
     match definition {
         ManagedType::Enum { values } => {
             let values: Vec<_> = values
@@ -201,7 +230,8 @@ mod tests {
             &loaded.definition,
             &[],
             &loaded.value_renames,
-        );
+        &Default::default(),
+);
         assert_eq!(
             load_type_str(Path::new("enum.yml"), &rendered).unwrap(),
             loaded

@@ -46,8 +46,8 @@ pub struct Baseline {
     pub ids: ValidIds,
     /// The annotations that travelled beside that revision's declarations.
     ///
-    /// Only `depends_on:` survives usefully — it is an ordering edge the
-    /// identifier scan cannot find, so rebuilding the baseline without it can
+    /// Only `depends_on:` of every kind of file survives usefully — it is an
+    /// ordering edge the identifier scan cannot find, so rebuilding the baseline without it can
     /// fail on declarations that were always valid. A baseline read from a state
     /// file has none: a snapshot records the database, and hints are not in it.
     pub hints: pbps_model::Hints,
@@ -387,7 +387,13 @@ fn load_from_git(
     let mut hints = pbps_model::Hints::default();
     let mut count = 0usize;
     git_objects::read(root, rev, &rel, |path, text| {
-        match pbps_load::load_file_str(Path::new(path), text) {
+        let loaded = pbps_load::load_file_str(Path::new(path), text);
+        // Every kind of file may carry annotations, so they are read through
+        // the one accessor and not in the arm of a kind (DEC-2469.8).
+        if let Ok(file) = &loaded {
+            hints.annotations.declare(file.depends_on().deps.clone());
+        }
+        match loaded {
             Ok(pbps_load::LoadedFile::Table(t)) => {
                 let t = *t;
                 schema.tables.insert(t.name, t.table);
@@ -402,9 +408,6 @@ fn load_from_git(
             // A module has no identity to reconstruct, so the baseline needs
             // nothing from it but the state itself (ADR-0002).
             Ok(pbps_load::LoadedFile::Module(m)) => {
-                if !m.depends_on.is_empty() {
-                    hints.annotations.declare_module(m.id.clone(), m.depends_on);
-                }
                 schema.modules.insert(m.id, m.module);
                 count += 1;
             }
