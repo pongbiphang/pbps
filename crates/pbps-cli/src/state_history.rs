@@ -1,6 +1,6 @@
 //! Read recorded states without adopting, applying or rewriting identity intent.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use pbps_config::Project;
 use pbps_db::{LedgerEntry, LedgerError};
@@ -233,33 +233,11 @@ fn historical_ids(
     recorded: &pbps_model::IdsFile,
     other: &pbps_model::IdsFile,
 ) -> pbps_model::IdsFile {
-    fn missing_by_name<T: Clone + Ord>(
-        own: &mut BTreeMap<pbps_model::Uid, T>,
-        other: &BTreeMap<pbps_model::Uid, T>,
-        taken: &mut BTreeSet<pbps_model::Uid>,
-    ) {
-        let mut names: BTreeSet<_> = own.values().cloned().collect();
-        for (uid, name) in other {
-            if !names.contains(name) && taken.insert(uid.clone()) {
-                own.insert(uid.clone(), name.clone());
-                names.insert(name.clone());
-            }
-        }
-    }
     let mut ids = recorded.clone();
-    let mut taken = ids
-        .tables
-        .keys()
-        .chain(ids.columns.keys())
-        .chain(ids.roles.keys())
-        .chain(ids.types.keys())
-        .chain(ids.tombstones.keys())
-        .cloned()
-        .collect();
-    missing_by_name(&mut ids.tables, &other.tables, &mut taken);
-    missing_by_name(&mut ids.columns, &other.columns, &mut taken);
-    missing_by_name(&mut ids.roles, &other.roles, &mut taken);
-    missing_by_name(&mut ids.types, &other.types, &mut taken);
+    // Every kind that holds an identity, through the one list of them: spelled out
+    // here, extensions were left out when they gained identities (#2878).
+    let mut taken = ids.held_uids().cloned().collect();
+    ids.fill_names_from(other, &mut taken);
     let observed = pbps_diff::observed_ids_reserving(schema, &ids, other);
     // Complete live names without replacing this snapshot's version or intent.
     // Spell every field so new identity metadata requires a preservation choice.
@@ -659,6 +637,7 @@ fn export(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     /// A readable identity tree in a layout the tool never writes (a blank line
     /// the writer leaves out), so a test can tell that the export left it byte
     /// for byte as it was. Returns the file's path and bytes.
@@ -1345,6 +1324,13 @@ mod tests {
                 values: vec!["a".into()],
             },
         );
+        schema.extensions.insert(
+            pbps_model::name::ObjectLocalName::new("citext"),
+            pbps_model::Extension {
+                schema: "public".into(),
+                version: "1.6".into(),
+            },
+        );
         let move_permission = pbps_model::Move {
             max_rows: 7,
             allowed_at: "2026-10-23".into(),
@@ -1359,7 +1345,17 @@ mod tests {
             operator: "selected".into(),
         };
         let mut recorded = pbps_model::IdsFile {
-            extensions: BTreeMap::new(),
+            extensions: [
+                (
+                    "e_aaaaaa".parse().unwrap(),
+                    pbps_model::name::ObjectLocalName::new("citext"),
+                ),
+                (
+                    "e_bbbbbb".parse().unwrap(),
+                    pbps_model::name::ObjectLocalName::new("missing"),
+                ),
+            ]
+            .into(),
             version: pbps_model::ids::CURRENT_VERSION,
             tables: [
                 ("t_aaaaaa".parse().unwrap(), table.clone()),
@@ -1474,6 +1470,7 @@ mod tests {
         recorded.columns.remove(&"c_bbbbbb".parse().unwrap());
         recorded.roles.remove(&"r_bbbbbb".parse().unwrap());
         recorded.types.remove(&"y_bbbbbb".parse().unwrap());
+        recorded.extensions.remove(&"e_bbbbbb".parse().unwrap());
         recorded.moves.remove(&"t_bbbbbb".parse().unwrap());
         recorded.conversions.remove(&"c_bbbbbb".parse().unwrap());
         assert_eq!(historical_ids(&schema, &selected, &other), recorded);
@@ -1486,6 +1483,9 @@ mod tests {
         assert_eq!(completed.columns, recorded.columns);
         assert_eq!(completed.roles, recorded.roles);
         assert_eq!(completed.types, recorded.types);
+        // An extension's identity is borrowed like any other kind's: left to be
+        // derived, the same extension reads as two in `state diff` (#2878).
+        assert_eq!(completed.extensions, recorded.extensions);
         assert!(
             completed.moves.is_empty(),
             "borrowed names do not grant move permission"

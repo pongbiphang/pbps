@@ -5911,9 +5911,10 @@ a whole schema wrote its own walk over the maps it knew, so a kind added to
 `Schema` compiled in every such walk and was silently left out of each one
 that was not told about it. Measured on `4deb4a916`: a throwaway kind fails
 the build at seven sites (the exhaustive destructures in the two docs
-renderers, `main.rs`, twice in `bootstrap.rs`, and `spelling.rs`), while a
-sweep finds more than two hundred walks and membership predicates that keep
-compiling. #2818, #2831, #2846, #2851 and the eight review rounds behind #2855
+renderers, `main.rs`, twice in `bootstrap.rs`, and `spelling.rs`), while the
+other walks and membership predicates keep compiling (counted in DEC-2878.2;
+"more than two hundred", as this entry first said, counted per-kind lists of
+every sort). #2818, #2831, #2846, #2851 and the eight review rounds behind #2855
 are each one of them missed; the kinds added in #2728, #2448, #2447 and #2729
 touched 45 to 75 files apiece.
 
@@ -5945,3 +5946,39 @@ SQL lowering and the wire formats remain exhaustive matches and typed DTOs;
 registration is static, and nothing registers itself at run time (SPEC 14.3).
 This entry adds the list and converts `declaration_file::paths_of` only.
 Consumers move to it step by step, each shown equal to the walk it replaces.
+
+<a id="dec-2878-2"></a>
+
+**DEC-2878.2. The reach of the kind list is narrower than DEC-2878.1 took it
+to be, and the identity file has its own list (#2878).** A census on
+`7039285a5`: besides the 8 exhaustive destructures, about 15 sites name three
+or more of `Schema`'s maps together and about 75, in 39 files, name two or
+more. Most of the sites that name several maps are not over `Schema` at all but
+over `IdsFile`, whose maps are the kinds that hold an identity (tables,
+columns, roles, types, extensions), a different set. And of the four additions
+DEC-2878.1 measured, only text search added a map: the exclusion constraint,
+comments and the extension update spread through `Change` dispatch, which is
+DEC-2790.1's ground.
+
+So this issue stops at the walks and at the three enums a new top-level kind
+forces a variant into (`LoadedFile`, `Declaration`, `LimitationTarget`). Load,
+pull, the differ and the engine catalog reads are not reorganised per kind:
+that would serve the rare case. The other enums with a member per kind
+(`ObjectKey`, `NameKind`, `UidKind`, the annotation `Root`, `Removal`,
+`Namespace`, the ids tree) were compared pairwise and are not one concept
+spelled several times; each holds what the others lack (a loaded definition,
+an unreadable catalog object, a bound uid, a sub-object selector, an engine
+namespace), so they are not merged. The measure is the number of compile
+errors a throwaway kind produces, recorded per change, and not a count of
+files on replay: about 18 of the 45 files of the text search addition are the
+kind's own code, tests, docs and the format version.
+
+`IdsFile` gets the same treatment by a smaller means: `each_name_map!` in
+`ids.rs` is the one list of its uid-to-name maps, behind `live_uids`,
+`held_uids`, `contains_uid`, `fill_names_from` and the checks of `validate`.
+It is private to that file because the maps share a shape (`uid -> name`), so
+the consumers need methods and not a walk of their own. It found its first
+instance on arrival: `pbps state diff` completed each record's identities from
+the other for tables, columns, roles and types and not for extensions, so one
+extension recorded under a uid in only one of the two states was given a
+derived uid in the other and compared as two objects.

@@ -21,6 +21,82 @@ use crate::uid::{Uid, UidKind};
 /// later; adding it once it is needed is already too late.
 pub const CURRENT_VERSION: u32 = 1;
 
+/// Evaluates `$body` once per uid-to-name map of an [`IdsFile`]: once for each
+/// kind of thing that holds an identity.
+///
+/// The one place those maps are listed. A walk that spelled them out compiled
+/// unchanged when extensions gained identities, and the one that was not told
+/// left them out (`pbps state diff`, #2878). The destructure names every
+/// field, so a new one does not compile until it is placed among the maps or
+/// among what is not one.
+///
+/// A macro and not a method over a visitor because the maps differ in their
+/// name type; the body is compiled once per map and may use `?`.
+macro_rules! each_name_map {
+    ($ids:expr, |$kind:ident, $map:ident| $body:expr) => {{
+        let IdsFile {
+            version: _,
+            tables,
+            columns,
+            roles,
+            types,
+            extensions,
+            tombstones: _,
+            moves: _,
+            rebuilds: _,
+            conversions: _,
+        } = $ids;
+        each_name_map!(@each $kind, $map, $body;
+            Table => tables, Column => columns, Role => roles, Type => types,
+            Extension => extensions);
+    }};
+    // Two files side by side: the same map of each.
+    ($ids:expr, $other:expr, |$map:ident, $theirs:ident| $body:expr) => {{
+        let IdsFile {
+            version: _,
+            tables: own_tables,
+            columns: own_columns,
+            roles: own_roles,
+            types: own_types,
+            extensions: own_extensions,
+            tombstones: _,
+            moves: _,
+            rebuilds: _,
+            conversions: _,
+        } = $ids;
+        let IdsFile {
+            version: _,
+            tables,
+            columns,
+            roles,
+            types,
+            extensions,
+            tombstones: _,
+            moves: _,
+            rebuilds: _,
+            conversions: _,
+        } = $other;
+        each_name_map!(@each $map, $theirs, $body;
+            own_tables => tables, own_columns => columns, own_roles => roles,
+            own_types => types, own_extensions => extensions);
+    }};
+    (@each $x:ident, $y:ident, $body:expr; $($left:ident => $right:ident),+) => {
+        $(
+            #[allow(unused_variables)]
+            {
+                let ($x, $y) = (each_name_map!(@left $left), $right);
+                $body;
+            }
+        )+
+    };
+    (@left Table) => { UidKind::Table };
+    (@left Column) => { UidKind::Column };
+    (@left Role) => { UidKind::Role };
+    (@left Type) => { UidKind::Type };
+    (@left Extension) => { UidKind::Extension };
+    (@left $other:ident) => { $other };
+}
+
 /// What the identity file or a plan's final identities got wrong.
 ///
 /// A name in a message is shown escaped by this type's own `Display`: the file
@@ -405,12 +481,37 @@ impl IdsFile {
 
     /// Whether any live entry or tombstone already holds this uid.
     pub fn contains_uid(&self, uid: &Uid) -> bool {
-        self.tables.contains_key(uid)
-            || self.columns.contains_key(uid)
-            || self.roles.contains_key(uid)
-            || self.types.contains_key(uid)
-            || self.extensions.contains_key(uid)
-            || self.tombstones.contains_key(uid)
+        let mut held = self.tombstones.contains_key(uid);
+        each_name_map!(self, |kind, map| held |= map.contains_key(uid));
+        held
+    }
+
+    /// Every uid a live entry holds, of every kind.
+    pub fn live_uids(&self) -> impl Iterator<Item = &Uid> {
+        let mut uids = Vec::new();
+        each_name_map!(self, |kind, map| uids.extend(map.keys()));
+        uids.into_iter()
+    }
+
+    /// Every uid this file holds: the live ones and the tombstoned ones. What
+    /// a derived uid must not collide with.
+    pub fn held_uids(&self) -> impl Iterator<Item = &Uid> {
+        self.live_uids().chain(self.tombstones.keys())
+    }
+
+    /// Takes from `other` each name this file does not hold, under the uid
+    /// `other` gives it, unless that uid is `taken`; a uid taken here joins
+    /// `taken`. This file's own names and uids are never replaced.
+    pub fn fill_names_from(&mut self, other: &IdsFile, taken: &mut BTreeSet<Uid>) {
+        each_name_map!(self, other, |own, theirs| {
+            let mut names: BTreeSet<_> = own.values().cloned().collect();
+            for (uid, name) in theirs {
+                if !names.contains(name) && taken.insert(uid.clone()) {
+                    own.insert(uid.clone(), name.clone());
+                    names.insert(name.clone());
+                }
+            }
+        });
     }
 
     /// The lineage record that produced the table with this uid, with the uid
@@ -495,32 +596,11 @@ impl IdsFile {
             });
         }
 
-        for uid in self.tables.keys() {
-            if uid.kind() != UidKind::Table {
+        each_name_map!(self, |kind, map| {
+            if let Some(uid) = map.keys().find(|uid| uid.kind() != kind) {
                 return Err(IdsError::KindMismatch { uid: uid.clone() });
             }
-        }
-        for uid in self.columns.keys() {
-            if uid.kind() != UidKind::Column {
-                return Err(IdsError::KindMismatch { uid: uid.clone() });
-            }
-        }
-        for uid in self.roles.keys() {
-            if uid.kind() != UidKind::Role {
-                return Err(IdsError::KindMismatch { uid: uid.clone() });
-            }
-        }
-
-        for uid in self.extensions.keys() {
-            if uid.kind() != UidKind::Extension {
-                return Err(IdsError::KindMismatch { uid: uid.clone() });
-            }
-        }
-        for uid in self.types.keys() {
-            if uid.kind() != UidKind::Type {
-                return Err(IdsError::KindMismatch { uid: uid.clone() });
-            }
-        }
+        });
 
         for (uid, tombstone) in &self.tombstones {
             if let Some(requirement) = &tombstone.require
@@ -531,21 +611,16 @@ impl IdsFile {
             {
                 return Err(IdsError::InvalidDropRequirement { uid: uid.clone() });
             }
-            if self.tables.contains_key(uid)
-                || self.columns.contains_key(uid)
-                || self.roles.contains_key(uid)
-                || self.types.contains_key(uid)
-                || self.extensions.contains_key(uid)
-            {
+            let mut live = false;
+            each_name_map!(self, |kind, map| live |= map.contains_key(uid));
+            if live {
                 return Err(IdsError::LiveAndTombstoned { uid: uid.clone() });
             }
         }
 
-        check_unique(self.tables.iter().map(|(u, n)| (u, n.raw().to_string())))?;
-        check_unique(self.columns.iter().map(|(u, n)| (u, n.raw().to_string())))?;
-        check_unique(self.roles.iter().map(|(u, n)| (u, n.raw().to_owned())))?;
-        check_unique(self.types.iter().map(|(u, n)| (u, n.raw().to_string())))?;
-        check_unique(self.extensions.iter().map(|(u, n)| (u, n.raw().to_owned())))?;
+        each_name_map!(self, |kind, map| check_unique(
+            map.iter().map(|(uid, name)| (uid, name.raw().to_string()))
+        )?);
 
         // A live column whose table has no entry cannot be produced by the tool:
         // a table rename moves its columns and a table drop tombstones them. So it
@@ -825,6 +900,113 @@ mod tests {
     #[test]
     fn sample_is_valid() {
         assert_eq!(*sample().validated().unwrap(), sample());
+    }
+
+    /// One entry of every kind that holds an identity, and one tombstone.
+    fn one_of_each() -> IdsFile {
+        let mut f = sample();
+        f.roles.insert(uid("r_aaaaaa"), "reader".into());
+        f.types.insert(uid("y_aaaaaa"), "dbo.kind".parse().unwrap());
+        f.extensions
+            .insert(uid("e_aaaaaa"), crate::ObjectLocalName::new("citext"));
+        f.tombstones.insert(
+            uid("t_zzzzzz"),
+            Tombstone {
+                require: None,
+                was: "dbo.retired".into(),
+                dropped_at: "2026-10-12".into(),
+                reason: "retired".into(),
+                operator: "test".into(),
+            },
+        );
+        f
+    }
+
+    #[test]
+    fn the_held_uids_are_the_live_ones_of_every_kind_and_the_tombstones() {
+        let ids = one_of_each();
+        let live: BTreeSet<_> = ids.live_uids().map(ToString::to_string).collect();
+        let expected = [
+            "c_k7x2mq", "c_p3n8vd", "e_aaaaaa", "r_aaaaaa", "t_a9k2mq", "y_aaaaaa",
+        ];
+        assert_eq!(live, expected.iter().map(ToString::to_string).collect());
+        assert_eq!(ids.held_uids().count(), live.len() + 1);
+        for held in ids.held_uids() {
+            assert!(ids.contains_uid(held));
+        }
+        // Negative: a uid nothing holds, and a file that holds nothing.
+        assert!(!ids.contains_uid(&uid("e_zzzzzz")));
+        assert_eq!(IdsFile::default().held_uids().count(), 0);
+    }
+
+    #[test]
+    fn a_uid_of_the_wrong_kind_is_refused_in_every_map() {
+        ids_valid(&one_of_each());
+        let wrong = |edit: fn(&mut IdsFile)| {
+            let mut ids = one_of_each();
+            edit(&mut ids);
+            assert!(
+                matches!(ids.validate(), Err(IdsError::KindMismatch { .. })),
+                "{:?}",
+                ids.validate()
+            );
+        };
+        wrong(|f| drop(f.tables.insert(uid("c_kkkkkk"), "dbo.x".parse().unwrap())));
+        wrong(|f| drop(f.columns.insert(uid("t_kkkkkk"), col("dbo.customer.x"))));
+        wrong(|f| drop(f.roles.insert(uid("t_kkkkkk"), "x".into())));
+        wrong(|f| drop(f.types.insert(uid("t_kkkkkk"), "dbo.x".parse().unwrap())));
+        wrong(|f| {
+            drop(
+                f.extensions
+                    .insert(uid("t_kkkkkk"), crate::ObjectLocalName::new("x")),
+            )
+        });
+    }
+
+    fn ids_valid(ids: &IdsFile) {
+        ids.validate().unwrap();
+    }
+
+    #[test]
+    fn names_are_taken_from_another_file_for_every_kind_and_never_replace_this_ones() {
+        let other = one_of_each();
+        let mut ids = IdsFile::default();
+        let mut taken = BTreeSet::new();
+        ids.fill_names_from(&other, &mut taken);
+        assert_eq!(
+            (
+                &ids.tables,
+                &ids.columns,
+                &ids.roles,
+                &ids.types,
+                &ids.extensions
+            ),
+            (
+                &other.tables,
+                &other.columns,
+                &other.roles,
+                &other.types,
+                &other.extensions
+            )
+        );
+        assert!(ids.tombstones.is_empty(), "a retirement is not a name");
+        assert_eq!(taken.len(), other.live_uids().count());
+
+        // Negative: a name this file holds keeps its uid, and a uid already taken
+        // is not given a second name.
+        let mut own = IdsFile::default();
+        own.extensions
+            .insert(uid("e_mmmmmm"), crate::ObjectLocalName::new("citext"));
+        own.roles.insert(uid("r_aaaaaa"), "someone_else".into());
+        let mut taken = own.held_uids().cloned().collect();
+        own.fill_names_from(&other, &mut taken);
+        assert_eq!(own.extensions.len(), 1);
+        assert!(own.extensions.contains_key(&uid("e_mmmmmm")));
+        assert_eq!(
+            own.roles.len(),
+            1,
+            "r_aaaaaa is taken, so `reader` is not borrowed"
+        );
     }
 
     #[test]

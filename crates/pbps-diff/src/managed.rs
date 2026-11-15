@@ -402,16 +402,7 @@ pub fn observed_ids(live: &Schema, recorded: &IdsFile) -> IdsFile {
 /// Complete observed identities while reserving another historical record's
 /// UIDs too. Derivation must never manufacture a match to its recorded intent.
 pub fn observed_ids_reserving(live: &Schema, recorded: &IdsFile, reserved: &IdsFile) -> IdsFile {
-    let taken = reserved
-        .tables
-        .keys()
-        .chain(reserved.columns.keys())
-        .chain(reserved.roles.keys())
-        .chain(reserved.types.keys())
-        .chain(reserved.extensions.keys())
-        .chain(reserved.tombstones.keys())
-        .cloned()
-        .collect();
+    let taken = reserved.held_uids().cloned().collect();
     observed_ids_reserved(live, recorded, taken)
 }
 
@@ -438,17 +429,7 @@ fn observed_ids_reserved(live: &Schema, recorded: &IdsFile, mut taken: BTreeSet<
     // report a rename that never happened.
     let roles_by_name: BTreeMap<&pbps_model::RoleName, &Uid> =
         recorded.roles.iter().map(|(u, n)| (n, u)).collect();
-    taken.extend(
-        recorded
-            .tables
-            .keys()
-            .chain(recorded.columns.keys())
-            .chain(recorded.roles.keys())
-            .chain(recorded.types.keys())
-            .chain(recorded.extensions.keys())
-            .chain(recorded.tombstones.keys())
-            .cloned(),
-    );
+    taken.extend(recorded.held_uids().cloned());
 
     let mut observed = IdsFile::default();
     for (name, table) in &live.tables {
