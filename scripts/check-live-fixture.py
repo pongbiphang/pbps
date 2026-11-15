@@ -3,9 +3,12 @@
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
+import sys
+import time
 
 
 MATRIX = json.loads(Path(__file__).with_name("compatibility-matrix.json").read_text())
@@ -46,6 +49,56 @@ def docker(*args):
     return result.stdout
 
 
+# Exit status of `--survive` for a start-up crash: the one case the caller may
+# answer with a fresh start (DEC-2875.1). Any other outcome exits 0 or 1.
+CRASHED = 75
+
+
+def survive(container, seconds, *, clock=time.monotonic, sleep=time.sleep):
+    """Hold a fixture that answered its readiness probe for `seconds`.
+
+    Returns ("survived", "") when it was still running at the end of the
+    window, ("crash", log) when it exited and its log names a `core.sqlservr`
+    dump, and ("other", "") for every other way of not running, including a
+    container the runtime no longer knows. Only a crash proves nothing about
+    the code under test (DEC-958.1); the rest is left to the admission below
+    to refuse.
+    """
+    deadline = clock() + seconds
+    while True:
+        try:
+            running = docker("container", "inspect", "--format", "{{.State.Running}}", container).strip()
+        except (RuntimeError, subprocess.TimeoutExpired):
+            return "other", ""
+        if running != "true":
+            break
+        if clock() >= deadline:
+            return "survived", ""
+        sleep(1)
+    try:
+        # The engine writes to both streams, and an unreadable log proves nothing.
+        done = subprocess.run(["docker", "logs", container], capture_output=True, text=True, timeout=45)
+    except subprocess.TimeoutExpired:
+        return "other", ""
+    log = done.stdout + done.stderr
+    if done.returncode == 0 and "core.sqlservr" in log:
+        return "crash", log
+    return "other", ""
+
+
+# Long enough to reach past a crash dump's own report: the dump collector's
+# `find: Permission denied` lines alone filled 80 lines (DEC-958.1).
+TAIL = 300
+
+
+def report(container, log):
+    """Print what the crashed fixture left behind: it is removed next."""
+    print(f"--- {container}: crashed while starting; the end of its log ---", flush=True)
+    for line in log.splitlines()[-TAIL:]:
+        print(f"  {line}", flush=True)
+    print(f"--- {container}: ends ---", flush=True)
+
+
 def inspect(kind, name):
     values = json.loads(docker(kind, "inspect", name))
     if len(values) != 1:
@@ -55,10 +108,24 @@ def inspect(kind, name):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cell", choices=MATRIX, required=True)
+    parser.add_argument("--cell", choices=MATRIX)
     parser.add_argument("--container", required=True)
-    parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--port", type=int)
+    parser.add_argument("--survive", type=float, metavar="SECONDS",
+                        help="only hold the container for this long and exit %d if it "
+                             "crashed with a core dump (DEC-2875.1)" % CRASHED)
     args = parser.parse_args()
+    if args.survive is not None:
+        # `nan` and `inf` parse as floats and never reach a deadline.
+        if not math.isfinite(args.survive) or args.survive < 0:
+            parser.error("--survive must be a finite, non-negative number of seconds")
+        verdict, log = survive(args.container, args.survive)
+        if verdict == "crash":
+            report(args.container, log)
+            sys.exit(CRASHED)
+        return
+    if args.cell is None or args.port is None:
+        parser.error("--cell and --port are required unless --survive is given")
     if not 1 <= args.port <= 65535:
         parser.error("port must be between 1 and 65535")
     row = MATRIX[args.cell]

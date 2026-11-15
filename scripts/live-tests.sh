@@ -12,6 +12,7 @@ if [[ -n ${PBPS_LIVE_SHARD:-} && ${PBPS_LIVE_ACTIVE:-} != 1 ]]; then
 fi
 
 source scripts/live-test-status.sh
+source scripts/live-sqlserver-start.sh
 
 NAME=${PBPS_TEST_MSSQL_NAME:-pbps-test-mssql}
 # Overridable: a developer machine often already has a SQL Server container
@@ -28,20 +29,14 @@ PASSWORD='Pbps!Test12345'
 # A stale fixture is refused; its owner decides when to replace it.
 IMAGE=mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1
 
+# A fixture this run starts is held through a survival window and, if it dumps
+# core while starting, started again (scripts/live-sqlserver-start.sh, #2875).
 containers=$(docker ps -a --format '{{.Names}}')
-if ! grep -Fxq -- "$NAME" <<< "$containers"; then
-    docker run -d --name "$NAME" -e ACCEPT_EULA=Y \
-        -e "MSSQL_SA_PASSWORD=$PASSWORD" -p "$PORT:1433" "$IMAGE" >/dev/null
+if grep -Fxq -- "$NAME" <<< "$containers"; then
+    primary_ready
+else
+    sqlserver_bring_up "$NAME" start_primary primary_ready
 fi
-
-echo "waiting for SQL Server..."
-for _ in $(seq 1 60); do
-    if docker exec "$NAME" /opt/mssql-tools18/bin/sqlcmd -C -S localhost \
-        -U sa -P "$PASSWORD" -Q "SELECT 1" >/dev/null 2>&1; then
-        break
-    fi
-    sleep 2
-done
 
 export PBPS_TEST_DB="Server=localhost,$PORT;User Id=sa;Password=$PASSWORD;TrustServerCertificate=true"
 
@@ -53,22 +48,11 @@ EXPRESS_NAME=${PBPS_TEST_MSSQL_EXPRESS_NAME:-pbps-test-mssql-express}
 EXPRESS_PORT=${PBPS_TEST_EXPRESS_PORT:-14331}
 if [[ ${PBPS_LIVE_SHARD:-0/1} == 0/* ]]; then
     containers=$(docker ps -a --format '{{.Names}}')
-    if ! grep -Fxq -- "$EXPRESS_NAME" <<< "$containers"; then
-        docker run -d --name "$EXPRESS_NAME" -e ACCEPT_EULA=Y -e MSSQL_PID=Express \
-            -e MSSQL_COLLATION=Latin1_General_100_CS_AS \
-            -e "MSSQL_SA_PASSWORD=$PASSWORD" -p "$EXPRESS_PORT:1433" "$IMAGE" >/dev/null
+    if grep -Fxq -- "$EXPRESS_NAME" <<< "$containers"; then
+        express_ready_probe
+    else
+        sqlserver_bring_up "$EXPRESS_NAME" start_express express_ready_probe
     fi
-    echo "waiting for the Express SQL Server..."
-    # A successful login precedes the asynchronous custom collation change.
-    express_ready=false
-    for _ in $(seq 1 60); do
-        if docker exec "$EXPRESS_NAME" /opt/mssql-tools18/bin/sqlcmd -C -S localhost \
-            -U sa -P "$PASSWORD" -b -Q "IF COALESCE(CONVERT(varchar(128), SERVERPROPERTY('Collation')), '') <> 'Latin1_General_100_CS_AS' THROW 50000, 'fixture collation is not ready', 1;" >/dev/null 2>&1; then
-            express_ready=true
-            break
-        fi
-        sleep 2
-    done
     if [[ "$express_ready" != true ]]; then
         echo "$EXPRESS_NAME did not reach its configured collation" >&2
         docker logs "$EXPRESS_NAME" >&2 || true
