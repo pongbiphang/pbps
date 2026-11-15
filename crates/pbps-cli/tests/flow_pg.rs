@@ -23736,6 +23736,247 @@ fn effective_function_ownership_decides_trigger_trust_before_postgres_17() {
     effective_ownership_decides_trust(&server, "effective_owner_old");
 }
 
+/// A function editor that is trusted only because it can `SET ROLE` to a
+/// superuser. `pg_has_role(editor, deployer, 'SET')` does not follow a path
+/// through a superuser role, yet such an editor can already do everything the
+/// deployer can, so refusing the write on its account refuses a valid plan
+/// (#859). Each case differs from the last in one grant. The refusals are the
+/// negative twins: a predicate that trusted any membership would pass the
+/// accepted cases and fail them, and one that ignored the superuser path would
+/// refuse the accepted cases.
+///
+/// An accepted case runs the whole writer sequence (prepare, the immediate
+/// check, the row write, commit) and the trigger body leaves a marker, so
+/// acceptance is a committed write and not a catalog truth value.
+fn superuser_editor_decides_trust(admin: &str, slug: &str) {
+    let topology = inherited_owner_topology(admin, slug);
+    let recorded = recorded_audit_trigger(&topology, "INSERT");
+    // A run-owned superuser rather than the cluster's own: the rule is about
+    // any `rolsuper` role, and no shared role is granted or dropped. Declared
+    // after the topology so it goes before the roles that are granted it.
+    let superuser = format!("pbps_{slug}_su_{}", std::process::id());
+    let _superuser_role = ClusterRoles {
+        server: admin.to_owned(),
+        names: vec![superuser.clone()],
+    };
+    on_server(admin, &format!("CREATE ROLE {superuser} SUPERUSER NOLOGIN"));
+    let Topology {
+        deployer,
+        owner,
+        inheritor,
+        distant,
+        ..
+    } = &topology;
+    let connection = topology.connection().to_owned();
+    let flag_sql = |sql: &str| format!("SELECT ({sql})::int::bigint");
+    // The inheritor holds the owner's rights from the first case on and is
+    // never granted the deployer, so it is an editor the predicate has to rule
+    // on, and the only thing that can change its answer is the superuser path.
+    let (usage, direct, via_superuser) = (
+        format!("pg_has_role('{inheritor}', '{owner}', 'USAGE')"),
+        format!("pg_has_role('{inheritor}', '{deployer}', 'SET')"),
+        format!(
+            "EXISTS (SELECT 1 FROM pg_roles su WHERE su.rolsuper \
+             AND pg_has_role('{inheritor}', su.oid, 'SET'))"
+        ),
+    );
+    assert_eq!(
+        scalar(
+            &connection,
+            &format!(
+                "SELECT count(*) FROM pg_roles WHERE rolname = '{inheritor}' AND NOT rolsuper"
+            )
+        ),
+        1,
+        "the editor is an ordinary role"
+    );
+    // (property, grant, trusted, the editor can SET to a superuser)
+    let cases: [(&str, String, bool, bool); 7] = [
+        (
+            "an editor inheriting the owner's rights with no SET path is refused",
+            format!("GRANT {owner} TO {inheritor} WITH INHERIT TRUE, SET FALSE"),
+            false,
+            false,
+        ),
+        (
+            "an editor that can only SET ROLE to a superuser is trusted",
+            format!("GRANT {superuser} TO {inheritor} WITH INHERIT FALSE, SET TRUE"),
+            true,
+            true,
+        ),
+        (
+            "membership of a superuser without SET is not a path to it",
+            format!(
+                "REVOKE {superuser} FROM {inheritor}; \
+                 GRANT {superuser} TO {inheritor} WITH INHERIT TRUE, SET FALSE"
+            ),
+            false,
+            false,
+        ),
+        (
+            "SET to an ordinary role with no superuser behind it is refused",
+            format!(
+                "REVOKE {superuser} FROM {inheritor}; \
+                 GRANT {distant} TO {inheritor} WITH INHERIT FALSE, SET TRUE"
+            ),
+            false,
+            false,
+        ),
+        (
+            "the superuser path is trusted again once restored",
+            format!(
+                "REVOKE {distant} FROM {inheritor}; \
+                 GRANT {superuser} TO {inheritor} WITH INHERIT FALSE, SET TRUE"
+            ),
+            true,
+            true,
+        ),
+        (
+            "one trusted editor does not excuse a different untrusted one",
+            format!("GRANT {owner} TO {distant} WITH INHERIT TRUE, SET FALSE"),
+            false,
+            true,
+        ),
+        (
+            "removing the untrusted editor restores trust",
+            format!("REVOKE {owner} FROM {distant}"),
+            true,
+            true,
+        ),
+    ];
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            use pbps_dialect::Dialect;
+            let mut writer =
+                pbps_db::Conn::connect(pbps_db::Driver::Postgres, &topology.deployment)
+                    .await
+                    .unwrap();
+            // Inside this runtime rather than through `on_server`: a nested
+            // `block_on` panics, and the grants have to land between the cases.
+            let mut grants = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &connection)
+                .await
+                .unwrap();
+            let dialect = pbps_pg::Postgres::new();
+            let framing = dialect.transaction_framing(&pbps_model::SessionZone::utc());
+            let admission = pbps_pg::admission::Admission::default();
+            let write = pbps_dialect::RowWrite {
+                table: pbps_model::TableName::new("app", "t"),
+                operation: pbps_dialect::RowOperation::Insert {
+                    columns: Default::default(),
+                },
+            };
+            let mut written = 0_i64;
+            for (property, grant, trusted, superuser_path) in cases {
+                grants.execute(&grant).await.unwrap();
+                let usage = live_scalar(&mut grants, &flag_sql(&usage)).await;
+                let direct = live_scalar(&mut grants, &flag_sql(&direct)).await;
+                let via_superuser = live_scalar(&mut grants, &flag_sql(&via_superuser)).await;
+                assert_eq!(usage, 1, "{property}: the editor holds the owner's rights");
+                assert_eq!(direct, 0, "{property}: no direct SET to the deployer");
+                assert_eq!(via_superuser == 1, superuser_path, "{property}");
+
+                writer.begin(&framing).await.unwrap();
+                let outcome = async {
+                    let guard = pbps_pg::data_triggers::prepare(
+                        &mut writer,
+                        &admission,
+                        std::slice::from_ref(&write),
+                        &recorded,
+                        &Default::default(),
+                    )
+                    .await?;
+                    pbps_pg::data_triggers::check(&mut writer, &admission, &write, &guard).await?;
+                    writer.execute("INSERT INTO app.t VALUES (1)").await
+                }
+                .await;
+                match (&outcome, trusted) {
+                    (Ok(()), true) => {
+                        writer.commit(&framing).await.unwrap();
+                        written += 1;
+                    }
+                    (Err(refusal), false) => {
+                        writer.rollback(&framing).await.unwrap();
+                        let message = refusal.to_string();
+                        assert!(
+                            message.contains("unsafe data trigger"),
+                            "{property}: {message}"
+                        );
+                    }
+                    _ => {
+                        writer.rollback(&framing).await.unwrap();
+                        panic!("{property}: trusted={trusted}, got {outcome:?}");
+                    }
+                }
+                // Accepted writes are committed; a refused one leaves neither a
+                // row nor a marker behind.
+                for table in ["app.t", "hook.calls"] {
+                    let sql = format!("SELECT count(*) FROM {table}");
+                    assert_eq!(
+                        live_scalar(&mut grants, &sql).await,
+                        written,
+                        "{property}: {table}"
+                    );
+                }
+            }
+
+            // The check is repeated under the writer's own lock rather than
+            // trusted from planning time, and it reads the superuser path too:
+            // revoking it between prepare and check refuses the write.
+            writer.begin(&framing).await.unwrap();
+            let guard = pbps_pg::data_triggers::prepare(
+                &mut writer,
+                &admission,
+                std::slice::from_ref(&write),
+                &recorded,
+                &Default::default(),
+            )
+            .await
+            .expect("the superuser path is trusted at planning time");
+            grants
+                .execute(&format!("REVOKE {superuser} FROM {inheritor}"))
+                .await
+                .unwrap();
+            let refused =
+                pbps_pg::data_triggers::check(&mut writer, &admission, &write, &guard).await;
+            writer.rollback(&framing).await.unwrap();
+            let message = refused.expect_err("the write must not run").to_string();
+            assert!(message.contains("unsafe data trigger"), "{message}");
+            let markers = live_scalar(&mut grants, "SELECT count(*) FROM hook.calls").await;
+            assert_eq!(markers, written);
+        });
+}
+
+/// `scalar` for a caller already inside a runtime, where it would panic.
+async fn live_scalar(conn: &mut pbps_db::Conn, sql: &str) -> i64 {
+    conn.query(sql).await.unwrap()[0]
+        .try_get_at::<i64>(0)
+        .unwrap()
+        .unwrap()
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_trigger_editor_with_set_to_a_superuser_allows_the_reference_data_write() {
+    superuser_editor_decides_trust(&server(), "superuser_editor");
+}
+
+/// The grant options and `pg_has_role(..., 'SET')` arrived together in
+/// PostgreSQL 16, so the superuser path has to mean the same on the oldest
+/// engine that has them.
+#[test]
+#[ignore = "needs PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+fn a_trigger_editor_with_set_to_a_superuser_allows_the_reference_data_write_before_postgres_17() {
+    let server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    on_server(
+        &server,
+        "DO $$ BEGIN IF current_setting('server_version_num')::integer >= 170000 THEN RAISE EXCEPTION 'this regression needs a pre-17 server'; END IF; END $$",
+    );
+    superuser_editor_decides_trust(&server, "superuser_editor_old");
+}
+
 /// Planning is not the last word: a membership granted after the plan was
 /// approved is caught by the re-read the writer does under its own lock. The
 /// lock cannot help here — `GRANT` does not touch the guarded table — which is
