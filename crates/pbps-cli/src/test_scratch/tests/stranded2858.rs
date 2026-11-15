@@ -335,21 +335,27 @@ mod tests {
         // A directory that can be entered but not listed cannot be shown empty.
         let (unlisted, _) = leftover(&root, Some(dead()), &run('d'));
         std::fs::set_permissions(&unlisted, std::fs::Permissions::from_mode(0o300)).unwrap();
-        assert!(
-            holds_runs(&unlisted),
-            "an unlistable directory keeps its records"
-        );
-        let rt = runtime_with(&run('d'));
-        let problems = swept(&root, &rt).await;
-        assert!(
-            problems
-                .iter()
-                .any(|p| p.contains(unlisted.to_str().unwrap())),
-            "{problems:?}"
-        );
-        assert!(rt.removed.borrow().is_empty());
-        std::fs::set_permissions(&unlisted, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(unlisted.exists());
+        if std::fs::read_dir(&unlisted).is_ok() {
+            // Root ignores permission bits, so the listing cannot be made to
+            // fail; only this case is skipped.
+            std::fs::remove_dir_all(&unlisted).unwrap();
+        } else {
+            assert!(
+                holds_runs(&unlisted),
+                "an unlistable directory keeps its records"
+            );
+            let rt = runtime_with(&run('d'));
+            let problems = swept(&root, &rt).await;
+            assert!(
+                problems
+                    .iter()
+                    .any(|p| p.contains(unlisted.to_str().unwrap())),
+                "{problems:?}"
+            );
+            assert!(rt.removed.borrow().is_empty());
+            std::fs::set_permissions(&unlisted, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(unlisted.exists());
+        }
         // So is a state directory this user cannot show to be private.
         let (open, dir) = leftover(&root, Some(dead()), &run('c'));
         std::fs::set_permissions(
