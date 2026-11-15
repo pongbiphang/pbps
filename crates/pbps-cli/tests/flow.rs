@@ -110,6 +110,8 @@ mod dev587;
 mod plan_test1165_mssql;
 #[path = "support/recovery2410_mssql.rs"]
 mod recovery2410_mssql;
+#[path = "support/rehearsal_refusals1920.rs"]
+mod rehearsal_refusals1920;
 
 /// These kill a real `pbps plan` against the resolver's second SQL Server
 /// (`PBPS_TEST_MSSQL_SCRATCH_DB`), which only the `resolver-mssql` job

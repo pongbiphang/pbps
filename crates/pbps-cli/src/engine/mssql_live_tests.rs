@@ -350,3 +350,6 @@ async fn the_connected_settlement_of_a_resolver_plan_keeps_the_bindings_that_ord
         .await
         .unwrap();
 }
+
+#[path = "mssql_live_tests/rehearsal_refusal1920_tests.rs"]
+mod rehearsal_refusal1920;

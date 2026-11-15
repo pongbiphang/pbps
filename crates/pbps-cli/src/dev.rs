@@ -191,7 +191,10 @@ pub fn rehearse<D: crate::emission::Engine>(
                 container::with_started(pbps_db::Driver::Mssql, &image, pull, run).await
             }
         }
-        .map_err(Into::into)
+        // Flattened once, here. `ProduceError::Run` displays the error it also
+        // names as its source, so `{:#}` on it prints that error twice, and with
+        // it every refusal reason a rehearsal reports (#1920).
+        .map_err(|error| anyhow::anyhow!("{error}"))
     })
 }
 
