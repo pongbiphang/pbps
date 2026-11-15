@@ -147,7 +147,9 @@ class Survival(unittest.TestCase):
     def test_the_survival_mode_needs_no_cell_and_the_admission_still_does(self):
         self.assertEqual(self.run_main("survived", "--survive", "1")[0], 0)
         self.assertEqual(self.run_main("survived")[0], 2)
-        self.assertEqual(self.run_main("survived", "--survive", "-1")[0], 2)
+        for window in ("-1", "nan", "inf", "-inf"):
+            with self.subTest(window=window):
+                self.assertEqual(self.run_main("survived", "--survive", window)[0], 2)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -115,8 +116,9 @@ def main():
                              "crashed with a core dump (DEC-2875.1)" % CRASHED)
     args = parser.parse_args()
     if args.survive is not None:
-        if args.survive < 0:
-            parser.error("--survive must not be negative")
+        # `nan` and `inf` parse as floats and never reach a deadline.
+        if not math.isfinite(args.survive) or args.survive < 0:
+            parser.error("--survive must be a finite, non-negative number of seconds")
         verdict, log = survive(args.container, args.survive)
         if verdict == "crash":
             report(args.container, log)
