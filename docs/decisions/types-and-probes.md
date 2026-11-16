@@ -6089,3 +6089,23 @@ and relations no kind declares; three variants split the module family by how
 much of an identity could be read; there is none for extensions or roles.
 Deriving it from the kind list would lose exactly those distinctions, and its
 sites are namespace questions. It stays as written.
+
+<a id="dec-2790-4"></a>
+
+**DEC-2790.4. A dialect's emitter takes each family in a module of its own
+(#2790).** The top match of PostgreSQL's `emit_statements` has one arm per
+family, `Change::Column(column) => column::emit(..)`, and each family's arms
+live in `crates/pbps-pg/src/emit/<family>.rs`, matching that family's enum
+exhaustively. Adding a kind means editing its family's file, where only that
+family is in view, and two branches that add kinds to different families no
+longer meet in one twelve-thousand-line file. The maintainer chose this over
+one function per family inside `emit.rs`, which is half of the same move and
+would have disturbed the branches twice.
+
+The split was mechanical (`scripts/change_family_split.py`, generic over a file
+and a function, reused for SQL Server's emitter and both preflights): every arm
+moved verbatim, in order; a family function takes exactly the parameters its
+arms use; an arm that named two families became one copy in each, its guard and
+body unchanged and its leading comment with the first. The helpers the arms
+call stay in `emit.rs` for now (`use super::*`): moving each helper beside its
+only family is a separate step, judged helper by helper.
