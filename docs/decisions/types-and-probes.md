@@ -6109,3 +6109,10 @@ arms use; an arm that named two families became one copy in each, its guard and
 body unchanged and its leading comment with the first. The helpers the arms
 call stay in `emit.rs` for now (`use super::*`): moving each helper beside its
 only family is a separate step, judged helper by helper.
+
+SQL Server's emitter (`crates/pbps-mssql/src/emit/`) is split the same way,
+with two rules the tool applies wherever they arise: a parent with no
+out-of-line module yet takes the new `mod` lines after its last top-level
+`use`; and a family answered by one unguarded whole-family arm (`Change::Policy(_)
+=> refuse`) keeps that arm in the dispatch, since a module would hold only
+`match policy { _ => .. }` around it.
