@@ -1731,7 +1731,8 @@ pub enum IndexMethod {
     /// The default B-tree.
     #[default]
     Btree,
-    /// PostgreSQL's generalized inverted index, over `jsonb` in this model.
+    /// PostgreSQL's generalized inverted index, over `jsonb` and `tsvector`
+    /// in this model (`tsvector_ops`, a `tsvector`'s default class, is left out).
     Gin,
     /// PostgreSQL's generalized search tree: range, `tsvector`, `inet` and the
     /// other geometric-style keys, mostly through an expression (DEC-2448.2).

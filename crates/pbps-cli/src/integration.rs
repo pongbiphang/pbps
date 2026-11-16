@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 109;
+pub const SCHEMA_VERSION: u32 = 112;
+// 112: the `method: gin` descriptions name `tsvector` beside `jsonb` (#1984); 110 and 111 belong to other changes.
 // 109: the `sequence:` file in declarations, and `sequences` in state (#2721 PR A); 108 was reserved and never used.
 // 107: a SQL Server table's, key's, unique constraint's and index's `filegroup` in declarations, plans and state (#2813); 106 belongs to another change.
 // 105: `doctor`'s `identity_file` becomes `identity_dir`: the identity tree's directory replaces the single identity file (#2600 PR 5a).

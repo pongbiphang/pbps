@@ -9815,7 +9815,7 @@ Out of this slice and unchanged: GIN over an expression (`to_tsvector(..)`), GiS
 over `tsvector` (held already as a typed column), and package-provided default
 classes. A btree over a `tsvector` is as before.
 
-Formats: none. No saved plan, state or published schema document changes. The
-declaration schema's descriptions of `method: gin` still say "over `jsonb`"; updating
-that wording moves the published schema set, so it waits for a number of its own.
+Formats: published schema set 112, for the wording alone: the two descriptions of
+`method: gin` in the declaration schema now name `tsvector` and its default class.
+No saved plan or state changes, and no schema property or enum does.
 
