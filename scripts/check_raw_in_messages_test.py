@@ -178,6 +178,31 @@ class BuilderMessages(unittest.TestCase):
                 self.assertEqual(run(sql, path=path), [])
                 self.assertEqual(run(sql + sql, path=path), [])
 
+    def test_a_family_module_of_an_emitter_or_preflight_is_a_builder(self):
+        sql = 'let sql = format!("ALTER TABLE {} ADD {}", quote(t.raw()), quote(c.raw()));'
+        for path in [
+            "crates/pbps-pg/src/emit/column.rs",
+            "crates/pbps-mssql/src/emit/index.rs",
+            "crates/pbps-pg/src/preflight/row.rs",
+        ]:
+            with self.subTest(path=path):
+                self.assertTrue(guard.is_builder(path))
+                self.assertEqual(run(sql, path=path), [])
+                # It is a builder, not exempt: a message still may not print raw.
+                self.assertEqual(len(run(BAIL, path=path)), 1)
+
+    def test_only_direct_children_of_emitters_and_preflights_inherit(self):
+        for path in [
+            "crates/pbps-pg/src/rows/column.rs",
+            "crates/pbps-pg/src/catalog/column.rs",
+            "crates/pbps-pg/src/emit/column/inner.rs",
+            "crates/pbps-cli/src/emit/column.rs",
+        ]:
+            with self.subTest(path=path):
+                self.assertFalse(guard.is_builder(path))
+                sql = 'let sql = format!("ALTER TABLE {}", quote(t.raw()));'
+                self.assertEqual(len(run(sql, path=path)), 1)
+
     def test_error_payloads_are_refused_in_each_builder(self):
         for path in guard.SQL_BUILDERS:
             for text in [

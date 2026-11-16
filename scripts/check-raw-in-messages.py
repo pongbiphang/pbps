@@ -78,6 +78,27 @@ SQL_BUILDERS = {
     "crates/pbps-mssql/src/resolver/capture/staged/names.rs",
 }
 
+# The emitter and preflight matches are split into one module per family of
+# changes (DEC-2790.4): `emit/column.rs` builds the column statements that
+# `emit.rs` built before, so a direct child of an emitter or preflight module
+# that is a builder is one too, with the parent's entry. Only those two
+# modules and only one level: a deeper file, or a child of `rows.rs` or
+# `catalog.rs`, still needs an entry of its own.
+FAMILY_SPLIT_MODULES = ("emit", "preflight")
+
+
+def is_builder(path):
+    if path in SQL_BUILDERS:
+        return True
+    parent, _, leaf = path.rpartition("/")
+    module = parent.rpartition("/")[2]
+    return (
+        module in FAMILY_SPLIT_MODULES
+        and leaf.endswith(".rs")
+        and f"{parent}.rs" in SQL_BUILDERS
+    )
+
+
 # path -> (count, why). `count` is how many `.raw()` in a message the file may
 # hold: None for a file that builds SQL or a document and so holds them by its
 # nature, a number for a known hole, which has to equal what the file holds -
@@ -605,7 +626,7 @@ def check(files, allowed=ALLOWED):
             errors.append(f"{path}: the count is None or a positive number, not {count!r}")
             unusable.add(path)
     for path, text in sorted(files.items()):
-        builder = path in SQL_BUILDERS
+        builder = is_builder(path)
         found, lost = hits(text, builder=builder)
         # A call whose end is not found is a call whose arguments were not
         # read: that is not a clean file, whatever the file is for.
