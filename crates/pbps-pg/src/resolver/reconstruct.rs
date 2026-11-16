@@ -35,6 +35,21 @@ use pbps_diff::order::scratch::{
 };
 pub mod refusal;
 mod trial;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::ExtensionChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::PolicyChange;
+use pbps_model::RoleChange;
+use pbps_model::RowChange;
+use pbps_model::SearchChange;
+use pbps_model::TableChange;
+use pbps_model::TablePropertyChange;
+use pbps_model::TypeChange;
+use pbps_model::TypeValueChange;
 use pbps_model::ValueSource;
 use pbps_model::{Change, ModuleId, ModuleKind};
 use std::collections::{BTreeMap, BTreeSet};
@@ -237,22 +252,22 @@ impl Reconstruction {
                 part(dialect, operation, planned, declaration, names, module)
             };
             match change {
-                Change::RebuildPartitionedTable(_)
-                | Change::BuildPartitionedIndex(_)
-                | Change::CopyTableRows(_)
-                | Change::AnalyzeTableTree(_) => {
+                Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+                | Change::Index(IndexChange::BuildPartitionedIndex(_))
+                | Change::Partition(PartitionChange::CopyTableRows(_))
+                | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => {
                     return Err(ReconstructError::Unsupported(format!(
                         "{} for `{}`",
                         change.pending_rebuild().unwrap().0,
                         change.table().unwrap().shown()
                     )));
                 }
-                Change::AddColumn {
+                Change::Column(ColumnChange::AddColumn {
                     table,
                     name,
                     column,
                     ..
-                } => {
+                }) => {
                     let mut added = make(
                         &format!("column {}", table.column(name).shown()),
                         Vec::new(),
@@ -264,7 +279,7 @@ impl Reconstruction {
                     added.metadata.table_part = Some(table.clone());
                     steps.push(added);
                 }
-                Change::AlterColumnExpression { column, .. } => {
+                Change::Column(ColumnChange::AlterColumnExpression { column, .. }) => {
                     let mut installed = make(
                         &format!("generation of {}", column.shown()),
                         Vec::new(),
@@ -276,7 +291,7 @@ impl Reconstruction {
                 }
                 // A bootstrap starts from nothing, so no partition is made
                 // beside a standing DEFAULT (#1547).
-                Change::CreateTable { name, table, .. } => {
+                Change::Table(TableChange::CreateTable { name, table, .. }) => {
                     // The indexes it keeps are made with it: a relation each.
                     let mut names = relation(&name.schema, &name.name);
                     names.extend(table.indexes.keys().map(|index| {
@@ -293,7 +308,7 @@ impl Reconstruction {
                             matches!(spec.value_source, ValueSource::Generated(_))
                                 && !expanded.changes.iter().any(|p| {
                                     matches!(&p.change,
-                                    Change::AlterColumnExpression { column: installed, .. }
+                                    Change::Column(ColumnChange::AlterColumnExpression { column: installed, .. })
                                         if installed == &name.column(*column))
                                 })
                         })
@@ -303,14 +318,14 @@ impl Reconstruction {
                 }
                 // An index is a relation: it can shadow a name a module
                 // bound, so its name joins the order check (#1042).
-                Change::AddIndex { table, name, .. } if is_part => {
+                Change::Index(IndexChange::AddIndex { table, name, .. }) if is_part => {
                     steps.push(make(
                         &format!("index {name} on {}", table.shown(), name = name.shown()),
                         vec![(Nameable::Index, table.schema.clone(), name.raw().to_owned())],
                         None,
                     )?);
                 }
-                Change::AddCheck { table, name, .. } if is_part => {
+                Change::Constraint(ConstraintChange::AddCheck { table, name, .. }) if is_part => {
                     steps.push(make(
                         &format!(
                             "check {check} on {table}",
@@ -321,14 +336,14 @@ impl Reconstruction {
                         None,
                     )?);
                 }
-                Change::AlterColumnDefault { column, .. }
-                | Change::AlterColumnNullability { column, .. }
+                Change::Column(ColumnChange::AlterColumnDefault { column, .. })
+                | Change::Column(ColumnChange::AlterColumnNullability { column, .. })
                     if is_part =>
                 {
                     steps.push(make(
                         &format!(
                             "the {} of {}",
-                            if matches!(change, Change::AlterColumnNullability { .. }) {
+                            if matches!(change, Change::Column(ColumnChange::AlterColumnNullability { .. })) {
                                 "NOT NULL"
                             } else {
                                 "default"
@@ -339,7 +354,7 @@ impl Reconstruction {
                         None,
                     )?);
                 }
-                Change::SetReplicaIdentity { table, .. } if is_part => {
+                Change::TableProperty(TablePropertyChange::SetReplicaIdentity { table, .. }) if is_part => {
                     steps.push(make(
                         &format!("replica identity of {table}", table = table.shown()),
                         Vec::new(),
@@ -350,12 +365,12 @@ impl Reconstruction {
                 // as it does a foreign key, so a bootstrap carries it as its own change, and
                 // not as a generated part of the table (#2448 C1b). Its backing index is a
                 // relation of the constraint's name, as an index's is.
-                Change::SetExclusion {
+                Change::Constraint(ConstraintChange::SetExclusion {
                     table,
                     name,
                     from: None,
                     to: Some(_),
-                } => {
+                }) => {
                     steps.push(make(
                         &format!(
                             "exclusion constraint {name} on {table}",
@@ -366,7 +381,7 @@ impl Reconstruction {
                         None,
                     )?);
                 }
-                Change::SetPrimaryKey { .. } | Change::AddUnique { .. } if is_part => {
+                Change::Constraint(ConstraintChange::SetPrimaryKey { .. }) | Change::Constraint(ConstraintChange::AddUnique { .. }) if is_part => {
                     steps.push(make(
                         &pbps_model::escape::Escaped(&change.subject()).to_string(),
                         Vec::new(),
@@ -377,7 +392,7 @@ impl Reconstruction {
                 // CREATE, so a bootstrap of related tables carries them as
                 // their own changes, and so does the split of a table that
                 // has them inline.
-                Change::AddForeignKey { table, .. } => {
+                Change::Constraint(ConstraintChange::AddForeignKey { table, .. }) => {
                     steps.push(make(
                         &format!("table {table}", table = table.shown()),
                         Vec::new(),
@@ -387,7 +402,7 @@ impl Reconstruction {
                 // A declared enum or domain precedes every part that names it,
                 // by a constraint. A bootstrap holds only creations of them, so
                 // the label operations and the drops stay refused.
-                Change::CreateType { name, .. } => {
+                Change::Type(TypeChange::CreateType { name, .. }) => {
                     steps.push(make(
                         &format!("type {name}", name = name.shown()),
                         vec![(
@@ -400,13 +415,13 @@ impl Reconstruction {
                 }
                 // Named by string literals alone, so it binds no name, but the scratch
                 // builds it ahead of the expressions that mention it (DEC-2728.2).
-                Change::CreateSearch { name, .. } => {
+                Change::Search(SearchChange::CreateSearch { name, .. }) => {
                     steps.push(make(&name.shown().to_string(), Vec::new(), None)?);
                 }
-                Change::AlterDomain { name, .. } if is_part => {
+                Change::TypeValue(TypeValueChange::AlterDomain { name, .. }) if is_part => {
                     steps.push(make(&format!("domain {}", name.shown()), Vec::new(), None)?);
                 }
-                Change::CreateModule { id, module } => {
+                Change::Module(ModuleChange::CreateModule { id, module }) => {
                     // A trigger is named by nothing and names its function
                     // with an exact signature.
                     let (names, compiled) = if module.kind == ModuleKind::Trigger {
@@ -433,63 +448,63 @@ impl Reconstruction {
                 // are not resolver surfaces (#595). Installing them here
                 // would also require recipient roles scratch need not hold.
                 // The typed deployment plan still emits policies and flags.
-                Change::DropPolicy { .. }
-                | Change::CreatePolicy { .. }
-                | Change::SetRowSecurity { .. } => {}
+                Change::Policy(PolicyChange::DropPolicy { .. })
+                | Change::Policy(PolicyChange::CreatePolicy { .. })
+                | Change::Policy(PolicyChange::SetRowSecurity { .. }) => {}
                 // None of these changes what a name resolves to.
-                Change::CreateRole { .. }
-                | Change::Grant { .. }
-                | Change::PublicExecution { .. }
-                | Change::InsertRow { .. }
-                | Change::SetDataMode { .. } => {}
-                Change::SetEnsureKeys { .. } => {}
+                Change::Role(RoleChange::CreateRole { .. })
+                | Change::Permission(GrantChange::Grant { .. })
+                | Change::Permission(GrantChange::PublicExecution { .. })
+                | Change::Row(RowChange::InsertRow { .. })
+                | Change::Row(RowChange::SetDataMode { .. }) => {}
+                Change::Row(RowChange::SetEnsureKeys { .. }) => {}
                 // A bootstrap from an empty schema has no renames, drops or
                 // alterations; one that does is not a bootstrap.
                 pbps_model::change_family!(type_values)
-                | Change::DropType { .. }
-                | Change::DropSearch { .. }
-                | Change::RenameType { .. }
-                | Change::DropTable { .. }
-                | Change::DetachPartition { .. }
-                | Change::AttachPartition { .. }
-                | Change::RenameTable { .. }
-                | Change::DropColumn { .. }
-                | Change::RenameColumn { .. }
-                | Change::AlterColumnType { .. }
-                | Change::AlterColumnNullability { .. }
-                | Change::AlterColumnDefault { .. }
-                | Change::AlterColumnNumbering { .. }
-                | Change::SetColumnDeprecated { .. }
+                | Change::Type(TypeChange::DropType { .. })
+                | Change::Search(SearchChange::DropSearch { .. })
+                | Change::Type(TypeChange::RenameType { .. })
+                | Change::Table(TableChange::DropTable { .. })
+                | Change::Partition(PartitionChange::DetachPartition { .. })
+                | Change::Partition(PartitionChange::AttachPartition { .. })
+                | Change::Table(TableChange::RenameTable { .. })
+                | Change::Column(ColumnChange::DropColumn { .. })
+                | Change::Column(ColumnChange::RenameColumn { .. })
+                | Change::Column(ColumnChange::AlterColumnType { .. })
+                | Change::Column(ColumnChange::AlterColumnNullability { .. })
+                | Change::Column(ColumnChange::AlterColumnDefault { .. })
+                | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+                | Change::Column(ColumnChange::SetColumnDeprecated { .. })
                 | pbps_model::change_family!(table_properties)
-                | Change::SetPrimaryKey { .. }
-                | Change::SetIndexStorageParameters { .. }
-                | Change::SetPartitionDefault { .. }
-                | Change::SetPartitionNotNull { .. }
-                | Change::AddUnique { .. }
-                | Change::DropUnique { .. }
-                | Change::SetExclusion { .. }
-                | Change::DropForeignKey { .. }
-                | Change::AddCheck { .. }
-                | Change::DropCheck { .. }
-                | Change::AddIndex { .. }
-                | Change::AddComputedColumn { .. }
-                | Change::DropComputedColumn { .. }
-                | Change::DropIndex { .. }
-                | Change::UpdateRow { .. }
-                | Change::DeleteRow { .. }
-                | Change::AlterModule { .. }
-                | Change::DropModule { .. }
-                | Change::DropRole { .. }
-                | Change::RenameRole { .. }
+                | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+                | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+                | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+                | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+                | Change::Constraint(ConstraintChange::AddUnique { .. })
+                | Change::Constraint(ConstraintChange::DropUnique { .. })
+                | Change::Constraint(ConstraintChange::SetExclusion { .. })
+                | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+                | Change::Constraint(ConstraintChange::AddCheck { .. })
+                | Change::Constraint(ConstraintChange::DropCheck { .. })
+                | Change::Index(IndexChange::AddIndex { .. })
+                | Change::Column(ColumnChange::AddComputedColumn { .. })
+                | Change::Column(ColumnChange::DropComputedColumn { .. })
+                | Change::Index(IndexChange::DropIndex { .. })
+                | Change::Row(RowChange::UpdateRow { .. })
+                | Change::Row(RowChange::DeleteRow { .. })
+                | Change::Module(ModuleChange::AlterModule { .. })
+                | Change::Module(ModuleChange::DropModule { .. })
+                | Change::Role(RoleChange::DropRole { .. })
+                | Change::Role(RoleChange::RenameRole { .. })
                 // A bootstrap is handed the packages it needs already
                 // installed (`bootstrap_base`); a create reaching it would be
                 // skipped and the parts that use the package would fail
                 // later with a message about something else.
-                | Change::CreateExtension { .. }
-                | Change::DropExtension { .. }
-                | Change::UpdateExtension { .. }
-                | Change::SetExtensionSchema { .. }
-                | Change::Revoke { .. } => {
+                | Change::Extension(ExtensionChange::CreateExtension { .. })
+                | Change::Extension(ExtensionChange::DropExtension { .. })
+                | Change::Extension(ExtensionChange::UpdateExtension { .. })
+                | Change::Extension(ExtensionChange::SetExtensionSchema { .. })
+                | Change::Permission(GrantChange::Revoke { .. }) => {
                     return Err(ReconstructError::Unsupported(
                         serde_json::to_value(change)
                             .ok()
@@ -1144,13 +1159,14 @@ fn part(
         metadata: Metadata {
             subject: planned.change.clone(),
             owner: match &planned.change {
-                Change::CreateModule { id, .. } => {
+                Change::Module(ModuleChange::CreateModule { id, .. }) => {
                     Some(pbps_model::diagnostic::Declaration::Module(id.clone()))
                 }
-                Change::CreateType { name, .. } | Change::AlterDomain { name, .. } => {
+                Change::Type(TypeChange::CreateType { name, .. })
+                | Change::TypeValue(TypeValueChange::AlterDomain { name, .. }) => {
                     Some(pbps_model::diagnostic::Declaration::Type(name.clone()))
                 }
-                Change::CreateSearch { name, .. } => {
+                Change::Search(SearchChange::CreateSearch { name, .. }) => {
                     Some(pbps_model::diagnostic::Declaration::Search(name.clone()))
                 }
                 other => other
@@ -1159,11 +1175,16 @@ fn part(
                     .map(pbps_model::diagnostic::Declaration::Table),
             },
             body: match &planned.change {
-                Change::CreateModule { module, .. } => Some(module.definition.clone()),
+                Change::Module(ModuleChange::CreateModule { module, .. }) => {
+                    Some(module.definition.clone())
+                }
                 _ => None,
             },
             table_part: None,
-            foreign_key: matches!(planned.change, Change::AddForeignKey { .. }),
+            foreign_key: matches!(
+                planned.change,
+                Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            ),
             declaration: declaration.to_owned(),
             names,
             generated: Vec::new(),
@@ -1179,10 +1200,10 @@ pub(crate) fn fixture_ids(bootstrap: &[Change]) -> pbps_model::IdsFile {
     let mut schema = pbps_model::Schema::default();
     for change in bootstrap {
         match change {
-            Change::CreateTable { name, table, .. } => {
+            Change::Table(TableChange::CreateTable { name, table, .. }) => {
                 schema.tables.insert(name.clone(), (**table).clone());
             }
-            Change::CreateModule { id, module } => {
+            Change::Module(ModuleChange::CreateModule { id, module }) => {
                 schema.modules.insert(id.clone(), (**module).clone());
             }
             _ => {}
@@ -1200,7 +1221,7 @@ pub(crate) fn fixture_ids(bootstrap: &[Change]) -> pbps_model::IdsFile {
     .unwrap()
     .ids;
     for change in bootstrap {
-        if let Change::CreateTable { uid, name, .. } = change {
+        if let Change::Table(TableChange::CreateTable { uid, name, .. }) = change {
             ids.tables.retain(|_, n| n != name);
             ids.tables.insert(uid.clone(), name.clone());
         }

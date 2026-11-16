@@ -1,6 +1,12 @@
 //! PostgreSQL's engine effects, through the operation-level verifier (#1954).
 
 use pbps_diff::order::{Baseline, Violation, analyse};
+use pbps_model::ColumnChange;
+use pbps_model::ExtensionChange;
+use pbps_model::IndexChange;
+use pbps_model::SearchChange;
+use pbps_model::TableChange;
+use pbps_model::TypeChange;
 use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
 use pbps_model::plan_names::PlanNames;
 use pbps_model::{
@@ -42,16 +48,16 @@ fn type_order_violations(drop: bool, order: &[usize]) -> Vec<Violation> {
             &empty,
             &empty_ids,
             vec![
-                Change::DropTable {
+                Change::Table(TableChange::DropTable {
                     uid: table_uid,
                     name,
                     detach_from: None,
-                },
-                Change::DropType {
+                }),
+                Change::Type(TypeChange::DropType {
                     uid: type_uid,
                     name: reference,
                     definition: Box::new(definition),
-                },
+                }),
             ],
         )
     } else {
@@ -61,18 +67,18 @@ fn type_order_violations(drop: bool, order: &[usize]) -> Vec<Violation> {
             &populated,
             &ids,
             vec![
-                Change::CreateType {
+                Change::Type(TypeChange::CreateType {
                     uid: type_uid,
                     name: reference,
                     definition: Box::new(definition),
-                },
-                Change::CreateTable {
+                }),
+                Change::Table(TableChange::CreateTable {
                     uid: table_uid,
                     name,
                     table: Box::new(table),
                     beside_default: None,
                     moves_at_most: None,
-                },
+                }),
             ],
         )
     };
@@ -91,10 +97,7 @@ fn type_order_violations(drop: bool, order: &[usize]) -> Vec<Violation> {
     .unwrap();
     assert_eq!(proposed.changes.len(), 2);
     for (planned, expected) in proposed.changes.iter().zip(&logical) {
-        assert_eq!(
-            std::mem::discriminant(&planned.change),
-            std::mem::discriminant(expected)
-        );
+        assert!(planned.change.same_kind(expected));
     }
     let logical: Vec<_> = logical.into_iter().map(PlannedChange::new).collect();
     let owners = PlanOwners::new(
@@ -170,14 +173,14 @@ fn violations(from: &str, to: &str, order: &[usize]) -> Vec<Violation> {
     ids.tables.insert(Uid::derived(UidKind::Table, "t", 0), t());
     ids.columns.insert(uid.clone(), t().column("id"));
     let logical: Vec<PlannedChange> = vec![
-        Change::AlterColumnNumbering {
+        Change::Column(ColumnChange::AlterColumnNumbering {
             uid: uid.clone(),
             column: t().column("id"),
             ty: ty(to),
             from: ValueSource::Identity(Identity::new(1, 1)),
             to: ValueSource::Identity(retuned),
-        },
-        Change::AlterColumnType {
+        }),
+        Change::Column(ColumnChange::AlterColumnType {
             uid,
             column: t().column("id"),
             from: ty(from),
@@ -188,7 +191,7 @@ fn violations(from: &str, to: &str, order: &[usize]) -> Vec<Violation> {
             to_collation: None,
             through_external_partitions: false,
             using: None,
-        },
+        }),
     ]
     .into_iter()
     .map(PlannedChange::new)
@@ -278,10 +281,12 @@ fn domain_bases_are_created_first_and_dropped_last_even_when_names_sort_the_othe
     };
     let created = pbps_diff::diff(none, full, &Postgres::new(), &Default::default()).unwrap();
     assert!(
-        matches!(&created.changes[0].change, Change::CreateType { name, .. } if name == &enumeration)
+        matches!(&created.changes[0].change, Change::Type(TypeChange::CreateType { name, .. }) if name == &enumeration)
     );
     let dropped = pbps_diff::diff(full, none, &Postgres::new(), &Default::default()).unwrap();
-    assert!(matches!(&dropped.changes[0].change, Change::DropType { name, .. } if name == &domain));
+    assert!(
+        matches!(&dropped.changes[0].change, Change::Type(TypeChange::DropType { name, .. }) if name == &domain)
+    );
 }
 
 /// An index key naming an operator class of a package requires the package's
@@ -375,7 +380,7 @@ fn an_index_key_naming_a_package_class_requires_the_package_and_an_engine_class_
         let effects = analyse(&ops, &owners, before, after, &Postgres::new()).effects;
         let at = changes
             .iter()
-            .position(|c| matches!(c.change, Change::AddIndex { .. }))
+            .position(|c| matches!(c.change, Change::Index(IndexChange::AddIndex { .. })))
             .expect("the plan adds the index");
         effects[at].requires.iter().any(|r| {
             matches!(
@@ -461,11 +466,11 @@ fn a_package_drop_requires_the_absence_of_an_index_it_releases() {
     let released =
         |releases: std::collections::BTreeSet<(TableName, pbps_model::ObjectLocalName)>| {
             let changes = vec![
-                PlannedChange::new(Change::DropIndex {
+                PlannedChange::new(Change::Index(IndexChange::DropIndex {
                     table: name.clone(),
                     name: "docs_ix".into(),
-                }),
-                PlannedChange::new(Change::DropExtension {
+                })),
+                PlannedChange::new(Change::Extension(ExtensionChange::DropExtension {
                     uid: uid.clone(),
                     name: "pg_trgm".into(),
                     definition: package.clone(),
@@ -473,7 +478,7 @@ fn a_package_drop_requires_the_absence_of_an_index_it_releases() {
                     releases: Default::default(),
                     index_releases: releases,
                     search_releases: Default::default(),
-                }),
+                })),
             ];
             let ops = Operations::of_plan(&changes, ModuleEdits::InPlace);
             let owners = PlanOwners::new(PlanNames::of(&changes, &ids).unwrap(), &base_ids, &ids);
@@ -559,12 +564,12 @@ fn search_objects_and_packages_wait_for_each_other_through_the_effects() {
         let ids_for = pbps_diff::resolve(&desired, &IdsFile::default(), &[], &ctx)
             .unwrap()
             .ids;
-        let create = PlannedChange::new(Change::CreateSearch {
+        let create = PlannedChange::new(Change::Search(SearchChange::CreateSearch {
             uid: ids_for.search_uid(&docs).unwrap().clone(),
             name: docs.clone(),
             definition: Box::new(config(dictionary)),
             unresolved: Vec::new(),
-        });
+        }));
         let (effects, ..) = effects_of(&Schema::default(), &desired, vec![create]);
         effects[0].requires.iter().any(|r| {
             matches!(
@@ -586,12 +591,12 @@ fn search_objects_and_packages_wait_for_each_other_through_the_effects() {
             .unwrap()
             .ids;
         let changes = vec![
-            PlannedChange::new(Change::DropSearch {
+            PlannedChange::new(Change::Search(SearchChange::DropSearch {
                 uid: base_ids.search_uid(&docs).unwrap().clone(),
                 name: docs.clone(),
                 definition: Box::new(config("ext.intdict")),
-            }),
-            PlannedChange::new(Change::DropExtension {
+            })),
+            PlannedChange::new(Change::Extension(ExtensionChange::DropExtension {
                 uid: base_ids.extension_uid(&"dict_int".into()).unwrap().clone(),
                 name: "dict_int".into(),
                 definition: package.clone(),
@@ -603,7 +608,7 @@ fn search_objects_and_packages_wait_for_each_other_through_the_effects() {
                 } else {
                     Default::default()
                 },
-            }),
+            })),
         ];
         let desired = Schema::default();
         let ops = Operations::of_plan(&changes, ModuleEdits::InPlace);

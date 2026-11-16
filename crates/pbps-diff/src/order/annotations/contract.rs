@@ -2,6 +2,14 @@
 use std::sync::Arc;
 
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::PolicyChange;
+use pbps_model::TableChange;
+use pbps_model::TypeChange;
+use pbps_model::TypeValueChange;
 use pbps_model::diagnostic::Declaration;
 use pbps_model::object_ref::{BoundRoot, Registry};
 use pbps_model::operation::symbolic::Attribute;
@@ -213,16 +221,17 @@ impl Contract {
         for (step, origin) in plan.changes.iter().zip(&plan.origins) {
             if !matches!(
                 step.change,
-                Change::CreateTable { .. }
-                    | Change::AddColumn { .. }
-                    | Change::AddComputedColumn { .. }
+                Change::Table(TableChange::CreateTable { .. })
+                    | Change::Column(ColumnChange::AddColumn { .. })
+                    | Change::Column(ColumnChange::AddComputedColumn { .. })
             ) {
                 continue;
             }
             let Some(table) = step.change.table() else {
                 continue;
             };
-            let spelling = if matches!(step.change, Change::CreateTable { .. }) {
+            let spelling = if matches!(step.change, Change::Table(TableChange::CreateTable { .. }))
+            {
                 origin.spelling().produced()
             } else {
                 origin.spelling()
@@ -332,12 +341,12 @@ impl Contract {
             return references.clone();
         }
         let root = match change {
-            Change::CreateTable { name, .. } => Root::Table(name.clone()),
-            Change::CreateModule { id, .. } | Change::AlterModule { id, .. } => {
-                Root::Module(id.clone())
-            }
-            Change::CreateType { name, .. } => Root::Type(name.clone()),
-            Change::AddColumn { table, .. } | Change::AddComputedColumn { table, .. } => {
+            Change::Table(TableChange::CreateTable { name, .. }) => Root::Table(name.clone()),
+            Change::Module(ModuleChange::CreateModule { id, .. })
+            | Change::Module(ModuleChange::AlterModule { id, .. }) => Root::Module(id.clone()),
+            Change::Type(TypeChange::CreateType { name, .. }) => Root::Type(name.clone()),
+            Change::Column(ColumnChange::AddColumn { table, .. })
+            | Change::Column(ColumnChange::AddComputedColumn { table, .. }) => {
                 Root::Table(table.clone())
             }
             _ => return BTreeSet::new(),
@@ -531,26 +540,25 @@ impl Contract {
             // Scratch defaults retain a table-UID carrier for reconstruction.
             // Resolve it through the same recorded ancestor binding as a
             // partition operation, without changing any engine's recipe.
-            let carrier =
-                if let (ColumnKey::Recorded(table), Change::AlterColumnDefault { column, .. }) =
-                    (key, operation.change())
-                    && table.uid().kind() == pbps_model::UidKind::Table
-                {
-                    let owner = owners
-                        .table(&column.table, spelling)
-                        .map_err(|e| e.to_string())?;
-                    if &owner != table.uid() {
-                        return Err(
-                            "scratch default carrier does not match its recorded table".into()
-                        );
-                    }
-                    Some(ColumnKey::Partition {
-                        table: table.clone(),
-                        column: column.name.clone(),
-                    })
-                } else {
-                    None
-                };
+            let carrier = if let (
+                ColumnKey::Recorded(table),
+                Change::Column(ColumnChange::AlterColumnDefault { column, .. }),
+            ) = (key, operation.change())
+                && table.uid().kind() == pbps_model::UidKind::Table
+            {
+                let owner = owners
+                    .table(&column.table, spelling)
+                    .map_err(|e| e.to_string())?;
+                if &owner != table.uid() {
+                    return Err("scratch default carrier does not match its recorded table".into());
+                }
+                Some(ColumnKey::Partition {
+                    table: table.clone(),
+                    column: column.name.clone(),
+                })
+            } else {
+                None
+            };
             Ok(match carrier.as_ref().unwrap_or(key) {
                 ColumnKey::Recorded(uid) => BoundRoot::Recorded(uid.uid().clone()),
                 ColumnKey::Partition { table, column } => {
@@ -606,7 +614,10 @@ impl Contract {
             },
             ObjectKey::Default(key) => ObjectRef {
                 root: column(key)?,
-                part: if matches!(operation.change(), Change::AlterColumnExpression { .. }) {
+                part: if matches!(
+                    operation.change(),
+                    Change::Column(ColumnChange::AlterColumnExpression { .. })
+                ) {
                     Selector::Generation
                 } else {
                     Selector::Default
@@ -662,7 +673,7 @@ impl Contract {
     ) -> Result<(), String> {
         let mut schema = Schema::default();
         let root = match op.change() {
-            Change::CreateTable { name, table, .. } => {
+            Change::Table(TableChange::CreateTable { name, table, .. }) => {
                 if let Some(chain) =
                     pbps_model::partitions::ancestor_chain(name, &self.after.schema.tables)
                 {
@@ -676,12 +687,12 @@ impl Contract {
                 schema.tables.insert(name.clone(), payload);
                 Root::Table(name.clone())
             }
-            Change::AddColumn {
+            Change::Column(ColumnChange::AddColumn {
                 table,
                 name,
                 column,
                 ..
-            } => {
+            }) => {
                 schema.tables.insert(
                     table.clone(),
                     Table {
@@ -691,11 +702,11 @@ impl Contract {
                 );
                 Root::Column(table.column(name))
             }
-            Change::AddComputedColumn {
+            Change::Column(ColumnChange::AddComputedColumn {
                 table,
                 name,
                 computed,
-            } => {
+            }) => {
                 schema.tables.insert(
                     table.clone(),
                     Table {
@@ -705,13 +716,14 @@ impl Contract {
                 );
                 Root::Column(table.column(name))
             }
-            Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
+            Change::Module(ModuleChange::CreateModule { id, module })
+            | Change::Module(ModuleChange::AlterModule { id, module }) => {
                 schema.modules.insert(id.clone(), (**module).clone());
                 Root::Module(id.clone())
             }
-            Change::CreateType {
+            Change::Type(TypeChange::CreateType {
                 name, definition, ..
-            } => {
+            }) => {
                 schema.types.insert(name.clone(), (**definition).clone());
                 Root::Type(name.clone())
             }
@@ -734,7 +746,10 @@ impl Contract {
                 self.record(index, bound, at, Transition::Produces);
             }
         }
-        if matches!(op.change(), Change::AlterModule { .. }) {
+        if matches!(
+            op.change(),
+            Change::Module(ModuleChange::AlterModule { .. })
+        ) {
             let reference = ObjectRef {
                 root,
                 part: Selector::Whole,
@@ -771,7 +786,7 @@ impl Contract {
             self.record(index, reference.clone(), at, transition);
         };
         match op.change() {
-            Change::AlterColumnNullability { to_nullable, .. } => event(
+            Change::Column(ColumnChange::AlterColumnNullability { to_nullable, .. }) => event(
                 Selector::NotNull,
                 if *to_nullable {
                     Transition::Ends
@@ -779,7 +794,7 @@ impl Contract {
                     Transition::Produces
                 },
             ),
-            Change::SetPartitionNotNull { not_null, .. } => event(
+            Change::Partition(PartitionChange::SetPartitionNotNull { not_null, .. }) => event(
                 Selector::NotNull,
                 if *not_null {
                     Transition::Produces
@@ -787,8 +802,10 @@ impl Contract {
                     Transition::Ends
                 },
             ),
-            Change::AlterColumnType { .. } => event(Selector::Whole, Transition::Produces),
-            Change::AlterColumnNumbering { from, to, .. } => {
+            Change::Column(ColumnChange::AlterColumnType { .. }) => {
+                event(Selector::Whole, Transition::Produces)
+            }
+            Change::Column(ColumnChange::AlterColumnNumbering { from, to, .. }) => {
                 if matches!(from, pbps_model::ValueSource::Sequence(_)) {
                     event(Selector::Sequence, Transition::Ends);
                 }
@@ -796,13 +813,15 @@ impl Contract {
                     event(Selector::Sequence, Transition::Produces);
                 }
             }
-            Change::AddEnumValue { .. } | Change::RenameEnumValue { .. } => {
+            Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. }) => {
                 event(Selector::Whole, Transition::Produces)
             }
-            Change::SetIndexStorageParameters { .. } | Change::SetRowSecurity { .. } => {
+            Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. }) => {
                 event(original_part, Transition::Produces)
             }
-            Change::AlterDomain { from, to, half, .. } => {
+            Change::TypeValue(TypeValueChange::AlterDomain { from, to, half, .. }) => {
                 let delta = pbps_model::DomainDelta::of(from, to)
                     .ok_or_else(|| "domain boundary metadata is unavailable".to_owned())?;
                 match half {

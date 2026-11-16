@@ -108,12 +108,10 @@ fn an_exclusion_on_a_package_operator_is_pinned_applied_and_refused_when_the_ope
                 .any(|p| p.kind == pbps_model::ProviderKind::Class && p.name == "gist_trgm_ops"),
             "the key's class is pinned beside its operator"
         );
-        assert!(
-            plan.changes
-                .changes
-                .iter()
-                .any(|c| matches!(c.change, pbps_model::Change::SetExclusion { .. }))
-        );
+        assert!(plan.changes.changes.iter().any(|c| matches!(
+            c.change,
+            pbps_model::Change::Constraint(pbps_model::ConstraintChange::SetExclusion { .. })
+        )));
 
         // The operator becomes a member of another family after the plan: the digest holds it.
         on_server(

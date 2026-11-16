@@ -1,5 +1,10 @@
 use super::*;
 use pbps_dialect::{Dialect, DialectError};
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::ModuleChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug, Default)]
@@ -66,11 +71,11 @@ impl Dialect for Probe {
                 .contains(&"default::app.t.x".parse().unwrap())
         );
         self.requests.fetch_add(1, Ordering::SeqCst);
-        let Change::CreateTable { name, table, .. } = change else {
+        let Change::Table(TableChange::CreateTable { name, table, .. }) = change else {
             return Ok(None);
         };
         let mut bare = change.clone();
-        let Change::CreateTable { table: shape, .. } = &mut bare else {
+        let Change::Table(TableChange::CreateTable { table: shape, .. }) = &mut bare else {
             panic!()
         };
         shape.columns["x"].value_source = pbps_model::ValueSource::None;
@@ -79,12 +84,12 @@ impl Dialect for Probe {
         };
         Ok(Some(vec![
             bare,
-            Change::AlterColumnDefault {
+            Change::Column(ColumnChange::AlterColumnDefault {
                 uid: ids.column_uid(&name.column("x")).unwrap().clone(),
                 column: name.column("x"),
                 from: None,
                 to: Some(expression.clone()),
-            },
+            }),
         ]))
     }
 }
@@ -99,7 +104,7 @@ impl crate::order::scratch::Engine for Probe {
             .iter()
             .enumerate()
             .filter(|(_, change)| {
-                !matches!(&change.change, Change::CreateModule { id, .. } if *id == "app.middle".parse().unwrap())
+                !matches!(&change.change, Change::Module(ModuleChange::CreateModule { id, .. }) if *id == "app.middle".parse().unwrap())
             })
             .map(|(operation, change)| crate::order::scratch::Part {
                 operation,
@@ -158,10 +163,10 @@ fn scratch_hard_readiness_projects_through_a_skipped_logical_vertex() {
     let mut changes = f.creates();
     changes.insert(
         1,
-        Change::CreateModule {
+        Change::Module(ModuleChange::CreateModule {
             id: "app.middle".parse().unwrap(),
             module: Box::new(view()),
-        },
+        }),
     );
     let plan = f.plan(changes, &ObjectDeps::default(), &goal).unwrap();
     let engine = Probe::default();
@@ -214,23 +219,23 @@ fn a_settlement_reuses_the_logical_name_timeline_after_a_rename() {
         "app.renamed.x".parse().unwrap(),
     );
     let changes = vec![
-        Change::CreateModule {
+        Change::Module(ModuleChange::CreateModule {
             id: "app.f".parse().unwrap(),
             module: Box::new(view()),
-        },
-        Change::CreateTable {
+        }),
+        Change::Table(TableChange::CreateTable {
             uid: "t_aaaaaa".parse().unwrap(),
             name: "app.t".parse().unwrap(),
             table: Box::new(table),
             beside_default: None,
             moves_at_most: None,
-        },
-        Change::RenameTable {
+        }),
+        Change::Table(TableChange::RenameTable {
             uid: "t_aaaaaa".parse().unwrap(),
             from: "app.t".parse().unwrap(),
             to: "app.renamed".parse().unwrap(),
             defaults: Default::default(),
-        },
+        }),
     ];
     let plan = f
         .plan(
@@ -297,11 +302,11 @@ fn scope_tails_retain_annotations_and_reserved_event_ids() {
             [(Origin::Whole(0), plan.changes[0].clone())],
             ModuleEdits::Rebuilt,
         );
-        let scope = PlannedChange::new(Change::SetDataMode {
+        let scope = PlannedChange::new(Change::Row(RowChange::SetDataMode {
             table: "app.t".parse().unwrap(),
             from: None,
             to: Some(pbps_model::data::DataMode::Exact),
-        });
+        }));
         let mut appended =
             crate::order::writebacks::PlanningInput::new(vec![scope]).append_to(plan);
         if let Some(contract) = contract {
@@ -338,7 +343,7 @@ fn fill_placement_consumes_the_annotation_settled_managed_order() {
     let settled = build(dependencies(&[("app.f", &["table::app.t"])])).unwrap();
     assert!(matches!(
         settled.parts()[0].change.change,
-        Change::CreateTable { .. }
+        Change::Table(TableChange::CreateTable { .. })
     ));
     let node = |dependency| FillNode {
         name: "external dependent".into(),
@@ -411,28 +416,28 @@ fn annotated_teardowns_consume_retained_input_addresses_after_a_rename() {
             "app.renamed.x".parse().unwrap(),
         );
         let mut changes = vec![
-            Change::RenameTable {
+            Change::Table(TableChange::RenameTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 from: "app.t".parse().unwrap(),
                 to: address.parse().unwrap(),
                 defaults: vec![],
-            },
-            Change::DropModule {
+            }),
+            Change::Module(ModuleChange::DropModule {
                 id: "app.f".parse().unwrap(),
                 kind: ModuleKind::View,
-            },
-            Change::DropCheck {
+            }),
+            Change::Constraint(ConstraintChange::DropCheck {
                 table: address.parse().unwrap(),
                 name: "ck".into(),
-            },
+            }),
         ];
         if intermediate {
-            changes.push(Change::RenameTable {
+            changes.push(Change::Table(TableChange::RenameTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 from: address.parse().unwrap(),
                 to: "app.renamed".parse().unwrap(),
                 defaults: vec![],
-            });
+            }));
         }
         let mut plan = f
             .plan(
@@ -518,14 +523,14 @@ fn tracked_in_place_module_edits_keep_annotation_removal_boundaries() {
     let mut plan = f
         .plan(
             vec![
-                Change::AlterModule {
+                Change::Module(ModuleChange::AlterModule {
                     id: "app.f".parse().unwrap(),
                     module: Box::new(f.after.modules[&"app.f".parse().unwrap()].clone()),
-                },
-                Change::DropModule {
+                }),
+                Change::Module(ModuleChange::DropModule {
                     id: "app.g".parse().unwrap(),
                     kind: ModuleKind::View,
-                },
+                }),
             ],
             &dependencies(&[("app.f", &["app.g"])]),
             &ObjectDeps::default(),
@@ -551,7 +556,7 @@ fn planning_shadow_readers_propagate_annotation_projection_errors() {
         .value_source = pbps_model::ValueSource::Default("1".into());
     let goal = dependencies(&[("table::app.t", &["default::app.t.x"])]);
     let mut changes = f.creates();
-    changes.push(Change::InsertRow {
+    changes.push(Change::Row(RowChange::InsertRow {
         table: "app.t".parse().unwrap(),
         key_column: "x".into(),
         identity_key: false,
@@ -559,7 +564,7 @@ fn planning_shadow_readers_propagate_annotation_projection_errors() {
         row: Default::default(),
         defaults: Default::default(),
         types: Default::default(),
-    });
+    }));
     let plan = f.plan(changes, &ObjectDeps::default(), &goal).unwrap();
     let expected = plan.annotation_edges().unwrap_err();
     assert!(expected.contains("internal creation cycle"), "{expected}");

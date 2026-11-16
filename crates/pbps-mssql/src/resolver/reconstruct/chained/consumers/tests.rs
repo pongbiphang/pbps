@@ -1,4 +1,6 @@
 use super::*;
+use pbps_model::ConstraintChange;
+use pbps_model::ModuleChange;
 use pbps_model::{Module, ModuleId, ModuleKind, PlannedChange};
 
 fn module(kind: ModuleKind, name: &str, definition: &str, bound: bool) -> Draft {
@@ -16,7 +18,7 @@ fn module(kind: ModuleKind, name: &str, definition: &str, bound: bool) -> Draft 
             created: vec![object(id.schema(), id.name())],
             auxiliary: None,
         },
-        change: PlannedChange::new(Change::CreateModule {
+        change: PlannedChange::new(Change::Module(ModuleChange::CreateModule {
             id,
             module: Box::new(Module {
                 kind,
@@ -27,7 +29,7 @@ fn module(kind: ModuleKind, name: &str, definition: &str, bound: bool) -> Draft 
                     ..Default::default()
                 },
             }),
-        }),
+        })),
     }
 }
 
@@ -318,14 +320,14 @@ fn structural_foreign_keys_and_trigger_targets_survive_body_filtering() {
         "AFTER INSERT AS SELECT 1",
         false,
     );
-    let Change::CreateModule { id, .. } = &mut trigger.change.change else {
+    let Change::Module(ModuleChange::CreateModule { id, .. }) = &mut trigger.change.change else {
         unreachable!()
     };
     *id = "dbo.v.tr".parse().unwrap();
     assert!(needs(&trigger, &external, &[&external]).unwrap());
     assert!(!needs(&trigger, &object("other", "v"), &[&external]).unwrap());
     let mut fk = trigger;
-    fk.change = PlannedChange::new(Change::AddForeignKey {
+    fk.change = PlannedChange::new(Change::Constraint(ConstraintChange::AddForeignKey {
         table: pbps_model::TableName::new("dbo", "t"),
         name: "fk".into(),
         constraint: Box::new(pbps_model::ForeignKey {
@@ -335,7 +337,7 @@ fn structural_foreign_keys_and_trigger_targets_survive_body_filtering() {
             on_delete: pbps_model::ReferentialAction::NoAction,
             on_update: pbps_model::ReferentialAction::NoAction,
         }),
-    });
+    }));
     assert!(needs(&fk, &external, &[&external]).unwrap());
     assert!(!needs(&fk, &object("other", "v"), &[&external]).unwrap());
 }

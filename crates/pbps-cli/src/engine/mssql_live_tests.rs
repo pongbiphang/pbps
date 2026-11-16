@@ -3,6 +3,7 @@
 use super::*;
 use pbps_dialect::slots::{Namespace, SlotKey};
 use pbps_diff::order::{self, Baseline};
+use pbps_model::ModuleChange;
 use pbps_model::operation::{
     Incarnation, ModuleEdits, ObjectKey, Operations, PlanOwners, Requirement, Snapshot,
 };
@@ -60,14 +61,14 @@ async fn module_only_callers_use_catalog_collation_and_reversed_order_is_refused
         after.modules.insert(caller.clone(), function(&caller_body));
         let changes = ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::CreateModule {
+                PlannedChange::new(Change::Module(ModuleChange::CreateModule {
                     id: caller.clone(),
                     module: Box::new(function(&caller_body)),
-                }),
-                PlannedChange::new(Change::AlterModule {
+                })),
+                PlannedChange::new(Change::Module(ModuleChange::AlterModule {
                     id: callee.clone(),
                     module: Box::new(function(new)),
-                }),
+                })),
             ],
         };
         assert!(before.tables.is_empty() && after.tables.is_empty());
@@ -115,11 +116,11 @@ async fn module_only_callers_use_catalog_collation_and_reversed_order_is_refused
         assert!(analysed.unowned.is_empty());
         let g = ops
             .iter()
-            .position(|op| matches!(op.change(), Change::CreateModule { id, .. } if id == &caller))
+            .position(|op| matches!(op.change(), Change::Module(ModuleChange::CreateModule { id, .. }) if id == &caller))
             .unwrap();
         let f = ops
             .iter()
-            .position(|op| matches!(op.change(), Change::AlterModule { id, .. } if id == &callee))
+            .position(|op| matches!(op.change(), Change::Module(ModuleChange::AlterModule { id, .. }) if id == &callee))
             .unwrap();
         assert_eq!(
             f < g,
@@ -338,7 +339,7 @@ async fn the_connected_settlement_of_a_resolver_plan_keeps_the_bindings_that_ord
         .expect("the connected settlement keeps the capture's order");
     let position = |wanted: &ModuleId| {
         ordered.changes().changes.iter().position(|planned| {
-            matches!(&planned.change, Change::AlterModule { id, .. } | Change::CreateModule { id, .. } if id == wanted)
+            matches!(&planned.change, Change::Module(ModuleChange::AlterModule { id, .. }) | Change::Module(ModuleChange::CreateModule { id, .. }) if id == wanted)
         })
     };
     assert!(position(&id("f2143")) < position(&id("v2143")));

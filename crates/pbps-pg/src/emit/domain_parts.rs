@@ -2,6 +2,8 @@
 //! SQL still derives solely from the existing DomainDelta and DomainHalf.
 //! An earlier typed CREATE and its UID establish context even after wire
 //! round-trip; diagnostic provenance is deliberately irrelevant.
+use pbps_model::TypeChange;
+use pbps_model::TypeValueChange;
 use pbps_model::{Change, ChangeSet, DomainDelta, IdsFile, ManagedType, Schema, TypeRef, Uid};
 use std::collections::BTreeMap;
 
@@ -14,18 +16,18 @@ impl DomainParts {
         let mut out = Self::default();
         for (at, planned) in changes.changes.iter().enumerate() {
             match &planned.change {
-                Change::CreateType {
+                Change::Type(TypeChange::CreateType {
                     uid, definition, ..
-                } => {
+                }) => {
                     current.insert(uid.clone(), definition.as_ref().clone());
                 }
-                Change::AlterDomain {
+                Change::TypeValue(TypeValueChange::AlterDomain {
                     uid,
                     name,
                     from,
                     to,
                     half,
-                } => {
+                }) => {
                     let Some(now) = current.get_mut(uid) else {
                         continue;
                     };
@@ -39,16 +41,16 @@ impl DomainParts {
                     *now = next;
                     out.0.insert(
                         at,
-                        Change::AlterDomain {
+                        Change::TypeValue(TypeValueChange::AlterDomain {
                             uid: uid.clone(),
                             name: name.clone(),
                             from: Box::new(before),
                             to: Box::new(now.clone()),
                             half: *half,
-                        },
+                        }),
                     );
                 }
-                Change::DropType { uid, .. } => {
+                Change::Type(TypeChange::DropType { uid, .. }) => {
                     current.remove(uid);
                 }
                 _ => {}
@@ -82,25 +84,25 @@ impl Copies {
         };
         for planned in &changes.changes {
             match &planned.change {
-                Change::CreateType { uid, name, .. } => {
+                Change::Type(TypeChange::CreateType { uid, name, .. }) => {
                     out.creates.insert((uid.clone(), name.clone()));
                 }
-                Change::EnumRebuild {
+                Change::TypeValue(TypeValueChange::EnumRebuild {
                     uid,
                     tmp,
                     step: pbps_model::EnumRebuildStep::Create { .. },
                     ..
-                } => {
+                }) => {
                     out.creates.insert((uid.clone(), tmp.clone()));
                 }
-                Change::AlterDomain {
+                Change::TypeValue(TypeValueChange::AlterDomain {
                     uid,
                     from: definition,
                     ..
-                }
-                | Change::RenameType {
+                })
+                | Change::Type(TypeChange::RenameType {
                     uid, definition, ..
-                } => {
+                }) => {
                     if ids.types.contains_key(uid)
                         && let ManagedType::Domain { default, .. } = definition.as_ref()
                     {
@@ -210,40 +212,44 @@ impl DomainParts {
         let mut copies = Copies::new(before, ids, changes);
         for (at, planned) in changes.changes.iter().enumerate() {
             match parts.at(at, &planned.change) {
-                Change::CreateType {
+                Change::Type(TypeChange::CreateType {
                     uid,
                     name,
                     definition,
-                }
-                | Change::RenameType {
+                })
+                | Change::Type(TypeChange::RenameType {
                     uid,
                     to: name,
                     definition,
                     ..
-                }
-                | Change::AddEnumValue {
+                })
+                | Change::TypeValue(TypeValueChange::AddEnumValue {
                     uid,
                     name,
                     definition,
                     ..
-                }
-                | Change::RenameEnumValue {
+                })
+                | Change::TypeValue(TypeValueChange::RenameEnumValue {
                     uid,
                     name,
                     definition,
                     ..
-                } => {
+                }) => {
                     copies.step(uid, name, Some(definition), false);
                 }
-                Change::AlterDomain { uid, name, to, .. } => copies.step(uid, name, Some(to), true),
-                Change::DropType { uid, name, .. } => copies.step(uid, name, None, false),
-                Change::EnumRebuild {
+                Change::TypeValue(TypeValueChange::AlterDomain { uid, name, to, .. }) => {
+                    copies.step(uid, name, Some(to), true)
+                }
+                Change::Type(TypeChange::DropType { uid, name, .. }) => {
+                    copies.step(uid, name, None, false)
+                }
+                Change::TypeValue(TypeValueChange::EnumRebuild {
                     uid,
                     name,
                     tmp,
                     step,
                     ..
-                } => match step {
+                }) => match step {
                     pbps_model::EnumRebuildStep::Create {
                         definition, over, ..
                     } => {
@@ -265,6 +271,8 @@ impl DomainParts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::TypeChange;
+    use pbps_model::TypeValueChange;
     use pbps_model::{DomainHalf, PlannedChange, UidKind};
     fn uid(name: &str) -> Uid {
         Uid::derived(UidKind::Type, name, 0)
@@ -279,20 +287,20 @@ mod tests {
         }
     }
     fn create(name: &str, base: &str, default: Option<&str>) -> Change {
-        Change::CreateType {
+        Change::Type(TypeChange::CreateType {
             uid: uid(name),
             name: name.parse().unwrap(),
             definition: Box::new(domain(base, default)),
-        }
+        })
     }
     fn alter(name: &str, from: Option<&str>, to: Option<&str>) -> Change {
-        Change::AlterDomain {
+        Change::TypeValue(TypeValueChange::AlterDomain {
             uid: uid(name),
             name: name.parse().unwrap(),
             from: Box::new(domain("integer", from)),
             to: Box::new(domain("integer", to)),
             half: DomainHalf::Loosen,
-        }
+        })
     }
     fn changes(changes: Vec<Change>) -> ChangeSet {
         ChangeSet {
@@ -332,22 +340,24 @@ mod tests {
         // Physical equality cannot erase an authored SET or recopy after DROP.
         let mut copy = changes.clone();
         for (from, to) in [(None, Some("7")), (Some("7"), None)] {
-            copy.changes.push(PlannedChange::new(Change::AlterDomain {
-                uid: uid("app.copy"),
-                name: "app.copy".parse().unwrap(),
-                from: Box::new(domain("app.base", from)),
-                to: Box::new(domain("app.base", to)),
-                half: DomainHalf::Loosen,
-            }));
+            copy.changes.push(PlannedChange::new(Change::TypeValue(
+                TypeValueChange::AlterDomain {
+                    uid: uid("app.copy"),
+                    name: "app.copy".parse().unwrap(),
+                    from: Box::new(domain("app.base", from)),
+                    to: Box::new(domain("app.base", to)),
+                    half: DomainHalf::Loosen,
+                },
+            )));
             let out = DomainParts::completed(&Schema::default(), &IdsFile::default(), &copy);
             assert_eq!(default(&out[&uid("app.copy")]), to);
             let at = copy.changes.len() - 1;
             let parts = DomainParts::new(&copy);
-            let Change::AlterDomain {
+            let Change::TypeValue(TypeValueChange::AlterDomain {
                 from: actual_from,
                 to: actual_to,
                 ..
-            } = parts.at(at, &copy.changes[at].change)
+            }) = parts.at(at, &copy.changes[at].change)
             else {
                 panic!("ALTER")
             };
@@ -368,17 +378,17 @@ mod tests {
             ..Default::default()
         };
         let changes = changes(vec![
-            Change::RenameType {
+            Change::Type(TypeChange::RenameType {
                 uid: uid("app.base"),
                 from: "app.base".parse().unwrap(),
                 to: "app.moved".parse().unwrap(),
                 definition: Box::new(domain("integer", Some("7"))),
-            },
-            Change::CreateType {
+            }),
+            Change::Type(TypeChange::CreateType {
                 uid: uid("replacement"),
                 name: "app.base".parse().unwrap(),
                 definition: Box::new(domain("integer", None)),
-            },
+            }),
             create("app.old", "app.moved", None),
             create("app.new", "app.base", None),
         ]);
@@ -406,18 +416,18 @@ mod tests {
         };
         let changes = changes(vec![
             create("app.copy", "app.b", None),
-            Change::RenameType {
+            Change::Type(TypeChange::RenameType {
                 uid: uid("b"),
                 from: "app.b".parse().unwrap(),
                 to: "app.c".parse().unwrap(),
                 definition: Box::new(domain("integer", None)),
-            },
-            Change::RenameType {
+            }),
+            Change::Type(TypeChange::RenameType {
                 uid: uid("a"),
                 from: "app.a".parse().unwrap(),
                 to: "app.b".parse().unwrap(),
                 definition: Box::new(domain("integer", Some("7"))),
-            },
+            }),
         ]);
         assert_eq!(
             default(&DomainParts::completed(&before, &ids, &changes)[&uid("app.copy")]),
@@ -440,13 +450,13 @@ mod tests {
             unreachable!()
         };
         *not_null = true;
-        let changes = changes(vec![Change::AlterDomain {
+        let changes = changes(vec![Change::TypeValue(TypeValueChange::AlterDomain {
             uid: uid("app.outer"),
             name: "app.outer".parse().unwrap(),
             from: Box::new(domain("app.base", None)),
             to: Box::new(to),
             half: DomainHalf::Tighten,
-        }]);
+        })]);
         assert_eq!(
             default(&DomainParts::completed(&before, &ids, &changes)[&uid("app.outer")]),
             Some("7")

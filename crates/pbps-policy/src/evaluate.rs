@@ -8,6 +8,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use pbps_model::ColumnChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
 use pbps_model::{Change, ChangeSet, Finding, RiskClass, Schema, Severity, TableName};
 
 use crate::civil;
@@ -253,7 +258,7 @@ fn table_identities(cs: &ChangeSet) -> Vec<Option<usize>> {
                 next += 1;
                 next - 1
             });
-            if let Change::RenameTable { from, to, .. } = &p.change {
+            if let Change::Table(TableChange::RenameTable { from, to, .. }) = &p.change {
                 current.remove(from);
                 current.insert(to, id);
             }
@@ -284,15 +289,15 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
         let mut dropped: BTreeSet<(usize, &str)> = BTreeSet::new();
         for (p, table) in cs.changes.iter().zip(&tables) {
             let Some(table) = *table else { continue };
-            if let Change::AddColumn { name, .. } | Change::AddComputedColumn { name, .. } =
-                &p.change
+            if let Change::Column(ColumnChange::AddColumn { name, .. })
+            | Change::Column(ColumnChange::AddComputedColumn { name, .. }) = &p.change
             {
                 added.insert((table, name.raw()));
             }
-            if let Change::DropColumn { column, .. } = &p.change {
+            if let Change::Column(ColumnChange::DropColumn { column, .. }) = &p.change {
                 dropped.insert((table, column.name.raw()));
             }
-            if let Change::DropComputedColumn { name, .. } = &p.change {
+            if let Change::Column(ColumnChange::DropComputedColumn { name, .. }) = &p.change {
                 dropped.insert((table, name.raw()));
             }
         }
@@ -302,17 +307,17 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
             // neither side of the pattern, and a new kind that is (a column
             // drop spelled differently, say) should have to be placed here.
             let contract = match &p.change {
-                Change::RebuildPartitionedTable(_)
-                | Change::BuildPartitionedIndex(_)
-                | Change::CopyTableRows(_)
-                | Change::AnalyzeTableTree(_) => None,
-                Change::AddColumn { .. } => {
+                Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+                | Change::Index(IndexChange::BuildPartitionedIndex(_))
+                | Change::Partition(PartitionChange::CopyTableRows(_))
+                | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => None,
+                Change::Column(ColumnChange::AddColumn { .. }) => {
                     if let Some(id) = id {
                         adds.entry(id).or_insert(i);
                     }
                     None
                 }
-                Change::DropColumn { column, .. } => Some(&column.table),
+                Change::Column(ColumnChange::DropColumn { column, .. }) => Some(&column.table),
                 // Narrowing, and tightening to NOT NULL: the rule's own words
                 // are "drop **or narrow**", and a column that stops accepting
                 // NULL accepts less than it did — `intrinsic_risks` calls it
@@ -320,12 +325,12 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                 // column". A type change folds a nullability change into
                 // itself (§12), so it carries `NotNull` rather than
                 // `Narrowing` when that is all it does (DECISIONS 173).
-                Change::AlterColumnType {
+                Change::Column(ColumnChange::AlterColumnType {
                     column,
                     from_nullable,
                     to_nullable,
                     ..
-                } if p.risks.contains(&RiskClass::Narrowing)
+                }) if p.risks.contains(&RiskClass::Narrowing)
                     || (*from_nullable && !*to_nullable) =>
                 {
                     Some(&column.table)
@@ -335,23 +340,23 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                 // (SPEC §7.1), and it is an add. Asking the risk would make one
                 // added column both sides of the pattern and fire the rule on
                 // it alone.
-                Change::AlterColumnNullability {
+                Change::Column(ColumnChange::AlterColumnNullability {
                     column,
                     to_nullable: false,
                     ..
-                } => Some(&column.table),
+                }) => Some(&column.table),
                 // A partition's own NOT NULL narrows its column the same way
                 // (#1581).
-                Change::SetPartitionNotNull {
+                Change::Partition(PartitionChange::SetPartitionNotNull {
                     table,
                     not_null: true,
                     ..
-                } => Some(table),
+                }) => Some(table),
                 // A computed column is a reader-facing name like any other:
                 // dropping one and adding another moves readers (DEC-1433.1).
                 // Under one name it is a rebuild, which `added`/`dropped`
                 // leave out.
-                Change::AddComputedColumn { name, .. } => {
+                Change::Column(ColumnChange::AddComputedColumn { name, .. }) => {
                     if let Some(id) = id
                         && !dropped.contains(&(id, name.raw()))
                     {
@@ -359,34 +364,34 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                     }
                     None
                 }
-                Change::DropComputedColumn { table, name, .. } => id
+                Change::Column(ColumnChange::DropComputedColumn { table, name, .. }) => id
                     .is_none_or(|id| !added.contains(&(id, name.raw())))
                     .then_some(table),
-                Change::AlterColumnType { .. }
+                Change::Column(ColumnChange::AlterColumnType { .. })
                 | pbps_model::change_family!(tables)
-                | Change::DetachPartition { .. }
-                | Change::AttachPartition { .. }
-                | Change::RenameColumn { .. }
-                | Change::AlterColumnNullability { .. }
-                | Change::AlterColumnDefault { .. }
-                | Change::SetPartitionDefault { .. }
-                | Change::SetPartitionNotNull { .. }
-                | Change::AlterColumnExpression { .. }
-                | Change::AlterColumnNumbering { .. }
-                | Change::SetColumnDeprecated { .. }
+                | Change::Partition(PartitionChange::DetachPartition { .. })
+                | Change::Partition(PartitionChange::AttachPartition { .. })
+                | Change::Column(ColumnChange::RenameColumn { .. })
+                | Change::Column(ColumnChange::AlterColumnNullability { .. })
+                | Change::Column(ColumnChange::AlterColumnDefault { .. })
+                | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+                | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+                | Change::Column(ColumnChange::AlterColumnExpression { .. })
+                | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+                | Change::Column(ColumnChange::SetColumnDeprecated { .. })
                 | pbps_model::change_family!(table_properties)
                 | pbps_model::change_family!(constraints)
-                | Change::SetIndexStorageParameters { .. }
+                | Change::Index(IndexChange::SetIndexStorageParameters { .. })
                 | pbps_model::change_family!(policies)
-                | Change::AddIndex { .. }
-                | Change::DropIndex { .. }
+                | Change::Index(IndexChange::AddIndex { .. })
+                | Change::Index(IndexChange::DropIndex { .. })
                 | pbps_model::change_family!(rows)
                 | pbps_model::change_family!(modules)
                 | pbps_model::change_family!(type_values)
                 | pbps_model::catalog_change!()
-                | Change::Grant { .. }
-                | Change::Revoke { .. }
-                | Change::PublicExecution { .. } => None,
+                | Change::Permission(GrantChange::Grant { .. })
+                | Change::Permission(GrantChange::Revoke { .. })
+                | Change::Permission(GrantChange::PublicExecution { .. }) => None,
             };
             if let (Some(table), Some(id)) = (contract, id) {
                 contracts.entry(id).or_insert((i, table));
@@ -413,13 +418,13 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
 
     if let Some(live) = Live::of(policies, rules::CHANGE_NARROWING_ON_DATA, ctx) {
         for (i, p) in cs.changes.iter().enumerate() {
-            if let Change::AlterColumnType {
+            if let Change::Column(ColumnChange::AlterColumnType {
                 column,
                 from,
                 to,
                 using,
                 ..
-            } = &p.change
+            }) = &p.change
                 && p.risks.contains(&RiskClass::Narrowing)
             {
                 let subject = column.table.raw().to_string();
@@ -467,11 +472,11 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
 
     if let Some(live) = Live::of(policies, rules::GRANT_WIDEN, ctx) {
         for (i, p) in cs.changes.iter().enumerate() {
-            if let Change::Grant {
+            if let Change::Permission(GrantChange::Grant {
                 role,
                 target,
                 permissions,
-            } = &p.change
+            }) = &p.change
             {
                 let subject = format!("role {}", role.raw());
                 out.extend(
@@ -595,7 +600,7 @@ mod tests {
 
     #[test]
     fn enum_labels_do_not_become_table_expand_contract_operations() {
-        let add = PlannedChange::new(Change::AddEnumValue {
+        let add = PlannedChange::new(Change::TypeValue(TypeValueChange::AddEnumValue {
             uid: "y_000001".parse().unwrap(),
             name: "app.e".parse().unwrap(),
             value: "blue".into(),
@@ -604,7 +609,7 @@ mod tests {
             definition: Box::new(pbps_model::ManagedType::Enum {
                 values: vec!["blue".into()],
             }),
-        });
+        }));
         let drop = drop_column("old");
         assert!(
             plan(
@@ -629,11 +634,11 @@ mod tests {
     #[test]
     fn grant_policy_keys_stay_raw_while_shared_sentences_show_names_once() {
         let name = "role\nline\\path\u{202e}名前";
-        let change = PlannedChange::new(Change::Grant {
+        let change = PlannedChange::new(Change::Permission(GrantChange::Grant {
             role: name.into(),
             target: pbps_model::GrantTarget::Schema(name.into()),
             permissions: [pbps_model::Permission::Usage].into(),
-        });
+        }));
         let changes = cs(vec![change]);
         let context = ctx();
         let findings = plan(&changes, &Policies::default(), &context);
@@ -701,7 +706,7 @@ mod tests {
     fn plan_policy_subjects_match_raw_changed_subject_keys() {
         let part = "a\nb\\c\u{200b}";
         let name = pbps_model::TableName::new("app", part);
-        let narrow = PlannedChange::new(Change::AlterColumnType {
+        let narrow = PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
             uid: "c_aaaaaa".parse().unwrap(),
             column: name.column(part),
             from: "bigint".parse().unwrap(),
@@ -712,14 +717,14 @@ mod tests {
             from_collation: None,
             to_collation: None,
             using: None,
-        })
+        }))
         .with_risk(RiskClass::Narrowing);
-        let add = PlannedChange::new(Change::AddColumn {
+        let add = PlannedChange::new(Change::Column(ColumnChange::AddColumn {
             uid: "c_bbbbbb".parse().unwrap(),
             table: name,
             name: "new".into(),
             column: Box::new(Column::new("int".parse().unwrap())),
-        });
+        }));
         let changes = cs(vec![narrow, add]);
         let mut context = ctx();
         context.only = Some([format!("app.{part}")].into());
@@ -745,6 +750,10 @@ mod tests {
     }
 
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::GrantChange;
+    use pbps_model::TableChange;
+    use pbps_model::TypeValueChange;
     use pbps_model::{Column, ColumnType, PlannedChange, Table};
 
     fn policies(json: &str) -> Policies {
@@ -962,16 +971,16 @@ mod tests {
 
     #[test]
     fn adding_and_dropping_in_one_table_is_the_expand_contract_lint() {
-        let add = PlannedChange::new(Change::AddColumn {
+        let add = PlannedChange::new(Change::Column(ColumnChange::AddColumn {
             uid: "c_aaaaaa".parse().unwrap(),
             table: table(),
             name: "full_name".into(),
             column: Box::new(Column::new("int".parse().unwrap())),
-        });
-        let drop = PlannedChange::new(Change::DropColumn {
+        }));
+        let drop = PlannedChange::new(Change::Column(ColumnChange::DropColumn {
             uid: "c_bbbbbb".parse().unwrap(),
             column: table().column("name"),
-        });
+        }));
         let f = plan(
             &cs(vec![add.clone(), drop.clone()]),
             &Policies::default(),
@@ -986,7 +995,7 @@ mod tests {
     }
 
     fn add_computed(name: &str) -> PlannedChange {
-        PlannedChange::new(Change::AddComputedColumn {
+        PlannedChange::new(Change::Column(ColumnChange::AddComputedColumn {
             table: table(),
             name: name.into(),
             computed: pbps_model::ComputedColumn {
@@ -994,11 +1003,11 @@ mod tests {
                 persisted: false,
                 not_null: false,
             },
-        })
+        }))
     }
 
     fn drop_computed(name: &str) -> PlannedChange {
-        PlannedChange::new(Change::DropComputedColumn {
+        PlannedChange::new(Change::Column(ColumnChange::DropComputedColumn {
             table: table(),
             name: name.into(),
             computed: pbps_model::ComputedColumn {
@@ -1006,23 +1015,23 @@ mod tests {
                 persisted: false,
                 not_null: false,
             },
-        })
+        }))
     }
 
     fn add_column(name: &str) -> PlannedChange {
-        PlannedChange::new(Change::AddColumn {
+        PlannedChange::new(Change::Column(ColumnChange::AddColumn {
             uid: "c_aaaaaa".parse().unwrap(),
             table: table(),
             name: name.into(),
             column: Box::new(Column::new("int".parse().unwrap())),
-        })
+        }))
     }
 
     fn drop_column(name: &str) -> PlannedChange {
-        PlannedChange::new(Change::DropColumn {
+        PlannedChange::new(Change::Column(ColumnChange::DropColumn {
             uid: "c_bbbbbb".parse().unwrap(),
             column: table().column(name),
-        })
+        }))
     }
 
     /// A computed column is a reader-facing name (#1433): replacing one with
@@ -1066,17 +1075,17 @@ mod tests {
     fn a_table_is_one_table_across_its_rename() {
         let old: TableName = "dbo.customer_old".parse().unwrap();
         let rename = |from: &TableName, to: &TableName| {
-            PlannedChange::new(Change::RenameTable {
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: "t_cccccc".parse().unwrap(),
                 from: from.clone(),
                 to: to.clone(),
                 defaults: Vec::new(),
-            })
+            }))
         };
         let at = |mut p: PlannedChange, t: &TableName| {
-            if let Change::DropComputedColumn { table, .. } = &mut p.change {
+            if let Change::Column(ColumnChange::DropComputedColumn { table, .. }) = &mut p.change {
                 *table = t.clone();
-            } else if let Change::DropColumn { column, .. } = &mut p.change {
+            } else if let Change::Column(ColumnChange::DropColumn { column, .. }) = &mut p.change {
                 column.table = t.clone();
             } else {
                 panic!("not a drop: {:?}", p.change);
@@ -1128,23 +1137,23 @@ mod tests {
     /// and so carries `NotNull` rather than `Narrowing` (DECISIONS 173).
     #[test]
     fn tightening_to_not_null_is_the_contraction_half_too() {
-        let add = PlannedChange::new(Change::AddColumn {
+        let add = PlannedChange::new(Change::Column(ColumnChange::AddColumn {
             uid: "c_aaaaaa".parse().unwrap(),
             table: table(),
             name: "full_name".into(),
             column: Box::new(Column::new("int".parse().unwrap())),
-        });
-        let tighten = PlannedChange::new(Change::AlterColumnNullability {
+        }));
+        let tighten = PlannedChange::new(Change::Column(ColumnChange::AlterColumnNullability {
             uid: "c_bbbbbb".parse().unwrap(),
             column: table().column("name"),
             ty: "int".parse().unwrap(),
             to_nullable: false,
             through_external_partitions: false,
             collation: None,
-        });
+        }));
         // A widening type change that also tightens: `Narrowing` is not among
         // its risks, and it is still a contraction.
-        let widen_and_tighten = PlannedChange::new(Change::AlterColumnType {
+        let widen_and_tighten = PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
             uid: "c_cccccc".parse().unwrap(),
             column: table().column("n"),
             from: "int".parse().unwrap(),
@@ -1155,7 +1164,7 @@ mod tests {
             from_collation: None,
             to_collation: None,
             using: None,
-        });
+        }));
         assert!(
             !widen_and_tighten.risks.contains(&RiskClass::Narrowing),
             "the premise: {:?}",
@@ -1173,21 +1182,21 @@ mod tests {
         }
 
         // Loosening is not: a column that starts accepting NULL accepts more.
-        let loosen = PlannedChange::new(Change::AlterColumnNullability {
+        let loosen = PlannedChange::new(Change::Column(ColumnChange::AlterColumnNullability {
             uid: "c_bbbbbb".parse().unwrap(),
             column: table().column("name"),
             ty: "int".parse().unwrap(),
             to_nullable: true,
             through_external_partitions: false,
             collation: None,
-        });
+        }));
         assert!(plan(&cs(vec![add.clone(), loosen]), &Policies::default(), &ctx()).is_empty());
 
         // And neither half alone is the pattern. A NOT NULL column *addition*
         // carries `RiskClass::NotNull` as well (SPEC §7.1) — asking the risk
         // rather than the change would make that one change both sides and
         // fire on it alone.
-        let add_not_null = PlannedChange::new(Change::AddColumn {
+        let add_not_null = PlannedChange::new(Change::Column(ColumnChange::AddColumn {
             uid: "c_dddddd".parse().unwrap(),
             table: table(),
             name: "full_name".into(),
@@ -1196,7 +1205,7 @@ mod tests {
                 c.nullable = false;
                 c
             }),
-        });
+        }));
         assert!(
             add_not_null.risks.contains(&RiskClass::NotNull),
             "the premise: {:?}",
@@ -1208,7 +1217,7 @@ mod tests {
 
     #[test]
     fn a_narrowing_and_a_grant_are_noted_at_the_severity_the_project_chooses() {
-        let narrow = PlannedChange::new(Change::AlterColumnType {
+        let narrow = PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
             uid: "c_aaaaaa".parse().unwrap(),
             column: table().column("n"),
             from: "bigint".parse().unwrap(),
@@ -1219,13 +1228,13 @@ mod tests {
             from_collation: None,
             to_collation: None,
             using: None,
-        })
+        }))
         .with_risk(RiskClass::Narrowing);
-        let grant = PlannedChange::new(Change::Grant {
+        let grant = PlannedChange::new(Change::Permission(GrantChange::Grant {
             role: "r".into(),
             target: "dbo.customer".parse().unwrap(),
             permissions: [pbps_model::Permission::Select].into_iter().collect(),
-        });
+        }));
         let f = plan(&cs(vec![narrow, grant]), &Policies::default(), &ctx());
         let got: Vec<(usize, &str, Severity)> = f
             .iter()
@@ -1249,10 +1258,10 @@ mod tests {
             r#"{"rules": {"change.window": {"severity": "error", "offset": "+08:00",
                                             "allow": ["mon-fri 09:00-17:00"]}}}"#,
         );
-        let change = PlannedChange::new(Change::DropColumn {
+        let change = PlannedChange::new(Change::Column(ColumnChange::DropColumn {
             uid: "c_bbbbbb".parse().unwrap(),
             column: table().column("name"),
-        });
+        }));
         // 10:00 UTC Thursday is 18:00 in +08:00: outside.
         let mut c = ctx();
         assert!(
@@ -1295,7 +1304,7 @@ mod tests {
     #[test]
     fn a_recorded_conversion_is_not_described_as_refused() {
         for (using, refused) in [(None, true), (Some("n::integer[]".to_owned()), false)] {
-            let mut change = PlannedChange::new(Change::AlterColumnType {
+            let mut change = PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
                 uid: "c_aaaaaa".parse().unwrap(),
                 column: table().column("n"),
                 from: ColumnType::simple("bigint").into_array(),
@@ -1306,7 +1315,7 @@ mod tests {
                 to_collation: None,
                 through_external_partitions: false,
                 using,
-            });
+            }));
             change.risks.insert(RiskClass::Narrowing);
             let findings = plan(&cs(vec![change]), &Policies::default(), &ctx());
             let message = &findings
@@ -1336,7 +1345,7 @@ mod tests {
             } else {
                 (from, to, "")
             };
-            let mut change = PlannedChange::new(Change::AlterColumnType {
+            let mut change = PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
                 uid: "c_aaaaaa".parse().unwrap(),
                 column: table().column("n"),
                 from,
@@ -1347,7 +1356,7 @@ mod tests {
                 to_collation: None,
                 through_external_partitions: false,
                 using: None,
-            });
+            }));
             change.risks.insert(RiskClass::Narrowing);
             let findings = plan(&cs(vec![change.clone()]), &Policies::default(), &ctx());
             let finding = &findings

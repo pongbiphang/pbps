@@ -5,6 +5,21 @@
 
 use super::Error;
 use super::engine::BindingRecord;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::ExtensionChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::PolicyChange;
+use pbps_model::RoleChange;
+use pbps_model::RowChange;
+use pbps_model::SearchChange;
+use pbps_model::TableChange;
+use pbps_model::TablePropertyChange;
+use pbps_model::TypeChange;
+use pbps_model::TypeValueChange;
 use pbps_model::resolver::{ObjectIdentity, ObjectOwnership, ObjectTransition, Surface};
 use pbps_model::{Change, ChangeSet, Schema};
 use std::collections::{BTreeMap, BTreeSet};
@@ -249,9 +264,9 @@ pub(super) fn derive_for<D: super::PlanningDialect>(
     let mut affected: BTreeMap<Surface, Affected> = BTreeMap::new();
     let mut final_tables = base.ids.tables.clone();
     for step in &changes.changes {
-        if let Change::CreateTable { uid, name, .. } = &step.change {
+        if let Change::Table(TableChange::CreateTable { uid, name, .. }) = &step.change {
             final_tables.insert(uid.clone(), name.clone());
-        } else if let Change::RenameTable { uid, to, .. } = &step.change {
+        } else if let Change::Table(TableChange::RenameTable { uid, to, .. }) = &step.change {
             final_tables.insert(uid.clone(), to.clone());
         }
     }
@@ -264,11 +279,11 @@ pub(super) fn derive_for<D: super::PlanningDialect>(
         }
     }
     for (position, step) in changes.changes.iter().enumerate() {
-        let parent = if let Change::AddColumn { table, .. } | Change::RenameColumn { table, .. } =
-            &step.change
+        let parent = if let Change::Column(ColumnChange::AddColumn { table, .. })
+        | Change::Column(ColumnChange::RenameColumn { table, .. }) = &step.change
         {
             Some(table)
-        } else if let Change::DropColumn { column, .. } = &step.change {
+        } else if let Change::Column(ColumnChange::DropColumn { column, .. }) = &step.change {
             Some(&column.table)
         } else {
             None
@@ -304,8 +319,8 @@ pub(super) fn derive_for<D: super::PlanningDialect>(
             entry.dropped_before.extend(prior);
         }
         let (surface, children, opening, closing, dropped) = match &step.change {
-Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => return Err(Error::Binding(format!("blocking rewrite for `{}` is unavailable", step.change.table().unwrap().shown()))),
-            Change::CreateTable { uid, name, .. } => {
+Change::Partition(PartitionChange::RebuildPartitionedTable(_)) | Change::Index(IndexChange::BuildPartitionedIndex(_)) | Change::Partition(PartitionChange::CopyTableRows(_)) | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => return Err(Error::Binding(format!("blocking rewrite for `{}` is unavailable", step.change.table().unwrap().shown()))),
+            Change::Table(TableChange::CreateTable { uid, name, .. }) => {
                 if tables.values().any(|known| known == uid)
                     || tables.insert(name.clone(), uid.clone()).is_some()
                 {
@@ -318,7 +333,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                 })?;
                 (Surface::Table(endpoint.clone()), true, false, true, None)
             }
-            Change::DropTable { uid, name, .. } => {
+            Change::Table(TableChange::DropTable { uid, name, .. }) => {
                 if tables.remove(name).as_ref() != Some(uid) {
                     return Err(Error::Binding(
                         "a table drop disagrees with its recorded UID".into(),
@@ -338,7 +353,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                     )),
                 )
             }
-            Change::RenameTable { uid, from, to, .. } => {
+            Change::Table(TableChange::RenameTable { uid, from, to, .. }) => {
                 if tables.remove(from).as_ref() != Some(uid)
                     || tables.insert(to.clone(), uid.clone()).is_some()
                 {
@@ -357,9 +372,9 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                     base.ids.tables.get(uid).cloned().map(Surface::Table),
                 )
             }
-            Change::AddColumn {
+            Change::Column(ColumnChange::AddColumn {
                 uid, table, name, ..
-            } => {
+            }) => {
                 let final_column = final_column(uid, &table.column(name), desired);
                 (Surface::Column(final_column), true, false, true, None)
             }
@@ -367,10 +382,10 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             // surface of its column, as a PostgreSQL generated one is: its
             // record is the column's own. It has no recorded identity, so
             // a drop names the spelling it opened under (DEC-2143.2).
-            Change::AddComputedColumn { table, name, .. } => {
+            Change::Column(ColumnChange::AddComputedColumn { table, name, .. }) => {
                 (Surface::Default(table.column(name)), false, false, true, None)
             }
-            Change::DropComputedColumn { table, name, .. } => {
+            Change::Column(ColumnChange::DropComputedColumn { table, name, .. }) => {
                 // The surface is named as the closing schema spells it; the
                 // drop's "before" is the table's opening spelling, which a
                 // rename in the same plan has already moved (the check and
@@ -379,7 +394,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                 let before = Surface::Default(opening_table(&tables, base, table).column(name));
                 (surface, false, true, false, Some(before))
             }
-            Change::DropColumn { uid, column, .. } => (
+            Change::Column(ColumnChange::DropColumn { uid, column, .. }) => (
                 Surface::Column(column.clone()),
                 true,
                 true,
@@ -392,7 +407,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                         .unwrap_or_else(|| column.clone()),
                 )),
             ),
-            Change::RenameColumn { uid, table, to, .. } => {
+            Change::Column(ColumnChange::RenameColumn { uid, table, to, .. }) => {
                 let final_column = final_column(uid, &table.column(to), desired);
                 (
                     Surface::Column(final_column),
@@ -402,14 +417,14 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                     base.ids.columns.get(uid).cloned().map(Surface::Column),
                 )
             }
-            Change::AlterColumnType { uid, column, .. } => (
+            Change::Column(ColumnChange::AlterColumnType { uid, column, .. }) => (
                 Surface::Column(final_column(uid, column, desired)),
                 true,
                 true,
                 true,
                 None,
             ),
-            Change::AlterColumnNullability { uid, column, .. } => (
+            Change::Column(ColumnChange::AlterColumnNullability { uid, column, .. }) => (
                 Surface::Column(final_column(uid, column, desired)),
                 false,
                 true,
@@ -418,19 +433,19 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             ),
             // The column's identity, its default and the sequence it owns,
             // which are the column's children (#1889).
-            Change::AlterColumnNumbering { uid, column, .. } => (
+            Change::Column(ColumnChange::AlterColumnNumbering { uid, column, .. }) => (
                 Surface::Column(final_column(uid, column, desired)),
                 true,
                 true,
                 true,
                 None,
             ),
-            Change::AlterColumnDefault {
+            Change::Column(ColumnChange::AlterColumnDefault {
                 uid,
                 column,
                 from,
                 to,
-            } => {
+            }) => {
                 let surface = Surface::Default(column.clone());
                 // A teardown may carry an old address while an ordinary
                 // removal carries the final one. The recorded UID identifies
@@ -448,13 +463,13 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                 };
                 (surface, false, from.is_some(), to.is_some(), prior)
             }
-            Change::AlterColumnExpression { uid, column, from, .. }
+            Change::Column(ColumnChange::AlterColumnExpression { uid, column, from, .. })
                 if !base.ids.columns.contains_key(uid) => {
                 // A typed placeholder is born inside this plan: it has no
                 // opening catalog inventory. Prove that from the preceding
                 // CREATE payload and recorded UIDs, never from provenance.
                 let created_here = changes.changes[..position].iter().any(|p| matches!(&p.change,
-                    Change::CreateTable { uid: table_uid, name, table, .. }
+                    Change::Table(TableChange::CreateTable { uid: table_uid, name, table, .. })
                         if name == &column.table && !base.ids.tables.contains_key(table_uid)
                             && tables.get(name) == Some(table_uid)
                             && table.columns.get(&column.name).is_some_and(|c| matches!(&c.value_source,
@@ -466,7 +481,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                 }
                 (Surface::Default(column.clone()), false, false, true, None)
             }
-            Change::AlterColumnExpression { uid, column, .. } => {
+            Change::Column(ColumnChange::AlterColumnExpression { uid, column, .. }) => {
                 let prior = base.ids.columns.get(uid).cloned().ok_or_else(|| {
                     Error::Binding(
                         "an expression change lacks its recorded opening column UID".into(),
@@ -490,11 +505,11 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             }
             // A standalone index's parameters are its own row, as the model
             // scopes them; a key's or unique constraint's are the table's.
-            Change::SetIndexStorageParameters {
+            Change::Index(IndexChange::SetIndexStorageParameters {
                 table,
                 target: pbps_model::IndexPart::Index(name),
                 ..
-            } => (
+            }) => (
                 Surface::Index {
                     table: table.clone(),
                     name: name.clone(),
@@ -504,39 +519,39 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                 true,
                 None,
             ),
-            Change::SetPrimaryKey { table, .. }
-            | Change::SetIndexStorageParameters { table, .. }
-            | Change::SetTablePersistence { table, .. }
+            Change::Constraint(ConstraintChange::SetPrimaryKey { table, .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { table, .. })
+            | Change::TableProperty(TablePropertyChange::SetTablePersistence { table, .. })
             // A partition has no column of its own: its default and NOT
             // NULL are the partition's, as the model projects them (#1581).
-            | Change::SetPartitionDefault { table, .. }
-            | Change::SetPartitionNotNull { table, .. }
-            | Change::SetReplicaIdentity { table, .. }
-            | Change::SetStorageParameters { table, .. }
-            | Change::AddUnique { table, .. }
-            | Change::DropUnique { table, .. }
-            | Change::SetExclusion {
+            | Change::Partition(PartitionChange::SetPartitionDefault { table, .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { table, .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { table, .. })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters { table, .. })
+            | Change::Constraint(ConstraintChange::AddUnique { table, .. })
+            | Change::Constraint(ConstraintChange::DropUnique { table, .. })
+            | Change::Constraint(ConstraintChange::SetExclusion {
                 table,
                 from: Some(_),
                 ..
-            }
-            | Change::SetExclusion {
+            })
+            | Change::Constraint(ConstraintChange::SetExclusion {
                 table, to: None, ..
-            }
-            | Change::AddForeignKey { table, .. }
-            | Change::DropForeignKey { table, .. } => {
+            })
+            | Change::Constraint(ConstraintChange::AddForeignKey { table, .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { table, .. }) => {
                 (Surface::Table(table.clone()), false, true, true, None)
             }
             // The table stays, and every key, constraint and index on it is
             // renamed (#1544); or, attached, its columns turn inherited and
             // its matching keys and indexes become clones (#1545).
-            Change::DetachPartition { table, .. } | Change::AttachPartition { table, .. } => {
+            Change::Partition(PartitionChange::DetachPartition { table, .. }) | Change::Partition(PartitionChange::AttachPartition { table, .. }) => {
                 (Surface::Table(table.clone()), true, true, true, None)
             }
             // #1172 permits policy predicates with a named #595 coverage
             // limitation. Do not claim a policy binding transition here.
-            Change::DropPolicy { .. } | Change::CreatePolicy { .. } | Change::SetRowSecurity { .. } => continue,
-            Change::AddCheck { table, name, .. } => (
+            Change::Policy(PolicyChange::DropPolicy { .. }) | Change::Policy(PolicyChange::CreatePolicy { .. }) | Change::Policy(PolicyChange::SetRowSecurity { .. }) => continue,
+            Change::Constraint(ConstraintChange::AddCheck { table, name, .. }) => (
                 Surface::Check {
                     table: table.clone(),
                     name: name.clone(),
@@ -546,7 +561,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                 true,
                 None,
             ),
-            Change::DropCheck { table, name } => (
+            Change::Constraint(ConstraintChange::DropCheck { table, name }) => (
                 Surface::Check {
                     table: table.clone(),
                     name: name.clone(),
@@ -559,13 +574,13 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                     name: name.clone(),
                 }),
             ),
-            Change::AddIndex { table, name, .. }
-            | Change::SetExclusion {
+            Change::Index(IndexChange::AddIndex { table, name, .. })
+            | Change::Constraint(ConstraintChange::SetExclusion {
                 table,
                 name,
                 from: None,
                 to: Some(_),
-            } => (
+            }) => (
                 Surface::Index {
                     table: table.clone(),
                     name: name.clone(),
@@ -575,7 +590,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                 true,
                 None,
             ),
-            Change::DropIndex { table, name } => (
+            Change::Index(IndexChange::DropIndex { table, name }) => (
                 Surface::Index {
                     table: table.clone(),
                     name: name.clone(),
@@ -588,13 +603,13 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                     name: name.clone(),
                 }),
             ),
-            Change::CreateModule { id, .. } => {
+            Change::Module(ModuleChange::CreateModule { id, .. }) => {
                 (Surface::Module(id.clone()), false, false, true, None)
             }
-            Change::AlterModule { id, .. } => {
+            Change::Module(ModuleChange::AlterModule { id, .. }) => {
                 (Surface::Module(id.clone()), false, true, true, None)
             }
-            Change::DropModule { id, .. } => (
+            Change::Module(ModuleChange::DropModule { id, .. }) => (
                 Surface::Module(id.clone()),
                 false,
                 true,
@@ -605,17 +620,17 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             // its array type. A label operation, and a rebuild's create and
             // swap, change it in place; the rebuild's retype is a column's
             // (#2407).
-            Change::CreateType { name, .. } => {
+            Change::Type(TypeChange::CreateType { name, .. }) => {
                 (Surface::Type(name.clone()), false, false, true, None)
             }
-            Change::DropType { name, .. } => (
+            Change::Type(TypeChange::DropType { name, .. }) => (
                 Surface::Type(name.clone()),
                 false,
                 true,
                 false,
                 Some(Surface::Type(name.clone())),
             ),
-            Change::RenameType { uid, from, to, .. } => (
+            Change::Type(TypeChange::RenameType { uid, from, to, .. }) => (
                 Surface::Type(to.clone()),
                 false,
                 true,
@@ -624,25 +639,25 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                     base.ids.types.get(uid).cloned().unwrap_or_else(|| from.clone()),
                 )),
             ),
-            Change::AddEnumValue { name, .. }
-            | Change::AlterDomain { name, .. }
-            | Change::RenameEnumValue { name, .. } => {
+            Change::TypeValue(TypeValueChange::AddEnumValue { name, .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { name, .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { name, .. }) => {
                 (Surface::Type(name.clone()), false, true, true, None)
             }
-            Change::EnumRebuild {
+            Change::TypeValue(TypeValueChange::EnumRebuild {
                 name,
                 step:
                     pbps_model::EnumRebuildStep::Create { .. }
                     | pbps_model::EnumRebuildStep::Swap { .. },
                 ..
-            } => (Surface::Type(name.clone()), false, true, true, None),
-            Change::EnumRebuild {
+            }) => (Surface::Type(name.clone()), false, true, true, None),
+            Change::TypeValue(TypeValueChange::EnumRebuild {
                 step:
                     pbps_model::EnumRebuildStep::Retype {
                         column_uid, column, ..
                     },
                 ..
-            } => (
+            }) => (
                 Surface::Column(final_column(column_uid, column, desired)),
                 true,
                 true,
@@ -652,30 +667,30 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             // Authorization changes leave every fingerprinted property as it
             // was (DEC-1274.1): the target stays an untouched input, and the
             // ordinary apply guard checks that a declared grant took.
-            Change::PublicExecution { .. }
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetComment { .. }
-            | Change::CreateRole { .. }
-            | Change::RenameRole { .. }
-            | Change::DropRole { .. }
+            Change::Permission(GrantChange::PublicExecution { .. })
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::UpdateRow { .. })
+            | Change::Row(RowChange::DeleteRow { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+            | Change::TableProperty(TablePropertyChange::SetComment { .. })
+            | Change::Role(RoleChange::CreateRole { .. })
+            | Change::Role(RoleChange::RenameRole { .. })
+            | Change::Role(RoleChange::DropRole { .. })
             // A text search object is named by string literals alone: no surface
             // carries its fingerprint (DEC-2728.2).
-            | Change::CreateSearch { .. }
-            | Change::DropSearch { .. }
+            | Change::Search(SearchChange::CreateSearch { .. })
+            | Change::Search(SearchChange::DropSearch { .. })
             // A package's members are new to the target and no standing
             // object's fingerprint reads them until a declaration does
             // (member consumers, DEC-2447.7).
-            | Change::CreateExtension { .. }
-            | Change::DropExtension { .. }
-            | Change::UpdateExtension { .. }
-            | Change::SetExtensionSchema { .. } => continue,
+            | Change::Extension(ExtensionChange::CreateExtension { .. })
+            | Change::Extension(ExtensionChange::DropExtension { .. })
+            | Change::Extension(ExtensionChange::UpdateExtension { .. })
+            | Change::Extension(ExtensionChange::SetExtensionSchema { .. }) => continue,
         };
         let entry = affected.entry(surface).or_default();
         entry.children |= children;

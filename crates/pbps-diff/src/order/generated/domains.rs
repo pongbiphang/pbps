@@ -1,6 +1,12 @@
 //! Only consumers that copy a default or evaluate domain values need its facets.
 //! A routine naming a bare domain can precede its checks (DEC-2469.5).
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::PartitionChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
+use pbps_model::TypeChange;
+use pbps_model::TypeValueChange;
 use pbps_model::{ColumnType, DomainDelta, DomainHalf, ManagedType, TypeRef};
 
 #[derive(Clone, Copy)]
@@ -23,16 +29,16 @@ pub(super) fn constraints(
     let mut facets: BTreeMap<&TypeRef, Vec<(usize, bool)>> = BTreeMap::new();
     for (at, planned) in cs.changes.iter().enumerate() {
         match &planned.change {
-            Change::CreateType { name, .. } => {
+            Change::Type(TypeChange::CreateType { name, .. }) => {
                 creates.insert(name, at);
             }
-            Change::AlterDomain {
+            Change::TypeValue(TypeValueChange::AlterDomain {
                 name,
                 from,
                 to,
                 half,
                 ..
-            } if is_part(planned) => {
+            }) if is_part(planned) => {
                 if let Some(delta) = DomainDelta::of(from, to) {
                     if *half == DomainHalf::Loosen && delta.default.flatten().is_some() {
                         default_installers.insert(name);
@@ -96,9 +102,9 @@ pub(super) fn constraints(
     };
     for (at, planned) in cs.changes.iter().enumerate() {
         match &planned.change {
-            Change::CreateType {
+            Change::Type(TypeChange::CreateType {
                 name, definition, ..
-            } => {
+            }) => {
                 if let ManagedType::Domain { base, default, .. } = definition.as_ref() {
                     // An extracted explicit DEFAULT overrides any temporary
                     // inheritance. Its absence from CREATE is not a demand to
@@ -123,12 +129,12 @@ pub(super) fn constraints(
                     );
                 }
             }
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 name,
                 table,
                 beside_default,
                 ..
-            } => {
+            }) => {
                 let shape = if table.partition_of.is_some() {
                     root_table(declared, name).unwrap_or(table)
                 } else {
@@ -144,7 +150,7 @@ pub(super) fn constraints(
                     );
                 }
             }
-            Change::AddColumn { column, .. } => {
+            Change::Column(ColumnChange::AddColumn { column, .. }) => {
                 let values = !empty.contains(&at) || column.value_source != ValueSource::None;
                 require(
                     &column.ty,
@@ -152,17 +158,19 @@ pub(super) fn constraints(
                     if values { Need::Values } else { Need::Column },
                 );
             }
-            Change::AlterColumnType { to, .. } => require(to, at, Need::Values),
-            Change::InsertRow { table, .. }
-            | Change::UpdateRow { table, .. }
-            | Change::DeleteRow { table, .. } => {
+            Change::Column(ColumnChange::AlterColumnType { to, .. }) => {
+                require(to, at, Need::Values)
+            }
+            Change::Row(RowChange::InsertRow { table, .. })
+            | Change::Row(RowChange::UpdateRow { table, .. })
+            | Change::Row(RowChange::DeleteRow { table, .. }) => {
                 if let Some(table) = root_table(declared, table) {
                     for column in table.columns.values() {
                         require(&column.ty, at, Need::Values);
                     }
                 }
             }
-            Change::CopyTableRows(copy) => {
+            Change::Partition(PartitionChange::CopyTableRows(copy)) => {
                 for column in &copy.columns {
                     require(&column.cast, at, Need::Values);
                 }
@@ -179,7 +187,7 @@ fn root_table<'a>(declared: &'a Schema, name: &TableName) -> Option<&'a pbps_mod
 
 /// The existing half's expressions, never another facet's snapshot text.
 pub(super) fn texts(change: &Change) -> Vec<&str> {
-    let Change::AlterDomain { from, to, half, .. } = change else {
+    let Change::TypeValue(TypeValueChange::AlterDomain { from, to, half, .. }) = change else {
         return Vec::new();
     };
     let Some(delta) = DomainDelta::of(from, to) else {

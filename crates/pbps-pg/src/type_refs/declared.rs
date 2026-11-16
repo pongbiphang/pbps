@@ -118,26 +118,26 @@ fn pending_predecessor(
     executed: &[pbps_dialect::Statement],
 ) -> bool {
     changes.changes.iter().any(|step| match &step.change {
-        pbps_model::Change::DropType { uid, name, .. }
-        | pbps_model::Change::RenameType {
+        pbps_model::Change::Type(pbps_model::TypeChange::DropType { uid, name, .. })
+        | pbps_model::Change::Type(pbps_model::TypeChange::RenameType {
             uid, from: name, ..
-        } => {
+        }) => {
             name == &pin.name
                 && !executed
                     .iter()
                     .filter_map(|s| s.declared_type.as_ref())
                     .any(|s| &s.uid == uid)
         }
-        pbps_model::Change::DropTable { name, .. }
-        | pbps_model::Change::RenameTable { from: name, .. } => {
+        pbps_model::Change::Table(pbps_model::TableChange::DropTable { name, .. })
+        | pbps_model::Change::Table(pbps_model::TableChange::RenameTable { from: name, .. }) => {
             name.schema == pin.name.schema()
                 && name.name == pin.name.name()
                 && live.tables.contains_key(name)
         }
-        pbps_model::Change::DropModule {
+        pbps_model::Change::Module(pbps_model::ModuleChange::DropModule {
             id,
             kind: pbps_model::ModuleKind::View,
-        } => {
+        }) => {
             id.schema() == pin.name.schema()
                 && id.name() == pin.name.name()
                 && live
@@ -245,10 +245,12 @@ fn after(
     }
     for change in &changes.changes {
         match &change.change {
-            pbps_model::Change::EnumRebuild { tmp, .. } => {
+            pbps_model::Change::TypeValue(pbps_model::TypeValueChange::EnumRebuild {
+                tmp, ..
+            }) => {
                 before.types.remove(tmp);
             }
-            pbps_model::Change::RenameType { from, to, .. } => {
+            pbps_model::Change::Type(pbps_model::TypeChange::RenameType { from, to, .. }) => {
                 if let Ok(intermediate) = TypeRef::new(to.schema(), from.name()) {
                     before.types.remove(&intermediate);
                 }
@@ -311,12 +313,12 @@ fn check_definitions(
         .changes
         .iter()
         .filter_map(|p| {
-            if let pbps_model::Change::EnumRebuild {
+            if let pbps_model::Change::TypeValue(pbps_model::TypeValueChange::EnumRebuild {
                 name,
                 tmp,
                 step: pbps_model::EnumRebuildStep::Create { .. },
                 ..
-            } = &p.change
+            }) = &p.change
             {
                 Some((tmp.clone(), name.clone()))
             } else {
@@ -352,7 +354,7 @@ fn check_definitions(
                         .is_some_and(|t| matches!(t.definition, Some(ManagedType::Enum { .. })))
                 })
                 && changes.changes.iter().any(|p| {
-                    matches!(&p.change, pbps_model::Change::AlterDomain { uid, .. } if uid == &pin.uid)
+                    matches!(&p.change, pbps_model::Change::TypeValue(pbps_model::TypeValueChange::AlterDomain { uid, .. }) if uid == &pin.uid)
                 });
             let (definition, before) = match latest.and_then(|s| s.definition.as_ref()) {
                 Some(definition @ ManagedType::Enum { .. }) => (definition, true),
@@ -641,11 +643,13 @@ mod tests {
             changes: pins
                 .iter()
                 .map(|p| {
-                    pbps_model::PlannedChange::new(pbps_model::Change::CreateType {
-                        uid: p.uid.clone(),
-                        name: p.name.clone(),
-                        definition: Box::new(p.definition.clone()),
-                    })
+                    pbps_model::PlannedChange::new(pbps_model::Change::Type(
+                        pbps_model::TypeChange::CreateType {
+                            uid: p.uid.clone(),
+                            name: p.name.clone(),
+                            definition: Box::new(p.definition.clone()),
+                        },
+                    ))
                 })
                 .collect(),
         };
@@ -1013,13 +1017,13 @@ mod tests {
         };
         let altering = |half| pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange::new(
-                pbps_model::Change::AlterDomain {
+                pbps_model::Change::TypeValue(pbps_model::TypeValueChange::AlterDomain {
                     uid: uid.clone(),
                     name: "app.d".parse().unwrap(),
                     from: Box::new(from.clone()),
                     to: Box::new(to.clone()),
                     half,
-                },
+                }),
             )],
         };
         let live = |definition: ManagedType| Schema {
@@ -1103,13 +1107,13 @@ mod tests {
         );
         let altering = pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange::new(
-                pbps_model::Change::AlterDomain {
+                pbps_model::Change::TypeValue(pbps_model::TypeValueChange::AlterDomain {
                     uid: uid.clone(),
                     name: "app.renamed".parse().unwrap(),
                     from: Box::new(from.clone()),
                     to: Box::new(to.clone()),
                     half: pbps_model::DomainHalf::Loosen,
-                },
+                }),
             )],
         };
         let live = |definition: ManagedType| Schema {
@@ -1282,13 +1286,13 @@ mod tests {
         let pins = seal(&base, &base_ids, &desired, &ids);
         assert!(pins[0].before.is_none());
         let changes = pbps_model::ChangeSet {
-            changes: vec![pbps_model::PlannedChange::new(
-                pbps_model::Change::DropType {
+            changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Type(
+                pbps_model::TypeChange::DropType {
                     uid: old.uid.clone(),
                     name: old.name.clone(),
                     definition: Box::new(old.definition.clone()),
                 },
-            )],
+            ))],
         };
         check_definitions(&base, &pins, false, &changes, &[]).unwrap();
         let mut drop = wrote(&old, "app.x");
@@ -1346,13 +1350,13 @@ mod tests {
         pin.before = None;
         let table = pbps_model::TableName::new("app", "x");
         let changes = pbps_model::ChangeSet {
-            changes: vec![pbps_model::PlannedChange::new(
-                pbps_model::Change::DropTable {
+            changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Table(
+                pbps_model::TableChange::DropTable {
                     uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "x", 0),
                     name: table.clone(),
                     detach_from: None,
                 },
-            )],
+            ))],
         };
         let live = Schema {
             tables: [(table, Default::default())].into(),
@@ -1498,6 +1502,7 @@ mod tests {
 #[allow(clippy::wildcard_enum_match_arm)] // Non-label fixtures are unreachable.
 mod label_tests {
     use super::*;
+    use pbps_model::TypeValueChange;
     use pbps_model::{Change, ChangeSet, EnumPlacement, PlannedChange};
 
     fn enumeration(values: &[&str]) -> ManagedType {
@@ -1521,7 +1526,7 @@ mod label_tests {
         };
         let changes = ChangeSet {
             changes: vec![
-                Change::RenameEnumValue {
+                Change::TypeValue(TypeValueChange::RenameEnumValue {
                     uid: pin.uid.clone(),
                     name: name.clone(),
                     from: "sad".into(),
@@ -1529,23 +1534,23 @@ mod label_tests {
                     ordinal: 0,
                     retained: Vec::new(),
                     definition: Box::new(enumeration(&["blue", "ok"])),
-                },
-                Change::AddEnumValue {
+                }),
+                Change::TypeValue(TypeValueChange::AddEnumValue {
                     uid: pin.uid.clone(),
                     name: name.clone(),
                     value: "x".into(),
                     placement: Some(EnumPlacement::After("blue".into())),
                     ordinal: 1,
                     definition: Box::new(enumeration(&["blue", "x", "ok"])),
-                },
-                Change::AddEnumValue {
+                }),
+                Change::TypeValue(TypeValueChange::AddEnumValue {
                     uid: pin.uid.clone(),
                     name: name.clone(),
                     value: "y".into(),
                     placement: Some(EnumPlacement::After("ok".into())),
                     ordinal: 2,
                     definition: Box::new(pin.definition.clone()),
-                },
+                }),
             ]
             .into_iter()
             .map(PlannedChange::new)
@@ -1574,8 +1579,10 @@ mod label_tests {
         );
         for (i, step) in changes.changes.iter().enumerate() {
             let definition = match &step.change {
-                Change::AddEnumValue { definition, .. }
-                | Change::RenameEnumValue { definition, .. } => definition.as_ref(),
+                Change::TypeValue(TypeValueChange::AddEnumValue { definition, .. })
+                | Change::TypeValue(TypeValueChange::RenameEnumValue { definition, .. }) => {
+                    definition.as_ref()
+                }
                 _ => unreachable!(),
             };
             live.types.insert(name.clone(), definition.clone());

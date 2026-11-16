@@ -1,5 +1,6 @@
 //! Object-addressed engine answers enter comparison before plan construction.
 use crate::Side;
+use pbps_model::TypeValueChange;
 use pbps_model::{Change, ExpressionTarget, Hints, RenameAnchor, RetainedExpression, Schema};
 use std::{borrow::Cow, collections::BTreeSet};
 
@@ -14,7 +15,7 @@ pub fn candidates(base: Side<'_>, desired: Side<'_>, hints: &Hints) -> Vec<Retai
     let anchors: Vec<_> = steps
         .iter()
         .filter_map(|c| {
-            if let Change::RenameEnumValue { uid, ordinal, .. } = c {
+            if let Change::TypeValue(TypeValueChange::RenameEnumValue { uid, ordinal, .. }) = c {
                 Some(RenameAnchor {
                     uid: uid.clone(),
                     ordinal: *ordinal,
@@ -140,8 +141,8 @@ pub(crate) fn comparison<'a>(
         let Some(anchor) = answer.anchors.last() else {
             continue;
         };
-        let Some(Change::RenameEnumValue { retained, .. }) = steps.iter_mut().find(|c|
-            matches!(c, Change::RenameEnumValue { uid, ordinal, .. } if uid == &anchor.uid && ordinal == &anchor.ordinal))
+        let Some(Change::TypeValue(TypeValueChange::RenameEnumValue { retained, .. })) = steps.iter_mut().find(|c|
+            matches!(c, Change::TypeValue(TypeValueChange::RenameEnumValue { uid, ordinal, .. }) if uid == &anchor.uid && ordinal == &anchor.ordinal))
         else { continue; };
         retained.push(answer.clone());
         *answer.target.expression_mut(schema.to_mut()).unwrap() = answer.after.clone();

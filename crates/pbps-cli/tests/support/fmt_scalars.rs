@@ -1,4 +1,5 @@
 use super::{Demo, code, stderr, stdout};
+use pbps_model::RowChange;
 use pbps_model::{Change, Row, RowKey, SavedPlan, Value};
 
 fn inserted_rows(d: &Demo, filename: &str) -> Vec<(RowKey, Row)> {
@@ -10,7 +11,7 @@ fn inserted_rows(d: &Demo, filename: &str) -> Vec<(RowKey, Row)> {
         .changes
         .into_iter()
         .filter_map(|c| {
-            if let Change::InsertRow { key, row, .. } = c.change {
+            if let Change::Row(RowChange::InsertRow { key, row, .. }) = c.change {
                 Some((key, row))
             } else {
                 None

@@ -29,7 +29,7 @@
 //! and the differ compares it. The other half landed with #248:
 //! `pbps_diff::diff_roles` restates a declared role's full permission set on
 //! a target this dialect is about to rebuild — gated by
-//! `Dialect::rebuilds_modules`, so `Change::AlterModule` sorts a `Grant` after
+//! `Dialect::rebuilds_modules`, so `pbps_model::ModuleChange::AlterModule` sorts a `Grant` after
 //! itself in the same plan, exactly where a human approving it can see what
 //! access is restored. `read_acl` below is the other side of that decision: it
 //! reads the object's ACL the same structured way `pull` does — `aclexplode`,
@@ -45,7 +45,7 @@
 //! `acldefault` would otherwise put there — used to be a refusal for good,
 //! because there was no grantee named `PUBLIC` to re-emit a revoke from and a
 //! rebuild restores the default (DECISIONS 306). Issue #318 gave the model
-//! that grantee: `Change::PublicExecution` writes down what this plan has
+//! that grantee: `pbps_model::GrantChange::PublicExecution` writes down what this plan has
 //! settled about a routine's default `EXECUTE`, and where the plan carries one
 //! for this object it is accepted here for the same reason a declared grant is
 //! — the missing default is a state somebody recorded an intent about, which
@@ -65,6 +65,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
 use pbps_db::{Conn, DbError, Param, Row};
+use pbps_model::GrantChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
 use pbps_model::{
     Change, ChangeSet, GrantTarget, ModuleId, ModuleKind, ObjectName, Permission, Schema, TableName,
 };
@@ -221,7 +224,7 @@ pub async fn before_a_rebuild(
     let public_execution_settled = matches!(id, ModuleId::Routine(routine)
     if changes.changes.iter().any(|p| matches!(
         &p.change,
-        Change::PublicExecution { routine: r, .. } if r == routine
+        Change::Permission(GrantChange::PublicExecution { routine: r, .. }) if r == routine
     )));
     // Resolved **once**, and every read below is keyed by the oid rather than
     // by the name again. Two independent name matches would be two chances to
@@ -1018,7 +1021,7 @@ fn grant_target(id: &ModuleId) -> Option<GrantTarget> {
     }
 }
 
-/// The permissions this plan's own `Change::Grant` entries put on `target` —
+/// The permissions this plan's own `pbps_model::GrantChange::Grant` entries put on `target` —
 /// the **full** declared set for a target this dialect is rebuilding, not a
 /// delta, because `pbps_diff::diff_roles` treats an `AlterModule` exactly as
 /// it treats a `DropModule` once `Dialect::rebuilds_modules` answers `true`
@@ -1030,11 +1033,11 @@ fn declared_grants(
 ) -> BTreeMap<pbps_model::RoleName, BTreeSet<Permission>> {
     let mut by_role: BTreeMap<pbps_model::RoleName, BTreeSet<Permission>> = BTreeMap::new();
     for planned in &changes.changes {
-        if let Change::Grant {
+        if let Change::Permission(GrantChange::Grant {
             role,
             target: t,
             permissions,
-        } = &planned.change
+        }) = &planned.change
             && t == target
         {
             by_role
@@ -1309,9 +1312,11 @@ async fn read_clones(
         .changes
         .iter()
         .filter_map(|p| {
-            if let Change::DropTable { name, .. } = &p.change {
+            if let Change::Table(TableChange::DropTable { name, .. }) = &p.change {
                 Some(name)
-            } else if let Change::DetachPartition { table, .. } = &p.change {
+            } else if let Change::Partition(PartitionChange::DetachPartition { table, .. }) =
+                &p.change
+            {
                 Some(table)
             } else {
                 None
@@ -2531,16 +2536,20 @@ mod tests {
         let target = pbps_model::GrantTarget::Schema("app".into());
         let changes = pbps_model::ChangeSet {
             changes: vec![
-                pbps_model::PlannedChange::new(pbps_model::Change::Grant {
-                    role: name.clone(),
-                    target: target.clone(),
-                    permissions: [pbps_model::Permission::Select].into(),
-                }),
-                pbps_model::PlannedChange::new(pbps_model::Change::Grant {
-                    role: lookalike.clone(),
-                    target: target.clone(),
-                    permissions: [pbps_model::Permission::Update].into(),
-                }),
+                pbps_model::PlannedChange::new(pbps_model::Change::Permission(
+                    pbps_model::GrantChange::Grant {
+                        role: name.clone(),
+                        target: target.clone(),
+                        permissions: [pbps_model::Permission::Select].into(),
+                    },
+                )),
+                pbps_model::PlannedChange::new(pbps_model::Change::Permission(
+                    pbps_model::GrantChange::Grant {
+                        role: lookalike.clone(),
+                        target: target.clone(),
+                        permissions: [pbps_model::Permission::Update].into(),
+                    },
+                )),
             ],
         };
         let grants = super::declared_grants(&changes, &target);

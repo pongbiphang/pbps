@@ -3,6 +3,8 @@ use pbps_diff::order::deployment::{
     Sources,
     schedule::{Declarations, Facts, schedule},
 };
+use pbps_model::ColumnChange;
+use pbps_model::ModuleChange;
 use pbps_model::{Schema, ValueSource};
 
 fn compile<E: Dialect>(
@@ -74,7 +76,12 @@ fn check<E: Dialect>(engine: E) {
             .changes()
             .changes
             .iter()
-            .position(|p| matches!(&p.change, Change::AlterColumnDefault { to: None, .. }))
+            .position(|p| {
+                matches!(
+                    &p.change,
+                    Change::Column(ColumnChange::AlterColumnDefault { to: None, .. })
+                )
+            })
             .unwrap();
         let provider = removed
             .changes()
@@ -83,7 +90,8 @@ fn check<E: Dialect>(engine: E) {
             .position(|p| {
                 matches!(
                     &p.change,
-                    Change::AlterModule { .. } | Change::DropModule { .. }
+                    Change::Module(ModuleChange::AlterModule { .. })
+                        | Change::Module(ModuleChange::DropModule { .. })
                 )
             })
             .unwrap();
@@ -120,7 +128,8 @@ fn check<E: Dialect>(engine: E) {
         .position(|p| {
             matches!(
                 &p.change,
-                Change::AlterModule { .. } | Change::CreateModule { .. }
+                Change::Module(ModuleChange::AlterModule { .. })
+                    | Change::Module(ModuleChange::CreateModule { .. })
             )
         })
         .unwrap();
@@ -128,7 +137,12 @@ fn check<E: Dialect>(engine: E) {
         .changes()
         .changes
         .iter()
-        .position(|p| matches!(&p.change, Change::AlterColumnDefault { to: Some(_), .. }))
+        .position(|p| {
+            matches!(
+                &p.change,
+                Change::Column(ColumnChange::AlterColumnDefault { to: Some(_), .. })
+            )
+        })
         .unwrap();
     assert!(
         installed

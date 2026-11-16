@@ -1,4 +1,8 @@
 use super::*;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
 #[test]
 fn prepared_inventory_executes_through_the_existing_driver_with_stable_ids() {
     let f = Fixture::new();
@@ -17,28 +21,28 @@ fn prepared_inventory_executes_through_the_existing_driver_with_stable_ids() {
     let parts: Vec<_> = result.operations.iter().map(|op| op.change()).collect();
     let copy = parts
         .iter()
-        .position(|c| matches!(c, Change::CopyTableRows(_)))
+        .position(|c| matches!(c, Change::Partition(PartitionChange::CopyTableRows(_))))
         .unwrap();
     let own = parts
         .iter()
-        .position(|c| matches!(c, Change::BuildPartitionedIndex(_)))
+        .position(|c| matches!(c, Change::Index(IndexChange::BuildPartitionedIndex(_))))
         .unwrap();
     let analyze = parts
         .iter()
-        .position(|c| matches!(c, Change::AnalyzeTableTree(_)))
+        .position(|c| matches!(c, Change::Partition(PartitionChange::AnalyzeTableTree(_))))
         .unwrap();
     assert!(copy < own && own < analyze);
     let swap = parts
         .iter()
-        .position(|c| matches!(c, Change::RenameTable { .. }))
+        .position(|c| matches!(c, Change::Table(TableChange::RenameTable { .. })))
         .unwrap();
     assert!(analyze < swap);
     assert!(matches!(
         parts.last().unwrap(),
-        Change::DropTable {
+        Change::Table(TableChange::DropTable {
             detach_from: None,
             ..
-        }
+        })
     ));
     assert_eq!(result.rewrites, 1);
     assert_eq!(result.target.rebuilds, f.recorded.rebuilds);
@@ -176,11 +180,21 @@ fn independent_replay_rejects_premature_analysis_and_final_name_claims() {
     let mut ops = done.operations.as_slice().to_vec();
     let copy = ops
         .iter()
-        .position(|o| matches!(o.change(), Change::CopyTableRows(_)))
+        .position(|o| {
+            matches!(
+                o.change(),
+                Change::Partition(PartitionChange::CopyTableRows(_))
+            )
+        })
         .unwrap();
     let analyze = ops
         .iter()
-        .position(|o| matches!(o.change(), Change::AnalyzeTableTree(_)))
+        .position(|o| {
+            matches!(
+                o.change(),
+                Change::Partition(PartitionChange::AnalyzeTableTree(_))
+            )
+        })
         .unwrap();
     ops.swap(copy, analyze);
     let fx: Vec<_> = ops
@@ -202,8 +216,8 @@ fn independent_replay_rejects_premature_analysis_and_final_name_claims() {
         .collect();
     assert!(!order::verify::verify(&ops, &fx, &baseline, &Default::default()).is_empty());
     ops = done.operations.as_slice().to_vec();
-    let a = ops.iter().position(|o|matches!(o.change(),Change::RenameTable{uid,..} if f.root.intent.source.tables.contains_key(uid))).unwrap();
-    let b = ops.iter().position(|o|matches!(o.change(),Change::RenameTable{uid,to,..} if f.root.intent.replacement.tables.contains_key(uid) && to==&f.root.table)).unwrap();
+    let a = ops.iter().position(|o|matches!(o.change(),Change::Table(TableChange::RenameTable{uid,..}) if f.root.intent.source.tables.contains_key(uid))).unwrap();
+    let b = ops.iter().position(|o|matches!(o.change(),Change::Table(TableChange::RenameTable{uid,to,..}) if f.root.intent.replacement.tables.contains_key(uid) && to==&f.root.table)).unwrap();
     ops.swap(a, b);
     let mut description = prepared.slots().clone();
     description.effects = ops
@@ -240,18 +254,28 @@ fn final_verification_keeps_every_part_and_the_expansions_completion_order() {
     let own = reordered
         .changes
         .iter()
-        .position(|p| matches!(p.change, Change::BuildPartitionedIndex(_)))
+        .position(|p| {
+            matches!(
+                p.change,
+                Change::Index(IndexChange::BuildPartitionedIndex(_))
+            )
+        })
         .unwrap();
     let analyze = reordered
         .changes
         .iter()
-        .position(|p| matches!(p.change, Change::AnalyzeTableTree(_)))
+        .position(|p| {
+            matches!(
+                p.change,
+                Change::Partition(PartitionChange::AnalyzeTableTree(_))
+            )
+        })
         .unwrap();
     reordered.changes.swap(own, analyze);
     assert!(verify_plan(&f.input(), &prepared, &reordered, &pg).is_err());
     let mut edited = valid;
     for p in &mut edited.changes {
-        if let Change::CopyTableRows(c) = &mut p.change {
+        if let Change::Partition(PartitionChange::CopyTableRows(c)) = &mut p.change {
             c.max_rows += 1;
         }
     }
@@ -268,7 +292,7 @@ fn recertification_requires_readable_managed_and_reviewed_dependency_removals() 
         .changes
         .iter()
         .find_map(|p| {
-            if let Change::CopyTableRows(c) = &p.change {
+            if let Change::Partition(PartitionChange::CopyTableRows(c)) = &p.change {
                 Some((**c).clone())
             } else {
                 None
@@ -298,10 +322,12 @@ fn recertification_requires_readable_managed_and_reviewed_dependency_removals() 
             .unwrap_err()
             .contains("does not release")
     );
-    changes.changes.push(PlannedChange::new(Change::DropModule {
-        id,
-        kind: ModuleKind::View,
-    }));
+    changes.changes.push(PlannedChange::new(Change::Module(
+        ModuleChange::DropModule {
+            id,
+            kind: ModuleKind::View,
+        },
+    )));
     recertify(&f.catalog, &copy, side(&f.base, &f.ids), &changes).unwrap();
     f.catalog.publications = Fact::Unreadable("42501 membership".into());
     assert!(

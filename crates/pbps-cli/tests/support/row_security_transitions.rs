@@ -71,13 +71,10 @@ fn row_security_c_standing_transitions_apply_verify_and_replan_empty(pg: Pg) {
             );
             write(&d, &declaration(Some(&policy), false, false));
             let saved = apply(&d, connection);
-            assert!(
-                saved
-                    .changes
-                    .changes
-                    .iter()
-                    .any(|p| matches!(p.change, pbps_model::Change::CreatePolicy { .. }))
-            );
+            assert!(saved.changes.changes.iter().any(|p| matches!(
+                p.change,
+                pbps_model::Change::Policy(pbps_model::PolicyChange::CreatePolicy { .. })
+            )));
             assert_eq!(
                 scalar(
                     connection,
@@ -89,7 +86,7 @@ fn row_security_c_standing_transitions_apply_verify_and_replan_empty(pg: Pg) {
         write(&d, &declaration(None, false, false));
         let saved = apply(&d, connection);
         assert!(
-            matches!(&saved.changes.changes[..],[p] if matches!(p.change,pbps_model::Change::DropPolicy {..}))
+            matches!(&saved.changes.changes[..],[p] if matches!(p.change,pbps_model::Change::Policy(pbps_model::PolicyChange::DropPolicy {..})))
         );
         assert_eq!(
             scalar(
@@ -240,7 +237,8 @@ fn row_security_c_explicit_policy_removals_release_columns_and_routine_rebuilds(
         forged.changes.changes.retain(|step| {
             !matches!(
                 step.change,
-                pbps_model::Change::DropPolicy { .. } | pbps_model::Change::CreatePolicy { .. }
+                pbps_model::Change::Policy(pbps_model::PolicyChange::DropPolicy { .. })
+                    | pbps_model::Change::Policy(pbps_model::PolicyChange::CreatePolicy { .. })
             )
         });
         let pg = pbps_pg::Postgres::new();
@@ -306,21 +304,38 @@ fn row_security_c_explicit_policy_removals_release_columns_and_routine_rebuilds(
                 .position(|p| pred(&p.change))
                 .unwrap()
         };
-        let drop = pos(|c| matches!(c, pbps_model::Change::DropPolicy { .. }));
+        let drop = pos(|c| {
+            matches!(
+                c,
+                pbps_model::Change::Policy(pbps_model::PolicyChange::DropPolicy { .. })
+            )
+        });
         let routine = pos(|c| {
             matches!(
                 c,
-                pbps_model::Change::DropModule { .. } | pbps_model::Change::AlterModule { .. }
+                pbps_model::Change::Module(pbps_model::ModuleChange::DropModule { .. })
+                    | pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule { .. })
             )
         });
         let restored = pos(|c| {
             matches!(
                 c,
-                pbps_model::Change::CreateModule { .. } | pbps_model::Change::AlterModule { .. }
+                pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule { .. })
+                    | pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule { .. })
             )
         });
-        let create = pos(|c| matches!(c, pbps_model::Change::CreatePolicy { .. }));
-        let retype = pos(|c| matches!(c, pbps_model::Change::AlterColumnType { .. }));
+        let create = pos(|c| {
+            matches!(
+                c,
+                pbps_model::Change::Policy(pbps_model::PolicyChange::CreatePolicy { .. })
+            )
+        });
+        let retype = pos(|c| {
+            matches!(
+                c,
+                pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType { .. })
+            )
+        });
         assert!(drop < routine && restored < create && drop < retype && retype < create);
         // Removing the policy in the declarations releases its column too.
         write(
@@ -331,7 +346,7 @@ fn row_security_c_explicit_policy_removals_release_columns_and_routine_rebuilds(
         let saved = apply(&d, connection);
         assert!(matches!(
             &saved.changes.changes[0].change,
-            pbps_model::Change::DropPolicy { .. }
+            pbps_model::Change::Policy(pbps_model::PolicyChange::DropPolicy { .. })
         ));
         assert_eq!(
             scalar(
@@ -536,11 +551,11 @@ fn row_security_c_saved_policy_drops_pin_opening_definitions_before_ddl() {
             let original: pbps_model::SavedPlan =
                 serde_json::from_slice(&std::fs::read(&artifact).unwrap()).unwrap();
             assert!(
-                matches!(&original.changes.changes[..], [step] if matches!(step.change, pbps_model::Change::DropPolicy { .. }))
+                matches!(&original.changes.changes[..], [step] if matches!(step.change, pbps_model::Change::Policy(pbps_model::PolicyChange::DropPolicy { .. })))
             );
             let before = latest_snapshot(connection);
             let mut forged = original.clone();
-            let pbps_model::Change::DropPolicy { policy, .. } =
+            let pbps_model::Change::Policy(pbps_model::PolicyChange::DropPolicy { policy, .. }) =
                 &mut forged.changes.changes[0].change
             else {
                 unreachable!()

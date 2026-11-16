@@ -231,12 +231,12 @@ mod tests {
         let p_uid = crate::Uid::derived(crate::UidKind::Table, "p", 0);
         let q_uid = crate::Uid::derived(crate::UidKind::Table, "q", 0);
         let rename = |uid: &crate::Uid, from: &str, to: &str| {
-            crate::PlannedChange::new(crate::Change::RenameTable {
+            crate::PlannedChange::new(crate::Change::Table(crate::TableChange::RenameTable {
                 uid: uid.clone(),
                 from: name(from),
                 to: name(to),
                 defaults: vec![],
-            })
+            }))
         };
         let changes = [
             rename(&p_uid, "app.p", "app.tmp"),
@@ -289,12 +289,14 @@ mod tests {
         assert!(partitions.key_types(&name("app.t")).is_empty());
         // The parent is renamed: its key types go with it.
         let uid = crate::Uid::derived(crate::UidKind::Table, "p", 0);
-        let changes = [crate::PlannedChange::new(crate::Change::RenameTable {
-            uid: uid.clone(),
-            from: name("app.p"),
-            to: name("app.q"),
-            defaults: vec![],
-        })];
+        let changes = [crate::PlannedChange::new(crate::Change::Table(
+            crate::TableChange::RenameTable {
+                uid: uid.clone(),
+                from: name("app.p"),
+                to: name("app.q"),
+                defaults: vec![],
+            },
+        ))];
         let after = crate::IdsFile {
             tables: [(uid, name("app.q"))].into(),
             ..crate::IdsFile::default()
@@ -308,29 +310,30 @@ mod tests {
 
     #[test]
     fn boundary_relations_follow_renamed_children_and_never_their_replacements() {
+        use crate::TableChange;
         use crate::{Change, IdsFile, PlannedChange, Uid, UidKind};
         let original = Partitions::of(&schema());
         let child = Uid::derived(UidKind::Table, "child", 0);
         let next = Uid::derived(UidKind::Table, "next", 0);
         let changes = [
-            Change::RenameTable {
+            Change::Table(TableChange::RenameTable {
                 uid: child.clone(),
                 from: name("app.p_a"),
                 to: name("app.renamed"),
                 defaults: vec![],
-            },
-            Change::DropTable {
+            }),
+            Change::Table(TableChange::DropTable {
                 uid: child.clone(),
                 name: name("app.renamed"),
                 detach_from: Some(name("app.p")),
-            },
-            Change::CreateTable {
+            }),
+            Change::Table(TableChange::CreateTable {
                 uid: next.clone(),
                 name: name("app.renamed"),
                 table: Box::new(Table::default()),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
         ]
         .map(PlannedChange::new);
         let ids = IdsFile {
@@ -362,18 +365,18 @@ mod tests {
         let p_uid = crate::Uid::derived(crate::UidKind::Table, "p", 0);
         let q_uid = crate::Uid::derived(crate::UidKind::Table, "q", 0);
         let changes = [
-            crate::PlannedChange::new(crate::Change::RenameTable {
+            crate::PlannedChange::new(crate::Change::Table(crate::TableChange::RenameTable {
                 uid: q_uid.clone(),
                 from: q.clone(),
                 to: r.clone(),
                 defaults: vec![],
-            }),
-            crate::PlannedChange::new(crate::Change::RenameTable {
+            })),
+            crate::PlannedChange::new(crate::Change::Table(crate::TableChange::RenameTable {
                 uid: p_uid.clone(),
                 from: p.clone(),
                 to: q.clone(),
                 defaults: vec![],
-            }),
+            })),
         ];
         let after = crate::IdsFile {
             tables: [(p_uid, q.clone()), (q_uid, r.clone())].into(),

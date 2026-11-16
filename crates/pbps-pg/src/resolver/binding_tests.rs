@@ -2969,12 +2969,12 @@ async fn literal_and_dollar_quoted_semicolons2520_remain_one_declaration() {
             .unwrap();
         assert_eq!(rows[0].try_get::<&str>("n").unwrap(), Some("; COMMIT; --"));
         assert_eq!(rows[0].try_get::<&str>("f").unwrap(), Some(";"));
-        let added = pbps_model::Change::AddColumn {
+        let added = pbps_model::Change::Column(pbps_model::ColumnChange::AddColumn {
             uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
             table: "app.t".parse().unwrap(),
             name: "second".into(),
             column: Box::new(id),
-        };
+        });
         for statement in crate::emit::emit(&pg, &added, Default::default()).unwrap() {
             crate::statement::execute(&mut scratch, &statement)
                 .await

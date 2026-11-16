@@ -169,7 +169,8 @@ fn rebuilt(plan: &pbps_model::SavedPlan) -> bool {
     plan.changes.changes.iter().any(|p| {
         matches!(
             p.change,
-            pbps_model::Change::DropCheck { .. } | pbps_model::Change::AddCheck { .. }
+            pbps_model::Change::Constraint(pbps_model::ConstraintChange::DropCheck { .. })
+                | pbps_model::Change::Constraint(pbps_model::ConstraintChange::AddCheck { .. })
         )
     })
 }
@@ -285,7 +286,10 @@ fn retained2354_tampered_payloads_refuse_and_fresh_binding_cannot_be_skipped() {
         for structural in [true, false] {
             let mut plan = original.clone();
             for p in &mut plan.changes.changes {
-                if let pbps_model::Change::RenameEnumValue { retained, .. } = &mut p.change {
+                if let pbps_model::Change::TypeValue(
+                    pbps_model::TypeValueChange::RenameEnumValue { retained, .. },
+                ) = &mut p.change
+                {
                     if structural {
                         retained[0].anchors.clear();
                     } else {
@@ -452,7 +456,11 @@ fn retained2354_staged_failures_keep_the_old_record_until_verified_closure() {
         assert_eq!(retained(&original), 1);
         let mut bad = original.clone();
         for p in &mut bad.changes.changes {
-            if let pbps_model::Change::RenameEnumValue { retained, .. } = &mut p.change {
+            if let pbps_model::Change::TypeValue(pbps_model::TypeValueChange::RenameEnumValue {
+                retained,
+                ..
+            }) = &mut p.change
+            {
                 retained[0].after = "m IS NOT NULL".into();
             }
         }
@@ -746,7 +754,11 @@ fn layout_retention(server: &str, hole: bool) {
     assert!(!rebuilt(&plan));
     let mut tampered = plan.clone();
     for step in &mut tampered.changes.changes {
-        if let pbps_model::Change::RenameEnumValue { retained, .. } = &mut step.change {
+        if let pbps_model::Change::TypeValue(pbps_model::TypeValueChange::RenameEnumValue {
+            retained,
+            ..
+        }) = &mut step.change
+        {
             retained[0].after = "n <> 'blue'".into();
         }
     }
@@ -799,10 +811,12 @@ fn retained_defaults(plan: &pbps_model::SavedPlan) -> usize {
         .count()
 }
 fn altered_default(plan: &pbps_model::SavedPlan) -> bool {
-    plan.changes
-        .changes
-        .iter()
-        .any(|p| matches!(p.change, pbps_model::Change::AlterColumnDefault { .. }))
+    plan.changes.changes.iter().any(|p| {
+        matches!(
+            p.change,
+            pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnDefault { .. })
+        )
+    })
 }
 fn default_identity(f: &Fixture) -> String {
     text_of(
@@ -849,12 +863,10 @@ fn retained2354_defaults_keep_identity_and_advance_without_real_table_ddl() {
             assert_eq!(p.version, pbps_model::plan::CURRENT_VERSION);
             assert_eq!(retained_defaults(&p), 1, "{:?}", p.changes);
             assert!(!altered_default(&p));
-            assert!(
-                p.changes
-                    .changes
-                    .iter()
-                    .all(|p| matches!(p.change, pbps_model::Change::RenameEnumValue { .. }))
-            );
+            assert!(p.changes.changes.iter().all(|p| matches!(
+                p.change,
+                pbps_model::Change::TypeValue(pbps_model::TypeValueChange::RenameEnumValue { .. })
+            )));
             // Any real-table DDL, including a redundant SET DEFAULT, fails apply.
             on_server(
                 f.own.connection(),
@@ -1010,7 +1022,10 @@ fn retained2354_default_drift_and_forged_proofs_never_record_falsely() {
         for identity in [true, false] {
             let mut bad = original.clone();
             for p in &mut bad.changes.changes {
-                if let pbps_model::Change::RenameEnumValue { retained, .. } = &mut p.change {
+                if let pbps_model::Change::TypeValue(
+                    pbps_model::TypeValueChange::RenameEnumValue { retained, .. },
+                ) = &mut p.change
+                {
                     if identity {
                         if let pbps_model::ExpressionTarget::ColumnDefault { column, .. } =
                             &mut retained[0].target
@@ -1077,7 +1092,7 @@ fn retained2354_default_relation_lock_blocks_replacement_through_recording() {
             let held=pbps_pg::retained::hold(&mut conn,&plan.changes,Some(&state.declared.overlay(&state.schema))).await.unwrap();
             let mut forged = plan.changes.clone();
             for p in &mut forged.changes {
-                if let pbps_model::Change::RenameEnumValue { retained, .. } = &mut p.change {
+                if let pbps_model::Change::TypeValue(pbps_model::TypeValueChange::RenameEnumValue { retained, .. }) = &mut p.change {
                     retained[0].after = "'ok'".into();
                 }
             }
@@ -1106,7 +1121,11 @@ fn retained2354_default_staged_closure_and_resume_verify_before_recording() {
         assert_eq!(retained_defaults(&original), 1);
         let mut bad = original.clone();
         for p in &mut bad.changes.changes {
-            if let pbps_model::Change::RenameEnumValue { retained, .. } = &mut p.change {
+            if let pbps_model::Change::TypeValue(pbps_model::TypeValueChange::RenameEnumValue {
+                retained,
+                ..
+            }) = &mut p.change
+            {
                 retained[0].after = "'ok'".into();
             }
         }
@@ -1265,7 +1284,10 @@ fn retained2354_statement_tails_never_execute_at_apply() {
             let mut p = f.plan(true, false);
             assert_eq!(retained(&p), 1);
             for step in &mut p.changes.changes {
-                if let pbps_model::Change::RenameEnumValue { retained, .. } = &mut step.change {
+                if let pbps_model::Change::TypeValue(
+                    pbps_model::TypeValueChange::RenameEnumValue { retained, .. },
+                ) = &mut step.change
+                {
                     retained[0].after = tail.clone();
                 }
             }

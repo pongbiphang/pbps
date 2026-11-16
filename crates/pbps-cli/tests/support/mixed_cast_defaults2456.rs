@@ -157,9 +157,11 @@ fn mixed2456_rename_update_delete_use_catalog_defaults_and_converge() {
             // Before cells and unchanged cells bind in the approved snapshot,
             // whereas the newly written next default remains after-side text.
             for step in &planned.changes.changes {
-                if let pbps_model::Change::UpdateRow {
-                    columns, unchanged, ..
-                } = &step.change
+                if let pbps_model::Change::Row(pbps_model::RowChange::UpdateRow {
+                    columns,
+                    unchanged,
+                    ..
+                }) = &step.change
                 {
                     let (from, to) = &columns["next"];
                     assert_eq!(from, &pbps_model::Cell::Default(catalog(&before, "next")));
@@ -201,7 +203,7 @@ fn mixed2456_historical_authored_names_survive_later_update_delete_and_insert() 
         assert_eq!(renamed.changes.changes.len(), 1);
         assert!(matches!(
             renamed.changes.changes[0].change,
-            pbps_model::Change::RenameType { .. }
+            pbps_model::Change::Type(pbps_model::TypeChange::RenameType { .. })
         ));
         succeeds(apply(&d, db, &path));
         let renamed_state = snapshot(db);
@@ -221,13 +223,10 @@ fn mixed2456_historical_authored_names_survive_later_update_delete_and_insert() 
         succeeds(d.run(&["plan", "--no-dev"]));
         d.commit();
         let rows = plan(&d, db, &path);
-        assert!(
-            !rows
-                .changes
-                .changes
-                .iter()
-                .any(|c| matches!(c.change, pbps_model::Change::RenameType { .. }))
-        );
+        assert!(!rows.changes.changes.iter().any(|c| matches!(
+            c.change,
+            pbps_model::Change::Type(pbps_model::TypeChange::RenameType { .. })
+        )));
         for kind in ["UpdateRow", "DeleteRow", "InsertRow"] {
             assert!(
                 rows.changes
@@ -357,7 +356,10 @@ fn mixed2456_rename_chains_reused_names_and_new_defaults_keep_their_source_uid()
                 .changes
                 .changes
                 .iter()
-                .filter(|c| matches!(c.change, pbps_model::Change::RenameType { .. }))
+                .filter(|c| matches!(
+                    c.change,
+                    pbps_model::Change::Type(pbps_model::TypeChange::RenameType { .. })
+                ))
                 .count(),
             2
         );
@@ -405,9 +407,11 @@ fn mixed2456_state_diff_matches_the_applied_plan_without_rewriting_authored_defa
             .changes
             .iter()
             .find_map(|step| {
-                if let pbps_model::Change::UpdateRow {
-                    columns, unchanged, ..
-                } = &step.change
+                if let pbps_model::Change::Row(pbps_model::RowChange::UpdateRow {
+                    columns,
+                    unchanged,
+                    ..
+                }) = &step.change
                 {
                     Some((columns, unchanged))
                 } else {

@@ -316,7 +316,9 @@ pub(in crate::engine) async fn check_drop_blockers(
         .filter(|r| {
             matches!(
                 changes.changes.get(r.change_index).map(|p| &p.change),
-                Some(pbps_model::Change::AlterColumnType { .. })
+                Some(pbps_model::Change::Column(
+                    pbps_model::ColumnChange::AlterColumnType { .. }
+                ))
             )
         })
         .count();
@@ -385,28 +387,42 @@ pub(in crate::engine) async fn order_computed_by_edges<S: Clone>(
     let mut decides = false;
     for (at, p) in cs.changes.iter().enumerate() {
         match &p.change {
-            pbps_model::Change::RenameColumn { table, .. } => inputs.push(catalog(at, table)),
-            pbps_model::Change::DropColumn { column, .. }
-            | pbps_model::Change::AlterColumnType { column, .. }
-            | pbps_model::Change::AlterColumnNullability { column, .. } => {
+            pbps_model::Change::Column(pbps_model::ColumnChange::RenameColumn {
+                table, ..
+            }) => inputs.push(catalog(at, table)),
+            pbps_model::Change::Column(pbps_model::ColumnChange::DropColumn { column, .. })
+            | pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType {
+                column,
+                ..
+            })
+            | pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnNullability {
+                column,
+                ..
+            }) => {
                 inputs.push(catalog(at, &column.table));
             }
-            pbps_model::Change::DropComputedColumn { .. } => decides = true,
-            pbps_model::Change::AlterModule { module, .. } => {
+            pbps_model::Change::Column(pbps_model::ColumnChange::DropComputedColumn { .. }) => {
+                decides = true
+            }
+            pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule {
+                module, ..
+            }) => {
                 decides |= module.kind == pbps_model::ModuleKind::Function;
             }
-            pbps_model::Change::DropModule { kind, .. } => {
+            pbps_model::Change::Module(pbps_model::ModuleChange::DropModule { kind, .. }) => {
                 decides |= *kind == pbps_model::ModuleKind::Function;
                 drops += 1;
             }
-            pbps_model::Change::DropTable { .. } => drops += 1,
+            pbps_model::Change::Table(pbps_model::TableChange::DropTable { .. }) => drops += 1,
             _ => {}
         }
     }
-    let modules_dropped = cs
-        .changes
-        .iter()
-        .any(|p| matches!(p.change, pbps_model::Change::DropModule { .. }));
+    let modules_dropped = cs.changes.iter().any(|p| {
+        matches!(
+            p.change,
+            pbps_model::Change::Module(pbps_model::ModuleChange::DropModule { .. })
+        )
+    });
     decides |= modules_dropped && drops > 1;
     if !decides {
         decides = pbps_mssql::catalog::may_hold_computed_columns(conn, &inputs)
@@ -424,16 +440,20 @@ pub(in crate::engine) async fn order_computed_by_edges<S: Clone>(
     let mut targets = pbps_mssql::catalog::ReferrerTargets::default();
     for (at, p) in cs.changes.iter().enumerate() {
         match &p.change {
-            pbps_model::Change::AlterModule { id, module }
+            pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule { id, module })
                 if module.kind == pbps_model::ModuleKind::Function =>
             {
                 targets.functions.push(id.object_name());
             }
-            pbps_model::Change::DropModule {
+            pbps_model::Change::Module(pbps_model::ModuleChange::DropModule {
                 id,
                 kind: pbps_model::ModuleKind::Function,
-            } => targets.functions.push(id.object_name()),
-            pbps_model::Change::DropComputedColumn { table, name, .. } => {
+            }) => targets.functions.push(id.object_name()),
+            pbps_model::Change::Column(pbps_model::ColumnChange::DropComputedColumn {
+                table,
+                name,
+                ..
+            }) => {
                 targets
                     .computed_columns
                     .push((catalog(at, table), name.clone()));
@@ -1002,10 +1022,12 @@ impl PlanSession for pbps_mssql::Mssql {
         again: &dyn Fn(&BTreeSet<pbps_model::ModuleId>) -> anyhow::Result<PlanningPlan<S>>,
     ) -> anyhow::Result<(PlanningPlan<S::Output>, ConnectedCheck)> {
         anyhow::ensure!(
-            !changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, pbps_model::Change::RebuildPartitionedTable(_))),
+            !changes.changes.iter().any(|p| matches!(
+                p.change,
+                pbps_model::Change::Partition(
+                    pbps_model::PartitionChange::RebuildPartitionedTable(_)
+                )
+            )),
             "{TABLE_REBUILD_REFUSAL}"
         );
         account_for_module_dependents(

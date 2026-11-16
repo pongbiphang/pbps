@@ -1,5 +1,8 @@
 //! Approved row-guard expectations, separate from authored comparison text.
 use crate::Side;
+use pbps_model::ColumnChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
 use pbps_model::{Cell, Change, ColumnRef, PlannedChange};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -10,16 +13,16 @@ pub fn written(changes: &[PlannedChange]) -> BTreeSet<ColumnRef> {
     let mut written = BTreeSet::new();
     for step in changes {
         match &step.change {
-            Change::AlterColumnDefault { column, .. } => {
+            Change::Column(ColumnChange::AlterColumnDefault { column, .. }) => {
                 written.insert(column.clone());
             }
-            Change::AddColumn { table, name, .. } => {
+            Change::Column(ColumnChange::AddColumn { table, name, .. }) => {
                 written.insert(ColumnRef {
                     table: table.clone(),
                     name: name.clone(),
                 });
             }
-            Change::CreateTable { name, table, .. } => {
+            Change::Table(TableChange::CreateTable { name, table, .. }) => {
                 written.extend(table.columns.keys().map(|column| ColumnRef {
                     table: name.clone(),
                     name: column.clone(),
@@ -58,9 +61,9 @@ pub(crate) fn catalog(
             }
         };
         match &mut step.change {
-            Change::InsertRow {
+            Change::Row(RowChange::InsertRow {
                 table, defaults, ..
-            } => {
+            }) => {
                 for (name, text) in defaults {
                     let column = ColumnRef {
                         table: table.clone(),
@@ -73,12 +76,12 @@ pub(crate) fn catalog(
                     }
                 }
             }
-            Change::UpdateRow {
+            Change::Row(RowChange::UpdateRow {
                 table,
                 columns,
                 unchanged,
                 ..
-            } => {
+            }) => {
                 for (name, (from, to)) in columns {
                     let column = ColumnRef {
                         table: table.clone(),
@@ -99,7 +102,7 @@ pub(crate) fn catalog(
                     );
                 }
             }
-            Change::DeleteRow { table, row, .. } => {
+            Change::Row(RowChange::DeleteRow { table, row, .. }) => {
                 for (name, cell) in row {
                     replace(
                         &ColumnRef {
@@ -118,6 +121,8 @@ pub(crate) fn catalog(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::RowChange;
     use pbps_model::{IdsFile, RowKey, Schema, Uid, Value};
 
     #[test]
@@ -146,7 +151,7 @@ mod tests {
         let read_back = "('sad'::text)::app.current";
         let defaults = [(old, read_back.into())].into();
         let make = || {
-            PlannedChange::new(Change::UpdateRow {
+            PlannedChange::new(Change::Row(RowChange::UpdateRow {
                 table: new.table.clone(),
                 key_column: "id".into(),
                 key: RowKey::from("1"),
@@ -162,13 +167,13 @@ mod tests {
                 types: Default::default(),
                 after_types: Default::default(),
                 key_type: None,
-            })
+            }))
         };
         let mut retained = vec![make()];
         catalog(&mut retained, b, d, &defaults);
-        let Change::UpdateRow {
+        let Change::Row(RowChange::UpdateRow {
             columns, unchanged, ..
-        } = &retained[0].change
+        }) = &retained[0].change
         else {
             panic!()
         };
@@ -184,16 +189,16 @@ mod tests {
             Cell::Value(Value::Text("saved".into()))
         );
         let mut changed = vec![
-            PlannedChange::new(Change::AlterColumnDefault {
+            PlannedChange::new(Change::Column(ColumnChange::AlterColumnDefault {
                 uid,
                 column: new.clone(),
                 from: Some(authored.into()),
                 to: Some("'ok'::text::app.new".into()),
-            }),
+            })),
             make(),
         ];
         catalog(&mut changed, b, d, &defaults);
-        let Change::UpdateRow { columns, .. } = &changed[1].change else {
+        let Change::Row(RowChange::UpdateRow { columns, .. }) = &changed[1].change else {
             panic!()
         };
         assert_eq!(

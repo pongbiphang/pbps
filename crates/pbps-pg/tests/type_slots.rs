@@ -2,6 +2,10 @@
 
 use pbps_dialect::slots::{CatalogFacts, Namespace, Occupant, SlotKey};
 use pbps_diff::order::slots::{self, SlotViolation};
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
+use pbps_model::TypeChange;
+use pbps_model::TypeValueChange;
 use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
 use pbps_model::plan_names::PlanNames;
 use pbps_model::{
@@ -67,7 +71,7 @@ fn a_type_move_waits_for_its_intermediate_holder_and_refuses_a_kept_holder() {
         let logical = pbps_diff::diff(base, desired, &dialect, &hints).unwrap();
         assert!(matches!(
             logical.changes[0].change,
-            Change::RenameType { .. }
+            Change::Type(TypeChange::RenameType { .. })
         ));
         let result = schedule(
             logical,
@@ -89,16 +93,19 @@ fn a_type_move_waits_for_its_intermediate_holder_and_refuses_a_kept_holder() {
             );
         } else {
             let settled = result.unwrap().changes;
-            assert!(matches!(settled.changes[0].change, Change::DropType { .. }));
+            assert!(matches!(
+                settled.changes[0].change,
+                Change::Type(TypeChange::DropType { .. })
+            ));
             assert!(matches!(
                 settled.changes[1].change,
-                Change::RenameType { .. }
+                Change::Type(TypeChange::RenameType { .. })
             ));
         }
     }
 }
 fn create_type(domain: bool) -> Change {
-    Change::CreateType {
+    Change::Type(TypeChange::CreateType {
         uid: uid(UidKind::Type, "x"),
         name: "app.x".parse().unwrap(),
         definition: Box::new(if domain {
@@ -114,7 +121,7 @@ fn create_type(domain: bool) -> Change {
                 values: vec!["ok".into()],
             }
         }),
-    }
+    })
 }
 fn check(
     changes: Vec<Change>,
@@ -152,13 +159,13 @@ fn a_type_meets_table_and_view_row_types_but_not_indexes_or_sequences() {
         .insert(uid(UidKind::Type, "x"), "app.x".parse().unwrap());
     ids.tables.insert(uid(UidKind::Table, "x"), name());
     for domain in [false, true] {
-        let table = Change::CreateTable {
+        let table = Change::Table(TableChange::CreateTable {
             uid: uid(UidKind::Table, "x"),
             name: name(),
             table: Box::new(Table::default()),
             beside_default: None,
             moves_at_most: None,
-        };
+        });
         assert!(
             !check(
                 vec![create_type(domain), table],
@@ -169,7 +176,7 @@ fn a_type_meets_table_and_view_row_types_but_not_indexes_or_sequences() {
             )
             .is_empty()
         );
-        let view = Change::CreateModule {
+        let view = Change::Module(ModuleChange::CreateModule {
             id: "app.x".parse().unwrap(),
             module: Box::new(pbps_model::Module {
                 kind: pbps_model::ModuleKind::View,
@@ -177,7 +184,7 @@ fn a_type_meets_table_and_view_row_types_but_not_indexes_or_sequences() {
                 description: None,
                 options: Default::default(),
             }),
-        };
+        });
         assert!(
             !check(
                 vec![create_type(domain), view],
@@ -230,11 +237,11 @@ fn a_table_to_type_handoff_is_an_existing_slot_edge_and_the_reverse_is_rejected(
         types: [(uid(UidKind::Type, "x"), "app.x".parse().unwrap())].into(),
         ..Default::default()
     };
-    let drop = Change::DropTable {
+    let drop = Change::Table(TableChange::DropTable {
         uid: table_uid,
         name: name(),
         detach_from: None,
-    };
+    });
     assert!(
         check(
             vec![drop.clone(), create_type(false)],
@@ -492,7 +499,7 @@ async fn enum_label_definitions_are_vetted_at_each_add_and_rename_and_resumed_pr
         let mut executed = Vec::new();
         let changes = pbps_model::ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::RenameEnumValue {
+                PlannedChange::new(Change::TypeValue(TypeValueChange::RenameEnumValue {
                     uid: pin.uid.clone(),
                     name: name.clone(),
                     from: "sad".into(),
@@ -500,23 +507,23 @@ async fn enum_label_definitions_are_vetted_at_each_add_and_rename_and_resumed_pr
                     ordinal: 0,
                     retained: Vec::new(),
                     definition: Box::new(enumeration(&["blue", "ok"])),
-                }),
-                PlannedChange::new(Change::AddEnumValue {
+                })),
+                PlannedChange::new(Change::TypeValue(TypeValueChange::AddEnumValue {
                     uid: pin.uid.clone(),
                     name: name.clone(),
                     value: "middle".into(),
                     placement: Some(pbps_model::EnumPlacement::After("blue".into())),
                     ordinal: 1,
                     definition: Box::new(enumeration(&["blue", "middle", "ok"])),
-                }),
-                PlannedChange::new(Change::AddEnumValue {
+                })),
+                PlannedChange::new(Change::TypeValue(TypeValueChange::AddEnumValue {
                     uid: pin.uid.clone(),
                     name: name.clone(),
                     value: "end".into(),
                     placement: Some(pbps_model::EnumPlacement::After("ok".into())),
                     ordinal: 2,
                     definition: Box::new(pin.definition.clone()),
-                }),
+                })),
             ],
         };
         let sql = [
@@ -538,8 +545,10 @@ async fn enum_label_definitions_are_vetted_at_each_add_and_rename_and_resumed_pr
             .unwrap();
             conn.execute(sql[i]).await.unwrap();
             let definition = match &step.change {
-                Change::AddEnumValue { definition, .. }
-                | Change::RenameEnumValue { definition, .. } => definition.as_ref().clone(),
+                Change::TypeValue(TypeValueChange::AddEnumValue { definition, .. })
+                | Change::TypeValue(TypeValueChange::RenameEnumValue { definition, .. }) => {
+                    definition.as_ref().clone()
+                }
                 _ => unreachable!(),
             };
             let metadata = pbps_dialect::DeclaredTypeStatement {

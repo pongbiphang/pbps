@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use pbps_model::IndexChange;
 use pbps_model::{
     Change, ChangeSet, IndexPart, Part, PartAfter, PartDefinition, Schema, Table, TableName,
     plan_names::{At, Holder, PlanNames},
@@ -305,13 +306,13 @@ impl<'a> PartChanges<'a> {
                 );
                 parts.layout.push((slot, part.after));
             }
-            if let Change::SetIndexStorageParameters {
+            if let Change::Index(IndexChange::SetIndexStorageParameters {
                 table,
                 target,
                 set,
                 reset,
                 ..
-            } = &change.change
+            }) = &change.change
                 && let Some(table) = final_table(names, table, At::Before(i))
             {
                 let effect = tables
@@ -575,6 +576,8 @@ fn part_as_planned(
 #[cfg(test)]
 mod local_name_key_tests {
     use super::*;
+    use pbps_model::ConstraintChange;
+    use pbps_model::IndexChange;
     use pbps_model::{CheckConstraint, Index, IndexColumn, PlannedChange};
 
     #[test]
@@ -593,7 +596,7 @@ mod local_name_key_tests {
         };
         let changes = ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::AddUnique {
+                PlannedChange::new(Change::Constraint(ConstraintChange::AddUnique {
                     table: name.clone(),
                     name: format!("uq{RAW}").into(),
                     constraint: pbps_model::UniqueConstraint {
@@ -602,8 +605,8 @@ mod local_name_key_tests {
                         filegroup: None,
                     },
                     clustered: false,
-                }),
-                PlannedChange::new(Change::AddForeignKey {
+                })),
+                PlannedChange::new(Change::Constraint(ConstraintChange::AddForeignKey {
                     table: name.clone(),
                     name: format!("fk{RAW}").into(),
                     constraint: Box::new(pbps_model::ForeignKey {
@@ -613,20 +616,20 @@ mod local_name_key_tests {
                         on_delete: Default::default(),
                         on_update: Default::default(),
                     }),
-                }),
-                PlannedChange::new(Change::AddCheck {
+                })),
+                PlannedChange::new(Change::Constraint(ConstraintChange::AddCheck {
                     table: name.clone(),
                     name: format!("ck{RAW}").into(),
                     constraint: CheckConstraint {
                         expression: "id > 0".into(),
                     },
-                }),
-                PlannedChange::new(Change::AddIndex {
+                })),
+                PlannedChange::new(Change::Index(IndexChange::AddIndex {
                     table: name.clone(),
                     name: format!("ix{RAW}").into(),
                     index: Box::new(index.clone()),
                     clustered: false,
-                }),
+                })),
             ],
         };
         let ids = pbps_model::IdsFile {

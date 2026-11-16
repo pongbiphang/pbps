@@ -1,6 +1,10 @@
 #![cfg(test)]
 //! Frozen dd84f894 parent-default restoration, before S7 PR3 (DEC-1959.4).
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::PartitionChange;
+use pbps_model::RoleChange;
+use pbps_model::TableChange;
 
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(super) fn after_their_parents_defaults(
@@ -12,11 +16,11 @@ pub(super) fn after_their_parents_defaults(
     let mut added = 0;
     let mut i = 0;
     while i < cs.changes.len() {
-        let Change::AlterColumnDefault {
+        let Change::Column(ColumnChange::AlterColumnDefault {
             column,
             to: Some(_),
             ..
-        } = &cs.changes[i].change
+        }) = &cs.changes[i].change
         else {
             i += 1;
             continue;
@@ -36,12 +40,12 @@ pub(super) fn after_their_parents_defaults(
             .collect();
         for (partition, default) in own {
             let sets = |c: &Change| {
-                matches!(c, Change::SetPartitionDefault { table, column: c, to: Some(_), .. }
+                matches!(c, Change::Partition(PartitionChange::SetPartitionDefault { table, column: c, to: Some(_), .. })
                     if *table == partition && *c == column.name)
             };
             let later = cs.changes[i + 1..].iter().any(|p| {
                 sets(&p.change)
-                    || matches!(&p.change, Change::CreateTable { name, .. } if *name == partition)
+                    || matches!(&p.change, Change::Table(TableChange::CreateTable { name, .. }) if *name == partition)
             });
             if later {
                 continue;
@@ -65,7 +69,7 @@ pub(super) fn after_their_parents_defaults(
                 cs.changes.insert(
                     i + 1,
                     planned(
-                        Change::SetPartitionDefault {
+                        Change::Partition(PartitionChange::SetPartitionDefault {
                             uid,
                             table: partition,
                             parent: column.table.clone(),
@@ -73,7 +77,7 @@ pub(super) fn after_their_parents_defaults(
                             from: None,
                             to: Some(default),
                             fallback,
-                        },
+                        }),
                         dialect,
                     ),
                 );
@@ -98,11 +102,13 @@ pub(super) fn same_plan(
         {
             assert_eq!(origin.role, pbps_model::AddedRole::Restoration);
             assert!(old.provenance.is_none(), "an existing origin must survive");
-            let Change::SetPartitionDefault { parent, column, .. } = &now.change else {
+            let Change::Partition(PartitionChange::SetPartitionDefault { parent, column, .. }) =
+                &now.change
+            else {
                 panic!("only an added partition restoration has this origin");
             };
             assert!(actual.changes.iter().any(|p| {
-                matches!(&p.change, Change::AlterColumnDefault { column: c, to: Some(_), .. }
+                matches!(&p.change, Change::Column(ColumnChange::AlterColumnDefault { column: c, to: Some(_), .. })
                     if c.table == *parent && c.name == *column && p.change.subject() == origin.source)
             }), "a restoration serves a real parent SET");
             now.provenance = None;
@@ -202,16 +208,16 @@ fn fixture(salt: u32) -> (Schema, IdsFile) {
 
 fn parent(ids: &IdsFile, column: &str, to: Option<&str>) -> Change {
     let column = TableName::new("app", "ev").column(column);
-    Change::AlterColumnDefault {
+    Change::Column(ColumnChange::AlterColumnDefault {
         uid: ids.column_uid(&column).unwrap().clone(),
         column,
         from: Some("app.f(1)".into()),
         to: to.map(str::to_owned),
-    }
+    })
 }
 
 fn restore(ids: &IdsFile, k: usize) -> Change {
-    Change::SetPartitionDefault {
+    Change::Partition(PartitionChange::SetPartitionDefault {
         uid: ids.table_uid(&partition(k)).unwrap().clone(),
         table: partition(k),
         parent: TableName::new("app", "ev"),
@@ -219,24 +225,24 @@ fn restore(ids: &IdsFile, k: usize) -> Change {
         from: Some("9".into()),
         to: Some(if k == 0 { "app.f(2)" } else { "f(3)" }.into()),
         fallback: Some("app.f(1)".into()),
-    }
+    })
 }
 
 fn create(schema: &Schema, ids: &IdsFile, k: usize) -> Change {
-    Change::CreateTable {
+    Change::Table(TableChange::CreateTable {
         uid: ids.table_uid(&partition(k)).unwrap().clone(),
         name: partition(k),
         table: Box::new(schema.tables[&partition(k)].clone()),
         beside_default: None,
         moves_at_most: None,
-    }
+    })
 }
 
 fn free(name: &str, salt: u32) -> Change {
-    Change::CreateRole {
+    Change::Role(RoleChange::CreateRole {
         uid: Uid::derived(UidKind::Role, name, salt),
         name: name.into(),
-    }
+    })
 }
 
 fn plan(
@@ -297,7 +303,10 @@ fn parent_default_restorations_match_old_bytes_for_32_uid_seeds() {
                         let mut cs = plan(changes, &pg);
                         // Metadata on reused operations must survive too.
                         for p in &mut cs.changes {
-                            if matches!(p.change, Change::SetPartitionDefault { .. }) {
+                            if matches!(
+                                p.change,
+                                Change::Partition(PartitionChange::SetPartitionDefault { .. })
+                            ) {
                                 p.provenance = Some(pbps_model::Provenance {
                                     rule: if salt % 2 == 0 {
                                         "existing-restoration"

@@ -1362,9 +1362,11 @@ mod tests {
     /// requirer sorts after it by name, so only the edge and the rank can put it first.
     #[test]
     fn a_drop_is_exactly_the_restrict_statement_and_waits_for_its_requirer_and_its_modules() {
+        use pbps_model::ExtensionChange;
+        use pbps_model::ModuleChange;
         use pbps_model::{Change, IdsFile, Schema};
         let pg = crate::Postgres::new();
-        let drop = Change::DropExtension {
+        let drop = Change::Extension(ExtensionChange::DropExtension {
             uid: "e_000001".parse().unwrap(),
             name: "odd \"name".into(),
             definition: wanted("ext\"s", "1.0"),
@@ -1372,7 +1374,7 @@ mod tests {
             releases: Default::default(),
             index_releases: Default::default(),
             search_releases: Default::default(),
-        };
+        });
         let statements = crate::emit::emit(&pg, &drop, Default::default()).unwrap();
         assert_eq!(statements.len(), 1);
         assert_eq!(
@@ -1472,9 +1474,11 @@ mod tests {
             .changes
             .iter()
             .map(|p| {
-                if let Change::DropModule { id, .. } = &p.change {
+                if let Change::Module(ModuleChange::DropModule { id, .. }) = &p.change {
                     format!("module {}", id.shown())
-                } else if let Change::DropExtension { name, .. } = &p.change {
+                } else if let Change::Extension(ExtensionChange::DropExtension { name, .. }) =
+                    &p.change
+                {
                     format!("package {}", name.shown())
                 } else {
                     panic!("{:?}", p.change)
@@ -1494,6 +1498,8 @@ mod tests {
     /// (DEC-2728.2). Negative: retiring only the package is refused, naming the configuration.
     #[test]
     fn a_configuration_retired_with_its_packages_dictionary_is_dropped_before_the_package() {
+        use pbps_model::ExtensionChange;
+        use pbps_model::SearchChange;
         use pbps_model::{
             Change, IdsFile, Schema, SearchObject, SearchRef, Tombstone, Uid, UidKind,
         };
@@ -1564,9 +1570,12 @@ mod tests {
             .changes
             .iter()
             .map(|p| {
-                if matches!(p.change, Change::DropSearch { .. }) {
+                if matches!(p.change, Change::Search(SearchChange::DropSearch { .. })) {
                     "search"
-                } else if matches!(p.change, Change::DropExtension { .. }) {
+                } else if matches!(
+                    p.change,
+                    Change::Extension(ExtensionChange::DropExtension { .. })
+                ) {
                     "package"
                 } else {
                     panic!("{:?}", p.change)
@@ -1593,6 +1602,7 @@ mod tests {
 
     #[test]
     fn a_create_is_exactly_the_pinned_statement_and_waits_for_its_prerequisite() {
+        use pbps_model::ExtensionChange;
         use pbps_model::{Change, IdsFile, Schema};
         let pg = crate::Postgres::new();
         // `aaa` sorts first by name and requires `zzz`: only the edge can put
@@ -1641,7 +1651,10 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| {
-                if let Change::CreateExtension { name, requires, .. } = &p.change {
+                if let Change::Extension(ExtensionChange::CreateExtension {
+                    name, requires, ..
+                }) = &p.change
+                {
                     Some((name.raw().to_owned(), requires.len()))
                 } else {
                     None
@@ -1669,16 +1682,16 @@ mod tests {
         .unwrap();
         assert!(blind.changes().changes.iter().all(|p| !matches!(
             &p.change,
-            Change::CreateExtension { requires, .. } if !requires.is_empty()
+            Change::Extension(ExtensionChange::CreateExtension { requires, .. }) if !requires.is_empty()
         )));
         // The statement is the pin and nothing else, with the install boundary
         // the executor vets, and no option that would choose for the author.
-        let create = Change::CreateExtension {
+        let create = Change::Extension(ExtensionChange::CreateExtension {
             uid: "e_000001".parse().unwrap(),
             name: "odd \"name".into(),
             definition: wanted("ext\"s", "1.0'x"),
             requires: Default::default(),
-        };
+        });
         let statements = crate::emit::emit(&pg, &create, Default::default()).unwrap();
         assert_eq!(statements.len(), 1);
         assert_eq!(
@@ -1708,16 +1721,18 @@ mod tests {
     #[test]
     fn an_update_is_exactly_the_named_version_statement_and_waits_for_its_prerequisite_and_modules()
     {
+        use pbps_model::ExtensionChange;
+        use pbps_model::ModuleChange;
         use pbps_model::{Change, IdsFile, Schema};
         let pg = crate::Postgres::new();
-        let update = Change::UpdateExtension {
+        let update = Change::Extension(ExtensionChange::UpdateExtension {
             uid: "e_000001".parse().unwrap(),
             name: "odd \"name".into(),
             from: wanted("ext\"s", "1.0"),
             to: wanted("ext\"s", "1.0'x"),
             requires: Default::default(),
             releases: Default::default(),
-        };
+        });
         let statements = crate::emit::emit(&pg, &update, Default::default()).unwrap();
         assert_eq!(statements.len(), 1);
         assert_eq!(
@@ -1801,11 +1816,16 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| {
-                if let Change::DropModule { id, .. } = &p.change {
+                if let Change::Module(ModuleChange::DropModule { id, .. }) = &p.change {
                     Some(format!("drop module {}", id.shown()))
-                } else if let Change::UpdateExtension { name, to, .. } = &p.change {
+                } else if let Change::Extension(ExtensionChange::UpdateExtension {
+                    name, to, ..
+                }) = &p.change
+                {
                     Some(format!("update {} to {}", name.shown(), to.version))
-                } else if let Change::CreateExtension { name, .. } = &p.change {
+                } else if let Change::Extension(ExtensionChange::CreateExtension { name, .. }) =
+                    &p.change
+                {
                     Some(format!("create {}", name.shown()))
                 } else {
                     None
@@ -1821,14 +1841,19 @@ mod tests {
                 "update aaa to 1.1"
             ]
         );
-        let Change::UpdateExtension {
+        let Change::Extension(ExtensionChange::UpdateExtension {
             requires, releases, ..
-        } = &planned
+        }) = &planned
             .changes()
             .changes
             .iter()
             .map(|p| &p.change)
-            .find(|c| matches!(c, Change::UpdateExtension { .. }))
+            .find(|c| {
+                matches!(
+                    c,
+                    Change::Extension(ExtensionChange::UpdateExtension { .. })
+                )
+            })
             .unwrap()
         else {
             unreachable!()
@@ -1865,15 +1890,17 @@ mod tests {
     /// (DEC-2447.11).
     #[test]
     fn a_move_is_exactly_the_schema_statement_and_follows_its_update_and_the_name_it_takes() {
+        use pbps_model::ExtensionChange;
+        use pbps_model::ModuleChange;
         use pbps_model::{Change, IdsFile, Schema};
         let pg = crate::Postgres::new();
-        let move_to = Change::SetExtensionSchema {
+        let move_to = Change::Extension(ExtensionChange::SetExtensionSchema {
             uid: "e_000001".parse().unwrap(),
             name: "odd \"name".into(),
             from: wanted("ext", "1.0"),
             to: wanted("new \"schema", "1.0"),
             releases: Default::default(),
-        };
+        });
         let statements = crate::emit::emit(&pg, &move_to, Default::default()).unwrap();
         assert_eq!(statements.len(), 1);
         assert_eq!(
@@ -1933,11 +1960,18 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| {
-                if let Change::DropModule { id, .. } = &p.change {
+                if let Change::Module(ModuleChange::DropModule { id, .. }) = &p.change {
                     Some(format!("drop module {}", id.shown()))
-                } else if let Change::UpdateExtension { to, .. } = &p.change {
+                } else if let Change::Extension(ExtensionChange::UpdateExtension { to, .. }) =
+                    &p.change
+                {
                     Some(format!("update to {} in {}", to.version, to.schema))
-                } else if let Change::SetExtensionSchema { from, to, .. } = &p.change {
+                } else if let Change::Extension(ExtensionChange::SetExtensionSchema {
+                    from,
+                    to,
+                    ..
+                }) = &p.change
+                {
                     Some(format!(
                         "move {} {} to {}",
                         from.version, from.schema, to.schema
@@ -1980,13 +2014,10 @@ mod tests {
             ..Default::default()
         };
         let planned = pbps_diff::diff(side(&base), side(&stays), &pg, &hints).unwrap();
-        assert!(
-            !planned
-                .changes()
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, Change::SetExtensionSchema { .. }))
-        );
+        assert!(!planned.changes().changes.iter().any(|p| matches!(
+            p.change,
+            Change::Extension(ExtensionChange::SetExtensionSchema { .. })
+        )));
     }
 
     /// A member keeps its identity through a move, and the engine renders it with

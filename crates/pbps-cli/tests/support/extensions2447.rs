@@ -480,7 +480,7 @@ fn adopted_extensions_allow_resolver_and_rehearsal_for_ordinary_changes() {
             assert_eq!(saved.changes.changes.len(), 1);
             assert!(matches!(
                 saved.changes.changes[0].change,
-                pbps_model::Change::AddColumn { .. }
+                pbps_model::Change::Column(pbps_model::ColumnChange::AddColumn { .. })
             ));
             let checksum = super::plan_checksum(&path);
             succeeds(case.run(&[

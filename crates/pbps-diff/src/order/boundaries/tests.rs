@@ -1,5 +1,10 @@
 use super::*;
 use crate::order::{PlanningPlan, Schedule, plan};
+use pbps_model::ColumnChange;
+use pbps_model::GrantChange;
+use pbps_model::PartitionChange;
+use pbps_model::RoleChange;
+use pbps_model::TableChange;
 use pbps_model::operation::{
     ModuleEdits, ObjectKey, Operations, PlanOwners,
     symbolic::{Boundary as TransferBoundary, Move},
@@ -17,7 +22,7 @@ fn fixture() -> (PlanningPlan, Operations, Vec<Effects>, State) {
         .insert("r_aaaaaa".parse().unwrap(), "unused".into());
     let changes = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::AttachPartition {
+            PlannedChange::new(Change::Partition(PartitionChange::AttachPartition {
                 uid: child.clone(),
                 table: "app.a".parse().unwrap(),
                 parent: parent_name,
@@ -27,24 +32,26 @@ fn fixture() -> (PlanningPlan, Operations, Vec<Effects>, State) {
                 },
                 key: Default::default(),
                 shape: Box::default(),
-            }),
-            PlannedChange::new(Change::CreateRole {
+            })),
+            PlannedChange::new(Change::Role(RoleChange::CreateRole {
                 uid: "r_aaaaaa".parse().unwrap(),
                 name: "unused".into(),
-            }),
+            })),
         ],
     };
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, &ids).unwrap();
     let owners = PlanOwners::new(names, &ids, &ids);
     let operation = |uid, name| {
         Operations::of_plan(
-            &[PlannedChange::new(Change::CreateTable {
-                uid,
-                name,
-                table: Box::default(),
-                beside_default: None,
-                moves_at_most: None,
-            })],
+            &[PlannedChange::new(Change::Table(
+                TableChange::CreateTable {
+                    uid,
+                    name,
+                    table: Box::default(),
+                    beside_default: None,
+                    moves_at_most: None,
+                },
+            ))],
             ModuleEdits::InPlace,
         )
     };
@@ -166,19 +173,19 @@ fn a_detachs_parent_is_its_recorded_uid_even_when_a_rename_reuses_the_name() {
     after.tables.insert(other, name.clone());
     let changes = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::RenameTable {
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: p.clone(),
                 from: name.clone(),
                 to: new_name,
                 defaults: vec![],
-            }),
-            PlannedChange::new(Change::DetachPartition {
+            })),
+            PlannedChange::new(Change::Partition(PartitionChange::DetachPartition {
                 uid: a.clone(),
                 table: "app.a".parse().unwrap(),
                 parent: name,
                 names: vec![],
                 shape: Box::default(),
-            }),
+            })),
         ],
     };
     let schema = pbps_model::Schema::default();
@@ -265,10 +272,10 @@ fn appending_a_step_retains_boundary_event_ids_and_requires_new_discharge() {
     p.boundaries
         .discharge(ops.as_slice(), &fx, &base, &[])
         .unwrap();
-    let addition = PlannedChange::new(Change::CreateRole {
+    let addition = PlannedChange::new(Change::Role(RoleChange::CreateRole {
         uid: "r_bbbbbb".parse().unwrap(),
         name: "another".into(),
-    });
+    }));
     let mut p = crate::order::writebacks::PlanningInput::new(vec![addition]).append_to(p);
     assert!(plan::canonical(p.clone(), &pbps_dialect::MinimalDialect).is_err());
     let events = p.identities.clone().unwrap();
@@ -321,21 +328,21 @@ fn only_a_parent_whose_columns_change_beside_its_members_is_read() {
         (schema, ids)
     };
     let attach = |column_change: bool| {
-        let mut changes = vec![Change::AttachPartition {
+        let mut changes = vec![Change::Partition(PartitionChange::AttachPartition {
             uid: "t_bbbbbb".parse().unwrap(),
             table: "app.a".parse().unwrap(),
             parent: "app.p".parse().unwrap(),
             bound: PartitionBound::Default,
             key: Default::default(),
             shape: Box::default(),
-        }];
+        })];
         if column_change {
-            changes.push(Change::AlterColumnDefault {
+            changes.push(Change::Column(ColumnChange::AlterColumnDefault {
                 uid: "c_aaaaaa".parse().unwrap(),
                 column: "app.p.d".parse().unwrap(),
                 from: None,
                 to: Some("1".into()),
-            });
+            }));
         }
         ChangeSet {
             changes: changes.into_iter().map(PlannedChange::new).collect(),
@@ -443,20 +450,20 @@ fn logical_name_positions_survive_permutation_and_appended_input() {
         .insert("r_bbbbbb".parse().unwrap(), "newreader".into());
     let input = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::RenameTable {
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: parent.clone(),
                 from: "app.p".parse().unwrap(),
                 to: "app.q".parse().unwrap(),
                 defaults: vec![],
-            }),
-            PlannedChange::new(Change::AttachPartition {
+            })),
+            PlannedChange::new(Change::Partition(PartitionChange::AttachPartition {
                 uid: child.clone(),
                 table: "app.a".parse().unwrap(),
                 parent: "app.q".parse().unwrap(),
                 bound: pbps_model::PartitionBound::Default,
                 key: vec![],
                 shape: Box::default(),
-            }),
+            })),
         ],
     };
     let mut plan = crate::order::propose(input);
@@ -468,10 +475,10 @@ fn logical_name_positions_survive_permutation_and_appended_input() {
         ModuleEdits::InPlace,
     );
     let plan = crate::order::writebacks::PlanningInput::new(vec![PlannedChange::new(
-        Change::CreateRole {
+        Change::Role(RoleChange::CreateRole {
             uid: "r_bbbbbb".parse().unwrap(),
             name: "newreader".into(),
-        },
+        }),
     )])
     .append_to(plan);
     let mut schedule = Schedule::new(3);
@@ -493,7 +500,12 @@ fn logical_name_positions_survive_permutation_and_appended_input() {
         .as_ref()
         .unwrap()
         .iter()
-        .find(|op| matches!(op.change(), Change::AttachPartition { .. }))
+        .find(|op| {
+            matches!(
+                op.change(),
+                Change::Partition(PartitionChange::AttachPartition { .. })
+            )
+        })
         .unwrap();
     let history = plan.boundaries.names(&plan);
     let names = PlanNames::of(&history.changes, &after).unwrap();
@@ -521,11 +533,11 @@ fn logical_name_positions_survive_permutation_and_appended_input() {
 #[test]
 fn public_companions_keep_their_events_while_their_steps_are_out_of_the_window() {
     let (p, _, _, _) = fixture();
-    let part = PlannedChange::new(Change::PublicExecution {
+    let part = PlannedChange::new(Change::Permission(GrantChange::PublicExecution {
         routine: "app.f(integer)".parse().unwrap(),
         access: pbps_model::PublicAccess::Kept,
         origin: pbps_model::RoutineOrigin::Rebuilt,
-    });
+    }));
     let mut p = crate::order::writebacks::PlanningInput::new(vec![part]).append_to(p);
     let original = p.identities.clone().unwrap();
     let event = original.as_slice()[2].id();
@@ -536,12 +548,12 @@ fn public_companions_keep_their_events_while_their_steps_are_out_of_the_window()
         p.identities.as_ref().unwrap().as_slice()[0].id(),
         original.as_slice()[0].id()
     );
-    p = crate::order::writebacks::PlanningInput::new(vec![PlannedChange::new(
-        Change::CreateRole {
+    p = crate::order::writebacks::PlanningInput::new(vec![PlannedChange::new(Change::Role(
+        RoleChange::CreateRole {
             uid: "r_bbbbbb".parse().unwrap(),
             name: "later".into(),
         },
-    )])
+    ))])
     .append_to(p);
     let added = p.identities.as_ref().unwrap().as_slice()[2].id();
     assert_ne!(added, event, "a held logical source stays reserved");
@@ -566,9 +578,8 @@ fn retuning_a_parent_owned_sequence_does_not_claim_a_tree_alter_lock() {
         ids.columns
             .insert("c_aaaaaa".parse().unwrap(), name.column("d"));
         let old = pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence::serial());
-        plan.payload
-            .changes
-            .push(PlannedChange::new(Change::AlterColumnNumbering {
+        plan.payload.changes.push(PlannedChange::new(Change::Column(
+            ColumnChange::AlterColumnNumbering {
                 uid: "c_aaaaaa".parse().unwrap(),
                 column: name.column("d"),
                 ty: "integer".parse().unwrap(),
@@ -578,7 +589,8 @@ fn retuning_a_parent_owned_sequence_does_not_claim_a_tree_alter_lock() {
                 } else {
                     pbps_model::ValueSource::None
                 },
-            }));
+            },
+        )));
         let schema = pbps_model::Schema::default();
         let side = crate::Side {
             schema: &schema,
@@ -618,20 +630,20 @@ fn a_changed_physical_spelling_requires_boundary_recertification() {
         .tables
         .insert(parent.clone(), "app.q".parse().unwrap());
     let mut history = plan.changes.clone();
-    history[0] = PlannedChange::new(Change::RenameTable {
+    history[0] = PlannedChange::new(Change::Table(TableChange::RenameTable {
         uid: parent,
         from: "app.p".parse().unwrap(),
         to: "app.q".parse().unwrap(),
         defaults: vec![],
-    });
-    history[1] = PlannedChange::new(Change::AttachPartition {
+    }));
+    history[1] = PlannedChange::new(Change::Partition(PartitionChange::AttachPartition {
         uid: "t_bbbbbb".parse().unwrap(),
         table: "app.a".parse().unwrap(),
         parent: "app.q".parse().unwrap(),
         bound: pbps_model::PartitionBound::Default,
         key: vec![],
         shape: Box::default(),
-    });
+    }));
     let ordered =
         Operations::from_operations([ops.as_slice()[1].clone(), ops.as_slice()[0].clone()]);
     let names = PlanNames::of(&history, &after).unwrap();

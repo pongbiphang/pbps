@@ -9,6 +9,11 @@
 use crate::ColumnName;
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::ColumnChange;
+use crate::GrantChange;
+use crate::IndexChange;
+use crate::PartitionChange;
+use crate::TableChange;
 use crate::plan_names::{At, Holder, PlanNames};
 use crate::{Change, ColumnRef, IdsFile, Schema, TableName, Uid};
 
@@ -323,7 +328,7 @@ impl<'p> PhysicalSources<'p> {
                 slot: (_, name),
             } => {
                 let position = match &self.names.changes().get(*step)?.change {
-                    Change::CreateTable { table, .. } => {
+                    Change::Table(TableChange::CreateTable { table, .. }) => {
                         if let Some(of) = &table.partition_of {
                             let Located::Present(columns) =
                                 self.columns_at(&of.parent, At::Before(*step))
@@ -339,7 +344,8 @@ impl<'p> PhysicalSources<'p> {
                                 .position(|n| n == name)?
                         }
                     }
-                    Change::AddColumn { .. } | Change::AddComputedColumn { .. } => 0,
+                    Change::Column(ColumnChange::AddColumn { .. })
+                    | Change::Column(ColumnChange::AddComputedColumn { .. }) => 0,
                     _ => return None,
                 };
                 Some((1, *step, position))
@@ -539,17 +545,19 @@ impl Build<'_, '_> {
         // provisional membership order. Other identities keep their events.
         #[allow(clippy::wildcard_enum_match_arm)]
         let excluded = match change {
-            Change::CreateTable { uid, .. }
-            | Change::DropTable { uid, .. }
-            | Change::AttachPartition { uid, .. }
-            | Change::DetachPartition { uid, .. } => self.view.excluded.contains(uid),
-            Change::AddColumn { table, .. }
-            | Change::AddComputedColumn { table, .. }
-            | Change::DropComputedColumn { table, .. }
-            | Change::RenameColumn { table, .. } => {
+            Change::Table(TableChange::CreateTable { uid, .. })
+            | Change::Table(TableChange::DropTable { uid, .. })
+            | Change::Partition(PartitionChange::AttachPartition { uid, .. })
+            | Change::Partition(PartitionChange::DetachPartition { uid, .. }) => {
+                self.view.excluded.contains(uid)
+            }
+            Change::Column(ColumnChange::AddColumn { table, .. })
+            | Change::Column(ColumnChange::AddComputedColumn { table, .. })
+            | Change::Column(ColumnChange::DropComputedColumn { table, .. })
+            | Change::Column(ColumnChange::RenameColumn { table, .. }) => {
                 matches!(self.view.names.holder(table, before), Holder::Tracked(uid) if self.view.excluded.contains(uid))
             }
-            Change::DropColumn { column, .. } => {
+            Change::Column(ColumnChange::DropColumn { column, .. }) => {
                 matches!(self.view.names.holder(&column.table, before), Holder::Tracked(uid) if self.view.excluded.contains(uid))
             }
             _ => false,
@@ -558,11 +566,11 @@ impl Build<'_, '_> {
             return Ok(());
         }
         match change {
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => {}
-            Change::CreateTable { uid, table, .. } => {
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => {}
+            Change::Table(TableChange::CreateTable { uid, table, .. }) => {
                 self.view
                     .table_births
                     .put(uid.clone(), boundary, Some(step));
@@ -596,7 +604,7 @@ impl Build<'_, '_> {
                     self.create(step, (uid.clone(), column))?;
                 }
             }
-            Change::DropTable { uid, .. } => {
+            Change::Table(TableChange::DropTable { uid, .. }) => {
                 self.view.table_births.put(uid.clone(), boundary, None);
                 let columns: Vec<_> = self
                     .columns
@@ -609,33 +617,35 @@ impl Build<'_, '_> {
                 }
                 self.parent(boundary, uid.clone(), None);
             }
-            Change::AttachPartition { uid, parent, .. } => {
+            Change::Partition(PartitionChange::AttachPartition { uid, parent, .. }) => {
                 let parent = self.owner(parent, before)?;
                 self.parent(boundary, uid.clone(), Some(parent));
             }
-            Change::DetachPartition { uid, .. } => self.parent(boundary, uid.clone(), None),
-            Change::AddColumn { table, name, .. }
-            | Change::AddComputedColumn { table, name, .. } => {
+            Change::Partition(PartitionChange::DetachPartition { uid, .. }) => {
+                self.parent(boundary, uid.clone(), None)
+            }
+            Change::Column(ColumnChange::AddColumn { table, name, .. })
+            | Change::Column(ColumnChange::AddComputedColumn { table, name, .. }) => {
                 let table = self.owner(table, before)?;
                 for owner in self.reached(&table) {
                     self.create(step, (owner, name.clone()))?;
                 }
             }
-            Change::DropColumn { column, .. } => {
+            Change::Column(ColumnChange::DropColumn { column, .. }) => {
                 let table = self.owner(&column.table, before)?;
                 for owner in self.reached(&table) {
                     self.remove(boundary, &(owner, column.name.clone()));
                 }
             }
-            Change::DropComputedColumn { table, name, .. } => {
+            Change::Column(ColumnChange::DropComputedColumn { table, name, .. }) => {
                 let table = self.owner(table, before)?;
                 for owner in self.reached(&table) {
                     self.remove(boundary, &(owner, name.clone()));
                 }
             }
-            Change::RenameColumn {
+            Change::Column(ColumnChange::RenameColumn {
                 table, from, to, ..
-            } => {
+            }) => {
                 let table = self.owner(table, before)?;
                 for owner in self.reached(&table) {
                     let old = (owner.clone(), from.clone());
@@ -649,28 +659,28 @@ impl Build<'_, '_> {
                     self.insert(boundary, (owner, to.clone()), origin)?;
                 }
             }
-            Change::RenameTable { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::AlterColumnNumbering { .. }
-            | Change::SetColumnDeprecated { .. }
+            Change::Table(TableChange::RenameTable { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
             | crate::change_family!(constraints)
-            | Change::SetIndexStorageParameters { .. }
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
             | crate::change_family!(table_properties)
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
             | crate::change_family!(policies)
-            | Change::AddIndex { .. }
-            | Change::DropIndex { .. }
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
             | crate::change_family!(rows)
             | crate::change_family!(modules)
             | crate::change_family!(type_values)
             | crate::catalog_change!()
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => {}
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. }) => {}
         }
         Ok(())
     }

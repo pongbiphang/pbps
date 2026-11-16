@@ -40,6 +40,11 @@
 use pbps_diff::order::PlanningPlan;
 use std::collections::{BTreeMap, BTreeSet};
 
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
 use pbps_model::{Change, ChangeSet, PlannedChange, TableName};
 
 use crate::deploy::{NameFacts, Walk};
@@ -107,7 +112,7 @@ pub(crate) type Column = (TableName, pbps_model::ColumnName);
 pub(crate) fn renamed_column_names(cs: &ChangeSet) -> Vec<Column> {
     let mut per_table: BTreeMap<&TableName, usize> = BTreeMap::new();
     for p in &cs.changes {
-        if let Change::RenameColumn { table, .. } = &p.change {
+        if let Change::Column(ColumnChange::RenameColumn { table, .. }) = &p.change {
             *per_table.entry(table).or_default() += 1;
         }
     }
@@ -115,9 +120,9 @@ pub(crate) fn renamed_column_names(cs: &ChangeSet) -> Vec<Column> {
         .changes
         .iter()
         .filter_map(|p| match &p.change {
-            Change::RenameColumn {
+            Change::Column(ColumnChange::RenameColumn {
                 table, from, to, ..
-            } if per_table[table] > 1 => {
+            }) if per_table[table] > 1 => {
                 Some([(table.clone(), from.clone()), (table.clone(), to.clone())])
             }
             _ => None,
@@ -152,9 +157,9 @@ pub(crate) fn order_column_renames<S: Clone>(
     type Ends = (usize, Column, Column);
     let mut tables: BTreeMap<TableName, Vec<Ends>> = BTreeMap::new();
     for (i, p) in cs.changes.iter().enumerate() {
-        if let Change::RenameColumn {
+        if let Change::Column(ColumnChange::RenameColumn {
             table, from, to, ..
-        } = &p.change
+        }) = &p.change
         {
             tables.entry(table.clone()).or_default().push((
                 i,
@@ -176,7 +181,7 @@ pub(crate) fn order_column_renames<S: Clone>(
             for (v, (_, vacates, _)) in renames.iter().enumerate() {
                 if v != r && vacates == takes {
                     let spelled = |i: usize| {
-                        if let Change::RenameColumn { from, to, .. } =
+                        if let Change::Column(ColumnChange::RenameColumn { from, to, .. }) =
                             &cs.changes[renames[i].0].change
                         {
                             Some((from, to))
@@ -239,16 +244,16 @@ enum Part {
 #[allow(clippy::wildcard_enum_match_arm)]
 fn part(change: &Change) -> Option<Part> {
     match change {
-        Change::RenameTable { .. } => Some(Part::Rename),
-        Change::DropTable { .. }
-        | Change::DropIndex { .. }
-        | Change::DropUnique { .. }
-        | Change::DropForeignKey { .. }
-        | Change::DropCheck { .. }
+        Change::Table(TableChange::RenameTable { .. }) => Some(Part::Rename),
+        Change::Table(TableChange::DropTable { .. })
+        | Change::Index(IndexChange::DropIndex { .. })
+        | Change::Constraint(ConstraintChange::DropUnique { .. })
+        | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+        | Change::Constraint(ConstraintChange::DropCheck { .. })
         // A drop on a table as an index's is (DEC-1174.1): it names the
         // table, and is addressed by its name where it runs.
-        | Change::DropComputedColumn { .. }
-        | Change::SetPrimaryKey { to: None, .. } => Some(Part::Drop),
+        | Change::Column(ColumnChange::DropComputedColumn { .. })
+        | Change::Constraint(ConstraintChange::SetPrimaryKey { to: None, .. }) => Some(Part::Drop),
         _ => None,
     }
 }
@@ -260,16 +265,16 @@ fn part(change: &Change) -> Option<Part> {
 fn addressed(change: &Change, table: &TableName) -> Change {
     let mut change = change.clone();
     match &mut change {
-        Change::DropIndex { table: at, .. }
-        | Change::DropUnique { table: at, .. }
-        | Change::DropForeignKey { table: at, .. }
-        | Change::DropCheck { table: at, .. }
-        | Change::DropComputedColumn { table: at, .. }
-        | Change::SetPrimaryKey {
+        Change::Index(IndexChange::DropIndex { table: at, .. })
+        | Change::Constraint(ConstraintChange::DropUnique { table: at, .. })
+        | Change::Constraint(ConstraintChange::DropForeignKey { table: at, .. })
+        | Change::Constraint(ConstraintChange::DropCheck { table: at, .. })
+        | Change::Column(ColumnChange::DropComputedColumn { table: at, .. })
+        | Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: at,
             to: None,
             ..
-        } => *at = table.clone(),
+        }) => *at = table.clone(),
         _ => {}
     }
     change
@@ -348,7 +353,11 @@ impl<'c> Search<'c> {
             .filter_map(|(before, after)| Some((at(before)?, at(after)?)))
             .collect();
         let late_module = |i: usize| {
-            first.is_some_and(|f| i > f) && matches!(changes[i].change, Change::DropModule { .. })
+            first.is_some_and(|f| i > f)
+                && matches!(
+                    changes[i].change,
+                    Change::Module(ModuleChange::DropModule { .. })
+                )
         };
         let named = |i: usize| pairs.iter().any(|&(a, b)| a == i || b == i);
         // A module drop the search may move: one among the drops, or one
@@ -357,14 +366,17 @@ impl<'c> Search<'c> {
             late_module(i)
                 || (first.is_some_and(|f| i < f)
                     && named(i)
-                    && matches!(changes[i].change, Change::DropModule { .. }))
+                    && matches!(
+                        changes[i].change,
+                        Change::Module(ModuleChange::DropModule { .. })
+                    ))
         };
         let mut movable: BTreeSet<usize> = (0..changes.len())
             .filter(|&i| {
                 edge_module(i)
                     && named(i)
                     && matches!(&changes[i].change,
-                        Change::DropModule { id, .. } if facts.module_drop_matters(changes, id))
+                        Change::Module(ModuleChange::DropModule { id, .. }) if facts.module_drop_matters(changes, id))
             })
             .collect();
         let relevant = movable.clone();
@@ -413,7 +425,9 @@ impl<'c> Search<'c> {
         let moves: BTreeMap<usize, (TableName, TableName)> = region
             .iter()
             .filter_map(|&i| match &changes[i].change {
-                Change::RenameTable { from, to, .. } => Some((i, (from.clone(), to.clone()))),
+                Change::Table(TableChange::RenameTable { from, to, .. }) => {
+                    Some((i, (from.clone(), to.clone())))
+                }
                 _ => None,
             })
             .collect();
@@ -428,7 +442,7 @@ impl<'c> Search<'c> {
             let change = &changes[i].change;
             if let Some((_, to)) = moves.get(&i) {
                 names.insert(i, to);
-            } else if !matches!(change, Change::DropTable { .. })
+            } else if !matches!(change, Change::Table(TableChange::DropTable { .. }))
                 && let Some(table) = change.table()
                 && let Some((r, _)) = names.iter().find(|(_, now)| **now == table)
             {
@@ -616,6 +630,10 @@ impl<'c> Search<'c> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::TableChange;
     fn order_occupied_objects_under(
         cs: &mut ChangeSet,
         occupants: &[pbps_mssql::catalog::NameOccupant],
@@ -643,19 +661,19 @@ mod tests {
     }
 
     fn rename(from: &str, to: &str, defaults: &[&str]) -> PlannedChange {
-        PlannedChange::new(Change::RenameTable {
+        PlannedChange::new(Change::Table(TableChange::RenameTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, from, 0),
             from: name(from),
             to: name(to),
             defaults: defaults.iter().map(|d| (*d).into()).collect(),
-        })
+        }))
     }
 
     fn drop_check(table: &str, check: &str) -> PlannedChange {
-        PlannedChange::new(Change::DropCheck {
+        PlannedChange::new(Change::Constraint(ConstraintChange::DropCheck {
             table: name(table),
             name: check.into(),
-        })
+        }))
     }
 
     /// An object the catalog read found, under the name the plan asked for.
@@ -673,7 +691,7 @@ mod tests {
         cs.changes
             .iter()
             .filter_map(|p| {
-                if let Change::RenameTable { from, to, .. } = &p.change {
+                if let Change::Table(TableChange::RenameTable { from, to, .. }) = &p.change {
                     Some((from.raw().to_string(), to.raw().to_string()))
                 } else {
                     None
@@ -905,13 +923,13 @@ mod tests {
                     ),
                     &[],
                 ),
-                PlannedChange::new(Change::RenameColumn {
+                PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
                     uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "dbo.t.old", 0),
                     table: t.clone(),
                     from: "old".into(),
                     to: "new".into(),
                     table_was: None,
-                }),
+                })),
             ],
             &[held(
                 &format!(
@@ -1015,7 +1033,7 @@ mod tests {
     }
 
     fn rename_column(table: &str, from: &str, to: &str) -> PlannedChange {
-        PlannedChange::new(Change::RenameColumn {
+        PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
             uid: pbps_model::Uid::derived(
                 pbps_model::UidKind::Column,
                 &format!("{table}.{from}"),
@@ -1025,16 +1043,16 @@ mod tests {
             from: from.into(),
             to: to.into(),
             table_was: None,
-        })
+        }))
     }
 
     fn column_renames(cs: &ChangeSet) -> Vec<(String, String, String)> {
         cs.changes
             .iter()
             .filter_map(|p| {
-                if let Change::RenameColumn {
+                if let Change::Column(ColumnChange::RenameColumn {
                     table, from, to, ..
-                } = &p.change
+                }) = &p.change
                 {
                     Some((
                         table.raw().to_string(),
@@ -1151,16 +1169,16 @@ mod tests {
     #[test]
     fn a_module_drop_among_the_drops_keeps_its_place_in_the_search() {
         let drop_table = |table: &str| {
-            PlannedChange::new(Change::DropTable {
+            PlannedChange::new(Change::Table(TableChange::DropTable {
                 uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, table, 0),
                 name: name(table),
                 detach_from: None,
-            })
+            }))
         };
-        let drop_function = PlannedChange::new(Change::DropModule {
+        let drop_function = PlannedChange::new(Change::Module(ModuleChange::DropModule {
             id: pbps_model::ModuleId::Named(name("dbo.f")),
             kind: pbps_model::ModuleKind::Function,
-        });
+        }));
         // The conflict of the test above: `s1.a` cannot move to `s1.c` until
         // `s1.old` carries the default holding that name away.
         let adopted = held("s1.c", "default constraint", Some("s1.old"), Some("x"));
@@ -1187,7 +1205,8 @@ mod tests {
             .filter(|p| {
                 matches!(
                     p.change,
-                    Change::DropTable { .. } | Change::DropModule { .. }
+                    Change::Table(TableChange::DropTable { .. })
+                        | Change::Module(ModuleChange::DropModule { .. })
                 )
             })
             .map(|p| p.change.subject().to_string())
@@ -1198,10 +1217,10 @@ mod tests {
         let mut cs = ChangeSet {
             changes: vec![
                 drop_table("dbo.u"),
-                PlannedChange::new(Change::DropModule {
+                PlannedChange::new(Change::Module(ModuleChange::DropModule {
                     id: pbps_model::ModuleId::Named(name("dbo.f")),
                     kind: pbps_model::ModuleKind::Function,
-                }),
+                })),
                 drop_table("dbo.lookup"),
                 rename("s1.a", "s1.c", &[]),
                 rename("s1.old", "s2.new", &["x"]),
@@ -1221,7 +1240,8 @@ mod tests {
             .filter(|p| {
                 matches!(
                     p.change,
-                    Change::DropTable { .. } | Change::DropModule { .. }
+                    Change::Table(TableChange::DropTable { .. })
+                        | Change::Module(ModuleChange::DropModule { .. })
                 )
             })
             .map(|p| p.change.subject().to_string())
@@ -1231,10 +1251,10 @@ mod tests {
         // Negative: a module drop before the first rename or drop is class
         // 0's, and stays where it is, ahead of the region.
         let ahead = [
-            PlannedChange::new(Change::DropModule {
+            PlannedChange::new(Change::Module(ModuleChange::DropModule {
                 id: pbps_model::ModuleId::Named(name("dbo.g")),
                 kind: pbps_model::ModuleKind::Function,
-            }),
+            })),
             drop_table("dbo.u"),
             rename("s1.a", "s1.c", &[]),
         ];
@@ -1255,29 +1275,29 @@ mod tests {
     #[test]
     fn a_module_drop_moves_between_what_its_edges_order_it_after_and_before() {
         let drop_table = |table: &str| {
-            PlannedChange::new(Change::DropTable {
+            PlannedChange::new(Change::Table(TableChange::DropTable {
                 uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, table, 0),
                 name: name(table),
                 detach_from: None,
-            })
+            }))
         };
         let new = name("dbo.new");
         let generated = default_constraint_name(&new, "x");
-        let function = PlannedChange::new(Change::DropModule {
+        let function = PlannedChange::new(Change::Module(ModuleChange::DropModule {
             id: pbps_model::ModuleId::Named(name(&format!(
                 "dbo.{generated}",
                 // Preserve raw comparison-label or fixture SQL bytes in test data.
                 generated = generated.raw(),
             ))),
             kind: pbps_model::ModuleKind::Function,
-        });
-        let check = PlannedChange::new(Change::AddCheck {
+        }));
+        let check = PlannedChange::new(Change::Constraint(ConstraintChange::AddCheck {
             table: name("dbo.t"),
             name: generated.clone(),
             constraint: pbps_model::CheckConstraint {
                 expression: "a > 0".into(),
             },
-        });
+        }));
         // As `release` leaves it: the function right after `u`.
         let plan = || {
             vec![
@@ -1331,7 +1351,7 @@ mod tests {
         let renamed = cs
             .changes
             .iter()
-            .position(|p| matches!(p.change, Change::RenameTable { .. }))
+            .position(|p| matches!(p.change, Change::Table(TableChange::RenameTable { .. })))
             .unwrap();
         assert!(u < renamed && renamed < f, "{:?}", cs.changes);
 
@@ -1353,7 +1373,7 @@ mod tests {
         // The same with the function bound to a computed column dropped
         // before `z` (#1680 review): that drop waits for the function, so
         // the function cannot pass it, and the plan is refused.
-        let computed = PlannedChange::new(Change::DropComputedColumn {
+        let computed = PlannedChange::new(Change::Column(ColumnChange::DropComputedColumn {
             table: name("dbo.b"),
             name: "c".into(),
             computed: pbps_model::ComputedColumn {
@@ -1361,7 +1381,7 @@ mod tests {
                 persisted: false,
                 not_null: false,
             },
-        });
+        }));
         let mut changes = plan();
         changes.insert(2, computed.clone());
         let bound = [
@@ -1395,27 +1415,29 @@ mod tests {
         let generated = default_constraint_name(&new, "x");
         let functions: Vec<PlannedChange> = (0..11)
             .map(|k| {
-                PlannedChange::new(Change::DropModule {
+                PlannedChange::new(Change::Module(ModuleChange::DropModule {
                     id: pbps_model::ModuleId::Named(name(&format!("dbo.f{k}"))),
                     kind: pbps_model::ModuleKind::Function,
-                })
+                }))
             })
             .collect();
-        let z = PlannedChange::new(Change::DropTable {
+        let z = PlannedChange::new(Change::Table(TableChange::DropTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.z", 0),
             name: name("dbo.z"),
             detach_from: None,
-        });
+        }));
         let mut changes = vec![z.clone()];
         changes.extend(functions.iter().cloned());
         changes.push(rename("dbo.old", "dbo.new", &["x"]));
-        changes.push(PlannedChange::new(Change::AddCheck {
-            table: name("dbo.t"),
-            name: generated.clone(),
-            constraint: pbps_model::CheckConstraint {
-                expression: "a > 0".into(),
+        changes.push(PlannedChange::new(Change::Constraint(
+            ConstraintChange::AddCheck {
+                table: name("dbo.t"),
+                name: generated.clone(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "a > 0".into(),
+                },
             },
-        }));
+        )));
         let occupants = [
             held(
                 &format!(
@@ -1444,7 +1466,10 @@ mod tests {
         let mut cs = ChangeSet { changes };
         order_occupied_objects_under(&mut cs, &occupants, &[], "prod", &precedence).unwrap();
         assert!(
-            matches!(cs.changes[0].change, Change::RenameTable { .. }),
+            matches!(
+                cs.changes[0].change,
+                Change::Table(TableChange::RenameTable { .. })
+            ),
             "{:?}",
             cs.changes
         );
@@ -1465,27 +1490,27 @@ mod tests {
         let new = name("dbo.new");
         let generated = default_constraint_name(&new, "x");
         let check = |n: &str| {
-            PlannedChange::new(Change::AddCheck {
+            PlannedChange::new(Change::Constraint(ConstraintChange::AddCheck {
                 table: name("dbo.t"),
                 name: n.into(),
                 constraint: pbps_model::CheckConstraint {
                     expression: "a > 0".into(),
                 },
-            })
+            }))
         };
         let functions: Vec<PlannedChange> = (0..11)
             .map(|k| {
-                PlannedChange::new(Change::DropModule {
+                PlannedChange::new(Change::Module(ModuleChange::DropModule {
                     id: pbps_model::ModuleId::Named(name(&format!("dbo.g{k}"))),
                     kind: pbps_model::ModuleKind::Function,
-                })
+                }))
             })
             .collect();
-        let z = PlannedChange::new(Change::DropTable {
+        let z = PlannedChange::new(Change::Table(TableChange::DropTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.z", 0),
             name: name("dbo.z"),
             detach_from: None,
-        });
+        }));
         let mut changes = vec![z.clone()];
         changes.extend(functions.iter().cloned());
         changes.push(rename("dbo.old", "dbo.new", &["x"]));
@@ -1527,7 +1552,10 @@ mod tests {
         let mut cs = ChangeSet { changes };
         order_occupied_objects_under(&mut cs, &occupants, &[], "prod", &precedence).unwrap();
         assert!(
-            matches!(cs.changes[0].change, Change::RenameTable { .. }),
+            matches!(
+                cs.changes[0].change,
+                Change::Table(TableChange::RenameTable { .. })
+            ),
             "{:?}",
             cs.changes
         );
@@ -1563,19 +1591,19 @@ mod tests {
     #[test]
     fn a_module_drop_tied_to_a_movable_one_moves_with_it() {
         let drop_table = |table: &str| {
-            PlannedChange::new(Change::DropTable {
+            PlannedChange::new(Change::Table(TableChange::DropTable {
                 uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, table, 0),
                 name: name(table),
                 detach_from: None,
-            })
+            }))
         };
         let new = name("dbo.new");
         let generated = default_constraint_name(&new, "x");
         let drop_function = |n: &str| {
-            PlannedChange::new(Change::DropModule {
+            PlannedChange::new(Change::Module(ModuleChange::DropModule {
                 id: pbps_model::ModuleId::Named(name(n)),
                 kind: pbps_model::ModuleKind::Function,
-            })
+            }))
         };
         let f = drop_function(&format!(
             "dbo.{generated}",
@@ -1589,13 +1617,13 @@ mod tests {
             g.clone(),
             drop_table("dbo.z"),
             rename("dbo.old", "dbo.new", &["x"]),
-            PlannedChange::new(Change::AddCheck {
+            PlannedChange::new(Change::Constraint(ConstraintChange::AddCheck {
                 table: name("dbo.t"),
                 name: generated.clone(),
                 constraint: pbps_model::CheckConstraint {
                     expression: "a > 0".into(),
                 },
-            }),
+            })),
         ];
         let occupants = [
             held(
@@ -1632,7 +1660,7 @@ mod tests {
         let renamed = cs
             .changes
             .iter()
-            .position(|p| matches!(p.change, Change::RenameTable { .. }))
+            .position(|p| matches!(p.change, Change::Table(TableChange::RenameTable { .. })))
             .unwrap();
         assert!(
             renamed < at(&f.change) && at(&f.change) < at(&g.change),
@@ -1652,10 +1680,10 @@ mod tests {
         let new = name("dbo.new");
         let generated = default_constraint_name(&new, "x");
         let drop_function = |n: &str| {
-            PlannedChange::new(Change::DropModule {
+            PlannedChange::new(Change::Module(ModuleChange::DropModule {
                 id: pbps_model::ModuleId::Named(name(n)),
                 kind: pbps_model::ModuleKind::Function,
-            })
+            }))
         };
         let f = drop_function(&format!(
             "dbo.{generated}",
@@ -1663,24 +1691,24 @@ mod tests {
             generated = generated.raw(),
         ));
         let view = drop_function("dbo.v");
-        let lookup = PlannedChange::new(Change::DropTable {
+        let lookup = PlannedChange::new(Change::Table(TableChange::DropTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.lookup", 0),
             name: name("dbo.lookup"),
             detach_from: None,
-        });
+        }));
         let plan = || {
             vec![
                 f.clone(),
                 view.clone(),
                 lookup.clone(),
                 rename("dbo.old", "dbo.new", &["x"]),
-                PlannedChange::new(Change::AddCheck {
+                PlannedChange::new(Change::Constraint(ConstraintChange::AddCheck {
                     table: name("dbo.t"),
                     name: generated.clone(),
                     constraint: pbps_model::CheckConstraint {
                         expression: "a > 0".into(),
                     },
-                }),
+                })),
             ]
         };
         let occupants = [
@@ -1717,7 +1745,7 @@ mod tests {
         let renamed = cs
             .changes
             .iter()
-            .position(|p| matches!(p.change, Change::RenameTable { .. }))
+            .position(|p| matches!(p.change, Change::Table(TableChange::RenameTable { .. })))
             .unwrap();
         assert!(
             renamed < at(&f.change) && at(&f.change) < at(&lookup.change),
@@ -1740,10 +1768,10 @@ mod tests {
         let new = name("dbo.new");
         let generated = default_constraint_name(&new, "x");
         let drop_function = |n: &str| {
-            PlannedChange::new(Change::DropModule {
+            PlannedChange::new(Change::Module(ModuleChange::DropModule {
                 id: pbps_model::ModuleId::Named(name(n)),
                 kind: pbps_model::ModuleKind::Function,
-            })
+            }))
         };
         let f = drop_function(&format!(
             "dbo.{generated}",
@@ -1756,13 +1784,15 @@ mod tests {
         let mut changes = vec![f.clone()];
         changes.extend(followers.iter().cloned());
         changes.push(rename("dbo.old", "dbo.new", &["x"]));
-        changes.push(PlannedChange::new(Change::AddCheck {
-            table: name("dbo.t"),
-            name: generated.clone(),
-            constraint: pbps_model::CheckConstraint {
-                expression: "a > 0".into(),
+        changes.push(PlannedChange::new(Change::Constraint(
+            ConstraintChange::AddCheck {
+                table: name("dbo.t"),
+                name: generated.clone(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "a > 0".into(),
+                },
             },
-        }));
+        )));
         let occupants = [
             held(
                 &format!(
@@ -1794,7 +1824,10 @@ mod tests {
         let mut cs = ChangeSet { changes };
         order_occupied_objects_under(&mut cs, &occupants, &[], "prod", &precedence).unwrap();
         assert!(
-            matches!(cs.changes[0].change, Change::RenameTable { .. }),
+            matches!(
+                cs.changes[0].change,
+                Change::Table(TableChange::RenameTable { .. })
+            ),
             "{:?}",
             cs.changes
         );
@@ -1838,13 +1871,13 @@ mod tests {
         // A change the search does not move runs after the renames and drops
         // it ordered, where the walk it cleared had it: the proposal holds it
         // there, not only the renames' own order.
-        let column = PlannedChange::new(Change::RenameColumn {
+        let column = PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "dbo.t.p", 0),
             table: name("dbo.t"),
             from: "p".into(),
             to: "q".into(),
             table_was: None,
-        });
+        }));
         let with_column = order(
             vec![
                 rename("s1.a", "s1.c", &[]),
@@ -1890,8 +1923,8 @@ mod tests {
         let table = |cs: &[PlannedChange]| -> Vec<String> {
             cs.iter()
                 .filter_map(|p| {
-                    if let Change::DropCheck { table, .. }
-                    | Change::DropComputedColumn { table, .. } = &p.change
+                    if let Change::Constraint(ConstraintChange::DropCheck { table, .. })
+                    | Change::Column(ColumnChange::DropComputedColumn { table, .. }) = &p.change
                     {
                         Some(table.raw().to_string())
                     } else {
@@ -1901,7 +1934,7 @@ mod tests {
                 .collect()
         };
         // A computed column's drop is addressed the same way (#1174).
-        let computed = PlannedChange::new(Change::DropComputedColumn {
+        let computed = PlannedChange::new(Change::Column(ColumnChange::DropComputedColumn {
             table: name("s2.new"),
             name: "c".into(),
             computed: pbps_model::ComputedColumn {
@@ -1909,7 +1942,7 @@ mod tests {
                 persisted: false,
                 not_null: false,
             },
-        });
+        }));
         let after = [rename("s1.old", "s2.new", &[]), computed];
         let search = Search::new(&after, &[], &NameFacts::new(&[], &[]));
         assert_eq!(table(&reordered(&search, &[0, 1])), ["s2.new"]);

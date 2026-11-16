@@ -9,6 +9,11 @@
 //! it names nothing a module could bind, and it is there when the table is.
 
 use pbps_dialect::DialectError;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::TableChange;
+use pbps_model::TablePropertyChange;
 use pbps_model::{Change, ColumnName, ColumnRef, IdsFile, ModuleId, ValueSource};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -89,13 +94,13 @@ fn parts_in(
     scratch: bool,
     demand: &mut pbps_dialect::creation::Demand,
 ) -> Result<Option<Vec<Change>>, DialectError> {
-    let Change::CreateTable {
+    let Change::Table(TableChange::CreateTable {
         uid,
         name,
         table,
         beside_default,
         moves_at_most,
-    } = change
+    }) = change
     else {
         return Ok(None);
     };
@@ -232,12 +237,12 @@ fn parts_in(
                 && late_column(column)
             {
                 let from = crate::emit::generation_placeholder(&spec.ty)?;
-                tail.push(Change::AlterColumnExpression {
+                tail.push(Change::Column(ColumnChange::AlterColumnExpression {
                     uid: column_uid(column)?,
                     column: ColumnRef::new(name.clone(), column.clone()),
                     from: from.clone(),
                     to: std::mem::replace(&mut g.expression, from),
-                });
+                }));
             }
         }
     } else {
@@ -246,12 +251,12 @@ fn parts_in(
             if at < cut {
                 bare.columns.insert(column, spec);
             } else {
-                tail.push(Change::AddColumn {
+                tail.push(Change::Column(ColumnChange::AddColumn {
                     uid: column_uid(&column)?,
                     table: name.clone(),
                     name: column,
                     column: Box::new(spec),
-                });
+                }));
             }
         }
     }
@@ -263,12 +268,12 @@ fn parts_in(
             .keeps_part(name, &pbps_model::operation::PartKey::PrimaryKey)
             && key.columns.iter().any(&late_column)
     }) {
-        tail.push(Change::SetPrimaryKey {
+        tail.push(Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: name.clone(),
             from: None,
             to: bare.primary_key.take(),
             nonclustered: !table.primary_key_is_clustered(),
-        });
+        }));
     }
     for (key, constraint) in std::mem::take(&mut bare.unique) {
         if !demand
@@ -276,12 +281,12 @@ fn parts_in(
             .keeps_part(name, &pbps_model::operation::PartKey::Unique(key.clone()))
             && constraint.columns.iter().any(&late_column)
         {
-            tail.push(Change::AddUnique {
+            tail.push(Change::Constraint(ConstraintChange::AddUnique {
                 table: name.clone(),
                 clustered: table.unique_is_clustered(key.raw()),
                 name: key,
                 constraint,
-            });
+            }));
         } else {
             bare.unique.insert(key, constraint);
         }
@@ -294,11 +299,11 @@ fn parts_in(
         ) {
             bare.foreign_keys.insert(key, constraint);
         } else {
-            tail.push(Change::AddForeignKey {
+            tail.push(Change::Constraint(ConstraintChange::AddForeignKey {
                 table: name.clone(),
                 name: key,
                 constraint: Box::new(constraint),
-            });
+            }));
         }
     }
     for (key, constraint) in std::mem::take(&mut bare.checks) {
@@ -307,11 +312,11 @@ fn parts_in(
             .keeps_part(name, &pbps_model::operation::PartKey::Check(key.clone()))
             && late_text(&constraint.expression)
         {
-            tail.push(Change::AddCheck {
+            tail.push(Change::Constraint(ConstraintChange::AddCheck {
                 table: name.clone(),
                 name: key,
                 constraint,
-            });
+            }));
         } else {
             bare.checks.insert(key, constraint);
         }
@@ -326,12 +331,12 @@ fn parts_in(
                 .inline
                 .keeps_part(name, &pbps_model::operation::PartKey::Index(key.clone()))
         {
-            tail.push(Change::AddIndex {
+            tail.push(Change::Index(IndexChange::AddIndex {
                 table: name.clone(),
                 clustered: table.index_is_clustered(key.raw()),
                 name: key,
                 index: Box::new(index),
-            });
+            }));
         } else {
             bare.indexes.insert(key, index);
         }
@@ -345,11 +350,13 @@ fn parts_in(
         }
     };
     if identity_late {
-        tail.push(Change::SetReplicaIdentity {
-            uid: uid.clone(),
-            table: name.clone(),
-            to: bare.replica_identity.take(),
-        });
+        tail.push(Change::TableProperty(
+            TablePropertyChange::SetReplicaIdentity {
+                uid: uid.clone(),
+                table: name.clone(),
+                to: bare.replica_identity.take(),
+            },
+        ));
     }
     for (column, spec) in &mut bare.columns {
         if let ValueSource::Default(text) = &mut spec.value_source
@@ -358,7 +365,7 @@ fn parts_in(
         {
             let to = std::mem::take(text);
             spec.value_source = ValueSource::None;
-            tail.push(Change::AlterColumnDefault {
+            tail.push(Change::Column(ColumnChange::AlterColumnDefault {
                 // Scratch has no use for a recorded identity, and a table
                 // given none is still reconstructed.
                 uid: if scratch {
@@ -371,7 +378,7 @@ fn parts_in(
                 column: name.column(column),
                 from: None,
                 to: Some(to),
-            });
+            }));
         }
     }
     // A partition's own default is set after its parent's, which reaches
@@ -381,12 +388,12 @@ fn parts_in(
             && !demand.inline.keeps_default(name, column)
             && let Some(default) = own.default.take()
         {
-            tail.push(Change::AlterColumnDefault {
+            tail.push(Change::Column(ColumnChange::AlterColumnDefault {
                 uid: uid.clone(),
                 column: name.column(column),
                 from: None,
                 to: Some(default),
-            });
+            }));
         }
     }
 
@@ -396,16 +403,24 @@ fn parts_in(
             [
                 matches!(
                     part,
-                    Change::AddColumn { .. } | Change::AlterColumnExpression { .. }
+                    Change::Column(ColumnChange::AddColumn { .. })
+                        | Change::Column(ColumnChange::AlterColumnExpression { .. })
                 ),
                 matches!(
                     part,
-                    Change::SetPrimaryKey { .. } | Change::AddUnique { .. }
+                    Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+                        | Change::Constraint(ConstraintChange::AddUnique { .. })
                 ),
-                matches!(part, Change::AddForeignKey { .. }),
-                matches!(part, Change::AlterColumnDefault { .. }),
-                matches!(part, Change::AddCheck { .. }),
-                matches!(part, Change::AddIndex { .. }),
+                matches!(
+                    part,
+                    Change::Constraint(ConstraintChange::AddForeignKey { .. })
+                ),
+                matches!(
+                    part,
+                    Change::Column(ColumnChange::AlterColumnDefault { .. })
+                ),
+                matches!(part, Change::Constraint(ConstraintChange::AddCheck { .. })),
+                matches!(part, Change::Index(IndexChange::AddIndex { .. })),
             ]
             .iter()
             .position(|kind| *kind)
@@ -413,13 +428,13 @@ fn parts_in(
         };
         tail.sort_by_key(kinds);
     }
-    let mut parts = vec![Change::CreateTable {
+    let mut parts = vec![Change::Table(TableChange::CreateTable {
         uid: uid.clone(),
         name: name.clone(),
         table: Box::new(bare),
         beside_default: beside_default.clone(),
         moves_at_most: *moves_at_most,
-    }];
+    })];
     parts.extend(tail);
     demand.inline.check(&parts, "postgres")?;
     Ok(Some(parts))

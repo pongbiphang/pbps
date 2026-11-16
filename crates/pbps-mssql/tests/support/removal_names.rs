@@ -1,4 +1,7 @@
 use super::*;
+use pbps_model::ConstraintChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
 use pbps_model::{Change, ChangeSet, PlannedChange, change::DeleteCause};
 
 /// A removal names its table at that step, even if another table later takes
@@ -20,22 +23,28 @@ async fn a_removal_keeps_its_stored_table_when_names_change_hands() {
         db.conn.execute(sql).await.unwrap();
     }
     let table = |name: &str| TableName::new("dbo", name);
-    let rename = |from: &str, to: &str| Change::RenameTable {
-        uid: Uid::generate(pbps_model::UidKind::Table),
-        from: table(from),
-        to: table(to),
-        defaults: Vec::new(),
+    let rename = |from: &str, to: &str| {
+        Change::Table(TableChange::RenameTable {
+            uid: Uid::generate(pbps_model::UidKind::Table),
+            from: table(from),
+            to: table(to),
+            defaults: Vec::new(),
+        })
     };
-    let drop_a = || Change::DropTable {
-        uid: Uid::generate(pbps_model::UidKind::Table),
-        name: table("a"),
-        detach_from: None,
+    let drop_a = || {
+        Change::Table(TableChange::DropTable {
+            uid: Uid::generate(pbps_model::UidKind::Table),
+            name: table("a"),
+            detach_from: None,
+        })
     };
-    let drop_fk = |name: &str| Change::DropForeignKey {
-        table: table(name),
-        name: "fk_a".into(),
+    let drop_fk = |name: &str| {
+        Change::Constraint(ConstraintChange::DropForeignKey {
+            table: table(name),
+            name: "fk_a".into(),
+        })
     };
-    let deleting = Change::DeleteRow {
+    let deleting = Change::Row(RowChange::DeleteRow {
         table: table("p"),
         key_column: "id".into(),
         key: "1".into(),
@@ -45,7 +54,7 @@ async fn a_removal_keeps_its_stored_table_when_names_change_hands() {
         types: Default::default(),
         after_types: Default::default(),
         key_type: None,
-    };
+    });
     let dialect = Mssql;
     for (label, prefix, arrivals) in [
         ("drop then handoff", vec![drop_a(), rename("b", "a")], 0),
@@ -65,7 +74,7 @@ async fn a_removal_keeps_its_stored_table_when_names_change_hands() {
             vec![
                 drop_a(),
                 rename("b", "a"),
-                Change::InsertRow {
+                Change::Row(RowChange::InsertRow {
                     table: table("a"),
                     key_column: "id".into(),
                     key: "3".into(),
@@ -75,7 +84,7 @@ async fn a_removal_keeps_its_stored_table_when_names_change_hands() {
                         .collect(),
                     defaults: Default::default(),
                     types: [("parent".into(), "int".parse().unwrap())].into(),
-                },
+                }),
             ],
             1,
         ),

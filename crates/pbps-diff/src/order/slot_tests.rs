@@ -6,6 +6,12 @@ use std::collections::BTreeSet;
 
 use pbps_dialect::slots::{CatalogFacts, Namespace, SlotKey};
 use pbps_dialect::{Dialect, DialectError, MinimalDialect, Statement};
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
 use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot, effects};
 use pbps_model::plan_names::PlanNames;
 use pbps_model::{
@@ -43,7 +49,7 @@ impl Dialect for Slotted {
         strategy: Strategy,
     ) -> Result<Vec<TableName>, DialectError> {
         let statements = (|| -> Result<Vec<Statement>, DialectError> {
-            if let Change::RenameTable { from, to, .. } = change
+            if let Change::Table(TableChange::RenameTable { from, to, .. }) = change
                 && from.schema != to.schema
             {
                 let stop = TableName::new(to.schema.clone(), from.name.clone());
@@ -111,17 +117,17 @@ fn a_trigger_handover_is_pending_only_before_the_shared_schedule() {
         &[("t", "app.t")],
         &[("t", "app.t")],
         vec![
-            Change::AddCheck {
+            Change::Constraint(ConstraintChange::AddCheck {
                 table: name("app.t"),
                 name: "audit".into(),
                 constraint: CheckConstraint {
                     expression: "id > 0".into(),
                 },
-            },
-            Change::AlterModule {
+            }),
+            Change::Module(ModuleChange::AlterModule {
                 id: trigger.clone(),
                 module: Box::new(module("ORDINARY")),
-            },
+            }),
         ],
     );
     plan.before.modules.insert(trigger, module("CONSTRAINT"));
@@ -270,19 +276,19 @@ fn occupant(at: &str, owner: &str, column: Option<&str>) -> pbps_dialect::slots:
 }
 
 fn drop_table(seed: &str, at: &str) -> Change {
-    Change::DropTable {
+    Change::Table(TableChange::DropTable {
         uid: uid(seed),
         name: name(at),
         detach_from: None,
-    }
+    })
 }
 fn rename_table(seed: &str, from: &str, to: &str) -> Change {
-    Change::RenameTable {
+    Change::Table(TableChange::RenameTable {
         uid: uid(seed),
         from: name(from),
         to: name(to),
         defaults: Vec::new(),
-    }
+    })
 }
 
 fn held(violations: &[SlotViolation]) -> Vec<String> {
@@ -477,14 +483,14 @@ fn a_name_two_objects_keep_is_contested_not_misordered() {
         &[("t", "app.t")],
         &[("t", "app.t")],
         vec![
-            Change::AddCheck {
+            Change::Constraint(ConstraintChange::AddCheck {
                 table: name("app.t"),
                 name: "shared".into(),
                 constraint: pbps_model::CheckConstraint {
                     expression: "true".into(),
                 },
-            },
-            Change::AddUnique {
+            }),
+            Change::Constraint(ConstraintChange::AddUnique {
                 table: name("app.t"),
                 name: "shared".into(),
                 constraint: pbps_model::UniqueConstraint {
@@ -493,7 +499,7 @@ fn a_name_two_objects_keep_is_contested_not_misordered() {
                     filegroup: None,
                 },
                 clustered: false,
-            },
+            }),
         ],
     );
     let (found, _, _) = plan.run(&[0, 1], &Slotted { exact: true }, None);
@@ -511,19 +517,19 @@ fn a_columns_default_constraint_leaves_with_the_columns_default() {
         &[("t", "app.t")],
         &[("t", "app.t"), ("n", "app.DF_t_c")],
         vec![
-            Change::AlterColumnDefault {
+            Change::Column(ColumnChange::AlterColumnDefault {
                 uid: column_uid.clone(),
                 column: name("app.t").column("c"),
                 from: Some("1".into()),
                 to: None,
-            },
-            Change::CreateTable {
+            }),
+            Change::Table(TableChange::CreateTable {
                 uid: uid("n"),
                 name: name("app.DF_t_c"),
                 table: Box::default(),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
         ],
     );
     for (schema, ids) in [
@@ -573,17 +579,17 @@ fn a_column_and_an_index_of_one_table_do_not_share_a_name() {
         &[("t", "app.t")],
         &[("t", "app.t")],
         vec![
-            Change::RenameColumn {
+            Change::Column(ColumnChange::RenameColumn {
                 uid: column_uid.clone(),
                 table: name("app.t"),
                 from: "a".into(),
                 to: "ix".into(),
                 table_was: None,
-            },
-            Change::DropIndex {
+            }),
+            Change::Index(IndexChange::DropIndex {
                 table: name("app.t"),
                 name: "ix".into(),
-            },
+            }),
         ],
     );
     let int = || pbps_model::Column::new("int".parse().unwrap());
@@ -640,11 +646,11 @@ fn a_key_waits_for_the_index_whose_name_it_takes() {
         &[("t", "app.t")],
         &[("t", "app.t")],
         vec![
-            Change::DropIndex {
+            Change::Index(IndexChange::DropIndex {
                 table: name("app.t"),
                 name: "k".into(),
-            },
-            Change::AddUnique {
+            }),
+            Change::Constraint(ConstraintChange::AddUnique {
                 table: name("app.t"),
                 name: "k".into(),
                 constraint: pbps_model::UniqueConstraint {
@@ -653,7 +659,7 @@ fn a_key_waits_for_the_index_whose_name_it_takes() {
                     filegroup: None,
                 },
                 clustered: false,
-            },
+            }),
         ],
     );
     plan.before
@@ -697,10 +703,10 @@ fn a_dropped_triggers_catalog_row_does_not_hold_its_name() {
         &[("old", "s1.old"), ("owner", "s2.owner")],
         &[("old", "s2.new"), ("owner", "s2.owner")],
         vec![
-            Change::DropModule {
+            Change::Module(ModuleChange::DropModule {
                 id: trigger.clone(),
                 kind: pbps_model::ModuleKind::Trigger,
-            },
+            }),
             rename_table("old", "s1.old", "s2.new"),
         ],
     );
@@ -835,19 +841,19 @@ fn an_occupant_two_steps_may_free_is_ordered_by_neither() {
         &[("t", "app.t")],
         &[("t", "app.t"), ("n", "app.DF_t_c")],
         vec![
-            Change::AlterColumnDefault {
+            Change::Column(ColumnChange::AlterColumnDefault {
                 uid: column_uid.clone(),
                 column: name("app.t").column("c"),
                 from: Some("1".into()),
                 to: None,
-            },
-            Change::CreateTable {
+            }),
+            Change::Table(TableChange::CreateTable {
                 uid: uid("n"),
                 name: name("app.DF_t_c"),
                 table: Box::default(),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
         ],
     );
     for (schema, ids) in [
@@ -876,13 +882,15 @@ fn an_occupant_two_steps_may_free_is_ordered_by_neither() {
     assert_eq!(found, [(0, 1, true)]);
 
     // A rename of the same column may take the default away too.
-    plan.logical.push(PlannedChange::new(Change::RenameColumn {
-        uid: column_uid.clone(),
-        table: name("app.t"),
-        from: "c".into(),
-        to: "d".into(),
-        table_was: None,
-    }));
+    plan.logical.push(PlannedChange::new(Change::Column(
+        ColumnChange::RenameColumn {
+            uid: column_uid.clone(),
+            table: name("app.t"),
+            from: "c".into(),
+            to: "d".into(),
+            table_was: None,
+        },
+    )));
     let columns = &mut plan.after.tables.get_mut(&name("app.t")).unwrap().columns;
     let column = columns.shift_remove("c").unwrap();
     columns.insert("d".into(), column);
@@ -931,13 +939,13 @@ fn a_certain_step_decides_beside_a_column_change_that_only_may() {
         vec![
             rename_table("a", "s1.a", "s2.a"),
             rename_table("b", "s2.b", "s3.b"),
-            Change::RenameColumn {
+            Change::Column(ColumnChange::RenameColumn {
                 uid: column_uid.clone(),
                 table: name("s3.b"),
                 from: "id".into(),
                 to: "id2".into(),
                 table_was: Some(name("s2.b")),
-            },
+            }),
         ],
     );
     let int = || pbps_model::Column::new("int".parse().unwrap());
@@ -987,10 +995,10 @@ fn a_tables_move_frees_its_occupant_before_a_later_drop_of_its_column() {
         vec![
             rename_table("a", "s1.a", "s2.a"),
             rename_table("b", "s2.b", "s3.b"),
-            Change::DropColumn {
+            Change::Column(ColumnChange::DropColumn {
                 uid: column_uid.clone(),
                 column: name("s3.b").column("id"),
-            },
+            }),
         ],
     );
     plan.before
@@ -1021,16 +1029,18 @@ fn a_tables_move_frees_its_occupant_before_a_later_drop_of_its_column() {
 fn detach_handover(cyclic: bool) -> (Plan, CatalogFacts) {
     use pbps_dialect::slots::Occupant;
     use pbps_model::{DetachedKind, DetachedName};
-    let detach = |seed: &str, wanted: &str| Change::DetachPartition {
-        uid: uid(seed),
-        table: name(&format!("app.{seed}")),
-        parent: name("app.p"),
-        names: vec![DetachedName {
-            kind: DetachedKind::PrimaryKey,
-            parent: "p_pk".into(),
-            name: Some(wanted.into()),
-        }],
-        shape: Box::new(Table::default()),
+    let detach = |seed: &str, wanted: &str| {
+        Change::Partition(PartitionChange::DetachPartition {
+            uid: uid(seed),
+            table: name(&format!("app.{seed}")),
+            parent: name("app.p"),
+            names: vec![DetachedName {
+                kind: DetachedKind::PrimaryKey,
+                parent: "p_pk".into(),
+                name: Some(wanted.into()),
+            }],
+            shape: Box::new(Table::default()),
+        })
     };
     let tables = [("p", "app.p"), ("a", "app.a"), ("z", "app.z")];
     let plan = Plan::new(

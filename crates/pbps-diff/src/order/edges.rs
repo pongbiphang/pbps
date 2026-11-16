@@ -157,7 +157,8 @@ pub(crate) fn connected_module_release(edge: &Edge, operations: &[Operation]) ->
     ) && [edge.before, edge.after].into_iter().any(|at| {
         matches!(
             operations[at].change(),
-            pbps_model::Change::AlterModule { .. } | pbps_model::Change::DropModule { .. }
+            pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule { .. })
+                | pbps_model::Change::Module(pbps_model::ModuleChange::DropModule { .. })
         )
     })
 }
@@ -245,9 +246,9 @@ impl Checks {
 fn renames(op: &Operation) -> bool {
     matches!(
         op.change(),
-        pbps_model::Change::RenameTable { .. }
-            | pbps_model::Change::RenameColumn { .. }
-            | pbps_model::Change::RenameRole { .. }
+        pbps_model::Change::Table(pbps_model::TableChange::RenameTable { .. })
+            | pbps_model::Change::Column(pbps_model::ColumnChange::RenameColumn { .. })
+            | pbps_model::Change::Role(pbps_model::RoleChange::RenameRole { .. })
     )
 }
 

@@ -2,6 +2,10 @@
 //! independent tiny interpreter and enumeration are test-only (DEC-2296.1).
 use super::*;
 use crate::order::{Baseline, Checks, Schedule, Violation, graph, verify};
+use pbps_model::ColumnChange;
+use pbps_model::PartitionChange;
+use pbps_model::RoleChange;
+use pbps_model::TableChange;
 use pbps_model::operation::{
     BoundInput, ColumnKey, Incarnation, ModuleEdits, ObjectKey, Operations, OwnerError, Owners,
     Spelling,
@@ -47,13 +51,13 @@ impl Owners for NoLookup {
 fn recorded(uid: &str) -> Recorded {
     // Read identity from a real operation payload; do not add a constructor
     // or an executable fixture route for this contract.
-    let change = Change::CreateTable {
+    let change = Change::Table(TableChange::CreateTable {
         uid: uid.parse().unwrap(),
         name: "app.p".parse().unwrap(),
         table: Box::default(),
         beside_default: None,
         moves_at_most: None,
-    };
+    });
     let plan = vec![PlannedChange::new(change)];
     let ops = Operations::of_plan(&plan, ModuleEdits::InPlace);
     let ObjectKey::Table(recorded) = ops.as_slice()[0].key(&NoLookup).unwrap() else {
@@ -62,12 +66,14 @@ fn recorded(uid: &str) -> Recorded {
     recorded
 }
 fn column(uid: &str) -> ColumnKey {
-    let changes = vec![PlannedChange::new(Change::AddColumn {
-        uid: uid.parse().unwrap(),
-        table: "app.p".parse().unwrap(),
-        name: "d".into(),
-        column: Box::new(pbps_model::Column::new("int".parse().unwrap())),
-    })];
+    let changes = vec![PlannedChange::new(Change::Column(
+        ColumnChange::AddColumn {
+            uid: uid.parse().unwrap(),
+            table: "app.p".parse().unwrap(),
+            name: "d".into(),
+            column: Box::new(pbps_model::Column::new("int".parse().unwrap())),
+        },
+    ))];
     let ops = Operations::of_plan(&changes, ModuleEdits::InPlace);
     let ObjectKey::Column(key) = ops.as_slice()[0].key(&NoLookup).unwrap() else {
         panic!()
@@ -130,10 +136,10 @@ impl Fixture {
     fn new(n: usize) -> Self {
         let plan: Vec<_> = (0..n)
             .map(|i| {
-                PlannedChange::new(Change::CreateRole {
+                PlannedChange::new(Change::Role(RoleChange::CreateRole {
                     uid: "r_aaaaaa".parse().unwrap(),
                     name: format!("step{i}").into(),
-                })
+                }))
             })
             .collect();
         let ops = Operations::of_plan(&plan, ModuleEdits::InPlace)
@@ -1082,14 +1088,14 @@ fn physical_sources_agrees_with_symbolic_scope_entry_and_exit() {
         partition_of: Some(of),
         ..Default::default()
     };
-    let change = PlannedChange::new(Change::AttachPartition {
+    let change = PlannedChange::new(Change::Partition(PartitionChange::AttachPartition {
         uid: "t_bbbbbb".parse().unwrap(),
         table: child.clone(),
         parent: parent.clone(),
         bound,
         key: vec![],
         shape: Box::new(shape),
-    });
+    }));
     let changes = vec![change];
     let names = PlanNames::of(&changes, &final_ids).unwrap();
     let view = PhysicalSources::of(names, &base, &ids).unwrap();
@@ -1116,13 +1122,15 @@ fn physical_sources_agrees_with_symbolic_scope_entry_and_exit() {
     detached_ids
         .columns
         .insert("c_cccccc".parse().unwrap(), child.column("d"));
-    let detach = vec![PlannedChange::new(Change::DetachPartition {
-        uid: "t_bbbbbb".parse().unwrap(),
-        table: child.clone(),
-        parent: parent.clone(),
-        names: vec![],
-        shape: Box::new(table.clone()),
-    })];
+    let detach = vec![PlannedChange::new(Change::Partition(
+        PartitionChange::DetachPartition {
+            uid: "t_bbbbbb".parse().unwrap(),
+            table: child.clone(),
+            parent: parent.clone(),
+            names: vec![],
+            shape: Box::new(table.clone()),
+        },
+    ))];
     let detached_names = PlanNames::of(&detach, &detached_ids).unwrap();
     let detached = PhysicalSources::of(detached_names, &detached_base, &final_ids).unwrap();
     assert_eq!(

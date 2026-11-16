@@ -5,6 +5,8 @@
 use crate::certified_fixture::FixtureEmission;
 
 use pbps_dialect::Dialect;
+use pbps_model::ColumnChange;
+use pbps_model::TableChange;
 use pbps_model::{
     Change, ChangeSet, Column, Declared, IdsFile, PlanBaseline, PlanOrigin, PlannedChange,
     SavedPlan, Schema, StateKind, StateSnapshot, Table, TableName, Uid, state_checksum,
@@ -34,24 +36,24 @@ fn artifacts(text: &str) -> (Schema, IdsFile, SavedPlan, StateSnapshot) {
     };
     let changes = ChangeSet {
         changes: vec![
-            planned(Change::AddColumn {
+            planned(Change::Column(ColumnChange::AddColumn {
                 uid: uid("c_aaaaaa"),
                 table: table.clone(),
                 name: kept.clone().into(),
                 column: Box::new(Column::new("int".parse().unwrap())),
-            }),
-            planned(Change::DropColumn {
+            })),
+            planned(Change::Column(ColumnChange::DropColumn {
                 uid: uid("c_bbbbbb"),
                 column: table.column(dropped),
-            }),
-            planned(Change::AlterColumnNullability {
+            })),
+            planned(Change::Column(ColumnChange::AlterColumnNullability {
                 uid: uid("c_aaaaaa"),
                 column: table.column(&kept),
                 ty: "int".parse().unwrap(),
                 to_nullable: false,
                 collation: None,
                 through_external_partitions: false,
-            }),
+            })),
         ],
     };
     let schema = Schema {
@@ -199,13 +201,13 @@ fn a_dialect_refusal_escapes_a_table_name_exactly_once() {
         &pbps_mssql::Mssql,
     ] {
         for (part, shown) in [(NAME, SHOWN), ("名前_ünï", "名前_ünï")] {
-            let change = Change::CreateTable {
+            let change = Change::Table(TableChange::CreateTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: TableName::new("app", part),
                 table: Box::new(Table::default()),
                 beside_default: None,
                 moves_at_most: None,
-            };
+            });
             let error = dialect
                 .fixture_emit(&change, Default::default())
                 .unwrap_err();
@@ -297,11 +299,11 @@ fn declaration_policy_keys_stay_raw_and_cli_prose_is_shown_once() {
 #[test]
 fn table_change_descriptions_are_shown_once_in_json_and_under_approval() {
     let (_, _, mut plan, _) = artifacts(NAME);
-    plan.changes.changes = vec![PlannedChange::new(Change::DropTable {
+    plan.changes.changes = vec![PlannedChange::new(Change::Table(TableChange::DropTable {
         uid: "t_aaaaaa".parse().unwrap(),
         name: TableName::new("app", NAME),
         detach_from: None,
-    })];
+    }))];
     plan.ids = IdsFile::default();
     plan.data.clear();
     let dir = std::env::temp_dir().join(format!("pbps-name-description-{}", rand::random::<u64>()));

@@ -1256,23 +1256,25 @@ fn place(staging: &mut Staging, available: impl Fn(&BTreeSet<(String, String)>) 
     let changes: Vec<_> = required_relations(staging)
         .into_iter()
         .filter(|relation| available(&BTreeSet::from([relation.clone()])))
-        .map(|(schema, name)| pbps_model::Change::CreateTable {
-            uid: pbps_model::Uid::derived(
-                pbps_model::UidKind::Table,
-                &format!("{schema}.{name}"),
-                0,
-            ),
-            name: pbps_model::TableName::new(&schema, &name),
-            table: Box::new(pbps_model::Table {
-                columns: [(
-                    "id".into(),
-                    pbps_model::Column::new("integer".parse().unwrap()),
-                )]
-                .into(),
-                ..Default::default()
-            }),
-            beside_default: None,
-            moves_at_most: None,
+        .map(|(schema, name)| {
+            pbps_model::Change::Table(pbps_model::TableChange::CreateTable {
+                uid: pbps_model::Uid::derived(
+                    pbps_model::UidKind::Table,
+                    &format!("{schema}.{name}"),
+                    0,
+                ),
+                name: pbps_model::TableName::new(&schema, &name),
+                table: Box::new(pbps_model::Table {
+                    columns: [(
+                        "id".into(),
+                        pbps_model::Column::new("integer".parse().unwrap()),
+                    )]
+                    .into(),
+                    ..Default::default()
+                }),
+                beside_default: None,
+                moves_at_most: None,
+            })
         })
         .collect();
     let r = super::super::reconstruct::Reconstruction::with_fills(

@@ -5,6 +5,14 @@
 //! still receive its parent's expression. Preserve that transition rather than
 //! making each consumer recover it from `Change` (DEC-1773.1).
 
+use crate::ColumnChange;
+use crate::ConstraintChange;
+use crate::GrantChange;
+use crate::IndexChange;
+use crate::ModuleChange;
+use crate::PartitionChange;
+use crate::PolicyChange;
+use crate::TableChange;
 use crate::{Change, ColumnField, ColumnRef, ModuleId, ModuleKind, TableName, ValueSource};
 
 /// Where a part's creation comes from. A table's inline default is not a separate
@@ -96,7 +104,7 @@ impl Change {
         let named =
             |table, kind, name, effect| vec![direct(Part::Named { table, kind, name }, effect)];
         let mut out = match self {
-            Change::BuildPartitionedIndex(r) => vec![direct(
+            Change::Index(IndexChange::BuildPartitionedIndex(r)) => vec![direct(
                 match &r.definition {
                     crate::PartitionIndexDefinition::PrimaryKey(_) => Part::PrimaryKey(&r.parent.name),
                     crate::PartitionIndexDefinition::Index(_) => Part::Named {
@@ -112,8 +120,8 @@ impl Change {
                 },
                 Effect::Created,
             )],
-Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => Vec::new(),
-            Change::CreateTable { name, table, .. } => {
+Change::Partition(PartitionChange::RebuildPartitionedTable(_)) | Change::Partition(PartitionChange::CopyTableRows(_)) | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => Vec::new(),
+            Change::Table(TableChange::CreateTable { name, table, .. }) => {
                 let mut parts = vec![direct(Part::Table(name), Effect::Created)];
                 let mut contained = |part| {
                     parts.push(PartEffect {
@@ -145,14 +153,14 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
                 }
                 parts
             }
-            Change::DropTable { name, .. } => vec![direct(Part::Table(name), Effect::Removed)],
-            Change::RenameTable { from, .. } => vec![direct(Part::Table(from), Effect::Renamed)],
-            Change::AddColumn {
+            Change::Table(TableChange::DropTable { name, .. }) => vec![direct(Part::Table(name), Effect::Removed)],
+            Change::Table(TableChange::RenameTable { from, .. }) => vec![direct(Part::Table(from), Effect::Renamed)],
+            Change::Column(ColumnChange::AddColumn {
                 table,
                 name,
                 column,
                 ..
-            } => {
+            }) => {
                 let address = table.column(name);
                 let mut parts = vec![direct(Part::Column(address.clone()), Effect::Created)];
                 let expression = match column.value_source {
@@ -172,23 +180,23 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
                 }
                 parts
             }
-            Change::AddComputedColumn { table, name, .. } => vec![
+            Change::Column(ColumnChange::AddComputedColumn { table, name, .. }) => vec![
                 direct(Part::Column(table.column(name)), Effect::Created),
                 PartEffect { part: Part::Generated(table.column(name)), effect: Effect::Created, origin: Origin::Contained },
             ],
-            Change::DropComputedColumn { table, name, .. } => vec![
+            Change::Column(ColumnChange::DropComputedColumn { table, name, .. }) => vec![
                 direct(Part::Column(table.column(name)), Effect::Removed),
                 PartEffect { part: Part::Generated(table.column(name)), effect: Effect::Removed, origin: Origin::Contained },
             ],
-            Change::DropColumn { column, .. } => {
+            Change::Column(ColumnChange::DropColumn { column, .. }) => {
                 vec![direct(Part::Column(column.clone()), Effect::Removed)]
             }
-            Change::RenameColumn { table, from, .. } => {
+            Change::Column(ColumnChange::RenameColumn { table, from, .. }) => {
                 vec![direct(Part::Column(table.column(from)), Effect::Renamed)]
             }
-            Change::AlterColumnDefault {
+            Change::Column(ColumnChange::AlterColumnDefault {
                 column, from, to, ..
-            } => vec![direct(
+            }) => vec![direct(
                 Part::Default {
                     column: column.clone(),
                     change: DefaultChange::Column {
@@ -198,14 +206,14 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
                 },
                 transition(from.is_some(), to.is_some()),
             )],
-            Change::SetPartitionDefault {
+            Change::Partition(PartitionChange::SetPartitionDefault {
                 table,
                 column,
                 from,
                 to,
                 fallback,
                 ..
-            } => vec![direct(
+            }) => vec![direct(
                 Part::Default {
                     column: table.column(column),
                     change: DefaultChange::Partition {
@@ -216,36 +224,36 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
                 },
                 transition(from.is_some(), to.is_some() || fallback.is_some()),
             )],
-            Change::AlterColumnExpression { column, .. } => {
+            Change::Column(ColumnChange::AlterColumnExpression { column, .. }) => {
                 vec![direct(Part::Generated(column.clone()), Effect::Rewritten)]
             }
-            Change::DropPolicy { table, name, .. } => {
+            Change::Policy(PolicyChange::DropPolicy { table, name, .. }) => {
                 named(table, crate::Part::Policy, name, Effect::Removed)
             }
-            Change::CreatePolicy { table, name, .. } => {
+            Change::Policy(PolicyChange::CreatePolicy { table, name, .. }) => {
                 named(table, crate::Part::Policy, name, Effect::Created)
             }
-            Change::AddCheck { table, name, .. } => {
+            Change::Constraint(ConstraintChange::AddCheck { table, name, .. }) => {
                 named(table, crate::Part::Check, name.raw(), Effect::Created)
             }
-            Change::DropCheck { table, name } => {
+            Change::Constraint(ConstraintChange::DropCheck { table, name }) => {
                 named(table, crate::Part::Check, name.raw(), Effect::Removed)
             }
-            Change::AddIndex { table, name, .. } => {
+            Change::Index(IndexChange::AddIndex { table, name, .. }) => {
                 named(table, crate::Part::Index, name.raw(), Effect::Created)
             }
-            Change::DropIndex { table, name } => {
+            Change::Index(IndexChange::DropIndex { table, name }) => {
                 named(table, crate::Part::Index, name.raw(), Effect::Removed)
             }
-            Change::AddUnique { table, name, .. } => {
+            Change::Constraint(ConstraintChange::AddUnique { table, name, .. }) => {
                 named(table, crate::Part::Unique, name.raw(), Effect::Created)
             }
-            Change::DropUnique { table, name } => {
+            Change::Constraint(ConstraintChange::DropUnique { table, name }) => {
                 named(table, crate::Part::Unique, name.raw(), Effect::Removed)
             }
-            Change::SetExclusion {
+            Change::Constraint(ConstraintChange::SetExclusion {
                 table, name, to, ..
-            } => named(
+            }) => named(
                 table,
                 crate::Part::Exclusion,
                 name.raw(),
@@ -255,15 +263,15 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
                     Effect::Removed
                 },
             ),
-            Change::AddForeignKey { table, name, .. } => {
+            Change::Constraint(ConstraintChange::AddForeignKey { table, name, .. }) => {
                 named(table, crate::Part::ForeignKey, name.raw(), Effect::Created)
             }
-            Change::DropForeignKey { table, name } => {
+            Change::Constraint(ConstraintChange::DropForeignKey { table, name }) => {
                 named(table, crate::Part::ForeignKey, name.raw(), Effect::Removed)
             }
-            Change::SetPrimaryKey {
+            Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table, from, to, ..
-            } => {
+            }) => {
                 // No prior key and no replacement is not a catalog removal.
                 if from.is_none() && to.is_none() {
                     Vec::new()
@@ -274,41 +282,41 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
                     )]
                 }
             }
-            Change::CreateModule { id, module } => vec![direct(
+            Change::Module(ModuleChange::CreateModule { id, module }) => vec![direct(
                 Part::Module {
                     id,
                     kind: module.kind,
                 },
                 Effect::Created,
             )],
-            Change::AlterModule { id, module } => vec![direct(
+            Change::Module(ModuleChange::AlterModule { id, module }) => vec![direct(
                 Part::Module {
                     id,
                     kind: module.kind,
                 },
                 Effect::Rewritten,
             )],
-            Change::DropModule { id, kind } => {
+            Change::Module(ModuleChange::DropModule { id, kind }) => {
                 vec![direct(Part::Module { id, kind: *kind }, Effect::Removed)]
             }
             // These kinds have no separate dependency-bearing definition in
             // this projection. Column field changes are appended below.
-            Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
+            Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { .. })
             // A numbering source's sequence is no part this projection
             // names; PostgreSQL's drop impact finds it by its dependency on
             // the column (#1889).
-            | Change::AlterColumnNumbering { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetRowSecurity { .. }
+            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. })
             | crate::change_family!(table_properties)
-            | Change::SetPartitionNotNull { .. }
-            | Change::SetIndexStorageParameters { .. }
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
             | crate::change_family!(rows)
             | crate::change_family!(type_values)
-             | crate::catalog_change!() | Change::Grant { .. } | Change::Revoke { .. } | Change::PublicExecution { .. } => Vec::new(),
+             | crate::catalog_change!() | Change::Permission(GrantChange::Grant { .. }) | Change::Permission(GrantChange::Revoke { .. }) | Change::Permission(GrantChange::PublicExecution { .. }) => Vec::new(),
         };
         out.extend(
             self.columns_redefined()

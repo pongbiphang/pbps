@@ -1,5 +1,6 @@
 #![cfg(test)]
 use super::*;
+use pbps_model::GrantChange;
 
 pub(super) fn weave(
     cs: &mut ChangeSet,
@@ -80,7 +81,12 @@ pub(super) fn take_public_execution(cs: &mut ChangeSet) -> Vec<PlannedChange> {
     let observed = cs
         .changes
         .iter()
-        .filter(|p| matches!(p.change, Change::PublicExecution { .. }))
+        .filter(|p| {
+            matches!(
+                p.change,
+                Change::Permission(GrantChange::PublicExecution { .. })
+            )
+        })
         .cloned()
         .collect();
     crate::test_planning(cs, |plan| {

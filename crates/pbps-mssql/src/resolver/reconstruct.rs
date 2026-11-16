@@ -26,6 +26,16 @@
 use super::capture::{ObjectIdentity, class, object};
 use crate::Mssql;
 use pbps_diff::order::scratch::{Input, Part};
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PolicyChange;
+use pbps_model::RoleChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
+use pbps_model::TypeChange;
 use pbps_model::{Change, Strategy};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -185,15 +195,15 @@ impl Reconstruction {
                 part(operation, planned, declaration, created)
             };
             match &planned.change {
-                Change::CreateTable { name, .. } => steps.push(step(
+                Change::Table(TableChange::CreateTable { name, .. }) => steps.push(step(
                     format!("table {}", name.shown()),
                     vec![object(&name.schema, &name.name)],
                 )?),
-                Change::CreateModule { id, module } => steps.push(step(
+                Change::Module(ModuleChange::CreateModule { id, module }) => steps.push(step(
                     format!("{} {}", module.kind, id.shown()),
                     vec![object(id.schema(), id.name())],
                 )?),
-                Change::CreateType { name, .. } => steps.push(step(
+                Change::Type(TypeChange::CreateType { name, .. }) => steps.push(step(
                     format!("type {}", name.shown()),
                     vec![ObjectIdentity {
                         class: class::TYPE.into(),
@@ -203,52 +213,56 @@ impl Reconstruction {
                 )?),
                 // What a split table is made of, and the differ's own foreign
                 // keys: created after what they name by the route's constraints.
-                Change::AddColumn { table, name, .. } => steps.push(step(
+                Change::Column(ColumnChange::AddColumn { table, name, .. }) => steps.push(step(
                     format!("column {}", table.column(name.clone()).shown()),
                     Vec::new(),
                 )?),
-                Change::AlterColumnNullability { column, .. } => steps.push(step(
-                    format!("nullability of {}", column.shown()),
-                    Vec::new(),
-                )?),
-                Change::AddComputedColumn { table, name, .. } => steps.push(step(
-                    format!("computed column {}", table.column(name.clone()).shown()),
-                    Vec::new(),
-                )?),
-                Change::SetPrimaryKey { table, .. } => steps.push(step(
-                    format!("primary key of {}", table.shown()),
-                    Vec::new(),
-                )?),
-                Change::AddUnique { table, name, .. } => steps.push(step(
-                    format!("unique {} on {}", name.shown(), table.shown()),
-                    Vec::new(),
-                )?),
-                Change::AddIndex { table, name, .. } => steps.push(step(
+                Change::Column(ColumnChange::AlterColumnNullability { column, .. }) => steps.push(
+                    step(format!("nullability of {}", column.shown()), Vec::new())?,
+                ),
+                Change::Column(ColumnChange::AddComputedColumn { table, name, .. }) => {
+                    steps.push(step(
+                        format!("computed column {}", table.column(name.clone()).shown()),
+                        Vec::new(),
+                    )?)
+                }
+                Change::Constraint(ConstraintChange::SetPrimaryKey { table, .. }) => steps.push(
+                    step(format!("primary key of {}", table.shown()), Vec::new())?,
+                ),
+                Change::Constraint(ConstraintChange::AddUnique { table, name, .. }) => {
+                    steps.push(step(
+                        format!("unique {} on {}", name.shown(), table.shown()),
+                        Vec::new(),
+                    )?)
+                }
+                Change::Index(IndexChange::AddIndex { table, name, .. }) => steps.push(step(
                     format!("index {} on {}", name.shown(), table.shown()),
                     Vec::new(),
                 )?),
-                Change::AddForeignKey { table, name, .. } => steps.push(step(
-                    format!("foreign key {} of {}", name.shown(), table.shown()),
-                    Vec::new(),
-                )?),
-                Change::AlterColumnDefault { column, .. } => steps.push(step(
-                    format!("the default of {}", column.shown()),
-                    Vec::new(),
-                )?),
-                Change::AddCheck { table, name, .. } => steps.push(step(
-                    format!("check {} on {}", name.shown(), table.shown()),
-                    Vec::new(),
-                )?),
+                Change::Constraint(ConstraintChange::AddForeignKey { table, name, .. }) => steps
+                    .push(step(
+                        format!("foreign key {} of {}", name.shown(), table.shown()),
+                        Vec::new(),
+                    )?),
+                Change::Column(ColumnChange::AlterColumnDefault { column, .. }) => steps.push(
+                    step(format!("the default of {}", column.shown()), Vec::new())?,
+                ),
+                Change::Constraint(ConstraintChange::AddCheck { table, name, .. }) => {
+                    steps.push(step(
+                        format!("check {} on {}", name.shown(), table.shown()),
+                        Vec::new(),
+                    )?)
+                }
                 // None of these changes what a name resolves to.
-                Change::CreateRole { .. }
-                | Change::Grant { .. }
-                | Change::PublicExecution { .. }
-                | Change::InsertRow { .. }
-                | Change::SetDataMode { .. }
-                | Change::SetEnsureKeys { .. }
-                | Change::CreatePolicy { .. }
-                | Change::DropPolicy { .. }
-                | Change::SetRowSecurity { .. } => {}
+                Change::Role(RoleChange::CreateRole { .. })
+                | Change::Permission(GrantChange::Grant { .. })
+                | Change::Permission(GrantChange::PublicExecution { .. })
+                | Change::Row(RowChange::InsertRow { .. })
+                | Change::Row(RowChange::SetDataMode { .. })
+                | Change::Row(RowChange::SetEnsureKeys { .. })
+                | Change::Policy(PolicyChange::CreatePolicy { .. })
+                | Change::Policy(PolicyChange::DropPolicy { .. })
+                | Change::Policy(PolicyChange::SetRowSecurity { .. }) => {}
                 // A bootstrap from an empty schema has no renames, drops or
                 // alterations; one that does is not a bootstrap.
                 other => {

@@ -75,7 +75,7 @@ pub async fn plan<S: pbps_diff::order::RouteState<D>, D: pbps_dialect::Dialect>(
     let [planned] = changes.changes().changes.as_slice() else {
         return Err("a rebuild must be planned on its own".to_owned().into());
     };
-    let Change::RebuildPartitionedTable(root) = &planned.change else {
+    let Change::Partition(PartitionChange::RebuildPartitionedTable(root)) = &planned.change else {
         return Err("missing qualified rebuild root".to_owned().into());
     };
     let root = (**root).clone();
@@ -152,7 +152,7 @@ pub async fn plan<S: pbps_diff::order::RouteState<D>, D: pbps_dialect::Dialect>(
         .changes
         .iter()
         .find_map(|p| {
-            if let Change::CopyTableRows(c) = &p.change {
+            if let Change::Partition(PartitionChange::CopyTableRows(c)) = &p.change {
                 Some(c)
             } else {
                 None
@@ -204,13 +204,13 @@ pub async fn observe(
         let pg = Postgres::new();
         let mut required = Vec::new();
         for relation in &relations {
-            let spec = changes.changes.iter().find_map(|p| if let Change::CreateTable { uid, table, .. } = &p.change && uid == &relation.uid { Some(table) } else { None }).ok_or_else(|| "rebuild probe has no typed replacement table".to_owned())?;
+            let spec = changes.changes.iter().find_map(|p| if let Change::Table(TableChange::CreateTable { uid, table, .. }) = &p.change && uid == &relation.uid { Some(table) } else { None }).ok_or_else(|| "rebuild probe has no typed replacement table".to_owned())?;
             if relation.uid == copy.target.uid {
                 required = spec.columns.iter().filter(|(_, c)| !c.nullable).map(|(n, _)| crate::quote(n.raw()).map(|n| format!("{n} IS NOT NULL"))).collect::<Result<Vec<_>, _>>()?;
             }
             let mut table = (**spec).clone();
             if let Some(of) = &mut table.partition_of { of.parent = temporary.get(&of.parent).cloned().ok_or_else(|| "rebuild probe has a foreign parent".to_owned())?; }
-            let change = Change::CreateTable { uid: relation.uid.clone(), name: temporary[&relation.name].clone(), table: Box::new(table), beside_default: None, moves_at_most: None };
+            let change = Change::Table(TableChange::CreateTable { uid: relation.uid.clone(), name: temporary[&relation.name].clone(), table: Box::new(table), beside_default: None, moves_at_most: None });
             for statement in emit::emit(&pg, &change, Strategy::default())? { conn.execute(&statement.sql).await?; }
         }
         let mut bounds = Vec::new();
@@ -250,7 +250,7 @@ pub async fn window(
     changes: &ChangeSet,
 ) -> Result<(), Error> {
     for copy in changes.changes.iter().filter_map(|p| {
-        if let Change::CopyTableRows(c) = &p.change {
+        if let Change::Partition(PartitionChange::CopyTableRows(c)) = &p.change {
             Some(c)
         } else {
             None

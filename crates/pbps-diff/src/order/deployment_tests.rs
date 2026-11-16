@@ -1,4 +1,7 @@
 use super::*;
+use pbps_model::ConstraintChange;
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
 
 #[test]
 fn key_surfaces_keep_observed_teardown_declared_restoration_and_physical_names() {
@@ -28,12 +31,14 @@ fn key_surfaces_keep_observed_teardown_declared_restoration_and_physical_names()
         after.columns.insert(column, new.column("id"));
         ids.tables.insert(uid.clone(), old.clone());
         after.tables.insert(uid.clone(), new.clone());
-        renames.push(PlannedChange::new(Change::RenameTable {
-            uid,
-            from: old,
-            to: new,
-            defaults: Vec::new(),
-        }));
+        renames.push(PlannedChange::new(Change::Table(
+            TableChange::RenameTable {
+                uid,
+                from: old,
+                to: new,
+                defaults: Vec::new(),
+            },
+        )));
     }
     let final_name: TableName = "app.renamed".parse().unwrap();
     let mut declared = Schema::default();
@@ -68,7 +73,7 @@ fn key_surfaces_keep_observed_teardown_declared_restoration_and_physical_names()
         let d = as_declared(&view, &original).unwrap();
         assert!(d.managed(&declared));
         let removal = removal_of(&d, &declared, None).unwrap();
-        if let Change::SetPrimaryKey { from, .. } = &removal {
+        if let Change::Constraint(ConstraintChange::SetPrimaryKey { from, .. }) = &removal {
             assert_eq!(from.as_ref(), Some(&observed));
         }
         assert!(removes(
@@ -77,7 +82,7 @@ fn key_surfaces_keep_observed_teardown_declared_restoration_and_physical_names()
             &Partitions::default()
         ));
         let restoration = restoration_of(&d, &declared, None).unwrap();
-        if let Change::SetPrimaryKey { to, .. } = &restoration {
+        if let Change::Constraint(ConstraintChange::SetPrimaryKey { to, .. }) = &restoration {
             assert_eq!(to.as_ref(), table.primary_key.as_ref());
         }
         assert!(restores(
@@ -99,7 +104,9 @@ fn key_surfaces_keep_observed_teardown_declared_restoration_and_physical_names()
             physical.change.table(),
             Some(&"app.source".parse().unwrap())
         );
-        if let Change::AddForeignKey { constraint, .. } = physical.change {
+        if let Change::Constraint(ConstraintChange::AddForeignKey { constraint, .. }) =
+            physical.change
+        {
             assert_eq!(
                 constraint.references_table,
                 "app.old_target".parse().unwrap()
@@ -162,10 +169,10 @@ fn unsupported_descriptions_are_shown_once_and_reasons_stay_rendered() {
         holds: Holds::Module(module.clone()),
     };
     assert!(
-        matches!(removal_of(&d, &declared, None).unwrap(), Change::DropModule { id, .. } if id == module)
+        matches!(removal_of(&d, &declared, None).unwrap(), Change::Module(ModuleChange::DropModule { id, .. }) if id == module)
     );
     assert!(
-        matches!(restoration_of(&d, &declared, None).unwrap(), Change::CreateModule { id, .. } if id == module)
+        matches!(restoration_of(&d, &declared, None).unwrap(), Change::Module(ModuleChange::CreateModule { id, .. }) if id == module)
     );
 }
 
@@ -231,10 +238,12 @@ fn missing_source_and_unaccounted_descriptions_are_shown_once() {
         }],
     )]);
     let changes = ChangeSet {
-        changes: vec![PlannedChange::new(Change::DropModule {
-            id: root.clone(),
-            kind: ModuleKind::View,
-        })],
+        changes: vec![PlannedChange::new(Change::Module(
+            ModuleChange::DropModule {
+                id: root.clone(),
+                kind: ModuleKind::View,
+            },
+        ))],
     };
     let weave = Weave {
         roots: vec![root.clone()],
@@ -308,12 +317,14 @@ fn indexed_creation_names_keep_foreign_keys_parents_and_row_types_hard() {
         bound: pbps_model::PartitionBound::Default,
         columns: Default::default(),
     });
-    let create = |name: &str, table| Change::CreateTable {
-        uid: "t_aaaaaa".parse().unwrap(),
-        name: name.parse().unwrap(),
-        table: Box::new(table),
-        beside_default: None,
-        moves_at_most: None,
+    let create = |name: &str, table| {
+        Change::Table(TableChange::CreateTable {
+            uid: "t_aaaaaa".parse().unwrap(),
+            name: name.parse().unwrap(),
+            table: Box::new(table),
+            beside_default: None,
+            moves_at_most: None,
+        })
     };
     let owner = create("app.owner", shape);
     let indexed = TypedCreation::of(&owner);
@@ -346,7 +357,7 @@ fn a_new_exclusion_that_calls_a_created_function_is_moved_behind_it() {
         Module, ModuleKind, OperatorRef,
     };
     let exclusion = |key: IndexColumn, filter: Option<&str>, to: bool| {
-        PlannedChange::new(Change::SetExclusion {
+        PlannedChange::new(Change::Constraint(ConstraintChange::SetExclusion {
             table: TableName::new("app", "booking"),
             name: "xc".into(),
             from: None,
@@ -363,10 +374,10 @@ fn a_new_exclusion_that_calls_a_created_function_is_moved_behind_it() {
                     timing: ExclusionTiming::Immediate,
                 })
             }),
-        })
+        }))
     };
     let function = || {
-        PlannedChange::new(Change::CreateModule {
+        PlannedChange::new(Change::Module(ModuleChange::CreateModule {
             id: "app.slot(integer)".parse().unwrap(),
             module: Box::new(Module {
                 kind: ModuleKind::Function,
@@ -374,7 +385,7 @@ fn a_new_exclusion_that_calls_a_created_function_is_moved_behind_it() {
                 description: None,
                 options: Default::default(),
             }),
-        })
+        }))
     };
     // How many steps the pass moves, and whether the function ends up first.
     let moved = |constraint: PlannedChange| {
@@ -392,7 +403,7 @@ fn a_new_exclusion_that_calls_a_created_function_is_moved_behind_it() {
         .unwrap();
         let first = matches!(
             plan.changes().changes[0].change,
-            Change::CreateModule { .. }
+            Change::Module(ModuleChange::CreateModule { .. })
         );
         (count, first)
     };

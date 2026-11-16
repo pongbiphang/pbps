@@ -47,21 +47,21 @@ fn check(server: &str) {
     let target = pbps_model::ObjectName::new("app", "granted1454");
     assert!(plan.changes.changes.iter().any(|p| matches!(
         &p.change,
-        pbps_model::Change::Grant {
+        pbps_model::Change::Permission(pbps_model::GrantChange::Grant {
             target: pbps_model::GrantTarget::Object(object), ..
-        } if object == &target
+        }) if object == &target
     )));
     // A schema grant already moves the old condition; it cannot stand in
     // for evidence about this plan's object grant.
     assert!(!plan.changes.changes.iter().any(|p| matches!(
         &p.change,
-        pbps_model::Change::Grant {
+        pbps_model::Change::Permission(pbps_model::GrantChange::Grant {
             target: pbps_model::GrantTarget::Schema(_),
             ..
-        } | pbps_model::Change::Revoke {
+        }) | pbps_model::Change::Permission(pbps_model::GrantChange::Revoke {
             target: pbps_model::GrantTarget::Schema(_),
             ..
-        }
+        })
     )));
     let pbps_model::resolver::PlanAnalysis::Resolved(evidence) = &plan.analysis else {
         panic!("the connected plan must carry resolver evidence");
@@ -81,9 +81,9 @@ fn check(server: &str) {
         .position(|p| {
             matches!(
                 &p.change,
-                pbps_model::Change::Grant {
+                pbps_model::Change::Permission(pbps_model::GrantChange::Grant {
                     target: pbps_model::GrantTarget::Object(object), ..
-                } if object == &target
+                }) if object == &target
             )
         })
         .unwrap();

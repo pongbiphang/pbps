@@ -1,6 +1,13 @@
 //! Existing companion placement and partition splitting. The ordering
 //! boundary owns these writes; callers supply declarations and lexical facts.
 use pbps_dialect::Dialect;
+use pbps_model::ColumnChange;
+use pbps_model::GrantChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::RoleChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
 use pbps_model::{Change, ColumnRef, ModuleId, PlannedChange, Schema, TableName, ValueSource};
 use std::collections::BTreeSet;
 
@@ -29,7 +36,12 @@ pub fn take_public_execution(cs: &mut super::PlanningPlan) -> PublicDecisions {
         .zip(std::mem::take(&mut cs.origins))
         .zip(identities)
         .map(|((p, origin), identity)| (p, origin, identity))
-        .partition(|(p, _, _)| matches!(p.change, Change::PublicExecution { .. }));
+        .partition(|(p, _, _)| {
+            matches!(
+                p.change,
+                Change::Permission(GrantChange::PublicExecution { .. })
+            )
+        });
     let mut retained = Vec::new();
     for (step, origin, identity) in rest {
         cs.payload.changes.push(step);
@@ -47,7 +59,8 @@ pub fn take_public_execution(cs: &mut super::PlanningPlan) -> PublicDecisions {
 
 pub fn settle_public_execution(cs: &mut super::PlanningPlan, decisions: PublicDecisions) {
     for (decision, origin, identity) in decisions.0 {
-        let Change::PublicExecution { routine, .. } = &decision.change else {
+        let Change::Permission(GrantChange::PublicExecution { routine, .. }) = &decision.change
+        else {
             insert_identity(cs, cs.changes.len(), identity);
             cs.payload.changes.push(decision);
             cs.origins.push(origin);
@@ -59,15 +72,15 @@ pub fn settle_public_execution(cs: &mut super::PlanningPlan, decisions: PublicDe
             .iter()
             .rposition(|p| {
                 matches!(&p.change,
-                    Change::CreateModule { id: x, .. } | Change::AlterModule { id: x, .. } if *x == id)
+                    Change::Module(ModuleChange::CreateModule { id: x, .. }) | Change::Module(ModuleChange::AlterModule { id: x, .. }) if *x == id)
             })
             .map(|i| i + 1)
             .or_else(|| {
                 cs.changes.iter().position(|p| {
                     matches!(
                         p.change,
-                        Change::CreateRole { .. } | Change::Grant { .. } | Change::SetDataMode { .. }
-                        | Change::SetEnsureKeys { .. }
+                        Change::Role(RoleChange::CreateRole { .. }) | Change::Permission(GrantChange::Grant { .. }) | Change::Row(RowChange::SetDataMode { .. })
+                        | Change::Row(RowChange::SetEnsureKeys { .. })
                     )
                 })
             })
@@ -112,12 +125,12 @@ pub fn split_moving_defaults(
         .iter()
         .enumerate()
         .filter_map(|(j, p)| {
-            let Change::AddColumn {
+            let Change::Column(ColumnChange::AddColumn {
                 table,
                 name,
                 column,
                 ..
-            } = &p.change
+            }) = &p.change
             else {
                 return None;
             };
@@ -129,13 +142,13 @@ pub fn split_moving_defaults(
     // Each split change, with the place it goes right after.
     let mut sets: Vec<(usize, Change, pbps_model::operation::Origin)> = Vec::new();
     for (i, p) in cs.payload.changes.iter_mut().enumerate() {
-        let Change::CreateTable {
+        let Change::Table(TableChange::CreateTable {
             uid,
             name,
             table,
             beside_default: Some(_),
             moves_at_most: _,
-        } = &mut p.change
+        }) = &mut p.change
         else {
             continue;
         };
@@ -155,7 +168,7 @@ pub fn split_moving_defaults(
             {
                 sets.push((
                     after.unwrap_or(i),
-                    Change::SetPartitionDefault {
+                    Change::Partition(PartitionChange::SetPartitionDefault {
                         uid: uid.clone(),
                         table: name.clone(),
                         parent: parent.clone(),
@@ -163,19 +176,19 @@ pub fn split_moving_defaults(
                         from: None,
                         to: Some(to),
                         fallback: parent_default(declared, name, column.raw()),
-                    },
+                    }),
                     pbps_model::operation::Origin::Restoration(cs.origins[i].source()),
                 ));
             }
             if added_late && std::mem::take(&mut own.not_null) {
                 sets.push((
                     i,
-                    Change::SetPartitionNotNull {
+                    Change::Partition(PartitionChange::SetPartitionNotNull {
                         uid: uid.clone(),
                         table: name.clone(),
                         column: column.clone(),
                         not_null: true,
-                    },
+                    }),
                     pbps_model::operation::Origin::Restoration(cs.origins[i].source()),
                 ));
             }
@@ -260,17 +273,18 @@ fn planned(change: Change, dialect: &(impl Dialect + ?Sized)) -> PlannedChange {
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+    use pbps_model::GrantChange;
     use pbps_model::operation::{ModuleEdits, Operations, Origin, Source};
     use pbps_model::{ChangeSet, PublicAccess, RoutineOrigin};
     fn public(name: &str) -> PlannedChange {
         let ModuleId::Routine(routine) = format!("app.{name}()").parse().unwrap() else {
             panic!()
         };
-        PlannedChange::new(Change::PublicExecution {
+        PlannedChange::new(Change::Permission(GrantChange::PublicExecution {
             routine,
             access: PublicAccess::Revoked,
             origin: RoutineOrigin::Rebuilt,
-        })
+        }))
     }
     #[test]
     fn held_public_events_reserve_ids_even_when_no_operations_remain_visible() {

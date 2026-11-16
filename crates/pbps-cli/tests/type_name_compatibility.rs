@@ -76,20 +76,20 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
         .columns
         .insert("added".into(), added.clone());
     let changes = vec![
-        Change::CreateTable {
+        Change::Table(TableChange::CreateTable {
             uid: table_uid,
             name: name.clone(),
             table: Box::new(table.clone()),
             beside_default: None,
             moves_at_most: None,
-        },
-        Change::AddColumn {
+        }),
+        Change::Column(ColumnChange::AddColumn {
             table: name.clone(),
             uid: "c_bbbbbb".parse().unwrap(),
             name: "added".into(),
             column: Box::new(added),
-        },
-        Change::AlterColumnType {
+        }),
+        Change::Column(ColumnChange::AlterColumnType {
             column: name.column("id"),
             uid: column_uid,
             from: "int".parse().unwrap(),
@@ -100,7 +100,7 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
             to_collation: None,
             through_external_partitions: false,
             using: None,
-        },
+        }),
     ];
     let mut plan = SavedPlan::new(
         PlanOrigin::Database,
@@ -488,7 +488,7 @@ fn estimate_type_descriptions_are_shown_prose() {
     let table = TableName::new("app", "t");
     let uid: Uid = "c_aaaaaa".parse().unwrap();
     let ty = ColumnType::reference(TypeRef::new("app", NAME).unwrap());
-    let change = Change::AlterColumnType {
+    let change = Change::Column(ColumnChange::AlterColumnType {
         uid: uid.clone(),
         column: table.column("v"),
         from: "int".parse().unwrap(),
@@ -499,7 +499,7 @@ fn estimate_type_descriptions_are_shown_prose() {
         to_collation: None,
         through_external_partitions: false,
         using: None,
-    };
+    });
     let changes = vec![PlannedChange::new(change)];
     let ids = IdsFile {
         tables: [("t_aaaaaa".parse().unwrap(), table.clone())].into(),

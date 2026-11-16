@@ -101,6 +101,8 @@ pub(crate) fn refuse_occupied_names(
     label: &str,
 ) -> anyhow::Result<()> {
     use pbps_model::Change;
+    use pbps_model::ModuleChange;
+    use pbps_model::TableChange;
     let relation = |name: &TableName| -> Option<String> {
         if scoped.unmanaged.contains(name) && !unmanaged_relations.contains(name) {
             return Some(format!("table `{name}`", name = name.shown()));
@@ -130,18 +132,18 @@ pub(crate) fn refuse_occupied_names(
         .changes
         .iter()
         .filter_map(|p| match &p.change {
-            Change::DropModule { id, .. } => Some(id),
+            Change::Module(ModuleChange::DropModule { id, .. }) => Some(id),
             _ => None,
         })
         .collect();
     let mut taken: Vec<String> = Vec::new();
     for p in &cs.changes {
         let (declared, occupant) = match &p.change {
-            Change::CreateTable { name, .. } => (
+            Change::Table(TableChange::CreateTable { name, .. }) => (
                 format!("table `{name}`", name = name.shown()),
                 relation(name),
             ),
-            Change::CreateModule { id, module } if !dropped.contains(id) => {
+            Change::Module(ModuleChange::CreateModule { id, module }) if !dropped.contains(id) => {
                 let occupant = match id {
                     ModuleId::Named(name) => relation(name),
                     ModuleId::Routine(_) | ModuleId::Trigger { .. } => scoped
@@ -241,12 +243,22 @@ fn role_name_expectations<D: crate::emission::Engine>(
         // A change is pending while any of its statements is: a half-done
         // role drop has removed members and still holds the name.
         if completed < at + n {
-            if let pbps_model::Change::CreateRole { name, .. } = &p.change {
+            if let pbps_model::Change::Role(pbps_model::RoleChange::CreateRole { name, .. }) =
+                &p.change
+            {
                 wanted.push(name.clone());
-            } else if let pbps_model::Change::RenameRole { from, to, .. } = &p.change {
+            } else if let pbps_model::Change::Role(pbps_model::RoleChange::RenameRole {
+                from,
+                to,
+                ..
+            }) = &p.change
+            {
                 wanted.push(to.clone());
                 vacated.push(from.clone());
-            } else if let pbps_model::Change::DropRole { name, .. } = &p.change {
+            } else if let pbps_model::Change::Role(pbps_model::RoleChange::DropRole {
+                name, ..
+            }) = &p.change
+            {
                 vacated.push(name.clone());
             }
         }
@@ -378,9 +390,12 @@ fn key_type_changes_over_aliases(
 ) -> Vec<String> {
     let mut out = Vec::new();
     for p in &cs.changes {
-        let pbps_model::Change::AlterColumnType {
-            column, from, to, ..
-        } = &p.change
+        let pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType {
+            column,
+            from,
+            to,
+            ..
+        }) = &p.change
         else {
             continue;
         };

@@ -5,6 +5,8 @@
 use crate::certified_fixture::FixtureEmission;
 
 use pbps_dialect::Dialect;
+use pbps_model::GrantChange;
+use pbps_model::ModuleChange;
 use pbps_model::{
     Change, ChangeSet, Declared, IdsFile, Module, ModuleId, ModuleKind, PlanBaseline, PlanOrigin,
     PlannedChange, RoutineId, SavedPlan, Schema, StateKind, StateSnapshot, TableName,
@@ -60,18 +62,20 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
         .modules
         .iter()
         .map(|(id, module)| {
-            PlannedChange::new(Change::CreateModule {
+            PlannedChange::new(Change::Module(ModuleChange::CreateModule {
                 id: id.clone(),
                 module: Box::new(module.clone()),
-            })
+            }))
         })
         .collect();
     if let ModuleId::Routine(routine) = &routine {
-        changes.push(PlannedChange::new(Change::PublicExecution {
-            routine: routine.clone(),
-            access: pbps_model::PublicAccess::Revoked,
-            origin: pbps_model::RoutineOrigin::Created,
-        }));
+        changes.push(PlannedChange::new(Change::Permission(
+            GrantChange::PublicExecution {
+                routine: routine.clone(),
+                access: pbps_model::PublicAccess::Revoked,
+                origin: pbps_model::RoutineOrigin::Created,
+            },
+        )));
     }
     let ids = IdsFile::default();
     let mut plan = SavedPlan::new(
@@ -239,7 +243,7 @@ fn explain_shows_each_routine_name_and_argument_once() {
 fn a_routine_refusal_is_escaped_exactly_once() {
     for (part, shown) in [(NAME, SHOWN), ("名前_ünï", "名前_ünï")] {
         let id: ModuleId = format!("app.{part}(app.\"{part}\")").parse().unwrap();
-        let change = Change::CreateModule {
+        let change = Change::Module(ModuleChange::CreateModule {
             id,
             module: Box::new(Module {
                 kind: ModuleKind::Function,
@@ -247,7 +251,7 @@ fn a_routine_refusal_is_escaped_exactly_once() {
                 definition: String::new(),
                 options: Default::default(),
             }),
-        };
+        });
         let error = pbps_pg::Postgres::new()
             .fixture_emit(&change, Default::default())
             .unwrap_err();

@@ -27,6 +27,9 @@ pub struct EdgeWhy {
 
 pub use auxiliary::{Auxiliary, Node, Step};
 use pbps_dialect::Dialect;
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
+use pbps_model::TypeChange;
 use pbps_model::operation::{ModuleEdits, Operations};
 use pbps_model::{Change, ChangeSet, PlannedChange};
 pub use trial::{Attempt, Progress, TrialProgram, Trials};
@@ -82,15 +85,15 @@ pub fn prepare<S: super::RouteState<D>, D: Dialect + ?Sized>(
     let mut declared = pbps_model::Schema::default();
     for p in &input.changes {
         match &p.change {
-            Change::CreateTable { name, table, .. } => {
+            Change::Table(TableChange::CreateTable { name, table, .. }) => {
                 declared.tables.insert(name.clone(), (**table).clone());
             }
-            Change::CreateModule { id, module } => {
+            Change::Module(ModuleChange::CreateModule { id, module }) => {
                 declared.modules.insert(id.clone(), (**module).clone());
             }
-            Change::CreateType {
+            Change::Type(TypeChange::CreateType {
                 name, definition, ..
-            } => {
+            }) => {
                 declared.types.insert(name.clone(), (**definition).clone());
             }
             _ => {}
@@ -278,6 +281,7 @@ fn permute<T>(items: Vec<T>, sequence: &[usize]) -> Vec<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::RoleChange;
     mod auxiliary_tests;
     use pbps_dialect::PlanPayload;
     use pbps_model::operation::{Origin, Source as LogicalSource, Spelling};
@@ -292,10 +296,10 @@ mod tests {
         }
     }
     fn role(name: &str) -> PlannedChange {
-        PlannedChange::new(Change::CreateRole {
+        PlannedChange::new(Change::Role(RoleChange::CreateRole {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Role, name, 0),
             name: name.into(),
-        })
+        }))
     }
     /// One part for each of `operations`, the metadata being the operation.
     fn parts(changes: &[PlannedChange], operations: &[usize]) -> Vec<Part<usize>> {

@@ -2,13 +2,17 @@
 pub(super) mod required;
 use super::*;
 use pbps_dialect::lower::lower_all;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
 use pbps_model::{Change, PlanMode};
 
 fn root(plan: &pbps_model::ChangeSet) -> &pbps_model::Table {
     plan.changes
         .iter()
         .find_map(|p| {
-            if let Change::CreateTable { name, table, .. } = &p.change
+            if let Change::Table(TableChange::CreateTable { name, table, .. }) = &p.change
                 && name == &"app.t".parse().unwrap()
             {
                 Some(table.as_ref())
@@ -28,7 +32,7 @@ fn versioning_retains_its_independent_primary_key_and_period_in_create() {
         assert_eq!(prefix.primary_key.is_some(), versioned);
         assert!(prefix.columns.contains_key("vf") && prefix.columns.contains_key("vt"));
         assert!(!prefix.columns.contains_key("x"));
-        assert!(!plan.changes().changes.iter().any(|p|matches!(&p.change,Change::SetPrimaryKey{table,..} if table==&"app.t".parse().unwrap())));
+        assert!(!plan.changes().changes.iter().any(|p|matches!(&p.change,Change::Constraint(ConstraintChange::SetPrimaryKey{table,..}) if table==&"app.t".parse().unwrap())));
         let ordered = plan.ordered(PlanMode::Transactional, &engine);
         lower_all(
             &ordered as &dyn pbps_diff::order::PlanView<pbps_mssql::Mssql>,
@@ -59,14 +63,14 @@ fn required_groups_preserve_provider_only_and_before_create_dependencies() {
         .changes()
         .changes
         .iter()
-        .position(|p| matches!(p.change, Change::CreateModule { .. }))
+        .position(|p| matches!(p.change, Change::Module(ModuleChange::CreateModule { .. })))
         .unwrap();
     let table = plan
         .changes()
         .changes
         .iter()
         .position(
-            |p| matches!(&p.change,Change::CreateTable{name,..} if name==&"app.t".parse().unwrap()),
+            |p| matches!(&p.change,Change::Table(TableChange::CreateTable{name,..}) if name==&"app.t".parse().unwrap()),
         )
         .unwrap();
     assert!(function < table);
@@ -82,7 +86,7 @@ fn required_groups_preserve_provider_only_and_before_create_dependencies() {
         root(plan.changes()).columns["anchor"].value_source,
         pbps_model::ValueSource::Default(_)
     ));
-    assert!(!plan.changes().changes.iter().any(|p|matches!(&p.change,Change::AlterColumnDefault{column,..} if column==&"app.t.anchor".parse().unwrap())));
+    assert!(!plan.changes().changes.iter().any(|p|matches!(&p.change,Change::Column(ColumnChange::AlterColumnDefault{column,..}) if column==&"app.t.anchor".parse().unwrap())));
 }
 #[test]
 fn an_inline_requirement_names_the_real_conflict_instead_of_emitting_a_broken_create() {
@@ -143,14 +147,11 @@ fn selecting_identity_not_null_moves_its_whole_column_installation() {
     fn check<E: Dialect>(engine: E) {
         let f = required::identity(engine.name());
         let plan = f.compile(&engine).unwrap();
-        assert!(plan.changes().changes.iter().any(|p|matches!(&p.change,Change::AddColumn{column,..} if matches!(column.value_source,pbps_model::ValueSource::Identity(_)) && !column.nullable)));
-        assert!(
-            !plan
-                .changes()
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, Change::AlterColumnNullability { .. }))
-        );
+        assert!(plan.changes().changes.iter().any(|p|matches!(&p.change,Change::Column(ColumnChange::AddColumn{column,..}) if matches!(column.value_source,pbps_model::ValueSource::Identity(_)) && !column.nullable)));
+        assert!(!plan.changes().changes.iter().any(|p| matches!(
+            p.change,
+            Change::Column(ColumnChange::AlterColumnNullability { .. })
+        )));
     }
     check(pbps_mssql::Mssql);
     check(pbps_pg::Postgres::new());
@@ -159,13 +160,13 @@ fn selecting_identity_not_null_moves_its_whole_column_installation() {
 #[test]
 fn empty_demand_retains_engine_recipe_bytes() {
     fn check<E: Dialect>(engine: E, f: Fixture) {
-        let change = Change::CreateTable {
+        let change = Change::Table(TableChange::CreateTable {
             uid: "t_aaaaaa".parse().unwrap(),
             name: "app.t".parse().unwrap(),
             table: Box::new(f.schema.tables[&"app.t".parse().unwrap()].clone()),
             beside_default: None,
             moves_at_most: None,
-        };
+        });
         let refs: std::collections::BTreeSet<pbps_model::object_ref::ObjectRef> =
             Default::default();
         let old = engine
@@ -249,11 +250,11 @@ fn an_earlier_inline_demand_does_not_swallow_a_later_legal_suffix() {
         let module = |n: &str| {
             changes
                 .iter()
-                .position(|p| matches!(&p.change,Change::CreateModule{id,..} if id.name()==n))
+                .position(|p| matches!(&p.change,Change::Module(ModuleChange::CreateModule{id,..}) if id.name()==n))
                 .unwrap()
         };
-        let table=changes.iter().position(|p|matches!(&p.change,Change::CreateTable{name,..} if name==&"app.t".parse().unwrap())).unwrap();
-        let column=changes.iter().position(|p|matches!(&p.change,Change::AddColumn{table,..} if table==&"app.t".parse().unwrap())).unwrap();
+        let table=changes.iter().position(|p|matches!(&p.change,Change::Table(TableChange::CreateTable{name,..}) if name==&"app.t".parse().unwrap())).unwrap();
+        let column=changes.iter().position(|p|matches!(&p.change,Change::Column(ColumnChange::AddColumn{table,..}) if table==&"app.t".parse().unwrap())).unwrap();
         assert!(module("f") < table && table < module("after") && module("after") < column);
         assert!(root(plan.changes()).columns.contains_key("anchor"));
     }
@@ -266,12 +267,10 @@ fn an_earlier_inline_demand_does_not_swallow_a_later_legal_suffix() {
         .unwrap();
     assert!(!root(plan.changes()).columns.contains_key("y"));
     assert!(root(plan.changes()).checks.contains_key("ck_key"));
-    assert!(
-        plan.changes()
-            .changes
-            .iter()
-            .any(|p| matches!(p.change, Change::AlterColumnExpression { .. }))
-    );
+    assert!(plan.changes().changes.iter().any(|p| matches!(
+        p.change,
+        Change::Column(ColumnChange::AlterColumnExpression { .. })
+    )));
     assert!(
         f.compile(&pbps_pg::Postgres::new().with_server_version(160015))
             .unwrap_err()

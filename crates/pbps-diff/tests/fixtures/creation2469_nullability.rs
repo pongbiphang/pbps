@@ -1,6 +1,11 @@
 //! Nullability blockers share the ordinary canonical declaration route.
 #![allow(dead_code)]
 use super::fixture::Fixture;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
 use pbps_model::{Change, ChangeSet, Table};
 
 pub const BLOCKERS: &[&str] = &[
@@ -64,7 +69,7 @@ pub fn prefix(plan: &ChangeSet) -> &Table {
     plan.changes
         .iter()
         .find_map(|p| {
-            if let Change::CreateTable { name, table, .. } = &p.change
+            if let Change::Table(TableChange::CreateTable { name, table, .. }) = &p.change
                 && name == &"app.t".parse().unwrap()
             {
                 Some(table.as_ref())
@@ -78,20 +83,20 @@ pub fn prefix(plan: &ChangeSet) -> &Table {
 #[allow(clippy::wildcard_enum_match_arm)]
 pub fn assert_order(plan: &ChangeSet, kind: &str, engine: &str) {
     let changes = &plan.changes;
-    let create = changes.iter().position(|p| matches!(&p.change, Change::CreateTable {name,..} if name == &"app.t".parse().unwrap())).unwrap();
+    let create = changes.iter().position(|p| matches!(&p.change, Change::Table(TableChange::CreateTable {name,..}) if name == &"app.t".parse().unwrap())).unwrap();
     let function = changes
         .iter()
-        .position(|p| matches!(p.change, Change::CreateModule { .. }))
+        .position(|p| matches!(p.change, Change::Module(ModuleChange::CreateModule { .. })))
         .unwrap();
     let nn = changes
         .iter()
         .position(|p| {
             matches!(
                 p.change,
-                Change::AlterColumnNullability {
+                Change::Column(ColumnChange::AlterColumnNullability {
                     to_nullable: false,
                     ..
-                }
+                })
             )
         })
         .unwrap();
@@ -100,9 +105,13 @@ pub fn assert_order(plan: &ChangeSet, kind: &str, engine: &str) {
         let install = changes
             .iter()
             .position(|p| match &p.change {
-                Change::AddUnique { name, .. } => name.raw() == "uq_nn",
-                Change::AddIndex { name, .. } => name.raw() == "ix_nn",
-                Change::SetPrimaryKey { table, .. } => table == &"app.t".parse().unwrap(),
+                Change::Constraint(ConstraintChange::AddUnique { name, .. }) => {
+                    name.raw() == "uq_nn"
+                }
+                Change::Index(IndexChange::AddIndex { name, .. }) => name.raw() == "ix_nn",
+                Change::Constraint(ConstraintChange::SetPrimaryKey { table, .. }) => {
+                    table == &"app.t".parse().unwrap()
+                }
                 _ => false,
             })
             .unwrap_or_else(|| panic!("{engine} {kind}: blocker must be extracted"));
@@ -113,10 +122,10 @@ pub fn assert_order(plan: &ChangeSet, kind: &str, engine: &str) {
             prefix.unique.contains_key("uq_nn") || prefix.indexes.contains_key("ix_nn"),
             "PostgreSQL keeps its existing shape: {kind}"
         );
-        assert!(
-            !changes
-                .iter()
-                .any(|p| matches!(p.change, Change::AddUnique { .. } | Change::AddIndex { .. }))
-        );
+        assert!(!changes.iter().any(|p| matches!(
+            p.change,
+            Change::Constraint(ConstraintChange::AddUnique { .. })
+                | Change::Index(IndexChange::AddIndex { .. })
+        )));
     }
 }

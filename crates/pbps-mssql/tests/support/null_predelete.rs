@@ -1,4 +1,7 @@
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::RowChange;
 use pbps_model::{Cell, Change, ChangeSet, PlannedChange, RowKey, Value};
 
 fn changes(changes: Vec<Change>) -> ChangeSet {
@@ -8,7 +11,7 @@ fn changes(changes: Vec<Change>) -> ChangeSet {
 }
 
 fn delete_parent() -> Change {
-    Change::DeleteRow {
+    Change::Row(RowChange::DeleteRow {
         table: TableName::new("dbo", "p"),
         key_column: "id".into(),
         key: "1".into(),
@@ -18,7 +21,7 @@ fn delete_parent() -> Change {
         types: Default::default(),
         after_types: Default::default(),
         key_type: None,
-    }
+    })
 }
 
 async fn rolled_back(conn: &mut Conn, cs: &ChangeSet) -> Result<(), String> {
@@ -65,7 +68,7 @@ async fn a_null_default_moves_a_reference_off_the_deleted_parent() {
             .await
             .unwrap();
         for legacy in [false, true] {
-            let update = Change::UpdateRow {
+            let update = Change::Row(RowChange::UpdateRow {
                 table: TableName::new("dbo", "c"),
                 key_column: "id".into(),
                 key: RowKey::from("1"),
@@ -82,7 +85,7 @@ async fn a_null_default_moves_a_reference_off_the_deleted_parent() {
                 },
                 after_types: Default::default(),
                 key_type: None,
-            };
+            });
             let cs = changes(vec![update, delete_parent()]);
             let counts = probe_counts(&mut db.conn, &cs).await;
             let applied = rolled_back(&mut db.conn, &cs).await;
@@ -111,7 +114,7 @@ async fn a_null_default_moves_a_reference_off_the_deleted_parent() {
 }
 
 fn update_child(key: &str, after: Vec<(&str, Cell)>, unchanged: Vec<(&str, Cell)>) -> Change {
-    Change::UpdateRow {
+    Change::Row(RowChange::UpdateRow {
         table: TableName::new("dbo", "c"),
         key_column: "id".into(),
         key: key.into(),
@@ -128,7 +131,7 @@ fn update_child(key: &str, after: Vec<(&str, Cell)>, unchanged: Vec<(&str, Cell)
         .into(),
         after_types: Default::default(),
         key_type: None,
-    }
+    })
 }
 
 #[tokio::test]
@@ -173,7 +176,7 @@ async fn a_known_null_decides_only_its_own_rows_foreign_key_tuple() {
         ]
         .contains(&case);
         if ["insert", "omitted", "overridden default"].contains(&case) {
-            steps.push(Change::InsertRow {
+            steps.push(Change::Row(RowChange::InsertRow {
                 table: TableName::new("dbo", "c"),
                 key_column: "id".into(),
                 key: "1".into(),
@@ -195,7 +198,7 @@ async fn a_known_null_decides_only_its_own_rows_foreign_key_tuple() {
                     ("extra".into(), ty("int")),
                 ]
                 .into(),
-            });
+            }));
         } else {
             let held = ["held", "held default", "other key"].contains(&case);
             db.conn
@@ -275,12 +278,14 @@ async fn a_known_null_decides_only_its_own_rows_foreign_key_tuple() {
 async fn a_check_does_not_read_the_column_giving_up_its_name() {
     let mut db = TestDb::create_collated("vacated_check1771", "Latin1_General_100_CI_AI").await;
     let table = TableName::new("dbo", "t");
-    let rename = |from: &str, to: &str| Change::RenameColumn {
-        uid: Uid::generate(pbps_model::UidKind::Column),
-        table: table.clone(),
-        from: from.into(),
-        to: to.into(),
-        table_was: None,
+    let rename = |from: &str, to: &str| {
+        Change::Column(ColumnChange::RenameColumn {
+            uid: Uid::generate(pbps_model::UidKind::Column),
+            table: table.clone(),
+            from: from.into(),
+            to: to.into(),
+            table_was: None,
+        })
     };
     let computed = pbps_model::ComputedColumn {
         expression: "m".into(),
@@ -308,9 +313,11 @@ async fn a_check_does_not_read_the_column_giving_up_its_name() {
             })
             .await
             .unwrap();
-        let drop = |column: &str| Change::DropColumn {
-            uid: Uid::generate(pbps_model::UidKind::Column),
-            column: table.column(column),
+        let drop = |column: &str| {
+            Change::Column(ColumnChange::DropColumn {
+                uid: Uid::generate(pbps_model::UidKind::Column),
+                column: table.column(column),
+            })
         };
         let mut steps = match case {
             "drop rename" => vec![drop("n"), rename("m", "n")],
@@ -318,7 +325,7 @@ async fn a_check_does_not_read_the_column_giving_up_its_name() {
             "drop rename accent" => vec![drop("n"), rename("m", "ń")],
             "rename add" => vec![
                 rename("n", "old_n"),
-                Change::AddColumn {
+                Change::Column(ColumnChange::AddColumn {
                     uid: Uid::generate(pbps_model::UidKind::Column),
                     table: table.clone(),
                     name: "n".into(),
@@ -328,25 +335,25 @@ async fn a_check_does_not_read_the_column_giving_up_its_name() {
                         value_source: pbps_model::ValueSource::Default("1".into()),
                         ..Column::new(ty("int"))
                     }),
-                },
+                }),
             ],
             "rename computed" => vec![
                 rename("n", "old_n"),
-                Change::AddComputedColumn {
+                Change::Column(ColumnChange::AddComputedColumn {
                     table: table.clone(),
                     name: "n".into(),
                     computed: computed.clone(),
-                },
+                }),
             ],
             "drop computed rename" => vec![
-                Change::DropComputedColumn {
+                Change::Column(ColumnChange::DropComputedColumn {
                     table: table.clone(),
                     name: "n".into(),
                     computed: pbps_model::ComputedColumn {
                         expression: "-m".into(),
                         ..computed.clone()
                     },
-                },
+                }),
                 rename("m", "n"),
             ],
             "unrelated rename" => vec![rename("m", "m2")],
@@ -354,7 +361,7 @@ async fn a_check_does_not_read_the_column_giving_up_its_name() {
             "unrelated drop" => vec![drop("m")],
             _ => vec![],
         };
-        steps.push(Change::AddCheck {
+        steps.push(Change::Constraint(ConstraintChange::AddCheck {
             table: table.clone(),
             name: "positive".into(),
             constraint: pbps_model::CheckConstraint {
@@ -365,7 +372,7 @@ async fn a_check_does_not_read_the_column_giving_up_its_name() {
                 }
                 .into(),
             },
-        });
+        }));
         let cs = changes(steps);
         let counts = probe_counts(&mut db.conn, &cs).await;
         let unchecked = Mssql.fixture_preflight(&cs).unchecked;
@@ -415,14 +422,14 @@ async fn a_planned_foreign_key_counts_references_after_parent_deletion() {
             "null" => {
                 let mut update =
                     update_child("1", vec![("a", Cell::Default("NULL".into()))], vec![]);
-                if let Change::UpdateRow { types, .. } = &mut update {
+                if let Change::Row(RowChange::UpdateRow { types, .. }) = &mut update {
                     types.retain(|name, _| name.raw() == "a");
                 }
                 vec![update]
             }
             "delete" => {
                 let mut deleted = delete_parent();
-                if let Change::DeleteRow { table, .. } = &mut deleted {
+                if let Change::Row(RowChange::DeleteRow { table, .. }) = &mut deleted {
                     *table = TableName::new("dbo", "c");
                 }
                 vec![deleted]
@@ -430,7 +437,7 @@ async fn a_planned_foreign_key_counts_references_after_parent_deletion() {
             _ => vec![],
         };
         steps.push(delete_parent());
-        steps.push(Change::AddForeignKey {
+        steps.push(Change::Constraint(ConstraintChange::AddForeignKey {
             table: TableName::new("dbo", "c"),
             name: "fk_c".into(),
             constraint: Box::new(ForeignKey {
@@ -440,7 +447,7 @@ async fn a_planned_foreign_key_counts_references_after_parent_deletion() {
                 on_delete: ReferentialAction::NoAction,
                 on_update: ReferentialAction::NoAction,
             }),
-        });
+        }));
         let cs = changes(steps);
         observations.push((
             action,
@@ -485,7 +492,7 @@ async fn a_legacy_null_default_needs_no_catalog_assignment_type() {
             for clear in [false, true] {
                 let value = Cell::Value(Value::Text("/1/".into()));
                 let cs = changes(vec![
-                    Change::UpdateRow {
+                    Change::Row(RowChange::UpdateRow {
                         table: TableName::new("dbo", "c"),
                         key_column: "id".into(),
                         key: "1".into(),
@@ -509,7 +516,7 @@ async fn a_legacy_null_default_needs_no_catalog_assignment_type() {
                         },
                         after_types: Default::default(),
                         key_type: None,
-                    },
+                    }),
                     delete_parent(),
                 ]);
                 observations.push((

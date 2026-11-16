@@ -9,6 +9,7 @@ use pbps_diff::{
         schedule::{Declarations, Facts, schedule},
     },
 };
+use pbps_model::ColumnChange;
 #[test]
 fn column_membership_classes_finish_or_name_the_retained_endpoint_limit() {
     let mut cases = 0;
@@ -257,7 +258,7 @@ fn a_missing_ordinary_uid_is_an_obligation_before_any_name_projection() {
             "c_dddddd"
         }));
         let steps = vec![
-            PlannedChange::new(Change::AlterColumnType {
+            PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
                 uid: uid("c_bbbbbb"),
                 column: name("app.p").column("d"),
                 from: "integer".parse().unwrap(),
@@ -268,7 +269,7 @@ fn a_missing_ordinary_uid_is_an_obligation_before_any_name_projection() {
                 to_collation: None,
                 through_external_partitions: false,
                 using: None,
-            }),
+            })),
             PlannedChange::new(
                 crate::engine_effects::scenes_test::steps(&s, Kind::Widen, Motion::Attach)
                     .pop()

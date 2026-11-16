@@ -4,6 +4,15 @@
 use std::collections::BTreeSet;
 
 use indexmap::IndexMap;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
+use pbps_model::TablePropertyChange;
 use pbps_model::operation::{
     Effects, Incarnation, ModuleEdits, ObjectKey, Operation, Operations, Origin, PlanOwners,
     Requirement, Resource, Snapshot, Source as Origin_, effects,
@@ -110,19 +119,19 @@ fn create_then_add_column() -> Plan {
     after.tables.insert(t("t"), after_table);
     Plan {
         logical: vec![
-            p(Change::CreateTable {
+            p(Change::Table(TableChange::CreateTable {
                 uid: tid,
                 name: t("t"),
                 table: Box::new(table_with(&[])),
                 beside_default: None,
                 moves_at_most: None,
-            }),
-            p(Change::AddColumn {
+            })),
+            p(Change::Column(ColumnChange::AddColumn {
                 uid: cid,
                 table: t("t"),
                 name: "c".into(),
                 column: Box::new(Column::new(int())),
-            }),
+            })),
         ],
         before: Schema::default(),
         after,
@@ -148,11 +157,11 @@ fn two_dropped_tables() -> Plan {
     before.tables.insert(t("parent"), table_with(&["id"]));
     before.tables.insert(t("child"), child);
     let drop = |name: &str| {
-        p(Change::DropTable {
+        p(Change::Table(TableChange::DropTable {
             uid: uid(UidKind::Table, name),
             name: t(name),
             detach_from: None,
-        })
+        }))
     };
     Plan {
         // The child first: its key is gone before the table it points at.
@@ -238,14 +247,14 @@ fn view(name: &str) -> (ModuleId, Module) {
 fn a_broken_depends_on_is_refused_as_declared() {
     let ((input_id, input), (dependent_id, dependent)) = (view("v1"), view("v2"));
     let logical = vec![
-        p(Change::CreateModule {
+        p(Change::Module(ModuleChange::CreateModule {
             id: input_id.clone(),
             module: Box::new(input),
-        }),
-        p(Change::CreateModule {
+        })),
+        p(Change::Module(ModuleChange::CreateModule {
             id: dependent_id.clone(),
             module: Box::new(dependent),
-        }),
+        })),
     ];
     let plan = Plan {
         logical,
@@ -319,7 +328,7 @@ fn two_writes_to_one_resource_swapped_from_their_base_order_are_refused() {
 }
 
 fn row(table: &str, key: &str) -> PlannedChange {
-    p(Change::InsertRow {
+    p(Change::Row(RowChange::InsertRow {
         table: t(table),
         key_column: "id".into(),
         identity_key: false,
@@ -329,7 +338,7 @@ fn row(table: &str, key: &str) -> PlannedChange {
             .collect::<Row>(),
         defaults: Default::default(),
         types: Default::default(),
-    })
+    }))
 }
 
 #[test]
@@ -396,11 +405,11 @@ fn rebuilt_routine() -> (Operations, Vec<Effects>, Baseline) {
     let ModuleId::Routine(routine) = id.clone() else {
         unreachable!("declared as a routine")
     };
-    let logical = vec![p(Change::PublicExecution {
+    let logical = vec![p(Change::Permission(GrantChange::PublicExecution {
         routine,
         access: pbps_model::PublicAccess::Revoked,
         origin: pbps_model::RoutineOrigin::Rebuilt,
-    })];
+    }))];
     let source = Origin_::Rebinding(pbps_model::resolver::Surface::Module(id.clone()));
     let ops = Operations::expanded(
         1,
@@ -408,17 +417,17 @@ fn rebuilt_routine() -> (Operations, Vec<Effects>, Baseline) {
             (Origin::Whole(0), logical[0].clone()),
             (
                 Origin::Teardown(source.clone()),
-                p(Change::DropModule {
+                p(Change::Module(ModuleChange::DropModule {
                     id: id.clone(),
                     kind: ModuleKind::Function,
-                }),
+                })),
             ),
             (
                 Origin::Restoration(source),
-                p(Change::CreateModule {
+                p(Change::Module(ModuleChange::CreateModule {
                     id: id.clone(),
                     module: Box::new(module.clone()),
-                }),
+                })),
             ),
         ],
         ModuleEdits::InPlace,
@@ -483,13 +492,13 @@ fn the_effects_of_an_operation_read_its_own_payload_and_not_the_desired_table() 
     let mut after = Schema::default();
     after.tables.insert(t("t"), full);
     let ids = Plan::ids(&["t"], &[("t", "id")]);
-    let logical = vec![p(Change::CreateTable {
+    let logical = vec![p(Change::Table(TableChange::CreateTable {
         uid: uid(UidKind::Table, "t"),
         name: t("t"),
         table: Box::new(table_with(&["id"])),
         beside_default: None,
         moves_at_most: None,
-    })];
+    }))];
     let ops = Operations::of_plan(&logical, ModuleEdits::InPlace);
     let names = PlanNames::of(&logical, &ids).unwrap();
     let owners = PlanOwners::new(names, &ids, &ids);
@@ -624,13 +633,13 @@ fn renamed_default(after_default: Option<&str>) -> Plan {
     };
     Plan {
         logical: vec![
-            p(Change::RenameColumn {
+            p(Change::Column(ColumnChange::RenameColumn {
                 uid: moved.clone(),
                 table: t("t"),
                 from: "a".into(),
                 to: "b".into(),
                 table_was: None,
-            }),
+            })),
             row("t", "1"),
         ],
         before,
@@ -682,15 +691,15 @@ fn attached_partition() -> Plan {
     let pt = uid(UidKind::Table, "pt");
     Plan {
         logical: vec![
-            p(Change::AttachPartition {
+            p(Change::Partition(PartitionChange::AttachPartition {
                 uid: pt.clone(),
                 table: t("pt"),
                 parent: t("par"),
                 bound: PartitionBound::Default,
                 key: Vec::new(),
                 shape: Box::new(member),
-            }),
-            p(Change::SetPartitionDefault {
+            })),
+            p(Change::Partition(PartitionChange::SetPartitionDefault {
                 uid: pt.clone(),
                 table: t("pt"),
                 parent: t("par"),
@@ -698,13 +707,13 @@ fn attached_partition() -> Plan {
                 from: None,
                 to: Some("5".into()),
                 fallback: None,
-            }),
-            p(Change::SetPartitionNotNull {
+            })),
+            p(Change::Partition(PartitionChange::SetPartitionNotNull {
                 uid: pt,
                 table: t("pt"),
                 column: "note".into(),
                 not_null: true,
-            }),
+            })),
         ],
         before,
         after,
@@ -766,24 +775,24 @@ fn a_column_gaining_a_default_and_a_deprecation_runs_them_in_either_order() {
     let (tid, cid) = (uid(UidKind::Table, "t"), uid(UidKind::Column, "t.x"));
     let plan = Plan {
         logical: vec![
-            p(Change::CreateTable {
+            p(Change::Table(TableChange::CreateTable {
                 uid: tid,
                 name: t("t"),
                 table: Box::new(bare),
                 beside_default: None,
                 moves_at_most: None,
-            }),
-            p(Change::AlterColumnDefault {
+            })),
+            p(Change::Column(ColumnChange::AlterColumnDefault {
                 uid: cid.clone(),
                 column: t("t").column("x"),
                 from: None,
                 to: Some("1".into()),
-            }),
-            p(Change::SetColumnDeprecated {
+            })),
+            p(Change::Column(ColumnChange::SetColumnDeprecated {
                 uid: cid,
                 column: t("t").column("x"),
                 reason: Some("old".into()),
-            }),
+            })),
         ],
         before: Schema::default(),
         after,
@@ -832,7 +841,7 @@ fn a_new_replica_identity_index_does_not_order_the_old_one_s_parameter_change() 
     after.tables.insert(t("t"), will);
     let plan = Plan {
         logical: vec![
-            p(Change::SetIndexStorageParameters {
+            p(Change::Index(IndexChange::SetIndexStorageParameters {
                 table: t("t"),
                 target: IndexPart::Index("ix_old".into()),
                 method: IndexMethod::Btree,
@@ -840,18 +849,20 @@ fn a_new_replica_identity_index_does_not_order_the_old_one_s_parameter_change() 
                     .into_iter()
                     .collect(),
                 reset: Default::default(),
-            }),
-            p(Change::AddIndex {
+            })),
+            p(Change::Index(IndexChange::AddIndex {
                 table: t("t"),
                 name: "ix_new".into(),
                 index: Box::new(index()),
                 clustered: false,
-            }),
-            p(Change::SetReplicaIdentity {
-                uid: uid(UidKind::Table, "t"),
-                table: t("t"),
-                to: Some(ReplicaIdentity::Index("ix_new".into())),
-            }),
+            })),
+            p(Change::TableProperty(
+                TablePropertyChange::SetReplicaIdentity {
+                    uid: uid(UidKind::Table, "t"),
+                    table: t("t"),
+                    to: Some(ReplicaIdentity::Index("ix_new".into())),
+                },
+            )),
         ],
         before,
         after,
@@ -919,15 +930,17 @@ fn a_replica_identity_moves_to_a_standing_index_before_the_old_one_is_dropped() 
     after.tables.insert(t("t"), will);
     let plan = Plan {
         logical: vec![
-            p(Change::SetReplicaIdentity {
-                uid: uid(UidKind::Table, "t"),
-                table: t("t"),
-                to: Some(ReplicaIdentity::Index("ix_new".into())),
-            }),
-            p(Change::DropIndex {
+            p(Change::TableProperty(
+                TablePropertyChange::SetReplicaIdentity {
+                    uid: uid(UidKind::Table, "t"),
+                    table: t("t"),
+                    to: Some(ReplicaIdentity::Index("ix_new".into())),
+                },
+            )),
+            p(Change::Index(IndexChange::DropIndex {
                 table: t("t"),
                 name: "ix_old".into(),
-            }),
+            })),
         ],
         before,
         after,
@@ -956,15 +969,15 @@ fn a_revoke_reads_the_module_that_stands_so_it_may_precede_an_in_place_alteratio
     after.modules.insert(id.clone(), changed.clone());
     let plan = Plan {
         logical: vec![
-            p(Change::Revoke {
+            p(Change::Permission(GrantChange::Revoke {
                 role: "r".into(),
                 target: pbps_model::GrantTarget::Object(t("v")),
                 permissions: permissions(),
-            }),
-            p(Change::AlterModule {
+            })),
+            p(Change::Module(ModuleChange::AlterModule {
                 id,
                 module: Box::new(changed),
-            }),
+            })),
         ],
         before,
         after,
@@ -987,15 +1000,15 @@ fn a_revoke_reads_the_module_that_stands_so_it_may_precede_an_in_place_alteratio
     before.modules.insert(id.clone(), module);
     let dropped = Plan {
         logical: vec![
-            p(Change::Revoke {
+            p(Change::Permission(GrantChange::Revoke {
                 role: "r".into(),
                 target: pbps_model::GrantTarget::Object(t("v")),
                 permissions: permissions(),
-            }),
-            p(Change::DropModule {
+            })),
+            p(Change::Module(ModuleChange::DropModule {
                 id,
                 kind: ModuleKind::View,
-            }),
+            })),
         ],
         before,
         after: Schema::default(),
@@ -1032,7 +1045,7 @@ fn self_referencing(with_key: bool) -> Table {
 }
 
 fn child_row(id: i64, parent: Option<i64>) -> PlannedChange {
-    p(Change::InsertRow {
+    p(Change::Row(RowChange::InsertRow {
         table: t("c"),
         key_column: "id".into(),
         identity_key: false,
@@ -1045,7 +1058,7 @@ fn child_row(id: i64, parent: Option<i64>) -> PlannedChange {
         .collect::<Row>(),
         defaults: Default::default(),
         types: Default::default(),
-    })
+    }))
 }
 
 fn rows_of_c(before_key: bool, after_key: bool, logical: Vec<PlannedChange>) -> Plan {
@@ -1087,11 +1100,13 @@ fn rows_wait_only_for_a_key_that_stands_when_they_are_written() {
         .unwrap()
         .foreign_keys
         .clear();
-    added.logical.push(p(Change::AddForeignKey {
-        table: t("c"),
-        name: "fk".into(),
-        constraint: Box::new(reference(&["pid"], &["id"])),
-    }));
+    added
+        .logical
+        .push(p(Change::Constraint(ConstraintChange::AddForeignKey {
+            table: t("c"),
+            name: "fk".into(),
+            constraint: Box::new(reference(&["pid"], &["id"])),
+        })));
     let (ops, fx, baseline) = added.analysed(ModuleEdits::InPlace);
     assert_eq!(
         run(&ops, &fx, &baseline, &[0, 1, 2], &none, Checks::ALL),
@@ -1129,10 +1144,10 @@ fn rows_wait_only_for_a_key_that_stands_when_they_are_written() {
         .clear();
     dropped.logical.insert(
         0,
-        p(Change::DropForeignKey {
+        p(Change::Constraint(ConstraintChange::DropForeignKey {
             table: t("c"),
             name: "fk".into(),
-        }),
+        })),
     );
     let (ops, fx, baseline) = dropped.analysed(ModuleEdits::InPlace);
     assert_eq!(
@@ -1237,28 +1252,30 @@ fn a_replica_identity_target_made_usable_by_the_plan_is_switched_to_last() {
     after.tables.insert(t("t"), will);
     let tid = uid(UidKind::Table, "t");
     let switch = |to| {
-        p(Change::SetReplicaIdentity {
-            uid: tid.clone(),
-            table: t("t"),
-            to: Some(to),
-        })
+        p(Change::TableProperty(
+            TablePropertyChange::SetReplicaIdentity {
+                uid: tid.clone(),
+                table: t("t"),
+                to: Some(to),
+            },
+        ))
     };
     let plan = Plan {
         // The differ's order: FULL, drop the old index, tighten, then switch.
         logical: vec![
             switch(ReplicaIdentity::Full),
-            p(Change::DropIndex {
+            p(Change::Index(IndexChange::DropIndex {
                 table: t("t"),
                 name: "ix_old".into(),
-            }),
-            p(Change::AlterColumnNullability {
+            })),
+            p(Change::Column(ColumnChange::AlterColumnNullability {
                 uid: uid(UidKind::Column, "t.a"),
                 column: t("t").column("a"),
                 ty: int(),
                 to_nullable: false,
                 collation: None,
                 through_external_partitions: false,
-            }),
+            })),
             switch(ReplicaIdentity::Index("ix_new".into())),
         ],
         before,
@@ -1322,19 +1339,19 @@ fn tightened_column(logical: Vec<PlannedChange>) -> Plan {
 }
 
 fn tighten() -> PlannedChange {
-    p(Change::AlterColumnNullability {
+    p(Change::Column(ColumnChange::AlterColumnNullability {
         uid: uid(UidKind::Column, "t.n"),
         column: t("t").column("n"),
         ty: int(),
         to_nullable: false,
         collation: None,
         through_external_partitions: false,
-    })
+    }))
 }
 
 #[test]
 fn a_tightening_followed_by_a_non_null_write_is_a_valid_order() {
-    let insert = p(Change::InsertRow {
+    let insert = p(Change::Row(RowChange::InsertRow {
         table: t("t"),
         key_column: "id".into(),
         identity_key: false,
@@ -1344,7 +1361,7 @@ fn a_tightening_followed_by_a_non_null_write_is_a_valid_order() {
             .collect::<Row>(),
         defaults: Default::default(),
         types: Default::default(),
-    });
+    }));
     let plan = tightened_column(vec![tighten(), insert]);
     let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
     assert_eq!(
@@ -1362,12 +1379,12 @@ fn a_tightening_followed_by_a_non_null_write_is_a_valid_order() {
 
 #[test]
 fn a_recomputed_expression_runs_before_the_tightening_that_would_refuse_its_nulls() {
-    let recompute = p(Change::AlterColumnExpression {
+    let recompute = p(Change::Column(ColumnChange::AlterColumnExpression {
         uid: uid(UidKind::Column, "t.n"),
         column: t("t").column("n"),
         from: "1".into(),
         to: "2".into(),
-    });
+    }));
     let plan = tightened_column(vec![recompute, tighten()]);
     let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
     let none = ModuleDeps::new();
@@ -1382,10 +1399,10 @@ fn a_long_chain_of_annotated_modules_is_ordered_without_scanning_every_pair() {
     let logical: Vec<PlannedChange> = modules
         .iter()
         .map(|(id, module)| {
-            p(Change::CreateModule {
+            p(Change::Module(ModuleChange::CreateModule {
                 id: id.clone(),
                 module: Box::new(module.clone()),
-            })
+            }))
         })
         .collect();
     let declared: ModuleDeps = (1..n)
@@ -1439,11 +1456,11 @@ fn computed_then(second: Change, id: Option<ModuleId>) -> (Operations, Vec<Effec
     }
     let plan = Plan {
         logical: vec![
-            p(Change::DropComputedColumn {
+            p(Change::Column(ColumnChange::DropComputedColumn {
                 table: t("t"),
                 name: "c".into(),
                 computed,
-            }),
+            })),
             p(second),
         ],
         before,
@@ -1487,10 +1504,10 @@ fn a_function_change_ahead_of_a_computed_column_is_connected_and_a_column_change
     // pass moves it, so it is recorded and does not fail.
     let (id, module) = view("v");
     let (ops, fx, baseline) = computed_then(
-        Change::AlterModule {
+        Change::Module(ModuleChange::AlterModule {
             id: id.clone(),
             module: Box::new(module),
-        },
+        }),
         Some(id),
     );
     let (lines, fails) = judged(&ops, &fx, &baseline, &[1, 0]);
@@ -1510,10 +1527,10 @@ fn a_function_change_ahead_of_a_computed_column_is_connected_and_a_column_change
     // Negative: the same requirement on a column drop is an order the
     // differ itself makes, and fails.
     let (ops, fx, baseline) = computed_then(
-        Change::DropColumn {
+        Change::Column(ColumnChange::DropColumn {
             uid: uid(UidKind::Column, "t.a"),
             column: t("t").column("a"),
-        },
+        }),
         None,
     );
     let (lines, fails) = judged(&ops, &fx, &baseline, &[1, 0]);
@@ -1523,7 +1540,7 @@ fn a_function_change_ahead_of_a_computed_column_is_connected_and_a_column_change
 
 fn update_pid(id: i64, parent: i64) -> PlannedChange {
     use pbps_model::Cell;
-    p(Change::UpdateRow {
+    p(Change::Row(RowChange::UpdateRow {
         table: t("c"),
         key_column: "id".into(),
         key: RowKey::from(id.to_string().as_str()),
@@ -1537,7 +1554,7 @@ fn update_pid(id: i64, parent: i64) -> PlannedChange {
         types: Default::default(),
         after_types: Default::default(),
         key_type: Default::default(),
-    })
+    }))
 }
 
 #[test]
@@ -1576,12 +1593,12 @@ fn a_primary_key_over_a_column_the_plan_tightens_follows_the_tightening() {
     let plan = Plan {
         logical: vec![
             tighten(),
-            p(Change::SetPrimaryKey {
+            p(Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table: t("t"),
                 from: None,
                 to: will.primary_key,
                 nonclustered: false,
-            }),
+            })),
         ],
         before,
         after,
@@ -1617,7 +1634,7 @@ fn a_dropped_column_takes_its_default_with_it_so_a_later_insert_is_valid() {
     let (mut before, mut after) = (Schema::default(), Schema::default());
     before.tables.insert(t("t"), was);
     after.tables.insert(t("t"), table_with(&["id"]));
-    let insert = p(Change::InsertRow {
+    let insert = p(Change::Row(RowChange::InsertRow {
         table: t("t"),
         key_column: "id".into(),
         identity_key: false,
@@ -1625,13 +1642,13 @@ fn a_dropped_column_takes_its_default_with_it_so_a_later_insert_is_valid() {
         row: [("id".into(), Value::Int(1))].into_iter().collect::<Row>(),
         defaults: Default::default(),
         types: Default::default(),
-    });
+    }));
     let plan = Plan {
         logical: vec![
-            p(Change::DropColumn {
+            p(Change::Column(ColumnChange::DropColumn {
                 uid: uid(UidKind::Column, "t.d"),
                 column: t("t").column("d"),
-            }),
+            })),
             insert,
         ],
         before,
@@ -1703,14 +1720,14 @@ fn numbered_and_retyped(from: pbps_model::ValueSource, to: pbps_model::ValueSour
     let ids = Plan::ids(&["t"], &[("t", "id")]);
     Plan {
         logical: vec![
-            p(Change::AlterColumnNumbering {
+            p(Change::Column(ColumnChange::AlterColumnNumbering {
                 uid: id.clone(),
                 column: t("t").column("id"),
                 ty: "bigint".parse().unwrap(),
                 from,
                 to,
-            }),
-            p(Change::AlterColumnType {
+            })),
+            p(Change::Column(ColumnChange::AlterColumnType {
                 uid: id,
                 column: t("t").column("id"),
                 from: int(),
@@ -1721,7 +1738,7 @@ fn numbered_and_retyped(from: pbps_model::ValueSource, to: pbps_model::ValueSour
                 to_collation: None,
                 through_external_partitions: false,
                 using: None,
-            }),
+            })),
         ],
         before,
         after,
@@ -1848,7 +1865,7 @@ fn parent_default_changes_under_a_partition() -> Plan {
     let ids = Plan::ids(&["par", "pt"], &[("par", "v")]);
     let pt = uid(UidKind::Table, "pt");
     let set = |to: Option<&str>| {
-        p(Change::SetPartitionDefault {
+        p(Change::Partition(PartitionChange::SetPartitionDefault {
             uid: pt.clone(),
             table: t("pt"),
             parent: t("par"),
@@ -1856,16 +1873,16 @@ fn parent_default_changes_under_a_partition() -> Plan {
             from: None,
             to: to.map(Into::into),
             fallback: Some("2".into()),
-        })
+        }))
     };
     Plan {
         logical: vec![
-            p(Change::AlterColumnDefault {
+            p(Change::Column(ColumnChange::AlterColumnDefault {
                 uid: uid(UidKind::Column, "par.v"),
                 column: t("par").column("v"),
                 from: Some("1".into()),
                 to: Some("2".into()),
-            }),
+            })),
             set(None),
             set(Some("9")),
         ],
@@ -1913,26 +1930,26 @@ fn a_partition_created_beside_a_parent_column_add_runs_in_either_order() {
     after.tables.insert(t("pt"), member.clone());
     let plan = Plan {
         logical: vec![
-            p(Change::CreateTable {
+            p(Change::Table(TableChange::CreateTable {
                 uid: uid(UidKind::Table, "par"),
                 name: t("par"),
                 table: Box::new(table_with(&["id"])),
                 beside_default: None,
                 moves_at_most: None,
-            }),
-            p(Change::CreateTable {
+            })),
+            p(Change::Table(TableChange::CreateTable {
                 uid: uid(UidKind::Table, "pt"),
                 name: t("pt"),
                 table: Box::new(member),
                 beside_default: None,
                 moves_at_most: None,
-            }),
-            p(Change::AddColumn {
+            })),
+            p(Change::Column(ColumnChange::AddColumn {
                 uid: uid(UidKind::Column, "par.extra"),
                 table: t("par"),
                 name: "extra".into(),
                 column: Box::new(Column::new(int())),
-            }),
+            })),
         ],
         before: Schema::default(),
         after,
@@ -2147,7 +2164,7 @@ fn checked(was: &str, will: &str, update: pbps_model::Cell) -> Plan {
     before.tables.insert(t("t"), table(was));
     after.tables.insert(t("t"), table(will));
     let ids = Plan::ids(&["t"], &[("t", "id"), ("t", "n")]);
-    let mut logical = vec![p(Change::UpdateRow {
+    let mut logical = vec![p(Change::Row(RowChange::UpdateRow {
         table: t("t"),
         key_column: "id".into(),
         key: RowKey::from("1"),
@@ -2158,22 +2175,22 @@ fn checked(was: &str, will: &str, update: pbps_model::Cell) -> Plan {
         types: Default::default(),
         after_types: Default::default(),
         key_type: Default::default(),
-    })];
+    }))];
     if was != will {
         logical.insert(
             0,
-            p(Change::DropCheck {
+            p(Change::Constraint(ConstraintChange::DropCheck {
                 table: t("t"),
                 name: "ck".into(),
-            }),
+            })),
         );
-        logical.push(p(Change::AddCheck {
+        logical.push(p(Change::Constraint(ConstraintChange::AddCheck {
             table: t("t"),
             name: "ck".into(),
             constraint: pbps_model::CheckConstraint {
                 expression: will.into(),
             },
-        }));
+        })));
     }
     Plan {
         logical,
@@ -2302,12 +2319,12 @@ fn a_row_updated_to_its_default_follows_the_default_it_takes() {
         .value_source = ValueSource::Default("3".into());
     plan.logical.insert(
         0,
-        p(Change::AlterColumnDefault {
+        p(Change::Column(ColumnChange::AlterColumnDefault {
             uid: uid(UidKind::Column, "t.n"),
             column: t("t").column("n"),
             from: None,
             to: Some("3".into()),
-        }),
+        })),
     );
     let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
     let none = ModuleDeps::new();
@@ -2348,7 +2365,7 @@ fn a_foreign_key_added_follows_the_parent_rows_the_plan_writes() {
     let ids = Plan::ids(&["p", "c"], &[("p", "id"), ("c", "pid")]);
     let plan = Plan {
         logical: vec![
-            p(Change::InsertRow {
+            p(Change::Row(RowChange::InsertRow {
                 table: t("p"),
                 key_column: "id".into(),
                 identity_key: false,
@@ -2356,12 +2373,12 @@ fn a_foreign_key_added_follows_the_parent_rows_the_plan_writes() {
                 row: [("id".into(), Value::Int(1))].into_iter().collect::<Row>(),
                 defaults: Default::default(),
                 types: Default::default(),
-            }),
-            p(Change::AddForeignKey {
+            })),
+            p(Change::Constraint(ConstraintChange::AddForeignKey {
                 table: t("c"),
                 name: "fk".into(),
                 constraint: Box::new(key),
-            }),
+            })),
         ],
         before,
         after,
@@ -2444,19 +2461,19 @@ fn a_key_the_plan_makes_and_ends_is_not_found_after_its_ending() {
 fn a_default_dropped_by_the_old_name_runs_before_the_rename() {
     let mut plan = renamed_default(None);
     plan.logical = vec![
-        p(Change::AlterColumnDefault {
+        p(Change::Column(ColumnChange::AlterColumnDefault {
             uid: uid(UidKind::Column, "t.a"),
             column: t("t").column("a"),
             from: Some("1".into()),
             to: None,
-        }),
-        p(Change::RenameColumn {
+        })),
+        p(Change::Column(ColumnChange::RenameColumn {
             uid: uid(UidKind::Column, "t.a"),
             table: t("t"),
             from: "a".into(),
             to: "b".into(),
             table_was: None,
-        }),
+        })),
     ];
     let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
     let none = ModuleDeps::new();
@@ -2488,19 +2505,19 @@ fn a_numbering_put_on_a_column_with_a_default_follows_the_default_s_removal() {
     let ids = Plan::ids(&["t"], &[("t", "n")]);
     let plan = Plan {
         logical: vec![
-            p(Change::AlterColumnDefault {
+            p(Change::Column(ColumnChange::AlterColumnDefault {
                 uid: uid(UidKind::Column, "t.n"),
                 column: t("t").column("n"),
                 from: Some("0".into()),
                 to: None,
-            }),
-            p(Change::AlterColumnNumbering {
+            })),
+            p(Change::Column(ColumnChange::AlterColumnNumbering {
                 uid: uid(UidKind::Column, "t.n"),
                 column: t("t").column("n"),
                 ty: int(),
                 from: ValueSource::None,
                 to: identity,
-            }),
+            })),
         ],
         before,
         after,
@@ -2545,23 +2562,25 @@ fn a_replica_identity_switched_to_an_index_over_a_new_not_null_column_verifies_c
     after.tables.insert(t("t"), will);
     let plan = Plan {
         logical: vec![
-            p(Change::AddColumn {
+            p(Change::Column(ColumnChange::AddColumn {
                 uid: uid(UidKind::Column, "t.a"),
                 table: t("t"),
                 name: "a".into(),
                 column: Box::new(a),
-            }),
-            p(Change::AddIndex {
+            })),
+            p(Change::Index(IndexChange::AddIndex {
                 table: t("t"),
                 name: "ix".into(),
                 index: Box::new(index),
                 clustered: false,
-            }),
-            p(Change::SetReplicaIdentity {
-                uid: uid(UidKind::Table, "t"),
-                table: t("t"),
-                to: Some(ReplicaIdentity::Index("ix".into())),
-            }),
+            })),
+            p(Change::TableProperty(
+                TablePropertyChange::SetReplicaIdentity {
+                    uid: uid(UidKind::Table, "t"),
+                    table: t("t"),
+                    to: Some(ReplicaIdentity::Index("ix".into())),
+                },
+            )),
         ],
         before,
         after,
@@ -2601,22 +2620,22 @@ fn default_taken_off(then_rename: bool) -> Plan {
         ids.columns.insert(moved.clone(), t("t").column(column));
         ids
     };
-    let removal = p(Change::AlterColumnDefault {
+    let removal = p(Change::Column(ColumnChange::AlterColumnDefault {
         uid: moved.clone(),
         column: t("t").column("a"),
         from: Some("1".into()),
         to: None,
-    });
+    }));
     let (second, later, ids) = if then_rename {
         after.tables.insert(t("t"), with_default("b", None, "int"));
         (
-            p(Change::RenameColumn {
+            p(Change::Column(ColumnChange::RenameColumn {
                 uid: moved.clone(),
                 table: t("t"),
                 from: "a".into(),
                 to: "b".into(),
                 table_was: None,
-            }),
+            })),
             "b",
             named("b"),
         )
@@ -2625,7 +2644,7 @@ fn default_taken_off(then_rename: bool) -> Plan {
             .tables
             .insert(t("t"), with_default("a", None, "bigint"));
         (
-            p(Change::AlterColumnType {
+            p(Change::Column(ColumnChange::AlterColumnType {
                 uid: moved.clone(),
                 column: t("t").column("a"),
                 from: "int".parse().unwrap(),
@@ -2636,7 +2655,7 @@ fn default_taken_off(then_rename: bool) -> Plan {
                 to_collation: None,
                 through_external_partitions: false,
                 using: None,
-            }),
+            })),
             "a",
             named("a"),
         )
@@ -2711,19 +2730,19 @@ fn default_taken_off_after_the_rename() -> Plan {
     };
     Plan {
         logical: vec![
-            p(Change::RenameColumn {
+            p(Change::Column(ColumnChange::RenameColumn {
                 uid: moved.clone(),
                 table: t("t"),
                 from: "a".into(),
                 to: "b".into(),
                 table_was: None,
-            }),
-            p(Change::AlterColumnDefault {
+            })),
+            p(Change::Column(ColumnChange::AlterColumnDefault {
                 uid: moved.clone(),
                 column: t("t").column("b"),
                 from: Some("1".into()),
                 to: None,
-            }),
+            })),
         ],
         before,
         after,
@@ -2792,14 +2811,14 @@ fn a_retype_of_a_renamed_column_still_waits_for_the_foreign_key_into_it() {
         .insert(moved.clone(), t("p").column("key"));
     let plan = Plan {
         logical: vec![
-            p(Change::RenameColumn {
+            p(Change::Column(ColumnChange::RenameColumn {
                 uid: moved.clone(),
                 table: t("p"),
                 from: "id".into(),
                 to: "key".into(),
                 table_was: None,
-            }),
-            p(Change::AlterColumnType {
+            })),
+            p(Change::Column(ColumnChange::AlterColumnType {
                 uid: moved,
                 column: t("p").column("key"),
                 from: int(),
@@ -2810,11 +2829,11 @@ fn a_retype_of_a_renamed_column_still_waits_for_the_foreign_key_into_it() {
                 to_collation: None,
                 through_external_partitions: false,
                 using: None,
-            }),
-            p(Change::DropForeignKey {
+            })),
+            p(Change::Constraint(ConstraintChange::DropForeignKey {
                 table: t("c"),
                 name: "fk".into(),
-            }),
+            })),
         ],
         before,
         after,
@@ -2855,14 +2874,14 @@ fn update_beside_a_rename(guard: bool) -> Plan {
     };
     Plan {
         logical: vec![
-            p(Change::RenameColumn {
+            p(Change::Column(ColumnChange::RenameColumn {
                 uid: moved.clone(),
                 table: t("t"),
                 from: "a".into(),
                 to: "b".into(),
                 table_was: None,
-            }),
-            p(Change::UpdateRow {
+            })),
+            p(Change::Row(RowChange::UpdateRow {
                 table: t("t"),
                 key_column: "id".into(),
                 key: RowKey::from("1"),
@@ -2879,7 +2898,7 @@ fn update_beside_a_rename(guard: bool) -> Plan {
                 types: Default::default(),
                 after_types: Default::default(),
                 key_type: Default::default(),
-            }),
+            })),
         ],
         before,
         after,
@@ -2925,13 +2944,13 @@ fn insert_beside_a_new_column(held: bool) -> Plan {
     }
     Plan {
         logical: vec![
-            p(Change::AddColumn {
+            p(Change::Column(ColumnChange::AddColumn {
                 uid: uid(UidKind::Column, "t.c"),
                 table: t("t"),
                 name: "c".into(),
                 column: Box::new(Column::new(int())),
-            }),
-            p(Change::InsertRow {
+            })),
+            p(Change::Row(RowChange::InsertRow {
                 table: t("t"),
                 key_column: "id".into(),
                 identity_key: false,
@@ -2939,7 +2958,7 @@ fn insert_beside_a_new_column(held: bool) -> Plan {
                 row: [("a".into(), Value::Int(5))].into_iter().collect::<Row>(),
                 defaults: Default::default(),
                 types,
-            }),
+            })),
         ],
         before,
         after,
@@ -2989,12 +3008,12 @@ fn two_added_columns(apart: bool) -> Plan {
         .columns
         .insert("d".into(), Column::new(int()));
     let add = |table: &str, name: &str| {
-        p(Change::AddColumn {
+        p(Change::Column(ColumnChange::AddColumn {
             uid: uid(UidKind::Column, &format!("{table}.{name}")),
             table: t(table),
             name: name.into(),
             column: Box::new(Column::new(int())),
-        })
+        }))
     };
     let base = [("t", "id"), ("u", "id")];
     Plan {
@@ -3046,11 +3065,11 @@ fn insert_beside_a_dropped_column(required: bool) -> Plan {
     after.tables.insert(t("t"), table_with(&["id"]));
     Plan {
         logical: vec![
-            p(Change::DropColumn {
+            p(Change::Column(ColumnChange::DropColumn {
                 uid: uid(UidKind::Column, "t.a"),
                 column: t("t").column("a"),
-            }),
-            p(Change::InsertRow {
+            })),
+            p(Change::Row(RowChange::InsertRow {
                 table: t("t"),
                 key_column: "id".into(),
                 identity_key: false,
@@ -3058,7 +3077,7 @@ fn insert_beside_a_dropped_column(required: bool) -> Plan {
                 row: Row::default(),
                 defaults: Default::default(),
                 types: Default::default(),
-            }),
+            })),
         ],
         before,
         after,
@@ -3197,7 +3216,7 @@ fn rows_across(
     columns.push(("c", "id"));
     let ids = Plan::ids(&["p", "c"], &columns);
     let insert = |table: &str, key_column: &str, cells: &[(&str, i64)]| {
-        p(Change::InsertRow {
+        p(Change::Row(RowChange::InsertRow {
             table: t(table),
             key_column: key_column.into(),
             identity_key: false,
@@ -3208,7 +3227,7 @@ fn rows_across(
                 .collect::<Row>(),
             defaults: Default::default(),
             types: Default::default(),
-        })
+        }))
     };
     Plan {
         logical: vec![
@@ -3315,22 +3334,23 @@ fn a_retype_beside_a_foreign_key_the_plan_keeps_is_recorded_and_not_refused() {
     )
     .unwrap();
     assert!(
-        plan.changes
-            .iter()
-            .any(|p| matches!(p.change, Change::AlterColumnType { .. })),
+        plan.changes.iter().any(|p| matches!(
+            p.change,
+            Change::Column(ColumnChange::AlterColumnType { .. })
+        )),
         "{plan:?}"
     );
     assert!(
-        !plan
-            .changes
-            .iter()
-            .any(|p| matches!(p.change, Change::DropForeignKey { .. })),
+        !plan.changes.iter().any(|p| matches!(
+            p.change,
+            Change::Constraint(ConstraintChange::DropForeignKey { .. })
+        )),
         "{plan:?}"
     );
 }
 
 fn plain_row(table: &str, key: i64, cells: &[(&str, i64)]) -> PlannedChange {
-    p(Change::InsertRow {
+    p(Change::Row(RowChange::InsertRow {
         table: t(table),
         key_column: "id".into(),
         identity_key: false,
@@ -3342,7 +3362,7 @@ fn plain_row(table: &str, key: i64, cells: &[(&str, i64)]) -> PlannedChange {
             .collect::<Row>(),
         defaults: Default::default(),
         types: Default::default(),
-    })
+    }))
 }
 
 fn reference(columns: &[&str], references: &[&str]) -> ForeignKey {
@@ -3432,7 +3452,7 @@ fn a_child_row_sharing_its_parents_primary_key_waits_for_the_parent_row() {
 #[test]
 fn a_child_update_of_one_component_of_a_composite_reference_waits_for_the_new_tuple() {
     let none = ModuleDeps::new();
-    let update = p(Change::UpdateRow {
+    let update = p(Change::Row(RowChange::UpdateRow {
         table: t("c"),
         key_column: "id".into(),
         key: RowKey::from("1"),
@@ -3451,7 +3471,7 @@ fn a_child_update_of_one_component_of_a_composite_reference_waits_for_the_new_tu
         types: Default::default(),
         after_types: Default::default(),
         key_type: Default::default(),
-    });
+    }));
     let plan = parent_and_child(
         &["id", "a", "b"],
         &["a", "b"],
@@ -3469,7 +3489,7 @@ fn a_child_update_of_one_component_of_a_composite_reference_waits_for_the_new_tu
 }
 
 fn delete(table: &str, key: i64, cells: &[(&str, i64)]) -> PlannedChange {
-    p(Change::DeleteRow {
+    p(Change::Row(RowChange::DeleteRow {
         table: t(table),
         key_column: "id".into(),
         key: RowKey::from(key.to_string().as_str()),
@@ -3482,7 +3502,7 @@ fn delete(table: &str, key: i64, cells: &[(&str, i64)]) -> PlannedChange {
         types: Default::default(),
         after_types: Default::default(),
         key_type: None,
-    })
+    }))
 }
 
 /// The row that held the referenced values goes after the rows that name
@@ -3530,7 +3550,7 @@ fn rows_swapping_the_values_of_a_rebuilt_unique_index_draw_no_cycle() {
         filegroup: None,
     };
     let swap = |key: i64, from: i64, to: i64| {
-        p(Change::UpdateRow {
+        p(Change::Row(RowChange::UpdateRow {
             table: t("t"),
             key_column: "id".into(),
             key: RowKey::from(key.to_string().as_str()),
@@ -3547,7 +3567,7 @@ fn rows_swapping_the_values_of_a_rebuilt_unique_index_draw_no_cycle() {
             types: Default::default(),
             after_types: Default::default(),
             key_type: Default::default(),
-        })
+        }))
     };
     let table = |include: &[&str]| {
         let mut table = table_with(&["id", "code", "x"]);
@@ -3560,18 +3580,18 @@ fn rows_swapping_the_values_of_a_rebuilt_unique_index_draw_no_cycle() {
     let ids = Plan::ids(&["t"], &[("t", "id"), ("t", "code"), ("t", "x")]);
     let plan = Plan {
         logical: vec![
-            p(Change::DropIndex {
+            p(Change::Index(IndexChange::DropIndex {
                 table: t("t"),
                 name: "ix".into(),
-            }),
+            })),
             swap(1, 1, 2),
             swap(2, 2, 1),
-            p(Change::AddIndex {
+            p(Change::Index(IndexChange::AddIndex {
                 table: t("t"),
                 name: "ix".into(),
                 index: Box::new(index(&["x"])),
                 clustered: false,
-            }),
+            })),
         ],
         before,
         after,
@@ -3620,18 +3640,18 @@ fn a_foreign_key_into_a_renamed_table_still_orders_the_rows() {
         .insert(uid(UidKind::Column, "p.id"), t("q").column("id"));
     let row = |table: &str, key: i64, cells: &[(&str, i64)]| {
         let mut row = plain_row(table, key, cells);
-        if let Change::InsertRow { table: name, .. } = &mut row.change {
+        if let Change::Row(RowChange::InsertRow { table: name, .. }) = &mut row.change {
             *name = t(table);
         }
         row
     };
     plan.logical = vec![
-        p(Change::RenameTable {
+        p(Change::Table(TableChange::RenameTable {
             uid: moved,
             from: t("p"),
             to: t("q"),
             defaults: Vec::new(),
-        }),
+        })),
         row("c", 1, &[("pid", 1)]),
         row("q", 1, &[]),
     ];
@@ -3652,7 +3672,7 @@ fn a_foreign_key_into_a_renamed_table_still_orders_the_rows() {
 #[test]
 fn a_child_row_taking_a_literal_default_for_its_reference_waits_for_the_parent() {
     let none = ModuleDeps::new();
-    let child = p(Change::InsertRow {
+    let child = p(Change::Row(RowChange::InsertRow {
         table: t("c"),
         key_column: "id".into(),
         identity_key: false,
@@ -3660,7 +3680,7 @@ fn a_child_row_taking_a_literal_default_for_its_reference_waits_for_the_parent()
         row: Row::default(),
         defaults: [("pid".into(), "1".to_owned())].into_iter().collect(),
         types: Default::default(),
-    });
+    }));
     let mut plan = parent_and_child(
         &["id"],
         &[],
@@ -3699,13 +3719,13 @@ fn a_parent_row_deleted_under_a_renamed_unique_column_still_goes_after_its_child
         &["id", "pcode"],
         reference(&["pcode"], &["code"]),
         vec![
-            p(Change::RenameColumn {
+            p(Change::Column(ColumnChange::RenameColumn {
                 uid: moved.clone(),
                 table: t("p"),
                 from: "code".into(),
                 to: "slug".into(),
                 table_was: None,
-            }),
+            })),
             delete("p", 1, &[("slug", 9)]),
             delete("c", 1, &[("pcode", 9)]),
         ],
@@ -3741,7 +3761,7 @@ fn a_parent_row_deleted_under_a_renamed_unique_column_still_goes_after_its_child
 #[test]
 fn rows_swapping_the_values_of_a_key_over_a_retyped_column_draw_no_cycle() {
     let swap = |key: i64, from: i64, to: i64| {
-        p(Change::UpdateRow {
+        p(Change::Row(RowChange::UpdateRow {
             table: t("t"),
             key_column: "id".into(),
             key: RowKey::from(key.to_string().as_str()),
@@ -3758,7 +3778,7 @@ fn rows_swapping_the_values_of_a_key_over_a_retyped_column_draw_no_cycle() {
             types: Default::default(),
             after_types: Default::default(),
             key_type: Default::default(),
-        })
+        }))
     };
     let table = |ty: &str| {
         let mut table = table_with(&["id"]);
@@ -3781,7 +3801,7 @@ fn rows_swapping_the_values_of_a_key_over_a_retyped_column_draw_no_cycle() {
     let ids = Plan::ids(&["t"], &[("t", "id"), ("t", "code")]);
     let plan = Plan {
         logical: vec![
-            p(Change::AlterColumnType {
+            p(Change::Column(ColumnChange::AlterColumnType {
                 uid: uid(UidKind::Column, "t.code"),
                 column: t("t").column("code"),
                 from: "int".parse().unwrap(),
@@ -3792,7 +3812,7 @@ fn rows_swapping_the_values_of_a_key_over_a_retyped_column_draw_no_cycle() {
                 to_collation: None,
                 through_external_partitions: false,
                 using: None,
-            }),
+            })),
             swap(1, 1, 2),
             swap(2, 2, 1),
         ],
@@ -3817,7 +3837,7 @@ fn rows_swapping_the_values_of_a_key_over_a_retyped_column_draw_no_cycle() {
 #[test]
 fn a_child_row_waits_for_a_parent_update_to_a_literal_default() {
     let none = ModuleDeps::new();
-    let update = p(Change::UpdateRow {
+    let update = p(Change::Row(RowChange::UpdateRow {
         table: t("p"),
         key_column: "id".into(),
         key: RowKey::from("1"),
@@ -3834,7 +3854,7 @@ fn a_child_row_waits_for_a_parent_update_to_a_literal_default() {
         types: Default::default(),
         after_types: Default::default(),
         key_type: Default::default(),
-    });
+    }));
     let mut plan = parent_and_child(
         &["id", "code"],
         &["code"],
@@ -3866,7 +3886,7 @@ fn a_child_row_waits_for_a_parent_update_to_a_literal_default() {
 #[test]
 fn a_parent_row_deleted_holding_a_default_goes_after_its_child() {
     let none = ModuleDeps::new();
-    let parent = p(Change::DeleteRow {
+    let parent = p(Change::Row(RowChange::DeleteRow {
         table: t("p"),
         key_column: "id".into(),
         key: RowKey::from("1"),
@@ -3878,7 +3898,7 @@ fn a_parent_row_deleted_holding_a_default_goes_after_its_child() {
         types: Default::default(),
         after_types: Default::default(),
         key_type: None,
-    });
+    }));
     let plan = parent_and_child(
         &["id", "code"],
         &["code"],
@@ -3900,7 +3920,7 @@ fn a_parent_row_deleted_holding_a_default_goes_after_its_child() {
 #[test]
 fn a_child_row_taking_a_computed_default_for_its_reference_waits_for_the_parent() {
     let none = ModuleDeps::new();
-    let child = p(Change::InsertRow {
+    let child = p(Change::Row(RowChange::InsertRow {
         table: t("c"),
         key_column: "id".into(),
         identity_key: false,
@@ -3910,7 +3930,7 @@ fn a_child_row_taking_a_computed_default_for_its_reference_waits_for_the_parent(
             .into_iter()
             .collect(),
         types: Default::default(),
-    });
+    }));
     let mut plan = parent_and_child(
         &["id"],
         &[],
@@ -4037,7 +4057,7 @@ fn the_rows_of_two_tables_referencing_each_other_keep_the_order_given() {
 #[test]
 fn a_child_update_releasing_its_reference_goes_before_the_parent_row_is_deleted() {
     let none = ModuleDeps::new();
-    let update = p(Change::UpdateRow {
+    let update = p(Change::Row(RowChange::UpdateRow {
         table: t("c"),
         key_column: "id".into(),
         key: RowKey::from("1"),
@@ -4054,7 +4074,7 @@ fn a_child_update_releasing_its_reference_goes_before_the_parent_row_is_deleted(
         types: Default::default(),
         after_types: Default::default(),
         key_type: Default::default(),
-    });
+    }));
     let plan = parent_and_child(
         &["id"],
         &[],
@@ -4082,10 +4102,10 @@ fn a_parent_row_is_deleted_after_the_incoming_foreign_key_the_plan_drops() {
         &["id", "pid"],
         reference(&["pid"], &["id"]),
         vec![
-            p(Change::DropForeignKey {
+            p(Change::Constraint(ConstraintChange::DropForeignKey {
                 table: t("c"),
                 name: "fk".into(),
-            }),
+            })),
             delete("p", 1, &[]),
         ],
     );
@@ -4128,7 +4148,7 @@ fn a_parent_row_is_deleted_after_the_incoming_foreign_key_the_plan_drops() {
 #[test]
 fn the_rows_of_tables_in_a_cycle_of_foreign_keys_keep_their_relative_order() {
     let none = ModuleDeps::new();
-    let update = p(Change::UpdateRow {
+    let update = p(Change::Row(RowChange::UpdateRow {
         table: t("c"),
         key_column: "id".into(),
         key: RowKey::from("1"),
@@ -4145,7 +4165,7 @@ fn the_rows_of_tables_in_a_cycle_of_foreign_keys_keep_their_relative_order() {
         types: Default::default(),
         after_types: Default::default(),
         key_type: Default::default(),
-    });
+    }));
     let mut plan = parent_and_child(
         &["id", "cid"],
         &[],
@@ -4189,17 +4209,19 @@ fn the_rows_of_tables_in_a_cycle_of_foreign_keys_keep_their_relative_order() {
 fn a_row_update_waits_for_the_teardown_of_a_check_that_is_put_back_unchanged() {
     let none = ModuleDeps::new();
     let mut plan = checked("n > 0", "n > 0", pbps_model::Cell::Value(Value::Int(6)));
-    plan.logical.push(p(Change::DropCheck {
-        table: t("t"),
-        name: "ck".into(),
-    }));
-    plan.logical.push(p(Change::AddCheck {
-        table: t("t"),
-        name: "ck".into(),
-        constraint: pbps_model::CheckConstraint {
-            expression: "n > 0".into(),
-        },
-    }));
+    plan.logical
+        .push(p(Change::Constraint(ConstraintChange::DropCheck {
+            table: t("t"),
+            name: "ck".into(),
+        })));
+    plan.logical
+        .push(p(Change::Constraint(ConstraintChange::AddCheck {
+            table: t("t"),
+            name: "ck".into(),
+            constraint: pbps_model::CheckConstraint {
+                expression: "n > 0".into(),
+            },
+        })));
     let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
     // The update first meets the old check.
     let early = run(&ops, &fx, &baseline, &[0, 1, 2], &none, Checks::ALL);
@@ -4231,16 +4253,16 @@ fn a_parent_row_is_deleted_after_a_foreign_key_the_plan_rebuilds() {
         &["id", "pid"],
         reference(&["pid"], &["id"]),
         vec![
-            p(Change::DropForeignKey {
+            p(Change::Constraint(ConstraintChange::DropForeignKey {
                 table: t("c"),
                 name: "fk".into(),
-            }),
+            })),
             delete("p", 1, &[]),
-            p(Change::AddForeignKey {
+            p(Change::Constraint(ConstraintChange::AddForeignKey {
                 table: t("c"),
                 name: "fk".into(),
                 constraint: Box::new(reference(&["pid"], &["id"])),
-            }),
+            })),
         ],
     );
     let ops = Operations::of_plan(&plan.logical, ModuleEdits::InPlace);
@@ -4287,14 +4309,14 @@ fn a_row_delete_waits_for_the_rename_of_its_key_column() {
     };
     let plan = Plan {
         logical: vec![
-            p(Change::RenameColumn {
+            p(Change::Column(ColumnChange::RenameColumn {
                 uid: moved.clone(),
                 table: t("t"),
                 from: "a".into(),
                 to: "k".into(),
                 table_was: None,
-            }),
-            p(Change::DeleteRow {
+            })),
+            p(Change::Row(RowChange::DeleteRow {
                 table: t("t"),
                 key_column: "k".into(),
                 key: RowKey::from("1"),
@@ -4306,7 +4328,7 @@ fn a_row_delete_waits_for_the_rename_of_its_key_column() {
                 types: Default::default(),
                 after_types: Default::default(),
                 key_type: None,
-            }),
+            })),
         ],
         before,
         after,
@@ -4363,20 +4385,20 @@ fn a_partitions_default_follows_its_parents_default_through_a_column_rename() {
     };
     let plan = Plan {
         logical: vec![
-            p(Change::RenameColumn {
+            p(Change::Column(ColumnChange::RenameColumn {
                 uid: moved.clone(),
                 table: t("par"),
                 from: "a".into(),
                 to: "b".into(),
                 table_was: None,
-            }),
-            p(Change::AlterColumnDefault {
+            })),
+            p(Change::Column(ColumnChange::AlterColumnDefault {
                 uid: moved.clone(),
                 column: t("par").column("b"),
                 from: Some("1".into()),
                 to: Some("2".into()),
-            }),
-            p(Change::SetPartitionDefault {
+            })),
+            p(Change::Partition(PartitionChange::SetPartitionDefault {
                 uid: uid(UidKind::Table, "pt"),
                 table: t("pt"),
                 parent: t("par"),
@@ -4384,7 +4406,7 @@ fn a_partitions_default_follows_its_parents_default_through_a_column_rename() {
                 from: None,
                 to: Some("5".into()),
                 fallback: None,
-            }),
+            })),
         ],
         before,
         after,
@@ -4448,22 +4470,22 @@ fn one_index(name: &str, column: &str) -> (String, pbps_model::Index) {
 }
 
 fn add_index(table: &str, index: (String, pbps_model::Index)) -> PlannedChange {
-    p(Change::AddIndex {
+    p(Change::Index(IndexChange::AddIndex {
         table: t(table),
         name: index.0.into(),
         index: Box::new(index.1),
         clustered: false,
-    })
+    }))
 }
 
 fn add_check(table: &str) -> PlannedChange {
-    p(Change::AddCheck {
+    p(Change::Constraint(ConstraintChange::AddCheck {
         table: t(table),
         name: "ck".into(),
         constraint: pbps_model::CheckConstraint {
             expression: "id > 0".into(),
         },
-    })
+    }))
 }
 
 /// `t(id)` before, `will` after, the ids of `columns` on both sides.
@@ -4493,13 +4515,13 @@ fn a_new_table_s_foreign_key_waits_for_the_table_it_references() {
     after.tables.insert(t("p"), table_with(&["id"]));
     after.tables.insert(t("c"), child.clone());
     let create = |name: &str, table: Table| {
-        p(Change::CreateTable {
+        p(Change::Table(TableChange::CreateTable {
             uid: uid(UidKind::Table, name),
             name: t(name),
             table: Box::new(table),
             beside_default: None,
             moves_at_most: None,
-        })
+        }))
     };
     refused_backwards(&Plan {
         logical: vec![create("p", table_with(&["id"])), create("c", child)],
@@ -4532,18 +4554,18 @@ fn a_step_spelling_a_renamed_table_s_new_name_follows_the_rename() {
     after_ids.columns.insert(c.clone(), t("b").column("c"));
     refused_backwards(&Plan {
         logical: vec![
-            p(Change::RenameTable {
+            p(Change::Table(TableChange::RenameTable {
                 uid: tid,
                 from: t("a"),
                 to: t("b"),
                 defaults: vec![],
-            }),
-            p(Change::AddColumn {
+            })),
+            p(Change::Column(ColumnChange::AddColumn {
                 uid: c,
                 table: t("b"),
                 name: "c".into(),
                 column: Box::new(Column::new(int())),
-            }),
+            })),
         ],
         before,
         after,
@@ -4566,12 +4588,12 @@ fn a_check_follows_a_new_column_that_fills_the_rows_it_validates() {
     );
     let mut plan = on_one_table(
         vec![
-            p(Change::AddColumn {
+            p(Change::Column(ColumnChange::AddColumn {
                 uid: uid(UidKind::Column, "t.c"),
                 table: t("t"),
                 name: "c".into(),
                 column: Box::new(Column::new(int())),
-            }),
+            })),
             add_check("t"),
         ],
         table_with(&["id"]),
@@ -4590,12 +4612,12 @@ fn an_index_over_a_new_column_follows_the_column() {
     will.indexes.insert(name.into(), index);
     let mut plan = on_one_table(
         vec![
-            p(Change::AddColumn {
+            p(Change::Column(ColumnChange::AddColumn {
                 uid: uid(UidKind::Column, "t.c"),
                 table: t("t"),
                 name: "c".into(),
                 column: Box::new(Column::new(int())),
-            }),
+            })),
             add_index("t", one_index("ix", "c")),
         ],
         table_with(&["id"]),
@@ -4614,14 +4636,14 @@ fn a_column_s_drop_follows_the_drop_of_an_index_over_it() {
     was.indexes.insert(name.into(), index);
     let mut plan = on_one_table(
         vec![
-            p(Change::DropIndex {
+            p(Change::Index(IndexChange::DropIndex {
                 table: t("t"),
                 name: "ix".into(),
-            }),
-            p(Change::DropColumn {
+            })),
+            p(Change::Column(ColumnChange::DropColumn {
                 uid: uid(UidKind::Column, "t.c"),
                 column: t("t").column("c"),
-            }),
+            })),
         ],
         was,
         table_with(&["id"]),
@@ -4648,13 +4670,13 @@ fn an_index_spelling_a_renamed_column_s_new_name_follows_the_rename() {
         .insert(uid(UidKind::Column, "t.c"), t("t").column("d"));
     refused_backwards(&Plan {
         logical: vec![
-            p(Change::RenameColumn {
+            p(Change::Column(ColumnChange::RenameColumn {
                 uid: uid(UidKind::Column, "t.c"),
                 table: t("t"),
                 from: "c".into(),
                 to: "d".into(),
                 table_was: None,
-            }),
+            })),
             add_index("t", one_index("ix", "d")),
         ],
         before,
@@ -4665,7 +4687,7 @@ fn an_index_spelling_a_renamed_column_s_new_name_follows_the_rename() {
 }
 
 fn retype_c() -> PlannedChange {
-    p(Change::AlterColumnType {
+    p(Change::Column(ColumnChange::AlterColumnType {
         uid: uid(UidKind::Column, "t.c"),
         column: t("t").column("c"),
         from: int(),
@@ -4676,7 +4698,7 @@ fn retype_c() -> PlannedChange {
         to_collation: None,
         through_external_partitions: false,
         using: None,
-    })
+    }))
 }
 
 /// AlterColumnType: `Writes` of the column's values, which a check over the
@@ -4711,12 +4733,12 @@ fn a_new_default_follows_the_retype_of_its_column() {
     refused_backwards(&on_one_table(
         vec![
             retype_c(),
-            p(Change::AlterColumnDefault {
+            p(Change::Column(ColumnChange::AlterColumnDefault {
                 uid: uid(UidKind::Column, "t.c"),
                 column: t("t").column("c"),
                 from: None,
                 to: Some("0".into()),
-            }),
+            })),
         ],
         table_with(&["id", "c"]),
         will,
@@ -4731,12 +4753,12 @@ fn rebuilt_default_gap() -> Plan {
     let mut after = before.clone();
     after.columns.get_mut("c").unwrap().ty = "bigint".parse().unwrap();
     let default = |from, to| {
-        p(Change::AlterColumnDefault {
+        p(Change::Column(ColumnChange::AlterColumnDefault {
             uid: uid(UidKind::Column, "t.c"),
             column: t("t").column("c"),
             from,
             to,
-        })
+        }))
     };
     on_one_table(
         vec![
@@ -4789,12 +4811,12 @@ fn a_release_gap_requires_separate_halves_and_otherwise_keeps_the_order() {
     let release = plan.logical[0].clone();
     let retype = plan.logical[1].clone();
     let restore = plan.logical[2].clone();
-    let combined = p(Change::AlterColumnDefault {
+    let combined = p(Change::Column(ColumnChange::AlterColumnDefault {
         uid: uid(UidKind::Column, "t.c"),
         column: t("t").column("c"),
         from: Some("7".into()),
         to: Some("7".into()),
-    });
+    }));
     for logical in [
         vec![retype.clone()],
         vec![combined.clone(), retype.clone()],
@@ -4844,12 +4866,12 @@ fn a_unique_key_follows_the_rows_it_validates() {
     refused_backwards(&on_one_table(
         vec![
             plain_row("t", 1, &[("c", 1)]),
-            p(Change::AddUnique {
+            p(Change::Constraint(ConstraintChange::AddUnique {
                 table: t("t"),
                 name: "u".into(),
                 constraint: will.unique["u"].clone(),
                 clustered: false,
-            }),
+            })),
         ],
         table_with(&["id", "c"]),
         will,
@@ -4898,17 +4920,17 @@ fn a_foreign_key_follows_the_key_it_references() {
     let ids = Plan::ids(&["p", "c"], &[("p", "id"), ("c", "id"), ("c", "pid")]);
     refused_backwards(&Plan {
         logical: vec![
-            p(Change::SetPrimaryKey {
+            p(Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table: t("p"),
                 from: None,
                 to: Some(key),
                 nonclustered: false,
-            }),
-            p(Change::AddForeignKey {
+            })),
+            p(Change::Constraint(ConstraintChange::AddForeignKey {
                 table: t("c"),
                 name: "fk".into(),
                 constraint: Box::new(reference(&["pid"], &["id"])),
-            }),
+            })),
         ],
         before,
         after,
@@ -4951,15 +4973,15 @@ fn a_routine_s_public_execution_follows_its_edit_in_place() {
     after.modules.insert(id.clone(), module("SELECT a + 1"));
     refused_backwards(&Plan {
         logical: vec![
-            p(Change::AlterModule {
+            p(Change::Module(ModuleChange::AlterModule {
                 id,
                 module: Box::new(module("SELECT a + 1")),
-            }),
-            p(Change::PublicExecution {
+            })),
+            p(Change::Permission(GrantChange::PublicExecution {
                 routine,
                 access: pbps_model::PublicAccess::Revoked,
                 origin: pbps_model::RoutineOrigin::Rebuilt,
-            }),
+            })),
         ],
         before,
         after,
@@ -4979,12 +5001,12 @@ fn a_primary_key_s_drop_follows_the_drop_of_the_table_whose_key_references_it() 
         &["id", "pid"],
         reference(&["pid"], &["id"]),
         vec![
-            p(Change::DropTable {
+            p(Change::Table(TableChange::DropTable {
                 uid: uid(UidKind::Table, "c"),
                 name: t("c"),
                 detach_from: None,
-            }),
-            p(Change::SetPrimaryKey {
+            })),
+            p(Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table: t("p"),
                 from: Some(pbps_model::PrimaryKey {
                     name: None,
@@ -4994,7 +5016,7 @@ fn a_primary_key_s_drop_follows_the_drop_of_the_table_whose_key_references_it() 
                 }),
                 to: None,
                 nonclustered: false,
-            }),
+            })),
         ],
     );
     plan.after.tables.remove(&t("c"));
@@ -5017,15 +5039,15 @@ fn a_computed_column_s_drop_follows_the_drop_of_an_index_over_it() {
     was.indexes.insert(name.into(), index);
     refused_backwards(&on_one_table(
         vec![
-            p(Change::DropIndex {
+            p(Change::Index(IndexChange::DropIndex {
                 table: t("t"),
                 name: "ix".into(),
-            }),
-            p(Change::DropComputedColumn {
+            })),
+            p(Change::Column(ColumnChange::DropComputedColumn {
                 table: t("t"),
                 name: "cc".into(),
                 computed,
-            }),
+            })),
         ],
         was,
         table_with(&["id"]),
@@ -5039,7 +5061,7 @@ fn a_before_rewrite_requirement_orders_every_other_rewrite_without_requiring_pre
     let key = ObjectKey::Module(id.clone());
     let logical: Vec<_> = (0..3)
         .map(|_| {
-            p(Change::AlterModule {
+            p(Change::Module(ModuleChange::AlterModule {
                 id: id.clone(),
                 module: Box::new(Module {
                     kind: ModuleKind::Function,
@@ -5047,7 +5069,7 @@ fn a_before_rewrite_requirement_orders_every_other_rewrite_without_requiring_pre
                     description: None,
                     options: Default::default(),
                 }),
-            })
+            }))
         })
         .collect();
     let ops = Operations::of_plan(&logical, ModuleEdits::InPlace);

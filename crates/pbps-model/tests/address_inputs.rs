@@ -1,4 +1,6 @@
 //! Payload address bindings must not redirect fixed baseline FK reads.
+use pbps_model::ConstraintChange;
+use pbps_model::TableChange;
 use pbps_model::operation::{
     self, ModuleEdits, ObjectKey, Operations, Origin, OwnerError, Owners, PlanOwners, Snapshot,
     Source, Spelling,
@@ -85,22 +87,22 @@ fn a_reused_payload_name_keeps_the_distinct_baseline_foreign_key_target() {
     after.tables.insert(table("app.u2"), kept);
     let steps = ChangeSet {
         changes: vec![
-            Change::RenameTable {
+            Change::Table(TableChange::RenameTable {
                 uid: uid("t_bbbbbb"),
                 from: table("app.u2"),
                 to: table("app.v"),
                 defaults: vec![],
-            },
-            Change::RenameTable {
+            }),
+            Change::Table(TableChange::RenameTable {
                 uid: uid("t_aaaaaa"),
                 from: table("app.u"),
                 to: table("app.u2"),
                 defaults: vec![],
-            },
-            Change::DropForeignKey {
+            }),
+            Change::Constraint(ConstraintChange::DropForeignKey {
                 table: table("app.u2"),
                 name: "fk".into(),
-            },
+            }),
         ]
         .into_iter()
         .map(PlannedChange::new)
@@ -251,22 +253,22 @@ fn rename_reader(
         tables: [(table(final_name), shape)].into(),
         ..Default::default()
     };
-    let mut changes = vec![Change::RenameTable {
+    let mut changes = vec![Change::Table(TableChange::RenameTable {
         uid: uid("t_aaaaaa"),
         from: table("app.a"),
         to: table("app.b"),
         defaults: vec![],
-    }];
-    let second = Change::RenameTable {
+    })];
+    let second = Change::Table(TableChange::RenameTable {
         uid: uid("t_aaaaaa"),
         from: table("app.b"),
         to: table(final_name),
         defaults: vec![],
-    };
-    let drop = Change::DropCheck {
+    });
+    let drop = Change::Constraint(ConstraintChange::DropCheck {
         table: table(if read_after_last { final_name } else { "app.b" }),
         name: "ck".into(),
-    };
+    });
     changes.extend(if read_after_last {
         vec![second, drop]
     } else {

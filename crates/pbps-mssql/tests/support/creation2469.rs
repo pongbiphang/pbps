@@ -3,6 +3,7 @@ use super::*;
 mod fixture;
 use fixture::{FACETS, Fixture, generated_facet};
 use pbps_dialect::lower::lower_all;
+use pbps_model::ModuleChange;
 use pbps_model::{Change, PlanMode, object_ref::ObjectDeps};
 type Engine = Mssql;
 
@@ -28,7 +29,7 @@ async fn demanded_computed_columns_and_not_null_wait_for_the_function() {
             .changes()
             .changes
             .iter()
-            .position(|p| matches!(p.change, Change::CreateModule { .. }))
+            .position(|p| matches!(p.change, Change::Module(ModuleChange::CreateModule { .. })))
             .unwrap();
         let ordered = plan.ordered(PlanMode::Transactional, &engine);
         let lowered =
@@ -408,7 +409,7 @@ async fn required_inline_groups_preserve_create_options_and_late_columns() {
             .changes()
             .changes
             .iter()
-            .position(|p| matches!(p.change, Change::CreateModule { .. }))
+            .position(|p| matches!(p.change, Change::Module(ModuleChange::CreateModule { .. })))
             .unwrap();
         let ordered = plan.ordered(PlanMode::Transactional, &engine);
         let lowered =
@@ -523,7 +524,10 @@ async fn native_nullability_blockers(engine: &Mssql) {
                     .await
                     .unwrap_or_else(|e| panic!("{kind}: {}: {e}", statement.sql));
             }
-            if matches!(change.change, Change::CreateModule { .. }) {
+            if matches!(
+                change.change,
+                Change::Module(ModuleChange::CreateModule { .. })
+            ) {
                 let rows = db.conn.query("SELECT is_nullable FROM sys.columns WHERE object_id=OBJECT_ID('app.t') AND name='x'").await.unwrap();
                 assert_eq!(rows[0].try_get::<bool>("is_nullable").unwrap(), Some(true));
                 let rows = db.conn.query("SELECT COUNT(*) AS n FROM sys.indexes WHERE object_id=OBJECT_ID('app.t') AND index_id>0").await.unwrap();

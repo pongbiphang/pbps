@@ -743,10 +743,12 @@ pub fn ensure_key_changes(
             (before.mode == DataMode::Ensure
                 && after.mode == DataMode::Ensure
                 && before.keys != after.keys)
-                .then(|| crate::Change::SetEnsureKeys {
-                    table: name.clone(),
-                    from: before.keys.clone(),
-                    to: after.keys.clone(),
+                .then(|| {
+                    crate::Change::Row(crate::RowChange::SetEnsureKeys {
+                        table: name.clone(),
+                        from: before.keys.clone(),
+                        to: after.keys.clone(),
+                    })
                 })
         })
         .collect()
@@ -2005,6 +2007,7 @@ mod tests {
     }
     #[test]
     fn ensure_scope_changes_follow_identity_and_ignore_other_transitions() {
+        use crate::RowChange;
         use crate::{Change, IdsFile, Uid, UidKind};
         let uid = Uid::generate(UidKind::Table);
         let mut before_ids = IdsFile::default();
@@ -2024,11 +2027,11 @@ mod tests {
             let after = scope(DataMode::Ensure, &keys);
             assert_eq!(
                 ensure_key_changes(&before, &after, &before_ids, &before_ids),
-                vec![Change::SetEnsureKeys {
+                vec![Change::Row(RowChange::SetEnsureKeys {
                     table: name(),
                     from: before[&name()].keys.clone(),
                     to: after[&name()].keys.clone(),
-                }]
+                })]
             );
         }
         let after = scope(DataMode::Ensure, &["JP"]);

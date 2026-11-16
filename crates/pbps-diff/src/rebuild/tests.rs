@@ -997,7 +997,7 @@ fn a_plan_follows_what_its_environment_holds_of_the_lineage() {
     assert!(pending.errors.is_empty());
     assert!(matches!(
         &pending.changes.changes[0].change,
-        pbps_model::Change::RebuildPartitionedTable(_)
+        pbps_model::Change::Partition(pbps_model::PartitionChange::RebuildPartitionedTable(_))
     ));
 
     // The declarations moved since the approval: refused by name with the command.
@@ -1013,16 +1013,18 @@ fn a_plan_follows_what_its_environment_holds_of_the_lineage() {
         .changes
         .changes
         .iter()
-        .filter(|c| matches!(c.change, pbps_model::Change::CreateTable { .. }))
+        .filter(|c| {
+            matches!(
+                c.change,
+                pbps_model::Change::Table(pbps_model::TableChange::CreateTable { .. })
+            )
+        })
         .count();
     assert_eq!(created, 2);
-    assert!(
-        !fresh
-            .changes
-            .changes
-            .iter()
-            .any(|c| matches!(c.change, pbps_model::Change::DropTable { .. }))
-    );
+    assert!(!fresh.changes.changes.iter().any(|c| matches!(
+        c.change,
+        pbps_model::Change::Table(pbps_model::TableChange::DropTable { .. })
+    )));
 
     // Part of the lineage, never read as "nothing to rebuild".
     let record = approval.rebuilds.values().next().unwrap();
@@ -1549,7 +1551,9 @@ fn saved_plans_carry_the_lineage_but_not_a_broken_one_or_an_unadmitted_rewrite()
     let root = qualify(side(&base, &ids), side(&desired, &approval), &table()).unwrap();
     let mut rewrite = pbps_model::ChangeSet::default();
     rewrite.changes.push(pbps_model::PlannedChange::new(
-        pbps_model::Change::RebuildPartitionedTable(Box::new(root)),
+        pbps_model::Change::Partition(pbps_model::PartitionChange::RebuildPartitionedTable(
+            Box::new(root),
+        )),
     ));
     assert!(
         admit(&plan(approval, rewrite))

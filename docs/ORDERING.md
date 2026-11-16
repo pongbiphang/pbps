@@ -889,11 +889,15 @@ decision or the issue named in its row.
 
 ## Keeping this current
 
-- A new `Change` variant adds a row to [the table](#what-each-change-requires),
-  with its effects in `pbps_model::operation::effects` (an exhaustive match,
-  so it does not compile without them) and in the table's last column.
-  `every_change_kind_has_a_row_in_the_ordering_audit` lists the variants from
-  the enum and refuses one this file does not name, and
+- A new kind of `Change` goes into the enum of its family (`TableChange`,
+  `ColumnChange`, ... DEC-2790.2) and adds a row to
+  [the table](#what-each-change-requires), with its effects in
+  `pbps_model::operation::effects` (an exhaustive match, so it does not compile
+  without them) and in the table's last column. Its op also goes into the table
+  of `change/wire.rs`, which `the_ops_are_the_kinds_of_the_family_enums` and the
+  unknown-op pin of `tests/change_wire.rs` hold to the enums.
+  `every_change_kind_has_a_row_in_the_ordering_audit` lists the kinds from the
+  family enums and refuses one this file does not name, and
   `the_requires_table_states_the_effects_of_each_kind_it_names` refuses a last
   column the code disagrees with.
 - A new database-global named object (today roles, types and extensions,
@@ -905,12 +909,12 @@ decision or the issue named in its row.
   take the new kind out of the ones where it differs (DEC-2447.5). A
   `matches!` or `if let` does not use the macro, so a new kind never joins it
   unseen.
-- Every `Change` variant belongs to one family (`change_family!`,
-  `ChangeFamily`, DEC-2790.1), and `Change::family` does not compile until a
-  new variant is listed in one. A match arm that names a family is joined by
-  the new kind without a compile error, as with `catalog_change!()`: read each
-  `change_family!(<its family>)` site and name the members there where the new
-  kind differs.
+- Every kind of change belongs to one family (`change_family!`, `ChangeFamily`,
+  DEC-2790.1), and its enum is the family's (DEC-2790.2); `Change::family` does
+  not compile until a new family is listed. A match arm that names a family,
+  `Change::Table(_)` or `change_family!(tables)`, is joined by a new kind of that
+  family without a compile error: read each such site and name the members there
+  where the new kind differs.
 - A kind that waits for another kind of its own class (a package for the
   packages it requires, DEC-2447.6) needs two things: the effect edge, and a
   rank in the differ's draft so that the draft does not contradict the effects.

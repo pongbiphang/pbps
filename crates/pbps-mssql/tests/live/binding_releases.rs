@@ -5,6 +5,7 @@ use pbps_diff::{
     Side,
     order::{self, Schedule, Source},
 };
+use pbps_model::ModuleChange;
 use pbps_model::resolver::OrderReason;
 use pbps_model::{Change, ChangeSet, ModuleId, PlannedChange};
 
@@ -26,10 +27,10 @@ async fn binding_release_and_an_independent_computed_rebuild_both_apply() {
     for (id, module) in &before.modules {
         execute(
             &mut db.conn,
-            &Change::CreateModule {
+            &Change::Module(ModuleChange::CreateModule {
                 id: id.clone(),
                 module: Box::new(module.clone()),
-            },
+            }),
         )
         .await;
     }
@@ -40,10 +41,10 @@ async fn binding_release_and_an_independent_computed_rebuild_both_apply() {
     let z = ModuleId::Named(TableName::new("app", "z"));
     let sql = Mssql
         .fixture_emit(
-            &Change::AlterModule {
+            &Change::Module(ModuleChange::AlterModule {
                 id: z.clone(),
                 module: Box::new(after.modules[&z].clone()),
-            },
+            }),
             Default::default(),
         )
         .unwrap();

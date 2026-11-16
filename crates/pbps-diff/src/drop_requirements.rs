@@ -1,4 +1,6 @@
 //! Requirements follow retired UIDs, including columns removed by a table drop.
+use pbps_model::ColumnChange;
+use pbps_model::TableChange;
 use pbps_model::{Change, ChangeSet, DropGuard, IdsFile};
 
 fn guards(
@@ -16,7 +18,7 @@ fn guards(
     for (index, step) in names.changes().iter().enumerate() {
         #[allow(clippy::wildcard_enum_match_arm)]
         let (uid, table_uid, detach_from, columns) = match &step.change {
-            Change::DropColumn { uid, .. } => (
+            Change::Column(ColumnChange::DropColumn { uid, .. }) => (
                 uid,
                 names
                     .column_at(uid, At::Before(index))
@@ -24,9 +26,9 @@ fn guards(
                 None,
                 false,
             ),
-            Change::DropTable {
+            Change::Table(TableChange::DropTable {
                 uid, detach_from, ..
-            } => (uid, Some(uid), detach_from.clone(), true),
+            }) => (uid, Some(uid), detach_from.clone(), true),
             _ => {
                 guards.push(None);
                 continue;
@@ -125,10 +127,10 @@ pub fn check_columns(
     for (index, step) in names.changes().iter().enumerate() {
         #[allow(clippy::wildcard_enum_match_arm)]
         let uid = match &step.change {
-            Change::RenameColumn { uid, .. }
-            | Change::AlterColumnType { uid, .. }
-            | Change::AlterColumnExpression { uid, .. } => Some(uid),
-            Change::DropColumn { uid, .. } if matches!(&names.changes()[owner].change, Change::DropColumn { uid: own, .. } if own != uid) => {
+            Change::Column(ColumnChange::RenameColumn { uid, .. })
+            | Change::Column(ColumnChange::AlterColumnType { uid, .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { uid, .. }) => Some(uid),
+            Change::Column(ColumnChange::DropColumn { uid, .. }) if matches!(&names.changes()[owner].change, Change::Column(ColumnChange::DropColumn { uid: own, .. }) if own != uid) => {
                 Some(uid)
             }
             _ => None,
@@ -151,6 +153,7 @@ pub fn check_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::TableChange;
     use pbps_model::{DropRequirement, PlannedChange, Tombstone};
 
     #[test]
@@ -180,11 +183,11 @@ mod tests {
             );
         }
         let mut changes = ChangeSet {
-            changes: vec![PlannedChange::new(Change::DropTable {
+            changes: vec![PlannedChange::new(Change::Table(TableChange::DropTable {
                 uid: t,
                 name: table,
                 detach_from: None,
-            })],
+            }))],
         };
         assign(&mut changes, &before, &after).unwrap();
         assert_eq!(

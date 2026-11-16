@@ -1,6 +1,8 @@
 //! The rule driver over a toy rule (#1958): every role the plan creates needs
 //! a drop of the same name ahead of it.
 
+use pbps_model::RoleChange;
+use pbps_model::TableChange;
 use pbps_model::resolver::OrderReason;
 use pbps_model::{AddedRole, Change, ChangeSet, PlannedChange};
 
@@ -25,24 +27,24 @@ struct Toy(Mode);
 struct Undoes;
 
 fn create(name: &str) -> PlannedChange {
-    PlannedChange::new(Change::CreateRole {
+    PlannedChange::new(Change::Role(RoleChange::CreateRole {
         uid: "r_aaaaaa".parse().unwrap(),
         name: name.into(),
-    })
+    }))
 }
 
 fn drop(name: &str) -> PlannedChange {
-    PlannedChange::new(Change::DropRole {
+    PlannedChange::new(Change::Role(RoleChange::DropRole {
         uid: "r_aaaaaa".parse().unwrap(),
         name: name.into(),
         members: Vec::new(),
-    })
+    }))
 }
 
 fn name(p: &PlannedChange) -> Option<(&str, bool)> {
-    if let Change::CreateRole { name, .. } = &p.change {
+    if let Change::Role(RoleChange::CreateRole { name, .. }) = &p.change {
         Some(((name).raw(), true))
-    } else if let Change::DropRole { name, .. } = &p.change {
+    } else if let Change::Role(RoleChange::DropRole { name, .. }) = &p.change {
         Some(((name).raw(), false))
     } else {
         None
@@ -457,7 +459,7 @@ fn expansions_keep_sources_assigned_before_an_earlier_settlement() {
             LogicalSource::Change(usize::from(name != "a"))
         );
         assert_eq!(
-            matches!(part.change, Change::CreateRole { .. }),
+            matches!(part.change, Change::Role(RoleChange::CreateRole { .. })),
             matches!(origin, Origin::Whole(_))
         );
     }
@@ -527,11 +529,11 @@ fn a_respelling_into_another_kind_of_the_same_family_is_refused() {
 
 #[test]
 fn a_respelling_into_a_kind_of_another_family_is_refused() {
-    let into = PlannedChange::new(Change::DropTable {
+    let into = PlannedChange::new(Change::Table(TableChange::DropTable {
         uid: "t_aaaaaa".parse().unwrap(),
         name: "app.t".parse().unwrap(),
         detach_from: None,
-    });
+    }));
     assert_ne!(into.change.family(), create("a").change.family());
     let err = expand(plan(&["a"]), &Respeller(into), FACTOR).unwrap_err();
     assert_eq!(

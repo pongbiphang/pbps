@@ -1,6 +1,10 @@
 #[cfg(test)]
 mod default_rebuild_matrix {
     use super::*;
+    use pbps_model::ModuleChange;
+    use pbps_model::ColumnChange;
+    use pbps_model::PartitionChange;
+    use pbps_model::TableChange;
     use crate::order::{Constraint, Schedule};
     use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
 
@@ -25,60 +29,60 @@ mod default_rebuild_matrix {
             match (self, c) {
                 (
                     Self::Release(t, n),
-                    Change::AlterColumnDefault {
+                    Change::Column(ColumnChange::AlterColumnDefault {
                         column,
                         from: Some(_),
                         to: None,
                         ..
-                    },
+                    }),
                 ) => {
                     column.table == t.parse::<pbps_model::TableName>().unwrap()
                         && column.name.raw() == n
                 }
                 (
                     Self::Release(t, n),
-                    Change::SetPartitionDefault {
+                    Change::Partition(PartitionChange::SetPartitionDefault {
                         table,
                         column,
                         from: Some(_),
                         to: None,
                         ..
-                    },
+                    }),
                 ) => *table == t.parse::<pbps_model::TableName>().unwrap() && column.raw() == n,
                 (
                     Self::Restore(t, n),
-                    Change::AlterColumnDefault {
+                    Change::Column(ColumnChange::AlterColumnDefault {
                         column,
                         to: Some(_),
                         ..
-                    },
+                    }),
                 ) => {
                     column.table == t.parse::<pbps_model::TableName>().unwrap()
                         && column.name.raw() == n
                 }
                 (
                     Self::Restore(t, n),
-                    Change::SetPartitionDefault {
+                    Change::Partition(PartitionChange::SetPartitionDefault {
                         table,
                         column,
                         to: Some(_),
                         ..
-                    },
+                    }),
                 ) => *table == t.parse::<pbps_model::TableName>().unwrap() && column.raw() == n,
-                (Self::DropColumn(n), Change::DropColumn { column, .. }) => column.name.raw() == n,
-                (Self::AddColumn(n), Change::AddColumn { name, .. }) => name.raw() == n,
-                (Self::Rename(n), Change::RenameColumn { from, .. }) => from.raw() == n,
-                (Self::DropTable(t), Change::DropTable { name, .. }) => {
+                (Self::DropColumn(n), Change::Column(ColumnChange::DropColumn { column, .. })) => column.name.raw() == n,
+                (Self::AddColumn(n), Change::Column(ColumnChange::AddColumn { name, .. })) => name.raw() == n,
+                (Self::Rename(n), Change::Column(ColumnChange::RenameColumn { from, .. })) => from.raw() == n,
+                (Self::DropTable(t), Change::Table(TableChange::DropTable { name, .. })) => {
                     *name == t.parse::<pbps_model::TableName>().unwrap()
                 }
-                (Self::CreateTable(t), Change::CreateTable { name, .. }) => {
+                (Self::CreateTable(t), Change::Table(TableChange::CreateTable { name, .. })) => {
                     *name == t.parse::<pbps_model::TableName>().unwrap()
                 }
-                (Self::Retype, Change::AlterColumnType { .. })
-                | (Self::DropRoutine, Change::DropModule { .. })
-                | (Self::CreateRoutine, Change::CreateModule { .. })
-                | (Self::Attach, Change::AttachPartition { .. })
-                | (Self::Detach, Change::DetachPartition { .. }) => true,
+                (Self::Retype, Change::Column(ColumnChange::AlterColumnType { .. }))
+                | (Self::DropRoutine, Change::Module(ModuleChange::DropModule { .. }))
+                | (Self::CreateRoutine, Change::Module(ModuleChange::CreateModule { .. }))
+                | (Self::Attach, Change::Partition(PartitionChange::AttachPartition { .. }))
+                | (Self::Detach, Change::Partition(PartitionChange::DetachPartition { .. })) => true,
                 _ => false,
             }
         }
@@ -312,7 +316,7 @@ mod default_rebuild_matrix {
         assert_eq!(ordinary.changes.len(), 1, "{:?}", ordinary.changes);
         assert!(matches!(
             ordinary.changes[0].change,
-            Change::AlterColumnType { .. }
+            Change::Column(ColumnChange::AlterColumnType { .. })
         ));
         assert_eq!(
             serde_json::to_value(&planned.ordered.changes.changes).unwrap(),

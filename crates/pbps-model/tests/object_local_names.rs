@@ -158,14 +158,14 @@ fn declared_keys_and_bindings_remove_only_the_raw_check_and_index() {
     assert_eq!(declared.expressions.keys[&name].len(), 2);
     declared.advance(&ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::DropCheck {
+            PlannedChange::new(Change::Constraint(ConstraintChange::DropCheck {
                 table: name.clone(),
                 name: local("ck", RAW),
-            }),
-            PlannedChange::new(Change::DropIndex {
+            })),
+            PlannedChange::new(Change::Index(IndexChange::DropIndex {
                 table: name.clone(),
                 name: local("ix", RAW),
-            }),
+            })),
         ],
     });
     for (keys, kind) in [
@@ -203,52 +203,54 @@ fn whole_and_individual_operation_slots_claim_and_release_raw_local_names() {
         tables: [(table_name.clone(), table.clone())].into(),
         ..Default::default()
     };
-    let mut changes = vec![PlannedChange::new(Change::CreateTable {
-        uid,
-        name: table_name.clone(),
-        table: Box::new(table.clone()),
-        beside_default: None,
-        moves_at_most: None,
-    })];
+    let mut changes = vec![PlannedChange::new(Change::Table(
+        TableChange::CreateTable {
+            uid,
+            name: table_name.clone(),
+            table: Box::new(table.clone()),
+            beside_default: None,
+            moves_at_most: None,
+        },
+    ))];
     for change in [
-        Change::AddUnique {
+        Change::Constraint(ConstraintChange::AddUnique {
             table: table_name.clone(),
             name: local("uq", RAW),
             constraint: table.unique[&local("uq", RAW)].clone(),
             clustered: false,
-        },
-        Change::DropUnique {
+        }),
+        Change::Constraint(ConstraintChange::DropUnique {
             table: table_name.clone(),
             name: local("uq", RAW),
-        },
-        Change::AddForeignKey {
+        }),
+        Change::Constraint(ConstraintChange::AddForeignKey {
             table: table_name.clone(),
             name: local("fk", RAW),
             constraint: Box::new(table.foreign_keys[&local("fk", RAW)].clone()),
-        },
-        Change::DropForeignKey {
+        }),
+        Change::Constraint(ConstraintChange::DropForeignKey {
             table: table_name.clone(),
             name: local("fk", RAW),
-        },
-        Change::AddCheck {
+        }),
+        Change::Constraint(ConstraintChange::AddCheck {
             table: table_name.clone(),
             name: local("ck", RAW),
             constraint: table.checks[&local("ck", RAW)].clone(),
-        },
-        Change::DropCheck {
+        }),
+        Change::Constraint(ConstraintChange::DropCheck {
             table: table_name.clone(),
             name: local("ck", RAW),
-        },
-        Change::AddIndex {
+        }),
+        Change::Index(IndexChange::AddIndex {
             table: table_name.clone(),
             name: local("ix", RAW),
             index: Box::new(table.indexes[&local("ix", RAW)].clone()),
             clustered: false,
-        },
-        Change::DropIndex {
+        }),
+        Change::Index(IndexChange::DropIndex {
             table: table_name.clone(),
             name: local("ix", RAW),
-        },
+        }),
     ] {
         changes.push(PlannedChange::new(change));
     }
@@ -407,24 +409,26 @@ fn detach_binding_mappings_rename_only_the_raw_check_and_index() {
     let index = detached.indexes.remove(&local("ix", RAW)).unwrap();
     detached.indexes.insert(local("new_ix", RAW), index);
     declared.advance(&ChangeSet {
-        changes: vec![PlannedChange::new(Change::DetachPartition {
-            uid: "t_aaaaaa".parse().unwrap(),
-            table: child.clone(),
-            parent: parent.clone(),
-            names: vec![
-                DetachedName {
-                    kind: DetachedKind::Check,
-                    parent: local("ck", RAW),
-                    name: Some(local("new_ck", RAW)),
-                },
-                DetachedName {
-                    kind: DetachedKind::Index,
-                    parent: local("ix", RAW),
-                    name: Some(local("new_ix", RAW)),
-                },
-            ],
-            shape: Box::new(detached),
-        })],
+        changes: vec![PlannedChange::new(Change::Partition(
+            PartitionChange::DetachPartition {
+                uid: "t_aaaaaa".parse().unwrap(),
+                table: child.clone(),
+                parent: parent.clone(),
+                names: vec![
+                    DetachedName {
+                        kind: DetachedKind::Check,
+                        parent: local("ck", RAW),
+                        name: Some(local("new_ck", RAW)),
+                    },
+                    DetachedName {
+                        kind: DetachedKind::Index,
+                        parent: local("ix", RAW),
+                        name: Some(local("new_ix", RAW)),
+                    },
+                ],
+                shape: Box::new(detached),
+            },
+        ))],
     });
     for (map, old, new) in [
         (&declared.bindings.checks, "ck", "new_ck"),

@@ -1,4 +1,6 @@
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::ModuleChange;
 use pbps_model::resolver::{BoundSurface, ObjectIdentity};
 use pbps_model::{Change, Column, Hints, Module, ModuleId, ModuleKind, Schema, Table, TableName};
 use std::cell::Cell;
@@ -100,11 +102,12 @@ fn projection_work_depends_on_steps_not_evidence_width() {
         });
         assert_eq!(planned.changes.changes.len(), columns);
         assert!(
-            planned
-                .changes
-                .changes
-                .iter()
-                .all(|p| { matches!(p.change, Change::SetColumnDeprecated { .. }) }),
+            planned.changes.changes.iter().all(|p| {
+                matches!(
+                    p.change,
+                    Change::Column(ColumnChange::SetColumnDeprecated { .. })
+                )
+            }),
             "declaration-only metadata must not rebuild a dependent"
         );
         println!("columns={columns} views={views} projections={projections}");
@@ -251,11 +254,11 @@ fn the_prepared_graph_projects_the_split_steps_not_the_ordinary_positions() {
         .position(|p| {
             matches!(
                 p.change,
-                Change::AlterColumnDefault {
+                Change::Column(ColumnChange::AlterColumnDefault {
                     from: None,
                     to: Some(_),
                     ..
-                }
+                })
             )
         })
         .unwrap();
@@ -263,7 +266,7 @@ fn the_prepared_graph_projects_the_split_steps_not_the_ordinary_positions() {
         .changes
         .changes
         .iter()
-        .position(|p| matches!(&p.change, Change::CreateModule { id, .. } if id == &function))
+        .position(|p| matches!(&p.change, Change::Module(ModuleChange::CreateModule { id, .. }) if id == &function))
         .unwrap();
     // Only this binding edge proves the new default is provided; the order
     // of the split pair is the effects' (DEC-1968.2).
@@ -283,22 +286,30 @@ fn the_prepared_graph_projects_the_split_steps_not_the_ordinary_positions() {
     let at = |f: &dyn Fn(&Change) -> bool| steps.iter().position(|p| f(&p.change)).unwrap();
     // The old default is released before the new one is set, and the
     // function exists first: edges the effects and the evidence state.
-    let removal = at(&|c| matches!(c, Change::AlterColumnDefault { to: None, .. }));
+    let removal = at(&|c| {
+        matches!(
+            c,
+            Change::Column(ColumnChange::AlterColumnDefault { to: None, .. })
+        )
+    });
     let creation = at(&|c| {
         matches!(
             c,
-            Change::AlterColumnDefault {
+            Change::Column(ColumnChange::AlterColumnDefault {
                 from: None,
                 to: Some(_),
                 ..
-            }
+            })
         )
     });
-    let provider = at(&|c| matches!(c, Change::CreateModule { id, .. } if id == &function));
+    let provider = at(
+        &|c| matches!(c, Change::Module(ModuleChange::CreateModule { id, .. }) if id == &function),
+    );
     assert!(removal < creation && provider < creation, "{steps:?}");
     // Negative: a deprecation emits no SQL, so nothing orders it against the
     // split pair; the old same-table rule put it between them (#1954).
-    let deprecation = at(&|c| matches!(c, Change::SetColumnDeprecated { .. }));
+    let deprecation =
+        at(&|c| matches!(c, Change::Column(ColumnChange::SetColumnDeprecated { .. })));
     assert!(
         !planned.proof.edges().iter().any(|e| {
             (e.before == deprecation || e.after == deprecation)

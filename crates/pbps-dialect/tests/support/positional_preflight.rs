@@ -4,26 +4,28 @@
 #[ignore = "needs a live engine"]
 async fn tightening_reads_prior_writes_and_never_future_writes() {
     use pbps_model::{Cell, Change, ChangeSet, IdsFile, PlannedChange, Uid, UidKind, Value, plan_names::PlanNames};
+    use pbps_model::RowChange;
+    use pbps_model::ColumnChange;
     let mut db = TestDb::create("positional1775").await;
     let dialect = positional_dialect();
     let table = TableName::new(positional_schema(), "items");
     db.conn.execute(&format!("CREATE TABLE {table} (id int PRIMARY KEY, value int NULL); INSERT INTO {table} VALUES (1, NULL);", table = table.raw())).await.unwrap();
     let column = Uid::derived(UidKind::Column, "value", 0);
-    let tighten = Change::AlterColumnNullability {
+    let tighten = Change::Column(ColumnChange::AlterColumnNullability {
         uid: column.clone(), column: table.column("value"), ty: ty("int"), to_nullable: false,
         through_external_partitions: false, collation: None,
-    };
-    let update = Change::UpdateRow {
+    });
+    let update = Change::Row(RowChange::UpdateRow {
         table: table.clone(), key_column: "id".into(), key: "1".into(),
         columns: [("value".into(), (Cell::Value(Value::Null), Cell::Value(Value::Int(1))))].into(),
         unchanged: Default::default(), types: [("value".into(), ty("int"))].into(),
         after_types: Default::default(), key_type: None,
-    };
-    let delete = Change::DeleteRow {
+    });
+    let delete = Change::Row(RowChange::DeleteRow {
         table: table.clone(), key_column: "id".into(), key: "1".into(),
         cause: pbps_model::change::DeleteCause::Undeclared, row: Default::default(),
         dropped: Default::default(), types: Default::default(), after_types: Default::default(), key_type: None,
-    };
+    });
     let ids = IdsFile {
         tables: [(Uid::derived(UidKind::Table, "items", 0), table.clone())].into(),
         columns: [(column, table.column("value")), (Uid::derived(UidKind::Column, "id", 0), table.column("id"))].into(),
@@ -76,6 +78,8 @@ async fn check_deleted_self_reference(catalog_key: bool) {
         Cell, Change, ChangeSet, ForeignKey, IdsFile, PlannedChange, ReferentialAction, Uid,
         UidKind, Value, plan_names::PlanNames,
     };
+    use pbps_model::RowChange;
+    use pbps_model::ConstraintChange;
     let mut db = TestDb::create(if catalog_key { "catalog_self1977" } else { "planned_self1977" }).await;
     let table = TableName::new(positional_schema(), "nodes");
     db.conn
@@ -99,7 +103,7 @@ async fn check_deleted_self_reference(catalog_key: bool) {
             .collect(),
         ..Default::default()
     };
-    let add = Change::AddForeignKey {
+    let add = Change::Constraint(ConstraintChange::AddForeignKey {
         table: table.clone(),
         name: "nodes_parent_fkey".into(),
         constraint: Box::new(ForeignKey {
@@ -109,8 +113,8 @@ async fn check_deleted_self_reference(catalog_key: bool) {
             on_delete: ReferentialAction::NoAction,
             on_update: ReferentialAction::NoAction,
         }),
-    };
-    let update = Change::UpdateRow {
+    });
+    let update = Change::Row(RowChange::UpdateRow {
         table: table.clone(),
         key_column: "id".into(),
         key: "1".into(),
@@ -123,8 +127,8 @@ async fn check_deleted_self_reference(catalog_key: bool) {
         types: [("parent".into(), ty("int"))].into(),
         after_types: Default::default(),
         key_type: None,
-    };
-    let delete = Change::DeleteRow {
+    });
+    let delete = Change::Row(RowChange::DeleteRow {
         table: table.clone(),
         key_column: "id".into(),
         key: "1".into(),
@@ -134,7 +138,7 @@ async fn check_deleted_self_reference(catalog_key: bool) {
         types: Default::default(),
         after_types: Default::default(),
         key_type: None,
-    };
+    });
     let dialect = positional_dialect();
     let frame = dialect.transaction_framing(&pbps_model::SessionZone::utc());
     let mut observations = Vec::new();

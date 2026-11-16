@@ -4,6 +4,10 @@ use pbps_diff::{
     Side,
     order::{catalog::graph::*, rebuild::*},
 };
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
 use pbps_model::*;
 use serde_json::{Value as Json, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -58,12 +62,16 @@ enum Selector {
 impl Selector {
     fn matches(self, change: &Change, purpose: Purpose) -> bool {
         match self {
-            Self::Copy => matches!(change, Change::CopyTableRows(_)),
-            Self::Index => matches!(change, Change::BuildPartitionedIndex(_)),
-            Self::Check => matches!(change, Change::AddCheck { .. }),
+            Self::Copy => matches!(change, Change::Partition(PartitionChange::CopyTableRows(_))),
+            Self::Index => matches!(change, Change::Index(IndexChange::BuildPartitionedIndex(_))),
+            Self::Check => matches!(
+                change,
+                Change::Constraint(ConstraintChange::AddCheck { .. })
+            ),
             Self::Swap => purpose == Purpose::Swap,
             Self::Restore => {
-                purpose == Purpose::Restoration && matches!(change, Change::CreateModule { .. })
+                purpose == Purpose::Restoration
+                    && matches!(change, Change::Module(ModuleChange::CreateModule { .. }))
             }
         }
     }
@@ -473,7 +481,7 @@ async fn exercise(
             .operations
             .iter()
             .find_map(|o| {
-                if let Change::CopyTableRows(c) = o.change() {
+                if let Change::Partition(PartitionChange::CopyTableRows(c)) = o.change() {
                     Some(c)
                 } else {
                     None
@@ -600,7 +608,7 @@ async fn final_contract(
     root: &RebuildPartitionedTable,
 ) {
     for op in done.operations.iter() {
-        if let Change::BuildPartitionedIndex(recipe) = op.change() {
+        if let Change::Index(IndexChange::BuildPartitionedIndex(recipe)) = op.change() {
             let parent = &done.target.tables[&recipe.parent.uid];
             let parent_index =
                 qualified(&TableName::new(&parent.schema, recipe.name.raw())).unwrap();
@@ -631,7 +639,7 @@ async fn final_contract(
                 assert_eq!(value(conn,&format!("SELECT to_jsonb(i.indrelid=to_regclass({}) AND i.indisunique={unique} AND i.indisprimary={primary} AND i.indisvalid AND i.indisready AND COALESCE(h.inhparent,0)={index_parent} AND ((k.oid IS NOT NULL)={key}) AND (NOT {key} OR (k.conparentid={constraint_parent} AND k.conrelid=i.indrelid)))::text AS v FROM pg_index i LEFT JOIN pg_inherits h ON h.inhrelid=i.indexrelid LEFT JOIN pg_constraint k ON k.conindid=i.indexrelid AND k.contype IN('p','u') AND k.conrelid=i.indrelid WHERE i.indexrelid=to_regclass({})",literal(&qualified(table).unwrap()),literal(&index))).await,json!(true));
             }
         }
-        if let Change::AnalyzeTableTree(tree) = op.change() {
+        if let Change::Partition(PartitionChange::AnalyzeTableTree(tree)) = op.change() {
             for relation in std::iter::once(&tree.parent).chain(&tree.partitions) {
                 let name = qualified(&done.target.tables[&relation.uid]).unwrap();
                 assert_eq!(value(conn,&format!("SELECT to_jsonb(CASE WHEN (SELECT count(*) FROM {qualified})=0 THEN c.reltuples IN(-1,0) ELSE c.reltuples=(SELECT count(*) FROM {qualified}) AND EXISTS(SELECT 1 FROM pg_statistic s WHERE s.starelid=c.oid AND s.stainherit=(c.relkind='p')) END)::text AS v FROM pg_class c WHERE c.oid={name}::regclass",qualified=name,name=literal(&name))).await,json!(true));

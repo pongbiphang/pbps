@@ -24,6 +24,13 @@
 use std::collections::BTreeSet;
 
 use pbps_dialect::Dialect as _;
+use pbps_model::ColumnChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
+use pbps_model::TypeValueChange;
 use pbps_model::{Change, Module, ModuleId, ModuleKind, Schema, TableName};
 
 use crate::Mssql;
@@ -55,21 +62,27 @@ pub(crate) fn blocked_by(dialect: &Mssql, base: &Schema, change: &Change) -> BTr
             .collect()
     };
     match change {
-        Change::AlterColumnType { column, .. }
-        | Change::AlterColumnNullability { column, .. }
-        | Change::DropColumn { column, .. } => reading(&column.table, Some(column.name.raw())),
-        Change::RenameColumn { table, from, .. } => reading(table, Some(from.raw())),
-        // A computed column a view reads is a column of its table.
-        Change::DropComputedColumn { table, name, .. } => reading(table, Some(name.raw())),
-        Change::DropTable { name, .. } | Change::RenameTable { from: name, .. } => {
-            reading(name, None)
+        Change::Column(ColumnChange::AlterColumnType { column, .. })
+        | Change::Column(ColumnChange::AlterColumnNullability { column, .. })
+        | Change::Column(ColumnChange::DropColumn { column, .. }) => {
+            reading(&column.table, Some(column.name.raw()))
         }
+        Change::Column(ColumnChange::RenameColumn { table, from, .. }) => {
+            reading(table, Some(from.raw()))
+        }
+        // A computed column a view reads is a column of its table.
+        Change::Column(ColumnChange::DropComputedColumn { table, name, .. }) => {
+            reading(table, Some(name.raw()))
+        }
+        Change::Table(TableChange::DropTable { name, .. })
+        | Change::Table(TableChange::RenameTable { from: name, .. }) => reading(name, None),
         // A bound *view* over a view or function cannot stand while that
         // module is altered or dropped. A bound function's caller keeps the
         // ordering DEC-2192.1 and DEC-2228.1 give it: it is altered in place,
         // after or before its callee by the effects, and only a cycle is
         // refused.
-        Change::AlterModule { id, .. } | Change::DropModule { id, .. } => {
+        Change::Module(ModuleChange::AlterModule { id, .. })
+        | Change::Module(ModuleChange::DropModule { id, .. }) => {
             let Some(name) = id.referenced_name() else {
                 return BTreeSet::new();
             };
@@ -84,37 +97,37 @@ pub(crate) fn blocked_by(dialect: &Mssql, base: &Schema, change: &Change) -> BTr
         }
         // Listed rather than a wildcard, so a new kind of change has to say
         // whether a bound module can stand beside it.
-        Change::RebuildPartitionedTable(_)
-        | Change::BuildPartitionedIndex(_)
-        | Change::CopyTableRows(_)
-        | Change::AnalyzeTableTree(_)
-        | Change::CreateTable { .. }
-        | Change::CreateModule { .. }
-        | Change::DetachPartition { .. }
-        | Change::AttachPartition { .. }
-        | Change::AddColumn { .. }
-        | Change::AlterColumnDefault { .. }
-        | Change::AlterColumnExpression { .. }
-        | Change::AlterColumnNumbering { .. }
-        | Change::SetColumnDeprecated { .. }
+        Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+        | Change::Index(IndexChange::BuildPartitionedIndex(_))
+        | Change::Partition(PartitionChange::CopyTableRows(_))
+        | Change::Partition(PartitionChange::AnalyzeTableTree(_))
+        | Change::Table(TableChange::CreateTable { .. })
+        | Change::Module(ModuleChange::CreateModule { .. })
+        | Change::Partition(PartitionChange::DetachPartition { .. })
+        | Change::Partition(PartitionChange::AttachPartition { .. })
+        | Change::Column(ColumnChange::AddColumn { .. })
+        | Change::Column(ColumnChange::AlterColumnDefault { .. })
+        | Change::Column(ColumnChange::AlterColumnExpression { .. })
+        | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+        | Change::Column(ColumnChange::SetColumnDeprecated { .. })
         | pbps_model::change_family!(table_properties)
         | pbps_model::change_family!(constraints)
-        | Change::SetIndexStorageParameters { .. }
-        | Change::SetPartitionDefault { .. }
-        | Change::SetPartitionNotNull { .. }
+        | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+        | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+        | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
         | pbps_model::change_family!(policies)
-        | Change::AddIndex { .. }
-        | Change::AddComputedColumn { .. }
-        | Change::DropIndex { .. }
+        | Change::Index(IndexChange::AddIndex { .. })
+        | Change::Column(ColumnChange::AddComputedColumn { .. })
+        | Change::Index(IndexChange::DropIndex { .. })
         | pbps_model::change_family!(rows)
         | pbps_model::catalog_change!()
-        | Change::AlterDomain { .. }
-        | Change::Grant { .. }
-        | Change::Revoke { .. }
-        | Change::AddEnumValue { .. }
-        | Change::RenameEnumValue { .. }
-        | Change::EnumRebuild { .. }
-        | Change::PublicExecution { .. } => BTreeSet::new(),
+        | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+        | Change::Permission(GrantChange::Grant { .. })
+        | Change::Permission(GrantChange::Revoke { .. })
+        | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+        | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+        | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
+        | Change::Permission(GrantChange::PublicExecution { .. }) => BTreeSet::new(),
     }
 }
 

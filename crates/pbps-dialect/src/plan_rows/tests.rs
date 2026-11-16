@@ -1,4 +1,9 @@
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
+use pbps_model::TypeValueChange;
 use pbps_model::{IdsFile, PlannedChange, UidKind};
 
 #[test]
@@ -28,12 +33,12 @@ fn uid(kind: UidKind, name: &str) -> Uid {
 }
 
 fn rename(id: &Uid, from: &str, to: &str) -> PlannedChange {
-    PlannedChange::new(Change::RenameTable {
+    PlannedChange::new(Change::Table(TableChange::RenameTable {
         uid: id.clone(),
         from: table(from),
         to: table(to),
         defaults: vec![],
-    })
+    }))
 }
 
 #[test]
@@ -63,15 +68,15 @@ fn a_removal_keeps_its_original_holder_when_another_table_takes_the_name() {
     let a = uid(UidKind::Table, "a");
     let b = uid(UidKind::Table, "b");
     let changes = [
-        PlannedChange::new(Change::DropForeignKey {
+        PlannedChange::new(Change::Constraint(ConstraintChange::DropForeignKey {
             table: table("a"),
             name: "fk".into(),
-        }),
-        PlannedChange::new(Change::DropTable {
+        })),
+        PlannedChange::new(Change::Table(TableChange::DropTable {
             uid: a,
             name: table("a"),
             detach_from: None,
-        }),
+        })),
         rename(&b, "b", "a"),
     ];
     let ids = IdsFile {
@@ -107,20 +112,20 @@ fn a_temporary_name_and_column_chain_are_read_at_the_requested_boundary() {
         rename(&a, "a", "tmp"),
         rename(&b, "b", "a"),
         rename(&a, "tmp", "b"),
-        PlannedChange::new(Change::RenameColumn {
+        PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
             uid: c.clone(),
             table: table("b"),
             from: "c".into(),
             to: "d".into(),
             table_was: Some(table("a")),
-        }),
-        PlannedChange::new(Change::RenameColumn {
+        })),
+        PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
             uid: c.clone(),
             table: table("b"),
             from: "d".into(),
             to: "e".into(),
             table_was: Some(table("a")),
-        }),
+        })),
     ];
     let ids = IdsFile {
         tables: [(a, table("b")), (b, table("a"))].into(),
@@ -150,13 +155,15 @@ fn a_temporary_name_and_column_chain_are_read_at_the_requested_boundary() {
 #[test]
 fn a_created_table_has_no_stored_relation_even_after_its_create() {
     let id = uid(UidKind::Table, "new");
-    let changes = [PlannedChange::new(Change::CreateTable {
-        uid: id.clone(),
-        name: table("new"),
-        table: Box::default(),
-        beside_default: None,
-        moves_at_most: None,
-    })];
+    let changes = [PlannedChange::new(Change::Table(
+        TableChange::CreateTable {
+            uid: id.clone(),
+            name: table("new"),
+            table: Box::default(),
+            beside_default: None,
+            moves_at_most: None,
+        },
+    ))];
     let ids = IdsFile {
         tables: [(id, table("new"))].into(),
         ..IdsFile::default()
@@ -305,13 +312,13 @@ fn null_evidence_stays_with_its_row_and_uses_the_callers_interpretation() {
 fn a_backfill_and_a_later_retype_remain_distinct_prefix_facts() {
     let column = uid(UidKind::Column, "added");
     let changes = [
-        PlannedChange::new(Change::AddColumn {
+        PlannedChange::new(Change::Column(ColumnChange::AddColumn {
             uid: column.clone(),
             table: table("a"),
             name: "added".into(),
             column: Box::new(Column::new("integer".parse().unwrap())),
-        }),
-        PlannedChange::new(Change::AlterColumnType {
+        })),
+        PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
             uid: column.clone(),
             column: table("a").column("added"),
             from: "integer".parse().unwrap(),
@@ -322,7 +329,7 @@ fn a_backfill_and_a_later_retype_remain_distinct_prefix_facts() {
             to_collation: None,
             through_external_partitions: false,
             using: None,
-        }),
+        })),
     ];
     let ids = IdsFile {
         tables: [(uid(UidKind::Table, "a"), table("a"))].into(),
@@ -352,12 +359,12 @@ fn a_backfill_and_a_later_retype_remain_distinct_prefix_facts() {
 #[test]
 fn an_enum_rebuilds_retype_step_is_an_event_of_its_column_and_no_other_step_is() {
     let step = |step| {
-        PlannedChange::new(Change::EnumRebuild {
+        PlannedChange::new(Change::TypeValue(TypeValueChange::EnumRebuild {
             uid: "y_000001".parse().unwrap(),
             name: "app.e".parse().unwrap(),
             tmp: "app.tmp".parse().unwrap(),
             step,
-        })
+        }))
     };
     let definition = Box::new(pbps_model::ManagedType::Enum { values: vec![] });
     let changes = [
@@ -401,7 +408,7 @@ fn an_enum_rebuilds_retype_step_is_an_event_of_its_column_and_no_other_step_is()
 fn row_projection_preserves_unknown_assignments_and_excludes_future_deletes() {
     let key = RowKey("1".into());
     let changes = [
-        PlannedChange::new(Change::UpdateRow {
+        PlannedChange::new(Change::Row(RowChange::UpdateRow {
             table: table("a"),
             key_column: "id".into(),
             key: key.clone(),
@@ -417,8 +424,8 @@ fn row_projection_preserves_unknown_assignments_and_excludes_future_deletes() {
             types: [("fk".into(), "integer".parse().unwrap())].into(),
             after_types: [("fk".into(), "bigint".parse().unwrap())].into(),
             key_type: None,
-        }),
-        PlannedChange::new(Change::DeleteRow {
+        })),
+        PlannedChange::new(Change::Row(RowChange::DeleteRow {
             table: table("a"),
             key_column: "id".into(),
             key: key.clone(),
@@ -428,7 +435,7 @@ fn row_projection_preserves_unknown_assignments_and_excludes_future_deletes() {
             types: Default::default(),
             after_types: Default::default(),
             key_type: None,
-        }),
+        })),
     ];
     let ids = IdsFile {
         tables: [(uid(UidKind::Table, "a"), table("a"))].into(),

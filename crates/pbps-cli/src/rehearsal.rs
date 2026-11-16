@@ -17,6 +17,14 @@ use anyhow::Context as _;
 
 use pbps_db::Conn;
 use pbps_dialect::{Dialect, Statement};
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PolicyChange;
+use pbps_model::RoleChange;
+use pbps_model::RowChange;
 use pbps_model::role_mapping::RoleMapping;
 use pbps_model::{Change, ChangeSet, IdsFile, Schema, SessionZone};
 
@@ -149,14 +157,14 @@ struct Words {
 pub fn is_authorization(change: &Change) -> bool {
     matches!(
         change,
-        Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::CreatePolicy { .. }
-            | Change::DropPolicy { .. }
-            | Change::SetRowSecurity { .. }
+        Change::Role(RoleChange::CreateRole { .. })
+            | Change::Role(RoleChange::DropRole { .. })
+            | Change::Role(RoleChange::RenameRole { .. })
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Policy(PolicyChange::CreatePolicy { .. })
+            | Change::Policy(PolicyChange::DropPolicy { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. })
     )
 }
 
@@ -784,7 +792,7 @@ fn respelt(remaining: &ChangeSet, engine: &Schema) -> Vec<String> {
     let mut lines = classify(remaining, engine).1;
     for planned in &remaining.changes {
         match &planned.change {
-            Change::AlterModule { id, module, .. } => {
+            Change::Module(ModuleChange::AlterModule { id, module, .. }) => {
                 if let Some(stored) = engine.modules.get(id) {
                     lines.push(format!(
                         "{} {id}: declared `{}`, the engine stores `{}`",
@@ -795,9 +803,9 @@ fn respelt(remaining: &ChangeSet, engine: &Schema) -> Vec<String> {
                     ));
                 }
             }
-            Change::AddIndex {
+            Change::Index(IndexChange::AddIndex {
                 table, name, index, ..
-            } => {
+            }) => {
                 if let Some(stored) = engine.tables.get(table).and_then(|t| t.indexes.get(name))
                     && index.filter != stored.filter
                 {
@@ -828,11 +836,11 @@ fn classify(remaining: &ChangeSet, engine: &Schema) -> (Vec<String>, Vec<String>
         // added later is structural until somebody shows it is a spelling, and
         // the safe default is the one that fails the rehearsal loudly.
         match &p.change {
-            Change::AddCheck {
+            Change::Constraint(ConstraintChange::AddCheck {
                 table,
                 name,
                 constraint,
-            } => {
+            }) => {
                 // A spelling difference needs two spellings. When the engine has
                 // no constraint by that name the plan simply did not create it,
                 // which is non-convergence — and `converged()` looks only at
@@ -857,53 +865,57 @@ fn classify(remaining: &ChangeSet, engine: &Schema) -> (Vec<String>, Vec<String>
                     )),
                 }
             }
-            Change::AlterColumnDefault { column, to, .. } => spelling.push(format!(
-                "default on {column}: declared `{}`, the engine stores `{}`",
-                to.as_deref().unwrap_or("(none)"),
-                engine
-                    .tables
-                    .get(&column.table)
-                    .and_then(|t| t.columns.get(&column.name))
-                    .and_then(|c| match &c.value_source {
-                        pbps_model::ValueSource::Default(default) => Some(default.as_str()),
-                        pbps_model::ValueSource::None
-                        | pbps_model::ValueSource::Identity(_)
-                        | pbps_model::ValueSource::Sequence(_)
-                        | pbps_model::ValueSource::Generated(_) => None,
-                    })
-                    .unwrap_or("(none)"),
-                column = column.shown()
-            )),
+            Change::Column(ColumnChange::AlterColumnDefault { column, to, .. }) => {
+                spelling.push(format!(
+                    "default on {column}: declared `{}`, the engine stores `{}`",
+                    to.as_deref().unwrap_or("(none)"),
+                    engine
+                        .tables
+                        .get(&column.table)
+                        .and_then(|t| t.columns.get(&column.name))
+                        .and_then(|c| match &c.value_source {
+                            pbps_model::ValueSource::Default(default) => Some(default.as_str()),
+                            pbps_model::ValueSource::None
+                            | pbps_model::ValueSource::Identity(_)
+                            | pbps_model::ValueSource::Sequence(_)
+                            | pbps_model::ValueSource::Generated(_) => None,
+                        })
+                        .unwrap_or("(none)"),
+                    column = column.shown()
+                ))
+            }
             // A module whose stored body still differs is not layout: the
             // difference already survived `Dialect::normalize_definition`, and
             // the engine stores a module's text verbatim rather than rewriting
             // it the way it rewrites an expression. So it is the emitter or the
             // introspection that is wrong, and swallowing it here would let a
             // view with the wrong body pass as converged.
-            Change::AlterModule { id, module, .. } => structural.push(format!(
-                "{} {id}: declared `{}`, the engine stores `{}`",
-                module.kind,
-                module.definition.trim(),
-                engine
-                    .modules
-                    .get(id)
-                    .map(|m| m.definition.trim())
-                    .unwrap_or("(absent)"),
-                id = id.shown()
-            )),
+            Change::Module(ModuleChange::AlterModule { id, module, .. }) => {
+                structural.push(format!(
+                    "{} {id}: declared `{}`, the engine stores `{}`",
+                    module.kind,
+                    module.definition.trim(),
+                    engine
+                        .modules
+                        .get(id)
+                        .map(|m| m.definition.trim())
+                        .unwrap_or("(absent)"),
+                    id = id.shown()
+                ))
+            }
             // The other half of a check's drop+add pair: not a second finding.
-            Change::DropCheck { .. } => {}
+            Change::Constraint(ConstraintChange::DropCheck { .. }) => {}
             // A row whose every differing cell is "the default" on both sides
             // is the default's own spelling showing through — `N'x'` declared,
             // `'x'` stored — which is the check-constraint case one level
             // down. Any cell with a real value on either side is a row the
             // plan did not write as declared, and stays structural.
-            Change::UpdateRow {
+            Change::Row(RowChange::UpdateRow {
                 table,
                 key,
                 columns,
                 ..
-            } if columns.values().all(|(from, to)| {
+            }) if columns.values().all(|(from, to)| {
                 matches!(
                     (from, to),
                     (pbps_model::Cell::Default(_), pbps_model::Cell::Default(_))
@@ -924,7 +936,7 @@ fn classify(remaining: &ChangeSet, engine: &Schema) -> (Vec<String>, Vec<String>
             // it, so it comes back on every rehearsal of every declaration that
             // uses it — as non-convergence it would mean `plan --dev` could
             // never pass on a schema that documents a deprecated column.
-            Change::SetColumnDeprecated { .. } => {}
+            Change::Column(ColumnChange::SetColumnDeprecated { .. }) => {}
             other => structural.push(crate::report::describe(other)),
         }
     }
@@ -934,6 +946,12 @@ fn classify(remaining: &ChangeSet, engine: &Schema) -> (Vec<String>, Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::IndexChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::PolicyChange;
+    use pbps_model::RoleChange;
     fn planned(c: Change) -> pbps_model::PlannedChange {
         pbps_model::PlannedChange::new(c)
     }
@@ -1069,7 +1087,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             planned.changes().changes.as_slice(),
-            [p] if matches!(p.change, pbps_model::Change::CreateExtension { .. })
+            [p] if matches!(p.change, pbps_model::Change::Extension(pbps_model::ExtensionChange::CreateExtension { .. }))
         ));
     }
 
@@ -1270,10 +1288,10 @@ mod tests {
         engine.modules.insert(name.clone(), view("SELECT 1 AS one"));
 
         let remaining = ChangeSet {
-            changes: vec![planned(Change::AlterModule {
+            changes: vec![planned(Change::Module(ModuleChange::AlterModule {
                 id: name.clone(),
                 module: Box::new(view("SELECT 2 AS two")),
-            })],
+            }))],
         };
         let (structural, spelling) = classify(&remaining, &engine);
         assert!(spelling.is_empty(), "{spelling:?}");
@@ -1291,11 +1309,11 @@ mod tests {
     #[test]
     fn a_deprecation_never_fails_the_rehearsal() {
         let remaining = ChangeSet {
-            changes: vec![planned(Change::SetColumnDeprecated {
+            changes: vec![planned(Change::Column(ColumnChange::SetColumnDeprecated {
                 uid: "c_a1b2c3".parse().unwrap(),
                 column: "dbo.t.old".parse().unwrap(),
                 reason: Some("superseded by email".into()),
-            })],
+            }))],
         };
         let (structural, spelling) = classify(&remaining, &Schema::default());
         assert!(structural.is_empty(), "{structural:?}");
@@ -1310,13 +1328,13 @@ mod tests {
     fn a_check_the_plan_never_created_is_structural() {
         let table: pbps_model::TableName = "dbo.t".parse().unwrap();
         let remaining = ChangeSet {
-            changes: vec![planned(Change::AddCheck {
+            changes: vec![planned(Change::Constraint(ConstraintChange::AddCheck {
                 table: table.clone(),
                 name: "ck_positive".into(),
                 constraint: pbps_model::CheckConstraint {
                     expression: "qty > 0".into(),
                 },
-            })],
+            }))],
         };
 
         // Nothing in the engine: the plan failed to create it.
@@ -1344,10 +1362,10 @@ mod tests {
     #[test]
     fn an_unclassified_change_is_structural() {
         let remaining = ChangeSet {
-            changes: vec![planned(Change::DropColumn {
+            changes: vec![planned(Change::Column(ColumnChange::DropColumn {
                 uid: "c_a1b2c3".parse().unwrap(),
                 column: "dbo.t.gone".parse().unwrap(),
-            })],
+            }))],
         };
         let (structural, spelling) = classify(&remaining, &Schema::default());
         assert_eq!(structural.len(), 1, "{structural:?}");
@@ -1378,12 +1396,12 @@ mod tests {
 
     fn adding_index(filter: Option<&str>) -> ChangeSet {
         ChangeSet {
-            changes: vec![planned(Change::AddIndex {
+            changes: vec![planned(Change::Index(IndexChange::AddIndex {
                 table: "app.t".parse().unwrap(),
                 name: "ix".into(),
                 index: Box::new(index_on("app.t", "ix", filter)),
                 clustered: false,
-            })],
+            }))],
         }
     }
 
@@ -1406,10 +1424,10 @@ mod tests {
         // Negative: a module the engine lacks is the plan's failure, and
         // `classify` reports it.
         let module = ChangeSet {
-            changes: vec![planned(Change::AlterModule {
+            changes: vec![planned(Change::Module(ModuleChange::AlterModule {
                 id: "app.v".parse().unwrap(),
                 module: Box::new(view("SELECT 1 AS one")),
-            })],
+            }))],
         };
         assert!(respelt(&module, &Schema::default()).is_empty());
         let mut engine = Schema::default();
@@ -1426,51 +1444,51 @@ mod tests {
         use pbps_model::{Uid, UidKind};
         let role = || Uid::generate(UidKind::Role);
         for change in [
-            Change::CreateRole {
+            Change::Role(RoleChange::CreateRole {
                 uid: role(),
                 name: "r".into(),
-            },
-            Change::DropRole {
+            }),
+            Change::Role(RoleChange::DropRole {
                 uid: role(),
                 name: "r".into(),
                 members: Vec::new(),
-            },
-            Change::RenameRole {
+            }),
+            Change::Role(RoleChange::RenameRole {
                 uid: role(),
                 from: "r".into(),
                 to: "s".into(),
-            },
-            Change::CreatePolicy {
+            }),
+            Change::Policy(PolicyChange::CreatePolicy {
                 table: "app.t".parse().unwrap(),
                 name: "p".into(),
                 policy: Default::default(),
                 origin: pbps_model::RowSecurityOrigin::Created,
-            },
-            Change::DropPolicy {
+            }),
+            Change::Policy(PolicyChange::DropPolicy {
                 table: "app.t".parse().unwrap(),
                 name: "p".into(),
                 policy: Default::default(),
-            },
-            Change::SetRowSecurity {
+            }),
+            Change::Policy(PolicyChange::SetRowSecurity {
                 uid: Uid::generate(UidKind::Table),
                 table: "app.t".parse().unwrap(),
                 from: Default::default(),
                 to: Default::default(),
                 origin: pbps_model::RowSecurityOrigin::Created,
-            },
+            }),
         ] {
             assert!(is_authorization(&change), "{change:?}");
         }
         // Negative: the database's own objects are rehearsed.
         for change in [
-            Change::DropColumn {
+            Change::Column(ColumnChange::DropColumn {
                 uid: "c_a1b2c3".parse().unwrap(),
                 column: "dbo.t.gone".parse().unwrap(),
-            },
-            Change::DropIndex {
+            }),
+            Change::Index(IndexChange::DropIndex {
                 table: "app.t".parse().unwrap(),
                 name: "ix".into(),
-            },
+            }),
         ] {
             assert!(!is_authorization(&change), "{change:?}");
         }

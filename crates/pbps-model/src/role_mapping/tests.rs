@@ -1,5 +1,9 @@
 use super::*;
+use crate::change::GrantChange;
 use crate::change::PlannedChange;
+use crate::change::PolicyChange;
+use crate::change::RoleChange;
+use crate::change::TableChange;
 use crate::role::Role;
 use crate::schema::Table;
 use crate::uid::UidKind;
@@ -118,37 +122,37 @@ fn a_change_names_only_the_runs_roles_afterwards() {
     let permissions = BTreeSet::from([Permission::Usage]);
     let changes = ChangeSet {
         changes: vec![
-            planned(Change::Grant {
+            planned(Change::Permission(GrantChange::Grant {
                 role: name("reader"),
                 target: target.clone(),
                 permissions: permissions.clone(),
-            }),
-            planned(Change::Revoke {
+            })),
+            planned(Change::Permission(GrantChange::Revoke {
                 role: name("writer"),
                 target,
                 permissions,
-            }),
-            planned(Change::RenameRole {
+            })),
+            planned(Change::Role(RoleChange::RenameRole {
                 uid: Uid::generate(UidKind::Role),
                 from: name("old"),
                 to: name("new"),
-            }),
-            planned(Change::DropRole {
+            })),
+            planned(Change::Role(RoleChange::DropRole {
                 uid: Uid::generate(UidKind::Role),
                 name: name("gone"),
                 members: vec![name("member")],
-            }),
-            planned(Change::CreatePolicy {
+            })),
+            planned(Change::Policy(PolicyChange::CreatePolicy {
                 table: table(),
                 name: "p".into(),
                 policy: policy(&["reader", "auditor"]),
                 origin: crate::change::RowSecurityOrigin::Created,
-            }),
-            planned(Change::DropPolicy {
+            })),
+            planned(Change::Policy(PolicyChange::DropPolicy {
                 table: table(),
                 name: "q".into(),
                 policy: policy(&["writer"]),
-            }),
+            })),
         ],
     };
     let named: BTreeSet<_> = changes
@@ -179,11 +183,11 @@ fn a_change_names_only_the_runs_roles_afterwards() {
     );
     // Negative: a change that names no role is what it was.
     let plain = ChangeSet {
-        changes: vec![planned(Change::DropTable {
+        changes: vec![planned(Change::Table(TableChange::DropTable {
             uid: Uid::generate(UidKind::Table),
             name: table(),
             detach_from: None,
-        })],
+        }))],
     };
     assert_eq!(map.changes(&plain), plain);
 }
@@ -209,10 +213,10 @@ fn an_unchanged_mapping_is_the_identity_and_lists_what_to_make() {
         .insert(Uid::generate(UidKind::Role), name("reader"));
     assert_eq!(map.ids(&ids), ids);
     let changes = ChangeSet {
-        changes: vec![planned(Change::CreateRole {
+        changes: vec![planned(Change::Role(RoleChange::CreateRole {
             uid: Uid::generate(UidKind::Role),
             name: name("reader"),
-        })],
+        }))],
     };
     assert_eq!(map.changes(&changes), changes);
     // Negative: the default mapping makes nothing.

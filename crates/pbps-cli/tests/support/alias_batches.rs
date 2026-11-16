@@ -1,5 +1,6 @@
 //! Large declared data must use the ordinary baseline/plan/apply/verify path.
 use super::{Demo, OwnDatabase, apply_plan, code, on_server, scalar, server, stderr, succeeds};
+use pbps_model::RowChange;
 use pbps_model::{Change, SavedPlan};
 use serde_json::{Map, Value, json};
 
@@ -97,7 +98,7 @@ fn large_catalogues_read_back_inside_bootstrap_and_apply_transactions() {
     assert_eq!(saved.changes.changes.len(), 1);
     assert!(matches!(
         saved.changes.changes[0].change,
-        Change::InsertRow { .. }
+        Change::Row(RowChange::InsertRow { .. })
     ));
     succeeds(apply_plan(&d, connection, &path, false));
     assert_eq!(

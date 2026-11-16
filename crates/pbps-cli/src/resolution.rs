@@ -1240,12 +1240,12 @@ mod tests {
             ids: &base_ids,
         };
         let ordinary = pbps_model::ChangeSet {
-            changes: vec![pbps_model::PlannedChange::new(
-                pbps_model::Change::DropIndex {
+            changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Index(
+                pbps_model::IndexChange::DropIndex {
                     table: "app.t".parse().unwrap(),
                     name: "ix_gone".into(),
                 },
-            )],
+            ))],
         };
         assert!(matches!(
             case(Some(&selected), side, side, &ordinary, &pbps_mssql::Mssql),

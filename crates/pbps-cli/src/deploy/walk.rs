@@ -100,9 +100,12 @@ impl NameFacts {
         let module = self.one(&name);
         let in_schema = |t: &TableName, n: &str| TableName::new(t.schema.clone(), n);
         changes.iter().any(|p| {
-            let pbps_model::Change::RenameTable {
-                from, to, defaults, ..
-            } = &p.change
+            let pbps_model::Change::Table(pbps_model::TableChange::RenameTable {
+                from,
+                to,
+                defaults,
+                ..
+            }) = &p.change
             else {
                 return false;
             };
@@ -457,6 +460,10 @@ impl<'f> Walk<'f> {
     #[allow(clippy::wildcard_enum_match_arm)]
     pub(crate) fn step(&mut self, step: usize, change: &pbps_model::Change) {
         use pbps_model::Change;
+        use pbps_model::ColumnChange;
+        use pbps_model::ConstraintChange;
+        use pbps_model::ModuleChange;
+        use pbps_model::TableChange;
         use pbps_mssql::emit::default_constraint_name as generated;
         use pbps_mssql::emit::fallback_default_constraint_name as fallback_name;
         use pbps_mssql::emit::generated_default_names as left_under;
@@ -480,23 +487,23 @@ impl<'f> Walk<'f> {
             column: None,
         };
         match change {
-            Change::DropModule { id, .. } => {
+            Change::Module(ModuleChange::DropModule { id, .. }) => {
                 let name = module_object(id);
                 self.release(step, |h| h.name == name);
             }
-            Change::DropTable { name, .. } => {
+            Change::Table(TableChange::DropTable { name, .. }) => {
                 self.release(step, |h| &h.name == name || h.parent.as_ref() == Some(name));
             }
-            Change::RenameTable {
+            Change::Table(TableChange::RenameTable {
                 from, to, defaults, ..
-            } => self.rename_table(step, from, to, defaults),
-            Change::RenameColumn {
+            }) => self.rename_table(step, from, to, defaults),
+            Change::Column(ColumnChange::RenameColumn {
                 table,
                 from,
                 to,
                 table_was,
                 ..
-            } => {
+            }) => {
                 let new = in_schema(table, generated(table, to.raw()).raw());
                 let fallback = in_schema(table, fallback_name(table, to.raw()).raw());
                 for was in std::iter::once(table).chain(table_was) {
@@ -519,12 +526,12 @@ impl<'f> Walk<'f> {
                     }
                 }
             }
-            Change::DropColumn { column, .. } => self.release(step, |h| {
+            Change::Column(ColumnChange::DropColumn { column, .. }) => self.release(step, |h| {
                 h.parent.as_ref() == Some(&column.table) && h.column.as_ref() == Some(&column.name)
             }),
-            Change::AlterColumnDefault {
+            Change::Column(ColumnChange::AlterColumnDefault {
                 column, from, to, ..
-            } => {
+            }) => {
                 if from.is_some() {
                     self.release(step, |h| {
                         h.parent.as_ref() == Some(&column.table)
@@ -535,12 +542,12 @@ impl<'f> Walk<'f> {
                     self.claim(step, default_of(&column.table, column.name.raw()));
                 }
             }
-            Change::AddColumn {
+            Change::Column(ColumnChange::AddColumn {
                 table,
                 name,
                 column,
                 ..
-            } if (match column.value_source {
+            }) if (match column.value_source {
                 pbps_model::ValueSource::Default(_) => true,
                 pbps_model::ValueSource::None
                 | pbps_model::ValueSource::Identity(_)
@@ -550,27 +557,27 @@ impl<'f> Walk<'f> {
             {
                 self.claim(step, default_of(table, name.raw()))
             }
-            Change::DropUnique { table, name }
-            | Change::DropForeignKey { table, name }
-            | Change::DropCheck { table, name } => {
+            Change::Constraint(ConstraintChange::DropUnique { table, name })
+            | Change::Constraint(ConstraintChange::DropForeignKey { table, name })
+            | Change::Constraint(ConstraintChange::DropCheck { table, name }) => {
                 let name = in_schema(table, name.raw());
                 self.release(step, |h| h.name == name);
             }
-            Change::AddUnique { table, name, .. } => {
+            Change::Constraint(ConstraintChange::AddUnique { table, name, .. }) => {
                 self.claim(step, constraint(table, name.raw(), "unique constraint"));
             }
-            Change::AddForeignKey { table, name, .. } => {
+            Change::Constraint(ConstraintChange::AddForeignKey { table, name, .. }) => {
                 self.claim(
                     step,
                     constraint(table, name.raw(), "foreign key constraint"),
                 );
             }
-            Change::AddCheck { table, name, .. } => {
+            Change::Constraint(ConstraintChange::AddCheck { table, name, .. }) => {
                 self.claim(step, constraint(table, name.raw(), "check constraint"));
             }
-            Change::SetPrimaryKey {
+            Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table, from, to, ..
-            } => {
+            }) => {
                 match from
                     .as_ref()
                     .map(|k| k.name.as_ref().map(pbps_model::ObjectLocalName::raw))
@@ -593,7 +600,7 @@ impl<'f> Walk<'f> {
                     self.claim(step, constraint(table, name, "primary key constraint"));
                 }
             }
-            Change::CreateTable { name, table, .. } => {
+            Change::Table(TableChange::CreateTable { name, table, .. }) => {
                 self.claim(step, object(name, "user table"));
                 // The history is created by the same statement (#1176).
                 if let Some(v) = table
@@ -633,7 +640,7 @@ impl<'f> Walk<'f> {
                     self.claim(step, constraint(name, n, kind));
                 }
             }
-            Change::CreateModule { id, module } => {
+            Change::Module(ModuleChange::CreateModule { id, module }) => {
                 self.claim(step, object(&module_object(id), &module.kind.to_string()));
             }
             _ => {}

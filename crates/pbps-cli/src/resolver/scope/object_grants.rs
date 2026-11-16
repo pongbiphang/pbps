@@ -5,6 +5,8 @@
 use pbps_db::catalog::Pulled;
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
 use pbps_dialect::Dialect;
+use pbps_model::ModuleChange;
+use pbps_model::TypeChange;
 use pbps_model::plan_names::{At, Holder, PlanNames};
 use pbps_model::resolver::{
     AuthorizationGrant, GrantPhase, GrantPrincipal, GrantTargetState, GrantWrite,
@@ -52,18 +54,18 @@ impl ModuleCuts {
             ..Self::default()
         };
         for (i, p) in changes.changes.iter().enumerate() {
-            if let Change::CreateModule { id, .. } = &p.change {
+            if let Change::Module(ModuleChange::CreateModule { id, .. }) = &p.change {
                 cuts.created.entry(id.clone()).or_insert(i);
                 cuts.activity.entry(id.clone()).or_default().push((i, true));
             }
-            if let Change::DropModule { id, .. } = &p.change {
+            if let Change::Module(ModuleChange::DropModule { id, .. }) = &p.change {
                 cuts.dropped.insert(id.clone(), i);
                 cuts.activity
                     .entry(id.clone())
                     .or_default()
                     .push((i, false));
             }
-            cuts.type_moves |= matches!(p.change, Change::RenameType { .. });
+            cuts.type_moves |= matches!(p.change, Change::Type(TypeChange::RenameType { .. }));
         }
         cuts
     }
@@ -429,12 +431,12 @@ fn module_at(
         End::After => Box::new(changes.changes[index + 1..].iter()),
     };
     for p in steps {
-        if matches!((end, &p.change), (End::Before, Change::CreateModule { id: added, .. }) if added == &id)
-            || matches!((end, &p.change), (End::After, Change::DropModule { id: dropped, .. }) if dropped == &id)
+        if matches!((end, &p.change), (End::Before, Change::Module(ModuleChange::CreateModule { id: added, .. })) if added == &id)
+            || matches!((end, &p.change), (End::After, Change::Module(ModuleChange::DropModule { id: dropped, .. })) if dropped == &id)
         {
             return Ok(GrantTargetState::Absent);
         }
-        if let Change::RenameType { from, to, .. } = &p.change
+        if let Change::Type(TypeChange::RenameType { from, to, .. }) = &p.change
             && let ModuleId::Routine(routine) = &mut id
         {
             let (from, to) = match end {
@@ -515,22 +517,22 @@ fn canonical_target(
         })
         .collect();
     for p in &changes.changes[..index] {
-        if let Change::CreateModule {
+        if let Change::Module(ModuleChange::CreateModule {
             id: ModuleId::Routine(routine),
             ..
-        } = &p.change
+        }) = &p.change
             && &routine.name == name
         {
             candidates.insert(routine.clone());
         }
-        if let Change::DropModule {
+        if let Change::Module(ModuleChange::DropModule {
             id: ModuleId::Routine(routine),
             ..
-        } = &p.change
+        }) = &p.change
         {
             candidates.remove(routine);
         }
-        if let Change::RenameType { from, to, .. } = &p.change {
+        if let Change::Type(TypeChange::RenameType { from, to, .. }) = &p.change {
             candidates = candidates
                 .into_iter()
                 .map(|mut routine| {

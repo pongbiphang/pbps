@@ -1,5 +1,9 @@
 use super::transition_scope_tests::{object, seal};
 use super::*;
+use crate::ColumnChange;
+use crate::IndexChange;
+use crate::PartitionChange;
+use crate::TableChange;
 use crate::resolver::{ObjectOwnership, Surface};
 use crate::{PlannedChange, TableName};
 
@@ -22,36 +26,40 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
             .clone()
     });
     let source = match &fixture_changes.changes[0].change {
-        Change::RebuildPartitionedTable(_)
-        | Change::BuildPartitionedIndex(_)
-        | Change::CopyTableRows(_)
-        | Change::AnalyzeTableTree(_) => panic!("rename fixture contains a rebuild"),
-        Change::RenameColumn { table, from, .. } => Surface::Column(table.column(from)),
-        Change::RenameTable { from, .. } => Surface::Table(from.clone()),
-        Change::CreateTable { .. }
-        | Change::DetachPartition { .. }
+        Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+        | Change::Index(IndexChange::BuildPartitionedIndex(_))
+        | Change::Partition(PartitionChange::CopyTableRows(_))
+        | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => {
+            panic!("rename fixture contains a rebuild")
+        }
+        Change::Column(ColumnChange::RenameColumn { table, from, .. }) => {
+            Surface::Column(table.column(from))
+        }
+        Change::Table(TableChange::RenameTable { from, .. }) => Surface::Table(from.clone()),
+        Change::Table(TableChange::CreateTable { .. })
+        | Change::Partition(PartitionChange::DetachPartition { .. })
         | crate::change_family!(extensions)
         | crate::change_family!(search)
-        | Change::AttachPartition { .. }
-        | Change::DropTable { .. }
-        | Change::AddColumn { .. }
-        | Change::AddComputedColumn { .. }
+        | Change::Partition(PartitionChange::AttachPartition { .. })
+        | Change::Table(TableChange::DropTable { .. })
+        | Change::Column(ColumnChange::AddColumn { .. })
+        | Change::Column(ColumnChange::AddComputedColumn { .. })
         | crate::change_family!(policies)
         | crate::change_family!(table_properties)
-        | Change::SetPartitionDefault { .. }
-        | Change::SetPartitionNotNull { .. }
-        | Change::SetIndexStorageParameters { .. }
-        | Change::DropComputedColumn { .. }
-        | Change::DropColumn { .. }
-        | Change::AlterColumnType { .. }
-        | Change::AlterColumnNullability { .. }
-        | Change::AlterColumnDefault { .. }
-        | Change::AlterColumnExpression { .. }
-        | Change::AlterColumnNumbering { .. }
-        | Change::SetColumnDeprecated { .. }
+        | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+        | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+        | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+        | Change::Column(ColumnChange::DropComputedColumn { .. })
+        | Change::Column(ColumnChange::DropColumn { .. })
+        | Change::Column(ColumnChange::AlterColumnType { .. })
+        | Change::Column(ColumnChange::AlterColumnNullability { .. })
+        | Change::Column(ColumnChange::AlterColumnDefault { .. })
+        | Change::Column(ColumnChange::AlterColumnExpression { .. })
+        | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+        | Change::Column(ColumnChange::SetColumnDeprecated { .. })
         | crate::change_family!(constraints)
-        | Change::AddIndex { .. }
-        | Change::DropIndex { .. }
+        | Change::Index(IndexChange::AddIndex { .. })
+        | Change::Index(IndexChange::DropIndex { .. })
         | crate::change_family!(rows)
         | crate::change_family!(modules)
         | crate::change_family!(type_values)
@@ -77,31 +85,31 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
     let table: TableName = "app.t".parse().unwrap();
     let mut changes = ChangeSet::default();
     if rename_table {
-        changes
-            .changes
-            .push(PlannedChange::new(Change::RenameTable {
+        changes.changes.push(PlannedChange::new(Change::Table(
+            TableChange::RenameTable {
                 uid: "t_000000".parse().unwrap(),
                 from: old_table.clone(),
                 to: table.clone(),
                 defaults: vec![],
-            }));
+            },
+        )));
     }
     let rename = |first: bool, from: &str, to: &str| {
         if column {
-            Change::RenameColumn {
+            Change::Column(ColumnChange::RenameColumn {
                 uid: if first { "c_000000" } else { "c_111111" }.parse().unwrap(),
                 table: table.clone(),
                 from: from.into(),
                 to: to.into(),
                 table_was: rename_table.then(|| old_table.clone()),
-            }
+            })
         } else {
-            Change::RenameTable {
+            Change::Table(TableChange::RenameTable {
                 uid: if first { "t_000000" } else { "t_111111" }.parse().unwrap(),
                 from: format!("app.{from}").parse().unwrap(),
                 to: format!("app.{to}").parse().unwrap(),
                 defaults: vec![],
-            }
+            })
         }
     };
     if intermediate {

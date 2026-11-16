@@ -42,7 +42,8 @@ impl Comparison<'_> {
         if changes.changes().changes.iter().any(|p| {
             !matches!(
                 p.change,
-                pbps_model::Change::RenameEnumValue { .. } | pbps_model::Change::RenameType { .. }
+                pbps_model::Change::TypeValue(pbps_model::TypeValueChange::RenameEnumValue { .. })
+                    | pbps_model::Change::Type(pbps_model::TypeChange::RenameType { .. })
             )
         }) {
             return Ok(Vec::new());

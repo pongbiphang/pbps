@@ -361,7 +361,7 @@ mod effects_of_each_kind {
         let mut out = vec![
             (
                 "AddEnumValue",
-                Change::AddEnumValue {
+                Change::TypeValue(TypeValueChange::AddEnumValue {
                     uid: uid(UidKind::Type, "base"),
                     name: "app.base".parse().unwrap(),
                     value: "new".into(),
@@ -370,13 +370,13 @@ mod effects_of_each_kind {
                     definition: Box::new(ManagedType::Enum {
                         values: vec!["ok".into(), "new".into()],
                     }),
-                },
+                }),
             ),
             // Both halves state the same effects; the row says which class
             // each one takes.
             (
                 "AlterDomain",
-                Change::AlterDomain {
+                Change::TypeValue(TypeValueChange::AlterDomain {
                     uid: uid(UidKind::Type, "base"),
                     name: "app.base".parse().unwrap(),
                     from: Box::new(ManagedType::Domain {
@@ -394,11 +394,11 @@ mod effects_of_each_kind {
                         collation: None,
                     }),
                     half: DomainHalf::Tighten,
-                },
+                }),
             ),
             (
                 "RenameEnumValue",
-                Change::RenameEnumValue {
+                Change::TypeValue(TypeValueChange::RenameEnumValue {
                     uid: uid(UidKind::Type, "base"),
                     name: "app.base".parse().unwrap(),
                     from: "ok".into(),
@@ -408,12 +408,12 @@ mod effects_of_each_kind {
                     definition: Box::new(ManagedType::Enum {
                         values: vec!["fine".into()],
                     }),
-                },
+                }),
             ),
             // The three steps of one rebuild share a row, as its kinds do.
             (
                 "EnumRebuild",
-                Change::EnumRebuild {
+                Change::TypeValue(TypeValueChange::EnumRebuild {
                     uid: uid(UidKind::Type, "base"),
                     name: "app.base".parse().unwrap(),
                     tmp: "app.pbps_rebuild_base".parse().unwrap(),
@@ -426,13 +426,13 @@ mod effects_of_each_kind {
                         over: None,
                         why: None,
                     },
-                },
+                }),
             ),
             // A domain's replacement is created from its final declaration:
             // the type it is built on stands in its final incarnation first.
             (
                 "EnumRebuild",
-                Change::EnumRebuild {
+                Change::TypeValue(TypeValueChange::EnumRebuild {
                     uid: uid(UidKind::Type, "new_domain"),
                     name: "app.new_domain".parse().unwrap(),
                     tmp: "app.pbps_rebuild_new_domain".parse().unwrap(),
@@ -449,11 +449,11 @@ mod effects_of_each_kind {
                         over: None,
                         why: None,
                     },
-                },
+                }),
             ),
             (
                 "EnumRebuild",
-                Change::EnumRebuild {
+                Change::TypeValue(TypeValueChange::EnumRebuild {
                     uid: uid(UidKind::Type, "base"),
                     name: "app.base".parse().unwrap(),
                     tmp: "app.pbps_rebuild_base".parse().unwrap(),
@@ -464,11 +464,11 @@ mod effects_of_each_kind {
                         array: false,
                         values: Box::new(pbps_model::ValueChange::Relabel { removed: vec![] }),
                     },
-                },
+                }),
             ),
             (
                 "EnumRebuild",
-                Change::EnumRebuild {
+                Change::TypeValue(TypeValueChange::EnumRebuild {
                     uid: uid(UidKind::Type, "base"),
                     name: "app.base".parse().unwrap(),
                     tmp: "app.pbps_rebuild_base".parse().unwrap(),
@@ -480,11 +480,11 @@ mod effects_of_each_kind {
                         depth: 0,
                         over: None,
                     },
-                },
+                }),
             ),
             (
                 "CreateType",
-                Change::CreateType {
+                Change::Type(TypeChange::CreateType {
                     uid: uid(UidKind::Type, "new_domain"),
                     name: "app.new_domain".parse().unwrap(),
                     definition: Box::new(ManagedType::Domain {
@@ -494,184 +494,184 @@ mod effects_of_each_kind {
                         checks: BTreeMap::new(),
                         collation: None,
                     }),
-                },
+                }),
             ),
             (
                 "DropType",
-                Change::DropType {
+                Change::Type(TypeChange::DropType {
                     uid: uid(UidKind::Type, "base"),
                     name: "app.base".parse().unwrap(),
                     definition: Box::new(ManagedType::Enum { values: vec![] }),
-                },
+                }),
             ),
             (
                 "CreateType",
-                Change::CreateType {
+                Change::Type(TypeChange::CreateType {
                     uid: uid(UidKind::Type, "new"),
                     name: "app.new".parse().unwrap(),
                     definition: Box::new(ManagedType::Enum { values: vec![] }),
-                },
+                }),
             ),
             (
                 "DropType",
-                Change::DropType {
+                Change::Type(TypeChange::DropType {
                     uid: uid(UidKind::Type, "old"),
                     name: "app.old".parse().unwrap(),
                     definition: Box::new(ManagedType::Enum { values: vec![] }),
-                },
+                }),
             ),
             (
                 "RenameType",
-                Change::RenameType {
+                Change::Type(TypeChange::RenameType {
                     uid: uid(UidKind::Type, "old"),
                     from: "app.old".parse().unwrap(),
                     to: "app.renamed".parse().unwrap(),
                     definition: Box::new(ManagedType::Enum { values: vec![] }),
-                },
+                }),
             ),
             // A configuration waits for the dictionary it maps, which the plan holds; a
             // dictionary waits for nothing.
             (
                 "CreateSearch",
-                Change::CreateSearch {
+                Change::Search(SearchChange::CreateSearch {
                     uid: uid(UidKind::Search, "docs"),
                     name: search_ref("config app.docs"),
                     definition: Box::new(docs_object()),
                     unresolved: Vec::new(),
-                },
+                }),
             ),
             (
                 "CreateSearch",
-                Change::CreateSearch {
+                Change::Search(SearchChange::CreateSearch {
                     uid: uid(UidKind::Search, "fresh"),
                     name: search_ref("dictionary app.fresh"),
                     definition: Box::new(words_object()),
                     unresolved: Vec::new(),
-                },
+                }),
             ),
             // A dictionary leaves only after the configuration that maps it.
             (
                 "DropSearch",
-                Change::DropSearch {
+                Change::Search(SearchChange::DropSearch {
                     uid: uid(UidKind::Search, "words"),
                     name: search_ref("dictionary app.words"),
                     definition: Box::new(words_object()),
-                },
+                }),
             ),
             (
                 "DropSearch",
-                Change::DropSearch {
+                Change::Search(SearchChange::DropSearch {
                     uid: uid(UidKind::Search, "docs"),
                     name: search_ref("config app.docs"),
                     definition: Box::new(docs_object()),
-                },
+                }),
             ),
             (
                 "CreateTable",
-                Change::CreateTable {
+                Change::Table(TableChange::CreateTable {
                     uid: uid(UidKind::Table, "n"),
                     name: tn("n"),
                     table: Box::new(new_table),
                     beside_default: None,
                     moves_at_most: None,
-                },
+                }),
             ),
             (
                 "CreateTable",
-                Change::CreateTable {
+                Change::Table(TableChange::CreateTable {
                     uid: p.clone(),
                     name: tn("p"),
                     table: Box::new(w.p.clone()),
                     beside_default: Some(tn("r")),
                     moves_at_most: None,
-                },
+                }),
             ),
             (
                 "DropTable",
-                Change::DropTable {
+                Change::Table(TableChange::DropTable {
                     uid: uid(UidKind::Table, "r"),
                     name: tn("r"),
                     detach_from: None,
-                },
+                }),
             ),
             (
                 "DropTable",
-                Change::DropTable {
+                Change::Table(TableChange::DropTable {
                     uid: p.clone(),
                     name: tn("p"),
                     detach_from: Some(tn("t")),
-                },
+                }),
             ),
             (
                 "DetachPartition",
-                Change::DetachPartition {
+                Change::Partition(PartitionChange::DetachPartition {
                     uid: p.clone(),
                     table: tn("p"),
                     parent: tn("t"),
                     names: vec![],
                     shape: Box::new(table(&[("id", Column::new(int()))])),
-                },
+                }),
             ),
             (
                 "AttachPartition",
-                Change::AttachPartition {
+                Change::Partition(PartitionChange::AttachPartition {
                     uid: p.clone(),
                     table: tn("p"),
                     parent: tn("t"),
                     bound: bound(),
                     key: Vec::new(),
                     shape: Box::new(w.p.clone()),
-                },
+                }),
             ),
             (
                 "AttachPartition",
-                Change::AttachPartition {
+                Change::Partition(PartitionChange::AttachPartition {
                     uid: uid(UidKind::Table, "n"),
                     table: tn("n"),
                     parent: tn("t"),
                     bound: bound(),
                     key: Vec::new(),
                     shape: Box::new(w.p.clone()),
-                },
+                }),
             ),
             (
                 "RenameTable",
-                Change::RenameTable {
+                Change::Table(TableChange::RenameTable {
                     uid: t.clone(),
                     from: tn("t"),
                     to: tn("t2"),
                     defaults: vec![],
-                },
+                }),
             ),
             (
                 "AddColumn",
-                Change::AddColumn {
+                Change::Column(ColumnChange::AddColumn {
                     uid: uid(UidKind::Column, "t.z"),
                     table: tn("t"),
                     name: "z".into(),
                     column: Box::new(Column::new(int())),
-                },
+                }),
             ),
             (
                 "DropColumn",
-                Change::DropColumn {
+                Change::Column(ColumnChange::DropColumn {
                     uid: x.clone(),
                     column: xref.clone(),
-                },
+                }),
             ),
             (
                 "RenameColumn",
-                Change::RenameColumn {
+                Change::Column(ColumnChange::RenameColumn {
                     uid: x.clone(),
                     table: tn("t"),
                     from: "x".into(),
                     to: "x2".into(),
                     table_was: None,
-                },
+                }),
             ),
             (
                 "AlterColumnType",
-                Change::AlterColumnType {
+                Change::Column(ColumnChange::AlterColumnType {
                     uid: x.clone(),
                     column: xref.clone(),
                     from: int(),
@@ -682,115 +682,115 @@ mod effects_of_each_kind {
                     to_collation: None,
                     through_external_partitions: false,
                     using: None,
-                },
+                }),
             ),
             (
                 "AlterColumnNullability",
-                Change::AlterColumnNullability {
+                Change::Column(ColumnChange::AlterColumnNullability {
                     uid: y.clone(),
                     column: yref.clone(),
                     ty: int(),
                     to_nullable: false,
                     collation: None,
                     through_external_partitions: false,
-                },
+                }),
             ),
             (
                 "AlterColumnNullability",
-                Change::AlterColumnNullability {
+                Change::Column(ColumnChange::AlterColumnNullability {
                     uid: uid(UidKind::Column, "t.id"),
                     column: tn("t").column("id"),
                     ty: int(),
                     to_nullable: true,
                     collation: None,
                     through_external_partitions: false,
-                },
+                }),
             ),
             (
                 "AlterColumnDefault",
-                Change::AlterColumnDefault {
+                Change::Column(ColumnChange::AlterColumnDefault {
                     uid: x.clone(),
                     column: xref.clone(),
                     from: Some("1".into()),
                     to: Some("2".into()),
-                },
+                }),
             ),
             (
                 "AlterColumnDefault",
-                Change::AlterColumnDefault {
+                Change::Column(ColumnChange::AlterColumnDefault {
                     uid: x.clone(),
                     column: xref.clone(),
                     from: Some("1".into()),
                     to: None,
-                },
+                }),
             ),
             (
                 "AlterColumnExpression",
-                Change::AlterColumnExpression {
+                Change::Column(ColumnChange::AlterColumnExpression {
                     uid: y.clone(),
                     column: yref.clone(),
                     from: "1".into(),
                     to: "2".into(),
-                },
+                }),
             ),
             (
                 "AlterColumnNumbering",
-                Change::AlterColumnNumbering {
+                Change::Column(ColumnChange::AlterColumnNumbering {
                     uid: x.clone(),
                     column: xref.clone(),
                     ty: int(),
                     from: ValueSource::Default("1".into()),
                     to: ValueSource::Identity(Identity::new(1, 1)),
-                },
+                }),
             ),
             (
                 "AlterColumnNumbering",
-                Change::AlterColumnNumbering {
+                Change::Column(ColumnChange::AlterColumnNumbering {
                     uid: y.clone(),
                     column: yref.clone(),
                     ty: int(),
                     from: ValueSource::Identity(Identity::new(1, 1)),
                     to: ValueSource::None,
-                },
+                }),
             ),
             (
                 "AddComputedColumn",
-                Change::AddComputedColumn {
+                Change::Column(ColumnChange::AddComputedColumn {
                     table: tn("t"),
                     name: "c2".into(),
                     computed: computed(),
-                },
+                }),
             ),
             (
                 "DropComputedColumn",
-                Change::DropComputedColumn {
+                Change::Column(ColumnChange::DropComputedColumn {
                     table: tn("t"),
                     name: "c".into(),
                     computed: computed(),
-                },
+                }),
             ),
             (
                 "SetColumnDeprecated",
-                Change::SetColumnDeprecated {
+                Change::Column(ColumnChange::SetColumnDeprecated {
                     uid: y.clone(),
                     column: yref.clone(),
                     reason: None,
-                },
+                }),
             ),
             (
                 "DropPolicy",
-                Change::DropPolicy {
+                Change::Policy(PolicyChange::DropPolicy {
                     table: tn("t"),
                     name: "policy".into(),
                     policy: RowPolicy {
                         using: Some("x > 0".into()),
                         ..Default::default()
                     },
-                },
+                }),
             ),
             (
                 "CreatePolicy",
-                Change::CreatePolicy {
+                Change::Policy(PolicyChange::CreatePolicy {
                     table: tn("t"),
                     name: "policy".into(),
                     policy: RowPolicy {
@@ -799,11 +799,11 @@ mod effects_of_each_kind {
                         ..Default::default()
                     },
                     origin: RowSecurityOrigin::Created,
-                },
+                }),
             ),
             (
                 "SetRowSecurity",
-                Change::SetRowSecurity {
+                Change::Policy(PolicyChange::SetRowSecurity {
                     uid: t.clone(),
                     table: tn("t"),
                     from: RowSecurity::default(),
@@ -812,11 +812,11 @@ mod effects_of_each_kind {
                         forced: false,
                     },
                     origin: RowSecurityOrigin::Created,
-                },
+                }),
             ),
             (
                 "CreatePolicy",
-                Change::CreatePolicy {
+                Change::Policy(PolicyChange::CreatePolicy {
                     table: tn("t"),
                     name: "standing_policy".into(),
                     policy: RowPolicy {
@@ -826,11 +826,11 @@ mod effects_of_each_kind {
                         ..Default::default()
                     },
                     origin: RowSecurityOrigin::Standing,
-                },
+                }),
             ),
             (
                 "SetRowSecurity",
-                Change::SetRowSecurity {
+                Change::Policy(PolicyChange::SetRowSecurity {
                     uid: t.clone(),
                     table: tn("t"),
                     from: RowSecurity {
@@ -842,56 +842,56 @@ mod effects_of_each_kind {
                         forced: true,
                     },
                     origin: RowSecurityOrigin::Standing,
-                },
+                }),
             ),
             (
                 "SetComment",
-                Change::SetComment {
+                Change::TableProperty(TablePropertyChange::SetComment {
                     target: pbps_model::CommentTarget::Table {
                         uid: t.clone(),
                         table: tn("t"),
                     },
                     text: Some("a table".into()),
-                },
+                }),
             ),
             (
                 "SetComment",
-                Change::SetComment {
+                Change::TableProperty(TablePropertyChange::SetComment {
                     target: pbps_model::CommentTarget::Column {
                         uid: y.clone(),
                         column: yref.clone(),
                     },
                     text: None,
-                },
+                }),
             ),
             (
                 "SetReplicaIdentity",
-                Change::SetReplicaIdentity {
+                Change::TableProperty(TablePropertyChange::SetReplicaIdentity {
                     uid: t.clone(),
                     table: tn("t"),
                     to: Some(ReplicaIdentity::Index("ix".into())),
-                },
+                }),
             ),
             (
                 "SetStorageParameters",
-                Change::SetStorageParameters {
+                Change::TableProperty(TablePropertyChange::SetStorageParameters {
                     uid: t.clone(),
                     table: tn("t"),
                     set: BTreeMap::new(),
                     reset: BTreeSet::new(),
-                },
+                }),
             ),
             (
                 "SetTablePersistence",
-                Change::SetTablePersistence {
+                Change::TableProperty(TablePropertyChange::SetTablePersistence {
                     uid: t.clone(),
                     table: tn("t"),
                     unlogged: true,
-                },
+                }),
             ),
             (
                 "SetPartitionDefault",
-                Change::SetPartitionDefault {
+                Change::Partition(PartitionChange::SetPartitionDefault {
                     uid: p.clone(),
                     table: tn("p"),
                     parent: tn("t"),
@@ -899,48 +899,48 @@ mod effects_of_each_kind {
                     from: None,
                     to: Some("3".into()),
                     fallback: None,
-                },
+                }),
             ),
             (
                 "SetPartitionNotNull",
-                Change::SetPartitionNotNull {
+                Change::Partition(PartitionChange::SetPartitionNotNull {
                     uid: p.clone(),
                     table: tn("p"),
                     column: "x".into(),
                     not_null: true,
-                },
+                }),
             ),
             (
                 "SetIndexStorageParameters",
-                Change::SetIndexStorageParameters {
+                Change::Index(IndexChange::SetIndexStorageParameters {
                     table: tn("t"),
                     target: IndexPart::Index("ix".into()),
                     method: IndexMethod::Btree,
                     set: BTreeMap::new(),
                     reset: BTreeSet::new(),
-                },
+                }),
             ),
             (
                 "SetPrimaryKey { to: Some }",
-                Change::SetPrimaryKey {
+                Change::Constraint(ConstraintChange::SetPrimaryKey {
                     table: tn("t"),
                     from: Some(pk()),
                     to: Some(pk()),
                     nonclustered: false,
-                },
+                }),
             ),
             (
                 "SetPrimaryKey { to: None }",
-                Change::SetPrimaryKey {
+                Change::Constraint(ConstraintChange::SetPrimaryKey {
                     table: tn("t"),
                     from: Some(pk()),
                     to: None,
                     nonclustered: false,
-                },
+                }),
             ),
             (
                 "AddUnique",
-                Change::AddUnique {
+                Change::Constraint(ConstraintChange::AddUnique {
                     table: tn("t"),
                     name: "u2".into(),
                     constraint: UniqueConstraint {
@@ -949,18 +949,18 @@ mod effects_of_each_kind {
                         filegroup: None,
                     },
                     clustered: false,
-                },
+                }),
             ),
             (
                 "DropUnique",
-                Change::DropUnique {
+                Change::Constraint(ConstraintChange::DropUnique {
                     table: tn("t"),
                     name: "u".into(),
-                },
+                }),
             ),
             (
                 "SetExclusion { to: Some }",
-                Change::SetExclusion {
+                Change::Constraint(ConstraintChange::SetExclusion {
                     table: tn("t"),
                     name: "x".into(),
                     from: None,
@@ -975,11 +975,11 @@ mod effects_of_each_kind {
                         storage_parameters: BTreeMap::new(),
                         timing: pbps_model::ExclusionTiming::Immediate,
                     })),
-                },
+                }),
             ),
             (
                 "SetExclusion { to: None }",
-                Change::SetExclusion {
+                Change::Constraint(ConstraintChange::SetExclusion {
                     table: tn("t"),
                     name: "x0".into(),
                     from: Some(Box::new(pbps_model::ExclusionConstraint {
@@ -994,57 +994,57 @@ mod effects_of_each_kind {
                         timing: pbps_model::ExclusionTiming::Immediate,
                     })),
                     to: None,
-                },
+                }),
             ),
             (
                 "AddForeignKey",
-                Change::AddForeignKey {
+                Change::Constraint(ConstraintChange::AddForeignKey {
                     table: tn("t"),
                     name: "f2".into(),
                     constraint: Box::new(fk()),
-                },
+                }),
             ),
             (
                 "DropForeignKey",
-                Change::DropForeignKey {
+                Change::Constraint(ConstraintChange::DropForeignKey {
                     table: tn("t"),
                     name: "f".into(),
-                },
+                }),
             ),
             (
                 "AddCheck",
-                Change::AddCheck {
+                Change::Constraint(ConstraintChange::AddCheck {
                     table: tn("t"),
                     name: "k2".into(),
                     constraint: check(),
-                },
+                }),
             ),
             (
                 "DropCheck",
-                Change::DropCheck {
+                Change::Constraint(ConstraintChange::DropCheck {
                     table: tn("t"),
                     name: "k".into(),
-                },
+                }),
             ),
             (
                 "AddIndex",
-                Change::AddIndex {
+                Change::Index(IndexChange::AddIndex {
                     table: tn("t"),
                     name: "ix2".into(),
                     index: Box::new(index()),
                     clustered: false,
-                },
+                }),
             ),
             (
                 "DropIndex",
-                Change::DropIndex {
+                Change::Index(IndexChange::DropIndex {
                     table: tn("t"),
                     name: "ix".into(),
-                },
+                }),
             ),
             (
                 "InsertRow",
-                Change::InsertRow {
+                Change::Row(RowChange::InsertRow {
                     table: tn("t"),
                     key_column: "id".into(),
                     identity_key: false,
@@ -1054,11 +1054,11 @@ mod effects_of_each_kind {
                         .collect(),
                     defaults: [("y".into(), "1".to_owned())].into(),
                     types: BTreeMap::new(),
-                },
+                }),
             ),
             (
                 "UpdateRow",
-                Change::UpdateRow {
+                Change::Row(RowChange::UpdateRow {
                     table: tn("t"),
                     key_column: "id".into(),
                     key: key.clone(),
@@ -1067,11 +1067,11 @@ mod effects_of_each_kind {
                     types: BTreeMap::new(),
                     after_types: BTreeMap::new(),
                     key_type: None,
-                },
+                }),
             ),
             (
                 "DeleteRow",
-                Change::DeleteRow {
+                Change::Row(RowChange::DeleteRow {
                     table: tn("t"),
                     key_column: "id".into(),
                     key,
@@ -1081,48 +1081,48 @@ mod effects_of_each_kind {
                     types: BTreeMap::new(),
                     after_types: BTreeMap::new(),
                     key_type: None,
-                },
+                }),
             ),
             (
                 "SetDataMode",
-                Change::SetDataMode {
+                Change::Row(RowChange::SetDataMode {
                     table: tn("t"),
                     from: None,
                     to: Some(DataMode::Exact),
-                },
+                }),
             ),
             (
                 "SetEnsureKeys",
-                Change::SetEnsureKeys {
+                Change::Row(RowChange::SetEnsureKeys {
                     table: tn("t"),
                     from: BTreeSet::new(),
                     to: BTreeSet::new(),
-                },
+                }),
             ),
             (
                 "CreateModule",
-                Change::CreateModule {
+                Change::Module(ModuleChange::CreateModule {
                     id: routine.clone(),
                     module: Box::new(module.clone()),
-                },
+                }),
             ),
             (
                 "AlterModule",
-                Change::AlterModule {
+                Change::Module(ModuleChange::AlterModule {
                     id: routine.clone(),
                     module: Box::new(module),
-                },
+                }),
             ),
             (
                 "DropModule",
-                Change::DropModule {
+                Change::Module(ModuleChange::DropModule {
                     id: routine,
                     kind: ModuleKind::Function,
-                },
+                }),
             ),
             (
                 "CreateExtension",
-                Change::CreateExtension {
+                Change::Extension(ExtensionChange::CreateExtension {
                     uid: uid(UidKind::Extension, "earthdistance"),
                     name: "earthdistance".into(),
                     definition: pbps_model::Extension {
@@ -1130,11 +1130,11 @@ mod effects_of_each_kind {
                         version: "1.1".into(),
                     },
                     requires: [uid(UidKind::Extension, "cube")].into(),
-                },
+                }),
             ),
             (
                 "DropExtension",
-                Change::DropExtension {
+                Change::Extension(ExtensionChange::DropExtension {
                     uid: uid(UidKind::Extension, "earthdistance"),
                     name: "earthdistance".into(),
                     definition: pbps_model::Extension {
@@ -1145,11 +1145,11 @@ mod effects_of_each_kind {
                     releases: Default::default(),
                     index_releases: Default::default(),
                     search_releases: Default::default(),
-                },
+                }),
             ),
             (
                 "UpdateExtension",
-                Change::UpdateExtension {
+                Change::Extension(ExtensionChange::UpdateExtension {
                     uid: uid(UidKind::Extension, "earthdistance"),
                     name: "earthdistance".into(),
                     from: pbps_model::Extension {
@@ -1162,11 +1162,11 @@ mod effects_of_each_kind {
                     },
                     requires: [uid(UidKind::Extension, "cube")].into(),
                     releases: ["app.f(integer)".parse().unwrap()].into(),
-                },
+                }),
             ),
             (
                 "SetExtensionSchema",
-                Change::SetExtensionSchema {
+                Change::Extension(ExtensionChange::SetExtensionSchema {
                     uid: uid(UidKind::Extension, "earthdistance"),
                     name: "earthdistance".into(),
                     from: pbps_model::Extension {
@@ -1178,59 +1178,59 @@ mod effects_of_each_kind {
                         version: "1.2".into(),
                     },
                     releases: ["app.f(integer)".parse().unwrap()].into(),
-                },
+                }),
             ),
             (
                 "CreateRole",
-                Change::CreateRole {
+                Change::Role(RoleChange::CreateRole {
                     uid: uid(UidKind::Role, "new"),
                     name: "new".into(),
-                },
+                }),
             ),
             (
                 "DropRole",
-                Change::DropRole {
+                Change::Role(RoleChange::DropRole {
                     uid: uid(UidKind::Role, "reader"),
                     name: "reader".into(),
                     members: vec![],
-                },
+                }),
             ),
             (
                 "RenameRole",
-                Change::RenameRole {
+                Change::Role(RoleChange::RenameRole {
                     uid: uid(UidKind::Role, "reader"),
                     from: "reader".into(),
                     to: "viewer".into(),
-                },
+                }),
             ),
             (
                 "Grant",
-                Change::Grant {
+                Change::Permission(GrantChange::Grant {
                     role: "reader".into(),
                     target: GrantTarget::Object(tn("t")),
                     permissions: BTreeSet::from([Permission::Select]),
-                },
+                }),
             ),
             (
                 "Revoke",
-                Change::Revoke {
+                Change::Permission(GrantChange::Revoke {
                     role: "reader".into(),
                     target: GrantTarget::Object(tn("t")),
                     permissions: BTreeSet::from([Permission::Select]),
-                },
+                }),
             ),
             (
                 "PublicExecution",
-                Change::PublicExecution {
+                Change::Permission(GrantChange::PublicExecution {
                     routine: routine_id,
                     access: PublicAccess::Revoked,
                     origin: RoutineOrigin::Created,
-                },
+                }),
             ),
         ];
         let mut rebuild: Vec<Change> =
             serde_json::from_str(include_str!("fixtures/rebuild_operations.json")).unwrap();
-        if let Change::CopyTableRows(c) = &mut rebuild[1] {
+        if let Change::Partition(PartitionChange::CopyTableRows(c)) = &mut rebuild[1] {
             c.source = pbps_model::RebuildRelation {
                 uid: uid(UidKind::Table, "r"),
                 name: tn("r"),
@@ -1243,7 +1243,7 @@ mod effects_of_each_kind {
             c.target_partitions.clear();
             c.columns.clear();
         }
-        if let Change::AnalyzeTableTree(c) = &mut rebuild[2] {
+        if let Change::Partition(PartitionChange::AnalyzeTableTree(c)) = &mut rebuild[2] {
             c.parent = pbps_model::RebuildRelation {
                 uid: uid(UidKind::Table, "t"),
                 name: tn("t"),
@@ -1252,17 +1252,19 @@ mod effects_of_each_kind {
         }
         out.push((
             "BuildPartitionedIndex",
-            Change::BuildPartitionedIndex(Box::new(pbps_model::BuildPartitionedIndex {
-                parent: pbps_model::RebuildRelation {
-                    uid: uid(UidKind::Table, "t"),
-                    name: tn("t"),
+            Change::Index(IndexChange::BuildPartitionedIndex(Box::new(
+                pbps_model::BuildPartitionedIndex {
+                    parent: pbps_model::RebuildRelation {
+                        uid: uid(UidKind::Table, "t"),
+                        name: tn("t"),
+                    },
+                    name: "recipe_index".into(),
+                    definition: pbps_model::PartitionIndexDefinition::Index(
+                        serde_json::from_str(r#"{"columns":[{"name":"k"}]}"#).unwrap(),
+                    ),
+                    clones: Vec::new(),
                 },
-                name: "recipe_index".into(),
-                definition: pbps_model::PartitionIndexDefinition::Index(
-                    serde_json::from_str(r#"{"columns":[{"name":"k"}]}"#).unwrap(),
-                ),
-                clones: Vec::new(),
-            })),
+            ))),
         ));
         out.extend(
             [
@@ -1374,7 +1376,9 @@ mod effects_of_each_kind {
                 );
                 assert_eq!(names.releases[0].address.name, "policy");
             }
-            if let Change::EnumRebuild { step, .. } = ops.as_slice()[0].change() {
+            if let Change::TypeValue(TypeValueChange::EnumRebuild { step, .. }) =
+                ops.as_slice()[0].change()
+            {
                 let names =
                     pbps_model::operation::names(&ops.as_slice()[0], &owners, snapshot).unwrap();
                 match step {

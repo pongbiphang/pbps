@@ -1,4 +1,7 @@
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::PartitionChange;
+use pbps_model::TypeValueChange;
 
 fn endpoints() -> (Schema, IdsFile, Schema, IdsFile, TableName) {
     let (mut attached, inherited, leaf) = partitioned();
@@ -62,20 +65,20 @@ fn attachment_pairs_retiring_column_uids_before_comparing_nullability() {
             }
         }
         let changes = vec![
-            Change::AttachPartition {
+            Change::Partition(PartitionChange::AttachPartition {
                 uid: uid("t_bbbbbb"),
                 table: leaf.clone(),
                 parent: name(),
                 bound: pbps_model::PartitionBound::Default,
                 key: vec!["old".into()],
                 shape: Box::new(attached.tables[&leaf].clone()),
-            },
-            Change::SetPartitionNotNull {
+            }),
+            Change::Partition(PartitionChange::SetPartitionNotNull {
                 uid: uid("t_bbbbbb"),
                 table: leaf.clone(),
                 column: "old".into(),
                 not_null: false,
-            },
+            }),
         ];
         let sides = [
             Side {
@@ -155,20 +158,20 @@ fn detachment_pairs_new_column_uids_before_comparing_domain_nullability() {
             .unwrap()
             .nullable = !local_required;
         let changes = vec![
-            Change::DetachPartition {
+            Change::Partition(PartitionChange::DetachPartition {
                 uid: uid("t_bbbbbb"),
                 table: leaf.clone(),
                 parent: name(),
                 names: vec![],
                 shape: Box::new(detached.tables[&leaf].clone()),
-            },
-            Change::AlterDomain {
+            }),
+            Change::TypeValue(TypeValueChange::AlterDomain {
                 uid: uid("y_aaaaaa"),
                 name: ty.clone(),
                 from: Box::new(attached.types[&ty].clone()),
                 to: Box::new(detached.types[&ty].clone()),
                 half: pbps_model::DomainHalf::Loosen,
-            },
+            }),
         ];
         let sides = [
             Side {
@@ -282,16 +285,16 @@ fn inherited_replacements_keep_the_supplied_column_exception_for_sibling_writers
         new.columns.remove(&uid("c_cccccc"));
         new.columns.insert(uid("c_eeeeee"), name().column("other"));
         let changes = vec![
-            Change::DropColumn {
+            Change::Column(ColumnChange::DropColumn {
                 uid: uid("c_cccccc"),
                 column: name().column("other"),
-            },
-            Change::AddColumn {
+            }),
+            Change::Column(ColumnChange::AddColumn {
                 uid: uid("c_eeeeee"),
                 table: name(),
                 name: "other".into(),
                 column: Box::new(replacement),
-            },
+            }),
         ];
         for entry in ["app.t.old", "app.leaf.old"] {
             let found = findings(

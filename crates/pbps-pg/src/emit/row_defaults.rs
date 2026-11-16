@@ -1,5 +1,7 @@
 //! Execution-position context for catalog-backed row defaults (DEC-2456.1).
 use crate::type_refs::renames::TypeRenames;
+use pbps_model::TypeChange;
+use pbps_model::TypeValueChange;
 use pbps_model::{Change, ChangeSet, ColumnName, ColumnRef, IdsFile, TableName};
 use std::collections::BTreeMap;
 
@@ -26,13 +28,13 @@ impl RowDefaultIndex {
             // reconstruction, never a row-filled prefix (DEC-2456.1).
             if matches!(
                 planned.change,
-                Change::CreateType { .. }
-                    | Change::DropType { .. }
-                    | Change::RenameType { .. }
-                    | Change::AddEnumValue { .. }
-                    | Change::RenameEnumValue { .. }
-                    | Change::AlterDomain { .. }
-                    | Change::EnumRebuild { .. }
+                Change::Type(TypeChange::CreateType { .. })
+                    | Change::Type(TypeChange::DropType { .. })
+                    | Change::Type(TypeChange::RenameType { .. })
+                    | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+                    | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+                    | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+                    | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
             ) {
                 now = pbps_diff::identity::type_refs::after_steps(
                     &now,
@@ -103,21 +105,24 @@ thread_local! { static BUILDS: std::cell::Cell<usize> = const { std::cell::Cell:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::RowChange;
+    use pbps_model::TypeChange;
     use pbps_model::{ColumnType, ManagedType, PlannedChange, Row, RowKey};
 
     fn rename(uid: &str, from: &str, to: &str) -> PlannedChange {
-        PlannedChange::new(Change::RenameType {
+        PlannedChange::new(Change::Type(TypeChange::RenameType {
             uid: uid.parse().unwrap(),
             from: from.parse().unwrap(),
             to: to.parse().unwrap(),
             definition: Box::new(ManagedType::Enum {
                 values: vec!["sad".into()],
             }),
-        })
+        }))
     }
 
     fn row() -> PlannedChange {
-        PlannedChange::new(Change::InsertRow {
+        PlannedChange::new(Change::Row(RowChange::InsertRow {
             table: "app.t".parse().unwrap(),
             key_column: "id".into(),
             identity_key: false,
@@ -125,7 +130,7 @@ mod tests {
             row: Row::default(),
             defaults: Default::default(),
             types: Default::default(),
-        })
+        }))
     }
 
     #[test]
@@ -134,13 +139,13 @@ mod tests {
             changes: vec![
                 rename("y_000002", "app.feeling", "moved.last"),
                 rename("y_000001", "app.mood", "app.feeling"),
-                PlannedChange::new(Change::CreateType {
+                PlannedChange::new(Change::Type(TypeChange::CreateType {
                     uid: "y_000003".parse().unwrap(),
                     name: "app.mood".parse().unwrap(),
                     definition: Box::new(ManagedType::Enum {
                         values: vec!["replacement".into()],
                     }),
-                }),
+                })),
                 row(),
             ],
         };
@@ -184,7 +189,7 @@ mod tests {
         let changes = ChangeSet {
             changes: vec![
                 rename("y_000001", "\"App\".\"M\"\"ood\"", "\"Moved\".\"select\""),
-                PlannedChange::new(Change::AlterColumnDefault {
+                PlannedChange::new(Change::Column(ColumnChange::AlterColumnDefault {
                     uid: "c_000001".parse().unwrap(),
                     column: ColumnRef {
                         table: table.clone(),
@@ -192,7 +197,7 @@ mod tests {
                     },
                     from: None,
                     to: Some("'sad'::text::app.future".into()),
-                }),
+                })),
                 row(),
                 rename("y_000002", "app.future", "app.later"),
             ],
@@ -231,7 +236,7 @@ mod tests {
     }
 
     fn update(key: usize, renamed: bool) -> PlannedChange {
-        PlannedChange::new(Change::UpdateRow {
+        PlannedChange::new(Change::Row(RowChange::UpdateRow {
             table: "app.t".parse().unwrap(),
             key_column: "id".into(),
             key: RowKey::from(key.to_string()),
@@ -259,7 +264,7 @@ mod tests {
                 Default::default()
             },
             key_type: Some("integer".parse().unwrap()),
-        })
+        }))
     }
 
     fn admitted(
@@ -410,9 +415,9 @@ mod tests {
     fn mixed2456_no_lifecycle_keeps_empty_context_and_default_write_boundaries() {
         let pg = crate::Postgres::new();
         let mut after = update(1, false);
-        let Change::UpdateRow {
+        let Change::Row(RowChange::UpdateRow {
             columns, unchanged, ..
-        } = &mut after.change
+        }) = &mut after.change
         else {
             unreachable!()
         };
@@ -427,12 +432,12 @@ mod tests {
         let changes = ChangeSet {
             changes: vec![
                 update(0, false),
-                PlannedChange::new(Change::AlterColumnDefault {
+                PlannedChange::new(Change::Column(ColumnChange::AlterColumnDefault {
                     uid: "c_000002".parse().unwrap(),
                     column: "app.t.next".parse().unwrap(),
                     from: Some("'sad'::text::app.mood".into()),
                     to: Some("'sad'::varchar::app.mood".into()),
-                }),
+                })),
                 after,
             ],
         };
@@ -495,9 +500,9 @@ mod tests {
             changes: (0..5000).map(|key| update(key, false)).collect(),
         };
         for step in &mut changes.changes {
-            let Change::UpdateRow {
+            let Change::Row(RowChange::UpdateRow {
                 unchanged, types, ..
-            } = &mut step.change
+            }) = &mut step.change
             else {
                 unreachable!()
             };

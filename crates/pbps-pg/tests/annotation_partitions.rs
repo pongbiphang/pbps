@@ -1,6 +1,11 @@
 //! Annotation decomposition keeps inherited identity separate from scratch parts.
 use crate::certified_fixture::FixtureEmission as _;
 use pbps_diff::order::{Source, propose, scratch};
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
 use pbps_model::object_ref::{BoundRoot, Problem, Registry};
 use pbps_model::operation::{ColumnKey, ModuleEdits, ObjectKey, Operations, PlanOwners, Spelling};
 use pbps_model::plan_names::PlanNames;
@@ -29,14 +34,19 @@ fn a_partition_default_installs_after_its_annotated_module_at_every_depth() {
                     .position(|p| predicate(&p.change))
                     .unwrap()
             };
-            let module = at(|c| matches!(c, Change::CreateModule { .. }));
-            let default = at(|c| matches!(c, Change::SetPartitionDefault { .. }));
+            let module = at(|c| matches!(c, Change::Module(ModuleChange::CreateModule { .. })));
+            let default = at(|c| {
+                matches!(
+                    c,
+                    Change::Partition(PartitionChange::SetPartitionDefault { .. })
+                )
+            });
             let relation = plan
                 .changes
                 .iter()
                 .position(|p| {
                     matches!(&p.change,
-                Change::CreateTable { name, .. } if name == &scene.child)
+                Change::Table(TableChange::CreateTable { name, .. }) if name == &scene.child)
                 })
                 .unwrap();
             assert!(relation < module && module < default);
@@ -99,14 +109,16 @@ fn an_annotated_partition_bootstrap_reaches_the_complete_reconstruction() {
                     .iter()
                     .position(|p| {
                         matches!(&p.change,
-                    Change::AlterColumnDefault { column, .. } if column.table == scene.child)
+                    Change::Column(ColumnChange::AlterColumnDefault { column, .. }) if column.table == scene.child)
                     })
                     .unwrap();
                 let module = prepared
                     .changes()
                     .changes
                     .iter()
-                    .position(|p| matches!(p.change, Change::CreateModule { .. }))
+                    .position(|p| {
+                        matches!(p.change, Change::Module(ModuleChange::CreateModule { .. }))
+                    })
                     .unwrap();
                 assert!(prepared.edges().iter().any(|e| e.before == module
                     && e.after == default
@@ -134,12 +146,17 @@ fn an_inherited_fallback_does_not_install_the_partitions_deferred_own_default() 
     let module = plan
         .changes
         .iter()
-        .position(|p| matches!(p.change, Change::CreateModule { .. }))
+        .position(|p| matches!(p.change, Change::Module(ModuleChange::CreateModule { .. })))
         .unwrap();
     let default = plan
         .changes
         .iter()
-        .position(|p| matches!(p.change, Change::SetPartitionDefault { .. }))
+        .position(|p| {
+            matches!(
+                p.change,
+                Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            )
+        })
         .unwrap();
     assert!(module < default);
 }
@@ -156,13 +173,13 @@ fn scratch_annotations_share_the_inherited_installation_identity() {
         )
         .unwrap();
         let default = prepared.changes().changes.iter().position(|p| matches!(&p.change,
-            Change::AlterColumnDefault { uid, column, .. }
+            Change::Column(ColumnChange::AlterColumnDefault { uid, column, .. })
                 if Some(uid) == scene.ids.table_uid(&scene.child) && column == &scene.child.column("x"))).unwrap();
         let module = prepared
             .changes()
             .changes
             .iter()
-            .position(|p| matches!(p.change, Change::CreateModule { .. }))
+            .position(|p| matches!(p.change, Change::Module(ModuleChange::CreateModule { .. })))
             .unwrap();
         assert!(
             prepared
@@ -206,7 +223,7 @@ fn inherited_generation_not_null_and_extracted_checks_keep_their_boundaries() {
             serde_json::from_value(serde_json::json!({"expression": "x > 0"})).unwrap(),
         );
     for planned in &mut scene.changes.changes {
-        if let Change::CreateTable { name, table, .. } = &mut planned.change {
+        if let Change::Table(TableChange::CreateTable { name, table, .. }) = &mut planned.change {
             **table = scene.schema.tables[name].clone();
         }
     }
@@ -227,17 +244,22 @@ fn inherited_generation_not_null_and_extracted_checks_keep_their_boundaries() {
     let module = plan
         .changes
         .iter()
-        .position(|p| matches!(p.change, Change::CreateModule { .. }))
+        .position(|p| matches!(p.change, Change::Module(ModuleChange::CreateModule { .. })))
         .unwrap();
     let child = plan
         .changes
         .iter()
-        .position(|p| matches!(&p.change, Change::CreateTable { name, .. } if name == &scene.child))
+        .position(|p| matches!(&p.change, Change::Table(TableChange::CreateTable { name, .. }) if name == &scene.child))
         .unwrap();
     let check = plan
         .changes
         .iter()
-        .position(|p| matches!(p.change, Change::AddCheck { .. }))
+        .position(|p| {
+            matches!(
+                p.change,
+                Change::Constraint(ConstraintChange::AddCheck { .. })
+            )
+        })
         .unwrap();
     assert!(module < child && module < check);
     assert!(

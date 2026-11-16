@@ -1,4 +1,13 @@
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::RoleChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
+use pbps_model::TablePropertyChange;
 use pbps_model::resolver::OrderEdge;
 use pbps_model::{Change, PlannedChange};
 
@@ -7,10 +16,10 @@ fn example() -> ChangeSet {
         changes: ["a", "b", "c"]
             .into_iter()
             .map(|name| {
-                PlannedChange::new(Change::CreateRole {
+                PlannedChange::new(Change::Role(RoleChange::CreateRole {
                     uid: "r_aaaaaa".parse().unwrap(),
                     name: name.into(),
-                })
+                }))
             })
             .collect(),
     }
@@ -204,6 +213,8 @@ fn a_binding_edge_is_respected_where_the_effects_allow_the_other_order() {
 
 mod unowned_steps {
     use super::*;
+    use pbps_model::ConstraintChange;
+    use pbps_model::ModuleChange;
     use pbps_model::operation::{Origin, OwnerError, Source};
     use pbps_model::{CheckConstraint, Column, IdsFile, Module, ModuleKind, Schema, Table};
 
@@ -256,14 +267,14 @@ mod unowned_steps {
         desired.modules.insert(function.clone(), module.clone());
         let before_ids = ids(&base, &IdsFile::default());
         let after_ids = ids(&desired, &before_ids);
-        let create = PlannedChange::new(Change::CreateModule {
+        let create = PlannedChange::new(Change::Module(ModuleChange::CreateModule {
             id: function.clone(),
             module: Box::new(module),
-        });
-        let unowned = PlannedChange::new(Change::DropCheck {
+        }));
+        let unowned = PlannedChange::new(Change::Constraint(ConstraintChange::DropCheck {
             table: external,
             name: "old_check".into(),
-        });
+        }));
         let mut logical = ChangeSet {
             changes: vec![create.clone()],
         };
@@ -274,18 +285,18 @@ mod unowned_steps {
         let candidates = [
             (
                 Origin::Teardown(rebinding.clone()),
-                PlannedChange::new(Change::DropCheck {
+                PlannedChange::new(Change::Constraint(ConstraintChange::DropCheck {
                     table: table.clone(),
                     name: "ck".into(),
-                }),
+                })),
             ),
             (
                 Origin::Restoration(rebinding),
-                PlannedChange::new(Change::AddCheck {
+                PlannedChange::new(Change::Constraint(ConstraintChange::AddCheck {
                     table,
                     name: "ck".into(),
                     constraint,
-                }),
+                })),
             ),
             (Origin::Whole(1), unowned),
             (Origin::Whole(0), create),
@@ -583,23 +594,24 @@ fn independent_table_changes_can_cross_the_old_name_order_without_a_false_cycle(
         steps.iter().position(|p| predicate(&p.change)).unwrap()
     };
     let input_at = at(
-        &|c| matches!(c, Change::AddColumn { table, name, .. } if table == &input.table && name == &input.name),
+        &|c| matches!(c, Change::Column(ColumnChange::AddColumn { table, name, .. }) if table == &input.table && name == &input.name),
     );
-    let routine_at = at(&|c| matches!(c, Change::CreateModule { id, .. } if id == &routine));
+    let routine_at = at(
+        &|c| matches!(c, Change::Module(ModuleChange::CreateModule { id, .. }) if id == &routine),
+    );
     let default_at = at(
-        &|c| matches!(c, Change::AddColumn { table, name, .. } if table == &column.table && name == &column.name),
+        &|c| matches!(c, Change::Column(ColumnChange::AddColumn { table, name, .. }) if table == &column.table && name == &column.name),
     );
     assert!(input_at < routine_at && routine_at < default_at);
     assert_eq!(steps[default_at].strategy, Strategy { online: true });
     assert!(
-        matches!(&steps[default_at].change, Change::AddColumn { column, .. } if column.value_source == pbps_model::ValueSource::Default("app.f()".into()))
+        matches!(&steps[default_at].change, Change::Column(ColumnChange::AddColumn { column, .. }) if column.value_source == pbps_model::ValueSource::Default("app.f()".into()))
     );
     // ADD COLUMN's default backfills existing rows; it stays one typed step.
-    assert!(
-        !steps
-            .iter()
-            .any(|p| matches!(p.change, Change::AlterColumnDefault { .. }))
-    );
+    assert!(!steps.iter().any(|p| matches!(
+        p.change,
+        Change::Column(ColumnChange::AlterColumnDefault { .. })
+    )));
     observations[1].desired.as_mut().unwrap().managed_inputs =
         BTreeSet::from([Surface::Column(column.clone())]);
     assert!(matches!(
@@ -742,15 +754,15 @@ fn schema_authorization_precedes_binding_ddl_and_keeps_principal_creation() {
     let steps = &ordered.changes.changes;
     let role = steps
         .iter()
-        .position(|p| matches!(p.change, Change::CreateRole { .. }))
+        .position(|p| matches!(p.change, Change::Role(RoleChange::CreateRole { .. })))
         .unwrap();
     let grant = steps
         .iter()
-        .position(|p| matches!(p.change, Change::Grant { .. }))
+        .position(|p| matches!(p.change, Change::Permission(GrantChange::Grant { .. })))
         .unwrap();
     let create = steps
         .iter()
-        .position(|p| matches!(p.change, Change::CreateModule { .. }))
+        .position(|p| matches!(p.change, Change::Module(ModuleChange::CreateModule { .. })))
         .unwrap();
     assert!(role < grant && grant < create);
     let mut missing = ordered.changes.changes().clone();
@@ -784,11 +796,11 @@ fn a_delayed_child_rename_does_not_lose_its_foreign_key_drop_dependency() {
     child.foreign_keys.clear();
     desired.tables.insert(new.clone(), child);
     let changes = ChangeSet { changes: vec![
-        PlannedChange::new(Change::RenameTable { uid: old_ids.table_uid(&old).unwrap().clone(), from: old.clone(), to: new.clone(), defaults: vec![] }),
-        PlannedChange::new(Change::DropForeignKey { table: new.clone(), name: "fk".into() }),
-        PlannedChange::new(Change::AlterColumnType { uid: old_ids.column_uid(&parent.column("id")).unwrap().clone(), column: parent.column("id"), from: "int".parse::<ColumnType>().unwrap(), to: "text".parse().unwrap(), from_nullable: false, to_nullable: false, from_collation: None, to_collation: None, through_external_partitions: false, using: None }),
-        PlannedChange::new(Change::DropModule { id: routine.clone(), kind: ModuleKind::Function }),
-        PlannedChange::new(Change::CreateModule { id: routine.clone(), module: Box::new(Module { kind: ModuleKind::Function, description: None, options: Default::default(), definition: "() RETURNS integer LANGUAGE SQL RETURN (SELECT count(*)::integer FROM app.u)".into() }) }),
+        PlannedChange::new(Change::Table(TableChange::RenameTable { uid: old_ids.table_uid(&old).unwrap().clone(), from: old.clone(), to: new.clone(), defaults: vec![] })),
+        PlannedChange::new(Change::Constraint(ConstraintChange::DropForeignKey { table: new.clone(), name: "fk".into() })),
+        PlannedChange::new(Change::Column(ColumnChange::AlterColumnType { uid: old_ids.column_uid(&parent.column("id")).unwrap().clone(), column: parent.column("id"), from: "int".parse::<ColumnType>().unwrap(), to: "text".parse().unwrap(), from_nullable: false, to_nullable: false, from_collation: None, to_collation: None, through_external_partitions: false, using: None })),
+        PlannedChange::new(Change::Module(ModuleChange::DropModule { id: routine.clone(), kind: ModuleKind::Function })),
+        PlannedChange::new(Change::Module(ModuleChange::CreateModule { id: routine.clone(), module: Box::new(Module { kind: ModuleKind::Function, description: None, options: Default::default(), definition: "() RETURNS integer LANGUAGE SQL RETURN (SELECT count(*)::integer FROM app.u)".into() }) })),
     ] };
     let mut observed = observation(
         Surface::Module(routine),
@@ -815,11 +827,21 @@ fn a_delayed_child_rename_does_not_lose_its_foreign_key_drop_dependency() {
     let steps = &ordered.changes.changes;
     let drop = steps
         .iter()
-        .position(|p| matches!(p.change, Change::DropForeignKey { .. }))
+        .position(|p| {
+            matches!(
+                p.change,
+                Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            )
+        })
         .unwrap();
     let alter = steps
         .iter()
-        .position(|p| matches!(p.change, Change::AlterColumnType { .. }))
+        .position(|p| {
+            matches!(
+                p.change,
+                Change::Column(ColumnChange::AlterColumnType { .. })
+            )
+        })
         .unwrap();
     assert!(
         drop < alter,
@@ -827,7 +849,7 @@ fn a_delayed_child_rename_does_not_lose_its_foreign_key_drop_dependency() {
     );
     let rename = steps
         .iter()
-        .position(|p| matches!(p.change, Change::RenameTable { .. }))
+        .position(|p| matches!(p.change, Change::Table(TableChange::RenameTable { .. })))
         .unwrap();
     assert!(rename < drop, "the drop uses the child's approved new name");
 }
@@ -902,7 +924,7 @@ fn deprecation_does_not_rebuild_unchanged_column_dependents() {
         let hints = Default::default();
         let ordinary = crate::diff(old, wanted, &pbps_dialect::MinimalDialect, &hints).unwrap();
         assert!(
-            matches!(&ordinary.changes[..], [p] if matches!(p.change, Change::SetColumnDeprecated { .. }))
+            matches!(&ordinary.changes[..], [p] if matches!(p.change, Change::Column(ColumnChange::SetColumnDeprecated { .. })))
         );
         let resolved = plan(
             old,
@@ -1001,7 +1023,7 @@ fn splitting_table_creation_preserves_the_declared_index_layout() {
             .changes
             .iter()
             .filter_map(|step| {
-                if let Change::AddIndex { clustered, .. } = &step.change {
+                if let Change::Index(IndexChange::AddIndex { clustered, .. }) = &step.change {
                     Some(*clustered)
                 } else {
                     None
@@ -1012,7 +1034,7 @@ fn splitting_table_creation_preserves_the_declared_index_layout() {
         ordered.proof.validate(&ordered.changes).unwrap();
         let mut changed = ordered.changes.changes().clone();
         for step in &mut changed.changes {
-            if let Change::AddIndex { clustered, .. } = &mut step.change {
+            if let Change::Index(IndexChange::AddIndex { clustered, .. }) = &mut step.change {
                 *clustered = !*clustered;
             }
         }
@@ -1070,7 +1092,7 @@ fn splitting_table_creation_sets_an_index_identity_after_its_index() {
         for name in ["app.a", "app.z"] {
             let name: pbps_model::TableName = name.parse().unwrap();
             let created = steps.iter().find_map(|p| {
-                if let Change::CreateTable { name: n, table, .. } = &p.change
+                if let Change::Table(TableChange::CreateTable { name: n, table, .. }) = &p.change
                     && *n == name
                 {
                     Some(table)
@@ -1079,10 +1101,10 @@ fn splitting_table_creation_sets_an_index_identity_after_its_index() {
                 }
             });
             let set = steps.iter().position(
-                |p| matches!(&p.change, Change::SetReplicaIdentity { table, .. } if *table == name),
+                |p| matches!(&p.change, Change::TableProperty(TablePropertyChange::SetReplicaIdentity { table, .. }) if *table == name),
             );
             let index = steps.iter().position(
-                |p| matches!(&p.change, Change::AddIndex { table, .. } if *table == name),
+                |p| matches!(&p.change, Change::Index(IndexChange::AddIndex { table, .. }) if *table == name),
             );
             if identity == ReplicaIdentity::Full {
                 assert_eq!(
@@ -1152,11 +1174,14 @@ fn a_replica_identity_keeps_its_order_against_its_tables_indexes() {
             .iter()
             .filter(|p| p.change.table() == Some(&"app.a".parse().unwrap()))
             .map(|p| {
-                if let Change::AddIndex { name, .. } = &p.change {
+                if let Change::Index(IndexChange::AddIndex { name, .. }) = &p.change {
                     format!("add {name}", name = name.shown(),)
-                } else if let Change::DropIndex { name, .. } = &p.change {
+                } else if let Change::Index(IndexChange::DropIndex { name, .. }) = &p.change {
                     format!("drop {name}", name = name.shown(),)
-                } else if matches!(p.change, Change::SetReplicaIdentity { .. }) {
+                } else if matches!(
+                    p.change,
+                    Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+                ) {
                     "identity".to_owned()
                 } else {
                     format!("{:?}", p.change)
@@ -1231,7 +1256,7 @@ fn new_table_indexes_are_offline_while_existing_table_indexes_keep_the_requested
                 .changes
                 .changes
                 .iter()
-                .filter(|p| matches!(p.change, Change::AddIndex { .. }))
+                .filter(|p| matches!(p.change, Change::Index(IndexChange::AddIndex { .. })))
                 .collect();
             assert_eq!(indexes.len(), 2);
             for index in indexes {
@@ -1244,6 +1269,14 @@ fn new_table_indexes_are_offline_while_existing_table_indexes_keep_the_requested
 
 mod generated_surface_coverage {
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::GrantChange;
+    use pbps_model::IndexChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::PartitionChange;
+    use pbps_model::RowChange;
+    use pbps_model::TableChange;
 
     include!("default_rebuild_matrix.rs");
     use pbps_model::resolver::{Binding, BoundSurface, ObjectIdentity};
@@ -1379,12 +1412,12 @@ mod generated_surface_coverage {
         assert_eq!(ordered.changes.changes.len(), 1);
         assert_eq!(
             ordered.changes.changes[0].change,
-            Change::AlterColumnExpression {
+            Change::Column(ColumnChange::AlterColumnExpression {
                 uid,
                 column: "app.t.g".parse().unwrap(),
                 from: "a * 2 + 1".into(),
                 to: "a * 3".into(),
-            }
+            })
         );
         ordered.proof.validate(&ordered.changes).unwrap();
     }
@@ -1405,12 +1438,12 @@ mod generated_surface_coverage {
         assert_eq!(ordered.changes.changes.len(), 1);
         assert_eq!(
             ordered.changes.changes[0].change,
-            Change::AddColumn {
+            Change::Column(ColumnChange::AddColumn {
                 uid,
                 table: "app.t".parse().unwrap(),
                 name: "h".into(),
                 column: Box::new(generated("a + 4")),
-            }
+            })
         );
         ordered.proof.validate(&ordered.changes).unwrap();
     }
@@ -1570,10 +1603,12 @@ mod generated_surface_coverage {
                     .position(|p| f(&p.change))
                     .unwrap()
             };
-            let created = at(&|c| matches!(c, Change::CreateModule { id, .. } if id == &function));
+            let created = at(
+                &|c| matches!(c, Change::Module(ModuleChange::CreateModule { id, .. }) if id == &function),
+            );
             let generation = at(&|c| {
-                matches!(c, Change::CreateTable { .. })
-                    || matches!(c, Change::AddColumn { name, .. } if name.raw() == "g")
+                matches!(c, Change::Table(TableChange::CreateTable { .. }))
+                    || matches!(c, Change::Column(ColumnChange::AddColumn { name, .. }) if name.raw() == "g")
             });
             assert!(created < generation, "new_table={new_table}");
             ordered.proof.validate(&ordered.changes).unwrap();
@@ -1687,9 +1722,15 @@ mod generated_surface_coverage {
             desired: Some(bound("pg_constraint", "app.t.ck", &[], "f_new")),
         };
         let ordered = sided(&base, &desired, &[observation]);
-        let drop = at(&ordered, &|c| matches!(c, Change::DropCheck { .. }));
-        let update = at(&ordered, &|c| matches!(c, Change::UpdateRow { .. }));
-        let add = at(&ordered, &|c| matches!(c, Change::AddCheck { .. }));
+        let drop = at(&ordered, &|c| {
+            matches!(c, Change::Constraint(ConstraintChange::DropCheck { .. }))
+        });
+        let update = at(&ordered, &|c| {
+            matches!(c, Change::Row(RowChange::UpdateRow { .. }))
+        });
+        let add = at(&ordered, &|c| {
+            matches!(c, Change::Constraint(ConstraintChange::AddCheck { .. }))
+        });
         assert!(
             drop < update && update < add,
             "{:?}",
@@ -1754,11 +1795,14 @@ mod generated_surface_coverage {
             ],
         );
         let rewrite = at(&ordered, &|c| {
-            matches!(c, Change::AlterColumnExpression { .. })
+            matches!(
+                c,
+                Change::Column(ColumnChange::AlterColumnExpression { .. })
+            )
         });
         let drop = at(
             &ordered,
-            &|c| matches!(c, Change::DropModule { id: d, .. } if d == &id),
+            &|c| matches!(c, Change::Module(ModuleChange::DropModule { id: d, .. }) if d == &id),
         );
         assert!(rewrite < drop, "{:?}", ordered.changes.changes);
         ordered.proof.validate(&ordered.changes).unwrap();
@@ -1804,7 +1848,12 @@ mod generated_surface_coverage {
             table: "app.t".parse().unwrap(),
             name: "ix".into(),
         };
-        let parameters = |c: &Change| matches!(c, Change::SetIndexStorageParameters { .. });
+        let parameters = |c: &Change| {
+            matches!(
+                c,
+                Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            )
+        };
         for rebinds in [true, false] {
             let ordered = sided(
                 &base,
@@ -1841,7 +1890,7 @@ mod generated_surface_coverage {
             if rebinds {
                 assert!(!kept, "{:?}", ordered.changes.changes);
                 let added = ordered.changes.changes.iter().find_map(|p| {
-                    if let Change::AddIndex { index, .. } = &p.change {
+                    if let Change::Index(IndexChange::AddIndex { index, .. }) = &p.change {
                         Some(index.storage_parameters.clone())
                     } else {
                         None
@@ -1904,10 +1953,12 @@ mod generated_surface_coverage {
                 },
             ],
         );
-        let grant = at(&ordered, &|c| matches!(c, Change::Grant { .. }));
+        let grant = at(&ordered, &|c| {
+            matches!(c, Change::Permission(GrantChange::Grant { .. }))
+        });
         let column = at(
             &ordered,
-            &|c| matches!(c, Change::AddColumn { name, .. } if name.raw() == "g"),
+            &|c| matches!(c, Change::Column(ColumnChange::AddColumn { name, .. }) if name.raw() == "g"),
         );
         assert!(grant < column, "{:?}", ordered.changes.changes);
         ordered.proof.validate(&ordered.changes).unwrap();
@@ -1952,7 +2003,7 @@ mod generated_surface_coverage {
         );
         assert!(ordered.changes.changes.iter().any(|p| matches!(
             &p.change,
-            Change::AlterColumnExpression { from, to, .. } if from == "app.f(a)" && to == "app.f(a)"
+            Change::Column(ColumnChange::AlterColumnExpression { from, to, .. }) if from == "app.f(a)" && to == "app.f(a)"
         )));
         ordered.proof.validate(&ordered.changes).unwrap();
     }
@@ -2002,13 +2053,10 @@ mod generated_surface_coverage {
             )
         };
         let ordered = plan(removed("app.u")).unwrap();
-        assert!(
-            ordered
-                .changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, Change::DropCheck { .. }))
-        );
+        assert!(ordered.changes.changes.iter().any(|p| matches!(
+            p.change,
+            Change::Constraint(ConstraintChange::DropCheck { .. })
+        )));
         ordered.proof.validate(&ordered.changes).unwrap();
         assert!(matches!(
             plan(removed("app.t")),
@@ -2086,10 +2134,13 @@ mod generated_surface_coverage {
                 .position(|p| f(&p.change))
                 .unwrap_or_else(|| panic!("missing from {steps:?}"))
         };
-        let dropped_table =
-            position(&|c| matches!(c, Change::DropTable { uid, .. } if uid == &dropped));
-        let rename = position(&|c| matches!(c, Change::RenameTable { .. }));
-        let check = position(&|c| matches!(c, Change::DropCheck { table, .. } if table == &a));
+        let dropped_table = position(
+            &|c| matches!(c, Change::Table(TableChange::DropTable { uid, .. }) if uid == &dropped),
+        );
+        let rename = position(&|c| matches!(c, Change::Table(TableChange::RenameTable { .. })));
+        let check = position(
+            &|c| matches!(c, Change::Constraint(ConstraintChange::DropCheck { table, .. }) if table == &a),
+        );
         assert!(dropped_table < rename, "{steps:?}");
         assert!(rename < check, "{steps:?}");
         ordered.proof.validate(&ordered.changes).unwrap();
@@ -2257,7 +2308,9 @@ mod generated_surface_coverage {
                 .changes
                 .iter()
                 .filter_map(|p| {
-                    if let Change::AlterColumnExpression { column, .. } = &p.change {
+                    if let Change::Column(ColumnChange::AlterColumnExpression { column, .. }) =
+                        &p.change
+                    {
                         Some(column.clone())
                     } else {
                         None
@@ -2271,7 +2324,7 @@ mod generated_surface_coverage {
                 .changes
                 .changes
                 .iter()
-                .filter(|p| matches!(p.change, Change::RenameTable { .. }))
+                .filter(|p| matches!(p.change, Change::Table(TableChange::RenameTable { .. })))
                 .count(),
             2
         );
@@ -2375,10 +2428,18 @@ mod generated_surface_coverage {
                 .position(|p| f(&p.change))
                 .unwrap_or_else(|| panic!("missing from {steps:?}"))
         };
-        let teardown = position(&|ch| matches!(ch, Change::DropCheck { table, .. } if table == &b));
-        let away = position(&|ch| matches!(ch, Change::RenameTable { from, .. } if from == &b));
-        let into = position(&|ch| matches!(ch, Change::RenameTable { to, .. } if to == &b));
-        let restore = position(&|ch| matches!(ch, Change::AddCheck { table, .. } if table == &c));
+        let teardown = position(
+            &|ch| matches!(ch, Change::Constraint(ConstraintChange::DropCheck { table, .. }) if table == &b),
+        );
+        let away = position(
+            &|ch| matches!(ch, Change::Table(TableChange::RenameTable { from, .. }) if from == &b),
+        );
+        let into = position(
+            &|ch| matches!(ch, Change::Table(TableChange::RenameTable { to, .. }) if to == &b),
+        );
+        let restore = position(
+            &|ch| matches!(ch, Change::Constraint(ConstraintChange::AddCheck { table, .. }) if table == &c),
+        );
         assert!(teardown < away, "{steps:?}");
         assert!(away < into, "{steps:?}");
         assert!(away < restore, "{steps:?}");
@@ -2413,19 +2474,19 @@ mod generated_surface_coverage {
         after_ids.rename_table(&b, &c);
         after_ids.rename_table(&a, &b);
         let rename = |from: &pbps_model::TableName, to: &pbps_model::TableName| {
-            PlannedChange::new(Change::RenameTable {
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: before_ids.table_uid(from).unwrap().clone(),
                 from: from.clone(),
                 to: to.clone(),
                 defaults: Vec::new(),
-            })
+            }))
         };
         let changes = ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::DropCheck {
+                PlannedChange::new(Change::Constraint(ConstraintChange::DropCheck {
                     table: b.clone(),
                     name: "k".into(),
-                }),
+                })),
                 rename(&b, &c),
                 rename(&a, &b),
             ],
@@ -2455,7 +2516,7 @@ mod generated_surface_coverage {
         assert!(!between(2, 0) && !between(0, 2), "{edges:?}");
         assert!(matches!(
             ordered.changes.changes[0].change,
-            Change::DropCheck { .. }
+            Change::Constraint(ConstraintChange::DropCheck { .. })
         ));
     }
 
@@ -2542,10 +2603,18 @@ mod generated_surface_coverage {
                 .position(|p| f(&p.change))
                 .unwrap_or_else(|| panic!("missing from {steps:?}"))
         };
-        let teardown = position(&|ch| matches!(ch, Change::DropCheck { table, .. } if table == &a));
-        let away = position(&|ch| matches!(ch, Change::RenameTable { from, .. } if from == &b));
-        let into = position(&|ch| matches!(ch, Change::RenameTable { to, .. } if to == &b));
-        let restore = position(&|ch| matches!(ch, Change::AddCheck { table, .. } if table == &b));
+        let teardown = position(
+            &|ch| matches!(ch, Change::Constraint(ConstraintChange::DropCheck { table, .. }) if table == &a),
+        );
+        let away = position(
+            &|ch| matches!(ch, Change::Table(TableChange::RenameTable { from, .. }) if from == &b),
+        );
+        let into = position(
+            &|ch| matches!(ch, Change::Table(TableChange::RenameTable { to, .. }) if to == &b),
+        );
+        let restore = position(
+            &|ch| matches!(ch, Change::Constraint(ConstraintChange::AddCheck { table, .. }) if table == &b),
+        );
         assert!(teardown < into, "{steps:?}");
         assert!(away < into, "{steps:?}");
         assert!(into < restore, "{steps:?}");
@@ -2612,24 +2681,26 @@ mod generated_surface_coverage {
         after_ids.rename_table(&b, &c);
         after_ids.rename_table(&a, &b);
         let rename = |from: &pbps_model::TableName, to: &pbps_model::TableName| {
-            PlannedChange::new(Change::RenameTable {
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: before_ids.table_uid(from).unwrap().clone(),
                 from: from.clone(),
                 to: to.clone(),
                 defaults: Vec::new(),
-            })
+            }))
         };
         let logical = ChangeSet {
             changes: vec![rename(&b, &c), rename(&a, &b)],
         };
         let mut steps = logical.clone();
-        steps.changes.push(PlannedChange::new(Change::AddCheck {
-            table: b.clone(),
-            name: "k".into(),
-            constraint: pbps_model::CheckConstraint {
-                expression: "a > 0".into(),
+        steps.changes.push(PlannedChange::new(Change::Constraint(
+            ConstraintChange::AddCheck {
+                table: b.clone(),
+                name: "k".into(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "a > 0".into(),
+                },
             },
-        }));
+        )));
         let rebinding = Source::Rebinding(Surface::Check {
             table: b.clone(),
             name: "k".into(),
@@ -2712,8 +2783,12 @@ mod generated_surface_coverage {
                 .position(|op| f(op.change()))
                 .unwrap_or_else(|| panic!("missing from {ops:?}"))
         };
-        let down = position(&|ch| matches!(ch, Change::DropCheck { table, .. } if table == &b));
-        let up = position(&|ch| matches!(ch, Change::AddCheck { table, .. } if table == &c));
+        let down = position(
+            &|ch| matches!(ch, Change::Constraint(ConstraintChange::DropCheck { table, .. }) if table == &b),
+        );
+        let up = position(
+            &|ch| matches!(ch, Change::Constraint(ConstraintChange::AddCheck { table, .. }) if table == &c),
+        );
         let (teardown, restoration) = (&ops[down], &ops[up]);
         assert_eq!(teardown.role(), Role::Teardown);
         assert_eq!(restoration.role(), Role::Restoration);
@@ -2857,10 +2932,16 @@ mod generated_surface_coverage {
                 .position(|p| f(&p.change))
                 .unwrap_or_else(|| panic!("missing from {steps:?}"))
         };
-        let removal = position(&|c| matches!(c, Change::DropCheck { table, .. } if table == &a));
-        let table = position(&|c| matches!(c, Change::DropTable { uid, .. } if uid == &dropped));
+        let removal = position(
+            &|c| matches!(c, Change::Constraint(ConstraintChange::DropCheck { table, .. }) if table == &a),
+        );
+        let table = position(
+            &|c| matches!(c, Change::Table(TableChange::DropTable { uid, .. }) if uid == &dropped),
+        );
         let drop = |id: &pbps_model::ModuleId| {
-            position(&|c| matches!(c, Change::DropModule { id: d, .. } if d == id))
+            position(
+                &|c| matches!(c, Change::Module(ModuleChange::DropModule { id: d, .. }) if d == id),
+            )
         };
         assert!(removal < drop(&f2), "{steps:?}");
         assert!(table < drop(&f1), "{steps:?}");
@@ -2947,11 +3028,12 @@ mod generated_surface_coverage {
             .unwrap()
         };
         let removal = |ordered: &Ordered<_>| {
-            ordered
-                .changes
-                .changes
-                .iter()
-                .position(|p| matches!(p.change, Change::AlterColumnDefault { to: None, .. }))
+            ordered.changes.changes.iter().position(|p| {
+                matches!(
+                    p.change,
+                    Change::Column(ColumnChange::AlterColumnDefault { to: None, .. })
+                )
+            })
         };
         let renames = |ordered: &Ordered<_>| -> Vec<usize> {
             ordered
@@ -2962,7 +3044,8 @@ mod generated_surface_coverage {
                 .filter(|(_, p)| {
                     matches!(
                         p.change,
-                        Change::RenameTable { .. } | Change::RenameColumn { .. }
+                        Change::Table(TableChange::RenameTable { .. })
+                            | Change::Column(ColumnChange::RenameColumn { .. })
                     )
                 })
                 .map(|(i, _)| i)
@@ -3052,8 +3135,13 @@ mod generated_surface_coverage {
                 .position(|p| f(&p.change))
                 .unwrap_or_else(|| panic!("missing from {:?}", ordered.changes.changes))
         };
-        let rename = |from: &'static str| move |c: &Change| matches!(c, Change::RenameColumn { from: f, .. } if f.raw() == from);
-        let removal = |c: &Change| matches!(c, Change::AlterColumnDefault { to: None, .. });
+        let rename = |from: &'static str| move |c: &Change| matches!(c, Change::Column(ColumnChange::RenameColumn { from: f, .. }) if f.raw() == from);
+        let removal = |c: &Change| {
+            matches!(
+                c,
+                Change::Column(ColumnChange::AlterColumnDefault { to: None, .. })
+            )
+        };
         let attrdef = |binds: &str| Some(bound("pg_attrdef", "app.t.d", &[], binds));
 
         // The old `a` loses its default under its final name `b`.
@@ -3209,7 +3297,9 @@ mod generated_surface_coverage {
             &pbps_dialect::MinimalDialect,
         )
         .unwrap_or_else(|error| panic!("freeing drop: {error:?}"));
-        let drop = position(&freed, &|c| matches!(c, Change::DropColumn { .. }));
+        let drop = position(&freed, &|c| {
+            matches!(c, Change::Column(ColumnChange::DropColumn { .. }))
+        });
         let into = position(&freed, &rename("a"));
         let at = position(&freed, &removal);
         assert!(drop < into && into < at, "{:?}", freed.changes.changes);
@@ -3345,21 +3435,21 @@ mod generated_surface_coverage {
         };
         let ordered = sided(&base, &desired, &[keeps("app.t"), own, dropped, created]);
         let release = at(&ordered, &|c| {
-            matches!(c, Change::SetPartitionDefault { table, column, from: Some(from), to: None, fallback: None, .. }
+            matches!(c, Change::Partition(PartitionChange::SetPartitionDefault { table, column, from: Some(from), to: None, fallback: None, .. })
                 if *table == p && column.raw() == "d" && from == "app.f(1)")
         });
         let restore = at(&ordered, &|c| {
-            matches!(c, Change::SetPartitionDefault { table, column, from: None, to: Some(to), fallback: Some(fallback), .. }
+            matches!(c, Change::Partition(PartitionChange::SetPartitionDefault { table, column, from: None, to: Some(to), fallback: Some(fallback), .. })
                 if *table == p && column.raw() == "d" && to == "app.f(1)" && fallback == "0")
         });
         assert!(release < restore, "{:?}", ordered.changes.changes);
         let drop = at(
             &ordered,
-            &|c| matches!(c, Change::DropModule { id, .. } if *id == f),
+            &|c| matches!(c, Change::Module(ModuleChange::DropModule { id, .. }) if *id == f),
         );
         let create = at(
             &ordered,
-            &|c| matches!(c, Change::CreateModule { id, .. } if *id == g),
+            &|c| matches!(c, Change::Module(ModuleChange::CreateModule { id, .. }) if *id == g),
         );
         assert!(
             release < drop && create < restore,
@@ -3369,11 +3459,10 @@ mod generated_surface_coverage {
         // Negative: the parent's default keeps its binding, so it is not
         // rebuilt.
         assert!(
-            !ordered
-                .changes
-                .changes
-                .iter()
-                .any(|c| matches!(c.change, Change::AlterColumnDefault { .. })),
+            !ordered.changes.changes.iter().any(|c| matches!(
+                c.change,
+                Change::Column(ColumnChange::AlterColumnDefault { .. })
+            )),
             "{:?}",
             ordered.changes.changes
         );
@@ -3393,11 +3482,11 @@ mod generated_surface_coverage {
         let p: pbps_model::TableName = "app.p".parse().unwrap();
         let parent = at(
             &ordered,
-            &|c| matches!(c, Change::AlterColumnDefault { column, to: Some(_), .. } if column.table == t),
+            &|c| matches!(c, Change::Column(ColumnChange::AlterColumnDefault { column, to: Some(_), .. }) if column.table == t),
         );
         let own = at(
             &ordered,
-            &|c| matches!(c, Change::SetPartitionDefault { table, to: Some(_), .. } if *table == p),
+            &|c| matches!(c, Change::Partition(PartitionChange::SetPartitionDefault { table, to: Some(_), .. }) if *table == p),
         );
         assert!(parent < own, "{:?}", ordered.changes.changes);
         assert!(
@@ -3483,27 +3572,27 @@ mod generated_surface_coverage {
         let p: pbps_model::TableName = "app.p".parse().unwrap();
         let release_parent = at(
             &ordered,
-            &|c| matches!(c, Change::AlterColumnDefault { column, to: None, .. } if column.table == t),
+            &|c| matches!(c, Change::Column(ColumnChange::AlterColumnDefault { column, to: None, .. }) if column.table == t),
         );
         let release_own = at(
             &ordered,
-            &|c| matches!(c, Change::SetPartitionDefault { table, to: None, fallback: None, .. } if *table == p),
+            &|c| matches!(c, Change::Partition(PartitionChange::SetPartitionDefault { table, to: None, fallback: None, .. }) if *table == p),
         );
         let drop = at(
             &ordered,
-            &|c| matches!(c, Change::DropModule { id, .. } if *id == f),
+            &|c| matches!(c, Change::Module(ModuleChange::DropModule { id, .. }) if *id == f),
         );
         let create = at(
             &ordered,
-            &|c| matches!(c, Change::CreateModule { id, .. } if *id == f),
+            &|c| matches!(c, Change::Module(ModuleChange::CreateModule { id, .. }) if *id == f),
         );
         let restore_parent = at(
             &ordered,
-            &|c| matches!(c, Change::AlterColumnDefault { column, to: Some(_), .. } if column.table == t),
+            &|c| matches!(c, Change::Column(ColumnChange::AlterColumnDefault { column, to: Some(_), .. }) if column.table == t),
         );
         let restore_own = at(
             &ordered,
-            &|c| matches!(c, Change::SetPartitionDefault { table, to: Some(_), .. } if *table == p),
+            &|c| matches!(c, Change::Partition(PartitionChange::SetPartitionDefault { table, to: Some(_), .. }) if *table == p),
         );
         assert!(
             release_parent < drop
@@ -3566,11 +3655,11 @@ mod generated_surface_coverage {
         .unwrap_or_else(|error| panic!("a replaced column is refused: {error:?}"));
         let dropped = at(
             &ordered,
-            &|ch| matches!(ch, Change::DropColumn { uid, .. } if *uid == old),
+            &|ch| matches!(ch, Change::Column(ColumnChange::DropColumn { uid, .. }) if *uid == old),
         );
         let added = at(
             &ordered,
-            &|ch| matches!(ch, Change::AddColumn { uid, .. } if *uid == new),
+            &|ch| matches!(ch, Change::Column(ColumnChange::AddColumn { uid, .. }) if *uid == new),
         );
         assert!(dropped < added, "{:?}", ordered.changes.changes);
         ordered.proof.validate(&ordered.changes).unwrap();
@@ -3668,7 +3757,7 @@ mod generated_surface_coverage {
                 .changes
                 .changes
                 .iter()
-                .any(|c| matches!(&c.change, Change::DropColumn { uid, .. } if *uid == d)),
+                .any(|c| matches!(&c.change, Change::Column(ColumnChange::DropColumn { uid, .. }) if *uid == d)),
             "{:?}",
             ordered.changes.changes
         );
@@ -3748,15 +3837,15 @@ mod generated_surface_coverage {
         )
         .unwrap_or_else(|error| panic!("a kept override is refused: {error:?}"));
         let rename = at(&ordered, &|c| {
-            matches!(c, Change::RenameColumn { table, from, to, .. }
+            matches!(c, Change::Column(ColumnChange::RenameColumn { table, from, to, .. })
                 if *table == t && from.raw() == "e" && to.raw() == "d")
         });
         let release = at(&ordered, &|c| {
-            matches!(c, Change::SetPartitionDefault { table, column, to: None, fallback: None, .. }
+            matches!(c, Change::Partition(PartitionChange::SetPartitionDefault { table, column, to: None, fallback: None, .. })
                 if *table == p && column.raw() == "e")
         });
         let restore = at(&ordered, &|c| {
-            matches!(c, Change::SetPartitionDefault { table, column, to: Some(to), .. }
+            matches!(c, Change::Partition(PartitionChange::SetPartitionDefault { table, column, to: Some(to), .. })
                 if *table == p && column.raw() == "d" && to == "app.f(2)")
         });
         assert!(
@@ -3839,11 +3928,11 @@ mod generated_surface_coverage {
         let renamed = |from: &str| {
             at(
                 &ordered,
-                &|c| matches!(c, Change::RenameColumn { table, from: f, .. } if *table == t && f.raw() == from),
+                &|c| matches!(c, Change::Column(ColumnChange::RenameColumn { table, from: f, .. }) if *table == t && f.raw() == from),
             )
         };
         let removal = at(&ordered, &|c| {
-            matches!(c, Change::SetPartitionDefault { table, column, from: Some(_), to: None, .. }
+            matches!(c, Change::Partition(PartitionChange::SetPartitionDefault { table, column, from: Some(_), to: None, .. })
                 if *table == p && column.raw() == "e")
         });
         assert!(
@@ -3898,14 +3987,14 @@ mod generated_surface_coverage {
         .unwrap_or_else(|error| panic!("a renamed parent is refused: {error:?}"));
         let rename = at(
             &ordered,
-            &|c| matches!(c, Change::RenameColumn { from, to, .. } if from.raw() == "e" && to.raw() == "d"),
+            &|c| matches!(c, Change::Column(ColumnChange::RenameColumn { from, to, .. }) if from.raw() == "e" && to.raw() == "d"),
         );
         let release = at(&ordered, &|c| {
-            matches!(c, Change::SetPartitionDefault { table, column, to: None, fallback: None, .. }
+            matches!(c, Change::Partition(PartitionChange::SetPartitionDefault { table, column, to: None, fallback: None, .. })
                 if *table == p && column.raw() == "e")
         });
         let restore = at(&ordered, &|c| {
-            matches!(c, Change::SetPartitionDefault { table, column, to: Some(_), .. }
+            matches!(c, Change::Partition(PartitionChange::SetPartitionDefault { table, column, to: Some(_), .. })
                 if *table == p && column.raw() == "d")
         });
         assert!(
@@ -3942,8 +4031,8 @@ mod generated_surface_coverage {
                 .filter(|c| {
                     matches!(
                         &c.change,
-                        Change::SetPartitionDefault { to: None, .. }
-                            | Change::AlterColumnDefault { to: None, .. }
+                        Change::Partition(PartitionChange::SetPartitionDefault { to: None, .. })
+                            | Change::Column(ColumnChange::AlterColumnDefault { to: None, .. })
                     )
                 })
                 .count()
@@ -4057,12 +4146,17 @@ mod generated_surface_coverage {
         )
         .unwrap_or_else(|error| panic!("an attach is refused: {error:?}"));
         let release = at(&ordered, &|c| {
-            matches!(c, Change::AlterColumnDefault { column, from: Some(from), to: None, .. }
+            matches!(c, Change::Column(ColumnChange::AlterColumnDefault { column, from: Some(from), to: None, .. })
                 if column.table == p && from == "app.f(1)")
         });
-        let attach = at(&ordered, &|c| matches!(c, Change::AttachPartition { .. }));
+        let attach = at(&ordered, &|c| {
+            matches!(
+                c,
+                Change::Partition(PartitionChange::AttachPartition { .. })
+            )
+        });
         let restore = at(&ordered, &|c| {
-            matches!(c, Change::SetPartitionDefault { table, from: None, to: Some(to), .. }
+            matches!(c, Change::Partition(PartitionChange::SetPartitionDefault { table, from: None, to: Some(to), .. })
                 if *table == p && to == "app.f(1)")
         });
         assert!(
@@ -4102,12 +4196,12 @@ mod generated_surface_coverage {
         };
         let ordered = sided(&base, &desired, &[keeps("app.t"), own, dropped]);
         let given_back = at(&ordered, &|c| {
-            matches!(c, Change::SetPartitionDefault { table, from: Some(_), to: None, fallback: Some(_), .. }
+            matches!(c, Change::Partition(PartitionChange::SetPartitionDefault { table, from: Some(_), to: None, fallback: Some(_), .. })
                 if *table == p)
         });
         let drop = at(
             &ordered,
-            &|c| matches!(c, Change::DropModule { id, .. } if *id == f),
+            &|c| matches!(c, Change::Module(ModuleChange::DropModule { id, .. }) if *id == f),
         );
         assert!(given_back < drop, "{:?}", ordered.changes.changes);
         assert!(
@@ -4143,10 +4237,10 @@ mod generated_surface_coverage {
         .unwrap_or_else(|error| panic!("a parent's rebuild is refused: {error:?}"));
         let parent = at(
             &ordered,
-            &|c| matches!(c, Change::AlterColumnDefault { column, to: Some(_), .. } if column.table == t),
+            &|c| matches!(c, Change::Column(ColumnChange::AlterColumnDefault { column, to: Some(_), .. }) if column.table == t),
         );
         let again = at(&ordered, &|c| {
-            matches!(c, Change::SetPartitionDefault { table, from: Some(from), to: Some(to), fallback: Some(fallback), .. }
+            matches!(c, Change::Partition(PartitionChange::SetPartitionDefault { table, from: Some(from), to: Some(to), fallback: Some(fallback), .. })
                 if *table == p && from == "7" && to == "7" && fallback == "app.f(0)")
         });
         assert!(
@@ -4172,11 +4266,10 @@ mod generated_surface_coverage {
         )
         .unwrap_or_else(|error| panic!("a parent's rebuild is refused: {error:?}"));
         assert!(
-            !ordered
-                .changes
-                .changes
-                .iter()
-                .any(|c| matches!(c.change, Change::SetPartitionDefault { .. })),
+            !ordered.changes.changes.iter().any(|c| matches!(
+                c.change,
+                Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            )),
             "{:?}",
             ordered.changes.changes
         );
@@ -4228,11 +4321,11 @@ mod generated_surface_coverage {
             .unwrap_or_else(|error| panic!("a replaced table is refused: {error:?}"));
         let dropped = at(
             &ordered,
-            &|c| matches!(c, Change::DropTable { uid, .. } if *uid == old),
+            &|c| matches!(c, Change::Table(TableChange::DropTable { uid, .. }) if *uid == old),
         );
         let created = at(
             &ordered,
-            &|c| matches!(c, Change::CreateTable { name, .. } if *name == t),
+            &|c| matches!(c, Change::Table(TableChange::CreateTable { name, .. }) if *name == t),
         );
         assert!(dropped < created, "{:?}", ordered.changes.changes);
         ordered.proof.validate(&ordered.changes).unwrap();
@@ -4267,12 +4360,17 @@ mod generated_surface_coverage {
         )
         .unwrap_or_else(|error| panic!("a detach is refused: {error:?}"));
         let release = at(&ordered, &|c| {
-            matches!(c, Change::SetPartitionDefault { table, from: Some(from), to: None, fallback: None, .. }
+            matches!(c, Change::Partition(PartitionChange::SetPartitionDefault { table, from: Some(from), to: None, fallback: None, .. })
                 if *table == p && from == "app.f(1)")
         });
-        let detach = at(&ordered, &|c| matches!(c, Change::DetachPartition { .. }));
+        let detach = at(&ordered, &|c| {
+            matches!(
+                c,
+                Change::Partition(PartitionChange::DetachPartition { .. })
+            )
+        });
         let restore = at(&ordered, &|c| {
-            matches!(c, Change::AlterColumnDefault { column, from: None, to: Some(to), .. }
+            matches!(c, Change::Column(ColumnChange::AlterColumnDefault { column, from: None, to: Some(to), .. })
                 if column.table == p && to == "app.f(1)")
         });
         assert!(
@@ -4294,19 +4392,18 @@ mod generated_surface_coverage {
         let t: pbps_model::TableName = "app.t".parse().unwrap();
         let release = at(
             &ordered,
-            &|c| matches!(c, Change::AlterColumnDefault { column, to: None, .. } if column.table == t),
+            &|c| matches!(c, Change::Column(ColumnChange::AlterColumnDefault { column, to: None, .. }) if column.table == t),
         );
         let restore = at(
             &ordered,
-            &|c| matches!(c, Change::AlterColumnDefault { column, from: None, to: Some(_), .. } if column.table == t),
+            &|c| matches!(c, Change::Column(ColumnChange::AlterColumnDefault { column, from: None, to: Some(_), .. }) if column.table == t),
         );
         assert!(release < restore, "{:?}", ordered.changes.changes);
         assert!(
-            !ordered
-                .changes
-                .changes
-                .iter()
-                .any(|c| matches!(c.change, Change::SetPartitionDefault { .. })),
+            !ordered.changes.changes.iter().any(|c| matches!(
+                c.change,
+                Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            )),
             "{:?}",
             ordered.changes.changes
         );
@@ -4590,12 +4687,12 @@ fn a_parents_new_index_precedes_its_partitions_own_under_the_resolver() {
         filegroup: None,
     };
     let add = |table: &TableName, name: &str| {
-        PlannedChange::new(Change::AddIndex {
+        PlannedChange::new(Change::Index(IndexChange::AddIndex {
             table: table.clone(),
             name: name.into(),
             index: Box::new(index.clone()),
             clustered: false,
-        })
+        }))
     };
     // In the wrong order, as nothing else would keep them.
     let changes = ChangeSet {
@@ -4735,11 +4832,11 @@ fn a_resolver_plan_keeps_the_move_a_human_allowed() {
             .changes
             .iter()
             .find_map(|p| {
-                if let Change::CreateTable {
+                if let Change::Table(TableChange::CreateTable {
                     beside_default: Some(_),
                     moves_at_most,
                     ..
-                } = &p.change
+                }) = &p.change
                 {
                     Some(*moves_at_most)
                 } else {
@@ -4765,6 +4862,11 @@ fn a_resolver_plan_keeps_the_move_a_human_allowed() {
 /// a step does.
 mod operations {
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::IndexChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::TableChange;
     use pbps_model::operation::{
         InForce, Incarnations, ObjectKey, Operation, Origin, PartKey, PlanOwners, ReplayError,
         Role, Source, Transition,
@@ -4882,7 +4984,7 @@ mod operations {
         let z: pbps_model::TableName = "app.z".parse().unwrap();
         let (bare_at, bare) = find(
             &planned,
-            &|c| matches!(c, Change::CreateTable { name, .. } if name == &a),
+            &|c| matches!(c, Change::Table(TableChange::CreateTable { name, .. }) if name == &a),
         );
         let defined = |op: &Operation| -> Vec<ObjectKey> {
             op.defines(&owners)
@@ -4906,10 +5008,14 @@ mod operations {
         let replay = Incarnations::replay(planned.operations.as_slice(), &owners).unwrap();
         let later = [
             find(&planned, &|c| {
-                matches!(c, Change::AlterColumnDefault { .. })
+                matches!(c, Change::Column(ColumnChange::AlterColumnDefault { .. }))
             }),
-            find(&planned, &|c| matches!(c, Change::AddCheck { .. })),
-            find(&planned, &|c| matches!(c, Change::AddIndex { .. })),
+            find(&planned, &|c| {
+                matches!(c, Change::Constraint(ConstraintChange::AddCheck { .. }))
+            }),
+            find(&planned, &|c| {
+                matches!(c, Change::Index(IndexChange::AddIndex { .. }))
+            }),
         ];
         for (at, op) in later {
             assert!(at > bare_at, "{:?}", planned.operations);
@@ -4940,7 +5046,7 @@ mod operations {
         // A create with nothing to take out is one whole operation.
         let (_, whole) = find(
             &planned,
-            &|c| matches!(c, Change::CreateTable { name, .. } if name == &z),
+            &|c| matches!(c, Change::Table(TableChange::CreateTable { name, .. }) if name == &z),
         );
         assert_eq!(whole.role(), Role::Whole);
         assert_ne!(whole.source(), bare.source());
@@ -5036,7 +5142,7 @@ mod operations {
         // logical change, the plan's second, while it runs fifth.
         let (at, whole) = find(
             &first,
-            &|c| matches!(c, Change::CreateTable { name, .. } if name.name == "z"),
+            &|c| matches!(c, Change::Table(TableChange::CreateTable { name, .. }) if name.name == "z"),
         );
         assert_eq!(at, 4);
         assert_eq!(whole.source(), Source::Change(1));
@@ -5103,15 +5209,15 @@ mod operations {
         let owners = owners(&planned, &old, &new);
         let (down, teardown) = find(
             &planned,
-            &|c| matches!(c, Change::DropModule { id, .. } if id == &view),
+            &|c| matches!(c, Change::Module(ModuleChange::DropModule { id, .. }) if id == &view),
         );
         let (up, restoration) = find(
             &planned,
-            &|c| matches!(c, Change::CreateModule { id, .. } if id == &view),
+            &|c| matches!(c, Change::Module(ModuleChange::CreateModule { id, .. }) if id == &view),
         );
         let (made, _) = find(
             &planned,
-            &|c| matches!(c, Change::CreateModule { id, .. } if id == &function),
+            &|c| matches!(c, Change::Module(ModuleChange::CreateModule { id, .. }) if id == &function),
         );
         assert_eq!(teardown.role(), Role::SplitPart);
         assert_eq!(restoration.role(), Role::SplitPart);
@@ -5121,7 +5227,7 @@ mod operations {
         };
         assert!(matches!(
             &planned.logical.changes[logical].change,
-            Change::AlterModule { id, .. } if id == &view
+            Change::Module(ModuleChange::AlterModule { id, .. }) if id == &view
         ));
         let key = teardown.key(&owners).unwrap();
         assert_eq!(restoration.key(&owners).unwrap(), key);
@@ -5243,7 +5349,7 @@ fn two_reference_tables_referencing_each_other_plan_and_settle_in_the_differs_or
         differ
             .changes
             .iter()
-            .filter(|p| matches!(p.change, Change::InsertRow { .. }))
+            .filter(|p| matches!(p.change, Change::Row(RowChange::InsertRow { .. })))
             .count()
             == 2,
         "{differ:?}"
@@ -5293,25 +5399,25 @@ fn preparing_generated_creation_parts_preserves_their_creation_risks() {
     }
     let mut ordinary = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::CreateTable {
+            PlannedChange::new(Change::Table(TableChange::CreateTable {
                 uid: identities.table_uid(&name).unwrap().clone(),
                 name: name.clone(),
                 table: Box::new(table),
                 beside_default: None,
                 moves_at_most: None,
-            }),
-            PlannedChange::new(Change::AddColumn {
+            })),
+            PlannedChange::new(Change::Column(ColumnChange::AddColumn {
                 uid: identities.column_uid(&name.column("z")).unwrap().clone(),
                 table: name.clone(),
                 name: "z".into(),
                 column: Box::new(z),
-            }),
-            PlannedChange::new(Change::AlterColumnExpression {
+            })),
+            PlannedChange::new(Change::Column(ColumnChange::AlterColumnExpression {
                 uid: identities.column_uid(&name.column("g")).unwrap().clone(),
                 column: name.column("g"),
                 from: "NULL::integer".into(),
                 to: "id * 2".into(),
-            }),
+            })),
         ],
     };
     for part in &mut ordinary.changes {
@@ -5337,13 +5443,10 @@ fn preparing_generated_creation_parts_preserves_their_creation_risks() {
         .unwrap()
     };
     let prepared = prepare(&ordinary);
-    assert!(
-        prepared
-            .changes
-            .changes
-            .iter()
-            .any(|p| matches!(p.change, Change::AddCheck { .. }))
-    );
+    assert!(prepared.changes.changes.iter().any(|p| matches!(
+        p.change,
+        Change::Constraint(ConstraintChange::AddCheck { .. })
+    )));
     assert!(
         prepared.changes.gated_risks().is_empty(),
         "{:?}",
@@ -5351,20 +5454,21 @@ fn preparing_generated_creation_parts_preserves_their_creation_risks() {
     );
     let mut late = ordinary.clone();
     let column = late.changes.remove(1);
-    late.changes.push(PlannedChange::new(Change::InsertRow {
-        table: name.clone(),
-        key_column: "id".into(),
-        identity_key: false,
-        key: "1".into(),
-        row: Default::default(),
-        defaults: Default::default(),
-        types: Default::default(),
-    }));
+    late.changes
+        .push(PlannedChange::new(Change::Row(RowChange::InsertRow {
+            table: name.clone(),
+            key_column: "id".into(),
+            identity_key: false,
+            key: "1".into(),
+            row: Default::default(),
+            defaults: Default::default(),
+            types: Default::default(),
+        })));
     late.changes.push(column);
     let prepared_late = prepare(&late);
     assert!(
         prepared_late.changes.changes.iter().any(|p| {
-            matches!(&p.change, Change::AddColumn { name, .. } if name.raw() == "z")
+            matches!(&p.change, Change::Column(ColumnChange::AddColumn { name, .. }) if name.raw() == "z")
                 && p.risks.contains(&pbps_model::RiskClass::NotNull)
         }),
         "a lowering cannot borrow the earlier installation's empty context"
@@ -5372,7 +5476,7 @@ fn preparing_generated_creation_parts_preserves_their_creation_risks() {
     let mut standing = prepared.changes;
     standing
         .changes
-        .retain(|p| !matches!(p.change, Change::CreateTable { .. }));
+        .retain(|p| !matches!(p.change, Change::Table(TableChange::CreateTable { .. })));
     let unmarked = prepare(&standing);
     assert!(
         unmarked
@@ -5450,23 +5554,23 @@ fn placeholder_creates_do_not_claim_the_installed_expressions_bindings() {
         }
         let changes = ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::CreateTable {
+                PlannedChange::new(Change::Table(TableChange::CreateTable {
                     uid: ids.table_uid(&name).unwrap().clone(),
                     name: name.clone(),
                     table: Box::new(created),
                     beside_default: None,
                     moves_at_most: None,
-                }),
-                PlannedChange::new(Change::CreateModule {
+                })),
+                PlannedChange::new(Change::Module(ModuleChange::CreateModule {
                     id: function.clone(),
                     module: Box::new(module.clone()),
-                }),
-                PlannedChange::new(Change::AlterColumnExpression {
+                })),
+                PlannedChange::new(Change::Column(ColumnChange::AlterColumnExpression {
                     uid: ids.column_uid(&column).unwrap().clone(),
                     column: column.clone(),
                     from: from.into(),
                     to: "app.f(1)".into(),
-                }),
+                })),
             ],
         };
         let owners = PlanOwners::new(

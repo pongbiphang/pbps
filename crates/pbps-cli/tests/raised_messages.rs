@@ -3,6 +3,9 @@
 #[cfg(test)]
 use crate::certified_fixture::FixtureEmission;
 
+use pbps_model::ColumnChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
 use pbps_model::{Change, RowKey, TableName};
 
 const HOSTILE: &str = "name\n\u{1b}[31m\\'_%名前";
@@ -32,7 +35,7 @@ fn row_messages(dialect: &dyn FixtureEmission) {
     let pg = dialect.name() == "postgres";
     for (name, shown) in [(HOSTILE, SHOWN), ("ordinary'_%名前", "ordinary'_%名前")] {
         let table = TableName::new("app", name);
-        let insert = Change::InsertRow {
+        let insert = Change::Row(RowChange::InsertRow {
             table: table.clone(),
             key_column: "code".into(),
             identity_key: false,
@@ -40,8 +43,8 @@ fn row_messages(dialect: &dyn FixtureEmission) {
             row: Default::default(),
             defaults: Default::default(),
             types: Default::default(),
-        };
-        let delete = Change::DeleteRow {
+        });
+        let delete = Change::Row(RowChange::DeleteRow {
             table,
             key_column: "code".into(),
             key: RowKey::from("x"),
@@ -51,7 +54,7 @@ fn row_messages(dialect: &dyn FixtureEmission) {
             types: Default::default(),
             after_types: Default::default(),
             key_type: None,
-        };
+        });
         for (change, count) in [(insert, 1), (delete, if pg { 4 } else { 3 })] {
             let sql = sql(dialect, &change);
             let marker = if pg {
@@ -82,7 +85,7 @@ fn row_messages(dialect: &dyn FixtureEmission) {
 }
 
 fn partition(name: &str, allowed: Option<u64>) -> Change {
-    Change::CreateTable {
+    Change::Table(TableChange::CreateTable {
         uid: "t_aaaaaa".parse().unwrap(),
         name: TableName::new(name, "part"),
         table: Box::new(pbps_model::Table {
@@ -98,7 +101,7 @@ fn partition(name: &str, allowed: Option<u64>) -> Change {
         }),
         beside_default: Some(TableName::new(name, "rest")),
         moves_at_most: allowed,
-    }
+    })
 }
 
 #[test]
@@ -108,13 +111,13 @@ fn raised_partition_and_numbering_messages_show_names_once() {
         let column = TableName::new(name, "parent").column(name);
         let numbered = sql(
             &pg,
-            &Change::AlterColumnNumbering {
+            &Change::Column(ColumnChange::AlterColumnNumbering {
                 uid: "c_aaaaaa".parse().unwrap(),
                 column,
                 ty: "integer".parse().unwrap(),
                 from: pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence::serial()),
                 to: pbps_model::ValueSource::None,
-            },
+            }),
         );
         let expected = format!(
             "{shown}.parent.{shown} is not numbered by a sequence it owns, as this plan expected; nothing was applied"

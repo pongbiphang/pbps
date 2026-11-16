@@ -189,14 +189,17 @@ fn reference_inserts_and_updates_take_the_restored_function_default() {
             .position(|p| {
                 matches!(
                     p.change,
-                    pbps_model::Change::AlterColumnDefault { to: Some(_), .. }
+                    pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnDefault {
+                        to: Some(_),
+                        ..
+                    })
                 )
             })
             .unwrap();
-        let insert = changes.iter().position(|p| matches!(&p.change, pbps_model::Change::InsertRow { defaults, .. } if defaults.contains_key("old"))).unwrap();
+        let insert = changes.iter().position(|p| matches!(&p.change, pbps_model::Change::Row(pbps_model::RowChange::InsertRow { defaults, .. }) if defaults.contains_key("old"))).unwrap();
         assert!(restore < insert, "{saved:?}");
         if update {
-            let write = changes.iter().position(|p| matches!(&p.change, pbps_model::Change::UpdateRow { columns, .. } if columns.values().any(|(_, to)| matches!(to, pbps_model::Cell::Default(_))))).unwrap();
+            let write = changes.iter().position(|p| matches!(&p.change, pbps_model::Change::Row(pbps_model::RowChange::UpdateRow { columns, .. }) if columns.values().any(|(_, to)| matches!(to, pbps_model::Cell::Default(_))))).unwrap();
             assert!(restore < write, "{saved:?}");
         }
         ok(d.run(&[

@@ -12,6 +12,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::{Conn, DbError, Param};
 use pbps_diff::order::catalog::{Dependent, Holds, Part};
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
+use pbps_model::TypeValueChange;
 use pbps_model::{
     Change, ChangeSet, ColumnName, EnumRebuildStep, IdsFile, ManagedType, ModuleId, Schema,
     TableName, TypeRef,
@@ -92,12 +98,12 @@ pub async fn census(
         .changes
         .iter()
         .filter_map(|p| {
-            if let Change::EnumRebuild {
+            if let Change::TypeValue(TypeValueChange::EnumRebuild {
                 uid,
                 name,
                 tmp,
                 step: EnumRebuildStep::Create { definition, .. },
-            } = &p.change
+            }) = &p.change
             {
                 Some((
                     uid,
@@ -181,14 +187,14 @@ pub async fn census(
         // The columns the plan moves, as the database has them today.
         let mut moved: BTreeSet<(String, String, String)> = BTreeSet::new();
         for planned in &changes.changes {
-            if let Change::EnumRebuild {
+            if let Change::TypeValue(TypeValueChange::EnumRebuild {
                 uid: u,
                 step:
                     EnumRebuildStep::Retype {
                         column_uid, column, ..
                     },
                 ..
-            } = &planned.change
+            }) = &planned.change
                 && u == uid
             {
                 let live = before.columns.get(column_uid).unwrap_or(column);
@@ -457,19 +463,19 @@ impl Renamed {
     fn of(changes: &ChangeSet) -> Self {
         let mut out = Self::default();
         for planned in &changes.changes {
-            if let Change::RenameTable { from, to, .. } = &planned.change {
+            if let Change::Table(TableChange::RenameTable { from, to, .. }) = &planned.change {
                 out.tables.insert(from.clone(), to.clone());
             }
             // A column rename names its table as the plan leaves it; the
             // catalog has the column under the table's name from before, when
             // the plan renamed that too.
-            if let Change::RenameColumn {
+            if let Change::Column(ColumnChange::RenameColumn {
                 table,
                 from,
                 to,
                 table_was,
                 ..
-            } = &planned.change
+            }) = &planned.change
             {
                 out.columns.insert(
                     (
@@ -498,7 +504,7 @@ impl Renamed {
     fn drops_table(&self, changes: &ChangeSet, table: &TableName) -> bool {
         let target = self.table(table);
         changes.changes.iter().any(
-            |p| matches!(&p.change, Change::DropTable { name, .. } if *name == target || name == table),
+            |p| matches!(&p.change, Change::Table(TableChange::DropTable { name, .. }) if *name == target || name == table),
         )
     }
 
@@ -512,7 +518,7 @@ impl Renamed {
         let named = self.column(table, column);
         self.drops_table(changes, table)
             || changes.changes.iter().any(|p| {
-                matches!(&p.change, Change::DropColumn { column: c, .. }
+                matches!(&p.change, Change::Column(ColumnChange::DropColumn { column: c, .. })
                     if c.table == target && c.name == named)
             })
     }
@@ -533,12 +539,16 @@ fn drops(changes: &ChangeSet, table: &TableName, part: &Part) -> bool {
         return true;
     }
     changes.changes.iter().any(|p| match (&p.change, part) {
-        (Change::DropCheck { table: t, name }, Part::Check(n)) => *t == target && name == n,
-        (Change::DropIndex { table: t, name }, Part::Index(n)) => *t == target && name == n,
+        (Change::Constraint(ConstraintChange::DropCheck { table: t, name }), Part::Check(n)) => {
+            *t == target && name == n
+        }
+        (Change::Index(IndexChange::DropIndex { table: t, name }), Part::Index(n)) => {
+            *t == target && name == n
+        }
         (
-            Change::AlterColumnDefault {
+            Change::Column(ColumnChange::AlterColumnDefault {
                 column, to: None, ..
-            },
+            }),
             Part::Default(c),
         ) => column.table == target && column.name == renamed.column(table, c),
         _ => false,
@@ -560,14 +570,14 @@ fn module_verdict(id: &ModuleId, changes: &ChangeSet, declared: Option<&Schema>)
             .any(|p| wanted(&p.change).is_some_and(|m| m == id))
     };
     let drops = planned(|c| {
-        if let Change::DropModule { id, .. } = c {
+        if let Change::Module(ModuleChange::DropModule { id, .. }) = c {
             Some(id)
         } else {
             None
         }
     });
     let restates = planned(|c| {
-        if let Change::AlterModule { id, .. } = c {
+        if let Change::Module(ModuleChange::AlterModule { id, .. }) = c {
             Some(id)
         } else {
             None
@@ -645,6 +655,11 @@ fn verdict(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::IndexChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::TableChange;
     use pbps_model::{Module, ModuleKind, ObjectName, PlannedChange};
 
     fn dependent(holds: Holds) -> Dependent {
@@ -743,10 +758,10 @@ mod tests {
                 verdict(Level::Type, &held, &plan(vec![]), None, &Default::default()),
                 Verdict::Refuse(_)
             ));
-            let dropped = plan(vec![Change::DropModule {
+            let dropped = plan(vec![Change::Module(ModuleChange::DropModule {
                 id: id.clone(),
                 kind,
-            }]);
+            })]);
             assert!(matches!(
                 verdict(Level::Type, &held, &dropped, None, &Default::default()),
                 Verdict::Fine
@@ -780,10 +795,10 @@ mod tests {
                 &Default::default(),
             );
             assert!(matches!(v, Verdict::Refuse(why) if why.contains("after the plan")));
-            let rebuilt = plan(vec![Change::DropModule {
+            let rebuilt = plan(vec![Change::Module(ModuleChange::DropModule {
                 id: id.clone(),
                 kind: ModuleKind::View,
-            }]);
+            })]);
             let v = verdict(
                 level,
                 &dependent(holds.clone()),
@@ -795,7 +810,7 @@ mod tests {
             // A module the plan only restates in place runs after the retype:
             // it is rebuilt around them at planning, and refused as it stands
             // at apply.
-            let restated = plan(vec![Change::AlterModule {
+            let restated = plan(vec![Change::Module(ModuleChange::AlterModule {
                 id: id.clone(),
                 module: Box::new(Module {
                     kind: ModuleKind::View,
@@ -803,7 +818,7 @@ mod tests {
                     definition: "SELECT 2".into(),
                     options: Default::default(),
                 }),
-            }]);
+            })]);
             let v = verdict(
                 level,
                 &dependent(holds.clone()),
@@ -834,16 +849,16 @@ mod tests {
     #[test]
     fn constants_of_the_old_type_need_the_drop_the_plan_makes_and_a_column_alone_does_not() {
         let table = TableName::new("app", "t");
-        let drop_check = Change::DropCheck {
+        let drop_check = Change::Constraint(ConstraintChange::DropCheck {
             table: table.clone(),
             name: "c".into(),
-        };
-        let drop_default = Change::AlterColumnDefault {
+        });
+        let drop_default = Change::Column(ColumnChange::AlterColumnDefault {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "m", 0),
             column: table.column("m"),
             from: Some("'a'".into()),
             to: None,
-        };
+        });
         let planned = plan(vec![drop_check, drop_default]);
         let none = plan(vec![]);
         let schema = Schema::default();
@@ -898,24 +913,26 @@ mod tests {
         // and drops the default under the names it leaves.
         let live = TableName::new("app", "old");
         let target = TableName::new("app", "new");
-        let rename_table = Change::RenameTable {
+        let rename_table = Change::Table(TableChange::RenameTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "t", 0),
             from: live.clone(),
             to: target.clone(),
             defaults: vec![],
-        };
-        let rename_column = Change::RenameColumn {
+        });
+        let rename_column = Change::Column(ColumnChange::RenameColumn {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "m", 0),
             table: target.clone(),
             from: "m".into(),
             to: "mood".into(),
             table_was: Some(live.clone()),
-        };
-        let drop_default = |table: &TableName, column: &str| Change::AlterColumnDefault {
-            uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "m", 0),
-            column: table.column(column),
-            from: Some("'a'".into()),
-            to: None,
+        });
+        let drop_default = |table: &TableName, column: &str| {
+            Change::Column(ColumnChange::AlterColumnDefault {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "m", 0),
+                column: table.column(column),
+                from: Some("'a'".into()),
+                to: None,
+            })
         };
         let held = Holds::TablePart {
             table: live.clone(),
@@ -971,22 +988,22 @@ mod tests {
     fn a_check_and_an_index_on_a_renamed_table_are_matched_by_the_name_it_leaves() {
         let live = TableName::new("app", "old");
         let target = TableName::new("app", "new");
-        let rename = Change::RenameTable {
+        let rename = Change::Table(TableChange::RenameTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "t", 0),
             from: live.clone(),
             to: target.clone(),
             defaults: vec![],
-        };
+        });
         let at = |table: &TableName| {
             [
-                Change::DropCheck {
+                Change::Constraint(ConstraintChange::DropCheck {
                     table: table.clone(),
                     name: "c".into(),
-                },
-                Change::DropIndex {
+                }),
+                Change::Index(IndexChange::DropIndex {
                     table: table.clone(),
                     name: "i".into(),
-                },
+                }),
             ]
         };
         for part in [Part::Check("c".into()), Part::Index("i".into())] {
@@ -1012,18 +1029,18 @@ mod tests {
     }
 
     fn drop_column(table: &str, column: &str) -> Change {
-        Change::DropColumn {
+        Change::Column(ColumnChange::DropColumn {
             uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
             column: TableName::new("app", table).column(column),
-        }
+        })
     }
 
     fn drop_table(table: &str) -> Change {
-        Change::DropTable {
+        Change::Table(TableChange::DropTable {
             uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
             name: TableName::new("app", table),
             detach_from: None,
-        }
+        })
     }
 
     fn gone(changes: &ChangeSet, table: &str, column: &str) -> bool {
@@ -1049,12 +1066,12 @@ mod tests {
         // Named as the plan leaves the table, which the catalog has under its
         // old name.
         let renamed = plan(vec![
-            Change::RenameTable {
+            Change::Table(TableChange::RenameTable {
                 uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
                 from: TableName::new("app", "t"),
                 to: TableName::new("app", "tt"),
                 defaults: vec![],
-            },
+            }),
             drop_column("tt", "m"),
         ]);
         assert!(gone(&renamed, "t", "m"));

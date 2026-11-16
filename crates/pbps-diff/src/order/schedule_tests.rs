@@ -1,6 +1,7 @@
 //! `settle` on its own: the properties and negatives #1956 names, over edges
 //! stated by hand. The effect graph's own cases are in `tests.rs`.
 
+use pbps_model::RoleChange;
 use pbps_model::resolver::OrderReason;
 use pbps_model::{Change, ChangeSet, PlannedChange};
 
@@ -13,10 +14,10 @@ fn plan(names: &[&str]) -> ChangeSet {
         changes: names
             .iter()
             .map(|name| {
-                PlannedChange::new(Change::CreateRole {
+                PlannedChange::new(Change::Role(RoleChange::CreateRole {
                     uid: "r_aaaaaa".parse().unwrap(),
                     name: (*name).into(),
-                })
+                }))
             })
             .collect(),
     }
@@ -320,10 +321,10 @@ fn a_long_cycle_is_named_without_overflowing_the_stack() {
     let changes = ChangeSet {
         changes: (0..n)
             .map(|_| {
-                PlannedChange::new(Change::CreateRole {
+                PlannedChange::new(Change::Role(RoleChange::CreateRole {
                     uid: "r_aaaaaa".parse().unwrap(),
                     name: "r".into(),
-                })
+                }))
             })
             .collect(),
     };
@@ -491,10 +492,10 @@ fn ordering_refusals_show_raw_subject_keys_once_without_changing_the_keys() {
         ("r\n\u{1b}[31m\\\u{202e}", r"r\n\u{1b}[31m\\\u{202e}"),
         ("名前_ünï❤️", "名前_ünï❤️"),
     ] {
-        let change = pbps_model::Change::CreateRole {
+        let change = pbps_model::Change::Role(pbps_model::RoleChange::CreateRole {
             uid: "r_aaaaaa".parse().unwrap(),
             name: name.into(),
-        };
+        });
         let raw = change.subject();
         let changes = pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange::new(change)],

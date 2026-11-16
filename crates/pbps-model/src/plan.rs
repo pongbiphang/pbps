@@ -95,7 +95,7 @@ use crate::zone::SessionZone;
 /// baseline cells whose columns are dropped. Older readers deny unknown
 /// change fields; the version identifies that format boundary (DECISIONS 442).
 ///
-/// Bumped to 9 for `Change::PublicExecution`, which is a boundary in both
+/// Bumped to 9 for `GrantChange::PublicExecution`, which is a boundary in both
 /// directions (DECISIONS 517). A version 8 reader meets an unknown change
 /// variant and calls the file broken, when what it is is newer — the same
 /// shape as the field boundary above, one level up. And a version 8 plan
@@ -929,6 +929,10 @@ fn digest_of<T: serde::Serialize>(value: &T) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::change::ColumnChange;
+    use crate::change::ModuleChange;
+    use crate::change::RoleChange;
+    use crate::change::TableChange;
     use crate::change::{Change, PlannedChange};
     use crate::module::{Module, ModuleKind};
     use crate::name::TableName;
@@ -1253,18 +1257,20 @@ mod tests {
     fn column_order_still_changes_a_plans_own_checksum() {
         let created = |order: &[&str]| {
             plan_over(ChangeSet {
-                changes: vec![PlannedChange::new(Change::CreateTable {
-                    uid: "t_a1b2c3".parse().unwrap(),
-                    name: TableName::new("dbo", "customer"),
-                    table: Box::new(
-                        schema_of(order)
-                            .tables
-                            .remove(&TableName::new("dbo", "customer"))
-                            .unwrap(),
-                    ),
-                    beside_default: None,
-                    moves_at_most: None,
-                })],
+                changes: vec![PlannedChange::new(Change::Table(
+                    TableChange::CreateTable {
+                        uid: "t_a1b2c3".parse().unwrap(),
+                        name: TableName::new("dbo", "customer"),
+                        table: Box::new(
+                            schema_of(order)
+                                .tables
+                                .remove(&TableName::new("dbo", "customer"))
+                                .unwrap(),
+                        ),
+                        beside_default: None,
+                        moves_at_most: None,
+                    },
+                ))],
             })
             .wire_fingerprint()
         };
@@ -1287,11 +1293,11 @@ mod tests {
     fn a_changed_plan_changes_its_checksum() {
         let empty = plan_over(ChangeSet::default());
         let one = plan_over(ChangeSet {
-            changes: vec![PlannedChange::new(Change::DropTable {
+            changes: vec![PlannedChange::new(Change::Table(TableChange::DropTable {
                 uid: "t_a1b2c3".parse().unwrap(),
                 name: TableName::new("dbo", "customer"),
                 detach_from: None,
-            })],
+            }))],
         });
         assert_ne!(empty.wire_fingerprint(), one.wire_fingerprint());
         assert_eq!(
@@ -1347,10 +1353,10 @@ mod tests {
     #[test]
     fn unknown_scope_and_finding_fields_in_saved_plans_are_refused() {
         let mut plan = plan_over(ChangeSet {
-            changes: vec![PlannedChange::new(Change::CreateRole {
+            changes: vec![PlannedChange::new(Change::Role(RoleChange::CreateRole {
                 name: "app_reader".into(),
                 uid: "r_a1b2c3".parse().unwrap(),
-            })],
+            }))],
         });
         plan.data.insert(
             TableName::new("dbo", "customer"),
@@ -1396,11 +1402,11 @@ mod tests {
     #[test]
     fn unknown_change_fields_are_refused() {
         let mut json = serde_json::to_value(plan_over(ChangeSet {
-            changes: vec![PlannedChange::new(Change::DropTable {
+            changes: vec![PlannedChange::new(Change::Table(TableChange::DropTable {
                 uid: "t_a1b2c3".parse().unwrap(),
                 name: TableName::new("dbo", "customer"),
                 detach_from: None,
-            })],
+            }))],
         }))
         .unwrap();
         json["changes"]["changes"][0]["approved"] = serde_json::Value::Bool(true);
@@ -1414,12 +1420,14 @@ mod tests {
     fn unknown_nested_plan_fields_are_refused() {
         let add_column = || {
             plan_over(ChangeSet {
-                changes: vec![PlannedChange::new(Change::AddColumn {
-                    uid: "c_a1b2c3".parse().unwrap(),
-                    table: TableName::new("dbo", "customer"),
-                    name: "score".into(),
-                    column: Box::new(Column::new("int".parse().unwrap())),
-                })],
+                changes: vec![PlannedChange::new(Change::Column(
+                    ColumnChange::AddColumn {
+                        uid: "c_a1b2c3".parse().unwrap(),
+                        table: TableName::new("dbo", "customer"),
+                        name: "score".into(),
+                        column: Box::new(Column::new("int".parse().unwrap())),
+                    },
+                ))],
             })
         };
 
@@ -1432,28 +1440,32 @@ mod tests {
         assert!(serde_json::from_value::<SavedPlan>(strategy).is_err());
 
         let mut table = serde_json::to_value(plan_over(ChangeSet {
-            changes: vec![PlannedChange::new(Change::CreateTable {
-                uid: "t_a1b2c3".parse().unwrap(),
-                name: TableName::new("dbo", "customer"),
-                table: Box::new(Table::default()),
-                beside_default: None,
-                moves_at_most: None,
-            })],
+            changes: vec![PlannedChange::new(Change::Table(
+                TableChange::CreateTable {
+                    uid: "t_a1b2c3".parse().unwrap(),
+                    name: TableName::new("dbo", "customer"),
+                    table: Box::new(Table::default()),
+                    beside_default: None,
+                    moves_at_most: None,
+                },
+            ))],
         }))
         .unwrap();
         table["changes"]["changes"][0]["table"]["colums"] = serde_json::json!({});
         assert!(serde_json::from_value::<SavedPlan>(table).is_err());
 
         let mut module = serde_json::to_value(plan_over(ChangeSet {
-            changes: vec![PlannedChange::new(Change::CreateModule {
-                id: crate::ModuleId::Named(TableName::new("dbo", "active_customer")),
-                module: Box::new(Module {
-                    kind: ModuleKind::View,
-                    description: None,
-                    definition: "SELECT 1 AS id".into(),
-                    options: Default::default(),
-                }),
-            })],
+            changes: vec![PlannedChange::new(Change::Module(
+                ModuleChange::CreateModule {
+                    id: crate::ModuleId::Named(TableName::new("dbo", "active_customer")),
+                    module: Box::new(Module {
+                        kind: ModuleKind::View,
+                        description: None,
+                        definition: "SELECT 1 AS id".into(),
+                        options: Default::default(),
+                    }),
+                },
+            ))],
         }))
         .unwrap();
         module["changes"]["changes"][0]["module"]["defintion"] =
@@ -1695,18 +1707,20 @@ mod tests {
         // The evidence is part of what the plan is: it changes the checksum.
         assert_ne!(plan.wire_fingerprint(), dropping.wire_fingerprint());
         // Negative: a drop change with nothing to wait for writes neither list.
-        let change = serde_json::to_value(crate::Change::DropExtension {
-            uid: "e_aaaaaa".parse().unwrap(),
-            name: "citext".into(),
-            definition: crate::Extension {
-                schema: "ext".into(),
-                version: "1.0".into(),
+        let change = serde_json::to_value(crate::Change::Extension(
+            crate::ExtensionChange::DropExtension {
+                uid: "e_aaaaaa".parse().unwrap(),
+                name: "citext".into(),
+                definition: crate::Extension {
+                    schema: "ext".into(),
+                    version: "1.0".into(),
+                },
+                requirers: Default::default(),
+                releases: Default::default(),
+                index_releases: Default::default(),
+                search_releases: Default::default(),
             },
-            requirers: Default::default(),
-            releases: Default::default(),
-            index_releases: Default::default(),
-            search_releases: Default::default(),
-        })
+        ))
         .unwrap();
         let payload = change.get("drop_extension").unwrap_or(&change);
         assert!(

@@ -1,6 +1,8 @@
 //! Whole-table holds and the readers behind them, as the constraints on the
 //! parts order them (DEC-1959.3, DEC-2389.1).
 use super::*;
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
 use pbps_model::{
     Column, ForeignKey, Generated, IdsFile, Module, PrimaryKey, Schema, Table, TableName, Uid,
     UidKind,
@@ -130,20 +132,22 @@ fn bootstrap(schema: &Schema, seed: u32) -> (Vec<Change>, IdsFile) {
                 column,
             );
         }
-        changes.push(Change::CreateTable {
+        changes.push(Change::Table(TableChange::CreateTable {
             uid,
             name: name.clone(),
             table: Box::new(table.clone()),
             beside_default: None,
             moves_at_most: None,
-        });
+        }));
     }
     let mut modules: Vec<_> = schema
         .modules
         .iter()
-        .map(|(id, module)| Change::CreateModule {
-            id: id.clone(),
-            module: Box::new(module.clone()),
+        .map(|(id, module)| {
+            Change::Module(ModuleChange::CreateModule {
+                id: id.clone(),
+                module: Box::new(module.clone()),
+            })
         })
         .collect();
     let count = modules.len();
@@ -220,7 +224,7 @@ fn multiple_holds_and_their_readers_follow_their_functions_for_32_uid_seeds() {
                     changes
                         .iter()
                         .position(
-                            |c| matches!(c, Change::CreateModule { id, .. } if id.name() == name),
+                            |c| matches!(c, Change::Module(ModuleChange::CreateModule { id, .. }) if id.name() == name),
                         )
                         .unwrap()
                 };

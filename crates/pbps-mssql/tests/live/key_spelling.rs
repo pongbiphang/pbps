@@ -1,8 +1,9 @@
 use super::*;
+use pbps_model::RowChange;
 use pbps_model::{Cell, Change, Row, RowKey, Value};
 
 fn insert(table: &str, key: &str) -> Change {
-    Change::InsertRow {
+    Change::Row(RowChange::InsertRow {
         table: TableName::new("dbo", table),
         key_column: "co'de]x".into(),
         identity_key: false,
@@ -10,11 +11,11 @@ fn insert(table: &str, key: &str) -> Change {
         row: Row([("label".into(), Value::Text("a".into()))].into()),
         defaults: Default::default(),
         types: [("label".into(), ty("nvarchar(20)"))].into(),
-    }
+    })
 }
 
 fn update(table: &str, key: &str) -> Change {
-    Change::UpdateRow {
+    Change::Row(RowChange::UpdateRow {
         table: TableName::new("dbo", table),
         key_column: "co'de]x".into(),
         key: RowKey::from(key),
@@ -30,7 +31,7 @@ fn update(table: &str, key: &str) -> Change {
         types: [("label".into(), ty("nvarchar(20)"))].into(),
         after_types: Default::default(),
         key_type: None,
-    }
+    })
 }
 
 async fn contents(conn: &mut Conn, table: &str) -> Vec<(String, String)> {

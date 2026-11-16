@@ -1,5 +1,6 @@
 //! Reference-data scope changes reach the ordinary saved-plan gate (DEC-1803.1, DEC-1808.1).
 use super::{Demo, OwnDatabase, code, on_server, stderr, stdout};
+use pbps_model::RowChange;
 use pbps_model::{Change, DataMode, SavedPlan};
 use std::process::Output;
 
@@ -98,7 +99,7 @@ fn assert_takeover(saved: &SavedPlan, table: &str, mode: DataMode) {
         .changes
         .iter()
         .filter_map(|planned| {
-            if let Change::SetDataMode { table, from, to } = &planned.change {
+            if let Change::Row(RowChange::SetDataMode { table, from, to }) = &planned.change {
                 Some((table.raw().to_string(), *from, *to))
             } else {
                 None
@@ -277,7 +278,7 @@ fn assert_keys(saved: &SavedPlan, table: &str, from: &[&str], to: &[&str]) {
         .changes
         .iter()
         .filter_map(|p| {
-            if let Change::SetEnsureKeys { table, from, to } = &p.change {
+            if let Change::Row(RowChange::SetEnsureKeys { table, from, to }) = &p.change {
                 Some((table.raw().to_string(), from.clone(), to.clone()))
             } else {
                 None
@@ -466,7 +467,7 @@ pub fn ensure_writes_and_rename(server: &str, pg: bool) {
             .changes
             .changes
             .iter()
-            .any(|p| matches!(&p.change, Change::InsertRow { .. }))
+            .any(|p| matches!(&p.change, Change::Row(RowChange::InsertRow { .. })))
     );
     ok(apply(&d, connection, &saved.wire_fingerprint(), false));
     ensure_rows(
@@ -478,7 +479,7 @@ pub fn ensure_writes_and_rename(server: &str, pg: bool) {
     assert_eq!(saved.changes.changes.len(), 1);
     assert!(matches!(
         &saved.changes.changes[0].change,
-        Change::UpdateRow { .. }
+        Change::Row(RowChange::UpdateRow { .. })
     ));
     let path = d.dir.join("plan.json");
     ok(d.run(&[

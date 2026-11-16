@@ -4,6 +4,14 @@ use super::{
     binding::{Entry, Target},
     effective::{ColumnPair, Interfaces},
 };
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
+use pbps_model::TypeChange;
+use pbps_model::TypeValueChange;
 use pbps_model::{
     Change, ColumnName, DomainDelta, DomainHalf, ManagedType, PlannedChange, RiskClass, TypeRef,
     Uid, ValueSource,
@@ -131,8 +139,8 @@ pub(super) fn classify(
                 .then_some(U)
         };
     match &p.change {
-        Change::RebuildPartitionedTable(_) => hit.then_some(U),
-        Change::BuildPartitionedIndex(index) => {
+        Change::Partition(PartitionChange::RebuildPartitionedTable(_)) => hit.then_some(U),
+        Change::Index(IndexChange::BuildPartitionedIndex(index)) => {
             let unique = match &index.definition {
                 pbps_model::PartitionIndexDefinition::Index(i) => i.unique,
                 pbps_model::PartitionIndexDefinition::PrimaryKey(_)
@@ -140,20 +148,21 @@ pub(super) fn classify(
             };
             write(write_hit && unique && !unchanged(&p.change, table))
         }
-        Change::RenameEnumValue { name, .. } | Change::DropType { name, .. } => {
-            uses_type(name).then_some(U)
+        Change::TypeValue(TypeValueChange::RenameEnumValue { name, .. })
+        | Change::Type(TypeChange::DropType { name, .. }) => uses_type(name).then_some(U),
+        Change::Type(TypeChange::RenameType { from, to, .. }) => {
+            (uses_type(from) || uses_type(to)).then_some(U)
         }
-        Change::RenameType { from, to, .. } => (uses_type(from) || uses_type(to)).then_some(U),
-        Change::AlterDomain {
+        Change::TypeValue(TypeValueChange::AlterDomain {
             name,
             from,
             to,
             half,
             ..
-        } => domain(name, from, to, Some(*half)),
-        Change::EnumRebuild {
+        }) => domain(name, from, to, Some(*half)),
+        Change::TypeValue(TypeValueChange::EnumRebuild {
             uid, name, step, ..
-        } => match step {
+        }) => match step {
             pbps_model::EnumRebuildStep::Retype {
                 column_uid, values, ..
             } => match values.as_ref() {
@@ -169,29 +178,32 @@ pub(super) fn classify(
             }
             pbps_model::EnumRebuildStep::Swap { .. } => None,
         },
-        Change::CreateTable { table: shape, .. } => {
+        Change::Table(TableChange::CreateTable { table: shape, .. }) => {
             write(shape.partition_of.as_ref().is_some_and(|of| {
                 sides
                     .iter()
                     .any(|s| s.ids.table_uid(&of.parent) == entry.table())
             }))
         }
-        Change::DropTable { .. } | Change::RenameTable { .. } => hit.then_some(B),
-        Change::DetachPartition { parent, .. } | Change::AttachPartition { parent, .. } => write(
+        Change::Table(TableChange::DropTable { .. })
+        | Change::Table(TableChange::RenameTable { .. }) => hit.then_some(B),
+        Change::Partition(PartitionChange::DetachPartition { parent, .. })
+        | Change::Partition(PartitionChange::AttachPartition { parent, .. }) => write(
             hit || sides
                 .iter()
                 .any(|s| s.ids.table_uid(parent) == entry.table()),
         ),
-        Change::DropColumn { uid, .. } | Change::RenameColumn { uid, .. } => {
-            column(uid).then_some(B)
+        Change::Column(ColumnChange::DropColumn { uid, .. })
+        | Change::Column(ColumnChange::RenameColumn { uid, .. }) => column(uid).then_some(B),
+        Change::Column(ColumnChange::AddColumn { uid, .. }) => {
+            write(interfaces.columns().any(|pair| {
+                pair.has_uid(uid)
+                    && written_pair(pair)
+                    && pair.after.is_some_and(|c| !c.column.nullable)
+                    && !pair.supplied()
+            }))
         }
-        Change::AddColumn { uid, .. } => write(interfaces.columns().any(|pair| {
-            pair.has_uid(uid)
-                && written_pair(pair)
-                && pair.after.is_some_and(|c| !c.column.nullable)
-                && !pair.supplied()
-        })),
-        Change::AlterColumnType { uid, .. } => retype(
+        Change::Column(ColumnChange::AlterColumnType { uid, .. }) => retype(
             uid,
             interfaces
                 .columns()
@@ -202,27 +214,27 @@ pub(super) fn classify(
                 .filter(|pair| pair.has_uid(uid))
                 .any(collation),
         ),
-        Change::AlterColumnNullability { uid, .. } => interfaces
+        Change::Column(ColumnChange::AlterColumnNullability { uid, .. }) => interfaces
             .columns()
             .filter(|pair| pair.has_uid(uid))
             .any(nullability)
             .then_some(U),
-        Change::AlterColumnDefault { uid, .. } => interfaces
+        Change::Column(ColumnChange::AlterColumnDefault { uid, .. }) => interfaces
             .columns()
             .filter(|pair| pair.has_uid(uid))
             .any(default)
             .then_some(U),
-        Change::AlterColumnExpression { uid, .. } => {
+        Change::Column(ColumnChange::AlterColumnExpression { uid, .. }) => {
             (column(uid) || (entry.writes && hit)).then_some(U)
         }
-        Change::AlterColumnNumbering { uid, .. } => write(
+        Change::Column(ColumnChange::AlterColumnNumbering { uid, .. }) => write(
             column(uid)
                 && (p.risks.contains(&RiskClass::Numbering)
                     || p.risks.contains(&RiskClass::Rename)),
         ),
-        Change::DropComputedColumn {
+        Change::Column(ColumnChange::DropComputedColumn {
             table: owner, name, ..
-        } => {
+        }) => {
             if !named(name) || entry.writes {
                 return None;
             }
@@ -237,14 +249,14 @@ pub(super) fn classify(
                 Some(if restored { U } else { B })
             }
         }
-        Change::SetPartitionDefault { column, .. } => interfaces
+        Change::Partition(PartitionChange::SetPartitionDefault { column, .. }) => interfaces
             .columns()
             .filter(|pair| {
                 table == Some(pair.table) && pair.addresses().any(|at| &at.name == column)
             })
             .any(default)
             .then_some(U),
-        Change::SetPartitionNotNull { column, .. } => interfaces
+        Change::Partition(PartitionChange::SetPartitionNotNull { column, .. }) => interfaces
             .columns()
             .filter(|pair| {
                 table == Some(pair.table) && pair.addresses().any(|at| &at.name == column)
@@ -253,17 +265,17 @@ pub(super) fn classify(
             .then_some(U),
         // Restoration equivalence belongs to the differ, including generated
         // names, inferred attributes, rename remapping and parameter-only edits.
-        Change::SetPrimaryKey { to, .. } => {
+        Change::Constraint(ConstraintChange::SetPrimaryKey { to, .. }) => {
             write(write_hit && to.is_some() && !unchanged(&p.change, table))
         }
         // An exclusion is added as a unique constraint is: it checks the rows
         // the table holds; dropping one asks nothing of a consumer.
-        Change::AddUnique { .. }
-        | Change::AddCheck { .. }
-        | Change::SetExclusion { to: Some(_), .. } => {
+        Change::Constraint(ConstraintChange::AddUnique { .. })
+        | Change::Constraint(ConstraintChange::AddCheck { .. })
+        | Change::Constraint(ConstraintChange::SetExclusion { to: Some(_), .. }) => {
             write(write_hit && !unchanged(&p.change, table))
         }
-        Change::AddForeignKey { constraint, .. } => write(
+        Change::Constraint(ConstraintChange::AddForeignKey { constraint, .. }) => write(
             !unchanged(&p.change, table)
                 && (write_hit
                     || sides.iter().any(|s| {
@@ -272,17 +284,18 @@ pub(super) fn classify(
                             .is_some_and(|uid| written.is_some_and(|set| set.contains(uid)))
                     })),
         ),
-        Change::AddIndex { index, .. } => {
+        Change::Index(IndexChange::AddIndex { index, .. }) => {
             write(write_hit && index.unique && !unchanged(&p.change, table))
         }
-        Change::CreateModule { id, .. } | Change::AlterModule { id, .. } => (entry.target
+        Change::Module(ModuleChange::CreateModule { id, .. })
+        | Change::Module(ModuleChange::AlterModule { id, .. }) => (entry.target
             == Target::Module(id.clone())
             && !unchanged(&p.change, table)
             && sides
                 .first()
                 .is_some_and(|s| s.schema.modules.contains_key(id)))
         .then_some(U),
-        Change::DropModule { id, .. } => {
+        Change::Module(ModuleChange::DropModule { id, .. }) => {
             if entry.target != Target::Module(id.clone()) || unchanged(&p.change, table) {
                 None
             } else {
@@ -298,22 +311,22 @@ pub(super) fn classify(
                 )
             }
         }
-        Change::CopyTableRows(_)
-        | Change::AnalyzeTableTree(_)
-        | Change::AddEnumValue { .. }
-        | Change::CreateType { .. }
+        Change::Partition(PartitionChange::CopyTableRows(_))
+        | Change::Partition(PartitionChange::AnalyzeTableTree(_))
+        | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+        | Change::Type(TypeChange::CreateType { .. })
         | pbps_model::change_family!(extensions)
         | pbps_model::change_family!(search)
-        | Change::AddComputedColumn { .. }
-        | Change::SetColumnDeprecated { .. }
+        | Change::Column(ColumnChange::AddComputedColumn { .. })
+        | Change::Column(ColumnChange::SetColumnDeprecated { .. })
         | pbps_model::change_family!(table_properties)
-        | Change::SetIndexStorageParameters { .. }
+        | Change::Index(IndexChange::SetIndexStorageParameters { .. })
         | pbps_model::change_family!(policies)
-        | Change::DropUnique { .. }
-        | Change::SetExclusion { to: None, .. }
-        | Change::DropForeignKey { .. }
-        | Change::DropCheck { .. }
-        | Change::DropIndex { .. }
+        | Change::Constraint(ConstraintChange::DropUnique { .. })
+        | Change::Constraint(ConstraintChange::SetExclusion { to: None, .. })
+        | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+        | Change::Constraint(ConstraintChange::DropCheck { .. })
+        | Change::Index(IndexChange::DropIndex { .. })
         | pbps_model::change_family!(rows)
         | pbps_model::change_family!(roles)
         | pbps_model::change_family!(permissions) => None,

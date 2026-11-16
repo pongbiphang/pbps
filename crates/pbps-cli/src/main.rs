@@ -2465,6 +2465,12 @@ pub fn attach_policy_findings<S: Clone>(
 #[cfg(test)]
 mod consumer_contract_tests {
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::IndexChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::PartitionChange;
+    use pbps_model::TypeValueChange;
     use pbps_model::{
         Change, ChangeSet, IdsFile, Module, ModuleKind, ModuleOptions, PlannedChange, Schema,
     };
@@ -2647,9 +2653,10 @@ mod consumer_contract_tests {
                         .collect(),
                 };
                 assert!(
-                    cs.changes
-                        .iter()
-                        .any(|p| matches!(&p.change, Change::EnumRebuild { .. })),
+                    cs.changes.iter().any(|p| matches!(
+                        &p.change,
+                        Change::TypeValue(TypeValueChange::EnumRebuild { .. })
+                    )),
                     "{label}/{ty}: {cs:?}"
                 );
                 let sides = [
@@ -2900,51 +2907,53 @@ mod consumer_contract_tests {
                     }
                 }
                 let restoration = match kind {
-                    Part::Computed => Change::DropComputedColumn {
+                    Part::Computed => Change::Column(ColumnChange::DropComputedColumn {
                         table: table.clone(),
                         name: "derived".into(),
                         computed: shape.computed["derived"].clone(),
-                    },
-                    Part::PrimaryKey => Change::SetPrimaryKey {
+                    }),
+                    Part::PrimaryKey => Change::Constraint(ConstraintChange::SetPrimaryKey {
                         table: table.clone(),
                         from: None,
                         to: after.primary_key.clone(),
                         nonclustered: !after.primary_key_is_clustered(),
-                    },
-                    Part::Unique => Change::AddUnique {
+                    }),
+                    Part::Unique => Change::Constraint(ConstraintChange::AddUnique {
                         table: table.clone(),
                         name: "uq".into(),
                         constraint: after.unique["uq"].clone(),
                         clustered: after.unique_is_clustered("uq"),
-                    },
+                    }),
                     // The physical rebuild can carry the engine's expression spelling.
-                    Part::Check => Change::AddCheck {
+                    Part::Check => Change::Constraint(ConstraintChange::AddCheck {
                         table: table.clone(),
                         name: "ck".into(),
                         constraint: CheckConstraint {
                             expression: if changed { "old > 10" } else { "((old)>(0))" }.into(),
                         },
-                    },
-                    Part::ForeignKey => Change::AddForeignKey {
+                    }),
+                    Part::ForeignKey => Change::Constraint(ConstraintChange::AddForeignKey {
                         table: table.clone(),
                         name: "fk".into(),
                         constraint: Box::new(after.foreign_keys["fk"].clone()),
-                    },
-                    Part::Index => Change::AddIndex {
+                    }),
+                    Part::Index => Change::Index(IndexChange::AddIndex {
                         table: table.clone(),
                         name: "ix".into(),
                         index: Box::new(after.indexes["ix"].clone()),
                         clustered: after.index_is_clustered("ix"),
-                    },
+                    }),
                     Part::Policy | Part::Exclusion => unreachable!(),
                 };
                 let mut changes = vec![PlannedChange::new(restoration)];
                 if kind == Part::Computed {
-                    changes.push(PlannedChange::new(Change::AddComputedColumn {
-                        table: table.clone(),
-                        name: "derived".into(),
-                        computed: after.computed["derived"].clone(),
-                    }));
+                    changes.push(PlannedChange::new(Change::Column(
+                        ColumnChange::AddComputedColumn {
+                            table: table.clone(),
+                            name: "derived".into(),
+                            computed: after.computed["derived"].clone(),
+                        },
+                    )));
                 }
                 let cs = ChangeSet { changes };
                 let consumers: Consumers = [(
@@ -3107,7 +3116,7 @@ mod consumer_contract_tests {
             let id: pbps_model::ModuleId = "app.f".parse().unwrap();
             let default_change = |from, to| {
                 if partition {
-                    Change::SetPartitionDefault {
+                    Change::Partition(PartitionChange::SetPartitionDefault {
                         uid: owner.clone(),
                         table: table.clone(),
                         parent: parent.clone(),
@@ -3115,24 +3124,24 @@ mod consumer_contract_tests {
                         from,
                         to,
                         fallback: Some("app.f()".into()),
-                    }
+                    })
                 } else {
-                    Change::AlterColumnDefault {
+                    Change::Column(ColumnChange::AlterColumnDefault {
                         uid: column.clone(),
                         column: table.column("old"),
                         from,
                         to,
-                    }
+                    })
                 }
             };
             let cs = ChangeSet {
                 changes: vec![
                     PlannedChange::new(default_change(Some("app.f()".into()), None)),
-                    PlannedChange::new(Change::DropModule {
+                    PlannedChange::new(Change::Module(ModuleChange::DropModule {
                         id: id.clone(),
                         kind: ModuleKind::Function,
-                    }),
-                    PlannedChange::new(Change::CreateModule {
+                    })),
+                    PlannedChange::new(Change::Module(ModuleChange::CreateModule {
                         id,
                         module: Box::new(Module {
                             kind: ModuleKind::Function,
@@ -3140,7 +3149,7 @@ mod consumer_contract_tests {
                             description: None,
                             options: ModuleOptions::default(),
                         }),
-                    }),
+                    })),
                     PlannedChange::new(default_change(None, Some(desired.into()))),
                 ],
             };
@@ -3274,14 +3283,14 @@ mod consumer_contract_tests {
                 let bound = Bindings::resolve(&consumers, &sides, &Clone::clone).unwrap();
                 let cs = ChangeSet {
                     changes: vec![
-                        PlannedChange::new(Change::DropModule {
+                        PlannedChange::new(Change::Module(ModuleChange::DropModule {
                             id: id.clone(),
                             kind: module.kind,
-                        }),
-                        PlannedChange::new(Change::CreateModule {
+                        })),
+                        PlannedChange::new(Change::Module(ModuleChange::CreateModule {
                             id: id.clone(),
                             module: Box::new(restored),
-                        }),
+                        })),
                     ],
                 };
                 let findings = pbps_policy::consumers::plan(
@@ -5951,9 +5960,16 @@ pub(crate) fn logical_changes(cs: &pbps_model::ChangeSet) -> usize {
         // `if let` rather than a match with a wildcard: no other change
         // brings a routine into being, so there is no list to enumerate and
         // none to keep up to date.
-        let id = if let pbps_model::Change::CreateModule { id, .. } = &planned.change {
+        let id = if let pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule {
+            id,
+            ..
+        }) = &planned.change
+        {
             id
-        } else if let pbps_model::Change::AlterModule { id, .. } = &planned.change {
+        } else if let pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule {
+            id, ..
+        }) = &planned.change
+        {
             id
         } else {
             continue;
@@ -5970,9 +5986,16 @@ pub(crate) fn logical_changes(cs: &pbps_model::ChangeSet) -> usize {
     cs.changes
         .iter()
         .filter(|planned| {
-            if let pbps_model::Change::PublicExecution { routine, .. } = &planned.change {
+            if let pbps_model::Change::Permission(pbps_model::GrantChange::PublicExecution {
+                routine,
+                ..
+            }) = &planned.change
+            {
                 !built.contains(routine)
-            } else if let pbps_model::Change::EnumRebuild { uid, .. } = &planned.change {
+            } else if let pbps_model::Change::TypeValue(
+                pbps_model::TypeValueChange::EnumRebuild { uid, .. },
+            ) = &planned.change
+            {
                 rebuilt.insert(uid)
             } else {
                 true
@@ -6019,17 +6042,19 @@ fn public_execution_decisions_match_their_modules(
     cs: &pbps_model::ChangeSet,
     dialect: &dyn Dialect,
 ) -> anyhow::Result<()> {
+    use pbps_model::GrantChange;
+    use pbps_model::ModuleChange;
     use pbps_model::{Change, ModuleId, RoutineOrigin};
 
     let routine_of = |change: &Change| -> Option<(u8, pbps_model::RoutineId)> {
         // `if let` rather than a match with a wildcard: these are the three
         // changes that decide whether an object is there afterwards, and a
         // list of all the rest would need maintaining for nothing.
-        let (rank, id) = if let Change::CreateModule { id, .. } = change {
+        let (rank, id) = if let Change::Module(ModuleChange::CreateModule { id, .. }) = change {
             (0u8, id)
-        } else if let Change::AlterModule { id, .. } = change {
+        } else if let Change::Module(ModuleChange::AlterModule { id, .. }) = change {
             (1, id)
-        } else if let Change::DropModule { id, .. } = change {
+        } else if let Change::Module(ModuleChange::DropModule { id, .. }) = change {
             (2, id)
         } else {
             return None;
@@ -6066,9 +6091,9 @@ fn public_execution_decisions_match_their_modules(
     let mut decided: std::collections::BTreeMap<&pbps_model::RoutineId, usize> =
         std::collections::BTreeMap::new();
     for (index, planned) in cs.changes.iter().enumerate() {
-        let Change::PublicExecution {
+        let Change::Permission(GrantChange::PublicExecution {
             routine, origin, ..
-        } = &planned.change
+        }) = &planned.change
         else {
             continue;
         };
@@ -6718,6 +6743,7 @@ mod tests {
     /// identity is a routine that existed a statement earlier.
     #[test]
     fn a_public_decision_is_believed_only_where_the_plan_bears_out_its_origin() {
+        use pbps_model::GrantChange;
         use pbps_model::{Change, PublicAccess, RoutineOrigin};
 
         // What the differ writes, each of the three shapes.
@@ -6754,11 +6780,11 @@ mod tests {
         let e = pg_verdict(vec![
             create(),
             decided(RoutineOrigin::Created),
-            Change::PublicExecution {
+            Change::Permission(GrantChange::PublicExecution {
                 routine: "app.f(integer)".parse().unwrap(),
                 access: PublicAccess::Kept,
                 origin: RoutineOrigin::Created,
-            },
+            }),
         ])
         .expect_err("two decisions on one routine")
         .to_string();
@@ -6777,6 +6803,7 @@ mod tests {
     /// `EXECUTE` privilege to decide about.
     #[test]
     fn a_routine_this_plan_builds_must_carry_a_public_decision() {
+        use pbps_model::ModuleChange;
         use pbps_model::{Change, ModuleKind, RoutineOrigin};
 
         for silent in [vec![create()], vec![alter()]] {
@@ -6790,7 +6817,7 @@ mod tests {
         assert!(pg_verdict(vec![drop_it()]).is_ok());
         // Nothing but a routine has an `EXECUTE` privilege to settle.
         assert!(
-            pg_verdict(vec![Change::CreateModule {
+            pg_verdict(vec![Change::Module(ModuleChange::CreateModule {
                 id: "app.v".parse().unwrap(),
                 module: Box::new(pbps_model::Module {
                     kind: ModuleKind::View,
@@ -6798,7 +6825,7 @@ mod tests {
                     definition: "AS SELECT 1 AS one".into(),
                     options: Default::default(),
                 }),
-            }])
+            })])
             .is_ok()
         );
         // And an engine that grants no such default has no decision to make,
@@ -6831,18 +6858,24 @@ mod tests {
     /// (DEC-2032.1, #2035). Negative: a Unicode name is shown as it is.
     #[test]
     fn a_refusal_naming_a_routine_shows_its_name_escaped() {
+        use pbps_model::GrantChange;
+        use pbps_model::ModuleChange;
         use pbps_model::{Change, PublicAccess, RoutineOrigin};
         const HOSTILE: &str = "f\n\u{1b}[31mred\r\u{202e}";
         const SHOWN: &str = "f\\n\\u{1b}[31mred\\r\\u{202e}";
         let routine = |name: &str| format!("app.{name}(integer)");
-        let create = |name: &str| Change::CreateModule {
-            id: routine(name).parse().unwrap(),
-            module: routine_module(),
+        let create = |name: &str| {
+            Change::Module(ModuleChange::CreateModule {
+                id: routine(name).parse().unwrap(),
+                module: routine_module(),
+            })
         };
-        let decide = |name: &str, origin| Change::PublicExecution {
-            routine: routine(name).parse().unwrap(),
-            access: PublicAccess::Revoked,
-            origin,
+        let decide = |name: &str, origin| {
+            Change::Permission(GrantChange::PublicExecution {
+                routine: routine(name).parse().unwrap(),
+                access: PublicAccess::Revoked,
+                origin,
+            })
         };
         for (what, changes) in [
             (
@@ -6884,32 +6917,32 @@ mod tests {
     }
 
     fn create() -> pbps_model::Change {
-        pbps_model::Change::CreateModule {
+        pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule {
             id: "app.f(integer)".parse().unwrap(),
             module: routine_module(),
-        }
+        })
     }
 
     fn alter() -> pbps_model::Change {
-        pbps_model::Change::AlterModule {
+        pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule {
             id: "app.f(integer)".parse().unwrap(),
             module: routine_module(),
-        }
+        })
     }
 
     fn drop_it() -> pbps_model::Change {
-        pbps_model::Change::DropModule {
+        pbps_model::Change::Module(pbps_model::ModuleChange::DropModule {
             id: "app.f(integer)".parse().unwrap(),
             kind: pbps_model::ModuleKind::Function,
-        }
+        })
     }
 
     fn decided(origin: pbps_model::RoutineOrigin) -> pbps_model::Change {
-        pbps_model::Change::PublicExecution {
+        pbps_model::Change::Permission(pbps_model::GrantChange::PublicExecution {
             routine: "app.f(integer)".parse().unwrap(),
             access: pbps_model::PublicAccess::Revoked,
             origin,
-        }
+        })
     }
 
     fn pg_verdict(changes: Vec<pbps_model::Change>) -> anyhow::Result<()> {
@@ -7049,6 +7082,7 @@ mod tests {
 
     #[test]
     fn saved_add_column_risks_use_the_selected_dialect_and_reject_edits() {
+        use pbps_model::ColumnChange;
         use pbps_model::{
             Change, ChangeSet, Column, IdsFile, PlanBaseline, PlanOrigin, PlannedChange, RiskClass,
             SavedPlan, Uid, UidKind,
@@ -7061,12 +7095,12 @@ mod tests {
                 column.value_source = default.map_or(pbps_model::ValueSource::None, |text| {
                     pbps_model::ValueSource::Default(text.into())
                 });
-                let mut planned = PlannedChange::new(Change::AddColumn {
+                let mut planned = PlannedChange::new(Change::Column(ColumnChange::AddColumn {
                     uid: Uid::generate(UidKind::Column),
                     table: "app.t".parse().unwrap(),
                     name: "added".into(),
                     column: Box::new(column),
-                });
+                }));
                 planned.risks = dialect.change_risks(&planned.change);
                 let mut plan = SavedPlan::new(
                     PlanOrigin::Database,
@@ -7103,6 +7137,10 @@ mod tests {
 
     #[test]
     fn saved_creation_part_risks_require_a_preceding_create_of_the_same_table() {
+        use pbps_model::ColumnChange;
+        use pbps_model::PartitionChange;
+        use pbps_model::RowChange;
+        use pbps_model::TableChange;
         use pbps_model::{
             Change, ChangeSet, IdsFile, PlanBaseline, PlanOrigin, PlannedChange, Provenance,
             RiskClass, SavedPlan, Table, TableName,
@@ -7112,19 +7150,20 @@ mod tests {
         let table: Table = serde_json::from_str(
             r#"{"columns":{"id":{"type":"integer","nullable":true},"g":{"type":"integer","nullable":true,"generated":{"expression":"NULL::integer","stored":true}}}}"#,
         ).unwrap();
-        let create = PlannedChange::new(Change::CreateTable {
+        let create = PlannedChange::new(Change::Table(TableChange::CreateTable {
             uid: "t_015030".parse().unwrap(),
             name: name.clone(),
             table: Box::new(table),
             beside_default: None,
             moves_at_most: None,
-        });
-        let mut expression = PlannedChange::new(Change::AlterColumnExpression {
-            uid: "c_015032".parse().unwrap(),
-            column: name.column("g"),
-            from: "NULL::integer".into(),
-            to: "id * 2".into(),
-        });
+        }));
+        let mut expression =
+            PlannedChange::new(Change::Column(ColumnChange::AlterColumnExpression {
+                uid: "c_015032".parse().unwrap(),
+                column: name.column("g"),
+                from: "NULL::integer".into(),
+                to: "id * 2".into(),
+            }));
         expression.risks.clear();
         expression.provenance = Some(Provenance {
             rule: pbps_diff::order::generated::RULE,
@@ -7165,7 +7204,7 @@ mod tests {
                 .contains("inconsistent risks")
         );
         plan.changes.changes[1].risks.clear();
-        let write = PlannedChange::new(Change::InsertRow {
+        let write = PlannedChange::new(Change::Row(RowChange::InsertRow {
             table: name.clone(),
             key_column: "id".into(),
             identity_key: false,
@@ -7173,7 +7212,7 @@ mod tests {
             row: pbps_model::Row::default(),
             defaults: Default::default(),
             types: Default::default(),
-        });
+        }));
         let mut reordered = plan.clone();
         reordered.changes.changes.insert(1, write.clone());
         assert!(
@@ -7195,14 +7234,14 @@ mod tests {
         let child = TableName::new("app", "child");
         let child_uid = "t_015036".parse().unwrap();
         attached.ids.tables.insert(child_uid, child.clone());
-        let attach = PlannedChange::new(Change::AttachPartition {
+        let attach = PlannedChange::new(Change::Partition(PartitionChange::AttachPartition {
             uid: attached.ids.table_uid(&child).unwrap().clone(),
             table: child,
             parent: name.clone(),
             bound: pbps_model::PartitionBound::Default,
             key: vec!["id".into()],
             shape: Box::new(Table::default()),
-        });
+        }));
         attached.changes.changes.insert(1, attach.clone());
         let encoded = serde_json::to_vec(&attached).unwrap();
         attached = serde_json::from_slice(&encoded).unwrap();
@@ -7225,7 +7264,9 @@ mod tests {
             .expect("attachment after installation preserves empty creation");
         let mut different = plan.clone();
         let other = TableName::new("app", "other");
-        if let Change::CreateTable { uid, name, .. } = &mut different.changes.changes[0].change {
+        if let Change::Table(TableChange::CreateTable { uid, name, .. }) =
+            &mut different.changes.changes[0].change
+        {
             *uid = "t_015033".parse().unwrap();
             *name = other.clone();
         }
@@ -7249,7 +7290,9 @@ mod tests {
             "an unrelated CREATE proves nothing about a standing table"
         );
         let mut filled = plan.clone();
-        if let Change::CreateTable { beside_default, .. } = &mut filled.changes.changes[0].change {
+        if let Change::Table(TableChange::CreateTable { beside_default, .. }) =
+            &mut filled.changes.changes[0].change
+        {
             *beside_default = Some(TableName::new("app", "old_default"));
         }
         assert!(
@@ -7279,6 +7322,8 @@ mod tests {
 
     #[test]
     fn row_security_saved_plans_refuse_incomplete_creations_and_partition_payloads() {
+        use pbps_model::PartitionChange;
+        use pbps_model::TableChange;
         use pbps_model::{
             Change, ChangeSet, IdsFile, PlanBaseline, PlanOrigin, PlannedChange, SavedPlan, Table,
         };
@@ -7300,28 +7345,28 @@ mod tests {
                     let table = "app.t".parse().unwrap();
                     let uid = "t_117200".parse().unwrap();
                     let change = match kind {
-                        0 => Change::CreateTable {
+                        0 => Change::Table(TableChange::CreateTable {
                             uid,
                             name: table,
                             table: Box::new(shape),
                             beside_default: None,
                             moves_at_most: None,
-                        },
-                        1 => Change::AttachPartition {
+                        }),
+                        1 => Change::Partition(PartitionChange::AttachPartition {
                             uid,
                             table,
                             parent: "app.parent".parse().unwrap(),
                             bound: pbps_model::PartitionBound::Default,
                             key: vec![],
                             shape: Box::new(shape),
-                        },
-                        _ => Change::DetachPartition {
+                        }),
+                        _ => Change::Partition(PartitionChange::DetachPartition {
                             uid,
                             table,
                             parent: "app.parent".parse().unwrap(),
                             names: vec![],
                             shape: Box::new(shape),
-                        },
+                        }),
                     };
                     // This tests policy completeness, so its table creation
                     // needs the ordinary valid final identity mapping first.
@@ -7421,18 +7466,22 @@ mod plan_fixture {
         let table_uid: Uid = "t_aaaaaa".parse().unwrap();
         let column_uid: Uid = "c_aaaaaa".parse().unwrap();
         let table = |name| pbps_model::TableName::new("app", name);
-        let renamed_table = |from, to| Change::RenameTable {
-            uid: table_uid.clone(),
-            from: table(from),
-            to: table(to),
-            defaults: vec![],
+        let renamed_table = |from, to| {
+            Change::Table(TableChange::RenameTable {
+                uid: table_uid.clone(),
+                from: table(from),
+                to: table(to),
+                defaults: vec![],
+            })
         };
-        let renamed_column = |from: &str, to: &str| Change::RenameColumn {
-            uid: column_uid.clone(),
-            table: table("final_table"),
-            from: from.into(),
-            to: to.into(),
-            table_was: Some(table("original_table")),
+        let renamed_column = |from: &str, to: &str| {
+            Change::Column(ColumnChange::RenameColumn {
+                uid: column_uid.clone(),
+                table: table("final_table"),
+                from: from.into(),
+                to: to.into(),
+                table_was: Some(table("original_table")),
+            })
         };
         let changes = ChangeSet {
             changes: vec![

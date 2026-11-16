@@ -102,10 +102,13 @@ pub mod value_change;
 pub mod zone;
 
 pub use change::{
-    AddedRole, CatalogObject, CellAfter, Change, ChangeSet, ColumnField, ColumnPromise,
-    CommentTarget, DetachedKind, DetachedName, Dropped, IndexPart, ModuleAfter, NumberingKind,
-    Part, PartAfter, PartChange, PartDefinition, PermissionChange, PlannedChange, Presence,
-    Provenance, PublicAccess, RiskClass, RoutineOrigin, RowAfter, RowSecurityOrigin,
+    AddedRole, CatalogObject, CellAfter, Change, ChangeSet, ColumnChange, ColumnField,
+    ColumnPromise, CommentTarget, ConstraintChange, DetachedKind, DetachedName, Dropped,
+    ExtensionChange, GrantChange, IndexChange, IndexPart, ModuleAfter, ModuleChange, NumberingKind,
+    Part, PartAfter, PartChange, PartDefinition, PartitionChange, PermissionChange, PlannedChange,
+    PolicyChange, Presence, Provenance, PublicAccess, RiskClass, RoleChange, RoutineOrigin,
+    RowAfter, RowChange, RowSecurityOrigin, SearchChange, TableChange, TablePropertyChange,
+    TypeChange, TypeValueChange,
 };
 pub use data::{
     Cell, DataMode, DataScope, DataScopes, ObservedRow, ObservedRows, ObservedTable, Row,

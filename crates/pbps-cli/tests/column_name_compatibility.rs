@@ -184,16 +184,16 @@ fn artifacts(text: &str, dialect: &dyn FixtureEmission) -> (Schema, SavedPlan, S
         .iter()
         .enumerate()
         .map(|(i, (name, table))| {
-            PlannedChange::new(Change::CreateTable {
+            PlannedChange::new(Change::Table(TableChange::CreateTable {
                 uid: format!("t_{i:06}").parse().unwrap(),
                 name: name.clone(),
                 table: Box::new(table.clone()),
                 beside_default: None,
                 moves_at_most: None,
-            })
+            }))
         })
         .collect();
-    changes.push(PlannedChange::new(Change::UpdateRow {
+    changes.push(PlannedChange::new(Change::Row(RowChange::UpdateRow {
         table: name,
         key_column: text.into(),
         key: "1".into(),
@@ -206,7 +206,7 @@ fn artifacts(text: &str, dialect: &dyn FixtureEmission) -> (Schema, SavedPlan, S
         types: [(payload.into(), "int".parse().unwrap())].into(),
         after_types: Default::default(),
         key_type: Some("int".parse().unwrap()),
-    }));
+    })));
     let plan = SavedPlan::new(
         PlanOrigin::Database,
         dialect.name(),

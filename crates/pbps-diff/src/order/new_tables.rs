@@ -4,6 +4,11 @@
 use std::collections::BTreeSet;
 
 use pbps_dialect::Dialect;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
 use pbps_model::{Change, ColumnRef, IdsFile, ModuleKind, PlannedChange, ValueSource};
 
 use super::expand::{Expansion, Order, Rewrite};
@@ -29,22 +34,22 @@ impl<D: Dialect + ?Sized> NewTables<'_, D> {
     }
 
     fn parts(&self, original: &PlannedChange) -> Option<(PlannedChange, Vec<PlannedChange>)> {
-        let Change::CreateTable { name, table, .. } = &original.change else {
+        let Change::Table(TableChange::CreateTable { name, table, .. }) = &original.change else {
             return None;
         };
         let mut bare = original.change.clone();
-        let Change::CreateTable { table: rest, .. } = &mut bare else {
+        let Change::Table(TableChange::CreateTable { table: rest, .. }) = &mut bare else {
             unreachable!("a clone retains its kind");
         };
         let mut parts = Vec::new();
         for (name_in_table, constraint) in &table.checks {
             if self.calls(&constraint.expression) {
                 rest.checks.remove(name_in_table);
-                parts.push(self.planned(Change::AddCheck {
+                parts.push(self.planned(Change::Constraint(ConstraintChange::AddCheck {
                     table: name.clone(),
                     name: name_in_table.clone(),
                     constraint: constraint.clone(),
-                }));
+                })));
             }
         }
         for (name_in_table, index) in &table.indexes {
@@ -54,12 +59,12 @@ impl<D: Dialect + ?Sized> NewTables<'_, D> {
             // broadening that lexical rule would change which parts split.
             if index.holds_expression() && self.calls(&texts.join(" , ")) {
                 rest.indexes.remove(name_in_table);
-                parts.push(self.planned(Change::AddIndex {
+                parts.push(self.planned(Change::Index(IndexChange::AddIndex {
                     table: name.clone(),
                     name: name_in_table.clone(),
                     index: Box::new(index.clone()),
                     clustered: table.index_is_clustered(name_in_table.raw()),
-                }));
+                })));
             }
         }
         for (column, spec) in &mut rest.columns {
@@ -75,12 +80,14 @@ impl<D: Dialect + ?Sized> NewTables<'_, D> {
             {
                 let to = std::mem::take(default);
                 spec.value_source = ValueSource::None;
-                parts.push(self.planned(Change::AlterColumnDefault {
-                    uid: uid.clone(),
-                    column: column_ref,
-                    from: None,
-                    to: Some(to),
-                }));
+                parts.push(
+                    self.planned(Change::Column(ColumnChange::AlterColumnDefault {
+                        uid: uid.clone(),
+                        column: column_ref,
+                        from: None,
+                        to: Some(to),
+                    })),
+                );
             }
         }
         if parts.is_empty() {
@@ -101,7 +108,7 @@ impl<D: Dialect + ?Sized> Expansion for NewTables<'_, D> {
 
     fn unmet(&self, plan: &[PlannedChange]) -> Result<Vec<usize>, String> {
         let last = plan.iter().rposition(|p| {
-            matches!(&p.change, Change::CreateModule { module, .. } | Change::AlterModule { module, .. }
+            matches!(&p.change, Change::Module(ModuleChange::CreateModule { module, .. }) | Change::Module(ModuleChange::AlterModule { module, .. })
                 if module.kind == ModuleKind::Function)
         });
         // Work from the end, as before: earlier positions keep naming their

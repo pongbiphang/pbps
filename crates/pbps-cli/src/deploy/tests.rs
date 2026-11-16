@@ -120,13 +120,13 @@ fn the_probes_read_a_plan_against_the_stored_partitions_under_their_new_parent()
         columns: [(column_uid.clone(), renamed.column("m"))].into(),
         ..IdsFile::default()
     };
-    let rename = pbps_model::Change::RenameTable {
+    let rename = pbps_model::Change::Table(pbps_model::TableChange::RenameTable {
         uid: table_uid,
         from: parent,
         to: renamed.clone(),
         defaults: vec![],
-    };
-    let rebuild = pbps_model::Change::EnumRebuild {
+    });
+    let rebuild = pbps_model::Change::TypeValue(pbps_model::TypeValueChange::EnumRebuild {
         uid: "y_000001".parse().unwrap(),
         name: "app.mood".parse().unwrap(),
         tmp: "app.tmp".parse().unwrap(),
@@ -139,14 +139,14 @@ fn the_probes_read_a_plan_against_the_stored_partitions_under_their_new_parent()
                 removed: vec!["sad".to_owned()],
             }),
         },
-    };
-    let check = pbps_model::Change::AddCheck {
+    });
+    let check = pbps_model::Change::Constraint(pbps_model::ConstraintChange::AddCheck {
         table: partition,
         name: "p_1_mood".into(),
         constraint: pbps_model::CheckConstraint {
             expression: "m <= 'ok'::app.mood".to_owned(),
         },
-    };
+    });
     let probed = |changes: Vec<pbps_model::Change>, with_relation: bool| {
         let changes: Vec<_> = changes
             .into_iter()
@@ -265,7 +265,7 @@ fn bootstrap_records_identified_types_created_on_an_empty_target() {
         .unwrap();
         assert_eq!(changes.changes.len(), 1);
         assert!(
-            matches!(&changes.changes[0].change, pbps_model::Change::CreateType { name, .. } if name == &ty.name)
+            matches!(&changes.changes[0].change, pbps_model::Change::Type(pbps_model::TypeChange::CreateType { name, .. }) if name == &ty.name)
         );
         // The catalog may respell domain expressions. The recording must
         // retain both that read-back and the authored definition.
@@ -508,6 +508,7 @@ fn order_carried_moves(
 
 #[test]
 fn created_column_guard_keys_stay_raw_and_missing_names_are_shown_once() {
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, Column, PlannedChange, Table};
     const RAW: &str = "column\n\r\u{1b}[31m\\\u{200b}名前";
     const SHOWN: &str = r"column\n\r\u{1b}[31m\\\u{200b}名前";
@@ -521,13 +522,15 @@ fn created_column_guard_keys_stay_raw_and_missing_names_are_shown_once() {
         ..Default::default()
     };
     let created = ChangeSet {
-        changes: vec![PlannedChange::new(Change::CreateTable {
-            uid: "t_aaaaaa".parse().unwrap(),
-            name: name.clone(),
-            table: Box::new(ordinary.clone()),
-            beside_default: None,
-            moves_at_most: None,
-        })],
+        changes: vec![PlannedChange::new(Change::Table(
+            TableChange::CreateTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                name: name.clone(),
+                table: Box::new(ordinary.clone()),
+                beside_default: None,
+                moves_at_most: None,
+            },
+        ))],
     };
     let empty = Schema::default();
     let correct = schema(ordinary.clone());
@@ -562,6 +565,7 @@ fn created_column_guard_keys_stay_raw_and_missing_names_are_shown_once() {
 
 #[test]
 fn computed_column_guard_keys_stay_raw_and_changed_names_are_shown_once() {
+    use pbps_model::ColumnChange;
     use pbps_model::{Change, ChangeSet, Column, ComputedColumn, PlannedChange, Table};
     const RAW: &str = "column\n\r\u{1b}[31m\\\u{200b}名前";
     const SHOWN: &str = r"column\n\r\u{1b}[31m\\\u{200b}名前";
@@ -584,14 +588,16 @@ fn computed_column_guard_keys_stay_raw_and_changed_names_are_shown_once() {
     );
     let before = schema(computed.clone());
     let changing = ChangeSet {
-        changes: vec![PlannedChange::new(Change::AlterColumnNullability {
-            uid: "c_aaaaaa".parse().unwrap(),
-            column: name.column("id"),
-            ty: "int".parse().unwrap(),
-            to_nullable: false,
-            collation: None,
-            through_external_partitions: false,
-        })],
+        changes: vec![PlannedChange::new(Change::Column(
+            ColumnChange::AlterColumnNullability {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: name.column("id"),
+                ty: "int".parse().unwrap(),
+                to_nullable: false,
+                collation: None,
+                through_external_partitions: false,
+            },
+        ))],
     };
     computed.columns.get_mut("id").unwrap().nullable = false;
     refuse_unplanned_movement(
@@ -727,12 +733,12 @@ fn dropped_referrer_name_keys_keep_raw_qualified_names() {
     let part = "a\nb\\c\u{200b}";
     let table = pbps_model::TableName::new("app", part);
     let changes = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::DropModule {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Module(
+            pbps_model::ModuleChange::DropModule {
                 id: pbps_model::ModuleId::Named(table),
                 kind: pbps_model::ModuleKind::View,
             },
-        )],
+        ))],
     };
     assert_eq!(
         super::dropped_referrer_names(&changes),
@@ -923,15 +929,16 @@ fn refuse_permanent_referencers(
 /// that holds the target is refused too.
 #[test]
 fn a_table_renames_target_is_claimed_when_the_rename_runs() {
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
     use pbps_mssql::catalog::NameOccupant;
     let rename = |from: &str, to: &str| {
-        PlannedChange::new(Change::RenameTable {
+        PlannedChange::new(Change::Table(TableChange::RenameTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, from, 0),
             from: from.parse().unwrap(),
             to: to.parse().unwrap(),
             defaults: vec![],
-        })
+        }))
     };
     let both = ChangeSet {
         changes: vec![
@@ -1020,11 +1027,12 @@ fn a_table_renames_target_is_claimed_when_the_rename_runs() {
 /// history takes is not this check's.
 #[test]
 fn a_history_occupant_blocks_unless_the_plan_frees_it_first() {
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
     use pbps_mssql::catalog::NameOccupant;
     let history = TableName::new("dbo", "old_history");
     let uid = |n: &str| pbps_model::Uid::derived(pbps_model::UidKind::Table, n, 0);
-    let create = PlannedChange::new(Change::CreateTable {
+    let create = PlannedChange::new(Change::Table(TableChange::CreateTable {
         uid: uid("dbo.t"),
         name: TableName::new("dbo", "t"),
         table: Box::new(pbps_model::Table {
@@ -1041,7 +1049,7 @@ fn a_history_occupant_blocks_unless_the_plan_frees_it_first() {
         }),
         beside_default: None,
         moves_at_most: None,
-    });
+    }));
     let at = |name: &TableName| NameOccupant {
         wanted: name.clone(),
         name: name.clone(),
@@ -1060,18 +1068,18 @@ fn a_history_occupant_blocks_unless_the_plan_frees_it_first() {
         blocking(vec![create.clone()]),
         [("dbo.t".to_owned(), "dbo.old_history".to_owned())]
     );
-    let dropped = PlannedChange::new(Change::DropTable {
+    let dropped = PlannedChange::new(Change::Table(TableChange::DropTable {
         uid: uid("dbo.old_history"),
         name: history.clone(),
         detach_from: None,
-    });
+    }));
     assert!(blocking(vec![dropped, create.clone()]).is_empty());
-    let renamed = PlannedChange::new(Change::RenameTable {
+    let renamed = PlannedChange::new(Change::Table(TableChange::RenameTable {
         uid: uid("dbo.old_history"),
         from: history.clone(),
         to: TableName::new("dbo", "archived"),
         defaults: Vec::new(),
-    });
+    }));
     assert!(blocking(vec![renamed, create.clone()]).is_empty());
     // Negative: an occupant of a name no history takes.
     let other = [at(&TableName::new("dbo", "elsewhere"))];
@@ -1088,18 +1096,22 @@ fn a_history_occupant_blocks_unless_the_plan_frees_it_first() {
 
 #[test]
 fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, Module, ModuleKind, PlannedChange};
     use pbps_mssql::catalog::NameOccupant;
     let x = TableName::new("dbo", "x");
     let old = TableName::new("dbo", "old");
     let create_table = || {
-        PlannedChange::new(Change::CreateTable {
+        PlannedChange::new(Change::Table(TableChange::CreateTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.x", 0),
             name: x.clone(),
             table: Box::default(),
             beside_default: None,
             moves_at_most: None,
-        })
+        }))
     };
     let occupant = |kind: &str, parent: Option<&TableName>| NameOccupant {
         wanted: x.clone(),
@@ -1144,19 +1156,19 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
 
     // Freed by the plan itself.
     let drop_table = |name: &TableName| {
-        PlannedChange::new(Change::DropTable {
+        PlannedChange::new(Change::Table(TableChange::DropTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.gone", 0),
             name: name.clone(),
             detach_from: None,
-        })
+        }))
     };
     let rename = |to: TableName| {
-        PlannedChange::new(Change::RenameTable {
+        PlannedChange::new(Change::Table(TableChange::RenameTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.old", 0),
             from: old.clone(),
             to,
             defaults: Vec::new(),
-        })
+        }))
     };
     assert_eq!(
         refused(
@@ -1168,10 +1180,10 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
     assert_eq!(
         refused(
             vec![
-                PlannedChange::new(Change::DropCheck {
+                PlannedChange::new(Change::Constraint(ConstraintChange::DropCheck {
                     table: old.clone(),
                     name: "x".into(),
-                }),
+                })),
                 create_table()
             ],
             occupant("check constraint", Some(&old))
@@ -1185,10 +1197,10 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
         refused(
             vec![
                 rename(new.clone()),
-                PlannedChange::new(Change::DropCheck {
+                PlannedChange::new(Change::Constraint(ConstraintChange::DropCheck {
                     table: new.clone(),
                     name: "x".into(),
-                }),
+                })),
                 create_table()
             ],
             occupant("check constraint", Some(&old))
@@ -1225,10 +1237,10 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
         options: Default::default(),
     };
     let create_view = || {
-        PlannedChange::new(Change::CreateModule {
+        PlannedChange::new(Change::Module(ModuleChange::CreateModule {
             id: ModuleId::Named(x.clone()),
             module: Box::new(view()),
-        })
+        }))
     };
     // A default goes with its column, whose drop runs before the tables
     // are created; a changed default is dropped only after them, in time
@@ -1242,18 +1254,18 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
         name: "c".into(),
     };
     let drop_column = || {
-        PlannedChange::new(Change::DropColumn {
+        PlannedChange::new(Change::Column(ColumnChange::DropColumn {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "dbo.old.c", 0),
             column: column.clone(),
-        })
+        }))
     };
     let redefault = || {
-        PlannedChange::new(Change::AlterColumnDefault {
+        PlannedChange::new(Change::Column(ColumnChange::AlterColumnDefault {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "dbo.old.c", 0),
             column: column.clone(),
             from: Some("0".into()),
             to: Some("1".into()),
-        })
+        }))
     };
     assert_eq!(
         refused(vec![drop_column(), create_table()], default_of("c")),
@@ -1272,7 +1284,7 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
     assert_eq!(
         refused(
             vec![
-                PlannedChange::new(Change::SetPrimaryKey {
+                PlannedChange::new(Change::Constraint(ConstraintChange::SetPrimaryKey {
                     table: old.clone(),
                     from: Some(pbps_model::PrimaryKey {
                         name: None,
@@ -1282,7 +1294,7 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
                     }),
                     to: None,
                     nonclustered: false,
-                }),
+                })),
                 create_table()
             ],
             occupant("primary key constraint", Some(&old))
@@ -1292,7 +1304,7 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
     // A named key dropped outright goes before the tables; one replaced
     // in place goes with its add, after them.
     let key = |to: Option<pbps_model::PrimaryKey>| {
-        PlannedChange::new(Change::SetPrimaryKey {
+        PlannedChange::new(Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: old.clone(),
             from: Some(pbps_model::PrimaryKey {
                 name: Some("x".into()),
@@ -1302,7 +1314,7 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
             }),
             to,
             nonclustered: false,
-        })
+        }))
     };
     let replacement = || {
         Some(pbps_model::PrimaryKey {
@@ -1339,22 +1351,22 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
         parent_column: None,
     };
     let create_at = |name: &TableName| {
-        PlannedChange::new(Change::CreateTable {
+        PlannedChange::new(Change::Table(TableChange::CreateTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.n", 0),
             name: name.clone(),
             table: Box::default(),
             beside_default: None,
             moves_at_most: None,
-        })
+        }))
     };
     let rename_column = || {
-        PlannedChange::new(Change::RenameColumn {
+        PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "dbo.old.c", 0),
             table: old.clone(),
             from: "c".into(),
             to: "d".into(),
             table_was: None,
-        })
+        }))
     };
     let the_default = NameOccupant {
         wanted: generated.clone(),
@@ -1383,13 +1395,13 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
     // default; under a free name it passes, and a check dropped and
     // added again under one name passes too.
     let check_named = |name: &str| {
-        PlannedChange::new(Change::AddCheck {
+        PlannedChange::new(Change::Constraint(ConstraintChange::AddCheck {
             table: old.clone(),
             name: name.into(),
             constraint: pbps_model::CheckConstraint {
                 expression: "1 = 1".into(),
             },
-        })
+        }))
     };
     let e = refuse_occupied_objects(
         &plan(vec![rename_column(), check_named(&fallback.name)]),
@@ -1420,10 +1432,10 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
     };
     refuse_occupied_objects(
         &plan(vec![
-            PlannedChange::new(Change::DropCheck {
+            PlannedChange::new(Change::Constraint(ConstraintChange::DropCheck {
                 table: old.clone(),
                 name: "ck_same".into(),
-            }),
+            })),
             check_named("ck_same"),
         ]),
         &[existing_check],
@@ -1434,12 +1446,12 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
     // still held because target and fallback are both taken.
     let mut defaulted = pbps_model::Column::new("int".parse().unwrap());
     defaulted.value_source = pbps_model::ValueSource::Default("0".into());
-    let add_c = PlannedChange::new(Change::AddColumn {
+    let add_c = PlannedChange::new(Change::Column(ColumnChange::AddColumn {
         uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.old", 0),
         table: old.clone(),
         name: "c".into(),
         column: Box::new(defaulted),
-    });
+    }));
     assert!(
         refuse_occupied_objects(
             &plan(vec![rename_column(), add_c]),
@@ -1482,10 +1494,10 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
         parent: Some(old.clone()),
         parent_column: None,
     };
-    let drop_check = PlannedChange::new(Change::DropCheck {
+    let drop_check = PlannedChange::new(Change::Constraint(ConstraintChange::DropCheck {
         table: old.clone(),
         name: target.name.clone().into(),
-    });
+    }));
     refuse_occupied_objects(
         &plan(vec![drop_check, rename_column(), create_at(&generated)]),
         &[the_default.clone(), check_at_target.clone()],
@@ -1528,12 +1540,12 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
         parent: Some(other.clone()),
         parent_column: None,
     };
-    let transfer = PlannedChange::new(Change::RenameTable {
+    let transfer = PlannedChange::new(Change::Table(TableChange::RenameTable {
         uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.other", 0),
         from: other.clone(),
         to: TableName::new("archive", "other"),
         defaults: Vec::new(),
-    });
+    }));
     refuse_occupied_objects(
         &plan(vec![transfer, rename_column(), create_at(&generated)]),
         &[the_default.clone(), on_other.clone()],
@@ -1569,13 +1581,13 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
         parent_column: Some(column.into()),
     };
     let rename = |from: &str, to: &str| {
-        PlannedChange::new(Change::RenameColumn {
+        PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "dbo.old.x", 0),
             table: old.clone(),
             from: from.into(),
             to: to.into(),
             table_was: None,
-        })
+        }))
     };
     let chain = [default_at("a"), default_at("b")];
     refuse_occupied_objects(
@@ -1614,12 +1626,12 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
     // A table rename in its schema moves each default it lists.
     let renamed = TableName::new("dbo", "fresh");
     let table_moves = plan(vec![
-        PlannedChange::new(Change::RenameTable {
+        PlannedChange::new(Change::Table(TableChange::RenameTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.old", 0),
             from: old.clone(),
             to: renamed.clone(),
             defaults: vec!["c".into()],
-        }),
+        })),
         create_at(&generated),
     ]);
     // The read covers the move's target and the renamed table's children.
@@ -1635,13 +1647,13 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
     // which names are one; with no such answer they are two names.
     let other = TableName::new("dbo", "other_t");
     let check_on = |table: &TableName, name: &str| {
-        PlannedChange::new(Change::AddCheck {
+        PlannedChange::new(Change::Constraint(ConstraintChange::AddCheck {
             table: table.clone(),
             name: name.into(),
             constraint: pbps_model::CheckConstraint {
                 expression: "1 = 1".into(),
             },
-        })
+        }))
     };
     let both = plan(vec![check_on(&old, "Ck_Name"), check_on(&other, "ck_name")]);
     let alike = [(
@@ -1667,12 +1679,14 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
         parent: Some(old.clone()),
         parent_column: None,
     };
-    let transfer_old = plan(vec![PlannedChange::new(Change::RenameTable {
-        uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.old", 0),
-        from: old.clone(),
-        to: TableName::new("archive", "old"),
-        defaults: Vec::new(),
-    })]);
+    let transfer_old = plan(vec![PlannedChange::new(Change::Table(
+        TableChange::RenameTable {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.old", 0),
+            from: old.clone(),
+            to: TableName::new("archive", "old"),
+            defaults: Vec::new(),
+        },
+    ))]);
     let candidates = alike_candidates(&transfer_old, &[], std::slice::from_ref(&carried));
     assert!(
         candidates.contains(&TableName::new("archive", "Ck_Name")),
@@ -1685,12 +1699,12 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
     // A renamed table's new name is held and asked about too, so a later
     // name the database reads as the same one meets it.
     let into_ck = plan(vec![
-        PlannedChange::new(Change::RenameTable {
+        PlannedChange::new(Change::Table(TableChange::RenameTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.old", 0),
             from: old.clone(),
             to: TableName::new("dbo", "Ck_Name"),
             defaults: Vec::new(),
-        }),
+        })),
         check_on(&other, "ck_name"),
     ]);
     assert!(alike_candidates(&into_ck, &[], &[]).contains(&TableName::new("dbo", "Ck_Name")));
@@ -1712,11 +1726,11 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
     // leaves it out: it is asked about all the same.
     let rebuilt_view = ModuleId::Named(TableName::new("dbo", "Ck_Name"));
     let rebuild_view = plan(vec![
-        PlannedChange::new(Change::DropModule {
+        PlannedChange::new(Change::Module(ModuleChange::DropModule {
             id: rebuilt_view.clone(),
             kind: pbps_model::ModuleKind::View,
-        }),
-        PlannedChange::new(Change::CreateModule {
+        })),
+        PlannedChange::new(Change::Module(ModuleChange::CreateModule {
             id: rebuilt_view,
             module: Box::new(pbps_model::Module {
                 kind: pbps_model::ModuleKind::View,
@@ -1724,7 +1738,7 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
                 definition: "CREATE VIEW dbo.Ck_Name AS SELECT 1 AS x".into(),
                 options: Default::default(),
             }),
-        }),
+        })),
     ]);
     assert!(
         alike_candidates(&rebuild_view, &[], &[]).contains(&TableName::new("dbo", "Ck_Name")),
@@ -1752,14 +1766,14 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
     // #1214: every name the walk claims for an addition is read too, so
     // one already held in the database is found.
     let cs = plan(vec![
-        PlannedChange::new(Change::AddCheck {
+        PlannedChange::new(Change::Constraint(ConstraintChange::AddCheck {
             table: old.clone(),
             name: "ck_added".into(),
             constraint: pbps_model::CheckConstraint {
                 expression: "1 = 1".into(),
             },
-        }),
-        PlannedChange::new(Change::AddUnique {
+        })),
+        PlannedChange::new(Change::Constraint(ConstraintChange::AddUnique {
             table: old.clone(),
             name: "uq_added".into(),
             constraint: pbps_model::UniqueConstraint {
@@ -1768,7 +1782,7 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
                 filegroup: None,
             },
             clustered: false,
-        }),
+        })),
     ]);
     let (added, _) = object_reads(&cs);
     for name in ["ck_added", "uq_added"] {
@@ -1809,12 +1823,12 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
         parent_column: Some(column.into()),
     };
     let rename_table = |from: &TableName, to: &TableName| {
-        PlannedChange::new(Change::RenameTable {
+        PlannedChange::new(Change::Table(TableChange::RenameTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.t", 0),
             from: from.clone(),
             to: to.clone(),
             defaults: vec!["c".into()],
-        })
+        }))
     };
     let a_default = default_on(&a, "c");
     refuse_occupied_objects(
@@ -1881,12 +1895,12 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
     };
     let e = refuse_occupied_objects(
         &plan(vec![
-            PlannedChange::new(Change::RenameTable {
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.other", 0),
                 from: other.clone(),
                 to: TableName::new("archive", "other"),
                 defaults: Vec::new(),
-            }),
+            })),
             create_at(&TableName::new("archive", "carried")),
         ]),
         &[carried],
@@ -1901,13 +1915,13 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
     // And a check the plan adds before a view at its name is created.
     let e = refuse_occupied_objects(
         &plan(vec![
-            PlannedChange::new(Change::AddCheck {
+            PlannedChange::new(Change::Constraint(ConstraintChange::AddCheck {
                 table: old.clone(),
                 name: "x".into(),
                 constraint: pbps_model::CheckConstraint {
                     expression: "1 = 1".into(),
                 },
-            }),
+            })),
             create_view(),
         ]),
         &[],
@@ -1918,27 +1932,29 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
     assert!(e.contains("this plan puts check constraint `dbo.x`"), "{e}");
 
     let rebuild = plan(vec![
-        PlannedChange::new(Change::DropModule {
+        PlannedChange::new(Change::Module(ModuleChange::DropModule {
             id: ModuleId::Named(x.clone()),
             kind: ModuleKind::View,
-        }),
-        PlannedChange::new(Change::CreateModule {
+        })),
+        PlannedChange::new(Change::Module(ModuleChange::CreateModule {
             id: ModuleId::Named(x.clone()),
             module: Box::new(view()),
-        }),
+        })),
     ]);
     assert!(created_object_names(&rebuild).is_empty());
     // A trigger is asked of its table's schema.
-    let trigger = plan(vec![PlannedChange::new(Change::CreateModule {
-        id: ModuleId::Trigger {
-            on: TableName::new("sales", "t"),
-            name: "tr".into(),
+    let trigger = plan(vec![PlannedChange::new(Change::Module(
+        ModuleChange::CreateModule {
+            id: ModuleId::Trigger {
+                on: TableName::new("sales", "t"),
+                name: "tr".into(),
+            },
+            module: Box::new(Module {
+                kind: ModuleKind::Trigger,
+                ..view()
+            }),
         },
-        module: Box::new(Module {
-            kind: ModuleKind::Trigger,
-            ..view()
-        }),
-    })]);
+    ))]);
     assert_eq!(
         created_object_names(&trigger),
         [TableName::new("sales", "tr")]
@@ -1960,13 +1976,15 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
             }),
             ..Default::default()
         };
-        plan(vec![PlannedChange::new(Change::CreateTable {
-            uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.x", 0),
-            name: x.clone(),
-            table: Box::new(table),
-            beside_default: None,
-            moves_at_most: None,
-        })])
+        plan(vec![PlannedChange::new(Change::Table(
+            TableChange::CreateTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.x", 0),
+                name: x.clone(),
+                table: Box::new(table),
+                beside_default: None,
+                moves_at_most: None,
+            },
+        ))])
     };
     assert_eq!(
         created_object_names(&temporal(true)),
@@ -2167,6 +2185,7 @@ fn the_engines_reading_replaces_only_the_texts_it_was_read_for() {
 /// something another session adds to it is, before the attach or after.
 #[test]
 fn an_attached_table_is_held_to_its_shape_once_it_is_a_partition() {
+    use pbps_model::PartitionChange;
     use pbps_model::{
         Change, ChangeSet, Column, PartitionBound, PartitionBy, PartitionOf, PlannedChange, Table,
     };
@@ -2199,14 +2218,16 @@ fn an_attached_table_is_held_to_its_shape_once_it_is_a_partition() {
         s
     };
     let changes = ChangeSet {
-        changes: vec![PlannedChange::new(Change::AttachPartition {
-            uid: "t_aaaaaa".parse().unwrap(),
-            table: TableName::new("app", "t"),
-            parent: TableName::new("app", "ev"),
-            bound: PartitionBound::Default,
-            key: Vec::new(),
-            shape: Box::new(shape.clone()),
-        })],
+        changes: vec![PlannedChange::new(Change::Partition(
+            PartitionChange::AttachPartition {
+                uid: "t_aaaaaa".parse().unwrap(),
+                table: TableName::new("app", "t"),
+                parent: TableName::new("app", "ev"),
+                bound: PartitionBound::Default,
+                key: Vec::new(),
+                shape: Box::new(shape.clone()),
+            },
+        ))],
     };
     let before = schema(&ordinary);
     let held = |after: &Schema, settled: Settled| {
@@ -2281,22 +2302,26 @@ fn an_attached_table_is_held_to_its_shape_once_it_is_a_partition() {
 /// plan starts. A table made logged is never asked about.
 #[test]
 fn a_table_made_unlogged_is_refused_by_the_publication_that_lists_it() {
+    use pbps_model::TableChange;
+    use pbps_model::TablePropertyChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
     use pbps_pg::catalog::NamingPublication;
     let uid = pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.t", 0);
     let switch = |table: &str, unlogged: bool| {
-        PlannedChange::new(Change::SetTablePersistence {
-            uid: uid.clone(),
-            table: table.parse().unwrap(),
-            unlogged,
-        })
+        PlannedChange::new(Change::TableProperty(
+            TablePropertyChange::SetTablePersistence {
+                uid: uid.clone(),
+                table: table.parse().unwrap(),
+                unlogged,
+            },
+        ))
     };
-    let rename = PlannedChange::new(Change::RenameTable {
+    let rename = PlannedChange::new(Change::Table(TableChange::RenameTable {
         uid: uid.clone(),
         from: "app.t".parse().unwrap(),
         to: "app.t2".parse().unwrap(),
         defaults: vec![],
-    });
+    }));
     let listing = |table: &str| NamingPublication {
         table: table.parse().unwrap(),
         publication: "pub_x".into(),
@@ -2514,11 +2539,15 @@ fn a_baseline_refuses_handing_over_only_a_held_partition_a_drop_intent_names() {
 
 #[test]
 fn an_unlogged_partition_under_a_permanent_key_is_refused_by_name() {
+    use pbps_model::ConstraintChange;
+    use pbps_model::PartitionChange;
+    use pbps_model::TableChange;
+    use pbps_model::TablePropertyChange;
     use pbps_model::{Change, ChangeSet, PartitionBound, PartitionOf, PlannedChange, Table};
     use pbps_pg::catalog::PermanentReferencer;
     let parent = TableName::new("app", "ev");
     let partition = |unlogged: bool| {
-        PlannedChange::new(Change::CreateTable {
+        PlannedChange::new(Change::Table(TableChange::CreateTable {
             uid: "t_aaaaaa".parse().unwrap(),
             name: TableName::new("app", "ev_u"),
             table: Box::new(Table {
@@ -2532,7 +2561,7 @@ fn an_unlogged_partition_under_a_permanent_key_is_refused_by_name() {
             }),
             beside_default: None,
             moves_at_most: None,
-        })
+        }))
     };
     let referencer = |of: &TableName| PermanentReferencer {
         parent: of.clone(),
@@ -2558,7 +2587,7 @@ fn an_unlogged_partition_under_a_permanent_key_is_refused_by_name() {
     // A table attached unlogged is a new partition under the key all
     // the same (#1545), and one attached permanent is not.
     let attach = |unlogged: bool| {
-        PlannedChange::new(Change::AttachPartition {
+        PlannedChange::new(Change::Partition(PartitionChange::AttachPartition {
             uid: "t_bbbbbb".parse().unwrap(),
             table: TableName::new("app", "t"),
             parent: parent.clone(),
@@ -2568,7 +2597,7 @@ fn an_unlogged_partition_under_a_permanent_key_is_refused_by_name() {
                 unlogged,
                 ..Table::default()
             }),
-        })
+        }))
     };
     let e = refused(vec![attach(true)], &parent).unwrap_err();
     assert!(
@@ -2587,33 +2616,37 @@ fn an_unlogged_partition_under_a_permanent_key_is_refused_by_name() {
     for (what, first) in [
         (
             "its key dropped",
-            vec![PlannedChange::new(Change::DropForeignKey {
-                table: TableName::new("ext", "r"),
-                name: "r_ev_fkey".into(),
-            })],
+            vec![PlannedChange::new(Change::Constraint(
+                ConstraintChange::DropForeignKey {
+                    table: TableName::new("ext", "r"),
+                    name: "r_ev_fkey".into(),
+                },
+            ))],
         ),
         (
             "its table dropped",
-            vec![PlannedChange::new(Change::DropTable {
+            vec![PlannedChange::new(Change::Table(TableChange::DropTable {
                 uid: "t_bbbbbb".parse().unwrap(),
                 name: TableName::new("ext", "r"),
                 detach_from: None,
-            })],
+            }))],
         ),
         (
             "its table renamed and made unlogged",
             vec![
-                PlannedChange::new(Change::RenameTable {
+                PlannedChange::new(Change::Table(TableChange::RenameTable {
                     uid: "t_bbbbbb".parse().unwrap(),
                     from: TableName::new("ext", "r"),
                     to: renamed.clone(),
                     defaults: Vec::new(),
-                }),
-                PlannedChange::new(Change::SetTablePersistence {
-                    uid: "t_bbbbbb".parse().unwrap(),
-                    table: renamed.clone(),
-                    unlogged: true,
-                }),
+                })),
+                PlannedChange::new(Change::TableProperty(
+                    TablePropertyChange::SetTablePersistence {
+                        uid: "t_bbbbbb".parse().unwrap(),
+                        table: renamed.clone(),
+                        unlogged: true,
+                    },
+                )),
             ],
         ),
     ] {
@@ -2625,15 +2658,17 @@ fn an_unlogged_partition_under_a_permanent_key_is_refused_by_name() {
     // still leaves this one's key in place.
     let e = refused(
         vec![
-            PlannedChange::new(Change::DropForeignKey {
+            PlannedChange::new(Change::Constraint(ConstraintChange::DropForeignKey {
                 table: TableName::new("ext", "other"),
                 name: "r_ev_fkey".into(),
-            }),
-            PlannedChange::new(Change::SetTablePersistence {
-                uid: "t_bbbbbb".parse().unwrap(),
-                table: TableName::new("ext", "r"),
-                unlogged: false,
-            }),
+            })),
+            PlannedChange::new(Change::TableProperty(
+                TablePropertyChange::SetTablePersistence {
+                    uid: "t_bbbbbb".parse().unwrap(),
+                    table: TableName::new("ext", "r"),
+                    unlogged: false,
+                },
+            )),
             partition(true),
         ],
         &parent,
@@ -2647,11 +2682,13 @@ fn an_unlogged_partition_under_a_permanent_key_is_refused_by_name() {
     let switched_after = || {
         vec![
             partition(true),
-            PlannedChange::new(Change::SetTablePersistence {
-                uid: "t_bbbbbb".parse().unwrap(),
-                table: TableName::new("ext", "r"),
-                unlogged: true,
-            }),
+            PlannedChange::new(Change::TableProperty(
+                TablePropertyChange::SetTablePersistence {
+                    uid: "t_bbbbbb".parse().unwrap(),
+                    table: TableName::new("ext", "r"),
+                    unlogged: true,
+                },
+            )),
         ]
     };
     let e = refused(switched_after(), &parent).unwrap_err();
@@ -2663,17 +2700,17 @@ fn an_unlogged_partition_under_a_permanent_key_is_refused_by_name() {
     // review).
     refused(
         vec![
-            PlannedChange::new(Change::DropTable {
+            PlannedChange::new(Change::Table(TableChange::DropTable {
                 uid: "t_bbbbbb".parse().unwrap(),
                 name: TableName::new("ext", "r"),
                 detach_from: None,
-            }),
-            PlannedChange::new(Change::RenameTable {
+            })),
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: "t_cccccc".parse().unwrap(),
                 from: TableName::new("ext", "other"),
                 to: TableName::new("ext", "r"),
                 defaults: Vec::new(),
-            }),
+            })),
             partition(true),
         ],
         &parent,
@@ -2684,23 +2721,23 @@ fn an_unlogged_partition_under_a_permanent_key_is_refused_by_name() {
     for (key_table, before_renames, allowed) in
         [("r", true, true), ("r2", false, true), ("r", false, false)]
     {
-        let drop_key = PlannedChange::new(Change::DropForeignKey {
+        let drop_key = PlannedChange::new(Change::Constraint(ConstraintChange::DropForeignKey {
             table: TableName::new("ext", key_table),
             name: "r_ev_fkey".into(),
-        });
+        }));
         let mut changes = vec![
-            PlannedChange::new(Change::RenameTable {
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: "t_bbbbbb".parse().unwrap(),
                 from: TableName::new("ext", "r"),
                 to: renamed.clone(),
                 defaults: Vec::new(),
-            }),
-            PlannedChange::new(Change::RenameTable {
+            })),
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: "t_cccccc".parse().unwrap(),
                 from: TableName::new("ext", "other"),
                 to: TableName::new("ext", "r"),
                 defaults: Vec::new(),
-            }),
+            })),
         ];
         changes.insert(if before_renames { 0 } else { 2 }, drop_key);
         changes.push(partition(true));
@@ -2716,17 +2753,19 @@ fn an_unlogged_partition_under_a_permanent_key_is_refused_by_name() {
     // Negative: the newcomer made unlogged is not the referencer.
     let e = refused(
         vec![
-            PlannedChange::new(Change::RenameTable {
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: "t_cccccc".parse().unwrap(),
                 from: TableName::new("ext", "other"),
                 to: TableName::new("ext", "r"),
                 defaults: Vec::new(),
-            }),
-            PlannedChange::new(Change::SetTablePersistence {
-                uid: "t_cccccc".parse().unwrap(),
-                table: TableName::new("ext", "r"),
-                unlogged: true,
-            }),
+            })),
+            PlannedChange::new(Change::TableProperty(
+                TablePropertyChange::SetTablePersistence {
+                    uid: "t_cccccc".parse().unwrap(),
+                    table: TableName::new("ext", "r"),
+                    unlogged: true,
+                },
+            )),
             partition(true),
         ],
         &parent,
@@ -2744,10 +2783,10 @@ fn an_unlogged_partition_under_a_permanent_key_is_refused_by_name() {
         root_table: TableName::new("ext", "rp"),
         root_key: "rp_k".into(),
     };
-    let drop_root = PlannedChange::new(Change::DropForeignKey {
+    let drop_root = PlannedChange::new(Change::Constraint(ConstraintChange::DropForeignKey {
         table: TableName::new("ext", "rp"),
         name: "rp_k".into(),
-    });
+    }));
     let leaf_refused = |changes: Vec<PlannedChange>| {
         refuse_permanent_referencers(&ChangeSet { changes }, std::slice::from_ref(&leaf), true)
             .map_err(|e| e.to_string())
@@ -2765,7 +2804,7 @@ fn an_unlogged_partition_under_a_permanent_key_is_refused_by_name() {
     // new name: the catalog's referencer names it as it is now, and is
     // the same key (#1613).
     let ev2 = TableName::new("app", "ev2");
-    let under_ev2 = PlannedChange::new(Change::CreateTable {
+    let under_ev2 = PlannedChange::new(Change::Table(TableChange::CreateTable {
         uid: "t_aaaaaa".parse().unwrap(),
         name: TableName::new("app", "ev_u"),
         table: Box::new(Table {
@@ -2779,13 +2818,13 @@ fn an_unlogged_partition_under_a_permanent_key_is_refused_by_name() {
         }),
         beside_default: None,
         moves_at_most: None,
-    });
-    let rename_parent = PlannedChange::new(Change::RenameTable {
+    }));
+    let rename_parent = PlannedChange::new(Change::Table(TableChange::RenameTable {
         uid: "t_dddddd".parse().unwrap(),
         from: parent.clone(),
         to: ev2.clone(),
         defaults: Vec::new(),
-    });
+    }));
     let e = refused(vec![rename_parent.clone(), under_ev2.clone()], &parent).unwrap_err();
     assert!(e.contains("ext.r's foreign key `r_ev_fkey`"), "{e}");
     // Negative: a key under the new name, which no table the catalog
@@ -2801,21 +2840,25 @@ fn an_unlogged_partition_under_a_permanent_key_is_refused_by_name() {
 /// `<table>_pkey` PostgreSQL moves aside when taken (DEC-465.1).
 #[test]
 fn an_index_the_plan_creates_meets_held_and_carried_names() {
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::IndexChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, PlannedChange, PrimaryKey, UniqueConstraint};
     use pbps_pg::catalog::NameOccupant;
     let t = TableName::new("archive", "t");
     let index: Box<pbps_model::Index> =
         Box::new(serde_json::from_str(r#"{"columns": [{"name": "n"}]}"#).unwrap());
     let add_index = |name: &str| {
-        PlannedChange::new(Change::AddIndex {
+        PlannedChange::new(Change::Index(IndexChange::AddIndex {
             table: t.clone(),
             name: name.into(),
             index: index.clone(),
             clustered: false,
-        })
+        }))
     };
     let add_unique = |name: &str| {
-        PlannedChange::new(Change::AddUnique {
+        PlannedChange::new(Change::Constraint(ConstraintChange::AddUnique {
             table: t.clone(),
             name: name.into(),
             constraint: UniqueConstraint {
@@ -2824,10 +2867,10 @@ fn an_index_the_plan_creates_meets_held_and_carried_names() {
                 filegroup: None,
             },
             clustered: false,
-        })
+        }))
     };
     let set_key = |name: Option<&str>| {
-        PlannedChange::new(Change::SetPrimaryKey {
+        PlannedChange::new(Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: t.clone(),
             from: None,
             to: Some(PrimaryKey {
@@ -2837,7 +2880,7 @@ fn an_index_the_plan_creates_meets_held_and_carried_names() {
                 filegroup: None,
             }),
             nonclustered: false,
-        })
+        }))
     };
     let held = NameOccupant {
         name: TableName::new("archive", "s"),
@@ -2866,13 +2909,13 @@ fn an_index_the_plan_creates_meets_held_and_carried_names() {
     }
     let mut declared = pbps_model::Table::default();
     declared.indexes.insert("s".into(), (*index).clone());
-    let created = PlannedChange::new(Change::CreateTable {
+    let created = PlannedChange::new(Change::Table(TableChange::CreateTable {
         uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "archive.u", 0),
         name: TableName::new("archive", "u"),
         table: Box::new(declared),
         beside_default: None,
         moves_at_most: None,
-    });
+    }));
     assert!(
         refused(vec![created], &held).is_err(),
         "a created table's own index is created too"
@@ -2886,12 +2929,12 @@ fn an_index_the_plan_creates_meets_held_and_carried_names() {
         owner: Some(old.clone()),
         owner_column: Some("n".into()),
     };
-    let to_archive = PlannedChange::new(Change::RenameTable {
+    let to_archive = PlannedChange::new(Change::Table(TableChange::RenameTable {
         uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.old", 0),
         from: old,
         to: TableName::new("archive", "new"),
         defaults: Vec::new(),
-    });
+    }));
     let e = refused(vec![to_archive.clone(), add_index("old_n_seq")], &carried).unwrap_err();
     assert!(
         e.contains("`archive.old_n_seq`: this plan moves sequence `app.old_n_seq`"),
@@ -2915,13 +2958,13 @@ fn an_index_the_plan_creates_meets_held_and_carried_names() {
         })
     };
     let numbering = |from, to| {
-        PlannedChange::new(Change::AlterColumnNumbering {
+        PlannedChange::new(Change::Column(ColumnChange::AlterColumnNumbering {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "archive.t.n", 0),
             column: pbps_model::ColumnRef::new(t.clone(), "n"),
             ty: "integer".parse().unwrap(),
             from,
             to,
-        })
+        }))
     };
     for to in [
         pbps_model::ValueSource::None,
@@ -2954,20 +2997,20 @@ fn an_index_the_plan_creates_meets_held_and_carried_names() {
         "a retune keeps the name: {e}"
     );
     // Under a column this plan renames first, the sequence follows it.
-    let renamed = PlannedChange::new(Change::RenameColumn {
+    let renamed = PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
         uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "archive.t.n", 0),
         table: t.clone(),
         from: "n".into(),
         to: "m".into(),
         table_was: None,
-    });
-    let numbering_m = PlannedChange::new(Change::AlterColumnNumbering {
+    }));
+    let numbering_m = PlannedChange::new(Change::Column(ColumnChange::AlterColumnNumbering {
         uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "archive.t.n", 0),
         column: pbps_model::ColumnRef::new(t.clone(), "m"),
         ty: "integer".parse().unwrap(),
         from: serial(Some("t_n_seq"), 1),
         to: pbps_model::ValueSource::None,
-    });
+    }));
     refused(
         vec![renamed.clone(), numbering_m, add_index("t_n_seq")],
         &numbered,
@@ -2994,10 +3037,10 @@ fn an_index_the_plan_creates_meets_held_and_carried_names() {
         owner: Some(t.clone()),
         owner_column: None,
     };
-    let drop = PlannedChange::new(Change::DropIndex {
+    let drop = PlannedChange::new(Change::Index(IndexChange::DropIndex {
         table: t.clone(),
         name: "ix".into(),
-    });
+    }));
     refused(vec![drop, add_index("ix")], &own).unwrap();
     let pkey = NameOccupant {
         name: TableName::new("archive", "t_pkey"),
@@ -3016,6 +3059,8 @@ fn an_index_the_plan_creates_meets_held_and_carried_names() {
 /// while `s1.a`'s holds its name in `s1` until it moves to `s2`.
 #[test]
 fn an_occupant_is_matched_by_the_name_its_owner_has_at_each_change() {
+    use pbps_model::IndexChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
     use pbps_pg::catalog::NameOccupant;
     let (a, b, c) = (
@@ -3026,27 +3071,27 @@ fn an_occupant_is_matched_by_the_name_its_owner_has_at_each_change() {
     let index: Box<pbps_model::Index> =
         Box::new(serde_json::from_str(r#"{"columns": [{"name": "n"}]}"#).unwrap());
     let add_index = |table: &TableName| {
-        PlannedChange::new(Change::AddIndex {
+        PlannedChange::new(Change::Index(IndexChange::AddIndex {
             table: table.clone(),
             name: "n_pkey".into(),
             index: index.clone(),
             clustered: false,
-        })
+        }))
     };
     let rename = |from: &TableName, to: &TableName| {
-        PlannedChange::new(Change::RenameTable {
+        PlannedChange::new(Change::Table(TableChange::RenameTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, &from.raw().to_string(), 0),
             from: from.clone(),
             to: to.clone(),
             defaults: Vec::new(),
-        })
+        }))
     };
     let moves = || {
         vec![
-            PlannedChange::new(Change::DropIndex {
+            PlannedChange::new(Change::Index(IndexChange::DropIndex {
                 table: b.clone(),
                 name: "n_pkey".into(),
-            }),
+            })),
             rename(&b, &c),
             rename(&a, &b),
         ]
@@ -3103,15 +3148,17 @@ fn an_occupant_is_matched_by_the_name_its_owner_has_at_each_change() {
 /// names pass, and one the plan drops first frees the name.
 #[test]
 fn a_carried_occupant_meets_what_already_holds_its_name() {
+    use pbps_model::IndexChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
     use pbps_pg::catalog::NameOccupant;
     let rename = |from: &TableName, to: &TableName| {
-        PlannedChange::new(Change::RenameTable {
+        PlannedChange::new(Change::Table(TableChange::RenameTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, &from.raw().to_string(), 0),
             from: from.clone(),
             to: to.clone(),
             defaults: Vec::new(),
-        })
+        }))
     };
     let occupant = |at: &TableName, kind, owner: Option<&TableName>| NameOccupant {
         name: at.clone(),
@@ -3167,10 +3214,10 @@ fn a_carried_occupant_meets_what_already_holds_its_name() {
         &[other, sequence],
     )
     .expect("distinct names land apart");
-    let drop_index = PlannedChange::new(Change::DropIndex {
+    let drop_index = PlannedChange::new(Change::Index(IndexChange::DropIndex {
         table: a.clone(),
         name: "x_id_seq".into(),
-    });
+    }));
     refused(vec![drop_index, rename(&a, &a_to)], &[index, held])
         .expect("the index is dropped before its table moves");
 }
@@ -3182,15 +3229,18 @@ fn a_carried_occupant_meets_what_already_holds_its_name() {
 /// renames away first, and an index dropped before its table moves.
 #[test]
 fn a_carried_index_meets_the_table_or_view_at_its_landing_name() {
+    use pbps_model::IndexChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, ModuleKind, PlannedChange};
     use pbps_pg::catalog::NameOccupant;
     let rename = |from: &TableName, to: TableName| {
-        PlannedChange::new(Change::RenameTable {
+        PlannedChange::new(Change::Table(TableChange::RenameTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, &from.raw().to_string(), 0),
             from: from.clone(),
             to,
             defaults: Vec::new(),
-        })
+        }))
     };
     let a = TableName::new("s1", "a");
     let landing = TableName::new("s2", "n");
@@ -3234,27 +3284,27 @@ fn a_carried_index_meets_the_table_or_view_at_its_landing_name() {
     refused(vec![moved()], &[(TableName::new("s3", "n"), "table")]).expect("nothing holds `s2.n`");
     refused(vec![rename(&a, TableName::new("s1", "b"))], &held)
         .expect("a rename within `s1` lands nothing in `s2`");
-    let drop_table = PlannedChange::new(Change::DropTable {
+    let drop_table = PlannedChange::new(Change::Table(TableChange::DropTable {
         uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "s2.n", 0),
         name: landing.clone(),
         detach_from: None,
-    });
+    }));
     refused(vec![drop_table, moved()], &held).expect("the holder is dropped first");
     refused(
         vec![rename(&landing, TableName::new("s2", "m")), moved()],
         &held,
     )
     .expect("the holder is renamed away first");
-    let drop_view = PlannedChange::new(Change::DropModule {
+    let drop_view = PlannedChange::new(Change::Module(ModuleChange::DropModule {
         id: ModuleId::Named(landing.clone()),
         kind: ModuleKind::View,
-    });
+    }));
     refused(vec![drop_view, moved()], &[(landing.clone(), "view")])
         .expect("the view is dropped first");
-    let drop_index = PlannedChange::new(Change::DropIndex {
+    let drop_index = PlannedChange::new(Change::Index(IndexChange::DropIndex {
         table: a.clone(),
         name: "n".into(),
-    });
+    }));
     refused(vec![drop_index, moved()], &held).expect("the index is dropped before its table moves");
     // The holder moved away after the move is still there when it runs.
     let e = refused(
@@ -3296,7 +3346,13 @@ fn carried_sides(
         sides.3.tables.insert(uid, after.clone());
     };
     for p in changes {
-        if let pbps_model::Change::RenameTable { uid, from, to, .. } = &p.change {
+        if let pbps_model::Change::Table(pbps_model::TableChange::RenameTable {
+            uid,
+            from,
+            to,
+            ..
+        }) = &p.change
+        {
             put(uid.clone(), from, to);
         }
     }
@@ -3412,6 +3468,7 @@ fn only_uniquely_identified_renamed_clones_release_their_names() {
 
 #[test]
 fn a_detach_refuses_owned_non_clones_at_its_requested_clone_name() {
+    use pbps_model::PartitionChange;
     use pbps_model::{Change, ChangeSet, DetachedKind, DetachedName, PlannedChange, Uid, UidKind};
     use pbps_pg::catalog::{DetachClone, NameOccupant};
     let table = TableName::new("app", "a");
@@ -3428,13 +3485,15 @@ fn a_detach_refuses_owned_non_clones_at_its_requested_clone_name() {
     };
     let facts = detach_clone_slots(&uid, &names, std::slice::from_ref(&clone));
     let changes = ChangeSet {
-        changes: vec![PlannedChange::new(Change::DetachPartition {
-            uid,
-            table: table.clone(),
-            parent: TableName::new("app", "p"),
-            names,
-            shape: Box::default(),
-        })],
+        changes: vec![PlannedChange::new(Change::Partition(
+            PartitionChange::DetachPartition {
+                uid,
+                table: table.clone(),
+                parent: TableName::new("app", "p"),
+                names,
+                shape: Box::default(),
+            },
+        ))],
     };
     for kind in ["sequence", "index"] {
         let occupants = [
@@ -3464,6 +3523,7 @@ fn a_detach_refuses_owned_non_clones_at_its_requested_clone_name() {
 
 #[test]
 fn a_detach_admits_its_exact_retained_clones_and_internal_exchanges() {
+    use pbps_model::PartitionChange;
     use pbps_model::{
         Change, ChangeSet, DetachedKind as K, DetachedName, PlannedChange, Uid, UidKind,
     };
@@ -3516,13 +3576,15 @@ fn a_detach_admits_its_exact_retained_clones_and_internal_exchanges() {
             })
             .collect();
         let changes = ChangeSet {
-            changes: vec![PlannedChange::new(Change::DetachPartition {
-                uid: uid.clone(),
-                table: table.clone(),
-                parent: TableName::new("app", "p"),
-                names,
-                shape: Box::default(),
-            })],
+            changes: vec![PlannedChange::new(Change::Partition(
+                PartitionChange::DetachPartition {
+                    uid: uid.clone(),
+                    table: table.clone(),
+                    parent: TableName::new("app", "p"),
+                    names,
+                    shape: Box::default(),
+                },
+            ))],
         };
         refuse_uninventoried_occupants(&changes, &occupants, &[], "prod", &facts)
             .expect("retaining a_key/a_unique or exchanging them is a valid detach");
@@ -3549,6 +3611,8 @@ enum CloneRelease {
 
 fn check_rename_clone_handover(carried: bool, release: CloneRelease) {
     use pbps_dialect::slots::{CatalogFacts, Namespace, SlotKey};
+    use pbps_model::PartitionChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, DetachedKind, DetachedName, PlannedChange, Uid, UidKind};
     use pbps_pg::catalog::NameOccupant;
 
@@ -3564,20 +3628,20 @@ fn check_rename_clone_handover(carried: bool, release: CloneRelease) {
     let child_uid = Uid::derived(UidKind::Table, &child.raw().to_string(), 0);
     let releases = !matches!(release, CloneRelease::Retain);
     let drops = matches!(release, CloneRelease::Drop);
-    let rename = PlannedChange::new(Change::RenameTable {
+    let rename = PlannedChange::new(Change::Table(TableChange::RenameTable {
         uid: Uid::derived(UidKind::Table, &from.raw().to_string(), 0),
         from: from.clone(),
         to,
         defaults: Vec::new(),
-    });
+    }));
     let freeing = PlannedChange::new(if drops {
-        Change::DropTable {
+        Change::Table(TableChange::DropTable {
             uid: child_uid.clone(),
             name: child.clone(),
             detach_from: Some(parent.clone()),
-        }
+        })
     } else {
-        Change::DetachPartition {
+        Change::Partition(PartitionChange::DetachPartition {
             uid: child_uid.clone(),
             table: child.clone(),
             parent: parent.clone(),
@@ -3587,7 +3651,7 @@ fn check_rename_clone_handover(carried: bool, release: CloneRelease) {
                 name: Some(if releases { "released" } else { "held" }.into()),
             }],
             shape: Box::default(),
-        }
+        })
     });
     let mut changes = ChangeSet {
         changes: vec![rename, freeing],
@@ -3695,6 +3759,8 @@ struct IdentityHandover {
 
 impl IdentityHandover {
     fn new(to: pbps_model::ValueSource) -> Self {
+        use pbps_model::ColumnChange;
+        use pbps_model::TableChange;
         use pbps_model::{Change, ColumnRef, PlannedChange, Table, Uid, UidKind};
         let owner = TableName::new("app", "t");
         // The catalog name differs from the engine's original spelling.
@@ -3740,20 +3806,20 @@ impl IdentityHandover {
             after_ids,
             changes: pbps_model::ChangeSet {
                 changes: vec![
-                    PlannedChange::new(Change::CreateTable {
+                    PlannedChange::new(Change::Table(TableChange::CreateTable {
                         uid: claimed_id,
                         name: claimed.clone(),
                         table: Box::new(created),
                         beside_default: None,
                         moves_at_most: None,
-                    }),
-                    PlannedChange::new(Change::AlterColumnNumbering {
+                    })),
+                    PlannedChange::new(Change::Column(ColumnChange::AlterColumnNumbering {
                         uid: column_id,
                         column,
                         ty,
                         from,
                         to,
-                    }),
+                    })),
                 ],
             },
             occupants: vec![pbps_pg::catalog::NameOccupant {
@@ -3865,8 +3931,10 @@ fn identity_handover_matches_raw_column_owners_without_escaped_aliases() {
                 column.name = RAW.into();
             }
         }
-        let pbps_model::Change::AlterColumnNumbering { column, .. } =
-            &mut plan.changes.changes[1].change
+        let pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnNumbering {
+            column,
+            ..
+        }) = &mut plan.changes.changes[1].change
         else {
             panic!("the fixture gives up an identity");
         };
@@ -3889,6 +3957,8 @@ fn identity_handover_matches_raw_column_owners_without_escaped_aliases() {
 
 #[test]
 fn a_retyped_identity_releases_its_catalog_name_before_the_new_holder() {
+    use pbps_model::ColumnChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, Identity, OwnedSequence, ValueSource};
 
     for to in [
@@ -3928,12 +3998,10 @@ fn a_retyped_identity_releases_its_catalog_name_before_the_new_holder() {
         .unwrap()
         .changes()
         .clone();
-        assert!(
-            plan.changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, Change::AlterColumnType { .. }))
-        );
+        assert!(plan.changes.changes.iter().any(|p| matches!(
+            p.change,
+            Change::Column(ColumnChange::AlterColumnType { .. })
+        )));
         let generic = pbps_diff::order::slots::handovers(
             &plan.changes.changes,
             sides.0,
@@ -3967,13 +4035,18 @@ fn a_retyped_identity_releases_its_catalog_name_before_the_new_holder() {
                 .changes
                 .changes
                 .iter()
-                .position(|p| matches!(p.change, Change::AlterColumnNumbering { .. }))
+                .position(|p| {
+                    matches!(
+                        p.change,
+                        Change::Column(ColumnChange::AlterColumnNumbering { .. })
+                    )
+                })
                 .unwrap();
             let claim = plan
                 .changes
                 .changes
                 .iter()
-                .position(|p| matches!(p.change, Change::CreateTable { .. }))
+                .position(|p| matches!(p.change, Change::Table(TableChange::CreateTable { .. })))
                 .unwrap();
             assert!(
                 release < claim,
@@ -3983,7 +4056,7 @@ fn a_retyped_identity_releases_its_catalog_name_before_the_new_holder() {
             let kept = |steps: &[pbps_model::PlannedChange]| {
                 steps
                     .iter()
-                    .filter(|p| !matches!(p.change, Change::CreateTable { .. }))
+                    .filter(|p| !matches!(p.change, Change::Table(TableChange::CreateTable { .. })))
                     .cloned()
                     .collect::<Vec<_>>()
             };
@@ -3997,9 +4070,10 @@ fn a_retyped_identity_releases_its_catalog_name_before_the_new_holder() {
             assert_eq!(plan.changes, ordered);
         } else {
             assert!(
-                original
-                    .iter()
-                    .all(|p| !matches!(p.change, Change::AlterColumnNumbering { .. })),
+                original.iter().all(|p| !matches!(
+                    p.change,
+                    Change::Column(ColumnChange::AlterColumnNumbering { .. })
+                )),
                 "this negative only retypes the kept identity"
             );
             assert_eq!(plan.changes.changes, original);
@@ -4013,6 +4087,7 @@ fn a_retyped_identity_releases_its_catalog_name_before_the_new_holder() {
 
 #[test]
 fn settling_an_identity_handover_preserves_the_claims_dependents() {
+    use pbps_model::ColumnChange;
     use pbps_model::{Change, ColumnRef, PlannedChange, Uid, UidKind, ValueSource};
     let mut plan = IdentityHandover::new(ValueSource::None);
     let claimed = TableName::new("app", "counter");
@@ -4030,12 +4105,12 @@ fn settling_an_identity_handover_preserves_the_claims_dependents() {
         .insert(uid.clone(), ColumnRef::new(claimed.clone(), "extra"));
     plan.changes.changes.insert(
         1,
-        PlannedChange::new(Change::AddColumn {
+        PlannedChange::new(Change::Column(ColumnChange::AddColumn {
             uid,
             table: claimed,
             name: "extra".into(),
             column: Box::new(column),
-        }),
+        })),
     );
     let original = plan.changes.changes.clone();
     plan.order();
@@ -4067,16 +4142,18 @@ fn settling_an_identity_handover_preserves_the_claims_dependents() {
 /// change other than a table rename that the move would pass.
 #[test]
 fn a_move_runs_after_the_rename_that_moves_its_carried_names_holder_away() {
+    use pbps_model::IndexChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, PlannedChange};
     use pbps_pg::catalog::NameOccupant;
     let t = TableName::new;
     let rename = |from: TableName, to: TableName| {
-        PlannedChange::new(Change::RenameTable {
+        PlannedChange::new(Change::Table(TableChange::RenameTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, &from.raw().to_string(), 0),
             from,
             to,
             defaults: Vec::new(),
-        })
+        }))
     };
     let sequence = |name: TableName, owner: TableName| NameOccupant {
         name,
@@ -4174,10 +4251,10 @@ fn a_move_runs_after_the_rename_that_moves_its_carried_names_holder_away() {
 
     // The move would pass a change other than a table rename, which a
     // release build has no edge to order it against.
-    let between = PlannedChange::new(Change::DropIndex {
+    let between = PlannedChange::new(Change::Index(IndexChange::DropIndex {
         table: t("s9", "z"),
         name: "z_ix".into(),
-    });
+    }));
     let (changes, refused) = ordered(vec![a_in(), between.clone(), b_out()], &[t("s9", "z")]);
     assert_eq!(changes, vec![a_in(), between, b_out()]);
     refused.expect_err("only table renames pass one another");
@@ -4202,10 +4279,10 @@ fn a_move_runs_after_the_rename_that_moves_its_carried_names_holder_away() {
         ),
         "{e}"
     );
-    let drop_z = PlannedChange::new(Change::DropIndex {
+    let drop_z = PlannedChange::new(Change::Index(IndexChange::DropIndex {
         table: t("s3", "x"),
         name: "z".into(),
-    });
+    }));
     refuse_uninventoried_occupants(
         &pbps_model::ChangeSet {
             changes: vec![drop_z, b_to_z()],
@@ -4237,16 +4314,17 @@ fn only_marked_steps_pass_one_another() {
 /// on, for the second catalog read. A same-schema rename carries nothing.
 #[test]
 fn carried_names_are_where_each_move_lands() {
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
     use pbps_pg::catalog::NameOccupant;
     let a = TableName::new("s1", "a");
     let rename = |to: TableName| {
-        PlannedChange::new(Change::RenameTable {
+        PlannedChange::new(Change::Table(TableChange::RenameTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "s1.a", 0),
             from: a.clone(),
             to,
             defaults: Vec::new(),
-        })
+        }))
     };
     let index = NameOccupant {
         name: TableName::new("s1", "ix"),
@@ -4280,26 +4358,30 @@ fn carried_names_are_where_each_move_lands() {
 /// on is free.
 #[test]
 fn a_cross_schema_rename_carries_what_its_table_owns() {
+    use pbps_model::ColumnChange;
+    use pbps_model::IndexChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, ColumnRef, PlannedChange};
     use pbps_pg::catalog::NameOccupant;
     let old = TableName::new("app", "old");
     let carried = TableName::new("archive", "old_n_seq");
     let rename = |to: TableName| {
-        PlannedChange::new(Change::RenameTable {
+        PlannedChange::new(Change::Table(TableChange::RenameTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.old", 0),
             from: old.clone(),
             to,
             defaults: Vec::new(),
-        })
+        }))
     };
     let create = |name: &TableName| {
-        PlannedChange::new(Change::CreateTable {
+        PlannedChange::new(Change::Table(TableChange::CreateTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "archive.x", 0),
             name: name.clone(),
             table: Box::default(),
             beside_default: None,
             moves_at_most: None,
-        })
+        }))
     };
     let sequence = NameOccupant {
         name: TableName::new("app", "old_n_seq"),
@@ -4357,13 +4439,13 @@ fn a_cross_schema_rename_carries_what_its_table_owns() {
     refuse_uninventoried_occupants(
         &plan(vec![
             to_archive(),
-            PlannedChange::new(Change::DropColumn {
+            PlannedChange::new(Change::Column(ColumnChange::DropColumn {
                 uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "app.old.n", 0),
                 column: ColumnRef {
                     table: TableName::new("archive", "new"),
                     name: "n".into(),
                 },
-            }),
+            })),
             create(&carried),
         ]),
         std::slice::from_ref(&sequence),
@@ -4375,10 +4457,10 @@ fn a_cross_schema_rename_carries_what_its_table_owns() {
     refuse_uninventoried_occupants(
         &plan(vec![
             to_archive(),
-            PlannedChange::new(Change::DropIndex {
+            PlannedChange::new(Change::Index(IndexChange::DropIndex {
                 table: TableName::new("archive", "new"),
                 name: "old_n_seq".into(),
-            }),
+            })),
             create(&carried),
         ]),
         std::slice::from_ref(&index),
@@ -4391,12 +4473,12 @@ fn a_cross_schema_rename_carries_what_its_table_owns() {
     // name before the rename, and the carried sequence takes it.
     let view = TableName::new("archive", "old_n_seq");
     let rebuild = vec![
-        PlannedChange::new(Change::DropModule {
+        PlannedChange::new(Change::Module(ModuleChange::DropModule {
             id: ModuleId::Named(view.clone()),
             kind: pbps_model::ModuleKind::View,
-        }),
+        })),
         to_archive(),
-        PlannedChange::new(Change::CreateModule {
+        PlannedChange::new(Change::Module(ModuleChange::CreateModule {
             id: ModuleId::Named(view.clone()),
             module: Box::new(pbps_model::Module {
                 kind: pbps_model::ModuleKind::View,
@@ -4404,7 +4486,7 @@ fn a_cross_schema_rename_carries_what_its_table_owns() {
                 definition: "SELECT 1".into(),
                 options: Default::default(),
             }),
-        }),
+        })),
     ];
     let e = refuse_uninventoried_occupants(
         &plan(rebuild),
@@ -4445,18 +4527,23 @@ fn a_cross_schema_rename_carries_what_its_table_owns() {
 /// table it drops. A view the plan rebuilds already owns its name.
 #[test]
 fn an_uninventoried_occupant_refuses_unless_the_plan_frees_it() {
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::IndexChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, Module, ModuleKind, PlannedChange};
     use pbps_pg::catalog::NameOccupant;
     let x = TableName::new("app", "x");
     let owner = TableName::new("app", "old");
     let create_table = || {
-        PlannedChange::new(Change::CreateTable {
+        PlannedChange::new(Change::Table(TableChange::CreateTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.x", 0),
             name: x.clone(),
             table: Box::default(),
             beside_default: None,
             moves_at_most: None,
-        })
+        }))
     };
     let view = || Module {
         kind: ModuleKind::View,
@@ -4493,10 +4580,10 @@ fn an_uninventoried_occupant_refuses_unless_the_plan_frees_it() {
     .to_string();
     assert!(e.contains("already has index `app.x` on `app.old`"), "{e}");
     // A new view's name is asked too.
-    let new_view = PlannedChange::new(Change::CreateModule {
+    let new_view = PlannedChange::new(Change::Module(ModuleChange::CreateModule {
         id: ModuleId::Named(x.clone()),
         module: Box::new(view()),
-    });
+    }));
     assert!(
         refuse_uninventoried_occupants(
             &plan(vec![new_view.clone()]),
@@ -4509,10 +4596,10 @@ fn an_uninventoried_occupant_refuses_unless_the_plan_frees_it() {
     );
 
     // Freed by the plan itself.
-    let drop_index = PlannedChange::new(Change::DropIndex {
+    let drop_index = PlannedChange::new(Change::Index(IndexChange::DropIndex {
         table: owner.clone(),
         name: "x".into(),
-    });
+    }));
     refuse_uninventoried_occupants(
         &plan(vec![drop_index, create_table()]),
         &[occupant("index", Some(&owner))],
@@ -4521,11 +4608,11 @@ fn an_uninventoried_occupant_refuses_unless_the_plan_frees_it() {
         &Default::default(),
     )
     .expect("an index the plan drops first");
-    let drop_table = PlannedChange::new(Change::DropTable {
+    let drop_table = PlannedChange::new(Change::Table(TableChange::DropTable {
         uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.old", 0),
         name: owner.clone(),
         detach_from: None,
-    });
+    }));
     for kind in ["index", "sequence"] {
         refuse_uninventoried_occupants(
             &plan(vec![drop_table.clone(), create_table()]),
@@ -4538,12 +4625,12 @@ fn an_uninventoried_occupant_refuses_unless_the_plan_frees_it() {
     }
     // The index behind a unique constraint or a primary key the plan
     // drops, named after the constraint (#1082 review).
-    let drop_unique = PlannedChange::new(Change::DropUnique {
+    let drop_unique = PlannedChange::new(Change::Constraint(ConstraintChange::DropUnique {
         table: owner.clone(),
         name: "x".into(),
-    });
+    }));
     let drop_key = |name: Option<&str>| {
-        PlannedChange::new(Change::SetPrimaryKey {
+        PlannedChange::new(Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: TableName::new("app", if name.is_some() { "old" } else { "x" }),
             from: Some(pbps_model::PrimaryKey {
                 name: name.map(Into::into),
@@ -4553,7 +4640,7 @@ fn an_uninventoried_occupant_refuses_unless_the_plan_frees_it() {
             }),
             to: None,
             nonclustered: false,
-        })
+        }))
     };
     for dropped in [drop_unique, drop_key(Some("x"))] {
         refuse_uninventoried_occupants(
@@ -4580,12 +4667,12 @@ fn an_uninventoried_occupant_refuses_unless_the_plan_frees_it() {
     // An owner moved to another schema takes its index along; one renamed
     // within the schema does not.
     let rename = |to: TableName| {
-        PlannedChange::new(Change::RenameTable {
+        PlannedChange::new(Change::Table(TableChange::RenameTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.old", 0),
             from: owner.clone(),
             to,
             defaults: Vec::new(),
-        })
+        }))
     };
     refuse_uninventoried_occupants(
         &plan(vec![
@@ -4614,10 +4701,10 @@ fn an_uninventoried_occupant_refuses_unless_the_plan_frees_it() {
         owner_column: Some(column.into()),
         ..occupant("sequence", Some(&owner))
     };
-    let drop_column = PlannedChange::new(Change::DropColumn {
+    let drop_column = PlannedChange::new(Change::Column(ColumnChange::DropColumn {
         uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "app.old.id", 0),
         column: pbps_model::ColumnRef::new(owner.clone(), "id"),
-    });
+    }));
     refuse_uninventoried_occupants(
         &plan(vec![drop_column.clone(), create_table()]),
         &[owned_by("id")],
@@ -4648,16 +4735,16 @@ fn an_uninventoried_occupant_refuses_unless_the_plan_frees_it() {
         owner_column: column.map(Into::into),
     };
     let create_at = |name: &str| {
-        PlannedChange::new(Change::CreateTable {
+        PlannedChange::new(Change::Table(TableChange::CreateTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, name, 0),
             name: TableName::new("app", name),
             table: Box::default(),
             beside_default: None,
             moves_at_most: None,
-        })
+        }))
     };
     let unnamed_key_on = |table: &TableName| {
-        PlannedChange::new(Change::SetPrimaryKey {
+        PlannedChange::new(Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: table.clone(),
             from: Some(pbps_model::PrimaryKey {
                 name: None,
@@ -4667,7 +4754,7 @@ fn an_uninventoried_occupant_refuses_unless_the_plan_frees_it() {
             }),
             to: None,
             nonclustered: false,
-        })
+        }))
     };
     refuse_uninventoried_occupants(
         &plan(vec![
@@ -4692,10 +4779,10 @@ fn an_uninventoried_occupant_refuses_unless_the_plan_frees_it() {
         .is_err(),
         "without the rename, dropping `renamed`'s key frees `renamed_pkey`"
     );
-    let drop_renamed_column = PlannedChange::new(Change::DropColumn {
+    let drop_renamed_column = PlannedChange::new(Change::Column(ColumnChange::DropColumn {
         uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "app.renamed.n", 0),
         column: pbps_model::ColumnRef::new(renamed.clone(), "n"),
-    });
+    }));
     refuse_uninventoried_occupants(
         &plan(vec![
             rename(renamed.clone()),
@@ -4710,16 +4797,18 @@ fn an_uninventoried_occupant_refuses_unless_the_plan_frees_it() {
     .expect("the sequence's owning column is dropped under its new table name");
 
     // A view dropped and created is a rebuild: its name is its own.
-    let drop_view = PlannedChange::new(Change::DropModule {
+    let drop_view = PlannedChange::new(Change::Module(ModuleChange::DropModule {
         id: ModuleId::Named(x.clone()),
         kind: ModuleKind::View,
-    });
+    }));
     assert!(created_relation_names(&plan(vec![drop_view, new_view])).is_empty());
 }
 
 #[test]
 fn serial_claims_use_the_emitted_name_and_leave_ordering_names_unchanged() {
     use pbps_dialect::PlanDialect as _;
+    use pbps_model::ColumnChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, Column, OwnedSequence, PlanMode, PlannedChange, Table, ValueSource};
     let pg = pbps_pg::Postgres::new();
     for (table, column) in [
@@ -4742,19 +4831,19 @@ fn serial_claims_use_the_emitted_name_and_leave_ordering_names_unchanged() {
             });
             let mut t = Table::default();
             t.columns.insert(column.into(), c.clone());
-            let create = Change::CreateTable {
+            let create = Change::Table(TableChange::CreateTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: name.clone(),
                 table: Box::new(t),
                 beside_default: None,
                 moves_at_most: None,
-            };
-            let add = Change::AddColumn {
+            });
+            let add = Change::Column(ColumnChange::AddColumn {
                 uid: "c_aaaaaa".parse().unwrap(),
                 table: name.clone(),
                 name: column.into(),
                 column: Box::new(c),
-            };
+            });
             assert_eq!(relation_names_created(&create), vec![name]);
             assert!(relation_names_created(&add).is_empty());
             for change in [create, add] {
@@ -4782,7 +4871,7 @@ fn serial_claims_use_the_emitted_name_and_leave_ordering_names_unchanged() {
             }
         }
     }
-    let add_identity = Change::AddColumn {
+    let add_identity = Change::Column(ColumnChange::AddColumn {
         uid: "c_aaaaaa".parse().unwrap(),
         table: TableName::new("app", "t"),
         name: "id".into(),
@@ -4792,12 +4881,15 @@ fn serial_claims_use_the_emitted_name_and_leave_ordering_names_unchanged() {
             )
             .unwrap(),
         ),
-    };
+    });
     assert!(sequence_names_claimed(&add_identity).is_empty());
 }
 
 #[test]
 fn fixed_sequence_claims_meet_catalog_and_planned_relations_after_releases() {
+    use pbps_model::ColumnChange;
+    use pbps_model::IndexChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, Column, ColumnRef, OwnedSequence, Table, ValueSource};
     use pbps_pg::catalog::NameOccupant;
     let table = TableName::new("app", "t");
@@ -4812,25 +4904,27 @@ fn fixed_sequence_claims_meet_catalog_and_planned_relations_after_releases() {
     column.value_source = serial(None);
     let mut t = Table::default();
     t.columns.insert("id".into(), column.clone());
-    let create = Change::CreateTable {
+    let create = Change::Table(TableChange::CreateTable {
         uid: "t_aaaaaa".parse().unwrap(),
         name: table.clone(),
         table: Box::new(t),
         beside_default: None,
         moves_at_most: None,
-    };
-    let add = Change::AddColumn {
+    });
+    let add = Change::Column(ColumnChange::AddColumn {
         uid: "c_aaaaaa".parse().unwrap(),
         table: table.clone(),
         name: "id".into(),
         column: Box::new(column),
-    };
-    let numbering = |from, to| Change::AlterColumnNumbering {
-        uid: "c_aaaaaa".parse().unwrap(),
-        column: ColumnRef::new(table.clone(), "id"),
-        ty: "integer".parse().unwrap(),
-        from,
-        to,
+    });
+    let numbering = |from, to| {
+        Change::Column(ColumnChange::AlterColumnNumbering {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: ColumnRef::new(table.clone(), "id"),
+            ty: "integer".parse().unwrap(),
+            from,
+            to,
+        })
     };
     let identity = ValueSource::Identity(pbps_model::Identity {
         seed: 1,
@@ -4857,19 +4951,19 @@ fn fixed_sequence_claims_meet_catalog_and_planned_relations_after_releases() {
             &Default::default(),
         )
     };
-    let other_table = Change::CreateTable {
+    let other_table = Change::Table(TableChange::CreateTable {
         uid: "t_bbbbbb".parse().unwrap(),
         name: target.clone(),
         table: Box::default(),
         beside_default: None,
         moves_at_most: None,
-    };
-    let index = Change::AddIndex {
+    });
+    let index = Change::Index(IndexChange::AddIndex {
         table: TableName::new("app", "other"),
         name: target.name.clone().into(),
         index: Box::new(serde_json::from_str(r#"{"columns":[{"name":"n"}]}"#).unwrap()),
         clustered: false,
-    };
+    });
     for claim in claims {
         assert!(
             created_relation_names(&pbps_model::ChangeSet {
@@ -4903,11 +4997,11 @@ fn fixed_sequence_claims_meet_catalog_and_planned_relations_after_releases() {
                 assert!(!replay(changes, &[], &[]).is_empty());
             }
         }
-        let drop = Change::DropTable {
+        let drop = Change::Table(TableChange::DropTable {
             uid: "t_bbbbbb".parse().unwrap(),
             name: target.clone(),
             detach_from: None,
-        };
+        });
         assert!(replay(vec![drop, claim.clone()], &[], &[(target.clone(), "table")]).is_empty());
         let owner = TableName::new("app", "old");
         let occupant = NameOccupant {
@@ -4916,11 +5010,11 @@ fn fixed_sequence_claims_meet_catalog_and_planned_relations_after_releases() {
             owner: Some(owner.clone()),
             owner_column: Some("id".into()),
         };
-        let drop = Change::DropTable {
+        let drop = Change::Table(TableChange::DropTable {
             uid: "t_bbbbbb".parse().unwrap(),
             name: owner,
             detach_from: None,
-        };
+        });
         assert!(replay(vec![drop, claim.clone()], &[occupant], &[]).is_empty());
         let elsewhere = NameOccupant {
             name: TableName::new("other", "t_id_seq"),
@@ -4955,15 +5049,16 @@ fn fixed_sequence_claims_meet_catalog_and_planned_relations_after_releases() {
 #[test]
 fn an_added_index_meets_unrecorded_relations() {
     use pbps_db::catalog::LimitationTarget;
+    use pbps_model::IndexChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
     let x = TableName::new("app", "x");
     let add = |name: &str| ChangeSet {
-        changes: vec![PlannedChange::new(Change::AddIndex {
+        changes: vec![PlannedChange::new(Change::Index(IndexChange::AddIndex {
             table: TableName::new("app", "t"),
             name: name.into(),
             index: Box::new(serde_json::from_str(r#"{"columns": [{"name": "n"}]}"#).unwrap()),
             clustered: false,
-        })],
+        }))],
     };
     let empty = pbps_diff::Scoped {
         baseline_evidence: None,
@@ -5013,16 +5108,19 @@ fn an_added_index_meets_unrecorded_relations() {
 #[test]
 fn a_new_name_is_occupied_only_by_what_shares_its_namespace() {
     use pbps_db::catalog::LimitationTarget;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
     let x = TableName::new("app", "x");
     let create = ChangeSet {
-        changes: vec![PlannedChange::new(Change::CreateTable {
-            uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.x", 0),
-            name: x.clone(),
-            table: Box::default(),
-            beside_default: None,
-            moves_at_most: None,
-        })],
+        changes: vec![PlannedChange::new(Change::Table(
+            TableChange::CreateTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.x", 0),
+                name: x.clone(),
+                table: Box::default(),
+                beside_default: None,
+                moves_at_most: None,
+            },
+        ))],
     };
     let empty = pbps_diff::Scoped {
         baseline_evidence: None,
@@ -5091,15 +5189,18 @@ fn a_new_name_is_occupied_only_by_what_shares_its_namespace() {
 /// found open, and the one it declared open found closed.
 #[test]
 fn the_closing_read_holds_a_routine_to_what_the_plan_settled_about_public() {
+    use pbps_model::GrantChange;
     use pbps_model::{Change, ChangeSet, PlannedChange, PublicAccess, RoutineOrigin};
     let id: pbps_model::ModuleId = "app.f(integer)".parse().unwrap();
     let decided = |access| {
         let mut cs = ChangeSet::default();
-        cs.changes.push(PlannedChange::new(Change::PublicExecution {
-            routine: "app.f(integer)".parse().unwrap(),
-            access,
-            origin: RoutineOrigin::Created,
-        }));
+        cs.changes.push(PlannedChange::new(Change::Permission(
+            GrantChange::PublicExecution {
+                routine: "app.f(integer)".parse().unwrap(),
+                access,
+                origin: RoutineOrigin::Created,
+            },
+        )));
         cs
     };
     let read = |open: bool| {
@@ -5156,22 +5257,28 @@ fn the_closing_read_holds_a_routine_to_what_the_plan_settled_about_public() {
 /// because it has nothing to be a companion of.
 #[test]
 fn a_routines_public_decision_is_counted_with_the_create_it_belongs_to() {
+    use pbps_model::GrantChange;
+    use pbps_model::ModuleChange;
     use pbps_model::{
         Change, ChangeSet, Module, ModuleKind, PlannedChange, PublicAccess, RoutineOrigin,
     };
-    let create = |name: &str| Change::CreateModule {
-        id: name.parse().unwrap(),
-        module: Box::new(Module {
-            kind: ModuleKind::Function,
-            description: None,
-            definition: "() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$".into(),
-            options: Default::default(),
-        }),
+    let create = |name: &str| {
+        Change::Module(ModuleChange::CreateModule {
+            id: name.parse().unwrap(),
+            module: Box::new(Module {
+                kind: ModuleKind::Function,
+                description: None,
+                definition: "() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$".into(),
+                options: Default::default(),
+            }),
+        })
     };
-    let decided = |name: &str, access| Change::PublicExecution {
-        routine: name.parse().unwrap(),
-        access,
-        origin: RoutineOrigin::Created,
+    let decided = |name: &str, access| {
+        Change::Permission(GrantChange::PublicExecution {
+            routine: name.parse().unwrap(),
+            access,
+            origin: RoutineOrigin::Created,
+        })
     };
     let count = |changes: Vec<Change>| {
         let mut cs = ChangeSet::default();
@@ -5215,12 +5322,16 @@ fn a_routines_public_decision_is_counted_with_the_create_it_belongs_to() {
 /// of its own (DEC-1635.7).
 #[test]
 fn a_rebuilds_steps_are_one_logical_change_and_its_companions_are_not() {
+    use pbps_model::ConstraintChange;
+    use pbps_model::TypeValueChange;
     use pbps_model::{Change, ChangeSet, EnumRebuildStep, ManagedType, PlannedChange};
-    let step = |uid: &str, step| Change::EnumRebuild {
-        uid: uid.parse().unwrap(),
-        name: "app.e".parse().unwrap(),
-        tmp: "app.tmp".parse().unwrap(),
-        step,
+    let step = |uid: &str, step| {
+        Change::TypeValue(TypeValueChange::EnumRebuild {
+            uid: uid.parse().unwrap(),
+            name: "app.e".parse().unwrap(),
+            tmp: "app.tmp".parse().unwrap(),
+            step,
+        })
     };
     let definition = Box::new(ManagedType::Enum {
         values: vec!["ok".into()],
@@ -5271,10 +5382,10 @@ fn a_rebuilds_steps_are_one_logical_change_and_its_companions_are_not() {
     two.extend(rebuild("y_000002"));
     assert_eq!(count(two), 2);
     let mut with_default = rebuild("y_000001");
-    with_default.push(Change::DropCheck {
+    with_default.push(Change::Constraint(ConstraintChange::DropCheck {
         table: "app.t".parse().unwrap(),
         name: "c".into(),
-    });
+    }));
     assert_eq!(count(with_default), 2);
 }
 
@@ -5416,15 +5527,18 @@ fn a_read_only_probe_still_refuses_a_violating_row() {
 }
 
 fn check_on(schema: &str, expression: &str) -> pbps_model::ChangeSet {
+    use pbps_model::ConstraintChange;
     use pbps_model::{Change, ChangeSet, CheckConstraint, PlannedChange};
     ChangeSet {
-        changes: vec![PlannedChange::new(Change::AddCheck {
-            table: format!("{schema}.t").parse().expect("a table name"),
-            name: "t_ck".into(),
-            constraint: CheckConstraint {
-                expression: expression.to_owned(),
+        changes: vec![PlannedChange::new(Change::Constraint(
+            ConstraintChange::AddCheck {
+                table: format!("{schema}.t").parse().expect("a table name"),
+                name: "t_ck".into(),
+                constraint: CheckConstraint {
+                    expression: expression.to_owned(),
+                },
             },
-        })],
+        ))],
     }
 }
 
@@ -5441,6 +5555,7 @@ fn a_probe_is_answered_under_the_settings_the_statement_will_run_under() {
 }
 
 async fn a_probe_is_answered_under_the_pins() {
+    use pbps_model::ConstraintChange;
     use pbps_model::{Change, ChangeSet, CheckConstraint, PlannedChange};
 
     let database = crate::test_pg::TestDb::create("pins").await;
@@ -5463,13 +5578,15 @@ async fn a_probe_is_answered_under_the_pins() {
 
     let table: pbps_model::TableName = format!("{schema}.t").parse().expect("a table name");
     let changes = ChangeSet {
-        changes: vec![PlannedChange::new(Change::AddCheck {
-            table: table.clone(),
-            name: "t_ck".into(),
-            constraint: CheckConstraint {
-                expression: "d < '02/01/2026'".to_owned(),
+        changes: vec![PlannedChange::new(Change::Constraint(
+            ConstraintChange::AddCheck {
+                table: table.clone(),
+                name: "t_ck".into(),
+                constraint: CheckConstraint {
+                    expression: "d < '02/01/2026'".to_owned(),
+                },
             },
-        })],
+        ))],
     };
 
     let dialect = pbps_pg::Postgres::new();
@@ -5856,10 +5973,12 @@ fn carried_view(described: &str, schema: &str, name: &str) -> pbps_db::impact::R
 }
 
 fn dropping(kind: pbps_model::ModuleKind, id: &str) -> pbps_model::PlannedChange {
-    pbps_model::PlannedChange::new(pbps_model::Change::DropModule {
-        id: id.parse().unwrap(),
-        kind,
-    })
+    pbps_model::PlannedChange::new(pbps_model::Change::Module(
+        pbps_model::ModuleChange::DropModule {
+            id: id.parse().unwrap(),
+            kind,
+        },
+    ))
 }
 
 /// #823: a view this plan drops is not reported as carried by the rename
@@ -6083,14 +6202,15 @@ fn sql_server_impact_output_is_unchanged() {
 #[test]
 fn intermediate_names_are_absent_unless_the_plan_deliberately_reuses_them() {
     use pbps_dialect::Statement;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
     let rename = |uid: &str, from: &str, to: &str| {
-        PlannedChange::new(Change::RenameTable {
+        PlannedChange::new(Change::Table(TableChange::RenameTable {
             uid: uid.parse().unwrap(),
             from: from.parse().unwrap(),
             to: to.parse().unwrap(),
             defaults: Vec::new(),
-        })
+        }))
     };
     let mut changes = ChangeSet {
         changes: vec![rename("t_aaaaaa", "app.t", "moved.u")],
@@ -6218,29 +6338,33 @@ fn a_change_no_statement_of_this_plan_makes_refuses_the_apply() {
 
     // The same change, when it *is* this plan's: a plan that revokes the
     // grant must not be refused for having revoked it.
-    let planned = changes(vec![pbps_model::Change::Revoke {
-        role: "app".to_owned().into(),
-        target: dbo(),
-        permissions: [pbps_model::Permission::Select].into_iter().collect(),
-    }]);
+    let planned = changes(vec![pbps_model::Change::Permission(
+        pbps_model::GrantChange::Revoke {
+            role: "app".to_owned().into(),
+            target: dbo(),
+            permissions: [pbps_model::Permission::Select].into_iter().collect(),
+        },
+    )]);
     refuse(&planned, &before, &robbed).expect("the plan's own change");
 
     // A table retyped behind the plan's back, and the same retype planned.
     let retyped = schema("bigint", &[pbps_model::Permission::Select]);
     let e = refuse(&changes(vec![]), &before, &retyped).expect_err("the table moved");
     assert!(e.contains("dbo.t"), "{e}");
-    let planned = changes(vec![pbps_model::Change::AlterColumnType {
-        uid: "c_aaaaaa".parse().unwrap(),
-        column: pbps_model::ColumnRef::new("dbo.t".parse().unwrap(), "c"),
-        from: "int".parse().unwrap(),
-        to: "bigint".parse().unwrap(),
-        from_nullable: true,
-        to_nullable: true,
-        through_external_partitions: false,
-        from_collation: None,
-        to_collation: None,
-        using: None,
-    }]);
+    let planned = changes(vec![pbps_model::Change::Column(
+        pbps_model::ColumnChange::AlterColumnType {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: pbps_model::ColumnRef::new("dbo.t".parse().unwrap(), "c"),
+            from: "int".parse().unwrap(),
+            to: "bigint".parse().unwrap(),
+            from_nullable: true,
+            to_nullable: true,
+            through_external_partitions: false,
+            from_collation: None,
+            to_collation: None,
+            using: None,
+        },
+    )]);
     refuse(&planned, &before, &retyped).expect("the plan's own change");
 
     // Appearing and vanishing are movements too, and neither reads as
@@ -6296,13 +6420,15 @@ fn a_numbering_change_is_held_to_the_source_it_gives() {
         )
         .map_err(|e| format!("{e:#}"))
     };
-    let retune = changes(vec![pbps_model::Change::AlterColumnNumbering {
-        uid: "c_aaaaaa".parse().unwrap(),
-        column: pbps_model::ColumnRef::new("app.t".parse().unwrap(), "id"),
-        ty: "integer".parse().unwrap(),
-        from: identity(1, 1),
-        to: identity(5, 2),
-    }]);
+    let retune = changes(vec![pbps_model::Change::Column(
+        pbps_model::ColumnChange::AlterColumnNumbering {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: pbps_model::ColumnRef::new("app.t".parse().unwrap(), "id"),
+            ty: "integer".parse().unwrap(),
+            from: identity(1, 1),
+            to: identity(5, 2),
+        },
+    )]);
     let before = schema(identity(1, 1));
     refuse(&retune, &before, &schema(identity(5, 2))).expect("the plan's own change");
     let e = refuse(&retune, &before, &schema(identity(5, 3))).expect_err("undone");
@@ -6322,25 +6448,29 @@ fn a_numbering_change_is_held_to_the_source_it_gives() {
             options: Default::default(),
         })
     };
-    let unnamed = changes(vec![pbps_model::Change::AlterColumnNumbering {
-        uid: "c_aaaaaa".parse().unwrap(),
-        column: pbps_model::ColumnRef::new("app.t".parse().unwrap(), "id"),
-        ty: "integer".parse().unwrap(),
-        from: serial(1, "t_id_seq"),
-        to: serial(5, ""),
-    }]);
+    let unnamed = changes(vec![pbps_model::Change::Column(
+        pbps_model::ColumnChange::AlterColumnNumbering {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: pbps_model::ColumnRef::new("app.t".parse().unwrap(), "id"),
+            ty: "integer".parse().unwrap(),
+            from: serial(1, "t_id_seq"),
+            to: serial(5, ""),
+        },
+    )]);
     let before = schema(serial(1, "t_id_seq"));
     refuse(&unnamed, &before, &schema(serial(5, "t_id_seq"))).expect("kept");
     let e = refuse(&unnamed, &before, &schema(serial(5, "other_seq"))).expect_err("renamed");
     assert!(e.contains("numbering source"), "{e}");
     let before = schema(identity(1, 1));
     // Negative: a plan that touches only another column excuses nothing.
-    let elsewhere = changes(vec![pbps_model::Change::AlterColumnDefault {
-        uid: "c_bbbbbb".parse().unwrap(),
-        column: pbps_model::ColumnRef::new("app.t".parse().unwrap(), "a"),
-        from: None,
-        to: Some("1".to_owned()),
-    }]);
+    let elsewhere = changes(vec![pbps_model::Change::Column(
+        pbps_model::ColumnChange::AlterColumnDefault {
+            uid: "c_bbbbbb".parse().unwrap(),
+            column: pbps_model::ColumnRef::new("app.t".parse().unwrap(), "a"),
+            from: None,
+            to: Some("1".to_owned()),
+        },
+    )]);
     let e = refuse(&elsewhere, &before, &schema(identity(5, 2))).expect_err("unplanned");
     assert!(e.contains("column `id` has a different identity"), "{e}");
 }
@@ -6384,20 +6514,24 @@ fn a_generation_this_plan_does_not_move_is_still_compared() {
         )
         .map_err(|e| format!("{e:#}"))
     };
-    let recompute = changes(vec![pbps_model::Change::AlterColumnExpression {
-        uid: "c_aaaaaa".parse().unwrap(),
-        column: pbps_model::ColumnRef::new("app.t".parse().unwrap(), "g"),
-        from: "(a * 2)".to_owned(),
-        to: "a * 3".to_owned(),
-    }]);
+    let recompute = changes(vec![pbps_model::Change::Column(
+        pbps_model::ColumnChange::AlterColumnExpression {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: pbps_model::ColumnRef::new("app.t".parse().unwrap(), "g"),
+            from: "(a * 2)".to_owned(),
+            to: "a * 3".to_owned(),
+        },
+    )]);
     // A plan that touches the table through another column, so the
     // table is compared column by column rather than whole.
-    let elsewhere = changes(vec![pbps_model::Change::AlterColumnDefault {
-        uid: "c_bbbbbb".parse().unwrap(),
-        column: pbps_model::ColumnRef::new("app.t".parse().unwrap(), "a"),
-        from: None,
-        to: Some("1".to_owned()),
-    }]);
+    let elsewhere = changes(vec![pbps_model::Change::Column(
+        pbps_model::ColumnChange::AlterColumnDefault {
+            uid: "c_bbbbbb".parse().unwrap(),
+            column: pbps_model::ColumnRef::new("app.t".parse().unwrap(), "a"),
+            from: None,
+            to: Some("1".to_owned()),
+        },
+    )]);
     let before = schema(Some(("(a * 2)", true)));
     let changed = schema(Some(("(a * 3)", true)));
     refuse(&recompute, &before, &changed).expect("the plan's own change");
@@ -6444,11 +6578,13 @@ fn a_grant_this_plan_does_not_move_is_still_compared() {
         s
     };
     let plan_granting = |permission: Permission| pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Grant {
-            role: "app".to_owned().into(),
-            target: dbo(),
-            permissions: [permission].into_iter().collect(),
-        })],
+        changes: vec![pbps_model::PlannedChange::new(
+            pbps_model::Change::Permission(pbps_model::GrantChange::Grant {
+                role: "app".to_owned().into(),
+                target: dbo(),
+                permissions: [permission].into_iter().collect(),
+            }),
+        )],
     };
     let refuse = |cs: &pbps_model::ChangeSet, before: &Schema, after: &Schema| {
         refuse_unplanned_movement(
@@ -6477,11 +6613,13 @@ fn a_grant_this_plan_does_not_move_is_still_compared() {
 
     // And a revoke the plan *did* ask for is not reported as movement.
     let revoking = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Revoke {
-            role: "app".to_owned().into(),
-            target: dbo(),
-            permissions: [Permission::Select].into_iter().collect(),
-        })],
+        changes: vec![pbps_model::PlannedChange::new(
+            pbps_model::Change::Permission(pbps_model::GrantChange::Revoke {
+                role: "app".to_owned().into(),
+                target: dbo(),
+                permissions: [Permission::Select].into_iter().collect(),
+            }),
+        )],
     };
     refuse(&revoking, &before, &schema(&[])).expect("the plan's own revoke");
 
@@ -6556,14 +6694,14 @@ fn a_table_rename_does_not_forward_the_grant_on_a_routine_of_that_name() {
         s
     };
     let rename = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::RenameTable {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Table(
+            pbps_model::TableChange::RenameTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 from: "dbo.f".parse().unwrap(),
                 to: "dbo.g".parse().unwrap(),
                 defaults: Vec::new(),
             },
-        )],
+        ))],
     };
     let refuse = |after: &Schema| {
         refuse_unplanned_movement(
@@ -6591,23 +6729,29 @@ fn a_table_rename_does_not_forward_the_grant_on_a_routine_of_that_name() {
 fn a_dropped_trigger_is_excused_from_the_rename_impact_under_its_catalog_name() {
     let changes = pbps_model::ChangeSet {
         changes: vec![
-            pbps_model::PlannedChange::new(pbps_model::Change::DropModule {
-                id: "dbo.t.audit".parse().unwrap(),
-                kind: pbps_model::ModuleKind::Trigger,
-            }),
-            pbps_model::PlannedChange::new(pbps_model::Change::DropModule {
-                id: "dbo.v".parse().unwrap(),
-                kind: pbps_model::ModuleKind::View,
-            }),
-            pbps_model::PlannedChange::new(pbps_model::Change::AlterModule {
-                id: "dbo.kept".parse().unwrap(),
-                module: Box::new(pbps_model::Module {
+            pbps_model::PlannedChange::new(pbps_model::Change::Module(
+                pbps_model::ModuleChange::DropModule {
+                    id: "dbo.t.audit".parse().unwrap(),
+                    kind: pbps_model::ModuleKind::Trigger,
+                },
+            )),
+            pbps_model::PlannedChange::new(pbps_model::Change::Module(
+                pbps_model::ModuleChange::DropModule {
+                    id: "dbo.v".parse().unwrap(),
                     kind: pbps_model::ModuleKind::View,
-                    description: None,
-                    definition: "SELECT 1".to_owned(),
-                    options: Default::default(),
-                }),
-            }),
+                },
+            )),
+            pbps_model::PlannedChange::new(pbps_model::Change::Module(
+                pbps_model::ModuleChange::AlterModule {
+                    id: "dbo.kept".parse().unwrap(),
+                    module: Box::new(pbps_model::Module {
+                        kind: pbps_model::ModuleKind::View,
+                        description: None,
+                        definition: "SELECT 1".to_owned(),
+                        options: Default::default(),
+                    }),
+                },
+            )),
         ],
     };
     let names: Vec<String> = dropped_referrer_names(&changes).into_iter().collect();
@@ -6657,12 +6801,12 @@ fn a_dropped_overload_does_not_excuse_the_siblings_grants() {
         s
     };
     let dropping_int = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::DropModule {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Module(
+            pbps_model::ModuleChange::DropModule {
                 id: int.clone(),
                 kind: pbps_model::ModuleKind::Function,
             },
-        )],
+        ))],
     };
     let refuse = |after: &Schema| {
         refuse_unplanned_movement(
@@ -6692,6 +6836,7 @@ fn a_dropped_overload_does_not_excuse_the_siblings_grants() {
 /// independently held. Multiple parents are a transactional plan (ADR-0003).
 #[test]
 fn a_checkpoint_carries_only_the_named_parent_in_a_child() {
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, ForeignKey, PlannedChange, Table};
 
     let child = |first: &str, second: &str| {
@@ -6714,12 +6859,14 @@ fn a_checkpoint_carries_only_the_named_parent_in_a_child() {
     };
 
     let renames = ChangeSet {
-        changes: vec![PlannedChange::new(Change::RenameTable {
-            uid: "t_aaaaaa".parse().unwrap(),
-            from: "dbo.one".parse().unwrap(),
-            to: "dbo.one_x".parse().unwrap(),
-            defaults: Vec::new(),
-        })],
+        changes: vec![PlannedChange::new(Change::Table(
+            TableChange::RenameTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                from: "dbo.one".parse().unwrap(),
+                to: "dbo.one_x".parse().unwrap(),
+                defaults: Vec::new(),
+            },
+        ))],
     };
 
     // The parents themselves, so the reads are the shape a real one has:
@@ -6783,6 +6930,7 @@ fn a_checkpoint_carries_only_the_named_parent_in_a_child() {
 /// multiple renames compose only at transactional settlement (DEC-1950.1).
 #[test]
 fn renames_keep_constraints_at_single_change_checkpoints_and_transactional_close() {
+    use pbps_model::ColumnChange;
     use pbps_model::{Change, ChangeSet, Column, PlannedChange, PrimaryKey, Table};
 
     // The columns and the constraints that name them move together: a
@@ -6816,20 +6964,20 @@ fn renames_keep_constraints_at_single_change_checkpoints_and_transactional_close
 
     let renames = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::RenameColumn {
+            PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
                 uid: "c_aaaaaa".parse().unwrap(),
                 table: "dbo.t".parse().unwrap(),
                 from: "a".into(),
                 to: "a2".into(),
                 table_was: None,
-            }),
-            PlannedChange::new(Change::RenameColumn {
+            })),
+            PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
                 uid: "c_bbbbbb".parse().unwrap(),
                 table: "dbo.t".parse().unwrap(),
                 from: "b".into(),
                 to: "b2".into(),
                 table_was: None,
-            }),
+            })),
         ],
     };
 
@@ -6930,12 +7078,12 @@ fn a_module_this_plan_writes_is_held_to_what_it_wrote() {
         s
     };
     let writing = |definition: &str| pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::AlterModule {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Module(
+            pbps_model::ModuleChange::AlterModule {
                 id: "dbo.v".parse().unwrap(),
                 module: Box::new(view(definition)),
             },
-        )],
+        ))],
     };
     let before = schema_with(Some(view("SELECT 1")));
 
@@ -6976,12 +7124,12 @@ fn a_module_this_plan_writes_is_held_to_what_it_wrote() {
 
     // And the other direction: a module this plan drops must be gone.
     let dropping = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::DropModule {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Module(
+            pbps_model::ModuleChange::DropModule {
                 id: "dbo.v".parse().unwrap(),
                 kind: pbps_model::ModuleKind::View,
             },
-        )],
+        ))],
     };
     refuse_unplanned_movement(
         &pbps_mssql::Mssql,
@@ -7040,18 +7188,22 @@ fn a_renamed_serial_keeps_its_sequence_across_the_apply() {
             Settled::Whole,
         )
     };
-    let column = || pbps_model::Change::RenameColumn {
-        uid: "c_aaaaaa".parse().unwrap(),
-        table: "app.t".parse().unwrap(),
-        from: "id".into(),
-        to: "n".into(),
-        table_was: None,
+    let column = || {
+        pbps_model::Change::Column(pbps_model::ColumnChange::RenameColumn {
+            uid: "c_aaaaaa".parse().unwrap(),
+            table: "app.t".parse().unwrap(),
+            from: "id".into(),
+            to: "n".into(),
+            table_was: None,
+        })
     };
-    let table = || pbps_model::Change::RenameTable {
-        uid: "t_aaaaaa".parse().unwrap(),
-        from: "app.t".parse().unwrap(),
-        to: "app.u".parse().unwrap(),
-        defaults: Vec::new(),
+    let table = || {
+        pbps_model::Change::Table(pbps_model::TableChange::RenameTable {
+            uid: "t_aaaaaa".parse().unwrap(),
+            from: "app.t".parse().unwrap(),
+            to: "app.u".parse().unwrap(),
+            defaults: Vec::new(),
+        })
     };
     check(column(), &schema("app.t", "n", serial(Some("t_id_seq"), 1)))
         .expect("the column's rename leaves its sequence's name");
@@ -7090,27 +7242,33 @@ fn a_column_name_that_changes_hands_is_compared_by_the_column_holding_it() {
     };
     let named: TableName = "dbo.t".parse().unwrap();
     let rename = |uid: &str, from: &str, to: &str| {
-        pbps_model::PlannedChange::new(pbps_model::Change::RenameColumn {
-            uid: uid.parse().unwrap(),
-            table: named.clone(),
-            from: from.into(),
-            to: to.into(),
-            table_was: None,
-        })
+        pbps_model::PlannedChange::new(pbps_model::Change::Column(
+            pbps_model::ColumnChange::RenameColumn {
+                uid: uid.parse().unwrap(),
+                table: named.clone(),
+                from: from.into(),
+                to: to.into(),
+                table_was: None,
+            },
+        ))
     };
     let add = |uid: &str, name: &str, spec: &str| {
-        pbps_model::PlannedChange::new(pbps_model::Change::AddColumn {
-            uid: uid.parse().unwrap(),
-            table: named.clone(),
-            name: name.into(),
-            column: Box::new(pbps_model::Column::new(spec.parse().unwrap())),
-        })
+        pbps_model::PlannedChange::new(pbps_model::Change::Column(
+            pbps_model::ColumnChange::AddColumn {
+                uid: uid.parse().unwrap(),
+                table: named.clone(),
+                name: name.into(),
+                column: Box::new(pbps_model::Column::new(spec.parse().unwrap())),
+            },
+        ))
     };
     let drop = |uid: &str, name: &str| {
-        pbps_model::PlannedChange::new(pbps_model::Change::DropColumn {
-            uid: uid.parse().unwrap(),
-            column: named.column(name),
-        })
+        pbps_model::PlannedChange::new(pbps_model::Change::Column(
+            pbps_model::ColumnChange::DropColumn {
+                uid: uid.parse().unwrap(),
+                column: named.column(name),
+            },
+        ))
     };
     let check = |changes: Vec<pbps_model::PlannedChange>,
                  before: &[(&str, &str)],
@@ -7196,17 +7354,21 @@ fn a_column_renamed_into_a_dropped_columns_name_is_not_movement() {
     // it (DECISIONS 474).
     let changes = pbps_model::ChangeSet {
         changes: vec![
-            pbps_model::PlannedChange::new(pbps_model::Change::DropColumn {
-                uid: "c_aaaaaa".parse().unwrap(),
-                column: named.column("note"),
-            }),
-            pbps_model::PlannedChange::new(pbps_model::Change::RenameColumn {
-                uid: "c_bbbbbb".parse().unwrap(),
-                table: named.clone(),
-                from: "label".into(),
-                to: "note".into(),
-                table_was: None,
-            }),
+            pbps_model::PlannedChange::new(pbps_model::Change::Column(
+                pbps_model::ColumnChange::DropColumn {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    column: named.column("note"),
+                },
+            )),
+            pbps_model::PlannedChange::new(pbps_model::Change::Column(
+                pbps_model::ColumnChange::RenameColumn {
+                    uid: "c_bbbbbb".parse().unwrap(),
+                    table: named.clone(),
+                    from: "label".into(),
+                    to: "note".into(),
+                    table_was: None,
+                },
+            )),
         ],
     };
     refuse_unplanned_movement(
@@ -7374,8 +7536,8 @@ fn a_touched_table_answers_for_the_shape_the_plan_leaves_alone() {
     };
     // The plan widens `note`, and nothing else.
     let widening = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::AlterColumnType {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Column(
+            pbps_model::ColumnChange::AlterColumnType {
                 uid: "c_aaaaaa".parse().unwrap(),
                 column: "dbo.t.note".parse().unwrap(),
                 from: "nvarchar(50)".parse().unwrap(),
@@ -7387,7 +7549,7 @@ fn a_touched_table_answers_for_the_shape_the_plan_leaves_alone() {
                 to_collation: None,
                 using: None,
             },
-        )],
+        ))],
     };
     let before = table("nvarchar(50)", None);
     refuse_unplanned_movement(
@@ -7473,8 +7635,8 @@ fn a_touched_table_answers_for_the_shape_the_plan_leaves_alone() {
 
     // The plan's own index change is exempt, both ways round.
     let adding = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::AddIndex {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Index(
+            pbps_model::IndexChange::AddIndex {
                 table: "dbo.t".parse().unwrap(),
                 name: "ix_note".into(),
                 index: Box::new(pbps_model::Index {
@@ -7493,7 +7655,7 @@ fn a_touched_table_answers_for_the_shape_the_plan_leaves_alone() {
                 }),
                 clustered: false,
             },
-        )],
+        ))],
     };
     refuse_unplanned_movement(
         &pbps_mssql::Mssql,
@@ -7576,8 +7738,8 @@ fn a_row_this_plan_writes_holds_the_cells_it_spelled() {
         s
     };
     let inserting = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::InsertRow {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Row(
+            pbps_model::RowChange::InsertRow {
                 table: "dbo.t".parse().unwrap(),
                 key_column: "code".into(),
                 identity_key: false,
@@ -7588,7 +7750,7 @@ fn a_row_this_plan_writes_holds_the_cells_it_spelled() {
                 defaults: Default::default(),
                 types: Default::default(),
             },
-        )],
+        ))],
     };
     let empty = Schema::default();
     refuse_unplanned_movement(
@@ -7650,10 +7812,12 @@ fn a_module_still_to_be_dropped_stays_in_the_staged_scope() {
         changes: ["dbo.a", "dbo.b"]
             .into_iter()
             .map(|name| {
-                pbps_model::PlannedChange::new(pbps_model::Change::DropModule {
-                    id: name.parse().unwrap(),
-                    kind: pbps_model::ModuleKind::View,
-                })
+                pbps_model::PlannedChange::new(pbps_model::Change::Module(
+                    pbps_model::ModuleChange::DropModule {
+                        id: name.parse().unwrap(),
+                        kind: pbps_model::ModuleKind::View,
+                    },
+                ))
             })
             .collect(),
     };
@@ -7670,12 +7834,12 @@ fn a_module_still_to_be_dropped_stays_in_the_staged_scope() {
 
     // And a module the plan creates is watched from the start either way.
     let creating = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::CreateModule {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Module(
+            pbps_model::ModuleChange::CreateModule {
                 id: "dbo.c".parse().unwrap(),
                 module: Box::new(module("dbo.c").1),
             },
-        )],
+        ))],
     };
     for settled in [Settled::Whole, Settled::SoFar] {
         assert!(
@@ -7711,22 +7875,26 @@ fn what_this_plan_creates_is_compared_too() {
     };
     let creating = pbps_model::ChangeSet {
         changes: vec![
-            pbps_model::PlannedChange::new(pbps_model::Change::CreateTable {
-                uid: "t_aaaaaa".parse().unwrap(),
-                name: "dbo.new".parse().unwrap(),
-                table: Box::new(pbps_model::Table::default()),
-                beside_default: None,
-                moves_at_most: None,
-            }),
-            pbps_model::PlannedChange::new(pbps_model::Change::InsertRow {
-                table: "dbo.new".parse().unwrap(),
-                key_column: "code".into(),
-                identity_key: false,
-                key: RowKey::from("declared"),
-                row: pbps_model::Row::default(),
-                defaults: Default::default(),
-                types: Default::default(),
-            }),
+            pbps_model::PlannedChange::new(pbps_model::Change::Table(
+                pbps_model::TableChange::CreateTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: "dbo.new".parse().unwrap(),
+                    table: Box::new(pbps_model::Table::default()),
+                    beside_default: None,
+                    moves_at_most: None,
+                },
+            )),
+            pbps_model::PlannedChange::new(pbps_model::Change::Row(
+                pbps_model::RowChange::InsertRow {
+                    table: "dbo.new".parse().unwrap(),
+                    key_column: "code".into(),
+                    identity_key: false,
+                    key: RowKey::from("declared"),
+                    row: pbps_model::Row::default(),
+                    defaults: Default::default(),
+                    types: Default::default(),
+                },
+            )),
         ],
     };
     refuse_unplanned_movement(
@@ -7770,15 +7938,19 @@ fn what_this_plan_creates_is_compared_too() {
     };
     let creating_role = pbps_model::ChangeSet {
         changes: vec![
-            pbps_model::PlannedChange::new(pbps_model::Change::CreateRole {
-                uid: "r_aaaaaa".parse().unwrap(),
-                name: "app".to_owned().into(),
-            }),
-            pbps_model::PlannedChange::new(pbps_model::Change::Grant {
-                role: "app".to_owned().into(),
-                target: GrantTarget::Schema("dbo".to_owned()),
-                permissions: [Permission::Select].into_iter().collect(),
-            }),
+            pbps_model::PlannedChange::new(pbps_model::Change::Role(
+                pbps_model::RoleChange::CreateRole {
+                    uid: "r_aaaaaa".parse().unwrap(),
+                    name: "app".to_owned().into(),
+                },
+            )),
+            pbps_model::PlannedChange::new(pbps_model::Change::Permission(
+                pbps_model::GrantChange::Grant {
+                    role: "app".to_owned().into(),
+                    target: GrantTarget::Schema("dbo".to_owned()),
+                    permissions: [Permission::Select].into_iter().collect(),
+                },
+            )),
         ],
     };
     refuse_unplanned_movement(
@@ -7822,11 +7994,13 @@ fn the_guard_looks_where_the_plan_reaches() {
         s
     };
     let granting = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Grant {
-            role: "app".to_owned().into(),
-            target: GrantTarget::Schema("dbo".to_owned()),
-            permissions: [Permission::Select].into_iter().collect(),
-        })],
+        changes: vec![pbps_model::PlannedChange::new(
+            pbps_model::Change::Permission(pbps_model::GrantChange::Grant {
+                role: "app".to_owned().into(),
+                target: GrantTarget::Schema("dbo".to_owned()),
+                permissions: [Permission::Select].into_iter().collect(),
+            }),
+        )],
     };
     let none = role(BTreeMap::new());
     let e = refuse_unplanned_movement(
@@ -7858,8 +8032,8 @@ fn the_guard_looks_where_the_plan_reaches() {
         s
     };
     let inserting = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::InsertRow {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Row(
+            pbps_model::RowChange::InsertRow {
                 table: "dbo.t".parse().unwrap(),
                 key_column: "code".into(),
                 identity_key: false,
@@ -7868,7 +8042,7 @@ fn the_guard_looks_where_the_plan_reaches() {
                 defaults: Default::default(),
                 types: Default::default(),
             },
-        )],
+        ))],
     };
     let e = refuse_unplanned_movement(
         &pbps_mssql::Mssql,
@@ -7912,8 +8086,8 @@ fn the_guard_looks_where_the_plan_reaches() {
         s
     };
     let tightening = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::AlterColumnNullability {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Column(
+            pbps_model::ColumnChange::AlterColumnNullability {
                 uid: "c_aaaaaa".parse().unwrap(),
                 column: "dbo.t.note".parse().unwrap(),
                 ty: "nvarchar(50)".parse().unwrap(),
@@ -7921,7 +8095,7 @@ fn the_guard_looks_where_the_plan_reaches() {
                 through_external_partitions: false,
                 collation: None,
             },
-        )],
+        ))],
     };
     let e = refuse_unplanned_movement(
         &pbps_mssql::Mssql,
@@ -7955,14 +8129,18 @@ fn a_module_replacement_is_judged_by_its_net_result() {
     // `order_key` puts the drop first, which is the order a plan holds.
     let replacing = pbps_model::ChangeSet {
         changes: vec![
-            pbps_model::PlannedChange::new(pbps_model::Change::DropModule {
-                id: "dbo.v".parse().unwrap(),
-                kind: pbps_model::ModuleKind::View,
-            }),
-            pbps_model::PlannedChange::new(pbps_model::Change::CreateModule {
-                id: "dbo.v".parse().unwrap(),
-                module: Box::new(module(pbps_model::ModuleKind::Function)),
-            }),
+            pbps_model::PlannedChange::new(pbps_model::Change::Module(
+                pbps_model::ModuleChange::DropModule {
+                    id: "dbo.v".parse().unwrap(),
+                    kind: pbps_model::ModuleKind::View,
+                },
+            )),
+            pbps_model::PlannedChange::new(pbps_model::Change::Module(
+                pbps_model::ModuleChange::CreateModule {
+                    id: "dbo.v".parse().unwrap(),
+                    module: Box::new(module(pbps_model::ModuleKind::Function)),
+                },
+            )),
         ],
     };
     refuse_unplanned_movement(
@@ -7982,6 +8160,7 @@ fn a_module_replacement_is_judged_by_its_net_result() {
 /// 7.6).
 #[test]
 fn a_created_tables_computed_columns_answer_for_themselves() {
+    use pbps_model::TableChange;
     use pbps_model::{Change, Column, ComputedColumn, PlannedChange, Table};
     let name = TableName::new("dbo", "t");
     let computed = |persisted: bool| ComputedColumn {
@@ -7995,13 +8174,15 @@ fn a_created_tables_computed_columns_answer_for_themselves() {
         .insert("a".into(), Column::new("int".parse().unwrap()));
     created.computed.insert("c".into(), computed(true));
     let changes = pbps_model::ChangeSet {
-        changes: vec![PlannedChange::new(Change::CreateTable {
-            uid: "t_aaaaaa".parse().unwrap(),
-            name: name.clone(),
-            table: Box::new(created.clone()),
-            beside_default: None,
-            moves_at_most: None,
-        })],
+        changes: vec![PlannedChange::new(Change::Table(
+            TableChange::CreateTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                name: name.clone(),
+                table: Box::new(created.clone()),
+                beside_default: None,
+                moves_at_most: None,
+            },
+        ))],
     };
     let read = |edit: &dyn Fn(&mut Table)| {
         let mut t = created.clone();
@@ -8047,6 +8228,7 @@ fn a_created_tables_computed_columns_answer_for_themselves() {
 /// the engine respelled is not.
 #[test]
 fn a_created_partitions_own_defaults_and_not_nulls_answer_for_themselves() {
+    use pbps_model::TableChange;
     use pbps_model::{Change, PartitionColumn, PartitionOf, PlannedChange, Table};
     let name = TableName::new("app", "p");
     let own = |default: Option<&str>, not_null: bool| PartitionColumn {
@@ -8062,13 +8244,15 @@ fn a_created_partitions_own_defaults_and_not_nulls_answer_for_themselves() {
         ..Table::default()
     };
     let changes = pbps_model::ChangeSet {
-        changes: vec![PlannedChange::new(Change::CreateTable {
-            uid: "t_aaaaaa".parse().unwrap(),
-            name: name.clone(),
-            table: Box::new(created.clone()),
-            beside_default: None,
-            moves_at_most: None,
-        })],
+        changes: vec![PlannedChange::new(Change::Table(
+            TableChange::CreateTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                name: name.clone(),
+                table: Box::new(created.clone()),
+                beside_default: None,
+                moves_at_most: None,
+            },
+        ))],
     };
     let read = |edit: &dyn Fn(
         &mut std::collections::BTreeMap<pbps_model::ColumnName, PartitionColumn>,
@@ -8129,6 +8313,7 @@ fn a_created_partitions_own_defaults_and_not_nulls_answer_for_themselves() {
 /// session is movement.
 #[test]
 fn a_created_partitions_persistence_and_storage_answer_for_themselves() {
+    use pbps_model::TableChange;
     use pbps_model::{Change, PartitionOf, PlannedChange, Table};
     let name = TableName::new("app", "p");
     let created = Table {
@@ -8142,13 +8327,15 @@ fn a_created_partitions_persistence_and_storage_answer_for_themselves() {
         ..Table::default()
     };
     let changes = pbps_model::ChangeSet {
-        changes: vec![PlannedChange::new(Change::CreateTable {
-            uid: "t_aaaaaa".parse().unwrap(),
-            name: name.clone(),
-            table: Box::new(created.clone()),
-            beside_default: None,
-            moves_at_most: None,
-        })],
+        changes: vec![PlannedChange::new(Change::Table(
+            TableChange::CreateTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                name: name.clone(),
+                table: Box::new(created.clone()),
+                beside_default: None,
+                moves_at_most: None,
+            },
+        ))],
     };
     let read = |edit: &dyn Fn(&mut Table)| {
         let mut t = created.clone();
@@ -8201,6 +8388,8 @@ fn a_created_partitions_persistence_and_storage_answer_for_themselves() {
 /// index of another shape is movement, at every read (#1056 review).
 #[test]
 fn a_created_tables_split_index_answers_for_its_structure() {
+    use pbps_model::IndexChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, Column, Index, IndexColumn, PlannedChange, Table};
     let name = TableName::new("app", "t");
     let mut created = Table::default();
@@ -8226,19 +8415,19 @@ fn a_created_tables_split_index_answers_for_its_structure() {
     let planned_index = index("id", false, Some("id > 0"));
     let changes = pbps_model::ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::CreateTable {
+            PlannedChange::new(Change::Table(TableChange::CreateTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: name.clone(),
                 table: Box::new(created.clone()),
                 beside_default: None,
                 moves_at_most: None,
-            }),
-            PlannedChange::new(Change::AddIndex {
+            })),
+            PlannedChange::new(Change::Index(IndexChange::AddIndex {
                 table: name.clone(),
                 name: "ix".into(),
                 index: Box::new(planned_index.clone()),
                 clustered: false,
-            }),
+            })),
         ],
     };
     let with_index = |ix: Index| {
@@ -8251,7 +8440,8 @@ fn a_created_tables_split_index_answers_for_its_structure() {
     };
     let mut carried = changes.clone();
     carried.changes.truncate(1);
-    let Change::CreateTable { table, .. } = &mut carried.changes[0].change else {
+    let Change::Table(TableChange::CreateTable { table, .. }) = &mut carried.changes[0].change
+    else {
         unreachable!()
     };
     table.indexes.insert("ix".into(), planned_index.clone());
@@ -8292,6 +8482,8 @@ fn a_created_tables_split_index_answers_for_its_structure() {
 /// review).
 #[test]
 fn a_created_index_is_held_to_its_declared_parameters() {
+    use pbps_model::IndexChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, Column, Index, IndexColumn, PlannedChange, PrimaryKey, Table};
     let name = TableName::new("app", "t");
     let fill =
@@ -8332,12 +8524,12 @@ fn a_created_index_is_held_to_its_declared_parameters() {
         ..Default::default()
     };
     let adding = pbps_model::ChangeSet {
-        changes: vec![PlannedChange::new(Change::AddIndex {
+        changes: vec![PlannedChange::new(Change::Index(IndexChange::AddIndex {
             table: name.clone(),
             name: "ix".into(),
             index: Box::new(index("70")),
             clustered: false,
-        })],
+        }))],
     };
     let check = |plan: &pbps_model::ChangeSet, before: &Schema, after: &Schema| {
         refuse_unplanned_movement(
@@ -8355,13 +8547,15 @@ fn a_created_index_is_held_to_its_declared_parameters() {
     assert!(format!("{e:#}").contains("index `ix`"), "{e:#}");
 
     let creating = pbps_model::ChangeSet {
-        changes: vec![PlannedChange::new(Change::CreateTable {
-            uid: "t_000000".parse().unwrap(),
-            name: name.clone(),
-            table: Box::new(table(None, "80")),
-            beside_default: None,
-            moves_at_most: None,
-        })],
+        changes: vec![PlannedChange::new(Change::Table(
+            TableChange::CreateTable {
+                uid: "t_000000".parse().unwrap(),
+                name: name.clone(),
+                table: Box::new(table(None, "80")),
+                beside_default: None,
+                moves_at_most: None,
+            },
+        ))],
     };
     let empty = Schema::default();
     check(&creating, &empty, &schema(table(None, "80"))).expect("as created");
@@ -8375,6 +8569,7 @@ fn a_created_index_is_held_to_its_declared_parameters() {
 /// the plan's is movement (#1442).
 #[test]
 fn index_storage_parameters_the_plan_sets_are_held_at_the_close() {
+    use pbps_model::IndexChange;
     use pbps_model::{Change, Column, Index, IndexColumn, PlannedChange, Table};
     let name = TableName::new("app", "t");
     let schema = |fillfactor: &str| {
@@ -8406,13 +8601,15 @@ fn index_storage_parameters_the_plan_sets_are_held_at_the_close() {
         }
     };
     let setting = pbps_model::ChangeSet {
-        changes: vec![PlannedChange::new(Change::SetIndexStorageParameters {
-            table: name.clone(),
-            target: pbps_model::IndexPart::Index("ix".into()),
-            method: Default::default(),
-            set: [("fillfactor".to_owned(), "80".to_owned())].into(),
-            reset: Default::default(),
-        })],
+        changes: vec![PlannedChange::new(Change::Index(
+            IndexChange::SetIndexStorageParameters {
+                table: name.clone(),
+                target: pbps_model::IndexPart::Index("ix".into()),
+                method: Default::default(),
+                set: [("fillfactor".to_owned(), "80".to_owned())].into(),
+                reset: Default::default(),
+            },
+        ))],
     };
     let check = |after: &Schema, settled| {
         refuse_unplanned_movement(
@@ -8473,6 +8670,8 @@ fn index_storage_parameters_the_plan_sets_are_held_at_the_close() {
 /// review).
 #[test]
 fn a_table_the_plan_alters_but_does_not_drop_has_to_stay() {
+    use pbps_model::IndexChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, Column, Index, IndexColumn, IndexKey, PlannedChange, Table};
     let name = TableName::new("app", "t");
     let with_table = |indexed: bool| {
@@ -8516,10 +8715,10 @@ fn a_table_the_plan_alters_but_does_not_drop_has_to_stay() {
             settled,
         )
     };
-    let drop_index = plan(vec![Change::DropIndex {
+    let drop_index = plan(vec![Change::Index(IndexChange::DropIndex {
         table: name.clone(),
         name: "t_v".into(),
-    }]);
+    })]);
     let e = check(&drop_index, &Schema::default(), Settled::Whole).expect_err("the table is gone");
     assert!(
         format!("{e:#}").contains("app.t is gone, and no change of this plan drops it"),
@@ -8537,17 +8736,19 @@ fn a_table_the_plan_alters_but_does_not_drop_has_to_stay() {
     check(&drop_index, &with_table(false), Settled::Whole).expect("as planned");
     check(&drop_index, &with_table(false), Settled::SoFar).expect("as planned so far");
     // Negative: a plan that drops the table answers for it as before.
-    let drop_table = plan(vec![Change::DropTable {
+    let drop_table = plan(vec![Change::Table(TableChange::DropTable {
         uid: "t_a1b2c3".parse().unwrap(),
         name: name.clone(),
         detach_from: None,
-    }]);
+    })]);
     check(&drop_table, &Schema::default(), Settled::Whole).expect("dropped as planned");
     check(&drop_table, &Schema::default(), Settled::SoFar).expect("dropped so far");
 }
 
 #[test]
 fn a_partitions_own_columns_set_by_someone_else_are_movement() {
+    use pbps_model::ColumnChange;
+    use pbps_model::PartitionChange;
     use pbps_model::{
         Change, Column, PartitionBound, PartitionBy, PartitionColumn, PartitionOf, PlannedChange,
         Table,
@@ -8617,12 +8818,14 @@ fn a_partitions_own_columns_set_by_someone_else_are_movement() {
     assert!(format!("{e:#}").contains("app.ev_1"), "{e:#}");
 
     let uid: pbps_model::Uid = "t_000000".parse().unwrap();
-    let tightening = plan(vec![Change::SetPartitionNotNull {
-        uid: uid.clone(),
-        table: name.clone(),
-        column: "v".into(),
-        not_null: true,
-    }]);
+    let tightening = plan(vec![Change::Partition(
+        PartitionChange::SetPartitionNotNull {
+            uid: uid.clone(),
+            table: name.clone(),
+            column: "v".into(),
+            not_null: true,
+        },
+    )]);
     let tight = schema(&[("v", false, true)]);
     check(&tightening, &none, &tight, Settled::Whole).expect("the plan's own");
     check(&tightening, &none, &none, Settled::SoFar).expect("not run yet");
@@ -8638,15 +8841,17 @@ fn a_partitions_own_columns_set_by_someone_else_are_movement() {
     .expect_err("another column");
     assert!(format!("{e:#}").contains("app.ev_1's own column"), "{e:#}");
 
-    let defaulting = plan(vec![Change::SetPartitionDefault {
-        uid,
-        table: name.clone(),
-        parent: parent.clone(),
-        column: "v".into(),
-        from: None,
-        to: Some("1".into()),
-        fallback: None,
-    }]);
+    let defaulting = plan(vec![Change::Partition(
+        PartitionChange::SetPartitionDefault {
+            uid,
+            table: name.clone(),
+            parent: parent.clone(),
+            column: "v".into(),
+            from: None,
+            to: Some("1".into()),
+            fallback: None,
+        },
+    )]);
     let own = schema(&[("v", true, false)]);
     check(&defaulting, &none, &own, Settled::Whole).expect("the plan's own");
     check(&defaulting, &none, &own, Settled::SoFar).expect("run so far");
@@ -8721,14 +8926,14 @@ fn a_partitions_own_columns_set_by_someone_else_are_movement() {
         s
     };
     let renaming = plan(vec![
-        Change::RenameColumn {
+        Change::Column(ColumnChange::RenameColumn {
             uid: "c_000001".parse().unwrap(),
             table: parent.clone(),
             from: "w".into(),
             to: "w2".into(),
             table_was: None,
-        },
-        Change::SetPartitionDefault {
+        }),
+        Change::Partition(PartitionChange::SetPartitionDefault {
             uid: "t_000000".parse().unwrap(),
             table: name.clone(),
             parent: parent.clone(),
@@ -8736,7 +8941,7 @@ fn a_partitions_own_columns_set_by_someone_else_are_movement() {
             from: None,
             to: Some("1".into()),
             fallback: None,
-        },
+        }),
     ]);
     check(&renaming, &none, &renamed(true), Settled::Whole).expect("renamed and set");
     let e =
@@ -8753,14 +8958,14 @@ fn a_partitions_own_columns_set_by_someone_else_are_movement() {
         .get_mut("w")
         .unwrap()
         .nullable = false;
-    let tightening_parent = plan(vec![Change::AlterColumnNullability {
+    let tightening_parent = plan(vec![Change::Column(ColumnChange::AlterColumnNullability {
         uid: "c_000001".parse().unwrap(),
         column: pbps_model::ColumnRef::new(parent.clone(), "w"),
         ty: "integer".parse().unwrap(),
         to_nullable: false,
         through_external_partitions: false,
         collation: None,
-    }]);
+    })]);
     check(
         &tightening_parent,
         &schema(&[("w", false, true)]),
@@ -8782,20 +8987,20 @@ fn a_partitions_own_columns_set_by_someone_else_are_movement() {
         s
     };
     let handing = plan(vec![
-        Change::RenameColumn {
+        Change::Column(ColumnChange::RenameColumn {
             uid: "c_000001".parse().unwrap(),
             table: parent.clone(),
             from: "w".into(),
             to: "w2".into(),
             table_was: None,
-        },
-        Change::AddColumn {
+        }),
+        Change::Column(ColumnChange::AddColumn {
             uid: "c_000002".parse().unwrap(),
             table: parent.clone(),
             name: "w".into(),
             column: Box::new(Column::new("integer".parse().unwrap())),
-        },
-        Change::SetPartitionDefault {
+        }),
+        Change::Partition(PartitionChange::SetPartitionDefault {
             uid: "t_000000".parse().unwrap(),
             table: name.clone(),
             parent: parent.clone(),
@@ -8803,7 +9008,7 @@ fn a_partitions_own_columns_set_by_someone_else_are_movement() {
             from: None,
             to: Some("1".into()),
             fallback: None,
-        },
+        }),
     ]);
     let was = schema(&[("w", false, true)]);
     check(&handing, &was, &handed(true), Settled::Whole).expect("each column its own");
@@ -8859,17 +9064,17 @@ fn a_partitions_own_columns_set_by_someone_else_are_movement() {
         s
     };
     let reusing = plan(vec![
-        Change::DropColumn {
+        Change::Column(ColumnChange::DropColumn {
             uid: "c_000002".parse().unwrap(),
             column: pbps_model::ColumnRef::new(parent.clone(), "w"),
-        },
-        Change::RenameColumn {
+        }),
+        Change::Column(ColumnChange::RenameColumn {
             uid: "c_000003".parse().unwrap(),
             table: parent.clone(),
             from: "x".into(),
             to: "w".into(),
             table_was: None,
-        },
+        }),
     ]);
     check(&reusing, &was_x, &reused(true), Settled::Whole).expect("the renamed column's own");
     let e = check(&reusing, &was_x, &reused(false), Settled::Whole)
@@ -8901,17 +9106,17 @@ fn a_partitions_own_columns_set_by_someone_else_are_movement() {
         .columns
         .insert("u".into(), Column::new("integer".parse().unwrap()));
     let rekeying = plan(vec![
-        Change::DropColumn {
+        Change::Column(ColumnChange::DropColumn {
             uid: "c_000002".parse().unwrap(),
             column: pbps_model::ColumnRef::new(parent.clone(), "w"),
-        },
-        Change::RenameColumn {
+        }),
+        Change::Column(ColumnChange::RenameColumn {
             uid: "c_000003".parse().unwrap(),
             table: parent.clone(),
             from: "v".into(),
             to: "w".into(),
             table_was: None,
-        },
+        }),
     ]);
     check(&rekeying, &was_u, &keyed("w"), Settled::Whole).expect("the key renamed");
     let e = check(&rekeying, &was_u, &keyed("u"), Settled::Whole)
@@ -8927,6 +9132,8 @@ fn a_partitions_own_columns_set_by_someone_else_are_movement() {
 /// held once the run is whole; a created table is held to its `CREATE`.
 #[test]
 fn a_persistence_switch_by_someone_else_is_movement() {
+    use pbps_model::TableChange;
+    use pbps_model::TablePropertyChange;
     use pbps_model::{Change, Column, PlannedChange, Table};
     let name = TableName::new("app", "t");
     let schema = |unlogged: bool| {
@@ -8959,11 +9166,13 @@ fn a_persistence_switch_by_someone_else_is_movement() {
         .expect_err("switched by another");
     assert!(format!("{e:#}").contains("app.t"), "{e:#}");
     let switching = pbps_model::ChangeSet {
-        changes: vec![PlannedChange::new(Change::SetTablePersistence {
-            uid: "t_000000".parse().unwrap(),
-            table: name.clone(),
-            unlogged: true,
-        })],
+        changes: vec![PlannedChange::new(Change::TableProperty(
+            TablePropertyChange::SetTablePersistence {
+                uid: "t_000000".parse().unwrap(),
+                table: name.clone(),
+                unlogged: true,
+            },
+        ))],
     };
     check(&switching, &schema(false), &schema(true), Settled::Whole).expect("the plan's own");
     check(&switching, &schema(false), &schema(false), Settled::SoFar).expect("not run yet");
@@ -8973,13 +9182,15 @@ fn a_persistence_switch_by_someone_else_is_movement() {
     let mut declared = schema(true).tables.remove(&name).unwrap();
     declared.unlogged = true;
     let creating = pbps_model::ChangeSet {
-        changes: vec![PlannedChange::new(Change::CreateTable {
-            uid: "t_000000".parse().unwrap(),
-            name: name.clone(),
-            table: Box::new(declared),
-            beside_default: None,
-            moves_at_most: None,
-        })],
+        changes: vec![PlannedChange::new(Change::Table(
+            TableChange::CreateTable {
+                uid: "t_000000".parse().unwrap(),
+                name: name.clone(),
+                table: Box::new(declared),
+                beside_default: None,
+                moves_at_most: None,
+            },
+        ))],
     };
     let empty = Schema::default();
     check(&creating, &empty, &schema(true), Settled::SoFar).expect("as created");
@@ -9026,6 +9237,8 @@ fn a_history_schema_is_a_declared_schema() {
 /// plan's (#1501 review).
 #[test]
 fn a_system_time_change_by_someone_else_is_movement() {
+    use pbps_model::ColumnChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, Column, PlannedChange, Table};
     let name = TableName::new("dbo", "t");
     let schema = |retention: Option<&str>| {
@@ -9070,24 +9283,24 @@ fn a_system_time_change_by_someone_else_is_movement() {
         .unwrap()
         .columns
         .insert("note".into(), Column::new("int".parse().unwrap()));
-    let adding = plan(vec![Change::AddColumn {
+    let adding = plan(vec![Change::Column(ColumnChange::AddColumn {
         table: name.clone(),
         name: "note".into(),
         column: Box::new(Column::new("int".parse().unwrap())),
         uid: "c_000000".parse().unwrap(),
-    }]);
+    })]);
     let e = check(&adding, &schema(None), &grown, Settled::Whole)
         .expect_err("changed by another, touched");
     assert!(format!("{e:#}").contains("system versioning"), "{e:#}");
     // Created: held to the `CREATE` from the first read.
     let declared = schema(Some("6 months")).tables.remove(&name).unwrap();
-    let creating = plan(vec![Change::CreateTable {
+    let creating = plan(vec![Change::Table(TableChange::CreateTable {
         uid: "t_000000".parse().unwrap(),
         name: name.clone(),
         table: Box::new(declared),
         beside_default: None,
         moves_at_most: None,
-    }]);
+    })]);
     let empty = Schema::default();
     check(&creating, &empty, &schema(Some("6 months")), Settled::SoFar).expect("as created");
     let e = check(&creating, &empty, &schema(Some("1 day")), Settled::SoFar)
@@ -9101,6 +9314,9 @@ fn a_system_time_change_by_someone_else_is_movement() {
 /// created table is held to its `CREATE` from the first read.
 #[test]
 fn storage_parameters_moved_by_someone_else_are_movement() {
+    use pbps_model::ConstraintChange;
+    use pbps_model::TableChange;
+    use pbps_model::TablePropertyChange;
     use pbps_model::{Change, Column, PlannedChange, Table};
     let name = TableName::new("app", "t");
     let mut t = Table::default();
@@ -9130,13 +9346,15 @@ fn storage_parameters_moved_by_someone_else_are_movement() {
         )
     };
     let unrelated = pbps_model::ChangeSet {
-        changes: vec![PlannedChange::new(Change::AddCheck {
-            table: name.clone(),
-            name: "ck".into(),
-            constraint: pbps_model::CheckConstraint {
-                expression: "id > 0".into(),
+        changes: vec![PlannedChange::new(Change::Constraint(
+            ConstraintChange::AddCheck {
+                table: name.clone(),
+                name: "ck".into(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "id > 0".into(),
+                },
             },
-        })],
+        ))],
     };
     let was = schema(&[("fillfactor", "70"), ("autovacuum_enabled", "false")]);
     check(&unrelated, &was, &was, Settled::SoFar).expect("unchanged");
@@ -9150,12 +9368,14 @@ fn storage_parameters_moved_by_someone_else_are_movement() {
     assert!(format!("{e:#}").contains("storage parameters"), "{e:#}");
 
     let setting = pbps_model::ChangeSet {
-        changes: vec![PlannedChange::new(Change::SetStorageParameters {
-            uid: "t_000000".parse().unwrap(),
-            table: name.clone(),
-            set: [("fillfactor".to_owned(), "80".to_owned())].into(),
-            reset: ["autovacuum_enabled".to_owned()].into(),
-        })],
+        changes: vec![PlannedChange::new(Change::TableProperty(
+            TablePropertyChange::SetStorageParameters {
+                uid: "t_000000".parse().unwrap(),
+                table: name.clone(),
+                set: [("fillfactor".to_owned(), "80".to_owned())].into(),
+                reset: ["autovacuum_enabled".to_owned()].into(),
+            },
+        ))],
     };
     let after = schema(&[("fillfactor", "80")]);
     check(&setting, &was, &after, Settled::Whole).expect("the plan's own");
@@ -9176,13 +9396,15 @@ fn storage_parameters_moved_by_someone_else_are_movement() {
         .storage_parameters
         .insert("fillfactor".into(), "80".into());
     let creating = pbps_model::ChangeSet {
-        changes: vec![PlannedChange::new(Change::CreateTable {
-            uid: "t_000000".parse().unwrap(),
-            name: name.clone(),
-            table: Box::new(declared),
-            beside_default: None,
-            moves_at_most: None,
-        })],
+        changes: vec![PlannedChange::new(Change::Table(
+            TableChange::CreateTable {
+                uid: "t_000000".parse().unwrap(),
+                name: name.clone(),
+                table: Box::new(declared),
+                beside_default: None,
+                moves_at_most: None,
+            },
+        ))],
     };
     let empty = Schema::default();
     check(&creating, &empty, &after, Settled::SoFar).expect("as created");
@@ -9196,6 +9418,9 @@ fn storage_parameters_moved_by_someone_else_are_movement() {
 /// declared identity once it shows one, or once the run is whole.
 #[test]
 fn a_replica_identity_moved_by_someone_else_is_movement() {
+    use pbps_model::ConstraintChange;
+    use pbps_model::TableChange;
+    use pbps_model::TablePropertyChange;
     use pbps_model::{Change, Column, PlannedChange, ReplicaIdentity, Table};
     let name = TableName::new("app", "t");
     let mut t = Table::default();
@@ -9212,13 +9437,15 @@ fn a_replica_identity_moved_by_someone_else_is_movement() {
         }
     };
     let unrelated = pbps_model::ChangeSet {
-        changes: vec![PlannedChange::new(Change::AddCheck {
-            table: name.clone(),
-            name: "ck".into(),
-            constraint: pbps_model::CheckConstraint {
-                expression: "id > 0".into(),
+        changes: vec![PlannedChange::new(Change::Constraint(
+            ConstraintChange::AddCheck {
+                table: name.clone(),
+                name: "ck".into(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "id > 0".into(),
+                },
             },
-        })],
+        ))],
     };
     let check = |plan: &pbps_model::ChangeSet, before: &Schema, after: &Schema, settled| {
         refuse_unplanned_movement(
@@ -9243,11 +9470,13 @@ fn a_replica_identity_moved_by_someone_else_is_movement() {
         "{e:#}"
     );
     let setting = pbps_model::ChangeSet {
-        changes: vec![PlannedChange::new(Change::SetReplicaIdentity {
-            uid: "t_000000".parse().unwrap(),
-            table: name.clone(),
-            to: Some(ReplicaIdentity::Full),
-        })],
+        changes: vec![PlannedChange::new(Change::TableProperty(
+            TablePropertyChange::SetReplicaIdentity {
+                uid: "t_000000".parse().unwrap(),
+                table: name.clone(),
+                to: Some(ReplicaIdentity::Full),
+            },
+        ))],
     };
     check(
         &setting,
@@ -9292,13 +9521,15 @@ fn a_replica_identity_moved_by_someone_else_is_movement() {
     let mut declared = t.clone();
     declared.replica_identity = Some(ReplicaIdentity::Full);
     let creating = pbps_model::ChangeSet {
-        changes: vec![PlannedChange::new(Change::CreateTable {
-            uid: "t_000000".parse().unwrap(),
-            name: name.clone(),
-            table: Box::new(declared),
-            beside_default: None,
-            moves_at_most: None,
-        })],
+        changes: vec![PlannedChange::new(Change::Table(
+            TableChange::CreateTable {
+                uid: "t_000000".parse().unwrap(),
+                name: name.clone(),
+                table: Box::new(declared),
+                beside_default: None,
+                moves_at_most: None,
+            },
+        ))],
     };
     let empty = Schema::default();
     check(&creating, &empty, &schema(None), Settled::SoFar).expect("not set yet");
@@ -9332,18 +9563,20 @@ fn a_replica_identity_moved_by_someone_else_is_movement() {
     bare.replica_identity = None;
     let split = pbps_model::ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::CreateTable {
+            PlannedChange::new(Change::Table(TableChange::CreateTable {
                 uid: "t_000000".parse().unwrap(),
                 name: name.clone(),
                 table: Box::new(bare),
                 beside_default: None,
                 moves_at_most: None,
-            }),
-            PlannedChange::new(Change::SetReplicaIdentity {
-                uid: "t_000000".parse().unwrap(),
-                table: name.clone(),
-                to: Some(ReplicaIdentity::Full),
-            }),
+            })),
+            PlannedChange::new(Change::TableProperty(
+                TablePropertyChange::SetReplicaIdentity {
+                    uid: "t_000000".parse().unwrap(),
+                    table: name.clone(),
+                    to: Some(ReplicaIdentity::Full),
+                },
+            )),
         ],
     };
     // Splitting the setting creates a multi-change transactional plan;
@@ -9384,28 +9617,32 @@ fn a_replica_identity_moved_by_someone_else_is_movement() {
         ("t_000001".parse().unwrap(), "t_000002".parse().unwrap());
     let handoff = pbps_model::ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::SetReplicaIdentity {
-                uid: two.clone(),
-                table: b.clone(),
-                to: Some(ReplicaIdentity::Full),
-            }),
-            PlannedChange::new(Change::RenameTable {
+            PlannedChange::new(Change::TableProperty(
+                TablePropertyChange::SetReplicaIdentity {
+                    uid: two.clone(),
+                    table: b.clone(),
+                    to: Some(ReplicaIdentity::Full),
+                },
+            )),
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: two,
                 from: b.clone(),
                 to: c.clone(),
                 defaults: Vec::new(),
-            }),
-            PlannedChange::new(Change::RenameTable {
+            })),
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: one.clone(),
                 from: a.clone(),
                 to: b.clone(),
                 defaults: Vec::new(),
-            }),
-            PlannedChange::new(Change::SetReplicaIdentity {
-                uid: one,
-                table: b.clone(),
-                to: Some(ReplicaIdentity::Nothing),
-            }),
+            })),
+            PlannedChange::new(Change::TableProperty(
+                TablePropertyChange::SetReplicaIdentity {
+                    uid: one,
+                    table: b.clone(),
+                    to: Some(ReplicaIdentity::Nothing),
+                },
+            )),
         ],
     };
     check(
@@ -9437,6 +9674,8 @@ fn a_replica_identity_moved_by_someone_else_is_movement() {
 /// of the clustered index is not movement.
 #[test]
 fn a_touched_tables_layout_moved_by_someone_else_is_movement() {
+    use pbps_model::ConstraintChange;
+    use pbps_model::IndexChange;
     use pbps_model::{Change, Clustered, Column, Index, IndexColumn, PlannedChange, Table};
     let name = TableName::new("app", "t");
     let mut t = Table::default();
@@ -9472,13 +9711,15 @@ fn a_touched_tables_layout_moved_by_someone_else_is_movement() {
         }
     };
     let unrelated = pbps_model::ChangeSet {
-        changes: vec![PlannedChange::new(Change::AddCheck {
-            table: name.clone(),
-            name: "ck".into(),
-            constraint: pbps_model::CheckConstraint {
-                expression: "id > 0".into(),
+        changes: vec![PlannedChange::new(Change::Constraint(
+            ConstraintChange::AddCheck {
+                table: name.clone(),
+                name: "ck".into(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "id > 0".into(),
+                },
             },
-        })],
+        ))],
     };
     let check = |plan: &pbps_model::ChangeSet, after: &Schema, settled| {
         refuse_unplanned_movement(
@@ -9505,28 +9746,28 @@ fn a_touched_tables_layout_moved_by_someone_else_is_movement() {
     // The plan's own move is not movement.
     let moving = pbps_model::ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::SetPrimaryKey {
+            PlannedChange::new(Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table: name.clone(),
                 from: t.primary_key.clone(),
                 to: None,
                 nonclustered: false,
-            }),
-            PlannedChange::new(Change::DropIndex {
+            })),
+            PlannedChange::new(Change::Index(IndexChange::DropIndex {
                 table: name.clone(),
                 name: "ix".into(),
-            }),
-            PlannedChange::new(Change::AddIndex {
+            })),
+            PlannedChange::new(Change::Index(IndexChange::AddIndex {
                 table: name.clone(),
                 name: "ix".into(),
                 index: Box::new(ix),
                 clustered: true,
-            }),
-            PlannedChange::new(Change::SetPrimaryKey {
+            })),
+            PlannedChange::new(Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table: name.clone(),
                 from: None,
                 to: t.primary_key.clone(),
                 nonclustered: true,
-            }),
+            })),
         ],
     };
     check(
@@ -9552,12 +9793,14 @@ fn a_touched_tables_layout_moved_by_someone_else_is_movement() {
     // One SetPrimaryKey emits its own DROP/ADD statements. Two separate
     // changes would not be an admitted staged plan.
     let rekeying = pbps_model::ChangeSet {
-        changes: vec![PlannedChange::new(Change::SetPrimaryKey {
-            table: name.clone(),
-            from: t.primary_key.clone(),
-            to: t.primary_key.clone(),
-            nonclustered: true,
-        })],
+        changes: vec![PlannedChange::new(Change::Constraint(
+            ConstraintChange::SetPrimaryKey {
+                table: name.clone(),
+                from: t.primary_key.clone(),
+                to: t.primary_key.clone(),
+                nonclustered: true,
+            },
+        ))],
     };
     let recheck = |after: &Schema| {
         refuse_unplanned_movement(
@@ -9602,6 +9845,7 @@ fn a_touched_tables_layout_moved_by_someone_else_is_movement() {
 /// the clustered constraint finds a heap, which is the plan in progress.
 #[test]
 fn a_created_tables_layout_is_held_once_its_clustered_object_is_there() {
+    use pbps_model::TableChange;
     use pbps_model::{Change, Clustered, Column, PlannedChange, PrimaryKey, Table};
     let name = TableName::new("app", "t");
     let mut created = Table::default();
@@ -9627,13 +9871,15 @@ fn a_created_tables_layout_is_held_once_its_clustered_object_is_there() {
     );
     created.clustered = Some(Clustered::Unique("uq_code".into()));
     let changes = pbps_model::ChangeSet {
-        changes: vec![PlannedChange::new(Change::CreateTable {
-            uid: "t_aaaaaa".parse().unwrap(),
-            name: name.clone(),
-            table: Box::new(created.clone()),
-            beside_default: None,
-            moves_at_most: None,
-        })],
+        changes: vec![PlannedChange::new(Change::Table(
+            TableChange::CreateTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                name: name.clone(),
+                table: Box::new(created.clone()),
+                beside_default: None,
+                moves_at_most: None,
+            },
+        ))],
     };
     let read = |f: &dyn Fn(&mut Table)| {
         let mut t = created.clone();
@@ -9677,6 +9923,8 @@ fn a_created_tables_layout_is_held_once_its_clustered_object_is_there() {
 /// one the plan passes through. A default nobody planned still refuses.
 #[test]
 fn a_created_tables_default_set_later_by_the_plan_is_the_one_it_must_hold() {
+    use pbps_model::ColumnChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, Column, ColumnRef, PlannedChange, Table};
     let name = TableName::new("app", "t");
     let mut created = Table::default();
@@ -9694,19 +9942,19 @@ fn a_created_tables_default_set_later_by_the_plan_is_the_one_it_must_hold() {
             ..Default::default()
         }
     };
-    let create = PlannedChange::new(Change::CreateTable {
+    let create = PlannedChange::new(Change::Table(TableChange::CreateTable {
         uid: "t_aaaaaa".parse().unwrap(),
         name: name.clone(),
         table: Box::new(created.clone()),
         beside_default: None,
         moves_at_most: None,
-    });
-    let set_default = PlannedChange::new(Change::AlterColumnDefault {
+    }));
+    let set_default = PlannedChange::new(Change::Column(ColumnChange::AlterColumnDefault {
         uid: "c_bbbbbb".parse().unwrap(),
         column: ColumnRef::new(name.clone(), "v"),
         from: None,
         to: Some("1".into()),
-    });
+    }));
     let planned = pbps_model::ChangeSet {
         changes: vec![create.clone(), set_default],
     };
@@ -9804,15 +10052,15 @@ fn a_created_tables_pending_parts_are_added_but_recorded_parts_still_compare() {
         },
     );
     let changes = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::CreateTable {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Table(
+            pbps_model::TableChange::CreateTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: name.clone(),
                 table: Box::new(declared.clone()),
                 beside_default: None,
                 moves_at_most: None,
             },
-        )],
+        ))],
     };
     let schema = |table| Schema {
         tables: [(name.clone(), table)].into(),
@@ -9944,15 +10192,15 @@ fn a_table_this_plan_creates_answers_for_the_shape_it_was_given() {
         t
     };
     let creating = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::CreateTable {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Table(
+            pbps_model::TableChange::CreateTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: "dbo.new".parse().unwrap(),
                 table: Box::new(declared()),
                 beside_default: None,
                 moves_at_most: None,
             },
-        )],
+        ))],
     };
     let after_with = |t: pbps_model::Table| {
         let mut s = Schema::default();
@@ -9970,8 +10218,8 @@ fn a_table_this_plan_creates_answers_for_the_shape_it_was_given() {
         pbps_model::Column::new("decimal(18,0)".parse().unwrap()),
     );
     let bare = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::CreateTable {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Table(
+            pbps_model::TableChange::CreateTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: "dbo.new".parse().unwrap(),
                 table: Box::new({
@@ -9985,7 +10233,7 @@ fn a_table_this_plan_creates_answers_for_the_shape_it_was_given() {
                 beside_default: None,
                 moves_at_most: None,
             },
-        )],
+        ))],
     };
     refuse_unplanned_movement(
         &pbps_mssql::Mssql,
@@ -10076,18 +10324,22 @@ fn a_table_this_plan_creates_answers_for_the_shape_it_was_given() {
     };
     let with_fk = pbps_model::ChangeSet {
         changes: vec![
-            pbps_model::PlannedChange::new(pbps_model::Change::CreateTable {
-                uid: "t_aaaaaa".parse().unwrap(),
-                name: "dbo.new".parse().unwrap(),
-                table: Box::new(declared()),
-                beside_default: None,
-                moves_at_most: None,
-            }),
-            pbps_model::PlannedChange::new(pbps_model::Change::AddForeignKey {
-                table: "dbo.new".parse().unwrap(),
-                name: "fk_new".into(),
-                constraint: Box::new(fk.clone()),
-            }),
+            pbps_model::PlannedChange::new(pbps_model::Change::Table(
+                pbps_model::TableChange::CreateTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: "dbo.new".parse().unwrap(),
+                    table: Box::new(declared()),
+                    beside_default: None,
+                    moves_at_most: None,
+                },
+            )),
+            pbps_model::PlannedChange::new(pbps_model::Change::Constraint(
+                pbps_model::ConstraintChange::AddForeignKey {
+                    table: "dbo.new".parse().unwrap(),
+                    name: "fk_new".into(),
+                    constraint: Box::new(fk.clone()),
+                },
+            )),
         ],
     };
     let mut keyed = declared();
@@ -10114,15 +10366,15 @@ fn a_table_this_plan_creates_answers_for_the_shape_it_was_given() {
         t
     };
     let creates = |t: pbps_model::Table| pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::CreateTable {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Table(
+            pbps_model::TableChange::CreateTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: "dbo.new".parse().unwrap(),
                 table: Box::new(t),
                 beside_default: None,
                 moves_at_most: None,
             },
-        )],
+        ))],
     };
     let plain = creates(column(&|_| {}));
     for tamper in [
@@ -10209,15 +10461,15 @@ fn a_table_this_plan_creates_answers_for_the_shape_it_was_given() {
         t
     };
     let plans = |t: pbps_model::Table| pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::CreateTable {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Table(
+            pbps_model::TableChange::CreateTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: "dbo.new".parse().unwrap(),
                 table: Box::new(t),
                 beside_default: None,
                 moves_at_most: None,
             },
-        )],
+        ))],
     };
     let e = refuse_unplanned_movement(
         &pbps_mssql::Mssql,
@@ -10288,18 +10540,22 @@ fn a_table_this_plan_creates_answers_for_the_shape_it_was_given() {
     };
     let adding = |fk: pbps_model::ForeignKey| pbps_model::ChangeSet {
         changes: vec![
-            pbps_model::PlannedChange::new(pbps_model::Change::CreateTable {
-                uid: "t_aaaaaa".parse().unwrap(),
-                name: "dbo.new".parse().unwrap(),
-                table: Box::new(declared()),
-                beside_default: None,
-                moves_at_most: None,
-            }),
-            pbps_model::PlannedChange::new(pbps_model::Change::AddForeignKey {
-                table: "dbo.new".parse().unwrap(),
-                name: "fk_new".into(),
-                constraint: Box::new(fk),
-            }),
+            pbps_model::PlannedChange::new(pbps_model::Change::Table(
+                pbps_model::TableChange::CreateTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: "dbo.new".parse().unwrap(),
+                    table: Box::new(declared()),
+                    beside_default: None,
+                    moves_at_most: None,
+                },
+            )),
+            pbps_model::PlannedChange::new(pbps_model::Change::Constraint(
+                pbps_model::ConstraintChange::AddForeignKey {
+                    table: "dbo.new".parse().unwrap(),
+                    name: "fk_new".into(),
+                    constraint: Box::new(fk),
+                },
+            )),
         ],
     };
     let read_back = |fk: pbps_model::ForeignKey| {
@@ -10401,8 +10657,8 @@ fn a_cell_this_plan_writes_as_null_is_still_answered_for() {
         .insert("code".into(), pbps_model::Value::Text("k".into()));
     written.0.insert("note".into(), pbps_model::Value::Null);
     let inserting = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::InsertRow {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Row(
+            pbps_model::RowChange::InsertRow {
                 table: "dbo.t".parse().unwrap(),
                 key_column: "code".into(),
                 identity_key: false,
@@ -10411,7 +10667,7 @@ fn a_cell_this_plan_writes_as_null_is_still_answered_for() {
                 defaults: Default::default(),
                 types: Default::default(),
             },
-        )],
+        ))],
     };
     let mut before = schema_with(None);
     before
@@ -10483,8 +10739,8 @@ fn a_column_this_plan_retypes_still_answers_for_its_other_fields() {
         s
     };
     let widening = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::AlterColumnType {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Column(
+            pbps_model::ColumnChange::AlterColumnType {
                 uid: "c_aaaaaa".parse().unwrap(),
                 column: "dbo.t.note".parse().unwrap(),
                 from: "nvarchar(50)".parse().unwrap(),
@@ -10496,7 +10752,7 @@ fn a_column_this_plan_retypes_still_answers_for_its_other_fields() {
                 to_collation: None,
                 using: None,
             },
-        )],
+        ))],
     };
     let before = schema_with("nvarchar(50)", None, true);
 
@@ -10540,8 +10796,8 @@ fn a_column_this_plan_retypes_still_answers_for_its_other_fields() {
 
     // Where the plan does move it, it is the plan's own business again.
     let tightening = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::AlterColumnType {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Column(
+            pbps_model::ColumnChange::AlterColumnType {
                 uid: "c_aaaaaa".parse().unwrap(),
                 column: "dbo.t.note".parse().unwrap(),
                 from: "nvarchar(50)".parse().unwrap(),
@@ -10553,7 +10809,7 @@ fn a_column_this_plan_retypes_still_answers_for_its_other_fields() {
                 to_collation: None,
                 using: None,
             },
-        )],
+        ))],
     };
     refuse_unplanned_movement(
         &pbps_mssql::Mssql,
@@ -10614,8 +10870,8 @@ fn a_column_this_plan_makes_not_null_is_its_own_business() {
         s
     };
     let tightening = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::AlterColumnNullability {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Column(
+            pbps_model::ColumnChange::AlterColumnNullability {
                 uid: "c_aaaaaa".parse().unwrap(),
                 column: "dbo.t.note".parse().unwrap(),
                 ty: "int".parse().unwrap(),
@@ -10623,7 +10879,7 @@ fn a_column_this_plan_makes_not_null_is_its_own_business() {
                 through_external_partitions: false,
                 collation: None,
             },
-        )],
+        ))],
     };
     refuse_unplanned_movement(
         &pbps_mssql::Mssql,
@@ -10689,16 +10945,20 @@ fn a_redefined_index_is_judged_by_its_net_result() {
     // `order_key` puts the drop first, which is the order a plan holds.
     let redefining = pbps_model::ChangeSet {
         changes: vec![
-            pbps_model::PlannedChange::new(pbps_model::Change::DropIndex {
-                table: "dbo.t".parse().unwrap(),
-                name: "ix_note".into(),
-            }),
-            pbps_model::PlannedChange::new(pbps_model::Change::AddIndex {
-                table: "dbo.t".parse().unwrap(),
-                name: "ix_note".into(),
-                index: Box::new(index(true)),
-                clustered: false,
-            }),
+            pbps_model::PlannedChange::new(pbps_model::Change::Index(
+                pbps_model::IndexChange::DropIndex {
+                    table: "dbo.t".parse().unwrap(),
+                    name: "ix_note".into(),
+                },
+            )),
+            pbps_model::PlannedChange::new(pbps_model::Change::Index(
+                pbps_model::IndexChange::AddIndex {
+                    table: "dbo.t".parse().unwrap(),
+                    name: "ix_note".into(),
+                    index: Box::new(index(true)),
+                    clustered: false,
+                },
+            )),
         ],
     };
     refuse_unplanned_movement(
@@ -10713,12 +10973,12 @@ fn a_redefined_index_is_judged_by_its_net_result() {
 
     // Net, not blanket: a plan that only drops still has to see it gone.
     let dropping = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::DropIndex {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Index(
+            pbps_model::IndexChange::DropIndex {
                 table: "dbo.t".parse().unwrap(),
                 name: "ix_note".into(),
             },
-        )],
+        ))],
     };
     let e = refuse_unplanned_movement(
         &pbps_mssql::Mssql,
@@ -10734,6 +10994,9 @@ fn a_redefined_index_is_judged_by_its_net_result() {
 
 #[test]
 fn early_part_drops_follow_their_table_and_still_enforce_absence() {
+    use pbps_model::ConstraintChange;
+    use pbps_model::IndexChange;
+    use pbps_model::TableChange;
     use pbps_model::{
         Change, ChangeSet, ForeignKey, Index, IndexColumn, PlannedChange, PrimaryKey, Table,
         UniqueConstraint,
@@ -10762,10 +11025,10 @@ fn early_part_drops_follow_their_table_and_still_enforce_absence() {
                             filegroup: None,
                         },
                     );
-                    Change::DropIndex {
+                    Change::Index(IndexChange::DropIndex {
                         table: source.clone(),
                         name: "gone".into(),
-                    }
+                    })
                 }
                 "unique" => {
                     original.unique.insert(
@@ -10776,10 +11039,10 @@ fn early_part_drops_follow_their_table_and_still_enforce_absence() {
                             filegroup: None,
                         },
                     );
-                    Change::DropUnique {
+                    Change::Constraint(ConstraintChange::DropUnique {
                         table: source.clone(),
                         name: "gone".into(),
-                    }
+                    })
                 }
                 "foreign key" => {
                     original.foreign_keys.insert(
@@ -10792,10 +11055,10 @@ fn early_part_drops_follow_their_table_and_still_enforce_absence() {
                             on_update: Default::default(),
                         },
                     );
-                    Change::DropForeignKey {
+                    Change::Constraint(ConstraintChange::DropForeignKey {
                         table: source.clone(),
                         name: "gone".into(),
-                    }
+                    })
                 }
                 "primary key" => {
                     let key = PrimaryKey {
@@ -10805,12 +11068,12 @@ fn early_part_drops_follow_their_table_and_still_enforce_absence() {
                         filegroup: None,
                     };
                     original.primary_key = Some(key.clone());
-                    Change::SetPrimaryKey {
+                    Change::Constraint(ConstraintChange::SetPrimaryKey {
                         table: source.clone(),
                         from: Some(key),
                         to: None,
                         nonclustered: false,
-                    }
+                    })
                 }
                 _ => unreachable!(),
             };
@@ -10825,12 +11088,12 @@ fn early_part_drops_follow_their_table_and_still_enforce_absence() {
             let changes = ChangeSet {
                 changes: vec![
                     PlannedChange::new(change),
-                    PlannedChange::new(Change::RenameTable {
+                    PlannedChange::new(Change::Table(TableChange::RenameTable {
                         uid: "t_aaaaaa".parse().unwrap(),
                         from: source,
                         to: destination.clone(),
                         defaults: Vec::new(),
-                    }),
+                    })),
                 ],
             };
             for settled in [Settled::Whole, Settled::Closing] {
@@ -10862,12 +11125,12 @@ fn early_part_drops_follow_their_table_and_still_enforce_absence() {
                 let mut rebuilding = changes.clone();
                 rebuilding
                     .changes
-                    .push(PlannedChange::new(Change::AddIndex {
+                    .push(PlannedChange::new(Change::Index(IndexChange::AddIndex {
                         table: destination.clone(),
                         name: "gone".into(),
                         index: Box::new(original.indexes["gone"].clone()),
                         clustered: false,
-                    }));
+                    })));
                 let mut restored = Schema {
                     tables: [(destination.clone(), original.clone())].into(),
                     ..Schema::default()
@@ -10938,15 +11201,15 @@ fn a_half_run_plan_is_compared_on_movement_alone() {
         .tables
         .insert("dbo.kept".parse().unwrap(), pbps_model::Table::default());
     let creating = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::CreateTable {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Table(
+            pbps_model::TableChange::CreateTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: "dbo.new".parse().unwrap(),
                 table: Box::new(pbps_model::Table::default()),
                 beside_default: None,
                 moves_at_most: None,
             },
-        )],
+        ))],
     };
     // Mid-run the table is not there yet, and that is not a failure.
     refuse_unplanned_movement(
@@ -10997,15 +11260,15 @@ fn a_half_run_plan_is_compared_on_movement_alone() {
 fn a_staged_checkpoint_is_not_asked_what_the_plan_achieved() {
     let before = Schema::default();
     let creating = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::CreateTable {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Table(
+            pbps_model::TableChange::CreateTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: "dbo.new".parse().unwrap(),
                 table: Box::new(pbps_model::Table::default()),
                 beside_default: None,
                 moves_at_most: None,
             },
-        )],
+        ))],
     };
     staged_movement(
         &pbps_mssql::Mssql,
@@ -11045,12 +11308,12 @@ fn a_staged_checkpoint_is_not_asked_what_the_plan_achieved() {
 fn a_role_this_plan_creates_has_to_be_there() {
     let empty = Schema::default();
     let creating = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::CreateRole {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Role(
+            pbps_model::RoleChange::CreateRole {
                 uid: "r_aaaaaa".parse().unwrap(),
                 name: "app".to_owned().into(),
             },
-        )],
+        ))],
     };
     let e = refuse_unplanned_movement(
         &pbps_mssql::Mssql,
@@ -11083,13 +11346,13 @@ fn a_role_this_plan_creates_has_to_be_there() {
 
     // And a dropped role that came back.
     let dropping = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::DropRole {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Role(
+            pbps_model::RoleChange::DropRole {
                 uid: "r_aaaaaa".parse().unwrap(),
                 name: "app".to_owned().into(),
                 members: Vec::new(),
             },
-        )],
+        ))],
     };
     let e = refuse_unplanned_movement(
         &pbps_mssql::Mssql,
@@ -11130,14 +11393,14 @@ fn a_grant_follows_the_table_this_plan_renames() {
         s
     };
     let rename = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::RenameTable {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Table(
+            pbps_model::TableChange::RenameTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 from: "dbo.old".parse().unwrap(),
                 to: "dbo.new".parse().unwrap(),
                 defaults: Vec::new(),
             },
-        )],
+        ))],
     };
     refuse_unplanned_movement(
         &pbps_mssql::Mssql,
@@ -11201,15 +11464,15 @@ fn a_column_this_plan_changes_is_not_compared_row_by_row() {
         s
     };
     let renaming = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::RenameColumn {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Column(
+            pbps_model::ColumnChange::RenameColumn {
                 uid: "c_aaaaaa".parse().unwrap(),
                 table: "dbo.t".parse().unwrap(),
                 from: "old".into(),
                 to: "new".into(),
                 table_was: None,
             },
-        )],
+        ))],
     };
     // The one column is renamed, so the row is keyed differently on each
     // side. That is the plan's own doing.
@@ -11268,13 +11531,13 @@ fn a_grant_on_a_table_this_plan_drops_goes_with_it() {
         },
     );
     let dropping = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::DropTable {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Table(
+            pbps_model::TableChange::DropTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: "dbo.t".parse().unwrap(),
                 detach_from: None,
             },
-        )],
+        ))],
     };
     refuse_unplanned_movement(
         &pbps_mssql::Mssql,
@@ -11335,17 +11598,17 @@ fn a_rename_exempts_the_name_at_each_end() {
     let uid: pbps_model::Uid = "t_aaaaaa".parse().unwrap();
     let cs = pbps_model::ChangeSet {
         changes: [
-            pbps_model::Change::RenameTable {
+            pbps_model::Change::Table(pbps_model::TableChange::RenameTable {
                 uid: uid.clone(),
                 from: "dbo.old".parse().unwrap(),
                 to: "dbo.new".parse().unwrap(),
                 defaults: Vec::new(),
-            },
-            pbps_model::Change::RenameRole {
+            }),
+            pbps_model::Change::Role(pbps_model::RoleChange::RenameRole {
                 uid: "r_aaaaaa".parse().unwrap(),
                 from: "was".to_owned().into(),
                 to: "now".to_owned().into(),
-            },
+            }),
         ]
         .into_iter()
         .map(pbps_model::PlannedChange::new)
@@ -11466,6 +11729,7 @@ fn a_baseline_is_pinned_under_the_recorded_scopes_plus_the_newly_covered() {
 /// plan on a table whose keys are spelled the engine's way is not.
 #[test]
 fn a_key_type_change_over_an_aliased_key_is_named_and_one_without_is_not() {
+    use pbps_model::ColumnChange;
     use pbps_model::{Change, ChangeSet, ColumnRef, ColumnType, PlannedChange};
     use std::str::FromStr;
     let table: TableName = "dbo.t".parse().unwrap();
@@ -11483,7 +11747,7 @@ fn a_key_type_change_over_an_aliased_key_is_named_and_one_without_is_not() {
     });
     declared.tables.insert(table.clone(), t);
     let change = |name: &str| {
-        PlannedChange::new(Change::AlterColumnType {
+        PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
             uid: "c_aaaaaa".parse().unwrap(),
             column: ColumnRef::new(table.clone(), name),
             from: ColumnType::from_str("int").unwrap(),
@@ -11494,7 +11758,7 @@ fn a_key_type_change_over_an_aliased_key_is_named_and_one_without_is_not() {
             from_collation: None,
             to_collation: None,
             using: None,
-        })
+        }))
     };
     let cs = ChangeSet {
         changes: vec![change("id")],
@@ -11540,6 +11804,7 @@ fn a_key_type_change_over_an_aliased_key_is_named_and_one_without_is_not() {
 /// change through.
 #[test]
 fn a_table_renamed_by_the_same_plan_is_still_checked_for_aliased_keys() {
+    use pbps_model::ColumnChange;
     use pbps_model::{Change, ChangeSet, ColumnRef, ColumnType, PlannedChange};
     use std::str::FromStr;
     let uid: pbps_model::Uid = "t_aaaaaa".parse().unwrap();
@@ -11574,19 +11839,21 @@ fn a_table_renamed_by_the_same_plan_is_still_checked_for_aliased_keys() {
     rows.insert(before, observed);
 
     let cs = ChangeSet {
-        changes: vec![PlannedChange::new(Change::AlterColumnType {
-            uid: "c_aaaaaa".parse().unwrap(),
-            // The plan's own name for it: the one after the rename.
-            column: ColumnRef::new(after, "id"),
-            from: ColumnType::from_str("int").unwrap(),
-            to: ColumnType::from_str("varchar(10)").unwrap(),
-            from_nullable: false,
-            to_nullable: false,
-            through_external_partitions: false,
-            from_collation: None,
-            to_collation: None,
-            using: None,
-        })],
+        changes: vec![PlannedChange::new(Change::Column(
+            ColumnChange::AlterColumnType {
+                uid: "c_aaaaaa".parse().unwrap(),
+                // The plan's own name for it: the one after the rename.
+                column: ColumnRef::new(after, "id"),
+                from: ColumnType::from_str("int").unwrap(),
+                to: ColumnType::from_str("varchar(10)").unwrap(),
+                from_nullable: false,
+                to_nullable: false,
+                through_external_partitions: false,
+                from_collation: None,
+                to_collation: None,
+                using: None,
+            },
+        ))],
     };
     let found = key_type_changes_over_aliases(&cs, &declared, &rows, &final_ids, &live_ids);
     assert_eq!(found.len(), 1, "{found:?}");
@@ -11597,19 +11864,20 @@ fn a_table_renamed_by_the_same_plan_is_still_checked_for_aliased_keys() {
 /// one, fewer as the `DROP MEMBER`s commit, none once the role is gone.
 #[test]
 fn a_resumed_role_drop_expects_only_the_members_whose_statements_remain() {
+    use pbps_model::RoleChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
     let uid: pbps_model::Uid = "r_aaaaaa".parse().unwrap();
     let cs = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::CreateRole {
+            PlannedChange::new(Change::Role(RoleChange::CreateRole {
                 uid: uid.clone(),
                 name: "auditors".into(),
-            }),
-            PlannedChange::new(Change::DropRole {
+            })),
+            PlannedChange::new(Change::Role(RoleChange::DropRole {
                 uid,
                 name: "reporting".into(),
                 members: vec!["a".into(), "b".into()],
-            }),
+            })),
         ],
     };
     let expect = |completed: usize| {
@@ -11659,26 +11927,27 @@ fn a_resumed_role_drop_expects_only_the_members_whose_statements_remain() {
 /// and a half-done role drop still holds the name it is vacating.
 #[test]
 fn a_resume_asks_only_about_the_role_names_its_remaining_statements_touch() {
+    use pbps_model::RoleChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
     let r1: pbps_model::Uid = "r_aaaaaa".parse().unwrap();
     let r2: pbps_model::Uid = "r_bbbbbb".parse().unwrap();
     let r3: pbps_model::Uid = "r_cccccc".parse().unwrap();
     let cs = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::RenameRole {
+            PlannedChange::new(Change::Role(RoleChange::RenameRole {
                 uid: r1,
                 from: "reader".into(),
                 to: "app_reader".into(),
-            }),
-            PlannedChange::new(Change::CreateRole {
+            })),
+            PlannedChange::new(Change::Role(RoleChange::CreateRole {
                 uid: r2,
                 name: "auditors".into(),
-            }),
-            PlannedChange::new(Change::DropRole {
+            })),
+            PlannedChange::new(Change::Role(RoleChange::DropRole {
                 uid: r3,
                 name: "reporting".into(),
                 members: vec!["a".into()],
-            }),
+            })),
         ],
     };
     let expect = |completed: usize| {
@@ -12203,12 +12472,14 @@ fn a_column_this_plan_writes_is_held_to_the_definition_it_gives() {
     let before = schema(&[("kept", kept.clone())]);
 
     // Adding: the read-back is the declaration, in the engine's spelling.
-    let adding = plan(pbps_model::Change::AddColumn {
-        uid: "c_aaaaaa".parse().unwrap(),
-        table: dbo_t.clone(),
-        name: "amount".into(),
-        column: Box::new(column("decimal", false, Some("0"))),
-    });
+    let adding = plan(pbps_model::Change::Column(
+        pbps_model::ColumnChange::AddColumn {
+            uid: "c_aaaaaa".parse().unwrap(),
+            table: dbo_t.clone(),
+            name: "amount".into(),
+            column: Box::new(column("decimal", false, Some("0"))),
+        },
+    ));
     refuse_unplanned_movement(
         &pbps_mssql::Mssql,
         &adding,
@@ -12239,18 +12510,20 @@ fn a_column_this_plan_writes_is_held_to_the_definition_it_gives() {
     }
 
     // Altering: each change promises the field it moves, and only that.
-    let retyping = plan(pbps_model::Change::AlterColumnType {
-        uid: "c_aaaaaa".parse().unwrap(),
-        column: dbo_t.column("kept"),
-        from: "int".parse().unwrap(),
-        to: "bigint".parse().unwrap(),
-        from_nullable: false,
-        to_nullable: false,
-        through_external_partitions: false,
-        from_collation: None,
-        to_collation: None,
-        using: None,
-    });
+    let retyping = plan(pbps_model::Change::Column(
+        pbps_model::ColumnChange::AlterColumnType {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: dbo_t.column("kept"),
+            from: "int".parse().unwrap(),
+            to: "bigint".parse().unwrap(),
+            from_nullable: false,
+            to_nullable: false,
+            through_external_partitions: false,
+            from_collation: None,
+            to_collation: None,
+            using: None,
+        },
+    ));
     refuse_unplanned_movement(
         &pbps_mssql::Mssql,
         &retyping,
@@ -12283,14 +12556,16 @@ fn a_column_this_plan_writes_is_held_to_the_definition_it_gives() {
     .expect_err("the nullability the ALTER restated");
     assert!(format!("{e:#}").contains("nullability"), "{e:#}");
 
-    let loosening = plan(pbps_model::Change::AlterColumnNullability {
-        uid: "c_aaaaaa".parse().unwrap(),
-        column: dbo_t.column("kept"),
-        ty: "int".parse().unwrap(),
-        to_nullable: true,
-        through_external_partitions: false,
-        collation: None,
-    });
+    let loosening = plan(pbps_model::Change::Column(
+        pbps_model::ColumnChange::AlterColumnNullability {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: dbo_t.column("kept"),
+            ty: "int".parse().unwrap(),
+            to_nullable: true,
+            through_external_partitions: false,
+            collation: None,
+        },
+    ));
     let e = refuse_unplanned_movement(
         &pbps_mssql::Mssql,
         &loosening,
@@ -12302,12 +12577,14 @@ fn a_column_this_plan_writes_is_held_to_the_definition_it_gives() {
     .expect_err("still NOT NULL");
     assert!(format!("{e:#}").contains("nullability"), "{e:#}");
 
-    let defaulting = plan(pbps_model::Change::AlterColumnDefault {
-        uid: "c_aaaaaa".parse().unwrap(),
-        column: dbo_t.column("kept"),
-        from: None,
-        to: Some("0".to_owned()),
-    });
+    let defaulting = plan(pbps_model::Change::Column(
+        pbps_model::ColumnChange::AlterColumnDefault {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: dbo_t.column("kept"),
+            from: None,
+            to: Some("0".to_owned()),
+        },
+    ));
     refuse_unplanned_movement(
         &pbps_mssql::Mssql,
         &defaulting,
@@ -12359,15 +12636,15 @@ fn a_column_is_followed_across_its_rename_and_compared_after_it() {
         s
     };
     let renaming = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::RenameColumn {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Column(
+            pbps_model::ColumnChange::RenameColumn {
                 uid: "c_aaaaaa".parse().unwrap(),
                 table: dbo_t.clone(),
                 from: "a".into(),
                 to: "b".into(),
                 table_was: None,
             },
-        )],
+        ))],
     };
     // The read spanning the rename: one column, two names.
     refuse_unplanned_movement(
@@ -12414,14 +12691,14 @@ fn a_column_is_followed_across_its_rename_and_compared_after_it() {
     // The same for a column the plan adds: on both sides of a later read,
     // it is compared like any other.
     let adding = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::AddColumn {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Column(
+            pbps_model::ColumnChange::AddColumn {
                 uid: "c_aaaaaa".parse().unwrap(),
                 table: dbo_t.clone(),
                 name: "b".into(),
                 column: Box::new(pbps_model::Column::new("int".parse().unwrap())),
             },
-        )],
+        ))],
     };
     let e = refuse_unplanned_movement(
         &pbps_mssql::Mssql,
@@ -12437,25 +12714,29 @@ fn a_column_is_followed_across_its_rename_and_compared_after_it() {
     // rename, and nothing else.
     let renaming_and_retyping = pbps_model::ChangeSet {
         changes: vec![
-            pbps_model::PlannedChange::new(pbps_model::Change::RenameColumn {
-                uid: "c_aaaaaa".parse().unwrap(),
-                table: dbo_t.clone(),
-                from: "a".into(),
-                to: "b".into(),
-                table_was: None,
-            }),
-            pbps_model::PlannedChange::new(pbps_model::Change::AlterColumnType {
-                uid: "c_aaaaaa".parse().unwrap(),
-                column: dbo_t.column("b"),
-                from: "int".parse().unwrap(),
-                to: "bigint".parse().unwrap(),
-                from_nullable: false,
-                to_nullable: false,
-                through_external_partitions: false,
-                from_collation: None,
-                to_collation: None,
-                using: None,
-            }),
+            pbps_model::PlannedChange::new(pbps_model::Change::Column(
+                pbps_model::ColumnChange::RenameColumn {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    table: dbo_t.clone(),
+                    from: "a".into(),
+                    to: "b".into(),
+                    table_was: None,
+                },
+            )),
+            pbps_model::PlannedChange::new(pbps_model::Change::Column(
+                pbps_model::ColumnChange::AlterColumnType {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    column: dbo_t.column("b"),
+                    from: "int".parse().unwrap(),
+                    to: "bigint".parse().unwrap(),
+                    from_nullable: false,
+                    to_nullable: false,
+                    through_external_partitions: false,
+                    from_collation: None,
+                    to_collation: None,
+                    using: None,
+                },
+            )),
         ],
     };
     refuse_unplanned_movement(
@@ -12502,8 +12783,8 @@ fn a_columns_collation_is_held_to_what_the_plan_leaves_it() {
         }
     };
     let tightening = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::AlterColumnNullability {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Column(
+            pbps_model::ColumnChange::AlterColumnNullability {
                 uid: "c_aaaaaa".parse().unwrap(),
                 column: dbo_t.column("c"),
                 ty: "varchar(10)".parse().unwrap(),
@@ -12511,7 +12792,7 @@ fn a_columns_collation_is_held_to_what_the_plan_leaves_it() {
                 through_external_partitions: false,
                 collation: Some(Collation::new("Latin1_General_CS_AS")),
             },
-        )],
+        ))],
     };
     let check = |plan: &pbps_model::ChangeSet, after: &Schema| {
         refuse_unplanned_movement(
@@ -12531,8 +12812,8 @@ fn a_columns_collation_is_held_to_what_the_plan_leaves_it() {
     // Negative: a plan that touches another column is not excused for
     // this one's collation.
     let elsewhere = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::AlterColumnNullability {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Column(
+            pbps_model::ColumnChange::AlterColumnNullability {
                 uid: "c_bbbbbb".parse().unwrap(),
                 column: dbo_t.column("n"),
                 ty: "int".parse().unwrap(),
@@ -12540,7 +12821,7 @@ fn a_columns_collation_is_held_to_what_the_plan_leaves_it() {
                 through_external_partitions: false,
                 collation: None,
             },
-        )],
+        ))],
     };
     let e = check(&elsewhere, &schema(true, Some("Latin1_General_CI_AS")))
         .expect_err("another session changed the collation");
@@ -12619,12 +12900,14 @@ fn a_part_this_plan_adds_is_held_to_its_definition() {
         assert!(e.contains("is not the one this plan adds"), "{why}: {e}");
     };
 
-    let adding_index = plan(pbps_model::Change::AddIndex {
-        table: dbo_t.clone(),
-        name: "ix".into(),
-        index: Box::new(index("id", false)),
-        clustered: false,
-    });
+    let adding_index = plan(pbps_model::Change::Index(
+        pbps_model::IndexChange::AddIndex {
+            table: dbo_t.clone(),
+            name: "ix".into(),
+            index: Box::new(index("id", false)),
+            clustered: false,
+        },
+    ));
     check(
         &adding_index,
         &with(&|t| {
@@ -12666,12 +12949,14 @@ fn a_part_this_plan_adds_is_held_to_its_definition() {
         }],
         ..index("id", false)
     };
-    let adding_expression = plan(pbps_model::Change::AddIndex {
-        table: dbo_t.clone(),
-        name: "ix".into(),
-        index: Box::new(over(pbps_model::IndexKey::Expression("id+1".into()))),
-        clustered: false,
-    });
+    let adding_expression = plan(pbps_model::Change::Index(
+        pbps_model::IndexChange::AddIndex {
+            table: dbo_t.clone(),
+            name: "ix".into(),
+            index: Box::new(over(pbps_model::IndexKey::Expression("id+1".into()))),
+            clustered: false,
+        },
+    ));
     check(
         &adding_expression,
         &with(&|t| {
@@ -12690,12 +12975,14 @@ fn a_part_this_plan_adds_is_held_to_its_definition() {
         }),
         "the expression key came back as a column",
     );
-    let adding_clustered = plan(pbps_model::Change::AddIndex {
-        table: dbo_t.clone(),
-        name: "ix".into(),
-        index: Box::new(index("id", false)),
-        clustered: true,
-    });
+    let adding_clustered = plan(pbps_model::Change::Index(
+        pbps_model::IndexChange::AddIndex {
+            table: dbo_t.clone(),
+            name: "ix".into(),
+            index: Box::new(index("id", false)),
+            clustered: true,
+        },
+    ));
     check(
         &adding_clustered,
         &with(&|t| {
@@ -12712,12 +12999,14 @@ fn a_part_this_plan_adds_is_held_to_its_definition() {
         "the index came back nonclustered",
     );
     let adding_key = |nonclustered: bool| {
-        plan(pbps_model::Change::SetPrimaryKey {
-            table: dbo_t.clone(),
-            from: None,
-            to: Some(key("id")),
-            nonclustered,
-        })
+        plan(pbps_model::Change::Constraint(
+            pbps_model::ConstraintChange::SetPrimaryKey {
+                table: dbo_t.clone(),
+                from: None,
+                to: Some(key("id")),
+                nonclustered,
+            },
+        ))
     };
     let keyed = |layout: Option<pbps_model::Clustered>| {
         with(&|t| {
@@ -12756,12 +13045,14 @@ fn a_part_this_plan_adds_is_held_to_its_definition() {
     let e = check(&adding_index, &bare).expect_err("not there at all");
     assert!(format!("{e:#}").contains("is not there"), "{e:#}");
 
-    let adding_unique = plan(pbps_model::Change::AddUnique {
-        table: dbo_t.clone(),
-        name: "uq".into(),
-        constraint: unique("id"),
-        clustered: false,
-    });
+    let adding_unique = plan(pbps_model::Change::Constraint(
+        pbps_model::ConstraintChange::AddUnique {
+            table: dbo_t.clone(),
+            name: "uq".into(),
+            constraint: unique("id"),
+            clustered: false,
+        },
+    ));
     refused(
         &adding_unique,
         &with(&|t| {
@@ -12770,12 +13061,14 @@ fn a_part_this_plan_adds_is_held_to_its_definition() {
         "a unique of that name over another column",
     );
 
-    let keying = plan(pbps_model::Change::SetPrimaryKey {
-        table: dbo_t.clone(),
-        from: None,
-        to: Some(key("id")),
-        nonclustered: false,
-    });
+    let keying = plan(pbps_model::Change::Constraint(
+        pbps_model::ConstraintChange::SetPrimaryKey {
+            table: dbo_t.clone(),
+            from: None,
+            to: Some(key("id")),
+            nonclustered: false,
+        },
+    ));
     check(
         &keying,
         &with(&|t| {
@@ -12796,11 +13089,13 @@ fn a_part_this_plan_adds_is_held_to_its_definition() {
         "a key over another column",
     );
 
-    let adding_fk = plan(pbps_model::Change::AddForeignKey {
-        table: dbo_t.clone(),
-        name: "fk".into(),
-        constraint: Box::new(fk(&dbo_p, pbps_model::ReferentialAction::Cascade)),
-    });
+    let adding_fk = plan(pbps_model::Change::Constraint(
+        pbps_model::ConstraintChange::AddForeignKey {
+            table: dbo_t.clone(),
+            name: "fk".into(),
+            constraint: Box::new(fk(&dbo_p, pbps_model::ReferentialAction::Cascade)),
+        },
+    ));
     check(
         &adding_fk,
         &with(&|t| {
@@ -12824,13 +13119,15 @@ fn a_part_this_plan_adds_is_held_to_its_definition() {
 
     // A check is nothing but an expression, and the engine rewrites it:
     // its name is all a read-back can be held to (183).
-    let adding_check = plan(pbps_model::Change::AddCheck {
-        table: dbo_t.clone(),
-        name: "ck".into(),
-        constraint: pbps_model::CheckConstraint {
-            expression: "id > 0".to_owned(),
+    let adding_check = plan(pbps_model::Change::Constraint(
+        pbps_model::ConstraintChange::AddCheck {
+            table: dbo_t.clone(),
+            name: "ck".into(),
+            constraint: pbps_model::CheckConstraint {
+                expression: "id > 0".to_owned(),
+            },
         },
-    });
+    ));
     check(
         &adding_check,
         &with(&|t| {
@@ -12875,15 +13172,15 @@ fn a_closing_staged_refusal_does_not_promise_a_resume() {
     };
     // The data table is untouched while one other table is created.
     let untouched = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::CreateTable {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Table(
+            pbps_model::TableChange::CreateTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: "dbo.planned".parse().unwrap(),
                 table: Box::new(declared.clone()),
                 beside_default: None,
                 moves_at_most: None,
             },
-        )],
+        ))],
     };
     let refusal_for = |environment: Option<&str>, read: StagedRead| {
         staged_movement(
@@ -12979,15 +13276,15 @@ fn a_checkpoint_refusal_names_status_only_to_a_caller_who_can_run_it() {
     };
     // The data table is untouched while one other table is created.
     let untouched = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::CreateTable {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Table(
+            pbps_model::TableChange::CreateTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: "dbo.planned".parse().unwrap(),
                 table: Box::new(declared.clone()),
                 beside_default: None,
                 moves_at_most: None,
             },
-        )],
+        ))],
     };
     let refusal = |environment: Option<&str>| {
         staged_movement(
@@ -13084,7 +13381,7 @@ fn a_cell_left_to_its_default_is_held_there_at_the_close() {
     };
     // The declaration stops spelling `note`, so the plan sets it to
     // DEFAULT; `tag` was always left to its `NEWID()`.
-    let defaulting = plan(pbps_model::Change::UpdateRow {
+    let defaulting = plan(pbps_model::Change::Row(pbps_model::RowChange::UpdateRow {
         table: dbo_t.clone(),
         key_column: "code".into(),
         key: RowKey::from("k"),
@@ -13103,7 +13400,7 @@ fn a_cell_left_to_its_default_is_held_there_at_the_close() {
         types: Default::default(),
         after_types: Default::default(),
         key_type: None,
-    });
+    }));
     let before = schema(&[("note", "custom")]);
     let check = |after: &Schema, settled: Settled| {
         staged_comparison(
@@ -13160,7 +13457,7 @@ fn a_cell_left_to_its_default_is_held_there_at_the_close() {
     }
 
     // An insert leaves columns to their defaults too.
-    let inserting = plan(pbps_model::Change::InsertRow {
+    let inserting = plan(pbps_model::Change::Row(pbps_model::RowChange::InsertRow {
         table: dbo_t.clone(),
         key_column: "code".into(),
         identity_key: false,
@@ -13168,7 +13465,7 @@ fn a_cell_left_to_its_default_is_held_there_at_the_close() {
         row: Default::default(),
         defaults: [("note".into(), "'n/a'".to_owned())].into_iter().collect(),
         types: Default::default(),
-    });
+    }));
     let empty = Schema::default();
     let e = staged_comparison(
         &pbps_mssql::Mssql,

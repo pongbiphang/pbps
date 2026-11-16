@@ -19,6 +19,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::Dialect;
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::TableChange;
 use pbps_model::{Change, PlannedChange, Renames, TableName};
 
 use crate::Side;
@@ -55,7 +58,7 @@ pub(crate) fn order(
     // (review of #1346).
     let mut weak_claims: BTreeMap<TableName, BTreeSet<usize>> = BTreeMap::new();
     for (i, p) in planned.iter().enumerate() {
-        if let Change::RenameTable { from, to, .. } = &p.change {
+        if let Change::Table(TableChange::RenameTable { from, to, .. }) = &p.change {
             owners.insert(to.clone(), (i, from.clone()));
             claims.entry(to.clone()).or_default().insert(i);
             // SET SCHEMA precedes RENAME TO in the PostgreSQL emitter.
@@ -122,13 +125,14 @@ pub(crate) fn order(
     // taken as the doomed table's.
     let mut own = BTreeSet::new();
     for p in planned.iter() {
-        if let Change::DropTable { name, .. } = &p.change
+        if let Change::Table(TableChange::DropTable { name, .. }) = &p.change
             && let Some(t) = base.schema.tables.get(name)
         {
             let mut remaining: BTreeSet<&pbps_model::ObjectLocalName> =
                 t.foreign_keys.keys().collect();
             for (j, q) in planned.iter().enumerate() {
-                if let Change::DropForeignKey { table, name: fk } = &q.change
+                if let Change::Constraint(ConstraintChange::DropForeignKey { table, name: fk }) =
+                    &q.change
                     && table == name
                     && remaining.remove(fk)
                 {
@@ -156,7 +160,7 @@ pub(crate) fn order(
     let mut folded_edges: Vec<(usize, usize)> = Vec::new();
     let mut generated_edges: Vec<(usize, usize)> = Vec::new();
     for (i, p) in planned.iter().enumerate() {
-        if let Change::DropTable { name, .. } = &p.change {
+        if let Change::Table(TableChange::DropTable { name, .. }) = &p.change {
             let mut released = vec![(name.name.clone(), true)];
             if let Some(t) = base.schema.tables.get(name) {
                 released.extend(
@@ -248,18 +252,23 @@ pub(crate) fn order(
         if drops.contains(&i)
             && let Some(t) = before(table)
         {
-            let columns = if let Change::DropUnique { name, .. } = &p.change {
-                t.unique.get(name).map(|u| u.columns.clone())
-            } else if let Change::SetPrimaryKey { from: Some(pk), .. } = &p.change {
-                Some(pk.columns.clone())
-            } else if let Change::DropIndex { name, .. } = &p.change {
-                t.indexes
-                    .get(name)
-                    .filter(|index| index.unique && index.filter.is_none())
-                    .and_then(|index| index.column_keys())
-            } else {
-                None
-            };
+            let columns =
+                if let Change::Constraint(ConstraintChange::DropUnique { name, .. }) = &p.change {
+                    t.unique.get(name).map(|u| u.columns.clone())
+                } else if let Change::Constraint(ConstraintChange::SetPrimaryKey {
+                    from: Some(pk),
+                    ..
+                }) = &p.change
+                {
+                    Some(pk.columns.clone())
+                } else if let Change::Index(IndexChange::DropIndex { name, .. }) = &p.change {
+                    t.indexes
+                        .get(name)
+                        .filter(|index| index.unique && index.filter.is_none())
+                        .and_then(|index| index.column_keys())
+                } else {
+                    None
+                };
             if let Some(columns) = columns {
                 keys.push((
                     i,
@@ -359,7 +368,8 @@ pub(crate) fn order(
     let mut fixed = BTreeSet::new();
     for (drop, doomed) in &doomed {
         for (j, p) in planned.iter().enumerate() {
-            let Change::DropForeignKey { table, name } = &p.change else {
+            let Change::Constraint(ConstraintChange::DropForeignKey { table, name }) = &p.change
+            else {
                 continue;
             };
             let references = if own.contains(&j) {
@@ -391,7 +401,7 @@ pub(crate) fn order(
         }
     }
     for (i, p) in planned.iter().enumerate() {
-        let Change::DropForeignKey { table, name } = &p.change else {
+        let Change::Constraint(ConstraintChange::DropForeignKey { table, name }) = &p.change else {
             continue;
         };
         // A dropped table's own key is read under its baseline name, which a
@@ -430,7 +440,12 @@ pub(crate) fn order(
     let mut selected = drops.clone();
     selected.extend(owners.values().map(|(i, _)| *i));
     for &drop in &drops {
-        if fixed.contains(&drop) || matches!(planned[drop].change, Change::DropTable { .. }) {
+        if fixed.contains(&drop)
+            || matches!(
+                planned[drop].change,
+                Change::Table(TableChange::DropTable { .. })
+            )
+        {
             continue;
         }
         let table = planned[drop].change.table().expect("a relation or FK drop");
@@ -495,13 +510,13 @@ pub(crate) fn order(
             // The address is part of the typed, checksummed change, not a
             // hidden emitter rewrite. Declared::advance also consumes this
             // execution order and removes an old filter before rekeying it.
-            if let Change::DropIndex { table, .. }
-            | Change::DropUnique { table, .. }
-            | Change::DropForeignKey { table, .. }
-            | Change::DropCheck { table, .. }
-            | Change::SetPrimaryKey {
+            if let Change::Index(IndexChange::DropIndex { table, .. })
+            | Change::Constraint(ConstraintChange::DropUnique { table, .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { table, .. })
+            | Change::Constraint(ConstraintChange::DropCheck { table, .. })
+            | Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table, to: None, ..
-            } = &mut planned[drop].change
+            }) = &mut planned[drop].change
             {
                 *table = source.clone();
             }
@@ -699,25 +714,26 @@ fn dropped_relation(
     indexes: bool,
     constraints: bool,
 ) -> Option<(&TableName, &str)> {
-    if let Change::DropUnique { table, name } = change {
+    if let Change::Constraint(ConstraintChange::DropUnique { table, name }) = change {
         return Some((table, name.raw()));
     }
-    if let Change::DropIndex { table, name } = change
+    if let Change::Index(IndexChange::DropIndex { table, name }) = change
         && indexes
     {
         return Some((table, name.raw()));
     }
-    if let Change::DropCheck { table, name } | Change::DropForeignKey { table, name } = change
+    if let Change::Constraint(ConstraintChange::DropCheck { table, name })
+    | Change::Constraint(ConstraintChange::DropForeignKey { table, name }) = change
         && constraints
     {
         return Some((table, name.raw()));
     }
-    if let Change::SetPrimaryKey {
+    if let Change::Constraint(ConstraintChange::SetPrimaryKey {
         table,
         from: Some(pk),
         to: None,
         ..
-    } = change
+    }) = change
     {
         return pk
             .name

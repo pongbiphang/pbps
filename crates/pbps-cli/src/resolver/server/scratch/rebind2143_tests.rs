@@ -4,6 +4,7 @@
 
 use super::reconstruct2374::{both, declared, exec, module, table};
 use super::*;
+use pbps_model::ModuleChange;
 use pbps_model::{Change, ModuleKind};
 use std::pin::Pin;
 
@@ -736,9 +737,9 @@ async fn mssql_an_arriving_unrelated_routine_does_not_rebuild_a_managed_view() {
                 changes.iter().any(|planned| {
                     matches!(
                         &planned.change,
-                        Change::CreateModule { id, .. }
-                            | Change::AlterModule { id, .. }
-                            | Change::DropModule { id, .. } if id == wanted
+                        Change::Module(ModuleChange::CreateModule { id, .. })
+                            | Change::Module(ModuleChange::AlterModule { id, .. })
+                            | Change::Module(ModuleChange::DropModule { id, .. }) if id == wanted
                     )
                 })
             };

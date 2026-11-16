@@ -1,6 +1,9 @@
 //! Ownership facts are independent of the proposed transition inventory.
 
 use super::Surface;
+use crate::ColumnChange;
+use crate::TableChange;
+use crate::TypeChange;
 use crate::{Change, ChangeSet};
 use schemars::JsonSchema;
 
@@ -109,7 +112,7 @@ fn relocate(
     column_uid: &mut Option<crate::Uid>,
 ) {
     match change {
-        Change::RenameTable { uid, from, to, .. } => {
+        Change::Table(TableChange::RenameTable { uid, from, to, .. }) => {
             let table = match surface {
                 Surface::Table(table)
                 | Surface::Check { table, .. }
@@ -128,7 +131,7 @@ fn relocate(
         }
         // A type is selected by its rename's UID as a table is, in the same
         // slot: a surface is one or the other.
-        Change::RenameType { uid, from, to, .. } => {
+        Change::Type(TypeChange::RenameType { uid, from, to, .. }) => {
             let (from, to) = if forward { (from, to) } else { (to, from) };
             if let Surface::Type(name) = surface
                 && name == from
@@ -138,13 +141,13 @@ fn relocate(
                 *name = to.clone();
             }
         }
-        Change::RenameColumn {
+        Change::Column(ColumnChange::RenameColumn {
             uid,
             table,
             from,
             to,
             ..
-        } => {
+        }) => {
             let (from, to) = if forward { (from, to) } else { (to, from) };
             if let Surface::Column(column) | Surface::Default(column) = surface
                 && &column.table == table
@@ -162,22 +165,24 @@ fn relocate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RoleChange;
+    use crate::TypeChange;
     use crate::{PlannedChange, TypeRef, Uid, UidKind};
 
     fn renaming(uid: &Uid, from: &str, to: &str) -> ChangeSet {
         ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::RenameType {
+                PlannedChange::new(Change::Type(TypeChange::RenameType {
                     uid: uid.clone(),
                     from: from.parse().unwrap(),
                     to: to.parse().unwrap(),
                     definition: Box::new(crate::ManagedType::Enum { values: Vec::new() }),
-                }),
+                })),
                 // A step after it, to ask the opening snapshot of.
-                PlannedChange::new(Change::CreateRole {
+                PlannedChange::new(Change::Role(RoleChange::CreateRole {
                     uid: Uid::generate(UidKind::Role),
                     name: "later".into(),
-                }),
+                })),
             ],
         }
     }

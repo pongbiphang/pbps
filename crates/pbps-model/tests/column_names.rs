@@ -216,13 +216,15 @@ fn declared_expression_and_binding_keys_follow_raw_column_renames() {
         .defaults
         .insert(name.clone(), [(old.clone(), Binding::default())].into());
     declared.advance(&ChangeSet {
-        changes: vec![PlannedChange::new(Change::RenameColumn {
-            uid: "c_aaaaaa".parse().unwrap(),
-            table: name.clone(),
-            from: old.clone(),
-            to: new.clone(),
-            table_was: None,
-        })],
+        changes: vec![PlannedChange::new(Change::Column(
+            ColumnChange::RenameColumn {
+                uid: "c_aaaaaa".parse().unwrap(),
+                table: name.clone(),
+                from: old.clone(),
+                to: new.clone(),
+                table_was: None,
+            },
+        ))],
     });
     assert_eq!(
         declared.expressions.defaults[&name]
@@ -267,14 +269,14 @@ fn column_history_physical_sources_and_name_slots_keep_raw_addresses() {
     let mut final_ids = base.clone();
     final_ids.columns.insert(uid.clone(), table.column(&next));
     let changes = vec![
-        PlannedChange::new(Change::RenameColumn {
+        PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
             uid: uid.clone(),
             table: table.clone(),
             from: RAW.into(),
             to: next.clone(),
             table_was: None,
-        }),
-        PlannedChange::new(Change::AddComputedColumn {
+        })),
+        PlannedChange::new(Change::Column(ColumnChange::AddComputedColumn {
             table: table.clone(),
             name: computed.clone(),
             computed: ComputedColumn {
@@ -282,7 +284,7 @@ fn column_history_physical_sources_and_name_slots_keep_raw_addresses() {
                 persisted: false,
                 not_null: false,
             },
-        }),
+        })),
     ];
     let names = PlanNames::of(&changes, &final_ids).unwrap();
     assert_eq!(

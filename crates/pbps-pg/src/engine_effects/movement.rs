@@ -2,6 +2,9 @@
 use super::{columns, facts};
 use crate::Postgres;
 use pbps_model::Change;
+use pbps_model::ColumnChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
 use pbps_model::operation::{
     ColumnKey, End, Family, Lineage, ObjectKey, Operation, OwnerError, Owners, Recorded, Role,
     Snapshot, Standing, symbolic::*,
@@ -55,9 +58,15 @@ impl Context<'_> {
         parent: &Recorded,
         family: &Family,
     ) -> Vec<Clause> {
-        let kind = if matches!(op.change(), Change::AttachPartition { .. }) {
+        let kind = if matches!(
+            op.change(),
+            Change::Partition(PartitionChange::AttachPartition { .. })
+        ) {
             MoveKind::Attach
-        } else if matches!(op.change(), Change::DetachPartition { .. }) {
+        } else if matches!(
+            op.change(),
+            Change::Partition(PartitionChange::DetachPartition { .. })
+        ) {
             MoveKind::Detach
         } else {
             MoveKind::Drop
@@ -225,7 +234,10 @@ impl Context<'_> {
             .and_then(|t| t.partition_of.as_ref())
             .and_then(|of| of.columns.get(&slot.name));
         let value = match (op.change(), &attribute) {
-            (Change::SetPartitionNotNull { not_null, .. }, Attribute::NotNull) => {
+            (
+                Change::Partition(PartitionChange::SetPartitionNotNull { not_null, .. }),
+                Attribute::NotNull,
+            ) => {
                 if *not_null != own.is_some_and(|o| o.not_null) {
                     return require(
                         "the NOT NULL restoration payload disagrees with its declared own goal",
@@ -252,7 +264,10 @@ impl Context<'_> {
                     (!not_null).then_some(Ownership::Inherited),
                 )
             }
-            (Change::SetPartitionDefault { to, fallback, .. }, Attribute::Default) => {
+            (
+                Change::Partition(PartitionChange::SetPartitionDefault { to, fallback, .. }),
+                Attribute::Default,
+            ) => {
                 let Some(name) = self
                     .after
                     .ids
@@ -326,16 +341,19 @@ pub(super) fn of(
     let clauses = match (&key, op.change()) {
         (
             ObjectKey::Table(child),
-            Change::AttachPartition { .. }
-            | Change::DetachPartition { .. }
-            | Change::DropTable {
+            Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Table(TableChange::DropTable {
                 detach_from: Some(_),
                 ..
-            },
+            }),
         ) => {
             let Some((parent, family)) = context.family(
                 child,
-                if matches!(op.change(), Change::AttachPartition { .. }) {
+                if matches!(
+                    op.change(),
+                    Change::Partition(PartitionChange::AttachPartition { .. })
+                ) {
                     End::Goal
                 } else {
                     End::Base
@@ -347,15 +365,15 @@ pub(super) fn of(
         }
         (
             ObjectKey::Column(key @ ColumnKey::Partition { table: child, .. }),
-            Change::SetPartitionNotNull { .. },
+            Change::Partition(PartitionChange::SetPartitionNotNull { .. }),
         ) => context.restoration(op, child, key, Attribute::NotNull),
         (
             ObjectKey::Default(key @ ColumnKey::Partition { table: child, .. }),
-            Change::SetPartitionDefault { .. },
+            Change::Partition(PartitionChange::SetPartitionDefault { .. }),
         ) => context.restoration(op, child, key, Attribute::Default),
         (
             ObjectKey::Default(key @ ColumnKey::Recorded(_)),
-            Change::AlterColumnDefault { uid, .. },
+            Change::Column(ColumnChange::AlterColumnDefault { uid, .. }),
         ) => {
             let child = [after, before].into_iter().find_map(|s| {
                 s.ids

@@ -1,4 +1,5 @@
 use super::*;
+use pbps_model::TypeValueChange;
 use pbps_model::{Change, ChangeSet, Column, DataMode, DataScope, ManagedType, PlannedChange};
 
 fn mood(uid: &str) -> (IdsFile, Schema) {
@@ -43,7 +44,7 @@ fn plan(ids: &IdsFile, renames: &[(&str, &str, &str)]) -> pbps_model::SavedPlan 
                 .iter()
                 .enumerate()
                 .map(|(ordinal, (uid, from, to))| {
-                    PlannedChange::new(Change::RenameEnumValue {
+                    PlannedChange::new(Change::TypeValue(TypeValueChange::RenameEnumValue {
                         uid: uid.parse().unwrap(),
                         name: "app.mood".parse().unwrap(),
                         from: (*from).into(),
@@ -53,7 +54,7 @@ fn plan(ids: &IdsFile, renames: &[(&str, &str, &str)]) -> pbps_model::SavedPlan 
                         definition: Box::new(ManagedType::Enum {
                             values: vec![(*to).into()],
                         }),
-                    })
+                    }))
                 })
                 .collect(),
         },
@@ -135,7 +136,9 @@ fn a_chain_of_renames_over_a_narrow_ensure_table_moves_no_row() {
     let chain = |ids: &IdsFile| {
         let mut changes = plan(ids, &[("y_000001", "b", "c"), ("y_000001", "a", "b")]).changes;
         for (step, labels) in changes.changes.iter_mut().zip([["a", "c"], ["b", "c"]]) {
-            if let Change::RenameEnumValue { definition, .. } = &mut step.change {
+            if let Change::TypeValue(TypeValueChange::RenameEnumValue { definition, .. }) =
+                &mut step.change
+            {
                 **definition = ManagedType::Enum {
                     values: labels.iter().map(|l| (*l).to_owned()).collect(),
                 };

@@ -3,7 +3,10 @@
 use crate::certified_fixture::FixtureEmission as _;
 
 use super::*;
+use pbps_model::ColumnChange;
 use pbps_model::Generated;
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
 #[path = "../resolver/generated_fixtures.rs"]
 mod cases;
 use cases::shape;
@@ -92,19 +95,23 @@ fn generated_table_parts_keep_names_early_and_columns_in_declaration_order_on_ev
         let mut view_at = 0;
         for (i, p) in unknown.changes.iter().enumerate() {
             match &p.change {
-                Change::CreateTable { name, table, .. } if name == &a => {
+                Change::Table(TableChange::CreateTable { name, table, .. }) if name == &a => {
                     table_at = Some(i);
                     columns.extend(table.columns.keys().cloned());
                 }
-                Change::AddColumn {
+                Change::Column(ColumnChange::AddColumn {
                     table, name, uid, ..
-                } if table == &a => {
+                }) if table == &a => {
                     assert_eq!(Some(uid), ids.column_uid(&table.column(name)));
                     columns.push(name.clone());
                     last = i;
                 }
-                Change::CreateModule { id, .. } if id.name() == "f" => function_at = Some(i),
-                Change::CreateModule { id, .. } if id.name() == "v" => view_at = i,
+                Change::Module(ModuleChange::CreateModule { id, .. }) if id.name() == "f" => {
+                    function_at = Some(i)
+                }
+                Change::Module(ModuleChange::CreateModule { id, .. }) if id.name() == "v" => {
+                    view_at = i
+                }
                 _ => {}
             }
         }
@@ -143,15 +150,16 @@ fn only_unsplittable_generated_tables_use_known_set_expression_capability() {
         )
         .unwrap();
         assert!(
-            cs.changes
-                .iter()
-                .any(|p| matches!(p.change, Change::AlterColumnExpression { .. })),
+            cs.changes.iter().any(|p| matches!(
+                p.change,
+                Change::Column(ColumnChange::AlterColumnExpression { .. })
+            )),
             "{case}"
         );
         assert!(
             !cs.changes
                 .iter()
-                .any(|p| matches!(p.change, Change::AddColumn { .. })),
+                .any(|p| matches!(p.change, Change::Column(ColumnChange::AddColumn { .. }))),
             "{case}"
         );
     }
@@ -196,15 +204,16 @@ fn called_table_readers_require_full_shape_or_keep_the_named_hold() {
         )
         .unwrap();
         assert!(
-            cs.changes
-                .iter()
-                .any(|p| matches!(p.change, Change::AlterColumnExpression { .. })),
+            cs.changes.iter().any(|p| matches!(
+                p.change,
+                Change::Column(ColumnChange::AlterColumnExpression { .. })
+            )),
             "{read}"
         );
         assert!(
             !cs.changes
                 .iter()
-                .any(|p| matches!(p.change, Change::AddColumn { .. })),
+                .any(|p| matches!(p.change, Change::Column(ColumnChange::AddColumn { .. }))),
             "{read}"
         );
     }
@@ -219,7 +228,7 @@ fn called_table_readers_require_full_shape_or_keep_the_named_hold() {
         assert!(
             cs.changes
                 .iter()
-                .any(|p| matches!(p.change, Change::AddColumn { .. }))
+                .any(|p| matches!(p.change, Change::Column(ColumnChange::AddColumn { .. })))
         );
     }
 }
@@ -233,18 +242,18 @@ fn composite_consumers_and_views_wait_for_the_complete_table() {
             .changes
             .iter()
             .rposition(
-                |p| matches!(&p.change, Change::AddColumn { table, .. } if table.name == "a"),
+                |p| matches!(&p.change, Change::Column(ColumnChange::AddColumn { table, .. }) if table.name == "a"),
             )
             .unwrap();
         let view = cs
             .changes
             .iter()
-            .position(|p| matches!(&p.change, Change::CreateModule { id, .. } if id.name() == "v"))
+            .position(|p| matches!(&p.change, Change::Module(ModuleChange::CreateModule { id, .. }) if id.name() == "v"))
             .unwrap();
         let consumer = cs
             .changes
             .iter()
-            .position(|p| matches!(&p.change, Change::CreateTable { name, .. } if name.name == "b"))
+            .position(|p| matches!(&p.change, Change::Table(TableChange::CreateTable { name, .. }) if name.name == "b"))
             .unwrap();
         assert!(
             complete < view && complete < consumer,
@@ -366,7 +375,7 @@ async fn generated_table_parts_apply_with_the_declared_column_order_values_and_n
                     let rows = conn.query("SELECT a FROM app.a WHERE id=3").await?;
                     assert_eq!(rows[0].try_get::<i32>("a")?, Some(if shape_case == "prefix-only" { 6 } else { 10 }), "{case}");
                     let has_parts = cs.changes.iter().any(pbps_diff::order::generated::is_part);
-                    let placeholder = cs.changes.iter().any(|p| matches!(p.change, Change::AlterColumnExpression { .. }));
+                    let placeholder = cs.changes.iter().any(|p| matches!(p.change, Change::Column(ColumnChange::AlterColumnExpression { .. })));
                     let version = conn.query("SHOW server_version_num").await?;
                     let modern = version[0].try_get::<&str>("server_version_num")?.unwrap().parse::<i64>()? >= pbps_pg::generated::SET_EXPRESSION_ARRIVED_IN;
                     let suffix_input = shape_case == "prefix-later";
@@ -435,8 +444,8 @@ async fn called_table_readers_use_complete_shapes_and_old_servers_keep_the_hold(
                     return Ok(());
                 }
                 let cs = result.map_err(anyhow::Error::msg)?;
-                assert!(cs.changes.iter().any(|p| matches!(p.change, Change::AlterColumnExpression { .. })));
-                assert!(!cs.changes.iter().any(|p| matches!(p.change, Change::AddColumn { .. })));
+                assert!(cs.changes.iter().any(|p| matches!(p.change, Change::Column(ColumnChange::AlterColumnExpression { .. }))));
+                assert!(!cs.changes.iter().any(|p| matches!(p.change, Change::Column(ColumnChange::AddColumn { .. }))));
                 for p in &cs.changes { for sql in pg.fixture_emit(&p.change, p.strategy)? { conn.execute(&sql.sql).await?; } }
                 let count = conn.query("SELECT count(*)::int4 AS n FROM information_schema.columns WHERE table_schema='app' AND table_name='v'").await?;
                 assert_eq!(count[0].try_get::<i32>("n")?, Some(3));
@@ -474,15 +483,18 @@ fn transitive_table_readers_use_placeholders_and_keep_old_holds() {
                 );
             } else {
                 let cs = result.unwrap();
-                let placeholder = cs
-                    .changes
-                    .iter()
-                    .any(|p| matches!(p.change, Change::AlterColumnExpression { .. }));
+                let placeholder = cs.changes.iter().any(|p| {
+                    matches!(
+                        p.change,
+                        Change::Column(ColumnChange::AlterColumnExpression { .. })
+                    )
+                });
                 assert_eq!(placeholder, case == "chain", "{case}, {version:?}");
                 assert_eq!(
-                    cs.changes
-                        .iter()
-                        .any(|p| matches!(p.change, Change::AddColumn { .. })),
+                    cs.changes.iter().any(|p| matches!(
+                        p.change,
+                        Change::Column(ColumnChange::AddColumn { .. })
+                    )),
                     case == "chain-pure"
                 );
             }
@@ -502,9 +514,10 @@ fn declared_callee_dependencies_share_the_ordering_closure() {
     for deps in [ModuleDeps::new(), [(f, [g].into())].into()] {
         let cs = ordinary_with_dependencies(&schema, &ids, &deps, &pg).unwrap();
         assert_eq!(
-            cs.changes
-                .iter()
-                .any(|p| matches!(p.change, Change::AlterColumnExpression { .. })),
+            cs.changes.iter().any(|p| matches!(
+                p.change,
+                Change::Column(ColumnChange::AlterColumnExpression { .. })
+            )),
             !deps.is_empty()
         );
     }
@@ -552,9 +565,10 @@ async fn transitive_table_readers_apply_placeholders_or_keep_the_named_hold() {
                 }
                 let cs = result.map_err(anyhow::Error::msg)?;
                 assert_eq!(
-                    cs.changes
-                        .iter()
-                        .any(|p| matches!(p.change, Change::AlterColumnExpression { .. })),
+                    cs.changes.iter().any(|p| matches!(
+                        p.change,
+                        Change::Column(ColumnChange::AlterColumnExpression { .. })
+                    )),
                     case == "chain"
                 );
                 for p in &cs.changes {

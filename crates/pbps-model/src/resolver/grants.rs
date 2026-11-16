@@ -1,5 +1,6 @@
 //! Source-free object-grant questions, separate from binding inputs.
 
+use crate::GrantChange;
 use crate::{Change, ChangeSet, GrantTarget, Permission, RoleName};
 use schemars::JsonSchema;
 use std::collections::{BTreeMap, BTreeSet};
@@ -65,16 +66,16 @@ impl AuthorizationGrant {
             .iter()
             .enumerate()
             .filter_map(|(i, p)| {
-                if let Change::Grant {
+                if let Change::Permission(GrantChange::Grant {
                     role,
                     target,
                     permissions,
-                }
-                | Change::Revoke {
+                })
+                | Change::Permission(GrantChange::Revoke {
                     role,
                     target,
                     permissions,
-                } = &p.change
+                }) = &p.change
                 {
                     return (!matches!(target, GrantTarget::Schema(_))).then(|| {
                         (
@@ -83,14 +84,17 @@ impl AuthorizationGrant {
                                 target: target.clone(),
                                 grantee: GrantPrincipal::Role { name: role.clone() },
                                 permissions: permissions.clone(),
-                                grant: matches!(p.change, Change::Grant { .. }),
+                                grant: matches!(
+                                    p.change,
+                                    Change::Permission(GrantChange::Grant { .. })
+                                ),
                             },
                         )
                     });
                 }
-                let Change::PublicExecution {
+                let Change::Permission(GrantChange::PublicExecution {
                     routine, access, ..
-                } = &p.change
+                }) = &p.change
                 else {
                     return None;
                 };
@@ -169,14 +173,17 @@ impl AuthorizationGrant {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GrantChange;
 
     fn changes() -> ChangeSet {
         ChangeSet {
-            changes: vec![crate::PlannedChange::new(Change::Grant {
-                role: "reader".into(),
-                target: GrantTarget::Object(crate::ObjectName::new("app", "t")),
-                permissions: BTreeSet::from([Permission::Select]),
-            })],
+            changes: vec![crate::PlannedChange::new(Change::Permission(
+                GrantChange::Grant {
+                    role: "reader".into(),
+                    target: GrantTarget::Object(crate::ObjectName::new("app", "t")),
+                    permissions: BTreeSet::from([Permission::Select]),
+                },
+            ))],
         }
     }
 

@@ -1,5 +1,9 @@
 use super::*;
 use pbps_dialect::MinimalDialect;
+use pbps_model::IndexChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
+use pbps_model::TablePropertyChange;
 use pbps_model::operation::{
     ModuleEdits, Operations, Origin, PlanOwners, Snapshot, Source as OriginSource, effects,
 };
@@ -26,7 +30,7 @@ fn rebuild_copy_precedes_analyze_by_effects_in_adversarial_input_order() {
     let mut parts = fixture::changes();
     parts.remove(0);
     parts.reverse();
-    let Change::CopyTableRows(copy) = &parts[1] else {
+    let Change::Partition(PartitionChange::CopyTableRows(copy)) = &parts[1] else {
         panic!()
     };
     let target = copy.target.clone();
@@ -38,13 +42,13 @@ fn rebuild_copy_precedes_analyze_by_effects_in_adversarial_input_order() {
                 .columns
                 .insert("k".into(), Column::new("bigint".parse().unwrap()));
         }
-        parts.push(Change::CreateTable {
+        parts.push(Change::Table(TableChange::CreateTable {
             uid: relation.uid,
             name: relation.name,
             table: Box::new(table),
             beside_default: None,
             moves_at_most: None,
-        });
+        }));
     }
     let changes = ChangeSet {
         changes: parts.into_iter().map(PlannedChange::new).collect(),
@@ -98,12 +102,11 @@ fn rebuild_copy_precedes_analyze_by_effects_in_adversarial_input_order() {
 
 #[test]
 fn rebuild_roots_and_partial_parts_cannot_gain_canonical_authority() {
-    for change in
-        fixture::changes()
-            .into_iter()
-            .chain(std::iter::once(Change::BuildPartitionedIndex(Box::new(
-                fixture::index_recipe(),
-            ))))
+    for change in fixture::changes()
+        .into_iter()
+        .chain(std::iter::once(Change::Index(
+            IndexChange::BuildPartitionedIndex(Box::new(fixture::index_recipe())),
+        )))
     {
         let name = change.table().unwrap().shown().to_string();
         let plan = propose(ChangeSet {
@@ -126,12 +129,12 @@ fn rebuild_swap_uses_shared_slots_with_distinct_reserved_holders() {
     let old = base.index().table_uid(&root.table).unwrap().clone();
     let new = desired.index().table_uid(&root.table).unwrap().clone();
     let rename = |uid, from, to| {
-        PlannedChange::new(Change::RenameTable {
+        PlannedChange::new(Change::Table(TableChange::RenameTable {
             uid,
             from,
             to,
             defaults: vec![],
-        })
+        }))
     };
     // The premature final claim must wait for the source's release, despite equal logical names.
     let parts = vec![
@@ -175,12 +178,11 @@ fn rebuild_roots_and_partial_parts_are_refused_by_the_shared_route() {
         },
         annotations: &deps,
     };
-    for change in
-        fixture::changes()
-            .into_iter()
-            .chain(std::iter::once(Change::BuildPartitionedIndex(Box::new(
-                fixture::index_recipe(),
-            ))))
+    for change in fixture::changes()
+        .into_iter()
+        .chain(std::iter::once(Change::Index(
+            IndexChange::BuildPartitionedIndex(Box::new(fixture::index_recipe())),
+        )))
     {
         let name = change.table().unwrap().shown().to_string();
         let draft = propose(ChangeSet {
@@ -232,10 +234,10 @@ fn a_saved_rebuild_that_lost_a_declared_comment_is_named() {
     declared.description = Some("the table".into());
     declared.columns["k"].description = Some("the key".into());
     let write = |target, text: &str| {
-        PlannedChange::new(Change::SetComment {
+        PlannedChange::new(Change::TableProperty(TablePropertyChange::SetComment {
             target,
             text: Some(text.into()),
-        })
+        }))
     };
     let table = write(
         CommentTarget::Table {

@@ -216,12 +216,12 @@ async fn expansion_replays_own_parts_external_bindings_and_member_lifetimes() {
             );
         }
         assert!(
-            matches!(ops.last().unwrap().change(),Change::DropTable{uid,..} if uid==ids.table_uid(&table).unwrap())
+            matches!(ops.last().unwrap().change(),Change::Table(TableChange::DropTable{uid,..}) if uid==ids.table_uid(&table).unwrap())
         );
         assert!(done.rewrites > 1);
         assert_eq!(
             ops.iter()
-                .filter(|op| matches!(op.change(),Change::Grant{role:r,..} if r.raw()==role))
+                .filter(|op| matches!(op.change(),Change::Permission(GrantChange::Grant{role:r,..}) if r.raw()==role))
                 .count(),
             3
         );
@@ -229,8 +229,8 @@ async fn expansion_replays_own_parts_external_bindings_and_member_lifetimes() {
             let position = |n: &str, create| {
                 ops.iter()
                     .position(|o| {
-                        matches!(o.change(),Change::CreateModule{id,..} if create && id==&n.parse().unwrap())
-                            || matches!(o.change(),Change::DropModule{id,..} if !create && id==&n.parse().unwrap())
+                        matches!(o.change(),Change::Module(ModuleChange::CreateModule{id,..}) if create && id==&n.parse().unwrap())
+                            || matches!(o.change(),Change::Module(ModuleChange::DropModule{id,..}) if !create && id==&n.parse().unwrap())
                     })
                     .unwrap()
             };
@@ -244,17 +244,20 @@ async fn expansion_replays_own_parts_external_bindings_and_member_lifetimes() {
             done.target.tables.len() + root.intent.source.tables.len(),
             ids.tables.len() + root.intent.replacement.tables.len()
         );
-        assert!(ops.iter().any(|op|matches!(op.change(),Change::AddForeignKey{table,..} if table==&"app.incoming".parse().unwrap())));
+        assert!(ops.iter().any(|op|matches!(op.change(),Change::Constraint(ConstraintChange::AddForeignKey{table,..}) if table==&"app.incoming".parse().unwrap())));
         assert_eq!(
             ops.iter()
-                .filter(|op| matches!(op.change(), Change::BuildPartitionedIndex(_)))
+                .filter(|op| matches!(
+                    op.change(),
+                    Change::Index(IndexChange::BuildPartitionedIndex(_))
+                ))
                 .count(),
             3
         );
-        assert!(
-            ops.iter()
-                .any(|op| matches!(op.change(), Change::CreateModule { .. }))
-        );
+        assert!(ops.iter().any(|op| matches!(
+            op.change(),
+            Change::Module(ModuleChange::CreateModule { .. })
+        )));
     }
     db.conn.execute("ROLLBACK").await.unwrap();
     assert_eq!(owned_snapshot(&mut db, &role_suffix).await, base);

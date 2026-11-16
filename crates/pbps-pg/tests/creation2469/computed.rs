@@ -1,4 +1,7 @@
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
 
 #[test]
 fn computed_column_and_not_null_demands_select_the_computed_suffix() {
@@ -10,29 +13,28 @@ fn computed_column_and_not_null_demands_select_the_computed_suffix() {
         table.computed.insert("z_suffix".into(), constant);
         let plan = f.compile(&pbps_mssql::Mssql).unwrap();
         let changes = &plan.changes().changes;
-        let bare = changes.iter().position(|p| matches!(&p.change, Change::CreateTable { name, table, .. }
+        let bare = changes.iter().position(|p| matches!(&p.change, Change::Table(TableChange::CreateTable { name, table, .. })
             if name == &"app.t".parse().unwrap() && table.computed.keys().map(|c| c.raw()).eq(["a_prefix"]))).unwrap();
         let function = changes
             .iter()
-            .position(|p| matches!(&p.change, Change::CreateModule { .. }))
+            .position(|p| matches!(&p.change, Change::Module(ModuleChange::CreateModule { .. })))
             .unwrap();
         let column = changes
             .iter()
             .position(|p| {
-                matches!(&p.change, Change::AddComputedColumn { name, computed, .. }
+                matches!(&p.change, Change::Column(ColumnChange::AddComputedColumn { name, computed, .. })
             if name.raw() == "g" && computed.not_null == (facet == "not_null"))
             })
             .unwrap();
-        let suffix = changes.iter().position(|p| matches!(&p.change, Change::AddComputedColumn { name, .. } if name.raw() == "z_suffix")).unwrap();
+        let suffix = changes.iter().position(|p| matches!(&p.change, Change::Column(ColumnChange::AddComputedColumn { name, .. }) if name.raw() == "z_suffix")).unwrap();
         assert!(
             bare < function && function < column && column < suffix,
             "{facet}"
         );
-        assert!(
-            !changes
-                .iter()
-                .any(|p| matches!(p.change, Change::AlterColumnNullability { .. }))
-        );
+        assert!(!changes.iter().any(|p| matches!(
+            p.change,
+            Change::Column(ColumnChange::AlterColumnNullability { .. })
+        )));
         assert!(
             plan.annotation_edges()
                 .unwrap()
@@ -53,26 +55,27 @@ fn generated_column_and_not_null_demands_keep_the_postgres_recipe() {
             let changes = &plan.changes().changes;
             let function = changes
                 .iter()
-                .position(|p| matches!(p.change, Change::CreateModule { .. }))
+                .position(|p| matches!(p.change, Change::Module(ModuleChange::CreateModule { .. })))
                 .unwrap();
             let part = changes
                 .iter()
                 .position(|p| match &p.change {
-                    Change::AddColumn { name, .. } => facet == "column" && name.raw() == "g",
-                    Change::AlterColumnNullability {
+                    Change::Column(ColumnChange::AddColumn { name, .. }) => {
+                        facet == "column" && name.raw() == "g"
+                    }
+                    Change::Column(ColumnChange::AlterColumnNullability {
                         column,
                         to_nullable: false,
                         ..
-                    } => facet == "not_null" && column.name.raw() == "g",
+                    }) => facet == "not_null" && column.name.raw() == "g",
                     _ => false,
                 })
                 .unwrap();
             assert!(function < part, "{version} {facet}");
-            assert!(
-                !changes
-                    .iter()
-                    .any(|p| matches!(p.change, Change::AlterColumnExpression { .. }))
-            );
+            assert!(!changes.iter().any(|p| matches!(
+                p.change,
+                Change::Column(ColumnChange::AlterColumnExpression { .. })
+            )));
         }
     }
 }
@@ -110,11 +113,16 @@ fn computed_columns_still_wait_for_their_actual_function_inputs() {
         let changes = &plan.changes().changes;
         let function = changes
             .iter()
-            .position(|p| matches!(p.change, Change::CreateModule { .. }))
+            .position(|p| matches!(p.change, Change::Module(ModuleChange::CreateModule { .. })))
             .unwrap();
         let column = changes
             .iter()
-            .position(|p| matches!(p.change, Change::AddComputedColumn { .. }))
+            .position(|p| {
+                matches!(
+                    p.change,
+                    Change::Column(ColumnChange::AddComputedColumn { .. })
+                )
+            })
             .unwrap();
         assert!(function < column);
         // An acyclic annotation cannot override the expression's actual input.
@@ -179,7 +187,8 @@ fn demanded_decorators_over_generation_keep_their_independent_boundaries() {
             // A decorator can wait for a function without moving the generation it reads.
             assert!(!plan.changes().changes.iter().any(|p| matches!(
                 p.change,
-                Change::AddComputedColumn { .. } | Change::AlterColumnExpression { .. }
+                Change::Column(ColumnChange::AddComputedColumn { .. })
+                    | Change::Column(ColumnChange::AlterColumnExpression { .. })
             )));
         }
     }

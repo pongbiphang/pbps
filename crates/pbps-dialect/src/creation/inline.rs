@@ -1,6 +1,9 @@
 //! Engine-required CREATE surfaces and their existing local prerequisites.
 use super::{Demand, Request};
 use crate::{Dialect, DialectError};
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::TableChange;
 use pbps_model::object_ref::{ObjectRef, Root, Selector};
 use pbps_model::operation::PartKey;
 use pbps_model::{Change, ColumnName, Table, TableName, ValueSource};
@@ -159,45 +162,51 @@ impl Inline {
                         });
                     }
                     let change = match part {
-                        PartKey::PrimaryKey => {
-                            full.primary_key.as_ref().map(|key| Change::SetPrimaryKey {
+                        PartKey::PrimaryKey => full.primary_key.as_ref().map(|key| {
+                            Change::Constraint(ConstraintChange::SetPrimaryKey {
                                 table: name.clone(),
                                 from: None,
                                 to: Some(key.clone()),
                                 nonclustered: !full.primary_key_is_clustered(),
                             })
-                        }
-                        PartKey::Unique(key) => full.unique.get(key).map(|c| Change::AddUnique {
-                            table: name.clone(),
-                            name: key.clone(),
-                            constraint: c.clone(),
-                            clustered: full.unique_is_clustered(key.raw()),
                         }),
-                        PartKey::Exclusion(key) => {
-                            full.exclude.get(key).map(|c| Change::SetExclusion {
+                        PartKey::Unique(key) => full.unique.get(key).map(|c| {
+                            Change::Constraint(ConstraintChange::AddUnique {
+                                table: name.clone(),
+                                name: key.clone(),
+                                constraint: c.clone(),
+                                clustered: full.unique_is_clustered(key.raw()),
+                            })
+                        }),
+                        PartKey::Exclusion(key) => full.exclude.get(key).map(|c| {
+                            Change::Constraint(ConstraintChange::SetExclusion {
                                 table: name.clone(),
                                 name: key.clone(),
                                 from: None,
                                 to: Some(Box::new(c.clone())),
                             })
-                        }
-                        PartKey::ForeignKey(key) => {
-                            full.foreign_keys.get(key).map(|c| Change::AddForeignKey {
+                        }),
+                        PartKey::ForeignKey(key) => full.foreign_keys.get(key).map(|c| {
+                            Change::Constraint(ConstraintChange::AddForeignKey {
                                 table: name.clone(),
                                 name: key.clone(),
                                 constraint: Box::new(c.clone()),
                             })
-                        }
-                        PartKey::Check(key) => full.checks.get(key).map(|c| Change::AddCheck {
-                            table: name.clone(),
-                            name: key.clone(),
-                            constraint: c.clone(),
                         }),
-                        PartKey::Index(key) => full.indexes.get(key).map(|c| Change::AddIndex {
-                            table: name.clone(),
-                            name: key.clone(),
-                            index: Box::new(c.clone()),
-                            clustered: full.index_is_clustered(key.raw()),
+                        PartKey::Check(key) => full.checks.get(key).map(|c| {
+                            Change::Constraint(ConstraintChange::AddCheck {
+                                table: name.clone(),
+                                name: key.clone(),
+                                constraint: c.clone(),
+                            })
+                        }),
+                        PartKey::Index(key) => full.indexes.get(key).map(|c| {
+                            Change::Index(IndexChange::AddIndex {
+                                table: name.clone(),
+                                name: key.clone(),
+                                index: Box::new(c.clone()),
+                                clustered: full.index_is_clustered(key.raw()),
+                            })
                         }),
                         PartKey::Computed(column) => {
                             add(ObjectRef {
@@ -292,7 +301,7 @@ impl Inline {
             tables: parts
                 .iter()
                 .filter_map(|change| {
-                    if let Change::CreateTable { name, table, .. } = change {
+                    if let Change::Table(TableChange::CreateTable { name, table, .. }) = change {
                         Some((name.clone(), table.as_ref().clone()))
                     } else {
                         None

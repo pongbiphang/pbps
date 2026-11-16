@@ -305,56 +305,62 @@ pub(crate) fn compare_reported(
 pub(crate) fn planned_schema_grants(
     changes: &pbps_model::ChangeSet,
 ) -> Result<Vec<PlannedGrant>, String> {
+    use pbps_model::GrantChange;
+    use pbps_model::IndexChange;
+    use pbps_model::PartitionChange;
+    use pbps_model::RoleChange;
     use pbps_model::{Change, GrantTarget};
     let mut planned = Vec::new();
     for p in &changes.changes {
         if matches!(
             p.change,
-            Change::CreateRole { .. } | Change::RenameRole { .. } | Change::DropRole { .. }
+            Change::Role(RoleChange::CreateRole { .. })
+                | Change::Role(RoleChange::RenameRole { .. })
+                | Change::Role(RoleChange::DropRole { .. })
         ) {
             return Err(
                 "persistent resolver authorization cannot project role identity changes".into(),
             );
         }
         let statement = match &p.change {
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => {
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => {
                 return Err(format!(
                     "blocking rewrite for `{}` is unavailable",
                     p.change.table().unwrap().shown()
                 ));
             }
-            Change::Grant {
+            Change::Permission(GrantChange::Grant {
                 role,
                 target: GrantTarget::Schema(schema),
                 permissions,
-            }
-            | Change::Revoke {
+            })
+            | Change::Permission(GrantChange::Revoke {
                 role,
                 target: GrantTarget::Schema(schema),
                 permissions,
-            } => Some((role, schema, permissions)),
+            }) => Some((role, schema, permissions)),
             pbps_model::change_family!(tables)
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
             | pbps_model::change_family!(columns)
             | pbps_model::change_family!(policies)
             | pbps_model::change_family!(table_properties)
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
             | pbps_model::change_family!(constraints)
-            | Change::AddIndex { .. }
-            | Change::DropIndex { .. }
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
             | pbps_model::change_family!(rows)
             | pbps_model::change_family!(modules)
             | pbps_model::change_family!(type_values)
             | pbps_model::catalog_change!()
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => None,
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. }) => None,
         };
         if let Some((role, schema, permissions)) = statement {
             let privileges = permissions
@@ -364,7 +370,7 @@ pub(crate) fn planned_schema_grants(
             if privileges.is_empty() {
                 return Err("a planned schema grant names no permission".into());
             }
-            if matches!(&p.change, Change::Grant { .. }) {
+            if matches!(&p.change, Change::Permission(GrantChange::Grant { .. })) {
                 planned.push(PlannedGrant {
                     principal: role.clone(),
                     schema: schema.clone(),
@@ -440,6 +446,10 @@ impl Authorization {
         measured: Option<&mssql_auth::Condition>,
     ) -> Result<pbps_model::resolver::AuthorizationCondition, String> {
         use pbps_model::Change;
+        use pbps_model::GrantChange;
+        use pbps_model::RoleChange;
+        use pbps_model::TypeChange;
+        use pbps_model::TypeValueChange;
         let planned = planned_schema_grants(changes)?;
         if !self.unpredictable(&planned).is_empty() {
             return Err("the adapter cannot derive the approved authorization transition".into());
@@ -474,19 +484,19 @@ impl Authorization {
                 .filter(|(_, p)| {
                     matches!(
                         p.change,
-                        Change::Grant { .. }
-                            | Change::Revoke { .. }
-                            | Change::PublicExecution { .. }
-                            | Change::AddEnumValue { .. }
-                            | Change::AlterDomain { .. }
-                            | Change::RenameEnumValue { .. }
-                            | Change::EnumRebuild { .. }
-                            | Change::CreateType { .. }
-                            | Change::DropType { .. }
-                            | Change::RenameType { .. }
-                            | Change::CreateRole { .. }
-                            | Change::RenameRole { .. }
-                            | Change::DropRole { .. }
+                        Change::Permission(GrantChange::Grant { .. })
+                            | Change::Permission(GrantChange::Revoke { .. })
+                            | Change::Permission(GrantChange::PublicExecution { .. })
+                            | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+                            | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+                            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+                            | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
+                            | Change::Type(TypeChange::CreateType { .. })
+                            | Change::Type(TypeChange::DropType { .. })
+                            | Change::Type(TypeChange::RenameType { .. })
+                            | Change::Role(RoleChange::CreateRole { .. })
+                            | Change::Role(RoleChange::RenameRole { .. })
+                            | Change::Role(RoleChange::DropRole { .. })
                     )
                 })
                 .map(|(i, _)| i)
@@ -873,23 +883,27 @@ mod tests {
                 .unwrap();
             assert_eq!(unchanged.before, unchanged.after);
             let changes = pbps_model::ChangeSet {
-                changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Grant {
-                    role: "PUBLIC".into(),
-                    target: pbps_model::GrantTarget::Schema("app".into()),
-                    permissions: std::collections::BTreeSet::from([pbps_model::Permission::Usage]),
-                })],
+                changes: vec![pbps_model::PlannedChange::new(
+                    pbps_model::Change::Permission(pbps_model::GrantChange::Grant {
+                        role: "PUBLIC".into(),
+                        target: pbps_model::GrantTarget::Schema("app".into()),
+                        permissions: std::collections::BTreeSet::from([
+                            pbps_model::Permission::Usage,
+                        ]),
+                    }),
+                )],
             };
             let projected = postgres.persisted(&key, &changes, Vec::new()).unwrap();
             assert_eq!(projected.before, unchanged.before);
             assert_ne!(projected.before, projected.after);
             assert_eq!(projected.changes, std::collections::BTreeSet::from([0]));
             let unsupported = pbps_model::ChangeSet {
-                changes: vec![pbps_model::PlannedChange::new(
-                    pbps_model::Change::CreateRole {
+                changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Role(
+                    pbps_model::RoleChange::CreateRole {
                         uid: "r_aaaaaa".parse().unwrap(),
                         name: "new_role".into(),
                     },
-                )],
+                ))],
             };
             assert!(postgres.persisted(&key, &unsupported, Vec::new()).is_err());
         }

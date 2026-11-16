@@ -7,6 +7,21 @@
 //! no idea what to type.
 
 use pbps_diff::{Blocker, RenameSide};
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::ExtensionChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::PolicyChange;
+use pbps_model::RoleChange;
+use pbps_model::RowChange;
+use pbps_model::SearchChange;
+use pbps_model::TableChange;
+use pbps_model::TablePropertyChange;
+use pbps_model::TypeChange;
+use pbps_model::TypeValueChange;
 use pbps_model::change::DeleteCause;
 use pbps_model::escape::Escaped;
 use pbps_model::plan_names::{At, Holder, PlanNames};
@@ -373,6 +388,7 @@ fn batch_flags(blocker: &Blocker, fixed: &mut Vec<String>, choices: &mut Vec<Str
 #[cfg(test)]
 mod batch_tests {
     use super::*;
+    use pbps_model::ModuleChange;
 
     #[test]
     fn module_counts_distinguish_raw_names_from_their_display_spelling() {
@@ -381,10 +397,10 @@ mod batch_tests {
         let changes: Vec<_> = [id.clone(), id, escaped]
             .into_iter()
             .map(|id| {
-                pbps_model::PlannedChange::new(Change::DropModule {
+                pbps_model::PlannedChange::new(Change::Module(ModuleChange::DropModule {
                     id,
                     kind: pbps_model::ModuleKind::Function,
-                })
+                }))
             })
             .collect();
         let ids = pbps_model::IdsFile::default();
@@ -1086,30 +1102,30 @@ pub fn touched(names: &PlanNames<'_>) -> (usize, usize) {
 // summary stops counting it.
 fn role_of(change: &Change) -> Option<&pbps_model::RoleName> {
     match change {
-Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => None,
-        Change::AddEnumValue { .. } | Change::AlterDomain { .. } | Change::RenameEnumValue { .. } | Change::EnumRebuild { .. } | Change::CreateType { .. } | Change::DropType { .. } | Change::RenameType { .. } | Change::CreateSearch { .. } | Change::DropSearch { .. } | Change::CreateExtension { .. } | Change::DropExtension { .. } | Change::UpdateExtension { .. } | Change::SetExtensionSchema { .. } => None,
-        Change::CreateRole { name, .. }
-        | Change::DropRole { name, .. }
-        | Change::Grant { role: name, .. }
-        | Change::Revoke { role: name, .. } => Some(name),
-        Change::RenameRole { from, .. } => Some(from),
+Change::Partition(PartitionChange::RebuildPartitionedTable(_)) | Change::Index(IndexChange::BuildPartitionedIndex(_)) | Change::Partition(PartitionChange::CopyTableRows(_)) | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => None,
+        Change::TypeValue(TypeValueChange::AddEnumValue { .. }) | Change::TypeValue(TypeValueChange::AlterDomain { .. }) | Change::TypeValue(TypeValueChange::RenameEnumValue { .. }) | Change::TypeValue(TypeValueChange::EnumRebuild { .. }) | Change::Type(TypeChange::CreateType { .. }) | Change::Type(TypeChange::DropType { .. }) | Change::Type(TypeChange::RenameType { .. }) | Change::Search(SearchChange::CreateSearch { .. }) | Change::Search(SearchChange::DropSearch { .. }) | Change::Extension(ExtensionChange::CreateExtension { .. }) | Change::Extension(ExtensionChange::DropExtension { .. }) | Change::Extension(ExtensionChange::UpdateExtension { .. }) | Change::Extension(ExtensionChange::SetExtensionSchema { .. }) => None,
+        Change::Role(RoleChange::CreateRole { name, .. })
+        | Change::Role(RoleChange::DropRole { name, .. })
+        | Change::Permission(GrantChange::Grant { role: name, .. })
+        | Change::Permission(GrantChange::Revoke { role: name, .. }) => Some(name),
+        Change::Role(RoleChange::RenameRole { from, .. }) => Some(from),
         pbps_model::change_family!(tables)
-        | Change::DetachPartition { .. }
-        | Change::AttachPartition { .. }
+        | Change::Partition(PartitionChange::DetachPartition { .. })
+        | Change::Partition(PartitionChange::AttachPartition { .. })
         | pbps_model::change_family!(columns)
         | pbps_model::change_family!(table_properties)
         | pbps_model::change_family!(constraints)
-        | Change::SetIndexStorageParameters { .. }
-        | Change::SetPartitionDefault { .. }
-        | Change::SetPartitionNotNull { .. }
+        | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+        | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+        | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
         | pbps_model::change_family!(policies)
-        | Change::AddIndex { .. }
-        | Change::DropIndex { .. }
+        | Change::Index(IndexChange::AddIndex { .. })
+        | Change::Index(IndexChange::DropIndex { .. })
         | pbps_model::change_family!(rows)
         | pbps_model::change_family!(modules)
         // `PUBLIC` is not a role the summary can count: no declaration, ids
         // file or pull ever names it (ADR-0010 §5).
-        | Change::PublicExecution { .. } => None,
+        | Change::Permission(GrantChange::PublicExecution { .. }) => None,
     }
 }
 
@@ -1491,22 +1507,22 @@ fn comment_preview(text: &pbps_model::Text) -> String {
 
 pub fn describe(c: &Change) -> String {
     match c {
-        Change::RebuildPartitionedTable(_)
-        | Change::BuildPartitionedIndex(_)
-        | Change::CopyTableRows(_)
-        | Change::AnalyzeTableTree(_) => {
+        Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+        | Change::Index(IndexChange::BuildPartitionedIndex(_))
+        | Change::Partition(PartitionChange::CopyTableRows(_))
+        | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => {
             let (operation, _) = c.pending_rebuild().expect("rebuild variant");
             format!(
                 "pending blocking rewrite: {operation} for {} (unavailable)",
                 Escaped(&c.subject())
             )
         }
-        Change::AddEnumValue {
+        Change::TypeValue(TypeValueChange::AddEnumValue {
             name,
             value,
             placement,
             ..
-        } => {
+        }) => {
             let position = match placement {
                 Some(pbps_model::EnumPlacement::Before(label)) => {
                     format!(" before {}", Escaped(label))
@@ -1522,13 +1538,13 @@ pub fn describe(c: &Change) -> String {
                 name.shown()
             )
         }
-        Change::AlterDomain {
+        Change::TypeValue(TypeValueChange::AlterDomain {
             name,
             from,
             to,
             half,
             ..
-        } => {
+        }) => {
             let mut parts = Vec::new();
             if let Some(delta) = pbps_model::DomainDelta::of(from, to) {
                 match half {
@@ -1571,15 +1587,15 @@ pub fn describe(c: &Change) -> String {
                 parts.join(", ")
             )
         }
-        Change::RenameEnumValue { name, from, to, .. } => format!(
+        Change::TypeValue(TypeValueChange::RenameEnumValue { name, from, to, .. }) => format!(
             "~ rename enum value {} -> {} in {}",
             Escaped(from),
             Escaped(to),
             name.shown()
         ),
-        Change::EnumRebuild {
+        Change::TypeValue(TypeValueChange::EnumRebuild {
             name, tmp, step, ..
-        } => match step {
+        }) => match step {
             pbps_model::EnumRebuildStep::Create {
                 definition,
                 removed,
@@ -1637,23 +1653,23 @@ pub fn describe(c: &Change) -> String {
                 }
             ),
         },
-        Change::CreateType {
+        Change::Type(TypeChange::CreateType {
             name, definition, ..
-        } => format!("+ create {} {}", definition.kind(), name.shown()),
-        Change::DropType {
+        }) => format!("+ create {} {}", definition.kind(), name.shown()),
+        Change::Type(TypeChange::DropType {
             name, definition, ..
-        } => format!("- drop {} {}", definition.kind(), name.shown()),
-        Change::RenameType { from, to, .. } => {
+        }) => format!("- drop {} {}", definition.kind(), name.shown()),
+        Change::Type(TypeChange::RenameType { from, to, .. }) => {
             format!("~ rename type {} -> {}", from.shown(), to.shown())
         }
         // The files a dictionary reads are the server's, not the project's: the create is
         // what opens them, so the plan names each before it is applied (DEC-2728.2).
-        Change::CreateSearch {
+        Change::Search(SearchChange::CreateSearch {
             name,
             definition,
             unresolved,
             ..
-        } => {
+        }) => {
             let files = definition.server_files();
             let mut note = String::new();
             if !files.is_empty() {
@@ -1684,16 +1700,16 @@ pub fn describe(c: &Change) -> String {
             }
             format!("+ create {}{note}", name.shown())
         }
-        Change::DropSearch { name, .. } => format!("- drop {}", name.shown()),
+        Change::Search(SearchChange::DropSearch { name, .. }) => format!("- drop {}", name.shown()),
         // A partition has no columns of its own to count; what it is, is its
         // parent and the rows it takes (#1170).
-        Change::CreateTable {
+        Change::Table(TableChange::CreateTable {
             name,
             table,
             beside_default,
             moves_at_most,
             ..
-        } => match &table.partition_of {
+        }) => match &table.partition_of {
             Some(of) => match &of.bound {
                 pbps_model::PartitionBound::Default => {
                     format!(
@@ -1765,17 +1781,17 @@ pub fn describe(c: &Change) -> String {
                 name = name.shown()
             ),
         },
-        Change::DropTable {
+        Change::Table(TableChange::DropTable {
             name,
             detach_from: None,
             ..
-        } => format!("- drop table {name}", name = name.shown()),
-        Change::DetachPartition {
+        }) => format!("- drop table {name}", name = name.shown()),
+        Change::Partition(PartitionChange::DetachPartition {
             table,
             parent,
             names,
             ..
-        } => format!(
+        }) => format!(
             "~ detach table {table} from {parent}, keeping its rows, with {} name(s) of its own",
             names
                 .iter()
@@ -1784,12 +1800,12 @@ pub fn describe(c: &Change) -> String {
             table = table.shown(),
             parent = parent.shown()
         ),
-        Change::AttachPartition {
+        Change::Partition(PartitionChange::AttachPartition {
             table,
             parent,
             bound,
             ..
-        } => {
+        }) => {
             let partition = if *bound == pbps_model::PartitionBound::Default {
                 "its default partition"
             } else {
@@ -1803,29 +1819,31 @@ pub fn describe(c: &Change) -> String {
         }
         // Said, because the detach is a statement of its own and locks the
         // parent (#1171).
-        Change::DropTable {
+        Change::Table(TableChange::DropTable {
             name,
             detach_from: Some(parent),
             ..
-        } => format!(
+        }) => format!(
             "- drop table {name}, a partition of {parent}, detached from it first",
             name = name.shown(),
             parent = parent.shown()
         ),
-        Change::RenameTable { from, to, .. } => format!(
+        Change::Table(TableChange::RenameTable { from, to, .. }) => format!(
             "~ rename table {from} -> {to}",
             from = from.shown(),
             to = to.shown()
         ),
-        Change::AddColumn { name, column, .. } => {
+        Change::Column(ColumnChange::AddColumn { name, column, .. }) => {
             format!(
                 "+ add column {name} {}",
                 column.ty.shown(),
                 name = name.shown(),
             )
         }
-        Change::DropColumn { column, .. } => format!("- drop column {}", column.name.shown()),
-        Change::RenameColumn { from, to, .. } => format!(
+        Change::Column(ColumnChange::DropColumn { column, .. }) => {
+            format!("- drop column {}", column.name.shown())
+        }
+        Change::Column(ColumnChange::RenameColumn { from, to, .. }) => format!(
             "~ rename column {from} -> {to}",
             from = from.shown(),
             to = to.shown(),
@@ -1833,13 +1851,13 @@ pub fn describe(c: &Change) -> String {
         // The whole expression, never elided: a reviewer approving a plan is
         // approving what the data becomes, and it is the one text in the
         // plan that nobody but its author has read (DEC-2331.1).
-        Change::AlterColumnType {
+        Change::Column(ColumnChange::AlterColumnType {
             column,
             from,
             to,
             using,
             ..
-        } => {
+        }) => {
             format!(
                 "~ {} type {from} -> {to}{}",
                 column.name.shown(),
@@ -1851,16 +1869,16 @@ pub fn describe(c: &Change) -> String {
                 to = to.shown(),
             )
         }
-        Change::AlterColumnNullability {
+        Change::Column(ColumnChange::AlterColumnNullability {
             column,
             to_nullable,
             ..
-        } => format!(
+        }) => format!(
             "~ {} becomes {}",
             column.name.shown(),
             if *to_nullable { "nullable" } else { "NOT NULL" }
         ),
-        Change::AlterColumnDefault { column, to, .. } => match to {
+        Change::Column(ColumnChange::AlterColumnDefault { column, to, .. }) => match to {
             Some(v) => format!(
                 "~ {} default -> {v}",
                 column.name.shown(),
@@ -1868,32 +1886,32 @@ pub fn describe(c: &Change) -> String {
             ),
             None => format!("~ {} default removed", column.name.shown()),
         },
-        Change::AlterColumnExpression { column, to, .. } => {
+        Change::Column(ColumnChange::AlterColumnExpression { column, to, .. }) => {
             format!(
                 "~ {} generated as {to}",
                 column.name.shown(),
                 to = pbps_model::escape::Escaped(&to.to_string()),
             )
         }
-        Change::AlterColumnNumbering {
+        Change::Column(ColumnChange::AlterColumnNumbering {
             column, from, to, ..
-        } => format!(
+        }) => format!(
             "~ {} numbered by {} -> {}",
             column.name.shown(),
             numbering_source(from),
             numbering_source(to)
         ),
-        Change::AddComputedColumn { name, computed, .. } => format!(
+        Change::Column(ColumnChange::AddComputedColumn { name, computed, .. }) => format!(
             "+ add computed column {name} as ({}){}{}",
             Escaped(&computed.expression),
             if computed.persisted { " persisted" } else { "" },
             if computed.not_null { " not null" } else { "" },
             name = name.shown(),
         ),
-        Change::DropComputedColumn { name, .. } => {
+        Change::Column(ColumnChange::DropComputedColumn { name, .. }) => {
             format!("- drop computed column {name}", name = name.shown(),)
         }
-        Change::SetComment { target, text } => {
+        Change::TableProperty(TablePropertyChange::SetComment { target, text }) => {
             let what = match target.column() {
                 Some(column) => format!("{} comment", column.name.shown()),
                 None => "comment".to_owned(),
@@ -1903,11 +1921,11 @@ pub fn describe(c: &Change) -> String {
                 None => format!("- {what} removed"),
             }
         }
-        Change::SetColumnDeprecated { column, reason, .. } => match reason {
+        Change::Column(ColumnChange::SetColumnDeprecated { column, reason, .. }) => match reason {
             Some(r) => format!("~ {} marked deprecated: {}", column.name.shown(), r.shown()),
             None => format!("~ {} no longer deprecated", column.name.shown()),
         },
-        Change::SetPrimaryKey { to, .. } => match to {
+        Change::Constraint(ConstraintChange::SetPrimaryKey { to, .. }) => match to {
             Some(pk) => format!(
                 "~ primary key -> ({})",
                 pk.columns
@@ -1918,17 +1936,17 @@ pub fn describe(c: &Change) -> String {
             ),
             None => "- drop primary key".to_owned(),
         },
-        Change::SetTablePersistence { unlogged, .. } => {
+        Change::TableProperty(TablePropertyChange::SetTablePersistence { unlogged, .. }) => {
             if *unlogged { "~ unlogged" } else { "~ logged" }.to_owned()
         }
         // Named as a column's, under the partition it is listed under
         // (#1581). Without its own, the partition takes its parent's again.
-        Change::SetPartitionDefault {
+        Change::Partition(PartitionChange::SetPartitionDefault {
             column,
             to,
             fallback,
             ..
-        } => match (to, fallback) {
+        }) => match (to, fallback) {
             (Some(v), _) => format!(
                 "~ {column} default -> {v}",
                 column = column.shown(),
@@ -1940,16 +1958,16 @@ pub fn describe(c: &Change) -> String {
             ),
             (None, None) => format!("~ {column} default removed", column = column.shown(),),
         },
-        Change::SetPartitionNotNull {
+        Change::Partition(PartitionChange::SetPartitionNotNull {
             column, not_null, ..
-        } => format!(
+        }) => format!(
             "~ {column} becomes {}",
             if *not_null { "NOT NULL" } else { "nullable" },
             column = column.shown(),
         ),
-        Change::SetIndexStorageParameters {
+        Change::Index(IndexChange::SetIndexStorageParameters {
             target, set, reset, ..
-        } => {
+        }) => {
             let mut parts: Vec<String> = set
                 .iter()
                 .map(|(k, v)| {
@@ -1970,7 +1988,7 @@ pub fn describe(c: &Change) -> String {
             };
             format!("~ storage parameters of {of}: {}", parts.join(", "))
         }
-        Change::SetStorageParameters { set, reset, .. } => {
+        Change::TableProperty(TablePropertyChange::SetStorageParameters { set, reset, .. }) => {
             let mut parts: Vec<String> = set
                 .iter()
                 .map(|(k, v)| {
@@ -1984,8 +2002,10 @@ pub fn describe(c: &Change) -> String {
             parts.extend(reset.iter().map(|k| format!("{} reset", Escaped(k))));
             format!("~ storage parameters: {}", parts.join(", "))
         }
-        Change::DropPolicy { name, .. } => format!("- drop row policy {}", Escaped(name)),
-        Change::CreatePolicy { name, policy, .. } => format!(
+        Change::Policy(PolicyChange::DropPolicy { name, .. }) => {
+            format!("- drop row policy {}", Escaped(name))
+        }
+        Change::Policy(PolicyChange::CreatePolicy { name, policy, .. }) => format!(
             "+ create row policy {} FOR {} AS {}",
             Escaped(name),
             policy.command.as_str().to_ascii_uppercase(),
@@ -1995,54 +2015,66 @@ pub fn describe(c: &Change) -> String {
                 "PERMISSIVE"
             }
         ),
-        Change::SetRowSecurity { to, .. } => format!(
+        Change::Policy(PolicyChange::SetRowSecurity { to, .. }) => format!(
             "~ row security: enabled={}, forced={}",
             to.enabled, to.forced
         ),
-        Change::SetReplicaIdentity { to, .. } => match to {
+        Change::TableProperty(TablePropertyChange::SetReplicaIdentity { to, .. }) => match to {
             Some(identity) => format!(
                 "~ replica identity -> {identity}",
                 identity = identity.shown(),
             ),
             None => "~ replica identity -> default".to_owned(),
         },
-        Change::AddUnique { name, .. } => {
+        Change::Constraint(ConstraintChange::AddUnique { name, .. }) => {
             format!("+ unique constraint {name}", name = name.shown(),)
         }
-        Change::DropUnique { name, .. } => {
+        Change::Constraint(ConstraintChange::DropUnique { name, .. }) => {
             format!("- unique constraint {name}", name = name.shown(),)
         }
-        Change::AddForeignKey { name, .. } => format!("+ foreign key {name}", name = name.shown(),),
-        Change::DropForeignKey { name, .. } => {
+        Change::Constraint(ConstraintChange::AddForeignKey { name, .. }) => {
+            format!("+ foreign key {name}", name = name.shown(),)
+        }
+        Change::Constraint(ConstraintChange::DropForeignKey { name, .. }) => {
             format!("- foreign key {name}", name = name.shown(),)
         }
-        Change::SetExclusion {
+        Change::Constraint(ConstraintChange::SetExclusion {
             name, to: Some(_), ..
-        } => format!("+ exclusion constraint {name}", name = name.shown()),
-        Change::SetExclusion { name, to: None, .. } => {
+        }) => format!("+ exclusion constraint {name}", name = name.shown()),
+        Change::Constraint(ConstraintChange::SetExclusion { name, to: None, .. }) => {
             format!("- exclusion constraint {name}", name = name.shown())
         }
-        Change::AddCheck { name, .. } => format!("+ check constraint {name}", name = name.shown(),),
-        Change::DropCheck { name, .. } => {
+        Change::Constraint(ConstraintChange::AddCheck { name, .. }) => {
+            format!("+ check constraint {name}", name = name.shown(),)
+        }
+        Change::Constraint(ConstraintChange::DropCheck { name, .. }) => {
             format!("- check constraint {name}", name = name.shown(),)
         }
-        Change::AddIndex { name, .. } => format!("+ index {name}", name = name.shown(),),
-        Change::DropIndex { name, .. } => format!("- index {name}", name = name.shown(),),
-        Change::CreateModule { module, .. } => format!("+ create {}", module.kind),
+        Change::Index(IndexChange::AddIndex { name, .. }) => {
+            format!("+ index {name}", name = name.shown(),)
+        }
+        Change::Index(IndexChange::DropIndex { name, .. }) => {
+            format!("- index {name}", name = name.shown(),)
+        }
+        Change::Module(ModuleChange::CreateModule { module, .. }) => {
+            format!("+ create {}", module.kind)
+        }
         // "restate", not "alter": the whole definition is sent, which is what
         // `CREATE OR ALTER` does and what the reviewer is approving.
-        Change::AlterModule { module, .. } => format!("~ restate {}", module.kind),
-        Change::DropModule { kind, .. } => format!("- drop {kind}"),
+        Change::Module(ModuleChange::AlterModule { module, .. }) => {
+            format!("~ restate {}", module.kind)
+        }
+        Change::Module(ModuleChange::DropModule { kind, .. }) => format!("- drop {kind}"),
         // Reference data (ADR-0004). The key identifies the row to a reviewer
         // who has no connection, so it leads every line.
-        Change::InsertRow { key, row, .. } => {
+        Change::Row(RowChange::InsertRow { key, row, .. }) => {
             format!(
                 "+ row {key} ({} values)",
                 row.0.len() + 1,
                 key = pbps_model::escape::Escaped(&key.to_string()),
             )
         }
-        Change::UpdateRow { key, columns, .. } => {
+        Change::Row(RowChange::UpdateRow { key, columns, .. }) => {
             // Both ends, because the reviewer at the gate cannot look the old
             // value up — and "sets label" is not something anyone can approve.
             let cells: Vec<String> = columns
@@ -2062,7 +2094,7 @@ pub fn describe(c: &Change) -> String {
                 key = pbps_model::escape::Escaped(&key.to_string()),
             )
         }
-        Change::DeleteRow { key, cause, .. } => match cause {
+        Change::Row(RowChange::DeleteRow { key, cause, .. }) => match cause {
             DeleteCause::Undeclared => format!(
                 "- row {key} (not declared)",
                 key = pbps_model::escape::Escaped(&key.to_string()),
@@ -2072,11 +2104,11 @@ pub fn describe(c: &Change) -> String {
                 key = pbps_model::escape::Escaped(&key.to_string()),
             ),
         },
-        Change::SetDataMode { to, .. } => match to {
+        Change::Row(RowChange::SetDataMode { to, .. }) => match to {
             Some(m) => format!("~ reference data is now `{m}`"),
             None => "~ reference data is no longer declared".to_owned(),
         },
-        Change::SetEnsureKeys { from, to, .. } => format!(
+        Change::Row(RowChange::SetEnsureKeys { from, to, .. }) => format!(
             "~ ensure keys: manage [{}]; stop managing [{}]",
             to.difference(from)
                 .map(|key| Escaped(&key.to_string()).to_string())
@@ -2090,35 +2122,37 @@ pub fn describe(c: &Change) -> String {
         // Roles (ADR-0005). The permissions are spelled out: "grant on
         // dbo.customer" tells a reviewer nothing about how much wider access
         // just got.
-        Change::CreateRole { name, .. } => format!("+ create role {name}", name = name.shown(),),
-        Change::DropExtension { name, .. } => format!(
+        Change::Role(RoleChange::CreateRole { name, .. }) => {
+            format!("+ create role {name}", name = name.shown(),)
+        }
+        Change::Extension(ExtensionChange::DropExtension { name, .. }) => format!(
             "- drop extension {} (deletes its members and anything that depends on it)",
             name.shown()
         ),
-        Change::UpdateExtension { name, from, to, .. } => format!(
+        Change::Extension(ExtensionChange::UpdateExtension { name, from, to, .. }) => format!(
             "~ update extension {} from version {} to {} (runs the package's update scripts)",
             name.shown(),
             Escaped(&from.version),
             Escaped(&to.version)
         ),
-        Change::SetExtensionSchema { name, from, to, .. } => format!(
+        Change::Extension(ExtensionChange::SetExtensionSchema { name, from, to, .. }) => format!(
             "~ move extension {} from schema {} to {} (its members move with it; what spells one with the old schema stops finding it)",
             name.shown(),
             Escaped(&from.schema),
             Escaped(&to.schema)
         ),
-        Change::CreateExtension {
+        Change::Extension(ExtensionChange::CreateExtension {
             name, definition, ..
-        } => format!(
+        }) => format!(
             "+ create extension {} version {} in schema {} (runs the package's install script)",
             name.shown(),
             Escaped(&definition.version),
             Escaped(&definition.schema)
         ),
-        Change::DropRole { name, members, .. } if members.is_empty() => {
+        Change::Role(RoleChange::DropRole { name, members, .. }) if members.is_empty() => {
             format!("- drop role {name}", name = name.shown(),)
         }
-        Change::DropRole { name, members, .. } => format!(
+        Change::Role(RoleChange::DropRole { name, members, .. }) => format!(
             "- drop role {name}, removing {} member(s) first: {}",
             members.len(),
             members
@@ -2128,34 +2162,34 @@ pub fn describe(c: &Change) -> String {
                 .join(", "),
             name = name.shown(),
         ),
-        Change::RenameRole { from, to, .. } => format!(
+        Change::Role(RoleChange::RenameRole { from, to, .. }) => format!(
             "~ rename role {from} -> {to}",
             from = from.shown(),
             to = to.shown(),
         ),
-        Change::Grant {
+        Change::Permission(GrantChange::Grant {
             target,
             permissions,
             ..
-        } => format!(
+        }) => format!(
             "+ grant {} on {target}",
             permissions_list(permissions),
             target = target.shown(),
         ),
-        Change::Revoke {
+        Change::Permission(GrantChange::Revoke {
             target,
             permissions,
             ..
-        } => format!(
+        }) => format!(
             "- revoke {} on {target}",
             permissions_list(permissions),
             target = target.shown(),
         ),
-        Change::PublicExecution {
+        Change::Permission(GrantChange::PublicExecution {
             routine,
             access: pbps_model::PublicAccess::Revoked,
             ..
-        } => format!(
+        }) => format!(
             "- revoke execute on {routine} from PUBLIC",
             routine = routine.shown()
         ),
@@ -2163,11 +2197,11 @@ pub fn describe(c: &Change) -> String {
         // something to take on trust (DECISIONS 517) — and worth a reader's
         // eye either way: it says this routine stays runnable by every
         // principal in the cluster.
-        Change::PublicExecution {
+        Change::Permission(GrantChange::PublicExecution {
             routine,
             access: pbps_model::PublicAccess::Kept,
             ..
-        } => format!(
+        }) => format!(
             "+ grant execute on {routine} to PUBLIC (declared)",
             routine = routine.shown()
         ),
@@ -2383,16 +2417,16 @@ mod tests {
             },
             live_checksum: "after".into(),
             changes: set(vec![
-                Change::DropTable {
+                Change::Table(TableChange::DropTable {
                     uid: uid(UidKind::Table, "a"),
                     name: "app.a".parse().unwrap(),
                     detach_from: None,
-                },
-                Change::DropTable {
+                }),
+                Change::Table(TableChange::DropTable {
                     uid: uid(UidKind::Table, "b"),
                     name: "app.b".parse().unwrap(),
                     detach_from: None,
-                },
+                }),
             ]),
             unmanaged: Vec::new(),
             unexpressible: vec!["app.c: unsupported difference".into()],
@@ -2427,19 +2461,22 @@ mod tests {
 
     #[test]
     fn enum_label_lines_show_placement_and_escaped_rename_without_inventing_a_neighbour() {
+        use pbps_model::TypeValueChange;
         use pbps_model::{Change, EnumPlacement, ManagedType};
         let name: pbps_model::TypeRef = "app.e".parse().unwrap();
         let uid: pbps_model::Uid = "y_000001".parse().unwrap();
         let definition = Box::new(ManagedType::Enum {
             values: vec!["new\nline".into()],
         });
-        let add = |placement| Change::AddEnumValue {
-            uid: uid.clone(),
-            name: name.clone(),
-            value: "new\nline".into(),
-            placement,
-            ordinal: 0,
-            definition: definition.clone(),
+        let add = |placement| {
+            Change::TypeValue(TypeValueChange::AddEnumValue {
+                uid: uid.clone(),
+                name: name.clone(),
+                value: "new\nline".into(),
+                placement,
+                ordinal: 0,
+                definition: definition.clone(),
+            })
         };
         assert_eq!(
             super::describe(&add(Some(EnumPlacement::Before("old".into())))),
@@ -2447,7 +2484,7 @@ mod tests {
         );
         assert!(!super::describe(&add(None)).contains("before"));
         assert_eq!(
-            super::describe(&Change::RenameEnumValue {
+            super::describe(&Change::TypeValue(TypeValueChange::RenameEnumValue {
                 uid,
                 name,
                 from: "old".into(),
@@ -2455,7 +2492,7 @@ mod tests {
                 ordinal: 0,
                 retained: Vec::new(),
                 definition
-            }),
+            })),
             "~ rename enum value old -> new\\nline in app.e"
         );
     }
@@ -2477,12 +2514,14 @@ mod tests {
                 collation: None,
             }
         };
-        let alter = |from, to, half| Change::AlterDomain {
-            uid: "y_000001".parse().unwrap(),
-            name: "app.code".parse().unwrap(),
-            from: Box::new(from),
-            to: Box::new(to),
-            half,
+        let alter = |from, to, half| {
+            Change::TypeValue(TypeValueChange::AlterDomain {
+                uid: "y_000001".parse().unwrap(),
+                name: "app.code".parse().unwrap(),
+                from: Box::new(from),
+                to: Box::new(to),
+                half,
+            })
         };
         let from = domain(true, Some("'a'"), &[("old\nname", "1"), ("kept", "2")]);
         let to = domain(false, None, &[("kept", "2"), ("fresh", "3")]);
@@ -2500,12 +2539,15 @@ mod tests {
     /// each retype the table it rewrites and the lock it takes (DEC-1635.7).
     #[test]
     fn enum_rebuild_lines_name_the_rewritten_table_the_lock_and_the_removed_labels() {
+        use pbps_model::TypeValueChange;
         use pbps_model::{Change, ColumnRef, EnumRebuildStep, ManagedType};
-        let step = |step| Change::EnumRebuild {
-            uid: "y_000001".parse().unwrap(),
-            name: "app.e".parse().unwrap(),
-            tmp: "app.tmp".parse().unwrap(),
-            step,
+        let step = |step| {
+            Change::TypeValue(TypeValueChange::EnumRebuild {
+                uid: "y_000001".parse().unwrap(),
+                name: "app.e".parse().unwrap(),
+                tmp: "app.tmp".parse().unwrap(),
+                step,
+            })
         };
         let definition = Box::new(ManagedType::Enum {
             values: vec!["ok".into()],
@@ -2566,9 +2608,10 @@ mod tests {
     /// enum's, which has none, reads as before (DEC-1635.9).
     #[test]
     fn domain_rebuild_lines_say_why_the_domain_is_rebuilt() {
+        use pbps_model::TypeValueChange;
         use pbps_model::{Change, EnumRebuildStep, ManagedType};
         let create = |why: Option<&str>| {
-            super::describe(&Change::EnumRebuild {
+            super::describe(&Change::TypeValue(TypeValueChange::EnumRebuild {
                 uid: "y_000002".parse().unwrap(),
                 name: "app.d".parse().unwrap(),
                 tmp: "app.tmp".parse().unwrap(),
@@ -2585,7 +2628,7 @@ mod tests {
                     over: None,
                     why: why.map(str::to_owned),
                 },
-            })
+            }))
         };
         let line = create(Some("its base type changed"));
         assert!(
@@ -2602,6 +2645,7 @@ mod tests {
     /// case: a retune of the start alone shows no options.
     #[test]
     fn a_numbering_line_shows_the_options_each_side_sets() {
+        use pbps_model::ColumnChange;
         use pbps_model::{Change, ColumnRef, Identity, SequenceOptions, ValueSource};
         let identity = |seed, options| {
             ValueSource::Identity(Identity {
@@ -2611,7 +2655,7 @@ mod tests {
             })
         };
         let line = |from, to| {
-            super::describe(&Change::AlterColumnNumbering {
+            super::describe(&Change::Column(ColumnChange::AlterColumnNumbering {
                 uid: "c_aaaaaa".parse().unwrap(),
                 column: ColumnRef {
                     table: "app.t".parse().unwrap(),
@@ -2620,7 +2664,7 @@ mod tests {
                 ty: "integer".parse().unwrap(),
                 from,
                 to,
-            })
+            }))
         };
         let bounded = |max| SequenceOptions {
             max: Some(max),
@@ -2656,12 +2700,13 @@ mod tests {
     /// plan read back from its file, shows none (DEC-1958.3).
     #[test]
     fn an_added_step_names_its_origin_and_a_plain_one_names_none() {
+        use pbps_model::ConstraintChange;
         use pbps_model::{AddedRole, Change, ChangeSet, PlannedChange, Provenance};
         let drop = || {
-            PlannedChange::new(Change::DropCheck {
+            PlannedChange::new(Change::Constraint(ConstraintChange::DropCheck {
                 table: "app.t".parse().unwrap(),
                 name: "ck".into(),
-            })
+            }))
         };
         let mut added = drop();
         added.provenance = Some(Provenance {
@@ -2692,20 +2737,24 @@ mod tests {
     /// the columns it has none of (#1170); an ordinary table by its columns.
     #[test]
     fn a_created_partition_is_described_by_its_parent_and_bound() {
+        use pbps_model::PartitionChange;
+        use pbps_model::TableChange;
         use pbps_model::{BoundDatum as D, Change, PartitionBound as B};
-        let create = |bound: Option<B>| Change::CreateTable {
-            uid: "t_aaaaaa".parse().unwrap(),
-            name: "app.p1".parse().unwrap(),
-            table: Box::new(pbps_model::Table {
-                partition_of: bound.map(|bound| pbps_model::PartitionOf {
-                    parent: "app.ev".parse().unwrap(),
-                    bound,
-                    columns: Default::default(),
+        let create = |bound: Option<B>| {
+            Change::Table(TableChange::CreateTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                name: "app.p1".parse().unwrap(),
+                table: Box::new(pbps_model::Table {
+                    partition_of: bound.map(|bound| pbps_model::PartitionOf {
+                        parent: "app.ev".parse().unwrap(),
+                        bound,
+                        columns: Default::default(),
+                    }),
+                    ..Default::default()
                 }),
-                ..Default::default()
-            }),
-            beside_default: None,
-            moves_at_most: None,
+                beside_default: None,
+                moves_at_most: None,
+            })
         };
         assert_eq!(
             super::describe(&create(Some(B::Range {
@@ -2721,9 +2770,9 @@ mod tests {
         );
         // Beside a standing DEFAULT, it says which rows it takes from where
         // (#1547).
-        let Change::CreateTable {
+        let Change::Table(TableChange::CreateTable {
             uid, name, table, ..
-        } = create(Some(B::Range {
+        }) = create(Some(B::Range {
             from: vec![D::Value("1".into())],
             to: vec![D::Value("2".into())],
         }))
@@ -2731,21 +2780,21 @@ mod tests {
             unreachable!("a create");
         };
         assert_eq!(
-            super::describe(&Change::CreateTable {
+            super::describe(&Change::Table(TableChange::CreateTable {
                 uid,
                 name,
                 table,
                 beside_default: Some("app.ev_rest".parse().unwrap()),
                 moves_at_most: None,
-            }),
+            })),
             "+ create table app.p1, a partition of app.ev for rows from (\"1\") to (\"2\"), \
              moving those rows out of the default partition app.ev_rest, none allowed: the \
              apply refuses any it holds"
         );
         // And how many a human allowed it to take (#1788).
-        let Change::CreateTable {
+        let Change::Table(TableChange::CreateTable {
             uid, name, table, ..
-        } = create(Some(B::Range {
+        }) = create(Some(B::Range {
             from: vec![D::Value("1".into())],
             to: vec![D::Value("2".into())],
         }))
@@ -2753,13 +2802,13 @@ mod tests {
             unreachable!("a create");
         };
         assert_eq!(
-            super::describe(&Change::CreateTable {
+            super::describe(&Change::Table(TableChange::CreateTable {
                 uid,
                 name,
                 table,
                 beside_default: Some("app.ev_rest".parse().unwrap()),
                 moves_at_most: Some(500),
-            }),
+            })),
             "+ create table app.p1, a partition of app.ev for rows from (\"1\") to (\"2\"), \
              moving those rows out of the default partition app.ev_rest, at most 500 as allowed"
         );
@@ -2767,17 +2816,19 @@ mod tests {
             super::describe(&create(None)),
             "+ create table app.p1 (0 columns)"
         );
-        let drop = |detach_from: Option<&str>| Change::DropTable {
-            uid: "t_aaaaaa".parse().unwrap(),
-            name: "app.p1".parse().unwrap(),
-            detach_from: detach_from.map(|p| p.parse().unwrap()),
+        let drop = |detach_from: Option<&str>| {
+            Change::Table(TableChange::DropTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                name: "app.p1".parse().unwrap(),
+                detach_from: detach_from.map(|p| p.parse().unwrap()),
+            })
         };
         assert_eq!(
             super::describe(&drop(Some("app.ev"))),
             "- drop table app.p1, a partition of app.ev, detached from it first"
         );
         assert_eq!(super::describe(&drop(None)), "- drop table app.p1");
-        let detach = Change::DetachPartition {
+        let detach = Change::Partition(PartitionChange::DetachPartition {
             uid: "t_aaaaaa".parse().unwrap(),
             table: "app.p1".parse().unwrap(),
             parent: "app.ev".parse().unwrap(),
@@ -2794,24 +2845,24 @@ mod tests {
                 },
             ],
             shape: Box::default(),
-        };
+        });
         assert_eq!(
             super::describe(&detach),
             "~ detach table app.p1 from app.ev, keeping its rows, with 1 name(s) of its own"
         );
-        let attach = Change::AttachPartition {
+        let attach = Change::Partition(PartitionChange::AttachPartition {
             uid: "t_aaaaaa".parse().unwrap(),
             table: "app.t".parse().unwrap(),
             parent: "app.ev".parse().unwrap(),
             bound: pbps_model::PartitionBound::Default,
             key: Vec::new(),
             shape: Box::default(),
-        };
+        });
         assert_eq!(
             super::describe(&attach),
             "~ attach table app.t to app.ev as its default partition, keeping its rows"
         );
-        let ranged = Change::AttachPartition {
+        let ranged = Change::Partition(PartitionChange::AttachPartition {
             uid: "t_aaaaaa".parse().unwrap(),
             table: "app.t".parse().unwrap(),
             parent: "app.ev".parse().unwrap(),
@@ -2821,7 +2872,7 @@ mod tests {
             },
             key: Vec::new(),
             shape: Box::default(),
-        };
+        });
         assert_eq!(
             super::describe(&ranged),
             "~ attach table app.t to app.ev as a partition, keeping its rows"
@@ -2914,6 +2965,11 @@ mod tests {
         assert!(text.contains("prompt answer"), "{text}");
     }
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::GrantChange;
+    use pbps_model::RoleChange;
+    use pbps_model::TableChange;
+    use pbps_model::TypeValueChange;
     use pbps_model::change::PlannedChange;
     use pbps_model::{GrantTarget, Permission, Uid, UidKind};
 
@@ -2933,16 +2989,16 @@ mod tests {
     #[test]
     fn a_renamed_role_whose_grants_also_change_is_one_role() {
         let cs = set(vec![
-            Change::RenameRole {
+            Change::Role(RoleChange::RenameRole {
                 uid: uid(UidKind::Role, "a"),
                 from: "a".into(),
                 to: "b".into(),
-            },
-            Change::Grant {
+            }),
+            Change::Permission(GrantChange::Grant {
                 role: "b".into(),
                 target: GrantTarget::Object("dbo.t".parse().unwrap()),
                 permissions: [Permission::Select].into_iter().collect(),
-            },
+            }),
         ]);
         let after = pbps_model::IdsFile {
             roles: [(uid(UidKind::Role, "a"), "b".into())].into(),
@@ -2962,18 +3018,18 @@ mod tests {
     #[test]
     fn a_renamed_table_that_also_changes_is_one_table() {
         let cs = set(vec![
-            Change::RenameTable {
+            Change::Table(TableChange::RenameTable {
                 uid: uid(UidKind::Table, "dbo.old"),
                 from: "dbo.old".parse().unwrap(),
                 to: "dbo.new".parse().unwrap(),
                 defaults: Vec::new(),
-            },
-            Change::AddColumn {
+            }),
+            Change::Column(ColumnChange::AddColumn {
                 uid: uid(UidKind::Column, "dbo.new.extra"),
                 table: "dbo.new".parse().unwrap(),
                 name: "extra".into(),
                 column: Box::new(pbps_model::Column::new("int".parse().unwrap())),
-            },
+            }),
         ]);
         let after = pbps_model::IdsFile {
             tables: [(uid(UidKind::Table, "dbo.old"), "dbo.new".parse().unwrap())].into(),
@@ -2998,16 +3054,16 @@ mod tests {
     #[test]
     fn a_renamed_role_and_an_unrelated_one_stay_two_roles() {
         let cs = set(vec![
-            Change::RenameRole {
+            Change::Role(RoleChange::RenameRole {
                 uid: uid(UidKind::Role, "a"),
                 from: "a".into(),
                 to: "b".into(),
-            },
-            Change::Grant {
+            }),
+            Change::Permission(GrantChange::Grant {
                 role: "c".into(),
                 target: GrantTarget::Schema("dbo".into()),
                 permissions: [Permission::Select].into_iter().collect(),
-            },
+            }),
         ]);
         let after = pbps_model::IdsFile {
             roles: [(uid(UidKind::Role, "a"), "b".into())].into(),
@@ -3030,23 +3086,23 @@ mod tests {
     #[test]
     fn a_role_rename_does_not_merge_two_tables_that_render_like_it() {
         let cs = set(vec![
-            Change::RenameRole {
+            Change::Role(RoleChange::RenameRole {
                 uid: uid(UidKind::Role, "app.reader"),
                 from: "app.reader".into(),
                 to: "new.role".into(),
-            },
-            Change::AddColumn {
+            }),
+            Change::Column(ColumnChange::AddColumn {
                 uid: uid(UidKind::Column, "role app.reader.extra"),
                 table: "role app.reader".parse().unwrap(),
                 name: "extra".into(),
                 column: Box::new(pbps_model::Column::new("int".parse().unwrap())),
-            },
-            Change::AddColumn {
+            }),
+            Change::Column(ColumnChange::AddColumn {
                 uid: uid(UidKind::Column, "role new.role.extra"),
                 table: "role new.role".parse().unwrap(),
                 name: "extra".into(),
                 column: Box::new(pbps_model::Column::new("int".parse().unwrap())),
-            },
+            }),
         ]);
         let after = pbps_model::IdsFile {
             roles: [(uid(UidKind::Role, "app.reader"), "new.role".into())].into(),
@@ -3073,28 +3129,28 @@ mod tests {
         let table = uid(UidKind::Table, "a");
         let role = uid(UidKind::Role, "a");
         let cs = set(vec![
-            Change::RenameTable {
+            Change::Table(TableChange::RenameTable {
                 uid: table.clone(),
                 from: "app.a".parse().unwrap(),
                 to: "app.tmp".parse().unwrap(),
                 defaults: vec![],
-            },
-            Change::RenameTable {
+            }),
+            Change::Table(TableChange::RenameTable {
                 uid: table.clone(),
                 from: "app.tmp".parse().unwrap(),
                 to: "app.b".parse().unwrap(),
                 defaults: vec![],
-            },
-            Change::RenameRole {
+            }),
+            Change::Role(RoleChange::RenameRole {
                 uid: role.clone(),
                 from: "a".into(),
                 to: "tmp".into(),
-            },
-            Change::RenameRole {
+            }),
+            Change::Role(RoleChange::RenameRole {
                 uid: role.clone(),
                 from: "tmp".into(),
                 to: "b".into(),
-            },
+            }),
         ]);
         let after = pbps_model::IdsFile {
             tables: [(table, "app.b".parse().unwrap())].into(),
@@ -3408,7 +3464,7 @@ mod tests {
         let visible = ColumnType::reference(TypeRef::new("app", r#"type\n\\\u{1b}"名前"#).unwrap());
         let raw_text = "app.\"type\n\\\u{1b}\"\"名前\"";
         let visible_text = r#"app."type\n\\\u{1b}""名前""#;
-        let change = Change::AlterColumnType {
+        let change = Change::Column(ColumnChange::AlterColumnType {
             uid: "c_aaaaaa".parse().unwrap(),
             column: TableName::new("app", "t").column("v"),
             from: raw,
@@ -3419,7 +3475,7 @@ mod tests {
             to_collation: None,
             through_external_partitions: false,
             using: None,
-        };
+        });
         assert_eq!(
             describe(&change),
             format!(
@@ -3433,6 +3489,7 @@ mod tests {
 
     #[test]
     fn merged_type_lifecycle_descriptions_show_names_once_and_keep_raw_identities() {
+        use pbps_model::TypeChange;
         use pbps_model::{Change, ManagedType, TypeRef};
         for (name, shown) in [
             (
@@ -3464,30 +3521,30 @@ mod tests {
                 let target_shown = shown.replacen("app.", "other.", 1);
                 for (change, expected, key) in [
                     (
-                        Change::CreateType {
+                        Change::Type(TypeChange::CreateType {
                             uid: uid.clone(),
                             name: from.clone(),
                             definition: Box::new(definition.clone()),
-                        },
+                        }),
                         format!("+ create {} {shown}", definition.kind()),
                         "name",
                     ),
                     (
-                        Change::DropType {
+                        Change::Type(TypeChange::DropType {
                             uid: uid.clone(),
                             name: from.clone(),
                             definition: Box::new(definition.clone()),
-                        },
+                        }),
                         format!("- drop {} {shown}", definition.kind()),
                         "name",
                     ),
                     (
-                        Change::RenameType {
+                        Change::Type(TypeChange::RenameType {
                             uid,
                             from: from.clone(),
                             to,
                             definition: Box::new(definition.clone()),
-                        },
+                        }),
                         format!("~ rename type {shown} -> {target_shown}"),
                         "from",
                     ),
@@ -3525,37 +3582,41 @@ mod tests {
                 columns: Default::default(),
             };
             for change in [
-                Change::RebuildPartitionedTable(Box::new(RebuildPartitionedTable {
-                    earlier: Vec::new(),
-                    table: table.clone(),
-                    before: Default::default(),
-                    after: Default::default(),
-                    intent: Rebuild {
-                        source: identities.clone(),
-                        replacement: identities,
-                        replacement_root: "t_aaaaaa".parse().unwrap(),
-                        continues: Default::default(),
-                        target_checksum: "not an execution fixture".into(),
-                        max_rows: 0,
-                        allowed_at: "2026-10-24T00:00:00Z".into(),
-                        reason: "planned rewrite".parse().unwrap(),
-                        operator: "operator".into(),
-                        types: Default::default(),
-                        conversions: Default::default(),
+                Change::Partition(PartitionChange::RebuildPartitionedTable(Box::new(
+                    RebuildPartitionedTable {
+                        earlier: Vec::new(),
+                        table: table.clone(),
+                        before: Default::default(),
+                        after: Default::default(),
+                        intent: Rebuild {
+                            source: identities.clone(),
+                            replacement: identities,
+                            replacement_root: "t_aaaaaa".parse().unwrap(),
+                            continues: Default::default(),
+                            target_checksum: "not an execution fixture".into(),
+                            max_rows: 0,
+                            allowed_at: "2026-10-24T00:00:00Z".into(),
+                            reason: "planned rewrite".parse().unwrap(),
+                            operator: "operator".into(),
+                            types: Default::default(),
+                            conversions: Default::default(),
+                        },
                     },
-                })),
-                Change::CopyTableRows(Box::new(CopyTableRows {
+                ))),
+                Change::Partition(PartitionChange::CopyTableRows(Box::new(CopyTableRows {
                     source: relation.clone(),
                     target: relation.clone(),
                     columns: Vec::new(),
                     source_partitions: Vec::new(),
                     target_partitions: Vec::new(),
                     max_rows: 0,
-                })),
-                Change::AnalyzeTableTree(Box::new(AnalyzeTableTree {
-                    parent: relation,
-                    partitions: Vec::new(),
-                })),
+                }))),
+                Change::Partition(PartitionChange::AnalyzeTableTree(Box::new(
+                    AnalyzeTableTree {
+                        parent: relation,
+                        partitions: Vec::new(),
+                    },
+                ))),
             ] {
                 let (operation, _) = change.pending_rebuild().unwrap();
                 assert_eq!(
@@ -3575,6 +3636,7 @@ mod tests {
 #[cfg(test)]
 mod offline_base_tests {
     use super::*;
+    use pbps_model::RoleChange;
 
     #[test]
     fn offline_no_change_text_names_and_escapes_its_comparison() {
@@ -3617,10 +3679,12 @@ mod offline_base_tests {
         assert_eq!(plan(&cs, &names), "No changes.\n");
 
         let cs = ChangeSet {
-            changes: vec![pbps_model::PlannedChange::new(Change::CreateRole {
-                uid: "r_aaaaaa".parse().unwrap(),
-                name: "reader".into(),
-            })],
+            changes: vec![pbps_model::PlannedChange::new(Change::Role(
+                RoleChange::CreateRole {
+                    uid: "r_aaaaaa".parse().unwrap(),
+                    name: "reader".into(),
+                },
+            ))],
         };
         let mut role_ids = pbps_model::IdsFile::default();
         role_ids

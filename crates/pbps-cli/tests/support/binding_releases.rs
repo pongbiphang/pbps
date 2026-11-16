@@ -74,7 +74,11 @@ pub fn check() {
             .changes
             .iter()
             .filter_map(|step| {
-                if let pbps_model::Change::AlterModule { id, .. } = &step.change {
+                if let pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule {
+                    id,
+                    ..
+                }) = &step.change
+                {
                     Some(id.referenced_name().unwrap().name.clone())
                 } else {
                     None
@@ -185,7 +189,12 @@ pub fn check_independent_connected_release() {
         .changes
         .changes
         .iter()
-        .position(|p| matches!(p.change, pbps_model::Change::DropComputedColumn { .. }))
+        .position(|p| {
+            matches!(
+                p.change,
+                pbps_model::Change::Column(pbps_model::ColumnChange::DropComputedColumn { .. })
+            )
+        })
         .unwrap();
     assert!(drop_column < at("dbo.z"), "{:?}", saved.changes);
     assert!(at("dbo.g") < at("dbo.f"), "{:?}", saved.changes);

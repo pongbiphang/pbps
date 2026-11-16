@@ -1,4 +1,8 @@
 use super::TestDb;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::TableChange;
 use pbps_model::{Change, ChangeSet, PlannedChange, TableName, UidKind};
 use pbps_mssql::estimate::{self, Reads, Rewrite, RowStorage};
 
@@ -12,7 +16,7 @@ fn fixture_planned_estimates(changes: &ChangeSet) -> Vec<(usize, estimate::Estim
 }
 
 fn retype(table: &str, column: &str, from: &str, to: &str) -> PlannedChange {
-    PlannedChange::new(Change::AlterColumnType {
+    PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
         uid: pbps_model::Uid::generate(UidKind::Column),
         column: table.parse::<TableName>().unwrap().column(column),
         from: from.parse().unwrap(),
@@ -23,7 +27,7 @@ fn retype(table: &str, column: &str, from: &str, to: &str) -> PlannedChange {
         from_collation: None,
         to_collation: None,
         using: None,
-    })
+    }))
 }
 
 #[tokio::test]
@@ -272,26 +276,26 @@ async fn connected_estimates_keep_storage_and_identity_uncertainty_visible() {
     assert_eq!((e.rewrite, e.reads), (Rewrite::No, Reads::Nothing));
 
     let column = retype("dbo.renamed", "amount", "int", "bigint");
-    let Change::AlterColumnType { uid, .. } = &column.change else {
+    let Change::Column(ColumnChange::AlterColumnType { uid, .. }) = &column.change else {
         unreachable!()
     };
     let uid = uid.clone();
     let mut renamed = ChangeSet {
         changes: vec![
             column.clone(),
-            PlannedChange::new(Change::RenameColumn {
+            PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
                 uid,
                 table: "dbo.renamed".parse().unwrap(),
                 from: "v".into(),
                 to: "amount".into(),
                 table_was: None,
-            }),
-            PlannedChange::new(Change::RenameTable {
+            })),
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: pbps_model::Uid::generate(UidKind::Table),
                 from: "dbo.t".parse().unwrap(),
                 to: "dbo.renamed".parse().unwrap(),
                 defaults: Vec::new(),
-            }),
+            })),
         ],
     };
     renamed.changes.reverse();
@@ -316,7 +320,7 @@ async fn connected_estimates_keep_storage_and_identity_uncertainty_visible() {
     // A same-name current table cannot supply a future identity's row count.
     let created = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::CreateTable {
+            PlannedChange::new(Change::Table(TableChange::CreateTable {
                 uid: pbps_model::Uid::generate(UidKind::Table),
                 name: "dbo.t".parse().unwrap(),
                 table: Box::new(pbps_model::Table {
@@ -325,7 +329,7 @@ async fn connected_estimates_keep_storage_and_identity_uncertainty_visible() {
                 }),
                 beside_default: None,
                 moves_at_most: None,
-            }),
+            })),
             cs.changes[0].clone(),
         ],
     };
@@ -486,28 +490,28 @@ async fn a_clustered_index_change_is_a_rewrite_only_where_the_catalog_says_so() 
     };
     let cs = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::SetPrimaryKey {
+            PlannedChange::new(Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table: table.clone(),
                 from: Some(key.clone()),
                 to: None,
                 nonclustered: false,
-            }),
-            PlannedChange::new(Change::DropIndex {
+            })),
+            PlannedChange::new(Change::Index(IndexChange::DropIndex {
                 table: table.clone(),
                 name: "ix_v".into(),
-            }),
-            PlannedChange::new(Change::AddIndex {
+            })),
+            PlannedChange::new(Change::Index(IndexChange::AddIndex {
                 table: table.clone(),
                 name: "cx_v".into(),
                 index: Box::new(index("v")),
                 clustered: true,
-            }),
-            PlannedChange::new(Change::SetPrimaryKey {
+            })),
+            PlannedChange::new(Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table: table.clone(),
                 from: None,
                 to: Some(key),
                 nonclustered: true,
-            }),
+            })),
         ],
     };
     let mut estimates = fixture_planned_estimates(&cs);
@@ -546,13 +550,13 @@ async fn a_clustered_index_change_is_a_rewrite_only_where_the_catalog_says_so() 
     assert!(e.lock.contains("unknown"));
     let created = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::CreateTable {
+            PlannedChange::new(Change::Table(TableChange::CreateTable {
                 uid: pbps_model::Uid::generate(UidKind::Table),
                 name: table.clone(),
                 table: Box::default(),
                 beside_default: None,
                 moves_at_most: None,
-            }),
+            })),
             cs.changes[2].clone(),
         ],
     };

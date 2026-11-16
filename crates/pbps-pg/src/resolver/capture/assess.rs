@@ -1041,21 +1041,26 @@ mod tests {
                         .await
                         .unwrap();
                 }
-                let managed = super::super::Managed::from_schema(&{
-                    let mut schema = pbps_model::Schema::default();
-                    for c in &changes {
-                        match c {
-                            pbps_model::Change::CreateTable { name, table, .. } => {
-                                schema.tables.insert(name.clone(), *table.clone());
+                let managed =
+                    super::super::Managed::from_schema(&{
+                        let mut schema = pbps_model::Schema::default();
+                        for c in &changes {
+                            match c {
+                                pbps_model::Change::Table(
+                                    pbps_model::TableChange::CreateTable { name, table, .. },
+                                ) => {
+                                    schema.tables.insert(name.clone(), *table.clone());
+                                }
+                                pbps_model::Change::Module(
+                                    pbps_model::ModuleChange::CreateModule { id, module },
+                                ) => {
+                                    schema.modules.insert(id.clone(), *module.clone());
+                                }
+                                _ => unreachable!(),
                             }
-                            pbps_model::Change::CreateModule { id, module } => {
-                                schema.modules.insert(id.clone(), *module.clone());
-                            }
-                            _ => unreachable!(),
                         }
-                    }
-                    schema
-                });
+                        schema
+                    });
                 let captured =
                     super::super::capture(&mut conn, &super::super::managed_scope(&managed))
                         .await
@@ -1095,6 +1100,8 @@ mod tests {
     /// actual engine binding to that name can make the earlier surface suspect.
     #[test]
     fn a_data_literal_is_not_an_early_binding_to_the_function_it_names() {
+        use pbps_model::ModuleChange;
+        use pbps_model::TableChange;
         use pbps_model::{
             Change, Column, Generated, Module, ModuleKind, Table, TableName, Uid, UidKind,
             ValueSource,
@@ -1110,17 +1117,17 @@ mod tests {
         });
         table.columns.insert("g".into(), generated);
         let changes = [
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: Uid::derived(UidKind::Table, "t", 0), name: TableName::new("app", "t"),
                 table: Box::new(table), beside_default: None, moves_at_most: None,
-            },
-            Change::CreateModule {
+            }),
+            Change::Module(ModuleChange::CreateModule {
                 id: "app.f(integer)".parse().unwrap(), module: Box::new(Module {
                     kind: ModuleKind::Function, description: None,
                     definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT count(*)::int FROM app.t $$".into(),
                     options: Default::default(),
                 }),
-            },
+            }),
         ];
         let object = id(
             "pg_attrdef",

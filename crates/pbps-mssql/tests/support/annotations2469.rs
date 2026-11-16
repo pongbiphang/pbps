@@ -1,6 +1,8 @@
 //! Extended references stay library-only until the YAML contract is enabled.
 use super::*;
 use pbps_diff::order::{Schedule, Source, propose};
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
 use pbps_model::object_ref::ObjectDeps;
 use pbps_model::operation::Snapshot;
 use pbps_model::{Change, ChangeSet, Module, ModuleKind, PlannedChange};
@@ -46,17 +48,17 @@ async fn module_to_object_annotations_drive_installs_and_removals() {
     );
     let input = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::CreateModule {
+            PlannedChange::new(Change::Module(ModuleChange::CreateModule {
                 id: "app.v".parse().unwrap(),
                 module: Box::new(module),
-            }),
-            PlannedChange::new(Change::CreateTable {
+            })),
+            PlannedChange::new(Change::Table(TableChange::CreateTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: table.clone(),
                 table: Box::new(shape),
                 beside_default: None,
                 moves_at_most: None,
-            }),
+            })),
         ],
     };
     let plan = propose(input)
@@ -98,15 +100,15 @@ async fn module_to_object_annotations_drive_installs_and_removals() {
     assert_eq!(rows[0].try_get::<i32>("x").unwrap(), Some(7));
     let removals = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::DropTable {
+            PlannedChange::new(Change::Table(TableChange::DropTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: table,
                 detach_from: None,
-            }),
-            PlannedChange::new(Change::DropModule {
+            })),
+            PlannedChange::new(Change::Module(ModuleChange::DropModule {
                 id: "app.v".parse().unwrap(),
                 kind: ModuleKind::View,
-            }),
+            })),
         ],
     };
     let plan = propose(removals)
@@ -184,14 +186,14 @@ async fn in_place_provider_keeps_availability_and_releases_old_dependencies() {
     );
     let input = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::AlterModule {
+            PlannedChange::new(Change::Module(ModuleChange::AlterModule {
                 id: "app.provider".parse().unwrap(),
                 module: Box::new(module("SELECT 2 AS x")),
-            }),
-            PlannedChange::new(Change::DropModule {
+            })),
+            PlannedChange::new(Change::Module(ModuleChange::DropModule {
                 id: "app.consumer".parse().unwrap(),
                 kind: ModuleKind::View,
-            }),
+            })),
         ],
     };
     let annotated = propose(input)
@@ -260,14 +262,14 @@ async fn in_place_provider_keeps_availability_and_releases_old_dependencies() {
         .unwrap();
     let plan = propose(ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::DropModule {
+            PlannedChange::new(Change::Module(ModuleChange::DropModule {
                 id: "app.provider".parse().unwrap(),
                 kind: ModuleKind::View,
-            }),
-            PlannedChange::new(Change::AlterModule {
+            })),
+            PlannedChange::new(Change::Module(ModuleChange::AlterModule {
                 id: "app.consumer".parse().unwrap(),
                 module: Box::new(module("SELECT 3 AS x")),
-            }),
+            })),
         ],
     })
     .with_annotations(

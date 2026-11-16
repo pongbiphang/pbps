@@ -2,6 +2,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::Dialect;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
+use pbps_model::TypeChange;
+use pbps_model::TypeValueChange;
 use pbps_model::{
     Cell, Change, ChangeSet, ColumnName, ColumnType, EnumPlacement, EnumRebuildStep, Hints,
     IdsFile, ManagedType, Schema, TableName, TypeRef, Uid, Value, ValueSource,
@@ -133,7 +141,7 @@ pub(crate) fn changes(
                 .position(|v| v == &from)
                 .expect("validated source");
             current[index] = to.clone();
-            out.push(Change::RenameEnumValue {
+            out.push(Change::TypeValue(TypeValueChange::RenameEnumValue {
                 uid: uid.clone(),
                 name: name.clone(),
                 from,
@@ -143,7 +151,7 @@ pub(crate) fn changes(
                 definition: Box::new(ManagedType::Enum {
                     values: current.clone(),
                 }),
-            });
+            }));
             ordinal += 1;
         }
         // A label absent from the declaration, or retained labels in another
@@ -194,7 +202,7 @@ pub(crate) fn changes(
                 current.first().cloned().map(EnumPlacement::Before)
             };
             current.insert(index, value.clone());
-            out.push(Change::AddEnumValue {
+            out.push(Change::TypeValue(TypeValueChange::AddEnumValue {
                 uid: uid.clone(),
                 name: name.clone(),
                 value: value.clone(),
@@ -203,7 +211,7 @@ pub(crate) fn changes(
                 definition: Box::new(ManagedType::Enum {
                     values: current.clone(),
                 }),
-            });
+            }));
             ordinal += 1;
         }
     }
@@ -401,7 +409,7 @@ pub(crate) fn rebuild_type(
         depth,
     } = replacement;
     let over_swap = over.clone();
-    let mut out = vec![Change::EnumRebuild {
+    let mut out = vec![Change::TypeValue(TypeValueChange::EnumRebuild {
         uid: uid.clone(),
         name: name.clone(),
         tmp: tmp.clone(),
@@ -412,12 +420,12 @@ pub(crate) fn rebuild_type(
             over,
             why,
         },
-    }];
+    })];
     out.extend(columns.into_iter().map(|(column_uid, column, to)| {
         let value_arrays = resolver
             .values_shape(TypeSide::Desired, &to, desired.schema)
             .arrays;
-        Change::EnumRebuild {
+        Change::TypeValue(TypeValueChange::EnumRebuild {
             uid: uid.clone(),
             name: name.clone(),
             tmp: tmp.clone(),
@@ -438,9 +446,9 @@ pub(crate) fn rebuild_type(
                     pbps_model::ValueChange::Relabel { .. } => values.clone(),
                 }),
             },
-        }
+        })
     }));
-    out.push(Change::EnumRebuild {
+    out.push(Change::TypeValue(TypeValueChange::EnumRebuild {
         uid: uid.clone(),
         name: name.clone(),
         tmp,
@@ -450,7 +458,7 @@ pub(crate) fn rebuild_type(
             depth,
             over: over_swap,
         },
-    });
+    }));
     Ok(out)
 }
 
@@ -463,13 +471,13 @@ pub(crate) fn rebuild_defaults(base: Side<'_>, desired: Side<'_>, changes: &mut 
     let retyped: Vec<_> = changes
         .iter()
         .filter_map(|change| {
-            if let Change::EnumRebuild {
+            if let Change::TypeValue(TypeValueChange::EnumRebuild {
                 step:
                     EnumRebuildStep::Retype {
                         column_uid, column, ..
                     },
                 ..
-            } = change
+            }) = change
             {
                 Some((column_uid.clone(), column.clone()))
             } else {
@@ -483,7 +491,7 @@ pub(crate) fn rebuild_defaults(base: Side<'_>, desired: Side<'_>, changes: &mut 
     };
     for (uid, column) in retyped {
         changes.retain(
-            |change| !matches!(change, Change::AlterColumnDefault { column: c, .. } if *c == column),
+            |change| !matches!(change, Change::Column(ColumnChange::AlterColumnDefault { column: c, .. }) if *c == column),
         );
         let was = default(
             base.ids
@@ -499,20 +507,20 @@ pub(crate) fn rebuild_defaults(base: Side<'_>, desired: Side<'_>, changes: &mut 
                 .and_then(|t| t.columns.get(&column.name)),
         );
         if let Some(text) = was {
-            changes.push(Change::AlterColumnDefault {
+            changes.push(Change::Column(ColumnChange::AlterColumnDefault {
                 uid: uid.clone(),
                 column: column.clone(),
                 from: Some(text),
                 to: None,
-            });
+            }));
         }
         if let Some(text) = will {
-            changes.push(Change::AlterColumnDefault {
+            changes.push(Change::Column(ColumnChange::AlterColumnDefault {
                 uid,
                 column,
                 from: None,
                 to: Some(text),
-            });
+            }));
         }
     }
 }
@@ -552,7 +560,7 @@ pub fn probe_schema(base: Side<'_>, desired: Side<'_>, hints: &Hints) -> Schema 
         .0
         .into_iter()
         .filter_map(|change| match change {
-            Change::RenameEnumValue { uid, .. } => Some(uid),
+            Change::TypeValue(TypeValueChange::RenameEnumValue { uid, .. }) => Some(uid),
             _ => None,
         })
         .collect();
@@ -698,13 +706,13 @@ pub type LabelRenames<'a> = BTreeMap<&'a Uid, Vec<(usize, &'a str, &'a str)>>;
 pub fn label_renames<'a>(changes: impl IntoIterator<Item = &'a Change>) -> LabelRenames<'a> {
     let mut out: LabelRenames<'_> = BTreeMap::new();
     for change in changes {
-        if let Change::RenameEnumValue {
+        if let Change::TypeValue(TypeValueChange::RenameEnumValue {
             uid,
             from,
             to,
             ordinal,
             ..
-        } = change
+        }) = change
         {
             out.entry(uid).or_default().push((*ordinal, from, to));
         }
@@ -1036,7 +1044,10 @@ impl<'a> PlanLabels<'a> {
                 .clone()
                 .into_iter()
                 .filter_map(|change| {
-                    if let Change::RenameEnumValue { uid, name, .. } = change {
+                    if let Change::TypeValue(TypeValueChange::RenameEnumValue {
+                        uid, name, ..
+                    }) = change
+                    {
                         Some((name, uid))
                     } else {
                         None
@@ -1046,7 +1057,7 @@ impl<'a> PlanLabels<'a> {
             moves: changes
                 .into_iter()
                 .filter_map(|change| {
-                    if let Change::RenameType { from, to, .. } = change {
+                    if let Change::Type(TypeChange::RenameType { from, to, .. }) = change {
                         Some((from, to))
                     } else {
                         None
@@ -1096,9 +1107,9 @@ pub(crate) fn unsafe_uses(
 ) -> Vec<DiffError> {
     let mut errors = Vec::new();
     for added in &changes.changes {
-        let Change::AddEnumValue {
+        let Change::TypeValue(TypeValueChange::AddEnumValue {
             uid, name, value, ..
-        } = &added.change
+        }) = &added.change
         else {
             continue;
         };
@@ -1169,42 +1180,44 @@ pub(crate) fn unsafe_uses(
         let cell_uses = |cell: &Value| matches!(cell, Value::Text(t) if t == value);
         for step in &changes.changes {
             let used = match &step.change {
-                Change::InsertRow {
+                Change::Row(RowChange::InsertRow {
                     table,
                     key_column,
                     key,
                     row,
                     ..
-                } => {
+                }) => {
                     (key.as_str() == value && column_uses(table, key_column))
                         || row
                             .columns()
                             .any(|(column, v)| cell_uses(v) && column_uses(table, column))
                 }
-                Change::UpdateRow {
+                Change::Row(RowChange::UpdateRow {
                     table,
                     key_column,
                     key,
                     columns,
                     ..
-                } => {
+                }) => {
                     (key.as_str() == value && column_uses(table, key_column))
                         || columns.iter().any(|(column, (_, after))| {
                             matches!(after, Cell::Value(v) if cell_uses(v))
                                 && column_uses(table, column)
                         })
                 }
-                Change::CreateTable { table, .. }
-                | Change::AttachPartition { shape: table, .. } => table_uses(table),
-                Change::AddColumn { column, .. } => {
+                Change::Table(TableChange::CreateTable { table, .. })
+                | Change::Partition(PartitionChange::AttachPartition { shape: table, .. }) => {
+                    table_uses(table)
+                }
+                Change::Column(ColumnChange::AddColumn { column, .. }) => {
                     typed(&column.ty)
                         && matches!(&column.value_source, ValueSource::Default(s) if text(s))
                 }
-                Change::AlterColumnDefault {
+                Change::Column(ColumnChange::AlterColumnDefault {
                     column,
                     to: Some(to),
                     ..
-                } => {
+                }) => {
                     desired
                         .schema
                         .tables
@@ -1213,12 +1226,12 @@ pub(crate) fn unsafe_uses(
                         .is_some_and(|c| typed(&c.ty))
                         && text(to)
                 }
-                Change::SetPartitionDefault {
+                Change::Partition(PartitionChange::SetPartitionDefault {
                     table,
                     column,
                     to: Some(to),
                     ..
-                } => {
+                }) => {
                     desired.schema.tables.get(table).is_some_and(|t| {
                         inherited(t)
                             .columns
@@ -1226,11 +1239,11 @@ pub(crate) fn unsafe_uses(
                             .is_some_and(|c| typed(&c.ty))
                     }) && text(to)
                 }
-                Change::AddCheck {
+                Change::Constraint(ConstraintChange::AddCheck {
                     table,
                     constraint: check,
                     ..
-                } => {
+                }) => {
                     desired
                         .schema
                         .tables
@@ -1240,11 +1253,11 @@ pub(crate) fn unsafe_uses(
                 }
                 // A rebuilt domain's replacement is created from its final
                 // declaration, as a new domain is (DEC-1635.9).
-                Change::CreateType { definition, .. }
-                | Change::EnumRebuild {
+                Change::Type(TypeChange::CreateType { definition, .. })
+                | Change::TypeValue(TypeValueChange::EnumRebuild {
                     step: pbps_model::EnumRebuildStep::Create { definition, .. },
                     ..
-                } => match definition.as_ref() {
+                }) => match definition.as_ref() {
                     ManagedType::Domain {
                         base,
                         default,
@@ -1260,7 +1273,7 @@ pub(crate) fn unsafe_uses(
                 // Only what the half introduces: the default `Loosen` sets and
                 // the checks `Tighten` adds or changes. A dropped or untouched
                 // expression is no use of the new label (DEC-1635.8).
-                Change::AlterDomain { from, to, half, .. } => {
+                Change::TypeValue(TypeValueChange::AlterDomain { from, to, half, .. }) => {
                     match (to.as_ref(), pbps_model::DomainDelta::of(from, to)) {
                         (ManagedType::Domain { base, .. }, Some(delta)) => {
                             typed(base)
@@ -1276,7 +1289,8 @@ pub(crate) fn unsafe_uses(
                         _ => false,
                     }
                 }
-                Change::CreateModule { module, .. } | Change::AlterModule { module, .. } => {
+                Change::Module(ModuleChange::CreateModule { module, .. })
+                | Change::Module(ModuleChange::AlterModule { module, .. }) => {
                     let lexicon = dialect.lexicon();
                     let deferred = matches!(
                         module.kind,
@@ -1337,9 +1351,9 @@ pub fn valid_steps(changes: &ChangeSet, pins: &[pbps_model::DeclaredTypePin]) ->
     let mut created_domains: BTreeSet<Uid> = BTreeSet::new();
     for step in &changes.changes {
         match &step.change {
-            Change::CreateType {
+            Change::Type(TypeChange::CreateType {
                 uid, definition, ..
-            } => {
+            }) => {
                 if matches!(definition.as_ref(), ManagedType::Domain { .. }) {
                     created_domains.insert(uid.clone());
                 }
@@ -1352,13 +1366,13 @@ pub fn valid_steps(changes: &ChangeSet, pins: &[pbps_model::DeclaredTypePin]) ->
             // check names and default presence (its texts are the differ's
             // own, the catalog's before-definition being another spelling of
             // them), and the half has a statement to run.
-            Change::AlterDomain {
+            Change::TypeValue(TypeValueChange::AlterDomain {
                 uid,
                 name,
                 from,
                 to,
                 half,
-            } => {
+            }) => {
                 // New creation facets carry recipe snapshots, which may commute.
                 // Replay their existing half against the installed definition;
                 // the final pin below still certifies every installed facet.
@@ -1439,14 +1453,14 @@ pub fn valid_steps(changes: &ChangeSet, pins: &[pbps_model::DeclaredTypePin]) ->
                 };
                 definitions.insert(uid.clone(), left);
             }
-            Change::AddEnumValue {
+            Change::TypeValue(TypeValueChange::AddEnumValue {
                 uid,
                 name,
                 value,
                 placement,
                 definition,
                 ..
-            } => {
+            }) => {
                 if !pins.iter().any(|p| &p.uid == uid && &p.name == name) {
                     return false;
                 }
@@ -1476,14 +1490,14 @@ pub fn valid_steps(changes: &ChangeSet, pins: &[pbps_model::DeclaredTypePin]) ->
                     return false;
                 }
             }
-            Change::RenameEnumValue {
+            Change::TypeValue(TypeValueChange::RenameEnumValue {
                 uid,
                 name,
                 from,
                 to,
                 definition,
                 ..
-            } => {
+            }) => {
                 if !pins.iter().any(|p| &p.uid == uid && &p.name == name) {
                     return false;
                 }
@@ -1504,9 +1518,9 @@ pub fn valid_steps(changes: &ChangeSet, pins: &[pbps_model::DeclaredTypePin]) ->
             // The replacement's labels are the old type's minus `removed`,
             // plus whatever the declaration adds; the swap installs exactly
             // them. A step out of that order cannot certify itself.
-            Change::EnumRebuild {
+            Change::TypeValue(TypeValueChange::EnumRebuild {
                 uid, name, step, ..
-            } => {
+            }) => {
                 if !pins.iter().any(|p| &p.uid == uid && &p.name == name) {
                     return false;
                 }
@@ -1575,6 +1589,13 @@ pub fn valid_steps(changes: &ChangeSet, pins: &[pbps_model::DeclaredTypePin]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::ConstraintChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::PartitionChange;
+    use pbps_model::RowChange;
+    use pbps_model::TableChange;
+    use pbps_model::TypeChange;
+    use pbps_model::TypeValueChange;
     use pbps_model::{Column, DeclaredTypeBefore, DeclaredTypePin, PlannedChange, Table};
 
     fn enumeration(values: &[&str]) -> ManagedType {
@@ -1681,7 +1702,7 @@ mod tests {
         let plan = annotated_creation(&base, &desired, &[("blue", "sad")]);
         assert_eq!(plan.changes.len(), 1);
         assert!(matches!(&plan.changes[0].change,
-            Change::CreateType { uid, name, definition }
+            Change::Type(TypeChange::CreateType { uid, name, definition })
                 if uid.to_string() == "y_000002"
                     && name == &"app.e".parse::<pbps_model::TypeRef>().unwrap()
                     && **definition == enumeration(&["blue", "ok"])));
@@ -1702,7 +1723,7 @@ mod tests {
             let plan = annotated_creation(&base, &desired, &renames);
             assert_eq!(plan.changes.len(), 1);
             assert!(matches!(&plan.changes[0].change,
-                Change::CreateType { uid, name, definition }
+                Change::Type(TypeChange::CreateType { uid, name, definition })
                     if uid.to_string() == "y_000001"
                         && name == &"app.e".parse::<pbps_model::TypeRef>().unwrap()
                         && **definition == enumeration(&values)));
@@ -1717,9 +1738,9 @@ mod tests {
         let plan = annotated_creation(&base, &desired, &[("blue", "sad")]);
         assert_eq!(plan.changes.len(), 2);
         assert!(plan.changes.iter().any(|step| matches!(&step.change,
-            Change::DropType { uid, .. } if uid.to_string() == "y_000001")));
+            Change::Type(TypeChange::DropType { uid, .. }) if uid.to_string() == "y_000001")));
         assert!(plan.changes.iter().any(|step| matches!(&step.change,
-            Change::CreateType { uid, name, definition }
+            Change::Type(TypeChange::CreateType { uid, name, definition })
                 if uid.to_string() == "y_000002"
                     && name == &"app.e".parse::<pbps_model::TypeRef>().unwrap()
                     && **definition == enumeration(&["blue", "ok"]))));
@@ -1759,7 +1780,8 @@ mod tests {
             assert!(valid_steps(&steps, std::slice::from_ref(&pin)));
             let mut broken = steps.clone();
             if let Some(step) = broken.changes.first_mut()
-                && let Change::AddEnumValue { placement, .. } = &mut step.change
+                && let Change::TypeValue(TypeValueChange::AddEnumValue { placement, .. }) =
+                    &mut step.change
             {
                 *placement = Some(EnumPlacement::After("missing".into()));
             }
@@ -1769,13 +1791,13 @@ mod tests {
         assert!(errors.is_empty());
         assert!(matches!(
             &steps.changes[0].change,
-            Change::AddEnumValue {
+            Change::TypeValue(TypeValueChange::AddEnumValue {
                 placement: None,
                 ..
-            }
+            })
         ));
         assert!(
-            matches!(&steps.changes[1].change, Change::AddEnumValue { placement: Some(EnumPlacement::After(v)), .. } if v == "a")
+            matches!(&steps.changes[1].change, Change::TypeValue(TypeValueChange::AddEnumValue { placement: Some(EnumPlacement::After(v)), .. }) if v == "a")
         );
     }
 
@@ -1786,7 +1808,7 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(steps.changes.len(), 1);
         assert!(matches!(&steps.changes[0].change,
-            Change::AddEnumValue { value, placement: Some(EnumPlacement::After(neighbour)), .. }
+            Change::TypeValue(TypeValueChange::AddEnumValue { value, placement: Some(EnumPlacement::After(neighbour)), .. })
                 if value == "d" && neighbour == "c"));
         let (noop, errors, _, _) = planned(&["b", "c"], &["b", "c"], &hints);
         assert!(errors.is_empty(), "{errors:?}");
@@ -1799,7 +1821,7 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(steps.changes.len(), 1);
         assert!(
-            matches!(&steps.changes[0].change, Change::RenameEnumValue { from, to, .. } if from == "a" && to == "b")
+            matches!(&steps.changes[0].change, Change::TypeValue(TypeValueChange::RenameEnumValue { from, to, .. }) if from == "a" && to == "b")
         );
 
         let (steps, errors, _, _) = planned(
@@ -1810,10 +1832,10 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(steps.changes.len(), 2);
         assert!(
-            matches!(&steps.changes[0].change, Change::RenameEnumValue { from, to, .. } if from == "x" && to == "y")
+            matches!(&steps.changes[0].change, Change::TypeValue(TypeValueChange::RenameEnumValue { from, to, .. }) if from == "x" && to == "y")
         );
         assert!(
-            matches!(&steps.changes[1].change, Change::AddEnumValue { value, .. } if value == "d")
+            matches!(&steps.changes[1].change, Change::TypeValue(TypeValueChange::AddEnumValue { value, .. }) if value == "d")
         );
 
         for wanted in [vec!["b", "a"], vec!["a", "b"]] {
@@ -1839,10 +1861,10 @@ mod tests {
         let (steps, errors, _, _) = planned(&["a", "b"], &["b", "c"], &[("b", "a"), ("c", "b")]);
         assert!(errors.is_empty(), "{errors:?}");
         assert!(
-            matches!(&steps.changes[0].change, Change::RenameEnumValue { from, to, .. } if from == "b" && to == "c")
+            matches!(&steps.changes[0].change, Change::TypeValue(TypeValueChange::RenameEnumValue { from, to, .. }) if from == "b" && to == "c")
         );
         assert!(
-            matches!(&steps.changes[1].change, Change::RenameEnumValue { from, to, .. } if from == "a" && to == "b")
+            matches!(&steps.changes[1].change, Change::TypeValue(TypeValueChange::RenameEnumValue { from, to, .. }) if from == "a" && to == "b")
         );
         assert!(
             planned(&["b", "c"], &["b", "c"], &[("b", "a"), ("c", "b")])
@@ -2039,23 +2061,25 @@ mod tests {
             ));
             for value in ["old", "new"] {
                 steps.changes.truncate(1);
-                steps.changes.push(PlannedChange::new(Change::CreateTable {
-                    uid: "t_000001".parse().unwrap(),
-                    name: "app.t".parse().unwrap(),
-                    table: Box::new(Table {
-                        columns: [(
-                            "m".into(),
-                            Column {
-                                value_source: ValueSource::Default(format!("'{value}'")),
-                                ..Column::new(ty.parse().unwrap())
-                            },
-                        )]
-                        .into(),
-                        ..Default::default()
-                    }),
-                    beside_default: None,
-                    moves_at_most: None,
-                }));
+                steps.changes.push(PlannedChange::new(Change::Table(
+                    TableChange::CreateTable {
+                        uid: "t_000001".parse().unwrap(),
+                        name: "app.t".parse().unwrap(),
+                        table: Box::new(Table {
+                            columns: [(
+                                "m".into(),
+                                Column {
+                                    value_source: ValueSource::Default(format!("'{value}'")),
+                                    ..Column::new(ty.parse().unwrap())
+                                },
+                            )]
+                            .into(),
+                            ..Default::default()
+                        }),
+                        beside_default: None,
+                        moves_at_most: None,
+                    },
+                )));
                 let errors = unsafe_uses(
                     &steps,
                     Side {
@@ -2139,9 +2163,9 @@ mod tests {
                     options: Default::default(),
                 });
                 steps.changes.push(PlannedChange::new(if alter {
-                    Change::AlterModule { id, module }
+                    Change::Module(ModuleChange::AlterModule { id, module })
                 } else {
-                    Change::CreateModule { id, module }
+                    Change::Module(ModuleChange::CreateModule { id, module })
                 }));
                 let errors = unsafe_uses(
                     &steps,
@@ -2200,14 +2224,14 @@ mod tests {
         );
         for value in ["old", "new"] {
             for change in [
-                Change::AddCheck {
+                Change::Constraint(ConstraintChange::AddCheck {
                     table: child.clone(),
                     name: "kept".into(),
                     constraint: pbps_model::CheckConstraint {
                         expression: format!("m <> '{value}'"),
                     },
-                },
-                Change::SetPartitionDefault {
+                }),
+                Change::Partition(PartitionChange::SetPartitionDefault {
                     uid: "c_000001".parse().unwrap(),
                     table: child.clone(),
                     parent: parent.clone(),
@@ -2215,7 +2239,7 @@ mod tests {
                     from: None,
                     to: Some(format!("'{value}'")),
                     fallback: None,
-                },
+                }),
             ] {
                 let mut steps = labels.clone();
                 steps.changes.push(PlannedChange::new(change));
@@ -2289,21 +2313,21 @@ mod tests {
             let (labels, errors, mut schema, ids) = planned(&["old"], &["old", "new"], &[]);
             assert!(errors.is_empty());
             let (name, child) = keyed_by_enum(&mut schema, key, bound.clone());
-            let creating = Change::CreateTable {
+            let creating = Change::Table(TableChange::CreateTable {
                 uid: "t_000001".parse().unwrap(),
                 name: name.clone(),
                 table: Box::new(child.clone()),
                 beside_default: None,
                 moves_at_most: None,
-            };
-            let attaching = Change::AttachPartition {
+            });
+            let attaching = Change::Partition(PartitionChange::AttachPartition {
                 uid: "t_000001".parse().unwrap(),
                 table: name,
                 parent: "app.parent".parse().unwrap(),
                 bound,
                 key: vec![],
                 shape: Box::new(child),
-            };
+            });
             for change in [creating, attaching] {
                 for with_label in [true, false] {
                     let mut steps = if with_label {
@@ -2374,13 +2398,15 @@ mod tests {
                 }),
             };
             let changes = ChangeSet {
-                changes: vec![PlannedChange::new(Change::AlterDomain {
-                    uid: pin.uid.clone(),
-                    name: pin.name.clone(),
-                    from: Box::new(from.clone()),
-                    to: Box::new(to),
-                    half: pbps_model::DomainHalf::Loosen,
-                })],
+                changes: vec![PlannedChange::new(Change::TypeValue(
+                    TypeValueChange::AlterDomain {
+                        uid: pin.uid.clone(),
+                        name: pin.name.clone(),
+                        from: Box::new(from.clone()),
+                        to: Box::new(to),
+                        half: pbps_model::DomainHalf::Loosen,
+                    },
+                ))],
             };
             assert_eq!(
                 valid_steps(&changes, std::slice::from_ref(&pin)),
@@ -2425,13 +2451,13 @@ mod tests {
             }),
         };
         let step = |from: &ManagedType, to: &ManagedType, half| {
-            PlannedChange::new(Change::AlterDomain {
+            PlannedChange::new(Change::TypeValue(TypeValueChange::AlterDomain {
                 uid: uid.clone(),
                 name: name.clone(),
                 from: Box::new(from.clone()),
                 to: Box::new(to.clone()),
                 half,
-            })
+            }))
         };
         let plan = |steps: Vec<PlannedChange>| ChangeSet { changes: steps };
         let whole = || vec![step(&before, &to, Loosen), step(&before, &to, Tighten)];
@@ -2532,11 +2558,13 @@ mod tests {
                     let uid: Uid = "y_000002".parse().unwrap();
                     ids.types.insert(uid.clone(), name.clone());
                     schema.types.insert(name.clone(), definition.clone());
-                    steps.changes.push(PlannedChange::new(Change::CreateType {
-                        uid,
-                        name,
-                        definition: Box::new(definition),
-                    }));
+                    steps
+                        .changes
+                        .push(PlannedChange::new(Change::Type(TypeChange::CreateType {
+                            uid,
+                            name,
+                            definition: Box::new(definition),
+                        })));
                     let errors = unsafe_uses(
                         &steps,
                         Side {
@@ -2607,13 +2635,15 @@ mod tests {
                 }
                 let (mut steps, errors, schema, ids) = planned(&["old"], &["old", "new"], &[]);
                 assert!(errors.is_empty());
-                steps.changes.push(PlannedChange::new(Change::AlterDomain {
-                    uid: "y_000002".parse().unwrap(),
-                    name: "app.d".parse().unwrap(),
-                    from: Box::new(from.clone()),
-                    to: Box::new(to.clone()),
-                    half,
-                }));
+                steps.changes.push(PlannedChange::new(Change::TypeValue(
+                    TypeValueChange::AlterDomain {
+                        uid: "y_000002".parse().unwrap(),
+                        name: "app.d".parse().unwrap(),
+                        from: Box::new(from.clone()),
+                        to: Box::new(to.clone()),
+                        half,
+                    },
+                )));
                 let errors = unsafe_uses(
                     &steps,
                     Side {
@@ -2639,13 +2669,15 @@ mod tests {
         for to in [with_default("old"), with_check("old")] {
             for half in [DomainHalf::Loosen, DomainHalf::Tighten] {
                 let (mut steps, _, schema, ids) = planned(&["old"], &["old", "new"], &[]);
-                steps.changes.push(PlannedChange::new(Change::AlterDomain {
-                    uid: "y_000002".parse().unwrap(),
-                    name: "app.d".parse().unwrap(),
-                    from: Box::new(none.clone()),
-                    to: Box::new(to.clone()),
-                    half,
-                }));
+                steps.changes.push(PlannedChange::new(Change::TypeValue(
+                    TypeValueChange::AlterDomain {
+                        uid: "y_000002".parse().unwrap(),
+                        name: "app.d".parse().unwrap(),
+                        from: Box::new(none.clone()),
+                        to: Box::new(to.clone()),
+                        half,
+                    },
+                )));
                 let errors = unsafe_uses(
                     &steps,
                     Side {
@@ -2659,13 +2691,15 @@ mod tests {
         }
         // A domain over a different enum does not use this enum's new label.
         let (mut steps, _, schema, ids) = planned(&["old"], &["old", "new"], &[]);
-        steps.changes.push(PlannedChange::new(Change::AlterDomain {
-            uid: "y_000002".parse().unwrap(),
-            name: "app.d".parse().unwrap(),
-            from: Box::new(domain("app.other", None, &[])),
-            to: Box::new(domain("app.other", Some("'new'::app.other"), &[])),
-            half: DomainHalf::Loosen,
-        }));
+        steps.changes.push(PlannedChange::new(Change::TypeValue(
+            TypeValueChange::AlterDomain {
+                uid: "y_000002".parse().unwrap(),
+                name: "app.d".parse().unwrap(),
+                from: Box::new(domain("app.other", None, &[])),
+                to: Box::new(domain("app.other", Some("'new'::app.other"), &[])),
+                half: DomainHalf::Loosen,
+            },
+        )));
         let errors = unsafe_uses(
             &steps,
             Side {
@@ -2705,7 +2739,7 @@ mod tests {
     }
 
     fn rename(from: &str, to: &str, ordinal: usize) -> Change {
-        Change::RenameEnumValue {
+        Change::TypeValue(TypeValueChange::RenameEnumValue {
             uid: "y_000001".parse().unwrap(),
             name: "app.e".parse().unwrap(),
             from: from.into(),
@@ -2713,24 +2747,26 @@ mod tests {
             ordinal,
             retained: Vec::new(),
             definition: Box::new(enumeration(&["a"])),
-        }
+        })
     }
 
     /// DEC-2346.2: a row's key or cell over the enum is a use of the label,
     /// and a cell of another column, or one the update leaves, is not.
     #[test]
     fn a_row_using_a_label_added_in_the_same_plan_is_refused() {
-        let insert = |key: &str, cells: &[(&str, &str)]| Change::InsertRow {
-            table: "app.t".parse().unwrap(),
-            key_column: "m".into(),
-            identity_key: false,
-            key: key.into(),
-            row: row(cells),
-            defaults: Default::default(),
-            types: Default::default(),
+        let insert = |key: &str, cells: &[(&str, &str)]| {
+            Change::Row(RowChange::InsertRow {
+                table: "app.t".parse().unwrap(),
+                key_column: "m".into(),
+                identity_key: false,
+                key: key.into(),
+                row: row(cells),
+                defaults: Default::default(),
+                types: Default::default(),
+            })
         };
-        let update =
-            |key: &str, changed: &[(&str, &str, &str)], held: &[(&str, &str)]| Change::UpdateRow {
+        let update = |key: &str, changed: &[(&str, &str, &str)], held: &[(&str, &str)]| {
+            Change::Row(RowChange::UpdateRow {
                 table: "app.t".parse().unwrap(),
                 key_column: "m".into(),
                 key: key.into(),
@@ -2753,7 +2789,8 @@ mod tests {
                 types: Default::default(),
                 after_types: Default::default(),
                 key_type: None,
-            };
+            })
+        };
         let cases: Vec<(&str, Change, bool)> = vec![
             ("a new label as a key", insert("new", &[]), true),
             (
@@ -2878,7 +2915,7 @@ mod tests {
         // leave the rows alone.
         assert!(forwarded(&[]).is_none());
         let mut other = rename("a", "b", 0);
-        if let Change::RenameEnumValue { uid, .. } = &mut other {
+        if let Change::TypeValue(TypeValueChange::RenameEnumValue { uid, .. }) = &mut other {
             *uid = "y_000009".parse().unwrap();
         }
         assert!(forwarded(&[other]).is_none());
@@ -3068,6 +3105,11 @@ mod array_tests {
 mod rebuild_tests {
     use super::*;
     use pbps_dialect::MinimalDialect;
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::TypeChange;
+    use pbps_model::TypeValueChange;
     use pbps_model::{
         Column, ColumnRef, DeclaredTypeBefore, DeclaredTypePin, PlannedChange, Table, TableName,
         UidKind,
@@ -3149,7 +3191,7 @@ mod rebuild_tests {
         changes
             .iter()
             .filter_map(|c| match c {
-                Change::EnumRebuild { step, .. } => Some(step),
+                Change::TypeValue(TypeValueChange::EnumRebuild { step, .. }) => Some(step),
                 _ => None,
             })
             .collect()
@@ -3203,7 +3245,8 @@ mod rebuild_tests {
         ));
         // One uid throughout, never a new one, and a name no label step uses.
         for change in &out {
-            let Change::EnumRebuild { uid, name, tmp, .. } = change else {
+            let Change::TypeValue(TypeValueChange::EnumRebuild { uid, name, tmp, .. }) = change
+            else {
                 panic!("{change:?}");
             };
             assert_eq!(uid, &type_uid());
@@ -3229,14 +3272,20 @@ mod rebuild_tests {
         assert!(rebuilds(&["a", "b"], &["a", "b"], &[]).0.is_empty());
         let (added, errors) = rebuilds(&["a", "b"], &["a", "c", "b"], &[]);
         assert!(errors.is_empty());
-        assert!(matches!(added.as_slice(), [Change::AddEnumValue { .. }]));
+        assert!(matches!(
+            added.as_slice(),
+            [Change::TypeValue(TypeValueChange::AddEnumValue { .. })]
+        ));
     }
 
     #[test]
     fn a_removal_with_additions_creates_them_in_the_replacement_without_add_value() {
         let (out, errors) = rebuilds(&["a", "b"], &["new", "b"], &[]);
         assert!(errors.is_empty(), "{errors:?}");
-        assert!(out.iter().all(|c| matches!(c, Change::EnumRebuild { .. })));
+        assert!(
+            out.iter()
+                .all(|c| matches!(c, Change::TypeValue(TypeValueChange::EnumRebuild { .. })))
+        );
         assert!(matches!(
             steps(&out)[0],
             EnumRebuildStep::Create { removed, definition, .. }
@@ -3252,7 +3301,7 @@ mod rebuild_tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert!(matches!(
             out.first(),
-            Some(Change::RenameEnumValue { from, to, ordinal: 0, .. }) if from == "sad" && to == "blue"
+            Some(Change::TypeValue(TypeValueChange::RenameEnumValue { from, to, ordinal: 0, .. })) if from == "sad" && to == "blue"
         ));
         let EnumRebuildStep::Create {
             removed, ordinal, ..
@@ -3265,9 +3314,10 @@ mod rebuild_tests {
         let (chain, errors) = rebuilds(&["a", "b"], &["b", "c"], &[("b", "a"), ("c", "b")]);
         assert!(errors.is_empty(), "{errors:?}");
         assert!(
-            chain
-                .iter()
-                .all(|c| matches!(c, Change::RenameEnumValue { .. })),
+            chain.iter().all(|c| matches!(
+                c,
+                Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+            )),
             "{chain:?}"
         );
     }
@@ -3433,14 +3483,16 @@ mod rebuild_tests {
     #[test]
     fn a_declared_bound_is_carried_back_through_the_label_renames_the_plan_runs() {
         use pbps_model::{BoundDatum, ListDatum, PartitionBound};
-        let rename = |name: &str, ordinal: usize, from: &str, to: &str| Change::RenameEnumValue {
-            uid: type_uid(),
-            name: name.parse().unwrap(),
-            from: from.into(),
-            to: to.into(),
-            ordinal,
-            retained: Vec::new(),
-            definition: Box::new(enumeration(&[])),
+        let rename = |name: &str, ordinal: usize, from: &str, to: &str| {
+            Change::TypeValue(TypeValueChange::RenameEnumValue {
+                uid: type_uid(),
+                name: name.parse().unwrap(),
+                from: from.into(),
+                to: to.into(),
+                ordinal,
+                retained: Vec::new(),
+                definition: Box::new(enumeration(&[])),
+            })
         };
         let list = |labels: &[&str]| PartitionBound::List {
             values: labels
@@ -3483,12 +3535,12 @@ mod rebuild_tests {
         // The type's own rename is followed to the spelling the label
         // renames name.
         let moved = [
-            Change::RenameType {
+            Change::Type(TypeChange::RenameType {
                 uid: type_uid(),
                 from: "app.old".parse().unwrap(),
                 to: "app.e".parse().unwrap(),
                 definition: Box::new(enumeration(&[])),
-            },
+            }),
             rename("app.e", 0, "a", "b"),
         ];
         assert_eq!(back(&moved, &list(&["b"]), &key("app.old")), list(&["a"]));
@@ -3564,14 +3616,16 @@ mod rebuild_tests {
     fn a_standing_partitions_bound_is_carried_through_the_label_renames_in_the_order_they_run() {
         use pbps_model::{BoundDatum, ListDatum, PartitionBound};
         let uid = type_uid();
-        let rename = |ordinal: usize, from: &str, to: &str| Change::RenameEnumValue {
-            uid: uid.clone(),
-            name: "app.e".parse().unwrap(),
-            from: from.into(),
-            to: to.into(),
-            ordinal,
-            retained: Vec::new(),
-            definition: Box::new(enumeration(&[])),
+        let rename = |ordinal: usize, from: &str, to: &str| {
+            Change::TypeValue(TypeValueChange::RenameEnumValue {
+                uid: uid.clone(),
+                name: "app.e".parse().unwrap(),
+                from: from.into(),
+                to: to.into(),
+                ordinal,
+                retained: Vec::new(),
+                definition: Box::new(enumeration(&[])),
+            })
         };
         let (base, _) = world(&["a", "b"]);
         let mut parent = base.tables[&"app.t".parse::<TableName>().unwrap()].clone();
@@ -3624,7 +3678,7 @@ mod rebuild_tests {
             }
         );
         // The renames of another enum do not reach a key of this one.
-        let other = Change::RenameEnumValue {
+        let other = Change::TypeValue(TypeValueChange::RenameEnumValue {
             uid: "y_000009".parse().unwrap(),
             name: "app.other".parse().unwrap(),
             from: "a".into(),
@@ -3632,7 +3686,7 @@ mod rebuild_tests {
             ordinal: 0,
             retained: Vec::new(),
             definition: Box::new(enumeration(&[])),
-        };
+        });
         assert_eq!(carried(&[other], &list(&["a"])), list(&["a"]));
         // A key that is not the enum keeps its text.
         let mut by_id = parent.clone();
@@ -3662,7 +3716,7 @@ mod rebuild_tests {
         );
         let (out, errors) = changes(side(&base), side(&desired), &Hints::default());
         assert!(errors.is_empty(), "{errors:?}");
-        let Change::EnumRebuild { tmp, .. } = &out[0] else {
+        let Change::TypeValue(TypeValueChange::EnumRebuild { tmp, .. }) = &out[0] else {
             panic!("{out:?}");
         };
         assert_eq!(
@@ -3693,7 +3747,7 @@ mod rebuild_tests {
             table: "app.t".parse().unwrap(),
             name: "m".into(),
         };
-        let retype = Change::EnumRebuild {
+        let retype = Change::TypeValue(TypeValueChange::EnumRebuild {
             uid: type_uid(),
             name: "app.e".parse().unwrap(),
             tmp: "app.tmp".parse().unwrap(),
@@ -3704,7 +3758,7 @@ mod rebuild_tests {
                 array: false,
                 values: Box::new(pbps_model::ValueChange::Relabel { removed: vec![] }),
             },
-        };
+        });
         let (mut base, mut desired) = (world(&["a"]), world(&["a"]));
         for (w, text) in [(&mut base, "'a'"), (&mut desired, "'b'")] {
             w.0.tables
@@ -3717,18 +3771,20 @@ mod rebuild_tests {
         // would have run after the retype, with the old one standing.
         let mut plan = vec![
             retype.clone(),
-            Change::AlterColumnDefault {
+            Change::Column(ColumnChange::AlterColumnDefault {
                 uid: uid.clone(),
                 column: column.clone(),
                 from: Some("'a'".into()),
                 to: Some("'b'".into()),
-            },
+            }),
         ];
         rebuild_defaults(side(&base), side(&desired), &mut plan);
         let defaults: Vec<_> = plan
             .iter()
             .filter_map(|c| match c {
-                Change::AlterColumnDefault { from, to, .. } => Some((from.clone(), to.clone())),
+                Change::Column(ColumnChange::AlterColumnDefault { from, to, .. }) => {
+                    Some((from.clone(), to.clone()))
+                }
                 _ => None,
             })
             .collect();
@@ -3784,19 +3840,19 @@ mod rebuild_tests {
             assert!(!valid_steps(&sequence(broken), &pins));
         }
         let mut lie = out.clone();
-        if let Change::EnumRebuild {
+        if let Change::TypeValue(TypeValueChange::EnumRebuild {
             step: EnumRebuildStep::Create { removed, .. },
             ..
-        } = &mut lie[0]
+        }) = &mut lie[0]
         {
             removed.clear();
         }
         assert!(!valid_steps(&sequence(lie), &pins));
         let mut other = out.clone();
-        if let Change::EnumRebuild {
+        if let Change::TypeValue(TypeValueChange::EnumRebuild {
             step: EnumRebuildStep::Swap { definition, .. },
             ..
-        } = &mut other[3]
+        }) = &mut other[3]
         {
             **definition = enumeration(&["ok"]);
         }
@@ -3906,17 +3962,25 @@ mod rebuild_tests {
             .changes
             .iter()
             .map(|p| match &p.change {
-                Change::EnumRebuild { step, .. } => match step {
+                Change::TypeValue(TypeValueChange::EnumRebuild { step, .. }) => match step {
                     EnumRebuildStep::Create { .. } => "create".to_owned(),
                     EnumRebuildStep::Retype { column, .. } => {
                         format!("retype {}", column.name.shown())
                     }
                     EnumRebuildStep::Swap { .. } => "swap".to_owned(),
                 },
-                Change::DropCheck { name, .. } => format!("drop check {}", name.shown()),
-                Change::AddCheck { name, .. } => format!("add check {}", name.shown()),
-                Change::AlterColumnDefault { to: None, .. } => "drop default".to_owned(),
-                Change::AlterColumnDefault { to: Some(_), .. } => "set default".to_owned(),
+                Change::Constraint(ConstraintChange::DropCheck { name, .. }) => {
+                    format!("drop check {}", name.shown())
+                }
+                Change::Constraint(ConstraintChange::AddCheck { name, .. }) => {
+                    format!("add check {}", name.shown())
+                }
+                Change::Column(ColumnChange::AlterColumnDefault { to: None, .. }) => {
+                    "drop default".to_owned()
+                }
+                Change::Column(ColumnChange::AlterColumnDefault { to: Some(_), .. }) => {
+                    "set default".to_owned()
+                }
                 other => format!("{other:?}"),
             })
             .collect();
@@ -3951,13 +4015,10 @@ mod rebuild_tests {
             &Hints::default(),
         )
         .expect("a rebuild plans");
-        assert!(
-            !plain
-                .changes()
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, Change::DropCheck { .. })),
-        );
+        assert!(!plain.changes().changes.iter().any(|p| matches!(
+            p.change,
+            Change::Constraint(ConstraintChange::DropCheck { .. })
+        )),);
         // Every step asks for the risk class, so the plan is gated.
         assert!(
             plan.changes()
@@ -3994,19 +4055,19 @@ mod rebuild_tests {
                 .changes
                 .iter()
                 .filter_map(|p| match &p.change {
-                    Change::EnumRebuild {
+                    Change::TypeValue(TypeValueChange::EnumRebuild {
                         step: EnumRebuildStep::Retype { column, .. },
                         ..
-                    } => Some(format!("retype {}", column.name.shown())),
-                    Change::EnumRebuild {
+                    }) => Some(format!("retype {}", column.name.shown())),
+                    Change::TypeValue(TypeValueChange::EnumRebuild {
                         step: EnumRebuildStep::Swap { .. },
                         ..
-                    } => Some("swap".to_owned()),
-                    Change::DropModule { .. } => Some("drop view".to_owned()),
-                    Change::CreateModule { module, .. } => {
+                    }) => Some("swap".to_owned()),
+                    Change::Module(ModuleChange::DropModule { .. }) => Some("drop view".to_owned()),
+                    Change::Module(ModuleChange::CreateModule { module, .. }) => {
                         Some(format!("create view {}", module.definition))
                     }
-                    Change::AlterModule { module, .. } => {
+                    Change::Module(ModuleChange::AlterModule { module, .. }) => {
                         Some(format!("restate view {}", module.definition))
                     }
                     _ => None,

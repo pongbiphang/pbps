@@ -1,3 +1,5 @@
+use pbps_model::TableChange;
+use pbps_model::TypeChange;
 use pbps_model::{Change, ChangeSet, IdsFile};
 use pbps_pg::type_refs::declared::DomainDefaults;
 
@@ -109,7 +111,7 @@ impl<'a> Staged<'a> {
         // Move the pinned UID with the same adapter; observations never choose
         // either its identity or its spelling.
         if let [change] = changes.changes.as_mut_slice()
-            && let Change::RenameTable { from, to, .. } = &mut change.change
+            && let Change::Table(TableChange::RenameTable { from, to, .. }) = &mut change.change
             && let [(statement_from, statement_to)] = statement.renames.as_slice()
         {
             ids.rename_table(to, statement_to);
@@ -117,7 +119,7 @@ impl<'a> Staged<'a> {
             *to = statement_to.clone();
         }
         if let [change] = changes.changes.as_mut_slice()
-            && let Change::RenameType { uid, from, to, .. } = &mut change.change
+            && let Change::Type(TypeChange::RenameType { uid, from, to, .. }) = &mut change.change
             && let Some(emitted) = &statement.declared_type
         {
             if let Some(before) = previous.and_then(|s| s.declared_type.as_ref())
@@ -152,6 +154,11 @@ impl StatementPlan {
 mod tests {
     use super::*;
     use crate::deploy::refuse_pinned_movement;
+    use pbps_model::GrantChange;
+    use pbps_model::IndexChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::TableChange;
+    use pbps_model::TypeChange;
     use pbps_model::{
         Column, Index, IndexColumn, IndexKey, IndexPart, PlannedChange, Schema, Table, TableName,
     };
@@ -187,13 +194,13 @@ mod tests {
     }
 
     fn create(name: &TableName, table: Table) -> Change {
-        Change::CreateTable {
+        Change::Table(TableChange::CreateTable {
             uid: "t_000001".parse().unwrap(),
             name: name.clone(),
             table: Box::new(table),
             beside_default: None,
             moves_at_most: None,
-        }
+        })
     }
 
     fn schema(name: &TableName, table: Table) -> Schema {
@@ -221,25 +228,25 @@ mod tests {
             }
             let mut steps = vec![create(&name, declared)];
             if carried {
-                steps.push(Change::DropIndex {
+                steps.push(Change::Index(IndexChange::DropIndex {
                     table: name.clone(),
                     name: "ix".into(),
-                });
+                }));
             }
             steps.extend([
-                Change::AddIndex {
+                Change::Index(IndexChange::AddIndex {
                     table: name.clone(),
                     name: "ix".into(),
                     index: Box::new(index()),
                     clustered: false,
-                },
-                Change::SetIndexStorageParameters {
+                }),
+                Change::Index(IndexChange::SetIndexStorageParameters {
                     table: name.clone(),
                     target: IndexPart::Index("ix".into()),
                     method: Default::default(),
                     set: [("fillfactor".into(), "80".into())].into(),
                     reset: Default::default(),
-                },
+                }),
             ]);
             let planned = changes(steps);
             let error = Staged::new(Plan {
@@ -259,19 +266,23 @@ mod tests {
 
     #[test]
     fn a_routines_own_public_execution_companion_is_one_staged_change() {
-        let routine = || Change::CreateModule {
-            id: "app.f(integer)".parse().unwrap(),
-            module: Box::new(pbps_model::Module {
-                kind: pbps_model::ModuleKind::Function,
-                description: None,
-                definition: "(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$".into(),
-                options: Default::default(),
-            }),
+        let routine = || {
+            Change::Module(ModuleChange::CreateModule {
+                id: "app.f(integer)".parse().unwrap(),
+                module: Box::new(pbps_model::Module {
+                    kind: pbps_model::ModuleKind::Function,
+                    description: None,
+                    definition: "(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$".into(),
+                    options: Default::default(),
+                }),
+            })
         };
-        let access = |name: &str| Change::PublicExecution {
-            routine: name.parse().unwrap(),
-            access: pbps_model::PublicAccess::Revoked,
-            origin: pbps_model::RoutineOrigin::Created,
+        let access = |name: &str| {
+            Change::Permission(GrantChange::PublicExecution {
+                routine: name.parse().unwrap(),
+                access: pbps_model::PublicAccess::Revoked,
+                origin: pbps_model::RoutineOrigin::Created,
+            })
         };
         let ids = IdsFile::default();
         let own = changes(vec![routine(), access("app.f(integer)")]);
@@ -364,12 +375,12 @@ mod tests {
         };
         let from: pbps_model::TypeRef = "app.old".parse().unwrap();
         let to: pbps_model::TypeRef = "archive.new".parse().unwrap();
-        let planned = changes(vec![Change::RenameType {
+        let planned = changes(vec![Change::Type(TypeChange::RenameType {
             uid: uid.clone(),
             from: from.clone(),
             to: to.clone(),
             definition: Box::new(definition.clone()),
-        }]);
+        })]);
         let mut baseline = schema(
             &TableName::new("app", "t"),
             Table {
@@ -432,12 +443,12 @@ mod tests {
     fn one_cross_schema_rename_keeps_its_uid_at_each_emitted_address() {
         let from = TableName::new("app", "old");
         let to = TableName::new("archive", "new");
-        let planned = changes(vec![Change::RenameTable {
+        let planned = changes(vec![Change::Table(TableChange::RenameTable {
             uid: "t_000001".parse().unwrap(),
             from: from.clone(),
             to: to.clone(),
             defaults: Vec::new(),
-        }]);
+        })]);
         let baseline = schema(&from, table());
         let ids = super::super::fixture_ids(&planned, &baseline);
         let staged = Staged::new(Plan {

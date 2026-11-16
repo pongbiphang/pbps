@@ -297,8 +297,8 @@ pub fn prepare(
         input,
         dialect,
         out: Prepared {
-            logical: vec![PlannedChange::new(Change::RebuildPartitionedTable(
-                Box::new(r.clone()),
+            logical: vec![PlannedChange::new(Change::Partition(
+                PartitionChange::RebuildPartitionedTable(Box::new(r.clone())),
             ))],
             target,
             addresses,
@@ -322,13 +322,13 @@ pub fn prepare(
             of.parent = parent.name.clone();
         }
         rule.add(
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: relation.uid,
                 name: relation.name,
                 table: Box::new(bare),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
             Purpose::Tree,
         );
     }
@@ -340,10 +340,10 @@ pub fn prepare(
         let relation = rule.address(rule.out.target.table_uid(table).unwrap());
         for (target, text) in described(table, spec, &relation, input.desired.ids)? {
             rule.add(
-                Change::SetComment {
+                Change::TableProperty(TablePropertyChange::SetComment {
                     target,
                     text: Some(text),
-                },
+                }),
                 Purpose::Describe,
             );
         }
@@ -375,21 +375,23 @@ pub fn prepare(
         column.target.table = parent.name.clone();
     }
     rule.add(
-        Change::CopyTableRows(Box::new(CopyTableRows {
+        Change::Partition(PartitionChange::CopyTableRows(Box::new(CopyTableRows {
             source,
             target: parent.clone(),
             columns,
             source_partitions,
             target_partitions: target_partitions.clone(),
             max_rows: r.cap(),
-        })),
+        }))),
         Purpose::Copy,
     );
     rule.add(
-        Change::AnalyzeTableTree(Box::new(AnalyzeTableTree {
-            parent: parent.clone(),
-            partitions: target_partitions.clone(),
-        })),
+        Change::Partition(PartitionChange::AnalyzeTableTree(Box::new(
+            AnalyzeTableTree {
+                parent: parent.clone(),
+                partitions: target_partitions.clone(),
+            },
+        ))),
         Purpose::Analyze,
     );
     for identities in [r.source(), &r.intent.replacement] {
@@ -402,12 +404,12 @@ pub fn prepare(
                 (address, final_name.clone())
             };
             rule.add(
-                Change::RenameTable {
+                Change::Table(TableChange::RenameTable {
                     uid: uid.clone(),
                     from,
                     to,
                     defaults: vec![],
-                },
+                }),
                 Purpose::Swap,
             );
         }
@@ -468,11 +470,11 @@ pub fn prepare(
         }
         for (name, fk) in &spec.foreign_keys {
             rule.add(
-                Change::AddForeignKey {
+                Change::Constraint(ConstraintChange::AddForeignKey {
                     table: table.clone(),
                     name: name.clone(),
                     constraint: Box::new(fk.clone()),
-                },
+                }),
                 Purpose::Restoration,
             );
         }
@@ -521,7 +523,7 @@ pub fn prepare(
         }
         recipe.validate().map_err(invalid_recipe)?;
         rule.add(
-            Change::BuildPartitionedIndex(Box::new(recipe)),
+            Change::Index(IndexChange::BuildPartitionedIndex(Box::new(recipe))),
             Purpose::Own,
         );
     }
@@ -555,11 +557,11 @@ pub fn prepare(
             };
             if affected {
                 rule.add(
-                    Change::Grant {
+                    Change::Permission(GrantChange::Grant {
                         role: role.clone(),
                         target: target.clone(),
                         permissions: permissions.clone(),
-                    },
+                    }),
                     Purpose::Restoration,
                 );
             }
@@ -568,7 +570,7 @@ pub fn prepare(
     for module in modules {
         if let ModuleId::Routine(routine) = &module {
             rule.add(
-                Change::PublicExecution {
+                Change::Permission(GrantChange::PublicExecution {
                     routine: routine.clone(),
                     access: if input.hints.public_execute.contains(&module) {
                         PublicAccess::Kept
@@ -576,7 +578,7 @@ pub fn prepare(
                         PublicAccess::Revoked
                     },
                     origin: RoutineOrigin::Rebuilt,
-                },
+                }),
                 Purpose::Restoration,
             );
         }
@@ -589,11 +591,11 @@ pub fn prepare(
                 .name
         });
         rule.add(
-            Change::DropTable {
+            Change::Table(TableChange::DropTable {
                 uid: uid.clone(),
                 name: relation.name,
                 detach_from: parent,
-            },
+            }),
             Purpose::Retire,
         );
     }
@@ -720,7 +722,7 @@ pub(super) fn lost_comment(
 ) -> Option<&'static str> {
     let written = |wanted: &dyn Fn(&pbps_model::CommentTarget) -> bool, text: &pbps_model::Text| {
         plan.iter().any(|p| {
-            matches!(&p.change, Change::SetComment { target, text: Some(x) } if wanted(target) && x == text)
+            matches!(&p.change, Change::TableProperty(TablePropertyChange::SetComment { target, text: Some(x) }) if wanted(target) && x == text)
         })
     };
     if let Some(text) = declared.description.as_ref().filter(|t| !t.is_empty())
@@ -755,7 +757,7 @@ pub(super) fn validate_saved(
         .changes
         .iter()
         .filter_map(|p| {
-            if let Change::CopyTableRows(c) = &p.change {
+            if let Change::Partition(PartitionChange::CopyTableRows(c)) = &p.change {
                 Some(&**c)
             } else {
                 None
@@ -763,17 +765,20 @@ pub(super) fn validate_saved(
         })
         .collect();
     for p in &plan.changes.changes {
-        if matches!(p.change, Change::RebuildPartitionedTable(_)) {
+        if matches!(
+            p.change,
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+        ) {
             return Err("an unexpanded rebuild cannot be admitted".into());
         }
-        let owner = if let Change::BuildPartitionedIndex(i) = &p.change {
+        let owner = if let Change::Index(IndexChange::BuildPartitionedIndex(i)) = &p.change {
             Some(&i.parent.uid)
-        } else if let Change::AnalyzeTableTree(t) = &p.change {
+        } else if let Change::Partition(PartitionChange::AnalyzeTableTree(t)) = &p.change {
             Some(&t.parent.uid)
         } else {
             None
         };
-        if let Change::DropTable { uid, .. } = &p.change
+        if let Change::Table(TableChange::DropTable { uid, .. }) = &p.change
             && plan.ids.rebuilds.contains_key(uid)
             && !copies.iter().any(|c| &c.source.uid == uid)
         {
@@ -808,12 +813,12 @@ pub(super) fn validate_saved(
             .clone();
         let create = |uid: &Uid| {
             plan.changes.changes.iter().find_map(|p| {
-                if let Change::CreateTable {
+                if let Change::Table(TableChange::CreateTable {
                     uid: u,
                     name,
                     table,
                     ..
-                } = &p.change
+                }) = &p.change
                     && u == uid
                 {
                     Some((name, &**table))
@@ -824,7 +829,7 @@ pub(super) fn validate_saved(
         };
         let (temporary, declared) =
             create(&copy.target.uid).ok_or("copy has no replacement definition")?;
-        if temporary != &copy.target.name || !plan.changes.changes.iter().any(|p| matches!(&p.change, Change::DropTable {uid,..} if uid == &copy.source.uid)) || !plan.changes.changes.iter().any(|p| matches!(&p.change, Change::AnalyzeTableTree(t) if t.parent == copy.target && t.partitions == copy.target_partitions)) {
+        if temporary != &copy.target.name || !plan.changes.changes.iter().any(|p| matches!(&p.change, Change::Table(TableChange::DropTable {uid,..}) if uid == &copy.source.uid)) || !plan.changes.changes.iter().any(|p| matches!(&p.change, Change::Partition(PartitionChange::AnalyzeTableTree(t)) if t.parent == copy.target && t.partitions == copy.target_partitions)) {
             return Err("copy has incomplete creation, analysis or retirement".into());
         }
         let mut source = Table::default();
@@ -889,7 +894,7 @@ pub(super) fn validate_saved(
                 .tables
                 .get(&relation.uid)
                 .ok_or("foreign replacement member")?;
-            if create(&relation.uid).map(|v| v.0) != Some(&relation.name) || !plan.changes.changes.iter().any(|p| matches!(&p.change, Change::RenameTable {uid,from,to,..} if uid == &relation.uid && from == &relation.name && to == final_name)) { return Err("replacement member has no reviewed name swap".into()); }
+            if create(&relation.uid).map(|v| v.0) != Some(&relation.name) || !plan.changes.changes.iter().any(|p| matches!(&p.change, Change::Table(TableChange::RenameTable {uid,from,to,..}) if uid == &relation.uid && from == &relation.name && to == final_name)) { return Err("replacement member has no reviewed name swap".into()); }
         }
     }
     Ok(())

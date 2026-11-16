@@ -5982,3 +5982,56 @@ instance on arrival: `pbps state diff` completed each record's identities from
 the other for tables, columns, roles and types and not for extensions, so one
 extension recorded under a uid in only one of the two states was given a
 derived uid in the other and compared as two objects.
+
+<a id="dec-2790-2"></a>
+
+**DEC-2790.2. `Change` is an enum of fifteen family enums, moved in one change,
+and a change is still written, printed and ordered as one kind (#2790).** The
+families of DEC-2790.1 are now types: `Change::Table(TableChange)`,
+`Change::Column(ColumnChange)` and so on, one outer variant per family and one
+enum of kinds inside it. The inner name is the singular of the family and
+`Change`, except the permissions family, whose enum is `GrantChange` because
+`PermissionChange` is another type of change.rs. What it buys is a typed
+boundary: a function for constraints takes a `ConstraintChange`, a consumer
+that has no business with a family says so in one outer arm, and the large
+emitters and preflights can be split by family. The census of #2790 measured
+that none of the 220 matches over `Change` computes its answer from the kind
+alone, so a table of properties per kind had nothing to absorb; this is the
+other remedy, and it does not lower the number of real decisions a new kind
+needs.
+
+Why enums and not the macro: `change_family!` could only be used as a match arm
+and told a function nothing about what it was handed. A function that wants the
+constraints of a plan wants the type. The two macros stay until the arms that
+name whole families are collapsed (the third step of the issue), and keep
+working: they expand to the nested patterns.
+
+Why one change and not a family at a time. A half-moved enum breaks three things
+the compiler cannot see, each measured on a trial that moved two families: a
+plan that fails to read loses the wording of its refusal for every kind, because
+a derive over the flat part cannot be told to skip the moved kinds; the
+planner's tie-break and the words of a refusal are built from `Debug`, so a
+saved plan's order changed (and `change_in_words` named the family); and a
+refusal that compares `mem::discriminant` of two changes compared families, which
+no test noticed. All three are put right by one thing, which cannot be written
+for a half-moved enum without a copy of the kinds that remain:
+`change/wire.rs`, which writes `Serialize` (the family's enum writes its own
+`op`), `Deserialize` (the `op` read where it is met, as the derived enum read its
+tag; the entries kept whole and read by the family's derive afterwards, so the
+wording and the absence of a position of a field refusal are the flat enum's),
+`Debug` (the kind alone), and `JsonSchema` (the flat `oneOf`) for `Change`. The
+pins of the preparation PR hold all of it to the flat enum's words and bytes,
+and `Change::same_kind` compares kinds. No saved byte, message or order changes.
+
+What was given up: a kind that joins a family joins every arm that takes the
+family whole (`Change::Table(_)`) with no compile error, as it joined every
+`change_family!` arm. Inner matches stay exhaustive and have no wildcard.
+
+The rule for a new kind of change: it goes into the enum of its family, its op
+into the table of `change/wire.rs` (`the_ops_are_the_kinds_of_the_family_enums`
+and the unknown-op pin of `tests/change_wire.rs` fail until it is there), and its
+row into ORDERING.md; every `match` over that family's enum then asks for it. A
+new family gets an enum of its own, a variant of `Change`, a row in the op table
+and a `ChangeFamily` variant, and the pins say where each is missing. The rewrite
+tool `scripts/change_family_rewrite.py` stays until the freeze of #2790 is over,
+so that a branch opened before the move can be carried across it.

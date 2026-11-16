@@ -1,6 +1,6 @@
 //! Stored-value semantics shared by column retypes and type rebuilds (#2461).
 
-use crate::{Change, ColumnType, EnumRebuildStep};
+use crate::{Change, ColumnChange, ColumnType, EnumRebuildStep, TypeValueChange};
 use schemars::JsonSchema;
 
 /// What stored values undergo, independently of the statements that move them.
@@ -39,13 +39,13 @@ impl Change {
     #[allow(clippy::wildcard_enum_match_arm)] // Only column retypes expose this optional judgement.
     pub fn value_change(&self) -> Option<ValueChange> {
         match self {
-            Self::AlterColumnType {
+            Self::Column(ColumnChange::AlterColumnType {
                 from, to, using, ..
-            } => ValueChange::cast(from, to, using.clone()),
-            Self::EnumRebuild {
+            }) => ValueChange::cast(from, to, using.clone()),
+            Self::TypeValue(TypeValueChange::EnumRebuild {
                 step: EnumRebuildStep::Retype { values, .. },
                 ..
-            } => Some((**values).clone()),
+            }) => Some((**values).clone()),
             _ => None,
         }
     }

@@ -17,15 +17,20 @@ fn demanded_domain_facets_split_without_a_lexical_function_call() {
             let changes = &plan.changes().changes;
             let created = changes
                 .iter()
-                .position(|p| matches!(p.change, Change::CreateType { .. }))
+                .position(|p| matches!(p.change, Change::Type(TypeChange::CreateType { .. })))
                 .unwrap();
             let function = changes
                 .iter()
-                .position(|p| matches!(p.change, Change::CreateModule { .. }))
+                .position(|p| matches!(p.change, Change::Module(ModuleChange::CreateModule { .. })))
                 .unwrap();
             let installed = changes
                 .iter()
-                .position(|p| matches!(p.change, Change::AlterDomain { .. }))
+                .position(|p| {
+                    matches!(
+                        p.change,
+                        Change::TypeValue(TypeValueChange::AlterDomain { .. })
+                    )
+                })
                 .unwrap();
             assert!(created < function && function < installed);
             assert!(
@@ -34,9 +39,9 @@ fn demanded_domain_facets_split_without_a_lexical_function_call() {
                     .iter()
                     .all(|edge| edge.before < edge.after)
             );
-            let Change::CreateType {
+            let Change::Type(TypeChange::CreateType {
                 uid, definition, ..
-            } = &changes[created].change
+            }) = &changes[created].change
             else {
                 panic!()
             };
@@ -113,16 +118,13 @@ fn empty_domain_demand_keeps_changes_proof_and_sql_bytes() {
         before,
         serde_json::to_vec(&(plan.changes(), plan.proof())).unwrap()
     );
-    let Change::CreateType { .. } = &plan.changes().changes[0].change else {
+    let Change::Type(TypeChange::CreateType { .. }) = &plan.changes().changes[0].change else {
         panic!()
     };
-    assert!(
-        !plan
-            .changes()
-            .changes
-            .iter()
-            .any(|p| matches!(p.change, Change::AlterDomain { .. }))
-    );
+    assert!(!plan.changes().changes.iter().any(|p| matches!(
+        p.change,
+        Change::TypeValue(TypeValueChange::AlterDomain { .. })
+    )));
     let empty = Schema::default();
     let ids = IdsFile::default();
     let before = pbps_diff::Side {
@@ -193,11 +195,11 @@ fn missing_domain_facets_and_external_aliases_are_not_available() {
         assert!(f.compile(&engine).is_err(), "{target}");
     }
     let f = Fixture::new("check", false);
-    let create = Change::CreateType {
+    let create = Change::Type(TypeChange::CreateType {
         uid: "y_aaaaaa".parse().unwrap(),
         name: "c2469.d".parse().unwrap(),
         definition: Box::new(f.schema.types[&"c2469.d".parse().unwrap()].clone()),
-    };
+    });
     let engine = pbps_mssql::Mssql;
     let refs: std::collections::BTreeSet<pbps_model::object_ref::ObjectRef> =
         ["check::type::c2469.d.positive".parse().unwrap()].into();
@@ -251,17 +253,17 @@ fn baseline_domain_facet_removal_waits_for_its_annotated_consumer() {
     let changes = &plan.changes().changes;
     let removed = changes
         .iter()
-        .position(|p| matches!(p.change, Change::DropModule { .. }))
+        .position(|p| matches!(p.change, Change::Module(ModuleChange::DropModule { .. })))
         .unwrap();
     let facet = changes
         .iter()
         .position(|p| {
             matches!(
                 p.change,
-                Change::AlterDomain {
+                Change::TypeValue(TypeValueChange::AlterDomain {
                     half: DomainHalf::Loosen,
                     ..
-                }
+                })
             )
         })
         .unwrap();
@@ -292,27 +294,33 @@ fn empty_scalar_columns_need_the_type_before_its_facets_and_arrays_require_final
                 .iter()
                 .position(|p| {
                     if suffix {
-                        matches!(&p.change,Change::AddColumn{name,..} if name.raw()=="x")
+                        matches!(&p.change,Change::Column(ColumnChange::AddColumn{name,..}) if name.raw()=="x")
                     } else {
-                        matches!(p.change, Change::CreateTable { .. })
+                        matches!(p.change, Change::Table(TableChange::CreateTable { .. }))
                     }
                 })
                 .unwrap();
             let installed = parts
                 .iter()
-                .position(|p| matches!(p.change, Change::AlterDomain { .. }))
+                .position(|p| {
+                    matches!(
+                        p.change,
+                        Change::TypeValue(TypeValueChange::AlterDomain { .. })
+                    )
+                })
                 .unwrap();
             assert!(column < installed);
             let mut rows = plan.changes().clone();
-            rows.changes.push(PlannedChange::new(Change::InsertRow {
-                table: "c2469.t".parse().unwrap(),
-                key_column: "anchor".into(),
-                identity_key: false,
-                key: "1".into(),
-                row: Row::default(),
-                defaults: Default::default(),
-                types: Default::default(),
-            }));
+            rows.changes
+                .push(PlannedChange::new(Change::Row(RowChange::InsertRow {
+                    table: "c2469.t".parse().unwrap(),
+                    key_column: "anchor".into(),
+                    identity_key: false,
+                    key: "1".into(),
+                    row: Row::default(),
+                    defaults: Default::default(),
+                    types: Default::default(),
+                })));
             let edges = pbps_diff::order::generated::constraints(
                 &rows,
                 &f.schema,
@@ -355,11 +363,18 @@ fn a_domain_copy_waits_for_the_default_it_copies_and_rejects_a_copy_cycle() {
     let parts = &plan.changes().changes;
     let default = parts
         .iter()
-        .position(|p| matches!(p.change, Change::AlterDomain { .. }))
+        .position(|p| {
+            matches!(
+                p.change,
+                Change::TypeValue(TypeValueChange::AlterDomain { .. })
+            )
+        })
         .unwrap();
     let copy = parts
         .iter()
-        .position(|p| matches!(&p.change,Change::CreateType{name,..} if name==&child))
+        .position(
+            |p| matches!(&p.change,Change::Type(TypeChange::CreateType{name,..}) if name==&child),
+        )
         .unwrap();
     assert!(default < copy);
     f.deps.0[1].1 = ["type::c2469.child".parse().unwrap()].into();
@@ -378,9 +393,9 @@ fn a_selected_domain_prefix_also_defers_its_existing_planned_callees() {
     let steps = &plan.changes().changes;
     let function = steps
         .iter()
-        .position(|p| matches!(p.change, Change::CreateModule { .. }))
+        .position(|p| matches!(p.change, Change::Module(ModuleChange::CreateModule { .. })))
         .unwrap();
-    let check=steps.iter().position(|p|matches!(&p.change,Change::AlterDomain{from,to,half:DomainHalf::Tighten,..} if !DomainDelta::of(from,to).unwrap().add_checks.is_empty())).unwrap();
+    let check=steps.iter().position(|p|matches!(&p.change,Change::TypeValue(TypeValueChange::AlterDomain{from,to,half:DomainHalf::Tighten,..}) if !DomainDelta::of(from,to).unwrap().add_checks.is_empty())).unwrap();
     assert!(function < check);
     let mut ordinary = Fixture::new("not_null", false);
     ordinary.schema.types.insert(
@@ -393,7 +408,7 @@ fn a_selected_domain_prefix_also_defers_its_existing_planned_callees() {
         .changes
         .iter()
         .find_map(|p| {
-            if let Change::CreateType { definition, .. } = &p.change {
+            if let Change::Type(TypeChange::CreateType { definition, .. }) = &p.change {
                 Some(definition.as_ref())
             } else {
                 None
@@ -480,7 +495,7 @@ fn wire_round_trip_keeps_domain_statements_and_complete_definition_evidence() {
         }
         let mut unexpected = wire.clone();
         for step in &mut unexpected.changes.changes {
-            if let Change::CreateType { definition, .. } = &mut step.change
+            if let Change::Type(TypeChange::CreateType { definition, .. }) = &mut step.change
                 && let ManagedType::Domain { checks, .. } = definition.as_mut()
             {
                 checks.insert("unapproved_extra".into(), "VALUE <> 0".into());
@@ -497,7 +512,7 @@ fn wire_round_trip_keeps_domain_statements_and_complete_definition_evidence() {
         assert!(why.to_string().contains("pinned intermediate"), "{why}");
         let mut missing = wire.clone();
         missing.changes.changes.retain(|p| {
-            !matches!(&p.change, Change::AlterDomain{from,to,half:DomainHalf::Tighten,..} if DomainDelta::of(from,to).unwrap().set_not_null)
+            !matches!(&p.change, Change::TypeValue(TypeValueChange::AlterDomain{from,to,half:DomainHalf::Tighten,..}) if DomainDelta::of(from,to).unwrap().set_not_null)
         });
         let changed = missing.wire_fingerprint();
         let why = pbps_diff::order::admit(
@@ -555,10 +570,15 @@ fn an_explicit_intermediate_domain_default_shadows_ancestor_prerequisites() {
     f.deps.0[1].1 = ["type::c2469.child".parse().unwrap()].into();
     let plan = f.compile(&engine).unwrap();
     let changes = &plan.changes().changes;
-    let child = changes.iter().position(|p| matches!(&p.change,Change::CreateType{name,..} if name==&"c2469.child".parse().unwrap())).unwrap();
+    let child = changes.iter().position(|p| matches!(&p.change,Change::Type(TypeChange::CreateType{name,..}) if name==&"c2469.child".parse().unwrap())).unwrap();
     let default = changes
         .iter()
-        .position(|p| matches!(p.change, Change::AlterDomain { .. }))
+        .position(|p| {
+            matches!(
+                p.change,
+                Change::TypeValue(TypeValueChange::AlterDomain { .. })
+            )
+        })
         .unwrap();
     assert!(child < default);
 }
@@ -574,7 +594,7 @@ fn deferred_explicit_domain_defaults_do_not_require_a_temporary_inherited_copy()
             .iter()
             .enumerate()
             .filter_map(|(i, p)| {
-                if let Change::CreateType { definition, .. } = &p.change {
+                if let Change::Type(TypeChange::CreateType { definition, .. }) = &p.change {
                     assert!(matches!(
                         definition.as_ref(),
                         ManagedType::Domain { default: None, .. }
@@ -587,7 +607,7 @@ fn deferred_explicit_domain_defaults_do_not_require_a_temporary_inherited_copy()
             .collect();
         let function = changes
             .iter()
-            .position(|p| matches!(p.change, Change::CreateModule { .. }))
+            .position(|p| matches!(p.change, Change::Module(ModuleChange::CreateModule { .. })))
             .unwrap();
         let defaults: Vec<_> = changes
             .iter()
@@ -595,10 +615,10 @@ fn deferred_explicit_domain_defaults_do_not_require_a_temporary_inherited_copy()
             .filter_map(|(i, p)| {
                 matches!(
                     p.change,
-                    Change::AlterDomain {
+                    Change::TypeValue(TypeValueChange::AlterDomain {
                         half: DomainHalf::Loosen,
                         ..
-                    }
+                    })
                 )
                 .then_some(i)
             })
@@ -612,13 +632,18 @@ fn deferred_explicit_domain_defaults_do_not_require_a_temporary_inherited_copy()
         assert_eq!(record.types, f.schema.types);
         // A final declaration alone cannot stand in for a missing installer.
         let mut missing = plan.changes().clone();
-        missing.changes.retain(|p| !matches!(&p.change,Change::AlterDomain{name,..} if name==&"c2469.child".parse().unwrap()));
+        missing.changes.retain(|p| !matches!(&p.change,Change::TypeValue(TypeValueChange::AlterDomain{name,..}) if name==&"c2469.child".parse().unwrap()));
         let parts = &missing.changes;
         let base_default = parts
             .iter()
-            .position(|p| matches!(p.change, Change::AlterDomain { .. }))
+            .position(|p| {
+                matches!(
+                    p.change,
+                    Change::TypeValue(TypeValueChange::AlterDomain { .. })
+                )
+            })
             .unwrap();
-        let child = parts.iter().position(|p|matches!(&p.change,Change::CreateType{name,..} if name==&"c2469.child".parse().unwrap())).unwrap();
+        let child = parts.iter().position(|p|matches!(&p.change,Change::Type(TypeChange::CreateType{name,..}) if name==&"c2469.child".parse().unwrap())).unwrap();
         let edges =
             pbps_diff::order::generated::constraints(&missing, &f.schema, &Default::default(), &pg);
         assert!(
@@ -638,9 +663,14 @@ fn deferred_explicit_domain_defaults_do_not_require_a_temporary_inherited_copy()
         let parts = &plan.changes().changes;
         let default = parts
             .iter()
-            .position(|p| matches!(p.change, Change::AlterDomain { .. }))
+            .position(|p| {
+                matches!(
+                    p.change,
+                    Change::TypeValue(TypeValueChange::AlterDomain { .. })
+                )
+            })
             .unwrap();
-        let child=parts.iter().position(|p|matches!(&p.change,Change::CreateType{name,..} if name==&"c2469.child".parse().unwrap())).unwrap();
+        let child=parts.iter().position(|p|matches!(&p.change,Change::Type(TypeChange::CreateType{name,..}) if name==&"c2469.child".parse().unwrap())).unwrap();
         assert!(default < child);
     }
 }
@@ -655,8 +685,8 @@ fn a_deferred_middle_default_shadows_deeper_defaults_but_precedes_its_copy() {
         parts
             .iter()
             .position(|p| {
-                matches!(&p.change, Change::CreateType { name, .. } if create && name == &wanted.parse().unwrap())
-                    || matches!(&p.change, Change::AlterDomain { name, .. } if !create && name == &wanted.parse().unwrap())
+                matches!(&p.change, Change::Type(TypeChange::CreateType { name, .. }) if create && name == &wanted.parse().unwrap())
+                    || matches!(&p.change, Change::TypeValue(TypeValueChange::AlterDomain { name, .. }) if !create && name == &wanted.parse().unwrap())
             })
             .unwrap()
     };

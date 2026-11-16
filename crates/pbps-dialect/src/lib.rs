@@ -53,6 +53,14 @@ pub mod types;
 
 #[cfg(test)]
 use pbps_model::ChangeSet;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::PartitionChange;
+use pbps_model::PolicyChange;
+use pbps_model::RowChange;
+use pbps_model::TablePropertyChange;
 use pbps_model::module::{CodeToken, code_tokens};
 use pbps_model::{
     Change, ColumnType, Module, ModuleId, ModuleKind, ObjectName, Partitions, RiskClass, Role,
@@ -376,7 +384,7 @@ pub struct Statement {
     ///
     /// # Why the emitter has to say this
     ///
-    /// One [`pbps_model::Change::RenameTable`] can need two statements — SQL
+    /// One [`pbps_model::TableChange::RenameTable`] can need two statements — SQL
     /// Server's `sp_rename` cannot move a table between schemas and `ALTER
     /// SCHEMA TRANSFER` cannot rename it — and between them the table carries a
     /// name that appears in neither the baseline nor the plan. A staged apply
@@ -703,113 +711,113 @@ pub struct Unchecked {
 impl Unchecked {
     pub fn for_change(change: &Change, reason: impl Into<String>) -> Self {
         let description = match change {
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => {
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => {
                 pbps_model::escape::Escaped(&change.subject()).to_string()
             }
-            Change::AddCheck { table, name, .. } => {
+            Change::Constraint(ConstraintChange::AddCheck { table, name, .. }) => {
                 format!(
                     "new check {name} on {table}",
                     table = table.shown(),
                     name = name.shown(),
                 )
             }
-            Change::AddUnique { table, name, .. } => {
+            Change::Constraint(ConstraintChange::AddUnique { table, name, .. }) => {
                 format!(
                     "new unique constraint {name} on {table}",
                     table = table.shown(),
                     name = name.shown(),
                 )
             }
-            Change::SetExclusion { table, name, .. } => {
+            Change::Constraint(ConstraintChange::SetExclusion { table, name, .. }) => {
                 format!(
                     "exclusion constraint {name} on {table}",
                     table = table.shown(),
                     name = name.shown(),
                 )
             }
-            Change::AddForeignKey { table, name, .. } => {
+            Change::Constraint(ConstraintChange::AddForeignKey { table, name, .. }) => {
                 format!(
                     "new foreign key {name} on {table}",
                     table = table.shown(),
                     name = name.shown(),
                 )
             }
-            Change::AddIndex { table, name, .. } => {
+            Change::Index(IndexChange::AddIndex { table, name, .. }) => {
                 format!(
                     "new unique index {name} on {table}",
                     table = table.shown(),
                     name = name.shown(),
                 )
             }
-            Change::SetPrimaryKey { table, to, .. } => format!(
+            Change::Constraint(ConstraintChange::SetPrimaryKey { table, to, .. }) => format!(
                 "new primary key {} on {table}",
                 to.as_ref()
                     .and_then(|key| key.name.as_ref().map(|n| n.shown().to_string()))
                     .unwrap_or_else(|| "(unnamed)".to_owned()),
                 table = table.shown()
             ),
-            Change::AddColumn { table, name, .. } => {
+            Change::Column(ColumnChange::AddColumn { table, name, .. }) => {
                 format!("new NOT NULL column {}", table.column(name).shown())
             }
-            Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. } => {
+            Change::Policy(PolicyChange::DropPolicy { .. })
+            | Change::Policy(PolicyChange::CreatePolicy { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. }) => {
                 pbps_model::escape::Escaped(&change.subject()).to_string()
             }
-            Change::SetReplicaIdentity { table, .. } => {
+            Change::TableProperty(TablePropertyChange::SetReplicaIdentity { table, .. }) => {
                 format!("replica identity of {table}", table = table.shown())
             }
-            Change::SetStorageParameters { table, .. } => {
+            Change::TableProperty(TablePropertyChange::SetStorageParameters { table, .. }) => {
                 format!("storage parameters of {table}", table = table.shown())
             }
-            Change::SetTablePersistence { table, .. } => {
+            Change::TableProperty(TablePropertyChange::SetTablePersistence { table, .. }) => {
                 format!("persistence of {table}", table = table.shown())
             }
-            Change::SetIndexStorageParameters { table, .. } => {
+            Change::Index(IndexChange::SetIndexStorageParameters { table, .. }) => {
                 format!("index storage parameters on {table}", table = table.shown())
             }
-            Change::AlterColumnNullability { column, .. } => {
+            Change::Column(ColumnChange::AlterColumnNullability { column, .. }) => {
                 format!("NOT NULL column {column}", column = column.shown())
             }
-            Change::SetPartitionNotNull { table, column, .. } => {
+            Change::Partition(PartitionChange::SetPartitionNotNull { table, column, .. }) => {
                 format!(
                     "NOT NULL column {} on the partition",
                     table.column(column).shown()
                 )
             }
-            Change::AddComputedColumn { table, name, .. } => {
+            Change::Column(ColumnChange::AddComputedColumn { table, name, .. }) => {
                 format!("new computed column {}", table.column(name).shown())
             }
-            Change::AlterColumnType { column, .. } => {
+            Change::Column(ColumnChange::AlterColumnType { column, .. }) => {
                 format!("type conversion of {column}", column = column.shown())
             }
-            Change::AlterColumnExpression { column, .. } => {
+            Change::Column(ColumnChange::AlterColumnExpression { column, .. }) => {
                 format!(
                     "recomputed generated column {column}",
                     column = column.shown()
                 )
             }
-            Change::AlterColumnNumbering { column, .. } => {
+            Change::Column(ColumnChange::AlterColumnNumbering { column, .. }) => {
                 format!("numbering source of {column}", column = column.shown())
             }
-            Change::DeleteRow { table, key, .. } => {
+            Change::Row(RowChange::DeleteRow { table, key, .. }) => {
                 format!(
                     "references to row {key} in {table}",
                     table = table.shown(),
                     key = pbps_model::escape::Escaped(&key.to_string())
                 )
             }
-            Change::DetachPartition { table, parent, .. } => {
+            Change::Partition(PartitionChange::DetachPartition { table, parent, .. }) => {
                 format!(
                     "references to the partition {table}, detached from {parent}",
                     table = table.shown(),
                     parent = parent.shown()
                 )
             }
-            Change::AttachPartition { table, parent, .. } => {
+            Change::Partition(PartitionChange::AttachPartition { table, parent, .. }) => {
                 format!(
                     "rows of {table} outside the range it takes under {parent}",
                     table = table.shown(),
@@ -817,27 +825,27 @@ impl Unchecked {
                 )
             }
             pbps_model::change_family!(tables)
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetComment { .. }
-            | Change::DropUnique { .. }
-            | Change::DropForeignKey { .. }
-            | Change::DropCheck { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
+            | Change::Column(ColumnChange::DropColumn { .. })
+            | Change::Column(ColumnChange::RenameColumn { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+            | Change::TableProperty(TablePropertyChange::SetComment { .. })
+            | Change::Constraint(ConstraintChange::DropUnique { .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            | Change::Constraint(ConstraintChange::DropCheck { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::UpdateRow { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
             | pbps_model::change_family!(modules)
             | pbps_model::change_family!(type_values)
             | pbps_model::catalog_change!()
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => {
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. }) => {
                 pbps_model::escape::Escaped(&change.subject()).to_string()
             }
         };
@@ -2824,7 +2832,7 @@ pub trait Dialect {
     /// checked against this same answer so artifact validation cannot disagree.
     fn change_risks(&self, change: &Change) -> std::collections::BTreeSet<RiskClass> {
         let mut risks = change.intrinsic_risks_with(self.lexicon().identifier_continues);
-        if let Change::CopyTableRows(copy) = change {
+        if let Change::Partition(PartitionChange::CopyTableRows(copy)) = change {
             for column in &copy.columns {
                 if let Some(source) = &column.source {
                     let mut previous = (&source.ty, &source.collation);
@@ -2853,18 +2861,18 @@ pub trait Dialect {
             if let Some(risk) = self.value_change(&values, "").risk.risk_class() {
                 risks.insert(risk);
             }
-        } else if let Change::AlterColumnType { from, to, .. } = change
+        } else if let Change::Column(ColumnChange::AlterColumnType { from, to, .. }) = change
             && let Some(risk) = self.type_change_risk(from, to).risk_class()
         {
             // Scalar/array crossings have no shared leaf shape.
             risks.insert(risk);
         }
-        if let Change::AlterColumnType {
+        if let Change::Column(ColumnChange::AlterColumnType {
             to,
             from_collation,
             to_collation,
             ..
-        } = change
+        }) = change
             && from_collation != to_collation
             && let Some(risk) = self.collation_change_risk(to)
         {
@@ -3619,7 +3627,7 @@ pub trait Dialect {
     /// `CREATE` commits. SQL Server grants no principal `EXECUTE` on a
     /// procedure it creates, and its `public` is an ordinary database role
     /// rather than the engine's default, so it answers `false` and
-    /// [`Change::PublicExecution`] is never built for it.
+    /// [`pbps_model::GrantChange::PublicExecution`] is never built for it.
     ///
     /// What the differ does with a `true` is take the default away as part of
     /// creating the routine, unless the declaration opts back in
@@ -5299,35 +5307,41 @@ mod tests {
     use pbps_model::{CheckConstraint, Index, IndexColumn, PrimaryKey, UniqueConstraint};
 
     use super::*;
+    use pbps_model::ConstraintChange;
+    use pbps_model::IndexChange;
+    use pbps_model::TableChange;
+    use pbps_model::TypeValueChange;
 
     /// A domain rebuild's retype carries the risk of its base change beside
     /// the rebuild's, and only when the base changes (DEC-1635.9).
     #[test]
     fn a_rebuild_retype_takes_the_risk_of_its_base_change_and_none_without_one() {
-        let retype = |base_change: Option<Box<(ColumnType, ColumnType)>>| Change::EnumRebuild {
-            uid: "y_000002".parse().unwrap(),
-            name: "app.d".parse().unwrap(),
-            tmp: "app.tmp".parse().unwrap(),
-            step: pbps_model::EnumRebuildStep::Retype {
-                column_uid: "c_aaaaaa".parse().unwrap(),
-                column: pbps_model::TableName::new("app", "t").column("v"),
-                to: ColumnType::reference("app.d".parse().unwrap()),
-                array: false,
-                values: Box::new(match base_change {
-                    Some(pair) => pbps_model::ValueChange::Cast {
-                        from: pair.0,
-                        to: pair.1,
-                        arrays: 0,
-                        using: None,
-                    },
-                    None => pbps_model::ValueChange::cast(
-                        &ColumnType::simple("text"),
-                        &ColumnType::simple("text"),
-                        None,
-                    )
-                    .unwrap(),
-                }),
-            },
+        let retype = |base_change: Option<Box<(ColumnType, ColumnType)>>| {
+            Change::TypeValue(TypeValueChange::EnumRebuild {
+                uid: "y_000002".parse().unwrap(),
+                name: "app.d".parse().unwrap(),
+                tmp: "app.tmp".parse().unwrap(),
+                step: pbps_model::EnumRebuildStep::Retype {
+                    column_uid: "c_aaaaaa".parse().unwrap(),
+                    column: pbps_model::TableName::new("app", "t").column("v"),
+                    to: ColumnType::reference("app.d".parse().unwrap()),
+                    array: false,
+                    values: Box::new(match base_change {
+                        Some(pair) => pbps_model::ValueChange::Cast {
+                            from: pair.0,
+                            to: pair.1,
+                            arrays: 0,
+                            using: None,
+                        },
+                        None => pbps_model::ValueChange::cast(
+                            &ColumnType::simple("text"),
+                            &ColumnType::simple("text"),
+                            None,
+                        )
+                        .unwrap(),
+                    }),
+                },
+            })
         };
         let (text, integer): (ColumnType, ColumnType) =
             ("text".parse().unwrap(), "integer".parse().unwrap());
@@ -5464,13 +5478,13 @@ mod tests {
             ("part\n\u{1b}[31m\\\u{202e}", r"part\n\u{1b}[31m\\\u{202e}"),
             ("名前_ünï❤️", "名前_ünï❤️"),
         ] {
-            let change = Change::AddCheck {
+            let change = Change::Constraint(ConstraintChange::AddCheck {
                 table: TableName::new("app", name),
                 name: name.into(),
                 constraint: pbps_model::CheckConstraint {
                     expression: "true".into(),
                 },
-            };
+            });
             let unchecked = Unchecked::for_change(&change, r"tool text \x");
             assert_eq!(
                 unchecked.description,
@@ -5479,10 +5493,10 @@ mod tests {
             assert_eq!(unchecked.reason, r"tool text \x");
             assert!(!unchecked.description.chars().any(char::is_control));
             let fallback = Unchecked::for_change(
-                &Change::DropIndex {
+                &Change::Index(IndexChange::DropIndex {
                     table: TableName::new("app", name),
                     name: name.into(),
-                },
+                }),
                 "not checked",
             );
             assert_eq!(fallback.description, format!("app.{shown}"));
@@ -6264,11 +6278,13 @@ mod tests {
     #[test]
     fn a_dialect_without_probes_returns_none() {
         let changes = ChangeSet {
-            changes: vec![pbps_model::PlannedChange::new(Change::DropTable {
-                uid: "t_a1b2c3".parse().unwrap(),
-                name: "dbo.customer".parse().unwrap(),
-                detach_from: None,
-            })],
+            changes: vec![pbps_model::PlannedChange::new(Change::Table(
+                TableChange::DropTable {
+                    uid: "t_a1b2c3".parse().unwrap(),
+                    name: "dbo.customer".parse().unwrap(),
+                    detach_from: None,
+                },
+            ))],
         };
         let ids = pbps_model::IdsFile::default();
         let names = pbps_model::plan_names::PlanNames::of(&changes.changes, &ids).unwrap();

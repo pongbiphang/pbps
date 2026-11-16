@@ -1,4 +1,7 @@
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::PartitionChange;
+use pbps_model::TypeValueChange;
 
 fn fixture() -> (Schema, IdsFile) {
     let table = Table {
@@ -143,12 +146,12 @@ fn column_writers_keep_required_sibling_defaults_without_broadening_other_edits(
             &ids,
             &ids,
             &consumers(entry, writes),
-            vec![Change::AlterColumnDefault {
+            vec![Change::Column(ColumnChange::AlterColumnDefault {
                 uid: ids.column_uid(&changed).unwrap().clone(),
                 column: changed,
                 from: Some("7".into()),
                 to: to.map(str::to_owned),
-            }],
+            })],
         );
         assert_eq!(found.len(), count, "{label}: {found:?}");
         for (_, f) in found {
@@ -301,7 +304,7 @@ fn partition_defaults_distinguish_direct_contracts_from_siblings() {
                 .unwrap()
                 .columns
                 .clear();
-            Change::SetPartitionDefault {
+            Change::Partition(PartitionChange::SetPartitionDefault {
                 uid: uid("t_cccccc"),
                 table: leaf,
                 parent: name(),
@@ -309,7 +312,7 @@ fn partition_defaults_distinguish_direct_contracts_from_siblings() {
                 from: Some("8".into()),
                 to: None,
                 fallback: parent_default.map(str::to_owned),
-            }
+            })
         } else {
             after
                 .tables
@@ -319,12 +322,12 @@ fn partition_defaults_distinguish_direct_contracts_from_siblings() {
                 .get_mut("b")
                 .unwrap()
                 .value_source = ValueSource::None;
-            Change::AlterColumnDefault {
+            Change::Column(ColumnChange::AlterColumnDefault {
                 uid: uid("c_bbbbbb"),
                 column: name().column("b"),
                 from: Some("7".into()),
                 to: None,
-            }
+            })
         };
         let found = findings(
             &before,
@@ -380,7 +383,7 @@ fn domain_default_losses_share_the_sibling_rule_in_alter_and_rebuild_paths() {
             let mut after = before.clone();
             after.types.insert("app.d".parse().unwrap(), to.clone());
             let change = if rebuild {
-                Change::EnumRebuild {
+                Change::TypeValue(TypeValueChange::EnumRebuild {
                     uid: uid("y_aaaaaa"),
                     name: "app.d".parse().unwrap(),
                     tmp: "app.tmp".parse().unwrap(),
@@ -391,15 +394,15 @@ fn domain_default_losses_share_the_sibling_rule_in_alter_and_rebuild_paths() {
                         over: None,
                         why: Some("domain base type changes".into()),
                     },
-                }
+                })
             } else {
-                Change::AlterDomain {
+                Change::TypeValue(TypeValueChange::AlterDomain {
                     uid: uid("y_aaaaaa"),
                     name: "app.d".parse().unwrap(),
                     from: Box::new(from),
                     to: Box::new(to),
                     half: pbps_model::DomainHalf::Loosen,
-                }
+                })
             };
             let found = findings(
                 &before,

@@ -6,6 +6,7 @@ use super::*;
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn a_new_columns_retype_has_no_stored_key_to_probe_but_a_missing_old_one_refuses() {
+    use pbps_model::ColumnChange;
     use pbps_model::{Change, PlannedChange, plan_names::PlanNames};
     let mut db = TestDb::create("new_retype1868").await;
     db.conn
@@ -17,7 +18,7 @@ async fn a_new_columns_retype_has_no_stored_key_to_probe_but_a_missing_old_one_r
         columns: [("c_aaaaaa".parse().unwrap(), "dbo.t.added".parse().unwrap())].into(),
         ..Default::default()
     };
-    let widen = PlannedChange::new(Change::AlterColumnType {
+    let widen = PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
         uid: "c_aaaaaa".parse().unwrap(),
         column: "dbo.t.added".parse().unwrap(),
         from: ty("varchar(10)"),
@@ -28,7 +29,7 @@ async fn a_new_columns_retype_has_no_stored_key_to_probe_but_a_missing_old_one_r
         to_collation: None,
         through_external_partitions: false,
         using: None,
-    });
+    }));
     let existing = [widen.clone()];
     let names = PlanNames::of(&existing, &after).unwrap();
     let missing = pbps_mssql::impact::key_drop_blockers(&mut db.conn, &names)
@@ -42,12 +43,12 @@ async fn a_new_columns_retype_has_no_stored_key_to_probe_but_a_missing_old_one_r
     );
 
     let changes = [
-        PlannedChange::new(Change::AddColumn {
+        PlannedChange::new(Change::Column(ColumnChange::AddColumn {
             uid: "c_aaaaaa".parse().unwrap(),
             table: "dbo.t".parse().unwrap(),
             name: "added".into(),
             column: Box::new(Column::new(ty("varchar(10)"))),
-        }),
+        })),
         widen,
     ];
     let names = PlanNames::of(&changes, &after).unwrap();
@@ -82,27 +83,29 @@ async fn a_new_columns_retype_has_no_stored_key_to_probe_but_a_missing_old_one_r
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn layout_estimates_measure_each_occupant_before_and_after_name_reuse() {
+    use pbps_model::IndexChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, IdsFile, PlannedChange, plan_names::PlanNames};
     use pbps_mssql::estimate::{self, Reads, Rewrite};
     let mut db = TestDb::create("estimate_reuse1868").await;
     db.conn.execute("CREATE TABLE dbo.a(v int); CREATE CLUSTERED INDEX ix ON dbo.a(v); INSERT dbo.a VALUES(1),(2),(3); CREATE TABLE dbo.b(v int); INSERT dbo.b VALUES(1),(2),(3),(4),(5),(6),(7);").await.unwrap();
     let changes = [
-        Change::DropIndex {
+        Change::Index(IndexChange::DropIndex {
             table: "dbo.a".parse().unwrap(),
             name: "ix".into(),
-        },
-        Change::DropTable {
+        }),
+        Change::Table(TableChange::DropTable {
             uid: "t_aaaaaa".parse().unwrap(),
             name: "dbo.a".parse().unwrap(),
             detach_from: None,
-        },
-        Change::RenameTable {
+        }),
+        Change::Table(TableChange::RenameTable {
             uid: "t_bbbbbb".parse().unwrap(),
             from: "dbo.b".parse().unwrap(),
             to: "dbo.a".parse().unwrap(),
             defaults: vec![],
-        },
-        Change::AddIndex {
+        }),
+        Change::Index(IndexChange::AddIndex {
             table: "dbo.a".parse().unwrap(),
             name: "ix".into(),
             clustered: true,
@@ -115,7 +118,7 @@ async fn layout_estimates_measure_each_occupant_before_and_after_name_reuse() {
                 storage_parameters: Default::default(),
                 filegroup: None,
             }),
-        },
+        }),
     ]
     .map(PlannedChange::new);
     let ids = IdsFile {

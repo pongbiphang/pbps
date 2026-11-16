@@ -2,6 +2,12 @@
 // Materialize that missing fixture input here, never in product code. The
 // index's own acceptance tests use explicit ids independent of this helper.
 use pbps_model::{Change, ChangeSet, ColumnRef, IdsFile, Uid, UidKind};
+use pbps_model::RoleChange;
+use pbps_model::TypeValueChange;
+use pbps_model::ColumnChange;
+use pbps_model::PartitionChange;
+use pbps_model::TablePropertyChange;
+use pbps_model::TableChange;
 use std::collections::{BTreeMap, BTreeSet};
 
 // Only identity-bearing variants supply ids; every other fixture change leaves them alone.
@@ -12,23 +18,23 @@ pub fn ids(changes: &ChangeSet) -> IdsFile {
     let mut seen = BTreeSet::new();
     for p in &changes.changes {
         let initial = match &p.change {
-            Change::CreateTable { uid, name, .. } => {
+            Change::Table(TableChange::CreateTable { uid, name, .. }) => {
                 known.insert(name.clone());
                 seen.insert(uid.clone());
                 None
             }
-            Change::RenameTable { uid, from, to, .. } => {
+            Change::Table(TableChange::RenameTable { uid, from, to, .. }) => {
                 known.extend([from.clone(), to.clone()]);
                 Some((uid, from))
             }
-            Change::DropTable { uid, name, .. } => Some((uid, name)),
-            Change::AttachPartition { uid, table, .. }
-            | Change::DetachPartition { uid, table, .. }
-            | Change::SetTablePersistence { uid, table, .. }
-            | Change::SetStorageParameters { uid, table, .. }
-            | Change::SetReplicaIdentity { uid, table, .. }
-            | Change::SetPartitionDefault { uid, table, .. }
-            | Change::SetPartitionNotNull { uid, table, .. } => Some((uid, table)),
+            Change::Table(TableChange::DropTable { uid, name, .. }) => Some((uid, name)),
+            Change::Partition(PartitionChange::AttachPartition { uid, table, .. })
+            | Change::Partition(PartitionChange::DetachPartition { uid, table, .. })
+            | Change::TableProperty(TablePropertyChange::SetTablePersistence { uid, table, .. })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters { uid, table, .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { uid, table, .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { uid, table, .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { uid, table, .. }) => Some((uid, table)),
             _ => None,
         };
         if let Some((uid, name)) = initial {
@@ -50,21 +56,21 @@ pub fn ids(changes: &ChangeSet) -> IdsFile {
     for p in &changes.changes {
         let mut inline = None;
         match &p.change {
-            Change::CreateTable { uid, name, table, .. } => {
+            Change::Table(TableChange::CreateTable { uid, name, table, .. }) => {
                 ids.tables.insert(uid.clone(), name.clone());
                 inline = Some((uid, table.as_ref()));
             }
-            Change::RenameTable { uid, to, .. } => { ids.tables.insert(uid.clone(), to.clone()); }
-            Change::DropTable { uid, .. } => {
+            Change::Table(TableChange::RenameTable { uid, to, .. }) => { ids.tables.insert(uid.clone(), to.clone()); }
+            Change::Table(TableChange::DropTable { uid, .. }) => {
                 ids.tables.remove(uid);
                 columns.retain(|_, (owner, _)| owner != uid);
             }
-            Change::AttachPartition { uid, .. } => { columns.retain(|_, (owner, _)| owner != uid); }
-            Change::DetachPartition { uid, shape, .. } => { inline = Some((uid, shape.as_ref())); }
-            Change::CreateRole { uid, name } | Change::RenameRole { uid, to: name, .. } => {
+            Change::Partition(PartitionChange::AttachPartition { uid, .. }) => { columns.retain(|_, (owner, _)| owner != uid); }
+            Change::Partition(PartitionChange::DetachPartition { uid, shape, .. }) => { inline = Some((uid, shape.as_ref())); }
+            Change::Role(RoleChange::CreateRole { uid, name }) | Change::Role(RoleChange::RenameRole { uid, to: name, .. }) => {
                 ids.roles.insert(uid.clone(), name.clone());
             }
-            Change::DropRole { uid, .. } => { ids.roles.remove(uid); }
+            Change::Role(RoleChange::DropRole { uid, .. }) => { ids.roles.remove(uid); }
             _ => {}
         }
         if let Some((owner, shape)) = inline {
@@ -76,15 +82,15 @@ pub fn ids(changes: &ChangeSet) -> IdsFile {
             }
         }
         let column = match &p.change {
-            Change::AddColumn { uid, table, name, .. } => Some((uid, table.column(name), Some(name))),
-            Change::RenameColumn { uid, table, from, to, .. } => Some((uid, table.column(from), Some(to))),
-            Change::DropColumn { uid, column } => Some((uid, column.clone(), None)),
-            Change::EnumRebuild { step: pbps_model::EnumRebuildStep::Retype { column_uid: uid, column, .. }, .. }
-            | Change::AlterColumnType { uid, column, .. }
-            | Change::AlterColumnNullability { uid, column, .. }
-            | Change::AlterColumnDefault { uid, column, .. }
-            | Change::AlterColumnExpression { uid, column, .. }
-            | Change::SetColumnDeprecated { uid, column, .. } => Some((uid, column.clone(), Some(&column.name))),
+            Change::Column(ColumnChange::AddColumn { uid, table, name, .. }) => Some((uid, table.column(name), Some(name))),
+            Change::Column(ColumnChange::RenameColumn { uid, table, from, to, .. }) => Some((uid, table.column(from), Some(to))),
+            Change::Column(ColumnChange::DropColumn { uid, column }) => Some((uid, column.clone(), None)),
+            Change::TypeValue(TypeValueChange::EnumRebuild { step: pbps_model::EnumRebuildStep::Retype { column_uid: uid, column, .. }, .. })
+            | Change::Column(ColumnChange::AlterColumnType { uid, column, .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { uid, column, .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { uid, column, .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { uid, column, .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { uid, column, .. }) => Some((uid, column.clone(), Some(&column.name))),
             _ => None,
         };
         if let Some((uid, address, after)) = column {
@@ -109,10 +115,10 @@ fn fixture_table_identities_use_raw_name_seeds() {
     let part = "a\nb\\c\u{200b}";
     let name = pbps_model::TableName::new("app", part);
     let changes = ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(Change::AddColumn {
+        changes: vec![pbps_model::PlannedChange::new(Change::Column(ColumnChange::AddColumn {
             uid: "c_aaaaaa".parse().unwrap(), table: name.clone(), name: part.into(),
             column: Box::new(pbps_model::Column::new("int".parse().unwrap())),
-        })],
+        }))],
     };
     let actual = ids(&changes);
     assert_eq!(actual.table_uid(&name), Some(&Uid::derived(UidKind::Table, &format!("app.{part}"), 0)));

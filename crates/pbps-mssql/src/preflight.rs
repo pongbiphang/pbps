@@ -37,6 +37,17 @@ use pbps_dialect::plan_rows::{Event, PlanFacts, Removal, RowWrites, View, Writte
 use pbps_dialect::{DialectError, Preflight, Probe, Unchecked};
 #[cfg(test)]
 use pbps_model::ChangeSet;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::PolicyChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
+use pbps_model::TablePropertyChange;
+use pbps_model::TypeValueChange;
 use pbps_model::plan_names::PlanNames;
 use pbps_model::{Cell, Change, ColumnRef, ColumnType, RowKey, TableName, TypeArg, Uid, Value};
 
@@ -66,12 +77,12 @@ pub fn probes(plan_names: &PlanNames<'_>) -> Preflight {
             let mut names = AsStored::of(facts.before(step));
             // The current DELETE removes its target's earlier writes as well
             // as its stored self-reference (DEC-1977.1).
-            if let Change::DeleteRow {
+            if let Change::Row(RowChange::DeleteRow {
                 table,
                 key_column,
                 key,
                 ..
-            } = &p.change
+            }) = &p.change
             {
                 names
                     .moved
@@ -480,13 +491,13 @@ fn build<'v, 'p: 'v>(
     unchecked: &mut Vec<Unchecked>,
 ) -> Result<Vec<Probe>, DialectError> {
     match change {
-Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => { let (operation, table) = change.pending_rebuild().expect("rebuild variant"); Err(DialectError::RebuildUnavailable { operation, table: table.clone() }) },
-        Change::AddColumn {
+Change::Partition(PartitionChange::RebuildPartitionedTable(_)) | Change::Index(IndexChange::BuildPartitionedIndex(_)) | Change::Partition(PartitionChange::CopyTableRows(_)) | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => { let (operation, table) = change.pending_rebuild().expect("rebuild variant"); Err(DialectError::RebuildUnavailable { operation, table: table.clone() }) },
+        Change::Column(ColumnChange::AddColumn {
             table,
             name,
             column,
             ..
-        } if !column.nullable && !column.has_required_add_value_source() => {
+        }) if !column.nullable && !column.has_required_add_value_source() => {
             let Some(stored) = names.view().table(table) else {
                 return Ok(Vec::new());
             };
@@ -523,11 +534,11 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
         // The preceding writes may fill or remove stored NULLs. Using the
         // same relation as key probes also handles a tightening before those
         // writes, without copying the planner's sort predicate (DEC-1775.1).
-        Change::AlterColumnNullability {
+        Change::Column(ColumnChange::AlterColumnNullability {
             column,
             to_nullable: false,
             ..
-        } => {
+        }) => {
             let Some(rows) = rows_after(
                 names,
                 &column.table,
@@ -541,7 +552,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             };
             Ok(vec![null_probe(column, &format!("(\n{rows}\n) AS r"), "r.k0")?])
         }
-        Change::AlterColumnType {
+        Change::Column(ColumnChange::AlterColumnType {
             column,
             from,
             to,
@@ -549,7 +560,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             to_nullable,
             to_collation,
             ..
-        } => {
+        }) => {
             let Some(stored) = names.view().column(column) else {
                 return Ok(skip(change, "the column does not exist before apply", unchecked));
             };
@@ -589,11 +600,11 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             Ok(out)
         }
 
-        Change::AddCheck {
+        Change::Constraint(ConstraintChange::AddCheck {
             table,
             name,
             constraint,
-        } => {
+        }) => {
             let Some(stored) = names.view().table(table) else {
                 return Ok(skip(change, "the table does not exist before apply", unchecked));
             };
@@ -651,11 +662,11 @@ name = name.shown(),
             )])
         }
 
-        Change::AddUnique {
+        Change::Constraint(ConstraintChange::AddUnique {
             table,
             name,
             constraint, ..
-        } => {
+        }) => {
             let Some(rows) = rows_after(
                 names,
                 table,
@@ -676,11 +687,11 @@ name = name.shown(),
             )?])
         }
 
-        Change::SetPrimaryKey {
+        Change::Constraint(ConstraintChange::SetPrimaryKey {
             table,
             to: Some(pk),
             ..
-        } => {
+        }) => {
             // The same relation the unique above is built over, and for the
             // same reason: a primary key follows these row changes, so the
             // rows it will meet are the ones the plan leaves (DECISIONS 175).
@@ -716,19 +727,19 @@ name = name.shown(),
         // division by zero) fails the statement. No probe evaluates it before
         // apply; a non-persisted one is computed on read and asks nothing
         // (#1174).
-        Change::AddComputedColumn { computed, .. } if computed.persisted => Ok(skip(
+        Change::Column(ColumnChange::AddComputedColumn { computed, .. }) if computed.persisted => Ok(skip(
             change,
             "a persisted computed column's values cannot be evaluated before apply",
             unchecked,
         )),
-        Change::AddComputedColumn { .. } => Ok(Vec::new()),
+        Change::Column(ColumnChange::AddComputedColumn { .. }) => Ok(Vec::new()),
 
         // The same question `AddUnique` asks, because in SQL Server it is the
         // same object: a UNIQUE constraint is enforced by a unique index, and
         // which YAML key the uniqueness was written under cannot decide
         // whether the data is counted. A plain index constrains nothing and
         // falls to the arm below.
-        Change::AddIndex { table, name, index, .. } if index.unique => {
+        Change::Index(IndexChange::AddIndex { table, name, index, .. }) if index.unique => {
             // The key columns only. `INCLUDE` is payload the engine carries in
             // the leaf and never compares, so counting it would group rows the
             // index will still collide.
@@ -761,11 +772,11 @@ name = name.shown(),
             )?])
         }
 
-        Change::AddForeignKey {
+        Change::Constraint(ConstraintChange::AddForeignKey {
             table,
             name,
             constraint,
-        } => {
+        }) => {
             // Both sides as the plan will leave them, not as they stand:
             // An `AddForeignKey` after the row changes of a plan that
             // supplies the missing parent rows, or repairs the orphaned
@@ -843,63 +854,63 @@ name = name.shown(),
 
         // Everything else either cannot fail on data or cannot be counted; see
         // the module docs.
-        Change::CreateTable { .. }
-        | Change::DropTable { .. }
-        | Change::DetachPartition { .. }
-        | Change::AttachPartition { .. }
-        | Change::SetPartitionDefault { .. }
-        | Change::SetPartitionNotNull { .. }
-        | Change::RenameTable { .. }
-        | Change::AddColumn { .. }
-        | Change::DropColumn { .. }
-        | Change::RenameColumn { .. }
-        | Change::AlterColumnNullability {
+        Change::Table(TableChange::CreateTable { .. })
+        | Change::Table(TableChange::DropTable { .. })
+        | Change::Partition(PartitionChange::DetachPartition { .. })
+        | Change::Partition(PartitionChange::AttachPartition { .. })
+        | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+        | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+        | Change::Table(TableChange::RenameTable { .. })
+        | Change::Column(ColumnChange::AddColumn { .. })
+        | Change::Column(ColumnChange::DropColumn { .. })
+        | Change::Column(ColumnChange::RenameColumn { .. })
+        | Change::Column(ColumnChange::AlterColumnNullability {
             to_nullable: true, ..
-        }
-        | Change::AlterColumnDefault { .. }
-        | Change::AlterColumnExpression { .. }
-        | Change::AlterColumnNumbering { .. }
+        })
+        | Change::Column(ColumnChange::AlterColumnDefault { .. })
+        | Change::Column(ColumnChange::AlterColumnExpression { .. })
+        | Change::Column(ColumnChange::AlterColumnNumbering { .. })
         // A module holds no rows. A definition the engine will not compile
         // fails inside the plan's transaction, where the rollback is total.
-        | Change::CreateModule { .. }
-        | Change::AlterModule { .. }
-        | Change::DropModule { .. }
-        | Change::SetColumnDeprecated { .. }
-        | Change::SetComment { .. }
-        | Change::SetPrimaryKey { to: None, .. }
-        | Change::DropUnique { .. }
-        | Change::DropForeignKey { .. }
-        | Change::DropCheck { .. }
+        | Change::Module(ModuleChange::CreateModule { .. })
+        | Change::Module(ModuleChange::AlterModule { .. })
+        | Change::Module(ModuleChange::DropModule { .. })
+        | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+        | Change::TableProperty(TablePropertyChange::SetComment { .. })
+        | Change::Constraint(ConstraintChange::SetPrimaryKey { to: None, .. })
+        | Change::Constraint(ConstraintChange::DropUnique { .. })
+        | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+        | Change::Constraint(ConstraintChange::DropCheck { .. })
         // The unique ones are counted above; a plain index refuses nothing.
-        | Change::AddIndex { .. }
-        | Change::DropComputedColumn { .. }
-        | Change::DropIndex { .. }
+        | Change::Index(IndexChange::AddIndex { .. })
+        | Change::Column(ColumnChange::DropComputedColumn { .. })
+        | Change::Index(IndexChange::DropIndex { .. })
         // Inserting and updating a declared row need no probe: the row's whole
         // content is in the plan, and anything the engine refuses about it
         // rolls the plan back.
-        | Change::InsertRow { .. }
-        | Change::UpdateRow { .. }
-        | Change::SetDataMode { .. }
-        | Change::SetEnsureKeys { .. }
+        | Change::Row(RowChange::InsertRow { .. })
+        | Change::Row(RowChange::UpdateRow { .. })
+        | Change::Row(RowChange::SetDataMode { .. })
+        | Change::Row(RowChange::SetEnsureKeys { .. })
         // A permission change fails on nothing in the data; the engine refuses
         // an impossible grant inside the transaction.
-        | Change::AddEnumValue { .. }
-        | Change::AlterDomain { .. }
-        | Change::RenameEnumValue { .. }
-        | Change::EnumRebuild { .. }
+        | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+        | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+        | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+        | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
         | pbps_model::catalog_change!()
         // This dialect never produces one and `emit` refuses it; a probe
         // would be a second opinion about a statement that will not be
         // written.
-        | Change::SetIndexStorageParameters { .. }
-        | Change::SetTablePersistence { .. }
-        | Change::SetStorageParameters { .. }
-        | Change::DropPolicy { .. }
-        | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::SetExclusion { .. }
-        | Change::PublicExecution { .. } => Ok(Vec::new()),
+        | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+        | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+        | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+        | Change::Policy(PolicyChange::DropPolicy { .. })
+        | Change::Policy(PolicyChange::CreatePolicy { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+            | Change::Constraint(ConstraintChange::SetExclusion { .. })
+        | Change::Permission(GrantChange::PublicExecution { .. }) => Ok(Vec::new()),
 
         // Except for the one thing a permission change can fail on that is
         // not the permission: the securable. `validate` accepts a schema
@@ -909,7 +920,7 @@ name = name.shown(),
         // Under `apply --staged` every change before it has committed by
         // then (DECISIONS 134). An *object* target needs no probe: it is
         // declared, so it exists or this plan creates it.
-        Change::Grant { role, target, .. } | Change::Revoke { role, target, .. } => {
+        Change::Permission(GrantChange::Grant { role, target, .. }) | Change::Permission(GrantChange::Revoke { role, target, .. }) => {
             match target {
                 pbps_model::GrantTarget::Schema(schema) => Ok(vec![schema_probe(role, schema)]),
                 // Both are declared objects, so each exists or this plan
@@ -922,12 +933,12 @@ name = name.shown(),
             }
         }
 
-        Change::DeleteRow {
+        Change::Row(RowChange::DeleteRow {
             table,
             key_column,
             key,
             ..
-        } => match names.view().column(&table.column(key_column)) {
+        }) => match names.view().column(&table.column(key_column)) {
             Some(stored) => {
                 let mut probes = vec![delete_probe(table, key, &stored, names)?];
                 // And, per table this plan writes to a default the probe
@@ -2210,6 +2221,11 @@ mod tests {
     use plan_fixture::FixturePreflight as _;
 
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::IndexChange;
+    use pbps_model::RowChange;
+    use pbps_model::TableChange;
     fn probes(changes: &ChangeSet) -> Vec<Probe> {
         crate::Mssql.fixture_preflight(changes).probes
     }
@@ -2243,14 +2259,14 @@ mod tests {
 
     #[test]
     fn tightening_nullability_counts_the_nulls() {
-        let sql = sql_of(&Change::AlterColumnNullability {
+        let sql = sql_of(&Change::Column(ColumnChange::AlterColumnNullability {
             uid: uid("c_aaaaaa"),
             column: cref("dbo.customer.email"),
             ty: ty("nvarchar(255)"),
             to_nullable: false,
             through_external_partitions: false,
             collation: None,
-        });
+        }));
         assert_eq!(
             sql,
             [
@@ -2263,12 +2279,12 @@ mod tests {
     fn adding_a_required_column_counts_every_existing_row() {
         let mut column = pbps_model::Column::new(ty("int"));
         column.nullable = false;
-        let sql = sql_of(&Change::AddColumn {
+        let sql = sql_of(&Change::Column(ColumnChange::AddColumn {
             uid: uid("c_aaaaaa"),
             table: tname("dbo.customer"),
             name: "score".into(),
             column: Box::new(column),
-        });
+        }));
         assert_eq!(sql, ["SELECT COUNT(*) AS n FROM [dbo].[customer];"]);
     }
 
@@ -2277,12 +2293,12 @@ mod tests {
         let mut column = pbps_model::Column::new(ty("int"));
         column.nullable = false;
         column.value_source = pbps_model::ValueSource::Default("((NULL))".into());
-        let sql = sql_of(&Change::AddColumn {
+        let sql = sql_of(&Change::Column(ColumnChange::AddColumn {
             uid: uid("c_aaaaaa"),
             table: tname("dbo.customer"),
             name: "score".into(),
             column: Box::new(column),
-        });
+        }));
         assert_eq!(sql, ["SELECT COUNT(*) AS n FROM [dbo].[customer];"]);
     }
 
@@ -2303,12 +2319,12 @@ mod tests {
             let mut column = pbps_model::Column::new(ty("int"));
             column.nullable = false;
             column.value_source = pbps_model::ValueSource::Default(default.into());
-            let sql = sql_of(&Change::AddColumn {
+            let sql = sql_of(&Change::Column(ColumnChange::AddColumn {
                 uid: uid("c_aaaaaa"),
                 table: tname("dbo.customer"),
                 name: "score".into(),
                 column: Box::new(column),
-            });
+            }));
             assert_eq!(
                 sql,
                 ["SELECT COUNT(*) AS n FROM [dbo].[customer];"],
@@ -2333,12 +2349,12 @@ mod tests {
             let mut column = pbps_model::Column::new(ty("int"));
             column.nullable = false;
             column.value_source = pbps_model::ValueSource::Default(default.into());
-            let sql = sql_of(&Change::AddColumn {
+            let sql = sql_of(&Change::Column(ColumnChange::AddColumn {
                 uid: uid("c_aaaaaa"),
                 table: tname("dbo.customer"),
                 name: "score".into(),
                 column: Box::new(column),
-            });
+            }));
             assert!(
                 !sql.contains(&"SELECT COUNT(*) AS n FROM [dbo].[customer];".to_owned()),
                 "default {default:?} produced: {sql:?}"
@@ -2352,12 +2368,12 @@ mod tests {
             let mut column = pbps_model::Column::new(ty("int"));
             column.nullable = false;
             column.value_source = pbps_model::ValueSource::Default(default.into());
-            let sql = sql_of(&Change::AddColumn {
+            let sql = sql_of(&Change::Column(ColumnChange::AddColumn {
                 uid: uid("c_aaaaaa"),
                 table: tname("dbo.customer"),
                 name: "score".into(),
                 column: Box::new(column),
-            });
+            }));
             assert!(sql.is_empty(), "default {default} produced: {sql:?}");
         }
     }
@@ -2368,12 +2384,12 @@ mod tests {
         column.nullable = false;
         column.value_source =
             pbps_model::ValueSource::Default("NEXT VALUE FOR dbo.[seq]]null]".into());
-        let sql = sql_of(&Change::AddColumn {
+        let sql = sql_of(&Change::Column(ColumnChange::AddColumn {
             uid: uid("c_aaaaaa"),
             table: tname("dbo.customer"),
             name: "sequence_value".into(),
             column: Box::new(column),
-        });
+        }));
         assert!(sql.is_empty(), "a quoted identifier produced: {sql:?}");
     }
 
@@ -2383,12 +2399,12 @@ mod tests {
         column.nullable = false;
         column.value_source =
             pbps_model::ValueSource::Default("NEXT VALUE FOR dbo.seq$null".into());
-        let sql = sql_of(&Change::AddColumn {
+        let sql = sql_of(&Change::Column(ColumnChange::AddColumn {
             uid: uid("c_aaaaaa"),
             table: tname("dbo.customer"),
             name: "sequence_value".into(),
             column: Box::new(column),
-        });
+        }));
         assert!(sql.is_empty(), "an identifier suffix produced: {sql:?}");
     }
 
@@ -2397,19 +2413,19 @@ mod tests {
         let mut column = pbps_model::Column::new(ty("int"));
         column.nullable = false;
         let cs = plan(vec![
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: uid("t_aaaaaa"),
                 name: tname("dbo.customer"),
                 table: Box::new(pbps_model::Table::default()),
                 beside_default: None,
                 moves_at_most: None,
-            },
-            Change::AddColumn {
+            }),
+            Change::Column(ColumnChange::AddColumn {
                 uid: uid("c_aaaaaa"),
                 table: tname("dbo.customer"),
                 name: "score".into(),
                 column: Box::new(column),
-            },
+            }),
         ]);
         assert!(probes(&cs).is_empty());
     }
@@ -2419,14 +2435,14 @@ mod tests {
     #[test]
     fn relaxing_nullability_needs_no_probe() {
         assert!(
-            sql_of(&Change::AlterColumnNullability {
+            sql_of(&Change::Column(ColumnChange::AlterColumnNullability {
                 uid: uid("c_aaaaaa"),
                 column: cref("dbo.customer.email"),
                 ty: ty("nvarchar(255)"),
                 to_nullable: true,
                 through_external_partitions: false,
                 collation: None,
-            })
+            }))
             .is_empty()
         );
     }
@@ -2436,7 +2452,7 @@ mod tests {
     /// carried.
     #[test]
     fn a_type_change_that_also_tightens_nullability_probes_both() {
-        let sql = sql_of(&Change::AlterColumnType {
+        let sql = sql_of(&Change::Column(ColumnChange::AlterColumnType {
             uid: uid("c_aaaaaa"),
             column: cref("dbo.customer.email"),
             from: ty("nvarchar(255)"),
@@ -2447,7 +2463,7 @@ mod tests {
             from_collation: None,
             to_collation: None,
             using: None,
-        });
+        }));
         assert_eq!(sql.len(), 2, "{sql:?}");
         assert!(sql[0].contains("IS NULL"), "{sql:?}");
         assert!(
@@ -2463,17 +2479,19 @@ mod tests {
     /// characters, and is asked nothing (#1175).
     #[test]
     fn a_collation_change_is_probed_under_the_collation_it_moves_to() {
-        let alter = |ty_: &str, to: Option<&str>| Change::AlterColumnType {
-            uid: uid("c_aaaaaa"),
-            column: cref("dbo.customer.email"),
-            from: ty(ty_),
-            to: ty(ty_),
-            from_nullable: true,
-            to_nullable: true,
-            through_external_partitions: false,
-            from_collation: None,
-            to_collation: to.map(pbps_model::Collation::new),
-            using: None,
+        let alter = |ty_: &str, to: Option<&str>| {
+            Change::Column(ColumnChange::AlterColumnType {
+                uid: uid("c_aaaaaa"),
+                column: cref("dbo.customer.email"),
+                from: ty(ty_),
+                to: ty(ty_),
+                from_nullable: true,
+                to_nullable: true,
+                through_external_partitions: false,
+                from_collation: None,
+                to_collation: to.map(pbps_model::Collation::new),
+                using: None,
+            })
         };
         let sql = sql_of(&alter(
             "varchar(5)",
@@ -2490,7 +2508,7 @@ mod tests {
         );
         // Back to the default: that is what the probe converts into.
         let mut back = alter("varchar(5)", None);
-        if let Change::AlterColumnType { from_collation, .. } = &mut back {
+        if let Change::Column(ColumnChange::AlterColumnType { from_collation, .. }) = &mut back {
             *from_collation = Some(pbps_model::Collation::new("Latin1_General_BIN2"));
         }
         let sql = sql_of(&back);
@@ -2511,14 +2529,14 @@ mod tests {
         let mut column = pbps_model::Column::new(ty("varchar(10)"));
         column.collation = Some(pbps_model::Collation::new("Latin1_General_CS_AS"));
         let add = |column: pbps_model::Column| {
-            PlannedChange::new(Change::AddColumn {
+            PlannedChange::new(Change::Column(ColumnChange::AddColumn {
                 uid: uid("c_bbbbbb"),
                 table: tname("dbo.customer"),
                 name: "code".into(),
                 column: Box::new(column),
-            })
+            }))
         };
-        let unique = PlannedChange::new(Change::AddUnique {
+        let unique = PlannedChange::new(Change::Constraint(ConstraintChange::AddUnique {
             table: tname("dbo.customer"),
             name: "uq_code".into(),
             constraint: UniqueConstraint {
@@ -2527,7 +2545,7 @@ mod tests {
                 filegroup: None,
             },
             clustered: false,
-        });
+        }));
         let sql = |changes: Vec<PlannedChange>| -> Vec<String> {
             probes(&ChangeSet { changes })
                 .into_iter()
@@ -2562,13 +2580,13 @@ mod tests {
         ));
         let changes = ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::AddColumn {
+                PlannedChange::new(Change::Column(ColumnChange::AddColumn {
                     uid: uid("c_bbbbbb"),
                     table: tname("dbo.customer"),
                     name: "code".into(),
                     column: Box::new(column),
-                }),
-                PlannedChange::new(Change::AddUnique {
+                })),
+                PlannedChange::new(Change::Constraint(ConstraintChange::AddUnique {
                     table: tname("dbo.customer"),
                     name: "uq_code".into(),
                     constraint: UniqueConstraint {
@@ -2577,7 +2595,7 @@ mod tests {
                         filegroup: None,
                     },
                     clustered: false,
-                }),
+                })),
             ],
         };
         let sql: Vec<String> = probes(&changes).into_iter().map(|p| p.sql).collect();
@@ -2597,7 +2615,7 @@ mod tests {
     #[test]
     fn a_foreign_key_is_probed_under_its_columns_new_collation() {
         let recollate = |column: &str| {
-            PlannedChange::new(Change::AlterColumnType {
+            PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
                 uid: uid("c_aaaaaa"),
                 column: cref(column),
                 from: ty("varchar(10)"),
@@ -2608,9 +2626,9 @@ mod tests {
                 from_collation: None,
                 to_collation: Some(pbps_model::Collation::new("Latin1_General_CS_AS")),
                 using: None,
-            })
+            }))
         };
-        let fk = PlannedChange::new(Change::AddForeignKey {
+        let fk = PlannedChange::new(Change::Constraint(ConstraintChange::AddForeignKey {
             table: tname("dbo.child"),
             name: "fk_child_parent".into(),
             constraint: Box::new(ForeignKey {
@@ -2620,7 +2638,7 @@ mod tests {
                 on_delete: ReferentialAction::NoAction,
                 on_update: ReferentialAction::NoAction,
             }),
-        });
+        }));
         let sql = |changes: Vec<PlannedChange>| -> Vec<String> {
             probes(&ChangeSet { changes })
                 .into_iter()
@@ -2651,7 +2669,7 @@ mod tests {
     fn a_rebuilt_key_is_counted_under_its_columns_new_collation() {
         let changes = ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::AlterColumnType {
+                PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
                     uid: uid("c_aaaaaa"),
                     column: cref("dbo.customer.email"),
                     from: ty("nvarchar(255)"),
@@ -2662,8 +2680,8 @@ mod tests {
                     from_collation: Some(pbps_model::Collation::new("Latin1_General_CS_AS")),
                     to_collation: Some(pbps_model::Collation::new("Latin1_General_CI_AS")),
                     using: None,
-                }),
-                PlannedChange::new(Change::AddUnique {
+                })),
+                PlannedChange::new(Change::Constraint(ConstraintChange::AddUnique {
                     table: tname("dbo.customer"),
                     name: "uq_email".into(),
                     constraint: UniqueConstraint {
@@ -2672,7 +2690,7 @@ mod tests {
                         filegroup: None,
                     },
                     clustered: false,
-                }),
+                })),
             ],
         };
         let sql: Vec<String> = probes(&changes).into_iter().map(|p| p.sql).collect();
@@ -2697,7 +2715,7 @@ mod tests {
     /// report nothing at all — length is the only question with an answer.
     #[test]
     fn shortening_a_string_is_probed_by_length_not_conversion() {
-        let sql = sql_of(&Change::AlterColumnType {
+        let sql = sql_of(&Change::Column(ColumnChange::AlterColumnType {
             uid: uid("c_aaaaaa"),
             column: cref("dbo.customer.email"),
             from: ty("nvarchar(255)"),
@@ -2708,7 +2726,7 @@ mod tests {
             from_collation: None,
             to_collation: None,
             using: None,
-        });
+        }));
         assert_eq!(sql.len(), 1);
         assert!(
             sql[0].contains("DATALENGTH(RTRIM(TRY_CONVERT(nvarchar(max), [email]))) > 100"),
@@ -2729,7 +2747,7 @@ mod tests {
     /// exactly as a narrowing `nvarchar` target does (issue #142).
     #[test]
     fn narrowing_to_sysname_is_probed_by_its_real_length_not_a_truncating_conversion() {
-        let sql = sql_of(&Change::AlterColumnType {
+        let sql = sql_of(&Change::Column(ColumnChange::AlterColumnType {
             uid: uid("c_aaaaaa"),
             column: cref("dbo.customer.label"),
             from: ty("nvarchar(129)"),
@@ -2740,7 +2758,7 @@ mod tests {
             from_collation: None,
             to_collation: None,
             using: None,
-        });
+        }));
         assert_eq!(sql.len(), 1, "{sql:?}");
         assert!(
             sql[0].contains("DATALENGTH(RTRIM(TRY_CONVERT(nvarchar(max), [label]))) > 256"),
@@ -2760,7 +2778,7 @@ mod tests {
     #[test]
     fn narrowing_to_sysname_at_its_own_capacity_needs_no_probe() {
         assert!(
-            sql_of(&Change::AlterColumnType {
+            sql_of(&Change::Column(ColumnChange::AlterColumnType {
                 uid: uid("c_aaaaaa"),
                 column: cref("dbo.customer.label"),
                 from: ty("nvarchar(128)"),
@@ -2771,7 +2789,7 @@ mod tests {
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            })
+            }))
             .is_empty()
         );
     }
@@ -2781,7 +2799,7 @@ mod tests {
     /// short conversion; the live test pins both that and zero-padded inputs.
     #[test]
     fn narrowing_a_non_character_source_to_sysname_is_not_probed_by_len() {
-        let sql = sql_of(&Change::AlterColumnType {
+        let sql = sql_of(&Change::Column(ColumnChange::AlterColumnType {
             uid: uid("c_aaaaaa"),
             column: cref("dbo.customer.label"),
             from: ty("varbinary(200)"),
@@ -2792,7 +2810,7 @@ mod tests {
             from_collation: None,
             to_collation: None,
             using: None,
-        });
+        }));
         assert_eq!(sql.len(), 1, "{sql:?}");
         assert!(
             sql[0].contains("TRY_CONVERT(sysname, [label]) IS NULL"),
@@ -2817,7 +2835,7 @@ mod tests {
             } else {
                 ty(to)
             };
-            let sql = sql_of(&Change::AlterColumnType {
+            let sql = sql_of(&Change::Column(ColumnChange::AlterColumnType {
                 uid: uid("c_aaaaaa"),
                 column: cref("dbo.customer.label"),
                 from: ty(from),
@@ -2828,7 +2846,7 @@ mod tests {
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            });
+            }));
             assert_eq!(sql.len(), 2, "{from} -> {to}: {sql:?}");
             let expected_len = match from {
                 "ntext" => "LEN(CONVERT(nvarchar(max), [label])) > 50",
@@ -2861,7 +2879,7 @@ mod tests {
             } else {
                 ty(to)
             };
-            let sql = sql_of(&Change::AlterColumnType {
+            let sql = sql_of(&Change::Column(ColumnChange::AlterColumnType {
                 uid: uid("c_aaaaaa"),
                 column: cref("dbo.customer.label"),
                 from: ty(from),
@@ -2872,7 +2890,7 @@ mod tests {
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            });
+            }));
             assert_eq!(sql.len(), 1, "{from} -> {to}: {sql:?}");
             assert!(!sql[0].contains("LEN("), "{sql:?}");
             let target_input = match from {
@@ -2889,7 +2907,7 @@ mod tests {
         }
 
         for to in ["varchar(50)", "varchar(max)"] {
-            let sql = sql_of(&Change::AlterColumnType {
+            let sql = sql_of(&Change::Column(ColumnChange::AlterColumnType {
                 uid: uid("c_aaaaaa"),
                 column: cref("dbo.customer.label"),
                 from: ty("varchar(20)"),
@@ -2900,7 +2918,7 @@ mod tests {
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            });
+            }));
             assert_eq!(sql.len(), 1, "varchar(20) -> {to}: {sql:?}");
             assert!(!sql[0].contains("LEN("), "{sql:?}");
             assert!(
@@ -2915,7 +2933,7 @@ mod tests {
             ("nvarchar(255)", "nvarchar(50)"),
             ("varchar(255)", "nvarchar(50)"),
         ] {
-            let sql = sql_of(&Change::AlterColumnType {
+            let sql = sql_of(&Change::Column(ColumnChange::AlterColumnType {
                 uid: uid("c_aaaaaa"),
                 column: cref("dbo.customer.label"),
                 from: ty(from),
@@ -2926,7 +2944,7 @@ mod tests {
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            });
+            }));
             assert_eq!(sql.len(), 1, "{from} -> {to}: {sql:?}");
             assert!(
                 sql[0].contains("DATALENGTH(RTRIM(TRY_CONVERT(nvarchar(max), [label]))) > 100"),
@@ -2937,7 +2955,7 @@ mod tests {
 
     #[test]
     fn narrowing_a_number_is_probed_by_conversion() {
-        let sql = sql_of(&Change::AlterColumnType {
+        let sql = sql_of(&Change::Column(ColumnChange::AlterColumnType {
             uid: uid("c_aaaaaa"),
             column: cref("dbo.customer.balance"),
             from: ty("bigint"),
@@ -2948,7 +2966,7 @@ mod tests {
             from_collation: None,
             to_collation: None,
             using: None,
-        });
+        }));
         assert_eq!(sql.len(), 1);
         assert!(
             sql[0].contains("TRY_CONVERT(int, [balance]) IS NULL"),
@@ -2979,7 +2997,7 @@ mod tests {
             ("varbinary(8)", "rowversion"),
         ] {
             assert!(
-                sql_of(&Change::AlterColumnType {
+                sql_of(&Change::Column(ColumnChange::AlterColumnType {
                     uid: uid("c_aaaaaa"),
                     column: cref("dbo.customer.v"),
                     from: ty(from),
@@ -2990,12 +3008,12 @@ mod tests {
                     from_collation: None,
                     to_collation: None,
                     using: None,
-                })
+                }))
                 .is_empty(),
                 "`{from}` -> `{to}` was probed"
             );
         }
-        let sql = sql_of(&Change::AlterColumnType {
+        let sql = sql_of(&Change::Column(ColumnChange::AlterColumnType {
             uid: uid("c_aaaaaa"),
             column: cref("dbo.customer.v"),
             from: ty("bigint"),
@@ -3006,7 +3024,7 @@ mod tests {
             from_collation: None,
             to_collation: None,
             using: None,
-        });
+        }));
         assert_eq!(sql.len(), 1, "{sql:?}");
         assert!(sql[0].contains("DATALENGTH([v]) > 8"), "{sql:?}");
     }
@@ -3016,7 +3034,7 @@ mod tests {
     #[test]
     fn widening_a_type_needs_no_probe() {
         assert!(
-            sql_of(&Change::AlterColumnType {
+            sql_of(&Change::Column(ColumnChange::AlterColumnType {
                 uid: uid("c_aaaaaa"),
                 column: cref("dbo.customer.balance"),
                 from: ty("int"),
@@ -3027,7 +3045,7 @@ mod tests {
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            })
+            }))
             .is_empty()
         );
     }
@@ -3043,7 +3061,7 @@ mod tests {
 
     #[test]
     fn trailing_line_comments_leave_probe_closers_and_deleted_row_exclusions_executable() {
-        let delete = Change::DeleteRow {
+        let delete = Change::Row(RowChange::DeleteRow {
             table: tname("dbo.customer"),
             key_column: "code".into(),
             key: RowKey::from("gone"),
@@ -3053,15 +3071,15 @@ mod tests {
             types: Default::default(),
             after_types: Default::default(),
             key_type: None,
-        };
+        });
         for change in [
-            Change::AddCheck {
+            Change::Constraint(ConstraintChange::AddCheck {
                 table: tname("dbo.customer"),
                 name: "ck_amount".into(),
                 constraint: CheckConstraint {
                     expression: "[amount] >= 0 -- reason".into(),
                 },
-            },
+            }),
             index(&["email"], true, Some("[amount] >= 0 -- reason")),
         ] {
             let report = probes(&plan(vec![delete.clone(), change]));
@@ -3083,13 +3101,13 @@ mod tests {
 
     #[test]
     fn a_check_counts_the_rows_it_would_reject() {
-        let sql = sql_of(&Change::AddCheck {
+        let sql = sql_of(&Change::Constraint(ConstraintChange::AddCheck {
             table: tname("dbo.customer"),
             name: "ck_customer_amount".into(),
             constraint: CheckConstraint {
                 expression: "[amount] >= 0".into(),
             },
-        });
+        }));
         assert_eq!(
             sql,
             ["SELECT COUNT(*) AS n FROM [dbo].[customer] WHERE NOT ([amount] >= 0\n);"]
@@ -3098,7 +3116,7 @@ mod tests {
 
     #[test]
     fn a_unique_constraint_counts_the_colliding_rows() {
-        let sql = sql_of(&Change::AddUnique {
+        let sql = sql_of(&Change::Constraint(ConstraintChange::AddUnique {
             table: tname("dbo.customer"),
             name: "uq_customer_email".into(),
             constraint: UniqueConstraint {
@@ -3107,7 +3125,7 @@ mod tests {
                 filegroup: None,
             },
             clustered: false,
-        });
+        }));
         assert_eq!(sql.len(), 1);
         // Over the relation the statement will meet, keyed `k0`, `k1` — the
         // same derived table the foreign key probe is built on (175).
@@ -3123,7 +3141,7 @@ mod tests {
 
     #[test]
     fn a_foreign_key_counts_the_orphans() {
-        let sql = sql_of(&Change::AddForeignKey {
+        let sql = sql_of(&Change::Constraint(ConstraintChange::AddForeignKey {
             table: tname("dbo.customer"),
             name: "fk_customer_region".into(),
             constraint: Box::new(ForeignKey {
@@ -3133,7 +3151,7 @@ mod tests {
                 on_delete: ReferentialAction::NoAction,
                 on_update: ReferentialAction::NoAction,
             }),
-        });
+        }));
         assert_eq!(sql.len(), 1);
         assert!(sql[0].contains("NOT EXISTS"), "{sql:?}");
         assert!(sql[0].contains("[dbo].[region] AS p"), "{sql:?}");
@@ -3155,7 +3173,7 @@ mod tests {
     #[test]
     fn a_new_foreign_key_counts_the_parent_rows_this_plan_inserts() {
         let sql = probes(&plan(vec![
-            Change::InsertRow {
+            Change::Row(RowChange::InsertRow {
                 table: tname("dbo.region"),
                 key_column: "region_id".into(),
                 identity_key: false,
@@ -3163,7 +3181,7 @@ mod tests {
                 row: pbps_model::Row::default(),
                 defaults: Default::default(),
                 types: Default::default(),
-            },
+            }),
             fk(),
         ]))
         .into_iter()
@@ -3179,7 +3197,7 @@ mod tests {
     /// counted against the constraint that will be created after it.
     #[test]
     fn a_new_foreign_key_ignores_the_child_rows_this_plan_repairs() {
-        let deleted = Change::DeleteRow {
+        let deleted = Change::Row(RowChange::DeleteRow {
             table: tname("dbo.customer"),
             key_column: "code".into(),
             key: RowKey::from("gone"),
@@ -3189,8 +3207,8 @@ mod tests {
             types: Default::default(),
             after_types: Default::default(),
             key_type: None,
-        };
-        let repaired = Change::UpdateRow {
+        });
+        let repaired = Change::Row(RowChange::UpdateRow {
             table: tname("dbo.customer"),
             key_column: "code".into(),
             key: RowKey::from("fixed"),
@@ -3207,10 +3225,10 @@ mod tests {
             types: Default::default(),
             after_types: Default::default(),
             key_type: None,
-        };
+        });
         // And one that leaves the key alone: it stays in the stored scan,
         // because the plan does nothing to where it points.
-        let elsewhere = Change::UpdateRow {
+        let elsewhere = Change::Row(RowChange::UpdateRow {
             table: tname("dbo.customer"),
             key_column: "code".into(),
             key: RowKey::from("untouched"),
@@ -3227,7 +3245,7 @@ mod tests {
             types: Default::default(),
             after_types: Default::default(),
             key_type: None,
-        };
+        });
         let sql = probes(&plan(vec![deleted, repaired, elsewhere, fk()]))
             .into_iter()
             .map(|p| p.sql)
@@ -3266,14 +3284,14 @@ mod tests {
             pbps_model::Column::new(ty("varchar(10)")),
         );
         let sql = probes(&plan(vec![
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: uid("t_bbbbbb"),
                 name: tname("dbo.region"),
                 table: Box::new(region),
                 beside_default: None,
                 moves_at_most: None,
-            },
-            Change::InsertRow {
+            }),
+            Change::Row(RowChange::InsertRow {
                 table: tname("dbo.region"),
                 key_column: "region_id".into(),
                 identity_key: false,
@@ -3281,7 +3299,7 @@ mod tests {
                 row: pbps_model::Row::default(),
                 defaults: Default::default(),
                 types: Default::default(),
-            },
+            }),
             fk(),
         ]))
         .into_iter()
@@ -3306,7 +3324,7 @@ mod tests {
     #[test]
     fn a_retyped_foreign_key_column_is_projected_through_the_type_it_will_have() {
         let sql = probes(&plan(vec![
-            Change::AlterColumnType {
+            Change::Column(ColumnChange::AlterColumnType {
                 uid: uid("c_bbbbbb"),
                 column: cref("dbo.customer.region_id"),
                 from: ty("int"),
@@ -3317,8 +3335,8 @@ mod tests {
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            },
-            Change::UpdateRow {
+            }),
+            Change::Row(RowChange::UpdateRow {
                 table: tname("dbo.customer"),
                 key_column: "code".into(),
                 key: RowKey::from("moved"),
@@ -3335,7 +3353,7 @@ mod tests {
                 types: Default::default(),
                 after_types: Default::default(),
                 key_type: None,
-            },
+            }),
             fk(),
         ]))
         .into_iter()
@@ -3376,16 +3394,16 @@ mod tests {
             pbps_model::ValueSource::Default("CONVERT(varchar(10), 'eu')".to_owned());
         region.columns.insert("region_id".into(), code);
         let sql = probes(&plan(vec![
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: uid("t_bbbbbb"),
                 name: tname("dbo.region"),
                 table: Box::new(region),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
             // The row leaves the key column to that default, so the probe
             // cannot say what it will hold.
-            Change::InsertRow {
+            Change::Row(RowChange::InsertRow {
                 table: tname("dbo.region"),
                 key_column: "other".into(),
                 identity_key: false,
@@ -3395,7 +3413,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 types: Default::default(),
-            },
+            }),
             fk(),
         ]))
         .into_iter()
@@ -3428,15 +3446,15 @@ mod tests {
                 .collect(),
         );
         let sql = probes(&plan(vec![
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: uid("t_bbbbbb"),
                 name: tname("dbo.region"),
                 table: Box::new(region),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
             // This one the probe can spell.
-            Change::InsertRow {
+            Change::Row(RowChange::InsertRow {
                 table: tname("dbo.region"),
                 key_column: "other".into(),
                 identity_key: false,
@@ -3444,9 +3462,9 @@ mod tests {
                 row: spelled,
                 defaults: Default::default(),
                 types: Default::default(),
-            },
+            }),
             // This one it cannot, and that is the whole relation's answer.
-            Change::InsertRow {
+            Change::Row(RowChange::InsertRow {
                 table: tname("dbo.region"),
                 key_column: "other".into(),
                 identity_key: false,
@@ -3456,7 +3474,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 types: Default::default(),
-            },
+            }),
             fk(),
         ]))
         .into_iter()
@@ -3474,7 +3492,7 @@ mod tests {
     /// the statement will meet instead of giving no answer (DECISIONS 175).
     #[test]
     fn a_key_is_probed_over_the_rows_its_statement_will_meet() {
-        let unique = Change::AddUnique {
+        let unique = Change::Constraint(ConstraintChange::AddUnique {
             table: tname("dbo.customer"),
             name: "uq_code".into(),
             constraint: pbps_model::UniqueConstraint {
@@ -3483,8 +3501,8 @@ mod tests {
                 filegroup: None,
             },
             clustered: false,
-        };
-        let delete = Change::DeleteRow {
+        });
+        let delete = Change::Row(RowChange::DeleteRow {
             table: tname("dbo.customer"),
             key_column: "code".into(),
             key: RowKey::from("dup"),
@@ -3494,7 +3512,7 @@ mod tests {
             types: Default::default(),
             after_types: Default::default(),
             key_type: None,
-        };
+        });
         let sql = |changes: Vec<Change>| {
             probes(&plan(changes))
                 .into_iter()
@@ -3511,7 +3529,7 @@ mod tests {
         // And a row it inserts is: unlike a check, a unique constraint's
         // columns are named, so the planned row can be spelled and counted.
         let s = sql(vec![
-            Change::InsertRow {
+            Change::Row(RowChange::InsertRow {
                 table: tname("dbo.customer"),
                 key_column: "code".into(),
                 identity_key: false,
@@ -3519,7 +3537,7 @@ mod tests {
                 row: Default::default(),
                 defaults: Default::default(),
                 types: Default::default(),
-            },
+            }),
             unique,
         ]);
         assert_eq!(s.len(), 1, "{s:?}");
@@ -3527,7 +3545,7 @@ mod tests {
     }
 
     fn index(columns: &[&str], unique: bool, filter: Option<&str>) -> Change {
-        Change::AddIndex {
+        Change::Index(IndexChange::AddIndex {
             table: tname("dbo.customer"),
             name: "ix_customer_email".into(),
             index: Box::new(pbps_model::Index {
@@ -3548,7 +3566,7 @@ mod tests {
                 filegroup: None,
             }),
             clustered: false,
-        }
+        })
     }
 
     /// The engine enforces a `UNIQUE` constraint with a unique index, so the
@@ -3588,7 +3606,7 @@ mod tests {
         // Beside a delete, both survive: the predicate decides membership and
         // the exclusion drops a row that will not be there to collide.
         let sql = probes(&plan(vec![
-            Change::DeleteRow {
+            Change::Row(RowChange::DeleteRow {
                 table: tname("dbo.customer"),
                 key_column: "code".into(),
                 key: RowKey::from("dup"),
@@ -3598,7 +3616,7 @@ mod tests {
                 types: Default::default(),
                 after_types: Default::default(),
                 key_type: None,
-            },
+            }),
             index(&["email"], true, Some("[deleted_at] IS NULL")),
         ]))
         .into_iter()
@@ -3630,7 +3648,7 @@ mod tests {
         // that touches no key column can still move a row in or out of it.
         assert_eq!(
             probed(vec![
-                Change::InsertRow {
+                Change::Row(RowChange::InsertRow {
                     table: tname("dbo.customer"),
                     key_column: "code".into(),
                     identity_key: false,
@@ -3638,7 +3656,7 @@ mod tests {
                     row: Default::default(),
                     defaults: Default::default(),
                     types: Default::default(),
-                },
+                }),
                 filtered.clone(),
             ]),
             0
@@ -3648,13 +3666,13 @@ mod tests {
         // text names the table as it will be, not as the probe finds it.
         assert_eq!(
             probed(vec![
-                Change::RenameColumn {
+                Change::Column(ColumnChange::RenameColumn {
                     uid: uid("c_aaaaaa"),
                     table: tname("dbo.customer"),
                     from: "removed_at".into(),
                     to: "deleted_at".into(),
                     table_was: None,
-                },
+                }),
                 filtered.clone(),
             ]),
             0
@@ -3668,7 +3686,7 @@ mod tests {
         // retyped `varchar` column, reads `'1' = '01'` and creates the index
         // over nothing. Refusing a plan the engine accepts is the direction
         // this whole probe exists to avoid.
-        let retype = Change::AlterColumnType {
+        let retype = Change::Column(ColumnChange::AlterColumnType {
             uid: uid("c_bbbbbb"),
             column: cref("dbo.customer.flag"),
             from: ty("int"),
@@ -3679,7 +3697,7 @@ mod tests {
             from_collation: None,
             to_collation: None,
             using: None,
-        };
+        });
         assert_eq!(
             probed(vec![
                 retype.clone(),
@@ -3693,7 +3711,7 @@ mod tests {
         // about *this* table's predicate, and must not cost the count.
         assert_eq!(
             probed(vec![
-                Change::AlterColumnType {
+                Change::Column(ColumnChange::AlterColumnType {
                     uid: uid("c_cccccc"),
                     column: cref("dbo.orders.flag"),
                     from: ty("int"),
@@ -3704,7 +3722,7 @@ mod tests {
                     from_collation: None,
                     to_collation: None,
                     using: None,
-                },
+                }),
                 index(&["email"], true, Some("[flag] = '01'")),
             ]),
             1
@@ -3715,13 +3733,13 @@ mod tests {
         // the key columns, so a retype is no obstacle there.
         assert_eq!(
             probed(vec![
-                Change::RenameColumn {
+                Change::Column(ColumnChange::RenameColumn {
                     uid: uid("c_aaaaaa"),
                     table: tname("dbo.customer"),
                     from: "removed_at".into(),
                     to: "deleted_at".into(),
                     table_was: None,
-                },
+                }),
                 index(&["email"], true, None),
             ]),
             1
@@ -3735,13 +3753,13 @@ mod tests {
     /// plan is about to write (DECISIONS 174).
     #[test]
     fn a_check_is_probed_over_the_rows_its_statement_will_meet() {
-        let check = Change::AddCheck {
+        let check = Change::Constraint(ConstraintChange::AddCheck {
             table: tname("dbo.customer"),
             name: "ck_positive".into(),
             constraint: pbps_model::CheckConstraint {
                 expression: "[amount] >= 0".into(),
             },
-        };
+        });
         let sql = |changes: Vec<Change>| {
             probes(&plan(changes))
                 .into_iter()
@@ -3761,7 +3779,7 @@ mod tests {
 
         // A row this plan deletes will not be there to violate anything.
         let s = sql(vec![
-            Change::DeleteRow {
+            Change::Row(RowChange::DeleteRow {
                 table: tname("dbo.customer"),
                 key_column: "code".into(),
                 key: RowKey::from("bad"),
@@ -3771,7 +3789,7 @@ mod tests {
                 types: Default::default(),
                 after_types: Default::default(),
                 key_type: None,
-            },
+            }),
             check.clone(),
         ]);
         assert_eq!(s.len(), 1, "{s:?}");
@@ -3782,7 +3800,7 @@ mod tests {
         // only the ones it sets. No answer, as everywhere else one cannot be
         // given.
         for writing in [
-            Change::InsertRow {
+            Change::Row(RowChange::InsertRow {
                 table: tname("dbo.customer"),
                 key_column: "code".into(),
                 identity_key: false,
@@ -3790,8 +3808,8 @@ mod tests {
                 row: pbps_model::Row::default(),
                 defaults: Default::default(),
                 types: Default::default(),
-            },
-            Change::UpdateRow {
+            }),
+            Change::Row(RowChange::UpdateRow {
                 table: tname("dbo.customer"),
                 key_column: "code".into(),
                 key: RowKey::from("old"),
@@ -3808,7 +3826,7 @@ mod tests {
                 types: Default::default(),
                 after_types: Default::default(),
                 key_type: None,
-            },
+            }),
         ] {
             let s = sql(vec![writing, check.clone()]);
             assert!(s.is_empty(), "no answer is the honest one: {s:?}");
@@ -3826,16 +3844,18 @@ mod tests {
         // `types` names every non-key column except the identity ones, which
         // is how this is known — see `Moved::typed`. `seq` is absent from it
         // and unspelled by the row, so it is the engine's.
-        let insert = |key: &str| Change::InsertRow {
-            table: tname("dbo.setting"),
-            key_column: "code".into(),
-            identity_key: false,
-            key: RowKey::from(key),
-            row: pbps_model::Row::default(),
-            defaults: Default::default(),
-            types: [("label".into(), ty("nvarchar(50)"))].into_iter().collect(),
+        let insert = |key: &str| {
+            Change::Row(RowChange::InsertRow {
+                table: tname("dbo.setting"),
+                key_column: "code".into(),
+                identity_key: false,
+                key: RowKey::from(key),
+                row: pbps_model::Row::default(),
+                defaults: Default::default(),
+                types: [("label".into(), ty("nvarchar(50)"))].into_iter().collect(),
+            })
         };
-        let unique = Change::AddUnique {
+        let unique = Change::Constraint(ConstraintChange::AddUnique {
             table: tname("dbo.setting"),
             name: "uq_setting_seq".into(),
             constraint: pbps_model::UniqueConstraint {
@@ -3844,7 +3864,7 @@ mod tests {
                 filegroup: None,
             },
             clustered: false,
-        };
+        });
 
         let sql = probes(&plan(vec![insert("a"), insert("b"), unique.clone()]))
             .into_iter()
@@ -3859,7 +3879,7 @@ mod tests {
         // The same plan over a column the insert genuinely leaves at NULL is
         // still probed. Without this the fix would be "stop probing inserts",
         // which trades an invented violation for a missed one.
-        let nullable = Change::AddUnique {
+        let nullable = Change::Constraint(ConstraintChange::AddUnique {
             table: tname("dbo.setting"),
             name: "uq_setting_label".into(),
             constraint: pbps_model::UniqueConstraint {
@@ -3868,7 +3888,7 @@ mod tests {
                 filegroup: None,
             },
             clustered: false,
-        };
+        });
         let sql = probes(&plan(vec![insert("a"), insert("b"), nullable]))
             .into_iter()
             .map(|p| p.sql)
@@ -3895,16 +3915,18 @@ mod tests {
     /// covered only one of its four callers would pass the other test.
     #[test]
     fn an_identity_parent_column_leaves_the_foreign_key_unchecked_not_orphaned() {
-        let insert = |key: &str| Change::InsertRow {
-            table: tname("dbo.region"),
-            key_column: "code".into(),
-            identity_key: false,
-            key: RowKey::from(key),
-            row: pbps_model::Row::default(),
-            defaults: Default::default(),
-            types: [("label".into(), ty("nvarchar(50)"))].into_iter().collect(),
+        let insert = |key: &str| {
+            Change::Row(RowChange::InsertRow {
+                table: tname("dbo.region"),
+                key_column: "code".into(),
+                identity_key: false,
+                key: RowKey::from(key),
+                row: pbps_model::Row::default(),
+                defaults: Default::default(),
+                types: [("label".into(), ty("nvarchar(50)"))].into_iter().collect(),
+            })
         };
-        let fk = Change::AddForeignKey {
+        let fk = Change::Constraint(ConstraintChange::AddForeignKey {
             table: tname("dbo.customer"),
             name: "fk_customer_region".into(),
             constraint: Box::new(ForeignKey {
@@ -3915,7 +3937,7 @@ mod tests {
                 on_delete: ReferentialAction::NoAction,
                 on_update: ReferentialAction::NoAction,
             }),
-        };
+        });
 
         let sql = probes(&plan(vec![insert("eu"), fk]))
             .into_iter()
@@ -3943,12 +3965,12 @@ mod tests {
             c.value_source = default.map_or(pbps_model::ValueSource::None, |text| {
                 pbps_model::ValueSource::Default(text.into())
             });
-            Change::AddColumn {
+            Change::Column(ColumnChange::AddColumn {
                 uid: uid("c_cccccc"),
                 table: tname("dbo.customer"),
                 name: "region_id".into(),
                 column: Box::new(c),
-            }
+            })
         };
         let sql = |change: Change| {
             probes(&plan(vec![change, fk()]))
@@ -4003,14 +4025,14 @@ mod tests {
             c.value_source = default.map_or(pbps_model::ValueSource::None, |text| {
                 pbps_model::ValueSource::Default(text.into())
             });
-            Change::AddColumn {
+            Change::Column(ColumnChange::AddColumn {
                 uid: uid("c_cccccc"),
                 table: tname("dbo.customer"),
                 name: "region_id".into(),
                 column: Box::new(c),
-            }
+            })
         };
-        let unique = Change::AddUnique {
+        let unique = Change::Constraint(ConstraintChange::AddUnique {
             table: tname("dbo.customer"),
             name: "uq_region".into(),
             constraint: pbps_model::UniqueConstraint {
@@ -4019,7 +4041,7 @@ mod tests {
                 filegroup: None,
             },
             clustered: false,
-        };
+        });
 
         // Every stored row shares the one value the `ALTER` will put there,
         // so any two of them collide. Spelled inside the derived table
@@ -4062,13 +4084,13 @@ mod tests {
             pbps_model::Column::new(ty("varchar(10)")),
         );
         let sql = probes(&plan(vec![
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: uid("t_bbbbbb"),
                 name: tname("dbo.region"),
                 table: Box::new(region),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
             fk(),
         ]))
         .into_iter()
@@ -4088,7 +4110,7 @@ mod tests {
     }
 
     fn fk() -> Change {
-        Change::AddForeignKey {
+        Change::Constraint(ConstraintChange::AddForeignKey {
             table: tname("dbo.customer"),
             name: "fk_customer_region".into(),
             constraint: Box::new(ForeignKey {
@@ -4098,12 +4120,12 @@ mod tests {
                 on_delete: ReferentialAction::NoAction,
                 on_update: ReferentialAction::NoAction,
             }),
-        }
+        })
     }
 
     #[test]
     fn a_new_primary_key_probes_nulls_and_duplicates() {
-        let sql = sql_of(&Change::SetPrimaryKey {
+        let sql = sql_of(&Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: tname("dbo.customer"),
             from: None,
             to: Some(PrimaryKey {
@@ -4113,7 +4135,7 @@ mod tests {
                 filegroup: None,
             }),
             nonclustered: false,
-        });
+        }));
         assert_eq!(sql.len(), 2, "{sql:?}");
         assert!(sql[0].contains("r.k0 IS NULL"), "{sql:?}");
         assert!(sql[1].contains("GROUP BY r.k0"), "{sql:?}");
@@ -4130,23 +4152,23 @@ mod tests {
     #[test]
     fn drops_and_renames_carry_no_probe() {
         for change in [
-            Change::DropTable {
+            Change::Table(TableChange::DropTable {
                 uid: uid("t_aaaaaa"),
                 name: tname("dbo.customer"),
                 detach_from: None,
-            },
-            Change::DropColumn {
+            }),
+            Change::Column(ColumnChange::DropColumn {
                 uid: uid("c_aaaaaa"),
                 column: cref("dbo.customer.email"),
-            },
-            Change::RenameColumn {
+            }),
+            Change::Column(ColumnChange::RenameColumn {
                 uid: uid("c_aaaaaa"),
                 table: tname("dbo.customer"),
                 from: "email".into(),
                 to: "contact_email".into(),
                 table_was: None,
-            },
-            Change::SetPrimaryKey {
+            }),
+            Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table: tname("dbo.customer"),
                 from: Some(PrimaryKey {
                     name: None,
@@ -4156,7 +4178,7 @@ mod tests {
                 }),
                 to: None,
                 nonclustered: false,
-            },
+            }),
         ] {
             assert!(sql_of(&change).is_empty(), "{change:?}");
         }
@@ -4168,7 +4190,7 @@ mod tests {
     /// database has for them now.
     #[test]
     fn deleting_a_row_counts_the_rows_that_still_reference_it() {
-        let cs = plan(vec![Change::DeleteRow {
+        let cs = plan(vec![Change::Row(RowChange::DeleteRow {
             table: tname("dbo.status"),
             key_column: "code".into(),
             key: RowKey::from("old"),
@@ -4178,7 +4200,7 @@ mod tests {
             types: BTreeMap::new(),
             after_types: Default::default(),
             key_type: None,
-        }]);
+        })]);
         let p = probes(&cs);
         assert_eq!(p.len(), 1, "{p:?}");
         let sql = &p[0].sql;
@@ -4226,7 +4248,7 @@ mod tests {
     #[test]
     fn a_defaulted_write_onto_the_deleted_parent_is_an_arrival() {
         use pbps_model::Cell;
-        let delete = Change::DeleteRow {
+        let delete = Change::Row(RowChange::DeleteRow {
             table: tname("dbo.status"),
             key_column: "code".into(),
             key: RowKey::from("old"),
@@ -4236,17 +4258,19 @@ mod tests {
             types: BTreeMap::new(),
             after_types: Default::default(),
             key_type: None,
-        };
-        let insert = |default: &str| Change::InsertRow {
-            table: tname("dbo.kind"),
-            key_column: "id".into(),
-            identity_key: false,
-            key: RowKey::from("9"),
-            row: pbps_model::Row::default(),
-            defaults: [("status_code".into(), default.to_owned())]
-                .into_iter()
-                .collect(),
-            types: Default::default(),
+        });
+        let insert = |default: &str| {
+            Change::Row(RowChange::InsertRow {
+                table: tname("dbo.kind"),
+                key_column: "id".into(),
+                identity_key: false,
+                key: RowKey::from("9"),
+                row: pbps_model::Row::default(),
+                defaults: [("status_code".into(), default.to_owned())]
+                    .into_iter()
+                    .collect(),
+                types: Default::default(),
+            })
         };
         let sql_of = |cs: &ChangeSet| probes(cs)[0].sql.clone();
 
@@ -4316,7 +4340,7 @@ mod tests {
         assert!(null.contains("WHEN N'status_code' THEN N'NULL'"), "{null}");
 
         // An update to DEFAULT, the same way.
-        let update = Change::UpdateRow {
+        let update = Change::Row(RowChange::UpdateRow {
             unchanged: Default::default(),
             types: Default::default(),
             after_types: Default::default(),
@@ -4333,7 +4357,7 @@ mod tests {
             .into_iter()
             .collect(),
             key_type: None,
-        };
+        });
         let sql = sql_of(&plan(vec![update, delete]));
         assert!(
             sql.contains("WHEN N'status_code' THEN N'CONVERT('")
@@ -4352,7 +4376,7 @@ mod tests {
     fn default_assignment_types_do_not_claim_a_schema_type_change() {
         let table = tname("dbo.child");
         let key = RowKey::from("1");
-        let update = Change::UpdateRow {
+        let update = Change::Row(RowChange::UpdateRow {
             table: table.clone(),
             key_column: "id".into(),
             key: key.clone(),
@@ -4369,7 +4393,7 @@ mod tests {
             types: [("k".into(), ty("integer"))].into_iter().collect(),
             after_types: [("k".into(), ty("varchar(10)"))].into_iter().collect(),
             key_type: None,
-        };
+        });
         let changes = plan(vec![update]);
         let ids = plan_fixture::ids(&changes);
         let index = PlanNames::of(&changes.changes, &ids).unwrap();
@@ -4428,28 +4452,30 @@ mod tests {
     #[test]
     fn a_composite_foreign_key_is_matched_as_one_tuple() {
         use pbps_model::{Cell, Value};
-        let update = |key: &str, cells: &[(&str, Value)]| Change::UpdateRow {
-            unchanged: Default::default(),
-            types: Default::default(),
-            after_types: Default::default(),
-            table: tname("dbo.pair_child"),
-            key_column: "id".into(),
-            key: RowKey::from(key),
-            columns: cells
-                .iter()
-                .map(|(c, v)| {
-                    (
-                        (*c).into(),
-                        (Cell::Value(Value::Null), Cell::Value(v.clone())),
-                    )
-                })
-                .collect(),
-            key_type: None,
+        let update = |key: &str, cells: &[(&str, Value)]| {
+            Change::Row(RowChange::UpdateRow {
+                unchanged: Default::default(),
+                types: Default::default(),
+                after_types: Default::default(),
+                table: tname("dbo.pair_child"),
+                key_column: "id".into(),
+                key: RowKey::from(key),
+                columns: cells
+                    .iter()
+                    .map(|(c, v)| {
+                        (
+                            (*c).into(),
+                            (Cell::Value(Value::Null), Cell::Value(v.clone())),
+                        )
+                    })
+                    .collect(),
+                key_type: None,
+            })
         };
         let cs = plan(vec![
             update("1", &[("grp", Value::Int(2)), ("sub", Value::Int(1))]),
             update("2", &[("grp", Value::Int(1)), ("sub", Value::Null)]),
-            Change::InsertRow {
+            Change::Row(RowChange::InsertRow {
                 table: tname("dbo.pair_child"),
                 key_column: "id".into(),
                 identity_key: false,
@@ -4457,8 +4483,8 @@ mod tests {
                 row: [("grp".into(), Value::Int(1))].into_iter().collect(),
                 defaults: Default::default(),
                 types: Default::default(),
-            },
-            Change::DeleteRow {
+            }),
+            Change::Row(RowChange::DeleteRow {
                 table: tname("dbo.status"),
                 key_column: "code".into(),
                 key: RowKey::from("old"),
@@ -4468,7 +4494,7 @@ mod tests {
                 types: BTreeMap::new(),
                 after_types: Default::default(),
                 key_type: None,
-            },
+            }),
         ]);
         let p = probes(&cs);
         assert_eq!(p.len(), 1, "{p:?}");
@@ -4515,7 +4541,7 @@ mod tests {
     #[test]
     fn a_child_row_the_plan_moves_is_not_counted_against_the_delete() {
         let cs = plan(vec![
-            Change::UpdateRow {
+            Change::Row(RowChange::UpdateRow {
                 unchanged: Default::default(),
                 types: Default::default(),
                 after_types: Default::default(),
@@ -4532,8 +4558,8 @@ mod tests {
                 .into_iter()
                 .collect(),
                 key_type: None,
-            },
-            Change::DeleteRow {
+            }),
+            Change::Row(RowChange::DeleteRow {
                 table: tname("dbo.status"),
                 key_column: "code".into(),
                 key: RowKey::from("old"),
@@ -4543,7 +4569,7 @@ mod tests {
                 types: BTreeMap::new(),
                 after_types: Default::default(),
                 key_type: None,
-            },
+            }),
         ]);
         let p = probes(&cs);
         assert_eq!(p.len(), 1, "{p:?}");
@@ -4583,7 +4609,7 @@ mod tests {
     #[test]
     fn a_child_row_updated_elsewhere_is_still_counted_against_the_delete() {
         let cs = plan(vec![
-            Change::UpdateRow {
+            Change::Row(RowChange::UpdateRow {
                 unchanged: Default::default(),
                 types: Default::default(),
                 after_types: Default::default(),
@@ -4600,8 +4626,8 @@ mod tests {
                 .into_iter()
                 .collect(),
                 key_type: None,
-            },
-            Change::DeleteRow {
+            }),
+            Change::Row(RowChange::DeleteRow {
                 table: tname("dbo.kind"),
                 key_column: "id".into(),
                 key: RowKey::from("8"),
@@ -4611,8 +4637,8 @@ mod tests {
                 types: BTreeMap::new(),
                 after_types: Default::default(),
                 key_type: None,
-            },
-            Change::DeleteRow {
+            }),
+            Change::Row(RowChange::DeleteRow {
                 table: tname("dbo.status"),
                 key_column: "code".into(),
                 key: RowKey::from("old"),
@@ -4622,7 +4648,7 @@ mod tests {
                 types: BTreeMap::new(),
                 after_types: Default::default(),
                 key_type: None,
-            },
+            }),
         ]);
         let p = probes(&cs);
         let sql = &p
@@ -4651,13 +4677,13 @@ mod tests {
     #[test]
     fn a_row_delete_is_probed_under_the_table_name_the_database_still_has() {
         let cs = plan(vec![
-            Change::RenameTable {
+            Change::Table(TableChange::RenameTable {
                 uid: uid("t_aaaaaa"),
                 from: tname("dbo.state"),
                 to: tname("dbo.status"),
                 defaults: Vec::new(),
-            },
-            Change::DeleteRow {
+            }),
+            Change::Row(RowChange::DeleteRow {
                 table: tname("dbo.status"),
                 key_column: "code".into(),
                 key: RowKey::from("old"),
@@ -4667,7 +4693,7 @@ mod tests {
                 types: BTreeMap::new(),
                 after_types: Default::default(),
                 key_type: None,
-            },
+            }),
         ]);
         let p = probes(&cs);
         assert_eq!(p.len(), 1, "{p:?}");
@@ -4688,14 +4714,14 @@ mod tests {
             .columns
             .insert("code".into(), pbps_model::Column::new(ty("varchar(20)")));
         let cs = plan(vec![
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: uid("t_aaaaaa"),
                 name: tname("dbo.status"),
                 table: Box::new(table),
                 beside_default: None,
                 moves_at_most: None,
-            },
-            Change::DeleteRow {
+            }),
+            Change::Row(RowChange::DeleteRow {
                 table: tname("dbo.status"),
                 key_column: "code".into(),
                 key: RowKey::from("old"),
@@ -4705,7 +4731,7 @@ mod tests {
                 types: BTreeMap::new(),
                 after_types: Default::default(),
                 key_type: None,
-            },
+            }),
         ]);
         assert!(probes(&cs).is_empty());
     }
@@ -4716,22 +4742,22 @@ mod tests {
     #[test]
     fn every_probe_counts() {
         let changes = plan(vec![
-            Change::AlterColumnNullability {
+            Change::Column(ColumnChange::AlterColumnNullability {
                 uid: uid("c_aaaaaa"),
                 column: cref("dbo.customer.email"),
                 ty: ty("nvarchar(255)"),
                 to_nullable: false,
                 through_external_partitions: false,
                 collation: None,
-            },
-            Change::AddCheck {
+            }),
+            Change::Constraint(ConstraintChange::AddCheck {
                 table: tname("dbo.customer"),
                 name: "ck".into(),
                 constraint: CheckConstraint {
                     expression: "[amount] >= 0".into(),
                 },
-            },
-            Change::AddUnique {
+            }),
+            Change::Constraint(ConstraintChange::AddUnique {
                 table: tname("dbo.customer"),
                 name: "uq".into(),
                 constraint: UniqueConstraint {
@@ -4740,7 +4766,7 @@ mod tests {
                     filegroup: None,
                 },
                 clustered: false,
-            },
+            }),
         ]);
         let all = probes(&changes);
         assert!(!all.is_empty());
@@ -4758,21 +4784,21 @@ mod tests {
     #[test]
     fn a_probe_uses_the_name_the_database_still_has() {
         let cs = plan(vec![
-            Change::RenameColumn {
+            Change::Column(ColumnChange::RenameColumn {
                 uid: uid("c_aaaaaa"),
                 table: tname("dbo.customer"),
                 from: "email".into(),
                 to: "contact_email".into(),
                 table_was: None,
-            },
-            Change::AlterColumnNullability {
+            }),
+            Change::Column(ColumnChange::AlterColumnNullability {
                 uid: uid("c_aaaaaa"),
                 column: cref("dbo.customer.contact_email"),
                 ty: ty("nvarchar(255)"),
                 to_nullable: false,
                 through_external_partitions: false,
                 collation: None,
-            },
+            }),
         ]);
         let p = probes(&cs);
         assert_eq!(p.len(), 1);
@@ -4790,19 +4816,19 @@ mod tests {
     #[test]
     fn a_renamed_table_is_probed_under_its_old_name() {
         let cs = plan(vec![
-            Change::RenameTable {
+            Change::Table(TableChange::RenameTable {
                 uid: uid("t_aaaaaa"),
                 from: tname("dbo.client"),
                 to: tname("dbo.customer"),
                 defaults: Vec::new(),
-            },
-            Change::AddCheck {
+            }),
+            Change::Constraint(ConstraintChange::AddCheck {
                 table: tname("dbo.customer"),
                 name: "ck".into(),
                 constraint: CheckConstraint {
                     expression: "[amount] >= 0".into(),
                 },
-            },
+            }),
         ]);
         let p = probes(&cs);
         assert_eq!(p.len(), 1);
@@ -4821,7 +4847,7 @@ mod tests {
         table
             .columns
             .insert("id".into(), pbps_model::Column::new(ty("int")));
-        let unique = Change::AddUnique {
+        let unique = Change::Constraint(ConstraintChange::AddUnique {
             table: tname("dbo.brand_new"),
             name: "uq".into(),
             constraint: UniqueConstraint {
@@ -4830,26 +4856,28 @@ mod tests {
                 filegroup: None,
             },
             clustered: false,
-        };
-        let create = Change::CreateTable {
+        });
+        let create = Change::Table(TableChange::CreateTable {
             uid: uid("t_aaaaaa"),
             name: tname("dbo.brand_new"),
             table: Box::new(table),
             beside_default: None,
             moves_at_most: None,
-        };
-        let row = |key: &str, id: i64| Change::InsertRow {
-            table: tname("dbo.brand_new"),
-            key_column: "id".into(),
-            identity_key: false,
-            key: RowKey::from(key),
-            row: pbps_model::Row(
-                [("id".into(), pbps_model::Value::Int(id))]
-                    .into_iter()
-                    .collect(),
-            ),
-            defaults: Default::default(),
-            types: Default::default(),
+        });
+        let row = |key: &str, id: i64| {
+            Change::Row(RowChange::InsertRow {
+                table: tname("dbo.brand_new"),
+                key_column: "id".into(),
+                identity_key: false,
+                key: RowKey::from(key),
+                row: pbps_model::Row(
+                    [("id".into(), pbps_model::Value::Int(id))]
+                        .into_iter()
+                        .collect(),
+                ),
+                defaults: Default::default(),
+                types: Default::default(),
+            })
         };
 
         // No rows declared: an empty table collides with nothing, and saying

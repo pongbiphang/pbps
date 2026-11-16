@@ -1,6 +1,7 @@
 //! The parts of a step's engine effects that dialects share (#1954,
 //! DEC-1954.3). Pure: they read the step and the baseline model.
 
+use pbps_model::ColumnChange;
 use pbps_model::operation::{
     Effects, Operation, OwnerError, Owners, PartKey, Requirement, Snapshot, base_table,
 };
@@ -13,8 +14,10 @@ use crate::{Dialect, RetypeDependents};
 #[allow(clippy::wildcard_enum_match_arm)]
 fn column_of(change: &Change, renames_block: bool) -> Option<ColumnRef> {
     match change {
-        Change::DropColumn { column, .. } => Some(column.clone()),
-        Change::RenameColumn { table, from, .. } if renames_block => Some(table.column(from)),
+        Change::Column(ColumnChange::DropColumn { column, .. }) => Some(column.clone()),
+        Change::Column(ColumnChange::RenameColumn { table, from, .. }) if renames_block => {
+            Some(table.column(from))
+        }
         _ => None,
     }
 }
@@ -114,7 +117,7 @@ pub fn retype_blockers(
 ) -> Result<Effects, OwnerError> {
     let mut fx = Effects::default();
     let (uid, column, dependents) = match op.change() {
-        Change::AlterColumnType {
+        Change::Column(ColumnChange::AlterColumnType {
             uid,
             column,
             from,
@@ -124,7 +127,7 @@ pub fn retype_blockers(
             from_collation,
             to_collation,
             ..
-        } => (
+        }) => (
             uid,
             column,
             RetypeDependents::of_retype(
@@ -134,12 +137,12 @@ pub fn retype_blockers(
                 (from_nullable != to_nullable).then_some(*to_nullable),
             ),
         ),
-        Change::AlterColumnNullability {
+        Change::Column(ColumnChange::AlterColumnNullability {
             uid,
             column,
             to_nullable,
             ..
-        } => (uid, column, dialect.nullability_dependents(*to_nullable)),
+        }) => (uid, column, dialect.nullability_dependents(*to_nullable)),
         _ => return Ok(fx),
     };
     let Some(table) = base_table(op, owners, before, &column.table)? else {

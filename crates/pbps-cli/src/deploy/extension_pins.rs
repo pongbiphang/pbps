@@ -7,7 +7,11 @@ pub(crate) fn created_extensions(
     cs: &pbps_model::ChangeSet,
 ) -> impl Iterator<Item = &pbps_model::ObjectLocalName> {
     cs.changes.iter().filter_map(|p| {
-        if let pbps_model::Change::CreateExtension { name, .. } = &p.change {
+        if let pbps_model::Change::Extension(pbps_model::ExtensionChange::CreateExtension {
+            name,
+            ..
+        }) = &p.change
+        {
             Some(name)
         } else {
             None
@@ -22,11 +26,21 @@ pub(super) fn changed_extensions(
     cs: &pbps_model::ChangeSet,
 ) -> impl Iterator<Item = (&pbps_model::ObjectLocalName, &'static str)> {
     cs.changes.iter().filter_map(|p| {
-        if let pbps_model::Change::CreateExtension { name, .. } = &p.change {
+        if let pbps_model::Change::Extension(pbps_model::ExtensionChange::CreateExtension {
+            name,
+            ..
+        }) = &p.change
+        {
             Some((name, "created"))
-        } else if let pbps_model::Change::UpdateExtension { name, .. } = &p.change {
+        } else if let pbps_model::Change::Extension(
+            pbps_model::ExtensionChange::UpdateExtension { name, .. },
+        ) = &p.change
+        {
             Some((name, "updated"))
-        } else if let pbps_model::Change::SetExtensionSchema { name, .. } = &p.change {
+        } else if let pbps_model::Change::Extension(
+            pbps_model::ExtensionChange::SetExtensionSchema { name, .. },
+        ) = &p.change
+        {
             Some((name, "moved"))
         } else {
             None
@@ -226,6 +240,7 @@ pub(crate) async fn extension_change_pins(
     manifests: &crate::rehearsal::connected::Manifests,
     declared: &Schema,
 ) -> anyhow::Result<Vec<pbps_model::ExtensionChangePin>> {
+    use pbps_model::ExtensionChange;
     use pbps_model::{Change, Extension, Uid};
     type Step<'a> = (&'a Extension, &'a Extension);
     type Chain<'a> = (
@@ -235,22 +250,22 @@ pub(crate) async fn extension_change_pins(
     );
     let mut chains: BTreeMap<&Uid, Chain<'_>> = BTreeMap::new();
     for planned in &cs.changes {
-        if let Change::UpdateExtension {
+        if let Change::Extension(ExtensionChange::UpdateExtension {
             uid,
             name,
             from,
             to,
             ..
-        } = &planned.change
+        }) = &planned.change
         {
             chains.entry(uid).or_insert((name, None, None)).1 = Some((from, to));
-        } else if let Change::SetExtensionSchema {
+        } else if let Change::Extension(ExtensionChange::SetExtensionSchema {
             uid,
             name,
             from,
             to,
             releases,
-        } = &planned.change
+        }) = &planned.change
         {
             chains.entry(uid).or_insert((name, None, None)).2 = Some(((from, to), releases));
         }
@@ -385,12 +400,12 @@ pub(crate) async fn extension_drop_pins(
         .changes
         .iter()
         .filter_map(|p| {
-            if let pbps_model::Change::DropExtension {
+            if let pbps_model::Change::Extension(pbps_model::ExtensionChange::DropExtension {
                 uid,
                 name,
                 definition,
                 ..
-            } = &p.change
+            }) = &p.change
             {
                 Some((uid, name, definition))
             } else {
@@ -435,12 +450,12 @@ pub(crate) fn extension_pins(
 ) -> anyhow::Result<Vec<pbps_model::ExtensionPin>> {
     let mut pins = Vec::new();
     for planned in &cs.changes {
-        let pbps_model::Change::CreateExtension {
+        let pbps_model::Change::Extension(pbps_model::ExtensionChange::CreateExtension {
             uid,
             name,
             definition,
             ..
-        } = &planned.change
+        }) = &planned.change
         else {
             continue;
         };

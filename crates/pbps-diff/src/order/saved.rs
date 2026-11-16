@@ -239,12 +239,12 @@ pub(super) fn rebuild_is_well_formed(
     ids: &pbps_model::IdsFile,
     change: &pbps_model::Change,
 ) -> bool {
-    let pbps_model::Change::EnumRebuild {
+    let pbps_model::Change::TypeValue(pbps_model::TypeValueChange::EnumRebuild {
         uid,
         name,
         tmp,
         step,
-    } = change
+    }) = change
     else {
         return true;
     };
@@ -267,9 +267,16 @@ pub fn logical_changes(cs: &pbps_model::ChangeSet) -> usize {
         // `if let` rather than a match with a wildcard: no other change
         // brings a routine into being, so there is no list to enumerate and
         // none to keep up to date.
-        let id = if let pbps_model::Change::CreateModule { id, .. } = &planned.change {
+        let id = if let pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule {
+            id,
+            ..
+        }) = &planned.change
+        {
             id
-        } else if let pbps_model::Change::AlterModule { id, .. } = &planned.change {
+        } else if let pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule {
+            id, ..
+        }) = &planned.change
+        {
             id
         } else {
             continue;
@@ -284,9 +291,16 @@ pub fn logical_changes(cs: &pbps_model::ChangeSet) -> usize {
     cs.changes
         .iter()
         .filter(|planned| {
-            if let pbps_model::Change::PublicExecution { routine, .. } = &planned.change {
+            if let pbps_model::Change::Permission(pbps_model::GrantChange::PublicExecution {
+                routine,
+                ..
+            }) = &planned.change
+            {
                 !built.contains(routine)
-            } else if let pbps_model::Change::EnumRebuild { uid, .. } = &planned.change {
+            } else if let pbps_model::Change::TypeValue(
+                pbps_model::TypeValueChange::EnumRebuild { uid, .. },
+            ) = &planned.change
+            {
                 rebuilt.insert(uid)
             } else {
                 true
@@ -299,17 +313,19 @@ fn public_execution_decisions_match_their_modules(
     cs: &pbps_model::ChangeSet,
     dialect: &(impl Dialect + ?Sized),
 ) -> Result<(), AdmissionError> {
+    use pbps_model::GrantChange;
+    use pbps_model::ModuleChange;
     use pbps_model::{Change, ModuleId, RoutineOrigin};
 
     let routine_of = |change: &Change| -> Option<(u8, pbps_model::RoutineId)> {
         // `if let` rather than a match with a wildcard: these are the three
         // changes that decide whether an object is there afterwards, and a
         // list of all the rest would need maintaining for nothing.
-        let (rank, id) = if let Change::CreateModule { id, .. } = change {
+        let (rank, id) = if let Change::Module(ModuleChange::CreateModule { id, .. }) = change {
             (0u8, id)
-        } else if let Change::AlterModule { id, .. } = change {
+        } else if let Change::Module(ModuleChange::AlterModule { id, .. }) = change {
             (1, id)
-        } else if let Change::DropModule { id, .. } = change {
+        } else if let Change::Module(ModuleChange::DropModule { id, .. }) = change {
             (2, id)
         } else {
             return None;
@@ -346,9 +362,9 @@ fn public_execution_decisions_match_their_modules(
     let mut decided: std::collections::BTreeMap<&pbps_model::RoutineId, usize> =
         std::collections::BTreeMap::new();
     for (index, planned) in cs.changes.iter().enumerate() {
-        let Change::PublicExecution {
+        let Change::Permission(GrantChange::PublicExecution {
             routine, origin, ..
-        } = &planned.change
+        }) = &planned.change
         else {
             continue;
         };
@@ -511,11 +527,11 @@ pub fn validate_saved_plan(
         // These checks supplement the existing admission for type lifecycle payloads.
         #[allow(clippy::wildcard_enum_match_arm)]
         let valid = match &step.change {
-            pbps_model::Change::CreateType {
+            pbps_model::Change::Type(pbps_model::TypeChange::CreateType {
                 uid,
                 name,
                 definition,
-            } => {
+            }) => {
                 uid.kind() == pbps_model::UidKind::Type
                     && plan.ids.types.get(uid) == Some(name)
                     && plan.declared_type_pins.iter().any(|p| {
@@ -532,17 +548,19 @@ pub fn validate_saved_plan(
                             }
                     })
             }
-            pbps_model::Change::RenameType { uid, from, to, .. } => {
+            pbps_model::Change::Type(pbps_model::TypeChange::RenameType {
+                uid, from, to, ..
+            }) => {
                 uid.kind() == pbps_model::UidKind::Type
                     && plan.ids.types.get(uid) == Some(to)
                     && plan.declared_type_pins.iter().any(|p| {
                         p.uid == *uid && p.before.as_ref().is_some_and(|b| b.name == *from)
                     })
             }
-            pbps_model::Change::DropType { uid, .. } => {
+            pbps_model::Change::Type(pbps_model::TypeChange::DropType { uid, .. }) => {
                 uid.kind() == pbps_model::UidKind::Type && !plan.ids.types.contains_key(uid)
             }
-            pbps_model::Change::EnumRebuild { .. } => {
+            pbps_model::Change::TypeValue(pbps_model::TypeValueChange::EnumRebuild { .. }) => {
                 rebuild_is_well_formed(&plan.ids, &step.change)
             }
             _ => true,
@@ -555,12 +573,12 @@ pub fn validate_saved_plan(
     // dialect's own checks, so a hand-edited saved plan cannot create what the
     // declarations never held or drop what they still do (DEC-2728.2).
     for step in &plan.changes.changes {
-        if let pbps_model::Change::CreateSearch {
+        if let pbps_model::Change::Search(pbps_model::SearchChange::CreateSearch {
             uid,
             name,
             definition,
             ..
-        } = &step.change
+        }) = &step.change
         {
             if uid.kind() != pbps_model::UidKind::Search
                 || plan.ids.search.get(uid) != Some(name)
@@ -578,7 +596,11 @@ pub fn validate_saved_plan(
             {
                 return Err(AdmissionError::from_error(error));
             }
-        } else if let pbps_model::Change::DropSearch { uid, name, .. } = &step.change
+        } else if let pbps_model::Change::Search(pbps_model::SearchChange::DropSearch {
+            uid,
+            name,
+            ..
+        }) = &step.change
             && (uid.kind() != pbps_model::UidKind::Search || plan.ids.search.contains_key(uid))
         {
             refuse!(
@@ -625,18 +647,19 @@ pub fn validate_saved_plan(
 /// the pins, so a swapped manifest is a different plan; this refuses a plan
 /// whose own parts disagree before it can reach a statement.
 pub(super) fn package_pins_match_their_creates(plan: &SavedPlan) -> Result<(), AdmissionError> {
+    use pbps_model::ExtensionChange;
     use pbps_model::{Change, UidKind};
     let creates: std::collections::BTreeMap<_, _> = plan
         .changes
         .changes
         .iter()
         .filter_map(|p| {
-            if let Change::CreateExtension {
+            if let Change::Extension(ExtensionChange::CreateExtension {
                 uid,
                 name,
                 definition,
                 requires,
-            } = &p.change
+            }) = &p.change
             {
                 Some((uid, (name, definition, requires)))
             } else {
@@ -686,19 +709,20 @@ pub(super) fn package_pins_match_their_creates(plan: &SavedPlan) -> Result<(), A
 /// the plan does not drop. A drop whose own parts disagree never reaches a
 /// statement.
 pub(super) fn package_pins_match_their_drops(plan: &SavedPlan) -> Result<(), AdmissionError> {
+    use pbps_model::ExtensionChange;
     use pbps_model::{Change, UidKind};
     let drops: std::collections::BTreeMap<_, _> = plan
         .changes
         .changes
         .iter()
         .filter_map(|p| {
-            if let Change::DropExtension {
+            if let Change::Extension(ExtensionChange::DropExtension {
                 uid,
                 name,
                 definition,
                 requirers,
                 ..
-            } = &p.change
+            }) = &p.change
             {
                 Some((uid, (name, definition, requirers)))
             } else {
@@ -754,13 +778,14 @@ pub(super) fn package_pins_match_their_drops(plan: &SavedPlan) -> Result<(), Adm
 /// the target (and is empty for a move alone), and a required package is created
 /// by the same plan. A change whose own parts disagree never reaches a statement.
 pub(super) fn package_pins_match_their_updates(plan: &SavedPlan) -> Result<(), AdmissionError> {
+    use pbps_model::ExtensionChange;
     use pbps_model::{Change, Extension, UidKind};
     let creates: std::collections::BTreeSet<_> = plan
         .changes
         .changes
         .iter()
         .filter_map(|p| {
-            if let Change::CreateExtension { uid, .. } = &p.change {
+            if let Change::Extension(ExtensionChange::CreateExtension { uid, .. }) = &p.change {
                 Some(uid)
             } else {
                 None
@@ -777,28 +802,29 @@ pub(super) fn package_pins_match_their_updates(plan: &SavedPlan) -> Result<(), A
     }
     let mut chains: std::collections::BTreeMap<&pbps_model::Uid, Chain<'_>> = Default::default();
     for p in &plan.changes.changes {
-        let (uid, name, step, requires) = if let Change::UpdateExtension {
-            uid,
-            name,
-            from,
-            to,
-            requires,
-            ..
-        } = &p.change
-        {
-            (uid, name, (from, to), Some(requires))
-        } else if let Change::SetExtensionSchema {
-            uid,
-            name,
-            from,
-            to,
-            ..
-        } = &p.change
-        {
-            (uid, name, (from, to), None)
-        } else {
-            continue;
-        };
+        let (uid, name, step, requires) =
+            if let Change::Extension(ExtensionChange::UpdateExtension {
+                uid,
+                name,
+                from,
+                to,
+                requires,
+                ..
+            }) = &p.change
+            {
+                (uid, name, (from, to), Some(requires))
+            } else if let Change::Extension(ExtensionChange::SetExtensionSchema {
+                uid,
+                name,
+                from,
+                to,
+                ..
+            }) = &p.change
+            {
+                (uid, name, (from, to), None)
+            } else {
+                continue;
+            };
         let chain = chains.entry(uid).or_default();
         let slot = if requires.is_some() {
             &mut chain.update
@@ -875,12 +901,13 @@ pub(super) fn package_pins_match_their_updates(plan: &SavedPlan) -> Result<(), A
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::RoleChange;
     use pbps_model::{Change, PlannedChange};
     fn role(name: &str) -> PlannedChange {
-        PlannedChange::new(Change::CreateRole {
+        PlannedChange::new(Change::Role(RoleChange::CreateRole {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Role, name, 0),
             name: name.into(),
-        })
+        }))
     }
     fn wire(changes: ChangeSet) -> SavedPlan {
         SavedPlan::new(

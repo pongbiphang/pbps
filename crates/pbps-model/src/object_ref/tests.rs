@@ -1,4 +1,7 @@
 use super::*;
+use crate::ColumnChange;
+use crate::RoleChange;
+use crate::TableChange;
 use crate::diagnostic::Declaration;
 use crate::operation::{Origin, Owners, PlanOwners, Spelling};
 use crate::{
@@ -518,26 +521,26 @@ fn renames_keep_recorded_edges_and_reused_addresses_have_new_anchors() {
         ..Default::default()
     };
     let changes = vec![
-        PlannedChange::new(Change::RenameTable {
+        PlannedChange::new(Change::Table(TableChange::RenameTable {
             uid: tu,
             from: old.clone(),
             to: new.clone(),
             defaults: vec![],
-        }),
-        PlannedChange::new(Change::RenameColumn {
+        })),
+        PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
             uid: cu,
             table: new.clone(),
             from: "x".into(),
             to: "y".into(),
             table_was: Some(old.clone()),
-        }),
-        PlannedChange::new(Change::CreateTable {
+        })),
+        PlannedChange::new(Change::Table(TableChange::CreateTable {
             uid: replacement,
             name: old.clone(),
             table: Box::new(table()),
             beside_default: None,
             moves_at_most: None,
-        }),
+        })),
     ];
     let names = crate::plan_names::PlanNames::of(&changes, &goal_ids).unwrap();
     let owners = PlanOwners::new(names, &base_ids, &goal_ids);
@@ -675,19 +678,19 @@ fn inherited_columns_follow_the_parent_column_uid_through_renames() {
         ..Default::default()
     };
     let changes = [
-        PlannedChange::new(Change::RenameTable {
+        PlannedChange::new(Change::Table(TableChange::RenameTable {
             uid: parent_uid,
             from: parent.clone(),
             to: renamed.clone(),
             defaults: vec![],
-        }),
-        PlannedChange::new(Change::RenameColumn {
+        })),
+        PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
             uid: column_uid,
             table: renamed.clone(),
             from: "x".into(),
             to: "y".into(),
             table_was: Some(parent.clone()),
-        }),
+        })),
     ];
     let owners = PlanOwners::new(
         crate::plan_names::PlanNames::of(&changes, &goal_ids).unwrap(),
@@ -772,17 +775,17 @@ fn type_role_and_table_scoped_module_anchors_keep_their_recorded_identity() {
         ..Default::default()
     };
     let changes = [
-        PlannedChange::new(Change::RenameTable {
+        PlannedChange::new(Change::Table(TableChange::RenameTable {
             uid: "t_aaaaaa".parse().unwrap(),
             from: "app.t".parse().unwrap(),
             to: "app.renamed_t".parse().unwrap(),
             defaults: vec![],
-        }),
-        PlannedChange::new(Change::RenameRole {
+        })),
+        PlannedChange::new(Change::Role(RoleChange::RenameRole {
             uid: "r_aaaaaa".parse().unwrap(),
             from: "reader".into(),
             to: "renamed_reader".into(),
-        }),
+        })),
     ];
     let owners = PlanOwners::new(
         crate::plan_names::PlanNames::of(&changes, &goal_ids).unwrap(),

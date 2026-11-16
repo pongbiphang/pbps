@@ -1,4 +1,7 @@
 use super::*;
+use pbps_model::GrantChange;
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
 use pbps_model::{ObjectName, PlannedChange, Role, RoleName, Uid, UidKind};
 
 fn environment_key() -> EnvironmentFingerprintKey {
@@ -40,17 +43,17 @@ fn write(target: GrantTarget, permission: Permission, grant: bool) -> Change {
     let role = "reader".into();
     let permissions = BTreeSet::from([permission]);
     if grant {
-        Change::Grant {
+        Change::Permission(GrantChange::Grant {
             role,
             target,
             permissions,
-        }
+        })
     } else {
-        Change::Revoke {
+        Change::Permission(GrantChange::Revoke {
             role,
             target,
             permissions,
-        }
+        })
     }
 }
 
@@ -229,7 +232,7 @@ fn public_execution_is_separate_from_a_named_public_role_and_other_overloads() {
         .roles
         .insert(RoleName::from("PUBLIC"), Role::default());
     let mut change = write(target.clone(), Permission::Execute, true);
-    if let Change::Grant { role, .. } = &mut change {
+    if let Change::Permission(GrantChange::Grant { role, .. }) = &mut change {
         *role = "PUBLIC".into();
     }
     let named = changes(vec![change]);
@@ -258,11 +261,11 @@ fn public_execution_is_separate_from_a_named_public_role_and_other_overloads() {
             .1
             .is_empty()
     );
-    let public = changes(vec![Change::PublicExecution {
+    let public = changes(vec![Change::Permission(GrantChange::PublicExecution {
         routine,
         access: pbps_model::PublicAccess::Kept,
         origin: pbps_model::RoutineOrigin::Rebuilt,
-    }]);
+    })]);
     let sealed = seal(&key, &public, &IdsFile::default(), Some(&before)).unwrap();
     let mut wrong = before;
     wrong
@@ -289,12 +292,12 @@ fn tracked_names_use_their_grant_time_holder_and_endpoint_coordinates() {
     let old = ObjectName::new("app", "old");
     let new = ObjectName::new("app", "new");
     let changes = changes(vec![
-        Change::RenameTable {
+        Change::Table(TableChange::RenameTable {
             uid: uid.clone(),
             from: old.clone(),
             to: new.clone(),
             defaults: vec![],
-        },
+        }),
         write(GrantTarget::Object(new.clone()), Permission::Select, true),
     ]);
     let ids = IdsFile {
@@ -404,13 +407,13 @@ fn a_new_view_can_receive_a_grant_at_a_moved_tables_old_name() {
     let old = ObjectName::new("app", "old");
     let moved = ObjectName::new("app", "moved");
     let changes = changes(vec![
-        Change::RenameTable {
+        Change::Table(TableChange::RenameTable {
             uid: uid.clone(),
             from: old.clone(),
             to: moved.clone(),
             defaults: vec![],
-        },
-        Change::CreateModule {
+        }),
+        Change::Module(ModuleChange::CreateModule {
             id: ModuleId::Named(old.clone()),
             module: Box::new(pbps_model::Module {
                 kind: pbps_model::ModuleKind::View,
@@ -418,7 +421,7 @@ fn a_new_view_can_receive_a_grant_at_a_moved_tables_old_name() {
                 options: Default::default(),
                 definition: "SELECT 1 AS n".into(),
             }),
-        },
+        }),
         write(GrantTarget::Object(old.clone()), Permission::Select, true),
     ]);
     let ids = IdsFile {
@@ -449,10 +452,10 @@ fn a_new_view_can_receive_a_grant_at_a_moved_tables_old_name() {
     let mut removed = changes;
     removed.changes.insert(
         2,
-        PlannedChange::new(Change::DropModule {
+        PlannedChange::new(Change::Module(ModuleChange::DropModule {
             id: ModuleId::Named(old),
             kind: pbps_model::ModuleKind::View,
-        }),
+        })),
     );
     assert!(seal(&key, &removed, &ids, Some(&before)).is_err());
 }
@@ -464,16 +467,16 @@ fn a_standing_view_grant_can_precede_a_table_taking_its_name() {
     let source = ObjectName::new("app", "source");
     let changes = changes(vec![
         write(GrantTarget::Object(name.clone()), Permission::Select, true),
-        Change::DropModule {
+        Change::Module(ModuleChange::DropModule {
             id: ModuleId::Named(name.clone()),
             kind: pbps_model::ModuleKind::View,
-        },
-        Change::RenameTable {
+        }),
+        Change::Table(TableChange::RenameTable {
             uid: uid.clone(),
             from: source,
             to: name.clone(),
             defaults: vec![],
-        },
+        }),
     ]);
     let ids = IdsFile {
         tables: BTreeMap::from([(uid, name.clone())]),

@@ -112,6 +112,7 @@ fn row_security_validation_refuses_data_and_partition_trees() {
 
 #[test]
 fn row_security_emission_preserves_targets_modes_omissions_and_independent_flags() {
+    use pbps_model::PolicyChange;
     use pbps_model::{Change, RowSecurity, RowSecurityOrigin};
     let pg = pbps_pg::Postgres::new();
     let table = TableName::new("app", "docs");
@@ -141,12 +142,12 @@ fn row_security_emission_preserves_targets_modes_omissions_and_independent_flags
                 restrictive,
                 ..Default::default()
             };
-            let sql = emit(Change::CreatePolicy {
+            let sql = emit(Change::Policy(PolicyChange::CreatePolicy {
                 table: table.clone(),
                 name: "p".into(),
                 policy,
                 origin: RowSecurityOrigin::Created,
-            });
+            }));
             assert!(sql.contains(" TO PUBLIC;"), "{sql}");
             assert!(
                 sql.contains(if restrictive {
@@ -162,7 +163,7 @@ fn row_security_emission_preserves_targets_modes_omissions_and_independent_flags
             );
         }
     }
-    let sql = emit(Change::CreatePolicy {
+    let sql = emit(Change::Policy(PolicyChange::CreatePolicy {
         table: table.clone(),
         name: "a\"b".into(),
         policy: RowPolicy {
@@ -178,7 +179,7 @@ fn row_security_emission_preserves_targets_modes_omissions_and_independent_flags
             ..Default::default()
         },
         origin: RowSecurityOrigin::Created,
-    });
+    }));
     assert!(
         sql.contains("TO \"PUBLIC\", \"app_user\", \"role\"\"\n\u{202e}\""),
         "{sql}"
@@ -187,7 +188,7 @@ fn row_security_emission_preserves_targets_modes_omissions_and_independent_flags
         sql.contains("USING (id>0\n)") && !sql.contains("WITH CHECK"),
         "{sql}"
     );
-    let sql = emit(Change::SetRowSecurity {
+    let sql = emit(Change::Policy(PolicyChange::SetRowSecurity {
         uid: "t_117200".parse().unwrap(),
         table,
         from: Default::default(),
@@ -196,7 +197,7 @@ fn row_security_emission_preserves_targets_modes_omissions_and_independent_flags
             forced: true,
         },
         origin: RowSecurityOrigin::Created,
-    });
+    }));
     assert!(
         sql.contains("FORCE ROW LEVEL SECURITY") && !sql.contains("ENABLE"),
         "{sql}"
@@ -205,6 +206,7 @@ fn row_security_emission_preserves_targets_modes_omissions_and_independent_flags
 
 #[test]
 fn row_security_standing_sql_quotes_identifiers_and_is_transactional_for_every_flag_transition() {
+    use pbps_model::PolicyChange;
     use pbps_model::{Change, PlanMode, PlannedChange, RowSecurity, RowSecurityOrigin};
     let pg = pbps_pg::Postgres::new();
     let table = TableName::new("s\"q", "t\"q");
@@ -215,11 +217,11 @@ fn row_security_standing_sql_quotes_identifiers_and_is_transactional_for_every_f
         assert!(statements.iter().all(|s| s.transactional));
         statements.into_iter().map(|s| s.sql).collect::<Vec<_>>()
     };
-    let sql = emit(Change::DropPolicy {
+    let sql = emit(Change::Policy(PolicyChange::DropPolicy {
         table: table.clone(),
         name: "p\"q".into(),
         policy: RowPolicy::default(),
-    });
+    }));
     assert!(sql[0].contains(r#"DROP POLICY "p""q" ON "s""q"."t""q";"#));
     assert!(!sql[0].contains("CASCADE") && !sql[0].contains("IF EXISTS"));
     for a in 0..4 {
@@ -232,13 +234,13 @@ fn row_security_standing_sql_quotes_identifiers_and_is_transactional_for_every_f
                 enabled: b & 1 != 0,
                 forced: b & 2 != 0,
             };
-            let sql = emit(Change::SetRowSecurity {
+            let sql = emit(Change::Policy(PolicyChange::SetRowSecurity {
                 uid: "t_117307".parse().unwrap(),
                 table: table.clone(),
                 from,
                 to,
                 origin: RowSecurityOrigin::Standing,
-            });
+            }));
             assert_eq!(
                 sql.len(),
                 usize::from(from.enabled != to.enabled) + usize::from(from.forced != to.forced)

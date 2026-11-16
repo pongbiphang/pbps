@@ -215,10 +215,12 @@ pub(super) fn analyse_scoped(
         let born: std::collections::BTreeSet<_> = operations
             .iter()
             .filter_map(|op| match op.change() {
-                pbps_model::Change::CreateModule { id, .. } => {
-                    Some(pbps_model::operation::ObjectKey::Module(id.clone()))
-                }
-                pbps_model::Change::AlterModule { id, .. } if dialect.rebuilds_modules() => {
+                pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule {
+                    id, ..
+                }) => Some(pbps_model::operation::ObjectKey::Module(id.clone())),
+                pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule {
+                    id, ..
+                }) if dialect.rebuilds_modules() => {
                     Some(pbps_model::operation::ObjectKey::Module(id.clone()))
                 }
                 _ => None,
@@ -560,7 +562,8 @@ pub(crate) fn judge(ops: &[Operation], report: &Report, stage: Stage) -> (Vec<St
             && find(id).is_some_and(|o| {
                 matches!(
                     o.change(),
-                    pbps_model::Change::AlterModule { .. } | pbps_model::Change::DropModule { .. }
+                    pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule { .. })
+                        | pbps_model::Change::Module(pbps_model::ModuleChange::DropModule { .. })
                 )
             })
     };
@@ -695,21 +698,27 @@ pub(crate) fn judge_slots(
                 matches!(e.slot.namespace, pbps_dialect::slots::Namespace::Types(_))
                     || (matches!(
                         ops[e.before].change(),
-                        pbps_model::Change::AlterModule {
+                        pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule {
                             id: pbps_model::ModuleId::Trigger { .. },
                             ..
-                        } | pbps_model::Change::DropModule {
+                        }) | pbps_model::Change::Module(pbps_model::ModuleChange::DropModule {
                             id: pbps_model::ModuleId::Trigger { .. },
                             ..
-                        }
+                        })
                     ) && matches!(
                         ops[e.after].change(),
-                        pbps_model::Change::AddCheck { .. }
-                            | pbps_model::Change::AddForeignKey { .. }
-                            | pbps_model::Change::AddUnique { .. }
-                            | pbps_model::Change::SetPrimaryKey { to: Some(_), .. }
-                            | pbps_model::Change::CreateTable { .. }
-                            | pbps_model::Change::AttachPartition { .. }
+                        pbps_model::Change::Constraint(
+                            pbps_model::ConstraintChange::AddCheck { .. }
+                        ) | pbps_model::Change::Constraint(
+                            pbps_model::ConstraintChange::AddForeignKey { .. }
+                        ) | pbps_model::Change::Constraint(
+                            pbps_model::ConstraintChange::AddUnique { .. }
+                        ) | pbps_model::Change::Constraint(
+                            pbps_model::ConstraintChange::SetPrimaryKey { to: Some(_), .. }
+                        ) | pbps_model::Change::Table(pbps_model::TableChange::CreateTable { .. })
+                            | pbps_model::Change::Partition(
+                                pbps_model::PartitionChange::AttachPartition { .. }
+                            )
                     ))
             })
             .collect()

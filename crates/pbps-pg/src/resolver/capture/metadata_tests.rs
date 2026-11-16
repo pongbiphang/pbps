@@ -1,6 +1,7 @@
 //! Declaration-only metadata must not turn intact engine bindings into DDL.
 use super::*;
 use pbps_db::{Conn, Driver};
+use pbps_model::ColumnChange;
 use pbps_model::resolver::{Binding, BoundSurface, Surface, SurfaceResolution};
 use pbps_model::{Change, Column, Hints, IdsFile, Module, ModuleKind, Schema, Table};
 
@@ -183,7 +184,7 @@ async fn exercise(connection: String) {
         .unwrap();
         ordered.proof.validate(&ordered.changes).unwrap();
         assert!(
-            matches!(&ordered.changes.changes[..], [p] if matches!(p.change, Change::SetColumnDeprecated { .. })),
+            matches!(&ordered.changes.changes[..], [p] if matches!(p.change, Change::Column(ColumnChange::SetColumnDeprecated { .. }))),
             "metadata must not add module DDL: {:?}",
             ordered.changes
         );

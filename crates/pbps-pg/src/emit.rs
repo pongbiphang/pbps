@@ -50,6 +50,21 @@ use pbps_model::ColumnName;
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::{Created, DialectError, ScanCheckStep, Statement};
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::ExtensionChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::PolicyChange;
+use pbps_model::RoleChange;
+use pbps_model::RowChange;
+use pbps_model::SearchChange;
+use pbps_model::TableChange;
+use pbps_model::TablePropertyChange;
+use pbps_model::TypeChange;
+use pbps_model::TypeValueChange;
 use pbps_model::escape::Escaped;
 use pbps_model::{
     Cell, Change, Column, ColumnType, ForeignKey, GrantTarget, Index, Module, ModuleId, ModuleKind,
@@ -70,6 +85,9 @@ pub(crate) use row_defaults::{RowDefaultIndex, RowDefaults};
 #[cfg(test)]
 mod declared_type_emission_tests {
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::TypeChange;
+    use pbps_model::TypeValueChange;
 
     fn domain_for_alteration(
         not_null: bool,
@@ -93,13 +111,13 @@ mod declared_type_emission_tests {
         to: pbps_model::ManagedType,
         half: pbps_model::DomainHalf,
     ) -> Vec<Statement> {
-        let change = Change::AlterDomain {
+        let change = Change::TypeValue(TypeValueChange::AlterDomain {
             uid: "y_000001".parse().unwrap(),
             name: pbps_model::TypeRef::new("app", "co\"de").unwrap(),
             from: Box::new(from),
             to: Box::new(to),
             half,
-        };
+        });
         Postgres::new()
             .fixture_emit(&change, Default::default())
             .unwrap()
@@ -209,13 +227,14 @@ mod declared_type_emission_tests {
                       to: pbps_model::ManagedType,
                       half,
                       mode: pbps_model::PlanMode| {
-            let planned = pbps_model::PlannedChange::new(Change::AlterDomain {
-                uid: "y_000001".parse().unwrap(),
-                name: pbps_model::TypeRef::new("app", "code").unwrap(),
-                from: Box::new(from),
-                to: Box::new(to),
-                half,
-            });
+            let planned =
+                pbps_model::PlannedChange::new(Change::TypeValue(TypeValueChange::AlterDomain {
+                    uid: "y_000001".parse().unwrap(),
+                    name: pbps_model::TypeRef::new("app", "code").unwrap(),
+                    from: Box::new(from),
+                    to: Box::new(to),
+                    half,
+                }));
             let ordered = pbps_diff::order::singleton(planned, mode, &pg);
             let lowered = pbps_dialect::lower::lower_all(
                 &ordered as &dyn pbps_diff::order::PlanView<Postgres>,
@@ -292,7 +311,7 @@ mod declared_type_emission_tests {
             domain_for_alteration(false, None, &[("c", "VALUE <> ''"), ("d", "VALUE <> 'x'")]);
         assert!(altering(one.clone(), more.clone(), Loosen).is_empty());
         assert!(altering(more, one.clone(), Tighten).is_empty());
-        let change = Change::AlterDomain {
+        let change = Change::TypeValue(TypeValueChange::AlterDomain {
             uid: "y_000001".parse().unwrap(),
             name: "app.e".parse().unwrap(),
             from: Box::new(pbps_model::ManagedType::Enum {
@@ -300,7 +319,7 @@ mod declared_type_emission_tests {
             }),
             to: Box::new(one),
             half: Loosen,
-        };
+        });
         assert!(
             Postgres::new()
                 .fixture_emit(&change, Default::default())
@@ -315,14 +334,14 @@ mod declared_type_emission_tests {
         let definition = Box::new(pbps_model::ManagedType::Enum {
             values: vec!["can't".into(), "ok".into()],
         });
-        let change = Change::AddEnumValue {
+        let change = Change::TypeValue(TypeValueChange::AddEnumValue {
             uid,
             name,
             value: "can't".into(),
             placement: Some(pbps_model::EnumPlacement::Before("ok".into())),
             ordinal: 0,
             definition: definition.clone(),
-        };
+        });
         let output = emit(&Postgres::new(), &change, Strategy::default()).unwrap();
         assert_eq!(output.len(), 1);
         assert!(
@@ -342,10 +361,10 @@ mod declared_type_emission_tests {
             Some(definition.as_ref())
         );
         assert!(output[0].transactional);
-        let Change::AddEnumValue { uid, name, .. } = change else {
+        let Change::TypeValue(TypeValueChange::AddEnumValue { uid, name, .. }) = change else {
             unreachable!()
         };
-        let renamed = Change::RenameEnumValue {
+        let renamed = Change::TypeValue(TypeValueChange::RenameEnumValue {
             uid,
             name,
             from: "can't".into(),
@@ -355,7 +374,7 @@ mod declared_type_emission_tests {
             definition: Box::new(pbps_model::ManagedType::Enum {
                 values: vec!["blue".into(), "ok".into()],
             }),
-        };
+        });
         let output = emit(&Postgres::new(), &renamed, Strategy::default()).unwrap();
         assert!(output[0].sql.contains("RENAME VALUE E'can''t' TO E'blue';"));
         assert!(!output[0].sql.contains("ADD VALUE"));
@@ -370,11 +389,13 @@ mod declared_type_emission_tests {
         let definition = Box::new(pbps_model::ManagedType::Enum {
             values: vec!["it's".into(), "ok".into()],
         });
-        let step = |step| Change::EnumRebuild {
-            uid: uid.clone(),
-            name: name.clone(),
-            tmp: tmp.clone(),
-            step,
+        let step = |step| {
+            Change::TypeValue(TypeValueChange::EnumRebuild {
+                uid: uid.clone(),
+                name: name.clone(),
+                tmp: tmp.clone(),
+                step,
+            })
         };
         let sql = |change: &Change| emit(&Postgres::new(), change, Strategy::default()).unwrap();
         let create = sql(&step(Step::Create {
@@ -470,11 +491,13 @@ mod declared_type_emission_tests {
             checks: BTreeMap::from([("c".into(), "VALUE <> 'b'".into())]),
             collation: None,
         });
-        let step = |step| Change::EnumRebuild {
-            uid: uid.clone(),
-            name: name.clone(),
-            tmp: tmp.clone(),
-            step,
+        let step = |step| {
+            Change::TypeValue(TypeValueChange::EnumRebuild {
+                uid: uid.clone(),
+                name: name.clone(),
+                tmp: tmp.clone(),
+                step,
+            })
         };
         let sql = |change: &Change| emit(&Postgres::new(), change, Strategy::default()).unwrap();
         let create = sql(&step(Step::Create {
@@ -601,11 +624,11 @@ mod declared_type_emission_tests {
             };
             let statements = emit(
                 &pg,
-                &Change::CreateType {
+                &Change::Type(TypeChange::CreateType {
                     uid: "y_aaaaaa".parse().unwrap(),
                     name: "app.d".parse().unwrap(),
                     definition: Box::new(definition.clone()),
-                },
+                }),
                 Strategy::default(),
             )
             .unwrap();
@@ -621,12 +644,12 @@ mod declared_type_emission_tests {
             );
             let set = emit(
                 &pg,
-                &Change::AlterColumnDefault {
+                &Change::Column(ColumnChange::AlterColumnDefault {
                     uid: "c_aaaaaa".parse().unwrap(),
                     column: table.column("v"),
                     from: None,
                     to: Some(expression.into()),
-                },
+                }),
                 Strategy::default(),
             )
             .unwrap();
@@ -644,11 +667,11 @@ mod declared_type_emission_tests {
         let definition = pbps_model::ManagedType::Enum {
             values: vec!["can't".into(), "ok".into()],
         };
-        let create = Change::CreateType {
+        let create = Change::Type(TypeChange::CreateType {
             uid: uid.clone(),
             name: name.clone(),
             definition: Box::new(definition.clone()),
-        };
+        });
         let sql = emit(&pg, &create, Strategy::default()).unwrap();
         assert!(
             sql[0]
@@ -658,22 +681,22 @@ mod declared_type_emission_tests {
             sql[0].sql
         );
         assert!(sql[0].declared_type.is_some());
-        let drop = Change::DropType {
+        let drop = Change::Type(TypeChange::DropType {
             uid: uid.clone(),
             name: name.clone(),
             definition: Box::new(definition.clone()),
-        };
+        });
         assert!(
             emit(&pg, &drop, Strategy::default()).unwrap()[0]
                 .sql
                 .contains("DROP TYPE")
         );
-        let rename = Change::RenameType {
+        let rename = Change::Type(TypeChange::RenameType {
             uid: uid.clone(),
             from: name,
             to: "other.feeling".parse().unwrap(),
             definition: Box::new(definition),
-        };
+        });
         let statements = emit(&pg, &rename, Strategy::default()).unwrap();
         assert_eq!(statements.len(), 2);
         assert!(statements[0].sql.contains("SET SCHEMA \"other\""));
@@ -690,11 +713,11 @@ mod declared_type_emission_tests {
             checks: [("positive".into(), "VALUE <> ''".into())].into(),
             collation: Some("pg_catalog.\"C\"".parse().unwrap()),
         };
-        let create = Change::CreateType {
+        let create = Change::Type(TypeChange::CreateType {
             uid,
             name: "app.phone".parse().unwrap(),
             definition: Box::new(definition),
-        };
+        });
         let sql = &emit(&pg, &create, Strategy::default()).unwrap()[0].sql;
         let expected = concat!(
             "CREATE DOMAIN \"app\".\"phone\" AS character varying(20) ",
@@ -706,11 +729,11 @@ mod declared_type_emission_tests {
         assert!(
             emit(
                 &pg,
-                &Change::CreateType {
+                &Change::Type(TypeChange::CreateType {
                     uid: "y_bbbbbb".parse().unwrap(),
                     name: "app.empty".parse().unwrap(),
                     definition: Box::new(pbps_model::ManagedType::Enum { values: Vec::new() })
-                },
+                }),
                 Strategy::default()
             )
             .unwrap()[0]
@@ -1342,7 +1365,7 @@ fn is_one_dollar_quoted_literal(e: &str) -> bool {
 /// January in another.
 ///
 /// Its caller in `validate` is not a second guard, it is the *earlier* one, and
-/// it is where the whole rule is actually enforced: [`Change::AlterColumnDefault`]
+/// it is where the whole rule is actually enforced: [`pbps_model::ColumnChange::AlterColumnDefault`]
 /// carries a `ColumnRef` and two expressions and **no type**, so the emitter
 /// cannot ask this question on the one path that changes a default on a column
 /// that already exists. `validate_table` sees the declaration, types and all,
@@ -3986,10 +4009,16 @@ fn emit_statements(
     // DEC-2400.1: legacy recordings must stay inside every conversion wrapper.
     pbps_diff::conversion::check_change(change, pg).map_err(|error| invalid(error.to_string()))?;
     match change {
-        Change::BuildPartitionedIndex(recipe) => rebuild::build_partitioned_index(pg, recipe),
-        Change::CopyTableRows(copy) => rebuild::copy_table_rows(pg, copy),
-        Change::AnalyzeTableTree(tree) => rebuild::analyze_table_tree(pg, tree),
-        Change::RebuildPartitionedTable(_) => {
+        Change::Index(IndexChange::BuildPartitionedIndex(recipe)) => {
+            rebuild::build_partitioned_index(pg, recipe)
+        }
+        Change::Partition(PartitionChange::CopyTableRows(copy)) => {
+            rebuild::copy_table_rows(pg, copy)
+        }
+        Change::Partition(PartitionChange::AnalyzeTableTree(tree)) => {
+            rebuild::analyze_table_tree(pg, tree)
+        }
+        Change::Partition(PartitionChange::RebuildPartitionedTable(_)) => {
             let (operation, table) = change.pending_rebuild().expect("explicit rebuild variant");
             Err(DialectError::RebuildUnavailable {
                 operation,
@@ -3997,19 +4026,19 @@ fn emit_statements(
             })
         }
 
-        Change::DropPolicy { table, name, .. } => one(
+        Change::Policy(PolicyChange::DropPolicy { table, name, .. }) => one(
             pg,
             table,
             format!("DROP POLICY {} ON {};", quote(name)?, qualified(table)?),
         ),
-        Change::AddEnumValue {
+        Change::TypeValue(TypeValueChange::AddEnumValue {
             uid,
             name,
             value,
             placement,
             definition,
             ..
-        } => {
+        }) => {
             let position = match placement {
                 Some(pbps_model::EnumPlacement::Before(value)) => {
                     format!(" BEFORE {}", value_literal(value))
@@ -4039,21 +4068,21 @@ fn emit_statements(
             });
             Ok(vec![statement])
         }
-        Change::AlterDomain {
+        Change::TypeValue(TypeValueChange::AlterDomain {
             uid,
             name,
             from,
             to,
             half,
-        } => alter_domain(pg, uid, name, (from, to), *half),
-        Change::RenameEnumValue {
+        }) => alter_domain(pg, uid, name, (from, to), *half),
+        Change::TypeValue(TypeValueChange::RenameEnumValue {
             uid,
             name,
             from,
             to,
             definition,
             ..
-        } => {
+        }) => {
             let mut statement = scoped(
                 pg,
                 name.schema(),
@@ -4074,17 +4103,17 @@ fn emit_statements(
             });
             Ok(vec![statement])
         }
-        Change::EnumRebuild {
+        Change::TypeValue(TypeValueChange::EnumRebuild {
             uid,
             name,
             tmp,
             step,
-        } => emit_enum_rebuild(pg, uid, name, tmp, step),
-        Change::CreateType {
+        }) => emit_enum_rebuild(pg, uid, name, tmp, step),
+        Change::Type(TypeChange::CreateType {
             uid,
             name,
             definition,
-        } => {
+        }) => {
             let address = TableName::new(name.schema(), name.name());
             let sql = match definition.as_ref() {
                 pbps_model::ManagedType::Enum { values } => format!(
@@ -4108,18 +4137,20 @@ fn emit_statements(
             });
             Ok(vec![statement])
         }
-        Change::CreateSearch {
+        Change::Search(SearchChange::CreateSearch {
             uid,
             name,
             definition,
             ..
-        } => crate::search::create(uid, name, definition),
-        Change::DropSearch { uid, name, .. } => crate::search::drop(uid, name),
-        Change::DropType {
+        }) => crate::search::create(uid, name, definition),
+        Change::Search(SearchChange::DropSearch { uid, name, .. }) => {
+            crate::search::drop(uid, name)
+        }
+        Change::Type(TypeChange::DropType {
             uid,
             name,
             definition,
-        } => {
+        }) => {
             let mut statement = scoped(
                 pg,
                 name.schema(),
@@ -4144,12 +4175,12 @@ fn emit_statements(
             Ok(vec![statement])
         }
 
-        Change::RenameType {
+        Change::Type(TypeChange::RenameType {
             uid,
             from,
             to,
             definition,
-        } => {
+        }) => {
             let kind = if matches!(definition.as_ref(), pbps_model::ManagedType::Domain { .. }) {
                 "DOMAIN"
             } else {
@@ -4201,15 +4232,15 @@ fn emit_statements(
             }
             Ok(out)
         }
-        Change::CreatePolicy {
+        Change::Policy(PolicyChange::CreatePolicy {
             table,
             name,
             policy,
             ..
-        } => one(pg, table, create_policy_sql(table, name, policy)?),
-        Change::SetRowSecurity {
+        }) => one(pg, table, create_policy_sql(table, name, policy)?),
+        Change::Policy(PolicyChange::SetRowSecurity {
             table, from, to, ..
-        } => {
+        }) => {
             let mut statements = Vec::new();
             if from.enabled != to.enabled {
                 statements.extend(one(
@@ -4237,13 +4268,13 @@ fn emit_statements(
         }
         // The first statement is the one that brings the table into being; it
         // says so, and a staged checkpoint adopts the table from there.
-        Change::CreateTable {
+        Change::Table(TableChange::CreateTable {
             name,
             table,
             beside_default,
             moves_at_most,
             ..
-        } => {
+        }) => {
             let mut out = create_table(
                 pg,
                 name,
@@ -4261,11 +4292,11 @@ fn emit_statements(
         // (`other objects depend on it`), and the detach refuses while rows
         // still reference it. One statement, so that no apply, staged or
         // not, can stop with the partition detached and not dropped (#1171).
-        Change::DropTable {
+        Change::Table(TableChange::DropTable {
             name,
             detach_from: Some(parent),
             ..
-        } => one(
+        }) => one(
             pg,
             name,
             format!(
@@ -4275,28 +4306,28 @@ fn emit_statements(
                 qualified(name)?
             ),
         ),
-        Change::DropTable {
+        Change::Table(TableChange::DropTable {
             name,
             detach_from: None,
             ..
-        } => one(pg, name, format!("DROP TABLE {};", qualified(name)?)),
-        Change::DetachPartition {
+        }) => one(pg, name, format!("DROP TABLE {};", qualified(name)?)),
+        Change::Partition(PartitionChange::DetachPartition {
             table,
             parent,
             names,
             ..
-        } => unscoped(detach_partition(table, parent, names)?),
+        }) => unscoped(detach_partition(table, parent, names)?),
         // pbps's alone, every name qualified and no declared expression in
         // it, so on the session's empty path (DEC-1564.1). The engine takes
         // the parent, then the table; it adopts the table's indexes and keys
         // that match the parent's and builds the rest (#1545, measured on 16
         // and 18).
-        Change::AttachPartition {
+        Change::Partition(PartitionChange::AttachPartition {
             table,
             parent,
             bound,
             ..
-        } => unscoped(format!(
+        }) => unscoped(format!(
             "ALTER TABLE {} ATTACH PARTITION {} {};",
             qualified(parent)?,
             qualified(table)?,
@@ -4309,7 +4340,7 @@ fn emit_statements(
         // one in the new schema — and each statement says what it does to the
         // name (`Statement::renaming`), because between them the table is
         // findable under neither the baseline's name nor the plan's.
-        Change::RenameTable { from, to, .. } => rename_table(pg, from, to),
+        Change::Table(TableChange::RenameTable { from, to, .. }) => rename_table(pg, from, to),
 
         // No `own_batch`, and that is the difference from T-SQL rather than an
         // omission: measured, `ALTER TABLE t ADD COLUMN c int; ALTER TABLE t
@@ -4318,12 +4349,12 @@ fn emit_statements(
         // statement of a simple query when it reaches it. What it *does* read
         // up front is the whole batch's *lexis*, which is why
         // `standard_conforming_strings` is pinned by the framing and not here.
-        Change::AddColumn {
+        Change::Column(ColumnChange::AddColumn {
             table,
             name,
             column,
             ..
-        } => {
+        }) => {
             // A `serial`'s sequence before the column and its ownership after,
             // in the column's own statement, so no staged checkpoint falls
             // between them (#1631). Logged: the differ refuses a `serial`
@@ -4347,7 +4378,7 @@ fn emit_statements(
             ])
         }
 
-        Change::DropColumn { column, .. } => one(
+        Change::Column(ColumnChange::DropColumn { column, .. }) => one(
             pg,
             &column.table,
             format!(
@@ -4357,9 +4388,9 @@ fn emit_statements(
             ),
         ),
 
-        Change::RenameColumn {
+        Change::Column(ColumnChange::RenameColumn {
             table, from, to, ..
-        } => one(
+        }) => one(
             pg,
             table,
             format!(
@@ -4370,23 +4401,23 @@ fn emit_statements(
             ),
         ),
 
-        Change::AlterColumnType {
+        Change::Column(ColumnChange::AlterColumnType {
             column,
             to_collation: Some(collation),
             ..
-        }
-        | Change::AlterColumnType {
+        })
+        | Change::Column(ColumnChange::AlterColumnType {
             column,
             from_collation: Some(collation),
             ..
-        }
-        | Change::AlterColumnNullability {
+        })
+        | Change::Column(ColumnChange::AlterColumnNullability {
             column,
             collation: Some(collation),
             ..
-        } => Err(no_column_collation(column.shown(), collation)),
+        }) => Err(no_column_collation(column.shown(), collation)),
 
-        Change::AlterColumnType {
+        Change::Column(ColumnChange::AlterColumnType {
             column,
             from,
             to,
@@ -4395,7 +4426,7 @@ fn emit_statements(
             through_external_partitions,
             using,
             ..
-        } => {
+        }) => {
             let normalized = types::normalize(to)?;
             let was = types::normalize(from)?;
             if from.type_ref().is_some() || to.type_ref().is_some() {
@@ -4561,12 +4592,12 @@ fn emit_statements(
         // definition and reads an omitted `NULL` as nullable. This engine has a
         // subcommand for exactly this and needs no type, so the field is unused
         // here — deliberately, and not because it was missed.
-        Change::AlterColumnNullability {
+        Change::Column(ColumnChange::AlterColumnNullability {
             column,
             to_nullable,
             through_external_partitions,
             ..
-        } => {
+        }) => {
             let sql = one(
                 pg,
                 &column.table,
@@ -4591,15 +4622,15 @@ fn emit_statements(
         // A default is not a named object here — it is a property of the column
         // — so there is nothing to drop by name and no generated constraint
         // name to guess. `SET DEFAULT` replaces whatever was there.
-        Change::AlterColumnNumbering {
+        Change::Column(ColumnChange::AlterColumnNumbering {
             column,
             ty,
             from,
             to,
             ..
-        } => numbering(pg, column, ty, from, to),
+        }) => numbering(pg, column, ty, from, to),
 
-        Change::AlterColumnDefault { column, to, .. } => one(
+        Change::Column(ColumnChange::AlterColumnDefault { column, to, .. }) => one(
             pg,
             &column.table,
             match to {
@@ -4626,14 +4657,14 @@ fn emit_statements(
         // partition's schema, as its `CREATE` sets it, and its parent's
         // under the parent's, which another schema's partition does not
         // share (#1607 review).
-        Change::SetPartitionDefault {
+        Change::Partition(PartitionChange::SetPartitionDefault {
             table,
             parent,
             column,
             to,
             fallback,
             ..
-        } => {
+        }) => {
             let set = |expr: &str| -> Result<String, DialectError> {
                 Ok(format!(
                     "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
@@ -4656,12 +4687,12 @@ fn emit_statements(
                 ),
             }
         }
-        Change::SetPartitionNotNull {
+        Change::Partition(PartitionChange::SetPartitionNotNull {
             table,
             column,
             not_null,
             ..
-        } => one(
+        }) => one(
             pg,
             table,
             format!(
@@ -4683,15 +4714,17 @@ fn emit_statements(
         // Refused by validation: computed columns are SQL Server's (#1174),
         // and PostgreSQL's own are generated columns. An error rather than a
         // statement for a column this engine was never given.
-        Change::AddComputedColumn { table, name, .. }
-        | Change::DropComputedColumn { table, name, .. } => Err(DialectError::Invalid {
-            dialect: crate::types::DIALECT,
-            message: format!(
-                "{} is a computed column, which this model holds for SQL Server only",
-                table.column(name).shown()
-            ),
-        }),
-        Change::AlterColumnExpression { column, to, .. } => one(
+        Change::Column(ColumnChange::AddComputedColumn { table, name, .. })
+        | Change::Column(ColumnChange::DropComputedColumn { table, name, .. }) => {
+            Err(DialectError::Invalid {
+                dialect: crate::types::DIALECT,
+                message: format!(
+                    "{} is a computed column, which this model holds for SQL Server only",
+                    table.column(name).shown()
+                ),
+            })
+        }
+        Change::Column(ColumnChange::AlterColumnExpression { column, to, .. }) => one(
             pg,
             &column.table,
             format!(
@@ -4706,16 +4739,18 @@ fn emit_statements(
         // `COMMENT ON` would make it one, and that is a decision with its own
         // round trip to design; until then the honest output is nothing at all
         // rather than a statement that pretends to do something.
-        Change::SetColumnDeprecated { .. } => Ok(Vec::new()),
+        Change::Column(ColumnChange::SetColumnDeprecated { .. }) => Ok(Vec::new()),
 
-        Change::SetReplicaIdentity { table, to, .. } => {
+        Change::TableProperty(TablePropertyChange::SetReplicaIdentity { table, to, .. }) => {
             unscoped(set_replica_identity(table, to.as_ref())?)
         }
-        Change::SetComment { target, text } => unscoped(comment_on(target, text.as_ref())?),
+        Change::TableProperty(TablePropertyChange::SetComment { target, text }) => {
+            unscoped(comment_on(target, text.as_ref())?)
+        }
         // Rewrites the table and its indexes, in either direction (#1443).
-        Change::SetTablePersistence {
+        Change::TableProperty(TablePropertyChange::SetTablePersistence {
             table, unlogged, ..
-        } => one(
+        }) => one(
             pg,
             table,
             format!(
@@ -4724,13 +4759,13 @@ fn emit_statements(
                 if *unlogged { "UNLOGGED" } else { "LOGGED" }
             ),
         ),
-        Change::SetIndexStorageParameters {
+        Change::Index(IndexChange::SetIndexStorageParameters {
             table,
             target,
             method,
             set,
             reset,
-        } => {
+        }) => {
             let actions = storage_actions(set, reset, &|name| {
                 method.policy().parameter(name).is_some()
             })?;
@@ -4770,9 +4805,12 @@ fn emit_statements(
                 }
             }
         }
-        Change::SetStorageParameters {
-            table, set, reset, ..
-        } => {
+        Change::TableProperty(TablePropertyChange::SetStorageParameters {
+            table,
+            set,
+            reset,
+            ..
+        }) => {
             // One statement with both subcommands, so no read between them
             // finds half the change: a staged checkpoint holds the table to
             // its old parameters or its new ones (#1441).
@@ -4785,12 +4823,12 @@ fn emit_statements(
                 format!("ALTER TABLE {} {actions};", qualified(table)?),
             )
         }
-        Change::SetPrimaryKey {
+        Change::Constraint(ConstraintChange::SetPrimaryKey {
             table,
             from,
             to,
             nonclustered,
-        } => {
+        }) => {
             // Only a SQL Server declaration can make a key nonclustered, and
             // `validate` refuses the selector here; a change that says so
             // anyway came from somewhere else and has no statement.
@@ -4819,28 +4857,29 @@ fn emit_statements(
         // would be a change the gate never approved, so the hint is dropped
         // (see `built_concurrently`) rather than honoured by splitting one
         // declared constraint into two committed steps.
-        Change::AddUnique { table, .. } | Change::AddIndex { table, .. }
+        Change::Constraint(ConstraintChange::AddUnique { table, .. })
+        | Change::Index(IndexChange::AddIndex { table, .. })
             if change_is_clustered(change) =>
         {
             Err(no_clustered_layout(table))
         }
 
-        Change::AddUnique {
+        Change::Constraint(ConstraintChange::AddUnique {
             table,
             name,
             constraint,
             ..
-        } => one(
+        }) => one(
             pg,
             table,
             add_key_sql(table, &unique_clause(name.raw(), constraint)?, false)?,
         ),
 
-        Change::AddForeignKey {
+        Change::Constraint(ConstraintChange::AddForeignKey {
             table,
             name,
             constraint,
-        } => one(
+        }) => one(
             pg,
             table,
             format!(
@@ -4850,11 +4889,11 @@ fn emit_statements(
             ),
         ),
 
-        Change::AddCheck {
+        Change::Constraint(ConstraintChange::AddCheck {
             table,
             name,
             constraint,
-        } => one(
+        }) => one(
             pg,
             table,
             format!(
@@ -4865,12 +4904,12 @@ fn emit_statements(
             ),
         ),
 
-        Change::SetExclusion {
+        Change::Constraint(ConstraintChange::SetExclusion {
             table,
             name,
             from: None,
             to: Some(x),
-        } => one(
+        }) => one(
             pg,
             table,
             format!(
@@ -4882,14 +4921,14 @@ fn emit_statements(
         // Dropping or replacing one needs the retirement record and arrives with
         // it (DEC-2448.3); a replacement is a drop and an add as two changes,
         // each in its own ordering class, never one change carrying both.
-        Change::SetExclusion { name, .. } => Err(invalid(format!(
+        Change::Constraint(ConstraintChange::SetExclusion { name, .. }) => Err(invalid(format!(
             "exclusion constraint `{}` cannot be dropped or replaced yet: that arrives with \
              the retirement record (DEC-2448.3)",
             name.shown()
         ))),
-        Change::DropUnique { table, name }
-        | Change::DropForeignKey { table, name }
-        | Change::DropCheck { table, name } => one(
+        Change::Constraint(ConstraintChange::DropUnique { table, name })
+        | Change::Constraint(ConstraintChange::DropForeignKey { table, name })
+        | Change::Constraint(ConstraintChange::DropCheck { table, name }) => one(
             pg,
             table,
             format!(
@@ -4899,9 +4938,9 @@ fn emit_statements(
             ),
         ),
 
-        Change::AddIndex {
+        Change::Index(IndexChange::AddIndex {
             table, name, index, ..
-        } => {
+        }) => {
             let sql = create_index(table, name.raw(), index, strategy)?;
             if built_concurrently(index, strategy) {
                 // Alone in its batch and outside the transaction, because the
@@ -4925,7 +4964,7 @@ fn emit_statements(
         // statement non-transactional — and so the whole plan — to spare an
         // `ACCESS EXCLUSIVE` lock held for a catalog update, which is the one
         // part of an index's life that is not proportional to the table.
-        Change::DropIndex { table, name } => one(
+        Change::Index(IndexChange::DropIndex { table, name }) => one(
             pg,
             table,
             format!(
@@ -4938,7 +4977,8 @@ fn emit_statements(
         // The mode is a property of the declaration, not of the database: it
         // decides what future plans do about undeclared rows. The row changes
         // it implies are separate entries in this same plan.
-        Change::SetDataMode { .. } | Change::SetEnsureKeys { .. } => Ok(Vec::new()),
+        Change::Row(RowChange::SetDataMode { .. })
+        | Change::Row(RowChange::SetEnsureKeys { .. }) => Ok(Vec::new()),
 
         // A module is created, never replaced. `CREATE OR REPLACE` exists on
         // this engine and buys nothing: measured, it refuses a changed return
@@ -4946,19 +4986,23 @@ fn emit_statements(
         // rebuild does — so the cheap path is neither cheap nor complete, and
         // *which* edits it can express is decided by text §8.2 forbids parsing.
         // One shape, always (ADR-0009 §3).
-        Change::CreateModule { id, module } => Ok(vec![create_module(pg, id, module)?]),
+        Change::Module(ModuleChange::CreateModule { id, module }) => {
+            Ok(vec![create_module(pg, id, module)?])
+        }
 
         // Two statements, not one, so that the plan a human approves says
         // `DROP` where a `DROP` will run. Everything the catalog attached to
         // the old object goes with it, and carrying that across is the
         // connected plan's obligation, not the emitter's: only a connection can
         // see an ACL, an owner or a `reloptions` (ADR-0009 §3).
-        Change::AlterModule { id, module } => Ok(vec![
+        Change::Module(ModuleChange::AlterModule { id, module }) => Ok(vec![
             drop_module(pg, id, module.kind)?,
             create_module(pg, id, module)?,
         ]),
 
-        Change::DropModule { id, kind } => Ok(vec![drop_module(pg, id, *kind)?]),
+        Change::Module(ModuleChange::DropModule { id, kind }) => {
+            Ok(vec![drop_module(pg, id, *kind)?])
+        }
 
         // Roles (ADR-0005, ADR-0010 §3). The principal is a **cluster** object
         // here, not a database one, so `Dialect::manages_roles` is `false` and
@@ -4974,12 +5018,12 @@ fn emit_statements(
         // Exactly what the declaration pins: no `IF NOT EXISTS`, which would
         // adopt a package that is already there, and no `CASCADE`, which would
         // install a prerequisite at a version nobody approved (DEC-2447.6).
-        Change::CreateExtension {
+        Change::Extension(ExtensionChange::CreateExtension {
             uid,
             name,
             definition,
             ..
-        } => {
+        }) => {
             let mut statement = Statement::new(format!(
                 "CREATE EXTENSION {} SCHEMA {} VERSION {};",
                 quote(name.raw())?,
@@ -4997,7 +5041,7 @@ fn emit_statements(
         // is no `IF EXISTS` or `CASCADE`: a package the target lost is an
         // error, and what the drop reaches was sealed into the plan and is
         // checked by the executor (DEC-2447.8).
-        Change::DropExtension { uid, name, .. } => {
+        Change::Extension(ExtensionChange::DropExtension { uid, name, .. }) => {
             let mut statement =
                 Statement::new(format!("DROP EXTENSION {} RESTRICT;", quote(name.raw())?));
             statement.extension = Some(pbps_dialect::ExtensionStatement {
@@ -5012,13 +5056,13 @@ fn emit_statements(
         // recreate (DEC-2447.10).
         // Only the schema is named: the package keeps its version and every
         // member keeps its object number (DEC-2447.11).
-        Change::SetExtensionSchema {
+        Change::Extension(ExtensionChange::SetExtensionSchema {
             uid,
             name,
             from,
             to,
             ..
-        } => {
+        }) => {
             let mut statement = Statement::new(format!(
                 "ALTER EXTENSION {} SET SCHEMA {};",
                 quote(name.raw())?,
@@ -5031,13 +5075,13 @@ fn emit_statements(
             });
             Ok(vec![statement])
         }
-        Change::UpdateExtension {
+        Change::Extension(ExtensionChange::UpdateExtension {
             uid,
             name,
             from,
             to,
             ..
-        } => {
+        }) => {
             let mut statement = Statement::new(format!(
                 "ALTER EXTENSION {} UPDATE TO {};",
                 quote(name.raw())?,
@@ -5050,7 +5094,7 @@ fn emit_statements(
             });
             Ok(vec![statement])
         }
-        Change::CreateRole { name, .. } => {
+        Change::Role(RoleChange::CreateRole { name, .. }) => {
             let statement = format!("CREATE ROLE {};", quote(name.raw())?);
             Err(by_hand(
                 format!(
@@ -5060,7 +5104,7 @@ fn emit_statements(
                 statement,
             ))
         }
-        Change::DropRole { name, .. } => {
+        Change::Role(RoleChange::DropRole { name, .. }) => {
             let statement = format!("DROP ROLE {};", quote(name.raw())?);
             Err(by_hand(
                 format!(
@@ -5070,7 +5114,7 @@ fn emit_statements(
                 statement,
             ))
         }
-        Change::RenameRole { from, to, .. } => {
+        Change::Role(RoleChange::RenameRole { from, to, .. }) => {
             let statement = format!(
                 "ALTER ROLE {} RENAME TO {};",
                 quote(from.raw())?,
@@ -5084,11 +5128,11 @@ fn emit_statements(
                 statement,
             ))
         }
-        Change::Grant {
+        Change::Permission(GrantChange::Grant {
             role,
             target,
             permissions,
-        } => grant_statements(pg, role, target, permissions, false),
+        }) => grant_statements(pg, role, target, permissions, false),
         // One privilege per statement, unlike `GRANT` above. A `REVOKE`
         // removes only what the one grantor PostgreSQL selects for it put
         // there, and that selection is made once for the whole statement:
@@ -5100,11 +5144,11 @@ fn emit_statements(
         // (`catalog::revocable_by_current_role`), so keeping the emitted
         // statement that wide would promise something it cannot do
         // (DECISIONS 518, #251).
-        Change::Revoke {
+        Change::Permission(GrantChange::Revoke {
             role,
             target,
             permissions,
-        } => grant_statements(pg, role, target, permissions, true),
+        }) => grant_statements(pg, role, target, permissions, true),
 
         // `PUBLIC` is written bare, and that is the whole point of the
         // variant: it is SQL's keyword for every principal at once, and
@@ -5129,9 +5173,9 @@ fn emit_statements(
         // is still `NULL` it writes exactly `acldefault('f', owner)`,
         // measured equal, so the rebuild guard that compares against
         // `acldefault` sees no difference either.
-        Change::PublicExecution {
+        Change::Permission(GrantChange::PublicExecution {
             access, routine, ..
-        } => {
+        }) => {
             let target = GrantTarget::Routine(routine.clone());
             let execute = BTreeSet::from([Permission::Execute]);
             let statement = match access {
@@ -5156,7 +5200,7 @@ fn emit_statements(
         // plan reviewed — under the table's own write path, because the
         // defaults those checks compare against are the user's verbatim
         // expressions.
-        Change::InsertRow {
+        Change::Row(RowChange::InsertRow {
             table,
             key_column,
             identity_key,
@@ -5164,7 +5208,7 @@ fn emit_statements(
             row,
             defaults,
             types,
-        } => row_statement(
+        }) => row_statement(
             pg,
             table,
             pbps_dialect::RowOperation::Insert {
@@ -5184,7 +5228,7 @@ fn emit_statements(
                 row_defaults,
             )?),
         ),
-        Change::UpdateRow {
+        Change::Row(RowChange::UpdateRow {
             table,
             key_column,
             key,
@@ -5193,7 +5237,7 @@ fn emit_statements(
             types,
             after_types,
             key_type,
-        } => row_statement(
+        }) => row_statement(
             pg,
             table,
             pbps_dialect::RowOperation::Update {
@@ -5211,7 +5255,7 @@ fn emit_statements(
                 row_defaults,
             )?),
         ),
-        Change::DeleteRow {
+        Change::Row(RowChange::DeleteRow {
             table,
             key_column,
             key,
@@ -5220,7 +5264,7 @@ fn emit_statements(
             after_types,
             key_type,
             ..
-        } => row_statement(
+        }) => row_statement(
             pg,
             table,
             pbps_dialect::RowOperation::Delete,
@@ -5278,13 +5322,13 @@ fn rename_table(pg: &Postgres, from: &TableName, to: &TableName) -> Sql {
 fn change_is_clustered(change: &Change) -> bool {
     matches!(
         change,
-        Change::AddUnique {
+        Change::Constraint(ConstraintChange::AddUnique {
             clustered: true,
             ..
-        } | Change::AddIndex {
+        }) | Change::Index(IndexChange::AddIndex {
             clustered: true,
             ..
-        }
+        })
     )
 }
 
@@ -5629,14 +5673,14 @@ fn emit_enum_rebuild(
 /// The CHECK's name is the table's identity in the plan, so a resume and a
 /// `baseline` find it by name and never by a prefix (DEC-1638.1).
 pub(crate) fn staged_attach(change: &Change) -> Option<Sql> {
-    let Change::AttachPartition {
+    let Change::Partition(PartitionChange::AttachPartition {
         uid,
         table,
         parent,
         bound,
         key,
         ..
-    } = change
+    }) = change
     else {
         return None;
     };
@@ -7211,12 +7255,15 @@ fn rebuild_root_and_staged_parts_are_refused_by_name_before_sql_emission() {
     .unwrap();
     for change in changes
         .into_iter()
-        .chain([Change::BuildPartitionedIndex(Box::new(
+        .chain([Change::Index(IndexChange::BuildPartitionedIndex(Box::new(
             rebuild::fixture::index_recipe(),
-        ))])
+        )))])
     {
         let (operation, table) = change.pending_rebuild().unwrap();
-        if matches!(change, Change::RebuildPartitionedTable(_)) {
+        if matches!(
+            change,
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+        ) {
             assert!(emit(&Postgres::default(), &change, Strategy::default()).is_err());
         }
         let error = emit_staged(&Postgres::default(), &change, Strategy::default()).unwrap_err();
@@ -7240,7 +7287,7 @@ fn rebuild_copy_risk_uses_bound_types_without_calling_a_widening_narrowing() {
     .unwrap();
     let copy = &mut changes[1];
     assert!(Postgres::default().change_risks(copy).is_empty());
-    let Change::CopyTableRows(c) = copy else {
+    let Change::Partition(PartitionChange::CopyTableRows(c)) = copy else {
         panic!()
     };
     c.columns[0].cast = "smallint".parse().unwrap();
@@ -7285,13 +7332,13 @@ mod tests {
         let detach = |table: &str, names: Vec<DetachedName>| {
             Postgres::new()
                 .fixture_emit(
-                    &Change::DetachPartition {
+                    &Change::Partition(PartitionChange::DetachPartition {
                         uid: "t_aaaaaa".parse().unwrap(),
                         table: table.parse().unwrap(),
                         parent: "app.ev".parse().unwrap(),
                         names,
                         shape: Box::default(),
-                    },
+                    }),
                     Default::default(),
                 )
                 .expect("emit")
@@ -7399,11 +7446,11 @@ mod tests {
         let drop = |detach_from: Option<&str>| {
             Postgres::new()
                 .fixture_emit(
-                    &Change::DropTable {
+                    &Change::Table(TableChange::DropTable {
                         uid: "t_aaaaaa".parse().unwrap(),
                         name: "app.ev_2025".parse().unwrap(),
                         detach_from: detach_from.map(|p| p.parse().unwrap()),
-                    },
+                    }),
                     Default::default(),
                 )
                 .expect("emit")
@@ -7436,7 +7483,7 @@ mod tests {
     fn a_table_is_attached_in_one_unscoped_statement() {
         let sql: Vec<String> = Postgres::new()
             .fixture_emit(
-                &Change::AttachPartition {
+                &Change::Partition(PartitionChange::AttachPartition {
                     uid: "t_aaaaaa".parse().unwrap(),
                     table: "app.t".parse().unwrap(),
                     parent: "app.ev".parse().unwrap(),
@@ -7446,7 +7493,7 @@ mod tests {
                     },
                     key: Vec::new(),
                     shape: Box::default(),
-                },
+                }),
                 Default::default(),
             )
             .expect("emit")
@@ -7470,16 +7517,18 @@ mod tests {
     #[test]
     fn a_staged_attach_validates_a_check_its_bound_implies_first() {
         use pbps_model::{BoundDatum as D, ListDatum as L, PartitionBound as B};
-        let attach = |bound: B, key: &[&str]| Change::AttachPartition {
-            uid: "t_aaaaaa".parse().unwrap(),
-            table: "app.t".parse().unwrap(),
-            parent: "app.ev".parse().unwrap(),
-            bound,
-            key: key
-                .iter()
-                .map(|k| pbps_model::ColumnName::from(*k))
-                .collect(),
-            shape: Box::default(),
+        let attach = |bound: B, key: &[&str]| {
+            Change::Partition(PartitionChange::AttachPartition {
+                uid: "t_aaaaaa".parse().unwrap(),
+                table: "app.t".parse().unwrap(),
+                parent: "app.ev".parse().unwrap(),
+                bound,
+                key: key
+                    .iter()
+                    .map(|k| pbps_model::ColumnName::from(*k))
+                    .collect(),
+                shape: Box::default(),
+            })
         };
         let staged = |change: &Change| -> Vec<pbps_dialect::Statement> {
             Postgres::new()
@@ -7629,13 +7678,13 @@ mod tests {
         let emitted = |moves_at_most: Option<u64>| {
             Postgres::new()
                 .fixture_emit(
-                    &Change::CreateTable {
+                    &Change::Table(TableChange::CreateTable {
                         uid: "t_aaaaaa".parse().unwrap(),
                         name: "app.ev_2025".parse().unwrap(),
                         table: Box::new(partition.clone()),
                         beside_default: Some("app.ev_rest".parse().unwrap()),
                         moves_at_most,
-                    },
+                    }),
                     Default::default(),
                 )
                 .expect("emit")[0]
@@ -7712,13 +7761,13 @@ mod tests {
         let emitted = |beside_default: Option<&str>| {
             Postgres::new()
                 .fixture_emit(
-                    &Change::CreateTable {
+                    &Change::Table(TableChange::CreateTable {
                         uid: "t_aaaaaa".parse().unwrap(),
                         name: "app.ev_2025".parse().unwrap(),
                         table: Box::new(partition.clone()),
                         beside_default: beside_default.map(|d| d.parse().unwrap()),
                         moves_at_most: None,
-                    },
+                    }),
                     Default::default(),
                 )
                 .expect("emit")
@@ -7815,13 +7864,13 @@ mod tests {
             columns: vec!["lower(k)".into()],
             strategy: pbps_model::PartitionStrategy::Range,
         });
-        let change = Change::CreateTable {
+        let change = Change::Table(TableChange::CreateTable {
             uid: "t_aaaaaa".parse().unwrap(),
             name: "app.p".parse().unwrap(),
             table: Box::new(table),
             beside_default: None,
             moves_at_most: None,
-        };
+        });
         let sql = Postgres::new()
             .fixture_emit(&change, Default::default())
             .expect("emit")
@@ -7842,13 +7891,13 @@ mod tests {
         let create = |name: &str, table: &pbps_model::Table| {
             Postgres::new()
                 .fixture_emit(
-                    &Change::CreateTable {
+                    &Change::Table(TableChange::CreateTable {
                         uid: "t_aaaaaa".parse().unwrap(),
                         name: name.parse().unwrap(),
                         table: Box::new(table.clone()),
                         beside_default: None,
                         moves_at_most: None,
-                    },
+                    }),
                     Default::default(),
                 )
                 .expect("emit")
@@ -7931,13 +7980,13 @@ mod tests {
         let create = |name: &str, table: &pbps_model::Table| {
             Postgres::new()
                 .fixture_emit(
-                    &Change::CreateTable {
+                    &Change::Table(TableChange::CreateTable {
                         uid: "t_aaaaaa".parse().unwrap(),
                         name: name.parse().unwrap(),
                         table: Box::new(table.clone()),
                         beside_default: None,
                         moves_at_most: None,
-                    },
+                    }),
                     Default::default(),
                 )
                 .expect("emit")
@@ -8079,6 +8128,16 @@ mod tests {
 
     use super::*;
     use pbps_dialect::Dialect;
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::GrantChange;
+    use pbps_model::IndexChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::PartitionChange;
+    use pbps_model::RoleChange;
+    use pbps_model::RowChange;
+    use pbps_model::TableChange;
+    use pbps_model::TablePropertyChange;
     use pbps_model::{CheckConstraint, ColumnRef, ColumnType, Identity, IndexColumn, Uid, UidKind};
 
     fn ty(s: &str) -> ColumnType {
@@ -8158,13 +8217,13 @@ mod tests {
             table.unlogged = unlogged;
             sql_of(
                 &Postgres::new(),
-                &Change::CreateTable {
+                &Change::Table(TableChange::CreateTable {
                     uid: Uid::generate(UidKind::Table),
                     name: name("app", "t"),
                     table: Box::new(table),
                     beside_default: None,
                     moves_at_most: None,
-                },
+                }),
             )
         };
         let sql = create(false);
@@ -8199,12 +8258,12 @@ mod tests {
 
         let added = Postgres::new()
             .fixture_emit(
-                &Change::AddColumn {
+                &Change::Column(ColumnChange::AddColumn {
                     uid: Uid::generate(UidKind::Column),
                     table: name("app", "t"),
                     name: "n".into(),
                     column: Box::new(serial("integer", 7, 2, None)),
-                },
+                }),
                 Strategy::default(),
             )
             .expect("emit");
@@ -8243,13 +8302,13 @@ mod tests {
         });
         let sql = sql_of(
             &Postgres::new(),
-            &Change::CreateTable {
+            &Change::Table(TableChange::CreateTable {
                 uid: Uid::generate(UidKind::Table),
                 name: parent.clone(),
                 table: Box::new(table),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
         );
         assert_eq!(sql.len(), 1, "{sql:?}");
         let sql = &sql[0];
@@ -8276,13 +8335,13 @@ mod tests {
         };
         let sql = sql_of(
             &Postgres::new(),
-            &Change::CreateTable {
+            &Change::Table(TableChange::CreateTable {
                 uid: Uid::generate(UidKind::Table),
                 name: name("app", "p1"),
                 table: Box::new(partition),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
         );
         assert_eq!(sql.len(), 1, "{sql:?}");
         assert!(sql[0].contains("PARTITION OF \"app\".\"p\""), "{sql:?}");
@@ -8307,7 +8366,7 @@ mod tests {
                 name: explicit.map(str::to_owned),
                 ..pbps_model::OwnedSequence::serial()
             };
-            let mut change = Change::SetPartitionDefault {
+            let mut change = Change::Partition(PartitionChange::SetPartitionDefault {
                 uid: Uid::generate(UidKind::Table),
                 table: name("other", "p2"),
                 parent: parent.clone(),
@@ -8315,7 +8374,7 @@ mod tests {
                 from: None,
                 to: None,
                 fallback: Some(pg.owned_sequence_default(&parent, "id", &sequence).unwrap()),
-            };
+            });
             let sql = sql_of(&pg, &change).join("\n");
             assert!(sql.contains(&format!(
                 "ALTER TABLE \"other\".\"p2\" ALTER COLUMN \"id\" SET DEFAULT pg_catalog.nextval('\"app\".\"{expected}\"'::regclass)"
@@ -8323,14 +8382,17 @@ mod tests {
             assert!(!sql.contains("CREATE SEQUENCE"), "{sql}");
             // A declared override wins over the fallback, and the rebuild
             // form without either still drops the default entirely.
-            let Change::SetPartitionDefault { to, .. } = &mut change else {
+            let Change::Partition(PartitionChange::SetPartitionDefault { to, .. }) = &mut change
+            else {
                 unreachable!()
             };
             *to = Some("7".into());
             let sql = sql_of(&pg, &change).join("\n");
             assert!(sql.contains("SET DEFAULT 7"), "{sql}");
             assert!(!sql.contains("nextval"), "{sql}");
-            let Change::SetPartitionDefault { to, fallback, .. } = &mut change else {
+            let Change::Partition(PartitionChange::SetPartitionDefault { to, fallback, .. }) =
+                &mut change
+            else {
                 unreachable!()
             };
             *to = None;
@@ -8367,25 +8429,29 @@ mod tests {
     fn an_external_parents_dropped_not_null_is_cleared_from_its_partitions() {
         let pg = Postgres::new();
         let column = ColumnRef::new(name("app", "ev"), "it's");
-        let nullability = |to_nullable: bool, through: bool| Change::AlterColumnNullability {
-            uid: Uid::generate(UidKind::Column),
-            column: column.clone(),
-            ty: ty("integer"),
-            to_nullable,
-            through_external_partitions: through,
-            collation: None,
+        let nullability = |to_nullable: bool, through: bool| {
+            Change::Column(ColumnChange::AlterColumnNullability {
+                uid: Uid::generate(UidKind::Column),
+                column: column.clone(),
+                ty: ty("integer"),
+                to_nullable,
+                through_external_partitions: through,
+                collation: None,
+            })
         };
-        let retype = |from_nullable: bool, through: bool| Change::AlterColumnType {
-            uid: Uid::generate(UidKind::Column),
-            column: column.clone(),
-            from: ty("integer"),
-            to: ty("bigint"),
-            from_nullable,
-            to_nullable: true,
-            through_external_partitions: through,
-            from_collation: None,
-            to_collation: None,
-            using: None,
+        let retype = |from_nullable: bool, through: bool| {
+            Change::Column(ColumnChange::AlterColumnType {
+                uid: Uid::generate(UidKind::Column),
+                column: column.clone(),
+                from: ty("integer"),
+                to: ty("bigint"),
+                from_nullable,
+                to_nullable: true,
+                through_external_partitions: through,
+                from_collation: None,
+                to_collation: None,
+                using: None,
+            })
         };
         for change in [nullability(true, true), retype(false, true)] {
             let sql = sql_of(&pg, &change);
@@ -8411,14 +8477,14 @@ mod tests {
             );
         }
         // A name holding the block's usual tag takes another (#1833 review).
-        let tagged = Change::AlterColumnNullability {
+        let tagged = Change::Column(ColumnChange::AlterColumnNullability {
             uid: Uid::generate(UidKind::Column),
             column: ColumnRef::new(name("app", "ev"), "x$pbps$y"),
             ty: ty("integer"),
             to_nullable: true,
             through_external_partitions: true,
             collation: None,
-        };
+        });
         let sql = sql_of(&pg, &tagged);
         assert!(
             sql[0].contains("\nDO $pbps1$\n") && sql[0].ends_with("\n$pbps1$;"),
@@ -8466,20 +8532,22 @@ mod tests {
     #[test]
     fn an_array_element_change_is_emitted_only_where_it_keeps_every_value() {
         let pg = Postgres::new();
-        let change = |from: &str, to: &str| Change::AlterColumnType {
-            uid: Uid::generate(UidKind::Column),
-            column: ColumnRef {
-                table: name("app", "t"),
-                name: "c".into(),
-            },
-            from: ty(from),
-            to: ty(to),
-            from_nullable: true,
-            to_nullable: true,
-            through_external_partitions: false,
-            from_collation: None,
-            to_collation: None,
-            using: None,
+        let change = |from: &str, to: &str| {
+            Change::Column(ColumnChange::AlterColumnType {
+                uid: Uid::generate(UidKind::Column),
+                column: ColumnRef {
+                    table: name("app", "t"),
+                    name: "c".into(),
+                },
+                from: ty(from),
+                to: ty(to),
+                from_nullable: true,
+                to_nullable: true,
+                through_external_partitions: false,
+                from_collation: None,
+                to_collation: None,
+                using: None,
+            })
         };
         for (from, to) in [("int[]", "bigint[]"), ("varchar(10)[]", "varchar(20)[]")] {
             let sql = sql_of(&pg, &change(from, to)).join("\n");
@@ -8519,7 +8587,7 @@ mod tests {
         let mut c = Column::new(ty("text"));
         c.collation = collation.clone();
         for change in [
-            Change::AlterColumnType {
+            Change::Column(ColumnChange::AlterColumnType {
                 uid: Uid::generate(UidKind::Column),
                 column: column.clone(),
                 from: ty("text"),
@@ -8530,21 +8598,21 @@ mod tests {
                 from_collation: None,
                 to_collation: collation.clone(),
                 using: None,
-            },
-            Change::AlterColumnNullability {
+            }),
+            Change::Column(ColumnChange::AlterColumnNullability {
                 uid: Uid::generate(UidKind::Column),
                 column: column.clone(),
                 ty: ty("text"),
                 to_nullable: false,
                 through_external_partitions: false,
                 collation: collation.clone(),
-            },
-            Change::AddColumn {
+            }),
+            Change::Column(ColumnChange::AddColumn {
                 uid: Uid::generate(UidKind::Column),
                 table: name("app", "t"),
                 name: "c".into(),
                 column: Box::new(c.clone()),
-            },
+            }),
         ] {
             let e = pg
                 .fixture_emit(&change, Strategy::default())
@@ -8582,12 +8650,12 @@ mod tests {
         let add = |index: &pbps_model::Index| {
             sql_of(
                 &pg,
-                &Change::AddIndex {
+                &Change::Index(IndexChange::AddIndex {
                     table: table.clone(),
                     name: "ix".into(),
                     index: Box::new(index.clone()),
                     clustered: false,
-                },
+                }),
             )
             .join("\n")
         };
@@ -8599,12 +8667,12 @@ mod tests {
         index.storage_parameters = [("fastupdate".to_owned(), "true".to_owned())].into();
         assert!(
             pg.fixture_emit(
-                &Change::AddIndex {
+                &Change::Index(IndexChange::AddIndex {
                     table: table.clone(),
                     name: "ix".into(),
                     index: Box::new(index),
                     clustered: false,
-                },
+                }),
                 Strategy::default()
             )
             .is_err()
@@ -8622,13 +8690,13 @@ mod tests {
         let alter = |target: pbps_model::IndexPart| {
             sql_of(
                 &pg,
-                &Change::SetIndexStorageParameters {
+                &Change::Index(IndexChange::SetIndexStorageParameters {
                     table: table.clone(),
                     target,
                     method: pbps_model::IndexMethod::Btree,
                     set: [("fillfactor".to_owned(), "60".to_owned())].into(),
                     reset: ["deduplicate_items".to_owned()].into(),
-                },
+                }),
             )
             .join("\n")
         };
@@ -8659,13 +8727,13 @@ mod tests {
         created.unlogged = true;
         let create = sql_of(
             &pg,
-            &Change::CreateTable {
+            &Change::Table(TableChange::CreateTable {
                 uid: "t_000000".parse().unwrap(),
                 name: table.clone(),
                 table: Box::new(created),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
         );
         assert!(
             create[0].contains("CREATE UNLOGGED TABLE \"app\".\"t\""),
@@ -8674,11 +8742,11 @@ mod tests {
         for (unlogged, word) in [(true, "UNLOGGED"), (false, "LOGGED")] {
             let sql = sql_of(
                 &pg,
-                &Change::SetTablePersistence {
+                &Change::TableProperty(TablePropertyChange::SetTablePersistence {
                     uid: "t_000000".parse().unwrap(),
                     table: table.clone(),
                     unlogged,
-                },
+                }),
             )
             .join("\n");
             assert!(
@@ -8695,14 +8763,16 @@ mod tests {
     fn storage_parameters_are_one_statement_and_part_of_create() {
         let pg = Postgres::new();
         let table = name("app", "t");
-        let change = |set: &[(&str, &str)], reset: &[&str]| Change::SetStorageParameters {
-            uid: "t_000000".parse().unwrap(),
-            table: table.clone(),
-            set: set
-                .iter()
-                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-                .collect(),
-            reset: reset.iter().map(|k| (*k).to_owned()).collect(),
+        let change = |set: &[(&str, &str)], reset: &[&str]| {
+            Change::TableProperty(TablePropertyChange::SetStorageParameters {
+                uid: "t_000000".parse().unwrap(),
+                table: table.clone(),
+                set: set
+                    .iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect(),
+                reset: reset.iter().map(|k| (*k).to_owned()).collect(),
+            })
         };
         let sql = sql_of(
             &pg,
@@ -8737,13 +8807,13 @@ mod tests {
             .insert("fillfactor".into(), "70".into());
         let create = sql_of(
             &pg,
-            &Change::CreateTable {
+            &Change::Table(TableChange::CreateTable {
                 uid: "t_000000".parse().unwrap(),
                 name: table.clone(),
                 table: Box::new(created.clone()),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
         );
         assert!(
             create[0].contains(") USING heap WITH (fillfactor = '70');"),
@@ -8752,13 +8822,13 @@ mod tests {
         created.storage_parameters.clear();
         let plain = sql_of(
             &pg,
-            &Change::CreateTable {
+            &Change::Table(TableChange::CreateTable {
                 uid: "t_000000".parse().unwrap(),
                 name: table,
                 table: Box::new(created),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
         );
         assert!(plain[0].contains(") USING heap;"), "{plain:?}");
     }
@@ -8779,13 +8849,13 @@ mod tests {
         let on_table = |text: Option<&str>| {
             sql_of(
                 &pg,
-                &Change::SetComment {
+                &Change::TableProperty(TablePropertyChange::SetComment {
                     target: CommentTarget::Table {
                         uid: "t_000000".parse().unwrap(),
                         table: table.clone(),
                     },
                     text: text.map(Into::into),
-                },
+                }),
             )
         };
         assert_eq!(
@@ -8795,13 +8865,13 @@ mod tests {
         assert_eq!(on_table(None), ["COMMENT ON TABLE \"app\".\"t\" IS NULL;"]);
         let column = sql_of(
             &pg,
-            &Change::SetComment {
+            &Change::TableProperty(TablePropertyChange::SetComment {
                 target: CommentTarget::Column {
                     uid: "c_000000".parse().unwrap(),
                     column: table.column("we\"ird"),
                 },
                 text: Some("中文 \u{1F600}".into()),
-            },
+            }),
         );
         assert_eq!(
             column,
@@ -8817,11 +8887,11 @@ mod tests {
         let set = |to: Option<R>| {
             sql_of(
                 &pg,
-                &Change::SetReplicaIdentity {
+                &Change::TableProperty(TablePropertyChange::SetReplicaIdentity {
                     uid: "t_000000".parse().unwrap(),
                     table: table.clone(),
                     to,
-                },
+                }),
             )
             .join("\n")
         };
@@ -8854,11 +8924,11 @@ mod tests {
         // A table whose name holds the tag picks another one.
         let odd = sql_of(
             &pg,
-            &Change::SetReplicaIdentity {
+            &Change::TableProperty(TablePropertyChange::SetReplicaIdentity {
                 uid: "t_000000".parse().unwrap(),
                 table: name("app", "x$pbps$y"),
                 to: Some(R::PrimaryKey),
-            },
+            }),
         )
         .join("\n");
         assert!(odd.contains("DO $pbps1$"), "{odd}");
@@ -8887,13 +8957,13 @@ mod tests {
         created.replica_identity = Some(R::Index("t_ix".into()));
         let create = sql_of(
             &pg,
-            &Change::CreateTable {
+            &Change::Table(TableChange::CreateTable {
                 uid: "t_000000".parse().unwrap(),
                 name: table.clone(),
                 table: Box::new(created.clone()),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
         );
         let at = |needle: &str| {
             create
@@ -8909,13 +8979,13 @@ mod tests {
         created.replica_identity = None;
         let plain = sql_of(
             &pg,
-            &Change::CreateTable {
+            &Change::Table(TableChange::CreateTable {
                 uid: "t_000000".parse().unwrap(),
                 name: table,
                 table: Box::new(created),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
         );
         assert!(!plain.join("\n").contains("REPLICA IDENTITY"), "{plain:?}");
     }
@@ -8958,62 +9028,62 @@ mod tests {
         clustered_table.clustered = Some(pbps_model::Clustered::Heap);
         for (layout, plain) in [
             (
-                Change::SetPrimaryKey {
+                Change::Constraint(ConstraintChange::SetPrimaryKey {
                     table: table.clone(),
                     from: None,
                     to: Some(key.clone()),
                     nonclustered: true,
-                },
-                Change::SetPrimaryKey {
+                }),
+                Change::Constraint(ConstraintChange::SetPrimaryKey {
                     table: table.clone(),
                     from: None,
                     to: Some(key.clone()),
                     nonclustered: false,
-                },
+                }),
             ),
             (
-                Change::AddUnique {
+                Change::Constraint(ConstraintChange::AddUnique {
                     table: table.clone(),
                     name: "uq".into(),
                     constraint: unique.clone(),
                     clustered: true,
-                },
-                Change::AddUnique {
+                }),
+                Change::Constraint(ConstraintChange::AddUnique {
                     table: table.clone(),
                     name: "uq".into(),
                     constraint: unique.clone(),
                     clustered: false,
-                },
+                }),
             ),
             (
-                Change::AddIndex {
+                Change::Index(IndexChange::AddIndex {
                     table: table.clone(),
                     name: "ix".into(),
                     index: Box::new(index.clone()),
                     clustered: true,
-                },
-                Change::AddIndex {
+                }),
+                Change::Index(IndexChange::AddIndex {
                     table: table.clone(),
                     name: "ix".into(),
                     index: Box::new(index.clone()),
                     clustered: false,
-                },
+                }),
             ),
             (
-                Change::CreateTable {
+                Change::Table(TableChange::CreateTable {
                     uid: Uid::generate(UidKind::Table),
                     name: table.clone(),
                     table: Box::new(clustered_table.clone()),
                     beside_default: None,
                     moves_at_most: None,
-                },
-                Change::CreateTable {
+                }),
+                Change::Table(TableChange::CreateTable {
                     uid: Uid::generate(UidKind::Table),
                     name: table.clone(),
                     table: Box::new(created.clone()),
                     beside_default: None,
                     moves_at_most: None,
-                },
+                }),
             ),
         ] {
             let e = pg
@@ -9032,11 +9102,11 @@ mod tests {
         for table in ["p1", "p2a"] {
             let sql = sql_of(
                 &pg,
-                &Change::Grant {
+                &Change::Permission(GrantChange::Grant {
                     role: "writer".into(),
                     target: GrantTarget::Object(TableName::new("app", table)),
                     permissions: [Permission::Insert, Permission::SerialSequences].into(),
-                },
+                }),
             )
             .join("\n");
             assert!(sql.contains(&format!("COALESCE(pg_catalog.pg_partition_root('\"app\".\"{table}\"'::pg_catalog.regclass), '\"app\".\"{table}\"'::pg_catalog.regclass)::pg_catalog.oid")), "{sql}");
@@ -9051,11 +9121,11 @@ mod tests {
             assert!(!sql.contains("search_path = app"), "{sql}");
             let ordinary = sql_of(
                 &pg,
-                &Change::Grant {
+                &Change::Permission(GrantChange::Grant {
                     role: "writer".into(),
                     target: GrantTarget::Object(TableName::new("app", table)),
                     permissions: [Permission::Insert].into(),
-                },
+                }),
             )
             .join("\n");
             assert!(!ordinary.contains("pg_partition_root"), "{ordinary}");
@@ -9075,17 +9145,17 @@ mod tests {
                 let target = GrantTarget::Object(TableName::new("app", "t'$pbps$"));
                 let role = "writer '$pbps$".to_owned();
                 let change = if revoke {
-                    Change::Revoke {
+                    Change::Permission(GrantChange::Revoke {
                         role: role.into(),
                         target,
                         permissions,
-                    }
+                    })
                 } else {
-                    Change::Grant {
+                    Change::Permission(GrantChange::Grant {
                         role: role.into(),
                         target,
                         permissions,
-                    }
+                    })
                 };
                 let emitted = pg.fixture_emit(&change, Strategy::default()).unwrap();
                 assert_eq!(
@@ -9131,22 +9201,22 @@ mod tests {
         }
         assert!(
             pg.fixture_emit(
-                &Change::Grant {
+                &Change::Permission(GrantChange::Grant {
                     role: "writer".into(),
                     target: GrantTarget::Schema("app".into()),
                     permissions: [Permission::SerialSequences].into(),
-                },
+                }),
                 Strategy::default()
             )
             .is_err()
         );
         let ordinary = pg
             .fixture_emit(
-                &Change::Grant {
+                &Change::Permission(GrantChange::Grant {
                     role: "writer".into(),
                     target: GrantTarget::Schema("app".into()),
                     permissions: [Permission::Usage].into(),
-                },
+                }),
                 Strategy::default(),
             )
             .unwrap();
@@ -9188,11 +9258,11 @@ mod tests {
             ),
         ];
         for (spelled, list, expected) in cases {
-            let change = Change::Grant {
+            let change = Change::Permission(GrantChange::Grant {
                 role: "app_reader".to_owned().into(),
                 target: target(spelled),
                 permissions: permissions(&list),
-            };
+            });
             let sql = sql_of(&pg, &change);
             assert_eq!(sql.len(), 1, "{spelled}");
             assert!(sql[0].contains(expected), "{spelled}: {}", sql[0]);
@@ -9214,11 +9284,11 @@ mod tests {
         let pg = Postgres::new();
         let sql = sql_of(
             &pg,
-            &Change::Revoke {
+            &Change::Permission(GrantChange::Revoke {
                 role: "app_reader".to_owned().into(),
                 target: target("app.recent"),
                 permissions: permissions(&[Permission::Select]),
-            },
+            }),
         );
         assert!(
             sql[0].contains("REVOKE SELECT ON TABLE \"app\".\"recent\" FROM \"app_reader\";"),
@@ -9237,11 +9307,11 @@ mod tests {
         let pg = Postgres::new();
         let sql = sql_of(
             &pg,
-            &Change::Revoke {
+            &Change::Permission(GrantChange::Revoke {
                 role: "app_reader".to_owned().into(),
                 target: target("app.recent"),
                 permissions: permissions(&[Permission::Select, Permission::Insert]),
-            },
+            }),
         );
         let revokes: Vec<&String> = sql.iter().filter(|s| s.contains("REVOKE")).collect();
         assert_eq!(revokes.len(), 2, "{sql:?}");
@@ -9310,11 +9380,11 @@ mod tests {
         ] {
             let sql = sql_of(
                 &pg,
-                &Change::PublicExecution {
+                &Change::Permission(GrantChange::PublicExecution {
                     routine: spelled.parse().expect("a routine id parses"),
                     access,
                     origin: pbps_model::RoutineOrigin::Created,
-                },
+                }),
             );
             assert_eq!(sql.len(), 1, "{spelled} {access:?}");
             assert!(sql[0].contains(expected), "{spelled}: {}", sql[0]);
@@ -9336,26 +9406,26 @@ mod tests {
         let pg = Postgres::new();
         let cases = [
             (
-                Change::CreateRole {
+                Change::Role(RoleChange::CreateRole {
                     uid: Uid::generate(UidKind::Role),
                     name: "analyst".to_owned().into(),
-                },
+                }),
                 "CREATE ROLE \"analyst\";",
             ),
             (
-                Change::DropRole {
+                Change::Role(RoleChange::DropRole {
                     uid: Uid::generate(UidKind::Role),
                     name: "analyst".to_owned().into(),
                     members: Vec::new(),
-                },
+                }),
                 "DROP ROLE \"analyst\";",
             ),
             (
-                Change::RenameRole {
+                Change::Role(RoleChange::RenameRole {
                     uid: Uid::generate(UidKind::Role),
                     from: "analyst".to_owned().into(),
                     to: "reader".to_owned().into(),
-                },
+                }),
                 "ALTER ROLE \"analyst\" RENAME TO \"reader\";",
             ),
         ];
@@ -9378,11 +9448,11 @@ mod tests {
         for permission in [Permission::Alter, Permission::ViewDefinition] {
             let refusal = pg
                 .fixture_emit(
-                    &Change::Grant {
+                    &Change::Permission(GrantChange::Grant {
                         role: "app_reader".to_owned().into(),
                         target: target("app.customer"),
                         permissions: permissions(&[permission]),
-                    },
+                    }),
                     Strategy::default(),
                 )
                 .expect_err("this engine has no such word")
@@ -9398,11 +9468,11 @@ mod tests {
     fn a_grant_with_no_permission_is_refused_rather_than_rendered_empty() {
         let refusal = Postgres::new()
             .fixture_emit(
-                &Change::Grant {
+                &Change::Permission(GrantChange::Grant {
                     role: "app_reader".to_owned().into(),
                     target: target("app.customer"),
                     permissions: BTreeSet::new(),
-                },
+                }),
                 Strategy::default(),
             )
             .expect_err("nothing to grant")
@@ -9912,10 +9982,10 @@ mod tests {
         for (id, m, expected) in cases {
             let sql = sql_of(
                 &pg,
-                &Change::CreateModule {
+                &Change::Module(ModuleChange::CreateModule {
                     id: id.clone(),
                     module: Box::new(m),
-                },
+                }),
             );
             assert_eq!(
                 sql,
@@ -9936,13 +10006,13 @@ mod tests {
         let pg = Postgres::new();
         let sql = sql_of(
             &pg,
-            &Change::AlterModule {
+            &Change::Module(ModuleChange::AlterModule {
                 id: id("app.f(integer, text)"),
                 module: Box::new(module(
                     ModuleKind::Function,
                     "(a integer, b text) RETURNS int",
                 )),
-            },
+            }),
         );
         assert_eq!(sql.len(), 2, "{sql:?}");
         assert!(
@@ -9988,10 +10058,10 @@ mod tests {
         for (id, kind, expected) in cases {
             let sql = sql_of(
                 &pg,
-                &Change::DropModule {
+                &Change::Module(ModuleChange::DropModule {
                     id: id.clone(),
                     kind,
-                },
+                }),
             );
             assert_eq!(sql.len(), 1, "{}", id.shown());
             assert!(
@@ -10010,22 +10080,22 @@ mod tests {
     fn no_module_statement_offers_cascade() {
         let pg = Postgres::new();
         let changes = [
-            Change::DropModule {
+            Change::Module(ModuleChange::DropModule {
                 id: id("app.v"),
                 kind: ModuleKind::View,
-            },
-            Change::DropModule {
+            }),
+            Change::Module(ModuleChange::DropModule {
                 id: id("app.f(integer)"),
                 kind: ModuleKind::Function,
-            },
-            Change::DropModule {
+            }),
+            Change::Module(ModuleChange::DropModule {
                 id: id("app.t.audit"),
                 kind: ModuleKind::Trigger,
-            },
-            Change::AlterModule {
+            }),
+            Change::Module(ModuleChange::AlterModule {
                 id: id("app.v"),
                 module: Box::new(module(ModuleKind::View, "SELECT 1")),
-            },
+            }),
         ];
         for change in changes {
             for sql in sql_of(&pg, &change) {
@@ -10259,10 +10329,10 @@ mod tests {
             found[0]
         );
         let refused = Postgres::new().fixture_emit(
-            &Change::CreateModule {
+            &Change::Module(ModuleChange::CreateModule {
                 id: id("app.v"),
                 module: Box::new(empty),
-            },
+            }),
             Strategy::default(),
         );
         assert!(refused.is_err(), "an empty definition emitted a statement");
@@ -10279,11 +10349,11 @@ mod tests {
         let pg = Postgres::with_write_path_extras(vec!["shared".into(), "public".into()]);
         let sql = sql_of(
             &pg,
-            &Change::DropTable {
+            &Change::Table(TableChange::DropTable {
                 uid: Uid::generate(UidKind::Table),
                 name: name("app", "t"),
                 detach_from: None,
-            },
+            }),
         );
         assert_eq!(
             sql,
@@ -10332,10 +10402,10 @@ mod tests {
     fn the_path_of_an_unconfigured_project_is_the_objects_own_schema() {
         let sql = sql_of(
             &Postgres::new(),
-            &Change::DropIndex {
+            &Change::Index(IndexChange::DropIndex {
                 table: name("app", "t"),
                 name: "ix".into(),
-            },
+            }),
         );
         assert_eq!(
             sql,
@@ -10352,11 +10422,11 @@ mod tests {
     fn the_one_schema_a_path_cannot_name_is_refused_from_either_end() {
         let drop_it = |pg: &Postgres, schema: &str| {
             pg.fixture_emit(
-                &Change::DropTable {
+                &Change::Table(TableChange::DropTable {
                     uid: Uid::generate(UidKind::Table),
                     name: name(schema, "t"),
                     detach_from: None,
-                },
+                }),
                 Strategy::default(),
             )
         };
@@ -10391,11 +10461,11 @@ mod tests {
     fn the_one_schema_a_path_must_leave_out_is_refused_wherever_it_is_written() {
         let drop_it = |pg: &Postgres, schema: &str| {
             pg.fixture_emit(
-                &Change::DropTable {
+                &Change::Table(TableChange::DropTable {
                     uid: Uid::generate(UidKind::Table),
                     name: name(schema, "t"),
                     detach_from: None,
-                },
+                }),
                 Strategy::default(),
             )
         };
@@ -10437,11 +10507,11 @@ mod tests {
         let pg = Postgres::with_write_path_extras(vec![String::new()]);
         let refusal = pg
             .fixture_emit(
-                &Change::DropTable {
+                &Change::Table(TableChange::DropTable {
                     uid: Uid::generate(UidKind::Table),
                     name: name("app", "t"),
                     detach_from: None,
-                },
+                }),
                 Strategy::default(),
             )
             .expect_err("an empty schema name is not an identifier");
@@ -10452,7 +10522,7 @@ mod tests {
     }
 
     fn retype(from: &str, to: &str) -> Change {
-        Change::AlterColumnType {
+        Change::Column(ColumnChange::AlterColumnType {
             uid: Uid::generate(UidKind::Column),
             column: ColumnRef {
                 table: name("app", "t"),
@@ -10466,7 +10536,7 @@ mod tests {
             from_collation: None,
             to_collation: None,
             using: None,
-        }
+        })
     }
 
     /// Both refusals in the type arm, and the pair that must still pass
@@ -10525,13 +10595,13 @@ mod tests {
             .insert("id".into(), Column::new(ty("integer")).not_null());
         let sql = sql_of(
             &Postgres::new(),
-            &Change::CreateTable {
+            &Change::Table(TableChange::CreateTable {
                 uid: Uid::generate(UidKind::Table),
                 name: name("app", "t"),
                 table: Box::new(table),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
         );
         assert_eq!(
             sql,
@@ -10758,13 +10828,13 @@ mod tests {
         table.columns.insert("id".into(), id);
         let sql = sql_of(
             &Postgres::new(),
-            &Change::CreateTable {
+            &Change::Table(TableChange::CreateTable {
                 uid: Uid::generate(UidKind::Table),
                 name: name("app", "t"),
                 table: Box::new(table),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
         );
         assert!(
             sql[0].contains("GENERATED ALWAYS AS IDENTITY (START WITH 7 INCREMENT BY 3)"),
@@ -10808,13 +10878,13 @@ mod tests {
         table.columns.insert("n".into(), n);
         let sql = sql_of(
             &Postgres::new(),
-            &Change::CreateTable {
+            &Change::Table(TableChange::CreateTable {
                 uid: Uid::generate(UidKind::Table),
                 name: name("app", "t"),
                 table: Box::new(table),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
         )
         .join("\n");
         assert!(
@@ -10832,13 +10902,13 @@ mod tests {
         let retune = |from, to| {
             sql_of(
                 &Postgres::new(),
-                &Change::AlterColumnNumbering {
+                &Change::Column(ColumnChange::AlterColumnNumbering {
                     uid: Uid::generate(UidKind::Column),
                     column: name("app", "t").column("id"),
                     ty: ty("integer"),
                     from,
                     to,
-                },
+                }),
             )
             .join("\n")
         };
@@ -10893,16 +10963,16 @@ mod tests {
     /// which is an error.
     #[test]
     fn a_change_the_database_cannot_hold_emits_nothing_rather_than_pretending() {
-        let deprecated = Change::SetColumnDeprecated {
+        let deprecated = Change::Column(ColumnChange::SetColumnDeprecated {
             uid: Uid::generate(UidKind::Column),
             column: name("app", "t").column("c"),
             reason: Some("gone in March".into()),
-        };
-        let mode = Change::SetDataMode {
+        });
+        let mode = Change::Row(RowChange::SetDataMode {
             table: name("app", "t"),
             from: Some(pbps_model::DataMode::Ensure),
             to: Some(pbps_model::DataMode::Exact),
-        };
+        });
         for change in [deprecated, mode] {
             assert!(
                 Postgres::new()
@@ -10927,11 +10997,11 @@ mod tests {
         let emit = |fk| {
             sql_of(
                 &Postgres::new(),
-                &Change::AddForeignKey {
+                &Change::Constraint(ConstraintChange::AddForeignKey {
                     table: name("app", "t"),
                     name: "fk".into(),
                     constraint: Box::new(fk),
-                },
+                }),
             )
             .remove(0)
         };
@@ -10960,7 +11030,7 @@ mod tests {
     fn a_name_that_needs_quoting_is_quoted_in_both_positions() {
         let sql = sql_of(
             &Postgres::new(),
-            &Change::SetPrimaryKey {
+            &Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table: name("odd schema", "it's"),
                 from: Some(PrimaryKey {
                     name: None,
@@ -10970,7 +11040,7 @@ mod tests {
                 }),
                 to: None,
                 nonclustered: false,
-            },
+            }),
         );
         let block = &sql[0];
         // pbps's alone, so on the session's empty path and not the schema's
@@ -11003,7 +11073,7 @@ mod tests {
     fn a_name_that_spells_the_dollar_tag_does_not_end_the_block() {
         let sql = sql_of(
             &Postgres::new(),
-            &Change::SetPrimaryKey {
+            &Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table: name("app", "x$pbps$y"),
                 from: Some(PrimaryKey {
                     name: None,
@@ -11013,7 +11083,7 @@ mod tests {
                 }),
                 to: None,
                 nonclustered: false,
-            },
+            }),
         );
         let block = &sql[0];
         assert!(block.contains("DO $pbps1$"), "{block}");
@@ -11043,12 +11113,12 @@ mod tests {
             storage_parameters: Default::default(),
             filegroup: None,
         };
-        let change = Change::AddIndex {
+        let change = Change::Index(IndexChange::AddIndex {
             table: name("app", "t"),
             name: "ix".into(),
             index: Box::new(index.clone()),
             clustered: false,
-        };
+        });
         let sql = sql_of(&Postgres::new(), &change).remove(0);
         assert!(
             sql.contains("(lower(email) -- why\n) DESC, \"id\" ASC)"),
@@ -11076,12 +11146,12 @@ mod tests {
         });
         let added = sql_of(
             &Postgres::new(),
-            &Change::AddColumn {
+            &Change::Column(ColumnChange::AddColumn {
                 uid: "c_a1b2c3".parse().unwrap(),
                 table: name("app", "t"),
                 name: "b".into(),
                 column: Box::new(b),
-            },
+            }),
         )
         .remove(0);
         assert!(
@@ -11090,12 +11160,12 @@ mod tests {
         );
         let changed = sql_of(
             &Postgres::new(),
-            &Change::AlterColumnExpression {
+            &Change::Column(ColumnChange::AlterColumnExpression {
                 uid: "c_a1b2c3".parse().unwrap(),
                 column: name("app", "t").column("b"),
                 from: "a * 2".into(),
                 to: "a * 3 -- why".into(),
-            },
+            }),
         )
         .remove(0);
         assert!(
@@ -11117,7 +11187,7 @@ mod tests {
             opclass: opclass.map(|c| c.parse().unwrap()),
             collation: None,
         };
-        let change = Change::AddIndex {
+        let change = Change::Index(IndexChange::AddIndex {
             table: name("app", "doc"),
             name: "ix_body".into(),
             index: Box::new(Index {
@@ -11130,7 +11200,7 @@ mod tests {
                 filegroup: None,
             }),
             clustered: false,
-        };
+        });
         let sql = sql_of(&Postgres::new(), &change).remove(0);
         assert!(
             sql.contains(
@@ -11148,7 +11218,7 @@ mod tests {
     #[test]
     fn a_class_is_qualified_by_its_own_schema_or_by_pg_catalog() {
         let sql = |class: &str| {
-            let change = Change::AddIndex {
+            let change = Change::Index(IndexChange::AddIndex {
                 table: name("app", "doc"),
                 name: "ix".into(),
                 index: Box::new(Index {
@@ -11166,7 +11236,7 @@ mod tests {
                     filegroup: None,
                 }),
                 clustered: false,
-            };
+            });
             sql_of(&Postgres::new(), &change).remove(0)
         };
         assert!(
@@ -11211,12 +11281,12 @@ mod tests {
         let sql = |operator| {
             sql_of(
                 &Postgres::new(),
-                &Change::SetExclusion {
+                &Change::Constraint(ConstraintChange::SetExclusion {
                     table: name("app", "docs"),
                     name: "no_similar".into(),
                     from: None,
                     to: Some(Box::new(exclusion(operator))),
-                },
+                }),
             )
             .join("\n")
         };
@@ -11262,11 +11332,13 @@ mod tests {
             storage_parameters: [("fillfactor".to_owned(), "70".to_owned())].into(),
             timing,
         };
-        let add = |x: pbps_model::ExclusionConstraint| Change::SetExclusion {
-            table: name("app", "booking"),
-            name: "no_overlap".into(),
-            from: None,
-            to: Some(Box::new(x)),
+        let add = |x: pbps_model::ExclusionConstraint| {
+            Change::Constraint(ConstraintChange::SetExclusion {
+                table: name("app", "booking"),
+                name: "no_overlap".into(),
+                from: None,
+                to: Some(Box::new(x)),
+            })
         };
         let sql = sql_of(
             &Postgres::new(),
@@ -11330,12 +11402,12 @@ mod tests {
                 )),
             ),
         ] {
-            let change = Change::SetExclusion {
+            let change = Change::Constraint(ConstraintChange::SetExclusion {
                 table: name("app", "booking"),
                 name: "no_overlap".into(),
                 from: from.map(Box::new),
                 to: to.map(Box::new),
-            };
+            });
             let refused = Postgres::new()
                 .fixture_emit(&change, Strategy::default())
                 .expect_err("refused");
@@ -11371,12 +11443,12 @@ mod tests {
             filegroup: None,
         };
         let emit = |index: Index| {
-            let change = Change::AddIndex {
+            let change = Change::Index(IndexChange::AddIndex {
                 table: name("app", "booking"),
                 name: "ix".into(),
                 index: Box::new(index),
                 clustered: false,
-            };
+            });
             sql_of(&Postgres::new(), &change).remove(0)
         };
         let key =
@@ -11450,12 +11522,12 @@ mod tests {
             storage_parameters: Default::default(),
             filegroup: None,
         };
-        let change = Change::AddIndex {
+        let change = Change::Index(IndexChange::AddIndex {
             table: name("app", "t"),
             name: "ix".into(),
             index: Box::new(index),
             clustered: false,
-        };
+        });
         let offline = sql_of(&Postgres::new(), &change).remove(0);
         assert!(
             offline.starts_with("SET search_path = \"app\", \"pg_temp\";"),
@@ -11484,13 +11556,13 @@ mod tests {
     fn a_declared_expression_is_emitted_verbatim() {
         let sql = sql_of(
             &Postgres::new(),
-            &Change::AddCheck {
+            &Change::Constraint(ConstraintChange::AddCheck {
                 table: name("app", "t"),
                 name: "ck".into(),
                 constraint: CheckConstraint {
                     expression: "(n > 0)".into(),
                 },
-            },
+            }),
         )
         .remove(0);
         assert!(
@@ -11508,13 +11580,13 @@ mod tests {
         ] {
             let sql = sql_of(
                 &Postgres::new(),
-                &Change::AddCheck {
+                &Change::Constraint(ConstraintChange::AddCheck {
                     table: name("app", "t"),
                     name: "ck".into(),
                     constraint: CheckConstraint {
                         expression: expression.into(),
                     },
-                },
+                }),
             )
             .remove(0);
             assert!(sql.contains(tail), "{expression}: {sql}");
@@ -11528,41 +11600,41 @@ mod tests {
         table.columns.insert("n".into(), column.clone());
         let created = sql_of(
             &Postgres::new(),
-            &Change::CreateTable {
+            &Change::Table(TableChange::CreateTable {
                 uid: Uid::generate(UidKind::Table),
                 name: name("app", "t"),
                 table: Box::new(table),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
         )
         .remove(0);
         assert!(created.contains("DEFAULT (1 -- why\n)"), "{created}");
         let added = sql_of(
             &Postgres::new(),
-            &Change::AddColumn {
+            &Change::Column(ColumnChange::AddColumn {
                 uid: Uid::generate(UidKind::Column),
                 table: name("app", "t"),
                 name: "n".into(),
                 column: Box::new(column),
-            },
+            }),
         )
         .remove(0);
         assert!(added.contains("DEFAULT (1 -- why\n)"), "{added}");
         let set = sql_of(
             &Postgres::new(),
-            &Change::AlterColumnDefault {
+            &Change::Column(ColumnChange::AlterColumnDefault {
                 uid: Uid::generate(UidKind::Column),
                 column: name("app", "t").column("n"),
                 from: None,
                 to: Some("1 -- why".into()),
-            },
+            }),
         )
         .remove(0);
         assert!(set.contains("SET DEFAULT 1 -- why\n;"), "{set}");
         let indexed = sql_of(
             &Postgres::new(),
-            &Change::AddIndex {
+            &Change::Index(IndexChange::AddIndex {
                 table: name("app", "t"),
                 name: "ix".into(),
                 index: Box::new(Index {
@@ -11580,7 +11652,7 @@ mod tests {
                     filegroup: None,
                 }),
                 clustered: false,
-            },
+            }),
         )
         .remove(0);
         assert!(indexed.contains("WHERE (n > 0 -- why\n);"), "{indexed}");
@@ -11593,13 +11665,13 @@ mod tests {
     fn a_table_with_no_columns_is_refused_by_name() {
         let refusal = Postgres::new()
             .fixture_emit(
-                &Change::CreateTable {
+                &Change::Table(TableChange::CreateTable {
                     uid: Uid::generate(UidKind::Table),
                     name: name("app", "empty"),
                     table: Box::new(Table::default()),
                     beside_default: None,
                     moves_at_most: None,
-                },
+                }),
                 Strategy::default(),
             )
             .expect_err("no columns");
@@ -11695,7 +11767,7 @@ mod tests {
         let ty = |s: &str| s.parse::<ColumnType>().expect("a type");
         let mut row = Row::default();
         row.0.insert("label".into(), Value::Text("One".into()));
-        let change = Change::InsertRow {
+        let change = Change::Row(RowChange::InsertRow {
             table: "app.status".parse().expect("a table name"),
             key_column: "code".into(),
             identity_key: false,
@@ -11709,7 +11781,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-        };
+        });
         let sql = sql_of(&Postgres::new(), &change).join("\n");
         assert!(
             sql.contains("INSERT INTO \"app\".\"status\" (\"code\", \"label\")"),
@@ -11734,7 +11806,7 @@ mod tests {
     /// lock on the same door, for a plan that arrived some other way.
     #[test]
     fn an_identity_keyed_insert_is_refused_by_the_emitter_too() {
-        let change = Change::InsertRow {
+        let change = Change::Row(RowChange::InsertRow {
             table: "app.status".parse().expect("a table name"),
             key_column: "id".into(),
             identity_key: true,
@@ -11742,7 +11814,7 @@ mod tests {
             row: Row::default(),
             defaults: BTreeMap::new(),
             types: BTreeMap::new(),
-        };
+        });
         let e = Postgres::new()
             .fixture_emit(&change, Strategy::default())
             .expect_err("an identity key is refused on this engine");
@@ -11755,7 +11827,7 @@ mod tests {
     #[test]
     fn an_update_holds_the_row_before_and_after_without_restating_it() {
         let ty = |s: &str| s.parse::<ColumnType>().expect("a type");
-        let change = Change::UpdateRow {
+        let change = Change::Row(RowChange::UpdateRow {
             table: "app.status".parse().expect("a table name"),
             key_column: "code".into(),
             key: RowKey::from("a"),
@@ -11776,7 +11848,7 @@ mod tests {
                 .collect(),
             after_types: BTreeMap::new(),
             key_type: None,
-        };
+        });
         let sql = sql_of(&Postgres::new(), &change).join("\n");
         assert!(sql.contains("SET \"label\" = E'New'"), "{sql}");
         assert!(!sql.contains("SET \"label\" = E'New', \"rank\""), "{sql}");
@@ -11805,7 +11877,7 @@ mod tests {
                 [("kind".into(), ty(kind)), ("note".into(), ty("text"))].into();
             let after_types: BTreeMap<ColumnName, ColumnType> =
                 now.map(|n| ("kind".into(), ty(n))).into_iter().collect();
-            let update = Change::UpdateRow {
+            let update = Change::Row(RowChange::UpdateRow {
                 table: "app.moods".parse().expect("a table name"),
                 key_column: "m".into(),
                 key: RowKey::from("sad"),
@@ -11821,8 +11893,8 @@ mod tests {
                 types: types.clone(),
                 after_types: after_types.clone(),
                 key_type: None,
-            };
-            let delete = Change::DeleteRow {
+            });
+            let delete = Change::Row(RowChange::DeleteRow {
                 table: "app.moods".parse().expect("a table name"),
                 key_column: "m".into(),
                 key: RowKey::from("sad"),
@@ -11836,7 +11908,7 @@ mod tests {
                 types,
                 after_types,
                 key_type: None,
-            };
+            });
             [&update, &delete].map(|c| sql_of(&Postgres::new(), c).join("\n"))
         };
         // Renamed, moved, and an array of it: the old name is nowhere.
@@ -11866,7 +11938,7 @@ mod tests {
         let numeric = {
             let types: BTreeMap<ColumnName, ColumnType> = [("n".into(), ty("numeric(5,2)"))].into();
             let after: BTreeMap<ColumnName, ColumnType> = [("n".into(), ty("integer"))].into();
-            let change = Change::DeleteRow {
+            let change = Change::Row(RowChange::DeleteRow {
                 table: "app.moods".parse().expect("a table name"),
                 key_column: "m".into(),
                 key: RowKey::from("sad"),
@@ -11876,7 +11948,7 @@ mod tests {
                 types,
                 after_types: after,
                 key_type: None,
-            };
+            });
             sql_of(&Postgres::new(), &change).join("\n")
         };
         assert!(
@@ -11946,7 +12018,7 @@ mod tests {
     #[test]
     fn a_delete_holds_the_recorded_row_and_locks_the_parent_first() {
         let ty = |s: &str| s.parse::<ColumnType>().expect("a type");
-        let change = Change::DeleteRow {
+        let change = Change::Row(RowChange::DeleteRow {
             table: "app.status".parse().expect("a table name"),
             key_column: "code".into(),
             key: RowKey::from("old"),
@@ -11974,7 +12046,7 @@ mod tests {
                 .collect(),
             after_types: BTreeMap::new(),
             key_type: None,
-        };
+        });
         let json = serde_json::to_value(&change).unwrap();
         assert_eq!(
             json["dropped"]["label"]["value"]["text"],
@@ -12021,17 +12093,17 @@ mod tests {
             let target = GrantTarget::Sequence(TableName::new("app", "t'$pbps$").column("id'"));
             let permissions = [Permission::Usage, Permission::Select, Permission::Update].into();
             let change = if revoke {
-                Change::Revoke {
+                Change::Permission(GrantChange::Revoke {
                     role: "reader'".into(),
                     target,
                     permissions,
-                }
+                })
             } else {
-                Change::Grant {
+                Change::Permission(GrantChange::Grant {
                     role: "reader'".into(),
                     target,
                     permissions,
-                }
+                })
             };
             let statements = pg.fixture_emit(&change, Strategy::default()).unwrap();
             assert_eq!(statements.len(), if revoke { 3 } else { 1 });
@@ -12049,11 +12121,11 @@ mod tests {
             }
         }
         for permission in Permission::ALL {
-            let change = Change::Grant {
+            let change = Change::Permission(GrantChange::Grant {
                 role: "reader".into(),
                 target: "sequence::app.t.id".parse().unwrap(),
                 permissions: [permission].into(),
-            };
+            });
             assert_eq!(
                 pg.fixture_emit(&change, Strategy::default()).is_ok(),
                 [Permission::Usage, Permission::Select, Permission::Update].contains(&permission)
@@ -12061,11 +12133,11 @@ mod tests {
         }
         assert!(
             pg.fixture_emit(
-                &Change::Grant {
+                &Change::Permission(GrantChange::Grant {
                     role: "reader".into(),
                     target: "sequence::app.t.id".parse().unwrap(),
                     permissions: BTreeSet::new()
-                },
+                }),
                 Strategy::default()
             )
             .is_err()
@@ -12112,7 +12184,8 @@ mod tests {
         ] {
             for spelling in ["v", "v\n\\name"] {
                 let mut change = retype(from, to);
-                let Change::AlterColumnType { column, .. } = &mut change else {
+                let Change::Column(ColumnChange::AlterColumnType { column, .. }) = &mut change
+                else {
                     unreachable!("retype constructs an AlterColumnType");
                 };
                 column.name = spelling.into();

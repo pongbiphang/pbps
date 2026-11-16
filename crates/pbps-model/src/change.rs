@@ -15,6 +15,7 @@
 //! hold a `Dialect`, and attached to [`PlannedChange`] as data.
 
 mod columns;
+mod wire;
 pub use columns::{ColumnProperty, ColumnTransition, ColumnValue};
 
 use crate::ColumnName;
@@ -260,71 +261,59 @@ pub enum DetachedKind {
     Index,
 }
 
-/// Every variant carries the UID of the object it affects, so that applying a
-/// plan never has to match on names — names are exactly what may be changing.
+/// One change of a plan: a family (DEC-2790.1) and, inside it, the kind of change.
+///
+/// Every kind carries what it needs to be applied without matching on names, which
+/// are exactly what may be changing: the UID of the object it affects, or, for the
+/// kinds that have none, the table or module it names.
+///
+/// A change is saved as one flat object tagged by `op`, printed by `Debug` as the
+/// kind alone and described by one JSON schema, as it was when every kind was a
+/// variant of this enum. The impls that keep it so are in `change/wire.rs`; the
+/// derives here are only the ones that see nothing of the layering.
+///
+/// A kind that joins a family joins every `match` that takes the family whole
+/// (`Change::Table(_)`), with no compile error: read those where a kind is added.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Change {
+    /// The kinds of the `tables` family: [`TableChange`].
+    Table(TableChange),
+    /// The kinds of the `table_properties` family: [`TablePropertyChange`].
+    TableProperty(TablePropertyChange),
+    /// The kinds of the `partitions` family: [`PartitionChange`].
+    Partition(PartitionChange),
+    /// The kinds of the `columns` family: [`ColumnChange`].
+    Column(ColumnChange),
+    /// The kinds of the `constraints` family: [`ConstraintChange`].
+    Constraint(ConstraintChange),
+    /// The kinds of the `indexes` family: [`IndexChange`].
+    Index(IndexChange),
+    /// The kinds of the `policies` family: [`PolicyChange`].
+    Policy(PolicyChange),
+    /// The kinds of the `rows` family: [`RowChange`].
+    Row(RowChange),
+    /// The kinds of the `modules` family: [`ModuleChange`].
+    Module(ModuleChange),
+    /// The kinds of the `permissions` family: [`GrantChange`].
+    Permission(GrantChange),
+    /// The kinds of the `type_values` family: [`TypeValueChange`].
+    TypeValue(TypeValueChange),
+    /// The kinds of the `roles` family: [`RoleChange`].
+    Role(RoleChange),
+    /// The kinds of the `types` family: [`TypeChange`].
+    Type(TypeChange),
+    /// The kinds of the `extensions` family: [`ExtensionChange`].
+    Extension(ExtensionChange),
+    /// The kinds of the `search` family: [`SearchChange`].
+    Search(SearchChange),
+}
+
+/// The kinds of change of the `search` family (DEC-2790.1), the enum
+/// `change_family!(search)` names. [`Change::Search`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Change {
-    /// Planning-only until the complete rebuild route is admitted.
-    RebuildPartitionedTable(Box<crate::RebuildPartitionedTable>),
-    CopyTableRows(Box<crate::CopyTableRows>),
-    AnalyzeTableTree(Box<crate::AnalyzeTableTree>),
-    BuildPartitionedIndex(Box<crate::BuildPartitionedIndex>),
-    /// One additive label, carrying the definition immediately after this step.
-    AddEnumValue {
-        uid: Uid,
-        name: crate::TypeRef,
-        value: String,
-        placement: Option<crate::EnumPlacement>,
-        ordinal: usize,
-        definition: Box<crate::ManagedType>,
-    },
-    /// Explicit label intent changes the text returned by existing rows.
-    RenameEnumValue {
-        uid: Uid,
-        name: crate::TypeRef,
-        from: String,
-        to: String,
-        ordinal: usize,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        retained: Vec<crate::RetainedExpression>,
-        definition: Box<crate::ManagedType>,
-    },
-    /// One half of an in-place domain alteration (DEC-1635.8). The statements
-    /// derive from `(from, to, half)` alone: `Loosen` drops what the
-    /// declaration no longer holds and sets the default, `Tighten` adds what
-    /// it newly holds and validates it.
-    AlterDomain {
-        uid: Uid,
-        name: crate::TypeRef,
-        from: Box<crate::ManagedType>,
-        to: Box<crate::ManagedType>,
-        half: crate::DomainHalf,
-    },
-    /// A label removal or reorder, done by rebuilding the enum under the same
-    /// uid (DEC-1635.7). `name` is the live name, `tmp` the replacement's.
-    EnumRebuild {
-        uid: Uid,
-        name: crate::TypeRef,
-        tmp: crate::TypeRef,
-        step: crate::EnumRebuildStep,
-    },
-    CreateType {
-        uid: Uid,
-        name: crate::TypeRef,
-        definition: Box<crate::ManagedType>,
-    },
-    DropType {
-        uid: Uid,
-        name: crate::TypeRef,
-        definition: Box<crate::ManagedType>,
-    },
-    RenameType {
-        uid: Uid,
-        from: crate::TypeRef,
-        to: crate::TypeRef,
-        definition: Box<crate::ManagedType>,
-    },
+pub enum SearchChange {
     /// `CREATE TEXT SEARCH DICTIONARY`, or `CREATE TEXT SEARCH CONFIGURATION` and
     /// its `ADD MAPPING` groups, of an object the declarations hold under an `s_` uid
     /// and the target lacks (DEC-2728.2). The payload is the whole definition, as
@@ -347,6 +336,14 @@ pub enum Change {
         name: crate::SearchRef,
         definition: Box<crate::SearchObject>,
     },
+}
+
+/// The kinds of change of the `extensions` family (DEC-2790.1), the enum
+/// `change_family!(extensions)` names. [`Change::Extension`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExtensionChange {
     /// `CREATE EXTENSION name SCHEMA schema VERSION version` of a package the
     /// declaration holds under an `e_` uid and the target lacks (DEC-2447.6).
     /// It runs package code, so it is `extension-code` risk and is sealed with
@@ -436,413 +433,202 @@ pub enum Change {
         #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
         releases: BTreeSet<crate::ModuleId>,
     },
-    CreateTable {
-        uid: Uid,
-        name: TableName,
-        table: Box<Table>,
-        /// The DEFAULT partition of the standing parent a new range partition
-        /// goes under (#1547, DEC-1547.1): the partition is made as a plain
-        /// table, filled with the DEFAULT's rows in its range, and attached.
-        /// `None` for any other table, which an older plan's creates all are.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        beside_default: Option<TableName>,
-        /// Beside a DEFAULT, the most of its rows the move may take, as a
-        /// human allowed it (`pbps move-rows`, #1788); `None` allows none, and
-        /// the moving statement refuses if it finds any. Ignored with no
-        /// `beside_default`, where nothing moves.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        moves_at_most: Option<u64>,
-    },
-    DropTable {
-        uid: Uid,
-        name: TableName,
-        /// The partitioned table this one is a partition of, which the drop
-        /// detaches it from first (#1171): a partition a foreign key to its
-        /// parent reaches cannot be dropped while attached. `None` for any
-        /// other table, which an older plan's drops all are.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        detach_from: Option<TableName>,
-    },
-    /// A partition leaves its parent and stays, as an ordinary table of the
-    /// declared shape, which is its parent's under names of its own (#1544,
-    /// DEC-1544.1). Its rows leave the parent with it.
-    DetachPartition {
-        uid: Uid,
-        table: TableName,
-        parent: TableName,
-        /// The name each of the parent's objects takes on the detached table.
-        names: Vec<DetachedName>,
-        /// The table the detach leaves, as declared: what the apply holds
-        /// the read-back to, as it holds a created table to its `CREATE`.
-        shape: Box<Table>,
-    },
-    /// An ordinary table becomes a partition of a standing parent and keeps
-    /// its rows (#1545, DEC-1545.1). Its columns become the parent's; what it
-    /// holds of them otherwise, and its own indexes and checks, are brought
-    /// to the declaration by the partition's own changes after it.
-    AttachPartition {
-        uid: Uid,
-        table: TableName,
-        parent: TableName,
-        bound: crate::schema::PartitionBound,
-        /// The parent's key columns, in order, as the plan was made against
-        /// them. A staged attach writes a CHECK on them that implies the
-        /// bound, so the attach skips its scan (#1638, DEC-1638.1). Empty in
-        /// a plan made before it, or when live constraint names prevent the
-        /// temporary CHECK (DEC-2126.1); either uses the single statement.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        key: Vec<ColumnName>,
-        /// The partition as declared: what the apply holds the read-back to
-        /// once every statement has run, as it holds a created table to its
-        /// `CREATE`.
-        shape: Box<Table>,
-    },
-    RenameTable {
-        uid: Uid,
-        from: TableName,
-        to: TableName,
-        /// The columns that carry a default when the table is renamed, by the
-        /// names they have then (a column rename runs after the table's).
-        /// SQL Server names each default it creates after its table and column
-        /// (`DF_pbps_…`, DEC-496.1), and a rename leaves that name behind: a
-        /// new table declared under the old name then generates it again and
-        /// is refused (#975). The emitter renames each generated default with
-        /// its table. Empty on a plan written before this field existed.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        defaults: Vec<ColumnName>,
-    },
+}
 
-    AddColumn {
+/// The kinds of change of the `types` family (DEC-2790.1), the enum
+/// `change_family!(types)` names. [`Change::Type`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TypeChange {
+    CreateType {
         uid: Uid,
-        table: TableName,
-        name: ColumnName,
-        column: Box<Column>,
+        name: crate::TypeRef,
+        definition: Box<crate::ManagedType>,
     },
-    DropColumn {
+    DropType {
         uid: Uid,
-        column: ColumnRef,
+        name: crate::TypeRef,
+        definition: Box<crate::ManagedType>,
     },
-    RenameColumn {
+    RenameType {
         uid: Uid,
-        table: TableName,
-        from: ColumnName,
-        to: ColumnName,
-        /// The table's name before this plan renamed it, when it did. The
-        /// table rename leaves a generated default under the name built from
-        /// this one when the name it would move to is taken, so the column
-        /// rename looks for both (#975).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        table_was: Option<TableName>,
+        from: crate::TypeRef,
+        to: crate::TypeRef,
+        definition: Box<crate::ManagedType>,
     },
-    AlterColumnType {
+}
+
+/// The kinds of change of the `roles` family (DEC-2790.1), the enum
+/// `change_family!(roles)` names. [`Change::Role`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RoleChange {
+    // Roles (ADR-0005). Identity-tracked like tables: a rename is `ALTER ROLE
+    // ... WITH NAME`, never drop + add, because membership lives only in the
+    // environment. Grants are split out of the create, as foreign keys are
+    // out of `CreateTable`: they sort after the objects they name exist.
+    CreateRole {
         uid: Uid,
-        column: ColumnRef,
-        from: ColumnType,
-        to: ColumnType,
-        /// Nullability before and after, carried even when it is not what
-        /// changed.
-        ///
-        /// `ALTER COLUMN` restates the entire column definition, and SQL Server
-        /// reads an omitted `NULL` / `NOT NULL` as `NULL` — so a type change
-        /// emitted without the nullability silently drops a `NOT NULL`. The
-        /// differ therefore never emits a separate
-        /// [`Change::AlterColumnNullability`] beside a type change on the same
-        /// column, and carrying both ends keeps the `not-null` risk derivable
-        /// from the change alone.
-        from_nullable: bool,
-        to_nullable: bool,
-        /// Explicit collation before and after (#1175), `None` being the
-        /// database default. Carried for the reason the nullability is: SQL
-        /// Server's `ALTER COLUMN` restates the whole definition and reads an
-        /// omitted `COLLATE` as the database default — measured on 17.0, a
-        /// column `COLLATE Latin1_General_CI_AS` altered to `varchar(20)`
-        /// came back under the database's collation. A collation change on
-        /// a column whose type stays is this change too, with `from == to`:
-        /// the statement is the same `ALTER COLUMN`, and so are the
-        /// dependents it has to take down and put back.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        from_collation: Option<Collation>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        to_collation: Option<Collation>,
-        /// The table is a parent whose partitions are external (#1533), and
-        /// the change drops its NOT NULL: a NOT NULL a partition keeps of its
-        /// own, which PostgreSQL 18 leaves behind (DEC-1687.1), is dropped
-        /// after the parent's, since no declaration lists the partition to
-        /// bring it back (DEC-1533.1).
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        through_external_partitions: bool,
-        /// The expression a human recorded for exactly this `from` to `to`
-        /// change (`pbps convert`, #2331), verbatim. The only source of a
-        /// `USING` clause (ADR-0012 section 5, DEC-2331.1): the differ copies
-        /// it from the identity file when the change is the one the record
-        /// names, and it is sealed by the plan's checksum like the rest of the
-        /// change. Absent for every other change, so a plan without a
-        /// conversion serializes as it did before.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        using: Option<String>,
+        name: crate::RoleName,
     },
-    AlterColumnNullability {
+    /// Dropping a role that still has members is refused by the engine, and
+    /// membership is each environment's own — so a connected plan lists the
+    /// members it found and removes them first, by name, where the reviewer
+    /// can see who loses what. An offline plan has no environment to ask and
+    /// leaves the list empty (ADR-0005).
+    DropRole {
         uid: Uid,
-        column: ColumnRef,
-        /// The column's type, unchanged, restated for the same reason
-        /// [`Change::AlterColumnType`] carries the nullability: `ALTER COLUMN`
-        /// takes a whole column definition, and there is no way to say "keep the
-        /// type, change only this".
-        ty: ColumnType,
-        /// Whether the column is nullable after the change.
-        to_nullable: bool,
-        /// The column's explicit collation, unchanged, restated for the
-        /// reason [`Change::AlterColumnType`] carries it (#1175).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        collation: Option<Collation>,
-        /// The table is a parent whose partitions are external (#1533), and
-        /// the change drops its NOT NULL: a NOT NULL a partition keeps of its
-        /// own, which PostgreSQL 18 leaves behind (DEC-1687.1), is dropped
-        /// after the parent's, since no declaration lists the partition to
-        /// bring it back (DEC-1533.1).
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        through_external_partitions: bool,
+        name: crate::RoleName,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        members: Vec<crate::RoleName>,
     },
-    AlterColumnDefault {
+    RenameRole {
         uid: Uid,
-        column: ColumnRef,
-        from: Option<String>,
-        to: Option<String>,
+        from: crate::RoleName,
+        to: crate::RoleName,
     },
-    /// A generated column's expression, changed in place (DEC-1168.1).
-    /// PostgreSQL 17 and later recompute every row under the new expression
-    /// (`SET EXPRESSION`); older servers have no in-place form, and a plan
-    /// that needs one is refused before it runs.
-    AlterColumnExpression {
+}
+
+/// The kinds of change of the `type_values` family (DEC-2790.1), the enum
+/// `change_family!(type_values)` names. [`Change::TypeValue`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TypeValueChange {
+    /// One additive label, carrying the definition immediately after this step.
+    AddEnumValue {
         uid: Uid,
-        column: ColumnRef,
+        name: crate::TypeRef,
+        value: String,
+        placement: Option<crate::EnumPlacement>,
+        ordinal: usize,
+        definition: Box<crate::ManagedType>,
+    },
+    /// Explicit label intent changes the text returned by existing rows.
+    RenameEnumValue {
+        uid: Uid,
+        name: crate::TypeRef,
         from: String,
         to: String,
+        ordinal: usize,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        retained: Vec<crate::RetainedExpression>,
+        definition: Box<crate::ManagedType>,
     },
-    /// A PostgreSQL column's numbering source added, removed, retuned or
-    /// converted (#1889, DEC-1889.1): an identity or an owned sequence
-    /// (`serial`) on at least one side, and on the other one of them, a
-    /// plain default or nothing. Never a generated column.
+    /// One half of an in-place domain alteration (DEC-1635.8). The statements
+    /// derive from `(from, to, half)` alone: `Loosen` drops what the
+    /// declaration no longer holds and sets the default, `Tighten` adds what
+    /// it newly holds and validates it.
+    AlterDomain {
+        uid: Uid,
+        name: crate::TypeRef,
+        from: Box<crate::ManagedType>,
+        to: Box<crate::ManagedType>,
+        half: crate::DomainHalf,
+    },
+    /// A label removal or reorder, done by rebuilding the enum under the same
+    /// uid (DEC-1635.7). `name` is the live name, `tmp` the replacement's.
+    EnumRebuild {
+        uid: Uid,
+        name: crate::TypeRef,
+        tmp: crate::TypeRef,
+        step: crate::EnumRebuildStep,
+    },
+}
+
+/// The kinds of change of the `permissions` family (DEC-2790.1), the enum
+/// `change_family!(permissions)` names. [`Change::Permission`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GrantChange {
+    /// Permissions added on one target. Only the ones that are new: restating
+    /// what the role already holds would make the plan claim a widening that
+    /// is not one.
+    Grant {
+        role: crate::RoleName,
+        target: GrantTarget,
+        permissions: BTreeSet<Permission>,
+    },
+    /// Permissions removed from one target — the ones the declaration no
+    /// longer lists.
+    Revoke {
+        role: crate::RoleName,
+        target: GrantTarget,
+        permissions: BTreeSet<Permission>,
+    },
+    /// What this plan settles about the engine's default `EXECUTE` to
+    /// `PUBLIC` on a routine it brings into being (ADR-0010 §5).
     ///
-    /// No number already issued is renumbered or reissued: a source put on a
-    /// column that holds values continues past them, from the greater of its
-    /// declared start, the column's values and, for a conversion, the old
-    /// source's counter. Its start and increment change in place without
-    /// `RESTART`.
-    AlterColumnNumbering {
-        uid: Uid,
-        column: ColumnRef,
-        /// The column's type once the plan has run. A sequence is created
-        /// `AS` it, and an owned sequence kept through a retype is moved to
-        /// it, which the engine does for an identity's on its own.
-        ty: ColumnType,
-        from: ValueSource,
-        to: ValueSource,
+    /// # Why this is its own variant and not a `Revoke` from a role called
+    /// `PUBLIC`
+    ///
+    /// Because `PUBLIC` is not a role this model has, and a string field that
+    /// held the word would be a sentinel every reader had to know about: a
+    /// declaration may name a role `PUBLIC`, and the two would then be the
+    /// same value meaning two different things. ADR-0010 §5 names the gap as
+    /// "a grantee the model does not have", so this is that grantee — given
+    /// the narrowest shape that can express the decision and nothing else.
+    /// There is no permission set (`EXECUTE` is the only default `PUBLIC`
+    /// holds on a routine) and no [`GrantTarget`] (a view or a trigger cannot
+    /// be one), so a plan cannot ask about a grantee or a permission that is
+    /// not this one.
+    ///
+    /// # Why keeping the default is a change of its own
+    ///
+    /// [`PublicAccess::Kept`] is here because a plan that stayed silent could
+    /// not be told apart from one that had no opinion — and the connected
+    /// rebuild guard has to tell those apart. A routine somebody closed, whose
+    /// declaration now asks for the default back, is a *valid* rebuild, and
+    /// silence would have it refused with the missing default it was asked to
+    /// restore (ADR-0009 §3). Positive evidence, not an absence, is also what
+    /// a reviewer reads: "this routine stays executable by everyone" is a
+    /// line worth seeing.
+    ///
+    /// It renders a statement rather than trusting the `CREATE`, because the
+    /// engine's default is not the only thing deciding what a new routine
+    /// arrives holding: a cluster's own `ALTER DEFAULT PRIVILEGES` can revoke
+    /// it (DECISIONS 517).
+    PublicExecution {
+        routine: RoutineId,
+        access: PublicAccess,
+        origin: RoutineOrigin,
     },
-    /// A SQL Server computed column created (#1174, DEC-1174.1), at the end
-    /// of its table. An expression or persisted change is this after a
-    /// [`Change::DropComputedColumn`]: the engine changes neither in place
-    /// (`ALTER COLUMN … AS` is a syntax error, measured on 17.0).
-    AddComputedColumn {
-        table: TableName,
-        name: ColumnName,
-        computed: ComputedColumn,
-    },
-    /// A SQL Server computed column dropped, carrying what it was. Its values
-    /// are derived, so dropping one loses nothing a re-add cannot compute.
-    DropComputedColumn {
-        table: TableName,
-        name: ColumnName,
-        computed: ComputedColumn,
-    },
-    /// Deprecation flag changed. Produces no structural change; may optionally be
-    /// written to an extended property.
-    SetColumnDeprecated {
-        uid: Uid,
-        column: ColumnRef,
-        reason: Option<crate::Text>,
-    },
+}
 
-    /// A PostgreSQL table's replica identity (#1444): `ALTER TABLE …
-    /// REPLICA IDENTITY …`, with `None` for `DEFAULT`. Planned where the
-    /// declared identity differs from the database's, and again wherever the
-    /// plan re-adds the index it names, which a drop loses (DEC-1444.1).
-    SetReplicaIdentity {
-        uid: Uid,
-        table: TableName,
-        to: Option<ReplicaIdentity>,
+/// The kinds of change of the `modules` family (DEC-2790.1), the enum
+/// `change_family!(modules)` names. [`Change::Module`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModuleChange {
+    // Modules (ADR-0002) carry no uid: they carry no data either, so a rename
+    // is drop + add and the audit trail is git.
+    CreateModule {
+        id: ModuleId,
+        module: Box<Module>,
     },
+    /// Re-stated in full. `CREATE OR ALTER` is idempotent and — unlike drop plus
+    /// create — preserves the permissions granted on the object, which is the
+    /// DACPAC pain point this avoids.
+    AlterModule {
+        id: ModuleId,
+        module: Box<Module>,
+    },
+    DropModule {
+        id: ModuleId,
+        kind: ModuleKind,
+    },
+}
 
-    /// `COMMENT ON … IS …` for an object whose declaration has a `description`
-    /// (#2729, DEC-2729.1). `None` is `IS NULL`: the declared `""`, which the engine
-    /// stores as no comment. One variant for every kind of object, so a kind added
-    /// later is a [`CommentTarget`] arm and not a new `Change`.
-    SetComment {
-        target: CommentTarget,
-        text: Option<crate::Text>,
-    },
-
-    /// A PostgreSQL table's heap storage parameters (#1441): `ALTER TABLE …
-    /// SET (…)` for `set`, in canonical spelling, and `RESET (…)` for
-    /// `reset`. Only what changes: a parameter the plan leaves alone is not
-    /// restated (DEC-1441.1).
-    SetStorageParameters {
-        uid: Uid,
-        table: TableName,
-        set: BTreeMap<String, String>,
-        reset: BTreeSet<String>,
-    },
-
-    /// A PostgreSQL table switched between permanent and `UNLOGGED` (#1443):
-    /// `ALTER TABLE … SET LOGGED` or `SET UNLOGGED`, which rewrites the table
-    /// and its indexes under `AccessExclusiveLock` in either direction
-    /// (measured on 16 and 18). Ordered by the foreign keys between the
-    /// tables it switches (DEC-1443.1).
-    SetTablePersistence {
-        uid: Uid,
-        table: TableName,
-        unlogged: bool,
-    },
-
-    /// A partition's own default on a column it inherits (#1581, DEC-1581.1):
-    /// `ALTER TABLE <partition> ALTER COLUMN … SET DEFAULT` or `DROP
-    /// DEFAULT`. A partition declares no column and so has no column uid; it
-    /// is keyed by its table uid and the column's name. `from` and `to` are
-    /// the partition's own default as declared, and `fallback` is what the
-    /// partition holds without one: its parent's default, which the engine
-    /// copies into every partition, or none. The statement sets `to`, else
-    /// `fallback`, else drops the default. With both `None` it takes the
-    /// default off entirely, which is how a function rebuild releases it
-    /// (#1588). `parent` is where `fallback` was written: it is resolved under
-    /// the parent's schema, and `to` under the partition's, which may be
-    /// another. Function rebuilds also use this table-keyed form before an
-    /// attach when restoring a parent-derived expression: the plain table's
-    /// column UID cannot carry the parent's expression scope (DEC-1875.1).
-    SetPartitionDefault {
-        uid: Uid,
-        table: TableName,
-        parent: TableName,
-        column: ColumnName,
-        from: Option<String>,
-        to: Option<String>,
-        fallback: Option<String>,
-    },
-    /// A partition's own NOT NULL on a column its parent leaves nullable
-    /// (#1581): `ALTER TABLE <partition> ALTER COLUMN … SET NOT NULL` or
-    /// `DROP NOT NULL`, keyed as [`Change::SetPartitionDefault`] is.
-    SetPartitionNotNull {
-        uid: Uid,
-        table: TableName,
-        column: ColumnName,
-        not_null: bool,
-    },
-
-    /// A PostgreSQL index's storage parameters (#1442): `ALTER INDEX … SET
-    /// (…), RESET (…)`, in place, which every supported parameter of both
-    /// methods is (measured on 16 and 18). Only what changes; an index
-    /// rebuilt for another reason carries its parameters in its `CREATE`
-    /// (DEC-1442.1).
-    SetIndexStorageParameters {
-        table: TableName,
-        target: IndexPart,
-        method: IndexMethod,
-        set: BTreeMap<String, String>,
-        reset: BTreeSet<String>,
-    },
-
-    /// Policies are separate from CREATE TABLE so their routines already exist.
-    CreatePolicy {
-        table: TableName,
-        name: String,
-        policy: crate::RowPolicy,
-        origin: RowSecurityOrigin,
-    },
-    /// The dropped definition pins risk classification, including latent policies.
-    DropPolicy {
-        table: TableName,
-        name: String,
-        policy: crate::RowPolicy,
-    },
-    /// Independent PostgreSQL ENABLE and FORCE transitions.
-    SetRowSecurity {
-        uid: Uid,
-        table: TableName,
-        from: crate::RowSecurity,
-        to: crate::RowSecurity,
-        origin: RowSecurityOrigin,
-    },
-
-    // Constraints and indexes are always drop + add, never modified in place —
-    // that is how the database itself implements it, and pretending otherwise
-    // would only give the emitter one more path that can fail.
-    SetPrimaryKey {
-        table: TableName,
-        from: Option<PrimaryKey>,
-        to: Option<PrimaryKey>,
-        /// The key `to` adds is nonclustered: its table declares another
-        /// layout ([`Table::clustered`]). `false` is the default layout, a
-        /// clustered key, which is what a change written before the field
-        /// existed meant. The table-level selector cannot travel here — the
-        /// change carries the key, not its table — so the differ resolves it
-        /// into the one fact the emitter needs.
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        nonclustered: bool,
-    },
-    AddUnique {
-        table: TableName,
-        name: ObjectLocalName,
-        constraint: UniqueConstraint,
-        /// This constraint's index is the table's clustered one
-        /// ([`Table::clustered`]).
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        clustered: bool,
-    },
-    DropUnique {
-        table: TableName,
-        name: ObjectLocalName,
-    },
-    /// Adds (`from: None`), or drops (`to: None`), an exclusion constraint
-    /// (DEC-2448.3). One variant for both, as [`Change::SetPrimaryKey`] is: a
-    /// replacement is the drop half and the add half as two changes, each in the
-    /// ordering class its direction needs. Adding takes the `constraint` risk,
-    /// dropping the `destructive` one.
-    SetExclusion {
-        table: TableName,
-        name: ObjectLocalName,
-        from: Option<Box<ExclusionConstraint>>,
-        to: Option<Box<ExclusionConstraint>>,
-    },
-    AddForeignKey {
-        table: TableName,
-        name: ObjectLocalName,
-        constraint: Box<ForeignKey>,
-    },
-    DropForeignKey {
-        table: TableName,
-        name: ObjectLocalName,
-    },
-    AddCheck {
-        table: TableName,
-        name: ObjectLocalName,
-        constraint: CheckConstraint,
-    },
-    DropCheck {
-        table: TableName,
-        name: ObjectLocalName,
-    },
-    AddIndex {
-        table: TableName,
-        name: ObjectLocalName,
-        index: Box<Index>,
-        /// This index is the table's clustered one ([`Table::clustered`]).
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        clustered: bool,
-    },
-    DropIndex {
-        table: TableName,
-        name: ObjectLocalName,
-    },
-
+/// The kinds of change of the `rows` family (DEC-2790.1), the enum
+/// `change_family!(rows)` names. [`Change::Row`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RowChange {
     // Reference data (ADR-0004). No uid, and no rename intent: a row's entire
     // content is declared, so recreating one is lossless — the generalized
     // identity criterion of ADR-0005. The identity is the primary-key value,
@@ -1033,7 +819,6 @@ pub enum Change {
         from: Option<DataMode>,
         to: Option<DataMode>,
     },
-
     /// The keys an existing `ensure` declaration manages. Matching live rows
     /// need no DML, but the new scope must still reach the ordinary recording
     /// gate; observed row membership cannot stand in for it (DEC-1808.1).
@@ -1042,105 +827,467 @@ pub enum Change {
         from: BTreeSet<RowKey>,
         to: BTreeSet<RowKey>,
     },
+}
 
-    // Modules (ADR-0002) carry no uid: they carry no data either, so a rename
-    // is drop + add and the audit trail is git.
-    CreateModule {
-        id: ModuleId,
-        module: Box<Module>,
+/// The kinds of change of the `policies` family (DEC-2790.1), the enum
+/// `change_family!(policies)` names. [`Change::Policy`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PolicyChange {
+    /// Policies are separate from CREATE TABLE so their routines already exist.
+    CreatePolicy {
+        table: TableName,
+        name: String,
+        policy: crate::RowPolicy,
+        origin: RowSecurityOrigin,
     },
-    /// Re-stated in full. `CREATE OR ALTER` is idempotent and — unlike drop plus
-    /// create — preserves the permissions granted on the object, which is the
-    /// DACPAC pain point this avoids.
-    AlterModule {
-        id: ModuleId,
-        module: Box<Module>,
+    /// The dropped definition pins risk classification, including latent policies.
+    DropPolicy {
+        table: TableName,
+        name: String,
+        policy: crate::RowPolicy,
     },
-    DropModule {
-        id: ModuleId,
-        kind: ModuleKind,
-    },
-
-    // Roles (ADR-0005). Identity-tracked like tables: a rename is `ALTER ROLE
-    // ... WITH NAME`, never drop + add, because membership lives only in the
-    // environment. Grants are split out of the create, as foreign keys are
-    // out of `CreateTable`: they sort after the objects they name exist.
-    CreateRole {
+    /// Independent PostgreSQL ENABLE and FORCE transitions.
+    SetRowSecurity {
         uid: Uid,
-        name: crate::RoleName,
-    },
-    /// Dropping a role that still has members is refused by the engine, and
-    /// membership is each environment's own — so a connected plan lists the
-    /// members it found and removes them first, by name, where the reviewer
-    /// can see who loses what. An offline plan has no environment to ask and
-    /// leaves the list empty (ADR-0005).
-    DropRole {
-        uid: Uid,
-        name: crate::RoleName,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        members: Vec<crate::RoleName>,
-    },
-    RenameRole {
-        uid: Uid,
-        from: crate::RoleName,
-        to: crate::RoleName,
-    },
-    /// Permissions added on one target. Only the ones that are new: restating
-    /// what the role already holds would make the plan claim a widening that
-    /// is not one.
-    Grant {
-        role: crate::RoleName,
-        target: GrantTarget,
-        permissions: BTreeSet<Permission>,
-    },
-    /// Permissions removed from one target — the ones the declaration no
-    /// longer lists.
-    Revoke {
-        role: crate::RoleName,
-        target: GrantTarget,
-        permissions: BTreeSet<Permission>,
-    },
-
-    /// What this plan settles about the engine's default `EXECUTE` to
-    /// `PUBLIC` on a routine it brings into being (ADR-0010 §5).
-    ///
-    /// # Why this is its own variant and not a `Revoke` from a role called
-    /// `PUBLIC`
-    ///
-    /// Because `PUBLIC` is not a role this model has, and a string field that
-    /// held the word would be a sentinel every reader had to know about: a
-    /// declaration may name a role `PUBLIC`, and the two would then be the
-    /// same value meaning two different things. ADR-0010 §5 names the gap as
-    /// "a grantee the model does not have", so this is that grantee — given
-    /// the narrowest shape that can express the decision and nothing else.
-    /// There is no permission set (`EXECUTE` is the only default `PUBLIC`
-    /// holds on a routine) and no [`GrantTarget`] (a view or a trigger cannot
-    /// be one), so a plan cannot ask about a grantee or a permission that is
-    /// not this one.
-    ///
-    /// # Why keeping the default is a change of its own
-    ///
-    /// [`PublicAccess::Kept`] is here because a plan that stayed silent could
-    /// not be told apart from one that had no opinion — and the connected
-    /// rebuild guard has to tell those apart. A routine somebody closed, whose
-    /// declaration now asks for the default back, is a *valid* rebuild, and
-    /// silence would have it refused with the missing default it was asked to
-    /// restore (ADR-0009 §3). Positive evidence, not an absence, is also what
-    /// a reviewer reads: "this routine stays executable by everyone" is a
-    /// line worth seeing.
-    ///
-    /// It renders a statement rather than trusting the `CREATE`, because the
-    /// engine's default is not the only thing deciding what a new routine
-    /// arrives holding: a cluster's own `ALTER DEFAULT PRIVILEGES` can revoke
-    /// it (DECISIONS 517).
-    PublicExecution {
-        routine: RoutineId,
-        access: PublicAccess,
-        origin: RoutineOrigin,
+        table: TableName,
+        from: crate::RowSecurity,
+        to: crate::RowSecurity,
+        origin: RowSecurityOrigin,
     },
 }
 
-/// What a [`Change::PublicExecution`] settles.
+/// The kinds of change of the `indexes` family (DEC-2790.1), the enum
+/// `change_family!(indexes)` names. [`Change::Index`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum IndexChange {
+    BuildPartitionedIndex(Box<crate::BuildPartitionedIndex>),
+    /// A PostgreSQL index's storage parameters (#1442): `ALTER INDEX … SET
+    /// (…), RESET (…)`, in place, which every supported parameter of both
+    /// methods is (measured on 16 and 18). Only what changes; an index
+    /// rebuilt for another reason carries its parameters in its `CREATE`
+    /// (DEC-1442.1).
+    SetIndexStorageParameters {
+        table: TableName,
+        target: IndexPart,
+        method: IndexMethod,
+        set: BTreeMap<String, String>,
+        reset: BTreeSet<String>,
+    },
+    AddIndex {
+        table: TableName,
+        name: ObjectLocalName,
+        index: Box<Index>,
+        /// This index is the table's clustered one ([`Table::clustered`]).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        clustered: bool,
+    },
+    DropIndex {
+        table: TableName,
+        name: ObjectLocalName,
+    },
+}
+
+/// The kinds of change of the `constraints` family (DEC-2790.1), the enum
+/// `change_family!(constraints)` names. [`Change::Constraint`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ConstraintChange {
+    // Constraints and indexes are always drop + add, never modified in place —
+    // that is how the database itself implements it, and pretending otherwise
+    // would only give the emitter one more path that can fail.
+    SetPrimaryKey {
+        table: TableName,
+        from: Option<PrimaryKey>,
+        to: Option<PrimaryKey>,
+        /// The key `to` adds is nonclustered: its table declares another
+        /// layout ([`Table::clustered`]). `false` is the default layout, a
+        /// clustered key, which is what a change written before the field
+        /// existed meant. The table-level selector cannot travel here — the
+        /// change carries the key, not its table — so the differ resolves it
+        /// into the one fact the emitter needs.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        nonclustered: bool,
+    },
+    AddUnique {
+        table: TableName,
+        name: ObjectLocalName,
+        constraint: UniqueConstraint,
+        /// This constraint's index is the table's clustered one
+        /// ([`Table::clustered`]).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        clustered: bool,
+    },
+    DropUnique {
+        table: TableName,
+        name: ObjectLocalName,
+    },
+    /// Adds (`from: None`), or drops (`to: None`), an exclusion constraint
+    /// (DEC-2448.3). One variant for both, as [`ConstraintChange::SetPrimaryKey`] is: a
+    /// replacement is the drop half and the add half as two changes, each in the
+    /// ordering class its direction needs. Adding takes the `constraint` risk,
+    /// dropping the `destructive` one.
+    SetExclusion {
+        table: TableName,
+        name: ObjectLocalName,
+        from: Option<Box<ExclusionConstraint>>,
+        to: Option<Box<ExclusionConstraint>>,
+    },
+    AddForeignKey {
+        table: TableName,
+        name: ObjectLocalName,
+        constraint: Box<ForeignKey>,
+    },
+    DropForeignKey {
+        table: TableName,
+        name: ObjectLocalName,
+    },
+    AddCheck {
+        table: TableName,
+        name: ObjectLocalName,
+        constraint: CheckConstraint,
+    },
+    DropCheck {
+        table: TableName,
+        name: ObjectLocalName,
+    },
+}
+
+/// The kinds of change of the `columns` family (DEC-2790.1), the enum
+/// `change_family!(columns)` names. [`Change::Column`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ColumnChange {
+    AddColumn {
+        uid: Uid,
+        table: TableName,
+        name: ColumnName,
+        column: Box<Column>,
+    },
+    DropColumn {
+        uid: Uid,
+        column: ColumnRef,
+    },
+    RenameColumn {
+        uid: Uid,
+        table: TableName,
+        from: ColumnName,
+        to: ColumnName,
+        /// The table's name before this plan renamed it, when it did. The
+        /// table rename leaves a generated default under the name built from
+        /// this one when the name it would move to is taken, so the column
+        /// rename looks for both (#975).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        table_was: Option<TableName>,
+    },
+    AlterColumnType {
+        uid: Uid,
+        column: ColumnRef,
+        from: ColumnType,
+        to: ColumnType,
+        /// Nullability before and after, carried even when it is not what
+        /// changed.
+        ///
+        /// `ALTER COLUMN` restates the entire column definition, and SQL Server
+        /// reads an omitted `NULL` / `NOT NULL` as `NULL` — so a type change
+        /// emitted without the nullability silently drops a `NOT NULL`. The
+        /// differ therefore never emits a separate
+        /// [`ColumnChange::AlterColumnNullability`] beside a type change on the same
+        /// column, and carrying both ends keeps the `not-null` risk derivable
+        /// from the change alone.
+        from_nullable: bool,
+        to_nullable: bool,
+        /// Explicit collation before and after (#1175), `None` being the
+        /// database default. Carried for the reason the nullability is: SQL
+        /// Server's `ALTER COLUMN` restates the whole definition and reads an
+        /// omitted `COLLATE` as the database default — measured on 17.0, a
+        /// column `COLLATE Latin1_General_CI_AS` altered to `varchar(20)`
+        /// came back under the database's collation. A collation change on
+        /// a column whose type stays is this change too, with `from == to`:
+        /// the statement is the same `ALTER COLUMN`, and so are the
+        /// dependents it has to take down and put back.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_collation: Option<Collation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_collation: Option<Collation>,
+        /// The table is a parent whose partitions are external (#1533), and
+        /// the change drops its NOT NULL: a NOT NULL a partition keeps of its
+        /// own, which PostgreSQL 18 leaves behind (DEC-1687.1), is dropped
+        /// after the parent's, since no declaration lists the partition to
+        /// bring it back (DEC-1533.1).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        through_external_partitions: bool,
+        /// The expression a human recorded for exactly this `from` to `to`
+        /// change (`pbps convert`, #2331), verbatim. The only source of a
+        /// `USING` clause (ADR-0012 section 5, DEC-2331.1): the differ copies
+        /// it from the identity file when the change is the one the record
+        /// names, and it is sealed by the plan's checksum like the rest of the
+        /// change. Absent for every other change, so a plan without a
+        /// conversion serializes as it did before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        using: Option<String>,
+    },
+    AlterColumnNullability {
+        uid: Uid,
+        column: ColumnRef,
+        /// The column's type, unchanged, restated for the same reason
+        /// [`ColumnChange::AlterColumnType`] carries the nullability: `ALTER COLUMN`
+        /// takes a whole column definition, and there is no way to say "keep the
+        /// type, change only this".
+        ty: ColumnType,
+        /// Whether the column is nullable after the change.
+        to_nullable: bool,
+        /// The column's explicit collation, unchanged, restated for the
+        /// reason [`ColumnChange::AlterColumnType`] carries it (#1175).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        collation: Option<Collation>,
+        /// The table is a parent whose partitions are external (#1533), and
+        /// the change drops its NOT NULL: a NOT NULL a partition keeps of its
+        /// own, which PostgreSQL 18 leaves behind (DEC-1687.1), is dropped
+        /// after the parent's, since no declaration lists the partition to
+        /// bring it back (DEC-1533.1).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        through_external_partitions: bool,
+    },
+    AlterColumnDefault {
+        uid: Uid,
+        column: ColumnRef,
+        from: Option<String>,
+        to: Option<String>,
+    },
+    /// A generated column's expression, changed in place (DEC-1168.1).
+    /// PostgreSQL 17 and later recompute every row under the new expression
+    /// (`SET EXPRESSION`); older servers have no in-place form, and a plan
+    /// that needs one is refused before it runs.
+    AlterColumnExpression {
+        uid: Uid,
+        column: ColumnRef,
+        from: String,
+        to: String,
+    },
+    /// A PostgreSQL column's numbering source added, removed, retuned or
+    /// converted (#1889, DEC-1889.1): an identity or an owned sequence
+    /// (`serial`) on at least one side, and on the other one of them, a
+    /// plain default or nothing. Never a generated column.
+    ///
+    /// No number already issued is renumbered or reissued: a source put on a
+    /// column that holds values continues past them, from the greater of its
+    /// declared start, the column's values and, for a conversion, the old
+    /// source's counter. Its start and increment change in place without
+    /// `RESTART`.
+    AlterColumnNumbering {
+        uid: Uid,
+        column: ColumnRef,
+        /// The column's type once the plan has run. A sequence is created
+        /// `AS` it, and an owned sequence kept through a retype is moved to
+        /// it, which the engine does for an identity's on its own.
+        ty: ColumnType,
+        from: ValueSource,
+        to: ValueSource,
+    },
+    /// A SQL Server computed column created (#1174, DEC-1174.1), at the end
+    /// of its table. An expression or persisted change is this after a
+    /// [`ColumnChange::DropComputedColumn`]: the engine changes neither in place
+    /// (`ALTER COLUMN … AS` is a syntax error, measured on 17.0).
+    AddComputedColumn {
+        table: TableName,
+        name: ColumnName,
+        computed: ComputedColumn,
+    },
+    /// A SQL Server computed column dropped, carrying what it was. Its values
+    /// are derived, so dropping one loses nothing a re-add cannot compute.
+    DropComputedColumn {
+        table: TableName,
+        name: ColumnName,
+        computed: ComputedColumn,
+    },
+    /// Deprecation flag changed. Produces no structural change; may optionally be
+    /// written to an extended property.
+    SetColumnDeprecated {
+        uid: Uid,
+        column: ColumnRef,
+        reason: Option<crate::Text>,
+    },
+}
+
+/// The kinds of change of the `partitions` family (DEC-2790.1), the enum
+/// `change_family!(partitions)` names. [`Change::Partition`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PartitionChange {
+    /// Planning-only until the complete rebuild route is admitted.
+    RebuildPartitionedTable(Box<crate::RebuildPartitionedTable>),
+    CopyTableRows(Box<crate::CopyTableRows>),
+    AnalyzeTableTree(Box<crate::AnalyzeTableTree>),
+    /// A partition leaves its parent and stays, as an ordinary table of the
+    /// declared shape, which is its parent's under names of its own (#1544,
+    /// DEC-1544.1). Its rows leave the parent with it.
+    DetachPartition {
+        uid: Uid,
+        table: TableName,
+        parent: TableName,
+        /// The name each of the parent's objects takes on the detached table.
+        names: Vec<DetachedName>,
+        /// The table the detach leaves, as declared: what the apply holds
+        /// the read-back to, as it holds a created table to its `CREATE`.
+        shape: Box<Table>,
+    },
+    /// An ordinary table becomes a partition of a standing parent and keeps
+    /// its rows (#1545, DEC-1545.1). Its columns become the parent's; what it
+    /// holds of them otherwise, and its own indexes and checks, are brought
+    /// to the declaration by the partition's own changes after it.
+    AttachPartition {
+        uid: Uid,
+        table: TableName,
+        parent: TableName,
+        bound: crate::schema::PartitionBound,
+        /// The parent's key columns, in order, as the plan was made against
+        /// them. A staged attach writes a CHECK on them that implies the
+        /// bound, so the attach skips its scan (#1638, DEC-1638.1). Empty in
+        /// a plan made before it, or when live constraint names prevent the
+        /// temporary CHECK (DEC-2126.1); either uses the single statement.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        key: Vec<ColumnName>,
+        /// The partition as declared: what the apply holds the read-back to
+        /// once every statement has run, as it holds a created table to its
+        /// `CREATE`.
+        shape: Box<Table>,
+    },
+    /// A partition's own default on a column it inherits (#1581, DEC-1581.1):
+    /// `ALTER TABLE <partition> ALTER COLUMN … SET DEFAULT` or `DROP
+    /// DEFAULT`. A partition declares no column and so has no column uid; it
+    /// is keyed by its table uid and the column's name. `from` and `to` are
+    /// the partition's own default as declared, and `fallback` is what the
+    /// partition holds without one: its parent's default, which the engine
+    /// copies into every partition, or none. The statement sets `to`, else
+    /// `fallback`, else drops the default. With both `None` it takes the
+    /// default off entirely, which is how a function rebuild releases it
+    /// (#1588). `parent` is where `fallback` was written: it is resolved under
+    /// the parent's schema, and `to` under the partition's, which may be
+    /// another. Function rebuilds also use this table-keyed form before an
+    /// attach when restoring a parent-derived expression: the plain table's
+    /// column UID cannot carry the parent's expression scope (DEC-1875.1).
+    SetPartitionDefault {
+        uid: Uid,
+        table: TableName,
+        parent: TableName,
+        column: ColumnName,
+        from: Option<String>,
+        to: Option<String>,
+        fallback: Option<String>,
+    },
+    /// A partition's own NOT NULL on a column its parent leaves nullable
+    /// (#1581): `ALTER TABLE <partition> ALTER COLUMN … SET NOT NULL` or
+    /// `DROP NOT NULL`, keyed as [`PartitionChange::SetPartitionDefault`] is.
+    SetPartitionNotNull {
+        uid: Uid,
+        table: TableName,
+        column: ColumnName,
+        not_null: bool,
+    },
+}
+
+/// The kinds of change of the `table_properties` family (DEC-2790.1), the enum
+/// `change_family!(table_properties)` names. [`Change::TableProperty`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TablePropertyChange {
+    /// A PostgreSQL table's replica identity (#1444): `ALTER TABLE …
+    /// REPLICA IDENTITY …`, with `None` for `DEFAULT`. Planned where the
+    /// declared identity differs from the database's, and again wherever the
+    /// plan re-adds the index it names, which a drop loses (DEC-1444.1).
+    SetReplicaIdentity {
+        uid: Uid,
+        table: TableName,
+        to: Option<ReplicaIdentity>,
+    },
+    /// `COMMENT ON … IS …` for an object whose declaration has a `description`
+    /// (#2729, DEC-2729.1). `None` is `IS NULL`: the declared `""`, which the engine
+    /// stores as no comment. One variant for every kind of object, so a kind added
+    /// later is a [`CommentTarget`] arm and not a new `Change`.
+    SetComment {
+        target: CommentTarget,
+        text: Option<crate::Text>,
+    },
+    /// A PostgreSQL table's heap storage parameters (#1441): `ALTER TABLE …
+    /// SET (…)` for `set`, in canonical spelling, and `RESET (…)` for
+    /// `reset`. Only what changes: a parameter the plan leaves alone is not
+    /// restated (DEC-1441.1).
+    SetStorageParameters {
+        uid: Uid,
+        table: TableName,
+        set: BTreeMap<String, String>,
+        reset: BTreeSet<String>,
+    },
+    /// A PostgreSQL table switched between permanent and `UNLOGGED` (#1443):
+    /// `ALTER TABLE … SET LOGGED` or `SET UNLOGGED`, which rewrites the table
+    /// and its indexes under `AccessExclusiveLock` in either direction
+    /// (measured on 16 and 18). Ordered by the foreign keys between the
+    /// tables it switches (DEC-1443.1).
+    SetTablePersistence {
+        uid: Uid,
+        table: TableName,
+        unlogged: bool,
+    },
+}
+
+/// The kinds of change of the `tables` family (DEC-2790.1), the enum
+/// `change_family!(tables)` names. [`Change::Table`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TableChange {
+    CreateTable {
+        uid: Uid,
+        name: TableName,
+        table: Box<Table>,
+        /// The DEFAULT partition of the standing parent a new range partition
+        /// goes under (#1547, DEC-1547.1): the partition is made as a plain
+        /// table, filled with the DEFAULT's rows in its range, and attached.
+        /// `None` for any other table, which an older plan's creates all are.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        beside_default: Option<TableName>,
+        /// Beside a DEFAULT, the most of its rows the move may take, as a
+        /// human allowed it (`pbps move-rows`, #1788); `None` allows none, and
+        /// the moving statement refuses if it finds any. Ignored with no
+        /// `beside_default`, where nothing moves.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        moves_at_most: Option<u64>,
+    },
+    DropTable {
+        uid: Uid,
+        name: TableName,
+        /// The partitioned table this one is a partition of, which the drop
+        /// detaches it from first (#1171): a partition a foreign key to its
+        /// parent reaches cannot be dropped while attached. `None` for any
+        /// other table, which an older plan's drops all are.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detach_from: Option<TableName>,
+    },
+    RenameTable {
+        uid: Uid,
+        from: TableName,
+        to: TableName,
+        /// The columns that carry a default when the table is renamed, by the
+        /// names they have then (a column rename runs after the table's).
+        /// SQL Server names each default it creates after its table and column
+        /// (`DF_pbps_…`, DEC-496.1), and a rename leaves that name behind: a
+        /// new table declared under the old name then generates it again and
+        /// is refused (#975). The emitter renames each generated default with
+        /// its table. Empty on a plan written before this field existed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        defaults: Vec<ColumnName>,
+    },
+}
+
+/// What a [`GrantChange::PublicExecution`] settles.
 ///
 /// An enum rather than a bool for the reason [`RoutineOrigin`] is one: the two
 /// are different decisions about who may run the routine, not a flag, and a
@@ -1158,7 +1305,7 @@ pub enum PublicAccess {
     Kept,
 }
 
-/// Whether the routine a [`Change::PublicExecution`] speaks about is new in
+/// Whether the routine a [`GrantChange::PublicExecution`] speaks about is new in
 /// this plan, or one the plan rebuilds.
 ///
 /// It decides the risk class, and it is an enum rather than a bool beside the
@@ -1304,25 +1451,25 @@ pub fn drop_parameter_changes_of_rebuilt_indexes<T>(
     let rebuilt: BTreeSet<(TableName, IndexPart)> = changes
         .iter()
         .filter_map(|c| match change(c) {
-            Change::AddIndex { table, name, .. } => {
+            Change::Index(IndexChange::AddIndex { table, name, .. }) => {
                 Some((table.clone(), IndexPart::Index(name.clone())))
             }
-            Change::AddUnique { table, name, .. } => {
+            Change::Constraint(ConstraintChange::AddUnique { table, name, .. }) => {
                 Some((table.clone(), IndexPart::Unique(name.clone())))
             }
-            Change::SetPrimaryKey {
+            Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table, to: Some(_), ..
-            } => Some((table.clone(), IndexPart::PrimaryKey)),
+            }) => Some((table.clone(), IndexPart::PrimaryKey)),
             _ => None,
         })
         .collect();
     changes.retain(|c| {
-        !matches!(change(c), Change::SetIndexStorageParameters { table, target, .. }
+        !matches!(change(c), Change::Index(IndexChange::SetIndexStorageParameters { table, target, .. })
             if rebuilt.contains(&(table.clone(), target.clone())))
     });
 }
 
-/// The index whose storage parameters a [`Change::SetIndexStorageParameters`]
+/// The index whose storage parameters a [`IndexChange::SetIndexStorageParameters`]
 /// sets: the primary key's, a unique constraint's (which carries the
 /// constraint's name), or a standalone index's (#1442).
 #[derive(
@@ -1571,7 +1718,7 @@ impl Dropped {
     }
 }
 
-/// Which way a [`Change::Grant`] or [`Change::Revoke`] moves a role's
+/// Which way a [`GrantChange::Grant`] or [`GrantChange::Revoke`] moves a role's
 /// permissions on one target.
 ///
 /// An enum rather than a flag beside the set: the caller adds one and
@@ -1615,100 +1762,103 @@ pub enum CatalogObject {
 #[macro_export]
 macro_rules! change_family {
     (tables) => {
-        $crate::Change::CreateTable { .. }
-            | $crate::Change::DropTable { .. }
-            | $crate::Change::RenameTable { .. }
+        $crate::Change::Table($crate::TableChange::CreateTable { .. })
+            | $crate::Change::Table($crate::TableChange::DropTable { .. })
+            | $crate::Change::Table($crate::TableChange::RenameTable { .. })
     };
     (table_properties) => {
-        $crate::Change::SetReplicaIdentity { .. }
-            | $crate::Change::SetComment { .. }
-            | $crate::Change::SetStorageParameters { .. }
-            | $crate::Change::SetTablePersistence { .. }
+        $crate::Change::TableProperty($crate::TablePropertyChange::SetReplicaIdentity { .. })
+            | $crate::Change::TableProperty($crate::TablePropertyChange::SetComment { .. })
+            | $crate::Change::TableProperty(
+                $crate::TablePropertyChange::SetStorageParameters { .. },
+            )
+            | $crate::Change::TableProperty($crate::TablePropertyChange::SetTablePersistence { .. })
     };
     (partitions) => {
-        $crate::Change::RebuildPartitionedTable(..)
-            | $crate::Change::CopyTableRows(..)
-            | $crate::Change::AnalyzeTableTree(..)
-            | $crate::Change::DetachPartition { .. }
-            | $crate::Change::AttachPartition { .. }
-            | $crate::Change::SetPartitionDefault { .. }
-            | $crate::Change::SetPartitionNotNull { .. }
+        $crate::Change::Partition($crate::PartitionChange::RebuildPartitionedTable(..))
+            | $crate::Change::Partition($crate::PartitionChange::CopyTableRows(..))
+            | $crate::Change::Partition($crate::PartitionChange::AnalyzeTableTree(..))
+            | $crate::Change::Partition($crate::PartitionChange::DetachPartition { .. })
+            | $crate::Change::Partition($crate::PartitionChange::AttachPartition { .. })
+            | $crate::Change::Partition($crate::PartitionChange::SetPartitionDefault { .. })
+            | $crate::Change::Partition($crate::PartitionChange::SetPartitionNotNull { .. })
     };
     (columns) => {
-        $crate::Change::AddColumn { .. }
-            | $crate::Change::DropColumn { .. }
-            | $crate::Change::RenameColumn { .. }
-            | $crate::Change::AlterColumnType { .. }
-            | $crate::Change::AlterColumnNullability { .. }
-            | $crate::Change::AlterColumnDefault { .. }
-            | $crate::Change::AlterColumnExpression { .. }
-            | $crate::Change::AlterColumnNumbering { .. }
-            | $crate::Change::AddComputedColumn { .. }
-            | $crate::Change::DropComputedColumn { .. }
-            | $crate::Change::SetColumnDeprecated { .. }
+        $crate::Change::Column($crate::ColumnChange::AddColumn { .. })
+            | $crate::Change::Column($crate::ColumnChange::DropColumn { .. })
+            | $crate::Change::Column($crate::ColumnChange::RenameColumn { .. })
+            | $crate::Change::Column($crate::ColumnChange::AlterColumnType { .. })
+            | $crate::Change::Column($crate::ColumnChange::AlterColumnNullability { .. })
+            | $crate::Change::Column($crate::ColumnChange::AlterColumnDefault { .. })
+            | $crate::Change::Column($crate::ColumnChange::AlterColumnExpression { .. })
+            | $crate::Change::Column($crate::ColumnChange::AlterColumnNumbering { .. })
+            | $crate::Change::Column($crate::ColumnChange::AddComputedColumn { .. })
+            | $crate::Change::Column($crate::ColumnChange::DropComputedColumn { .. })
+            | $crate::Change::Column($crate::ColumnChange::SetColumnDeprecated { .. })
     };
     (constraints) => {
-        $crate::Change::SetPrimaryKey { .. }
-            | $crate::Change::AddUnique { .. }
-            | $crate::Change::DropUnique { .. }
-            | $crate::Change::SetExclusion { .. }
-            | $crate::Change::AddForeignKey { .. }
-            | $crate::Change::DropForeignKey { .. }
-            | $crate::Change::AddCheck { .. }
-            | $crate::Change::DropCheck { .. }
+        $crate::Change::Constraint($crate::ConstraintChange::SetPrimaryKey { .. })
+            | $crate::Change::Constraint($crate::ConstraintChange::AddUnique { .. })
+            | $crate::Change::Constraint($crate::ConstraintChange::DropUnique { .. })
+            | $crate::Change::Constraint($crate::ConstraintChange::SetExclusion { .. })
+            | $crate::Change::Constraint($crate::ConstraintChange::AddForeignKey { .. })
+            | $crate::Change::Constraint($crate::ConstraintChange::DropForeignKey { .. })
+            | $crate::Change::Constraint($crate::ConstraintChange::AddCheck { .. })
+            | $crate::Change::Constraint($crate::ConstraintChange::DropCheck { .. })
     };
     (indexes) => {
-        $crate::Change::AddIndex { .. }
-            | $crate::Change::DropIndex { .. }
-            | $crate::Change::SetIndexStorageParameters { .. }
-            | $crate::Change::BuildPartitionedIndex(..)
+        $crate::Change::Index($crate::IndexChange::AddIndex { .. })
+            | $crate::Change::Index($crate::IndexChange::DropIndex { .. })
+            | $crate::Change::Index($crate::IndexChange::SetIndexStorageParameters { .. })
+            | $crate::Change::Index($crate::IndexChange::BuildPartitionedIndex(..))
     };
     (policies) => {
-        $crate::Change::CreatePolicy { .. }
-            | $crate::Change::DropPolicy { .. }
-            | $crate::Change::SetRowSecurity { .. }
+        $crate::Change::Policy($crate::PolicyChange::CreatePolicy { .. })
+            | $crate::Change::Policy($crate::PolicyChange::DropPolicy { .. })
+            | $crate::Change::Policy($crate::PolicyChange::SetRowSecurity { .. })
     };
     (rows) => {
-        $crate::Change::InsertRow { .. }
-            | $crate::Change::UpdateRow { .. }
-            | $crate::Change::DeleteRow { .. }
-            | $crate::Change::SetDataMode { .. }
-            | $crate::Change::SetEnsureKeys { .. }
+        $crate::Change::Row($crate::RowChange::InsertRow { .. })
+            | $crate::Change::Row($crate::RowChange::UpdateRow { .. })
+            | $crate::Change::Row($crate::RowChange::DeleteRow { .. })
+            | $crate::Change::Row($crate::RowChange::SetDataMode { .. })
+            | $crate::Change::Row($crate::RowChange::SetEnsureKeys { .. })
     };
     (modules) => {
-        $crate::Change::CreateModule { .. }
-            | $crate::Change::AlterModule { .. }
-            | $crate::Change::DropModule { .. }
+        $crate::Change::Module($crate::ModuleChange::CreateModule { .. })
+            | $crate::Change::Module($crate::ModuleChange::AlterModule { .. })
+            | $crate::Change::Module($crate::ModuleChange::DropModule { .. })
     };
     (permissions) => {
-        $crate::Change::Grant { .. }
-            | $crate::Change::Revoke { .. }
-            | $crate::Change::PublicExecution { .. }
+        $crate::Change::Permission($crate::GrantChange::Grant { .. })
+            | $crate::Change::Permission($crate::GrantChange::Revoke { .. })
+            | $crate::Change::Permission($crate::GrantChange::PublicExecution { .. })
     };
     (type_values) => {
-        $crate::Change::AddEnumValue { .. }
-            | $crate::Change::RenameEnumValue { .. }
-            | $crate::Change::AlterDomain { .. }
-            | $crate::Change::EnumRebuild { .. }
+        $crate::Change::TypeValue($crate::TypeValueChange::AddEnumValue { .. })
+            | $crate::Change::TypeValue($crate::TypeValueChange::RenameEnumValue { .. })
+            | $crate::Change::TypeValue($crate::TypeValueChange::AlterDomain { .. })
+            | $crate::Change::TypeValue($crate::TypeValueChange::EnumRebuild { .. })
     };
     (roles) => {
-        $crate::Change::CreateRole { .. }
-            | $crate::Change::DropRole { .. }
-            | $crate::Change::RenameRole { .. }
+        $crate::Change::Role($crate::RoleChange::CreateRole { .. })
+            | $crate::Change::Role($crate::RoleChange::DropRole { .. })
+            | $crate::Change::Role($crate::RoleChange::RenameRole { .. })
     };
     (types) => {
-        $crate::Change::CreateType { .. }
-            | $crate::Change::DropType { .. }
-            | $crate::Change::RenameType { .. }
+        $crate::Change::Type($crate::TypeChange::CreateType { .. })
+            | $crate::Change::Type($crate::TypeChange::DropType { .. })
+            | $crate::Change::Type($crate::TypeChange::RenameType { .. })
     };
     (search) => {
-        $crate::Change::CreateSearch { .. } | $crate::Change::DropSearch { .. }
+        $crate::Change::Search($crate::SearchChange::CreateSearch { .. })
+            | $crate::Change::Search($crate::SearchChange::DropSearch { .. })
     };
     (extensions) => {
-        $crate::Change::CreateExtension { .. }
-            | $crate::Change::DropExtension { .. }
-            | $crate::Change::UpdateExtension { .. }
-            | $crate::Change::SetExtensionSchema { .. }
+        $crate::Change::Extension($crate::ExtensionChange::CreateExtension { .. })
+            | $crate::Change::Extension($crate::ExtensionChange::DropExtension { .. })
+            | $crate::Change::Extension($crate::ExtensionChange::UpdateExtension { .. })
+            | $crate::Change::Extension($crate::ExtensionChange::SetExtensionSchema { .. })
     };
 }
 
@@ -1750,11 +1900,57 @@ pub enum ChangeFamily {
 impl Change {
     /// Whether both are the same kind of change, the way a respelling is allowed
     /// to keep it (`CreateRole` and `DropRole` are not, though they share a
-    /// family). A named function so that the move of the kinds into family enums
-    /// (#2790) changes one body and not every comparison of discriminants.
+    /// family). The kinds are compared, not the families: the discriminant of
+    /// `Change` itself is the family's.
     #[must_use]
     pub fn same_kind(&self, other: &Change) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(other)
+        match self {
+            Change::Table(a) => {
+                matches!(other, Change::Table(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::TableProperty(a) => {
+                matches!(other, Change::TableProperty(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Partition(a) => {
+                matches!(other, Change::Partition(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Column(a) => {
+                matches!(other, Change::Column(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Constraint(a) => {
+                matches!(other, Change::Constraint(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Index(a) => {
+                matches!(other, Change::Index(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Policy(a) => {
+                matches!(other, Change::Policy(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Row(a) => {
+                matches!(other, Change::Row(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Module(a) => {
+                matches!(other, Change::Module(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Permission(a) => {
+                matches!(other, Change::Permission(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::TypeValue(a) => {
+                matches!(other, Change::TypeValue(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Role(a) => {
+                matches!(other, Change::Role(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Type(a) => {
+                matches!(other, Change::Type(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Extension(a) => {
+                matches!(other, Change::Extension(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Search(a) => {
+                matches!(other, Change::Search(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+        }
     }
 }
 
@@ -1826,7 +2022,7 @@ macro_rules! catalog_change {
     };
 }
 
-/// The object a [`Change::SetComment`] comments (#2729). Each arm carries the uid the plan
+/// The object a [`TablePropertyChange::SetComment`] comments (#2729). Each arm carries the uid the plan
 /// names the object by, as the other changes on it do, and the name it has when the
 /// statement runs (the final one, after any rename).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
@@ -1900,36 +2096,37 @@ impl Change {
         // Canonical grouping and policy key. Human consumers escape this value;
         // rendering it here would change identity comparisons (DEC-2084.1).
         match self {
-            Change::AddEnumValue { name, .. }
-            | Change::AlterDomain { name, .. }
-            | Change::RenameEnumValue { name, .. }
-            | Change::EnumRebuild { name, .. }
-            | Change::CreateType { name, .. }
-            | Change::DropType { name, .. } => name.raw().to_string(),
-            Change::RenameType { from, .. } => from.raw().to_string(),
-            Change::CreateSearch { name, .. } | Change::DropSearch { name, .. } => {
-                name.raw().to_string()
-            }
-            Change::CreateRole { name, .. }
-            | Change::DropRole { name, .. }
-            | Change::Grant { role: name, .. }
-            | Change::Revoke { role: name, .. } => {
+            Change::TypeValue(TypeValueChange::AddEnumValue { name, .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { name, .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { name, .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { name, .. })
+            | Change::Type(TypeChange::CreateType { name, .. })
+            | Change::Type(TypeChange::DropType { name, .. }) => name.raw().to_string(),
+            Change::Type(TypeChange::RenameType { from, .. }) => from.raw().to_string(),
+            Change::Search(SearchChange::CreateSearch { name, .. })
+            | Change::Search(SearchChange::DropSearch { name, .. }) => name.raw().to_string(),
+            Change::Role(RoleChange::CreateRole { name, .. })
+            | Change::Role(RoleChange::DropRole { name, .. })
+            | Change::Permission(GrantChange::Grant { role: name, .. })
+            | Change::Permission(GrantChange::Revoke { role: name, .. }) => {
                 format!("role {}", name.raw())
             }
-            Change::RenameRole { from, .. } => {
+            Change::Role(RoleChange::RenameRole { from, .. }) => {
                 format!("role {}", from.raw())
             }
-            Change::CreateExtension { name, .. }
-            | Change::DropExtension { name, .. }
-            | Change::UpdateExtension { name, .. }
-            | Change::SetExtensionSchema { name, .. } => {
+            Change::Extension(ExtensionChange::CreateExtension { name, .. })
+            | Change::Extension(ExtensionChange::DropExtension { name, .. })
+            | Change::Extension(ExtensionChange::UpdateExtension { name, .. })
+            | Change::Extension(ExtensionChange::SetExtensionSchema { name, .. }) => {
                 format!("extension {}", name.raw())
             }
             // The routine, not the grantee. `PUBLIC` is every principal at
             // once, so grouping by it would put every such revoke in the plan
             // under one heading; grouping by the routine puts each beside the
             // `CreateModule` that made it, which is the change it belongs to.
-            Change::PublicExecution { routine, .. } => routine.raw().to_string(),
+            Change::Permission(GrantChange::PublicExecution { routine, .. }) => {
+                routine.raw().to_string()
+            }
             // A module says its whole identity: `app.f(integer,text)` and
             // `app.f(text)` are two objects, and a label that showed `app.f`
             // for both would group two changes as one.
@@ -1945,16 +2142,16 @@ impl Change {
 
     /// A planning-only rewrite payload; every executable seam refuses it until PR4.
     pub fn pending_rebuild(&self) -> Option<(&'static str, &TableName)> {
-        if let Change::RebuildPartitionedTable(r) = self {
+        if let Change::Partition(PartitionChange::RebuildPartitionedTable(r)) = self {
             return Some(("RebuildPartitionedTable", &r.table));
         }
-        if let Change::CopyTableRows(c) = self {
+        if let Change::Partition(PartitionChange::CopyTableRows(c)) = self {
             return Some(("CopyTableRows", &c.target.name));
         }
-        if let Change::AnalyzeTableTree(a) = self {
+        if let Change::Partition(PartitionChange::AnalyzeTableTree(a)) = self {
             return Some(("AnalyzeTableTree", &a.parent.name));
         }
-        if let Change::BuildPartitionedIndex(r) = self {
+        if let Change::Index(IndexChange::BuildPartitionedIndex(r)) = self {
             return Some(("BuildPartitionedIndex", &r.parent.name));
         }
         None
@@ -1972,65 +2169,66 @@ impl Change {
     /// label asks [`Change::subject`].
     pub fn table(&self) -> Option<&TableName> {
         Some(match self {
-            Change::RebuildPartitionedTable(r) => &r.table,
-            Change::CopyTableRows(c) => &c.target.name,
-            Change::AnalyzeTableTree(a) => &a.parent.name,
-            Change::BuildPartitionedIndex(r) => &r.parent.name,
-            Change::CreateTable { name, .. } | Change::DropTable { name, .. } => name,
-            Change::RenameTable { from, .. } => from,
-            Change::AddColumn { table, .. }
-            | Change::RenameColumn { table, .. }
-            | Change::SetPrimaryKey { table, .. }
-            | Change::SetIndexStorageParameters { table, .. }
-            | Change::SetTablePersistence { table, .. }
-            | Change::SetStorageParameters { table, .. }
-            | Change::SetPartitionDefault { table, .. }
-            | Change::SetPartitionNotNull { table, .. }
-            | Change::DropPolicy { table, .. }
-            | Change::CreatePolicy { table, .. }
-            | Change::SetRowSecurity { table, .. }
-            | Change::SetReplicaIdentity { table, .. }
-            | Change::AddUnique { table, .. }
-            | Change::DropUnique { table, .. }
-            | Change::SetExclusion { table, .. }
-            | Change::AddForeignKey { table, .. }
-            | Change::DropForeignKey { table, .. }
-            | Change::AddCheck { table, .. }
-            | Change::DropCheck { table, .. }
-            | Change::AddIndex { table, .. }
-            | Change::AddComputedColumn { table, .. }
-            | Change::DropComputedColumn { table, .. }
-            | Change::DropIndex { table, .. }
-            | Change::InsertRow { table, .. }
-            | Change::UpdateRow { table, .. }
-            | Change::DeleteRow { table, .. }
-            | Change::SetDataMode { table, .. }
-            | Change::SetEnsureKeys { table, .. }
-            | Change::DetachPartition { table, .. }
-            | Change::AttachPartition { table, .. } => table,
-            Change::EnumRebuild {
+            Change::Partition(PartitionChange::RebuildPartitionedTable(r)) => &r.table,
+            Change::Partition(PartitionChange::CopyTableRows(c)) => &c.target.name,
+            Change::Partition(PartitionChange::AnalyzeTableTree(a)) => &a.parent.name,
+            Change::Index(IndexChange::BuildPartitionedIndex(r)) => &r.parent.name,
+            Change::Table(TableChange::CreateTable { name, .. })
+            | Change::Table(TableChange::DropTable { name, .. }) => name,
+            Change::Table(TableChange::RenameTable { from, .. }) => from,
+            Change::Column(ColumnChange::AddColumn { table, .. })
+            | Change::Column(ColumnChange::RenameColumn { table, .. })
+            | Change::Constraint(ConstraintChange::SetPrimaryKey { table, .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { table, .. })
+            | Change::TableProperty(TablePropertyChange::SetTablePersistence { table, .. })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters { table, .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { table, .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { table, .. })
+            | Change::Policy(PolicyChange::DropPolicy { table, .. })
+            | Change::Policy(PolicyChange::CreatePolicy { table, .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { table, .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { table, .. })
+            | Change::Constraint(ConstraintChange::AddUnique { table, .. })
+            | Change::Constraint(ConstraintChange::DropUnique { table, .. })
+            | Change::Constraint(ConstraintChange::SetExclusion { table, .. })
+            | Change::Constraint(ConstraintChange::AddForeignKey { table, .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { table, .. })
+            | Change::Constraint(ConstraintChange::AddCheck { table, .. })
+            | Change::Constraint(ConstraintChange::DropCheck { table, .. })
+            | Change::Index(IndexChange::AddIndex { table, .. })
+            | Change::Column(ColumnChange::AddComputedColumn { table, .. })
+            | Change::Column(ColumnChange::DropComputedColumn { table, .. })
+            | Change::Index(IndexChange::DropIndex { table, .. })
+            | Change::Row(RowChange::InsertRow { table, .. })
+            | Change::Row(RowChange::UpdateRow { table, .. })
+            | Change::Row(RowChange::DeleteRow { table, .. })
+            | Change::Row(RowChange::SetDataMode { table, .. })
+            | Change::Row(RowChange::SetEnsureKeys { table, .. })
+            | Change::Partition(PartitionChange::DetachPartition { table, .. })
+            | Change::Partition(PartitionChange::AttachPartition { table, .. }) => table,
+            Change::TypeValue(TypeValueChange::EnumRebuild {
                 step: crate::EnumRebuildStep::Retype { column, .. },
                 ..
-            }
-            | Change::DropColumn { column, .. }
-            | Change::AlterColumnType { column, .. }
-            | Change::AlterColumnNullability { column, .. }
-            | Change::AlterColumnDefault { column, .. }
-            | Change::AlterColumnExpression { column, .. }
-            | Change::AlterColumnNumbering { column, .. }
-            | Change::SetColumnDeprecated { column, .. } => &column.table,
-            Change::SetComment { target, .. } => target.table(),
-            Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
+            })
+            | Change::Column(ColumnChange::DropColumn { column, .. })
+            | Change::Column(ColumnChange::AlterColumnType { column, .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { column, .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { column, .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { column, .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { column, .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { column, .. }) => &column.table,
+            Change::TableProperty(TablePropertyChange::SetComment { target, .. }) => target.table(),
+            Change::Module(ModuleChange::CreateModule { .. })
+            | Change::Module(ModuleChange::AlterModule { .. })
+            | Change::Module(ModuleChange::DropModule { .. })
+            | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
             | crate::catalog_change!()
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => return None,
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. }) => return None,
         })
     }
 
@@ -2062,7 +2260,7 @@ impl Change {
     // and left to bless whatever happened at the other.
     pub fn objects(&self) -> impl Iterator<Item = &TableName> {
         let far_end = match self {
-            Change::RebuildPartitionedTable(r) => r
+            Change::Partition(PartitionChange::RebuildPartitionedTable(r)) => r
                 .before
                 .keys()
                 .chain(r.after.keys())
@@ -2070,7 +2268,7 @@ impl Change {
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect(),
-            Change::CopyTableRows(c) => std::iter::once(&c.source.name)
+            Change::Partition(PartitionChange::CopyTableRows(c)) => std::iter::once(&c.source.name)
                 .chain(
                     c.source_partitions
                         .iter()
@@ -2078,62 +2276,66 @@ impl Change {
                         .map(|p| &p.name),
                 )
                 .collect(),
-            Change::AnalyzeTableTree(a) => a.partitions.iter().map(|p| &p.name).collect(),
-            Change::BuildPartitionedIndex(r) => r.clones.iter().map(|c| &c.leaf.name).collect(),
-            Change::RenameTable { to, .. } => vec![to],
+            Change::Partition(PartitionChange::AnalyzeTableTree(a)) => {
+                a.partitions.iter().map(|p| &p.name).collect()
+            }
+            Change::Index(IndexChange::BuildPartitionedIndex(r)) => {
+                r.clones.iter().map(|c| &c.leaf.name).collect()
+            }
+            Change::Table(TableChange::RenameTable { to, .. }) => vec![to],
             // The parent's rows change, not its shape, and a partitioned
             // table holds no declared rows (#1544).
-            Change::CreateTable { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::DropTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::AlterColumnNumbering { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetComment { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::SetExclusion { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
+            Change::Table(TableChange::CreateTable { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Table(TableChange::DropTable { .. })
+            | Change::Column(ColumnChange::AddColumn { .. })
+            | Change::Column(ColumnChange::DropColumn { .. })
+            | Change::Column(ColumnChange::RenameColumn { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+            | Change::TableProperty(TablePropertyChange::SetComment { .. })
+            | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(PolicyChange::DropPolicy { .. })
+            | Change::Policy(PolicyChange::CreatePolicy { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+            | Change::Constraint(ConstraintChange::AddUnique { .. })
+            | Change::Constraint(ConstraintChange::DropUnique { .. })
+            | Change::Constraint(ConstraintChange::SetExclusion { .. })
+            | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            | Change::Constraint(ConstraintChange::AddCheck { .. })
+            | Change::Constraint(ConstraintChange::DropCheck { .. })
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::UpdateRow { .. })
+            | Change::Row(RowChange::DeleteRow { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
+            | Change::Module(ModuleChange::CreateModule { .. })
+            | Change::Module(ModuleChange::AlterModule { .. })
+            | Change::Module(ModuleChange::DropModule { .. })
+            | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
             | crate::catalog_change!()
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => Vec::new(),
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. }) => Vec::new(),
         };
         self.table().into_iter().chain(far_end)
     }
@@ -2168,17 +2370,17 @@ impl Change {
         // [`CellAfter::AtDefault`], and the caller asks the dialect which
         // case it is looking at (117, 165, 191).
         match self {
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => None,
-            Change::InsertRow {
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => None,
+            Change::Row(RowChange::InsertRow {
                 table,
                 key,
                 row,
                 defaults,
                 ..
-            } => Some((
+            }) => Some((
                 table,
                 key,
                 RowAfter::Holding(
@@ -2190,13 +2392,13 @@ impl Change {
                         .collect(),
                 ),
             )),
-            Change::UpdateRow {
+            Change::Row(RowChange::UpdateRow {
                 table,
                 key,
                 columns,
                 unchanged,
                 ..
-            } => Some((
+            }) => Some((
                 table,
                 key,
                 RowAfter::Holding(
@@ -2208,56 +2410,58 @@ impl Change {
                         .collect(),
                 ),
             )),
-            Change::DeleteRow { table, key, .. } => Some((table, key, RowAfter::Gone)),
-            Change::CreateTable { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::DropTable { .. }
-            | Change::RenameTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::AlterColumnNumbering { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::SetComment { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::SetExclusion { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropIndex { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
+            Change::Row(RowChange::DeleteRow { table, key, .. }) => {
+                Some((table, key, RowAfter::Gone))
+            }
+            Change::Table(TableChange::CreateTable { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Table(TableChange::DropTable { .. })
+            | Change::Table(TableChange::RenameTable { .. })
+            | Change::Column(ColumnChange::AddColumn { .. })
+            | Change::Column(ColumnChange::DropColumn { .. })
+            | Change::Column(ColumnChange::RenameColumn { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+            | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(PolicyChange::DropPolicy { .. })
+            | Change::Policy(PolicyChange::CreatePolicy { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+            | Change::TableProperty(TablePropertyChange::SetComment { .. })
+            | Change::Constraint(ConstraintChange::AddUnique { .. })
+            | Change::Constraint(ConstraintChange::DropUnique { .. })
+            | Change::Constraint(ConstraintChange::SetExclusion { .. })
+            | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            | Change::Constraint(ConstraintChange::AddCheck { .. })
+            | Change::Constraint(ConstraintChange::DropCheck { .. })
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
+            | Change::Module(ModuleChange::CreateModule { .. })
+            | Change::Module(ModuleChange::AlterModule { .. })
+            | Change::Module(ModuleChange::DropModule { .. })
+            | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
             | crate::catalog_change!()
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => None,
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. }) => None,
         }
     }
 
@@ -2285,7 +2489,7 @@ impl Change {
     // against a shape the plan itself moved.
     pub fn columns(&self) -> Vec<ColumnRef> {
         match self {
-            Change::RebuildPartitionedTable(r) => r
+            Change::Partition(PartitionChange::RebuildPartitionedTable(r)) => r
                 .intent
                 .source
                 .columns
@@ -2295,7 +2499,7 @@ impl Change {
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect(),
-            Change::CopyTableRows(c) => c
+            Change::Partition(PartitionChange::CopyTableRows(c)) => c
                 .columns
                 .iter()
                 .flat_map(|p| {
@@ -2306,65 +2510,68 @@ impl Change {
                 })
                 .cloned()
                 .collect(),
-            Change::AnalyzeTableTree(_) | Change::BuildPartitionedIndex(_) => Vec::new(),
-            Change::AddColumn { table, name, .. } => vec![table.column(name)],
-            Change::RenameColumn {
+            Change::Partition(PartitionChange::AnalyzeTableTree(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_)) => Vec::new(),
+            Change::Column(ColumnChange::AddColumn { table, name, .. }) => vec![table.column(name)],
+            Change::Column(ColumnChange::RenameColumn {
                 table, from, to, ..
-            } => vec![table.column(from), table.column(to)],
-            Change::EnumRebuild {
+            }) => vec![table.column(from), table.column(to)],
+            Change::TypeValue(TypeValueChange::EnumRebuild {
                 step: crate::EnumRebuildStep::Retype { column, .. },
                 ..
+            })
+            | Change::Column(ColumnChange::DropColumn { column, .. })
+            | Change::Column(ColumnChange::AlterColumnType { column, .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { column, .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { column, .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { column, .. }) => {
+                vec![column.clone()]
             }
-            | Change::DropColumn { column, .. }
-            | Change::AlterColumnType { column, .. }
-            | Change::AlterColumnDefault { column, .. }
-            | Change::AlterColumnExpression { column, .. }
-            | Change::AlterColumnNumbering { column, .. } => vec![column.clone()],
-            Change::AlterColumnNullability { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetComment { .. }
-            | Change::CreateTable { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::DropTable { .. }
-            | Change::RenameTable { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::SetExclusion { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
+            Change::Column(ColumnChange::AlterColumnNullability { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+            | Change::TableProperty(TablePropertyChange::SetComment { .. })
+            | Change::Table(TableChange::CreateTable { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Table(TableChange::DropTable { .. })
+            | Change::Table(TableChange::RenameTable { .. })
+            | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(PolicyChange::DropPolicy { .. })
+            | Change::Policy(PolicyChange::CreatePolicy { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+            | Change::Constraint(ConstraintChange::AddUnique { .. })
+            | Change::Constraint(ConstraintChange::DropUnique { .. })
+            | Change::Constraint(ConstraintChange::SetExclusion { .. })
+            | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            | Change::Constraint(ConstraintChange::AddCheck { .. })
+            | Change::Constraint(ConstraintChange::DropCheck { .. })
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::UpdateRow { .. })
+            | Change::Row(RowChange::DeleteRow { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
+            | Change::Module(ModuleChange::CreateModule { .. })
+            | Change::Module(ModuleChange::AlterModule { .. })
+            | Change::Module(ModuleChange::DropModule { .. })
+            | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
             | crate::catalog_change!()
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => Vec::new(),
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. }) => Vec::new(),
         }
     }
 
@@ -2393,32 +2600,34 @@ impl Change {
     // or the plan's own edit is reported as movement.
     pub fn columns_redefined(&self) -> Vec<(ColumnRef, ColumnField)> {
         match self {
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => Vec::new(),
-            Change::AddColumn { table, name, .. } => {
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => Vec::new(),
+            Change::Column(ColumnChange::AddColumn { table, name, .. }) => {
                 vec![(table.column(name), ColumnField::Whole)]
             }
-            Change::RenameColumn {
+            Change::Column(ColumnChange::RenameColumn {
                 table, from, to, ..
-            } => vec![
+            }) => vec![
                 (table.column(from), ColumnField::Whole),
                 (table.column(to), ColumnField::Whole),
             ],
-            Change::DropColumn { column, .. } => vec![(column.clone(), ColumnField::Whole)],
+            Change::Column(ColumnChange::DropColumn { column, .. }) => {
+                vec![(column.clone(), ColumnField::Whole)]
+            }
             // The type, and the nullability only where it actually moves:
             // `ALTER COLUMN` restates the whole definition (§12), so the
             // statement carries both, but a restatement that changes nothing
             // leaves a value two reads still agree on.
-            Change::AlterColumnType {
+            Change::Column(ColumnChange::AlterColumnType {
                 column,
                 from_nullable,
                 to_nullable,
                 from_collation,
                 to_collation,
                 ..
-            } => {
+            }) => {
                 let mut out = vec![(column.clone(), ColumnField::Type)];
                 if from_nullable != to_nullable {
                     out.push((column.clone(), ColumnField::Nullable));
@@ -2430,74 +2639,74 @@ impl Change {
             }
             // The column holds the replacement type until the rebuild's last
             // step names it back, so no read between them can promise it.
-            Change::EnumRebuild {
+            Change::TypeValue(TypeValueChange::EnumRebuild {
                 step: crate::EnumRebuildStep::Retype { column, .. },
                 ..
-            } => vec![(column.clone(), ColumnField::Type)],
+            }) => vec![(column.clone(), ColumnField::Type)],
             // Not the type: the differ emits this change only where the type
             // is unchanged, and the statement restates the one it read.
             // Measured: `ALTER COLUMN` leaves the default constraint's stored
             // definition untouched, so that stays comparable too.
-            Change::AlterColumnNullability { column, .. } => {
+            Change::Column(ColumnChange::AlterColumnNullability { column, .. }) => {
                 vec![(column.clone(), ColumnField::Nullable)]
             }
-            Change::AlterColumnDefault { column, .. } => {
+            Change::Column(ColumnChange::AlterColumnDefault { column, .. }) => {
                 vec![(column.clone(), ColumnField::Default)]
             }
-            Change::AlterColumnExpression { column, .. } => {
+            Change::Column(ColumnChange::AlterColumnExpression { column, .. }) => {
                 vec![(column.clone(), ColumnField::Generated)]
             }
             // A plain default given up or taken beside it is an
             // `AlterColumnDefault` of its own.
-            Change::AlterColumnNumbering { column, .. } => {
+            Change::Column(ColumnChange::AlterColumnNumbering { column, .. }) => {
                 vec![(column.clone(), ColumnField::Numbering)]
             }
-            Change::SetColumnDeprecated { column, .. } => {
+            Change::Column(ColumnChange::SetColumnDeprecated { column, .. }) => {
                 vec![(column.clone(), ColumnField::Deprecated)]
             }
-            Change::CreateTable { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::DropTable { .. }
-            | Change::RenameTable { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::SetComment { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::SetExclusion { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
+            Change::Table(TableChange::CreateTable { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Table(TableChange::DropTable { .. })
+            | Change::Table(TableChange::RenameTable { .. })
+            | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(PolicyChange::DropPolicy { .. })
+            | Change::Policy(PolicyChange::CreatePolicy { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+            | Change::TableProperty(TablePropertyChange::SetComment { .. })
+            | Change::Constraint(ConstraintChange::AddUnique { .. })
+            | Change::Constraint(ConstraintChange::DropUnique { .. })
+            | Change::Constraint(ConstraintChange::SetExclusion { .. })
+            | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            | Change::Constraint(ConstraintChange::AddCheck { .. })
+            | Change::Constraint(ConstraintChange::DropCheck { .. })
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::UpdateRow { .. })
+            | Change::Row(RowChange::DeleteRow { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
+            | Change::Module(ModuleChange::CreateModule { .. })
+            | Change::Module(ModuleChange::AlterModule { .. })
+            | Change::Module(ModuleChange::DropModule { .. })
+            | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
             | crate::catalog_change!()
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => Vec::new(),
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. }) => Vec::new(),
         }
     }
 
@@ -2518,62 +2727,66 @@ impl Change {
     // later that removes an object takes grants with it too.
     pub fn drops(&self) -> Option<Dropped> {
         match self {
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => None,
-            Change::DropTable { name, .. } => Some(Dropped::Table(name.clone())),
-            Change::DropModule { id, .. } => Some(Dropped::Module(id.clone())),
-            Change::CreateTable { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::RenameTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::AlterColumnNumbering { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::SetComment { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::SetExclusion { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => None,
+            Change::Table(TableChange::DropTable { name, .. }) => {
+                Some(Dropped::Table(name.clone()))
+            }
+            Change::Module(ModuleChange::DropModule { id, .. }) => {
+                Some(Dropped::Module(id.clone()))
+            }
+            Change::Table(TableChange::CreateTable { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Table(TableChange::RenameTable { .. })
+            | Change::Column(ColumnChange::AddColumn { .. })
+            | Change::Column(ColumnChange::DropColumn { .. })
+            | Change::Column(ColumnChange::RenameColumn { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+            | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(PolicyChange::DropPolicy { .. })
+            | Change::Policy(PolicyChange::CreatePolicy { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+            | Change::TableProperty(TablePropertyChange::SetComment { .. })
+            | Change::Constraint(ConstraintChange::AddUnique { .. })
+            | Change::Constraint(ConstraintChange::DropUnique { .. })
+            | Change::Constraint(ConstraintChange::SetExclusion { .. })
+            | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            | Change::Constraint(ConstraintChange::AddCheck { .. })
+            | Change::Constraint(ConstraintChange::DropCheck { .. })
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::UpdateRow { .. })
+            | Change::Row(RowChange::DeleteRow { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
+            | Change::Module(ModuleChange::CreateModule { .. })
+            | Change::Module(ModuleChange::AlterModule { .. })
+            | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
             | crate::catalog_change!()
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => None,
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. }) => None,
         }
     }
 
@@ -2596,20 +2809,20 @@ impl Change {
     // compared against a state it was never part of.
     pub fn grant(&self) -> Option<(&crate::RoleName, &GrantTarget, PermissionChange<'_>)> {
         match self {
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => None,
-            Change::Grant {
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => None,
+            Change::Permission(GrantChange::Grant {
                 role,
                 target,
                 permissions,
-            } => Some((role, target, PermissionChange::Granted(permissions))),
-            Change::Revoke {
+            }) => Some((role, target, PermissionChange::Granted(permissions))),
+            Change::Permission(GrantChange::Revoke {
                 role,
                 target,
                 permissions,
-            } => Some((role, target, PermissionChange::Revoked(permissions))),
+            }) => Some((role, target, PermissionChange::Revoked(permissions))),
             // Named here, and the answer is still `None`: the permission this
             // moves is `PUBLIC`'s, and `PUBLIC` is not a role the recorded
             // state holds (ADR-0010 §5, DECISIONS 371). A caller comparing
@@ -2617,55 +2830,55 @@ impl Change {
             // nothing on either side of this one — reporting it as a role's
             // revoke would put a grantee into that comparison that no pull
             // ever puts there, and the whole set would then read as drift.
-            Change::PublicExecution { .. } => None,
-            Change::CreateTable { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::DropTable { .. }
-            | Change::RenameTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::AlterColumnNumbering { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::SetComment { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::SetExclusion { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
+            Change::Permission(GrantChange::PublicExecution { .. }) => None,
+            Change::Table(TableChange::CreateTable { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Table(TableChange::DropTable { .. })
+            | Change::Table(TableChange::RenameTable { .. })
+            | Change::Column(ColumnChange::AddColumn { .. })
+            | Change::Column(ColumnChange::DropColumn { .. })
+            | Change::Column(ColumnChange::RenameColumn { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+            | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(PolicyChange::DropPolicy { .. })
+            | Change::Policy(PolicyChange::CreatePolicy { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+            | Change::TableProperty(TablePropertyChange::SetComment { .. })
+            | Change::Constraint(ConstraintChange::AddUnique { .. })
+            | Change::Constraint(ConstraintChange::DropUnique { .. })
+            | Change::Constraint(ConstraintChange::SetExclusion { .. })
+            | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            | Change::Constraint(ConstraintChange::AddCheck { .. })
+            | Change::Constraint(ConstraintChange::DropCheck { .. })
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::UpdateRow { .. })
+            | Change::Row(RowChange::DeleteRow { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
+            | Change::Module(ModuleChange::CreateModule { .. })
+            | Change::Module(ModuleChange::AlterModule { .. })
+            | Change::Module(ModuleChange::DropModule { .. })
+            | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
             | crate::catalog_change!() => None,
         }
     }
@@ -2678,75 +2891,75 @@ impl Change {
     // touched would be told "nothing" about it.
     pub fn roles(&self) -> impl Iterator<Item = &crate::RoleName> {
         let (one, two) = match self {
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => (None, None),
-            Change::CreateRole { name, .. }
-            | Change::DropRole { name, .. }
-            | Change::Grant { role: name, .. }
-            | Change::Revoke { role: name, .. } => (Some(name), None),
-            Change::RenameRole { from, to, .. } => (Some(from), Some(to)),
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => (None, None),
+            Change::Role(RoleChange::CreateRole { name, .. })
+            | Change::Role(RoleChange::DropRole { name, .. })
+            | Change::Permission(GrantChange::Grant { role: name, .. })
+            | Change::Permission(GrantChange::Revoke { role: name, .. }) => (Some(name), None),
+            Change::Role(RoleChange::RenameRole { from, to, .. }) => (Some(from), Some(to)),
             // `PUBLIC` is not a role name; it is every principal at once, and
             // no declaration, ids file or pull ever names it (ADR-0010 §5).
-            Change::PublicExecution { .. } => (None, None),
-            Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateSearch { .. }
-            | Change::DropSearch { .. }
-            | Change::CreateExtension { .. }
-            | Change::DropExtension { .. }
-            | Change::UpdateExtension { .. }
-            | Change::SetExtensionSchema { .. }
-            | Change::CreateTable { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::DropTable { .. }
-            | Change::RenameTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::AlterColumnNumbering { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::SetComment { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::SetExclusion { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. } => (None, None),
+            Change::Permission(GrantChange::PublicExecution { .. }) => (None, None),
+            Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
+            | Change::Type(TypeChange::CreateType { .. })
+            | Change::Type(TypeChange::DropType { .. })
+            | Change::Type(TypeChange::RenameType { .. })
+            | Change::Search(SearchChange::CreateSearch { .. })
+            | Change::Search(SearchChange::DropSearch { .. })
+            | Change::Extension(ExtensionChange::CreateExtension { .. })
+            | Change::Extension(ExtensionChange::DropExtension { .. })
+            | Change::Extension(ExtensionChange::UpdateExtension { .. })
+            | Change::Extension(ExtensionChange::SetExtensionSchema { .. })
+            | Change::Table(TableChange::CreateTable { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Table(TableChange::DropTable { .. })
+            | Change::Table(TableChange::RenameTable { .. })
+            | Change::Column(ColumnChange::AddColumn { .. })
+            | Change::Column(ColumnChange::DropColumn { .. })
+            | Change::Column(ColumnChange::RenameColumn { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+            | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(PolicyChange::DropPolicy { .. })
+            | Change::Policy(PolicyChange::CreatePolicy { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+            | Change::TableProperty(TablePropertyChange::SetComment { .. })
+            | Change::Constraint(ConstraintChange::AddUnique { .. })
+            | Change::Constraint(ConstraintChange::DropUnique { .. })
+            | Change::Constraint(ConstraintChange::SetExclusion { .. })
+            | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            | Change::Constraint(ConstraintChange::AddCheck { .. })
+            | Change::Constraint(ConstraintChange::DropCheck { .. })
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::UpdateRow { .. })
+            | Change::Row(RowChange::DeleteRow { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
+            | Change::Module(ModuleChange::CreateModule { .. })
+            | Change::Module(ModuleChange::AlterModule { .. })
+            | Change::Module(ModuleChange::DropModule { .. }) => (None, None),
         };
         one.into_iter().chain(two)
     }
@@ -2763,66 +2976,70 @@ impl Change {
     // Exhaustive rather than a wildcard, as every accessor here is.
     pub fn tables_after(&self) -> Vec<(&TableName, Presence)> {
         match self {
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => Vec::new(),
-            Change::CreateTable { name, .. } => vec![(name, Presence::Present)],
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => Vec::new(),
+            Change::Table(TableChange::CreateTable { name, .. }) => vec![(name, Presence::Present)],
             // The table stays, as an ordinary one (#1544).
-            Change::DetachPartition { table, .. } => vec![(table, Presence::Present)],
+            Change::Partition(PartitionChange::DetachPartition { table, .. }) => {
+                vec![(table, Presence::Present)]
+            }
             // The table stays, as a partition (#1545).
-            Change::AttachPartition { table, .. } => vec![(table, Presence::Present)],
-            Change::DropTable { name, .. } => vec![(name, Presence::Absent)],
-            Change::RenameTable { from, to, .. } => {
+            Change::Partition(PartitionChange::AttachPartition { table, .. }) => {
+                vec![(table, Presence::Present)]
+            }
+            Change::Table(TableChange::DropTable { name, .. }) => vec![(name, Presence::Absent)],
+            Change::Table(TableChange::RenameTable { from, to, .. }) => {
                 vec![(from, Presence::Absent), (to, Presence::Present)]
             }
-            Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::AlterColumnNumbering { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetComment { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::SetExclusion { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
+            Change::Column(ColumnChange::AddColumn { .. })
+            | Change::Column(ColumnChange::DropColumn { .. })
+            | Change::Column(ColumnChange::RenameColumn { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+            | Change::TableProperty(TablePropertyChange::SetComment { .. })
+            | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(PolicyChange::DropPolicy { .. })
+            | Change::Policy(PolicyChange::CreatePolicy { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+            | Change::Constraint(ConstraintChange::AddUnique { .. })
+            | Change::Constraint(ConstraintChange::DropUnique { .. })
+            | Change::Constraint(ConstraintChange::SetExclusion { .. })
+            | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            | Change::Constraint(ConstraintChange::AddCheck { .. })
+            | Change::Constraint(ConstraintChange::DropCheck { .. })
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::UpdateRow { .. })
+            | Change::Row(RowChange::DeleteRow { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
+            | Change::Module(ModuleChange::CreateModule { .. })
+            | Change::Module(ModuleChange::AlterModule { .. })
+            | Change::Module(ModuleChange::DropModule { .. })
+            | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
             | crate::catalog_change!()
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => Vec::new(),
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. }) => Vec::new(),
         }
     }
 
@@ -2840,27 +3057,27 @@ impl Change {
     // Exhaustive rather than a wildcard, as every accessor here is.
     pub fn columns_promised(&self) -> Vec<(ColumnRef, ColumnPromise<'_>)> {
         match self {
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => Vec::new(),
-            Change::AddColumn {
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => Vec::new(),
+            Change::Column(ColumnChange::AddColumn {
                 table,
                 name,
                 column,
                 ..
-            } => vec![(table.column(name), ColumnPromise::Whole(column))],
+            }) => vec![(table.column(name), ColumnPromise::Whole(column))],
             // Both: `ALTER COLUMN` restates the nullability with the type
             // (§12), so the statement promises it whether or not it moves.
             // And the collation: the statement restates it too, and one it
             // leaves out moves the column to the database default (#1175).
-            Change::AlterColumnType {
+            Change::Column(ColumnChange::AlterColumnType {
                 column,
                 to,
                 to_nullable,
                 to_collation,
                 ..
-            } => vec![
+            }) => vec![
                 (column.clone(), ColumnPromise::Type(to)),
                 (column.clone(), ColumnPromise::Nullable(*to_nullable)),
                 (
@@ -2871,90 +3088,90 @@ impl Change {
             // The type alone: the statement leaves the other fields as they
             // were, and `columns_redefined` excludes only this one. Held at
             // the closing read, the replacement having been named back.
-            Change::EnumRebuild {
+            Change::TypeValue(TypeValueChange::EnumRebuild {
                 step: crate::EnumRebuildStep::Retype { column, to, .. },
                 ..
-            } => vec![(column.clone(), ColumnPromise::Type(to))],
-            Change::AlterColumnNullability {
+            }) => vec![(column.clone(), ColumnPromise::Type(to))],
+            Change::Column(ColumnChange::AlterColumnNullability {
                 column,
                 to_nullable,
                 collation,
                 ..
-            } => vec![
+            }) => vec![
                 (column.clone(), ColumnPromise::Nullable(*to_nullable)),
                 (column.clone(), ColumnPromise::Collation(collation.as_ref())),
             ],
-            Change::AlterColumnDefault { column, to, .. } => {
+            Change::Column(ColumnChange::AlterColumnDefault { column, to, .. }) => {
                 vec![(column.clone(), ColumnPromise::Default(to.is_some()))]
             }
             // Held to being generated, not to its text, which the engine
             // respells as it does a default's (DEC-1168.1).
-            Change::AlterColumnExpression { column, .. } => {
+            Change::Column(ColumnChange::AlterColumnExpression { column, .. }) => {
                 vec![(column.clone(), ColumnPromise::Generated(true))]
             }
-            Change::AlterColumnNumbering {
+            Change::Column(ColumnChange::AlterColumnNumbering {
                 column, from, to, ..
-            } => {
+            }) => {
                 vec![(column.clone(), ColumnPromise::Numbering { from, to })]
             }
             // The comment the plan leaves; an empty text is no comment (DEC-2729.1).
-            Change::SetComment {
+            Change::TableProperty(TablePropertyChange::SetComment {
                 target: CommentTarget::Column { column, .. },
                 text,
                 ..
-            } => vec![(
+            }) => vec![(
                 column.clone(),
                 ColumnPromise::Description(text.as_ref().filter(|t| !t.is_empty())),
             )],
-            Change::RenameColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetComment {
+            Change::Column(ColumnChange::RenameColumn { .. })
+            | Change::Column(ColumnChange::DropColumn { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+            | Change::TableProperty(TablePropertyChange::SetComment {
                 target: CommentTarget::Table { .. },
                 ..
-            }
-            | Change::CreateTable { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::DropTable { .. }
-            | Change::RenameTable { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::SetExclusion { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
+            })
+            | Change::Table(TableChange::CreateTable { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Table(TableChange::DropTable { .. })
+            | Change::Table(TableChange::RenameTable { .. })
+            | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(PolicyChange::DropPolicy { .. })
+            | Change::Policy(PolicyChange::CreatePolicy { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+            | Change::Constraint(ConstraintChange::AddUnique { .. })
+            | Change::Constraint(ConstraintChange::DropUnique { .. })
+            | Change::Constraint(ConstraintChange::SetExclusion { .. })
+            | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            | Change::Constraint(ConstraintChange::AddCheck { .. })
+            | Change::Constraint(ConstraintChange::DropCheck { .. })
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::UpdateRow { .. })
+            | Change::Row(RowChange::DeleteRow { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
+            | Change::Module(ModuleChange::CreateModule { .. })
+            | Change::Module(ModuleChange::AlterModule { .. })
+            | Change::Module(ModuleChange::DropModule { .. })
+            | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
             | crate::catalog_change!()
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => Vec::new(),
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. }) => Vec::new(),
         }
     }
 
@@ -2968,83 +3185,85 @@ impl Change {
     // Exhaustive rather than a wildcard, as every accessor here is.
     pub fn columns_after(&self) -> Vec<(ColumnRef, Presence)> {
         match self {
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => Vec::new(),
-            Change::AddColumn { table, name, .. } => {
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => Vec::new(),
+            Change::Column(ColumnChange::AddColumn { table, name, .. }) => {
                 vec![(table.column(name), Presence::Present)]
             }
-            Change::DropColumn { column, .. } => vec![(column.clone(), Presence::Absent)],
-            Change::RenameColumn {
+            Change::Column(ColumnChange::DropColumn { column, .. }) => {
+                vec![(column.clone(), Presence::Absent)]
+            }
+            Change::Column(ColumnChange::RenameColumn {
                 table, from, to, ..
-            } => vec![
+            }) => vec![
                 (table.column(from), Presence::Absent),
                 (table.column(to), Presence::Present),
             ],
             // Still there afterwards, whatever else changed about it.
-            Change::EnumRebuild {
+            Change::TypeValue(TypeValueChange::EnumRebuild {
                 step: crate::EnumRebuildStep::Retype { column, .. },
                 ..
-            }
-            | Change::AlterColumnType { column, .. }
-            | Change::AlterColumnNullability { column, .. }
-            | Change::AlterColumnDefault { column, .. }
-            | Change::AlterColumnExpression { column, .. }
-            | Change::AlterColumnNumbering { column, .. }
-            | Change::SetColumnDeprecated { column, .. } => {
+            })
+            | Change::Column(ColumnChange::AlterColumnType { column, .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { column, .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { column, .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { column, .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { column, .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { column, .. }) => {
                 vec![(column.clone(), Presence::Present)]
             }
-            Change::SetComment {
+            Change::TableProperty(TablePropertyChange::SetComment {
                 target: CommentTarget::Column { column, .. },
                 ..
-            } => vec![(column.clone(), Presence::Present)],
-            Change::CreateTable { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::DropTable { .. }
-            | Change::RenameTable { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::SetComment {
+            }) => vec![(column.clone(), Presence::Present)],
+            Change::Table(TableChange::CreateTable { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Table(TableChange::DropTable { .. })
+            | Change::Table(TableChange::RenameTable { .. })
+            | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(PolicyChange::DropPolicy { .. })
+            | Change::Policy(PolicyChange::CreatePolicy { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+            | Change::TableProperty(TablePropertyChange::SetComment {
                 target: CommentTarget::Table { .. },
                 ..
-            }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::SetExclusion { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
+            })
+            | Change::Constraint(ConstraintChange::AddUnique { .. })
+            | Change::Constraint(ConstraintChange::DropUnique { .. })
+            | Change::Constraint(ConstraintChange::SetExclusion { .. })
+            | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            | Change::Constraint(ConstraintChange::AddCheck { .. })
+            | Change::Constraint(ConstraintChange::DropCheck { .. })
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::UpdateRow { .. })
+            | Change::Row(RowChange::DeleteRow { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
+            | Change::Module(ModuleChange::CreateModule { .. })
+            | Change::Module(ModuleChange::AlterModule { .. })
+            | Change::Module(ModuleChange::DropModule { .. })
+            | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
             | crate::catalog_change!()
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => Vec::new(),
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. }) => Vec::new(),
         }
     }
 
@@ -3065,7 +3284,7 @@ impl Change {
         let it = |table, name, after| Some(PartChange { table, name, after });
         let standing = |d| PartAfter::Standing(d);
         match self {
-            Change::BuildPartitionedIndex(r) => it(
+            Change::Index(IndexChange::BuildPartitionedIndex(r)) => it(
                 &r.parent.name,
                 (!matches!(r.definition, crate::PartitionIndexDefinition::PrimaryKey(_)))
                     .then_some(r.name.raw()),
@@ -3077,24 +3296,24 @@ impl Change {
                     crate::PartitionIndexDefinition::Unique(k) => PartDefinition::Unique(k, false),
                 }),
             ),
-            Change::RebuildPartitionedTable(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => None,
-            Change::DropPolicy { table, name, .. } => {
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => None,
+            Change::Policy(PolicyChange::DropPolicy { table, name, .. }) => {
                 it(table, Some(name), PartAfter::Gone(Part::Policy))
             }
-            Change::CreatePolicy {
+            Change::Policy(PolicyChange::CreatePolicy {
                 table,
                 name,
                 policy,
                 ..
-            } => it(table, Some(name), standing(PartDefinition::Policy(policy))),
-            Change::SetPrimaryKey {
+            }) => it(table, Some(name), standing(PartDefinition::Policy(policy))),
+            Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table,
                 to,
                 nonclustered,
                 ..
-            } => it(
+            }) => it(
                 table,
                 None,
                 match to {
@@ -3102,22 +3321,22 @@ impl Change {
                     None => PartAfter::Gone(Part::PrimaryKey),
                 },
             ),
-            Change::AddUnique {
+            Change::Constraint(ConstraintChange::AddUnique {
                 table,
                 name,
                 constraint,
                 clustered,
-            } => it(
+            }) => it(
                 table,
                 Some(name.raw()),
                 standing(PartDefinition::Unique(constraint, *clustered)),
             ),
-            Change::DropUnique { table, name, .. } => {
+            Change::Constraint(ConstraintChange::DropUnique { table, name, .. }) => {
                 it(table, Some(name.raw()), PartAfter::Gone(Part::Unique))
             }
-            Change::SetExclusion {
+            Change::Constraint(ConstraintChange::SetExclusion {
                 table, name, to, ..
-            } => it(
+            }) => it(
                 table,
                 Some(name.raw()),
                 match to {
@@ -3125,93 +3344,93 @@ impl Change {
                     None => PartAfter::Gone(Part::Exclusion),
                 },
             ),
-            Change::AddForeignKey {
+            Change::Constraint(ConstraintChange::AddForeignKey {
                 table,
                 name,
                 constraint,
-            } => it(
+            }) => it(
                 table,
                 Some(name.raw()),
                 standing(PartDefinition::ForeignKey(constraint)),
             ),
-            Change::DropForeignKey { table, name, .. } => {
+            Change::Constraint(ConstraintChange::DropForeignKey { table, name, .. }) => {
                 it(table, Some(name.raw()), PartAfter::Gone(Part::ForeignKey))
             }
-            Change::AddCheck {
+            Change::Constraint(ConstraintChange::AddCheck {
                 table,
                 name,
                 constraint,
-            } => it(
+            }) => it(
                 table,
                 Some(name.raw()),
                 standing(PartDefinition::Check(constraint)),
             ),
-            Change::DropCheck { table, name, .. } => {
+            Change::Constraint(ConstraintChange::DropCheck { table, name, .. }) => {
                 it(table, Some(name.raw()), PartAfter::Gone(Part::Check))
             }
-            Change::AddIndex {
+            Change::Index(IndexChange::AddIndex {
                 table,
                 name,
                 index,
                 clustered,
-            } => it(
+            }) => it(
                 table,
                 Some(name.raw()),
                 standing(PartDefinition::Index(index, *clustered)),
             ),
-            Change::DropIndex { table, name, .. } => {
+            Change::Index(IndexChange::DropIndex { table, name, .. }) => {
                 it(table, Some(name.raw()), PartAfter::Gone(Part::Index))
             }
-            Change::AddComputedColumn {
+            Change::Column(ColumnChange::AddComputedColumn {
                 table,
                 name,
                 computed,
-            } => it(
+            }) => it(
                 table,
                 Some(name.raw()),
                 standing(PartDefinition::Computed(computed)),
             ),
-            Change::DropComputedColumn { table, name, .. } => {
+            Change::Column(ColumnChange::DropComputedColumn { table, name, .. }) => {
                 it(table, Some(name.raw()), PartAfter::Gone(Part::Computed))
             }
-            Change::CreateTable { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::DropTable { .. }
-            | Change::RenameTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::AlterColumnNumbering { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
+            Change::Table(TableChange::CreateTable { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Table(TableChange::DropTable { .. })
+            | Change::Table(TableChange::RenameTable { .. })
+            | Change::Column(ColumnChange::AddColumn { .. })
+            | Change::Column(ColumnChange::DropColumn { .. })
+            | Change::Column(ColumnChange::RenameColumn { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+            | Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::UpdateRow { .. })
+            | Change::Row(RowChange::DeleteRow { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
+            | Change::Module(ModuleChange::CreateModule { .. })
+            | Change::Module(ModuleChange::AlterModule { .. })
+            | Change::Module(ModuleChange::DropModule { .. })
+            | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
             | crate::catalog_change!()
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::SetComment { .. } => None,
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+            | Change::TableProperty(TablePropertyChange::SetComment { .. }) => None,
         }
     }
 
@@ -3221,75 +3440,75 @@ impl Change {
     // Exhaustive rather than a wildcard, as every accessor here is.
     pub fn roles_after(&self) -> Vec<(&crate::RoleName, Presence)> {
         match self {
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => Vec::new(),
-            Change::CreateRole { name, .. } => vec![(name, Presence::Present)],
-            Change::DropRole { name, .. } => vec![(name, Presence::Absent)],
-            Change::RenameRole { from, to, .. } => {
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => Vec::new(),
+            Change::Role(RoleChange::CreateRole { name, .. }) => vec![(name, Presence::Present)],
+            Change::Role(RoleChange::DropRole { name, .. }) => vec![(name, Presence::Absent)],
+            Change::Role(RoleChange::RenameRole { from, to, .. }) => {
                 vec![(from, Presence::Absent), (to, Presence::Present)]
             }
-            Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateSearch { .. }
-            | Change::DropSearch { .. }
-            | Change::CreateExtension { .. }
-            | Change::DropExtension { .. }
-            | Change::UpdateExtension { .. }
-            | Change::SetExtensionSchema { .. }
-            | Change::CreateTable { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::DropTable { .. }
-            | Change::RenameTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::AlterColumnNumbering { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::SetComment { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::SetExclusion { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => Vec::new(),
+            Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
+            | Change::Type(TypeChange::CreateType { .. })
+            | Change::Type(TypeChange::DropType { .. })
+            | Change::Type(TypeChange::RenameType { .. })
+            | Change::Search(SearchChange::CreateSearch { .. })
+            | Change::Search(SearchChange::DropSearch { .. })
+            | Change::Extension(ExtensionChange::CreateExtension { .. })
+            | Change::Extension(ExtensionChange::DropExtension { .. })
+            | Change::Extension(ExtensionChange::UpdateExtension { .. })
+            | Change::Extension(ExtensionChange::SetExtensionSchema { .. })
+            | Change::Table(TableChange::CreateTable { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Table(TableChange::DropTable { .. })
+            | Change::Table(TableChange::RenameTable { .. })
+            | Change::Column(ColumnChange::AddColumn { .. })
+            | Change::Column(ColumnChange::DropColumn { .. })
+            | Change::Column(ColumnChange::RenameColumn { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+            | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(PolicyChange::DropPolicy { .. })
+            | Change::Policy(PolicyChange::CreatePolicy { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+            | Change::TableProperty(TablePropertyChange::SetComment { .. })
+            | Change::Constraint(ConstraintChange::AddUnique { .. })
+            | Change::Constraint(ConstraintChange::DropUnique { .. })
+            | Change::Constraint(ConstraintChange::SetExclusion { .. })
+            | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            | Change::Constraint(ConstraintChange::AddCheck { .. })
+            | Change::Constraint(ConstraintChange::DropCheck { .. })
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::UpdateRow { .. })
+            | Change::Row(RowChange::DeleteRow { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
+            | Change::Module(ModuleChange::CreateModule { .. })
+            | Change::Module(ModuleChange::AlterModule { .. })
+            | Change::Module(ModuleChange::DropModule { .. })
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. }) => Vec::new(),
         }
     }
 
@@ -3307,125 +3526,126 @@ impl Change {
     // read-back would record whatever is there as this plan's own result.
     pub fn module(&self) -> Option<(&ModuleId, ModuleAfter<'_>)> {
         match self {
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => None,
-            Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => None,
+            Change::Module(ModuleChange::CreateModule { id, module })
+            | Change::Module(ModuleChange::AlterModule { id, module }) => {
                 Some((id, ModuleAfter::Standing(module)))
             }
-            Change::DropModule { id, .. } => Some((id, ModuleAfter::Gone)),
-            Change::CreateTable { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::DropTable { .. }
-            | Change::RenameTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::AlterColumnNumbering { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::SetComment { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::SetExclusion { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
+            Change::Module(ModuleChange::DropModule { id, .. }) => Some((id, ModuleAfter::Gone)),
+            Change::Table(TableChange::CreateTable { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Table(TableChange::DropTable { .. })
+            | Change::Table(TableChange::RenameTable { .. })
+            | Change::Column(ColumnChange::AddColumn { .. })
+            | Change::Column(ColumnChange::DropColumn { .. })
+            | Change::Column(ColumnChange::RenameColumn { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+            | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(PolicyChange::DropPolicy { .. })
+            | Change::Policy(PolicyChange::CreatePolicy { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+            | Change::TableProperty(TablePropertyChange::SetComment { .. })
+            | Change::Constraint(ConstraintChange::AddUnique { .. })
+            | Change::Constraint(ConstraintChange::DropUnique { .. })
+            | Change::Constraint(ConstraintChange::SetExclusion { .. })
+            | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            | Change::Constraint(ConstraintChange::AddCheck { .. })
+            | Change::Constraint(ConstraintChange::DropCheck { .. })
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::UpdateRow { .. })
+            | Change::Row(RowChange::DeleteRow { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
+            | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
             | crate::catalog_change!()
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => None,
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. }) => None,
         }
     }
 
     /// The module this change acts on, if it is a module change at all.
     pub fn module_id(&self) -> Option<&ModuleId> {
         match self {
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => None,
-            Change::CreateModule { id, .. }
-            | Change::AlterModule { id, .. }
-            | Change::DropModule { id, .. } => Some(id),
-            Change::CreateTable { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::DropTable { .. }
-            | Change::RenameTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::AlterColumnNumbering { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::SetComment { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::SetExclusion { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => None,
+            Change::Module(ModuleChange::CreateModule { id, .. })
+            | Change::Module(ModuleChange::AlterModule { id, .. })
+            | Change::Module(ModuleChange::DropModule { id, .. }) => Some(id),
+            Change::Table(TableChange::CreateTable { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Table(TableChange::DropTable { .. })
+            | Change::Table(TableChange::RenameTable { .. })
+            | Change::Column(ColumnChange::AddColumn { .. })
+            | Change::Column(ColumnChange::DropColumn { .. })
+            | Change::Column(ColumnChange::RenameColumn { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+            | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(PolicyChange::DropPolicy { .. })
+            | Change::Policy(PolicyChange::CreatePolicy { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+            | Change::TableProperty(TablePropertyChange::SetComment { .. })
+            | Change::Constraint(ConstraintChange::AddUnique { .. })
+            | Change::Constraint(ConstraintChange::DropUnique { .. })
+            | Change::Constraint(ConstraintChange::SetExclusion { .. })
+            | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            | Change::Constraint(ConstraintChange::AddCheck { .. })
+            | Change::Constraint(ConstraintChange::DropCheck { .. })
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::UpdateRow { .. })
+            | Change::Row(RowChange::DeleteRow { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
+            | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
             | crate::catalog_change!()
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => None,
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. }) => None,
         }
     }
 
@@ -3442,30 +3662,30 @@ impl Change {
     pub fn intrinsic_risks_with(&self, continues_ident: fn(char) -> bool) -> BTreeSet<RiskClass> {
         let mut r = BTreeSet::new();
         match self {
-            Change::BuildPartitionedIndex(r) => {
+            Change::Index(IndexChange::BuildPartitionedIndex(r)) => {
                 return r.parent_change().intrinsic_risks_with(continues_ident);
             }
-            Change::RebuildPartitionedTable(_) => { r.insert(RiskClass::Destructive); },
-Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
-            Change::DropTable { .. }
-            | Change::DropColumn { .. }
-            | Change::DropIndex { .. }
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_)) => { r.insert(RiskClass::Destructive); },
+Change::Partition(PartitionChange::CopyTableRows(_)) | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => {},
+            Change::Table(TableChange::DropTable { .. })
+            | Change::Column(ColumnChange::DropColumn { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
             // An object gone, as an index is, though its values are derived:
             // an expression change, a drop and an add, faces this gate too.
-            | Change::DropComputedColumn { .. }
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
             // Removing uniqueness needs approval even without deleting rows;
             // FK/CHECK relaxation has a separate policy (DECISIONS 486).
-            | Change::DropUnique { .. }
+            | Change::Constraint(ConstraintChange::DropUnique { .. })
             // No row is deleted, but every row of the partition leaves its
             // parent: a query on the parent stops returning them (#1544).
-            | Change::DetachPartition { .. } => {
+            | Change::Partition(PartitionChange::DetachPartition { .. }) => {
                 r.insert(RiskClass::Destructive);
             }
             // The table's rows must satisfy the bound, and the keys,
             // uniques and foreign keys the parent clones onto it; the engine
             // scans for both, and fails the attach on the first that does
             // not (#1545).
-            Change::AttachPartition { .. } => {
+            Change::Partition(PartitionChange::AttachPartition { .. }) => {
                 r.insert(RiskClass::Constraint);
             }
             // Beside a standing DEFAULT the partition is filled with the
@@ -3479,11 +3699,11 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
             // DEFAULT may be unlogged itself, which the change does not
             // carry; the gate then asks for nothing that is lost, and asking
             // is the safe side.
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 table,
                 beside_default: Some(_),
                 ..
-            } => {
+            }) => {
                 if table.unlogged {
                     r.insert(RiskClass::Destructive);
                 }
@@ -3505,47 +3725,47 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
             // depends on it, not data — so it faces the gate, but needs no
             // tombstone and no reason: the definition is in git history, which
             // is this object family's audit trail (ADR-0002).
-            Change::DropType { .. }
-            | Change::DropSearch { .. }
-            | Change::DropModule { .. }
-            | Change::DropExtension { .. } => {
+            Change::Type(TypeChange::DropType { .. })
+            | Change::Search(SearchChange::DropSearch { .. })
+            | Change::Module(ModuleChange::DropModule { .. })
+            | Change::Extension(ExtensionChange::DropExtension { .. }) => {
                 r.insert(RiskClass::Destructive);
             }
             // A role rename keeps its membership — which is why it is a
             // rename and not drop + add — but the old name is gone the same
             // way a table's is, and `IS_ROLEMEMBER('old')` in a module or an
             // application breaks on the spot. Same gate as the other renames.
-            Change::RenameEnumValue { .. } | Change::RenameType { .. } | Change::RenameTable { .. } | Change::RenameColumn { .. } | Change::RenameRole { .. } => {
+            Change::TypeValue(TypeValueChange::RenameEnumValue { .. }) | Change::Type(TypeChange::RenameType { .. }) | Change::Table(TableChange::RenameTable { .. }) | Change::Column(ColumnChange::RenameColumn { .. }) | Change::Role(RoleChange::RenameRole { .. }) => {
                 r.insert(RiskClass::Rename);
             }
-            Change::EnumRebuild { .. } => {
+            Change::TypeValue(TypeValueChange::EnumRebuild { .. }) => {
                 r.insert(RiskClass::TypeRebuild);
             }
-            Change::CreateExtension { .. } => {
+            Change::Extension(ExtensionChange::CreateExtension { .. }) => {
                 r.insert(RiskClass::ExtensionCode);
             }
             // The update script is code pbps did not write, and nothing proves it
             // additive: a version path is not a promise about the data it
             // touches, so the label is conservative (DEC-2447.10).
-            Change::UpdateExtension { .. } => {
+            Change::Extension(ExtensionChange::UpdateExtension { .. }) => {
                 r.insert(RiskClass::ExtensionCode);
                 r.insert(RiskClass::Destructive);
             }
             // The members keep their identity and only their schema changes, but
             // what spells one with the old schema stops finding it (DEC-2447.11).
-            Change::SetExtensionSchema { .. } => {
+            Change::Extension(ExtensionChange::SetExtensionSchema { .. }) => {
                 r.insert(RiskClass::Rename);
             }
             // The loosening statements carry no class, as `DropCheck` does
             // (DECISIONS 486). A check added or changed validates every row
             // of every table using the domain, as `AddCheck` does, and NOT NULL
             // reads their NULLs (DEC-1635.8).
-            Change::AlterDomain {
+            Change::TypeValue(TypeValueChange::AlterDomain {
                 from,
                 to,
                 half: crate::DomainHalf::Tighten,
                 ..
-            } => {
+            }) => {
                 if let Some(delta) = crate::DomainDelta::of(from, to) {
                     if !delta.add_checks.is_empty() {
                         r.insert(RiskClass::Constraint);
@@ -3555,39 +3775,39 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
                     }
                 }
             }
-            Change::AlterDomain {
+            Change::TypeValue(TypeValueChange::AlterDomain {
                 half: crate::DomainHalf::Loosen,
                 ..
-            } => {}
-            Change::AlterColumnNullability {
+            }) => {}
+            Change::Column(ColumnChange::AlterColumnNullability {
                 to_nullable: false, ..
-            }
+            })
             // A partition's own NOT NULL tightens its column as a table's
             // does, over the rows it holds (#1581).
-            | Change::SetPartitionNotNull { not_null: true, .. }
-            | Change::AlterColumnType {
+            | Change::Partition(PartitionChange::SetPartitionNotNull { not_null: true, .. })
+            | Change::Column(ColumnChange::AlterColumnType {
                 from_nullable: true,
                 to_nullable: false,
                 ..
-            } => {
+            }) => {
                 r.insert(RiskClass::NotNull);
             }
-            Change::AddUnique { .. } | Change::AddForeignKey { .. } | Change::AddCheck { .. } => {
+            Change::Constraint(ConstraintChange::AddUnique { .. }) | Change::Constraint(ConstraintChange::AddForeignKey { .. }) | Change::Constraint(ConstraintChange::AddCheck { .. }) => {
                 r.insert(RiskClass::Constraint);
             }
             // Adding one checks every existing row under an exclusive lock;
             // dropping one gives up a guarantee, as dropping uniqueness does.
-            Change::SetExclusion { to: Some(_), .. } => {
+            Change::Constraint(ConstraintChange::SetExclusion { to: Some(_), .. }) => {
                 r.insert(RiskClass::Constraint);
             }
-            Change::SetExclusion { to: None, .. } => {
+            Change::Constraint(ConstraintChange::SetExclusion { to: None, .. }) => {
                 r.insert(RiskClass::Destructive);
             }
             // The engine recomputes and rewrites the value of every stored
             // row, and a NOT NULL, check or unique index over the column can
             // refuse what it computes: a value-changing conversion in all but
             // name (SPEC §7.2, DEC-1168.1).
-            Change::AlterColumnExpression { .. } => {
+            Change::Column(ColumnChange::AlterColumnExpression { .. }) => {
                 r.insert(RiskClass::Narrowing);
             }
             // Only where a writer working today can fail (DEC-1889.1): an
@@ -3601,7 +3821,7 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
             // (#1930 review). An owned sequence put on a column without a
             // source, or a start or increment changed, fails no insert that
             // works now.
-            Change::AlterColumnNumbering { from, to, .. } => {
+            Change::Column(ColumnChange::AlterColumnNumbering { from, to, .. }) => {
                 let removed = NumberingKind::of(to).is_none();
                 let identity_added = matches!(to, ValueSource::Identity(_))
                     && !matches!(from, ValueSource::Identity(_));
@@ -3650,30 +3870,30 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
             // over a column that holds duplicates plans as a no-risk change
             // and the engine refuses it mid-apply — where, under `--staged`,
             // every earlier checkpoint has already committed.
-            Change::AddIndex { index, .. } if index.unique => {
+            Change::Index(IndexChange::AddIndex { index, .. }) if index.unique => {
                 r.insert(RiskClass::Constraint);
             }
-            Change::SetPrimaryKey { to: Some(_), .. } => {
+            Change::Constraint(ConstraintChange::SetPrimaryKey { to: Some(_), .. }) => {
                 r.insert(RiskClass::Constraint);
             }
-            Change::SetPrimaryKey { to: None, .. } => {
+            Change::Constraint(ConstraintChange::SetPrimaryKey { to: None, .. }) => {
                 r.insert(RiskClass::Destructive);
             }
-            Change::UpdateRow { .. } => {
+            Change::Row(RowChange::UpdateRow { .. }) => {
                 r.insert(RiskClass::DataUpdate);
             }
-            Change::DeleteRow { .. } => {
+            Change::Row(RowChange::DeleteRow { .. }) => {
                 r.insert(RiskClass::DataDelete);
             }
             // An unlogged table is emptied by a crash or an unclean shutdown
             // and never reaches a standby: switching to it puts the rows at
             // that risk from then on. Switching back carries none (#1443).
-            Change::SetTablePersistence { unlogged, .. } => {
+            Change::TableProperty(TablePropertyChange::SetTablePersistence { unlogged, .. }) => {
                 if *unlogged {
                     r.insert(RiskClass::Destructive);
                 }
             }
-            Change::AddColumn { column, .. } => {
+            Change::Column(ColumnChange::AddColumn { column, .. }) => {
                 // Existing rows have no value for a newly added column. The
                 // engine can populate one from a DEFAULT or IDENTITY; without
                 // either, a NOT NULL addition is the same data hazard as
@@ -3687,13 +3907,13 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
             // A rebuild restores the engine's default `EXECUTE` to `PUBLIC`
             // and this takes it away again; what the declarations cannot say
             // is whether anyone was using it (ADR-0010 §5).
-            Change::DropRole { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution {
+            Change::Role(RoleChange::DropRole { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution {
                 access: PublicAccess::Revoked,
                 origin: RoutineOrigin::Rebuilt,
                 ..
-            } => {
+            }) => {
                 r.insert(RiskClass::Revoke);
             }
             // Leaving the default standing means every principal in the
@@ -3701,107 +3921,110 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
             // no statement, and it is still the widest access this model can
             // describe — labelled in every plan for the reason `GrantWiden`
             // exists, and ungated for the same one.
-            Change::Grant { .. }
-            | Change::PublicExecution {
+            Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::PublicExecution {
                 access: PublicAccess::Kept,
                 ..
-            } => {
+            }) => {
                 r.insert(RiskClass::GrantWiden);
             }
             // Classify latent policies as enabled: a later ENABLE must not
             // be the first time their access change appears (DEC-1173.1).
-            Change::CreatePolicy {
+            Change::Policy(PolicyChange::CreatePolicy {
                 policy, origin: RowSecurityOrigin::Standing, ..
-            } => {
+            }) => {
                 r.insert(if policy.restrictive {
                     RiskClass::Revoke
                 } else {
                     RiskClass::RowSecurity
                 });
             }
-            Change::DropPolicy { policy, .. } => {
+            Change::Policy(PolicyChange::DropPolicy { policy, .. }) => {
                 r.insert(if policy.restrictive {
                     RiskClass::RowSecurity
                 } else {
                     RiskClass::Revoke
                 });
             }
-            Change::SetRowSecurity {
+            Change::Policy(PolicyChange::SetRowSecurity {
                 from, to, origin: RowSecurityOrigin::Standing, ..
-            } => {
+            }) => {
                 for (was, now) in [(from.enabled, to.enabled), (from.forced, to.forced)] {
                     if was != now {
                         r.insert(if now { RiskClass::Revoke } else { RiskClass::RowSecurity });
                     }
                 }
             }
-            Change::CreateTable { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability {
+            Change::Table(TableChange::CreateTable { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnNullability {
                 to_nullable: true, ..
-            }
-            | Change::AlterColumnDefault { .. }
-            | Change::SetColumnDeprecated { .. }
+            })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
             // These relaxations add no intrinsic risk class; the uniqueness
             // exception above is deliberate, not a rule for all drops (486).
-            | Change::DropForeignKey { .. }
-            | Change::DropCheck { .. }
+            | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            | Change::Constraint(ConstraintChange::DropCheck { .. })
             // Only the non-unique ones: the arm above has already taken the
             // unique index, which can fail on the data like any other
             // uniqueness. A plain index constrains nothing.
-            | Change::AddIndex { .. }
+            | Change::Index(IndexChange::AddIndex { .. })
             // Nor does a computed column: it holds no value of its own, and
             // one the engine cannot compute is refused inside the transaction.
-            | Change::AddComputedColumn { .. }
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
             // A revoke that follows a `CREATE` takes nothing from anybody:
             // the object it names did not exist a statement earlier.
-            | Change::PublicExecution {
+            | Change::Permission(GrantChange::PublicExecution {
                 access: PublicAccess::Revoked,
                 origin: RoutineOrigin::Created,
                 ..
-            }
+            })
             // Neither creating nor re-stating a module risks anything: a failed
             // CREATE OR ALTER rolls back with the plan's transaction and the
             // environment is unchanged.
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
+            | Change::Module(ModuleChange::CreateModule { .. })
+            | Change::Module(ModuleChange::AlterModule { .. })
             // Inserting a declared row adds what the declaration says should be
             // there; a failure (a duplicate key, a violated FK) rolls back with
             // the plan. Changing the mode emits nothing at all.
-            | Change::InsertRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
+            | Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
             // Creating a role grants nothing by itself.
-            | Change::AddEnumValue { .. }
-            | Change::CreateType { .. }
-            | Change::CreateSearch { .. }
-            | Change::CreateRole { .. }
+            | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+            | Change::Type(TypeChange::CreateType { .. })
+            | Change::Search(SearchChange::CreateSearch { .. })
+            | Change::Role(RoleChange::CreateRole { .. })
             // A replica identity changes what logical replication carries to
             // name an old row, not a row or an access: no class here gates it
             // (DEC-1444.1).
-            | Change::CreatePolicy { origin: RowSecurityOrigin::Created, .. }
-            | Change::SetRowSecurity { origin: RowSecurityOrigin::Created, .. }
-            | Change::SetReplicaIdentity { .. }
+            | Change::Policy(PolicyChange::CreatePolicy { origin: RowSecurityOrigin::Created, .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { origin: RowSecurityOrigin::Created, .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
             // A comment is metadata the declaration states: listed in the plan, no gate (DEC-2729.1).
-            | Change::SetComment { .. }
+            | Change::TableProperty(TablePropertyChange::SetComment { .. })
             // Nor do storage parameters, which change how the engine stores
             // and vacuums the rows, not the rows: none rewrites the table
             // (DEC-1441.1).
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetStorageParameters { .. }
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
             // A partition's own default changes what a row written to it
             // directly gets, as a column's does; dropping its own NOT NULL
             // relaxes it.
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull {
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull {
                 not_null: false, ..
-            } => {}
+            }) => {}
         }
         // A recorded conversion rewrites every stored value by an expression
         // nobody but its author has read, so the type pair's own class is not
         // the whole of it: at least the class that asks for a human, whichever
         // pair the expression bridges (DEC-2331.1).
-        if matches!(self, Change::AlterColumnType { using: Some(_), .. }) {
+        if matches!(
+            self,
+            Change::Column(ColumnChange::AlterColumnType { using: Some(_), .. })
+        ) {
             r.insert(RiskClass::Destructive);
         }
         r
@@ -3974,11 +4197,11 @@ mod tests {
     #[test]
     fn a_table_subject_matches_the_raw_policy_and_grouping_key() {
         let part = "a\nb\\c\u{200b}";
-        let change = super::Change::DropTable {
+        let change = super::Change::Table(super::TableChange::DropTable {
             uid: "t_aaaaaa".parse().unwrap(),
             name: crate::TableName::new("app", part),
             detach_from: None,
-        };
+        });
         assert_eq!(change.subject(), format!("app.{part}"));
         assert_ne!(change.subject(), r"app.a\nb\c\u{200b}");
     }
@@ -3989,20 +4212,22 @@ mod tests {
     #[test]
     fn a_rebuilt_indexs_parameter_change_is_dropped() {
         let t: TableName = "app.t".parse().unwrap();
-        let set = |target: IndexPart| Change::SetIndexStorageParameters {
-            table: t.clone(),
-            target,
-            method: IndexMethod::Btree,
-            set: [("fillfactor".to_owned(), "80".to_owned())].into(),
-            reset: BTreeSet::new(),
+        let set = |target: IndexPart| {
+            Change::Index(IndexChange::SetIndexStorageParameters {
+                table: t.clone(),
+                target,
+                method: IndexMethod::Btree,
+                set: [("fillfactor".to_owned(), "80".to_owned())].into(),
+                reset: BTreeSet::new(),
+            })
         };
         let mut changes = vec![
             set(IndexPart::Index("ix".into())),
-            Change::DropIndex {
+            Change::Index(IndexChange::DropIndex {
                 table: t.clone(),
                 name: "ix".into(),
-            },
-            Change::AddIndex {
+            }),
+            Change::Index(IndexChange::AddIndex {
                 table: t.clone(),
                 name: "ix".into(),
                 index: Box::new(Index {
@@ -4015,14 +4240,19 @@ mod tests {
                     filegroup: None,
                 }),
                 clustered: false,
-            },
+            }),
             set(IndexPart::Index("other".into())),
             set(IndexPart::PrimaryKey),
         ];
         drop_parameter_changes_of_rebuilt_indexes(&mut changes, |c| c);
         let left: Vec<&Change> = changes
             .iter()
-            .filter(|c| matches!(c, Change::SetIndexStorageParameters { .. }))
+            .filter(|c| {
+                matches!(
+                    c,
+                    Change::Index(IndexChange::SetIndexStorageParameters { .. })
+                )
+            })
             .collect();
         assert_eq!(
             left,
@@ -4032,6 +4262,14 @@ mod tests {
             ]
         );
     }
+    use super::ColumnChange;
+    use super::ConstraintChange;
+    use super::GrantChange;
+    use super::IndexChange;
+    use super::ModuleChange;
+    use super::RoleChange;
+    use super::TableChange;
+    use super::TypeValueChange;
     use super::*;
 
     /// `--allow` names a class and the gate explains it; a class that gained a
@@ -4054,16 +4292,16 @@ mod tests {
         let perms: BTreeSet<Permission> = [Permission::Select].into_iter().collect();
         let cs = ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::Grant {
+                PlannedChange::new(Change::Permission(GrantChange::Grant {
                     role: "r".into(),
                     target: target.clone(),
                     permissions: perms.clone(),
-                }),
-                PlannedChange::new(Change::Revoke {
+                })),
+                PlannedChange::new(Change::Permission(GrantChange::Revoke {
                     role: "r".into(),
                     target,
                     permissions: perms,
-                }),
+                })),
             ],
         };
         assert!(cs.risks().contains(&RiskClass::GrantWiden));
@@ -4080,19 +4318,19 @@ mod tests {
         );
         // And a role drop is a revocation on top of its tombstone.
         assert!(
-            Change::DropRole {
+            Change::Role(RoleChange::DropRole {
                 uid: uid("r_aaaaaa"),
                 name: "r".into(),
                 members: Vec::new(),
-            }
+            })
             .intrinsic_risks()
             .contains(&RiskClass::Revoke)
         );
         assert!(
-            Change::CreateRole {
+            Change::Role(RoleChange::CreateRole {
                 uid: uid("r_aaaaaa"),
                 name: "r".into()
-            }
+            })
             .intrinsic_risks()
             .is_empty()
         );
@@ -4110,7 +4348,7 @@ mod tests {
     }
 
     fn enum_retype(column: &ColumnRef, to: &str) -> Change {
-        Change::EnumRebuild {
+        Change::TypeValue(TypeValueChange::EnumRebuild {
             uid: uid("y_p3n8vd"),
             name: "app.mood".parse().unwrap(),
             tmp: "app.pbps_rebuild_y_p3n8vd".parse().unwrap(),
@@ -4121,44 +4359,44 @@ mod tests {
                 array: false,
                 values: Box::new(crate::ValueChange::Relabel { removed: vec![] }),
             },
-        }
+        })
     }
 
     fn drop_column() -> Change {
-        Change::DropColumn {
+        Change::Column(ColumnChange::DropColumn {
             uid: uid("c_k7x2mq"),
             column: col("dbo.customer.legacy_code"),
-        }
+        })
     }
 
     fn drop_unique() -> Change {
-        Change::DropUnique {
+        Change::Constraint(ConstraintChange::DropUnique {
             table: "dbo.customer".parse().unwrap(),
             name: "uq_customer_email".into(),
-        }
+        })
     }
 
     fn drop_foreign_key() -> Change {
-        Change::DropForeignKey {
+        Change::Constraint(ConstraintChange::DropForeignKey {
             table: "dbo.customer".parse().unwrap(),
             name: "fk_customer_account".into(),
-        }
+        })
     }
 
     fn drop_check() -> Change {
-        Change::DropCheck {
+        Change::Constraint(ConstraintChange::DropCheck {
             table: "dbo.customer".parse().unwrap(),
             name: "ck_customer_email".into(),
-        }
+        })
     }
 
     fn add_column() -> Change {
-        Change::AddColumn {
+        Change::Column(ColumnChange::AddColumn {
             uid: uid("c_p3n8vd"),
             table: "dbo.customer".parse().unwrap(),
             name: "mobile".into(),
             column: Box::new(Column::new(ty("nvarchar(20)"))),
-        }
+        })
     }
 
     #[test]
@@ -4216,12 +4454,14 @@ mod tests {
             }),
             ..Default::default()
         };
-        let create = |table: &Table, beside: bool| Change::CreateTable {
-            uid: "t_aaaaaa".parse().unwrap(),
-            name: "app.ev_1".parse().unwrap(),
-            table: Box::new(table.clone()),
-            beside_default: beside.then(|| "app.ev_rest".parse().unwrap()),
-            moves_at_most: None,
+        let create = |table: &Table, beside: bool| {
+            Change::Table(TableChange::CreateTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                name: "app.ev_1".parse().unwrap(),
+                table: Box::new(table.clone()),
+                beside_default: beside.then(|| "app.ev_rest".parse().unwrap()),
+                moves_at_most: None,
+            })
         };
         assert!(create(&partition, true).intrinsic_risks().is_empty());
         partition.checks.insert(
@@ -4260,13 +4500,15 @@ mod tests {
     /// to be distinguished.
     #[test]
     fn nullability_risk_is_directional() {
-        let make = |to_nullable| Change::AlterColumnNullability {
-            uid: uid("c_k7x2mq"),
-            column: col("dbo.customer.email"),
-            ty: ty("nvarchar(255)"),
-            to_nullable,
-            through_external_partitions: false,
-            collation: None,
+        let make = |to_nullable| {
+            Change::Column(ColumnChange::AlterColumnNullability {
+                uid: uid("c_k7x2mq"),
+                column: col("dbo.customer.email"),
+                ty: ty("nvarchar(255)"),
+                to_nullable,
+                through_external_partitions: false,
+                collation: None,
+            })
         };
         let (tighten, loosen) = (make(false), make(true));
         assert!(tighten.intrinsic_risks().contains(&RiskClass::NotNull));
@@ -4278,22 +4520,22 @@ mod tests {
     /// rewrites none and stays ungated.
     #[test]
     fn a_changed_generation_expression_is_gated_and_a_changed_default_is_not() {
-        let expression = Change::AlterColumnExpression {
+        let expression = Change::Column(ColumnChange::AlterColumnExpression {
             uid: uid("c_k7x2mq"),
             column: col("app.t.b"),
             from: "(a * 2)".to_owned(),
             to: "a * 3".to_owned(),
-        };
+        });
         assert_eq!(
             expression.intrinsic_risks(),
             BTreeSet::from([RiskClass::Narrowing])
         );
-        let default = Change::AlterColumnDefault {
+        let default = Change::Column(ColumnChange::AlterColumnDefault {
             uid: uid("c_k7x2mq"),
             column: col("app.t.b"),
             from: Some("2".to_owned()),
             to: Some("3".to_owned()),
-        };
+        });
         assert!(default.intrinsic_risks().is_empty());
     }
 
@@ -4301,7 +4543,7 @@ mod tests {
     /// on its own.
     #[test]
     fn type_change_risk_is_left_to_the_dialect() {
-        let c = Change::AlterColumnType {
+        let c = Change::Column(ColumnChange::AlterColumnType {
             uid: uid("c_k7x2mq"),
             column: col("dbo.customer.balance"),
             from: ty("bigint"),
@@ -4312,7 +4554,7 @@ mod tests {
             from_collation: None,
             to_collation: None,
             using: None,
-        };
+        });
         assert!(
             c.intrinsic_risks().is_empty(),
             "the model layer must not guess type risks"
@@ -4328,17 +4570,19 @@ mod tests {
     /// did, so no existing plan changes its checksum.
     #[test]
     fn a_recorded_conversion_is_sealed_in_the_change_and_asks_for_a_human() {
-        let make = |using: Option<&str>| Change::AlterColumnType {
-            uid: uid("c_k7x2mq"),
-            column: col("dbo.customer.balance"),
-            from: ty("varchar(10)"),
-            to: ty("varchar(20)"),
-            from_nullable: true,
-            to_nullable: true,
-            through_external_partitions: false,
-            from_collation: None,
-            to_collation: None,
-            using: using.map(str::to_owned),
+        let make = |using: Option<&str>| {
+            Change::Column(ColumnChange::AlterColumnType {
+                uid: uid("c_k7x2mq"),
+                column: col("dbo.customer.balance"),
+                from: ty("varchar(10)"),
+                to: ty("varchar(20)"),
+                from_nullable: true,
+                to_nullable: true,
+                through_external_partitions: false,
+                from_collation: None,
+                to_collation: None,
+                using: using.map(str::to_owned),
+            })
         };
         let widening = make(None);
         assert!(widening.intrinsic_risks().is_empty());
@@ -4364,17 +4608,19 @@ mod tests {
     /// risk that the separate change would have carried.
     #[test]
     fn a_type_change_that_tightens_nullability_is_a_not_null_risk() {
-        let make = |from_nullable, to_nullable| Change::AlterColumnType {
-            uid: uid("c_k7x2mq"),
-            column: col("dbo.customer.email"),
-            from: ty("nvarchar(50)"),
-            to: ty("nvarchar(100)"),
-            from_nullable,
-            to_nullable,
-            through_external_partitions: false,
-            from_collation: None,
-            to_collation: None,
-            using: None,
+        let make = |from_nullable, to_nullable| {
+            Change::Column(ColumnChange::AlterColumnType {
+                uid: uid("c_k7x2mq"),
+                column: col("dbo.customer.email"),
+                from: ty("nvarchar(50)"),
+                to: ty("nvarchar(100)"),
+                from_nullable,
+                to_nullable,
+                through_external_partitions: false,
+                from_collation: None,
+                to_collation: None,
+                using: None,
+            })
         };
         assert!(
             make(true, false)
@@ -4403,12 +4649,12 @@ mod tests {
                     crate::ValueSource::Default(text.into())
                 })
             };
-            Change::AddColumn {
+            Change::Column(ColumnChange::AddColumn {
                 uid: uid("c_k7x2mq"),
                 table: "dbo.customer".parse().unwrap(),
                 name: "score".into(),
                 column: Box::new(column),
-            }
+            })
         };
 
         assert_eq!(
@@ -4485,11 +4731,11 @@ mod tests {
         );
         assert_eq!(drop_column().subject(), "dbo.customer");
         // A role is a principal, not an object: no table, but a subject.
-        let grant = Change::Grant {
+        let grant = Change::Permission(GrantChange::Grant {
             role: "app_reader".into(),
             target: "dbo.customer".parse().unwrap(),
             permissions: BTreeSet::new(),
-        };
+        });
         assert_eq!(grant.table(), None);
         assert_eq!(grant.subject(), "role app_reader");
     }
@@ -4517,16 +4763,16 @@ mod tests {
     fn a_change_reports_the_family_its_kind_is_in() {
         assert_eq!(drop_column().family(), ChangeFamily::Columns);
         assert_eq!(add_column().family(), ChangeFamily::Columns);
-        let grant = Change::Grant {
+        let grant = Change::Permission(GrantChange::Grant {
             role: "app_reader".into(),
             target: "dbo.customer".parse().unwrap(),
             permissions: BTreeSet::new(),
-        };
+        });
         assert_eq!(grant.family(), ChangeFamily::Permissions);
-        let role = Change::CreateRole {
+        let role = Change::Role(RoleChange::CreateRole {
             uid: uid("r_aaaaaa"),
             name: "app_reader".into(),
-        };
+        });
         assert_eq!(role.family(), ChangeFamily::Roles);
     }
 
@@ -4535,15 +4781,15 @@ mod tests {
     /// objects (DEC-2790.1).
     #[test]
     fn a_change_is_in_no_family_but_its_own() {
-        let grant = Change::Grant {
+        let grant = Change::Permission(GrantChange::Grant {
             role: "app_reader".into(),
             target: "dbo.customer".parse().unwrap(),
             permissions: BTreeSet::new(),
-        };
-        let role = Change::CreateRole {
+        });
+        let role = Change::Role(RoleChange::CreateRole {
             uid: uid("r_aaaaaa"),
             name: "app_reader".into(),
-        };
+        });
         assert_ne!(drop_column().family(), ChangeFamily::Tables);
         assert_ne!(grant.family(), ChangeFamily::Roles);
         assert!(is_about_a_column(&drop_column()));
@@ -4570,18 +4816,18 @@ mod tests {
     /// failed CREATE OR ALTER rolls back with the plan.
     #[test]
     fn only_dropping_a_module_is_risky() {
-        let create = Change::CreateModule {
+        let create = Change::Module(ModuleChange::CreateModule {
             id: "dbo.active_customer".parse().unwrap(),
             module: Box::new(a_view()),
-        };
-        let alter = Change::AlterModule {
+        });
+        let alter = Change::Module(ModuleChange::AlterModule {
             id: "dbo.active_customer".parse().unwrap(),
             module: Box::new(a_view()),
-        };
-        let drop = Change::DropModule {
+        });
+        let drop = Change::Module(ModuleChange::DropModule {
             id: "dbo.active_customer".parse().unwrap(),
             kind: crate::module::ModuleKind::View,
-        };
+        });
         assert!(create.intrinsic_risks().is_empty());
         assert!(alter.intrinsic_risks().is_empty());
         assert_eq!(
@@ -4598,24 +4844,26 @@ mod tests {
     /// no reviewer's gated-risk list, and failed at the engine mid-apply.
     #[test]
     fn only_a_unique_index_is_gated_like_the_constraint_it_is() {
-        let index = |unique: bool| Change::AddIndex {
-            table: "dbo.customer".parse().unwrap(),
-            name: "ix_customer_email".into(),
-            index: Box::new(crate::schema::Index {
-                columns: vec![crate::schema::IndexColumn {
-                    key: crate::IndexKey::Column("email".into()),
-                    descending: false,
-                    opclass: None,
-                    collation: None,
-                }],
-                include: Vec::new(),
-                unique,
-                filter: None,
-                method: Default::default(),
-                storage_parameters: Default::default(),
-                filegroup: None,
-            }),
-            clustered: false,
+        let index = |unique: bool| {
+            Change::Index(IndexChange::AddIndex {
+                table: "dbo.customer".parse().unwrap(),
+                name: "ix_customer_email".into(),
+                index: Box::new(crate::schema::Index {
+                    columns: vec![crate::schema::IndexColumn {
+                        key: crate::IndexKey::Column("email".into()),
+                        descending: false,
+                        opclass: None,
+                        collation: None,
+                    }],
+                    include: Vec::new(),
+                    unique,
+                    filter: None,
+                    method: Default::default(),
+                    storage_parameters: Default::default(),
+                    filegroup: None,
+                }),
+                clustered: false,
+            })
         };
         assert_eq!(
             index(true).intrinsic_risks(),
@@ -4645,28 +4893,28 @@ mod tests {
         ] {
             let raw = id.raw().to_string();
             let shown = id.shown().to_string();
-            let created = Change::CreateModule {
+            let created = Change::Module(ModuleChange::CreateModule {
                 id: id.clone(),
                 module: Box::new(a_view()),
-            };
-            let altered = Change::AlterModule {
+            });
+            let altered = Change::Module(ModuleChange::AlterModule {
                 id: id.clone(),
                 module: Box::new(a_view()),
-            };
-            let dropped = Change::DropModule {
+            });
+            let dropped = Change::Module(ModuleChange::DropModule {
                 id,
                 kind: crate::ModuleKind::View,
-            };
+            });
             for change in [created, altered, dropped] {
                 assert_eq!(change.subject(), raw);
                 assert_ne!(change.subject(), shown);
             }
         }
-        let change = Change::PublicExecution {
+        let change = Change::Permission(GrantChange::PublicExecution {
             routine: routine.clone(),
             access: crate::PublicAccess::Revoked,
             origin: RoutineOrigin::Created,
-        };
+        });
         assert_eq!(change.subject(), routine.raw().to_string());
         assert_eq!(
             change.subject(),
@@ -4677,10 +4925,10 @@ mod tests {
 
     #[test]
     fn a_module_change_reports_its_own_identity_and_no_table() {
-        let c = Change::CreateModule {
+        let c = Change::Module(ModuleChange::CreateModule {
             id: "dbo.active_customer".parse().unwrap(),
             module: Box::new(a_view()),
-        };
+        });
         assert!(c.table().is_none());
         assert_eq!(
             c.module_id().map(|id| id.raw().to_string()).as_deref(),
@@ -4692,16 +4940,16 @@ mod tests {
 
         // A trigger is named for its table, and a routine carries its
         // signature into every label a plan shows.
-        let trigger = Change::DropModule {
+        let trigger = Change::Module(ModuleChange::DropModule {
             id: "app.orders.audit".parse().unwrap(),
             kind: crate::module::ModuleKind::Trigger,
-        };
+        });
         assert_eq!(trigger.object().unwrap().raw().to_string(), "app.audit");
         assert_eq!(trigger.subject(), "app.orders.audit");
-        let routine = Change::DropModule {
+        let routine = Change::Module(ModuleChange::DropModule {
             id: "app.f(integer,text)".parse().unwrap(),
             kind: crate::module::ModuleKind::Function,
-        };
+        });
         assert_eq!(routine.object().unwrap().raw().to_string(), "app.f");
         assert_eq!(routine.subject(), "app.f(integer,text)");
     }
@@ -4739,12 +4987,12 @@ mod tests {
                 over: None,
             },
         ] {
-            let change = Change::EnumRebuild {
+            let change = Change::TypeValue(TypeValueChange::EnumRebuild {
                 uid: uid("y_p3n8vd"),
                 name: "app.mood".parse().unwrap(),
                 tmp: "app.pbps_rebuild_y_p3n8vd".parse().unwrap(),
                 step,
-            };
+            });
             assert!(change.columns_promised().is_empty());
         }
     }
@@ -4761,7 +5009,7 @@ mod tests {
             .column("mobile");
         let changes = [
             add_column(),
-            Change::AlterColumnType {
+            Change::Column(ColumnChange::AlterColumnType {
                 uid: uid("c_p3n8vd"),
                 column: column.clone(),
                 from: ty("int"),
@@ -4772,26 +5020,26 @@ mod tests {
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            },
-            Change::AlterColumnNullability {
+            }),
+            Change::Column(ColumnChange::AlterColumnNullability {
                 uid: uid("c_p3n8vd"),
                 column: column.clone(),
                 ty: ty("int"),
                 to_nullable: true,
                 through_external_partitions: false,
                 collation: None,
-            },
-            Change::AlterColumnDefault {
+            }),
+            Change::Column(ColumnChange::AlterColumnDefault {
                 uid: uid("c_p3n8vd"),
                 column: column.clone(),
                 from: None,
                 to: Some("0".into()),
-            },
-            Change::SetColumnDeprecated {
+            }),
+            Change::Column(ColumnChange::SetColumnDeprecated {
                 uid: uid("c_p3n8vd"),
                 column: column.clone(),
                 reason: None,
-            },
+            }),
             enum_retype(&column, "app.mood"),
         ];
         for change in &changes {
@@ -4819,13 +5067,13 @@ mod tests {
         // And the other way: a rename and a drop leave nothing to promise.
         assert!(drop_column().columns_promised().is_empty());
         assert!(
-            Change::RenameColumn {
+            Change::Column(ColumnChange::RenameColumn {
                 uid: uid("c_p3n8vd"),
                 table: "dbo.customer".parse().unwrap(),
                 from: "mobile".into(),
                 to: "phone".into(),
                 table_was: None,
-            }
+            })
             .columns_promised()
             .is_empty()
         );
@@ -4842,11 +5090,13 @@ mod tests {
             (PublicAccess::Kept, "kept"),
         ] {
             let cs = ChangeSet {
-                changes: vec![PlannedChange::new(Change::PublicExecution {
-                    routine: "app.f(integer,text)".parse().unwrap(),
-                    access,
-                    origin: RoutineOrigin::Rebuilt,
-                })],
+                changes: vec![PlannedChange::new(Change::Permission(
+                    GrantChange::PublicExecution {
+                        routine: "app.f(integer,text)".parse().unwrap(),
+                        access,
+                        origin: RoutineOrigin::Rebuilt,
+                    },
+                ))],
             };
             let json = serde_json::to_string(&cs).unwrap();
             assert!(json.contains(r#""op":"public_execution""#), "{json}");
@@ -4872,11 +5122,11 @@ mod tests {
     #[test]
     fn keeping_public_execution_widens_and_closing_a_fresh_routine_risks_nothing() {
         let risks = |access, origin| {
-            Change::PublicExecution {
+            Change::Permission(GrantChange::PublicExecution {
                 routine: "app.f()".parse().unwrap(),
                 access,
                 origin,
-            }
+            })
             .intrinsic_risks()
         };
         assert!(
@@ -4899,17 +5149,19 @@ mod tests {
     #[test]
     fn module_changes_round_trip_through_json() {
         let cs = ChangeSet {
-            changes: vec![PlannedChange::new(Change::CreateModule {
-                id: "dbo.active_customer".parse().unwrap(),
-                module: Box::new(a_view()),
-            })],
+            changes: vec![PlannedChange::new(Change::Module(
+                ModuleChange::CreateModule {
+                    id: "dbo.active_customer".parse().unwrap(),
+                    module: Box::new(a_view()),
+                },
+            ))],
         };
         let back: ChangeSet = serde_json::from_str(&serde_json::to_string(&cs).unwrap()).unwrap();
         assert_eq!(cs, back);
     }
 }
 
-/// Why a [`Change::DeleteRow`] is in the plan (ADR-0004).
+/// Why a [`RowChange::DeleteRow`] is in the plan (ADR-0004).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum DeleteCause {

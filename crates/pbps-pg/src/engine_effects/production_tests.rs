@@ -3,6 +3,10 @@
 use super::*;
 use crate::Postgres;
 use pbps_diff::order::{Baseline, Checks, Schedule, analyse, graph};
+use pbps_model::ColumnChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
 use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
 use pbps_model::plan_names::PlanNames;
 use pbps_model::{
@@ -108,7 +112,7 @@ fn bound() -> PartitionBound {
     }
 }
 fn attach(s: &Scene) -> Change {
-    Change::AttachPartition {
+    Change::Partition(PartitionChange::AttachPartition {
         uid: "t_bbbbbb".parse().unwrap(),
         table: "app.a".parse().unwrap(),
         parent: s.after.tables[&"app.a".parse::<TableName>().unwrap()]
@@ -120,7 +124,7 @@ fn attach(s: &Scene) -> Change {
         bound: bound(),
         key: Default::default(),
         shape: Box::new(s.after.tables[&"app.a".parse::<TableName>().unwrap()].clone()),
-    }
+    })
 }
 fn read(s: &Scene, steps: Vec<Change>) -> (Vec<usize>, pbps_diff::order::Graph) {
     read_input(s, steps, None)
@@ -266,16 +270,16 @@ fn a_rebuilt_routines_binding_is_final_on_the_restored_parent_default() {
     );
     let pg = Postgres::new().with_server_version(180000);
     let steps = vec![
-        PlannedChange::new(Change::AlterModule {
+        PlannedChange::new(Change::Module(ModuleChange::AlterModule {
             id: id.clone(),
             module: Box::new(rebuilt),
-        }),
-        PlannedChange::new(Change::AlterColumnDefault {
+        })),
+        PlannedChange::new(Change::Column(ColumnChange::AlterColumnDefault {
             uid: "c_bbbbbb".parse().unwrap(),
             column: "app.p.d".parse().unwrap(),
             from: None,
             to: Some("app.f(1)".into()),
-        }),
+        })),
         PlannedChange::new(attach(&s)),
     ];
     let ops = Operations::of_plan(&steps, ModuleEdits::Rebuilt);
@@ -352,12 +356,12 @@ fn unrelated_membership_trees_do_not_enter_an_active_familys_facts() {
         ids.tables.insert("t_dddddd".parse().unwrap(), c.clone());
     }
     let steps: Vec<_> = vec![
-        Change::AlterColumnDefault {
+        Change::Column(ColumnChange::AlterColumnDefault {
             uid: "c_bbbbbb".parse().unwrap(),
             column: "app.p.d".parse().unwrap(),
             from: Some("1".into()),
             to: Some("7".into()),
-        },
+        }),
         attach(&s),
     ]
     .into_iter()
@@ -407,7 +411,7 @@ fn a_detached_default_restores_the_transferred_property() {
     goal.value_source = old.value_source;
     goal.ty = "bigint".parse().unwrap();
     let steps = vec![
-        Change::AlterColumnType {
+        Change::Column(ColumnChange::AlterColumnType {
             uid: "c_bbbbbb".parse().unwrap(),
             column: p.column("d"),
             from: "integer".parse().unwrap(),
@@ -418,20 +422,20 @@ fn a_detached_default_restores_the_transferred_property() {
             to_nullable: true,
             through_external_partitions: false,
             using: None,
-        },
-        Change::DetachPartition {
+        }),
+        Change::Partition(PartitionChange::DetachPartition {
             uid: "t_bbbbbb".parse().unwrap(),
             table: a.clone(),
             parent: p,
             shape: Box::new(s.after.tables[&a].clone()),
             names: Default::default(),
-        },
-        Change::AlterColumnDefault {
+        }),
+        Change::Column(ColumnChange::AlterColumnDefault {
             uid: "c_dddddd".parse().unwrap(),
             column: a.column("d"),
             from: Some("9".into()),
             to: Some("9".into()),
-        },
+        }),
     ];
     let (_, graph) = read(&s, steps);
     assert!(graph.edges.iter().any(|e| e.before == 1 && e.after == 2));
@@ -503,19 +507,19 @@ fn a_partition_restoration_never_invents_a_goal_or_its_bindings() {
     use pbps_model::operation::symbolic::Clause;
     let s = scene(false);
     let mut steps = vec![
-        Change::AlterColumnDefault {
+        Change::Column(ColumnChange::AlterColumnDefault {
             uid: "c_bbbbbb".parse().unwrap(),
             column: "app.p.d".parse().unwrap(),
             from: Some("1".into()),
             to: Some("7".into()),
-        },
+        }),
         attach(&s),
-        Change::SetPartitionNotNull {
+        Change::Partition(PartitionChange::SetPartitionNotNull {
             uid: "t_bbbbbb".parse().unwrap(),
             table: "app.a".parse().unwrap(),
             column: "d".into(),
             not_null: true,
-        },
+        }),
     ];
     let inspect = |steps: Vec<Change>| {
         let steps: Vec<_> = steps.into_iter().map(PlannedChange::new).collect();
@@ -540,7 +544,7 @@ fn a_partition_restoration_never_invents_a_goal_or_its_bindings() {
         .symbolic
     };
     assert!(inspect(steps.clone()).iter().any(|c| matches!(c, Clause::Require(Fact::Unsupported { reason, .. }) if reason.contains("disagrees"))));
-    steps[2] = Change::SetPartitionDefault {
+    steps[2] = Change::Partition(PartitionChange::SetPartitionDefault {
         uid: "t_bbbbbb".parse().unwrap(),
         table: "app.a".parse().unwrap(),
         parent: "app.p".parse().unwrap(),
@@ -548,7 +552,7 @@ fn a_partition_restoration_never_invents_a_goal_or_its_bindings() {
         from: Some("9".into()),
         to: Some("app.f(3)".into()),
         fallback: None,
-    };
+    });
     assert!(
         inspect(steps)
             .iter()
@@ -566,19 +570,19 @@ fn a_new_parent_keeps_its_existing_birth_and_attachment_contract() {
     let mut birth = s.after.tables[&p].clone();
     let column = birth.columns.shift_remove("d").unwrap();
     let steps = vec![
-        Change::CreateTable {
+        Change::Table(TableChange::CreateTable {
             uid: "t_aaaaaa".parse().unwrap(),
             name: p.clone(),
             table: Box::new(birth),
             beside_default: None,
             moves_at_most: None,
-        },
-        Change::AddColumn {
+        }),
+        Change::Column(ColumnChange::AddColumn {
             uid: "c_bbbbbb".parse().unwrap(),
             table: p,
             name: "d".into(),
             column: Box::new(column),
-        },
+        }),
         attach(&s),
     ];
     let planned: Vec<_> = steps.into_iter().map(PlannedChange::new).collect();
@@ -665,25 +669,25 @@ fn ordinary_analysis_does_not_invent_membership_catalog_reads() {
         .columns
         .clear();
     let steps = vec![
-        Change::AlterColumnDefault {
+        Change::Column(ColumnChange::AlterColumnDefault {
             uid: "c_dddddd".parse().unwrap(),
             column: child.column("d"),
             from: None,
             to: None,
-        },
-        Change::AlterColumnDefault {
+        }),
+        Change::Column(ColumnChange::AlterColumnDefault {
             uid: "c_bbbbbb".parse().unwrap(),
             column: parent.column("d"),
             from: Some("app.f(1)".into()),
             to: None,
-        },
-        Change::AlterColumnDefault {
+        }),
+        Change::Column(ColumnChange::AlterColumnDefault {
             uid: "c_bbbbbb".parse().unwrap(),
             column: parent.column("d"),
             from: None,
             to: Some("app.f(1)".into()),
-        },
-        Change::SetPartitionDefault {
+        }),
+        Change::Partition(PartitionChange::SetPartitionDefault {
             uid: "t_bbbbbb".parse().unwrap(),
             table: child,
             parent: parent.clone(),
@@ -691,7 +695,7 @@ fn ordinary_analysis_does_not_invent_membership_catalog_reads() {
             from: None,
             to: None,
             fallback: Some("app.f(1)".into()),
-        },
+        }),
         attach(&s),
     ];
     let planned: Vec<_> = steps.into_iter().map(PlannedChange::new).collect();

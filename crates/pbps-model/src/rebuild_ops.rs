@@ -223,24 +223,30 @@ impl BuildPartitionedIndex {
         let table = self.parent.name.clone();
         let name = self.name.clone();
         match &self.definition {
-            PartitionIndexDefinition::Index(index) => crate::Change::AddIndex {
-                table,
-                name,
-                index: Box::new(index.clone()),
-                clustered: false,
-            },
-            PartitionIndexDefinition::PrimaryKey(key) => crate::Change::SetPrimaryKey {
-                table,
-                from: None,
-                to: Some(key.clone()),
-                nonclustered: false,
-            },
-            PartitionIndexDefinition::Unique(key) => crate::Change::AddUnique {
-                table,
-                name,
-                constraint: key.clone(),
-                clustered: false,
-            },
+            PartitionIndexDefinition::Index(index) => {
+                crate::Change::Index(crate::IndexChange::AddIndex {
+                    table,
+                    name,
+                    index: Box::new(index.clone()),
+                    clustered: false,
+                })
+            }
+            PartitionIndexDefinition::PrimaryKey(key) => {
+                crate::Change::Constraint(crate::ConstraintChange::SetPrimaryKey {
+                    table,
+                    from: None,
+                    to: Some(key.clone()),
+                    nonclustered: false,
+                })
+            }
+            PartitionIndexDefinition::Unique(key) => {
+                crate::Change::Constraint(crate::ConstraintChange::AddUnique {
+                    table,
+                    name,
+                    constraint: key.clone(),
+                    clustered: false,
+                })
+            }
         }
     }
 

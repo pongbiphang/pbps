@@ -2,6 +2,11 @@
 mod fixture;
 use fixture::*;
 use pbps_dialect::Dialect;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::ModuleChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
 use pbps_model::{Change, object_ref::ObjectDeps};
 
 fn pin<E: Dialect>(engine: E) {
@@ -14,7 +19,7 @@ fn pin<E: Dialect>(engine: E) {
             .changes()
             .changes
             .iter()
-            .position(|p| matches!(&p.change, Change::CreateModule { .. }))
+            .position(|p| matches!(&p.change, Change::Module(ModuleChange::CreateModule { .. })))
             .unwrap();
         let edges = plan.annotation_edges().unwrap();
         assert!(
@@ -103,14 +108,19 @@ fn pg16_names_the_placeholder_limit_and_pg18_exposes_only_the_final_generation()
     assert!(error.contains("SET EXPRESSION"), "{error}");
     let plan = f.compile(&new).unwrap();
     let changes = &plan.changes().changes;
-    let column=changes.iter().position(|p|matches!(p.change,Change::CreateTable { ref name, .. } if *name=="app.t".parse().unwrap())).unwrap();
+    let column=changes.iter().position(|p|matches!(p.change,Change::Table(TableChange::CreateTable { ref name, .. }) if *name=="app.t".parse().unwrap())).unwrap();
     let provider = changes
         .iter()
-        .position(|p| matches!(p.change, Change::CreateModule { .. }))
+        .position(|p| matches!(p.change, Change::Module(ModuleChange::CreateModule { .. })))
         .unwrap();
     let generation = changes
         .iter()
-        .position(|p| matches!(p.change, Change::AlterColumnExpression { .. }))
+        .position(|p| {
+            matches!(
+                p.change,
+                Change::Column(ColumnChange::AlterColumnExpression { .. })
+            )
+        })
         .unwrap();
     assert!(column < provider && provider < generation);
 }
@@ -138,13 +148,11 @@ fn standing_add_column_defaults_and_the_first_mssql_column_keep_legal_groups() {
                 .changes()
                 .clone()
         };
-        assert!(changes.changes.iter().any(|p|matches!(&p.change, Change::AddColumn { column, .. } if matches!(column.value_source, pbps_model::ValueSource::Default(_)))));
-        assert!(
-            !changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, Change::AlterColumnDefault { .. }))
-        );
+        assert!(changes.changes.iter().any(|p|matches!(&p.change, Change::Column(ColumnChange::AddColumn { column, .. }) if matches!(column.value_source, pbps_model::ValueSource::Default(_)))));
+        assert!(!changes.changes.iter().any(|p| matches!(
+            p.change,
+            Change::Column(ColumnChange::AlterColumnDefault { .. })
+        )));
     }
     let mut f = Fixture::new("column", "mssql");
     f.deps = ObjectDeps(vec![(
@@ -190,12 +198,12 @@ fn a_demanded_column_moves_its_entire_suffix_in_declaration_order() {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::AddColumn { table, name, .. }
+                Change::Column(ColumnChange::AddColumn { table, name, .. })
                     if table.schema == "app" && table.name == "t" =>
                 {
                     Some(name.raw())
                 }
-                Change::AddComputedColumn { table, name, .. }
+                Change::Column(ColumnChange::AddComputedColumn { table, name, .. })
                     if table.schema == "app" && table.name == "t" =>
                 {
                     Some(name.raw())
@@ -235,14 +243,14 @@ fn a_primary_key_waits_for_its_demanded_not_null_facet() {
             .position(|p| {
                 matches!(
                     p.change,
-                    Change::AlterColumnNullability {
+                    Change::Column(ColumnChange::AlterColumnNullability {
                         to_nullable: false,
                         ..
-                    }
+                    })
                 )
             })
             .unwrap();
-        let key=plan.changes().changes.iter().position(|p|matches!(p.change,Change::SetPrimaryKey{ref table,..} if table.schema=="app" && table.name=="t")).unwrap();
+        let key=plan.changes().changes.iter().position(|p|matches!(p.change,Change::Constraint(ConstraintChange::SetPrimaryKey{ref table,..}) if table.schema=="app" && table.name=="t")).unwrap();
         assert!(nn < key);
         f.deps.0[1].1 = ["primary_key::app.t".parse().unwrap()].into();
         assert!(f.compile(&engine).is_err());
@@ -263,17 +271,17 @@ fn demanded_not_null_keeps_creation_risk_only_before_the_first_write() {
             .position(|p| {
                 matches!(
                     p.change,
-                    Change::AlterColumnNullability {
+                    Change::Column(ColumnChange::AlterColumnNullability {
                         to_nullable: false,
                         ..
-                    }
+                    })
                 )
             })
             .unwrap();
         let risks = pbps_diff::order::generated::risks(&changes, &f.ids, &engine);
         assert!(!risks[nn].contains(&pbps_model::RiskClass::NotNull));
         assert_eq!(changes.changes[nn].risks, risks[nn]);
-        let write = pbps_model::PlannedChange::new(Change::InsertRow {
+        let write = pbps_model::PlannedChange::new(Change::Row(RowChange::InsertRow {
             table: "app.t".parse().unwrap(),
             key_column: "anchor".into(),
             identity_key: false,
@@ -281,18 +289,23 @@ fn demanded_not_null_keeps_creation_risk_only_before_the_first_write() {
             row: Default::default(),
             defaults: Default::default(),
             types: Default::default(),
-        });
+        }));
         changes.changes.insert(nn, write);
         assert!(
             pbps_diff::order::generated::risks(&changes, &f.ids, &engine)[nn + 1]
                 .contains(&pbps_model::RiskClass::NotNull)
         );
         let mut standing = plan.changes().clone();
-        standing.changes.retain(|p|!matches!(&p.change,Change::CreateTable{name,..} if name.schema=="app" && name.name=="t"));
+        standing.changes.retain(|p|!matches!(&p.change,Change::Table(TableChange::CreateTable{name,..}) if name.schema=="app" && name.name=="t"));
         let nn = standing
             .changes
             .iter()
-            .position(|p| matches!(p.change, Change::AlterColumnNullability { .. }))
+            .position(|p| {
+                matches!(
+                    p.change,
+                    Change::Column(ColumnChange::AlterColumnNullability { .. })
+                )
+            })
             .unwrap();
         assert!(
             pbps_diff::order::generated::risks(&standing, &f.ids, &engine)[nn]
@@ -309,12 +322,10 @@ fn hard_column_prerequisites_do_not_depend_on_module_text() {
     f.deps.0[1].1 = ["column::app.t.g".parse().unwrap()].into();
     let pg = pbps_pg::Postgres::new().with_server_version(180006);
     let plan = f.compile(&pg).unwrap();
-    assert!(
-        plan.changes()
-            .changes
-            .iter()
-            .any(|p| matches!(p.change, Change::AlterColumnExpression { .. }))
-    );
+    assert!(plan.changes().changes.iter().any(|p| matches!(
+        p.change,
+        Change::Column(ColumnChange::AlterColumnExpression { .. })
+    )));
     let old = f
         .compile(&pbps_pg::Postgres::new().with_server_version(160015))
         .unwrap_err();
@@ -369,15 +380,12 @@ fn an_inline_generation_provider_in_the_prefix_needs_no_set_expression() {
     let plan = f
         .compile(&pbps_pg::Postgres::new().with_server_version(160015))
         .unwrap();
-    assert!(
-        !plan
-            .changes()
-            .changes
-            .iter()
-            .any(|p| matches!(p.change, Change::AlterColumnExpression { .. }))
-    );
+    assert!(!plan.changes().changes.iter().any(|p| matches!(
+        p.change,
+        Change::Column(ColumnChange::AlterColumnExpression { .. })
+    )));
     assert!(plan.changes().changes.iter().any(
-        |p| matches!(&p.change,Change::CreateTable{table,..} if table.columns.contains_key("h"))
+        |p| matches!(&p.change,Change::Table(TableChange::CreateTable{table,..}) if table.columns.contains_key("h"))
     ));
     let table = f.schema.tables.get_mut(&"app.t".parse().unwrap()).unwrap();
     let h = table.columns.shift_remove("h").unwrap();
@@ -432,14 +440,16 @@ fn empty_demand_keeps_each_module_transition_in_complete_shape_analysis() {
     let mut changes = input.changes().clone();
     changes
         .changes
-        .push(pbps_model::PlannedChange::new(Change::AlterModule {
-            id: "app.f".parse().unwrap(),
-            module: Box::new(final_module),
-        }));
+        .push(pbps_model::PlannedChange::new(Change::Module(
+            ModuleChange::AlterModule {
+                id: "app.f".parse().unwrap(),
+                module: Box::new(final_module),
+            },
+        )));
     let create = changes
         .changes
         .iter()
-        .find(|p| matches!(&p.change,Change::CreateTable{name,..} if name.name=="t"))
+        .find(|p| matches!(&p.change,Change::Table(TableChange::CreateTable{name,..}) if name.name=="t"))
         .unwrap();
     assert!(
         pbps_diff::order::generated::parts(
@@ -461,12 +471,10 @@ fn generation_can_depend_directly_on_its_column_existence() {
     let plan = f
         .compile(&pbps_pg::Postgres::new().with_server_version(180006))
         .unwrap();
-    assert!(
-        plan.changes()
-            .changes
-            .iter()
-            .any(|p| matches!(p.change, Change::AlterColumnExpression { .. }))
-    );
+    assert!(plan.changes().changes.iter().any(|p| matches!(
+        p.change,
+        Change::Column(ColumnChange::AlterColumnExpression { .. })
+    )));
     let error = f
         .compile(&pbps_pg::Postgres::new().with_server_version(160015))
         .unwrap_err();

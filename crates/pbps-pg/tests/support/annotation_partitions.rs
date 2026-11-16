@@ -1,5 +1,7 @@
 //! Shared library input for the partition-default annotation regression.
 use pbps_diff::order::{PlanningPlan, generated, propose};
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
 use pbps_model::object_ref::ObjectDeps;
 use pbps_model::operation::Snapshot;
 use pbps_model::{
@@ -123,20 +125,20 @@ impl Scene {
         let mut changes: Vec<_> = tables
             .into_iter()
             .map(|name| {
-                PlannedChange::new(Change::CreateTable {
+                PlannedChange::new(Change::Table(TableChange::CreateTable {
                     uid: ids.table_uid(&name).unwrap().clone(),
                     table: Box::new(schema.tables[&name].clone()),
                     name,
                     beside_default: None,
                     moves_at_most: None,
-                })
+                }))
             })
             .collect();
         changes.extend(schema.modules.iter().map(|(id, module)| {
-            PlannedChange::new(Change::CreateModule {
+            PlannedChange::new(Change::Module(ModuleChange::CreateModule {
                 id: id.clone(),
                 module: Box::new(module.clone()),
-            })
+            }))
         }));
         let annotations = ObjectDeps(
             [
@@ -169,7 +171,8 @@ impl Scene {
             .columns["x"]
             .value_source = pbps_model::ValueSource::Default("1".into());
         for planned in &mut self.changes.changes {
-            if let Change::CreateTable { name, table, .. } = &mut planned.change {
+            if let Change::Table(TableChange::CreateTable { name, table, .. }) = &mut planned.change
+            {
                 **table = self.schema.tables[name].clone();
             }
         }
@@ -183,7 +186,7 @@ impl Scene {
         self.base.tables.retain(|_, name| name != &self.child);
         self.changes.changes.retain(|p| {
             !matches!(&p.change,
-            Change::CreateTable { name, .. } if name != &self.child)
+            Change::Table(TableChange::CreateTable { name, .. }) if name != &self.child)
         });
         self
     }

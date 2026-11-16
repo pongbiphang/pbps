@@ -1,4 +1,11 @@
 use super::*;
+use crate::ConstraintChange;
+use crate::GrantChange;
+use crate::IndexChange;
+use crate::ModuleChange;
+use crate::PartitionChange;
+use crate::RowChange;
+use crate::TableChange;
 use crate::{CheckConstraint, Column, Index, IndexColumn, IndexKey, Module, ModuleKind, Table};
 use crate::{UidKind, ValueSource};
 
@@ -31,27 +38,27 @@ fn ids(tables: &[(&Uid, TableName)], columns: &[(&Uid, ColumnRef)]) -> IdsFile {
     }
 }
 fn rename(uid: &Uid, from: TableName, to: TableName) -> PlannedChange {
-    p(Change::RenameTable {
+    p(Change::Table(TableChange::RenameTable {
         uid: uid.clone(),
         from,
         to,
         defaults: vec![],
-    })
+    }))
 }
 fn drop_check(on: TableName) -> Change {
-    Change::DropCheck {
+    Change::Constraint(ConstraintChange::DropCheck {
         table: on,
         name: "k".into(),
-    }
+    })
 }
 fn add_check(on: TableName) -> Change {
-    Change::AddCheck {
+    Change::Constraint(ConstraintChange::AddCheck {
         table: on,
         name: "k".into(),
         constraint: CheckConstraint {
             expression: "id > 0".into(),
         },
-    }
+    })
 }
 fn check_of(owner: &Uid) -> ObjectKey {
     ObjectKey::Part {
@@ -187,32 +194,32 @@ fn keyless_objects_are_keyed_by_their_owner_and_name() {
     let (id, module) = function();
     let keyless = [
         add_check(t("t")),
-        Change::DropIndex {
+        Change::Index(IndexChange::DropIndex {
             table: t("t"),
             name: "ix".into(),
-        },
-        Change::DropUnique {
+        }),
+        Change::Constraint(ConstraintChange::DropUnique {
             table: t("t"),
             name: "uq".into(),
-        },
-        Change::DropForeignKey {
+        }),
+        Change::Constraint(ConstraintChange::DropForeignKey {
             table: t("t"),
             name: "fk".into(),
-        },
-        Change::SetPrimaryKey {
+        }),
+        Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: t("t"),
             from: None,
             to: None,
             nonclustered: false,
-        },
-        Change::SetIndexStorageParameters {
+        }),
+        Change::Index(IndexChange::SetIndexStorageParameters {
             table: t("t"),
             target: IndexPart::Index("ix".into()),
             method: Default::default(),
             set: Default::default(),
             reset: Default::default(),
-        },
-        Change::DeleteRow {
+        }),
+        Change::Row(RowChange::DeleteRow {
             table: t("t"),
             key_column: "id".into(),
             key: RowKey("1".into()),
@@ -222,25 +229,25 @@ fn keyless_objects_are_keyed_by_their_owner_and_name() {
             types: Default::default(),
             after_types: Default::default(),
             key_type: None,
-        },
-        Change::CreateModule {
+        }),
+        Change::Module(ModuleChange::CreateModule {
             id: id.clone(),
             module: Box::new(module),
-        },
-        Change::Grant {
+        }),
+        Change::Permission(GrantChange::Grant {
             role: "reader".into(),
             target: GrantTarget::Object(t("t")),
             permissions: Default::default(),
-        },
-        Change::PublicExecution {
+        }),
+        Change::Permission(GrantChange::PublicExecution {
             routine: match &id {
                 ModuleId::Routine(r) => r.clone(),
                 ModuleId::Named(_) | ModuleId::Trigger { .. } => unreachable!(),
             },
             access: crate::PublicAccess::Revoked,
             origin: crate::RoutineOrigin::Created,
-        },
-        Change::SetPartitionDefault {
+        }),
+        Change::Partition(PartitionChange::SetPartitionDefault {
             uid: owner.clone(),
             table: t("t"),
             parent: t("parent"),
@@ -248,7 +255,7 @@ fn keyless_objects_are_keyed_by_their_owner_and_name() {
             from: None,
             to: Some("1".into()),
             fallback: None,
-        },
+        }),
     ];
     let logical: Vec<PlannedChange> = keyless.iter().cloned().map(p).collect();
     let owners = PlanOwners::new(PlanNames::of(&logical, &base).unwrap(), &base, &base);
@@ -284,11 +291,11 @@ fn keyless_objects_are_keyed_by_their_owner_and_name() {
     // `PUBLIC`: a declared role of that name is another key.
     let public = ops.as_slice()[9].key(&owners).unwrap();
     let named_public = Operations::of_plan(
-        &[p(Change::Grant {
+        &[p(Change::Permission(GrantChange::Grant {
             role: "PUBLIC".into(),
             target: public_target(&public),
             permissions: Default::default(),
-        })],
+        }))],
         ModuleEdits::InPlace,
     );
     assert_ne!(
@@ -387,13 +394,13 @@ fn a_step_defines_only_what_its_own_payload_holds() {
     bare.indexes.clear();
     bare.columns.get_mut("id").unwrap().value_source = ValueSource::None;
     let create = |table: Table| {
-        p(Change::CreateTable {
+        p(Change::Table(TableChange::CreateTable {
             uid: owner.clone(),
             name: t("t"),
             table: Box::new(table),
             beside_default: None,
             moves_at_most: None,
-        })
+        }))
     };
     let defined_against = |logical: &[PlannedChange], after: &IdsFile| {
         let owners = PlanOwners::new(PlanNames::of(logical, after).unwrap(), after, after);
@@ -429,11 +436,11 @@ fn a_step_defines_only_what_its_own_payload_holds() {
         ]
     );
     let dropped = defined_against(
-        &[p(Change::DropTable {
+        &[p(Change::Table(TableChange::DropTable {
             uid: owner.clone(),
             name: t("t"),
             detach_from: None,
-        })],
+        }))],
         &IdsFile::default(),
     );
     assert_eq!(dropped, [ObjectKey::Table(Recorded(owner.clone()))]);
@@ -444,10 +451,10 @@ fn a_step_defines_only_what_its_own_payload_holds() {
 #[test]
 fn a_module_edit_is_a_new_instance_only_where_the_engine_rebuilds_it() {
     let (id, module) = function();
-    let logical = [p(Change::AlterModule {
+    let logical = [p(Change::Module(ModuleChange::AlterModule {
         id: id.clone(),
         module: Box::new(module),
-    })];
+    }))];
     let none = IdsFile::default();
     let owners = PlanOwners::new(PlanNames::of(&logical, &none).unwrap(), &none, &none);
     let transitions = |modules| {
@@ -483,31 +490,31 @@ fn rebuild() -> (Operations, ObjectKey, ObjectKey) {
         [
             (
                 Origin::Teardown(root.clone()),
-                p(Change::DropModule {
+                p(Change::Module(ModuleChange::DropModule {
                     id: v.clone(),
                     kind: ModuleKind::View,
-                }),
+                })),
             ),
             (
                 Origin::SplitPart(0),
-                p(Change::DropModule {
+                p(Change::Module(ModuleChange::DropModule {
                     id: f.clone(),
                     kind: ModuleKind::Function,
-                }),
+                })),
             ),
             (
                 Origin::SplitPart(0),
-                p(Change::CreateModule {
+                p(Change::Module(ModuleChange::CreateModule {
                     id: f.clone(),
                     module: Box::new(function),
-                }),
+                })),
             ),
             (
                 Origin::Restoration(root),
-                p(Change::CreateModule {
+                p(Change::Module(ModuleChange::CreateModule {
                     id: v.clone(),
                     module: Box::new(view),
-                }),
+                })),
             ),
         ],
         ModuleEdits::Rebuilt,
@@ -519,10 +526,10 @@ fn rebuild() -> (Operations, ObjectKey, ObjectKey) {
 fn a_teardown_ends_the_base_and_its_restoration_produces_the_final_instance() {
     let (ops, f, v) = rebuild();
     let none = IdsFile::default();
-    let logical = [p(Change::DropModule {
+    let logical = [p(Change::Module(ModuleChange::DropModule {
         id: "app.f(integer)".parse().unwrap(),
         kind: ModuleKind::Function,
-    })];
+    }))];
     let owners = PlanOwners::new(PlanNames::of(&logical, &none).unwrap(), &none, &none);
     let roles: Vec<(Role, Vec<Incarnation>)> = ops
         .iter()
@@ -575,10 +582,10 @@ fn a_teardown_ends_the_base_and_its_restoration_produces_the_final_instance() {
 fn a_replay_refuses_a_key_read_as_a_third_instance() {
     let (ops, f, v) = rebuild();
     let none = IdsFile::default();
-    let logical = [p(Change::DropModule {
+    let logical = [p(Change::Module(ModuleChange::DropModule {
         id: "app.f(integer)".parse().unwrap(),
         kind: ModuleKind::Function,
-    })];
+    }))];
     let owners = PlanOwners::new(PlanNames::of(&logical, &none).unwrap(), &none, &none);
     let third =
         |order: &[usize]| match Incarnations::replay(ops.reordered(order).as_slice(), &owners) {

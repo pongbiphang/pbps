@@ -4,7 +4,11 @@
 use crate::certified_fixture::FixtureEmission as _;
 
 use super::*;
+use pbps_model::ColumnChange;
 use pbps_model::Module;
+use pbps_model::ModuleChange;
+use pbps_model::RoleChange;
+use pbps_model::TableChange;
 
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(super) fn after_their_functions(
@@ -31,8 +35,10 @@ pub(super) fn after_their_functions(
         // `AlterColumnDefault`; one beside a DEFAULT, whose create moves
         // rows, had its default split off already (`split_moving_defaults`).
         let texts: Vec<&str> = match &p.change {
-            Change::AddColumn { column, .. } => column_expression(column).into_iter().collect(),
-            Change::CreateTable { table, .. } => table
+            Change::Column(ColumnChange::AddColumn { column, .. }) => {
+                column_expression(column).into_iter().collect()
+            }
+            Change::Table(TableChange::CreateTable { table, .. }) => table
                 .columns
                 .values()
                 .filter_map(|c| match &c.value_source {
@@ -89,17 +95,17 @@ pub(super) fn after_their_functions(
     // what must follow the move would be let past it. One still held names a
     // column the parent adds behind a function in an own index or check,
     // which cannot be split off.
-    if let Some(Change::CreateTable {
+    if let Some(Change::Table(TableChange::CreateTable {
         name,
         beside_default: Some(default),
         ..
-    }) = held.iter().map(|&i| window[i]).find(|c| {
+    })) = held.iter().map(|&i| window[i]).find(|c| {
         matches!(
             c,
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 beside_default: Some(_),
                 ..
-            }
+            })
         )
     }) {
         return Err(format!(
@@ -176,7 +182,7 @@ pub(super) fn free_chain(schedule: &Schedule, start: usize, last: usize, held: &
 }
 
 fn routine(name: &str, definition: &str, kind: ModuleKind) -> Change {
-    Change::CreateModule {
+    Change::Module(ModuleChange::CreateModule {
         id: name.parse().unwrap(),
         module: Box::new(Module {
             kind,
@@ -184,7 +190,7 @@ fn routine(name: &str, definition: &str, kind: ModuleKind) -> Change {
             definition: definition.into(),
             options: Default::default(),
         }),
-    }
+    })
 }
 
 #[test]
@@ -201,19 +207,21 @@ fn function_windows_match_old_bytes_for_32_uid_seeds_and_named_cycles() {
                 }
                 .into(),
             );
-            let role = |name: &str| Change::CreateRole {
-                uid: Uid::derived(UidKind::Role, name, salt),
-                name: name.into(),
+            let role = |name: &str| {
+                Change::Role(RoleChange::CreateRole {
+                    uid: Uid::derived(UidKind::Role, name, salt),
+                    name: name.into(),
+                })
             };
             let mut cs = ChangeSet {
                 changes: vec![
                     role("prefix"),
-                    Change::AddColumn {
+                    Change::Column(ColumnChange::AddColumn {
                         uid: Uid::derived(UidKind::Column, "app.t.g", salt),
                         table: TableName::new("app", "t"),
                         name: "g".into(),
                         column: Box::new(column),
-                    },
+                    }),
                     routine("app.free_a", "SELECT 1 AS n", ModuleKind::View),
                     routine("app.reader", "SELECT * FROM app.t", ModuleKind::View),
                     routine("app.declared", "SELECT 1 AS n", ModuleKind::View),
@@ -285,7 +293,9 @@ fn function_windows_match_old_bytes_for_32_uid_seeds_and_named_cycles() {
                 let column = cs
                     .changes
                     .iter()
-                    .position(|p| matches!(p.change, Change::AddColumn { .. }))
+                    .position(|p| {
+                        matches!(p.change, Change::Column(ColumnChange::AddColumn { .. }))
+                    })
                     .unwrap();
                 assert!(at("app.f()") < column && column < at("app.reader"));
                 assert!(
@@ -316,7 +326,7 @@ async fn callable_columns_precede_their_readers_and_real_cycles_are_refused_on_b
             let column = |name: &str, expression: &str| {
                 let mut column = Column::new("integer".parse().unwrap());
                 column.value_source = ValueSource::Default(expression.into());
-                Change::AddColumn { uid: Uid::derived(UidKind::Column, name, 0), table: TableName::new("app", "t"), name: name.into(), column: Box::new(column) }
+                Change::Column(ColumnChange::AddColumn { uid: Uid::derived(UidKind::Column, name, 0), table: TableName::new("app", "t"), name: name.into(), column: Box::new(column) })
             };
             let mut cs = ChangeSet { changes: vec![
                 column("g", "app.f()"),

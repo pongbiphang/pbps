@@ -1,6 +1,11 @@
 //! Attachments consume complete shapes and can introduce standing rows.
 
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::GrantChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
 use pbps_model::{Column, Module, PartitionBound, PartitionBy, PartitionOf, RiskClass, Table};
 
 fn fixture(placeholder: bool, generated: bool) -> (ChangeSet, Schema, IdsFile, Schema, IdsFile) {
@@ -72,36 +77,35 @@ fn fixture(placeholder: bool, generated: bool) -> (ChangeSet, Schema, IdsFile, S
     before_ids.tables = [(ids.table_uid(&child).unwrap().clone(), child.clone())].into();
     let cs = ChangeSet {
         changes: [
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: ids.table_uid(&parent).unwrap().clone(),
                 name: parent,
                 table: Box::new(table),
                 beside_default: None,
                 moves_at_most: None,
-            },
-            Change::AttachPartition {
+            }),
+            Change::Partition(PartitionChange::AttachPartition {
                 uid: ids.table_uid(&child).unwrap().clone(),
                 table: child,
                 parent: TableName::new("app", "a"),
                 bound: PartitionBound::Default,
                 key: vec!["id".into()],
                 shape: Box::new(schema.tables[&TableName::new("app", "child")].clone()),
-            },
+            }),
         ]
         .into_iter()
-        .chain(
-            schema
-                .modules
-                .iter()
-                .map(|(id, module)| Change::CreateModule {
-                    id: id.clone(),
-                    module: Box::new(module.clone()),
-                }),
-        )
-        .chain(generated.then(|| Change::PublicExecution {
-            routine: "app.f(integer)".parse().unwrap(),
-            access: pbps_model::PublicAccess::Kept,
-            origin: pbps_model::RoutineOrigin::Created,
+        .chain(schema.modules.iter().map(|(id, module)| {
+            Change::Module(ModuleChange::CreateModule {
+                id: id.clone(),
+                module: Box::new(module.clone()),
+            })
+        }))
+        .chain(generated.then(|| {
+            Change::Permission(GrantChange::PublicExecution {
+                routine: "app.f(integer)".parse().unwrap(),
+                access: pbps_model::PublicAccess::Kept,
+                origin: pbps_model::RoutineOrigin::Created,
+            })
         }))
         .map(PlannedChange::new)
         .collect(),
@@ -147,14 +151,19 @@ fn attachments_follow_complete_columns_and_unsplit_attachments_keep_their_order(
             let attach = cs
                 .changes
                 .iter()
-                .position(|p| matches!(p.change, Change::AttachPartition { .. }))
+                .position(|p| {
+                    matches!(
+                        p.change,
+                        Change::Partition(PartitionChange::AttachPartition { .. })
+                    )
+                })
                 .unwrap();
             for (at, part) in cs.changes.iter().enumerate() {
                 if matches!(
                     part.change,
-                    Change::CreateTable { .. }
-                        | Change::AddColumn { .. }
-                        | Change::AlterColumnExpression { .. }
+                    Change::Table(TableChange::CreateTable { .. })
+                        | Change::Column(ColumnChange::AddColumn { .. })
+                        | Change::Column(ColumnChange::AlterColumnExpression { .. })
                 ) {
                     assert!(at < attach, "{cs:?}");
                 }
@@ -213,9 +222,9 @@ async fn attached_generated_partitions_use_complete_shapes_and_preserve_recomput
                     // standing child, before the real expression is installed.
                     conn.execute("ALTER TABLE app.a DETACH PARTITION app.child; DROP TABLE app.a; DROP FUNCTION app.f(integer)").await?;
                     let (mut reordered, ids) = (cs, ids);
-                    let installation = reordered.changes.iter().position(|p| matches!(p.change, Change::AlterColumnExpression { .. }));
+                    let installation = reordered.changes.iter().position(|p| matches!(p.change, Change::Column(ColumnChange::AlterColumnExpression { .. })));
                     if let Some(install) = installation {
-                        let attach = reordered.changes.iter().position(|p| matches!(p.change, Change::AttachPartition { .. })).unwrap();
+                        let attach = reordered.changes.iter().position(|p| matches!(p.change, Change::Partition(PartitionChange::AttachPartition { .. }))).unwrap();
                         let attachment = reordered.changes.remove(attach);
                         reordered.changes.insert(install, attachment);
                         let mut saved = SavedPlan::new(PlanOrigin::Database, "postgres", "2026-10-21T00:00:00Z", PlanBaseline {
@@ -236,7 +245,7 @@ async fn attached_generated_partitions_use_complete_shapes_and_preserve_recomput
                     } else {
                         // Offline and 16 keep the whole-table path. They do
                         // not manufacture an empty-table expression part.
-                        assert!(reordered.changes.iter().all(|p| !matches!(p.change, Change::AddColumn { .. })) || !placeholder);
+                        assert!(reordered.changes.iter().all(|p| !matches!(p.change, Change::Column(ColumnChange::AddColumn { .. }))) || !placeholder);
                         assert!(!placeholder || !reordered.changes.iter().any(pbps_diff::order::generated::is_part));
                     }
                     Ok(())

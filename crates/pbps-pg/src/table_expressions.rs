@@ -21,6 +21,13 @@
 //! two cannot bind it, and say so as a note rather than refuse.
 
 use pbps_db::{Conn, Param};
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::PolicyChange;
+use pbps_model::TableChange;
+use pbps_model::TypeChange;
+use pbps_model::TypeValueChange;
 use pbps_model::{Change, ManagedType, TableName, TypeRef, ValueSource};
 
 use crate::admission::Admission;
@@ -236,11 +243,11 @@ impl Spec {
 )]
 fn binds_on_table(change: &Change) -> bool {
     match change {
-        Change::AddCheck { .. }
-        | Change::AddIndex { .. }
-        | Change::CreatePolicy { .. }
-        | Change::AlterColumnExpression { .. } => true,
-        Change::AddColumn { column, .. } => {
+        Change::Constraint(ConstraintChange::AddCheck { .. })
+        | Change::Index(IndexChange::AddIndex { .. })
+        | Change::Policy(PolicyChange::CreatePolicy { .. })
+        | Change::Column(ColumnChange::AlterColumnExpression { .. }) => true,
+        Change::Column(ColumnChange::AddColumn { column, .. }) => {
             matches!(column.value_source, ValueSource::Generated(_))
         }
         _ => false,
@@ -254,13 +261,15 @@ fn binds_on_table(change: &Change) -> bool {
 )]
 fn bound_table(change: &Change) -> Option<&str> {
     match change {
-        Change::CreateTable { name, .. } => Some(&name.name),
-        Change::AddColumn { table, .. }
-        | Change::AddCheck { table, .. }
-        | Change::AddIndex { table, .. }
-        | Change::CreatePolicy { table, .. } => Some(&table.name),
-        Change::AlterColumnDefault { column, .. }
-        | Change::AlterColumnExpression { column, .. } => Some(&column.table.name),
+        Change::Table(TableChange::CreateTable { name, .. }) => Some(&name.name),
+        Change::Column(ColumnChange::AddColumn { table, .. })
+        | Change::Constraint(ConstraintChange::AddCheck { table, .. })
+        | Change::Index(IndexChange::AddIndex { table, .. })
+        | Change::Policy(PolicyChange::CreatePolicy { table, .. }) => Some(&table.name),
+        Change::Column(ColumnChange::AlterColumnDefault { column, .. })
+        | Change::Column(ColumnChange::AlterColumnExpression { column, .. }) => {
+            Some(&column.table.name)
+        }
         _ => None,
     }
 }
@@ -276,18 +285,19 @@ pub fn carries(change: &Change) -> bool {
         return true;
     }
     match change {
-        Change::CreateTable { table, .. } => {
+        Change::Table(TableChange::CreateTable { table, .. }) => {
             table.partition_of.is_none()
                 && (!table.checks.is_empty()
                     || table.columns.values().any(|c| has_value(&c.value_source)))
         }
-        Change::AddColumn { column, .. } => has_value(&column.value_source),
-        Change::AlterColumnDefault { to, .. } => to.is_some(),
-        Change::AlterColumnExpression { .. } | Change::AddCheck { .. } => true,
+        Change::Column(ColumnChange::AddColumn { column, .. }) => has_value(&column.value_source),
+        Change::Column(ColumnChange::AlterColumnDefault { to, .. }) => to.is_some(),
+        Change::Column(ColumnChange::AlterColumnExpression { .. })
+        | Change::Constraint(ConstraintChange::AddCheck { .. }) => true,
         // A key that is only a column, and no filter, calls nothing; such an
         // index is also the one built concurrently, outside any transaction.
-        Change::AddIndex { index, .. } => index.holds_expression(),
-        Change::CreatePolicy { policy, .. } => {
+        Change::Index(IndexChange::AddIndex { index, .. }) => index.holds_expression(),
+        Change::Policy(PolicyChange::CreatePolicy { policy, .. }) => {
             policy.using.is_some() || policy.with_check.is_some()
         }
         _ => false,
@@ -305,8 +315,10 @@ pub fn carries(change: &Change) -> bool {
 )]
 pub fn probed(change: &Change) -> bool {
     match change {
-        Change::AddIndex { index, .. } => index.unique && index.filter.is_some(),
-        Change::CreatePolicy { .. } => false,
+        Change::Index(IndexChange::AddIndex { index, .. }) => {
+            index.unique && index.filter.is_some()
+        }
+        Change::Policy(PolicyChange::CreatePolicy { .. }) => false,
         _ => domain_code(change).is_none(),
     }
 }
@@ -321,27 +333,27 @@ pub fn probed(change: &Change) -> bool {
 )]
 fn domain_code(change: &Change) -> Option<(TypeRef, ManagedType)> {
     let (name, mut domain) = match change {
-        Change::CreateType {
+        Change::Type(TypeChange::CreateType {
             name, definition, ..
-        } => (name, (**definition).clone()),
-        Change::EnumRebuild {
+        }) => (name, (**definition).clone()),
+        Change::TypeValue(TypeValueChange::EnumRebuild {
             name,
             step:
                 pbps_model::EnumRebuildStep::Create {
                     definition, over, ..
                 },
             ..
-        } => (
+        }) => (
             name,
             crate::emit::over_the_replacement(definition, over.as_ref()),
         ),
-        Change::AlterDomain {
+        Change::TypeValue(TypeValueChange::AlterDomain {
             name,
             from,
             to,
             half,
             ..
-        } => {
+        }) => {
             let delta = pbps_model::DomainDelta::of(from, to)?;
             let mut domain = (**to).clone();
             if let ManagedType::Domain {
@@ -865,31 +877,31 @@ fn describe(change: &Change) -> String {
         return format!("the expressions of domain {}", name.shown());
     }
     match change {
-        Change::CreateTable { name, .. } => {
+        Change::Table(TableChange::CreateTable { name, .. }) => {
             format!("the expressions of the new table {}", name.shown())
         }
-        Change::AddColumn { table, name, .. } => {
+        Change::Column(ColumnChange::AddColumn { table, name, .. }) => {
             format!("the expression of {}.{}", table.shown(), name.shown())
         }
-        Change::AlterColumnDefault { column, .. }
-        | Change::AlterColumnExpression { column, .. } => {
+        Change::Column(ColumnChange::AlterColumnDefault { column, .. })
+        | Change::Column(ColumnChange::AlterColumnExpression { column, .. }) => {
             format!(
                 "the expression of {}.{}",
                 column.table.shown(),
                 column.name.shown()
             )
         }
-        Change::AddCheck { table, name, .. } => {
+        Change::Constraint(ConstraintChange::AddCheck { table, name, .. }) => {
             format!("the CHECK `{}` of {}", name.shown(), table.shown())
         }
-        Change::AddIndex { table, name, .. } => {
+        Change::Index(IndexChange::AddIndex { table, name, .. }) => {
             format!(
                 "the expressions of index `{}` on {}",
                 name.shown(),
                 table.shown()
             )
         }
-        Change::CreatePolicy { table, name, .. } => {
+        Change::Policy(PolicyChange::CreatePolicy { table, name, .. }) => {
             format!(
                 "the expressions of row policy `{name}` on {}",
                 table.shown()
@@ -1022,7 +1034,7 @@ async fn spec(conn: &mut Conn, change: &Change) -> Result<Option<Spec>, String> 
     let sql_type =
         |ty: &pbps_model::ColumnType| crate::emit::sql_type(ty).map_err(|_| "0A000".to_owned());
     Ok(Some(match change {
-        Change::CreateTable { name, table, .. } => Spec {
+        Change::Table(TableChange::CreateTable { name, table, .. }) => Spec {
             what: describe(change),
             bound: bound_table(change).unwrap_or_default().to_owned(),
             table: name.shown().to_string(),
@@ -1049,12 +1061,12 @@ async fn spec(conn: &mut Conn, change: &Change) -> Result<Option<Spec>, String> 
             index: None,
             policy: None,
         },
-        Change::AddColumn {
+        Change::Column(ColumnChange::AddColumn {
             table,
             name,
             column,
             ..
-        } => Spec {
+        }) => Spec {
             what: describe(change),
             bound: bound_table(change).unwrap_or_default().to_owned(),
             table: table.shown().to_string(),
@@ -1071,11 +1083,11 @@ async fn spec(conn: &mut Conn, change: &Change) -> Result<Option<Spec>, String> 
             index: None,
             policy: None,
         },
-        Change::AddCheck {
+        Change::Constraint(ConstraintChange::AddCheck {
             table,
             name,
             constraint,
-        } => Spec {
+        }) => Spec {
             what: describe(change),
             bound: bound_table(change).unwrap_or_default().to_owned(),
             table: table.shown().to_string(),
@@ -1087,32 +1099,32 @@ async fn spec(conn: &mut Conn, change: &Change) -> Result<Option<Spec>, String> 
             index: None,
             policy: None,
         },
-        Change::AddIndex {
+        Change::Index(IndexChange::AddIndex {
             table, name, index, ..
-        } => on_table(
+        }) => on_table(
             change,
             table,
             Some((name.shown().to_string(), index.clone())),
             None,
         ),
-        Change::CreatePolicy {
+        Change::Policy(PolicyChange::CreatePolicy {
             table,
             name,
             policy,
             ..
-        } => on_table(
+        }) => on_table(
             change,
             table,
             None,
             Some((name.clone(), Box::new(policy.clone()))),
         ),
-        Change::AlterColumnDefault { column, to, .. } => {
+        Change::Column(ColumnChange::AlterColumnDefault { column, to, .. }) => {
             let Some(expression) = to else {
                 return Ok(None);
             };
             existing(conn, change, column, Value::Default(expression.clone())).await?
         }
-        Change::AlterColumnExpression { column, to, .. } => {
+        Change::Column(ColumnChange::AlterColumnExpression { column, to, .. }) => {
             existing(conn, change, column, Value::Generated(to.clone())).await?
         }
         _ => return Ok(None),

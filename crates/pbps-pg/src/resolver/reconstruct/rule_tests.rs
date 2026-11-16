@@ -3,6 +3,11 @@
 //! PostgreSQL 16 and 18 and compiled there by `scratch_rules_compile_on_both_servers`.
 use super::*;
 use crate::generated::SET_EXPRESSION_ARRIVED_IN;
+use pbps_model::ColumnChange;
+use pbps_model::ModuleChange;
+use pbps_model::SearchChange;
+use pbps_model::TableChange;
+use pbps_model::TypeChange;
 use pbps_model::{
     Column, Generated, Index, IndexColumn, IndexKey, Module, PartitionBound, PartitionBy,
     PartitionColumn, PartitionOf, Table, TableName, Uid, UidKind,
@@ -43,17 +48,17 @@ fn keyed(column: &str, unique: bool, filter: Option<&str>) -> Index {
 }
 
 fn create(name: &str, table: Table) -> Change {
-    Change::CreateTable {
+    Change::Table(TableChange::CreateTable {
         uid: Uid::derived(UidKind::Table, name, 0),
         name: TableName::new("app", name),
         table: Box::new(table),
         beside_default: None,
         moves_at_most: None,
-    }
+    })
 }
 
 fn module(id: &str, kind: ModuleKind, definition: &str) -> Change {
-    Change::CreateModule {
+    Change::Module(ModuleChange::CreateModule {
         id: id.parse().unwrap(),
         module: Box::new(Module {
             kind,
@@ -61,7 +66,7 @@ fn module(id: &str, kind: ModuleKind, definition: &str) -> Change {
             definition: definition.into(),
             options: Default::default(),
         }),
-    }
+    })
 }
 
 fn function(name: &str) -> Change {
@@ -171,11 +176,11 @@ fn an_index_that_holds_a_predicate_follows_every_module_and_generation() {
 }
 
 fn declared_type(name: &str, definition: pbps_model::ManagedType) -> Change {
-    Change::CreateType {
+    Change::Type(TypeChange::CreateType {
         uid: Uid::derived(UidKind::Type, name, 0),
         name: name.parse().unwrap(),
         definition: Box::new(definition),
-    }
+    })
 }
 
 fn mood() -> pbps_model::ManagedType {
@@ -228,12 +233,12 @@ fn a_created_type_precedes_what_names_it() {
 fn search(name: &str, definition: pbps_model::SearchObject) -> Change {
     let name: pbps_model::SearchRef = name.parse().unwrap();
     let uid = Uid::derived(UidKind::Search, &name.raw().to_string(), 0);
-    Change::CreateSearch {
+    Change::Search(SearchChange::CreateSearch {
         uid,
         name,
         definition: Box::new(definition),
         unresolved: Vec::new(),
-    }
+    })
 }
 
 fn dictionary_of(template: &str) -> pbps_model::SearchObject {
@@ -1211,10 +1216,10 @@ fn literal_plan(
     let mut schema = pbps_model::Schema::default();
     for change in changes {
         match change {
-            Change::CreateTable { name, table, .. } => {
+            Change::Table(TableChange::CreateTable { name, table, .. }) => {
                 schema.tables.insert(name.clone(), *table.clone());
             }
-            Change::CreateModule { id, module } => {
+            Change::Module(ModuleChange::CreateModule { id, module }) => {
                 schema.modules.insert(id.clone(), *module.clone());
             }
             _ => panic!("literal fixtures declare only tables and modules"),
@@ -1258,9 +1263,9 @@ fn a_literal_relation_reader_follows_a_table_held_for_its_function() {
         let changes = &prepared.changes().changes;
         let table = changes
             .iter()
-            .position(|p| matches!(p.change, Change::CreateTable { .. }))
+            .position(|p| matches!(p.change, Change::Table(TableChange::CreateTable { .. })))
             .unwrap();
-        let view = changes.iter().position(|p| matches!(&p.change, Change::CreateModule { module, .. } if module.kind == ModuleKind::View)).unwrap();
+        let view = changes.iter().position(|p| matches!(&p.change, Change::Module(ModuleChange::CreateModule { module, .. }) if module.kind == ModuleKind::View)).unwrap();
         assert!(
             prepared
                 .edges()
@@ -1293,14 +1298,21 @@ fn a_literal_function_name_and_a_code_call_are_scratch_guesses() {
             let prepared =
                 pbps_diff::order::scratch::prepare(&plan, &ids, &Default::default(), &pg).unwrap();
             let steps = &prepared.changes().changes;
-            let function = steps.iter().position(|p| matches!(&p.change, Change::CreateModule { module, .. } if module.kind == ModuleKind::Function)).unwrap();
+            let function = steps.iter().position(|p| matches!(&p.change, Change::Module(ModuleChange::CreateModule { module, .. }) if module.kind == ModuleKind::Function)).unwrap();
             let carrying = steps
                 .iter()
-                .position(|p| matches!(p.change, Change::AlterColumnExpression { .. }))
+                .position(|p| {
+                    matches!(
+                        p.change,
+                        Change::Column(ColumnChange::AlterColumnExpression { .. })
+                    )
+                })
                 .unwrap_or_else(|| {
                     steps
                         .iter()
-                        .position(|p| matches!(p.change, Change::CreateTable { .. }))
+                        .position(|p| {
+                            matches!(p.change, Change::Table(TableChange::CreateTable { .. }))
+                        })
                         .unwrap()
                 });
             let sources: Vec<_> = prepared
@@ -1596,17 +1608,22 @@ fn call_edge(changes: &[Change], kind: ModuleKind, name: &str) -> Option<pbps_di
     let provider = steps
         .iter()
         .position(|p| {
-            matches!(&p.change, Change::CreateModule { id, module }
+            matches!(&p.change, Change::Module(ModuleChange::CreateModule { id, module })
                 if module.kind == kind && id.name() == name)
         })
         .unwrap();
     let carrying = steps
         .iter()
-        .position(|p| matches!(p.change, Change::AlterColumnExpression { .. }))
+        .position(|p| {
+            matches!(
+                p.change,
+                Change::Column(ColumnChange::AlterColumnExpression { .. })
+            )
+        })
         .or_else(|| {
             steps
                 .iter()
-                .position(|p| matches!(p.change, Change::CreateTable { .. }))
+                .position(|p| matches!(p.change, Change::Table(TableChange::CreateTable { .. })))
         })
         .unwrap();
     prepared

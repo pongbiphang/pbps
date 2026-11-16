@@ -1,6 +1,8 @@
 //! Pending boundary comparisons remain attached to the immutable proposal.
 //! A settled permutation alone does not discharge a membership contract (DEC-2296.10).
 use super::membership;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
 use pbps_model::operation::{
     Effects, End, Lineage, ModuleEdits, Operation, Operations, Snapshot, Standing,
     symbolic::{Clause, MoveKind, State},
@@ -152,16 +154,23 @@ pub(crate) fn meetings(
     let mut result = BTreeSet::new();
     for planned in &changes.changes {
         let (child, parent, side) = match &planned.change {
-            Change::AttachPartition { uid, parent, .. } => (uid, parent, after),
-            Change::DetachPartition { uid, parent, .. } => (uid, parent, before),
-            Change::DropTable {
+            Change::Partition(PartitionChange::AttachPartition { uid, parent, .. }) => {
+                (uid, parent, after)
+            }
+            Change::Partition(PartitionChange::DetachPartition { uid, parent, .. }) => {
+                (uid, parent, before)
+            }
+            Change::Table(TableChange::DropTable {
                 uid,
                 detach_from: Some(parent),
                 ..
-            } => (uid, parent, before),
+            }) => (uid, parent, before),
             _ => continue,
         };
-        let parent_uid = if !matches!(planned.change, Change::AttachPartition { .. }) {
+        let parent_uid = if !matches!(
+            planned.change,
+            Change::Partition(PartitionChange::AttachPartition { .. })
+        ) {
             before
                 .ids
                 .tables
@@ -179,7 +188,7 @@ pub(crate) fn meetings(
             continue;
         };
         if changes.changes.iter().any(|p| {
-            if let Change::RenameTable { uid, .. } = &p.change {
+            if let Change::Table(TableChange::RenameTable { uid, .. }) = &p.change {
                 return uid == parent_uid;
             }
             let Some(uid) = p.change.parent_column_uid() else {
@@ -447,7 +456,9 @@ pub(super) fn replay<S>(
     let physical = PhysicalSources::of(actual, before.schema, before.ids)
         .map_err(|e| format!("{e}; {}", membership::REMEDY))?;
     for (at, op) in operations.iter().enumerate() {
-        if let Change::AttachPartition { table, parent, .. } = op.change() {
+        if let Change::Partition(PartitionChange::AttachPartition { table, parent, .. }) =
+            op.change()
+        {
             if !matches!(physical.members_at(parent, At::Before(at)), Located::Present(members) if !members.contains(table))
             {
                 return Err(format!(
@@ -472,12 +483,12 @@ pub(super) fn replay<S>(
                 }
             }
         }
-        if let Change::DetachPartition {
+        if let Change::Partition(PartitionChange::DetachPartition {
             table,
             parent,
             shape,
             ..
-        } = op.change()
+        }) = op.change()
         {
             if !matches!(physical.members_at(parent, At::Before(at)), Located::Present(members) if members.contains(table))
             {
@@ -523,7 +534,7 @@ fn lock_window<S>(
     use pbps_model::operation::symbolic::Attribute;
     let id = "plan.partition-alter-attach-lock";
     if !plan.changes.iter().any(|p| {
-        matches!(&p.change, Change::AttachPartition { uid, .. }
+        matches!(&p.change, Change::Partition(PartitionChange::AttachPartition { uid, .. })
         if plan.boundaries.pending.iter().any(|b| &b.child == uid))
     }) || plan
         .changes

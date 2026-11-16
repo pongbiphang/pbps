@@ -2595,13 +2595,23 @@ fn narrowing_projection_refuses_constraint_failures_before_the_first_statement()
             .changes
             .changes
             .iter()
-            .position(|p| matches!(&p.change, pbps_model::Change::AddColumn { .. }))
+            .position(|p| {
+                matches!(
+                    &p.change,
+                    pbps_model::Change::Column(pbps_model::ColumnChange::AddColumn { .. })
+                )
+            })
             .unwrap();
         let retype = saved
             .changes
             .changes
             .iter()
-            .position(|p| matches!(&p.change, pbps_model::Change::AlterColumnType { .. }))
+            .position(|p| {
+                matches!(
+                    &p.change,
+                    pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType { .. })
+                )
+            })
             .unwrap();
         assert!(
             addition < retype,
@@ -2752,31 +2762,46 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
         let c = &changes[index];
         assert_eq!(c["change_index"], index);
         match &p.change {
-            pbps_model::Change::RebuildPartitionedTable(_)
-            | pbps_model::Change::BuildPartitionedIndex(_)
-            | pbps_model::Change::CopyTableRows(_)
-            | pbps_model::Change::AnalyzeTableTree(_) => {
+            pbps_model::Change::Partition(
+                pbps_model::PartitionChange::RebuildPartitionedTable(_),
+            )
+            | pbps_model::Change::Index(pbps_model::IndexChange::BuildPartitionedIndex(_))
+            | pbps_model::Change::Partition(pbps_model::PartitionChange::CopyTableRows(_))
+            | pbps_model::Change::Partition(pbps_model::PartitionChange::AnalyzeTableTree(_)) => {
                 panic!("cost fixture must not contain a pending rewrite")
             }
-            pbps_model::Change::AddEnumValue { .. }
-            | pbps_model::Change::AlterDomain { .. }
-            | pbps_model::Change::RenameEnumValue { .. }
-            | pbps_model::Change::EnumRebuild { .. }
-            | pbps_model::Change::CreateType { .. }
-            | pbps_model::Change::DropType { .. }
-            | pbps_model::Change::RenameType { .. }
-            | pbps_model::Change::CreateSearch { .. }
-            | pbps_model::Change::DropSearch { .. }
-            | pbps_model::Change::CreateExtension { .. }
-            | pbps_model::Change::DropExtension { .. }
-            | pbps_model::Change::UpdateExtension { .. }
-            | pbps_model::Change::SetExtensionSchema { .. }
-            | pbps_model::Change::CreateTable { .. } => {
+            pbps_model::Change::TypeValue(pbps_model::TypeValueChange::AddEnumValue { .. })
+            | pbps_model::Change::TypeValue(pbps_model::TypeValueChange::AlterDomain { .. })
+            | pbps_model::Change::TypeValue(pbps_model::TypeValueChange::RenameEnumValue {
+                ..
+            })
+            | pbps_model::Change::TypeValue(pbps_model::TypeValueChange::EnumRebuild { .. })
+            | pbps_model::Change::Type(pbps_model::TypeChange::CreateType { .. })
+            | pbps_model::Change::Type(pbps_model::TypeChange::DropType { .. })
+            | pbps_model::Change::Type(pbps_model::TypeChange::RenameType { .. })
+            | pbps_model::Change::Search(pbps_model::SearchChange::CreateSearch { .. })
+            | pbps_model::Change::Search(pbps_model::SearchChange::DropSearch { .. })
+            | pbps_model::Change::Extension(pbps_model::ExtensionChange::CreateExtension {
+                ..
+            })
+            | pbps_model::Change::Extension(pbps_model::ExtensionChange::DropExtension {
+                ..
+            })
+            | pbps_model::Change::Extension(pbps_model::ExtensionChange::UpdateExtension {
+                ..
+            })
+            | pbps_model::Change::Extension(pbps_model::ExtensionChange::SetExtensionSchema {
+                ..
+            })
+            | pbps_model::Change::Table(pbps_model::TableChange::CreateTable { .. }) => {
                 assert_eq!(c["status"], "unavailable");
                 assert!(c["reason"].as_str().unwrap().contains("no measurement"));
                 checked += 1;
             }
-            pbps_model::Change::AlterColumnType { column, .. } => {
+            pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType {
+                column,
+                ..
+            }) => {
                 assert_eq!(c["lock"], "AccessExclusiveLock");
                 assert_eq!(c["blocks"], "reads and writes");
                 match column.name.raw() {
@@ -2801,59 +2826,119 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
                 }
                 checked += 1;
             }
-            pbps_model::Change::AlterColumnNullability { .. } => {
+            pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnNullability {
+                ..
+            }) => {
                 assert_eq!(c["rewrite"]["value"], "no");
                 assert_eq!(c["reads"]["value"], "unknown");
                 assert!(c["reads"]["reason"].as_str().unwrap().contains("ck_n"));
                 checked += 1;
             }
-            change @ pbps_model::Change::DropTable { .. }
-            | change @ pbps_model::Change::DetachPartition { .. }
-            | change @ pbps_model::Change::AttachPartition { .. }
-            | change @ pbps_model::Change::RenameTable { .. }
-            | change @ pbps_model::Change::AddColumn { .. }
-            | change @ pbps_model::Change::DropColumn { .. }
-            | change @ pbps_model::Change::RenameColumn { .. }
-            | change @ pbps_model::Change::AlterColumnDefault { .. }
-            | change @ pbps_model::Change::AlterColumnExpression { .. }
-            | change @ pbps_model::Change::AlterColumnNumbering { .. }
-            | change @ pbps_model::Change::SetColumnDeprecated { .. }
-            | change @ pbps_model::Change::SetComment { .. }
-            | change @ pbps_model::Change::SetPrimaryKey { .. }
-            | change @ pbps_model::Change::SetIndexStorageParameters { .. }
-            | change @ pbps_model::Change::SetTablePersistence { .. }
-            | change @ pbps_model::Change::SetPartitionDefault { .. }
-            | change @ pbps_model::Change::SetPartitionNotNull { .. }
-            | change @ pbps_model::Change::SetStorageParameters { .. }
-            | change @ pbps_model::Change::DropPolicy { .. }
-            | change @ pbps_model::Change::CreatePolicy { .. }
-            | change @ pbps_model::Change::SetRowSecurity { .. }
-            | change @ pbps_model::Change::SetReplicaIdentity { .. }
-            | change @ pbps_model::Change::AddUnique { .. }
-            | change @ pbps_model::Change::DropUnique { .. }
-            | change @ pbps_model::Change::SetExclusion { .. }
-            | change @ pbps_model::Change::AddForeignKey { .. }
-            | change @ pbps_model::Change::DropForeignKey { .. }
-            | change @ pbps_model::Change::AddCheck { .. }
-            | change @ pbps_model::Change::DropCheck { .. }
-            | change @ pbps_model::Change::AddIndex { .. }
-            | change @ pbps_model::Change::DropIndex { .. }
-            | change @ pbps_model::Change::AddComputedColumn { .. }
-            | change @ pbps_model::Change::DropComputedColumn { .. }
-            | change @ pbps_model::Change::InsertRow { .. }
-            | change @ pbps_model::Change::UpdateRow { .. }
-            | change @ pbps_model::Change::DeleteRow { .. }
-            | change @ pbps_model::Change::SetDataMode { .. }
-            | change @ pbps_model::Change::SetEnsureKeys { .. }
-            | change @ pbps_model::Change::CreateModule { .. }
-            | change @ pbps_model::Change::AlterModule { .. }
-            | change @ pbps_model::Change::DropModule { .. }
-            | change @ pbps_model::Change::CreateRole { .. }
-            | change @ pbps_model::Change::DropRole { .. }
-            | change @ pbps_model::Change::RenameRole { .. }
-            | change @ pbps_model::Change::Grant { .. }
-            | change @ pbps_model::Change::Revoke { .. }
-            | change @ pbps_model::Change::PublicExecution { .. } => {
+            change @ pbps_model::Change::Table(pbps_model::TableChange::DropTable { .. })
+            | change @ pbps_model::Change::Partition(
+                pbps_model::PartitionChange::DetachPartition { .. },
+            )
+            | change @ pbps_model::Change::Partition(
+                pbps_model::PartitionChange::AttachPartition { .. },
+            )
+            | change @ pbps_model::Change::Table(pbps_model::TableChange::RenameTable { .. })
+            | change @ pbps_model::Change::Column(pbps_model::ColumnChange::AddColumn { .. })
+            | change @ pbps_model::Change::Column(pbps_model::ColumnChange::DropColumn { .. })
+            | change @ pbps_model::Change::Column(pbps_model::ColumnChange::RenameColumn {
+                ..
+            })
+            | change @ pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnDefault {
+                ..
+            })
+            | change @ pbps_model::Change::Column(
+                pbps_model::ColumnChange::AlterColumnExpression { .. },
+            )
+            | change @ pbps_model::Change::Column(
+                pbps_model::ColumnChange::AlterColumnNumbering { .. },
+            )
+            | change @ pbps_model::Change::Column(pbps_model::ColumnChange::SetColumnDeprecated {
+                ..
+            })
+            | change @ pbps_model::Change::TableProperty(
+                pbps_model::TablePropertyChange::SetComment { .. },
+            )
+            | change @ pbps_model::Change::Constraint(
+                pbps_model::ConstraintChange::SetPrimaryKey { .. },
+            )
+            | change @ pbps_model::Change::Index(
+                pbps_model::IndexChange::SetIndexStorageParameters { .. },
+            )
+            | change @ pbps_model::Change::TableProperty(
+                pbps_model::TablePropertyChange::SetTablePersistence { .. },
+            )
+            | change @ pbps_model::Change::Partition(
+                pbps_model::PartitionChange::SetPartitionDefault { .. },
+            )
+            | change @ pbps_model::Change::Partition(
+                pbps_model::PartitionChange::SetPartitionNotNull { .. },
+            )
+            | change @ pbps_model::Change::TableProperty(
+                pbps_model::TablePropertyChange::SetStorageParameters { .. },
+            )
+            | change @ pbps_model::Change::Policy(pbps_model::PolicyChange::DropPolicy { .. })
+            | change @ pbps_model::Change::Policy(pbps_model::PolicyChange::CreatePolicy {
+                ..
+            })
+            | change @ pbps_model::Change::Policy(pbps_model::PolicyChange::SetRowSecurity {
+                ..
+            })
+            | change @ pbps_model::Change::TableProperty(
+                pbps_model::TablePropertyChange::SetReplicaIdentity { .. },
+            )
+            | change @ pbps_model::Change::Constraint(pbps_model::ConstraintChange::AddUnique {
+                ..
+            })
+            | change @ pbps_model::Change::Constraint(pbps_model::ConstraintChange::DropUnique {
+                ..
+            })
+            | change @ pbps_model::Change::Constraint(
+                pbps_model::ConstraintChange::SetExclusion { .. },
+            )
+            | change @ pbps_model::Change::Constraint(
+                pbps_model::ConstraintChange::AddForeignKey { .. },
+            )
+            | change @ pbps_model::Change::Constraint(
+                pbps_model::ConstraintChange::DropForeignKey { .. },
+            )
+            | change @ pbps_model::Change::Constraint(pbps_model::ConstraintChange::AddCheck {
+                ..
+            })
+            | change @ pbps_model::Change::Constraint(pbps_model::ConstraintChange::DropCheck {
+                ..
+            })
+            | change @ pbps_model::Change::Index(pbps_model::IndexChange::AddIndex { .. })
+            | change @ pbps_model::Change::Index(pbps_model::IndexChange::DropIndex { .. })
+            | change @ pbps_model::Change::Column(pbps_model::ColumnChange::AddComputedColumn {
+                ..
+            })
+            | change @ pbps_model::Change::Column(pbps_model::ColumnChange::DropComputedColumn {
+                ..
+            })
+            | change @ pbps_model::Change::Row(pbps_model::RowChange::InsertRow { .. })
+            | change @ pbps_model::Change::Row(pbps_model::RowChange::UpdateRow { .. })
+            | change @ pbps_model::Change::Row(pbps_model::RowChange::DeleteRow { .. })
+            | change @ pbps_model::Change::Row(pbps_model::RowChange::SetDataMode { .. })
+            | change @ pbps_model::Change::Row(pbps_model::RowChange::SetEnsureKeys { .. })
+            | change @ pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule {
+                ..
+            })
+            | change @ pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule {
+                ..
+            })
+            | change @ pbps_model::Change::Module(pbps_model::ModuleChange::DropModule { .. })
+            | change @ pbps_model::Change::Role(pbps_model::RoleChange::CreateRole { .. })
+            | change @ pbps_model::Change::Role(pbps_model::RoleChange::DropRole { .. })
+            | change @ pbps_model::Change::Role(pbps_model::RoleChange::RenameRole { .. })
+            | change @ pbps_model::Change::Permission(pbps_model::GrantChange::Grant { .. })
+            | change @ pbps_model::Change::Permission(pbps_model::GrantChange::Revoke { .. })
+            | change @ pbps_model::Change::Permission(pbps_model::GrantChange::PublicExecution {
+                ..
+            }) => {
                 panic!("unexpected change {change:?}")
             }
         }
@@ -2892,6 +2977,7 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn connected_cost_keeps_catalog_identity_through_column_and_table_renames() {
     use pbps_model::Change;
+    use pbps_model::ColumnChange;
     for move_table in [false, true] {
         let slug = if move_table {
             "cost_renamed_table347"
@@ -2947,7 +3033,7 @@ fn connected_cost_keeps_catalog_identity_through_column_and_table_renames() {
         for (i, p) in saved.changes.changes.iter().enumerate() {
             let c = &costs[i];
             assert_eq!(c["change_index"], i);
-            if let Change::AlterColumnType { column, .. } = &p.change
+            if let Change::Column(ColumnChange::AlterColumnType { column, .. }) = &p.change
                 && column.name == "amount".into()
             {
                 assert_eq!(c["rewrite"]["value"], "unknown", "{report:#}");
@@ -2955,7 +3041,7 @@ fn connected_cost_keeps_catalog_identity_through_column_and_table_renames() {
                 assert_eq!(c["rows"]["count"], 20);
                 verified += 1;
             }
-            if let Change::AlterColumnNullability { column, .. } = &p.change
+            if let Change::Column(ColumnChange::AlterColumnNullability { column, .. }) = &p.change
                 && column.name == "required".into()
             {
                 // The renamed CHECK is replaced after tightening. Its old
@@ -2964,7 +3050,7 @@ fn connected_cost_keeps_catalog_identity_through_column_and_table_renames() {
                 assert_eq!(c["rewrite"]["value"], "no");
                 verified += 1;
             }
-            if let Change::AlterColumnType { column, .. } = &p.change
+            if let Change::Column(ColumnChange::AlterColumnType { column, .. }) = &p.change
                 && column.name == "plain".into()
             {
                 assert_eq!(c["rewrite"]["value"], "yes");
@@ -3917,6 +4003,8 @@ fn a_standing_generated_expression_still_requires_narrowing_approval() {
 #[test]
 #[ignore = "needs PostgreSQL 18; set PBPS_TEST_PG_DB"]
 fn saved_rows_before_expression_installation_cannot_clear_narrowing() {
+    use pbps_model::ColumnChange;
+    use pbps_model::RowChange;
     use pbps_model::{Change, PlannedChange, RiskClass};
     let own = OwnDatabase::new(&server(), "row-before-expression-1503");
     let connection = own.connection();
@@ -3931,11 +4019,16 @@ fn saved_rows_before_expression_installation_cannot_clear_narrowing() {
         .changes
         .changes
         .iter()
-        .position(|p| matches!(p.change, Change::AlterColumnExpression { .. }))
+        .position(|p| {
+            matches!(
+                p.change,
+                Change::Column(ColumnChange::AlterColumnExpression { .. })
+            )
+        })
         .unwrap();
     saved.changes.changes.insert(
         install,
-        PlannedChange::new(Change::InsertRow {
+        PlannedChange::new(Change::Row(RowChange::InsertRow {
             table: pbps_model::TableName::new("app", "a"),
             key_column: "id".into(),
             identity_key: false,
@@ -3943,7 +4036,7 @@ fn saved_rows_before_expression_installation_cannot_clear_narrowing() {
             row: pbps_model::Row([("z".into(), pbps_model::Value::Int(3))].into()),
             defaults: Default::default(),
             types: [("z".into(), "integer".parse().unwrap())].into(),
-        }),
+        })),
     );
     let pg = pbps_pg::Postgres::new().with_server_version(180_000);
     let risks = pbps_diff::order::generated::risks(&saved.changes, &saved.ids, &pg);
@@ -4529,11 +4622,13 @@ fn partition_insert_uses_root_serial_sequences_and_round_trips_on_both_servers()
         let emit = |permissions| {
             let pg = pbps_pg::Postgres::new();
             let ordered = pbps_diff::order::singleton(
-                pbps_model::PlannedChange::new(pbps_model::Change::Grant {
-                    role: roles.1[0].clone().into(),
-                    target: "app.p2a".parse().unwrap(),
-                    permissions,
-                }),
+                pbps_model::PlannedChange::new(pbps_model::Change::Permission(
+                    pbps_model::GrantChange::Grant {
+                        role: roles.1[0].clone().into(),
+                        target: "app.p2a".parse().unwrap(),
+                        permissions,
+                    },
+                )),
                 pbps_model::PlanMode::Transactional,
                 &pg,
             );
@@ -13425,7 +13520,9 @@ fn created_partition_bounds_are_checked_before_writes_and_survive_staging() {
         let plan: pbps_model::SavedPlan =
             serde_json::from_slice(&std::fs::read(&artifact).unwrap()).unwrap();
         assert_eq!(plan.changes.changes.len(), 1);
-        let pbps_model::Change::CreateTable { table, .. } = &plan.changes.changes[0].change else {
+        let pbps_model::Change::Table(pbps_model::TableChange::CreateTable { table, .. }) =
+            &plan.changes.changes[0].change
+        else {
             panic!("the staged plan creates one partition");
         };
         assert_eq!(
@@ -16210,22 +16307,27 @@ fn a_released_input_dropped_past_an_inserted_row_carries_its_consumers() {
             .unwrap()
     };
     use pbps_model::Change;
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::RowChange;
     let release = at(
-        &|c| matches!(c,Change::AlterColumnExpression { column,.. } if column.table.raw().to_string()=="app.req"),
+        &|c| matches!(c,Change::Column(ColumnChange::AlterColumnExpression { column,.. }) if column.table.raw().to_string()=="app.req"),
     );
     let dropped = at(
-        &|c| matches!(c,Change::DropColumn { column,.. } if column.table.raw().to_string()=="app.req" && column.name.raw()=="a"),
+        &|c| matches!(c,Change::Column(ColumnChange::DropColumn { column,.. }) if column.table.raw().to_string()=="app.req" && column.name.raw()=="a"),
     );
     let parent = at(
-        &|c| matches!(c,Change::InsertRow { table,key,.. } if table.raw().to_string()=="app.req" && *key==pbps_model::RowKey::from("1")),
+        &|c| matches!(c,Change::Row(RowChange::InsertRow { table,key,.. }) if table.raw().to_string()=="app.req" && *key==pbps_model::RowKey::from("1")),
     );
     let later = at(
-        &|c| matches!(c,Change::InsertRow { table,key,.. } if table.raw().to_string()=="app.req" && *key==pbps_model::RowKey::from("2")),
+        &|c| matches!(c,Change::Row(RowChange::InsertRow { table,key,.. }) if table.raw().to_string()=="app.req" && *key==pbps_model::RowKey::from("2")),
     );
-    let child =
-        at(&|c| matches!(c,Change::InsertRow { table,.. } if table.raw().to_string()=="app.child"));
-    let key =
-        at(&|c| matches!(c,Change::AddUnique { table,.. } if table.raw().to_string()=="app.req"));
+    let child = at(
+        &|c| matches!(c,Change::Row(RowChange::InsertRow { table,.. }) if table.raw().to_string()=="app.child"),
+    );
+    let key = at(
+        &|c| matches!(c,Change::Constraint(ConstraintChange::AddUnique { table,.. }) if table.raw().to_string()=="app.req"),
+    );
     assert!(
         release < dropped && dropped < parent && parent < later && parent < child && later < key,
         "{:?}",
@@ -16313,6 +16415,9 @@ fn a_defaulted_generated_input_is_released_before_its_insert() {
             let saved: pbps_model::SavedPlan =
                 serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
             use pbps_model::Change;
+            use pbps_model::ColumnChange;
+            use pbps_model::ModuleChange;
+            use pbps_model::RowChange;
             let at = |predicate: fn(&Change) -> bool| {
                 saved
                     .changes
@@ -16321,10 +16426,15 @@ fn a_defaulted_generated_input_is_released_before_its_insert() {
                     .position(|p| predicate(&p.change))
                     .unwrap()
             };
-            let function = at(|c| matches!(c, Change::CreateModule { .. }));
-            let release = at(|c| matches!(c, Change::AlterColumnExpression { .. }));
-            let drop = at(|c| matches!(c, Change::DropColumn { .. }));
-            let insert = at(|c| matches!(c, Change::InsertRow { .. }));
+            let function = at(|c| matches!(c, Change::Module(ModuleChange::CreateModule { .. })));
+            let release = at(|c| {
+                matches!(
+                    c,
+                    Change::Column(ColumnChange::AlterColumnExpression { .. })
+                )
+            });
+            let drop = at(|c| matches!(c, Change::Column(ColumnChange::DropColumn { .. })));
+            let insert = at(|c| matches!(c, Change::Row(RowChange::InsertRow { .. })));
             assert!(
                 function < release && release < drop && drop < insert,
                 "{:?}",
@@ -16566,9 +16676,9 @@ fn a_dropped_generated_reader_releases_its_required_input_before_inserted_rows()
         let saved: pbps_model::SavedPlan =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         let drop_at = |name: &str| {
-            saved.changes.changes.iter().position(|p| matches!(&p.change,pbps_model::Change::DropColumn { column,.. } if column.table.raw().to_string()=="app.p" && column.name.raw()==name)).unwrap()
+            saved.changes.changes.iter().position(|p| matches!(&p.change,pbps_model::Change::Column(pbps_model::ColumnChange::DropColumn { column,.. }) if column.table.raw().to_string()=="app.p" && column.name.raw()==name)).unwrap()
         };
-        let insert=saved.changes.changes.iter().position(|p| matches!(&p.change,pbps_model::Change::InsertRow { table,.. } if table.raw().to_string()=="app.p")).unwrap();
+        let insert=saved.changes.changes.iter().position(|p| matches!(&p.change,pbps_model::Change::Row(pbps_model::RowChange::InsertRow { table,.. }) if table.raw().to_string()=="app.p")).unwrap();
         assert!(
             drop_at("g") < drop_at("a") && drop_at("a") < insert,
             "PG{version}: {:?}",
@@ -17799,7 +17909,7 @@ fn doctor_predicts_the_adopted_serial_sequence_grant_the_plan_cannot_revoke() {
             let saved: pbps_model::SavedPlan =
                 serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
             assert!(saved.changes.changes.iter().any(|p| matches!(&p.change,
-                pbps_model::Change::Revoke { role, target: found, permissions }
+                pbps_model::Change::Permission(pbps_model::GrantChange::Revoke { role, target: found, permissions })
                     if role.raw() == reader && found == &target && permissions.contains(&pbps_model::Permission::Usage)
             )), "{:?}", saved.changes);
             eprintln!(
@@ -17867,7 +17977,10 @@ fn arriving_overloads_rebind_unchanged_callers_in_the_approved_plan() {
         .changes
         .iter()
         .filter_map(|p| {
-            if let pbps_model::Change::AlterModule { id, .. } = &p.change {
+            if let pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule {
+                id, ..
+            }) = &p.change
+            {
                 Some(id.raw().to_string())
             } else {
                 None
@@ -18190,9 +18303,16 @@ fn a_plan_saved_before_a_grammar_upgrade_is_refused_after_the_transfer() {
         .changes
         .iter()
         .filter_map(|p| {
-            if let pbps_model::Change::CreateModule { id, .. } = &p.change {
+            if let pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule {
+                id, ..
+            }) = &p.change
+            {
                 Some(format!("create {id}", id = id.shown()))
-            } else if let pbps_model::Change::AlterModule { id, .. } = &p.change {
+            } else if let pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule {
+                id,
+                ..
+            }) = &p.change
+            {
                 Some(format!("alter {id}", id = id.shown()))
             } else {
                 None
@@ -20079,13 +20199,10 @@ fn permission_versions_are_checked_before_planning_bootstrap_apply_and_resume() 
     ]));
     let saved: pbps_model::SavedPlan =
         serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
-    assert!(
-        saved
-            .changes
-            .changes
-            .iter()
-            .all(|p| matches!(p.change, pbps_model::Change::Revoke { .. }))
-    );
+    assert!(saved.changes.changes.iter().all(|p| matches!(
+        p.change,
+        pbps_model::Change::Permission(pbps_model::GrantChange::Revoke { .. })
+    )));
     succeeds(d.run(&[
         "apply",
         "--db",
@@ -20915,6 +21032,7 @@ fn the_cli_probe_counts_real_null_rows_before_any_statement_and_then_accepts_cle
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn constraint_triggers_pull_bootstrap_and_plan_without_duplicate_constraints() {
+    use pbps_model::ModuleChange;
     use pbps_model::{Change, ModuleKind, SavedPlan};
     let own = OwnDatabase::new(&server(), "constraint_trigger229");
     let connection = own.connection();
@@ -21037,7 +21155,7 @@ fn constraint_triggers_pull_bootstrap_and_plan_without_duplicate_constraints() {
     let saved: SavedPlan = serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
     assert_eq!(saved.changes.changes.len(), 1, "{:?}", saved.changes);
     assert!(
-        matches!(&saved.changes.changes[0].change, Change::AlterModule { id, .. } if id == &trigger)
+        matches!(&saved.changes.changes[0].change, Change::Module(ModuleChange::AlterModule { id, .. }) if id == &trigger)
     );
     succeeds(approved_apply(&d, rebuilt, &plan, &[]));
     assert_eq!(
@@ -21960,17 +22078,18 @@ fn a_dropped_view_is_not_reported_as_carried_by_a_column_rename() {
         assert!(
             kinds.iter().any(|c| matches!(
                 c,
-                pbps_model::Change::DropModule {
+                pbps_model::Change::Module(pbps_model::ModuleChange::DropModule {
                     kind: pbps_model::ModuleKind::View,
                     id: pbps_model::ModuleId::Named(n),
-                } if n.raw().to_string() == "app.v"
+                }) if n.raw().to_string() == "app.v"
             )),
             "{kinds:#?}"
         );
         assert!(
-            kinds
-                .iter()
-                .any(|c| matches!(c, pbps_model::Change::RenameColumn { .. })),
+            kinds.iter().any(|c| matches!(
+                c,
+                pbps_model::Change::Column(pbps_model::ColumnChange::RenameColumn { .. })
+            )),
             "{kinds:#?}"
         );
 
@@ -22080,17 +22199,18 @@ fn a_dropped_function_is_not_reported_as_carried_by_a_column_rename() {
     assert!(
         kinds.iter().any(|c| matches!(
             c,
-            pbps_model::Change::DropModule {
+            pbps_model::Change::Module(pbps_model::ModuleChange::DropModule {
                 kind: pbps_model::ModuleKind::Function,
                 id: pbps_model::ModuleId::Routine(r),
-            } if r.raw().to_string() == "app.reads(integer)"
+            }) if r.raw().to_string() == "app.reads(integer)"
         )),
         "{kinds:#?}"
     );
     assert!(
-        kinds
-            .iter()
-            .any(|c| matches!(c, pbps_model::Change::RenameColumn { .. })),
+        kinds.iter().any(|c| matches!(
+            c,
+            pbps_model::Change::Column(pbps_model::ColumnChange::RenameColumn { .. })
+        )),
         "{kinds:#?}"
     );
 
@@ -26142,10 +26262,10 @@ fn a_referenced_key_replacement_applies_and_the_next_plan_is_empty() {
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             assert_eq!(saved.changes.changes.len(), 4, "{:?}", saved.changes);
             assert!(
-                matches!(&saved.changes.changes[0].change, pbps_model::Change::DropForeignKey {name, ..} if name.raw() == "fk_child")
+                matches!(&saved.changes.changes[0].change, pbps_model::Change::Constraint(pbps_model::ConstraintChange::DropForeignKey {name, ..}) if name.raw() == "fk_child")
             );
             assert!(
-                matches!(&saved.changes.changes[3].change, pbps_model::Change::AddForeignKey {name, ..} if name.raw() == "fk_child")
+                matches!(&saved.changes.changes[3].change, pbps_model::Change::Constraint(pbps_model::ConstraintChange::AddForeignKey {name, ..}) if name.raw() == "fk_child")
             );
             let checksum = plan_checksum(&path);
             let mut args = vec![
@@ -35193,7 +35313,7 @@ fn row_security_adoption_preserves_policies_during_an_unrelated_column_migration
         let saved: pbps_model::SavedPlan =
             serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
         assert!(
-            matches!(&saved.changes.changes[..], [step] if matches!(&step.change, pbps_model::Change::AddColumn { table, name, .. } if table == &pbps_model::TableName::new("app", "t") && name.raw() == "label"))
+            matches!(&saved.changes.changes[..], [step] if matches!(&step.change, pbps_model::Change::Column(pbps_model::ColumnChange::AddColumn { table, name, .. }) if table == &pbps_model::TableName::new("app", "t") && name.raw() == "label"))
         );
         succeeds(approved_apply(&d, connection, &plan, &[]));
         succeeds(d.run(&["verify", "--db", connection]));
@@ -35263,17 +35383,30 @@ fn row_security_created_policies_follow_routines_and_converge_after_apply_and_bo
                 .unwrap()
         };
         assert!(
-            at(|c| matches!(c, pbps_model::Change::CreateModule { .. }))
-                < at(|c| matches!(c, pbps_model::Change::CreatePolicy { .. }))
+            at(|c| matches!(
+                c,
+                pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule { .. })
+            )) < at(|c| matches!(
+                c,
+                pbps_model::Change::Policy(pbps_model::PolicyChange::CreatePolicy { .. })
+            ))
         );
         assert!(
             at(
-                |c| matches!(c, pbps_model::Change::AddColumn { name, .. } if name.raw() == "extra")
-            ) < at(|c| matches!(c, pbps_model::Change::CreatePolicy { .. }))
+                |c| matches!(c, pbps_model::Change::Column(pbps_model::ColumnChange::AddColumn { name, .. }) if name.raw() == "extra")
+            ) < at(|c| matches!(
+                c,
+                pbps_model::Change::Policy(pbps_model::PolicyChange::CreatePolicy { .. })
+            ))
         );
         assert!(
-            at(|c| matches!(c, pbps_model::Change::CreatePolicy { .. }))
-                < at(|c| matches!(c, pbps_model::Change::SetRowSecurity { .. }))
+            at(|c| matches!(
+                c,
+                pbps_model::Change::Policy(pbps_model::PolicyChange::CreatePolicy { .. })
+            )) < at(|c| matches!(
+                c,
+                pbps_model::Change::Policy(pbps_model::PolicyChange::SetRowSecurity { .. })
+            ))
         );
         succeeds(approved_apply(
             &d,
@@ -35422,7 +35555,8 @@ fn policy_rename_applies_and_replans_empty(d: &Demo, connection: &str) {
     assert!(!saved.changes.changes.is_empty());
     assert!(!saved.changes.changes.iter().any(|p| matches!(
         p.change,
-        pbps_model::Change::CreatePolicy { .. } | pbps_model::Change::SetRowSecurity { .. }
+        pbps_model::Change::Policy(pbps_model::PolicyChange::CreatePolicy { .. })
+            | pbps_model::Change::Policy(pbps_model::PolicyChange::SetRowSecurity { .. })
     )));
     succeeds(approved_apply(
         d,
@@ -35775,7 +35909,10 @@ fn row_security_policy_targets_must_exist_before_planning_or_bootstrap() {
                 .changes
                 .changes
                 .iter()
-                .filter(|p| matches!(p.change, pbps_model::Change::CreatePolicy { .. }))
+                .filter(|p| matches!(
+                    p.change,
+                    pbps_model::Change::Policy(pbps_model::PolicyChange::CreatePolicy { .. })
+                ))
                 .count(),
             4
         );
@@ -35906,11 +36043,11 @@ fn row_security_owned_sequence_removals_follow_policy_owner_drops() {
                     serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
                 assert!(
                     matches!(&saved.changes.changes[..], [owner, removal]
-                    if matches!(&owner.change, pbps_model::Change::DropTable { name, .. } if name.name=="z_owner")
+                    if matches!(&owner.change, pbps_model::Change::Table(pbps_model::TableChange::DropTable { name, .. }) if name.name=="z_owner")
                     && if whole_table {
-                        matches!(&removal.change, pbps_model::Change::DropTable { name, .. } if name.name=="a_input")
+                        matches!(&removal.change, pbps_model::Change::Table(pbps_model::TableChange::DropTable { name, .. }) if name.name=="a_input")
                     } else {
-                        matches!(&removal.change, pbps_model::Change::DropColumn { column, .. }
+                        matches!(&removal.change, pbps_model::Change::Column(pbps_model::ColumnChange::DropColumn { column, .. })
                             if column.table.name=="a_input" && column.name.raw()=="renamed_target")
                     }),
                     "{:?}",
@@ -36163,11 +36300,11 @@ fn state_history_preserves_recorded_partition_move_limits_in_json_and_human_outp
             let changes: pbps_model::ChangeSet =
                 serde_json::from_value(compared["data"]["changes"].clone()).unwrap();
             let limit = changes.changes.iter().find_map(|p| {
-                if let pbps_model::Change::CreateTable {
+                if let pbps_model::Change::Table(pbps_model::TableChange::CreateTable {
                     name,
                     moves_at_most,
                     ..
-                } = &p.change
+                }) = &p.change
                     && name == &partition
                 {
                     Some(*moves_at_most)

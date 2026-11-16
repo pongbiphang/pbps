@@ -1,4 +1,6 @@
 use super::*;
+use pbps_model::IndexChange;
+use pbps_model::PartitionChange;
 
 #[test]
 fn physical_parts_keep_explicit_copy_analysis_and_owned_index_sql() {
@@ -6,7 +8,7 @@ fn physical_parts_keep_explicit_copy_analysis_and_owned_index_sql() {
     let mut changes = fixture::changes();
     let analyze = changes.pop().unwrap();
     let mut copy = changes.pop().unwrap();
-    let Change::CopyTableRows(payload) = &mut copy else {
+    let Change::Partition(PartitionChange::CopyTableRows(payload)) = &mut copy else {
         panic!()
     };
     payload.columns.push(pbps_model::CopyColumn {
@@ -20,7 +22,7 @@ fn physical_parts_keep_explicit_copy_analysis_and_owned_index_sql() {
     let mut cases = vec![
         (copy, vec!["DO $pbps$\nDECLARE copied bigint;\nBEGIN\nINSERT INTO \"app\".\"tmp_p\" (\"k\", \"new\"\"column\") SELECT CAST(src.\"k\" AS bigint), CAST(NULL AS text) COLLATE \"C\" FROM \"app\".\"p\" AS src;\nGET DIAGNOSTICS copied = ROW_COUNT;\nIF copied > 10 THEN\nRAISE EXCEPTION USING MESSAGE = 'rebuild copy exceeds approved max_rows (10)', ERRCODE = 'P0001';\nEND IF;\nEND;\n$pbps$;".to_owned()]),
         (analyze, vec!["ANALYZE \"app\".\"tmp_p\";".into(), "ANALYZE \"app\".\"tmp_p1\";".into()]),
-        (Change::BuildPartitionedIndex(Box::new(recipe.clone())), vec![
+        (Change::Index(IndexChange::BuildPartitionedIndex(Box::new(recipe.clone()))), vec![
             "CREATE INDEX \"p_idx\" ON ONLY \"app\".\"tmp_p\" (\"k\" ASC);".into(),
             "CREATE INDEX \"p1_k_idx\" ON \"app\".\"tmp_p1\" (\"k\" ASC);".into(),
             "ALTER INDEX \"app\".\"p_idx\" ATTACH PARTITION \"app\".\"p1_k_idx\";".into(),
@@ -43,7 +45,10 @@ fn physical_parts_keep_explicit_copy_analysis_and_owned_index_sql() {
             ),
             "ALTER INDEX \"app\".\"p_idx\" ATTACH PARTITION \"app\".\"p1_k_idx\";".into(),
         ];
-        cases.push((Change::BuildPartitionedIndex(Box::new(key)), bodies.into()));
+        cases.push((
+            Change::Index(IndexChange::BuildPartitionedIndex(Box::new(key))),
+            bodies.into(),
+        ));
     }
     for (change, bodies) in cases {
         let expected: Vec<_> = bodies
@@ -62,7 +67,7 @@ fn physical_parts_keep_explicit_copy_analysis_and_owned_index_sql() {
     assert!(
         emit(
             &pg,
-            &Change::BuildPartitionedIndex(Box::new(invalid)),
+            &Change::Index(IndexChange::BuildPartitionedIndex(Box::new(invalid))),
             Strategy::default()
         )
         .is_err()
@@ -75,9 +80,9 @@ fn the_shared_emission_entry_refuses_unbalanced_rebuild_conversions() {
     let pg = Postgres::new();
     let mut copy = fixture::changes()
         .into_iter()
-        .find(|c| matches!(c, Change::CopyTableRows(_)))
+        .find(|c| matches!(c, Change::Partition(PartitionChange::CopyTableRows(_))))
         .unwrap();
-    let Change::CopyTableRows(payload) = &mut copy else {
+    let Change::Partition(PartitionChange::CopyTableRows(payload)) = &mut copy else {
         unreachable!()
     };
     let column = &mut payload.columns[0];
@@ -96,7 +101,7 @@ fn the_shared_emission_entry_refuses_unbalanced_rebuild_conversions() {
         why.contains("has unbalanced parentheses") && why.contains("re-record"),
         "{why}"
     );
-    let Change::CopyTableRows(payload) = &mut copy else {
+    let Change::Partition(PartitionChange::CopyTableRows(payload)) = &mut copy else {
         unreachable!()
     };
     payload.columns[0].stages[0].using = Some(format!("({expression_name})"));

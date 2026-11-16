@@ -92,6 +92,16 @@ use pbps_dialect::Dialect;
 use pbps_diff::order::expand::{self, Added, Addition, Anchor, Expansion, Order, Rewrite, expand};
 #[cfg(test)]
 use pbps_diff::order::{Schedule, Source};
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+#[cfg(test)]
+use pbps_model::RowChange;
+use pbps_model::TableChange;
+#[cfg(test)]
+use pbps_model::TablePropertyChange;
 #[cfg(test)]
 use pbps_model::resolver::OrderReason;
 use pbps_model::{Change, ChangeSet, ModuleId, ModuleKind, Partitions, Schema, TableName};
@@ -115,8 +125,10 @@ pub(crate) fn dropped_modules(changes: &ChangeSet) -> Vec<(ModuleId, ModuleKind)
     let mut out: Vec<(ModuleId, ModuleKind)> = Vec::new();
     for p in &changes.changes {
         let found = match &p.change {
-            Change::AlterModule { id, module } => Some((id.clone(), module.kind)),
-            Change::DropModule { id, kind } => Some((id.clone(), *kind)),
+            Change::Module(ModuleChange::AlterModule { id, module }) => {
+                Some((id.clone(), module.kind))
+            }
+            Change::Module(ModuleChange::DropModule { id, kind }) => Some((id.clone(), *kind)),
             _ => None,
         };
         if let Some(found) = found
@@ -141,9 +153,9 @@ pub(crate) fn untouched_module_dependents(
 ) -> std::collections::BTreeSet<ModuleId> {
     let touched = |x: &ModuleId| {
         changes.changes.iter().any(|p| match &p.change {
-            Change::AlterModule { id, .. }
-            | Change::DropModule { id, .. }
-            | Change::CreateModule { id, .. } => id == x,
+            Change::Module(ModuleChange::AlterModule { id, .. })
+            | Change::Module(ModuleChange::DropModule { id, .. })
+            | Change::Module(ModuleChange::CreateModule { id, .. }) => id == x,
             _ => false,
         })
     };
@@ -155,7 +167,8 @@ pub(crate) fn untouched_module_dependents(
     // (DEC-314.1, #947).
     let recreated = |root: &ModuleId| {
         changes.changes.iter().any(|p| match &p.change {
-            Change::AlterModule { id, .. } | Change::CreateModule { id, .. } => id == root,
+            Change::Module(ModuleChange::AlterModule { id, .. })
+            | Change::Module(ModuleChange::CreateModule { id, .. }) => id == root,
             _ => false,
         })
     };
@@ -230,12 +243,14 @@ fn span(changes: &[PlannedChange], root: &ModuleId) -> Option<Span> {
     let mut create_at = None;
     for (i, p) in changes.iter().enumerate() {
         match &p.change {
-            Change::AlterModule { id, .. } if id == root => {
+            Change::Module(ModuleChange::AlterModule { id, .. }) if id == root => {
                 drop_at = Some(i);
                 create_at = Some(i);
             }
-            Change::DropModule { id, .. } if id == root => drop_at = Some(i),
-            Change::CreateModule { id, .. } if id == root => create_at = Some(i),
+            Change::Module(ModuleChange::DropModule { id, .. }) if id == root => drop_at = Some(i),
+            Change::Module(ModuleChange::CreateModule { id, .. }) if id == root => {
+                create_at = Some(i)
+            }
             _ => {}
         }
     }
@@ -402,14 +417,13 @@ pub(crate) fn standing_partitions(schema: &Schema, cs: &ChangeSet) -> Partitions
         .changes
         .iter()
         .filter_map(|p| match &p.change {
-            Change::AttachPartition { table, .. } | Change::DetachPartition { table, .. } => {
-                Some(table)
-            }
-            Change::DropTable {
+            Change::Partition(PartitionChange::AttachPartition { table, .. })
+            | Change::Partition(PartitionChange::DetachPartition { table, .. }) => Some(table),
+            Change::Table(TableChange::DropTable {
                 name,
                 detach_from: Some(_),
                 ..
-            } => Some(name),
+            }) => Some(name),
             _ => None,
         })
         .collect();
@@ -449,33 +463,33 @@ fn edits_in_place(parts: &[PartEffect<'_>], holds: &Holds, _: &Partitions) -> bo
 #[cfg(test)]
 fn in_place_parts(change: &Change) -> Option<(Change, Change)> {
     Some(match change.clone() {
-        Change::AlterModule { id, module } => (
-            Change::DropModule {
+        Change::Module(ModuleChange::AlterModule { id, module }) => (
+            Change::Module(ModuleChange::DropModule {
                 id: id.clone(),
                 kind: module.kind,
-            },
-            Change::CreateModule { id, module },
+            }),
+            Change::Module(ModuleChange::CreateModule { id, module }),
         ),
-        Change::AlterColumnDefault {
+        Change::Column(ColumnChange::AlterColumnDefault {
             uid,
             column,
             from,
             to,
-        } => (
-            Change::AlterColumnDefault {
+        }) => (
+            Change::Column(ColumnChange::AlterColumnDefault {
                 uid: uid.clone(),
                 column: column.clone(),
                 from,
                 to: None,
-            },
-            Change::AlterColumnDefault {
+            }),
+            Change::Column(ColumnChange::AlterColumnDefault {
                 uid,
                 column,
                 from: None,
                 to,
-            },
+            }),
         ),
-        Change::SetPartitionDefault {
+        Change::Partition(PartitionChange::SetPartitionDefault {
             uid,
             table,
             parent,
@@ -483,8 +497,8 @@ fn in_place_parts(change: &Change) -> Option<(Change, Change)> {
             from,
             to,
             fallback,
-        } => (
-            Change::SetPartitionDefault {
+        }) => (
+            Change::Partition(PartitionChange::SetPartitionDefault {
                 uid: uid.clone(),
                 table: table.clone(),
                 parent: parent.clone(),
@@ -492,8 +506,8 @@ fn in_place_parts(change: &Change) -> Option<(Change, Change)> {
                 from,
                 to: None,
                 fallback: None,
-            },
-            Change::SetPartitionDefault {
+            }),
+            Change::Partition(PartitionChange::SetPartitionDefault {
                 uid,
                 table,
                 parent,
@@ -501,7 +515,7 @@ fn in_place_parts(change: &Change) -> Option<(Change, Change)> {
                 from: None,
                 to,
                 fallback,
-            },
+            }),
         ),
         _ => return None,
     })
@@ -574,10 +588,10 @@ fn respell(
         return;
     };
     match &mut p.change {
-        Change::DropCheck { table: t, .. }
-        | Change::AddCheck { table: t, .. }
-        | Change::DropIndex { table: t, .. }
-        | Change::AddIndex { table: t, .. } => *t = table.clone(),
+        Change::Constraint(ConstraintChange::DropCheck { table: t, .. })
+        | Change::Constraint(ConstraintChange::AddCheck { table: t, .. })
+        | Change::Index(IndexChange::DropIndex { table: t, .. })
+        | Change::Index(IndexChange::AddIndex { table: t, .. }) => *t = table.clone(),
         _ => return,
     }
     p.risks = dialect.change_risks(&p.change);
@@ -607,7 +621,7 @@ fn respell_at(
         return Err("the default's physical source is unavailable".into());
     };
     let (from, to, fallback, origin) = match &p.change {
-        Change::AlterColumnDefault { uid, from, to, .. } => {
+        Change::Column(ColumnChange::AlterColumnDefault { uid, from, to, .. }) => {
             // A standing parent's change still recurses into its child. It
             // keeps its identity, but uses its name at the new boundary.
             if let Owner::Partition { parent } = &located.owner
@@ -615,24 +629,24 @@ fn respell_at(
                 && let Some(table) = sources.names().table_at(table_uid, at)
                 && table == parent
             {
-                p.change = Change::AlterColumnDefault {
+                p.change = Change::Column(ColumnChange::AlterColumnDefault {
                     uid: uid.clone(),
                     column: table.column(name),
                     from: from.clone(),
                     to: to.clone(),
-                };
+                });
                 p.risks = dialect.change_risks(&p.change);
                 return Ok(());
             }
             (from.clone(), to.clone(), None, None)
         }
-        Change::SetPartitionDefault {
+        Change::Partition(PartitionChange::SetPartitionDefault {
             from,
             to,
             fallback,
             parent,
             ..
-        } => (
+        }) => (
             from.clone(),
             to.clone(),
             fallback.clone(),
@@ -672,14 +686,14 @@ fn default_change(
     // or losing it in an ordinary column's `to` expression (DEC-1875.1).
     let inherited = to.is_none() && fallback.is_some();
     if !inherited && let Some(uid) = column_uid {
-        Ok(Change::AlterColumnDefault {
+        Ok(Change::Column(ColumnChange::AlterColumnDefault {
             uid,
             column: located.address,
             from,
             to,
-        })
+        }))
     } else {
-        Ok(Change::SetPartitionDefault {
+        Ok(Change::Partition(PartitionChange::SetPartitionDefault {
             uid: located.table_uid,
             table: located.address.table,
             parent: origin
@@ -689,7 +703,7 @@ fn default_change(
             from,
             to,
             fallback,
-        })
+        }))
     }
 }
 
@@ -773,23 +787,23 @@ fn removal_of(
                     pbps_model::escape::Escaped(&d.described)
                 )
             })?;
-            Ok(Change::DropModule {
+            Ok(Change::Module(ModuleChange::DropModule {
                 id: x.clone(),
                 kind,
-            })
+            }))
         }
         Holds::TablePart { table, part } => Ok(match part {
             Part::PrimaryKey(_) | Part::Unique(_) | Part::ForeignKey(_) => {
                 unreachable!("outside the frozen module oracle")
             }
-            Part::Check(name) => Change::DropCheck {
+            Part::Check(name) => Change::Constraint(ConstraintChange::DropCheck {
                 table: table.clone(),
                 name: name.clone(),
-            },
-            Part::Index(name) => Change::DropIndex {
+            }),
+            Part::Index(name) => Change::Index(IndexChange::DropIndex {
                 table: table.clone(),
                 name: name.clone(),
-            },
+            }),
             Part::Default(column) => {
                 let from = if let Some(of) = partition_of(declared, table) {
                     of.columns.get(column).and_then(|own| own.default.clone())
@@ -846,25 +860,25 @@ fn restoration_of(
     match &d.holds {
         Holds::Module(x) => {
             let module = declared.modules.get(x).ok_or_else(unsupported)?;
-            Ok(Change::CreateModule {
+            Ok(Change::Module(ModuleChange::CreateModule {
                 id: x.clone(),
                 module: Box::new(module.clone()),
-            })
+            }))
         }
         Holds::TablePart { table, part } => {
             let t = declared.tables.get(table).ok_or_else(unsupported)?;
             Ok(match part {
-                Part::Check(name) => Change::AddCheck {
+                Part::Check(name) => Change::Constraint(ConstraintChange::AddCheck {
                     table: table.clone(),
                     name: name.clone(),
                     constraint: t.checks.get(name).ok_or_else(unsupported)?.clone(),
-                },
-                Part::Index(name) => Change::AddIndex {
+                }),
+                Part::Index(name) => Change::Index(IndexChange::AddIndex {
                     table: table.clone(),
                     name: name.clone(),
                     index: Box::new(t.indexes.get(name).ok_or_else(unsupported)?.clone()),
                     clustered: false,
-                },
+                }),
                 Part::PrimaryKey(_)
                 | Part::Unique(_)
                 | Part::ForeignKey(_)
@@ -948,11 +962,13 @@ fn taken_by_its_parent(changes: &[PlannedChange], holds: &Holds, drop_at: usize)
     if attach >= drop_at {
         return false;
     }
-    let Change::AttachPartition { parent, .. } = &changes[attach].change else {
+    let Change::Partition(PartitionChange::AttachPartition { parent, .. }) =
+        &changes[attach].change
+    else {
         return false;
     };
     changes[attach..drop_at].iter().any(|p| {
-        matches!(&p.change, Change::DropCheck { table, name: n } if table == parent && n == name)
+        matches!(&p.change, Change::Constraint(ConstraintChange::DropCheck { table, name: n }) if table == parent && n == name)
     })
 }
 
@@ -970,7 +986,7 @@ fn attached_at(changes: &[PlannedChange], holds: &Holds) -> Option<usize> {
         return None;
     };
     changes.iter().position(|p| {
-        matches!(&p.change, Change::AttachPartition { table: t, shape, .. }
+        matches!(&p.change, Change::Partition(PartitionChange::AttachPartition { table: t, shape, .. })
             if t == table && !shape.checks.contains_key(name))
     })
 }
@@ -1056,9 +1072,11 @@ fn oracle_weave(
                 .changes
                 .iter()
                 .filter_map(|p| {
-                    if let Change::DetachPartition {
-                        table: t, parent, ..
-                    } = &p.change
+                    if let Change::Partition(PartitionChange::DetachPartition {
+                        table: t,
+                        parent,
+                        ..
+                    }) = &p.change
                         && parent == table
                     {
                         Some(t.shown().to_string())
@@ -1612,14 +1630,14 @@ fn defaults_taken_by_rows(cs: &ChangeSet) -> std::collections::BTreeSet<ColumnRe
     let mut out = std::collections::BTreeSet::new();
     for p in &cs.changes {
         match &p.change {
-            Change::InsertRow {
+            Change::Row(RowChange::InsertRow {
                 table, defaults, ..
-            } => {
+            }) => {
                 for column in defaults.keys() {
                     out.insert(ColumnRef::new(table.clone(), column.clone()));
                 }
             }
-            Change::UpdateRow { table, columns, .. } => {
+            Change::Row(RowChange::UpdateRow { table, columns, .. }) => {
                 for (column, (_, after)) in columns {
                     if matches!(after, pbps_model::Cell::Default(_)) {
                         out.insert(ColumnRef::new(table.clone(), column.clone()));
@@ -1642,7 +1660,7 @@ fn last_function_create(cs: &ChangeSet) -> Option<usize> {
     // ahead of its `CREATE FUNCTION` names a function not there yet, and the
     // engine refuses it (DEC-942.1).
     let created = cs.changes.iter().any(|p| {
-        matches!(&p.change, Change::CreateModule { module, .. } if module.kind == ModuleKind::Function)
+        matches!(&p.change, Change::Module(ModuleChange::CreateModule { module, .. }) if module.kind == ModuleKind::Function)
     });
     // A routine the plan drops and creates counts when either side is a
     // function. The created side counts because a procedure that becomes a
@@ -1654,7 +1672,8 @@ fn last_function_create(cs: &ChangeSet) -> Option<usize> {
     // created kind alone stopped moving that check (#1047).
     let rebuilt = dropped_modules(cs).into_iter().any(|(id, dropped)| {
         cs.changes.iter().any(|p| match &p.change {
-            Change::AlterModule { id: x, module } | Change::CreateModule { id: x, module } => {
+            Change::Module(ModuleChange::AlterModule { id: x, module })
+            | Change::Module(ModuleChange::CreateModule { id: x, module }) => {
                 *x == id && (dropped == ModuleKind::Function || module.kind == ModuleKind::Function)
             }
             _ => false,
@@ -1664,7 +1683,8 @@ fn last_function_create(cs: &ChangeSet) -> Option<usize> {
         return None;
     }
     cs.changes.iter().rposition(|p| match &p.change {
-        Change::AlterModule { module, .. } | Change::CreateModule { module, .. } => {
+        Change::Module(ModuleChange::AlterModule { module, .. })
+        | Change::Module(ModuleChange::CreateModule { module, .. }) => {
             module.kind == ModuleKind::Function
         }
         _ => false,
@@ -1680,7 +1700,8 @@ fn function_creates(cs: &ChangeSet) -> Vec<(String, usize)> {
         .iter()
         .enumerate()
         .filter_map(|(i, p)| match &p.change {
-            Change::AlterModule { id, module } | Change::CreateModule { id, module }
+            Change::Module(ModuleChange::AlterModule { id, module })
+            | Change::Module(ModuleChange::CreateModule { id, module })
                 if module.kind == ModuleKind::Function =>
             {
                 id.referenced_name().map(|n| (n.name, i))
@@ -1856,9 +1877,9 @@ fn oracle_before_its_partitions_indexes(
     dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<(), String> {
     let adoptable_by = |parent: &TableName, index: &pbps_model::Index, c: &Change| {
-        let Change::AddIndex {
+        let Change::Index(IndexChange::AddIndex {
             table, index: own, ..
-        } = c
+        }) = c
         else {
             return false;
         };
@@ -1874,12 +1895,12 @@ fn oracle_before_its_partitions_indexes(
     let crossable = |c: &Change| {
         matches!(
             c,
-            Change::AddIndex { .. }
-                | Change::DropIndex { .. }
-                | Change::SetIndexStorageParameters { .. }
+            Change::Index(IndexChange::AddIndex { .. })
+                | Change::Index(IndexChange::DropIndex { .. })
+                | Change::Index(IndexChange::SetIndexStorageParameters { .. })
                 | pbps_model::change_family!(constraints)
                 | pbps_model::change_family!(policies)
-                | Change::SetReplicaIdentity { .. }
+                | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
                 | pbps_model::change_family!(permissions)
         )
     };
@@ -1889,11 +1910,11 @@ fn oracle_before_its_partitions_indexes(
     let mut stretch: Option<(usize, usize)> = None;
     let mut adoptions: Vec<(usize, usize)> = Vec::new();
     for (k, p) in cs.changes.iter().enumerate() {
-        let Change::AddIndex {
+        let Change::Index(IndexChange::AddIndex {
             table: parent,
             index,
             ..
-        } = &p.change
+        }) = &p.change
         else {
             continue;
         };
@@ -1940,7 +1961,9 @@ fn oracle_before_its_partitions_indexes(
         Err(pbps_diff::order::Refusal::Cycle { members, .. }) => {
             // `k` is a parent's `AddIndex`, as every adoption's first end is.
             let named = |i: usize| {
-                if let Change::AddIndex { table, name, .. } = &cs.changes[i].change {
+                if let Change::Index(IndexChange::AddIndex { table, name, .. }) =
+                    &cs.changes[i].change
+                {
                     (name.shown().to_string(), table.shown().to_string())
                 } else {
                     (
@@ -2040,16 +2063,16 @@ fn oracle_after_the_rows_that_leave(
     let mut schedule = Schedule::new(cs.changes.len());
     let mut held = false;
     for (d, p) in cs.changes.iter().enumerate() {
-        let (partition, parent) = if let Change::DropTable {
+        let (partition, parent) = if let Change::Table(TableChange::DropTable {
             name,
             detach_from: Some(parent),
             ..
-        }
-        | Change::DetachPartition {
+        })
+        | Change::Partition(PartitionChange::DetachPartition {
             table: name,
             parent,
             ..
-        } = &p.change
+        }) = &p.change
         {
             (name, parent)
         } else {
@@ -2060,7 +2083,7 @@ fn oracle_after_the_rows_that_leave(
             .filter(|&k| {
                 matches!(
                     &cs.changes[k].change,
-                    Change::UpdateRow { table, .. } | Change::DeleteRow { table, .. }
+                    Change::Row(RowChange::UpdateRow { table, .. }) | Change::Row(RowChange::DeleteRow { table, .. })
                         if from.contains(table)
                 )
             })
@@ -2101,17 +2124,19 @@ fn oracle_after_the_rows_that_leave(
 fn passable_by_a_leaving_partition(c: &Change, partition: &TableName, parent: &TableName) -> bool {
     let other = |table: &TableName| table != partition && table != parent;
     match c {
-        Change::DeleteRow { .. } => true,
-        Change::InsertRow { table, .. }
-        | Change::UpdateRow { table, .. }
-        | Change::AddColumn { table, .. }
-        | Change::SetStorageParameters { table, .. } => other(table),
-        Change::DropTable { name, .. } => other(name),
-        Change::AlterColumnType { column, .. }
-        | Change::AlterColumnNullability { column, .. }
-        | Change::AlterColumnDefault { column, .. }
-        | Change::AlterColumnExpression { column, .. }
-        | Change::SetColumnDeprecated { column, .. } => other(&column.table),
+        Change::Row(RowChange::DeleteRow { .. }) => true,
+        Change::Row(RowChange::InsertRow { table, .. })
+        | Change::Row(RowChange::UpdateRow { table, .. })
+        | Change::Column(ColumnChange::AddColumn { table, .. })
+        | Change::TableProperty(TablePropertyChange::SetStorageParameters { table, .. }) => {
+            other(table)
+        }
+        Change::Table(TableChange::DropTable { name, .. }) => other(name),
+        Change::Column(ColumnChange::AlterColumnType { column, .. })
+        | Change::Column(ColumnChange::AlterColumnNullability { column, .. })
+        | Change::Column(ColumnChange::AlterColumnDefault { column, .. })
+        | Change::Column(ColumnChange::AlterColumnExpression { column, .. })
+        | Change::Column(ColumnChange::SetColumnDeprecated { column, .. }) => other(&column.table),
         _ => false,
     }
 }
@@ -2148,33 +2173,33 @@ fn rests_on(
             return true;
         }
     }
-    if let Change::AddForeignKey { constraint, .. } = later
-        && let Change::AddUnique { table, .. }
-        | Change::SetPrimaryKey { table, .. }
-        | Change::AddIndex { table, .. } = earlier
+    if let Change::Constraint(ConstraintChange::AddForeignKey { constraint, .. }) = later
+        && let Change::Constraint(ConstraintChange::AddUnique { table, .. })
+        | Change::Constraint(ConstraintChange::SetPrimaryKey { table, .. })
+        | Change::Index(IndexChange::AddIndex { table, .. }) = earlier
         && *table == constraint.references_table
     {
         return true;
     }
-    if let Change::SetReplicaIdentity {
+    if let Change::TableProperty(TablePropertyChange::SetReplicaIdentity {
         table,
         to: Some(pbps_model::ReplicaIdentity::Index(index)),
         ..
-    } = later
-        && let Change::AddIndex {
+    }) = later
+        && let Change::Index(IndexChange::AddIndex {
             table: on, name, ..
-        } = earlier
+        }) = earlier
         && on == table
         && name == index
     {
         return true;
     }
     fn takes_a_name(c: &Change) -> Option<&TableName> {
-        if let Change::AddIndex { table, .. }
-        | Change::AddUnique { table, .. }
-        | Change::SetPrimaryKey { table, .. }
-        | Change::AddCheck { table, .. }
-        | Change::AddForeignKey { table, .. } = c
+        if let Change::Index(IndexChange::AddIndex { table, .. })
+        | Change::Constraint(ConstraintChange::AddUnique { table, .. })
+        | Change::Constraint(ConstraintChange::SetPrimaryKey { table, .. })
+        | Change::Constraint(ConstraintChange::AddCheck { table, .. })
+        | Change::Constraint(ConstraintChange::AddForeignKey { table, .. }) = c
         {
             Some(table)
         } else {
@@ -2182,11 +2207,11 @@ fn rests_on(
         }
     }
     fn frees_a_name(c: &Change) -> Option<&TableName> {
-        if let Change::DropIndex { table, .. }
-        | Change::DropUnique { table, .. }
-        | Change::SetPrimaryKey { table, .. }
-        | Change::DropCheck { table, .. }
-        | Change::DropForeignKey { table, .. } = c
+        if let Change::Index(IndexChange::DropIndex { table, .. })
+        | Change::Constraint(ConstraintChange::DropUnique { table, .. })
+        | Change::Constraint(ConstraintChange::SetPrimaryKey { table, .. })
+        | Change::Constraint(ConstraintChange::DropCheck { table, .. })
+        | Change::Constraint(ConstraintChange::DropForeignKey { table, .. }) = c
         {
             Some(table)
         } else {
@@ -2319,7 +2344,8 @@ fn oracle_after_the_rebuilds(
             (edge.after < edge.before
                 && matches!(
                     cs.changes[edge.after].change,
-                    Change::CreateTable { .. } | Change::AttachPartition { .. }
+                    Change::Table(TableChange::CreateTable { .. })
+                        | Change::Partition(PartitionChange::AttachPartition { .. })
                 ))
             .then_some((edge.after, edge.before))
         })
@@ -2329,18 +2355,20 @@ fn oracle_after_the_rebuilds(
         for later in first + 1..=last {
             for earlier in first..later {
                 let parent = match &cs.changes[earlier].change {
-                    Change::CreateTable { table, .. } => {
+                    Change::Table(TableChange::CreateTable { table, .. }) => {
                         table.partition_of.as_ref().map(|of| &of.parent)
                     }
-                    Change::AttachPartition { parent, .. } => Some(parent),
+                    Change::Partition(PartitionChange::AttachPartition { parent, .. }) => {
+                        Some(parent)
+                    }
                     _ => None,
                 };
                 // Rows written through the parent may route into the new
                 // partition even though they do not spell its name.
                 let parent_rows = match &cs.changes[later].change {
-                    Change::InsertRow { table, .. }
-                    | Change::UpdateRow { table, .. }
-                    | Change::DeleteRow { table, .. } => Some(table) == parent,
+                    Change::Row(RowChange::InsertRow { table, .. })
+                    | Change::Row(RowChange::UpdateRow { table, .. })
+                    | Change::Row(RowChange::DeleteRow { table, .. }) => Some(table) == parent,
                     _ => false,
                 };
                 if parent_rows
@@ -2367,7 +2395,7 @@ fn oracle_after_the_rebuilds(
     let recomputed: BTreeSet<&ColumnRef> = cs.changes[..last]
         .iter()
         .filter_map(|p| match &p.change {
-            Change::AlterColumnExpression { column, to, .. }
+            Change::Column(ColumnChange::AlterColumnExpression { column, to, .. })
                 if !released.contains(column) && calls(to) =>
             {
                 Some(column)
@@ -2378,16 +2406,18 @@ fn oracle_after_the_rebuilds(
     let mut moves: Vec<bool> = cs.changes[..last]
         .iter()
         .map(|p| match &p.change {
-            Change::AddCheck { constraint, .. } => calls(&constraint.expression),
-            Change::AlterColumnDefault {
+            Change::Constraint(ConstraintChange::AddCheck { constraint, .. }) => {
+                calls(&constraint.expression)
+            }
+            Change::Column(ColumnChange::AlterColumnDefault {
                 column,
                 to: Some(to),
                 ..
-            } => !taken.contains(column) && calls(to),
+            }) => !taken.contains(column) && calls(to),
             // A partition's, its own or its parent's taken back (#1588). A
             // row written through its parent takes the parent's default, not
             // the partition's (DEC-1578.1), so none is taken ahead of it.
-            Change::SetPartitionDefault { to, fallback, .. } => to
+            Change::Partition(PartitionChange::SetPartitionDefault { to, fallback, .. }) => to
                 .as_ref()
                 .or(fallback.as_ref())
                 .is_some_and(|text| calls(text)),
@@ -2396,47 +2426,49 @@ fn oracle_after_the_rebuilds(
             // column, so none is taken ahead of it.
             // One that releases a generated column from a module the plan
             // drops stays ahead of that drop, which `weave` put after it.
-            Change::AlterColumnExpression { column, .. } => recomputed.contains(column),
+            Change::Column(ColumnChange::AlterColumnExpression { column, .. }) => {
+                recomputed.contains(column)
+            }
             // What validates a recomputed column's values stays behind its new
             // expression, which the order kept among the moved preserves: a
             // `NOT NULL`, and a key over it on either side of a foreign key.
             // Left here, it would judge the values the old expression stored.
-            Change::AlterColumnNullability {
+            Change::Column(ColumnChange::AlterColumnNullability {
                 column,
                 to_nullable: false,
                 ..
-            } => recomputed.contains(column),
-            Change::AddIndex { table, index, .. } => {
+            }) => recomputed.contains(column),
+            Change::Index(IndexChange::AddIndex { table, index, .. }) => {
                 (index.holds_expression() && calls(&index_text(index)))
                     || index.column_keys().is_some_and(|keys| {
                         keys.iter().any(|k| recomputed.contains(&table.column(k)))
                     })
             }
-            Change::SetExclusion {
+            Change::Constraint(ConstraintChange::SetExclusion {
                 table, to: Some(x), ..
-            } => {
+            }) => {
                 calls(&x.expression_texts().collect::<Vec<_>>().join(" , "))
                     || x.key_columns().is_some_and(|keys| {
                         keys.iter().any(|k| recomputed.contains(&table.column(k)))
                     })
             }
-            Change::AddUnique {
+            Change::Constraint(ConstraintChange::AddUnique {
                 table, constraint, ..
-            } => constraint
+            }) => constraint
                 .columns
                 .iter()
                 .any(|c| recomputed.contains(&table.column(c))),
-            Change::SetPrimaryKey {
+            Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table,
                 to: Some(pk),
                 ..
-            } => pk
+            }) => pk
                 .columns
                 .iter()
                 .any(|c| recomputed.contains(&table.column(c))),
-            Change::AddForeignKey {
+            Change::Constraint(ConstraintChange::AddForeignKey {
                 table, constraint, ..
-            } => {
+            }) => {
                 constraint
                     .columns
                     .iter()
@@ -2592,8 +2624,8 @@ pub(crate) fn names_a_later_relation(
         // path. Measured on 16 and 18 (#1599 review).
         // Only a routine's body is a string the engine analyses: a view's
         // or a trigger's literals are data, read once (#1599 review).
-        let header = if let Change::CreateModule { module, .. } | Change::AlterModule { module, .. } =
-            &p.change
+        let header = if let Change::Module(ModuleChange::CreateModule { module, .. })
+        | Change::Module(ModuleChange::AlterModule { module, .. }) = &p.change
             && matches!(module.kind, ModuleKind::Function | ModuleKind::Procedure)
         {
             Some(routine_header(&module.definition, dialect))
@@ -3111,7 +3143,7 @@ pub(crate) fn key_name_prefixes(cs: &ChangeSet) -> Vec<(String, String)> {
             while let Some(into) = schemas.get(k).cloned() {
                 k += 1;
                 for p in &cs.changes {
-                    if let Change::RenameTable { from, to, .. } = &p.change
+                    if let Change::Table(TableChange::RenameTable { from, to, .. }) = &p.change
                         && to.schema == into
                         && !schemas.contains(&from.schema)
                     {
@@ -3235,7 +3267,7 @@ fn replay(present: &mut Vec<KeyNameHolder>, change: &Change) {
     match change {
         // A table moved to another schema takes its indexes and constraints
         // along under their names (measured on 16 and 18, #1729 review).
-        Change::RenameTable { from, to, .. } => {
+        Change::Table(TableChange::RenameTable { from, to, .. }) => {
             for h in present.iter_mut() {
                 if !h.constraint && h.name == *from {
                     h.name = to.clone();
@@ -3251,44 +3283,45 @@ fn replay(present: &mut Vec<KeyNameHolder>, change: &Change) {
                 }
             }
         }
-        Change::DropTable { name, .. } => {
+        Change::Table(TableChange::DropTable { name, .. }) => {
             present.retain(|h| !(owned(h, name) || (!h.constraint && h.name == *name)
                 || matches!(&h.parent_trigger, Some(ModuleId::Trigger { on, .. }) if on == name)));
         }
         // A unique constraint is its index and itself.
-        Change::DropUnique { table, name } => {
+        Change::Constraint(ConstraintChange::DropUnique { table, name }) => {
             present.retain(|h| !(owned(h, table) && h.name.name == name.raw()));
         }
-        Change::DropIndex { table, name } => {
+        Change::Index(IndexChange::DropIndex { table, name }) => {
             present.retain(|h| !(!h.constraint && owned(h, table) && h.name.name == name.raw()));
         }
-        Change::DropCheck { table, name } | Change::DropForeignKey { table, name } => {
+        Change::Constraint(ConstraintChange::DropCheck { table, name })
+        | Change::Constraint(ConstraintChange::DropForeignKey { table, name }) => {
             present.retain(|h| !(h.constraint && owned(h, table) && h.name.name == name.raw()));
         }
-        Change::SetPrimaryKey {
+        Change::Constraint(ConstraintChange::SetPrimaryKey {
             table,
             from: Some(_),
             ..
-        } => present.retain(|h| !(owned(h, table) && h.primary_key)),
-        Change::DropModule {
+        }) => present.retain(|h| !(owned(h, table) && h.primary_key)),
+        Change::Module(ModuleChange::DropModule {
             id: ModuleId::Named(name),
             kind: ModuleKind::View,
-        } => present.retain(|h| !(!h.constraint && h.name == *name)),
+        }) => present.retain(|h| !(!h.constraint && h.name == *name)),
         // A constraint trigger's row goes with the trigger, matched by the
         // trigger's own name, which a rename leaves apart from the row's
         // (#1738, #1752 review).
-        Change::DropModule {
+        Change::Module(ModuleChange::DropModule {
             id: id @ ModuleId::Trigger { on, name },
             ..
-        }
-        | Change::AlterModule {
+        })
+        | Change::Module(ModuleChange::AlterModule {
             id: id @ ModuleId::Trigger { on, name },
             ..
-        } => present.retain(|h| {
+        }) => present.retain(|h| {
             !(h.parent_trigger.as_ref() == Some(id)
                 || (owned(h, on) && h.trigger.as_deref() == Some(name.as_str())))
         }),
-        Change::DetachPartition { table, .. } => {
+        Change::Partition(PartitionChange::DetachPartition { table, .. }) => {
             present.retain(|h| !(owned(h, table) && h.parent_trigger.is_some()));
         }
         _ => {}
@@ -3355,7 +3388,7 @@ impl KeyTriggerClones {
                 }),
             };
         match change {
-            Change::RenameTable { from, to, .. } => {
+            Change::Table(TableChange::RenameTable { from, to, .. }) => {
                 self.parents = std::mem::take(&mut self.parents)
                     .into_iter()
                     .map(|(p, of)| {
@@ -3372,27 +3405,27 @@ impl KeyTriggerClones {
                     })
                     .collect();
             }
-            Change::DropTable { name, .. } => {
+            Change::Table(TableChange::DropTable { name, .. }) => {
                 self.parents.retain(|p, of| p != name && of != name);
                 self.triggers.retain(|(on, _), _| on != name);
             }
-            Change::DetachPartition { table, .. } => {
+            Change::Partition(PartitionChange::DetachPartition { table, .. }) => {
                 self.parents.remove(table);
             }
-            Change::DropModule {
+            Change::Module(ModuleChange::DropModule {
                 id: ModuleId::Trigger { on, name },
                 ..
-            } => {
+            }) => {
                 self.triggers.remove(&(on.clone(), name.clone()));
             }
-            Change::CreateModule {
+            Change::Module(ModuleChange::CreateModule {
                 id: ModuleId::Trigger { on, name },
                 module,
-            }
-            | Change::AlterModule {
+            })
+            | Change::Module(ModuleChange::AlterModule {
                 id: ModuleId::Trigger { on, name },
                 module,
-            } => {
+            }) => {
                 let id = (on.clone(), name.clone());
                 self.triggers.remove(&id);
                 if dialect.declares_a_constraint(module) {
@@ -3409,10 +3442,10 @@ impl KeyTriggerClones {
                     }
                 }
             }
-            Change::AttachPartition { table, parent, .. } => {
+            Change::Partition(PartitionChange::AttachPartition { table, parent, .. }) => {
                 self.arrive(present, table, parent, &holder);
             }
-            Change::CreateTable { name, table, .. } => {
+            Change::Table(TableChange::CreateTable { name, table, .. }) => {
                 if let Some(of) = &table.partition_of {
                     self.arrive(present, name, &of.parent, &holder);
                 }
@@ -3445,10 +3478,11 @@ impl KeyTriggerClones {
 fn constraints_added(change: &Change) -> Vec<TableName> {
     let in_schema = |table: &TableName, name: &str| TableName::new(table.schema.clone(), name);
     match change {
-        Change::AddCheck { table, name, .. } | Change::AddForeignKey { table, name, .. } => {
+        Change::Constraint(ConstraintChange::AddCheck { table, name, .. })
+        | Change::Constraint(ConstraintChange::AddForeignKey { table, name, .. }) => {
             vec![in_schema(table, name.raw())]
         }
-        Change::CreateTable { name, table, .. } => table
+        Change::Table(TableChange::CreateTable { name, table, .. }) => table
             .checks
             .keys()
             .chain(table.foreign_keys.keys())
@@ -3489,7 +3523,7 @@ fn relations_brought(change: &Change) -> Vec<(Step, Brought)> {
         None => Brought::Key(table.clone()),
     };
     let one = match change {
-        Change::CreateTable { name, table, .. } => {
+        Change::Table(TableChange::CreateTable { name, table, .. }) => {
             let mut out = vec![(AT_CREATE, Brought::Named(name.clone()))];
             out.extend(
                 table
@@ -3502,19 +3536,20 @@ fn relations_brought(change: &Change) -> Vec<(Step, Brought)> {
             out.extend(table.primary_key.as_ref().map(|pk| (KEYS, key(name, pk))));
             return out;
         }
-        Change::RenameTable { to, .. } => vec![Brought::Named(to.clone())],
-        Change::AddIndex { table, name, .. } | Change::AddUnique { table, name, .. } => {
+        Change::Table(TableChange::RenameTable { to, .. }) => vec![Brought::Named(to.clone())],
+        Change::Index(IndexChange::AddIndex { table, name, .. })
+        | Change::Constraint(ConstraintChange::AddUnique { table, name, .. }) => {
             vec![index(table, name.raw())]
         }
-        Change::SetPrimaryKey {
+        Change::Constraint(ConstraintChange::SetPrimaryKey {
             table,
             to: Some(pk),
             ..
-        } => vec![key(table, pk)],
-        Change::CreateModule {
+        }) => vec![key(table, pk)],
+        Change::Module(ModuleChange::CreateModule {
             id: ModuleId::Named(name),
             module,
-        } if module.kind == ModuleKind::View => {
+        }) if module.kind == ModuleKind::View => {
             vec![Brought::Named(name.clone())]
         }
         _ => Vec::new(),
@@ -3535,17 +3570,19 @@ fn relations_brought(change: &Change) -> Vec<(Step, Brought)> {
 #[allow(clippy::wildcard_enum_match_arm)]
 fn expression_schema(change: &Change) -> Option<&str> {
     match change {
-        Change::CreateTable { name: table, .. }
-        | Change::AddColumn { table, .. }
-        | Change::AddCheck { table, .. }
-        | Change::AddIndex { table, .. } => Some(&table.schema),
-        Change::AlterColumnDefault { column, .. }
-        | Change::AlterColumnExpression { column, .. } => Some(&column.table.schema),
+        Change::Table(TableChange::CreateTable { name: table, .. })
+        | Change::Column(ColumnChange::AddColumn { table, .. })
+        | Change::Constraint(ConstraintChange::AddCheck { table, .. })
+        | Change::Index(IndexChange::AddIndex { table, .. }) => Some(&table.schema),
+        Change::Column(ColumnChange::AlterColumnDefault { column, .. })
+        | Change::Column(ColumnChange::AlterColumnExpression { column, .. }) => {
+            Some(&column.table.schema)
+        }
         // Its own under the partition's schema, its parent's taken back
         // under the parent's, as each is written (#1607 review).
-        Change::SetPartitionDefault {
+        Change::Partition(PartitionChange::SetPartitionDefault {
             table, parent, to, ..
-        } => Some(if to.is_some() {
+        }) => Some(if to.is_some() {
             &table.schema
         } else {
             &parent.schema
@@ -3553,7 +3590,8 @@ fn expression_schema(change: &Change) -> Option<&str> {
         // A module's body is written in its own schema, and a literal in it
         // that the engine casts as it creates the module, an atomic body's or
         // a view's, is bound then (#1599 review).
-        Change::CreateModule { id, .. } | Change::AlterModule { id, .. } => Some(id.schema()),
+        Change::Module(ModuleChange::CreateModule { id, .. })
+        | Change::Module(ModuleChange::AlterModule { id, .. }) => Some(id.schema()),
         _ => None,
     }
 }
@@ -3570,7 +3608,7 @@ fn expressions_set(change: &Change) -> Vec<(Step, String, String)> {
             )
         })
     };
-    if let Change::CreateTable { name, table, .. } = change {
+    if let Change::Table(TableChange::CreateTable { name, table, .. }) = change {
         let at = |step: Step| move |(whose, text): (String, String)| (step, whose, text);
         let mut out: Vec<(Step, String, String)> = table
             .columns
@@ -3621,27 +3659,27 @@ fn expressions_set(change: &Change) -> Vec<(Step, String, String)> {
         return out;
     }
     let one: Vec<(String, String)> = match change {
-        Change::AddColumn {
+        Change::Column(ColumnChange::AddColumn {
             table,
             name,
             column: c,
             ..
-        } => column(table, name.raw(), c).into_iter().collect(),
-        Change::AlterColumnDefault {
+        }) => column(table, name.raw(), c).into_iter().collect(),
+        Change::Column(ColumnChange::AlterColumnDefault {
             column,
             to: Some(to),
             ..
-        } => vec![(
+        }) => vec![(
             format!("{column}'s default", column = column.shown()),
             to.clone(),
         )],
-        Change::SetPartitionDefault {
+        Change::Partition(PartitionChange::SetPartitionDefault {
             table,
             column,
             to,
             fallback,
             ..
-        } => to
+        }) => to
             .as_ref()
             .or(fallback.as_ref())
             .map(|text| {
@@ -3652,17 +3690,17 @@ fn expressions_set(change: &Change) -> Vec<(Step, String, String)> {
             })
             .into_iter()
             .collect(),
-        Change::AlterColumnExpression { column, to, .. } => {
+        Change::Column(ColumnChange::AlterColumnExpression { column, to, .. }) => {
             vec![(
                 format!("{column}'s generation expression", column = column.shown()),
                 to.clone(),
             )]
         }
-        Change::AddCheck {
+        Change::Constraint(ConstraintChange::AddCheck {
             table,
             name,
             constraint,
-        } => vec![(
+        }) => vec![(
             format!(
                 "check {name} on {table}",
                 table = table.shown(),
@@ -3670,9 +3708,9 @@ fn expressions_set(change: &Change) -> Vec<(Step, String, String)> {
             ),
             constraint.expression.clone(),
         )],
-        Change::AddIndex {
+        Change::Index(IndexChange::AddIndex {
             table, name, index, ..
-        } => vec![(
+        }) => vec![(
             format!(
                 "index {name} on {table}",
                 table = table.shown(),
@@ -3680,7 +3718,8 @@ fn expressions_set(change: &Change) -> Vec<(Step, String, String)> {
             ),
             index_text(index),
         )],
-        Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
+        Change::Module(ModuleChange::CreateModule { id, module })
+        | Change::Module(ModuleChange::AlterModule { id, module }) => {
             vec![(format!("{id}", id = id.shown()), module.definition.clone())]
         }
         _ => Vec::new(),
@@ -3863,8 +3902,10 @@ fn function_edges(
         // `AlterColumnDefault`; one beside a DEFAULT, whose create moves
         // rows, had its default split off already (`split_moving_defaults`).
         let texts: Vec<&str> = match &p.change {
-            Change::AddColumn { column, .. } => column_expression(column).into_iter().collect(),
-            Change::CreateTable { table, .. } => table
+            Change::Column(ColumnChange::AddColumn { column, .. }) => {
+                column_expression(column).into_iter().collect()
+            }
+            Change::Table(TableChange::CreateTable { table, .. }) => table
                 .columns
                 .values()
                 .filter_map(|c| match &c.value_source {
@@ -3921,17 +3962,17 @@ fn function_edges(
     // what must follow the move would be let past it. One still held names a
     // column the parent adds behind a function in an own index or check,
     // which cannot be split off.
-    if let Some(Change::CreateTable {
+    if let Some(Change::Table(TableChange::CreateTable {
         name,
         beside_default: Some(default),
         ..
-    }) = held.iter().map(|&i| window[i]).find(|c| {
+    })) = held.iter().map(|&i| window[i]).find(|c| {
         matches!(
             c,
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 beside_default: Some(_),
                 ..
-            }
+            })
         )
     }) {
         return Err(format!(
@@ -4020,10 +4061,10 @@ fn cycle(
             .into();
     };
     let column = match &cs.changes[at].change {
-        Change::AddColumn { table, name, .. } => {
+        Change::Column(ColumnChange::AddColumn { table, name, .. }) => {
             format!("{table}.{name}", table = table.shown(), name = name.shown(),)
         }
-        Change::CreateTable { name, table, .. } => table
+        Change::Table(TableChange::CreateTable { name, table, .. }) => table
             .columns
             .iter()
             .find(|(_, c)| match c.value_source {
@@ -4057,7 +4098,8 @@ fn cycle(
             !done[i] && start + i != at && needs(window[i], window[at - start], deps, partitions)
         })
         .filter_map(|i| match window[i] {
-            Change::InsertRow { table, .. } | Change::UpdateRow { table, .. } => Some(format!(
+            Change::Row(RowChange::InsertRow { table, .. })
+            | Change::Row(RowChange::UpdateRow { table, .. }) => Some(format!(
                 "a row this plan writes into `{table}`",
                 table = table.shown()
             )),
@@ -4105,59 +4147,67 @@ fn cycle(
 #[cfg(test)]
 fn needs(later: &Change, earlier: &Change, deps: &ModuleDeps, partitions: &Partitions) -> bool {
     match earlier {
-        Change::AddColumn { table, name, .. } => match later {
-            Change::CreateModule { id, module } | Change::AlterModule { id, module } => partitions
+        Change::Column(ColumnChange::AddColumn { table, name, .. }) => match later {
+            Change::Module(ModuleChange::CreateModule { id, module })
+            | Change::Module(ModuleChange::AlterModule { id, module }) => partitions
                 .holding(table)
                 .any(|t| reads_column(id, &module.definition, t, name.raw())),
-            Change::DropModule { .. } | Change::DeleteRow { .. } => false,
-            Change::InsertRow {
+            Change::Module(ModuleChange::DropModule { .. })
+            | Change::Row(RowChange::DeleteRow { .. }) => false,
+            Change::Row(RowChange::InsertRow {
                 table: t,
                 row,
                 defaults,
                 ..
-            } => {
+            }) => {
                 partitions.holding(table).any(|p| p == t)
                     && (row.get(name.raw()).is_some() || defaults.contains_key(name))
             }
-            Change::UpdateRow {
+            Change::Row(RowChange::UpdateRow {
                 table: t,
                 columns,
                 unchanged,
                 ..
-            } => {
+            }) => {
                 partitions.holding(table).any(|p| p == t)
                     && (columns.contains_key(name) || unchanged.contains_key(name))
             }
             other => names_column(other, table, name.raw(), partitions),
         },
-        Change::CreateModule { id: before, .. } | Change::AlterModule { id: before, .. } => {
-            match later {
-                Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
-                    let named = before
-                        .referenced_name()
-                        .is_some_and(|n| pbps_pg::generated::may_call(&module.definition, &n.name));
-                    let attached = id.attached_to().is_some()
-                        && id.attached_to() == before.referenced_name().as_ref();
-                    let sibling = id.referenced_name().is_some()
-                        && id.referenced_name() == before.referenced_name();
-                    let declared = deps.get(id).is_some_and(|d| d.contains(before));
-                    named || attached || sibling || declared
-                }
-                _ => true,
+        Change::Module(ModuleChange::CreateModule { id: before, .. })
+        | Change::Module(ModuleChange::AlterModule { id: before, .. }) => match later {
+            Change::Module(ModuleChange::CreateModule { id, module })
+            | Change::Module(ModuleChange::AlterModule { id, module }) => {
+                let named = before
+                    .referenced_name()
+                    .is_some_and(|n| pbps_pg::generated::may_call(&module.definition, &n.name));
+                let attached = id.attached_to().is_some()
+                    && id.attached_to() == before.referenced_name().as_ref();
+                let sibling = id.referenced_name().is_some()
+                    && id.referenced_name() == before.referenced_name();
+                let declared = deps.get(id).is_some_and(|d| d.contains(before));
+                named || attached || sibling || declared
             }
-        }
-        Change::InsertRow { .. } | Change::UpdateRow { .. } | Change::DeleteRow { .. } => true,
+            _ => true,
+        },
+        Change::Row(RowChange::InsertRow { .. })
+        | Change::Row(RowChange::UpdateRow { .. })
+        | Change::Row(RowChange::DeleteRow { .. }) => true,
         // Two new tables are independent unless the later one names the
         // earlier: a table held back for its generation expression must not
         // drag every later new table behind it, or a function that reads one
         // of those closes a cycle no order has (#1303 review).
-        Change::CreateTable { name: made, .. } if matches!(later, Change::CreateTable { .. }) => {
-            matches!(later, Change::CreateTable { table, .. } if names_new_table(table, made))
+        Change::Table(TableChange::CreateTable { name: made, .. })
+            if matches!(later, Change::Table(TableChange::CreateTable { .. })) =>
+        {
+            matches!(later, Change::Table(TableChange::CreateTable { table, .. }) if names_new_table(table, made))
         }
         other => match (later, other.table()) {
-            (Change::CreateModule { id, module } | Change::AlterModule { id, module }, Some(t)) => {
-                names_table(id, &module.definition, t)
-            }
+            (
+                Change::Module(ModuleChange::CreateModule { id, module })
+                | Change::Module(ModuleChange::AlterModule { id, module }),
+                Some(t),
+            ) => names_table(id, &module.definition, t),
             (later, Some(t)) => touches(later, t),
             _ => true,
         },
@@ -4234,7 +4284,7 @@ fn names_table(id: &ModuleId, definition: &str, table: &TableName) -> bool {
 fn names_column(change: &Change, table: &TableName, column: &str, partitions: &Partitions) -> bool {
     let named = |text: &str| pbps_pg::generated::may_read(text, column);
     let listed = |columns: &[pbps_model::ColumnName]| columns.iter().any(|c| c.raw() == column);
-    if let Change::AddForeignKey { constraint, .. } = change
+    if let Change::Constraint(ConstraintChange::AddForeignKey { constraint, .. }) = change
         && &constraint.references_table == table
         && listed(&constraint.references_columns)
     {
@@ -4244,7 +4294,7 @@ fn names_column(change: &Change, table: &TableName, column: &str, partitions: &P
     // and builds its own indexes and checks, on the parent's columns right
     // after its `CREATE`, so it needs each column one of them names (#1692
     // review).
-    if let Change::CreateTable { table: t, .. } = change
+    if let Change::Table(TableChange::CreateTable { table: t, .. }) = change
         && let Some(of) = &t.partition_of
         && &of.parent == table
         && (of.columns.contains_key(column)
@@ -4265,35 +4315,45 @@ fn names_column(change: &Change, table: &TableName, column: &str, partitions: &P
     // the others are told by the declared partitions, so a change of a table
     // that is no partition of this one never waits for its column.
     let partition_own = match change {
-        Change::SetPartitionDefault { parent, .. } => parent == table,
-        Change::SetPartitionNotNull { .. } | Change::AddIndex { .. } | Change::AddCheck { .. } => {
-            change
-                .table()
-                .is_some_and(|t| partitions.holding(table).skip(1).any(|p| p == t))
-        }
+        Change::Partition(PartitionChange::SetPartitionDefault { parent, .. }) => parent == table,
+        Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+        | Change::Index(IndexChange::AddIndex { .. })
+        | Change::Constraint(ConstraintChange::AddCheck { .. }) => change
+            .table()
+            .is_some_and(|t| partitions.holding(table).skip(1).any(|p| p == t)),
         _ => false,
     };
     if change.table() != Some(table) && !partition_own {
         return change.table().is_none();
     }
     match change {
-        Change::AddColumn { column: c, .. } => column_expression(c).is_some_and(named),
-        Change::AlterColumnDefault { column: c, to, .. } => {
+        Change::Column(ColumnChange::AddColumn { column: c, .. }) => {
+            column_expression(c).is_some_and(named)
+        }
+        Change::Column(ColumnChange::AlterColumnDefault { column: c, to, .. }) => {
             c.name == column.into() || to.as_deref().is_some_and(named)
         }
-        Change::SetPartitionDefault {
+        Change::Partition(PartitionChange::SetPartitionDefault {
             column: c,
             to,
             fallback,
             ..
-        } => c.raw() == column || to.as_deref().or(fallback.as_deref()).is_some_and(named),
-        Change::SetPartitionNotNull { column: c, .. } => c.raw() == column,
-        Change::AlterColumnExpression { column: c, to, .. } => c.name == column.into() || named(to),
-        Change::AlterColumnType { column: c, .. }
-        | Change::AlterColumnNullability { column: c, .. }
-        | Change::SetColumnDeprecated { column: c, .. } => c.name == column.into(),
-        Change::AddCheck { constraint, .. } => named(&constraint.expression),
-        Change::AddIndex { index, .. } => {
+        }) => c.raw() == column || to.as_deref().or(fallback.as_deref()).is_some_and(named),
+        Change::Partition(PartitionChange::SetPartitionNotNull { column: c, .. }) => {
+            c.raw() == column
+        }
+        Change::Column(ColumnChange::AlterColumnExpression { column: c, to, .. }) => {
+            c.name == column.into() || named(to)
+        }
+        Change::Column(ColumnChange::AlterColumnType { column: c, .. })
+        | Change::Column(ColumnChange::AlterColumnNullability { column: c, .. })
+        | Change::Column(ColumnChange::SetColumnDeprecated { column: c, .. }) => {
+            c.name == column.into()
+        }
+        Change::Constraint(ConstraintChange::AddCheck { constraint, .. }) => {
+            named(&constraint.expression)
+        }
+        Change::Index(IndexChange::AddIndex { index, .. }) => {
             index
                 .columns
                 .iter()
@@ -4301,9 +4361,15 @@ fn names_column(change: &Change, table: &TableName, column: &str, partitions: &P
                 || listed(&index.include)
                 || named(&index_text(index))
         }
-        Change::AddUnique { constraint, .. } => listed(&constraint.columns),
-        Change::SetPrimaryKey { to, .. } => to.as_ref().is_none_or(|pk| listed(&pk.columns)),
-        Change::AddForeignKey { constraint, .. } => listed(&constraint.columns),
+        Change::Constraint(ConstraintChange::AddUnique { constraint, .. }) => {
+            listed(&constraint.columns)
+        }
+        Change::Constraint(ConstraintChange::SetPrimaryKey { to, .. }) => {
+            to.as_ref().is_none_or(|pk| listed(&pk.columns))
+        }
+        Change::Constraint(ConstraintChange::AddForeignKey { constraint, .. }) => {
+            listed(&constraint.columns)
+        }
         _ => true,
     }
 }
@@ -4317,12 +4383,12 @@ fn touches(change: &Change, table: &TableName) -> bool {
         return true;
     }
     match change {
-        Change::AddForeignKey {
+        Change::Constraint(ConstraintChange::AddForeignKey {
             table: t,
             constraint,
             ..
-        } => t == table || &constraint.references_table == table,
-        Change::CreateTable { .. } => true,
+        }) => t == table || &constraint.references_table == table,
+        Change::Table(TableChange::CreateTable { .. }) => true,
         other => other.table().is_none_or(|t| t == table),
     }
 }
@@ -4356,7 +4422,8 @@ fn released(
                 continue;
             }
             if let Some(i) = find(view, &parts, &d.holds, partitions, removes)
-                && let Change::AlterColumnExpression { column, .. } = &cs.changes[i].change
+                && let Change::Column(ColumnChange::AlterColumnExpression { column, .. }) =
+                    &cs.changes[i].change
             {
                 out.insert(column.clone());
             }
@@ -4579,6 +4646,17 @@ mod tests {
         settle_public_execution, split_moving_defaults, take_public_execution,
     };
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::GrantChange;
+    use pbps_model::IndexChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::PartitionChange;
+    use pbps_model::PolicyChange;
+    use pbps_model::RoleChange;
+    use pbps_model::RowChange;
+    use pbps_model::TableChange;
+    use pbps_model::TablePropertyChange;
 
     fn names_a_later_relation(
         cs: &ChangeSet,
@@ -4644,25 +4722,25 @@ mod tests {
         };
         let mut changes = ChangeSet {
             changes: vec![
-                Change::DropModule {
+                Change::Module(ModuleChange::DropModule {
                     id: root.clone(),
                     kind: ModuleKind::Function,
-                },
-                Change::CreateModule {
+                }),
+                Change::Module(ModuleChange::CreateModule {
                     id: root,
                     module: Box::new(module),
-                },
-                Change::DropPolicy {
+                }),
+                Change::Policy(PolicyChange::DropPolicy {
                     table: table.clone(),
                     name: "gate_policy".into(),
                     policy: pbps_model::RowPolicy::default(),
-                },
-                Change::CreatePolicy {
+                }),
+                Change::Policy(PolicyChange::CreatePolicy {
                     table,
                     name: "gate_policy".into(),
                     policy: pbps_model::RowPolicy::default(),
                     origin: pbps_model::RowSecurityOrigin::Standing,
-                },
+                }),
             ]
             .into_iter()
             .map(PlannedChange::new)
@@ -4679,11 +4757,11 @@ mod tests {
         assert_eq!(changes.changes.len(), 4);
         assert!(matches!(
             changes.changes[0].change,
-            Change::DropPolicy { .. }
+            Change::Policy(PolicyChange::DropPolicy { .. })
         ));
         assert!(matches!(
             changes.changes[3].change,
-            Change::CreatePolicy { .. }
+            Change::Policy(PolicyChange::CreatePolicy { .. })
         ));
         assert!(unaccounted(&changes, &found, &Partitions::default()).is_empty());
         changes.changes.swap(0, 1);
@@ -4708,10 +4786,10 @@ mod tests {
         let found = [(root.clone(), vec![dependency])].into();
         for replace in [false, true] {
             let mut declared = Schema::default();
-            let mut steps = vec![Change::DropModule {
+            let mut steps = vec![Change::Module(ModuleChange::DropModule {
                 id: root.clone(),
                 kind: ModuleKind::Function,
-            }];
+            })];
             if replace {
                 let next = Module {
                     kind: ModuleKind::Function,
@@ -4720,16 +4798,16 @@ mod tests {
                     options: Default::default(),
                 };
                 declared.modules.insert(root.clone(), next.clone());
-                steps.push(Change::CreateModule {
+                steps.push(Change::Module(ModuleChange::CreateModule {
                     id: root.clone(),
                     module: Box::new(next),
-                });
+                }));
             }
-            steps.push(Change::DropTable {
+            steps.push(Change::Table(TableChange::DropTable {
                 uid: "t_117200".parse().unwrap(),
                 name: table.clone(),
                 detach_from: None,
-            });
+            }));
             let mut changes = ChangeSet {
                 changes: steps.into_iter().map(PlannedChange::new).collect(),
             };
@@ -4746,16 +4824,16 @@ mod tests {
             );
             assert!(matches!(
                 &changes.changes[0].change,
-                Change::DropTable { .. }
+                Change::Table(TableChange::DropTable { .. })
             ));
             assert!(matches!(
                 &changes.changes[1].change,
-                Change::DropModule { .. }
+                Change::Module(ModuleChange::DropModule { .. })
             ));
             if replace {
                 assert!(matches!(
                     &changes.changes[2].change,
-                    Change::CreateModule { .. }
+                    Change::Module(ModuleChange::CreateModule { .. })
                 ));
             }
             assert!(unaccounted(&changes, &found, &Partitions::default()).is_empty());
@@ -4866,29 +4944,35 @@ mod tests {
         cs.changes
             .iter()
             .map(|p| match &p.change {
-                Change::DropModule { id, .. } => format!("drop {id}", id = id.shown()),
-                Change::CreateModule { id, .. } => format!("create {id}", id = id.shown()),
-                Change::AlterModule { id, .. } => format!("alter {id}", id = id.shown()),
-                Change::DropCheck { name, .. } => format!(
+                Change::Module(ModuleChange::DropModule { id, .. }) => {
+                    format!("drop {id}", id = id.shown())
+                }
+                Change::Module(ModuleChange::CreateModule { id, .. }) => {
+                    format!("create {id}", id = id.shown())
+                }
+                Change::Module(ModuleChange::AlterModule { id, .. }) => {
+                    format!("alter {id}", id = id.shown())
+                }
+                Change::Constraint(ConstraintChange::DropCheck { name, .. }) => format!(
                     "drop check {name}",
                     // Preserve raw comparison-label or fixture SQL bytes in test data.
                     name = name.raw(),
                 ),
-                Change::AddCheck { name, .. } => format!(
+                Change::Constraint(ConstraintChange::AddCheck { name, .. }) => format!(
                     "add check {name}",
                     // Preserve raw comparison-label or fixture SQL bytes in test data.
                     name = name.raw(),
                 ),
-                Change::AlterColumnDefault { column, to, .. } => {
+                Change::Column(ColumnChange::AlterColumnDefault { column, to, .. }) => {
                     format!("default {} -> {to:?}", column.name.shown())
                 }
-                Change::SetPartitionDefault {
+                Change::Partition(PartitionChange::SetPartitionDefault {
                     table,
                     column,
                     to,
                     fallback,
                     ..
-                } => format!(
+                }) => format!(
                     "default {}.{column} -> {to:?} else {fallback:?}",
                     table.name,
                     column = column.shown(),
@@ -4905,23 +4989,27 @@ mod tests {
     #[test]
     #[allow(clippy::wildcard_enum_match_arm)]
     fn public_decisions_return_beside_their_routines_final_create() {
-        let decision = |routine: &str| Change::PublicExecution {
-            routine: routine.parse().unwrap(),
-            access: pbps_model::PublicAccess::Revoked,
-            origin: pbps_model::RoutineOrigin::Created,
+        let decision = |routine: &str| {
+            Change::Permission(GrantChange::PublicExecution {
+                routine: routine.parse().unwrap(),
+                access: pbps_model::PublicAccess::Revoked,
+                origin: pbps_model::RoutineOrigin::Created,
+            })
         };
         let f = module(
             ModuleKind::Function,
             "(x integer) RETURNS integer LANGUAGE sql AS $$ SELECT x $$",
         );
-        let create = |name: &str| Change::CreateModule {
-            id: id(name),
-            module: Box::new(f.clone()),
+        let create = |name: &str| {
+            Change::Module(ModuleChange::CreateModule {
+                id: id(name),
+                module: Box::new(f.clone()),
+            })
         };
-        let role = Change::CreateRole {
+        let role = Change::Role(RoleChange::CreateRole {
             uid: Uid::generate(UidKind::Role),
             name: "reader".into(),
-        };
+        });
         let mut cs = plan(vec![
             create("app.f(integer)"),
             decision("app.f(integer)"),
@@ -4932,29 +5020,28 @@ mod tests {
         ]);
         let decisions = take_public_execution(&mut cs);
         assert_eq!(decisions.len(), 3);
-        assert!(
-            cs.changes
-                .iter()
-                .all(|p| !matches!(p.change, Change::PublicExecution { .. }))
-        );
+        assert!(cs.changes.iter().all(|p| !matches!(
+            p.change,
+            Change::Permission(GrantChange::PublicExecution { .. })
+        )));
         // A pass moved `g` ahead of `f` and rebuilt `f` once more after it.
         cs.changes.swap(0, 1);
         cs.changes.insert(
             2,
-            PlannedChange::new(Change::AlterModule {
+            PlannedChange::new(Change::Module(ModuleChange::AlterModule {
                 id: id("app.f(integer)"),
                 module: Box::new(f.clone()),
-            }),
+            })),
         );
         settle_public_execution(&mut cs, decisions);
         let order: Vec<String> = cs
             .changes
             .iter()
             .map(|p| match &p.change {
-                Change::PublicExecution { routine, .. } => {
+                Change::Permission(GrantChange::PublicExecution { routine, .. }) => {
                     format!("public {routine}", routine = routine.shown())
                 }
-                Change::CreateRole { name, .. } => format!(
+                Change::Role(RoleChange::CreateRole { name, .. }) => format!(
                     "role {name}",
                     // Preserve the original spelling in this SQL or comparison fixture.
                     name = name.raw(),
@@ -4980,10 +5067,10 @@ mod tests {
     }
 
     fn alter(s: &Schema, name: &str) -> Change {
-        Change::AlterModule {
+        Change::Module(ModuleChange::AlterModule {
             id: id(name),
             module: Box::new(s.modules[&id(name)].clone()),
-        }
+        })
     }
 
     // A test rendering: every other change prints as `rendered` prints it.
@@ -4992,12 +5079,12 @@ mod tests {
         cs.changes
             .iter()
             .map(|p| match &p.change {
-                Change::AddIndex { name, .. } => format!(
+                Change::Index(IndexChange::AddIndex { name, .. }) => format!(
                     "add index {name}",
                     // Preserve raw comparison-label or fixture SQL bytes in test data.
                     name = name.raw(),
                 ),
-                Change::InsertRow { .. } => "insert".to_owned(),
+                Change::Row(RowChange::InsertRow { .. }) => "insert".to_owned(),
                 _ => rendered(&ChangeSet {
                     changes: vec![p.clone()],
                 })
@@ -5011,17 +5098,17 @@ mod tests {
     }
 
     fn check_of(name: &str, expression: &str) -> Change {
-        Change::AddCheck {
+        Change::Constraint(ConstraintChange::AddCheck {
             table: TableName::new("app", "t"),
             name: name.into(),
             constraint: CheckConstraint {
                 expression: expression.into(),
             },
-        }
+        })
     }
 
     fn add_index(name: &str, filter: Option<&str>) -> Change {
-        Change::AddIndex {
+        Change::Index(IndexChange::AddIndex {
             table: TableName::new("app", "t"),
             name: name.into(),
             index: Box::new(pbps_model::Index {
@@ -5039,7 +5126,7 @@ mod tests {
                 filegroup: None,
             }),
             clustered: false,
-        }
+        })
     }
 
     fn set_default(table: &str) -> Change {
@@ -5047,12 +5134,12 @@ mod tests {
     }
 
     fn default_of(table: &str, to: &str) -> Change {
-        Change::AlterColumnDefault {
+        Change::Column(ColumnChange::AlterColumnDefault {
             uid: Uid::derived(UidKind::Column, &format!("app.{table}.n"), 0),
             column: ColumnRef::new(TableName::new("app", table), "n"),
             from: None,
             to: Some(to.into()),
-        }
+        })
     }
 
     /// #942: what the plan itself adds, in the differ's order ahead of the
@@ -5098,37 +5185,43 @@ mod tests {
             expression: "app.f(id)".into(),
             stored: true,
         });
-        let add = |name: &str, column: pbps_model::Column| Change::AddColumn {
-            uid: "c_a1b2c3".parse().unwrap(),
-            table: t.clone(),
-            name: name.into(),
-            column: Box::new(column),
+        let add = |name: &str, column: pbps_model::Column| {
+            Change::Column(ColumnChange::AddColumn {
+                uid: "c_a1b2c3".parse().unwrap(),
+                table: t.clone(),
+                name: name.into(),
+                column: Box::new(column),
+            })
         };
-        let tighten = |column: &str| Change::AlterColumnNullability {
-            uid: "c_m3n4p5".parse().unwrap(),
-            column: t.column(column),
-            ty: "integer".parse().unwrap(),
-            to_nullable: false,
-            through_external_partitions: false,
-            collation: None,
+        let tighten = |column: &str| {
+            Change::Column(ColumnChange::AlterColumnNullability {
+                uid: "c_m3n4p5".parse().unwrap(),
+                column: t.column(column),
+                ty: "integer".parse().unwrap(),
+                to_nullable: false,
+                through_external_partitions: false,
+                collation: None,
+            })
         };
-        let unique = |column: &str| Change::AddUnique {
-            table: t.clone(),
-            name: format!("uq_{column}").into(),
-            constraint: pbps_model::UniqueConstraint {
-                columns: vec![column.into()],
-                storage_parameters: Default::default(),
-                filegroup: None,
-            },
-            clustered: false,
+        let unique = |column: &str| {
+            Change::Constraint(ConstraintChange::AddUnique {
+                table: t.clone(),
+                name: format!("uq_{column}").into(),
+                constraint: pbps_model::UniqueConstraint {
+                    columns: vec![column.into()],
+                    storage_parameters: Default::default(),
+                    filegroup: None,
+                },
+                clustered: false,
+            })
         };
         let mut cs = plan(vec![
-            Change::AlterColumnExpression {
+            Change::Column(ColumnChange::AlterColumnExpression {
                 uid: "c_d4e5f6".parse().unwrap(),
                 column: t.column("n"),
                 from: "id * 2".into(),
                 to: "app.f(id)".into(),
-            },
+            }),
             // `n`'s new NOT NULL and key follow its expression; `other`'s stay.
             tighten("n"),
             tighten("other"),
@@ -5141,12 +5234,19 @@ mod tests {
         assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 4);
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
-        let rebuilt = at(&|c| matches!(c, Change::AlterModule { .. }));
-        let expression = at(&|c| matches!(c, Change::AlterColumnExpression { .. }));
-        let generated_add =
-            at(&|c| matches!(c, Change::AddColumn { name, .. } if name.raw() == "g"));
-        let plain_add =
-            at(&|c| matches!(c, Change::AddColumn { name, .. } if name.raw() == "plain"));
+        let rebuilt = at(&|c| matches!(c, Change::Module(ModuleChange::AlterModule { .. })));
+        let expression = at(&|c| {
+            matches!(
+                c,
+                Change::Column(ColumnChange::AlterColumnExpression { .. })
+            )
+        });
+        let generated_add = at(
+            &|c| matches!(c, Change::Column(ColumnChange::AddColumn { name, .. }) if name.raw() == "g"),
+        );
+        let plain_add = at(
+            &|c| matches!(c, Change::Column(ColumnChange::AddColumn { name, .. }) if name.raw() == "plain"),
+        );
         assert!(rebuilt < expression, "{:?}", names(&cs));
         assert!(
             rebuilt < generated_add && plain_add < rebuilt,
@@ -5155,14 +5255,14 @@ mod tests {
         );
         let tightened = |name: &str| {
             at(
-                &|c| matches!(c, Change::AlterColumnNullability { column, .. } if column.name == name.into()),
+                &|c| matches!(c, Change::Column(ColumnChange::AlterColumnNullability { column, .. }) if column.name == name.into()),
             )
         };
         assert!(expression < tightened("n"), "{:?}", names(&cs));
         assert!(tightened("other") < rebuilt, "{:?}", names(&cs));
         let keyed = |name: &str| {
             at(
-                &|c| matches!(c, Change::AddUnique { name: n, .. } if n.raw() == format!("uq_{name}")),
+                &|c| matches!(c, Change::Constraint(ConstraintChange::AddUnique { name: n, .. }) if n.raw() == format!("uq_{name}")),
             )
         };
         assert!(expression < keyed("n"), "{:?}", names(&cs));
@@ -5178,11 +5278,13 @@ mod tests {
     fn a_releasing_expression_change_stays_ahead_of_the_drop() {
         let (s, _) = declared();
         let t = TableName::new("app", "t");
-        let recompute = |column: &str, to: &str| Change::AlterColumnExpression {
-            uid: "c_d4e5f6".parse().unwrap(),
-            column: t.column(column),
-            from: "app.f(id)".into(),
-            to: to.into(),
+        let recompute = |column: &str, to: &str| {
+            Change::Column(ColumnChange::AlterColumnExpression {
+                uid: "c_d4e5f6".parse().unwrap(),
+                column: t.column(column),
+                from: "app.f(id)".into(),
+                to: to.into(),
+            })
         };
         let mut cs = plan(vec![
             recompute("n", "id * 2"),
@@ -5194,13 +5296,13 @@ mod tests {
         let at = |name: &str| {
             cs.changes
                 .iter()
-                .position(|p| matches!(&p.change, Change::AlterColumnExpression { column, .. } if column.name == name.into()))
+                .position(|p| matches!(&p.change, Change::Column(ColumnChange::AlterColumnExpression { column, .. }) if column.name == name.into()))
                 .unwrap()
         };
         let rebuilt = cs
             .changes
             .iter()
-            .position(|p| matches!(p.change, Change::AlterModule { .. }))
+            .position(|p| matches!(p.change, Change::Module(ModuleChange::AlterModule { .. })))
             .unwrap();
         assert!(
             at("n") < rebuilt && rebuilt < at("other"),
@@ -5223,15 +5325,15 @@ mod tests {
             ))
         };
         let mut cs = plan(vec![
-            Change::DropModule {
+            Change::Module(ModuleChange::DropModule {
                 id: routine.clone(),
                 kind: ModuleKind::Procedure,
-            },
+            }),
             add_check("ck"),
-            Change::CreateModule {
+            Change::Module(ModuleChange::CreateModule {
                 id: routine.clone(),
                 module: as_kind(ModuleKind::Function),
-            },
+            }),
         ]);
         assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
         assert_eq!(
@@ -5246,19 +5348,19 @@ mod tests {
         // #1047: a function that becomes a procedure, beside a new function
         // `g` the check calls. The check follows `g`'s create.
         let mut cs = plan(vec![
-            Change::DropModule {
+            Change::Module(ModuleChange::DropModule {
                 id: routine.clone(),
                 kind: ModuleKind::Function,
-            },
+            }),
             check_of("ck", "app.g(id) >= 0"),
-            Change::CreateModule {
+            Change::Module(ModuleChange::CreateModule {
                 id: routine.clone(),
                 module: as_kind(ModuleKind::Procedure),
-            },
-            Change::CreateModule {
+            }),
+            Change::Module(ModuleChange::CreateModule {
                 id: id("app.g(integer)"),
                 module: as_kind(ModuleKind::Function),
-            },
+            }),
         ]);
         assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
         assert_eq!(
@@ -5274,15 +5376,15 @@ mod tests {
         // Negative: a procedure rebuilt as a procedure is no function
         // rebuild, and a check beside it stays where the differ put it.
         let mut cs = plan(vec![
-            Change::DropModule {
+            Change::Module(ModuleChange::DropModule {
                 id: routine.clone(),
                 kind: ModuleKind::Procedure,
-            },
+            }),
             add_check("ck"),
-            Change::CreateModule {
+            Change::Module(ModuleChange::CreateModule {
                 id: routine,
                 module: as_kind(ModuleKind::Procedure),
-            },
+            }),
         ]);
         let before = names(&cs);
         assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 0);
@@ -5335,16 +5437,16 @@ mod tests {
             Uid::derived(UidKind::Column, "app.n.v", 0),
             ColumnRef::new(n.clone(), "v"),
         );
-        let create = Change::CreateTable {
+        let create = Change::Table(TableChange::CreateTable {
             uid: Uid::derived(UidKind::Table, "app.n", 0),
             name: n.clone(),
             table: Box::new(t.clone()),
             beside_default: None,
             moves_at_most: None,
-        };
+        });
         #[allow(clippy::wildcard_enum_match_arm)]
         let table_of = |cs: &ChangeSet| match &cs.changes[0].change {
-            Change::CreateTable { table, .. } => (**table).clone(),
+            Change::Table(TableChange::CreateTable { table, .. }) => (**table).clone(),
             other => panic!("{other:?}"),
         };
 
@@ -5409,20 +5511,20 @@ mod tests {
                 ..Schema::default()
             };
             let mut cs = plan(vec![
-                Change::CreateTable {
+                Change::Table(TableChange::CreateTable {
                     uid: Uid::derived(UidKind::Table, "app.n", 0),
                     name: n.clone(),
                     table: Box::new(parent.clone()),
                     beside_default: None,
                     moves_at_most: None,
-                },
-                Change::CreateTable {
+                }),
+                Change::Table(TableChange::CreateTable {
                     uid: Uid::derived(UidKind::Table, "app.n_1", 0),
                     name: p1.clone(),
                     table: Box::new(partition(column)),
                     beside_default: None,
                     moves_at_most: None,
-                },
+                }),
                 alter(&s, "app.f(integer)"),
             ]);
             assert_eq!(split_new_tables(&mut cs, &[&ids], pg().as_ref()), Ok(3));
@@ -5433,10 +5535,10 @@ mod tests {
                 "{column}"
             );
             let parents = cs.changes.iter().position(|p| {
-                matches!(&p.change, Change::AlterColumnDefault { column, .. } if column.table == n)
+                matches!(&p.change, Change::Column(ColumnChange::AlterColumnDefault { column, .. }) if column.table == n)
             });
             let own = cs.changes.iter().position(|p| {
-                matches!(&p.change, Change::SetPartitionDefault { table, column: c, to: Some(to), .. }
+                matches!(&p.change, Change::Partition(PartitionChange::SetPartitionDefault { table, column: c, to: Some(to), .. })
                     if *table == p1 && c.raw() == "v" && to == "7")
             });
             if again {
@@ -5447,7 +5549,7 @@ mod tests {
         }
 
         // A row that omits `v` takes its default: the default stays for it.
-        let insert = Change::InsertRow {
+        let insert = Change::Row(RowChange::InsertRow {
             table: n.clone(),
             key_column: "id".into(),
             identity_key: false,
@@ -5455,7 +5557,7 @@ mod tests {
             row: pbps_model::Row::default(),
             defaults: BTreeMap::from([("v".into(), "app.f(1)".to_owned())]),
             types: BTreeMap::new(),
-        };
+        });
         let mut cs = plan(vec![create.clone(), insert, alter(&s, "app.f(integer)")]);
         assert_eq!(split_new_tables(&mut cs, &[&ids], pg().as_ref()), Ok(2));
         assert_eq!(
@@ -5477,19 +5579,21 @@ mod tests {
     /// boundary: nothing calls one from an expression.
     #[test]
     fn what_may_call_a_new_function_follows_its_create() {
-        let new_routine = |kind| Change::CreateModule {
-            id: id("app.h(integer)"),
-            module: Box::new(module(
-                kind,
-                "(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$",
-            )),
+        let new_routine = |kind| {
+            Change::Module(ModuleChange::CreateModule {
+                id: id("app.h(integer)"),
+                module: Box::new(module(
+                    kind,
+                    "(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$",
+                )),
+            })
         };
-        let recompute = Change::AlterColumnExpression {
+        let recompute = Change::Column(ColumnChange::AlterColumnExpression {
             uid: "c_d4e5f6".parse().unwrap(),
             column: TableName::new("app", "t").column("g"),
             from: "id * 2".into(),
             to: "app.h(id)".into(),
-        };
+        });
         let mut generated = pbps_model::Column::new("integer".parse().unwrap());
         generated.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
             expression: "id * 2".into(),
@@ -5499,18 +5603,23 @@ mod tests {
             check_of("ck", "app.h(id) >= 0"),
             default_of("t", "app.h(1)"),
             recompute.clone(),
-            Change::AddColumn {
+            Change::Column(ColumnChange::AddColumn {
                 uid: "c_a1b2c3".parse().unwrap(),
                 table: TableName::new("app", "t"),
                 name: "read".into(),
                 column: Box::new(generated),
-            },
+            }),
             new_routine(ModuleKind::Function),
         ]);
         assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 3);
         assert!(
-            matches!(cs.changes[0].change, Change::AddColumn { .. })
-                && matches!(cs.changes[1].change, Change::CreateModule { .. }),
+            matches!(
+                cs.changes[0].change,
+                Change::Column(ColumnChange::AddColumn { .. })
+            ) && matches!(
+                cs.changes[1].change,
+                Change::Module(ModuleChange::CreateModule { .. })
+            ),
             "{:?}",
             names(&cs)
         );
@@ -5525,20 +5634,20 @@ mod tests {
     }
 
     fn routine(name: &str, body: &str) -> Change {
-        Change::CreateModule {
+        Change::Module(ModuleChange::CreateModule {
             id: id(name),
             module: Box::new(module(
                 ModuleKind::Function,
                 &format!("() RETURNS integer LANGUAGE sql IMMUTABLE AS $$ {body} $$"),
             )),
-        }
+        })
     }
 
     fn new_view(name: &str, definition: &str) -> Change {
-        Change::CreateModule {
+        Change::Module(ModuleChange::CreateModule {
             id: id(name),
             module: Box::new(module(ModuleKind::View, definition)),
-        }
+        })
     }
 
     /// A column `app.t.<name>` added with a generation expression, or with
@@ -5553,12 +5662,12 @@ mod tests {
         } else {
             column.value_source = pbps_model::ValueSource::Default(expression.into());
         }
-        Change::AddColumn {
+        Change::Column(ColumnChange::AddColumn {
             uid: Uid::derived(UidKind::Column, &format!("app.t.{name}"), 0),
             table: TableName::new("app", "t"),
             name: name.into(),
             column: Box::new(column),
-        }
+        })
     }
 
     /// DEC-1364.1: an addition whose text names no function the plan creates
@@ -5571,12 +5680,12 @@ mod tests {
             check_of("ck", "id > 0"),
             default_of("t", "0"),
             add_index("ix_filtered", Some("id > 0")),
-            Change::AlterColumnExpression {
+            Change::Column(ColumnChange::AlterColumnExpression {
                 uid: "c_d4e5f6".parse().unwrap(),
                 column: TableName::new("app", "t").column("g"),
                 from: "id * 2".into(),
                 to: "id * 3".into(),
-            },
+            }),
             add_column("h", "id * 2", true),
             // A longer name is no call, in code or in a literal.
             check_of("ck_longer", "note <> 'app.ff(1)' AND app.ff(id) > 0"),
@@ -5605,19 +5714,19 @@ mod tests {
             },
         );
         let mut cs = plan(vec![
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: Uid::derived(UidKind::Table, "app.n", 0),
                 name: n,
                 table: Box::new(t),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
             alter(&s, "app.f(integer)"),
         ]);
         assert_eq!(split_new_tables(&mut cs, &[], pg().as_ref()), Ok(1));
         #[allow(clippy::wildcard_enum_match_arm)]
         match &cs.changes[0].change {
-            Change::CreateTable { table, .. } => {
+            Change::Table(TableChange::CreateTable { table, .. }) => {
                 assert_eq!(
                     table
                         .checks
@@ -5634,7 +5743,7 @@ mod tests {
 
     #[test]
     fn ordinary_modules_checks_and_rows_without_a_handover_keep_their_bytes() {
-        let ordinary = Change::AlterModule {
+        let ordinary = Change::Module(ModuleChange::AlterModule {
             id: ModuleId::Trigger {
                 on: TableName::new("app", "t"),
                 name: "audit".into(),
@@ -5643,10 +5752,10 @@ mod tests {
                 ModuleKind::Trigger,
                 "AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.fire()",
             )),
-        };
+        });
         for function in [false, true] {
             let mut cs = plan(vec![
-                Change::InsertRow {
+                Change::Row(RowChange::InsertRow {
                     table: TableName::new("app", "t"),
                     key_column: "id".into(),
                     identity_key: false,
@@ -5654,7 +5763,7 @@ mod tests {
                     row: pbps_model::Row::default(),
                     defaults: BTreeMap::new(),
                     types: BTreeMap::new(),
-                },
+                }),
                 check_of("positive", "id > 0"),
                 ordinary.clone(),
                 new_view("app.v", "SELECT id FROM app.t"),
@@ -5687,8 +5796,8 @@ mod tests {
     /// comparison fails; one that calls none, and a drop, move in neither.
     #[test]
     fn an_exclusion_calling_a_created_function_moves_behind_it_in_the_pass_and_its_oracle() {
-        let exclusion =
-            |key: pbps_model::IndexColumn, filter: Option<&str>, to: bool| Change::SetExclusion {
+        let exclusion = |key: pbps_model::IndexColumn, filter: Option<&str>, to: bool| {
+            Change::Constraint(ConstraintChange::SetExclusion {
                 table: TableName::new("app", "booking"),
                 name: "xc".into(),
                 from: None,
@@ -5705,7 +5814,8 @@ mod tests {
                         timing: pbps_model::ExclusionTiming::Immediate,
                     })
                 }),
-            };
+            })
+        };
         let moved = |change: Change| {
             let mut cs = plan(vec![change, routine("app.f()", "SELECT 1")]);
             let schedule = Schedule::new(cs.changes.len());
@@ -5745,14 +5855,14 @@ mod tests {
     #[test]
     fn a_constraint_slot_cycle_is_refused_with_its_steps_named() {
         let mut cs = plan(vec![
-            Change::AddCheck {
+            Change::Constraint(ConstraintChange::AddCheck {
                 table: TableName::new("app", "p0"),
                 name: "audit".into(),
                 constraint: CheckConstraint {
                     expression: "id > 0".into(),
                 },
-            },
-            Change::AlterModule {
+            }),
+            Change::Module(ModuleChange::AlterModule {
                 id: ModuleId::Trigger {
                     on: TableName::new("app", "t"),
                     name: "audit".into(),
@@ -5761,7 +5871,7 @@ mod tests {
                     ModuleKind::Trigger,
                     "AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.fire()",
                 )),
-            },
+            }),
         ]);
         let mut order = Schedule::new(cs.changes.len());
         order.edge(1, 0, Source::Effect, OrderReason::Identity);
@@ -5806,15 +5916,15 @@ mod tests {
         };
         for row in [None, Some(child.clone()), Some(parent.clone())] {
             let mut cs = plan(vec![
-                Change::CreateTable {
+                Change::Table(TableChange::CreateTable {
                     uid: Uid::derived(UidKind::Table, "child", 0),
                     name: child.clone(),
                     table: Box::new(shape.clone()),
                     beside_default: None,
                     moves_at_most: None,
-                },
+                }),
                 if let Some(table) = &row {
-                    Change::InsertRow {
+                    Change::Row(RowChange::InsertRow {
                         table: table.clone(),
                         key_column: "id".into(),
                         identity_key: false,
@@ -5822,17 +5932,17 @@ mod tests {
                         row: pbps_model::Row::default(),
                         defaults: BTreeMap::new(),
                         types: BTreeMap::new(),
-                    }
+                    })
                 } else {
-                    Change::AddCheck {
+                    Change::Constraint(ConstraintChange::AddCheck {
                         table: child.clone(),
                         name: "positive".into(),
                         constraint: CheckConstraint {
                             expression: "id > 0".into(),
                         },
-                    }
+                    })
                 },
-                Change::AlterModule {
+                Change::Module(ModuleChange::AlterModule {
                     id: ModuleId::Trigger {
                         on: parent.clone(),
                         name: "audit".into(),
@@ -5841,7 +5951,7 @@ mod tests {
                         ModuleKind::Trigger,
                         "AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f()",
                     )),
-                },
+                }),
             ]);
             let original = cs.clone();
             let mut order = Schedule::new(cs.changes.len());
@@ -5865,9 +5975,18 @@ mod tests {
                 assert_eq!(cs, original);
             } else {
                 assert!(result.is_ok(), "{result:?}");
-                assert!(matches!(cs.changes[0].change, Change::AlterModule { .. }));
-                assert!(matches!(cs.changes[1].change, Change::CreateTable { .. }));
-                assert!(matches!(cs.changes[2].change, Change::AddCheck { .. }));
+                assert!(matches!(
+                    cs.changes[0].change,
+                    Change::Module(ModuleChange::AlterModule { .. })
+                ));
+                assert!(matches!(
+                    cs.changes[1].change,
+                    Change::Table(TableChange::CreateTable { .. })
+                ));
+                assert!(matches!(
+                    cs.changes[2].change,
+                    Change::Constraint(ConstraintChange::AddCheck { .. })
+                ));
             }
         }
     }
@@ -5891,10 +6010,14 @@ mod tests {
             let at =
                 |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
             let column = |name: &str| {
-                at(&|c| matches!(c, Change::AddColumn { name: n, .. } if n.raw() == name))
+                at(
+                    &|c| matches!(c, Change::Column(ColumnChange::AddColumn { name: n, .. }) if n.raw() == name),
+                )
             };
             let created = |name: &str| {
-                at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id(name)))
+                at(
+                    &|c| matches!(c, Change::Module(ModuleChange::CreateModule { id: i, .. }) if *i == id(name)),
+                )
             };
             let order = names(&cs);
             assert!(created("app.f(integer)") < column("g"), "{order:?}");
@@ -5923,13 +6046,13 @@ mod tests {
             t.columns.insert("g".into(), g);
             t.columns
                 .insert("later".into(), Column::new("integer".parse().unwrap()));
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: Uid::derived(UidKind::Table, name, 0),
                 name: name.parse().unwrap(),
                 table: Box::new(t),
                 beside_default: None,
                 moves_at_most: None,
-            }
+            })
         };
         let mut cs = plan(vec![
             table("app.n", "app.f(later)"),
@@ -5941,10 +6064,15 @@ mod tests {
         assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
-        let created =
-            |name: &str| at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id(name)));
+        let created = |name: &str| {
+            at(
+                &|c| matches!(c, Change::Module(ModuleChange::CreateModule { id: i, .. }) if *i == id(name)),
+            )
+        };
         let table_at = |name: &str| {
-            at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.raw().to_string() == name))
+            at(
+                &|c| matches!(c, Change::Table(TableChange::CreateTable { name: n, .. }) if n.raw().to_string() == name),
+            )
         };
         let order = names(&cs);
         assert!(
@@ -5955,7 +6083,7 @@ mod tests {
         assert!(table_at("app.n") < created("app.a_reader()"), "{order:?}");
         #[allow(clippy::wildcard_enum_match_arm)]
         match &cs.changes[table_at("app.n")].change {
-            Change::CreateTable { table, .. } => {
+            Change::Table(TableChange::CreateTable { table, .. }) => {
                 assert_eq!(
                     table
                         .columns
@@ -5992,13 +6120,13 @@ mod tests {
                 }),
                 ..Table::default()
             };
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: Uid::derived(UidKind::Table, name, 0),
                 name: name.parse().unwrap(),
                 table: Box::new(t),
                 beside_default: None,
                 moves_at_most: None,
-            }
+            })
         };
         let mut parent = Table::default();
         parent
@@ -6010,13 +6138,13 @@ mod tests {
             strategy: Default::default(),
         });
         let mut cs = plan(vec![
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: Uid::derived(UidKind::Table, "app.ev", 0),
                 name: "app.ev".parse().unwrap(),
                 table: Box::new(parent),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
             partition("app.ev_new", "app.f(1)"),
             partition("app.ev_plain", "7"),
             routine("app.f(integer)", "SELECT 1"),
@@ -6025,10 +6153,13 @@ mod tests {
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
         let table_at = |name: &str| {
-            at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.raw().to_string() == name))
+            at(
+                &|c| matches!(c, Change::Table(TableChange::CreateTable { name: n, .. }) if n.raw().to_string() == name),
+            )
         };
-        let function =
-            at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id("app.f(integer)")));
+        let function = at(
+            &|c| matches!(c, Change::Module(ModuleChange::CreateModule { id: i, .. }) if *i == id("app.f(integer)")),
+        );
         let order = names(&cs);
         assert!(function < table_at("app.ev_new"), "{order:?}");
         assert!(table_at("app.ev") < function, "{order:?}");
@@ -6079,7 +6210,7 @@ mod tests {
                 on_update: pbps_model::ReferentialAction::default(),
             })
         };
-        let trigger = Change::CreateModule {
+        let trigger = Change::Module(ModuleChange::CreateModule {
             id: ModuleId::Trigger {
                 on: pbps_model::ObjectName::new("app", "ev_rest"),
                 name: "audit".into(),
@@ -6088,33 +6219,33 @@ mod tests {
                 ModuleKind::Trigger,
                 "AFTER DELETE ON app.ev_rest FOR EACH STATEMENT EXECUTE FUNCTION app.note()",
             )),
-        };
+        });
         let mut cs = plan(vec![
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: Uid::derived(UidKind::Table, "app.ev_1", 0),
                 name: "app.ev_1".parse().unwrap(),
                 table: Box::new(partition(Some("7"))),
                 beside_default: Some("app.ev_rest".parse().unwrap()),
                 moves_at_most: None,
-            },
-            Change::CreateTable {
+            }),
+            Change::Table(TableChange::CreateTable {
                 uid: Uid::derived(UidKind::Table, "app.ev_plain", 0),
                 name: "app.ev_plain".parse().unwrap(),
                 table: Box::new(partition(None)),
                 beside_default: None,
                 moves_at_most: None,
-            },
-            Change::SetPartitionNotNull {
+            }),
+            Change::Partition(PartitionChange::SetPartitionNotNull {
                 uid: Uid::derived(UidKind::Column, "app.ev_rest", 0),
                 table: "app.ev_rest".parse().unwrap(),
                 column: "v".into(),
                 not_null: true,
-            },
-            Change::AddForeignKey {
+            }),
+            Change::Constraint(ConstraintChange::AddForeignKey {
                 table: "app.child".parse().unwrap(),
                 name: "child_ev_fk".into(),
                 constraint: fk_into("app.ev"),
-            },
+            }),
             trigger,
             routine("app.f(integer)", "SELECT 1"),
         ]);
@@ -6122,21 +6253,29 @@ mod tests {
         let order = names(&cs);
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
-        let function =
-            at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id("app.f(integer)")));
+        let function = at(
+            &|c| matches!(c, Change::Module(ModuleChange::CreateModule { id: i, .. }) if *i == id("app.f(integer)")),
+        );
         let create = |n: &str| {
-            at(&|c| matches!(c, Change::CreateTable { name, .. } if name.raw().to_string() == n))
+            at(
+                &|c| matches!(c, Change::Table(TableChange::CreateTable { name, .. }) if name.raw().to_string() == n),
+            )
         };
-        let set = at(&|c| matches!(c, Change::SetPartitionDefault { .. }));
+        let set = at(&|c| {
+            matches!(
+                c,
+                Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            )
+        });
         assert_eq!(create("app.ev_1"), 0, "{order:?}");
         assert!(function < set, "{order:?}");
-        let Change::SetPartitionDefault {
+        let Change::Partition(PartitionChange::SetPartitionDefault {
             table,
             column,
             from,
             to,
             ..
-        } = &cs.changes[set].change
+        }) = &cs.changes[set].change
         else {
             unreachable!()
         };
@@ -6146,7 +6285,7 @@ mod tests {
         );
         // The create no longer carries the default it hands over; a default
         // calling nothing new, and a NOT NULL, stay in it.
-        let Change::CreateTable { table, .. } = &cs.changes[0].change else {
+        let Change::Table(TableChange::CreateTable { table, .. }) = &cs.changes[0].change else {
             unreachable!()
         };
         let own = &table.partition_of.as_ref().unwrap().columns;
@@ -6155,10 +6294,20 @@ mod tests {
         assert!(own["w"].not_null);
         // What must follow the move keeps its place after it.
         let trigger = at(
-            &|c| matches!(c, Change::CreateModule { module, .. } if module.kind == ModuleKind::Trigger),
+            &|c| matches!(c, Change::Module(ModuleChange::CreateModule { module, .. }) if module.kind == ModuleKind::Trigger),
         );
-        let key = at(&|c| matches!(c, Change::AddForeignKey { .. }));
-        let tightened = at(&|c| matches!(c, Change::SetPartitionNotNull { .. }));
+        let key = at(&|c| {
+            matches!(
+                c,
+                Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            )
+        });
+        let tightened = at(&|c| {
+            matches!(
+                c,
+                Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            )
+        });
         assert!(create("app.ev_1") < tightened, "{order:?}");
         assert!(
             tightened < key && key < trigger && trigger < function,
@@ -6170,7 +6319,10 @@ mod tests {
         assert_eq!(
             cs.changes
                 .iter()
-                .filter(|p| matches!(p.change, Change::SetPartitionDefault { .. }))
+                .filter(|p| matches!(
+                    p.change,
+                    Change::Partition(PartitionChange::SetPartitionDefault { .. })
+                ))
                 .count(),
             1,
             "{order:?}"
@@ -6226,25 +6378,25 @@ mod tests {
             let mut extra = Column::new("integer".parse().unwrap());
             extra.value_source = pbps_model::ValueSource::Default("app.f(1)".into());
             plan(vec![
-                Change::AddColumn {
+                Change::Column(ColumnChange::AddColumn {
                     uid: Uid::derived(UidKind::Column, "app.ev.extra", 0),
                     table: "app.ev".parse().unwrap(),
                     name: "extra".into(),
                     column: Box::new(extra),
-                },
-                Change::CreateTable {
+                }),
+                Change::Table(TableChange::CreateTable {
                     uid: Uid::derived(UidKind::Table, "app.ev_1", 0),
                     name: "app.ev_1".parse().unwrap(),
                     table: Box::new(t),
                     beside_default: Some("app.ev_rest".parse().unwrap()),
                     moves_at_most: None,
-                },
-                Change::SetPartitionNotNull {
+                }),
+                Change::Partition(PartitionChange::SetPartitionNotNull {
                     uid: Uid::derived(UidKind::Table, "app.ev_rest", 0),
                     table: "app.ev_rest".parse().unwrap(),
                     column: "v".into(),
                     not_null: true,
-                },
+                }),
                 routine("app.f(integer)", "SELECT 1"),
             ])
         };
@@ -6253,25 +6405,27 @@ mod tests {
         let order = names(&cs);
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
-        let function =
-            at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id("app.f(integer)")));
-        let added = at(&|c| matches!(c, Change::AddColumn { .. }));
-        let create = at(&|c| matches!(c, Change::CreateTable { .. }));
+        let function = at(
+            &|c| matches!(c, Change::Module(ModuleChange::CreateModule { id: i, .. }) if *i == id("app.f(integer)")),
+        );
+        let added = at(&|c| matches!(c, Change::Column(ColumnChange::AddColumn { .. })));
+        let create = at(&|c| matches!(c, Change::Table(TableChange::CreateTable { .. })));
         let tightened = at(
-            &|c| matches!(c, Change::SetPartitionNotNull { table, .. } if table.name == "ev_rest"),
+            &|c| matches!(c, Change::Partition(PartitionChange::SetPartitionNotNull { table, .. }) if table.name == "ev_rest"),
         );
         let own_default = at(&|c| {
-            matches!(c, Change::SetPartitionDefault { table, column, to, .. }
+            matches!(c, Change::Partition(PartitionChange::SetPartitionDefault { table, column, to, .. })
             if table.name == "ev_1" && column.raw() == "extra" && to.as_deref() == Some("9"))
         });
         let own_not_null = at(&|c| {
-            matches!(c, Change::SetPartitionNotNull { table, column, not_null: true, .. }
+            matches!(c, Change::Partition(PartitionChange::SetPartitionNotNull { table, column, not_null: true, .. })
             if table.name == "ev_1" && column.raw() == "extra")
         });
         assert!(create < tightened && tightened < function, "{order:?}");
         assert!(function < added, "{order:?}");
         assert!(added < own_default && added < own_not_null, "{order:?}");
-        let Change::CreateTable { table, .. } = &cs.changes[create].change else {
+        let Change::Table(TableChange::CreateTable { table, .. }) = &cs.changes[create].change
+        else {
             unreachable!()
         };
         assert!(
@@ -6320,27 +6474,29 @@ mod tests {
                 columns: vec!["k".into()],
                 strategy: Default::default(),
             });
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: Uid::derived(UidKind::Table, name, 0),
                 name: name.parse().unwrap(),
                 table: Box::new(t),
                 beside_default: None,
                 moves_at_most: None,
-            }
+            })
         };
-        let partition = |name: &str, of: &str| Change::CreateTable {
-            uid: Uid::derived(UidKind::Table, name, 0),
-            name: name.parse().unwrap(),
-            table: Box::new(Table {
-                partition_of: Some(pbps_model::PartitionOf {
-                    parent: of.parse().unwrap(),
-                    bound: pbps_model::PartitionBound::Default,
-                    columns: Default::default(),
+        let partition = |name: &str, of: &str| {
+            Change::Table(TableChange::CreateTable {
+                uid: Uid::derived(UidKind::Table, name, 0),
+                name: name.parse().unwrap(),
+                table: Box::new(Table {
+                    partition_of: Some(pbps_model::PartitionOf {
+                        parent: of.parse().unwrap(),
+                        bound: pbps_model::PartitionBound::Default,
+                        columns: Default::default(),
+                    }),
+                    ..Table::default()
                 }),
-                ..Table::default()
-            }),
-            beside_default: None,
-            moves_at_most: None,
+                beside_default: None,
+                moves_at_most: None,
+            })
         };
         let mut cs = plan(vec![
             parent("app.ev", Some("app.f(k)")),
@@ -6353,10 +6509,13 @@ mod tests {
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
         let table_at = |name: &str| {
-            at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.raw().to_string() == name))
+            at(
+                &|c| matches!(c, Change::Table(TableChange::CreateTable { name: n, .. }) if n.raw().to_string() == name),
+            )
         };
-        let function =
-            at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id("app.f(integer)")));
+        let function = at(
+            &|c| matches!(c, Change::Module(ModuleChange::CreateModule { id: i, .. }) if *i == id("app.f(integer)")),
+        );
         let order = names(&cs);
         assert!(function < table_at("app.ev"), "{order:?}");
         assert!(table_at("app.ev") < table_at("app.ev_1"), "{order:?}");
@@ -6371,26 +6530,28 @@ mod tests {
     /// A new partition with its own entries on other columns only is free.
     #[test]
     fn a_held_parent_column_takes_the_new_partitions_that_set_their_own_on_it() {
-        let partition = |name: &str, column: &str| Change::CreateTable {
-            uid: Uid::derived(UidKind::Table, name, 0),
-            name: name.parse().unwrap(),
-            table: Box::new(Table {
-                partition_of: Some(pbps_model::PartitionOf {
-                    parent: "app.ev".parse().unwrap(),
-                    bound: pbps_model::PartitionBound::Default,
-                    columns: [(
-                        column.into(),
-                        pbps_model::PartitionColumn {
-                            default: Some("5".to_owned()),
-                            not_null: false,
-                        },
-                    )]
-                    .into(),
+        let partition = |name: &str, column: &str| {
+            Change::Table(TableChange::CreateTable {
+                uid: Uid::derived(UidKind::Table, name, 0),
+                name: name.parse().unwrap(),
+                table: Box::new(Table {
+                    partition_of: Some(pbps_model::PartitionOf {
+                        parent: "app.ev".parse().unwrap(),
+                        bound: pbps_model::PartitionBound::Default,
+                        columns: [(
+                            column.into(),
+                            pbps_model::PartitionColumn {
+                                default: Some("5".to_owned()),
+                                not_null: false,
+                            },
+                        )]
+                        .into(),
+                    }),
+                    ..Table::default()
                 }),
-                ..Table::default()
-            }),
-            beside_default: None,
-            moves_at_most: None,
+                beside_default: None,
+                moves_at_most: None,
+            })
         };
         let index_on = |column: &str| pbps_model::Index {
             columns: vec![pbps_model::IndexColumn {
@@ -6409,44 +6570,46 @@ mod tests {
         // A new partition whose own index is on the column, with no own
         // default or NOT NULL on it, needs the column all the same.
         let indexed = |name: &str, index: &str, column: &str| {
-            let Change::CreateTable {
+            let Change::Table(TableChange::CreateTable {
                 uid,
                 name,
                 mut table,
                 ..
-            } = partition(name, "v")
+            }) = partition(name, "v")
             else {
                 unreachable!("a partition is created");
             };
             table.indexes.insert(index.into(), index_on(column));
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid,
                 name,
                 table,
                 beside_default: None,
                 moves_at_most: None,
-            }
+            })
         };
         // A standing partition's own changes on the column, and a default
         // on another parent's column of the same name.
-        let standing_default = |table: &str, parent: &str| Change::SetPartitionDefault {
-            uid: Uid::derived(UidKind::Table, table, 0),
-            table: table.parse().unwrap(),
-            parent: parent.parse().unwrap(),
-            column: "extra".into(),
-            from: None,
-            to: Some("6".into()),
-            fallback: None,
+        let standing_default = |table: &str, parent: &str| {
+            Change::Partition(PartitionChange::SetPartitionDefault {
+                uid: Uid::derived(UidKind::Table, table, 0),
+                table: table.parse().unwrap(),
+                parent: parent.parse().unwrap(),
+                column: "extra".into(),
+                from: None,
+                to: Some("6".into()),
+                fallback: None,
+            })
         };
         let mut extra = Column::new("integer".parse().unwrap());
         extra.value_source = pbps_model::ValueSource::Default("app.f()".into());
         let mut cs = plan(vec![
-            Change::AddColumn {
+            Change::Column(ColumnChange::AddColumn {
                 uid: "c_a1b2c3".parse().unwrap(),
                 table: TableName::new("app", "ev"),
                 name: "extra".into(),
                 column: Box::new(extra),
-            },
+            }),
             partition("app.ev_new", "extra"),
             partition("app.ev_plain", "v"),
             indexed("app.ev_ix", "ev_ix_extra", "extra"),
@@ -6455,26 +6618,26 @@ mod tests {
             standing_default("app.x_1", "app.x"),
             // Each on a partition of its own, so that none follows another
             // change of its table rather than the column.
-            Change::SetPartitionNotNull {
+            Change::Partition(PartitionChange::SetPartitionNotNull {
                 uid: Uid::derived(UidKind::Table, "app.ev_2", 0),
                 table: "app.ev_2".parse().unwrap(),
                 column: "extra".into(),
                 not_null: true,
-            },
-            Change::AddIndex {
+            }),
+            Change::Index(IndexChange::AddIndex {
                 table: "app.ev_3".parse().unwrap(),
                 name: "ev_3_extra".into(),
                 index: Box::new(index_on("extra")),
                 clustered: false,
-            },
+            }),
             // A table that is no partition of `app.ev`, with an index on a
             // column of the same name: free to go ahead (#1692 review).
-            Change::AddIndex {
+            Change::Index(IndexChange::AddIndex {
                 table: "app.u".parse().unwrap(),
                 name: "u_extra".into(),
                 index: Box::new(index_on("extra")),
                 clustered: false,
-            },
+            }),
             routine("app.f()", "SELECT 1"),
         ]);
         let mut declared = pbps_model::Schema::default();
@@ -6506,27 +6669,36 @@ mod tests {
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
         let table_at = |name: &str| {
-            at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.raw().to_string() == name))
+            at(
+                &|c| matches!(c, Change::Table(TableChange::CreateTable { name: n, .. }) if n.raw().to_string() == name),
+            )
         };
-        let function =
-            at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id("app.f()")));
-        let added = at(&|c| matches!(c, Change::AddColumn { .. }));
+        let function = at(
+            &|c| matches!(c, Change::Module(ModuleChange::CreateModule { id: i, .. }) if *i == id("app.f()")),
+        );
+        let added = at(&|c| matches!(c, Change::Column(ColumnChange::AddColumn { .. })));
         let order = names(&cs);
         assert!(function < added, "{order:?}");
         assert!(added < table_at("app.ev_new"), "{order:?}");
         assert!(added < table_at("app.ev_ix"), "{order:?}");
         let default_at = |table: &str| {
             at(
-                &|c| matches!(c, Change::SetPartitionDefault { table: t, .. } if t.raw().to_string() == table),
+                &|c| matches!(c, Change::Partition(PartitionChange::SetPartitionDefault { table: t, .. }) if t.raw().to_string() == table),
             )
         };
         assert!(added < default_at("app.ev_1"), "{order:?}");
         assert!(
-            added < at(&|c| matches!(c, Change::SetPartitionNotNull { .. })),
+            added
+                < at(&|c| matches!(
+                    c,
+                    Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+                )),
             "{order:?}"
         );
         let index_at = |table: &str| {
-            at(&|c| matches!(c, Change::AddIndex { table: t, .. } if t.raw().to_string() == table))
+            at(
+                &|c| matches!(c, Change::Index(IndexChange::AddIndex { table: t, .. }) if t.raw().to_string() == table),
+            )
         };
         assert!(added < index_at("app.ev_3"), "{order:?}");
         // Negative: an index of a table that is no partition of the parent.
@@ -6569,13 +6741,13 @@ mod tests {
                     },
                 );
             }
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: Uid::derived(UidKind::Table, name, 0),
                 name: name.parse().unwrap(),
                 table: Box::new(t),
                 beside_default: None,
                 moves_at_most: None,
-            }
+            })
         };
         // A later new table naming app.n only inside an OID-alias literal.
         let literal_table = || {
@@ -6583,35 +6755,37 @@ mod tests {
             let mut r = Column::new("regclass".parse().unwrap());
             r.value_source = pbps_model::ValueSource::Default("'app.n'::regclass".into());
             t.columns.insert("r".into(), r);
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: Uid::derived(UidKind::Table, "app.literal", 0),
                 name: "app.literal".parse().unwrap(),
                 table: Box::new(t),
                 beside_default: None,
                 moves_at_most: None,
-            }
+            })
         };
         // And a new partition naming it only in its own default (#1578).
-        let literal_partition = || Change::CreateTable {
-            uid: Uid::derived(UidKind::Table, "app.part", 0),
-            name: "app.part".parse().unwrap(),
-            table: Box::new(Table {
-                partition_of: Some(pbps_model::PartitionOf {
-                    parent: "app.other".parse().unwrap(),
-                    bound: pbps_model::PartitionBound::Default,
-                    columns: [(
-                        "id".into(),
-                        pbps_model::PartitionColumn {
-                            default: Some("'app.n'::regclass::oid::integer".into()),
-                            not_null: false,
-                        },
-                    )]
-                    .into(),
+        let literal_partition = || {
+            Change::Table(TableChange::CreateTable {
+                uid: Uid::derived(UidKind::Table, "app.part", 0),
+                name: "app.part".parse().unwrap(),
+                table: Box::new(Table {
+                    partition_of: Some(pbps_model::PartitionOf {
+                        parent: "app.other".parse().unwrap(),
+                        bound: pbps_model::PartitionBound::Default,
+                        columns: [(
+                            "id".into(),
+                            pbps_model::PartitionColumn {
+                                default: Some("'app.n'::regclass::oid::integer".into()),
+                                not_null: false,
+                            },
+                        )]
+                        .into(),
+                    }),
+                    ..Table::default()
                 }),
-                ..Table::default()
-            }),
-            beside_default: None,
-            moves_at_most: None,
+                beside_default: None,
+                moves_at_most: None,
+            })
         };
         let mut cs = plan(vec![
             new_table(
@@ -6630,9 +6804,11 @@ mod tests {
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
         let table_at = |name: &str| {
-            at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.raw().to_string() == name))
+            at(
+                &|c| matches!(c, Change::Table(TableChange::CreateTable { name: n, .. }) if n.raw().to_string() == name),
+            )
         };
-        let created = at(&|c| matches!(c, Change::CreateModule { .. }));
+        let created = at(&|c| matches!(c, Change::Module(ModuleChange::CreateModule { .. })));
         let order = names(&cs);
         assert!(table_at("app.other") < created, "{order:?}");
         assert!(created < table_at("app.n"), "{order:?}");
@@ -6669,8 +6845,8 @@ mod tests {
             cs.changes
                 .iter()
                 .position(|p| {
-                    matches!(&p.change, Change::CreateTable { name: n, .. } if n.raw().to_string() == name)
-                        || matches!(&p.change, Change::CreateModule { id, .. } if id.raw().to_string() == name)
+                    matches!(&p.change, Change::Table(TableChange::CreateTable { name: n, .. }) if n.raw().to_string() == name)
+                        || matches!(&p.change, Change::Module(ModuleChange::CreateModule { id, .. }) if id.raw().to_string() == name)
                 })
                 .unwrap_or_else(|| panic!("{name} missing from {order:?}"))
         };
@@ -6692,13 +6868,13 @@ mod tests {
                 &[("id", None), ("g", Some("app.f(later)")), ("later", None)],
                 None,
             ),
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: Uid::derived(UidKind::Table, "app.other", 0),
                 name: "app.other".parse().unwrap(),
                 table: Box::new(other),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
             routine("app.f(integer)", "SELECT count(*)::integer FROM app.other"),
         ]);
         assert_eq!(split_new_tables(&mut cs, &[], pg().as_ref()), Ok(0));
@@ -6708,8 +6884,8 @@ mod tests {
             cs.changes
                 .iter()
                 .position(|p| {
-                    matches!(&p.change, Change::CreateTable { name: n, .. } if n.raw().to_string() == name)
-                        || matches!(&p.change, Change::CreateModule { id, .. } if id.raw().to_string() == name)
+                    matches!(&p.change, Change::Table(TableChange::CreateTable { name: n, .. }) if n.raw().to_string() == name)
+                        || matches!(&p.change, Change::Module(ModuleChange::CreateModule { id, .. }) if id.raw().to_string() == name)
                 })
                 .unwrap_or_else(|| panic!("{name} missing from {order:?}"))
         };
@@ -6818,22 +6994,25 @@ mod tests {
         let mut cs = plan(vec![
             add_column("g", "app.z(1)", true),
             routine("app.a_reader()", "SELECT g FROM app.t LIMIT 1"),
-            Change::CreateModule {
+            Change::Module(ModuleChange::CreateModule {
                 id: id("app.b_user()"),
                 module: Box::new(module(
                     ModuleKind::Function,
                     "() RETURNS text LANGUAGE sql \
                      BEGIN ATOMIC SELECT 'app.a_reader()'::regprocedure::text; END",
                 )),
-            },
+            }),
             routine("app.z(integer)", "SELECT 1"),
         ]);
         assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
-        let created =
-            |name: &str| at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id(name)));
-        let column = at(&|c| matches!(c, Change::AddColumn { .. }));
+        let created = |name: &str| {
+            at(
+                &|c| matches!(c, Change::Module(ModuleChange::CreateModule { id: i, .. }) if *i == id(name)),
+            )
+        };
+        let column = at(&|c| matches!(c, Change::Column(ColumnChange::AddColumn { .. })));
         let order = names(&cs);
         assert!(created("app.z(integer)") < column, "{order:?}");
         assert!(column < created("app.a_reader()"), "{order:?}");
@@ -6860,7 +7039,7 @@ mod tests {
             cs.changes
                 .iter()
                 .position(
-                    |p| matches!(&p.change, Change::CreateModule { id: i, .. } if *i == id(name)),
+                    |p| matches!(&p.change, Change::Module(ModuleChange::CreateModule { id: i, .. }) if *i == id(name)),
                 )
                 .unwrap()
         };
@@ -6911,13 +7090,13 @@ mod tests {
             vec![
                 add_column("g", "app.f(1)", false),
                 routine("app.a_helper()", "SELECT max(g) FROM app.t"),
-                Change::CreateModule {
+                Change::Module(ModuleChange::CreateModule {
                     id: id("app.f(integer)"),
                     module: Box::new(module(
                         ModuleKind::Function,
                         "(x integer) RETURNS integer LANGUAGE sql AS $$ SELECT app.a_helper() $$",
                     )),
-                },
+                }),
             ],
             vec![
                 add_column("g", "app.f(1)", false),
@@ -6964,13 +7143,13 @@ mod tests {
             plan(vec![
                 add_column("g", "app.f(1)", false),
                 new_view("app.v", &format!("SELECT * FROM {over}")),
-                Change::CreateModule {
+                Change::Module(ModuleChange::CreateModule {
                     id: id("app.f(integer)"),
                     module: Box::new(module(
                         ModuleKind::Function,
                         "(x integer) RETURNS integer LANGUAGE sql AS $$ SELECT count(*)::int FROM app.v $$",
                     )),
-                },
+                }),
             ])
         };
         let mut cs = changes("app.t_1");
@@ -7018,21 +7197,23 @@ mod tests {
     /// and so does every row beside a generated column.
     #[test]
     fn a_row_writing_a_column_that_calls_a_new_function_is_refused() {
-        let insert = |row: &[&str], defaults: &[&str]| Change::InsertRow {
-            table: TableName::new("app", "t"),
-            key_column: "id".into(),
-            identity_key: false,
-            key: pbps_model::RowKey::from("1"),
-            row: pbps_model::Row(
-                row.iter()
-                    .map(|c| ((*c).into(), pbps_model::Value::Null))
+        let insert = |row: &[&str], defaults: &[&str]| {
+            Change::Row(RowChange::InsertRow {
+                table: TableName::new("app", "t"),
+                key_column: "id".into(),
+                identity_key: false,
+                key: pbps_model::RowKey::from("1"),
+                row: pbps_model::Row(
+                    row.iter()
+                        .map(|c| ((*c).into(), pbps_model::Value::Null))
+                        .collect(),
+                ),
+                defaults: defaults
+                    .iter()
+                    .map(|c| ((*c).into(), "app.f(1)".to_owned()))
                     .collect(),
-            ),
-            defaults: defaults
-                .iter()
-                .map(|c| ((*c).into(), "app.f(1)".to_owned()))
-                .collect(),
-            types: BTreeMap::new(),
+                types: BTreeMap::new(),
+            })
         };
         let ordered = |row: Change| {
             let mut cs = plan(vec![
@@ -7078,7 +7259,7 @@ mod tests {
         }
         let mut cs = plan(vec![
             set_default("u"),
-            Change::InsertRow {
+            Change::Row(RowChange::InsertRow {
                 table: TableName::new("app", "u"),
                 key_column: "id".into(),
                 identity_key: false,
@@ -7086,7 +7267,7 @@ mod tests {
                 row: pbps_model::Row::default(),
                 defaults: BTreeMap::from([("n".into(), "app.f(1)".to_owned())]),
                 types: BTreeMap::new(),
-            },
+            }),
             add_check("ck"),
             alter(&s, "app.f(integer)"),
         ]);
@@ -7109,30 +7290,34 @@ mod tests {
     #[test]
     fn a_default_is_held_back_only_by_a_row_that_takes_it() {
         let (s, _) = declared();
-        let insert = |defaults: &[&str]| Change::InsertRow {
-            table: TableName::new("app", "u"),
-            key_column: "id".into(),
-            identity_key: false,
-            key: pbps_model::RowKey::from("1"),
-            row: pbps_model::Row::default(),
-            defaults: defaults
-                .iter()
-                .map(|c| ((*c).into(), "app.f(1)".to_owned()))
-                .collect(),
-            types: BTreeMap::new(),
+        let insert = |defaults: &[&str]| {
+            Change::Row(RowChange::InsertRow {
+                table: TableName::new("app", "u"),
+                key_column: "id".into(),
+                identity_key: false,
+                key: pbps_model::RowKey::from("1"),
+                row: pbps_model::Row::default(),
+                defaults: defaults
+                    .iter()
+                    .map(|c| ((*c).into(), "app.f(1)".to_owned()))
+                    .collect(),
+                types: BTreeMap::new(),
+            })
         };
-        let update = |column: &str, after: pbps_model::Cell| Change::UpdateRow {
-            table: TableName::new("app", "u"),
-            key_column: "id".into(),
-            key: pbps_model::RowKey::from("1"),
-            columns: BTreeMap::from([(
-                column.into(),
-                (pbps_model::Cell::Value(pbps_model::Value::Null), after),
-            )]),
-            unchanged: BTreeMap::new(),
-            types: BTreeMap::new(),
-            after_types: BTreeMap::new(),
-            key_type: None,
+        let update = |column: &str, after: pbps_model::Cell| {
+            Change::Row(RowChange::UpdateRow {
+                table: TableName::new("app", "u"),
+                key_column: "id".into(),
+                key: pbps_model::RowKey::from("1"),
+                columns: BTreeMap::from([(
+                    column.into(),
+                    (pbps_model::Cell::Value(pbps_model::Value::Null), after),
+                )]),
+                unchanged: BTreeMap::new(),
+                types: BTreeMap::new(),
+                after_types: BTreeMap::new(),
+                key_type: None,
+            })
         };
         let moved = |write: Change| {
             let mut cs = plan(vec![set_default("u"), write, alter(&s, "app.f(integer)")]);
@@ -7187,13 +7372,13 @@ mod tests {
                 filegroup: None,
             },
         );
-        let parameters = Change::SetIndexStorageParameters {
+        let parameters = Change::Index(IndexChange::SetIndexStorageParameters {
             table: t.clone(),
             target: pbps_model::IndexPart::Index("ix_f".into()),
             method: Default::default(),
             set: [("fillfactor".to_owned(), "80".to_owned())].into(),
             reset: Default::default(),
-        };
+        });
         let mut cs = plan(vec![parameters, alter(&s, "app.f(integer)")]);
         let found = BTreeMap::from([(
             id("app.f(integer)"),
@@ -7204,14 +7389,15 @@ mod tests {
         )]);
         weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap();
         assert!(
-            !cs.changes
-                .iter()
-                .any(|p| matches!(p.change, Change::SetIndexStorageParameters { .. })),
+            !cs.changes.iter().any(|p| matches!(
+                p.change,
+                Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            )),
             "{:?}",
             rendered(&cs)
         );
         let added = cs.changes.iter().find_map(|p| {
-            if let Change::AddIndex { index, .. } = &p.change {
+            if let Change::Index(IndexChange::AddIndex { index, .. }) = &p.change {
                 Some(index.storage_parameters.clone())
             } else {
                 None
@@ -7262,14 +7448,14 @@ mod tests {
         s.tables
             .insert(TableName::new("app", "t"), partition.clone());
         let mut cs = plan(vec![
-            Change::AttachPartition {
+            Change::Partition(PartitionChange::AttachPartition {
                 uid: "t_cccccc".parse().unwrap(),
                 table: TableName::new("app", "t"),
                 parent: TableName::new("app", "p"),
                 bound,
                 key: Vec::new(),
                 shape: Box::new(partition),
-            },
+            }),
             alter(&s, "app.f(integer)"),
         ]);
         let on = |table: &str, name: &str| Dependent {
@@ -7288,23 +7474,27 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| {
-                if let Change::DropCheck { table, name } = &p.change {
+                if let Change::Constraint(ConstraintChange::DropCheck { table, name }) = &p.change {
                     Some(format!(
                         "drop {table} {name}",
                         table = table.shown(),
                         // Preserve raw comparison-label or fixture SQL bytes in test data.
                         name = name.raw(),
                     ))
-                } else if let Change::AddCheck { table, name, .. } = &p.change {
+                } else if let Change::Constraint(ConstraintChange::AddCheck {
+                    table, name, ..
+                }) = &p.change
+                {
                     Some(format!(
                         "add {table} {name}",
                         table = table.shown(),
                         // Preserve raw comparison-label or fixture SQL bytes in test data.
                         name = name.raw(),
                     ))
-                } else if let Change::AttachPartition { .. } = &p.change {
+                } else if let Change::Partition(PartitionChange::AttachPartition { .. }) = &p.change
+                {
                     Some("attach".to_owned())
-                } else if let Change::AlterModule { .. } = &p.change {
+                } else if let Change::Module(ModuleChange::AlterModule { .. }) = &p.change {
                     Some("alter".to_owned())
                 } else {
                     None
@@ -7334,7 +7524,12 @@ mod tests {
             alter(&s, "app.f(integer)"),
             cs.changes
                 .iter()
-                .find(|p| matches!(p.change, Change::AttachPartition { .. }))
+                .find(|p| {
+                    matches!(
+                        p.change,
+                        Change::Partition(PartitionChange::AttachPartition { .. })
+                    )
+                })
                 .unwrap()
                 .change
                 .clone(),
@@ -7395,13 +7590,13 @@ mod tests {
                 },
             }],
         )]);
-        let detach = Change::DetachPartition {
+        let detach = Change::Partition(PartitionChange::DetachPartition {
             uid: "t_a1b2c3".parse().unwrap(),
             table: ev_1.clone(),
             parent: ev.clone(),
             names: Vec::new(),
             shape: Box::default(),
-        };
+        });
         let mut cs = plan(vec![alter(&s, "app.f(integer)"), detach]);
         let why = weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).expect_err("refused");
         assert_eq!(
@@ -7410,11 +7605,11 @@ mod tests {
         );
         // Negative: the rebuild alone, or with the partition dropped, takes
         // the parent's check down and puts it back on the parent.
-        let dropped = Change::DropTable {
+        let dropped = Change::Table(TableChange::DropTable {
             uid: "t_a1b2c3".parse().unwrap(),
             name: ev_1.clone(),
             detach_from: Some(ev.clone()),
-        };
+        });
         for also in [vec![], vec![dropped]] {
             let mut changes = vec![alter(&s, "app.f(integer)")];
             changes.extend(also);
@@ -7423,7 +7618,7 @@ mod tests {
             assert!(
                 cs.changes
                     .iter()
-                    .any(|p| matches!(&p.change, Change::AddCheck { table, name, .. }
+                    .any(|p| matches!(&p.change, Change::Constraint(ConstraintChange::AddCheck { table, name, .. })
                         if *table == ev && name.raw() == "ev_ck")),
                 "{:?}",
                 cs.changes
@@ -7450,7 +7645,7 @@ mod tests {
             cs.changes
                 .iter()
                 .map(|p| {
-                    if let Change::AddCheck { name, .. } = &p.change {
+                    if let Change::Constraint(ConstraintChange::AddCheck { name, .. }) = &p.change {
                         name.raw().to_owned()
                     } else {
                         p.change.subject()
@@ -7525,57 +7720,71 @@ mod tests {
         );
         s.tables.insert(r.clone(), referencing);
         s.tables.insert(zz.clone(), Table::default());
-        let drop = Change::DropTable {
+        let drop = Change::Table(TableChange::DropTable {
             uid: Uid::derived(UidKind::Table, "app.ev_2025", 0),
             name: ev_2025.clone(),
             detach_from: Some(ev.clone()),
-        };
-        let detach = Change::DetachPartition {
+        });
+        let detach = Change::Partition(PartitionChange::DetachPartition {
             uid: Uid::derived(UidKind::Table, "app.ev_2025", 0),
             table: ev_2025.clone(),
             parent: ev.clone(),
             names: Vec::new(),
             shape: Box::default(),
+        });
+        let delete = |table: &TableName, key: &str| {
+            Change::Row(RowChange::DeleteRow {
+                table: table.clone(),
+                key_column: "id".into(),
+                key: pbps_model::RowKey::from(key),
+                cause: pbps_model::change::DeleteCause::Undeclared,
+                row: BTreeMap::new(),
+                dropped: BTreeMap::new(),
+                types: BTreeMap::new(),
+                after_types: BTreeMap::new(),
+                key_type: None,
+            })
         };
-        let delete = |table: &TableName, key: &str| Change::DeleteRow {
-            table: table.clone(),
-            key_column: "id".into(),
-            key: pbps_model::RowKey::from(key),
-            cause: pbps_model::change::DeleteCause::Undeclared,
-            row: BTreeMap::new(),
-            dropped: BTreeMap::new(),
-            types: BTreeMap::new(),
-            after_types: BTreeMap::new(),
-            key_type: None,
+        let update = |table: &TableName| {
+            Change::Row(RowChange::UpdateRow {
+                table: table.clone(),
+                key_column: "id".into(),
+                key: pbps_model::RowKey::from("2"),
+                columns: BTreeMap::new(),
+                unchanged: BTreeMap::new(),
+                types: BTreeMap::new(),
+                after_types: BTreeMap::new(),
+                key_type: None,
+            })
         };
-        let update = |table: &TableName| Change::UpdateRow {
-            table: table.clone(),
-            key_column: "id".into(),
-            key: pbps_model::RowKey::from("2"),
-            columns: BTreeMap::new(),
-            unchanged: BTreeMap::new(),
-            types: BTreeMap::new(),
-            after_types: BTreeMap::new(),
-            key_type: None,
-        };
-        let insert = |table: &TableName| Change::InsertRow {
-            table: table.clone(),
-            key_column: "id".into(),
-            identity_key: false,
-            key: pbps_model::RowKey::from("3"),
-            row: pbps_model::Row::default(),
-            defaults: BTreeMap::new(),
-            types: BTreeMap::new(),
+        let insert = |table: &TableName| {
+            Change::Row(RowChange::InsertRow {
+                table: table.clone(),
+                key_column: "id".into(),
+                identity_key: false,
+                key: pbps_model::RowKey::from("3"),
+                row: pbps_model::Row::default(),
+                defaults: BTreeMap::new(),
+                types: BTreeMap::new(),
+            })
         };
         let order = |cs: &ChangeSet| -> Vec<String> {
             cs.changes
                 .iter()
                 .map(|p| match &p.change {
-                    Change::DropTable { .. } => "drop".to_owned(),
-                    Change::DetachPartition { .. } => "detach".to_owned(),
-                    Change::DeleteRow { table, .. } => format!("delete {}", table.name),
-                    Change::UpdateRow { table, .. } => format!("update {}", table.name),
-                    Change::InsertRow { table, .. } => format!("insert {}", table.name),
+                    Change::Table(TableChange::DropTable { .. }) => "drop".to_owned(),
+                    Change::Partition(PartitionChange::DetachPartition { .. }) => {
+                        "detach".to_owned()
+                    }
+                    Change::Row(RowChange::DeleteRow { table, .. }) => {
+                        format!("delete {}", table.name)
+                    }
+                    Change::Row(RowChange::UpdateRow { table, .. }) => {
+                        format!("update {}", table.name)
+                    }
+                    Change::Row(RowChange::InsertRow { table, .. }) => {
+                        format!("insert {}", table.name)
+                    }
                     other => other.subject(),
                 })
                 .collect()
@@ -7602,13 +7811,13 @@ mod tests {
         }
         // Negative: a partition created between them, or a row written into
         // the parent, is not passed; the class order stands.
-        let create = Change::CreateTable {
+        let create = Change::Table(TableChange::CreateTable {
             uid: Uid::derived(UidKind::Table, "app.ev_new", 0),
             name: TableName::new("app", "ev_new"),
             table: Box::default(),
             beside_default: None,
             moves_at_most: None,
-        };
+        });
         for between in [create, insert(&ev)] {
             let mut cs = plan(vec![drop.clone(), between, delete(&r, "1")]);
             let before = cs.clone();
@@ -7664,25 +7873,27 @@ mod tests {
             },
         );
         s.tables.insert(other.clone(), Table::default());
-        let add = |table: &TableName, name: &str, column: &str, unique: bool| Change::AddIndex {
-            table: table.clone(),
-            name: name.into(),
-            index: Box::new(pbps_model::Index {
-                columns: vec![pbps_model::IndexColumn::column(column)],
-                include: Vec::new(),
-                unique,
-                filter: None,
-                method: Default::default(),
-                storage_parameters: Default::default(),
-                filegroup: None,
-            }),
-            clustered: false,
+        let add = |table: &TableName, name: &str, column: &str, unique: bool| {
+            Change::Index(IndexChange::AddIndex {
+                table: table.clone(),
+                name: name.into(),
+                index: Box::new(pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn::column(column)],
+                    include: Vec::new(),
+                    unique,
+                    filter: None,
+                    method: Default::default(),
+                    storage_parameters: Default::default(),
+                    filegroup: None,
+                }),
+                clustered: false,
+            })
         };
         let names = |cs: &ChangeSet| -> Vec<String> {
             cs.changes
                 .iter()
                 .map(|p| {
-                    if let Change::AddIndex { name, .. } = &p.change {
+                    if let Change::Index(IndexChange::AddIndex { name, .. }) = &p.change {
                         name.raw().to_owned()
                     } else {
                         p.change.subject()
@@ -7706,22 +7917,24 @@ mod tests {
         assert_eq!(cs, settled);
         // What rests on an adoptable unique one sinks with it: a foreign key
         // on it, and a replica identity on it.
-        let fk_on = |references: &TableName| Change::AddForeignKey {
-            table: other.clone(),
-            name: "zz_fk".into(),
-            constraint: Box::new(pbps_model::ForeignKey {
-                columns: vec!["k".into()],
-                references_table: references.clone(),
-                references_columns: vec!["k".into()],
-                on_delete: Default::default(),
-                on_update: Default::default(),
-            }),
+        let fk_on = |references: &TableName| {
+            Change::Constraint(ConstraintChange::AddForeignKey {
+                table: other.clone(),
+                name: "zz_fk".into(),
+                constraint: Box::new(pbps_model::ForeignKey {
+                    columns: vec!["k".into()],
+                    references_table: references.clone(),
+                    references_columns: vec!["k".into()],
+                    on_delete: Default::default(),
+                    on_update: Default::default(),
+                }),
+            })
         };
-        let identity = Change::SetReplicaIdentity {
+        let identity = Change::TableProperty(TablePropertyChange::SetReplicaIdentity {
             uid: Uid::derived(UidKind::Table, "app.ev_1", 0),
             table: ev_1.clone(),
             to: Some(pbps_model::ReplicaIdentity::Index("own_u".into())),
-        };
+        });
         let mut cs = plan(vec![
             add(&ev_1, "own_u", "k", true),
             fk_on(&ev_1),
@@ -7747,7 +7960,7 @@ mod tests {
         assert_eq!(cs, before);
         // Negative: a unique one the parent's could not take, and the foreign
         // key on it, stay as they are.
-        let fk = Change::AddForeignKey {
+        let fk = Change::Constraint(ConstraintChange::AddForeignKey {
             table: other.clone(),
             name: "zz_fk".into(),
             constraint: Box::new(pbps_model::ForeignKey {
@@ -7757,7 +7970,7 @@ mod tests {
                 on_delete: Default::default(),
                 on_update: Default::default(),
             }),
-        };
+        });
         let mut cs = plan(vec![
             add(&ev_1, "own_u", "k", true),
             fk,
@@ -7786,12 +7999,14 @@ mod tests {
         // Negative: a module that rests on the partition's index is not
         // carried, since what calls it would not follow: refused, as the
         // hoist refused passing it.
-        let function = |name: &str, body: &str| Change::CreateModule {
-            id: id(name),
-            module: Box::new(module(
-                ModuleKind::Function,
-                &format!("() RETURNS integer LANGUAGE sql BEGIN ATOMIC {body}; END"),
-            )),
+        let function = |name: &str, body: &str| {
+            Change::Module(ModuleChange::CreateModule {
+                id: id(name),
+                module: Box::new(module(
+                    ModuleKind::Function,
+                    &format!("() RETURNS integer LANGUAGE sql BEGIN ATOMIC {body}; END"),
+                )),
+            })
         };
         let mut cs = plan(vec![
             add(&ev_1, "own_k", "k", false),
@@ -7806,19 +8021,21 @@ mod tests {
         // names, with the drop that one's name needs (#1745 review).
         let filtered = |name: &str, filter: &str| {
             let mut c = add(&ev, name, "k", false);
-            if let Change::AddIndex { index, .. } = &mut c {
+            if let Change::Index(IndexChange::AddIndex { index, .. }) = &mut c {
                 index.filter = Some(filter.into());
             }
             c
         };
-        let drop = |table: &TableName, name: &str| Change::DropIndex {
-            table: table.clone(),
-            name: name.into(),
+        let drop = |table: &TableName, name: &str| {
+            Change::Index(IndexChange::DropIndex {
+                table: table.clone(),
+                name: name.into(),
+            })
         };
         // The partition's own has a predicate too, which is a match whatever
         // its text.
         let mut own = add(&ev_1, "own_k", "k", false);
-        if let Change::AddIndex { index, .. } = &mut own {
+        if let Change::Index(IndexChange::AddIndex { index, .. }) = &mut own {
             index.filter = Some("k > 0".into());
         }
         let mut cs = plan(vec![
@@ -7902,12 +8119,12 @@ mod tests {
 
         // The parent's default released: its `DROP DEFAULT` takes the
         // partition's copy, before the rebuild, and nothing comes back.
-        let released = Change::AlterColumnDefault {
+        let released = Change::Column(ColumnChange::AlterColumnDefault {
             uid: "c_a1b2c3".parse().unwrap(),
             column: ColumnRef::new(ev.clone(), "m"),
             from: Some("app.f(1)".into()),
             to: None,
-        };
+        });
         let mut cs = plan(vec![alter(&s, "app.f(integer)"), released.clone()]);
         weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).expect("woven");
         assert_eq!(
@@ -7922,7 +8139,7 @@ mod tests {
         // And the parent's statement stays the parent's: the partition's
         // name in it would drop the partition's default alone.
         assert!(
-            matches!(&cs.changes[0].change, Change::AlterColumnDefault { column, .. }
+            matches!(&cs.changes[0].change, Change::Column(ColumnChange::AlterColumnDefault { column, .. })
                 if column.table == ev),
             "{:?}",
             cs.changes[0].change
@@ -7942,13 +8159,13 @@ mod tests {
         renamed
             .tables
             .insert(ev_1.clone(), partition(&[("m2", "app.f(2)")]));
-        let rename = Change::RenameColumn {
+        let rename = Change::Column(ColumnChange::RenameColumn {
             uid: "c_d4e5f6".parse().unwrap(),
             table: ev.clone(),
             table_was: None,
             from: "m".into(),
             to: "m2".into(),
-        };
+        });
         for (order, expected) in [
             (
                 vec![alter(&renamed, "app.f(integer)"), rename.clone()],
@@ -7986,10 +8203,10 @@ mod tests {
             .unwrap()
             .columns
             .shift_remove("m");
-        let drop = Change::DropColumn {
+        let drop = Change::Column(ColumnChange::DropColumn {
             uid: "c_a7b8c9".parse().unwrap(),
             column: ColumnRef::new(ev.clone(), "m"),
-        };
+        });
         let mut cs = plan(vec![drop.clone(), alter(&dropped, "app.f(integer)")]);
         weave(&mut cs, &found, &dropped, &[&ids], pg().as_ref()).expect("woven");
         assert_eq!(
@@ -8006,20 +8223,20 @@ mod tests {
         let mut kept = s.clone();
         kept.tables
             .insert(ev_1.clone(), partition(&[("m", "app.f(2)")]));
-        let other = Change::AlterColumnDefault {
+        let other = Change::Column(ColumnChange::AlterColumnDefault {
             uid: "c_b1c2d3".parse().unwrap(),
             column: ColumnRef::new(ev.clone(), "k"),
             from: None,
             to: Some("0".into()),
-        };
-        let nullability = Change::AlterColumnNullability {
+        });
+        let nullability = Change::Column(ColumnChange::AlterColumnNullability {
             uid: "c_e4f5a6".parse().unwrap(),
             column: ColumnRef::new(ev.clone(), "m"),
             ty: "integer".parse().unwrap(),
             to_nullable: false,
             through_external_partitions: false,
             collation: None,
-        };
+        });
         for beside in [other, nullability] {
             let mut cs = plan(vec![beside, alter(&kept, "app.f(integer)")]);
             weave(&mut cs, &found, &kept, &[&ids], pg().as_ref()).expect("woven");
@@ -8099,14 +8316,14 @@ mod tests {
             id("app.f(integer)"),
             vec![default_on(&ev), default_on(&p_1)],
         )]);
-        let attach = Change::AttachPartition {
+        let attach = Change::Partition(PartitionChange::AttachPartition {
             uid: Uid::derived(UidKind::Table, "app.p_1", 0),
             table: p_1.clone(),
             parent: ev.clone(),
             bound,
             key: Vec::new(),
             shape: Box::new(plain),
-        };
+        });
         let mut cs = plan(vec![attach, alter(&s, "app.f(integer)")]);
         weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).expect("woven");
         let names = rendered(&cs);
@@ -8182,12 +8399,12 @@ mod tests {
         let ids = IdsFile::default();
         let mut cs = plan(vec![
             alter(&s, "app.f(integer)"),
-            Change::AlterColumnExpression {
+            Change::Column(ColumnChange::AlterColumnExpression {
                 uid: "c_d4e5f6".parse().unwrap(),
                 column: TableName::new("app", "t").column("g"),
                 from: "app.f(id)".into(),
                 to: "id * 2".into(),
-            },
+            }),
         ]);
         let found = BTreeMap::from([(
             id("app.f(integer)"),
@@ -8249,15 +8466,15 @@ mod tests {
             )]
             .into();
             for split in [false, true] {
-                let mut edits = vec![Change::AlterModule {
+                let mut edits = vec![Change::Module(ModuleChange::AlterModule {
                     id: root.clone(),
                     module: Box::new(schema.modules[&root].clone()),
-                }];
+                })];
                 if split {
-                    edits.push(Change::AlterModule {
+                    edits.push(Change::Module(ModuleChange::AlterModule {
                         id: child.clone(),
                         module: Box::new(schema.modules[&child].clone()),
-                    });
+                    }));
                 }
                 let mut cs = plan(edits);
                 weave(&mut cs, &found, &schema, &[], pg().as_ref()).unwrap();
@@ -8326,10 +8543,10 @@ mod tests {
         let mut cs = plan(vec![
             alter(&s, "app.v0"),
             alter(&s, "app.v1"),
-            Change::DropModule {
+            Change::Module(ModuleChange::DropModule {
                 id: id("app.v2"),
                 kind: ModuleKind::View,
-            },
+            }),
         ]);
         let found = BTreeMap::from([(id("app.v0"), vec![view("app.v2"), view("app.v1")])]);
         weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap();
@@ -8439,10 +8656,10 @@ mod tests {
         .unwrap_err();
         assert!(e.contains("does not declare it"), "{e}");
 
-        let mut gone = plan(vec![Change::DropModule {
+        let mut gone = plan(vec![Change::Module(ModuleChange::DropModule {
             id: id("app.f(integer)"),
             kind: ModuleKind::Function,
-        }]);
+        })]);
         let found = BTreeMap::from([(
             id("app.f(integer)"),
             vec![part(
@@ -8598,19 +8815,19 @@ mod tests {
         ids.columns
             .insert(uid.clone(), ColumnRef::new(TableName::new("app", "u"), "m"));
         let mut cs = plan(vec![
-            Change::RenameTable {
+            Change::Table(TableChange::RenameTable {
                 uid: Uid::derived(UidKind::Table, "app.t", 0),
                 from: TableName::new("app", "t"),
                 to: TableName::new("app", "u"),
                 defaults: Vec::new(),
-            },
-            Change::RenameColumn {
+            }),
+            Change::Column(ColumnChange::RenameColumn {
                 uid,
                 table: TableName::new("app", "u"),
                 from: "n".into(),
                 to: "m".into(),
                 table_was: None,
-            },
+            }),
             alter(&s, "app.f(integer)"),
         ]);
         let found = BTreeMap::from([(
@@ -8628,10 +8845,13 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::DropCheck { table, .. } | Change::AddCheck { table, .. } => {
+                Change::Constraint(ConstraintChange::DropCheck { table, .. })
+                | Change::Constraint(ConstraintChange::AddCheck { table, .. }) => {
                     Some(table.raw().to_string())
                 }
-                Change::AlterColumnDefault { column, .. } => Some(column.raw().to_string()),
+                Change::Column(ColumnChange::AlterColumnDefault { column, .. }) => {
+                    Some(column.raw().to_string())
+                }
                 _ => None,
             })
             .collect();
@@ -8657,11 +8877,11 @@ mod tests {
         let (mut s, ids) = declared();
         s.tables.remove(&TableName::new("app", "t"));
         let mut cs = plan(vec![
-            Change::DropTable {
+            Change::Table(TableChange::DropTable {
                 uid: Uid::derived(UidKind::Table, "app.t", 0),
                 name: TableName::new("app", "t"),
                 detach_from: None,
-            },
+            }),
             alter(&s, "app.f(integer)"),
         ]);
         let found = BTreeMap::from([(
@@ -8713,9 +8933,11 @@ mod tests {
         let mut dependent = view("app.v0");
         dependent.described = "view app.v0\n\u{1b}[31m\u{202e}\\n名前_ünï".into();
         let found = BTreeMap::from([(id("app.f(integer)"), vec![dependent])]);
-        let drop = || Change::DropModule {
-            id: id("app.f(integer)"),
-            kind: ModuleKind::Function,
+        let drop = || {
+            Change::Module(ModuleChange::DropModule {
+                id: id("app.f(integer)"),
+                kind: ModuleKind::Function,
+            })
         };
 
         let mut cs = plan(vec![drop()]);
@@ -8764,10 +8986,10 @@ mod tests {
             (id("app.f(integer)"), vec![view("app.v2"), view("app.v1")]),
             (id("app.v1"), vec![view("app.v2")]),
         ]);
-        let drop = Change::DropModule {
+        let drop = Change::Module(ModuleChange::DropModule {
             id: id("app.f(integer)"),
             kind: ModuleKind::Function,
-        };
+        });
         let cs = plan(vec![drop.clone(), alter(&s, "app.v1")]);
         let back: Vec<String> = untouched_module_dependents(&cs, &found, &s)
             .iter()
@@ -8788,22 +9010,22 @@ mod tests {
     fn a_dependent_whose_owner_the_plan_replaces_is_not_kept() {
         let (s, ids) = declared();
         let mut cs = plan(vec![
-            Change::DropModule {
+            Change::Module(ModuleChange::DropModule {
                 id: id("app.f(integer)"),
                 kind: ModuleKind::Function,
-            },
-            Change::DropTable {
+            }),
+            Change::Table(TableChange::DropTable {
                 uid: Uid::derived(UidKind::Table, "app.t", 0),
                 name: TableName::new("app", "t"),
                 detach_from: None,
-            },
-            Change::CreateTable {
+            }),
+            Change::Table(TableChange::CreateTable {
                 uid: Uid::derived(UidKind::Table, "app.t", 1),
                 name: TableName::new("app", "t"),
                 table: Box::new(s.tables[&TableName::new("app", "t")].clone()),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
         ]);
         let found = BTreeMap::from([(
             id("app.f(integer)"),
@@ -8841,25 +9063,25 @@ mod tests {
         s.tables.insert(TableName::new("app", "u"), t.clone());
         s.modules.remove(&id("app.f(integer)"));
         let mut cs = plan(vec![
-            Change::DropModule {
+            Change::Module(ModuleChange::DropModule {
                 id: id("app.f(integer)"),
                 kind: ModuleKind::Function,
-            },
-            Change::RenameTable {
+            }),
+            Change::Table(TableChange::RenameTable {
                 uid: Uid::derived(UidKind::Table, "app.t", 0),
                 from: TableName::new("app", "t"),
                 to: TableName::new("app", "u"),
                 defaults: Vec::new(),
-            },
-            Change::DropCheck {
+            }),
+            Change::Constraint(ConstraintChange::DropCheck {
                 table: TableName::new("app", "u"),
                 name: "ck".into(),
-            },
-            Change::AddCheck {
+            }),
+            Change::Constraint(ConstraintChange::AddCheck {
                 table: TableName::new("app", "u"),
                 name: "ck".into(),
                 constraint: t.checks["ck"].clone(),
-            },
+            }),
         ]);
         let found = BTreeMap::from([(
             id("app.f(integer)"),
@@ -8870,7 +9092,7 @@ mod tests {
         )]);
         weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap();
         match &cs.changes[0].change {
-            Change::DropCheck { table, name } => {
+            Change::Constraint(ConstraintChange::DropCheck { table, name }) => {
                 assert_eq!(table.raw().to_string(), "app.t");
                 assert_eq!(name.raw(), "ck");
             }
@@ -8918,16 +9140,18 @@ mod tests {
     /// the path binds it. A path the scan cannot read takes any schema.
     #[test]
     fn a_routine_body_reads_a_name_along_its_own_search_path() {
-        let with_path = |name: &str, path: &str, body: &str| Change::CreateModule {
-            id: id(name),
-            module: Box::new(module(
-                ModuleKind::Function,
-                &format!("() RETURNS integer LANGUAGE sql {path} AS $$ {body} $$"),
-            )),
+        let with_path = |name: &str, path: &str, body: &str| {
+            Change::Module(ModuleChange::CreateModule {
+                id: id(name),
+                module: Box::new(module(
+                    ModuleKind::Function,
+                    &format!("() RETURNS integer LANGUAGE sql {path} AS $$ {body} $$"),
+                )),
+            })
         };
         let index_in = |schema: &str| {
             let mut ix = add_index("ix_new", None);
-            if let Change::AddIndex { table, .. } = &mut ix {
+            if let Change::Index(IndexChange::AddIndex { table, .. }) = &mut ix {
                 *table = TableName::new(schema, "u");
             }
             ix
@@ -8995,7 +9219,7 @@ mod tests {
         }
         // An unread clause hides where the header ends: every literal is
         // then read one level in, in any schema.
-        let hidden = Change::CreateModule {
+        let hidden = Change::Module(ModuleChange::CreateModule {
             id: id("app.h()"),
             module: Box::new(module(
                 ModuleKind::Function,
@@ -9003,18 +9227,18 @@ mod tests {
                     "() RETURNS integer LANGUAGE sql SET search_path = $$x$$, return AS $$ {reads} $$"
                 ),
             )),
-        };
+        });
         assert_eq!(searched(vec![hidden, index_in("third")]).len(), 1);
         // An atomic body is parsed under the write path, whatever the
         // routine sets.
-        let atomic = Change::CreateModule {
+        let atomic = Change::Module(ModuleChange::CreateModule {
             id: id("app.g()"),
             module: Box::new(module(
                 ModuleKind::Function,
                 "() RETURNS integer LANGUAGE sql SET search_path = other \
                  RETURN ('ix_new'::regclass)::oid::integer",
             )),
-        };
+        });
         assert_eq!(searched(vec![atomic, index_in("app")]).len(), 1);
         // A path the scan cannot read takes any schema.
         let current = "SET search_path FROM CURRENT";
@@ -9030,9 +9254,11 @@ mod tests {
         assert!(searched(vec![with_path("app.f()", "", reads), index_in("other")]).is_empty());
         // Negative: a literal holding quotes is data in a view and in an
         // atomic body; only a string body is read one level in.
-        let data = |kind: ModuleKind, definition: &str| Change::CreateModule {
-            id: id("app.d()"),
-            module: Box::new(module(kind, definition)),
+        let data = |kind: ModuleKind, definition: &str| {
+            Change::Module(ModuleChange::CreateModule {
+                id: id("app.d()"),
+                module: Box::new(module(kind, definition)),
+            })
         };
         for (kind, definition) in [
             (ModuleKind::View, "SELECT '''app.ix_new'''::text AS s"),
@@ -9225,13 +9451,13 @@ mod tests {
         );
         assert!(refused.contains("second plan"), "{refused}");
         // A check, and an index filter, are created the same way.
-        let check = Change::AddCheck {
+        let check = Change::Constraint(ConstraintChange::AddCheck {
             table: TableName::new("app", "t"),
             name: "ck".into(),
             constraint: CheckConstraint {
                 expression: "'app.ix_new'::regclass IS NOT NULL".into(),
             },
-        };
+        });
         assert!(refusal_of(&plan(vec![check, add_index("ix_new", None)]), &*pg()).is_err());
         // Negative: the index first, a name the plan does not create, a
         // literal that only contains the name, another schema, and a name in
@@ -9275,7 +9501,7 @@ mod tests {
             .is_err()
         );
         let mut elsewhere = add_index("ix_new", None);
-        if let Change::AddIndex { table, .. } = &mut elsewhere {
+        if let Change::Index(IndexChange::AddIndex { table, .. }) = &mut elsewhere {
             *table = TableName::new("other", "u");
         }
         assert_eq!(
@@ -9306,15 +9532,15 @@ mod tests {
             refusal_of(&plan(vec![add_index("ix_new", None), reader]), &*pg()),
             Ok(())
         );
-        let atomic = Change::CreateModule {
+        let atomic = Change::Module(ModuleChange::CreateModule {
             id: id("app.g()"),
             module: Box::new(module(
                 ModuleKind::Function,
                 "() RETURNS integer LANGUAGE sql RETURN ('app.ix_new'::regclass)::oid::integer",
             )),
-        };
+        });
         assert!(refusal_of(&plan(vec![atomic, add_index("ix_new", None)]), &*pg()).is_err());
-        let partition = Change::CreateTable {
+        let partition = Change::Table(TableChange::CreateTable {
             uid: Uid::derived(UidKind::Table, "app.p", 0),
             name: "app.p".parse().unwrap(),
             table: Box::new(Table {
@@ -9334,7 +9560,7 @@ mod tests {
             }),
             beside_default: None,
             moves_at_most: None,
-        };
+        });
         let refused =
             refusal_of(&plan(vec![partition, add_index("ix_new", None)]), &*pg()).unwrap_err();
         assert!(refused.contains("app.p.n's own default"), "{refused}");
@@ -9366,7 +9592,7 @@ mod tests {
             );
         }
         for (name, filter) in indexes {
-            if let Change::AddIndex { index, .. } = add_index(name, *filter) {
+            if let Change::Index(IndexChange::AddIndex { index, .. }) = add_index(name, *filter) {
                 t.indexes.insert((*name).into(), *index);
             }
         }
@@ -9374,13 +9600,13 @@ mod tests {
     }
 
     fn create(table: Table) -> Change {
-        Change::CreateTable {
+        Change::Table(TableChange::CreateTable {
             uid: Uid::derived(UidKind::Table, "app.n", 0),
             name: TableName::new("app", "n"),
             table: Box::new(table),
             beside_default: None,
             moves_at_most: None,
-        }
+        })
     }
 
     /// #1592: a new table's own indexes are created after its defaults and
@@ -9498,12 +9724,12 @@ mod tests {
         assert!(later[0].what.contains("names app.n_pkey"), "{later:?}");
         assert_eq!(later[0].searched, ["app"]);
         // A key set on an existing table, after a default naming its index.
-        let set = Change::SetPrimaryKey {
+        let set = Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: TableName::new("app", "t"),
             from: None,
             to: Some(unnamed()),
             nonclustered: false,
-        };
+        });
         let later = names_a_later_relation(
             &plan(vec![default_of("t", &names("t_pkey")), set]),
             &*pg(),
@@ -9546,19 +9772,21 @@ mod tests {
         // A string body checked against its own path, where two schemas get
         // the generated name later: either may hold it now, so the target is
         // asked about both (#1640 review).
-        let body = Change::CreateModule {
+        let body = Change::Module(ModuleChange::CreateModule {
             id: id("app.f()"),
             module: Box::new(module(
                 ModuleKind::Function,
                 "() RETURNS integer LANGUAGE sql SET search_path = app, other \
                  AS $$ SELECT ('n_pkey'::regclass)::oid::integer $$",
             )),
-        };
-        let key_on = |schema: &str| Change::SetPrimaryKey {
-            table: TableName::new(schema, "n"),
-            from: None,
-            to: Some(unnamed()),
-            nonclustered: false,
+        });
+        let key_on = |schema: &str| {
+            Change::Constraint(ConstraintChange::SetPrimaryKey {
+                table: TableName::new(schema, "n"),
+                from: None,
+                to: Some(unnamed()),
+                nonclustered: false,
+            })
         };
         let later = names_a_later_relation(
             &plan(vec![body, key_on("app"), key_on("other")]),
@@ -9574,13 +9802,13 @@ mod tests {
         let pair = |table: &str, check: Option<&str>| {
             let mut t = new_table(None, check, &[]);
             t.primary_key = Some(unnamed());
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: Uid::derived(UidKind::Table, &format!("app.{table}"), 0),
                 name: TableName::new("app", table),
                 table: Box::new(t),
                 beside_default: None,
                 moves_at_most: None,
-            }
+            })
         };
         let cut = format!("{}_pkey", "t".repeat(58));
         let check = format!("{} <> ''", names(&cut));
@@ -9642,15 +9870,19 @@ mod tests {
             clones_to_partitions: false,
             parent_trigger: Some(id.clone()),
         };
-        let drop = |id: ModuleId| Change::DropModule {
-            id,
-            kind: ModuleKind::Trigger,
+        let drop = |id: ModuleId| {
+            Change::Module(ModuleChange::DropModule {
+                id,
+                kind: ModuleKind::Trigger,
+            })
         };
-        let create = |constraint| Change::CreateModule {
-            id: id.clone(),
-            module: module(constraint),
+        let create = |constraint| {
+            Change::Module(ModuleChange::CreateModule {
+                id: id.clone(),
+                module: module(constraint),
+            })
         };
-        let attach = Change::AttachPartition {
+        let attach = Change::Partition(PartitionChange::AttachPartition {
             uid: Uid::derived(UidKind::Table, "parts.p2", 0),
             table: "parts.p2".parse().unwrap(),
             parent: parent.clone(),
@@ -9660,8 +9892,8 @@ mod tests {
             },
             key: vec![],
             shape: Box::default(),
-        };
-        let key = Change::SetPrimaryKey {
+        });
+        let key = Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: "parts.n".parse().unwrap(),
             from: None,
             nonclustered: false,
@@ -9671,7 +9903,7 @@ mod tests {
                 storage_parameters: Default::default(),
                 filegroup: None,
             }),
-        };
+        });
         let arrival = |mut prefix: Vec<Change>, holders: &[KeyNameHolder], baseline: &Schema| {
             let at = prefix.len();
             prefix.push(key.clone());
@@ -9723,13 +9955,13 @@ mod tests {
             arrival(
                 vec![
                     attach.clone(),
-                    Change::DetachPartition {
+                    Change::Partition(PartitionChange::DetachPartition {
                         uid: Uid::derived(UidKind::Table, "parts.p2", 0),
                         table: "parts.p2".parse().unwrap(),
                         parent: parent.clone(),
                         names: vec![],
                         shape: Box::default(),
-                    }
+                    })
                 ],
                 &[],
                 &baseline
@@ -9737,7 +9969,7 @@ mod tests {
             .name,
             "n_pkey"
         );
-        let new_partition = Change::CreateTable {
+        let new_partition = Change::Table(TableChange::CreateTable {
             uid: Uid::derived(UidKind::Table, "parts.p2", 0),
             name: "parts.p2".parse().unwrap(),
             table: Box::new(pbps_model::Table {
@@ -9753,7 +9985,7 @@ mod tests {
             }),
             beside_default: None,
             moves_at_most: None,
-        };
+        });
         assert_eq!(arrival(vec![new_partition], &[], &baseline).name, "n_pkey1");
         let mut without_trigger = baseline.clone();
         without_trigger.modules.clear();
@@ -9763,10 +9995,10 @@ mod tests {
         );
         assert_eq!(
             arrival(
-                vec![Change::AlterModule {
+                vec![Change::Module(ModuleChange::AlterModule {
                     id: id.clone(),
                     module: module(false)
-                }],
+                })],
                 row,
                 &baseline
             )
@@ -9780,12 +10012,12 @@ mod tests {
         assert_eq!(
             arrival(
                 vec![
-                    Change::RenameTable {
+                    Change::Table(TableChange::RenameTable {
                         uid: Uid::derived(UidKind::Table, "app.p", 0),
                         from: parent,
                         to: moved.clone(),
                         defaults: vec![],
-                    },
+                    }),
                     drop(ModuleId::Trigger {
                         on: moved,
                         name: "n_pkey".into()
@@ -9823,15 +10055,17 @@ mod tests {
             from: vec![pbps_model::BoundDatum::Value("0".into())],
             to: vec![pbps_model::BoundDatum::Value("10".into())],
         };
-        let attach = |parent: &TableName| Change::AttachPartition {
-            uid: Uid::derived(UidKind::Table, "parts.p1", 0),
-            table: child.clone(),
-            parent: parent.clone(),
-            bound: bound.clone(),
-            key: vec![],
-            shape: Box::default(),
+        let attach = |parent: &TableName| {
+            Change::Partition(PartitionChange::AttachPartition {
+                uid: Uid::derived(UidKind::Table, "parts.p1", 0),
+                table: child.clone(),
+                parent: parent.clone(),
+                bound: bound.clone(),
+                key: vec![],
+                shape: Box::default(),
+            })
         };
-        let create = Change::CreateTable {
+        let create = Change::Table(TableChange::CreateTable {
             uid: Uid::derived(UidKind::Table, "parts.p1", 0),
             name: child.clone(),
             table: Box::new(pbps_model::Table {
@@ -9844,11 +10078,11 @@ mod tests {
             }),
             beside_default: None,
             moves_at_most: None,
-        };
+        });
         let arrival =
             |mut changes: Vec<Change>, holders: Option<&[KeyNameHolder]>, baseline: &Schema| {
                 let at = changes.len();
-                changes.push(Change::SetPrimaryKey {
+                changes.push(Change::Constraint(ConstraintChange::SetPrimaryKey {
                     table: "parts.n".parse().unwrap(),
                     from: None,
                     to: Some(pbps_model::PrimaryKey {
@@ -9858,7 +10092,7 @@ mod tests {
                         filegroup: None,
                     }),
                     nonclustered: false,
-                });
+                }));
                 key_arrivals(
                     &plan(changes),
                     &*pg(),
@@ -9890,20 +10124,22 @@ mod tests {
             arrival(vec![attach(&parent)], Some(&[noncloning]), &baseline),
             "n_pkey"
         );
-        let rename = Change::RenameTable {
+        let rename = Change::Table(TableChange::RenameTable {
             uid: Uid::derived(UidKind::Table, "app.p", 0),
             from: parent.clone(),
             to: moved.clone(),
             defaults: vec![],
-        };
+        });
         assert_eq!(
             arrival(vec![rename.clone(), attach(&moved)], row, &baseline),
             "n_pkey1"
         );
-        let drop = |name: &TableName| Change::DropTable {
-            uid: Uid::derived(UidKind::Table, &name.raw().to_string(), 0),
-            name: name.clone(),
-            detach_from: None,
+        let drop = |name: &TableName| {
+            Change::Table(TableChange::DropTable {
+                uid: Uid::derived(UidKind::Table, &name.raw().to_string(), 0),
+                name: name.clone(),
+                detach_from: None,
+            })
         };
         for changes in [
             vec![drop(&parent), attach(&parent)],
@@ -9912,13 +10148,13 @@ mod tests {
             vec![attach(&parent), drop(&child)],
             vec![
                 attach(&parent),
-                Change::DetachPartition {
+                Change::Partition(PartitionChange::DetachPartition {
                     uid: Uid::derived(UidKind::Table, "parts.p1", 0),
                     table: child.clone(),
                     parent: parent.clone(),
                     names: vec![],
                     shape: Box::default(),
-                },
+                }),
             ],
         ] {
             assert_eq!(arrival(changes, row, &baseline), "n_pkey");
@@ -9935,10 +10171,10 @@ mod tests {
         assert_eq!(
             arrival(
                 vec![
-                    Change::AlterModule {
+                    Change::Module(ModuleChange::AlterModule {
                         id,
                         module: Box::new(ordinary)
-                    },
+                    }),
                     attach(&parent)
                 ],
                 row,
@@ -9968,13 +10204,13 @@ mod tests {
                 storage_parameters: Default::default(),
                 filegroup: None,
             });
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: Uid::derived(UidKind::Table, "app.n", 0),
                 name: TableName::new("app", "n"),
                 table: Box::new(t),
                 beside_default: None,
                 moves_at_most: None,
-            }
+            })
         };
         let row_of = |trigger: &str| {
             [KeyNameHolder {
@@ -9992,24 +10228,28 @@ mod tests {
             on: TableName::new("app", table),
             name: "n_pkey".into(),
         };
-        let drop_named = |table: &str, name: &str| Change::DropModule {
-            id: ModuleId::Trigger {
-                on: TableName::new("app", table),
-                name: name.into(),
-            },
-            kind: ModuleKind::Trigger,
+        let drop_named = |table: &str, name: &str| {
+            Change::Module(ModuleChange::DropModule {
+                id: ModuleId::Trigger {
+                    on: TableName::new("app", table),
+                    name: name.into(),
+                },
+                kind: ModuleKind::Trigger,
+            })
         };
         let drop = |table: &str| drop_named(table, "n_pkey");
-        let create = |marker: &str| Change::CreateModule {
-            id: on("t"),
-            module: Box::new(pbps_model::Module {
-                kind: ModuleKind::Trigger,
-                description: None,
-                definition: format!(
-                    "{marker}AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f()"
-                ),
-                options: Default::default(),
-            }),
+        let create = |marker: &str| {
+            Change::Module(ModuleChange::CreateModule {
+                id: on("t"),
+                module: Box::new(pbps_model::Module {
+                    kind: ModuleKind::Trigger,
+                    description: None,
+                    definition: format!(
+                        "{marker}AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f()"
+                    ),
+                    options: Default::default(),
+                }),
+            })
         };
         let refused_over = |changes: Vec<Change>, holders: &[KeyNameHolder]| -> Vec<String> {
             names_a_later_relation(&plan(changes), &*pg(), Some(holders))
@@ -10067,13 +10307,13 @@ mod tests {
         let keyed_as = |table: &str, default: &str| {
             let mut t = new_table(Some(default), None, &[]);
             t.primary_key = Some(unnamed());
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: Uid::derived(UidKind::Table, &format!("app.{table}"), 0),
                 name: TableName::new("app", table),
                 table: Box::new(t),
                 beside_default: None,
                 moves_at_most: None,
-            }
+            })
         };
         let holder = |name: &str, owner: Option<&str>, primary_key: bool| KeyNameHolder {
             name: TableName::new("app", name),
@@ -10093,16 +10333,20 @@ mod tests {
                 .map(|n| n.what)
                 .collect()
         };
-        let drop_table = |name: &str| Change::DropTable {
-            uid: Uid::derived(UidKind::Table, &format!("app.{name}"), 0),
-            name: TableName::new("app", name),
-            detach_from: None,
+        let drop_table = |name: &str| {
+            Change::Table(TableChange::DropTable {
+                uid: Uid::derived(UidKind::Table, &format!("app.{name}"), 0),
+                name: TableName::new("app", name),
+                detach_from: None,
+            })
         };
-        let key_of_t = |from: bool| Change::SetPrimaryKey {
-            table: TableName::new("app", "t"),
-            from: from.then(unnamed),
-            to: (!from).then(unnamed),
-            nonclustered: false,
+        let key_of_t = |from: bool| {
+            Change::Constraint(ConstraintChange::SetPrimaryKey {
+                table: TableName::new("app", "t"),
+                from: from.then(unnamed),
+                to: (!from).then(unnamed),
+                nonclustered: false,
+            })
         };
 
         // Two tables cutting to one name: the second key's index is the
@@ -10144,13 +10388,13 @@ mod tests {
         // another table, a holder whose table the plan drops is another, or
         // a holder dropped only after the key. A check the plan adds earlier
         // numbers the key too.
-        let check = Change::AddCheck {
+        let check = Change::Constraint(ConstraintChange::AddCheck {
             table: TableName::new("app", "t"),
             name: "n_pkey".into(),
             constraint: CheckConstraint {
                 expression: "id > 0".into(),
             },
-        };
+        });
         for (changes, holders) in [
             (
                 vec![keyed_as("n", &names("n_pkey"))],
@@ -10192,10 +10436,10 @@ mod tests {
         // A check and an index of one name on one table are two holders:
         // dropping the check leaves the index, which numbers the key
         // (measured on 16 and 18, #1729 review).
-        let drop_check = Change::DropCheck {
+        let drop_check = Change::Constraint(ConstraintChange::DropCheck {
             table: TableName::new("app", "t"),
             name: "n_pkey".into(),
-        };
+        });
         let both = [checked, holder("n_pkey", Some("t"), false)];
         assert_eq!(
             refused(
@@ -10249,19 +10493,21 @@ mod tests {
         let keyed_as = |table: &str, default: &str| {
             let mut t = new_table(Some(default), None, &[]);
             t.primary_key = Some(unnamed());
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: Uid::derived(UidKind::Table, &format!("app.{table}"), 0),
                 name: TableName::new("app", table),
                 table: Box::new(t),
                 beside_default: None,
                 moves_at_most: None,
-            }
+            })
         };
-        let rename = |from: TableName, to: TableName| Change::RenameTable {
-            uid: Uid::derived(UidKind::Table, &from.raw().to_string(), 0),
-            from,
-            to,
-            defaults: Vec::new(),
+        let rename = |from: TableName, to: TableName| {
+            Change::Table(TableChange::RenameTable {
+                uid: Uid::derived(UidKind::Table, &from.raw().to_string(), 0),
+                from,
+                to,
+                defaults: Vec::new(),
+            })
         };
         let refused = |changes: Vec<Change>, holders: &[KeyNameHolder]| -> Vec<String> {
             names_a_later_relation(&plan(changes), &*pg(), Some(holders))
@@ -10271,11 +10517,11 @@ mod tests {
         };
         // `app.target` dropped, `app.old` renamed to it, and `app.old`
         // created again: `old_pkey` stays with the renamed table.
-        let drop_target = Change::DropTable {
+        let drop_target = Change::Table(TableChange::DropTable {
             uid: Uid::derived(UidKind::Table, "app.target", 0),
             name: TableName::new("app", "target"),
             detach_from: None,
-        };
+        });
         let swapped = |default: &str| {
             vec![
                 drop_target.clone(),
@@ -10334,10 +10580,10 @@ mod tests {
         // Moved in and then dropped, the index frees its name there.
         let dropped = vec![
             rename(TableName::new("archive", "t"), TableName::new("app", "t")),
-            Change::DropIndex {
+            Change::Index(IndexChange::DropIndex {
                 table: TableName::new("app", "t"),
                 name: "n_pkey1".into(),
-            },
+            }),
             keyed_as("n", &names("n_pkey1")),
         ];
         assert_eq!(refused(dropped, &held).len(), 1);
@@ -10345,11 +10591,11 @@ mod tests {
         // does: the moved index holds `n_pkey` then.
         let refill = |default: &str| {
             vec![
-                Change::DropTable {
+                Change::Table(TableChange::DropTable {
                     uid: Uid::derived(UidKind::Table, "app.n_pkey", 0),
                     name: TableName::new("app", "n_pkey"),
                     detach_from: None,
-                },
+                }),
                 rename(TableName::new("archive", "t"), TableName::new("app", "t")),
                 keyed_as("n", &names(default)),
             ]
@@ -10378,19 +10624,19 @@ mod tests {
         let mut in_s2 = new_table(Some("('s2.n_pkey'::regclass)::text"), None, &[]);
         in_s2.primary_key = Some(unnamed());
         let chain = vec![
-            Change::DropIndex {
+            Change::Index(IndexChange::DropIndex {
                 table: TableName::new("s2", "b"),
                 name: "n_pkey".into(),
-            },
+            }),
             rename(TableName::new("s2", "b"), TableName::new("s3", "c")),
             rename(TableName::new("s1", "a"), TableName::new("s2", "b")),
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: Uid::derived(UidKind::Table, "s2.n", 0),
                 name: TableName::new("s2", "n"),
                 table: Box::new(in_s2),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
         ];
         let prefixes = key_name_prefixes(&plan(chain.clone()));
         assert!(
@@ -10413,11 +10659,11 @@ mod tests {
             parent_trigger: None,
         }];
         let after_drop = vec![
-            Change::DropTable {
+            Change::Table(TableChange::DropTable {
                 uid: Uid::derived(UidKind::Table, "app.n_pkey", 0),
                 name: TableName::new("app", "n_pkey"),
                 detach_from: None,
-            },
+            }),
             keyed_as("n", &names("n_pkey1")),
         ];
         assert_eq!(refused(after_drop, &check_kept).len(), 1);
@@ -10446,13 +10692,13 @@ mod tests {
             [("app".to_owned(), "n_pkey".to_owned())]
         );
         let long = "t".repeat(62);
-        let prefixes = key_name_prefixes(&plan(vec![Change::CreateTable {
+        let prefixes = key_name_prefixes(&plan(vec![Change::Table(TableChange::CreateTable {
             uid: Uid::derived(UidKind::Table, "app.long", 0),
             name: TableName::new("app", &long),
             table: Box::new(t.clone()),
             beside_default: None,
             moves_at_most: None,
-        }]));
+        })]));
         assert_eq!(prefixes, [("app".to_owned(), "t".repeat(49))]);
         for n in [0, 1, 10, 1000] {
             assert!(
@@ -10462,11 +10708,13 @@ mod tests {
         }
         // A table moved into the key's schema through another brings what
         // it holds from where it starts.
-        let hop = |from: (&str, &str), to: (&str, &str)| Change::RenameTable {
-            uid: Uid::derived(UidKind::Table, "s1.a", 0),
-            from: TableName::new(from.0, from.1),
-            to: TableName::new(to.0, to.1),
-            defaults: Vec::new(),
+        let hop = |from: (&str, &str), to: (&str, &str)| {
+            Change::Table(TableChange::RenameTable {
+                uid: Uid::derived(UidKind::Table, "s1.a", 0),
+                from: TableName::new(from.0, from.1),
+                to: TableName::new(to.0, to.1),
+                defaults: Vec::new(),
+            })
         };
         let prefixes = key_name_prefixes(&plan(vec![
             hop(("s1", "a"), ("s2", "a")),
@@ -10492,7 +10740,7 @@ mod tests {
         let own = "('app.ix_self'::regclass)::oid > 0";
         assert!(refusal_of(&plan(vec![add_index("ix_self", Some(own))]), &*pg()).is_err());
         let mut expression = add_index("ix_self", None);
-        if let Change::AddIndex { index, .. } = &mut expression {
+        if let Change::Index(IndexChange::AddIndex { index, .. }) = &mut expression {
             index.columns[0].key = pbps_model::IndexKey::Expression(format!("({own})::int"));
         }
         assert!(refusal_of(&plan(vec![expression]), &*pg()).is_err());
@@ -10506,12 +10754,14 @@ mod tests {
             ),
             Ok(())
         );
-        let view = |name: &str, names: &str| Change::CreateModule {
-            id: id(name),
-            module: Box::new(module(
-                ModuleKind::View,
-                &format!("SELECT ('{names}'::regclass)::text AS x"),
-            )),
+        let view = |name: &str, names: &str| {
+            Change::Module(ModuleChange::CreateModule {
+                id: id(name),
+                module: Box::new(module(
+                    ModuleKind::View,
+                    &format!("SELECT ('{names}'::regclass)::text AS x"),
+                )),
+            })
         };
         assert!(refusal_of(&plan(vec![view("app.v", "app.v")]), &*pg()).is_err());
         assert_eq!(

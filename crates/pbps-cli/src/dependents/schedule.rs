@@ -29,6 +29,16 @@ use std::fmt;
 #[cfg(test)]
 use pbps_dialect::Dialect;
 #[cfg(test)]
+use pbps_model::ConstraintChange;
+#[cfg(test)]
+use pbps_model::ModuleChange;
+#[cfg(test)]
+use pbps_model::PartitionChange;
+#[cfg(test)]
+use pbps_model::RoleChange;
+#[cfg(test)]
+use pbps_model::TableChange;
+#[cfg(test)]
 use pbps_model::{Change, ChangeSet};
 use pbps_model::{ModuleDeps, ModuleId, Schema};
 use pbps_pg::modules::Dependent;
@@ -368,21 +378,21 @@ fn oracle_schedule(
             for edge in slots.constraints() {
                 if matches!(
                     &cs.changes[edge.before].change,
-                    Change::AlterModule {
+                    Change::Module(ModuleChange::AlterModule {
                         id: ModuleId::Trigger { .. },
                         ..
-                    } | Change::DropModule {
+                    }) | Change::Module(ModuleChange::DropModule {
                         id: ModuleId::Trigger { .. },
                         ..
-                    }
+                    })
                 ) && matches!(
                     &cs.changes[edge.after].change,
-                    Change::AddCheck { .. }
-                        | Change::AddForeignKey { .. }
-                        | Change::AddUnique { .. }
-                        | Change::SetPrimaryKey { to: Some(_), .. }
-                        | Change::CreateTable { .. }
-                        | Change::AttachPartition { .. }
+                    Change::Constraint(ConstraintChange::AddCheck { .. })
+                        | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+                        | Change::Constraint(ConstraintChange::AddUnique { .. })
+                        | Change::Constraint(ConstraintChange::SetPrimaryKey { to: Some(_), .. })
+                        | Change::Table(TableChange::CreateTable { .. })
+                        | Change::Partition(PartitionChange::AttachPartition { .. })
                 ) {
                     handovers.edge(edge.before, edge.after, edge.source, edge.reason);
                 }
@@ -423,7 +433,7 @@ fn oracle_schedule(
     if cs
         .changes
         .iter()
-        .any(|p| matches!(p.change, Change::DropRole { .. }))
+        .any(|p| matches!(p.change, Change::Role(RoleChange::DropRole { .. })))
     {
         match facts.role_members {
             Some(members) => {
@@ -617,6 +627,14 @@ mod rls_oracle;
 mod tests {
     use super::schedule_fixture as schedule;
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::GrantChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::PolicyChange;
+    use pbps_model::RoleChange;
+    use pbps_model::TableChange;
+    use pbps_model::TablePropertyChange;
     use pbps_model::{
         Column, ColumnRef, Generated, IdsFile, Module, ModuleKind, PlannedChange, Table, TableName,
         Uid, UidKind, ValueSource,
@@ -775,7 +793,7 @@ mod tests {
             .insert(target_uid.clone(), input.column("target"));
         for retype in [false, true] {
             let edit = if retype {
-                Change::AlterColumnType {
+                Change::Column(ColumnChange::AlterColumnType {
                     uid: target_uid.clone(),
                     column: input.column("target"),
                     from: "integer".parse().unwrap(),
@@ -786,34 +804,34 @@ mod tests {
                     from_collation: None,
                     to_collation: None,
                     using: None,
-                }
+                })
             } else {
-                Change::DropColumn {
+                Change::Column(ColumnChange::DropColumn {
                     uid: target_uid.clone(),
                     column: input.column("target"),
-                }
+                })
             };
             let changes = ChangeSet {
                 changes: vec![
                     edit,
-                    Change::RenameTable {
+                    Change::Table(TableChange::RenameTable {
                         uid: input_uid.clone(),
                         from: input.clone(),
                         to: renamed.clone(),
                         defaults: vec![],
-                    },
-                    Change::DropTable {
+                    }),
+                    Change::Table(TableChange::DropTable {
                         uid: owner_uid.clone(),
                         name: owner.clone(),
                         detach_from: None,
-                    },
-                    Change::CreateTable {
+                    }),
+                    Change::Table(TableChange::CreateTable {
                         uid: replacement_uid.clone(),
                         name: input.clone(),
                         table: Box::default(),
                         beside_default: None,
                         moves_at_most: None,
-                    },
+                    }),
                 ]
                 .into_iter()
                 .map(PlannedChange::new)
@@ -961,11 +979,11 @@ mod tests {
                 .iter()
                 .zip(&tables)
                 .map(|(uid, table)| {
-                    PlannedChange::new(Change::DropTable {
+                    PlannedChange::new(Change::Table(TableChange::DropTable {
                         uid: uid.clone(),
                         name: table.clone(),
                         detach_from: None,
-                    })
+                    }))
                 })
                 .collect(),
         };
@@ -1067,7 +1085,8 @@ mod tests {
         changes.changes.sort_by_key(|p| {
             matches!(
                 p.change,
-                Change::CreateModule { .. } | Change::PublicExecution { .. }
+                Change::Module(ModuleChange::CreateModule { .. })
+                    | Change::Permission(GrantChange::PublicExecution { .. })
             )
         });
         let result = scheduled(
@@ -1081,17 +1100,23 @@ mod tests {
         let policy = result
             .changes
             .iter()
-            .position(|p| matches!(p.change, Change::CreatePolicy { .. }))
+            .position(|p| matches!(p.change, Change::Policy(PolicyChange::CreatePolicy { .. })))
             .unwrap();
         let flags = result
             .changes
             .iter()
-            .position(|p| matches!(p.change, Change::SetRowSecurity { .. }))
+            .position(|p| {
+                matches!(
+                    p.change,
+                    Change::Policy(PolicyChange::SetRowSecurity { .. })
+                )
+            })
             .unwrap();
         for (at, step) in result.changes.iter().enumerate() {
             if matches!(
                 step.change,
-                Change::CreateModule { .. } | Change::PublicExecution { .. }
+                Change::Module(ModuleChange::CreateModule { .. })
+                    | Change::Permission(GrantChange::PublicExecution { .. })
             ) {
                 assert!(at < policy);
             }
@@ -1107,13 +1132,19 @@ mod tests {
         cs.changes
             .iter()
             .map(|p| match &p.change {
-                Change::CreateTable { name, .. } => format!("table {name}", name = name.shown()),
-                Change::CreateModule { id, .. } => format!("create {id}", id = id.shown()),
-                Change::DropModule { id, .. } => format!("drop {id}", id = id.shown()),
-                Change::AlterColumnDefault { column, .. } => {
+                Change::Table(TableChange::CreateTable { name, .. }) => {
+                    format!("table {name}", name = name.shown())
+                }
+                Change::Module(ModuleChange::CreateModule { id, .. }) => {
+                    format!("create {id}", id = id.shown())
+                }
+                Change::Module(ModuleChange::DropModule { id, .. }) => {
+                    format!("drop {id}", id = id.shown())
+                }
+                Change::Column(ColumnChange::AlterColumnDefault { column, .. }) => {
                     format!("default {}.{}", column.table.shown(), column.name.shown())
                 }
-                Change::DropRole { name, .. } => format!(
+                Change::Role(RoleChange::DropRole { name, .. }) => format!(
                     "drop role {name}",
                     // Preserve the original spelling in this SQL or comparison fixture.
                     name = name.raw(),
@@ -1264,27 +1295,32 @@ mod tests {
                 let release = at(&|change| {
                     matches!(
                         change,
-                        Change::AlterModule { .. } | Change::DropModule { .. }
+                        Change::Module(ModuleChange::AlterModule { .. })
+                            | Change::Module(ModuleChange::DropModule { .. })
                     )
                 });
                 let claim = at(&|change| {
                     matches!(
                         change,
-                        Change::AddUnique { .. }
-                            | Change::SetPrimaryKey { .. }
-                            | Change::AddCheck { .. }
+                        Change::Constraint(ConstraintChange::AddUnique { .. })
+                            | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+                            | Change::Constraint(ConstraintChange::AddCheck { .. })
                     )
                 });
                 let dependent = at(
-                    &|change| matches!(change, Change::AddForeignKey { name, .. } if name.raw() == "dependent"),
+                    &|change| matches!(change, Change::Constraint(ConstraintChange::AddForeignKey { name, .. }) if name.raw() == "dependent"),
                 );
                 let unrelated = at(
-                    &|change| matches!(change, Change::AddForeignKey { name, .. } if name.raw() == "unrelated"),
+                    &|change| matches!(change, Change::Constraint(ConstraintChange::AddForeignKey { name, .. }) if name.raw() == "unrelated"),
                 );
                 assert!(release < claim, "{kind}, drop={drop_trigger}: {changes:?}");
                 if kind != "check" {
-                    let identity =
-                        at(&|change| matches!(change, Change::SetReplicaIdentity { .. }));
+                    let identity = at(&|change| {
+                        matches!(
+                            change,
+                            Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+                        )
+                    });
                     assert!(claim < identity, "{kind}: {changes:?}");
                 }
                 if drop_trigger {
@@ -1324,7 +1360,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .any(|(i, p)| i > function
-                    && matches!(&p.change, Change::AddColumn { table, name, .. }
+                    && matches!(&p.change, Change::Column(ColumnChange::AddColumn { table, name, .. })
                 if table.name == "gen" && name.raw() == "g"))
         );
         // A default is split out of its table and set after the function.
@@ -1477,10 +1513,12 @@ mod tests {
         let schema = Schema::default();
         let ids = IdsFile::default();
         let plan = || ChangeSet {
-            changes: vec![PlannedChange::new(Change::DropModule {
-                id: id("app.f(integer)"),
-                kind: ModuleKind::Function,
-            })],
+            changes: vec![PlannedChange::new(Change::Module(
+                ModuleChange::DropModule {
+                    id: id("app.f(integer)"),
+                    kind: ModuleKind::Function,
+                },
+            ))],
         };
         let stranger = ModuleDependents::from([(
             id("app.f(integer)"),
@@ -1550,13 +1588,13 @@ mod tests {
         let schema = Schema::default();
         let ids = IdsFile::default();
         let drop = |name: &str| {
-            PlannedChange::new(Change::DropRole {
+            PlannedChange::new(Change::Role(RoleChange::DropRole {
                 // Effect analysis reads the identity history too: distinct
                 // roles cannot share one synthetic identity.
                 uid: Uid::derived(UidKind::Role, name, 0),
                 name: name.to_owned().into(),
                 members: Vec::new(),
-            })
+            }))
         };
         let plan = || ChangeSet {
             changes: vec![drop("member"), drop("holder")],
@@ -1599,13 +1637,13 @@ mod tests {
         // The members are written into the plan by name (ADR-0005).
         assert!(connected.changes.changes.iter().any(|p| matches!(
             &p.change,
-            Change::DropRole { name, members, .. } if name.raw() == "holder" && members == &[pbps_model::RoleName::from("member")]
+            Change::Role(RoleChange::DropRole { name, members, .. }) if name.raw() == "holder" && members == &[pbps_model::RoleName::from("member")]
         )));
         let mut expected = plan();
         for p in &mut expected.changes {
-            if let Change::DropRole {
+            if let Change::Role(RoleChange::DropRole {
                 name, members: of, ..
-            } = &mut p.change
+            }) = &mut p.change
             {
                 *of = members.get(name).cloned().unwrap_or_default();
             }
@@ -1643,7 +1681,8 @@ mod tests {
         // Unread also preserves any membership payload already supplied;
         // treating it as an empty read would silently erase that payload.
         let mut supplied = plan();
-        if let Change::DropRole { members, .. } = &mut supplied.changes[1].change {
+        if let Change::Role(RoleChange::DropRole { members, .. }) = &mut supplied.changes[1].change
+        {
             members.push("member".into());
         }
         let unread = schedule(
@@ -1671,18 +1710,18 @@ mod tests {
     fn role_drop_scripts_and_checksums_match_the_legacy_sort_for_interleaved_branches() {
         for salt in 0..32 {
             let drop = |name: &str, members: &[&str]| {
-                PlannedChange::new(Change::DropRole {
+                PlannedChange::new(Change::Role(RoleChange::DropRole {
                     uid: Uid::derived(UidKind::Role, name, salt),
                     name: name.into(),
                     members: members.iter().map(|m| (*m).into()).collect(),
-                })
+                }))
             };
             let other = |name: &str| {
-                PlannedChange::new(Change::DropTable {
+                PlannedChange::new(Change::Table(TableChange::DropTable {
                     uid: Uid::derived(UidKind::Table, name, salt),
                     name: TableName::new("dbo", name),
                     detach_from: None,
-                })
+                }))
             };
             for reverse in [false, true] {
                 let mut input = ChangeSet {

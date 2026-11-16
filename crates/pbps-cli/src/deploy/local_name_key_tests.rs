@@ -1,4 +1,6 @@
 use super::*;
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
 use pbps_model::{Change, ChangeSet, Index, IndexColumn, PlannedChange};
 
 #[test]
@@ -17,7 +19,7 @@ fn qualified_index_claims_and_constraint_reads_preserve_raw_local_names() {
     };
     let changes = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::SetPrimaryKey {
+            PlannedChange::new(Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table: table.clone(),
                 from: None,
                 to: Some(pbps_model::PrimaryKey {
@@ -27,8 +29,8 @@ fn qualified_index_claims_and_constraint_reads_preserve_raw_local_names() {
                     filegroup: None,
                 }),
                 nonclustered: false,
-            }),
-            PlannedChange::new(Change::AddUnique {
+            })),
+            PlannedChange::new(Change::Constraint(ConstraintChange::AddUnique {
                 table: table.clone(),
                 name: format!("uq{RAW}").into(),
                 constraint: pbps_model::UniqueConstraint {
@@ -37,8 +39,8 @@ fn qualified_index_claims_and_constraint_reads_preserve_raw_local_names() {
                     filegroup: None,
                 },
                 clustered: false,
-            }),
-            PlannedChange::new(Change::AddForeignKey {
+            })),
+            PlannedChange::new(Change::Constraint(ConstraintChange::AddForeignKey {
                 table: table.clone(),
                 name: format!("fk{RAW}").into(),
                 constraint: Box::new(pbps_model::ForeignKey {
@@ -48,20 +50,20 @@ fn qualified_index_claims_and_constraint_reads_preserve_raw_local_names() {
                     on_delete: Default::default(),
                     on_update: Default::default(),
                 }),
-            }),
-            PlannedChange::new(Change::AddCheck {
+            })),
+            PlannedChange::new(Change::Constraint(ConstraintChange::AddCheck {
                 table: table.clone(),
                 name: format!("ck{RAW}").into(),
                 constraint: pbps_model::CheckConstraint {
                     expression: "id > 0".into(),
                 },
-            }),
-            PlannedChange::new(Change::AddIndex {
+            })),
+            PlannedChange::new(Change::Index(IndexChange::AddIndex {
                 table: table.clone(),
                 name: format!("ix{RAW}").into(),
                 index: Box::new(index),
                 clustered: false,
-            }),
+            })),
         ],
     };
     let ids = IdsFile {

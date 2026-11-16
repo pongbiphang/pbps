@@ -12,6 +12,14 @@
 //! into a dependent does not imply that it permits deleting the target.
 
 use pbps_dialect::DialectError;
+use pbps_model::ColumnChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
+use pbps_model::TypeValueChange;
 use pbps_model::{Change, ColumnRef, ModuleId, ModuleKind, ObjectName, TableName};
 
 use crate::DbError;
@@ -109,10 +117,10 @@ pub fn rename_targets(
         .changes()
         .iter()
         .filter_map(|p| match &p.change {
-Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => None,
-            Change::RenameTable { uid, .. } => names.table_at(uid, At::Start)
+Change::Partition(PartitionChange::RebuildPartitionedTable(_)) | Change::Index(IndexChange::BuildPartitionedIndex(_)) | Change::Partition(PartitionChange::CopyTableRows(_)) | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => None,
+            Change::Table(TableChange::RenameTable { uid, .. }) => names.table_at(uid, At::Start)
                 .filter(|_| seen.insert(uid)).cloned().map(RenameTarget::Table),
-            Change::RenameColumn { uid, .. } => {
+            Change::Column(ColumnChange::RenameColumn { uid, .. }) => {
                 let (owner, column) = names.column_at(uid, At::Start)?;
                 let table = names.table_at(owner, At::Start)?;
                 seen.insert(uid).then(|| RenameTarget::Column(table.column(column)))
@@ -120,47 +128,47 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             // A module rename reaches the plan as this drop plus a create,
             // so the drop side is where the catalog has to be asked what
             // still points at the old name.
-            Change::DropModule { id, .. } => {
+            Change::Module(ModuleChange::DropModule { id, .. }) => {
                 include_module_drops.then(|| RenameTarget::Module(id.object_name()))
             }
             // Exhaustive rather than `_`: a change added later that also
             // moves a name must be considered here, and a catch-all would
             // let it through silently.
-            Change::CreateTable { .. }
-            | Change::DropTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
+            Change::Table(TableChange::CreateTable { .. })
+            | Change::Table(TableChange::DropTable { .. })
+            | Change::Column(ColumnChange::AddColumn { .. })
+            | Change::Column(ColumnChange::DropColumn { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { .. })
             // A sequence it renames is reached from a default or a view by
             // its oid, which the rename keeps; only text names it, and no
             // catalog lists that (#1889).
-            | Change::AlterColumnNumbering { .. }
-            | Change::SetColumnDeprecated { .. }
+            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
             | pbps_model::change_family!(table_properties)
             | pbps_model::change_family!(constraints)
-            | Change::SetIndexStorageParameters { .. }
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
             | pbps_model::change_family!(policies)
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropIndex { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Module(ModuleChange::CreateModule { .. })
+            | Change::Module(ModuleChange::AlterModule { .. })
             // Row changes move no name: a row's identity is its key, and a
             // changed key is a delete plus an insert, not a rename.
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
-             | pbps_model::catalog_change!() | Change::Grant { .. } | Change::Revoke { .. } | Change::DetachPartition { .. } | Change::AttachPartition { .. } | Change::SetPartitionDefault { .. } | Change::SetPartitionNotNull { .. } | Change::PublicExecution { .. } => None,
+            | Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::UpdateRow { .. })
+            | Change::Row(RowChange::DeleteRow { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
+            | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
+             | pbps_model::catalog_change!() | Change::Permission(GrantChange::Grant { .. }) | Change::Permission(GrantChange::Revoke { .. }) | Change::Partition(PartitionChange::DetachPartition { .. }) | Change::Partition(PartitionChange::AttachPartition { .. }) | Change::Partition(PartitionChange::SetPartitionDefault { .. }) | Change::Partition(PartitionChange::SetPartitionNotNull { .. }) | Change::Permission(GrantChange::PublicExecution { .. }) => None,
         })
         .collect()
 }
@@ -230,6 +238,10 @@ pub enum ImpactError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::TableChange;
+    use pbps_model::TypeValueChange;
     use pbps_model::{IdsFile, PlannedChange};
 
     fn table(s: &str) -> TableName {
@@ -237,27 +249,27 @@ mod tests {
     }
 
     fn rename_table(uid: &str, from: &str, to: &str) -> PlannedChange {
-        PlannedChange::new(Change::RenameTable {
+        PlannedChange::new(Change::Table(TableChange::RenameTable {
             uid: uid.parse().unwrap(),
             from: table(from),
             to: table(to),
             defaults: vec![],
-        })
+        }))
     }
 
     fn rename_column(uid: &str, owner: &str, from: &str, to: &str) -> PlannedChange {
-        PlannedChange::new(Change::RenameColumn {
+        PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
             uid: uid.parse().unwrap(),
             table: table(owner),
             from: from.into(),
             to: to.into(),
             table_was: None,
-        })
+        }))
     }
 
     #[test]
     fn label_changes_do_not_acquire_table_rename_targets_or_hide_actual_table_renames() {
-        let add = PlannedChange::new(Change::AddEnumValue {
+        let add = PlannedChange::new(Change::TypeValue(TypeValueChange::AddEnumValue {
             uid: "y_000001".parse().unwrap(),
             name: "app.e".parse().unwrap(),
             value: "blue".into(),
@@ -266,7 +278,7 @@ mod tests {
             definition: Box::new(pbps_model::ManagedType::Enum {
                 values: vec!["blue".into()],
             }),
-        });
+        }));
         let steps = vec![add, rename_table("t_000001", "app.old", "app.new")];
         let ids = IdsFile {
             types: [("y_000001".parse().unwrap(), "app.e".parse().unwrap())].into(),
@@ -348,10 +360,10 @@ mod tests {
     fn module_drop_selection_remains_the_callers_policy_beside_rename_chains() {
         let changes = [
             rename_table("t_aaaaaa", "app.a", "app.tmp"),
-            PlannedChange::new(Change::DropModule {
+            PlannedChange::new(Change::Module(ModuleChange::DropModule {
                 id: "app.v".parse().unwrap(),
                 kind: ModuleKind::View,
-            }),
+            })),
             rename_table("t_aaaaaa", "app.tmp", "app.b"),
         ];
         let after = IdsFile {
@@ -377,18 +389,18 @@ mod tests {
         use pbps_model::{IdsFile, PlannedChange, Uid};
         let uid: Uid = "t_aaaaaa".parse().unwrap();
         let changes = [
-            PlannedChange::new(Change::RenameTable {
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: uid.clone(),
                 from: table("app.a"),
                 to: table("app.tmp"),
                 defaults: vec![],
-            }),
-            PlannedChange::new(Change::RenameTable {
+            })),
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: uid.clone(),
                 from: table("app.tmp"),
                 to: table("app.b"),
                 defaults: vec![],
-            }),
+            })),
         ];
         let after = IdsFile {
             tables: [(uid, table("app.b"))].into(),
@@ -411,20 +423,20 @@ mod tests {
             .columns
             .insert("before".into(), Column::new("int".parse().unwrap()));
         let changes = [
-            PlannedChange::new(Change::CreateTable {
+            PlannedChange::new(Change::Table(TableChange::CreateTable {
                 uid: owner.clone(),
                 name: table("app.new"),
                 table: Box::new(shape),
                 beside_default: None,
                 moves_at_most: None,
-            }),
-            PlannedChange::new(Change::RenameColumn {
+            })),
+            PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
                 uid: column.clone(),
                 table: table("app.new"),
                 from: "before".into(),
                 to: "after".into(),
                 table_was: None,
-            }),
+            })),
         ];
         let after = IdsFile {
             tables: [(owner, table("app.new"))].into(),
@@ -438,13 +450,13 @@ mod tests {
     #[test]
     fn a_new_tables_rename_chain_has_no_catalog_target() {
         let changes = [
-            PlannedChange::new(Change::CreateTable {
+            PlannedChange::new(Change::Table(TableChange::CreateTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: table("app.new"),
                 table: Box::default(),
                 beside_default: None,
                 moves_at_most: None,
-            }),
+            })),
             rename_table("t_aaaaaa", "app.new", "app.tmp"),
             rename_table("t_aaaaaa", "app.tmp", "app.final"),
         ];

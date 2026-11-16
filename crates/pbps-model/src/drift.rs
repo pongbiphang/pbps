@@ -111,6 +111,7 @@ impl DriftReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::change::TableChange;
     use crate::change::{Change, PlannedChange};
     use crate::uid::Uid;
 
@@ -171,11 +172,11 @@ mod tests {
         let mut r = report("abc");
         r.changes
             .changes
-            .push(PlannedChange::new(Change::DropTable {
+            .push(PlannedChange::new(Change::Table(TableChange::DropTable {
                 uid: "t_a1b2c3".parse::<Uid>().unwrap(),
                 name: "dbo.customer".parse().unwrap(),
                 detach_from: None,
-            }));
+            })));
         assert!(r.has_drift());
     }
 
@@ -193,11 +194,11 @@ mod tests {
         let mut r = report("def");
         r.changes
             .changes
-            .push(PlannedChange::new(Change::DropTable {
+            .push(PlannedChange::new(Change::Table(TableChange::DropTable {
                 uid: "t_a1b2c3".parse::<Uid>().unwrap(),
                 name: "dbo.customer".parse().unwrap(),
                 detach_from: None,
-            }));
+            })));
         r.unmanaged.push("dbo.other_tool".parse().unwrap());
         let back: DriftReport = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(r, back);

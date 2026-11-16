@@ -79,29 +79,31 @@ pub fn positions(changes: &ChangeSet, facet: &str) -> (usize, usize, usize) {
         .changes
         .iter()
         .position(|p| match (&p.change, facet) {
-            (Change::AlterColumnDefault { column, .. }, "default") => column.name.raw() == "anchor",
-            (Change::AlterColumnNullability { column, .. }, "not_null") => {
+            (Change::Column(ColumnChange::AlterColumnDefault { column, .. }), "default") => {
                 column.name.raw() == "anchor"
             }
-            (Change::SetPrimaryKey { table, .. }, "primary_key") => {
+            (Change::Column(ColumnChange::AlterColumnNullability { column, .. }), "not_null") => {
+                column.name.raw() == "anchor"
+            }
+            (Change::Constraint(ConstraintChange::SetPrimaryKey { table, .. }), "primary_key") => {
                 table == &"app.t".parse().unwrap()
             }
-            (Change::AddUnique { .. }, "unique")
-            | (Change::AddCheck { .. }, "check")
-            | (Change::AddIndex { .. }, "index")
-            | (Change::AddForeignKey { .. }, "foreign_key") => true,
+            (Change::Constraint(ConstraintChange::AddUnique { .. }), "unique")
+            | (Change::Constraint(ConstraintChange::AddCheck { .. }), "check")
+            | (Change::Index(IndexChange::AddIndex { .. }), "index")
+            | (Change::Constraint(ConstraintChange::AddForeignKey { .. }), "foreign_key") => true,
             _ => false,
         })
         .unwrap();
     let function = changes
         .changes
         .iter()
-        .position(|p| matches!(&p.change, Change::CreateModule { id, .. } if id.name() == "f"))
+        .position(|p| matches!(&p.change, Change::Module(ModuleChange::CreateModule { id, .. }) if id.name() == "f"))
         .unwrap();
     let column = changes
         .changes
         .iter()
-        .position(|p| matches!(&p.change, Change::AddColumn { name, .. } if name.raw() == "x"))
+        .position(|p| matches!(&p.change, Change::Column(ColumnChange::AddColumn { name, .. }) if name.raw() == "x"))
         .unwrap();
     (part, function, column)
 }

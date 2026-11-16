@@ -87,9 +87,9 @@ pub(crate) fn counts_rows_an_enum_retype_strands(driver: Driver, changes: &Chang
 /// `PlanSession::probe_stranded_rows`.
 pub(crate) fn enum_retype_strands_rows(changes: &ChangeSet) -> bool {
     changes.changes.iter().any(|p| {
-        matches!(&p.change, pbps_model::Change::EnumRebuild {
+        matches!(&p.change, pbps_model::Change::TypeValue(pbps_model::TypeValueChange::EnumRebuild {
             step: pbps_model::EnumRebuildStep::Retype { values, .. }, ..
-        } if match values.as_ref() {
+        }) if match values.as_ref() {
             pbps_model::ValueChange::Cast { from, to, .. } => from != to,
             pbps_model::ValueChange::Relabel { removed } => !removed.is_empty(),
         })
@@ -118,11 +118,12 @@ pub(crate) async fn recheck_enum_rebuild_census(
 ) -> anyhow::Result<()> {
     match conn.driver() {
         Driver::Postgres => {
-            if !changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, pbps_model::Change::EnumRebuild { .. }))
-            {
+            if !changes.changes.iter().any(|p| {
+                matches!(
+                    p.change,
+                    pbps_model::Change::TypeValue(pbps_model::TypeValueChange::EnumRebuild { .. })
+                )
+            }) {
                 return Ok(());
             }
             pbps_pg::type_rebuild::census(conn, changes, None, stored, resuming)

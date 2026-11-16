@@ -4,6 +4,13 @@ use crate::certified_fixture::FixtureEmission as _;
 
 use pbps_dialect::Dialect;
 use pbps_diff::order::{Baseline, analyse, generated, verify};
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
 use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
 use pbps_model::plan_names::PlanNames;
 use pbps_model::{
@@ -91,7 +98,7 @@ fn generated_creation_parts_provide_columns_before_rows_and_preserve_stored_valu
         generated::expand(&mut cs, &ids, &Default::default(), &pg).unwrap();
         cs =
             pbps_diff::order::writebacks::PlanningInput::new(vec![pbps_model::PlannedChange::new(
-                Change::InsertRow {
+                Change::Row(RowChange::InsertRow {
                     table: TableName::new("app", "a"),
                     key_column: "id".into(),
                     identity_key: false,
@@ -99,7 +106,7 @@ fn generated_creation_parts_provide_columns_before_rows_and_preserve_stored_valu
                     row: pbps_model::Row([("z".into(), pbps_model::Value::Int(3))].into()),
                     defaults: Default::default(),
                     types: [("z".into(), "integer".parse().unwrap())].into(),
-                },
+                }),
             )])
             .append_to(cs);
         generated::settle(&mut cs, &schema, &Default::default(), &pg).unwrap();
@@ -133,7 +140,8 @@ fn generated_creation_parts_provide_columns_before_rows_and_preserve_stored_valu
             .position(|p| {
                 matches!(
                     p.change,
-                    Change::AddColumn { .. } | Change::AlterColumnExpression { .. }
+                    Change::Column(ColumnChange::AddColumn { .. })
+                        | Change::Column(ColumnChange::AlterColumnExpression { .. })
                 )
             })
             .unwrap();
@@ -180,13 +188,13 @@ fn generated_creation_requires_recorded_column_identities_and_leaves_uncalled_fu
     let (schema, ids) = fixture();
     let pg = Postgres::new();
     let table = &schema.tables[&TableName::new("app", "a")];
-    let change = Change::CreateTable {
+    let change = Change::Table(TableChange::CreateTable {
         uid: ids.table_uid(&TableName::new("app", "a")).unwrap().clone(),
         name: TableName::new("app", "a"),
         table: Box::new(table.clone()),
         beside_default: None,
         moves_at_most: None,
-    };
+    });
     let f = vec!["app.f(integer)".parse().unwrap()];
     assert!(
         pg.generated_table_parts(&change, &IdsFile::default(), &f, false)
@@ -223,13 +231,13 @@ fn indexes_split_from_a_new_generated_table_remain_transactional_with_an_online_
         },
     );
     let pg = Postgres::new();
-    let mut create = pbps_model::PlannedChange::new(Change::CreateTable {
+    let mut create = pbps_model::PlannedChange::new(Change::Table(TableChange::CreateTable {
         uid: ids.table_uid(&name).unwrap().clone(),
         name: name.clone(),
         table: Box::new(schema.tables[&name].clone()),
         beside_default: None,
         moves_at_most: None,
-    });
+    }));
     create.strategy.online = true;
     let parts = generated::parts(
         &create,
@@ -242,7 +250,7 @@ fn indexes_split_from_a_new_generated_table_remain_transactional_with_an_online_
     .unwrap();
     let index = parts
         .iter()
-        .find(|p| matches!(p.change, Change::AddIndex { .. }))
+        .find(|p| matches!(p.change, Change::Index(IndexChange::AddIndex { .. })))
         .unwrap();
     assert!(!index.strategy.online);
     assert!(
@@ -372,18 +380,18 @@ fn prefix_keys_checks_and_indexes_stay_inline_while_suffix_constraints_wait() {
             },
         );
     }
-    let change = Change::CreateTable {
+    let change = Change::Table(TableChange::CreateTable {
         uid: ids.table_uid(&name).unwrap().clone(),
         name,
         table: Box::new(table.clone()),
         beside_default: None,
         moves_at_most: None,
-    };
+    });
     let parts = Postgres::new()
         .generated_table_parts(&change, &ids, &["app.f(integer)".parse().unwrap()], false)
         .unwrap()
         .unwrap();
-    let Change::CreateTable { table, .. } = &parts[0] else {
+    let Change::Table(TableChange::CreateTable { table, .. }) = &parts[0] else {
         unreachable!()
     };
     assert!(
@@ -412,29 +420,29 @@ fn prefix_keys_checks_and_indexes_stay_inline_while_suffix_constraints_wait() {
     assert!(
         parts
             .iter()
-            .any(|p| matches!(p, Change::AddUnique { name, .. } if name.raw() == "suffix_unique"))
+            .any(|p| matches!(p, Change::Constraint(ConstraintChange::AddUnique { name, .. }) if name.raw() == "suffix_unique"))
     );
     assert!(
         parts
             .iter()
-            .any(|p| matches!(p, Change::AddCheck { name, .. } if name.raw() == "suffix_unique"))
+            .any(|p| matches!(p, Change::Constraint(ConstraintChange::AddCheck { name, .. }) if name.raw() == "suffix_unique"))
     );
     assert!(
         parts
             .iter()
-            .any(|p| matches!(p, Change::AddIndex { name, .. } if name.raw() == "suffix_unique"))
+            .any(|p| matches!(p, Change::Index(IndexChange::AddIndex { name, .. }) if name.raw() == "suffix_unique"))
     );
     assert!(!table.unique.contains_key("suffix_input"));
     assert!(!table.checks.contains_key("suffix_input"));
     assert!(
         parts
             .iter()
-            .any(|p| matches!(p, Change::AddUnique { name, .. } if name.raw() == "suffix_input"))
+            .any(|p| matches!(p, Change::Constraint(ConstraintChange::AddUnique { name, .. }) if name.raw() == "suffix_input"))
     );
     assert!(
         parts
             .iter()
-            .any(|p| matches!(p, Change::AddCheck { name, .. } if name.raw() == "suffix_input"))
+            .any(|p| matches!(p, Change::Constraint(ConstraintChange::AddCheck { name, .. }) if name.raw() == "suffix_input"))
     );
     for name in [
         "suffix_input",
@@ -446,7 +454,7 @@ fn prefix_keys_checks_and_indexes_stay_inline_while_suffix_constraints_wait() {
         assert!(
             parts
                 .iter()
-                .any(|p| matches!(p, Change::AddIndex { name: n, .. } if n.raw() == name)),
+                .any(|p| matches!(p, Change::Index(IndexChange::AddIndex { name: n, .. }) if n.raw() == name)),
             "{name}"
         );
     }
@@ -455,7 +463,7 @@ fn prefix_keys_checks_and_indexes_stay_inline_while_suffix_constraints_wait() {
         assert!(
             parts
                 .iter()
-                .any(|p| matches!(p, Change::AddForeignKey { name: n, .. } if n.raw() == name)),
+                .any(|p| matches!(p, Change::Constraint(ConstraintChange::AddForeignKey { name: n, .. }) if n.raw() == name)),
             "{name}"
         );
     }
@@ -485,13 +493,13 @@ fn prefix_generation_fixture(expression: &str, input_before_cut: bool) -> (Chang
     }
     schema.tables.insert(name.clone(), table.clone());
     let ids = identities(&schema);
-    let change = Change::CreateTable {
+    let change = Change::Table(TableChange::CreateTable {
         uid: ids.table_uid(&name).unwrap().clone(),
         name,
         table: Box::new(table),
         beside_default: None,
         moves_at_most: None,
-    };
+    });
     (change, ids)
 }
 
@@ -514,7 +522,7 @@ fn a_prefix_generation_reading_a_removed_column_requires_the_full_creation_shape
         .generated_table_parts(&change, &ids, &f, false)
         .unwrap()
         .unwrap();
-    let Change::CreateTable { table, .. } = &parts[0] else {
+    let Change::Table(TableChange::CreateTable { table, .. }) = &parts[0] else {
         panic!("{parts:?}")
     };
     assert_eq!(
@@ -534,7 +542,7 @@ fn a_prefix_generation_reading_a_removed_column_requires_the_full_creation_shape
         "only the function-calling expression is postponed"
     );
     assert!(
-        matches!(&parts[1], Change::AlterColumnExpression { column, to, .. } if column.name.raw() == "g" && to == "app.f(id)")
+        matches!(&parts[1], Change::Column(ColumnChange::AlterColumnExpression { column, to, .. }) if column.name.raw() == "g" && to == "app.f(id)")
     );
     let sql = Postgres::new()
         .fixture_emit(&parts[0], Default::default())
@@ -566,7 +574,7 @@ fn prefix_generation_inputs_kept_in_create_do_not_prevent_the_suffix_split() {
                 expected
             );
         }
-        let Change::CreateTable { table, .. } = &expected[0] else {
+        let Change::Table(TableChange::CreateTable { table, .. }) = &expected[0] else {
             panic!("{expected:?}")
         };
         assert_eq!(
@@ -583,13 +591,12 @@ fn prefix_generation_inputs_kept_in_create_do_not_prevent_the_suffix_split() {
         assert!(
             expected
                 .iter()
-                .any(|c| matches!(c, Change::AddColumn { name, .. } if name.raw() == "g"))
+                .any(|c| matches!(c, Change::Column(ColumnChange::AddColumn { name, .. }) if name.raw() == "g"))
         );
-        assert!(
-            !expected
-                .iter()
-                .any(|c| matches!(c, Change::AlterColumnExpression { .. }))
-        );
+        assert!(!expected.iter().any(|c| matches!(
+            c,
+            Change::Column(ColumnChange::AlterColumnExpression { .. })
+        )));
     }
 }
 
@@ -605,23 +612,23 @@ fn a_primary_key_using_a_suffix_input_waits_for_its_column() {
             storage_parameters: Default::default(),
             filegroup: None,
         });
-        let change = Change::CreateTable {
+        let change = Change::Table(TableChange::CreateTable {
             uid: ids.table_uid(&name).unwrap().clone(),
             name: name.clone(),
             table: Box::new(table),
             beside_default: None,
             moves_at_most: None,
-        };
+        });
         let parts = Postgres::new()
             .generated_table_parts(&change, &ids, &["app.f(integer)".parse().unwrap()], false)
             .unwrap()
             .unwrap();
-        let Change::CreateTable { table, .. } = &parts[0] else {
+        let Change::Table(TableChange::CreateTable { table, .. }) = &parts[0] else {
             panic!("{parts:?}")
         };
         assert!(table.primary_key.is_none());
         assert!(parts.iter().any(
-            |p| matches!(p, Change::SetPrimaryKey { to: Some(key), .. } if key.columns == [pbps_model::ColumnName::from(column)])
+            |p| matches!(p, Change::Constraint(ConstraintChange::SetPrimaryKey { to: Some(key), .. }) if key.columns == [pbps_model::ColumnName::from(column)])
         ));
     }
 }
@@ -643,13 +650,13 @@ fn generated_expression_installations_keep_their_creation_risks() {
         }
         let ids = identities(&schema);
         let pg = Postgres::new().with_server_version(180_000);
-        let create = pbps_model::PlannedChange::new(Change::CreateTable {
+        let create = pbps_model::PlannedChange::new(Change::Table(TableChange::CreateTable {
             uid: ids.table_uid(&name).unwrap().clone(),
             name: name.clone(),
             table: Box::new(schema.tables[&name].clone()),
             beside_default: None,
             moves_at_most: None,
-        });
+        }));
         assert!(create.risks.is_empty());
         let parts = generated::parts(
             &create,
@@ -660,11 +667,10 @@ fn generated_expression_installations_keep_their_creation_risks() {
         )
         .unwrap()
         .unwrap();
-        assert!(
-            parts
-                .iter()
-                .any(|p| matches!(p.change, Change::AlterColumnExpression { .. }))
-        );
+        assert!(parts.iter().any(|p| matches!(
+            p.change,
+            Change::Column(ColumnChange::AlterColumnExpression { .. })
+        )));
         for part in &parts {
             assert_eq!(part.risks, create.risks, "{:?}", part.change);
         }
@@ -741,13 +747,13 @@ fn generated_columns_and_validators_keep_their_creation_risks() {
         Postgres::new().with_server_version(160_000),
         Postgres::new().with_server_version(180_000),
     ] {
-        let create = pbps_model::PlannedChange::new(Change::CreateTable {
+        let create = pbps_model::PlannedChange::new(Change::Table(TableChange::CreateTable {
             uid: ids.table_uid(&name).unwrap().clone(),
             name: name.clone(),
             table: Box::new(schema.tables[&name].clone()),
             beside_default: None,
             moves_at_most: None,
-        });
+        }));
         let parts = generated::parts(
             &create,
             &ids,
@@ -763,12 +769,24 @@ fn generated_columns_and_validators_keep_their_creation_risks() {
         for kind in ["column", "key", "unique", "foreign key", "check", "index"] {
             assert!(
                 parts.iter().any(|p| match kind {
-                    "column" => matches!(p.change, Change::AddColumn { .. }),
-                    "key" => matches!(p.change, Change::SetPrimaryKey { .. }),
-                    "unique" => matches!(p.change, Change::AddUnique { .. }),
-                    "foreign key" => matches!(p.change, Change::AddForeignKey { .. }),
-                    "check" => matches!(p.change, Change::AddCheck { .. }),
-                    "index" => matches!(p.change, Change::AddIndex { .. }),
+                    "column" => matches!(p.change, Change::Column(ColumnChange::AddColumn { .. })),
+                    "key" => matches!(
+                        p.change,
+                        Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+                    ),
+                    "unique" => matches!(
+                        p.change,
+                        Change::Constraint(ConstraintChange::AddUnique { .. })
+                    ),
+                    "foreign key" => matches!(
+                        p.change,
+                        Change::Constraint(ConstraintChange::AddForeignKey { .. })
+                    ),
+                    "check" => matches!(
+                        p.change,
+                        Change::Constraint(ConstraintChange::AddCheck { .. })
+                    ),
+                    "index" => matches!(p.change, Change::Index(IndexChange::AddIndex { .. })),
                     _ => unreachable!(),
                 }),
                 "{kind}"
@@ -790,10 +808,10 @@ fn planned_functions(schema: &Schema) -> Vec<pbps_model::PlannedChange> {
         .modules
         .iter()
         .map(|(id, module)| {
-            pbps_model::PlannedChange::new(Change::CreateModule {
+            pbps_model::PlannedChange::new(Change::Module(ModuleChange::CreateModule {
                 id: id.clone(),
                 module: Box::new(module.clone()),
-            })
+            }))
         })
         .collect()
 }
@@ -809,13 +827,13 @@ fn creation_risks_require_all_installations_before_every_row_write() {
     }
     let ids = identities(&schema);
     let pg = Postgres::new().with_server_version(180_000);
-    let create = pbps_model::PlannedChange::new(Change::CreateTable {
+    let create = pbps_model::PlannedChange::new(Change::Table(TableChange::CreateTable {
         uid: ids.table_uid(&name).unwrap().clone(),
         name: name.clone(),
         table: Box::new(schema.tables[&name].clone()),
         beside_default: None,
         moves_at_most: None,
-    });
+    }));
     let parts = generated::parts(
         &create,
         &ids,
@@ -827,9 +845,14 @@ fn creation_risks_require_all_installations_before_every_row_write() {
     .unwrap();
     let install = parts
         .iter()
-        .position(|p| matches!(p.change, Change::AlterColumnExpression { .. }))
+        .position(|p| {
+            matches!(
+                p.change,
+                Change::Column(ColumnChange::AlterColumnExpression { .. })
+            )
+        })
         .unwrap();
-    let write = pbps_model::PlannedChange::new(Change::InsertRow {
+    let write = pbps_model::PlannedChange::new(Change::Row(RowChange::InsertRow {
         table: name.clone(),
         key_column: "id".into(),
         identity_key: false,
@@ -837,7 +860,7 @@ fn creation_risks_require_all_installations_before_every_row_write() {
         row: Default::default(),
         defaults: Default::default(),
         types: Default::default(),
-    });
+    }));
     let mut cs = pbps_model::ChangeSet {
         changes: parts.clone(),
     };
@@ -859,7 +882,8 @@ fn creation_risks_require_all_installations_before_every_row_write() {
             .contains(&pbps_model::RiskClass::Narrowing)
     );
     let mut unrelated = cs;
-    if let Change::InsertRow { table, .. } = &mut unrelated.changes[install].change {
+    if let Change::Row(RowChange::InsertRow { table, .. }) = &mut unrelated.changes[install].change
+    {
         *table = TableName::new("app", "other");
     }
     assert!(generated::risks(&unrelated, &ids, &pg)[install + 1].is_empty());
@@ -887,13 +911,13 @@ fn partition_membership_and_default_moves_cannot_certify_empty_creation() {
         ids.tables.insert(uid.parse().unwrap(), name.clone());
     }
     let pg = Postgres::new().with_server_version(180_000);
-    let create = PlannedChange::new(Change::CreateTable {
+    let create = PlannedChange::new(Change::Table(TableChange::CreateTable {
         uid: ids.table_uid(&parent).unwrap().clone(),
         name: parent.clone(),
         table: Box::new(schema.tables[&parent].clone()),
         beside_default: None,
         moves_at_most: None,
-    });
+    }));
     let parts = generated::parts(
         &create,
         &ids,
@@ -905,10 +929,15 @@ fn partition_membership_and_default_moves_cannot_certify_empty_creation() {
     .unwrap();
     let install = parts
         .iter()
-        .position(|p| matches!(p.change, Change::AlterColumnExpression { .. }))
+        .position(|p| {
+            matches!(
+                p.change,
+                Change::Column(ColumnChange::AlterColumnExpression { .. })
+            )
+        })
         .unwrap();
     let partition = |name: &TableName, parent: &TableName, source: Option<TableName>| {
-        PlannedChange::new(Change::CreateTable {
+        PlannedChange::new(Change::Table(TableChange::CreateTable {
             uid: ids.table_uid(name).unwrap().clone(),
             name: name.clone(),
             table: Box::new(Table {
@@ -921,10 +950,10 @@ fn partition_membership_and_default_moves_cannot_certify_empty_creation() {
             }),
             beside_default: source,
             moves_at_most: Some(1),
-        })
+        }))
     };
     let row = |name: &TableName| {
-        PlannedChange::new(Change::InsertRow {
+        PlannedChange::new(Change::Row(RowChange::InsertRow {
             table: name.clone(),
             key_column: "id".into(),
             identity_key: false,
@@ -932,28 +961,28 @@ fn partition_membership_and_default_moves_cannot_certify_empty_creation() {
             row: Default::default(),
             defaults: Default::default(),
             types: Default::default(),
-        })
+        }))
     };
-    let attach = PlannedChange::new(Change::AttachPartition {
+    let attach = PlannedChange::new(Change::Partition(PartitionChange::AttachPartition {
         uid: ids.table_uid(&child).unwrap().clone(),
         table: child.clone(),
         parent: parent.clone(),
         bound: PartitionBound::Default,
         key: vec![],
         shape: Box::default(),
-    });
-    let detach = PlannedChange::new(Change::DetachPartition {
+    }));
+    let detach = PlannedChange::new(Change::Partition(PartitionChange::DetachPartition {
         uid: ids.table_uid(&child).unwrap().clone(),
         table: child.clone(),
         parent: parent.clone(),
         names: vec![],
         shape: Box::default(),
-    });
-    let drop = PlannedChange::new(Change::DropTable {
+    }));
+    let drop = PlannedChange::new(Change::Table(TableChange::DropTable {
         uid: ids.table_uid(&child).unwrap().clone(),
         name: child.clone(),
         detach_from: Some(parent.clone()),
-    });
+    }));
     for (writes, narrowing) in [
         (vec![attach.clone()], true),
         (vec![detach], true),
@@ -977,7 +1006,7 @@ fn partition_membership_and_default_moves_cannot_certify_empty_creation() {
         cs.changes.splice(install..install, writes.clone());
         let mut final_ids = ids.clone();
         for write in &writes {
-            if let Change::DropTable { uid, .. } = &write.change {
+            if let Change::Table(TableChange::DropTable { uid, .. }) = &write.change {
                 final_ids.tables.remove(uid);
             }
         }

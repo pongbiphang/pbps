@@ -11,7 +11,8 @@ pub fn approval() -> (
     IdsFile,
     Vec<IntermediateAddress>,
 ) {
-    let Change::RebuildPartitionedTable(root) = changes().remove(0) else {
+    let Change::Partition(PartitionChange::RebuildPartitionedTable(root)) = changes().remove(0)
+    else {
         panic!("root fixture")
     };
     // The environment holds the sources; the files, as approval left them,
@@ -71,7 +72,7 @@ pub fn approval() -> (
 
 #[allow(dead_code)]
 pub fn index_recipe() -> BuildPartitionedIndex {
-    let Change::CopyTableRows(copy) = changes().remove(1) else {
+    let Change::Partition(PartitionChange::CopyTableRows(copy)) = changes().remove(1) else {
         panic!()
     };
     BuildPartitionedIndex {

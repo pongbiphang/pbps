@@ -3,7 +3,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use pbps_model::ColumnChange;
 use pbps_model::ColumnName;
+use pbps_model::ConstraintChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::PartitionChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
+use pbps_model::TypeValueChange;
 use pbps_model::plan_names::{At, Holder, PlanNames};
 use pbps_model::{
     Cell, Change, Collation, Column, ColumnRef, ColumnType, ForeignKey, Row, RowKey, Table,
@@ -115,27 +123,31 @@ impl<'p> PlanFacts<'p> {
         let mut removed = BTreeMap::new();
         for (at, p) in names.changes().iter().enumerate() {
             let event = match &p.change {
-                Change::RebuildPartitionedTable(_)
-                | Change::BuildPartitionedIndex(_)
-                | Change::CopyTableRows(_)
-                | Change::AnalyzeTableTree(_) => continue,
-                Change::CreateTable { name, table, .. } => Event::CreateTable { name, table },
-                Change::DropTable { name, .. } => Event::DropTable { name },
-                Change::RenameColumn {
+                Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+                | Change::Index(IndexChange::BuildPartitionedIndex(_))
+                | Change::Partition(PartitionChange::CopyTableRows(_))
+                | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => continue,
+                Change::Table(TableChange::CreateTable { name, table, .. }) => {
+                    Event::CreateTable { name, table }
+                }
+                Change::Table(TableChange::DropTable { name, .. }) => Event::DropTable { name },
+                Change::Column(ColumnChange::RenameColumn {
                     uid, table, from, ..
-                } => Event::RenameColumn { uid, table, from },
-                Change::DropColumn { uid, column } => Event::DropColumn { uid, column },
-                Change::AddColumn {
+                }) => Event::RenameColumn { uid, table, from },
+                Change::Column(ColumnChange::DropColumn { uid, column }) => {
+                    Event::DropColumn { uid, column }
+                }
+                Change::Column(ColumnChange::AddColumn {
                     table,
                     name,
                     column,
                     ..
-                } => Event::AddColumn {
+                }) => Event::AddColumn {
                     table,
                     name,
                     column,
                 },
-                Change::AlterColumnType {
+                Change::Column(ColumnChange::AlterColumnType {
                     column,
                     from,
                     to,
@@ -143,7 +155,7 @@ impl<'p> PlanFacts<'p> {
                     to_collation,
                     using,
                     ..
-                } => Event::AlterColumnType {
+                }) => Event::AlterColumnType {
                     column,
                     from,
                     to,
@@ -151,31 +163,35 @@ impl<'p> PlanFacts<'p> {
                     to_collation,
                     using,
                 },
-                Change::AlterColumnExpression { column, .. } => {
+                Change::Column(ColumnChange::AlterColumnExpression { column, .. }) => {
                     Event::AlterColumnExpression { column }
                 }
-                Change::EnumRebuild {
+                Change::TypeValue(TypeValueChange::EnumRebuild {
                     step: pbps_model::EnumRebuildStep::Retype { column, .. },
                     ..
-                } => Event::RebuildEnumColumn { column },
-                Change::AddComputedColumn { table, name, .. } => {
+                }) => Event::RebuildEnumColumn { column },
+                Change::Column(ColumnChange::AddComputedColumn { table, name, .. }) => {
                     Event::AddComputedColumn { table, name }
                 }
-                Change::DropComputedColumn { table, .. } => Event::DropComputedColumn { table },
-                Change::AddForeignKey {
+                Change::Column(ColumnChange::DropComputedColumn { table, .. }) => {
+                    Event::DropComputedColumn { table }
+                }
+                Change::Constraint(ConstraintChange::AddForeignKey {
                     table,
                     name,
                     constraint,
-                } => Event::AddForeignKey {
+                }) => Event::AddForeignKey {
                     table,
                     name,
                     constraint,
                 },
-                Change::DropForeignKey { table, name } => Event::DropForeignKey { table, name },
-                Change::AttachPartition { table, parent, .. } => {
+                Change::Constraint(ConstraintChange::DropForeignKey { table, name }) => {
+                    Event::DropForeignKey { table, name }
+                }
+                Change::Partition(PartitionChange::AttachPartition { table, parent, .. }) => {
                     Event::AttachPartition { table, parent }
                 }
-                Change::InsertRow {
+                Change::Row(RowChange::InsertRow {
                     table,
                     key_column,
                     key,
@@ -183,7 +199,7 @@ impl<'p> PlanFacts<'p> {
                     defaults,
                     types,
                     ..
-                } => Event::InsertRow {
+                }) => Event::InsertRow {
                     table,
                     key_column,
                     key,
@@ -191,7 +207,7 @@ impl<'p> PlanFacts<'p> {
                     defaults,
                     types,
                 },
-                Change::UpdateRow {
+                Change::Row(RowChange::UpdateRow {
                     table,
                     key_column,
                     key,
@@ -200,7 +216,7 @@ impl<'p> PlanFacts<'p> {
                     types,
                     after_types,
                     ..
-                } => Event::UpdateRow {
+                }) => Event::UpdateRow {
                     table,
                     key_column,
                     key,
@@ -209,47 +225,47 @@ impl<'p> PlanFacts<'p> {
                     types,
                     after_types,
                 },
-                Change::DeleteRow {
+                Change::Row(RowChange::DeleteRow {
                     table,
                     key_column,
                     key,
                     types,
                     after_types,
                     ..
-                } => Event::DeleteRow {
+                }) => Event::DeleteRow {
                     table,
                     key_column,
                     key,
                     types,
                     after_types,
                 },
-                Change::RenameTable { .. }
-                | Change::DetachPartition { .. }
-                | Change::AlterColumnNullability { .. }
-                | Change::AlterColumnDefault { .. }
-                | Change::AlterColumnNumbering { .. }
-                | Change::SetColumnDeprecated { .. }
+                Change::Table(TableChange::RenameTable { .. })
+                | Change::Partition(PartitionChange::DetachPartition { .. })
+                | Change::Column(ColumnChange::AlterColumnNullability { .. })
+                | Change::Column(ColumnChange::AlterColumnDefault { .. })
+                | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+                | Change::Column(ColumnChange::SetColumnDeprecated { .. })
                 | pbps_model::change_family!(table_properties)
-                | Change::SetPrimaryKey { .. }
-                | Change::AddUnique { .. }
-                | Change::DropUnique { .. }
-                | Change::SetExclusion { .. }
-                | Change::AddCheck { .. }
-                | Change::DropCheck { .. }
-                | Change::AddIndex { .. }
-                | Change::DropIndex { .. }
-                | Change::SetIndexStorageParameters { .. }
+                | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+                | Change::Constraint(ConstraintChange::AddUnique { .. })
+                | Change::Constraint(ConstraintChange::DropUnique { .. })
+                | Change::Constraint(ConstraintChange::SetExclusion { .. })
+                | Change::Constraint(ConstraintChange::AddCheck { .. })
+                | Change::Constraint(ConstraintChange::DropCheck { .. })
+                | Change::Index(IndexChange::AddIndex { .. })
+                | Change::Index(IndexChange::DropIndex { .. })
+                | Change::Index(IndexChange::SetIndexStorageParameters { .. })
                 | pbps_model::change_family!(policies)
-                | Change::SetPartitionDefault { .. }
-                | Change::SetPartitionNotNull { .. }
-                | Change::SetDataMode { .. }
-                | Change::SetEnsureKeys { .. }
+                | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+                | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+                | Change::Row(RowChange::SetDataMode { .. })
+                | Change::Row(RowChange::SetEnsureKeys { .. })
                 | pbps_model::change_family!(modules)
                 | pbps_model::change_family!(type_values)
                 | pbps_model::catalog_change!()
-                | Change::Grant { .. }
-                | Change::Revoke { .. }
-                | Change::PublicExecution { .. } => continue,
+                | Change::Permission(GrantChange::Grant { .. })
+                | Change::Permission(GrantChange::Revoke { .. })
+                | Change::Permission(GrantChange::PublicExecution { .. }) => continue,
             };
             let removal = match event {
                 Event::DropTable { name } => Some((name, None)),

@@ -14,6 +14,9 @@
 //! with it.
 
 use crate::schema_diff::Side;
+use pbps_model::ColumnChange;
+use pbps_model::TableChange;
+use pbps_model::TablePropertyChange;
 use pbps_model::{Change, CommentTarget, Text};
 use std::collections::BTreeSet;
 
@@ -29,7 +32,7 @@ pub(crate) fn changes(base: Side<'_>, declared: Side<'_>, planned: &[Change]) ->
     let created: BTreeSet<_> = planned
         .iter()
         .filter_map(|c| {
-            if let Change::CreateTable { name, .. } = c {
+            if let Change::Table(TableChange::CreateTable { name, .. }) = c {
                 Some(name)
             } else {
                 None
@@ -39,7 +42,7 @@ pub(crate) fn changes(base: Side<'_>, declared: Side<'_>, planned: &[Change]) ->
     let added: BTreeSet<_> = planned
         .iter()
         .filter_map(|c| {
-            if let Change::AddColumn { table, name, .. } = c {
+            if let Change::Column(ColumnChange::AddColumn { table, name, .. }) = c {
                 Some((table, name))
             } else {
                 None
@@ -61,13 +64,13 @@ pub(crate) fn changes(base: Side<'_>, declared: Side<'_>, planned: &[Change]) ->
         if let Some(want) = &table.description {
             let want = comment(Some(want));
             if want != was.and_then(|t| comment(t.description.as_ref())) {
-                out.push(Change::SetComment {
+                out.push(Change::TableProperty(TablePropertyChange::SetComment {
                     target: CommentTarget::Table {
                         uid: uid.clone(),
                         table: name.clone(),
                     },
                     text: want.cloned(),
-                });
+                }));
             }
         }
         for (column, spec) in &table.columns {
@@ -86,13 +89,13 @@ pub(crate) fn changes(base: Side<'_>, declared: Side<'_>, planned: &[Change]) ->
                 .and_then(|c| comment(c.description.as_ref()));
             let want = comment(Some(want));
             if want != have {
-                out.push(Change::SetComment {
+                out.push(Change::TableProperty(TablePropertyChange::SetComment {
                     target: CommentTarget::Column {
                         uid: column_uid.clone(),
                         column: name.column(column),
                     },
                     text: want.cloned(),
-                });
+                }));
             }
         }
     }
@@ -133,6 +136,9 @@ mod tests {
     use crate::schema_diff::diff;
     use indexmap::IndexMap;
     use pbps_dialect::{DescribingDialect, MinimalDialect};
+    use pbps_model::ColumnChange;
+    use pbps_model::TableChange;
+    use pbps_model::TablePropertyChange;
     use pbps_model::{Column, Hints, IdsFile, Intent, Schema, Table};
 
     fn ctx() -> Context {
@@ -200,7 +206,8 @@ mod tests {
         let mut found: Vec<_> = changes
             .iter()
             .filter_map(|c| {
-                let Change::SetComment { target, text } = c else {
+                let Change::TableProperty(TablePropertyChange::SetComment { target, text }) = c
+                else {
                     return None;
                 };
                 Some((
@@ -269,14 +276,12 @@ mod tests {
         );
         let create = changes
             .iter()
-            .position(|c| matches!(c, Change::CreateTable { .. }))
+            .position(|c| matches!(c, Change::Table(TableChange::CreateTable { .. })))
             .unwrap();
-        assert!(
-            changes
-                .iter()
-                .enumerate()
-                .all(|(at, c)| !matches!(c, Change::SetComment { .. }) || at > create)
-        );
+        assert!(changes.iter().enumerate().all(|(at, c)| !matches!(
+            c,
+            Change::TableProperty(TablePropertyChange::SetComment { .. })
+        ) || at > create));
         let mut grown = schema("app.t", Some("a table"), Some("a column"));
         grown
             .tables
@@ -331,7 +336,7 @@ mod tests {
         assert!(
             changes
                 .iter()
-                .any(|c| matches!(c, Change::DropTable { .. }))
+                .any(|c| matches!(c, Change::Table(TableChange::DropTable { .. })))
         );
         assert_eq!(
             comments(&changes),
@@ -349,7 +354,7 @@ mod tests {
         assert!(
             changes
                 .iter()
-                .any(|c| matches!(c, Change::AddColumn { .. }))
+                .any(|c| matches!(c, Change::Column(ColumnChange::AddColumn { .. })))
         );
         assert_eq!(
             comments(&changes),
@@ -372,7 +377,7 @@ mod tests {
         assert!(
             changes
                 .iter()
-                .any(|c| matches!(c, Change::RenameTable { .. }))
+                .any(|c| matches!(c, Change::Table(TableChange::RenameTable { .. })))
         );
         assert!(comments(&changes).is_empty(), "{changes:?}");
         let edited = schema("app.new", Some("edited"), Some("held column"));
@@ -383,11 +388,16 @@ mod tests {
         );
         let rename = changes
             .iter()
-            .position(|c| matches!(c, Change::RenameTable { .. }))
+            .position(|c| matches!(c, Change::Table(TableChange::RenameTable { .. })))
             .unwrap();
         let comment = changes
             .iter()
-            .position(|c| matches!(c, Change::SetComment { .. }))
+            .position(|c| {
+                matches!(
+                    c,
+                    Change::TableProperty(TablePropertyChange::SetComment { .. })
+                )
+            })
             .unwrap();
         assert!(rename < comment, "{changes:?}");
     }

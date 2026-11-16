@@ -109,6 +109,8 @@ fn two_spellings_are_two_names_without_any_catalog_fact() {
 #[test]
 fn a_constraint_trigger_releases_its_own_and_its_clones_constraint_slots() {
     use pbps_diff::order::slots::{SlotViolation, analyse, edges, verify};
+    use pbps_model::ConstraintChange;
+    use pbps_model::ModuleChange;
     use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
     use pbps_model::plan_names::PlanNames;
     use pbps_model::{
@@ -148,14 +150,14 @@ fn a_constraint_trigger_releases_its_own_and_its_clones_constraint_slots() {
     for constraint in [false, true] {
         schema.modules.insert(trigger.clone(), module(constraint));
         let changes = vec![
-            PlannedChange::new(Change::DropModule {
+            PlannedChange::new(Change::Module(ModuleChange::DropModule {
                 id: trigger.clone(),
                 kind: ModuleKind::Trigger,
-            }),
-            PlannedChange::new(Change::CreateModule {
+            })),
+            PlannedChange::new(Change::Module(ModuleChange::CreateModule {
                 id: trigger.clone(),
                 module: Box::new(module(constraint)),
-            }),
+            })),
         ];
         let names = PlanNames::of(&changes, &ids).unwrap();
         let owners = PlanOwners::new(names, &ids, &ids);
@@ -206,17 +208,17 @@ fn a_constraint_trigger_releases_its_own_and_its_clones_constraint_slots() {
     ] {
         schema.modules.insert(trigger.clone(), module(was));
         let changes: Vec<_> = vec![
-            Change::AddCheck {
+            Change::Constraint(ConstraintChange::AddCheck {
                 table: target.clone(),
                 name: "audit".into(),
                 constraint: CheckConstraint {
                     expression: "id > 0".into(),
                 },
-            },
-            Change::AlterModule {
+            }),
+            Change::Module(ModuleChange::AlterModule {
                 id: trigger.clone(),
                 module: Box::new(module(will)),
-            },
+            }),
         ]
         .into_iter()
         .map(PlannedChange::new)
@@ -275,6 +277,9 @@ fn a_constraint_trigger_releases_its_own_and_its_clones_constraint_slots() {
 #[test]
 fn an_arriving_partition_claims_a_constraint_clone_only_until_its_parent_releases_it() {
     use pbps_diff::order::slots::{SlotViolation, analyse, edges, verify};
+    use pbps_model::ModuleChange;
+    use pbps_model::PartitionChange;
+    use pbps_model::TableChange;
     use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
     use pbps_model::plan_names::PlanNames;
     use pbps_model::{
@@ -327,31 +332,31 @@ fn an_arriving_partition_claims_a_constraint_clone_only_until_its_parent_release
                 columns: Default::default(),
             });
             let arrival = if attach {
-                Change::AttachPartition {
+                Change::Partition(PartitionChange::AttachPartition {
                     uid: child_uid.clone(),
                     table: child.clone(),
                     parent: parent.clone(),
                     bound: PartitionBound::Default,
                     key: Vec::new(),
                     shape: Box::new(shape),
-                }
+                })
             } else {
-                Change::CreateTable {
+                Change::Table(TableChange::CreateTable {
                     uid: child_uid.clone(),
                     name: child.clone(),
                     table: Box::new(shape),
                     beside_default: None,
                     moves_at_most: None,
-                }
+                })
             };
             let mut after_ids = ids.clone();
             after_ids.tables.insert(child_uid.clone(), child.clone());
             let changes: Vec<_> = [
                 arrival,
-                Change::AlterModule {
+                Change::Module(ModuleChange::AlterModule {
                     id: id.clone(),
                     module: Box::new(trigger(will)),
-                },
+                }),
             ]
             .into_iter()
             .map(PlannedChange::new)
@@ -419,6 +424,9 @@ fn an_arriving_partition_claims_a_constraint_clone_only_until_its_parent_release
 #[test]
 fn an_attach_claims_its_standing_checks_instead_of_its_final_checks() {
     use pbps_diff::order::slots::{analyse, edges};
+    use pbps_model::ConstraintChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::PartitionChange;
     use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
     use pbps_model::plan_names::PlanNames;
     use pbps_model::{
@@ -472,32 +480,32 @@ fn an_attach_claims_its_standing_checks_instead_of_its_final_checks() {
             checks: [("audit".into(), check.clone())].into(),
             ..Table::default()
         };
-        let attach = Change::AttachPartition {
+        let attach = Change::Partition(PartitionChange::AttachPartition {
             uid: ids.table_uid(&child).unwrap().clone(),
             table: child.clone(),
             parent: parent.clone(),
             bound: PartitionBound::Default,
             key: Vec::new(),
             shape: Box::new(shape),
-        };
+        });
         let mut changes = Vec::new();
         if removed_first {
-            changes.push(Change::DropCheck {
+            changes.push(Change::Constraint(ConstraintChange::DropCheck {
                 table: child.clone(),
                 name: "audit".into(),
-            });
+            }));
         }
         let at = changes.len();
         changes.push(attach);
-        changes.push(Change::AddCheck {
+        changes.push(Change::Constraint(ConstraintChange::AddCheck {
             table: child.clone(),
             name: "audit".into(),
             constraint: check,
-        });
-        changes.push(Change::AlterModule {
+        }));
+        changes.push(Change::Module(ModuleChange::AlterModule {
             id: id.clone(),
             module: Box::new(module(false)),
-        });
+        }));
         let changes: Vec<_> = changes.into_iter().map(PlannedChange::new).collect();
         let names = PlanNames::of(&changes, &ids).unwrap();
         let owners = PlanOwners::new(names, &ids, &ids);

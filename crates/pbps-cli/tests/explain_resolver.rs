@@ -1,6 +1,8 @@
 //! Saved resolver artifacts: reviewable from the file alone, and approved
 //! through the ordinary command (#616).
 
+use pbps_model::ColumnChange;
+use pbps_model::RowChange;
 use pbps_model::data::{DataMode, DataScope};
 use pbps_model::resolver::*;
 use pbps_model::{
@@ -893,28 +895,28 @@ fn changes_naming(text: &str) -> (ChangeSet, IdsFile) {
         planned.risks = pbps_pg::Postgres::new().change_risks(&planned.change);
         planned
     };
-    let mut added = planned(Change::AddColumn {
+    let mut added = planned(Change::Column(ColumnChange::AddColumn {
         uid: uid("c_aaaaaa"),
         table: table.clone(),
         name: kept.clone().into(),
         column: Box::new(Column::new("int".parse().unwrap())),
-    });
+    }));
     added.findings = vec![Finding::new(text, Severity::Warning, text, None)];
     let changes = ChangeSet {
         changes: vec![
             added,
-            planned(Change::DropColumn {
+            planned(Change::Column(ColumnChange::DropColumn {
                 uid: uid("c_bbbbbb"),
                 column: table.column(dropped),
-            }),
-            planned(Change::AlterColumnNullability {
+            })),
+            planned(Change::Column(ColumnChange::AlterColumnNullability {
                 uid: uid("c_aaaaaa"),
                 column: table.column(&kept),
                 ty: "int".parse().unwrap(),
                 to_nullable: false,
                 collation: None,
                 through_external_partitions: false,
-            }),
+            })),
         ],
     };
     let ids = IdsFile {
@@ -1136,17 +1138,17 @@ fn plan_with_free_text(reason: &str) -> SavedPlan {
     column.deprecated = Some(reason.into());
     let changes = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::AddColumn {
+            PlannedChange::new(Change::Column(ColumnChange::AddColumn {
                 uid: uid("c_aaaaaa"),
                 table: table.clone(),
                 name: "kept".into(),
                 column: Box::new(column),
-            }),
-            PlannedChange::new(Change::SetColumnDeprecated {
+            })),
+            PlannedChange::new(Change::Column(ColumnChange::SetColumnDeprecated {
                 uid: uid("c_bbbbbb"),
                 column: table.column("old"),
                 reason: Some(reason.into()),
-            }),
+            })),
         ],
     };
     let ids = IdsFile {
@@ -1292,7 +1294,9 @@ fn a_refusal_naming_an_object_shows_the_name_escaped_on_explain_and_apply() {
             // is otherwise consistent, so explain and apply reach the emitter.
             what: "the emitter (UnquotableIdent)",
             edit: |plan| {
-                let Change::DropColumn { column, .. } = &mut plan.changes.changes[1].change else {
+                let Change::Column(ColumnChange::DropColumn { column, .. }) =
+                    &mut plan.changes.changes[1].change
+                else {
                     unreachable!()
                 };
                 column.name = ["\0", column.name.raw()].concat().into();
@@ -1428,7 +1432,7 @@ fn plan_holding_bytea_row(value: &str, key_column: &str, identity_key: bool) -> 
         .into(),
         ..Default::default()
     };
-    let change = PlannedChange::new(Change::InsertRow {
+    let change = PlannedChange::new(Change::Row(RowChange::InsertRow {
         table,
         key_column: key_column.into(),
         identity_key,
@@ -1438,7 +1442,7 @@ fn plan_holding_bytea_row(value: &str, key_column: &str, identity_key: bool) -> 
             .collect(),
         defaults: Default::default(),
         types: [("payload".into(), "bytea".parse().unwrap())].into(),
-    });
+    }));
     SavedPlan::new(
         PlanOrigin::Database,
         "postgres",

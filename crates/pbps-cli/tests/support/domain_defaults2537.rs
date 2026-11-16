@@ -1,5 +1,6 @@
 //! Creation-time domain DEFAULT copies remain physical evidence, not authored overrides.
 use super::*;
+use pbps_model::TypeValueChange;
 use pbps_model::{Change, ManagedType, SavedPlan, StateSnapshot};
 
 fn domain(d: &Demo, name: &str, base: &str, default: Option<&str>) {
@@ -54,7 +55,9 @@ fn assert_default(db: &str, name: &str, value: Option<&str>) {
 }
 fn only_default(saved: &SavedPlan, name: &str, value: Option<&str>) {
     assert_eq!(saved.changes.changes.len(), 1, "{:?}", saved.changes);
-    let Change::AlterDomain { name: at, to, .. } = &saved.changes.changes[0].change else {
+    let Change::TypeValue(TypeValueChange::AlterDomain { name: at, to, .. }) =
+        &saved.changes.changes[0].change
+    else {
         panic!("DEFAULT change expected")
     };
     assert_eq!(at, &name.parse::<pbps_model::TypeRef>().unwrap());
@@ -205,7 +208,7 @@ fn explicit_defaults_equal_to_a_copy_are_written_and_can_be_removed() {
         std::fs::write(file, text).unwrap();
         d.commit();
         let (path, saved) = plan(&d, db);
-        assert!(saved.changes.changes.iter().all(|p| matches!(&p.change, Change::AlterDomain { from, to, .. } if default(from).is_none() && default(to).is_none())));
+        assert!(saved.changes.changes.iter().all(|p| matches!(&p.change, Change::TypeValue(TypeValueChange::AlterDomain { from, to, .. }) if default(from).is_none() && default(to).is_none())));
         succeeds(d.run(&[
             "apply",
             "--db",

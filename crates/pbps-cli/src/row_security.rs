@@ -1,5 +1,6 @@
 //! Policy admission, dependency releases, and connected ownership targets.
 
+use pbps_model::PolicyChange;
 use pbps_model::{Change, IdsFile};
 #[cfg(test)]
 use pbps_model::{ChangeSet, Uid};
@@ -46,6 +47,8 @@ pub(crate) fn standing_owners(
     changes: &pbps_model::ChangeSet,
     ids: &IdsFile,
 ) -> anyhow::Result<Vec<pbps_model::TableName>> {
+    use pbps_model::PolicyChange;
+    use pbps_model::TableChange;
     use pbps_model::{
         Change,
         plan_names::{At, Holder, PlanNames},
@@ -54,12 +57,12 @@ pub(crate) fn standing_owners(
     let mut created = std::collections::BTreeSet::new();
     let mut tables = std::collections::BTreeSet::new();
     for (at, step) in changes.changes.iter().enumerate() {
-        if let Change::CreateTable { uid, .. } = &step.change {
+        if let Change::Table(TableChange::CreateTable { uid, .. }) = &step.change {
             created.insert(uid);
         }
-        if let Change::DropPolicy { table, .. }
-        | Change::CreatePolicy { table, .. }
-        | Change::SetRowSecurity { table, .. } = &step.change
+        if let Change::Policy(PolicyChange::DropPolicy { table, .. })
+        | Change::Policy(PolicyChange::CreatePolicy { table, .. })
+        | Change::Policy(PolicyChange::SetRowSecurity { table, .. }) = &step.change
         {
             let Holder::Tracked(uid) = names.holder(table, At::Before(at)) else {
                 anyhow::bail!(
@@ -92,17 +95,17 @@ pub(crate) fn check_dropped_policies(
     if !changes
         .changes
         .iter()
-        .any(|step| matches!(step.change, Change::DropPolicy { .. }))
+        .any(|step| matches!(step.change, Change::Policy(PolicyChange::DropPolicy { .. })))
     {
         return Ok(());
     }
     let names = PlanNames::of(&changes.changes, ids)?;
     for (at, step) in changes.changes.iter().enumerate() {
-        let Change::DropPolicy {
+        let Change::Policy(PolicyChange::DropPolicy {
             table,
             name,
             policy,
-        } = &step.change
+        }) = &step.change
         else {
             continue;
         };
@@ -146,6 +149,9 @@ pub(crate) fn binding_notices(schema: &pbps_model::Schema) -> Vec<String> {
 mod tests {
     use super::*;
     use pbps_diff::order::row_security::check_releases as check_policy_releases;
+    use pbps_model::ColumnChange;
+    use pbps_model::PolicyChange;
+    use pbps_model::TableChange;
     use pbps_model::{PlannedChange, RowPolicy, RowSecurity, RowSecurityOrigin, Table, TableName};
 
     fn fixture() -> (ChangeSet, IdsFile) {
@@ -162,7 +168,7 @@ mod tests {
         let mut ids = IdsFile::default();
         ids.tables.insert(uid.clone(), table.clone());
         let changes = vec![
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: uid.clone(),
                 name: table.clone(),
                 table: Box::new(Table {
@@ -172,20 +178,20 @@ mod tests {
                 }),
                 beside_default: None,
                 moves_at_most: None,
-            },
-            Change::CreatePolicy {
+            }),
+            Change::Policy(PolicyChange::CreatePolicy {
                 table: table.clone(),
                 name: "p".into(),
                 policy,
                 origin: RowSecurityOrigin::Created,
-            },
-            Change::SetRowSecurity {
+            }),
+            Change::Policy(PolicyChange::SetRowSecurity {
                 uid,
                 table,
                 from: Default::default(),
                 to: flags,
                 origin: RowSecurityOrigin::Created,
-            },
+            }),
         ];
         (
             ChangeSet {
@@ -257,28 +263,28 @@ mod tests {
         ids.tables.insert(original.clone(), kept.clone());
         let mut plan = ChangeSet {
             changes: vec![
-                Change::DropColumn {
+                Change::Column(ColumnChange::DropColumn {
                     uid: target.clone(),
                     column: input.column("target"),
-                },
-                Change::RenameTable {
+                }),
+                Change::Table(TableChange::RenameTable {
                     uid: original.clone(),
                     from: owner.clone(),
                     to: kept.clone(),
                     defaults: vec![],
-                },
-                Change::CreateTable {
+                }),
+                Change::Table(TableChange::CreateTable {
                     uid: replacement.clone(),
                     name: owner.clone(),
                     table: Box::default(),
                     beside_default: None,
                     moves_at_most: None,
-                },
-                Change::DropTable {
+                }),
+                Change::Table(TableChange::DropTable {
                     uid: replacement.clone(),
                     name: owner.clone(),
                     detach_from: None,
-                },
+                }),
             ]
             .into_iter()
             .map(PlannedChange::new)
@@ -304,11 +310,12 @@ mod tests {
             refused.contains("original_policy") && refused.contains("explicitly remove or replace"),
             "{refused}"
         );
-        plan.changes.push(PlannedChange::new(Change::DropTable {
-            uid: original.clone(),
-            name: kept,
-            detach_from: None,
-        }));
+        plan.changes
+            .push(PlannedChange::new(Change::Table(TableChange::DropTable {
+                uid: original.clone(),
+                name: kept,
+                detach_from: None,
+            })));
         ids.tables.remove(&original);
         let edges = policy_releases(&plan, &ids, &found).unwrap();
         assert_eq!((edges[0].before, edges[0].after), (4, 0));
@@ -330,19 +337,19 @@ mod tests {
             .insert(column_uid.clone(), after.column("renamed"));
         let mut plan = ChangeSet {
             changes: vec![
-                Change::RenameTable {
+                Change::Table(TableChange::RenameTable {
                     uid: table_uid.clone(),
                     from: before,
                     to: after.clone(),
                     defaults: vec![],
-                },
-                Change::RenameColumn {
+                }),
+                Change::Column(ColumnChange::RenameColumn {
                     uid: column_uid.clone(),
                     table: after,
                     from: "original".into(),
                     to: "renamed".into(),
                     table_was: Some(TableName::new("app", "before")),
-                },
+                }),
             ]
             .into_iter()
             .map(PlannedChange::new)
@@ -379,11 +386,11 @@ mod tests {
         found.insert(owner_uid.clone(), vec![]);
         plan.changes.insert(
             0,
-            PlannedChange::new(Change::DropTable {
+            PlannedChange::new(Change::Table(TableChange::DropTable {
                 uid: owner_uid,
                 name: owner,
                 detach_from: None,
-            }),
+            })),
         );
         let edges = policy_releases(&plan, &ids, &found).unwrap();
         assert_eq!((edges[0].before, edges[0].after), (0, 2));
@@ -424,17 +431,23 @@ mod tests {
                 4 => changes.changes.swap(1, 2),
                 5 => changes.changes.push(changes.changes[1].clone()),
                 6 => {
-                    if let Change::CreatePolicy { name, .. } = &mut changes.changes[1].change {
+                    if let Change::Policy(PolicyChange::CreatePolicy { name, .. }) =
+                        &mut changes.changes[1].change
+                    {
                         *name = "extra".into();
                     }
                 }
                 7 => {
-                    if let Change::SetRowSecurity { uid, .. } = &mut changes.changes[2].change {
+                    if let Change::Policy(PolicyChange::SetRowSecurity { uid, .. }) =
+                        &mut changes.changes[2].change
+                    {
                         *uid = "t_117201".parse().unwrap();
                     }
                 }
                 _ => {
-                    if let Change::SetRowSecurity { from, .. } = &mut changes.changes[2].change {
+                    if let Change::Policy(PolicyChange::SetRowSecurity { from, .. }) =
+                        &mut changes.changes[2].change
+                    {
                         from.enabled = true;
                     }
                 }
@@ -445,20 +458,22 @@ mod tests {
             );
         }
         let mut dropping_created = good.clone();
-        if let Change::CreatePolicy {
+        if let Change::Policy(PolicyChange::CreatePolicy {
             table,
             name,
             policy,
             ..
-        } = &good.changes[1].change
+        }) = &good.changes[1].change
         {
             dropping_created
                 .changes
-                .push(PlannedChange::new(Change::DropPolicy {
-                    table: table.clone(),
-                    name: name.clone(),
-                    policy: policy.clone(),
-                }));
+                .push(PlannedChange::new(Change::Policy(
+                    PolicyChange::DropPolicy {
+                        table: table.clone(),
+                        name: name.clone(),
+                        policy: policy.clone(),
+                    },
+                )));
         }
         assert!(
             validate(&dropping_created, &ids, &pbps_pg::Postgres::new())
@@ -482,7 +497,8 @@ mod tests {
         let (created, ids) = fixture();
         for at in [1, 2] {
             let mut forged = created.clone();
-            let (Change::CreatePolicy { origin, .. } | Change::SetRowSecurity { origin, .. }) =
+            let (Change::Policy(PolicyChange::CreatePolicy { origin, .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { origin, .. })) =
                 &mut forged.changes[at].change
             else {
                 unreachable!("fixture contains only policy and flag steps");
@@ -498,8 +514,8 @@ mod tests {
         let mut standing = created.clone();
         standing.changes.remove(0);
         for step in &mut standing.changes {
-            let (Change::CreatePolicy { origin, .. } | Change::SetRowSecurity { origin, .. }) =
-                &mut step.change
+            let (Change::Policy(PolicyChange::CreatePolicy { origin, .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { origin, .. })) = &mut step.change
             else {
                 unreachable!("fixture contains only policy and flag steps");
             };
@@ -508,7 +524,8 @@ mod tests {
         validate(&standing, &ids, &pg).unwrap();
         for at in [0, 1] {
             let mut forged = standing.clone();
-            let (Change::CreatePolicy { origin, .. } | Change::SetRowSecurity { origin, .. }) =
+            let (Change::Policy(PolicyChange::CreatePolicy { origin, .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { origin, .. })) =
                 &mut forged.changes[at].change
             else {
                 unreachable!("fixture contains only policy and flag steps");
@@ -521,7 +538,9 @@ mod tests {
                     .contains("forged row-security origin")
             );
         }
-        if let Change::SetRowSecurity { uid, .. } = &mut standing.changes[1].change {
+        if let Change::Policy(PolicyChange::SetRowSecurity { uid, .. }) =
+            &mut standing.changes[1].change
+        {
             *uid = "t_117301".parse().unwrap();
         }
         assert!(validate(&standing, &ids, &pg).is_err());
@@ -535,16 +554,16 @@ mod tests {
         let renamed = TableName::new("app", "renamed");
         changes.changes.insert(
             1,
-            PlannedChange::new(Change::RenameTable {
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: uid.clone(),
                 from: old.clone(),
                 to: renamed.clone(),
                 defaults: vec![],
-            }),
+            })),
         );
         for step in &mut changes.changes[2..] {
-            let (Change::CreatePolicy { table, .. } | Change::SetRowSecurity { table, .. }) =
-                &mut step.change
+            let (Change::Policy(PolicyChange::CreatePolicy { table, .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { table, .. })) = &mut step.change
             else {
                 unreachable!("fixture contains only policy and flag steps");
             };
@@ -557,15 +576,15 @@ mod tests {
         ids.tables.insert(standing_uid.clone(), old.clone());
         changes.changes.insert(
             2,
-            PlannedChange::new(Change::RenameTable {
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: standing_uid,
                 from: before,
                 to: old.clone(),
                 defaults: vec![],
-            }),
+            })),
         );
         let mut forged = changes.changes[3].clone();
-        if let Change::CreatePolicy { table, .. } = &mut forged.change {
+        if let Change::Policy(PolicyChange::CreatePolicy { table, .. }) = &mut forged.change {
             *table = old;
         }
         changes.changes.push(forged);
@@ -584,30 +603,30 @@ mod tests {
         let (mut changes, ids) = fixture();
         changes.changes.remove(0);
         for step in &mut changes.changes {
-            let (Change::CreatePolicy { origin, .. } | Change::SetRowSecurity { origin, .. }) =
-                &mut step.change
+            let (Change::Policy(PolicyChange::CreatePolicy { origin, .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { origin, .. })) = &mut step.change
             else {
                 unreachable!("fixture contains only policy and flag steps");
             };
             *origin = RowSecurityOrigin::Standing;
         }
-        let Change::CreatePolicy {
+        let Change::Policy(PolicyChange::CreatePolicy {
             table,
             name,
             policy,
             ..
-        } = &changes.changes[0].change
+        }) = &changes.changes[0].change
         else {
             unreachable!("fixture starts with a policy creation");
         };
         let (table, name, policy) = (table.clone(), name.clone(), policy.clone());
         changes.changes.insert(
             0,
-            PlannedChange::new(Change::DropPolicy {
+            PlannedChange::new(Change::Policy(PolicyChange::DropPolicy {
                 table,
                 name,
                 policy,
-            }),
+            })),
         );
         let risks = pbps_diff::order::generated::risks(&changes, &ids, &pg);
         for (step, risks) in changes.changes.iter_mut().zip(risks) {
@@ -673,8 +692,8 @@ mod tests {
             let created_plan = singleton(step.clone(), PlanMode::Transactional, &pg);
             assert!(!pg.emit(&created_plan, 0).unwrap().is_empty());
             let mut standing = step.change.clone();
-            let (Change::CreatePolicy { origin, .. } | Change::SetRowSecurity { origin, .. }) =
-                &mut standing
+            let (Change::Policy(PolicyChange::CreatePolicy { origin, .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { origin, .. })) = &mut standing
             else {
                 unreachable!("fixture contains only policy and flag steps");
             };
@@ -705,11 +724,11 @@ mod tests {
                     .contains("PostgreSQL row-security")
             );
         }
-        let drop = Change::DropPolicy {
+        let drop = Change::Policy(PolicyChange::DropPolicy {
             table: TableName::new("app", "docs"),
             name: "p".into(),
             policy: RowPolicy::default(),
-        };
+        });
         let pg_drop = singleton(
             PlannedChange::new(drop.clone()),
             PlanMode::Transactional,
@@ -735,6 +754,9 @@ mod live_tests;
 #[cfg(test)]
 mod transition_tests {
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::PolicyChange;
+    use pbps_model::TableChange;
     use pbps_model::{
         Change, ChangeSet, PlannedChange, RowPolicy, RowSecurity, RowSecurityOrigin, TableName, Uid,
     };
@@ -755,18 +777,18 @@ mod transition_tests {
             ..Default::default()
         };
         for change in [
-            Change::DropPolicy {
+            Change::Policy(PolicyChange::DropPolicy {
                 table: table.clone(),
                 name: "p".into(),
                 policy: RowPolicy::default(),
-            },
-            Change::CreatePolicy {
+            }),
+            Change::Policy(PolicyChange::CreatePolicy {
                 table: table.clone(),
                 name: "p".into(),
                 policy: RowPolicy::default(),
                 origin: RowSecurityOrigin::Standing,
-            },
-            Change::SetRowSecurity {
+            }),
+            Change::Policy(PolicyChange::SetRowSecurity {
                 uid: uid.clone(),
                 table: table.clone(),
                 from: RowSecurity::default(),
@@ -775,7 +797,7 @@ mod transition_tests {
                     forced: false,
                 },
                 origin: RowSecurityOrigin::Standing,
-            },
+            }),
         ] {
             let mut cs = changes(vec![change]);
             let pg = pbps_pg::Postgres::new();
@@ -814,7 +836,7 @@ mod transition_tests {
                     .contains("DEC-1173.3")
             );
         }
-        let hidden = changes(vec![Change::CreateTable {
+        let hidden = changes(vec![Change::Table(TableChange::CreateTable {
             uid,
             name: table,
             table: Box::new(pbps_model::Table {
@@ -826,7 +848,7 @@ mod transition_tests {
             }),
             beside_default: None,
             moves_at_most: None,
-        }]);
+        })]);
         let staged = SavedPlan::new(
             PlanOrigin::Database,
             "postgres",
@@ -875,30 +897,30 @@ mod transition_tests {
             ..Default::default()
         };
         let cs = changes(vec![
-            Change::RenameTable {
+            Change::Table(TableChange::RenameTable {
                 uid,
                 from: old.clone(),
                 to: new.clone(),
                 defaults: vec![],
-            },
-            Change::CreateTable {
+            }),
+            Change::Table(TableChange::CreateTable {
                 uid: replacement,
                 name: old.clone(),
                 table: Box::default(),
                 beside_default: None,
                 moves_at_most: None,
-            },
-            Change::CreatePolicy {
+            }),
+            Change::Policy(PolicyChange::CreatePolicy {
                 table: old.clone(),
                 name: "new".into(),
                 policy: RowPolicy::default(),
                 origin: RowSecurityOrigin::Created,
-            },
-            Change::DropPolicy {
+            }),
+            Change::Policy(PolicyChange::DropPolicy {
                 table: new,
                 name: "standing".into(),
                 policy: RowPolicy::default(),
-            },
+            }),
         ]);
         assert_eq!(standing_owners(&cs, &ids).unwrap(), vec![old]);
     }
@@ -916,21 +938,21 @@ mod transition_tests {
             ..Default::default()
         };
         let mut cs = changes(vec![
-            Change::RenameTable {
+            Change::Table(TableChange::RenameTable {
                 uid: owner.clone(),
                 from: old.clone(),
                 to: new.clone(),
                 defaults: vec![],
-            },
-            Change::DropPolicy {
+            }),
+            Change::Policy(PolicyChange::DropPolicy {
                 table: new,
                 name: "gate".into(),
                 policy: RowPolicy::default(),
-            },
-            Change::DropColumn {
+            }),
+            Change::Column(ColumnChange::DropColumn {
                 uid: col.clone(),
                 column: source.column("v"),
-            },
+            }),
         ]);
         let facts = [
             (owner, vec![]),
@@ -946,7 +968,8 @@ mod transition_tests {
         let edges = policy_releases(&cs, &ids, &facts).unwrap();
         assert_eq!((edges[0].before, edges[0].after), (1, 2));
         pbps_diff::order::row_security::check_releases(&cs, &ids, &facts).unwrap();
-        let Change::DropPolicy { name, .. } = &mut cs.changes[1].change else {
+        let Change::Policy(PolicyChange::DropPolicy { name, .. }) = &mut cs.changes[1].change
+        else {
             unreachable!()
         };
         *name = "sibling".into();
@@ -964,6 +987,8 @@ mod transition_tests {
 #[cfg(test)]
 mod dropped_policy_tests {
     use super::*;
+    use pbps_model::PolicyChange;
+    use pbps_model::TableChange;
     use pbps_model::{
         PlannedChange, PolicyCommand, PolicyRoles, RowPolicy, Schema, Table, TableName,
     };
@@ -990,24 +1015,24 @@ mod dropped_policy_tests {
         };
         let changes = ChangeSet {
             changes: vec![
-                Change::RenameTable {
+                Change::Table(TableChange::RenameTable {
                     uid,
                     from: opening.clone(),
                     to: final_name.clone(),
                     defaults: vec![],
-                },
-                Change::CreateTable {
+                }),
+                Change::Table(TableChange::CreateTable {
                     uid: replacement,
                     name: opening.clone(),
                     table: Box::default(),
                     beside_default: None,
                     moves_at_most: None,
-                },
-                Change::DropPolicy {
+                }),
+                Change::Policy(PolicyChange::DropPolicy {
                     table: final_name,
                     name: policy_name.into(),
                     policy: policy.clone(),
-                },
+                }),
             ]
             .into_iter()
             .map(PlannedChange::new)
@@ -1026,7 +1051,9 @@ mod dropped_policy_tests {
         };
         check_dropped_policies(&changes, &ids, &before).unwrap();
         let mut declared = changes.clone();
-        let Change::DropPolicy { policy, .. } = &mut declared.changes[2].change else {
+        let Change::Policy(PolicyChange::DropPolicy { policy, .. }) =
+            &mut declared.changes[2].change
+        else {
             unreachable!()
         };
         policy.using = Some("id > 0".into());
@@ -1034,7 +1061,9 @@ mod dropped_policy_tests {
         check_dropped_policies(&declared, &ids, &before).unwrap();
         for field in 0..5 {
             let mut changed = changes.clone();
-            let Change::DropPolicy { policy, .. } = &mut changed.changes[2].change else {
+            let Change::Policy(PolicyChange::DropPolicy { policy, .. }) =
+                &mut changed.changes[2].change
+            else {
                 unreachable!()
             };
             match field {

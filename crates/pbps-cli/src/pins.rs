@@ -161,7 +161,7 @@ pub(crate) fn require_declared_types(
 ) -> anyhow::Result<()> {
     for uid in required {
         if !pins.iter().any(|p| &p.uid == uid)
-            && !changes.changes.iter().any(|s| matches!(&s.change, pbps_model::Change::DropType { uid: dropped, .. } if dropped == uid))
+            && !changes.changes.iter().any(|s| matches!(&s.change, pbps_model::Change::Type(pbps_model::TypeChange::DropType { uid: dropped, .. }) if dropped == uid))
         {
             bail!("plan has no declared type pin for uid `{uid}`; plan again against the database");
         }
@@ -874,11 +874,13 @@ mod type_identity_tests {
         let definition = pbps_model::ManagedType::Enum {
             values: vec!["ok".into()],
         };
-        let created = pbps_model::PlannedChange::new(pbps_model::Change::CreateType {
-            uid: new,
-            name: name.clone(),
-            definition: Box::new(definition.clone()),
-        });
+        let created = pbps_model::PlannedChange::new(pbps_model::Change::Type(
+            pbps_model::TypeChange::CreateType {
+                uid: new,
+                name: name.clone(),
+                definition: Box::new(definition.clone()),
+            },
+        ));
         let pin = pbps_model::DeclaredTypePin {
             uid: old.clone(),
             name: name.clone(),
@@ -893,14 +895,16 @@ mod type_identity_tests {
                 changes: vec![created.clone()],
             };
             if rename {
-                changes.changes.push(pbps_model::PlannedChange::new(
-                    pbps_model::Change::RenameType {
-                        uid: old.clone(),
-                        from: name.clone(),
-                        to: "app.kept".parse().unwrap(),
-                        definition: Box::new(definition.clone()),
-                    },
-                ));
+                changes
+                    .changes
+                    .push(pbps_model::PlannedChange::new(pbps_model::Change::Type(
+                        pbps_model::TypeChange::RenameType {
+                            uid: old.clone(),
+                            from: name.clone(),
+                            to: "app.kept".parse().unwrap(),
+                            definition: Box::new(definition.clone()),
+                        },
+                    )));
             }
             assert!(require_declared_types(&[old.clone()].into(), &[], &changes).is_err());
             require_declared_types(&[old.clone()].into(), std::slice::from_ref(&pin), &changes)
@@ -910,11 +914,13 @@ mod type_identity_tests {
         let changes = pbps_model::ChangeSet {
             changes: vec![
                 created,
-                pbps_model::PlannedChange::new(pbps_model::Change::DropType {
-                    uid: old.clone(),
-                    name,
-                    definition: Box::new(definition),
-                }),
+                pbps_model::PlannedChange::new(pbps_model::Change::Type(
+                    pbps_model::TypeChange::DropType {
+                        uid: old.clone(),
+                        name,
+                        definition: Box::new(definition),
+                    },
+                )),
             ],
         };
         require_declared_types(&[old].into(), &[], &changes).unwrap();
@@ -943,13 +949,13 @@ mod type_identity_tests {
             .is_err()
         );
         let changes = pbps_model::ChangeSet {
-            changes: vec![pbps_model::PlannedChange::new(
-                pbps_model::Change::DropType {
+            changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Type(
+                pbps_model::TypeChange::DropType {
                     uid: old.clone(),
                     name,
                     definition: Box::new(definition),
                 },
-            )],
+            ))],
         };
         require_declared_types(&[old.clone()].into(), &[pin], &changes).unwrap();
         assert!(require_declared_types(&[old].into(), &[], &Default::default()).is_err());

@@ -1,4 +1,6 @@
 use super::*;
+use pbps_model::ConstraintChange;
+use pbps_model::TableChange;
 use pbps_model::operation::{
     AddressChain, ModuleEdits, Operations, Origin, PlanOwners, Snapshot, Source as LogicalSource,
     effects,
@@ -20,22 +22,22 @@ fn rename_dependencies_follow_consumed_versions_when_endpoint_names_are_equal() 
     };
     let steps = ChangeSet {
         changes: vec![
-            Change::RenameTable {
+            Change::Table(TableChange::RenameTable {
                 uid: uid.clone(),
                 from: name("app.a"),
                 to: name("app.b"),
                 defaults: vec![],
-            },
-            Change::RenameTable {
+            }),
+            Change::Table(TableChange::RenameTable {
                 uid,
                 from: name("app.b"),
                 to: name("app.a"),
                 defaults: vec![],
-            },
-            Change::DropCheck {
+            }),
+            Change::Constraint(ConstraintChange::DropCheck {
                 table: name("app.a"),
                 name: "ck".into(),
-            },
+            }),
         ]
         .into_iter()
         .map(PlannedChange::new)

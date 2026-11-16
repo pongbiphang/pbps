@@ -1,4 +1,5 @@
 use super::super::{Settled, refuse_unplanned_movement};
+use pbps_model::TypeChange;
 use pbps_model::{
     Change, ChangeSet, Column, Generated, Index, IndexColumn, IndexKey, ManagedType, Module,
     ModuleKind, PlannedChange, RowPolicy, Schema, Table, ValueSource,
@@ -114,12 +115,12 @@ fn approved_type_moves_preserve_every_catalog_expression_and_refuse_real_edits()
     let pg = pbps_pg::Postgres::new();
     for to in ["app.feeling", "moved.mood", "moved.feeling"] {
         let changes = ChangeSet {
-            changes: vec![PlannedChange::new(Change::RenameType {
+            changes: vec![PlannedChange::new(Change::Type(TypeChange::RenameType {
                 uid: "y_000001".parse().unwrap(),
                 from: "app.mood".parse().unwrap(),
                 to: to.parse().unwrap(),
                 definition: Box::new(before.types[&"app.mood".parse().unwrap()].clone()),
-            })],
+            }))],
         };
         let after = observed(to);
         let check = |after: &Schema| {
@@ -206,16 +207,16 @@ fn type_replacement_guards_follow_final_uids_and_refuse_the_old_definition() {
         types: [(name.clone(), new.clone())].into(),
         ..Default::default()
     };
-    let create = Change::CreateType {
+    let create = Change::Type(TypeChange::CreateType {
         uid: "y_000002".parse().unwrap(),
         name: name.clone(),
         definition: Box::new(new),
-    };
-    let drop = Change::DropType {
+    });
+    let drop = Change::Type(TypeChange::DropType {
         uid: "y_000001".parse().unwrap(),
         name: name.clone(),
         definition: Box::new(old),
-    };
+    });
     for parts in [
         vec![drop.clone(), create.clone()],
         vec![create.clone(), drop.clone()],
@@ -255,16 +256,16 @@ fn replacement_warnings_name_both_uids_and_preserve_identity_advice() {
     let definition = Box::new(ManagedType::Enum {
         values: vec!["ok".into()],
     });
-    let drop = PlannedChange::new(Change::DropType {
+    let drop = PlannedChange::new(Change::Type(TypeChange::DropType {
         uid: old.clone(),
         name: name.clone(),
         definition: definition.clone(),
-    });
-    let create = PlannedChange::new(Change::CreateType {
+    }));
+    let create = PlannedChange::new(Change::Type(TypeChange::CreateType {
         uid: new,
         name: name.clone(),
         definition: definition.clone(),
-    });
+    }));
     let warnings = type_replacement_warnings(
         &base,
         &desired,
@@ -293,12 +294,12 @@ fn replacement_warnings_name_both_uids_and_preserve_identity_advice() {
         vec![drop],
         vec![create],
         vec![],
-        vec![PlannedChange::new(Change::RenameType {
+        vec![PlannedChange::new(Change::Type(TypeChange::RenameType {
             uid: old,
             from: name,
             to: "app.renamed".parse().unwrap(),
             definition,
-        })],
+        }))],
     ] {
         assert!(
             type_replacement_warnings(&base, &desired, &ChangeSet { changes }, true).is_empty()

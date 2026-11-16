@@ -1,8 +1,10 @@
 use super::*;
+use pbps_model::ConstraintChange;
+use pbps_model::RowChange;
 use pbps_model::{Change, ChangeSet, PlannedChange, RowKey, change::DeleteCause};
 
 fn deletion() -> Change {
-    Change::DeleteRow {
+    Change::Row(RowChange::DeleteRow {
         table: TableName::new("dbo", "parent"),
         key_column: "code".into(),
         key: RowKey::from("1"),
@@ -12,7 +14,7 @@ fn deletion() -> Change {
         types: Default::default(),
         after_types: Default::default(),
         key_type: None,
-    }
+    })
 }
 
 fn plan() -> ChangeSet {
@@ -276,10 +278,10 @@ async fn hidden_security_policy_metadata_is_not_treated_as_no_policy() {
     let mut removed = plan();
     removed.changes.insert(
         0,
-        PlannedChange::new(Change::DropForeignKey {
+        PlannedChange::new(Change::Constraint(ConstraintChange::DropForeignKey {
             table: TableName::new("dbo", "child"),
             name: "fk_child".into(),
-        }),
+        })),
     );
     db.conn
         .execute("EXECUTE AS USER='deployer';")

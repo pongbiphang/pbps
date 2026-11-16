@@ -5,6 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use pbps_dialect::Dialect;
+use pbps_model::ColumnChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
 use pbps_model::resolver::OrderReason;
 use pbps_model::{Change, ColumnRef, IdsFile, PlannedChange, Schema, TableName, ValueSource};
 
@@ -39,11 +42,11 @@ impl fmt::Display for Restoration {
 }
 
 fn parent_set(change: &Change) -> Option<&ColumnRef> {
-    if let Change::AlterColumnDefault {
+    if let Change::Column(ColumnChange::AlterColumnDefault {
         column,
         to: Some(_),
         ..
-    } = change
+    }) = change
     {
         Some(column)
     } else {
@@ -52,14 +55,14 @@ fn parent_set(change: &Change) -> Option<&ColumnRef> {
 }
 
 fn sets(change: &Change, partition: &TableName, column: &ColumnRef) -> bool {
-    matches!(change, Change::SetPartitionDefault { table, column: name, to: Some(_), .. }
+    matches!(change, Change::Partition(PartitionChange::SetPartitionDefault { table, column: name, to: Some(_), .. })
         if table == partition && *name == column.name)
 }
 
 fn created_later(plan: &[PlannedChange], at: usize, partition: &TableName) -> bool {
     plan[at + 1..]
         .iter()
-        .any(|p| matches!(&p.change, Change::CreateTable { name, .. } if name == partition))
+        .any(|p| matches!(&p.change, Change::Table(TableChange::CreateTable { name, .. }) if name == partition))
 }
 
 fn order(before: Step, after: Step, source: Source) -> Order {
@@ -166,7 +169,7 @@ impl<D: Dialect + ?Sized> Expansion for ParentDefaults<'_, D> {
                     partition = need.partition.shown()
                 )
             })?;
-        let change = Change::SetPartitionDefault {
+        let change = Change::Partition(PartitionChange::SetPartitionDefault {
             uid,
             table: need.partition.clone(),
             parent: need.column.table.clone(),
@@ -174,7 +177,7 @@ impl<D: Dialect + ?Sized> Expansion for ParentDefaults<'_, D> {
             from: None,
             to: Some(default),
             fallback: self.fallback(&need.column),
-        };
+        });
         let mut planned = PlannedChange::new(change);
         planned.risks = self.dialect.change_risks(&planned.change);
         Ok(Rewrite::Add {

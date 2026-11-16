@@ -15,6 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::{Conn, DbError};
+use pbps_model::ExtensionChange;
 use pbps_model::escape::Escaped;
 use pbps_model::{
     Change, ChangeSet, ProviderKind, ProviderMember, ProviderPin, Schema, TypePin, TypeProvider,
@@ -232,7 +233,8 @@ pub fn refuse_update_beside_provided(
     noun: Noun,
 ) -> Result<(), String> {
     for planned in &changes.changes {
-        let Change::UpdateExtension { name, .. } = &planned.change else {
+        let Change::Extension(ExtensionChange::UpdateExtension { name, .. }) = &planned.change
+        else {
             continue;
         };
         if let Some(shown) = used(name.raw()) {
@@ -253,7 +255,9 @@ pub fn refuse_update_beside_provided(
 /// (DEC-2447.12). `None` when the plan does not move that package from there.
 pub fn moved_to(extension: &str, schema: &str, changes: &ChangeSet) -> Option<String> {
     changes.changes.iter().find_map(|planned| {
-        let Change::SetExtensionSchema { name, from, to, .. } = &planned.change else {
+        let Change::Extension(ExtensionChange::SetExtensionSchema { name, from, to, .. }) =
+            &planned.change
+        else {
             return None;
         };
         (name.raw() == extension && from.schema == schema).then(|| to.schema.clone())
@@ -531,6 +535,7 @@ pub(crate) fn proof_kind<K: PinKind>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::ExtensionChange;
 
     /// A pin of the fake kind: a schema, a name, a digest and the provider.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -653,14 +658,16 @@ mod tests {
 
     fn update(name: &str) -> ChangeSet {
         ChangeSet {
-            changes: vec![pbps_model::PlannedChange::new(Change::UpdateExtension {
-                uid: "e_aaaaaa".parse().unwrap(),
-                name: name.into(),
-                from: extension("ext", "1.0"),
-                to: extension("ext", "1.1"),
-                requires: Default::default(),
-                releases: Default::default(),
-            })],
+            changes: vec![pbps_model::PlannedChange::new(Change::Extension(
+                ExtensionChange::UpdateExtension {
+                    uid: "e_aaaaaa".parse().unwrap(),
+                    name: name.into(),
+                    from: extension("ext", "1.0"),
+                    to: extension("ext", "1.1"),
+                    requires: Default::default(),
+                    releases: Default::default(),
+                },
+            ))],
         }
     }
 
@@ -768,13 +775,15 @@ mod tests {
     #[test]
     fn a_move_names_only_its_own_package_and_schema() {
         let set = ChangeSet {
-            changes: vec![pbps_model::PlannedChange::new(Change::SetExtensionSchema {
-                uid: "e_aaaaaa".parse().unwrap(),
-                name: "alpha".into(),
-                from: extension("ext", "1.0"),
-                to: extension("moved", "1.0"),
-                releases: Default::default(),
-            })],
+            changes: vec![pbps_model::PlannedChange::new(Change::Extension(
+                ExtensionChange::SetExtensionSchema {
+                    uid: "e_aaaaaa".parse().unwrap(),
+                    name: "alpha".into(),
+                    from: extension("ext", "1.0"),
+                    to: extension("moved", "1.0"),
+                    releases: Default::default(),
+                },
+            ))],
         };
         assert_eq!(moved_to("alpha", "ext", &set).as_deref(), Some("moved"));
         assert_eq!(moved_to("beta", "ext", &set), None);

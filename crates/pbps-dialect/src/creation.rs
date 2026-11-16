@@ -1,5 +1,10 @@
 //! Demand selection and portable creation parts (DEC-2469.4).
 use crate::{Dialect, DialectError};
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::TableChange;
+use pbps_model::TablePropertyChange;
 use pbps_model::object_ref::{ObjectRef, Root, Selector};
 use pbps_model::operation::PartKey;
 use pbps_model::{Change, Column, ColumnName, IdsFile, TableName, ValueSource};
@@ -113,7 +118,7 @@ impl Demand {
     ) -> Self {
         let mut demand = Self::of(change, request.references);
         demand.scratch = request.scratch;
-        if let Change::CreateTable { name, table, .. } = change {
+        if let Change::Table(TableChange::CreateTable { name, table, .. }) = change {
             demand.inline = dialect.creation_inline(name, table);
             demand.inline.close(name, table, request, dialect);
             // A dependency on the atomic NOT NULL needs the whole column
@@ -180,11 +185,11 @@ pub fn expose(
     let empty: BTreeSet<_> = parts
         .iter()
         .filter_map(|change| {
-            if let Change::CreateTable {
+            if let Change::Table(TableChange::CreateTable {
                 name,
                 beside_default: None,
                 ..
-            } = change
+            }) = change
             {
                 Some(name.clone())
             } else {
@@ -209,13 +214,13 @@ pub fn expose(
     for mut change in parts {
         let mut tail = Vec::new();
         match &mut change {
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: table_uid,
                 name,
                 table,
                 beside_default,
                 ..
-            } if beside_default.is_none() => {
+            }) if beside_default.is_none() => {
                 let full = (**table).clone();
                 // A held engine recipe may return the original shape. Clamp
                 // its physical cut against the same inline group here too.
@@ -229,12 +234,12 @@ pub fn expose(
                         let column_uid = uid(name, &column)?;
                         let mut facets = Vec::new();
                         split_column(name, &column, &column_uid, &mut spec, demand, &mut facets);
-                        tail.push(Change::AddColumn {
+                        tail.push(Change::Column(ColumnChange::AddColumn {
                             uid: column_uid,
                             table: name.clone(),
                             name: column,
                             column: Box::new(spec),
-                        });
+                        }));
                         tail.extend(facets);
                     } else {
                         if demand.defaults.contains(&column) || demand.not_null.contains(&column) {
@@ -254,65 +259,65 @@ pub fn expose(
                 // This is an ordinal prerequisite even for a constant expression.
                 if !moved_columns.is_empty() {
                     for (column, computed) in std::mem::take(&mut table.computed) {
-                        tail.push(Change::AddComputedColumn {
+                        tail.push(Change::Column(ColumnChange::AddComputedColumn {
                             table: name.clone(),
                             name: column,
                             computed,
-                        });
+                        }));
                     }
                 }
                 let mut facets = Vec::new();
                 if let Some(key) = table.primary_key.take() {
                     facets.push((
                         PartKey::PrimaryKey,
-                        Change::SetPrimaryKey {
+                        Change::Constraint(ConstraintChange::SetPrimaryKey {
                             table: name.clone(),
                             from: None,
                             to: Some(key),
                             nonclustered: !full.primary_key_is_clustered(),
-                        },
+                        }),
                     ));
                 }
                 for (key, constraint) in std::mem::take(&mut table.unique) {
                     facets.push((
                         PartKey::Unique(key.clone()),
-                        Change::AddUnique {
+                        Change::Constraint(ConstraintChange::AddUnique {
                             table: name.clone(),
                             clustered: full.unique_is_clustered(key.raw()),
                             name: key,
                             constraint,
-                        },
+                        }),
                     ));
                 }
                 for (key, constraint) in std::mem::take(&mut table.foreign_keys) {
                     facets.push((
                         PartKey::ForeignKey(key.clone()),
-                        Change::AddForeignKey {
+                        Change::Constraint(ConstraintChange::AddForeignKey {
                             table: name.clone(),
                             name: key,
                             constraint: Box::new(constraint),
-                        },
+                        }),
                     ));
                 }
                 for (key, constraint) in std::mem::take(&mut table.checks) {
                     facets.push((
                         PartKey::Check(key.clone()),
-                        Change::AddCheck {
+                        Change::Constraint(ConstraintChange::AddCheck {
                             table: name.clone(),
                             name: key,
                             constraint,
-                        },
+                        }),
                     ));
                 }
                 for (key, index) in std::mem::take(&mut table.indexes) {
                     facets.push((
                         PartKey::Index(key.clone()),
-                        Change::AddIndex {
+                        Change::Index(IndexChange::AddIndex {
                             table: name.clone(),
                             clustered: full.index_is_clustered(key.raw()),
                             name: key,
                             index: Box::new(index),
-                        },
+                        }),
                     ));
                 }
                 let tightening = not_null_prerequisites(&full, engine);
@@ -335,23 +340,31 @@ pub fn expose(
                         tail.push(facet);
                     } else {
                         match facet {
-                            Change::SetPrimaryKey { to, .. } => table.primary_key = to,
-                            Change::AddUnique {
-                                name, constraint, ..
-                            } => {
+                            Change::Constraint(ConstraintChange::SetPrimaryKey { to, .. }) => {
+                                table.primary_key = to
+                            }
+                            Change::Constraint(ConstraintChange::AddUnique {
+                                name,
+                                constraint,
+                                ..
+                            }) => {
                                 table.unique.insert(name, constraint);
                             }
-                            Change::AddForeignKey {
-                                name, constraint, ..
-                            } => {
+                            Change::Constraint(ConstraintChange::AddForeignKey {
+                                name,
+                                constraint,
+                                ..
+                            }) => {
                                 table.foreign_keys.insert(name, *constraint);
                             }
-                            Change::AddCheck {
-                                name, constraint, ..
-                            } => {
+                            Change::Constraint(ConstraintChange::AddCheck {
+                                name,
+                                constraint,
+                                ..
+                            }) => {
                                 table.checks.insert(name, constraint);
                             }
-                            Change::AddIndex { name, index, .. } => {
+                            Change::Index(IndexChange::AddIndex { name, index, .. }) => {
                                 table.indexes.insert(name, *index);
                             }
                             _ => unreachable!(
@@ -371,21 +384,25 @@ pub fn expose(
                     _ => false,
                 };
                 if identity_late {
-                    tail.push(Change::SetReplicaIdentity {
-                        uid: table_uid.clone(),
-                        table: name.clone(),
-                        to: table.replica_identity.take(),
-                    });
+                    tail.push(Change::TableProperty(
+                        TablePropertyChange::SetReplicaIdentity {
+                            uid: table_uid.clone(),
+                            table: name.clone(),
+                            to: table.replica_identity.take(),
+                        },
+                    ));
                 }
             }
             // A standing table may contain rows. ADD COLUMN DEFAULT can populate
             // them in the same statement; preserve that engine-owned group.
-            Change::AddColumn {
+            Change::Column(ColumnChange::AddColumn {
                 uid,
                 table,
                 name,
                 column,
-            } if empty.contains(table) => split_column(table, name, uid, column, demand, &mut tail),
+            }) if empty.contains(table) => {
+                split_column(table, name, uid, column, demand, &mut tail)
+            }
             _ => {}
         }
         out.push(change);
@@ -411,12 +428,12 @@ fn split_column(
         else {
             unreachable!()
         };
-        tail.push(Change::AlterColumnDefault {
+        tail.push(Change::Column(ColumnChange::AlterColumnDefault {
             uid: uid.clone(),
             column: table.column(name),
             from: None,
             to: Some(default),
-        });
+        }));
     }
     // Both engines require NOT NULL in the identity column's installation.
     if demand.not_null.contains(name)
@@ -427,13 +444,13 @@ fn split_column(
         && !demand.inline.column_not_null.contains_key(name)
     {
         column.nullable = true;
-        tail.push(Change::AlterColumnNullability {
+        tail.push(Change::Column(ColumnChange::AlterColumnNullability {
             uid: uid.clone(),
             column: table.column(name),
             ty: column.ty.clone(),
             to_nullable: false,
             collation: column.collation.clone(),
             through_external_partitions: false,
-        });
+        }));
     }
 }

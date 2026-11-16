@@ -46,33 +46,35 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
     };
     let mut changes = Vec::new();
     if dialect.name() == "mssql" {
-        changes.push(PlannedChange::new(Change::CreateRole {
+        changes.push(PlannedChange::new(Change::Role(RoleChange::CreateRole {
             uid: "r_aaaaaa".parse().unwrap(),
             name: text.into(),
-        }));
-        changes.push(PlannedChange::new(Change::RenameRole {
+        })));
+        changes.push(PlannedChange::new(Change::Role(RoleChange::RenameRole {
             uid: "r_bbbbbb".parse().unwrap(),
             from: format!("{text}old").into(),
             to: format!("{text}new").into(),
-        }));
-        changes.push(PlannedChange::new(Change::DropRole {
+        })));
+        changes.push(PlannedChange::new(Change::Role(RoleChange::DropRole {
             uid: "r_bbbbbb".parse().unwrap(),
             name: format!("{text}new").into(),
             members: vec![format!("{text}member").into()],
-        }));
+        })));
     }
     for (target, permissions) in &schema.roles.values().next().unwrap().grants {
-        changes.push(PlannedChange::new(Change::Grant {
+        changes.push(PlannedChange::new(Change::Permission(GrantChange::Grant {
             role: text.into(),
             target: target.clone(),
             permissions: permissions.clone(),
-        }));
+        })));
     }
-    changes.push(PlannedChange::new(Change::Revoke {
-        role: text.into(),
-        target,
-        permissions: [Permission::Update].into(),
-    }));
+    changes.push(PlannedChange::new(Change::Permission(
+        GrantChange::Revoke {
+            role: text.into(),
+            target,
+            permissions: [Permission::Update].into(),
+        },
+    )));
     let plan = SavedPlan::new(
         PlanOrigin::Database,
         dialect.name(),

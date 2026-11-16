@@ -26,6 +26,21 @@ use pbps_model::ColumnName;
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::Dialect;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::ExtensionChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::PolicyChange;
+use pbps_model::RoleChange;
+use pbps_model::RowChange;
+use pbps_model::SearchChange;
+use pbps_model::TableChange;
+use pbps_model::TablePropertyChange;
+use pbps_model::TypeChange;
+use pbps_model::TypeValueChange;
 use pbps_model::change::DeleteCause;
 use pbps_model::data::cell;
 use pbps_model::{
@@ -951,7 +966,7 @@ pub(crate) fn diff_partial_rebuilding(
         .values()
         .filter_map(|r| declared.ids.tables.get(&r.replacement_root))
         .filter_map(|table| crate::rebuild::qualify(base, declared, table, dialect).ok())
-        .map(|root| Change::RebuildPartitionedTable(Box::new(root)))
+        .map(|root| Change::Partition(PartitionChange::RebuildPartitionedTable(Box::new(root))))
         .map(|change| PlannedChange {
             risks: dialect.change_risks(&change),
             ..PlannedChange::new(change)
@@ -1078,11 +1093,11 @@ pub(crate) fn diff_partial_rebuilding(
                 if used {
                     errs.push(DiffError::TypeLifecycleUnsupported { name: old_name.clone(), reason: "a retained declaration still uses this type; drop or change its dependents first".into() });
                 }
-                changes.push(Change::DropType {
+                changes.push(Change::Type(TypeChange::DropType {
                     uid: uid.clone(),
                     name: old_name.clone(),
                     definition: Box::new(old.clone()),
-                });
+                }));
             }
             Some((name, new)) => {
                 let mut comparable = old.clone();
@@ -1133,20 +1148,20 @@ pub(crate) fn diff_partial_rebuilding(
                         (pbps_model::DomainHalf::Tighten, delta.tightens()),
                     ] {
                         if wanted {
-                            changes.push(Change::AlterDomain {
+                            changes.push(Change::TypeValue(TypeValueChange::AlterDomain {
                                 uid: uid.clone(),
                                 name: name.clone(),
                                 from: Box::new(comparable.clone()),
                                 to: Box::new(new.clone()),
                                 half,
-                            });
+                            }));
                         }
                     }
                 }
                 errs.extend(refused);
                 if old_name != name {
                     type_renames.insert(old_name.clone(), name.clone());
-                    changes.push(Change::RenameType {
+                    changes.push(Change::Type(TypeChange::RenameType {
                         uid: uid.clone(),
                         from: old_name.clone(),
                         to: name.clone(),
@@ -1159,7 +1174,7 @@ pub(crate) fn diff_partial_rebuilding(
                             (pbps_model::ManagedType::Domain { .. }, true) => comparable.clone(),
                             (pbps_model::ManagedType::Domain { .. }, false) => new.clone(),
                         }),
-                    });
+                    }));
                 }
             }
         }
@@ -1173,11 +1188,11 @@ pub(crate) fn diff_partial_rebuilding(
             .is_none()
             && let Some(definition) = declared.schema.types.get(name)
         {
-            changes.push(Change::CreateType {
+            changes.push(Change::Type(TypeChange::CreateType {
                 uid: uid.clone(),
                 name: name.clone(),
                 definition: Box::new(definition.clone()),
-            });
+            }));
         }
     }
     for start in type_renames.keys() {
@@ -1251,13 +1266,13 @@ pub(crate) fn diff_partial_rebuilding(
         if !declared_tables.contains_key(uid) {
             if let Some(t) = base.schema.tables.get(name) {
                 for fk_name in t.foreign_keys.keys() {
-                    changes.push(Change::DropForeignKey {
+                    changes.push(Change::Constraint(ConstraintChange::DropForeignKey {
                         table: name.clone(),
                         name: fk_name.clone(),
-                    });
+                    }));
                 }
             }
-            changes.push(Change::DropTable {
+            changes.push(Change::Table(TableChange::DropTable {
                 uid: uid.clone(),
                 name: name.clone(),
                 // A partition is detached from its parent before it goes
@@ -1268,7 +1283,7 @@ pub(crate) fn diff_partial_rebuilding(
                     .get(name)
                     .and_then(|t| t.partition_of.as_ref())
                     .map(|of| final_parent(&of.parent)),
-            });
+            }));
         }
     }
 
@@ -1282,11 +1297,11 @@ pub(crate) fn diff_partial_rebuilding(
         {
             let mut table = t.clone();
             for (fk_name, fk) in std::mem::take(&mut table.foreign_keys) {
-                changes.push(Change::AddForeignKey {
+                changes.push(Change::Constraint(ConstraintChange::AddForeignKey {
                     table: name.clone(),
                     name: fk_name,
                     constraint: Box::new(fk),
-                });
+                }));
             }
             // Rows are split out of the CREATE for the same reason the
             // foreign keys above are: they are separate statements in a
@@ -1306,7 +1321,7 @@ pub(crate) fn diff_partial_rebuilding(
                     });
                     for (key, row) in &data.rows {
                         let (defaults, types) = omitted_defaults(&table, pk.columns[0].raw(), row);
-                        changes.push(Change::InsertRow {
+                        changes.push(Change::Row(RowChange::InsertRow {
                             table: name.clone(),
                             key_column: pk.columns[0].clone(),
                             identity_key,
@@ -1314,7 +1329,7 @@ pub(crate) fn diff_partial_rebuilding(
                             row: row.clone(),
                             defaults,
                             types,
-                        });
+                        }));
                     }
                 }
                 (Some(_), _) => errs.push(DiffError::DataWithoutKey {
@@ -1333,40 +1348,40 @@ pub(crate) fn diff_partial_rebuilding(
                 .and_then(|_| declared.ids.moves.get(uid))
                 .map(|m| m.max_rows);
             for (policy_name, policy) in &table.row_policies {
-                changes.push(Change::CreatePolicy {
+                changes.push(Change::Policy(PolicyChange::CreatePolicy {
                     table: name.clone(),
                     name: policy_name.clone(),
                     policy: policy.clone(),
                     origin: pbps_model::RowSecurityOrigin::Created,
-                });
+                }));
             }
             if !table.row_security.is_default() {
-                changes.push(Change::SetRowSecurity {
+                changes.push(Change::Policy(PolicyChange::SetRowSecurity {
                     uid: uid.clone(),
                     table: name.clone(),
                     from: Default::default(),
                     to: table.row_security,
                     origin: pbps_model::RowSecurityOrigin::Created,
-                });
+                }));
             }
             // An exclusion is added by its own change, after the table's rows
             // (DEC-2448.3): the creation payload never carries one, so no
             // emitter can create the table and lose it.
             let exclusions = std::mem::take(&mut table.exclude);
-            changes.push(Change::CreateTable {
+            changes.push(Change::Table(TableChange::CreateTable {
                 uid: uid.clone(),
                 name: name.clone(),
                 table: Box::new(table),
                 beside_default,
                 moves_at_most,
-            });
+            }));
             for (exclusion, constraint) in exclusions {
-                changes.push(Change::SetExclusion {
+                changes.push(Change::Constraint(ConstraintChange::SetExclusion {
                     table: name.clone(),
                     name: exclusion,
                     from: None,
                     to: Some(Box::new(constraint)),
-                });
+                }));
             }
         }
     }
@@ -1432,12 +1447,12 @@ pub(crate) fn diff_partial_rebuilding(
                         .collect()
                 })
                 .unwrap_or_default();
-            changes.push(Change::RenameTable {
+            changes.push(Change::Table(TableChange::RenameTable {
                 uid: uid.clone(),
                 from: base_name.clone(),
                 to: declared_name.clone(),
                 defaults,
-            });
+            }));
         }
         let (Some(base_table), Some(declared_table)) = (
             base.schema.tables.get(base_name),
@@ -1460,29 +1475,29 @@ pub(crate) fn diff_partial_rebuilding(
                 continue;
             }
             if let Some(policy) = before {
-                changes.push(Change::DropPolicy {
+                changes.push(Change::Policy(PolicyChange::DropPolicy {
                     table: base_name.clone(),
                     name: name.clone(),
                     policy: policy.clone(),
-                });
+                }));
             }
             if let Some(policy) = after {
-                changes.push(Change::CreatePolicy {
+                changes.push(Change::Policy(PolicyChange::CreatePolicy {
                     table: declared_name.clone(),
                     name: name.clone(),
                     policy: policy.clone(),
                     origin: pbps_model::RowSecurityOrigin::Standing,
-                });
+                }));
             }
         }
         if base_table.row_security != declared_table.row_security {
-            changes.push(Change::SetRowSecurity {
+            changes.push(Change::Policy(PolicyChange::SetRowSecurity {
                 uid: uid.clone(),
                 table: declared_name.clone(),
                 from: base_table.row_security,
                 to: declared_table.row_security,
                 origin: pbps_model::RowSecurityOrigin::Standing,
-            });
+            }));
         }
         // A partition declared as an ordinary table is detached, and that is
         // all this plan does to it (#1544, DEC-1544.1): its base holds no
@@ -1519,13 +1534,13 @@ pub(crate) fn diff_partial_rebuilding(
                             .is_some_and(|(_, _, _, pending)| *pending),
                     )
                 }) {
-                Ok(names) => changes.push(Change::DetachPartition {
+                Ok(names) => changes.push(Change::Partition(PartitionChange::DetachPartition {
                     uid: uid.clone(),
                     table: declared_name.clone(),
                     parent: final_parent(&of.parent),
                     names,
                     shape: Box::new(declared_table.clone()),
-                }),
+                })),
                 Err(what) => errs.push(DiffError::DetachedShape {
                     table: declared_name.clone(),
                     parent: of.parent.clone(),
@@ -1569,12 +1584,12 @@ pub(crate) fn diff_partial_rebuilding(
                     // index left for each of its parent's or builds it; one
                     // the declaration keeps as its own is added after.
                     for name in displaced {
-                        changes.push(Change::DropIndex {
+                        changes.push(Change::Index(IndexChange::DropIndex {
                             table: declared_name.clone(),
                             name,
-                        });
+                        }));
                     }
-                    changes.push(Change::AttachPartition {
+                    changes.push(Change::Partition(PartitionChange::AttachPartition {
                         uid: uid.clone(),
                         table: declared_name.clone(),
                         parent: of.parent.clone(),
@@ -1598,7 +1613,7 @@ pub(crate) fn diff_partial_rebuilding(
                             &declared.schema.types,
                         ),
                         shape: Box::new(declared_table.clone()),
-                    });
+                    }));
                     // Compared as this plan leaves them: an own foreign key
                     // to a table renamed in the same plan is declared under
                     // the new name (#1632). Matched to the parent's above on
@@ -1618,11 +1633,13 @@ pub(crate) fn diff_partial_rebuilding(
                         &mut changes,
                     );
                     if table.unlogged != declared_table.unlogged {
-                        changes.push(Change::SetTablePersistence {
-                            uid: uid.clone(),
-                            table: declared_name.clone(),
-                            unlogged: declared_table.unlogged,
-                        });
+                        changes.push(Change::TableProperty(
+                            TablePropertyChange::SetTablePersistence {
+                                uid: uid.clone(),
+                                table: declared_name.clone(),
+                                unlogged: declared_table.unlogged,
+                            },
+                        ));
                     }
                     diff_partition_columns(
                         uid,
@@ -1656,7 +1673,7 @@ pub(crate) fn diff_partial_rebuilding(
                             &mut errs,
                         );
                         if let (None, Some(fallback)) = (own, fallback) {
-                            changes.push(Change::SetPartitionDefault {
+                            changes.push(Change::Partition(PartitionChange::SetPartitionDefault {
                                 uid: uid.clone(),
                                 table: declared_name.clone(),
                                 parent: of.parent.clone(),
@@ -1664,7 +1681,7 @@ pub(crate) fn diff_partial_rebuilding(
                                 from: None,
                                 to: None,
                                 fallback: Some(fallback),
-                            });
+                            }));
                         }
                     }
                 }
@@ -1715,11 +1732,13 @@ pub(crate) fn diff_partial_rebuilding(
         diff_computed(declared_name, base_table, declared_table, &mut changes);
         diff_storage_parameters(uid, declared_name, base_table, declared_table, &mut changes);
         if base_table.unlogged != declared_table.unlogged {
-            changes.push(Change::SetTablePersistence {
-                uid: uid.clone(),
-                table: declared_name.clone(),
-                unlogged: declared_table.unlogged,
-            });
+            changes.push(Change::TableProperty(
+                TablePropertyChange::SetTablePersistence {
+                    uid: uid.clone(),
+                    table: declared_name.clone(),
+                    unlogged: declared_table.unlogged,
+                },
+            ));
         }
         diff_partition_columns(
             uid,
@@ -1801,123 +1820,125 @@ pub(crate) fn diff_partial_rebuilding(
     let arriving: Vec<ModuleId> = changes
         .iter()
         .filter_map(|change| match change {
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => None,
-            Change::CreateModule { id, .. } => Some(id.clone()),
-            Change::CreateTable { name, .. } => Some(ModuleId::Named(name.clone())),
-            Change::RenameTable { to, .. } => Some(ModuleId::Named(to.clone())),
-            Change::DropTable { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::AlterColumnNumbering { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetComment { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::SetExclusion { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => None,
+            Change::Module(ModuleChange::CreateModule { id, .. }) => Some(id.clone()),
+            Change::Table(TableChange::CreateTable { name, .. }) => {
+                Some(ModuleId::Named(name.clone()))
+            }
+            Change::Table(TableChange::RenameTable { to, .. }) => Some(ModuleId::Named(to.clone())),
+            Change::Table(TableChange::DropTable { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Column(ColumnChange::AddColumn { .. })
+            | Change::Column(ColumnChange::DropColumn { .. })
+            | Change::Column(ColumnChange::RenameColumn { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+            | Change::TableProperty(TablePropertyChange::SetComment { .. })
+            | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(PolicyChange::DropPolicy { .. })
+            | Change::Policy(PolicyChange::CreatePolicy { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+            | Change::Constraint(ConstraintChange::AddUnique { .. })
+            | Change::Constraint(ConstraintChange::DropUnique { .. })
+            | Change::Constraint(ConstraintChange::SetExclusion { .. })
+            | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            | Change::Constraint(ConstraintChange::AddCheck { .. })
+            | Change::Constraint(ConstraintChange::DropCheck { .. })
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::UpdateRow { .. })
+            | Change::Row(RowChange::DeleteRow { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
+            | Change::Module(ModuleChange::AlterModule { .. })
+            | Change::Module(ModuleChange::DropModule { .. })
+            | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
             | pbps_model::catalog_change!()
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => None,
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. }) => None,
         })
         .collect();
     let changed: BTreeSet<ModuleId> = changes
         .iter()
         .filter_map(|change| match change {
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => None,
-            Change::CreateModule { id, .. }
-            | Change::AlterModule { id, .. }
-            | Change::DropModule { id, .. } => Some(id.clone()),
-            Change::CreateTable { .. }
-            | Change::DropTable { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::RenameTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::AlterColumnNumbering { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetComment { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::SetExclusion { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => None,
+            Change::Module(ModuleChange::CreateModule { id, .. })
+            | Change::Module(ModuleChange::AlterModule { id, .. })
+            | Change::Module(ModuleChange::DropModule { id, .. }) => Some(id.clone()),
+            Change::Table(TableChange::CreateTable { .. })
+            | Change::Table(TableChange::DropTable { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Table(TableChange::RenameTable { .. })
+            | Change::Column(ColumnChange::AddColumn { .. })
+            | Change::Column(ColumnChange::DropColumn { .. })
+            | Change::Column(ColumnChange::RenameColumn { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+            | Change::TableProperty(TablePropertyChange::SetComment { .. })
+            | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(PolicyChange::DropPolicy { .. })
+            | Change::Policy(PolicyChange::CreatePolicy { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+            | Change::Constraint(ConstraintChange::AddUnique { .. })
+            | Change::Constraint(ConstraintChange::DropUnique { .. })
+            | Change::Constraint(ConstraintChange::SetExclusion { .. })
+            | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            | Change::Constraint(ConstraintChange::AddCheck { .. })
+            | Change::Constraint(ConstraintChange::DropCheck { .. })
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::UpdateRow { .. })
+            | Change::Row(RowChange::DeleteRow { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
+            | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
             | pbps_model::catalog_change!()
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => None,
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. }) => None,
         })
         .collect();
     // One set, so a module both the dialect and the caller ask for is rebuilt
@@ -1936,10 +1957,10 @@ pub(crate) fn diff_partial_rebuilding(
             && base.schema.modules.contains_key(&id)
             && let Some(module) = declared.schema.modules.get(&id)
         {
-            changes.push(Change::AlterModule {
+            changes.push(Change::Module(ModuleChange::AlterModule {
                 id,
                 module: Box::new(module.clone()),
-            });
+            }));
         }
     }
     // A module over a rebuilt enum's column cannot be restated in place after
@@ -1948,17 +1969,17 @@ pub(crate) fn diff_partial_rebuilding(
     if !hints.enum_dependents.is_empty() {
         let mut split = Vec::new();
         for change in std::mem::take(&mut changes) {
-            if let Change::AlterModule { id, module } = &change
+            if let Change::Module(ModuleChange::AlterModule { id, module }) = &change
                 && hints.enum_dependents.contains(id)
             {
-                split.push(Change::DropModule {
+                split.push(Change::Module(ModuleChange::DropModule {
                     id: id.clone(),
                     kind: module.kind,
-                });
-                split.push(Change::CreateModule {
+                }));
+                split.push(Change::Module(ModuleChange::CreateModule {
                     id: id.clone(),
                     module: module.clone(),
-                });
+                }));
             } else {
                 split.push(change);
             }
@@ -1979,19 +2000,19 @@ pub(crate) fn diff_partial_rebuilding(
             continue;
         };
         if changes.iter().any(|c| {
-            matches!(c, Change::DropModule { id: other, .. } | Change::CreateModule { id: other, .. } if *other == id)
+            matches!(c, Change::Module(ModuleChange::DropModule { id: other, .. }) | Change::Module(ModuleChange::CreateModule { id: other, .. }) if *other == id)
         }) {
             continue;
         }
-        changes.retain(|c| !matches!(c, Change::AlterModule { id: other, .. } if *other == id));
-        changes.push(Change::DropModule {
+        changes.retain(|c| !matches!(c, Change::Module(ModuleChange::AlterModule { id: other, .. }) if *other == id));
+        changes.push(Change::Module(ModuleChange::DropModule {
             id: id.clone(),
             kind: before.kind,
-        });
-        changes.push(Change::CreateModule {
+        }));
+        changes.push(Change::Module(ModuleChange::CreateModule {
             id,
             module: Box::new(module.clone()),
-        });
+        }));
     }
     diff_roles(base, declared, dialect, &mut changes);
     revoke_public_execution(base.schema, dialect, hints, &mut changes);
@@ -2081,7 +2102,9 @@ pub(crate) fn diff_partial_rebuilding(
     let attach_parents: BTreeMap<TableName, TableName> = planned
         .iter()
         .filter_map(|p| {
-            if let Change::AttachPartition { table, parent, .. } = &p.change {
+            if let Change::Partition(PartitionChange::AttachPartition { table, parent, .. }) =
+                &p.change
+            {
                 Some((table.clone(), parent.clone()))
             } else {
                 None
@@ -2138,62 +2161,62 @@ pub(crate) fn diff_partial_rebuilding(
     let tables_claiming_a_column_name: BTreeSet<TableName> = planned
         .iter()
         .filter_map(|p| match &p.change {
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => None,
-            Change::RenameColumn { table, .. } => Some(table.clone()),
-            Change::CreateTable { .. }
-            | Change::DropTable { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::RenameTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::AlterColumnNumbering { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetComment { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::SetExclusion { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => None,
+            Change::Column(ColumnChange::RenameColumn { table, .. }) => Some(table.clone()),
+            Change::Table(TableChange::CreateTable { .. })
+            | Change::Table(TableChange::DropTable { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Table(TableChange::RenameTable { .. })
+            | Change::Column(ColumnChange::AddColumn { .. })
+            | Change::Column(ColumnChange::DropColumn { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+            | Change::TableProperty(TablePropertyChange::SetComment { .. })
+            | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(PolicyChange::DropPolicy { .. })
+            | Change::Policy(PolicyChange::CreatePolicy { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+            | Change::Constraint(ConstraintChange::AddUnique { .. })
+            | Change::Constraint(ConstraintChange::DropUnique { .. })
+            | Change::Constraint(ConstraintChange::SetExclusion { .. })
+            | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            | Change::Constraint(ConstraintChange::AddCheck { .. })
+            | Change::Constraint(ConstraintChange::DropCheck { .. })
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::UpdateRow { .. })
+            | Change::Row(RowChange::DeleteRow { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
+            | Change::Module(ModuleChange::CreateModule { .. })
+            | Change::Module(ModuleChange::AlterModule { .. })
+            | Change::Module(ModuleChange::DropModule { .. })
+            | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
             | pbps_model::catalog_change!()
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => None,
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. }) => None,
         })
         .collect();
     // Whether this drop can be what frees a name a `RenameColumn` above is
@@ -2201,64 +2224,64 @@ pub(crate) fn diff_partial_rebuilding(
     // column name.
     let frees_a_renamed_column = |c: &Change| -> bool {
         match c {
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => false,
-            Change::DropColumn { column, .. } => {
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => false,
+            Change::Column(ColumnChange::DropColumn { column, .. }) => {
                 tables_claiming_a_column_name.contains(&column.table)
             }
-            Change::CreateTable { .. }
-            | Change::DropTable { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::RenameTable { .. }
-            | Change::AddColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::AlterColumnNumbering { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetComment { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::SetExclusion { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
+            Change::Table(TableChange::CreateTable { .. })
+            | Change::Table(TableChange::DropTable { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Table(TableChange::RenameTable { .. })
+            | Change::Column(ColumnChange::AddColumn { .. })
+            | Change::Column(ColumnChange::RenameColumn { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+            | Change::TableProperty(TablePropertyChange::SetComment { .. })
+            | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(PolicyChange::DropPolicy { .. })
+            | Change::Policy(PolicyChange::CreatePolicy { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+            | Change::Constraint(ConstraintChange::AddUnique { .. })
+            | Change::Constraint(ConstraintChange::DropUnique { .. })
+            | Change::Constraint(ConstraintChange::SetExclusion { .. })
+            | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            | Change::Constraint(ConstraintChange::AddCheck { .. })
+            | Change::Constraint(ConstraintChange::DropCheck { .. })
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::UpdateRow { .. })
+            | Change::Row(RowChange::DeleteRow { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
+            | Change::Module(ModuleChange::CreateModule { .. })
+            | Change::Module(ModuleChange::AlterModule { .. })
+            | Change::Module(ModuleChange::DropModule { .. })
+            | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
             | pbps_model::catalog_change!()
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => false,
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. }) => false,
         }
     };
     // A column rename into a name another rename of the same table vacates
@@ -2271,9 +2294,9 @@ pub(crate) fn diff_partial_rebuilding(
     let vacates: BTreeMap<(TableName, ColumnName), ColumnName> = planned
         .iter()
         .filter_map(|p| {
-            if let Change::RenameColumn {
+            if let Change::Column(ColumnChange::RenameColumn {
                 table, from, to, ..
-            } = &p.change
+            }) = &p.change
             {
                 Some(((table.clone(), from.clone()), to.clone()))
             } else {
@@ -2421,12 +2444,12 @@ pub(crate) fn diff_partial_rebuilding(
     let held_back: BTreeSet<ColumnRef> = planned
         .iter()
         .filter_map(|p| {
-            if let Change::AlterColumnNullability {
+            if let Change::Column(ColumnChange::AlterColumnNullability {
                 column,
                 to_nullable: false,
                 ..
-            }
-            | Change::AlterColumnType { column, .. } = &p.change
+            })
+            | Change::Column(ColumnChange::AlterColumnType { column, .. }) = &p.change
             {
                 Some(column.clone())
             } else {
@@ -2444,9 +2467,9 @@ pub(crate) fn diff_partial_rebuilding(
     let bounds_first: BTreeSet<ColumnRef> = planned
         .iter()
         .filter_map(|p| {
-            if let Change::AlterColumnType {
+            if let Change::Column(ColumnChange::AlterColumnType {
                 column, from, to, ..
-            } = &p.change
+            }) = &p.change
                 && p.change.value_change().map_or_else(
                     || dialect.type_change_risk(from, to),
                     |values| dialect.value_change(&values, "").risk,
@@ -2461,12 +2484,12 @@ pub(crate) fn diff_partial_rebuilding(
             planned.iter().any(|p| {
                 matches!(
                     &p.change,
-                    Change::AlterColumnNumbering {
+                    Change::Column(ColumnChange::AlterColumnNumbering {
                         column: c,
                         from: ValueSource::Identity(_),
                         to: ValueSource::Identity(_),
                         ..
-                    } if c == *column
+                    }) if c == *column
                 )
             })
         })
@@ -2503,11 +2526,11 @@ pub(crate) fn diff_partial_rebuilding(
         })
         .collect();
     let follows_late_attach = |c: &Change| -> bool {
-        if let Change::SetPartitionDefault { table, .. }
-        | Change::SetPartitionNotNull { table, .. }
-        | Change::SetTablePersistence { table, .. }
-        | Change::SetStorageParameters { table, .. }
-        | Change::SetIndexStorageParameters { table, .. } = c
+        if let Change::Partition(PartitionChange::SetPartitionDefault { table, .. })
+        | Change::Partition(PartitionChange::SetPartitionNotNull { table, .. })
+        | Change::TableProperty(TablePropertyChange::SetTablePersistence { table, .. })
+        | Change::TableProperty(TablePropertyChange::SetStorageParameters { table, .. })
+        | Change::Index(IndexChange::SetIndexStorageParameters { table, .. }) = c
         {
             late_attach.contains_key(table)
         } else {
@@ -2530,7 +2553,12 @@ pub(crate) fn diff_partial_rebuilding(
     // build it (#1792).
     let fk_graph = planned
         .iter()
-        .any(|p| matches!(p.change, Change::SetTablePersistence { .. }))
+        .any(|p| {
+            matches!(
+                p.change,
+                Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+            )
+        })
         .then(|| ForeignKeyGraph::of(declared.schema));
     let deepest = fk_graph.as_ref().map_or(0, ForeignKeyGraph::deepest);
     // A parent's column default, numbering source or NULL-ness this plan
@@ -2540,17 +2568,17 @@ pub(crate) fn diff_partial_rebuilding(
         .iter()
         .filter_map(|p| {
             // A retype carries its NOT NULL change with it (#1692 review).
-            if let Change::AlterColumnDefault { column, .. }
-            | Change::AlterColumnNumbering { column, .. }
-            | Change::AlterColumnNullability { column, .. } = &p.change
+            if let Change::Column(ColumnChange::AlterColumnDefault { column, .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { column, .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { column, .. }) = &p.change
             {
                 Some((column.table.clone(), column.name.clone()))
-            } else if let Change::AlterColumnType {
+            } else if let Change::Column(ColumnChange::AlterColumnType {
                 column,
                 from_nullable,
                 to_nullable,
                 ..
-            } = &p.change
+            }) = &p.change
                 && from_nullable != to_nullable
             {
                 Some((column.table.clone(), column.name.clone()))
@@ -2577,10 +2605,10 @@ pub(crate) fn diff_partial_rebuilding(
     let moved_out_of: BTreeSet<TableName> = planned
         .iter()
         .filter_map(|p| {
-            if let Change::CreateTable {
+            if let Change::Table(TableChange::CreateTable {
                 beside_default: Some(default),
                 ..
-            } = &p.change
+            }) = &p.change
             {
                 Some(default.clone())
             } else {
@@ -2589,8 +2617,8 @@ pub(crate) fn diff_partial_rebuilding(
         })
         .collect();
     let follows_its_parent = |c: &Change| -> bool {
-        let (Change::SetPartitionDefault { table, column, .. }
-        | Change::SetPartitionNotNull { table, column, .. }) = c
+        let (Change::Partition(PartitionChange::SetPartitionDefault { table, column, .. })
+        | Change::Partition(PartitionChange::SetPartitionNotNull { table, column, .. })) = c
         else {
             return false;
         };
@@ -2629,14 +2657,14 @@ pub(crate) fn diff_partial_rebuilding(
     let sort_class = |c: &Change| -> (u8, usize) {
         if matches!(
             c,
-            Change::CreateType { .. }
-                | Change::CreateSearch { .. }
-                | Change::AddEnumValue { .. }
-                | Change::RenameEnumValue { .. }
-                | Change::EnumRebuild {
+            Change::Type(TypeChange::CreateType { .. })
+                | Change::Search(SearchChange::CreateSearch { .. })
+                | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+                | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+                | Change::TypeValue(TypeValueChange::EnumRebuild {
                     step: pbps_model::EnumRebuildStep::Create { .. },
                     ..
-                }
+                })
         ) {
             return (7, 0);
         }
@@ -2644,29 +2672,29 @@ pub(crate) fn diff_partial_rebuilding(
         // alterations of class 9, ranked with a retype (DEC-1635.7).
         if matches!(
             c,
-            Change::EnumRebuild {
+            Change::TypeValue(TypeValueChange::EnumRebuild {
                 step: pbps_model::EnumRebuildStep::Retype { .. }
                     | pbps_model::EnumRebuildStep::Swap { .. },
                 ..
-            }
+            })
         ) {
             return (COLUMN_ALTERATIONS, 1);
         }
 
         // After every module and its PUBLIC decision, then policies before
         // either flag. Keep the established class ordinals (DEC-1172.1).
-        if matches!(c, Change::CreatePolicy { .. }) {
+        if matches!(c, Change::Policy(PolicyChange::CreatePolicy { .. })) {
             return (14, 2);
         }
-        if matches!(c, Change::SetRowSecurity { .. }) {
+        if matches!(c, Change::Policy(PolicyChange::SetRowSecurity { .. })) {
             return (14, 3);
         }
-        if let Change::AlterColumnNumbering { column, .. } = c
+        if let Change::Column(ColumnChange::AlterColumnNumbering { column, .. }) = c
             && bounds_first.contains(column)
         {
             return (COLUMN_ALTERATIONS, 0);
         }
-        if let Change::AttachPartition { table, .. } = c
+        if let Change::Partition(PartitionChange::AttachPartition { table, .. }) = c
             && late_attach.contains_key(table)
         {
             return (ROW_DELETIONS - 1, 1);
@@ -2680,11 +2708,11 @@ pub(crate) fn diff_partial_rebuilding(
         // change): the rows the move takes may be the ones holding NULL there,
         // and the engine scans what is left. Its own checks and uniques are of
         // class 13, after every create already (#1763 review).
-        if let Change::SetPartitionNotNull {
+        if let Change::Partition(PartitionChange::SetPartitionNotNull {
             table,
             not_null: true,
             ..
-        } = c
+        }) = c
             && moved_out_of.contains(table)
         {
             return (COLUMN_ALTERATIONS, 6);
@@ -2692,9 +2720,11 @@ pub(crate) fn diff_partial_rebuilding(
         if follows_its_parent(c) {
             return (COLUMN_ALTERATIONS, 4);
         }
-        if let Change::SetTablePersistence {
-            table, unlogged, ..
-        } = c
+        if let Change::TableProperty(TablePropertyChange::SetTablePersistence {
+            table,
+            unlogged,
+            ..
+        }) = c
         {
             let depth = fk_graph.as_ref().map_or(0, |g| g.depth(table));
             return (
@@ -2706,7 +2736,7 @@ pub(crate) fn diff_partial_rebuilding(
         // first, under the table's old name: before the drops of class 2 can
         // take its old index, which would leave the table identifying no row
         // (DEC-1444.1).
-        if let Change::SetReplicaIdentity { uid, to, .. } = c
+        if let Change::TableProperty(TablePropertyChange::SetReplicaIdentity { uid, to, .. }) = c
             && early_identity.contains(&(uid.clone(), to.clone()))
         {
             return (0, 1);
@@ -2729,24 +2759,24 @@ pub(crate) fn diff_partial_rebuilding(
         // still follow them (#1930 review).
         let early =
             |column: &ColumnRef| inserted.contains(&column.table) && !late.contains(&column.table);
-        if let Change::AlterColumnNullability {
+        if let Change::Column(ColumnChange::AlterColumnNullability {
             column,
             to_nullable: false,
             ..
-        } = c
+        }) = c
             && row_tables.contains(&column.table)
             && !(identified.contains(column) && early(column))
         {
             return (ROW_DELETIONS, 2);
         }
-        if let Change::AlterColumnNumbering { column, .. } = c
+        if let Change::Column(ColumnChange::AlterColumnNumbering { column, .. }) = c
             && installed.contains(column)
             && row_tables.contains(&column.table)
             && !early(column)
         {
             return (ROW_DELETIONS, 3);
         }
-        if let Change::InsertRow { table, .. } = c
+        if let Change::Row(RowChange::InsertRow { table, .. }) = c
             && late.contains(table)
         {
             return (ROW_DELETIONS, 4);
@@ -2762,7 +2792,7 @@ pub(crate) fn diff_partial_rebuilding(
         //
         // Among them, a rename to a name another of them frees follows it,
         // down the chain (#1930 review).
-        if let Change::AlterColumnNumbering { column, .. } = c
+        if let Change::Column(ColumnChange::AlterColumnNumbering { column, .. }) = c
             && let Some(depth) = early_release.get(column)
         {
             return (6, 1 + depth);
@@ -2775,8 +2805,7 @@ pub(crate) fn diff_partial_rebuilding(
         // and refuses to retype one a generated column reads. A generated
         // column never reads another, and nothing in class 9 needs one that is
         // new, so one layer each way is the whole order (DEC-1168.1).
-        let drops_generated =
-            matches!(c, Change::DropColumn { uid, .. } if generated_in_base.contains(uid));
+        let drops_generated = matches!(c, Change::Column(ColumnChange::DropColumn { uid, .. }) if generated_in_base.contains(uid));
         if frees_a_renamed_column(c) {
             // The layer holds here too: every drop of a table that renames a
             // column comes to this class, the generated one and its input
@@ -2805,7 +2834,7 @@ pub(crate) fn diff_partial_rebuilding(
         if drops_generated {
             return (order_key(c), 0);
         }
-        if let Change::AddColumn { column, .. } = c
+        if let Change::Column(ColumnChange::AddColumn { column, .. }) = c
             && (match &column.value_source {
                 ValueSource::Generated(_) => true,
                 ValueSource::None
@@ -2821,7 +2850,7 @@ pub(crate) fn diff_partial_rebuilding(
         // included, and goes up after every alteration of class 9: it reads
         // the columns, in their final type, and nothing in either class reads
         // it (#1174).
-        if matches!(c, Change::DropComputedColumn { .. }) {
+        if matches!(c, Change::Column(ColumnChange::DropComputedColumn { .. })) {
             return (2, 4);
         }
         // A package's own objects are what a column, a domain or a module of
@@ -2831,20 +2860,23 @@ pub(crate) fn diff_partial_rebuilding(
         // uid.
         if matches!(
             c,
-            Change::CreateExtension { .. }
-                | Change::UpdateExtension { .. }
-                | Change::SetExtensionSchema { .. }
+            Change::Extension(ExtensionChange::CreateExtension { .. })
+                | Change::Extension(ExtensionChange::UpdateExtension { .. })
+                | Change::Extension(ExtensionChange::SetExtensionSchema { .. })
         ) {
             return (order_key(c), 0);
         }
-        if matches!(c, Change::AddComputedColumn { .. }) {
+        if matches!(c, Change::Column(ColumnChange::AddComputedColumn { .. })) {
             return (COLUMN_ALTERATIONS, 3);
         }
         // A detach comes after every table drop of its class: it claims the
         // declared names of what it keeps, and a dropped table's index or
         // key may be what holds one now. A drop claims no name, so nothing
         // waits the other way (#1544).
-        if matches!(c, Change::DetachPartition { .. }) {
+        if matches!(
+            c,
+            Change::Partition(PartitionChange::DetachPartition { .. })
+        ) {
             return (order_key(c), 2);
         }
         // A partition is created after every parent, whose columns, keys and
@@ -2852,7 +2884,7 @@ pub(crate) fn diff_partial_rebuilding(
         // whose columns this plan changes, after those changes too: its own
         // default may name a column the parent adds, and a parent's default
         // set or dropped afterwards would overwrite its own (#1692 review).
-        if let Change::CreateTable { table, .. } = c
+        if let Change::Table(TableChange::CreateTable { table, .. }) = c
             && let Some(of) = &table.partition_of
         {
             if parent_columns_change.contains(&of.parent) {
@@ -2865,7 +2897,7 @@ pub(crate) fn diff_partial_rebuilding(
         // (#1737 review, DEC-1688.1). First rather than the partition's own
         // last, which would put it after a replica identity naming it. A
         // parent's index reads only its columns, all of earlier classes.
-        if let Change::AddIndex { table, .. } = c
+        if let Change::Index(IndexChange::AddIndex { table, .. }) = c
             && declared
                 .schema
                 .tables
@@ -2874,7 +2906,7 @@ pub(crate) fn diff_partial_rebuilding(
         {
             return (order_key(c), 0);
         }
-        if let Change::RenameColumn { table, from, .. } = c {
+        if let Change::Column(ColumnChange::RenameColumn { table, from, .. }) = c {
             let depth = chain_depth
                 .get(&(table.clone(), from.clone()))
                 .copied()
@@ -2896,11 +2928,11 @@ pub(crate) fn diff_partial_rebuilding(
     // change instead of tying with it, where the subject decided (#2696 ready
     // round, DEC-2447.12).
     fn built_domain(c: &Change) -> Option<&pbps_model::ManagedType> {
-        let definition = if let Change::CreateType { definition, .. }
-        | Change::EnumRebuild {
+        let definition = if let Change::Type(TypeChange::CreateType { definition, .. })
+        | Change::TypeValue(TypeValueChange::EnumRebuild {
             step: pbps_model::EnumRebuildStep::Create { definition, .. },
             ..
-        } = c
+        }) = c
         {
             definition.as_ref()
         } else {
@@ -2911,11 +2943,13 @@ pub(crate) fn diff_partial_rebuilding(
     let package_floor: isize = planned
         .iter()
         .filter_map(|p| {
-            if let Change::CreateExtension { uid, .. } | Change::UpdateExtension { uid, .. } =
-                &p.change
+            if let Change::Extension(ExtensionChange::CreateExtension { uid, .. })
+            | Change::Extension(ExtensionChange::UpdateExtension { uid, .. }) = &p.change
             {
                 Some(extension_rank.get(uid).copied().unwrap_or(0) + 1)
-            } else if let Change::SetExtensionSchema { uid, .. } = &p.change {
+            } else if let Change::Extension(ExtensionChange::SetExtensionSchema { uid, .. }) =
+                &p.change
+            {
                 Some(extension_rank.get(uid).copied().unwrap_or(0) + 2)
             } else {
                 None
@@ -2932,7 +2966,7 @@ pub(crate) fn diff_partial_rebuilding(
     let created_search: BTreeSet<&pbps_model::SearchRef> = planned
         .iter()
         .filter_map(|p| {
-            if let Change::CreateSearch { name, .. } = &p.change {
+            if let Change::Search(SearchChange::CreateSearch { name, .. }) = &p.change {
                 Some(name)
             } else {
                 None
@@ -3005,23 +3039,25 @@ pub(crate) fn diff_partial_rebuilding(
         (
             class,
             within,
-            if let Change::AttachPartition { table, .. } = &p.change
+            if let Change::Partition(PartitionChange::AttachPartition { table, .. }) = &p.change
                 && let Some(rank) = late_attach.get(table)
             {
                 *rank
-            } else if let Change::CreateExtension { uid, .. }
-            | Change::DropExtension { uid, .. }
-            | Change::UpdateExtension { uid, .. } = &p.change
+            } else if let Change::Extension(ExtensionChange::CreateExtension { uid, .. })
+            | Change::Extension(ExtensionChange::DropExtension { uid, .. })
+            | Change::Extension(ExtensionChange::UpdateExtension { uid, .. }) = &p.change
             {
                 // Behind the packages of this plan it requires, or that require
                 // it for a drop (DEC-2447.6, DEC-2447.8).
                 extension_rank.get(uid).copied().unwrap_or(0)
-            } else if let Change::CreateSearch { name, .. } = &p.change {
+            } else if let Change::Search(SearchChange::CreateSearch { name, .. }) = &p.change {
                 // Behind the packages and the dictionaries of this plan it maps.
                 search_rank.get(name).copied().unwrap_or(0)
-            } else if let Change::DropSearch { name, .. } = &p.change {
+            } else if let Change::Search(SearchChange::DropSearch { name, .. }) = &p.change {
                 -drop_search_rank.get(name).copied().unwrap_or(0)
-            } else if let Change::SetExtensionSchema { uid, .. } = &p.change {
+            } else if let Change::Extension(ExtensionChange::SetExtensionSchema { uid, .. }) =
+                &p.change
+            {
                 // One rank behind the package's own update, whose result the
                 // move starts from: the two rewrite one package, and the draft
                 // is what orders two writes (DEC-2447.11).
@@ -3047,7 +3083,7 @@ pub(crate) fn diff_partial_rebuilding(
             // which a pull writes and a positional `INSERT` binds to. Left
             // to the rendering below, the column's random uid decided it
             // (#2080).
-            if let Change::AddColumn { table, name, .. } = &p.change {
+            if let Change::Column(ColumnChange::AddColumn { table, name, .. }) = &p.change {
                 declared
                     .schema
                     .tables
@@ -3124,25 +3160,25 @@ fn diff_columns(
                         column: declared_ref.clone(),
                     });
                 }
-                changes.push(Change::AddColumn {
+                changes.push(Change::Column(ColumnChange::AddColumn {
                     uid: uid.clone(),
                     table: declared_table_name.clone(),
                     name: declared_ref.name.clone(),
                     column: Box::new(c.clone()),
-                });
+                }));
             }
             continue;
         };
 
         if base_ref.name != declared_ref.name {
-            changes.push(Change::RenameColumn {
+            changes.push(Change::Column(ColumnChange::RenameColumn {
                 uid: uid.clone(),
                 table: declared_table_name.clone(),
                 from: base_ref.name.clone(),
                 to: declared_ref.name.clone(),
                 table_was: (base_table_name != declared_table_name)
                     .then(|| base_table_name.clone()),
-            });
+            }));
         }
 
         let (Some(base_col), Some(col)) = (
@@ -3218,13 +3254,13 @@ fn diff_columns(
                     column: declared_ref.clone(),
                 });
             } else {
-                changes.push(Change::AlterColumnNumbering {
+                changes.push(Change::Column(ColumnChange::AlterColumnNumbering {
                     uid: uid.clone(),
                     column: declared_ref.clone(),
                     ty: to_ty.clone(),
                     from: from.clone(),
                     to: to.clone(),
-                });
+                }));
             }
         };
         // Compare the source as one property: ordinary defaults may change,
@@ -3250,12 +3286,12 @@ fn diff_columns(
                     });
                 } else if from.expression != to.expression {
                     recomputed = true;
-                    changes.push(Change::AlterColumnExpression {
+                    changes.push(Change::Column(ColumnChange::AlterColumnExpression {
                         uid: uid.clone(),
                         column: declared_ref.clone(),
                         from: from.expression.clone(),
                         to: to.expression.clone(),
-                    });
+                    }));
                 }
                 (None, None)
             }
@@ -3361,7 +3397,7 @@ fn diff_columns(
         }
         let converting = using.is_some();
         if retyped {
-            changes.push(Change::AlterColumnType {
+            changes.push(Change::Column(ColumnChange::AlterColumnType {
                 uid: uid.clone(),
                 column: declared_ref.clone(),
                 from: from_ty.clone(),
@@ -3372,26 +3408,26 @@ fn diff_columns(
                 from_collation: base_col.collation.clone(),
                 to_collation: col.collation.clone(),
                 using,
-            });
+            }));
             if tightened_after {
-                changes.push(Change::AlterColumnNullability {
+                changes.push(Change::Column(ColumnChange::AlterColumnNullability {
                     uid: uid.clone(),
                     column: declared_ref.clone(),
                     ty: to_ty,
                     to_nullable: false,
                     through_external_partitions: false,
                     collation: col.collation.clone(),
-                });
+                }));
             }
         } else if base_col.nullable != col.nullable {
-            changes.push(Change::AlterColumnNullability {
+            changes.push(Change::Column(ColumnChange::AlterColumnNullability {
                 uid: uid.clone(),
                 column: declared_ref.clone(),
                 ty: to_ty,
                 to_nullable: col.nullable,
                 through_external_partitions: false,
                 collation: col.collation.clone(),
-            });
+            }));
         }
         // A default the expression's result cannot take is refused by the
         // engine at the retype -- measured on 16 and 18, `default for column
@@ -3415,34 +3451,34 @@ fn diff_columns(
             // statement. Splitting it there would put two lines at opposite
             // ends of the plan where one says it better (SPEC §14.1).
             let split = retyped && old_default.is_some() && new_default.is_some();
-            changes.push(Change::AlterColumnDefault {
+            changes.push(Change::Column(ColumnChange::AlterColumnDefault {
                 uid: uid.clone(),
                 column: declared_ref.clone(),
                 from: old_default.cloned(),
                 to: if split { None } else { new_default.cloned() },
-            });
+            }));
             if split {
-                changes.push(Change::AlterColumnDefault {
+                changes.push(Change::Column(ColumnChange::AlterColumnDefault {
                     uid: uid.clone(),
                     column: declared_ref.clone(),
                     from: None,
                     to: new_default.cloned(),
-                });
+                }));
             }
         }
         if base_col.deprecated != col.deprecated {
-            changes.push(Change::SetColumnDeprecated {
+            changes.push(Change::Column(ColumnChange::SetColumnDeprecated {
                 uid: uid.clone(),
                 column: declared_ref.clone(),
                 reason: col.deprecated.clone(),
-            });
+            }));
         }
     }
 
     // Present only on the base side: a dropped column.
     for (uid, base_ref) in &base_cols {
         if !declared_cols.contains_key(uid) {
-            changes.push(Change::DropColumn {
+            changes.push(Change::Column(ColumnChange::DropColumn {
                 uid: uid.clone(),
                 // The **declared** table, with the column's base name. Only
                 // the table is renamed here — a column this plan drops is
@@ -3456,7 +3492,7 @@ fn diff_columns(
                 // because `order_key` runs the rename first: a valid,
                 // reviewed plan refused by the engine.
                 column: declared_table_name.column(base_ref.name.clone()),
-            });
+            }));
         }
     }
 }
@@ -3533,9 +3569,9 @@ fn recreate_referenced_foreign_keys(
     if !changes.iter().any(|c| {
         matches!(
             c,
-            Change::SetPrimaryKey { from: Some(_), .. }
-                | Change::DropUnique { .. }
-                | Change::DropIndex { .. }
+            Change::Constraint(ConstraintChange::SetPrimaryKey { from: Some(_), .. })
+                | Change::Constraint(ConstraintChange::DropUnique { .. })
+                | Change::Index(IndexChange::DropIndex { .. })
         )
     }) {
         return;
@@ -3553,25 +3589,25 @@ fn recreate_referenced_foreign_keys(
     let mut removed = BTreeSet::new();
     for change in changes.iter() {
         let (table, columns) = match change {
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => continue,
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => continue,
             // No foreign key references an exclusion constraint (measured:
             // 42830), so its drop frees no key (DEC-2448.3).
-            Change::SetExclusion { .. } => continue,
-            Change::SetPrimaryKey {
+            Change::Constraint(ConstraintChange::SetExclusion { .. }) => continue,
+            Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table,
                 from: Some(key),
                 ..
-            } => (table, key.columns.iter().cloned().collect::<BTreeSet<_>>()),
-            Change::DropUnique { table, name } => {
+            }) => (table, key.columns.iter().cloned().collect::<BTreeSet<_>>()),
+            Change::Constraint(ConstraintChange::DropUnique { table, name }) => {
                 let Some(key) = aligned.get(table).and_then(|t| t.unique.get(name)) else {
                     continue;
                 };
                 (table, key.columns.iter().cloned().collect::<BTreeSet<_>>())
             }
-            Change::DropIndex { table, name } => {
+            Change::Index(IndexChange::DropIndex { table, name }) => {
                 // Only a unique index over plain columns can back a foreign
                 // key: the engine refuses one over an expression (DEC-1169.2).
                 let Some(columns) = aligned
@@ -3584,55 +3620,55 @@ fn recreate_referenced_foreign_keys(
                 };
                 (table, columns.into_iter().collect::<BTreeSet<_>>())
             }
-            Change::CreateTable { .. }
-            | Change::DropTable { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::RenameTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::AlterColumnNumbering { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetComment { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::AddUnique { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
+            Change::Table(TableChange::CreateTable { .. })
+            | Change::Table(TableChange::DropTable { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Table(TableChange::RenameTable { .. })
+            | Change::Column(ColumnChange::AddColumn { .. })
+            | Change::Column(ColumnChange::DropColumn { .. })
+            | Change::Column(ColumnChange::RenameColumn { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+            | Change::TableProperty(TablePropertyChange::SetComment { .. })
+            | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+            | Change::Constraint(ConstraintChange::AddUnique { .. })
+            | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            | Change::Constraint(ConstraintChange::AddCheck { .. })
+            | Change::Constraint(ConstraintChange::DropCheck { .. })
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::UpdateRow { .. })
+            | Change::Row(RowChange::DeleteRow { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
+            | Change::Module(ModuleChange::CreateModule { .. })
+            | Change::Module(ModuleChange::AlterModule { .. })
+            | Change::Module(ModuleChange::DropModule { .. })
+            | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
             | pbps_model::catalog_change!()
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetReplicaIdentity { .. } => continue,
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(PolicyChange::DropPolicy { .. })
+            | Change::Policy(PolicyChange::CreatePolicy { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. }) => continue,
         };
         // PostgreSQL can bind a permutation of a composite candidate key.
         // SQL Server requires its order; a set conservatively covers both.
@@ -3647,18 +3683,18 @@ fn recreate_referenced_foreign_keys(
                 continue;
             };
             if !removed.contains(&(fk.references_table.clone(), fk.references_columns.iter().cloned().collect()))
-                || changes.iter().any(|c| matches!(c, Change::DropForeignKey { table: on, name: n } if on == table && n == name)) {
+                || changes.iter().any(|c| matches!(c, Change::Constraint(ConstraintChange::DropForeignKey { table: on, name: n }) if on == table && n == name)) {
                 continue;
             }
-            changes.push(Change::DropForeignKey {
+            changes.push(Change::Constraint(ConstraintChange::DropForeignKey {
                 table: table.clone(),
                 name: name.clone(),
-            });
-            changes.push(Change::AddForeignKey {
+            }));
+            changes.push(Change::Constraint(ConstraintChange::AddForeignKey {
                 table: table.clone(),
                 name: name.clone(),
                 constraint: Box::new(wanted.clone()),
-            });
+            }));
         }
     }
 }
@@ -3707,21 +3743,21 @@ fn rebind_foreign_keys_to_a_new_occupant(
             // PostgreSQL that key can share this one's name.
             if base_uid.get(&fk.references_table) == declared_uid.get(&wanted.references_table)
                 || changes.iter().any(|c| {
-                    matches!(c, Change::AddForeignKey { table, name: n, .. }
+                    matches!(c, Change::Constraint(ConstraintChange::AddForeignKey { table, name: n, .. })
                         if table == new_name && n == name)
                 })
             {
                 continue;
             }
-            pairs.push(Change::DropForeignKey {
+            pairs.push(Change::Constraint(ConstraintChange::DropForeignKey {
                 table: new_name.clone(),
                 name: name.clone(),
-            });
-            pairs.push(Change::AddForeignKey {
+            }));
+            pairs.push(Change::Constraint(ConstraintChange::AddForeignKey {
                 table: new_name.clone(),
                 name: name.clone(),
                 constraint: Box::new(wanted.clone()),
-            });
+            }));
         }
     }
     changes.extend(pairs);
@@ -3740,12 +3776,12 @@ fn tables_with_row_changes(changes: &[Change]) -> BTreeSet<TableName> {
 fn identities_put_on<'a>(changes: impl Iterator<Item = &'a Change>) -> BTreeSet<ColumnRef> {
     changes
         .filter_map(|c| {
-            if let Change::AlterColumnNumbering {
+            if let Change::Column(ColumnChange::AlterColumnNumbering {
                 column,
                 from: ValueSource::None | ValueSource::Default(_) | ValueSource::Sequence(_),
                 to: ValueSource::Identity(_),
                 ..
-            } = c
+            }) = c
             {
                 Some(column.clone())
             } else {
@@ -3773,12 +3809,12 @@ fn sequence_release_depths<'a>(
     let mut claims: BTreeMap<ColumnRef, Option<(String, String)>> = BTreeMap::new();
     let mut renamed: BTreeMap<ColumnRef, (TableName, TableName)> = BTreeMap::new();
     for c in changes {
-        let Change::AlterColumnNumbering {
+        let Change::Column(ColumnChange::AlterColumnNumbering {
             column,
             from: ValueSource::Sequence(was),
             to,
             ..
-        } = c
+        }) = c
         else {
             continue;
         };
@@ -3842,9 +3878,9 @@ fn sequence_release_depths<'a>(
 fn numbering_put_on<'a>(changes: impl Iterator<Item = &'a Change>) -> BTreeSet<ColumnRef> {
     changes
         .filter_map(|c| {
-            if let Change::AlterColumnNumbering {
+            if let Change::Column(ColumnChange::AlterColumnNumbering {
                 column, from, to, ..
-            } = c
+            }) = c
                 && pbps_model::NumberingKind::installed(from, to)
             {
                 Some(column.clone())
@@ -3866,7 +3902,7 @@ fn numbering_after_deletes<'a>(
     let deleted: BTreeSet<TableName> = changes
         .clone()
         .filter_map(|c| {
-            if let Change::DeleteRow { table, .. } = c {
+            if let Change::Row(RowChange::DeleteRow { table, .. }) = c {
                 Some(table.clone())
             } else {
                 None
@@ -3900,7 +3936,7 @@ fn refuse_rows_referencing_late_inserts(
     let added: BTreeSet<(&TableName, &str)> = changes
         .iter()
         .filter_map(|c| {
-            if let Change::AddForeignKey { table, name, .. } = c {
+            if let Change::Constraint(ConstraintChange::AddForeignKey { table, name, .. }) = c {
                 Some((table, name.raw()))
             } else {
                 None
@@ -3909,7 +3945,9 @@ fn refuse_rows_referencing_late_inserts(
         .collect();
     let mut seen = BTreeSet::new();
     for change in changes {
-        let (Change::InsertRow { table, .. } | Change::UpdateRow { table, .. }) = change else {
+        let (Change::Row(RowChange::InsertRow { table, .. })
+        | Change::Row(RowChange::UpdateRow { table, .. })) = change
+        else {
             continue;
         };
         let Some(t) = declared.schema.tables.get(table) else {
@@ -3936,7 +3974,7 @@ fn refuse_rows_referencing_late_inserts(
 fn tables_with_inserts<'a>(changes: impl Iterator<Item = &'a Change>) -> BTreeSet<TableName> {
     changes
         .filter_map(|c| {
-            if let Change::InsertRow { table, .. } = c {
+            if let Change::Row(RowChange::InsertRow { table, .. }) = c {
                 Some(table.clone())
             } else {
                 None
@@ -3947,9 +3985,9 @@ fn tables_with_inserts<'a>(changes: impl Iterator<Item = &'a Change>) -> BTreeSe
 
 /// The table a row change writes or deletes in.
 fn row_table(change: &Change) -> Option<&TableName> {
-    if let Change::InsertRow { table, .. }
-    | Change::UpdateRow { table, .. }
-    | Change::DeleteRow { table, .. } = change
+    if let Change::Row(RowChange::InsertRow { table, .. })
+    | Change::Row(RowChange::UpdateRow { table, .. })
+    | Change::Row(RowChange::DeleteRow { table, .. }) = change
     {
         Some(table)
     } else {
@@ -3977,19 +4015,19 @@ fn clear_external_partitions_after_loosening(declared: &Schema, changes: &mut [C
             .is_some_and(|by| by.external)
     };
     for change in changes {
-        if let Change::AlterColumnNullability {
+        if let Change::Column(ColumnChange::AlterColumnNullability {
             column,
             to_nullable: true,
             through_external_partitions,
             ..
-        }
-        | Change::AlterColumnType {
+        })
+        | Change::Column(ColumnChange::AlterColumnType {
             column,
             from_nullable: false,
             to_nullable: true,
             through_external_partitions,
             ..
-        } = change
+        }) = change
         {
             *through_external_partitions = external(&column.table);
         }
@@ -4007,7 +4045,7 @@ fn split_tightenings_from_retypes(changes: &mut Vec<Change>) {
     let late = numbering_after_deletes(changes.iter());
     let mut split = Vec::new();
     for change in changes.iter_mut() {
-        if let Change::AlterColumnType {
+        if let Change::Column(ColumnChange::AlterColumnType {
             uid,
             column,
             to,
@@ -4015,7 +4053,7 @@ fn split_tightenings_from_retypes(changes: &mut Vec<Change>) {
             to_nullable,
             to_collation,
             ..
-        } = change
+        }) = change
             && !*to_nullable
             && rows.contains(&column.table)
             && !(identified.contains(column)
@@ -4023,14 +4061,14 @@ fn split_tightenings_from_retypes(changes: &mut Vec<Change>) {
                 && !late.contains(&column.table))
         {
             *to_nullable = true;
-            split.push(Change::AlterColumnNullability {
+            split.push(Change::Column(ColumnChange::AlterColumnNullability {
                 uid: uid.clone(),
                 column: column.clone(),
                 ty: to.clone(),
                 to_nullable: false,
                 through_external_partitions: false,
                 collation: to_collation.clone(),
-            });
+            }));
         }
     }
     changes.extend(split);
@@ -4118,14 +4156,14 @@ fn recreate_retyped_dependents(
     // parse (#1174).
     let removed = |column: &ColumnRef| -> Option<bool> {
         changes.iter().find_map(|c| {
-            if let Change::DropComputedColumn { table, name, .. } = c
+            if let Change::Column(ColumnChange::DropComputedColumn { table, name, .. }) = c
                 && *table == column.table
                 && *name == column.name
             {
                 Some(true)
-            } else if let Change::DropColumn {
+            } else if let Change::Column(ColumnChange::DropColumn {
                 column: dropped, ..
-            } = c
+            }) = c
                 && dropped == column
             {
                 Some(false)
@@ -4137,9 +4175,9 @@ fn recreate_retyped_dependents(
     let recomputed: BTreeSet<ColumnRef> = changes
         .iter()
         .filter_map(|change| {
-            if let Change::AddComputedColumn { table, name, .. } = change {
+            if let Change::Column(ColumnChange::AddComputedColumn { table, name, .. }) = change {
                 Some((table.column(name), true))
-            } else if let Change::AddColumn { table, name, .. } = change {
+            } else if let Change::Column(ColumnChange::AddColumn { table, name, .. }) = change {
                 Some((table.column(name), false))
             } else {
                 None
@@ -4160,11 +4198,11 @@ fn recreate_retyped_dependents(
         );
     }
     for (column, dependents) in changes.iter().filter_map(|change| match change {
-        Change::RebuildPartitionedTable(_)
-        | Change::BuildPartitionedIndex(_)
-        | Change::CopyTableRows(_)
-        | Change::AnalyzeTableTree(_) => None,
-        Change::AlterColumnType {
+        Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+        | Change::Index(IndexChange::BuildPartitionedIndex(_))
+        | Change::Partition(PartitionChange::CopyTableRows(_))
+        | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => None,
+        Change::Column(ColumnChange::AlterColumnType {
             column,
             from,
             to,
@@ -4173,7 +4211,7 @@ fn recreate_retyped_dependents(
             from_collation,
             to_collation,
             ..
-        } => {
+        }) => {
             // A nullability change in the same statement brings its own
             // blockers, which a type change alone may not have (#1363).
             let dependents = pbps_dialect::RetypeDependents::of_retype(
@@ -4184,76 +4222,76 @@ fn recreate_retyped_dependents(
             );
             Some((column.clone(), dependents))
         }
-        Change::AlterColumnNullability {
+        Change::Column(ColumnChange::AlterColumnNullability {
             column,
             to_nullable,
             ..
-        } => Some((column.clone(), dialect.nullability_dependents(*to_nullable))),
+        }) => Some((column.clone(), dialect.nullability_dependents(*to_nullable))),
         // A conversion by name leaves constants of the old type in checks,
         // keys and partial indexes that the replacement cannot be compared
         // with. The engine's own assignment cast of a domain's base change
         // keeps them (measured on 16 and 18, DEC-1635.9), so nothing comes
         // down for it.
-        Change::EnumRebuild {
+        Change::TypeValue(TypeValueChange::EnumRebuild {
             step: pbps_model::EnumRebuildStep::Retype { column, values, .. },
             ..
-        } => Some((
+        }) => Some((
             column.clone(),
             match values.as_ref() {
                 pbps_model::ValueChange::Relabel { .. } => dialect.enum_rebuild_dependents(),
                 pbps_model::ValueChange::Cast { .. } => Default::default(),
             },
         )),
-        Change::CreateTable { .. }
-        | Change::DropTable { .. }
-        | Change::DetachPartition { .. }
-        | Change::AttachPartition { .. }
-        | Change::RenameTable { .. }
-        | Change::AddColumn { .. }
-        | Change::DropColumn { .. }
-        | Change::RenameColumn { .. }
-        | Change::AlterColumnDefault { .. }
-        | Change::AlterColumnExpression { .. }
-        | Change::AlterColumnNumbering { .. }
-        | Change::SetColumnDeprecated { .. }
-        | Change::SetComment { .. }
-        | Change::SetPrimaryKey { .. }
-        | Change::SetIndexStorageParameters { .. }
-        | Change::SetTablePersistence { .. }
-        | Change::SetPartitionDefault { .. }
-        | Change::SetPartitionNotNull { .. }
-        | Change::DropPolicy { .. }
-        | Change::CreatePolicy { .. }
-        | Change::SetRowSecurity { .. }
-        | Change::SetStorageParameters { .. }
-        | Change::SetReplicaIdentity { .. }
-        | Change::AddUnique { .. }
-        | Change::DropUnique { .. }
-        | Change::SetExclusion { .. }
-        | Change::AddForeignKey { .. }
-        | Change::DropForeignKey { .. }
-        | Change::AddCheck { .. }
-        | Change::DropCheck { .. }
-        | Change::AddIndex { .. }
-        | Change::AddComputedColumn { .. }
-        | Change::DropComputedColumn { .. }
-        | Change::DropIndex { .. }
-        | Change::InsertRow { .. }
-        | Change::UpdateRow { .. }
-        | Change::DeleteRow { .. }
-        | Change::SetDataMode { .. }
-        | Change::SetEnsureKeys { .. }
-        | Change::CreateModule { .. }
-        | Change::AlterModule { .. }
-        | Change::DropModule { .. }
-        | Change::AddEnumValue { .. }
-        | Change::AlterDomain { .. }
-        | Change::RenameEnumValue { .. }
-        | Change::EnumRebuild { .. }
+        Change::Table(TableChange::CreateTable { .. })
+        | Change::Table(TableChange::DropTable { .. })
+        | Change::Partition(PartitionChange::DetachPartition { .. })
+        | Change::Partition(PartitionChange::AttachPartition { .. })
+        | Change::Table(TableChange::RenameTable { .. })
+        | Change::Column(ColumnChange::AddColumn { .. })
+        | Change::Column(ColumnChange::DropColumn { .. })
+        | Change::Column(ColumnChange::RenameColumn { .. })
+        | Change::Column(ColumnChange::AlterColumnDefault { .. })
+        | Change::Column(ColumnChange::AlterColumnExpression { .. })
+        | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+        | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+        | Change::TableProperty(TablePropertyChange::SetComment { .. })
+        | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+        | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+        | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+        | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+        | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+        | Change::Policy(PolicyChange::DropPolicy { .. })
+        | Change::Policy(PolicyChange::CreatePolicy { .. })
+        | Change::Policy(PolicyChange::SetRowSecurity { .. })
+        | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+        | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+        | Change::Constraint(ConstraintChange::AddUnique { .. })
+        | Change::Constraint(ConstraintChange::DropUnique { .. })
+        | Change::Constraint(ConstraintChange::SetExclusion { .. })
+        | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+        | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+        | Change::Constraint(ConstraintChange::AddCheck { .. })
+        | Change::Constraint(ConstraintChange::DropCheck { .. })
+        | Change::Index(IndexChange::AddIndex { .. })
+        | Change::Column(ColumnChange::AddComputedColumn { .. })
+        | Change::Column(ColumnChange::DropComputedColumn { .. })
+        | Change::Index(IndexChange::DropIndex { .. })
+        | Change::Row(RowChange::InsertRow { .. })
+        | Change::Row(RowChange::UpdateRow { .. })
+        | Change::Row(RowChange::DeleteRow { .. })
+        | Change::Row(RowChange::SetDataMode { .. })
+        | Change::Row(RowChange::SetEnsureKeys { .. })
+        | Change::Module(ModuleChange::CreateModule { .. })
+        | Change::Module(ModuleChange::AlterModule { .. })
+        | Change::Module(ModuleChange::DropModule { .. })
+        | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+        | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+        | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+        | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
         | pbps_model::catalog_change!()
-        | Change::Grant { .. }
-        | Change::Revoke { .. }
-        | Change::PublicExecution { .. } => None,
+        | Change::Permission(GrantChange::Grant { .. })
+        | Change::Permission(GrantChange::Revoke { .. })
+        | Change::Permission(GrantChange::PublicExecution { .. }) => None,
     }) {
         let merged = retyped.entry(column).or_default();
         also(merged, dependents);
@@ -4307,20 +4345,20 @@ fn recreate_retyped_dependents(
             && key.columns.iter().any(&key_column)
             && !changes
                 .iter()
-                .any(|c| matches!(c, Change::SetPrimaryKey { table, .. } if table == name))
+                .any(|c| matches!(c, Change::Constraint(ConstraintChange::SetPrimaryKey { table, .. }) if table == name))
         {
-            changes.push(Change::SetPrimaryKey {
+            changes.push(Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table: name.clone(),
                 from: Some(key.clone()),
                 to: None,
                 nonclustered: false,
-            });
-            changes.push(Change::SetPrimaryKey {
+            }));
+            changes.push(Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table: name.clone(),
                 from: None,
                 to: Some(wanted.clone()),
                 nonclustered: !after.primary_key_is_clustered(),
-            });
+            }));
         }
         // Only a constraint or index whose layout stays as it was: one whose
         // layout moves is already dropped and re-added by `diff_constraints`,
@@ -4330,29 +4368,29 @@ fn recreate_retyped_dependents(
                 && before.unique_is_clustered(n.raw()) == after.unique_is_clustered(n.raw())
                 && key.columns.iter().any(&key_column)
             {
-                changes.push(Change::DropUnique {
+                changes.push(Change::Constraint(ConstraintChange::DropUnique {
                     table: name.clone(),
                     name: n.clone(),
-                });
-                changes.push(Change::AddUnique {
+                }));
+                changes.push(Change::Constraint(ConstraintChange::AddUnique {
                     table: name.clone(),
                     name: n.clone(),
                     constraint: key.clone(),
                     clustered: after.unique_is_clustered(n.raw()),
-                });
+                }));
             }
         }
         for (n, check) in &before.checks {
             if checks && after.checks.get(n) == Some(check) {
-                changes.push(Change::DropCheck {
+                changes.push(Change::Constraint(ConstraintChange::DropCheck {
                     table: name.clone(),
                     name: n.clone(),
-                });
-                changes.push(Change::AddCheck {
+                }));
+                changes.push(Change::Constraint(ConstraintChange::AddCheck {
                     table: name.clone(),
                     name: n.clone(),
                     constraint: check.clone(),
-                });
+                }));
             }
         }
         for (n, index) in &before.indexes {
@@ -4371,16 +4409,16 @@ fn recreate_retyped_dependents(
                         && (index.filter.is_some()
                             || index.columns.iter().any(|c| c.key.expression().is_some()))))
             {
-                changes.push(Change::DropIndex {
+                changes.push(Change::Index(IndexChange::DropIndex {
                     table: name.clone(),
                     name: n.clone(),
-                });
-                changes.push(Change::AddIndex {
+                }));
+                changes.push(Change::Index(IndexChange::AddIndex {
                     table: name.clone(),
                     name: n.clone(),
                     index: Box::new(index.clone()),
                     clustered: after.index_is_clustered(n.raw()),
-                });
+                }));
             }
         }
         for (n, fk) in &before.foreign_keys {
@@ -4394,15 +4432,15 @@ fn recreate_retyped_dependents(
                     .chain(referenced)
                     .any(|c| retyped.get(&c).is_some_and(|d| d.foreign_keys))
             {
-                changes.push(Change::DropForeignKey {
+                changes.push(Change::Constraint(ConstraintChange::DropForeignKey {
                     table: name.clone(),
                     name: n.clone(),
-                });
-                changes.push(Change::AddForeignKey {
+                }));
+                changes.push(Change::Constraint(ConstraintChange::AddForeignKey {
                     table: name.clone(),
                     name: n.clone(),
                     constraint: Box::new(fk.clone()),
-                });
+                }));
             }
         }
     }
@@ -4416,22 +4454,22 @@ fn recreate_retyped_dependents(
 /// does to it. Every one is an `ALTER COLUMN` or an `sp_rename` the engine
 /// refuses on a computed column's input (#1174).
 fn input_change<'a>(change: &'a Change, table: &TableName) -> Option<(&'a str, &'static str)> {
-    if let Change::RenameColumn { table: t, from, .. } = change
+    if let Change::Column(ColumnChange::RenameColumn { table: t, from, .. }) = change
         && t == table
     {
         return Some((from.raw(), "renames"));
     }
-    if let Change::DropColumn { column, .. } = change
+    if let Change::Column(ColumnChange::DropColumn { column, .. }) = change
         && column.table == *table
     {
         return Some((column.name.raw(), "drops"));
     }
-    if let Change::AlterColumnType { column, .. } = change
+    if let Change::Column(ColumnChange::AlterColumnType { column, .. }) = change
         && column.table == *table
     {
         return Some((column.name.raw(), "retypes or recollates"));
     }
-    if let Change::AlterColumnNullability { column, .. } = change
+    if let Change::Column(ColumnChange::AlterColumnNullability { column, .. }) = change
         && column.table == *table
     {
         return Some((column.name.raw(), "changes the nullability of"));
@@ -4495,7 +4533,7 @@ fn refuse_temporal_changes(
     let created: BTreeSet<&TableName> = changes
         .iter()
         .filter_map(|c| {
-            if let Change::CreateTable { name, .. } = c {
+            if let Change::Table(TableChange::CreateTable { name, .. }) = c {
                 Some(name)
             } else {
                 None
@@ -4507,9 +4545,10 @@ fn refuse_temporal_changes(
     for change in changes {
         let ends_a_table = matches!(
             change,
-            Change::DropTable { .. } | Change::RenameTable { .. }
+            Change::Table(TableChange::DropTable { .. })
+                | Change::Table(TableChange::RenameTable { .. })
         );
-        if matches!(change, Change::CreateTable { .. })
+        if matches!(change, Change::Table(TableChange::CreateTable { .. }))
             || (!ends_a_table && change.table().is_some_and(|t| created.contains(t)))
         {
             continue;
@@ -4518,7 +4557,7 @@ fn refuse_temporal_changes(
         // NULL in every row of both, with versioning left on (DEC-1177.1,
         // measured on 17.0). A period column is declared through
         // `system_time`, whose difference is refused above.
-        if let Change::AddColumn { column, .. } = change
+        if let Change::Column(ColumnChange::AddColumn { column, .. }) = change
             && column.nullable
         {
             continue;
@@ -4526,26 +4565,27 @@ fn refuse_temporal_changes(
         // A drop or a rename acts on the table the base has at that name, and
         // a rename brings it to the declared one: asked of those sides, so the
         // ordinary table a new temporal one replaces may still go.
-        let asked: Vec<&TableName> = if let Change::DropTable { name, .. } = change {
-            vec![name]
-                .into_iter()
-                .filter(|n| temporal(base.schema, n))
-                .collect()
-        } else if let Change::RenameTable { from, to, .. } = change {
-            [(from, base.schema), (to, declared.schema)]
-                .into_iter()
-                .filter(|(n, side)| temporal(side, n))
-                .map(|(n, _)| n)
-                .collect()
-        } else {
-            change
-                .table()
-                .into_iter()
-                .filter(|n| temporal(base.schema, n) || temporal(declared.schema, n))
-                .collect()
-        };
+        let asked: Vec<&TableName> =
+            if let Change::Table(TableChange::DropTable { name, .. }) = change {
+                vec![name]
+                    .into_iter()
+                    .filter(|n| temporal(base.schema, n))
+                    .collect()
+            } else if let Change::Table(TableChange::RenameTable { from, to, .. }) = change {
+                [(from, base.schema), (to, declared.schema)]
+                    .into_iter()
+                    .filter(|(n, side)| temporal(side, n))
+                    .map(|(n, _)| n)
+                    .collect()
+            } else {
+                change
+                    .table()
+                    .into_iter()
+                    .filter(|n| temporal(base.schema, n) || temporal(declared.schema, n))
+                    .collect()
+            };
         // The one kind admitted is refused only for its nullability: say so.
-        let what = if matches!(change, Change::AddColumn { .. }) {
+        let what = if matches!(change, Change::Column(ColumnChange::AddColumn { .. })) {
             "add a NOT NULL column".to_owned()
         } else {
             change_in_words(change)
@@ -5242,19 +5282,19 @@ fn attached(
     if let Some(key) = &table.primary_key
         && contested(&key.columns)
     {
-        released.push(Change::SetPrimaryKey {
+        released.push(Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: declared_name.clone(),
             from: Some(key.clone()),
             to: None,
             nonclustered: false,
-        });
+        }));
     }
     for (name, u) in &table.unique {
         if contested(&u.columns) {
-            released.push(Change::DropUnique {
+            released.push(Change::Constraint(ConstraintChange::DropUnique {
                 table: declared_name.clone(),
                 name: name.clone(),
-            });
+            }));
         }
     }
     // A foreign key the engine takes for the parent's clone keeps its own
@@ -5280,10 +5320,10 @@ fn attached(
                 || declared.foreign_keys.contains_key(name)
                 || declared.checks.contains_key(name))
         {
-            released.push(Change::DropForeignKey {
+            released.push(Change::Constraint(ConstraintChange::DropForeignKey {
                 table: declared_name.clone(),
                 name: name.clone(),
-            });
+            }));
         }
     }
     if table.replica_identity.is_some() {
@@ -5394,7 +5434,7 @@ fn refuse_partition_changes(
     let renamed_parents: BTreeMap<&TableName, &TableName> = changes
         .iter()
         .filter_map(|c| {
-            if let Change::RenameTable { from, to, .. } = c
+            if let Change::Table(TableChange::RenameTable { from, to, .. }) = c
                 && standing_parent(base.schema, from)
                 && standing_parent(declared.schema, to)
             {
@@ -5559,7 +5599,7 @@ fn refuse_partition_changes(
     let created: BTreeSet<&TableName> = changes
         .iter()
         .filter_map(|c| {
-            if let Change::CreateTable { name, .. } = c {
+            if let Change::Table(TableChange::CreateTable { name, .. }) = c {
                 Some(name)
             } else {
                 None
@@ -5569,7 +5609,7 @@ fn refuse_partition_changes(
     let attaching: BTreeSet<&TableName> = changes
         .iter()
         .filter_map(|c| {
-            if let Change::AttachPartition { table, .. } = c {
+            if let Change::Partition(PartitionChange::AttachPartition { table, .. }) = c {
                 Some(table)
             } else {
                 None
@@ -5582,11 +5622,11 @@ fn refuse_partition_changes(
     let dropping: BTreeSet<&TableName> = changes
         .iter()
         .filter_map(|c| {
-            if let Change::DropTable {
+            if let Change::Table(TableChange::DropTable {
                 name,
                 detach_from: Some(_),
                 ..
-            } = c
+            }) = c
             {
                 Some(name)
             } else {
@@ -5600,11 +5640,11 @@ fn refuse_partition_changes(
     // still stand when the pre-flight probes the parent's column (#1692
     // review).
     for change in changes {
-        if let Change::DropTable {
+        if let Change::Table(TableChange::DropTable {
             name,
             detach_from: Some(parent),
             ..
-        } = change
+        }) = change
         {
             moving
                 .entry(declared_parent(parent))
@@ -5616,7 +5656,7 @@ fn refuse_partition_changes(
         // A partition is created with its parent, or under a parent that
         // already stands (#1171); either way it is a creation, and whether
         // the parent's rows let it be is the connected probe's question.
-        if matches!(change, Change::CreateTable { .. }) {
+        if matches!(change, Change::Table(TableChange::CreateTable { .. })) {
             continue;
         }
         // A partition is dropped, detached first, while its parent stands
@@ -5624,11 +5664,11 @@ fn refuse_partition_changes(
         // still refused below.
         if matches!(
             change,
-            Change::DropTable {
+            Change::Table(TableChange::DropTable {
                 detach_from: Some(_),
                 ..
-            } | Change::DetachPartition { .. }
-                | Change::AttachPartition { .. }
+            }) | Change::Partition(PartitionChange::DetachPartition { .. })
+                | Change::Partition(PartitionChange::AttachPartition { .. })
         ) {
             continue;
         }
@@ -5640,19 +5680,19 @@ fn refuse_partition_changes(
         // parent's to change (#1546).
         let own = matches!(
             change,
-            Change::AddIndex { .. }
-                | Change::DropIndex { .. }
-                | Change::AddCheck { .. }
-                | Change::DropCheck { .. }
-                | Change::AddForeignKey { .. }
-                | Change::DropForeignKey { .. }
-                | Change::SetPartitionDefault { .. }
-                | Change::SetPartitionNotNull { .. }
-                | Change::DropPolicy { .. }
-                | Change::CreatePolicy { .. }
-                | Change::SetRowSecurity { .. }
-                | Change::SetStorageParameters { .. }
-                | Change::SetTablePersistence { .. }
+            Change::Index(IndexChange::AddIndex { .. })
+                | Change::Index(IndexChange::DropIndex { .. })
+                | Change::Constraint(ConstraintChange::AddCheck { .. })
+                | Change::Constraint(ConstraintChange::DropCheck { .. })
+                | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+                | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+                | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+                | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+                | Change::Policy(PolicyChange::DropPolicy { .. })
+                | Change::Policy(PolicyChange::CreatePolicy { .. })
+                | Change::Policy(PolicyChange::SetRowSecurity { .. })
+                | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+                | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
         );
         let standing = |schema: &Schema, name: &TableName| {
             schema
@@ -5669,7 +5709,7 @@ fn refuse_partition_changes(
         {
             continue;
         }
-        if let Change::DropForeignKey { table, .. } = change
+        if let Change::Constraint(ConstraintChange::DropForeignKey { table, .. }) = change
             && standing(base.schema, table)
             && dropping.contains(table)
         {
@@ -5680,7 +5720,8 @@ fn refuse_partition_changes(
         // review). On a standing partition it is the parent's clone.
         if matches!(
             change,
-            Change::DropUnique { .. } | Change::SetPrimaryKey { to: None, .. }
+            Change::Constraint(ConstraintChange::DropUnique { .. })
+                | Change::Constraint(ConstraintChange::SetPrimaryKey { to: None, .. })
         ) && change.table().is_some_and(|t| attaching.contains(t))
         {
             continue;
@@ -5701,15 +5742,15 @@ fn refuse_partition_changes(
         // (#1689): the engine recurses each into every partition, a clone on
         // each that the reader leaves to the parent (DEC-1577.1). A new name
         // is a drop and an add, as on any table.
-        if let Change::AddIndex { table, .. }
-        | Change::DropIndex { table, .. }
-        | Change::SetPrimaryKey { table, .. }
-        | Change::AddUnique { table, .. }
-        | Change::DropUnique { table, .. }
-        | Change::AddCheck { table, .. }
-        | Change::DropCheck { table, .. }
-        | Change::AddForeignKey { table, .. }
-        | Change::DropForeignKey { table, .. } = change
+        if let Change::Index(IndexChange::AddIndex { table, .. })
+        | Change::Index(IndexChange::DropIndex { table, .. })
+        | Change::Constraint(ConstraintChange::SetPrimaryKey { table, .. })
+        | Change::Constraint(ConstraintChange::AddUnique { table, .. })
+        | Change::Constraint(ConstraintChange::DropUnique { table, .. })
+        | Change::Constraint(ConstraintChange::AddCheck { table, .. })
+        | Change::Constraint(ConstraintChange::DropCheck { table, .. })
+        | Change::Constraint(ConstraintChange::AddForeignKey { table, .. })
+        | Change::Constraint(ConstraintChange::DropForeignKey { table, .. }) = change
             && parent_standing(base.schema, table)
             && parent_standing(declared.schema, table)
         {
@@ -5756,8 +5797,10 @@ fn refuse_partition_changes(
             // A drop names the base column and a retype the declared one, so
             // each is asked of its own side's key: across one plan a name
             // can leave the key's column for another (#1692 review).
-            if (matches!(change, Change::DropColumn { .. }) && key(base.schema))
-                || (matches!(change, Change::AlterColumnType { .. }) && key(declared.schema))
+            if (matches!(change, Change::Column(ColumnChange::DropColumn { .. }))
+                && key(base.schema))
+                || (matches!(change, Change::Column(ColumnChange::AlterColumnType { .. }))
+                    && key(declared.schema))
             {
                 refuse(
                     table,
@@ -5766,7 +5809,7 @@ fn refuse_partition_changes(
                         change_in_words(change)
                     ),
                 );
-            } else if let Change::AddColumn { column: c, .. } = change
+            } else if let Change::Column(ColumnChange::AddColumn { column: c, .. }) = change
                 && (match &c.value_source {
                     ValueSource::Identity(_) => true,
                     ValueSource::None
@@ -5785,7 +5828,10 @@ fn refuse_partition_changes(
                 );
             } else if let Some(tables) = moving.get(table)
                 && !dialect.partition_meetings()
-                && !matches!(change, Change::SetColumnDeprecated { .. })
+                && !matches!(
+                    change,
+                    Change::Column(ColumnChange::SetColumnDeprecated { .. })
+                )
             {
                 // The capability's canonical symbolic schedule proves this
                 // cut; engines without that contract keep the guard (DEC-2296.12).
@@ -5812,7 +5858,7 @@ fn refuse_partition_changes(
         // A standing parent's rename (#1690): a plain `RENAME`, which its
         // partitions follow. A partition attached, detached or dropped under
         // it in the same plan is named on one side or the other of it.
-        if let Change::RenameTable { from, to, .. } = change
+        if let Change::Table(TableChange::RenameTable { from, to, .. }) = change
             && renamed_parents.get(to) == Some(&from)
         {
             let tables: Vec<String> = moving
@@ -5837,29 +5883,31 @@ fn refuse_partition_changes(
         }
         let ends_a_table = matches!(
             change,
-            Change::DropTable { .. } | Change::RenameTable { .. }
+            Change::Table(TableChange::DropTable { .. })
+                | Change::Table(TableChange::RenameTable { .. })
         );
         if !ends_a_table && change.table().is_some_and(|t| created.contains(t)) {
             continue;
         }
-        let asked: Vec<&TableName> = if let Change::DropTable { name, .. } = change {
-            vec![name]
-                .into_iter()
-                .filter(|n| partitioned(base.schema, n))
-                .collect()
-        } else if let Change::RenameTable { from, to, .. } = change {
-            [(from, base.schema), (to, declared.schema)]
-                .into_iter()
-                .filter(|(n, side)| partitioned(side, n))
-                .map(|(n, _)| n)
-                .collect()
-        } else {
-            change
-                .table()
-                .into_iter()
-                .filter(|n| partitioned(base.schema, n) || partitioned(declared.schema, n))
-                .collect()
-        };
+        let asked: Vec<&TableName> =
+            if let Change::Table(TableChange::DropTable { name, .. }) = change {
+                vec![name]
+                    .into_iter()
+                    .filter(|n| partitioned(base.schema, n))
+                    .collect()
+            } else if let Change::Table(TableChange::RenameTable { from, to, .. }) = change {
+                [(from, base.schema), (to, declared.schema)]
+                    .into_iter()
+                    .filter(|(n, side)| partitioned(side, n))
+                    .map(|(n, _)| n)
+                    .collect()
+            } else {
+                change
+                    .table()
+                    .into_iter()
+                    .filter(|n| partitioned(base.schema, n) || partitioned(declared.schema, n))
+                    .collect()
+            };
         for table in asked {
             refuse(table, change_in_words(change));
         }
@@ -5903,8 +5951,10 @@ fn refuse_parent_index(
     hints: &Hints,
     changes: &[Change],
 ) -> Option<String> {
-    if matches!(change, Change::AddIndex { .. } | Change::DropIndex { .. })
-        && hints.strategies.get(table).is_some_and(|s| s.online)
+    if matches!(
+        change,
+        Change::Index(IndexChange::AddIndex { .. }) | Change::Index(IndexChange::DropIndex { .. })
+    ) && hints.strategies.get(table).is_some_and(|s| s.online)
     {
         return Some(format!(
             "{} with `strategy: online`, which PostgreSQL cannot build or drop concurrently on a \
@@ -5938,10 +5988,10 @@ fn refuse_parent_index(
             missing = missing.shown(),
         )
     };
-    if let Change::SetPrimaryKey { to: Some(pk), .. } = change {
+    if let Change::Constraint(ConstraintChange::SetPrimaryKey { to: Some(pk), .. }) = change {
         return missing_key(&pk.columns).map(without_key);
     }
-    if let Change::AddUnique { constraint, .. } = change {
+    if let Change::Constraint(ConstraintChange::AddUnique { constraint, .. }) = change {
         return missing_key(&constraint.columns).map(without_key);
     }
     // A partition's own check under the parent's new check's name is
@@ -5949,7 +5999,7 @@ fn refuse_parent_index(
     // the parent's clone, which the parent's later drop removes, and another
     // is refused by the engine. Refused by name (leon, 2026-10-08), the
     // remedy being to drop or rename the partition's own first.
-    if let Change::AddCheck { name, .. } = change {
+    if let Change::Constraint(ConstraintChange::AddCheck { name, .. }) = change {
         let held: Vec<String> = partitions()
             .filter(|(_, t)| t.checks.contains_key(name.raw()))
             .map(|(partition, _)| partition.shown().to_string())
@@ -5963,7 +6013,7 @@ fn refuse_parent_index(
             )
         });
     }
-    let Change::AddIndex { name, index, .. } = change else {
+    let Change::Index(IndexChange::AddIndex { name, index, .. }) = change else {
         return None;
     };
     if index.unique
@@ -6001,7 +6051,7 @@ fn refuse_parent_index(
                     before.is_none_or(|b| {
                         b.indexes.contains_key(own.raw())
                             && !changes.iter().any(|c| {
-                                matches!(c, Change::DropIndex { table, name }
+                                matches!(c, Change::Index(IndexChange::DropIndex { table, name })
                                     if table == partition && name == *own)
                             })
                     })
@@ -6056,18 +6106,18 @@ pub fn adopts(parent: &pbps_model::Index, own: &pbps_model::Index) -> bool {
 #[allow(clippy::wildcard_enum_match_arm)]
 fn parent_column(change: &Change) -> Option<&ColumnName> {
     match change {
-        Change::AddColumn { name, .. } => Some(name),
-        Change::RenameColumn { from, .. } => Some(from),
-        Change::EnumRebuild {
+        Change::Column(ColumnChange::AddColumn { name, .. }) => Some(name),
+        Change::Column(ColumnChange::RenameColumn { from, .. }) => Some(from),
+        Change::TypeValue(TypeValueChange::EnumRebuild {
             step: pbps_model::EnumRebuildStep::Retype { column, .. },
             ..
-        }
-        | Change::DropColumn { column, .. }
-        | Change::AlterColumnType { column, .. }
-        | Change::AlterColumnNullability { column, .. }
-        | Change::AlterColumnDefault { column, .. }
-        | Change::AlterColumnNumbering { column, .. }
-        | Change::SetColumnDeprecated { column, .. } => Some(&column.name),
+        })
+        | Change::Column(ColumnChange::DropColumn { column, .. })
+        | Change::Column(ColumnChange::AlterColumnType { column, .. })
+        | Change::Column(ColumnChange::AlterColumnNullability { column, .. })
+        | Change::Column(ColumnChange::AlterColumnDefault { column, .. })
+        | Change::Column(ColumnChange::AlterColumnNumbering { column, .. })
+        | Change::Column(ColumnChange::SetColumnDeprecated { column, .. }) => Some(&column.name),
         _ => None,
     }
 }
@@ -6174,7 +6224,7 @@ fn diff_partition_columns(
         if defaults_differ(from.default.as_ref(), to.default.as_ref())
             || (default_moved && to.default.is_some())
         {
-            changes.push(Change::SetPartitionDefault {
+            changes.push(Change::Partition(PartitionChange::SetPartitionDefault {
                 uid: uid.clone(),
                 table: name.clone(),
                 parent: now.parent.clone(),
@@ -6191,17 +6241,17 @@ fn diff_partition_columns(
                     theirs_was.copied(),
                     errors,
                 ),
-            });
+            }));
         }
         let tightened =
             theirs.is_some_and(|c| !c.nullable) && theirs_was.is_some_and(|b| b.nullable);
         if !tightened && (from.not_null != to.not_null || loosened.contains(column)) {
-            changes.push(Change::SetPartitionNotNull {
+            changes.push(Change::Partition(PartitionChange::SetPartitionNotNull {
                 uid: uid.clone(),
                 table: name.clone(),
                 column: column.clone(),
                 not_null: to.not_null,
-            });
+            }));
         }
     }
 }
@@ -6293,7 +6343,7 @@ fn refuse_computed_dependencies(
     };
     let dropped = |table: &TableName, name: &ColumnName| {
         changes.iter().any(|c| {
-            matches!(c, Change::DropComputedColumn { table: t, name: n, .. }
+            matches!(c, Change::Column(ColumnChange::DropComputedColumn { table: t, name: n, .. })
                 if t == table && n == name)
         })
     };
@@ -6301,9 +6351,9 @@ fn refuse_computed_dependencies(
     // before a module this plan creates (class 7 and 9, before 14).
     let added = |table: &TableName, name: &ColumnName| {
         changes.iter().any(|c| {
-            matches!(c, Change::AddComputedColumn { table: t, name: n, .. }
+            matches!(c, Change::Column(ColumnChange::AddComputedColumn { table: t, name: n, .. })
                 if t == table && n == name)
-                || matches!(c, Change::CreateTable { name: t, table: created, .. }
+                || matches!(c, Change::Table(TableChange::CreateTable { name: t, table: created, .. })
                     if t == table && created.computed.contains_key(name))
         })
     };
@@ -6332,74 +6382,80 @@ fn refuse_computed_dependencies(
                     });
                 }
                 let module = match change {
-                    Change::RebuildPartitionedTable(_)
-                    | Change::BuildPartitionedIndex(_)
-                    | Change::CopyTableRows(_)
-                    | Change::AnalyzeTableTree(_) => None,
+                    Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+                    | Change::Index(IndexChange::BuildPartitionedIndex(_))
+                    | Change::Partition(PartitionChange::CopyTableRows(_))
+                    | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => None,
                     // Standing, or re-added: either way it calls the module
                     // when the module changes. One only dropped is out of the
                     // way first, its module's drop moved after it.
-                    Change::AlterModule { id, .. } if screened || added(table_name, name) => {
+                    Change::Module(ModuleChange::AlterModule { id, .. })
+                        if screened || added(table_name, name) =>
+                    {
                         Some((id, "alters"))
                     }
-                    Change::DropModule { id, .. } if screened || added(table_name, name) => {
+                    Change::Module(ModuleChange::DropModule { id, .. })
+                        if screened || added(table_name, name) =>
+                    {
                         Some((id, "drops"))
                     }
-                    Change::CreateModule { id, .. } if added(table_name, name) => {
+                    Change::Module(ModuleChange::CreateModule { id, .. })
+                        if added(table_name, name) =>
+                    {
                         Some((id, "creates"))
                     }
-                    Change::CreateTable { .. }
-                    | Change::DropTable { .. }
-                    | Change::DetachPartition { .. }
-                    | Change::AttachPartition { .. }
-                    | Change::RenameTable { .. }
-                    | Change::AddColumn { .. }
-                    | Change::DropColumn { .. }
-                    | Change::RenameColumn { .. }
-                    | Change::AlterColumnType { .. }
-                    | Change::AlterColumnNullability { .. }
-                    | Change::AlterColumnDefault { .. }
-                    | Change::AlterColumnExpression { .. }
-                    | Change::AlterColumnNumbering { .. }
-                    | Change::AddComputedColumn { .. }
-                    | Change::DropComputedColumn { .. }
-                    | Change::SetColumnDeprecated { .. }
-                    | Change::SetComment { .. }
-                    | Change::SetPrimaryKey { .. }
-                    | Change::SetIndexStorageParameters { .. }
-                    | Change::SetTablePersistence { .. }
-                    | Change::SetPartitionDefault { .. }
-                    | Change::SetPartitionNotNull { .. }
-                    | Change::DropPolicy { .. }
-                    | Change::CreatePolicy { .. }
-                    | Change::SetRowSecurity { .. }
-                    | Change::SetStorageParameters { .. }
-                    | Change::SetReplicaIdentity { .. }
-                    | Change::AddUnique { .. }
-                    | Change::DropUnique { .. }
-                    | Change::SetExclusion { .. }
-                    | Change::AddForeignKey { .. }
-                    | Change::DropForeignKey { .. }
-                    | Change::AddCheck { .. }
-                    | Change::DropCheck { .. }
-                    | Change::AddIndex { .. }
-                    | Change::DropIndex { .. }
-                    | Change::InsertRow { .. }
-                    | Change::UpdateRow { .. }
-                    | Change::DeleteRow { .. }
-                    | Change::SetDataMode { .. }
-                    | Change::SetEnsureKeys { .. }
-                    | Change::CreateModule { .. }
-                    | Change::AlterModule { .. }
-                    | Change::DropModule { .. }
-                    | Change::AddEnumValue { .. }
-                    | Change::AlterDomain { .. }
-                    | Change::RenameEnumValue { .. }
-                    | Change::EnumRebuild { .. }
+                    Change::Table(TableChange::CreateTable { .. })
+                    | Change::Table(TableChange::DropTable { .. })
+                    | Change::Partition(PartitionChange::DetachPartition { .. })
+                    | Change::Partition(PartitionChange::AttachPartition { .. })
+                    | Change::Table(TableChange::RenameTable { .. })
+                    | Change::Column(ColumnChange::AddColumn { .. })
+                    | Change::Column(ColumnChange::DropColumn { .. })
+                    | Change::Column(ColumnChange::RenameColumn { .. })
+                    | Change::Column(ColumnChange::AlterColumnType { .. })
+                    | Change::Column(ColumnChange::AlterColumnNullability { .. })
+                    | Change::Column(ColumnChange::AlterColumnDefault { .. })
+                    | Change::Column(ColumnChange::AlterColumnExpression { .. })
+                    | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+                    | Change::Column(ColumnChange::AddComputedColumn { .. })
+                    | Change::Column(ColumnChange::DropComputedColumn { .. })
+                    | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+                    | Change::TableProperty(TablePropertyChange::SetComment { .. })
+                    | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+                    | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+                    | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+                    | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+                    | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+                    | Change::Policy(PolicyChange::DropPolicy { .. })
+                    | Change::Policy(PolicyChange::CreatePolicy { .. })
+                    | Change::Policy(PolicyChange::SetRowSecurity { .. })
+                    | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+                    | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+                    | Change::Constraint(ConstraintChange::AddUnique { .. })
+                    | Change::Constraint(ConstraintChange::DropUnique { .. })
+                    | Change::Constraint(ConstraintChange::SetExclusion { .. })
+                    | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+                    | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+                    | Change::Constraint(ConstraintChange::AddCheck { .. })
+                    | Change::Constraint(ConstraintChange::DropCheck { .. })
+                    | Change::Index(IndexChange::AddIndex { .. })
+                    | Change::Index(IndexChange::DropIndex { .. })
+                    | Change::Row(RowChange::InsertRow { .. })
+                    | Change::Row(RowChange::UpdateRow { .. })
+                    | Change::Row(RowChange::DeleteRow { .. })
+                    | Change::Row(RowChange::SetDataMode { .. })
+                    | Change::Row(RowChange::SetEnsureKeys { .. })
+                    | Change::Module(ModuleChange::CreateModule { .. })
+                    | Change::Module(ModuleChange::AlterModule { .. })
+                    | Change::Module(ModuleChange::DropModule { .. })
+                    | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+                    | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+                    | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+                    | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
                     | pbps_model::catalog_change!()
-                    | Change::Grant { .. }
-                    | Change::Revoke { .. }
-                    | Change::PublicExecution { .. } => None,
+                    | Change::Permission(GrantChange::Grant { .. })
+                    | Change::Permission(GrantChange::Revoke { .. })
+                    | Change::Permission(GrantChange::PublicExecution { .. }) => None,
                 };
                 if let Some((id, what)) = module
                     && function(id)
@@ -6436,20 +6492,20 @@ fn diff_computed(name: &TableName, base: &Table, declared: &Table, changes: &mut
                 was: Option<&pbps_model::ComputedColumn>| matches!((wanted, was), (Some(w), Some(b)) if w.declares(b));
     for (column, was) in &base.computed {
         if !kept(declared.computed.get(column), Some(was)) {
-            changes.push(Change::DropComputedColumn {
+            changes.push(Change::Column(ColumnChange::DropComputedColumn {
                 table: name.clone(),
                 name: column.clone(),
                 computed: was.clone(),
-            });
+            }));
         }
     }
     for (column, wanted) in &declared.computed {
         if !kept(Some(wanted), base.computed.get(column)) {
-            changes.push(Change::AddComputedColumn {
+            changes.push(Change::Column(ColumnChange::AddComputedColumn {
                 table: name.clone(),
                 name: column.clone(),
                 computed: wanted.clone(),
-            });
+            }));
         }
     }
 }
@@ -6597,7 +6653,10 @@ fn unlink_cycles_around_persistence_switches(declared: &Schema, changes: &mut Ve
     let switching: BTreeSet<TableName> = changes
         .iter()
         .filter_map(|c| {
-            if let Change::SetTablePersistence { table, .. } = c {
+            if let Change::TableProperty(TablePropertyChange::SetTablePersistence {
+                table, ..
+            }) = c
+            {
                 Some(table.clone())
             } else {
                 None
@@ -6617,18 +6676,18 @@ fn unlink_cycles_around_persistence_switches(declared: &Schema, changes: &mut Ve
             let to = &fk.references_table;
             let in_cycle = to != name && switching.contains(to) && graph.same_component(name, to);
             let added = changes.iter().any(|c| {
-                matches!(c, Change::AddForeignKey { table: t, name: n, .. } if t == name && n == key)
+                matches!(c, Change::Constraint(ConstraintChange::AddForeignKey { table: t, name: n, .. }) if t == name && n == key)
             });
             if in_cycle && !added {
-                unlinked.push(Change::DropForeignKey {
+                unlinked.push(Change::Constraint(ConstraintChange::DropForeignKey {
                     table: name.clone(),
                     name: key.clone(),
-                });
-                unlinked.push(Change::AddForeignKey {
+                }));
+                unlinked.push(Change::Constraint(ConstraintChange::AddForeignKey {
                     table: name.clone(),
                     name: key.clone(),
                     constraint: Box::new(fk.clone()),
-                });
+                }));
             }
         }
     }
@@ -6659,12 +6718,14 @@ fn diff_storage_parameters(
         .cloned()
         .collect();
     if !set.is_empty() || !reset.is_empty() {
-        changes.push(Change::SetStorageParameters {
-            uid: uid.clone(),
-            table: name.clone(),
-            set,
-            reset,
-        });
+        changes.push(Change::TableProperty(
+            TablePropertyChange::SetStorageParameters {
+                uid: uid.clone(),
+                table: name.clone(),
+                set,
+                reset,
+            },
+        ));
     }
 }
 
@@ -6705,17 +6766,21 @@ fn diff_replica_identity(
         };
         let readded = changes.iter().any(|c| match (c, &table.replica_identity) {
             (
-                Change::SetPrimaryKey {
+                Change::Constraint(ConstraintChange::SetPrimaryKey {
                     table: t,
                     to: Some(_),
                     ..
-                },
+                }),
                 Some(ReplicaIdentity::PrimaryKey),
             ) => t == declared_name,
-            (Change::AddUnique { table: t, name, .. }, Some(ReplicaIdentity::Unique(n)))
-            | (Change::AddIndex { table: t, name, .. }, Some(ReplicaIdentity::Index(n))) => {
-                t == declared_name && name == n
-            }
+            (
+                Change::Constraint(ConstraintChange::AddUnique { table: t, name, .. }),
+                Some(ReplicaIdentity::Unique(n)),
+            )
+            | (
+                Change::Index(IndexChange::AddIndex { table: t, name, .. }),
+                Some(ReplicaIdentity::Index(n)),
+            ) => t == declared_name && name == n,
             _ => false,
         });
         if was.replica_identity == table.replica_identity && !readded {
@@ -6727,34 +6792,42 @@ fn diff_replica_identity(
         let on = |t: &TableName| t == base_name || t == declared_name;
         let old_index_dropped = changes.iter().any(|c| match (c, &was.replica_identity) {
             (
-                Change::SetPrimaryKey {
+                Change::Constraint(ConstraintChange::SetPrimaryKey {
                     table: t,
                     from: Some(_),
                     ..
-                },
+                }),
                 Some(ReplicaIdentity::PrimaryKey),
             ) => on(t),
-            (Change::DropUnique { table: t, name }, Some(ReplicaIdentity::Unique(n)))
-            | (Change::DropIndex { table: t, name }, Some(ReplicaIdentity::Index(n))) => {
-                on(t) && name == n
-            }
+            (
+                Change::Constraint(ConstraintChange::DropUnique { table: t, name }),
+                Some(ReplicaIdentity::Unique(n)),
+            )
+            | (
+                Change::Index(IndexChange::DropIndex { table: t, name }),
+                Some(ReplicaIdentity::Index(n)),
+            ) => on(t) && name == n,
             _ => false,
         });
         if now {
             early.insert((uid.clone(), table.replica_identity.clone()));
         } else if old_index_dropped {
             early.insert((uid.clone(), Some(ReplicaIdentity::Full)));
-            changes.push(Change::SetReplicaIdentity {
-                uid: uid.clone(),
-                table: base_name.clone(),
-                to: Some(ReplicaIdentity::Full),
-            });
+            changes.push(Change::TableProperty(
+                TablePropertyChange::SetReplicaIdentity {
+                    uid: uid.clone(),
+                    table: base_name.clone(),
+                    to: Some(ReplicaIdentity::Full),
+                },
+            ));
         }
-        changes.push(Change::SetReplicaIdentity {
-            uid: uid.clone(),
-            table: if now { base_name } else { declared_name }.clone(),
-            to: table.replica_identity.clone(),
-        });
+        changes.push(Change::TableProperty(
+            TablePropertyChange::SetReplicaIdentity {
+                uid: uid.clone(),
+                table: if now { base_name } else { declared_name }.clone(),
+                to: table.replica_identity.clone(),
+            },
+        ));
     }
     early
 }
@@ -7011,12 +7084,12 @@ fn diff_search(
                             })
                             .collect();
                         if missing.is_empty() || !target_read {
-                            changes.push(Change::CreateSearch {
+                            changes.push(Change::Search(SearchChange::CreateSearch {
                                 uid: uid.clone(),
                                 name: name.clone(),
                                 definition: Box::new(now.clone()),
                                 unresolved: missing,
-                            });
+                            }));
                         } else {
                             let shown: Vec<_> =
                                 missing.iter().map(|m| m.shown().to_string()).collect();
@@ -7038,11 +7111,11 @@ fn diff_search(
         if let Some(definition) = base.schema.search.get(name)
             && !declared.ids.search.contains_key(uid)
         {
-            changes.push(Change::DropSearch {
+            changes.push(Change::Search(SearchChange::DropSearch {
                 uid: uid.clone(),
                 name: name.clone(),
                 definition: Box::new(definition.clone()),
-            });
+            }));
         }
     }
     changes
@@ -7168,12 +7241,12 @@ fn diff_exclusions(
     }
     for (key, now) in &declared.exclude {
         if !base.exclude.contains_key(key) {
-            changes.push(Change::SetExclusion {
+            changes.push(Change::Constraint(ConstraintChange::SetExclusion {
                 table: name.clone(),
                 name: key.clone(),
                 from: None,
                 to: Some(Box::new(now.clone())),
-            });
+            }));
         }
     }
 }
@@ -7199,13 +7272,15 @@ fn exclusion_hazards<'a>(
     }
     for change in changes {
         let (column, what) = match change {
-            Change::DropColumn { column, .. } => (column, "dropped"),
-            Change::AlterColumnType { column, .. }
-            | Change::AlterColumnExpression { column, .. } => (column, "retyped"),
-            Change::EnumRebuild {
+            Change::Column(ColumnChange::DropColumn { column, .. }) => (column, "dropped"),
+            Change::Column(ColumnChange::AlterColumnType { column, .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { column, .. }) => {
+                (column, "retyped")
+            }
+            Change::TypeValue(TypeValueChange::EnumRebuild {
                 step: pbps_model::EnumRebuildStep::Retype { column, .. },
                 ..
-            } => (column, "retyped"),
+            }) => (column, "retyped"),
             _ => continue,
         };
         for (key, x) in &base.exclude {
@@ -7305,13 +7380,15 @@ fn diff_constraints_by(
                 });
                 Some(None)
             }
-            ParameterEdit::Alter { set, reset } => Some(Some(Change::SetIndexStorageParameters {
-                table: name.clone(),
-                target,
-                method,
-                set,
-                reset,
-            })),
+            ParameterEdit::Alter { set, reset } => Some(Some(Change::Index(
+                IndexChange::SetIndexStorageParameters {
+                    table: name.clone(),
+                    target,
+                    method,
+                    set,
+                    reset,
+                },
+            ))),
         }
     };
 
@@ -7369,7 +7446,7 @@ fn diff_constraints_by(
         // `Constraint` for the key it takes, which is what happens to the
         // database (DECISIONS 270).
         let split = base.primary_key.is_some() && declared.primary_key.is_some();
-        changes.push(Change::SetPrimaryKey {
+        changes.push(Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: name.clone(),
             from: base.primary_key.clone(),
             to: if split {
@@ -7383,14 +7460,14 @@ fn diff_constraints_by(
             nonclustered: !split
                 && declared.primary_key.is_some()
                 && !declared.primary_key_is_clustered(),
-        });
+        }));
         if split {
-            changes.push(Change::SetPrimaryKey {
+            changes.push(Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table: name.clone(),
                 from: None,
                 to: declared.primary_key.clone(),
                 nonclustered: !declared.primary_key_is_clustered(),
-            });
+            }));
         }
     }
 
@@ -7398,14 +7475,18 @@ fn diff_constraints_by(
         &base.foreign_keys,
         &declared.foreign_keys,
         |_, b, d| (b == d).then_some(None),
-        |n| Change::DropForeignKey {
-            table: name.clone(),
-            name: n.clone(),
+        |n| {
+            Change::Constraint(ConstraintChange::DropForeignKey {
+                table: name.clone(),
+                name: n.clone(),
+            })
         },
-        |n, c| Change::AddForeignKey {
-            table: name.clone(),
-            name: n.clone(),
-            constraint: Box::new(c.clone()),
+        |n, c| {
+            Change::Constraint(ConstraintChange::AddForeignKey {
+                table: name.clone(),
+                name: n.clone(),
+                constraint: Box::new(c.clone()),
+            })
         },
         changes,
     );
@@ -7413,14 +7494,18 @@ fn diff_constraints_by(
         &base.checks,
         &declared.checks,
         |_, b, d| (b == d).then_some(None),
-        |n| Change::DropCheck {
-            table: name.clone(),
-            name: n.clone(),
+        |n| {
+            Change::Constraint(ConstraintChange::DropCheck {
+                table: name.clone(),
+                name: n.clone(),
+            })
         },
-        |n, c| Change::AddCheck {
-            table: name.clone(),
-            name: n.clone(),
-            constraint: c.clone(),
+        |n, c| {
+            Change::Constraint(ConstraintChange::AddCheck {
+                table: name.clone(),
+                name: n.clone(),
+                constraint: c.clone(),
+            })
         },
         changes,
     );
@@ -7440,15 +7525,19 @@ fn diff_constraints_by(
             })
             .flatten()
         },
-        |n| Change::DropUnique {
-            table: name.clone(),
-            name: n.clone(),
+        |n| {
+            Change::Constraint(ConstraintChange::DropUnique {
+                table: name.clone(),
+                name: n.clone(),
+            })
         },
-        |n, c| Change::AddUnique {
-            table: name.clone(),
-            name: n.clone(),
-            constraint: c.clone(),
-            clustered: declared.unique_is_clustered(n.raw()),
+        |n, c| {
+            Change::Constraint(ConstraintChange::AddUnique {
+                table: name.clone(),
+                name: n.clone(),
+                constraint: c.clone(),
+                clustered: declared.unique_is_clustered(n.raw()),
+            })
         },
         changes,
     );
@@ -7468,15 +7557,19 @@ fn diff_constraints_by(
             })
             .flatten()
         },
-        |n| Change::DropIndex {
-            table: name.clone(),
-            name: n.clone(),
+        |n| {
+            Change::Index(IndexChange::DropIndex {
+                table: name.clone(),
+                name: n.clone(),
+            })
         },
-        |n, ix| Change::AddIndex {
-            table: name.clone(),
-            name: n.clone(),
-            index: Box::new(ix.clone()),
-            clustered: declared.index_is_clustered(n.raw()),
+        |n, ix| {
+            Change::Index(IndexChange::AddIndex {
+                table: name.clone(),
+                name: n.clone(),
+                index: Box::new(ix.clone()),
+                clustered: declared.index_is_clustered(n.raw()),
+            })
         },
         changes,
     );
@@ -7504,11 +7597,11 @@ fn diff_data(
     errs: &mut Vec<DiffError>,
 ) {
     if base.data.as_ref().map(|d| d.mode) != declared.data.as_ref().map(|d| d.mode) {
-        changes.push(Change::SetDataMode {
+        changes.push(Change::Row(RowChange::SetDataMode {
             table: name.clone(),
             from: base.data.as_ref().map(|d| d.mode),
             to: declared.data.as_ref().map(|d| d.mode),
-        });
+        }));
     }
 
     // Every row change names the column its key goes in, so without one there
@@ -7563,7 +7656,7 @@ fn diff_data(
                 // it on a column the baseline already has (DECISIONS 538).
                 let restored = changes.iter().any(|change| {
                     matches!(change,
-                    Change::SetPrimaryKey { table, from: None, to: Some(pk), .. }
+                    Change::Constraint(ConstraintChange::SetPrimaryKey { table, from: None, to: Some(pk), .. })
                     if table == name && pk.columns == [key_column.clone()])
                 });
                 if !restored {
@@ -7606,7 +7699,7 @@ fn diff_data(
         match base_rows.and_then(|r| r.get(key)) {
             None => {
                 let (defaults, types) = omitted_defaults(declared, key_column.raw(), row);
-                changes.push(Change::InsertRow {
+                changes.push(Change::Row(RowChange::InsertRow {
                     table: name.clone(),
                     key_column: key_column.clone(),
                     identity_key,
@@ -7614,7 +7707,7 @@ fn diff_data(
                     row: row.clone(),
                     defaults,
                     types,
-                })
+                }))
             }
             Some(before) => {
                 // Only the columns that differ. An UPDATE restating a column
@@ -7713,7 +7806,7 @@ fn diff_data(
                     }
                 }
                 if !columns.is_empty() {
-                    changes.push(Change::UpdateRow {
+                    changes.push(Change::Row(RowChange::UpdateRow {
                         table: name.clone(),
                         key_column: key_column.clone(),
                         key: key.clone(),
@@ -7725,7 +7818,7 @@ fn diff_data(
                         // before the row changes, so it is the one the
                         // `WHERE` meets (DEC-1564.2).
                         key_type: declared.columns.get(&key_column).map(|c| c.ty.clone()),
-                    });
+                    }));
                 }
             }
         }
@@ -7826,7 +7919,7 @@ fn diff_data(
                         cell(before, base_column.raw(), Some(spec)),
                     );
                 }
-                changes.push(Change::DeleteRow {
+                changes.push(Change::Row(RowChange::DeleteRow {
                     table: name.clone(),
                     key_column: key_column.clone(),
                     key: key.clone(),
@@ -7836,7 +7929,7 @@ fn diff_data(
                     types,
                     after_types,
                     key_type: declared.columns.get(&key_column).map(|c| c.ty.clone()),
-                });
+                }));
             }
         }
     }
@@ -7882,7 +7975,9 @@ pub(crate) fn member_depth(planned: &[PlannedChange]) -> BTreeMap<pbps_model::Ro
     let dropped: BTreeMap<&pbps_model::RoleName, &[pbps_model::RoleName]> = planned
         .iter()
         .filter_map(|p| match &p.change {
-            Change::DropRole { name, members, .. } => Some((name, members.as_slice())),
+            Change::Role(RoleChange::DropRole { name, members, .. }) => {
+                Some((name, members.as_slice()))
+            }
             _ => None,
         })
         .collect();
@@ -7954,75 +8049,75 @@ fn dependency_rank(
     drop_type_rank: &BTreeMap<pbps_model::TypeRef, isize>,
 ) -> isize {
     match change {
-        Change::RebuildPartitionedTable(_)
-        | Change::BuildPartitionedIndex(_)
-        | Change::CopyTableRows(_)
-        | Change::AnalyzeTableTree(_) => {
+        Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+        | Change::Index(IndexChange::BuildPartitionedIndex(_))
+        | Change::Partition(PartitionChange::CopyTableRows(_))
+        | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => {
             unreachable!("rebuild operations are expanded by order, never ranked by the differ")
         }
-        Change::CreateModule { id, .. } | Change::AlterModule { id, .. } => {
+        Change::Module(ModuleChange::CreateModule { id, .. }) | Change::Module(ModuleChange::AlterModule { id, .. }) => {
             create_rank.get(id).map_or(0, |r| *r as isize)
         }
-        Change::DropModule { id, .. } => -(drop_rank.get(id).map_or(0, |r| *r as isize)),
+        Change::Module(ModuleChange::DropModule { id, .. }) => -(drop_rank.get(id).map_or(0, |r| *r as isize)),
         // Module ranks can be arbitrarily deep. A fixed -1 would leave a
         // policy behind a dropped routine it calls (DEC-1173.2).
-        Change::DropPolicy { .. } => -(drop_rank.len() as isize) - 1,
-        Change::AddEnumValue { ordinal, .. } | Change::RenameEnumValue { ordinal, .. } => {
+        Change::Policy(PolicyChange::DropPolicy { .. }) => -(drop_rank.len() as isize) - 1,
+        Change::TypeValue(TypeValueChange::AddEnumValue { ordinal, .. }) | Change::TypeValue(TypeValueChange::RenameEnumValue { ordinal, .. }) => {
             *ordinal as isize
         }
         // After every label change of class 7, which it may name.
-        Change::AlterDomain {
+        Change::TypeValue(TypeValueChange::AlterDomain {
             half: pbps_model::DomainHalf::Loosen,
             from,
             to,
             ..
-        } if domain_sets_default(from, to) => isize::MAX,
-        Change::AlterDomain { .. } => 0,
-        Change::EnumRebuild {
+        }) if domain_sets_default(from, to) => isize::MAX,
+        Change::TypeValue(TypeValueChange::AlterDomain { .. }) => 0,
+        Change::TypeValue(TypeValueChange::EnumRebuild {
             step: pbps_model::EnumRebuildStep::Create { ordinal, .. },
             ..
-        } => *ordinal as isize,
+        }) => *ordinal as isize,
         // With a retype: after the defaults taken off for it (-2) and before
         // the ones written for the type it ends with (0). The swap follows
         // every column of its type because they share a subject and rank and
         // the rendering that breaks the tie names `Retype` before `Swap`
         // (pinned by `the_whole_plan_drops_and_restores_what_names_a_moved_column_and_orders_the_steps`).
-        Change::EnumRebuild { .. } => -1,
-        Change::CreateType { name, .. } | Change::RenameType { to: name, .. } => {
+        Change::TypeValue(TypeValueChange::EnumRebuild { .. }) => -1,
+        Change::Type(TypeChange::CreateType { name, .. }) | Change::Type(TypeChange::RenameType { to: name, .. }) => {
             *type_rank.get(name).unwrap_or(&0)
         }
-        Change::DropType { name, .. } => -drop_type_rank.get(name).copied().unwrap_or(0),
-        Change::CreateTable { .. }
+        Change::Type(TypeChange::DropType { name, .. }) => -drop_type_rank.get(name).copied().unwrap_or(0),
+        Change::Table(TableChange::CreateTable { .. })
         // Ranked by their depth where the sort key is built (`search_rank`).
-        | Change::CreateSearch { .. }
-        | Change::DropSearch { .. }
-        | Change::CreateExtension { .. }
-        | Change::DropExtension { .. }
-        | Change::UpdateExtension { .. }
-        | Change::SetExtensionSchema { .. }
-        | Change::DropTable { .. }
-        | Change::DetachPartition { .. }
-        | Change::AttachPartition { .. }
-        | Change::RenameTable { .. }
-        | Change::AddColumn { .. }
-        | Change::DropColumn { .. }
-        | Change::RenameColumn { .. }
-        | Change::SetColumnDeprecated { .. }
-        | Change::SetComment { .. }
-        | Change::SetIndexStorageParameters { .. }
-        | Change::SetTablePersistence { .. }
-        | Change::CreatePolicy { .. }
-        | Change::SetRowSecurity { .. }
-        | Change::SetStorageParameters { .. }
-        | Change::DropUnique { .. }
-        | Change::SetExclusion { .. }
-        | Change::AddCheck { .. }
-        | Change::DropCheck { .. }
-        | Change::DropIndex { .. }
-        | Change::AddComputedColumn { .. }
-        | Change::DropComputedColumn { .. }
-        | Change::SetDataMode { .. }
-        | Change::SetEnsureKeys { .. } => 0,
+        | Change::Search(SearchChange::CreateSearch { .. })
+        | Change::Search(SearchChange::DropSearch { .. })
+        | Change::Extension(ExtensionChange::CreateExtension { .. })
+        | Change::Extension(ExtensionChange::DropExtension { .. })
+        | Change::Extension(ExtensionChange::UpdateExtension { .. })
+        | Change::Extension(ExtensionChange::SetExtensionSchema { .. })
+        | Change::Table(TableChange::DropTable { .. })
+        | Change::Partition(PartitionChange::DetachPartition { .. })
+        | Change::Partition(PartitionChange::AttachPartition { .. })
+        | Change::Table(TableChange::RenameTable { .. })
+        | Change::Column(ColumnChange::AddColumn { .. })
+        | Change::Column(ColumnChange::DropColumn { .. })
+        | Change::Column(ColumnChange::RenameColumn { .. })
+        | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+        | Change::TableProperty(TablePropertyChange::SetComment { .. })
+        | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+        | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+        | Change::Policy(PolicyChange::CreatePolicy { .. })
+        | Change::Policy(PolicyChange::SetRowSecurity { .. })
+        | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+        | Change::Constraint(ConstraintChange::DropUnique { .. })
+        | Change::Constraint(ConstraintChange::SetExclusion { .. })
+        | Change::Constraint(ConstraintChange::AddCheck { .. })
+        | Change::Constraint(ConstraintChange::DropCheck { .. })
+        | Change::Index(IndexChange::DropIndex { .. })
+        | Change::Column(ColumnChange::AddComputedColumn { .. })
+        | Change::Column(ColumnChange::DropComputedColumn { .. })
+        | Change::Row(RowChange::SetDataMode { .. })
+        | Change::Row(RowChange::SetEnsureKeys { .. }) => 0,
         // The clustered index goes in ahead of the rest of the addition
         // class. Building it rebuilds every nonclustered index already on the
         // table, whose row locators become its key, so an index added before
@@ -8032,21 +8127,21 @@ fn dependency_rank(
         // A key with no layout to speak of — every PostgreSQL key, whose
         // `nonclustered` is always false — moves ahead of its siblings too,
         // which orders nothing that depends on it.
-        Change::SetPrimaryKey {
+        Change::Constraint(ConstraintChange::SetPrimaryKey {
             to: Some(_),
             nonclustered: false,
             ..
-        }
-        | Change::AddUnique {
+        })
+        | Change::Constraint(ConstraintChange::AddUnique {
             clustered: true, ..
-        }
-        | Change::AddIndex {
+        })
+        | Change::Index(IndexChange::AddIndex {
             clustered: true, ..
-        } => -1,
-        Change::SetPrimaryKey { .. } | Change::AddUnique { .. } | Change::AddIndex { .. } => 0,
+        }) => -1,
+        Change::Constraint(ConstraintChange::SetPrimaryKey { .. }) | Change::Constraint(ConstraintChange::AddUnique { .. }) | Change::Index(IndexChange::AddIndex { .. }) => 0,
         // After every addition of its class, the index it names among them,
         // and the foreign keys too: nothing in the class reads it.
-        Change::SetReplicaIdentity { .. } => 2,
+        Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. }) => 2,
         // A foreign key needs the key it references to exist, so it goes last
         // in the addition class and first in the drop class. Measured on the
         // pinned image, both halves are real: added before its key, the engine
@@ -8064,8 +8159,8 @@ fn dependency_rank(
         // supplier not recognised, and the ordering silently back) and buy
         // nothing. Everything else in both classes keeps rank 0 and the
         // tiebreaker it had.
-        Change::AddForeignKey { .. } => 1,
-        Change::DropForeignKey { .. } => -1,
+        Change::Constraint(ConstraintChange::AddForeignKey { .. }) => 1,
+        Change::Constraint(ConstraintChange::DropForeignKey { .. }) => -1,
         // A column's new type goes in before a default written for it. They
         // share class 9 and the tiebreaker below is the change's rendering,
         // which sorts `AlterColumnDefault` ahead of `AlterColumnType` by the
@@ -8079,7 +8174,7 @@ fn dependency_rank(
         // the dependency is a layering, not a graph. A type change never needs
         // a default that is already there, and the nullability travels inside
         // the type change rather than beside it.
-        Change::AlterColumnType { .. } => -1,
+        Change::Column(ColumnChange::AlterColumnType { .. }) => -1,
         // And the old default goes before the type, which makes the three
         // phases a column can need one rank each: drop the default the old
         // type gave meaning to, change the type, install the default written
@@ -8087,11 +8182,11 @@ fn dependency_rank(
         // while the first one's constraint stands (5074 with 4922 behind it),
         // and `diff_columns` splits a *replaced* default into these two halves
         // when the type moves, so both ranks have something to order.
-        Change::AlterColumnDefault { to: None, .. } => -2,
-        Change::AlterColumnDefault { to: Some(_), .. } => 0,
+        Change::Column(ColumnChange::AlterColumnDefault { to: None, .. }) => -2,
+        Change::Column(ColumnChange::AlterColumnDefault { to: Some(_), .. }) => 0,
         // After any type change, as a new default is: the expression is
         // recomputed under the column's final type (DEC-1168.1).
-        Change::AlterColumnExpression { .. } => 0,
+        Change::Column(ColumnChange::AlterColumnExpression { .. }) => 0,
         // A numbering source (#1889, DEC-1889.1). One given up, and an
         // identity turned into a sequence, go first: ahead of the relaxation
         // its column may also take, since measured on 16 and 18 `DROP NOT
@@ -8103,53 +8198,53 @@ fn dependency_rank(
         // NOT NULL before identity can be added"), so after the tightening,
         // and a sequence is moved past the column's values in the type the
         // column ends with, so after the retype.
-        Change::AlterColumnNumbering {
+        Change::Column(ColumnChange::AlterColumnNumbering {
             from: ValueSource::Identity(_) | ValueSource::Sequence(_),
             to: ValueSource::None,
             ..
-        }
-        | Change::AlterColumnNumbering {
+        })
+        | Change::Column(ColumnChange::AlterColumnNumbering {
             from: ValueSource::Identity(_),
             to: ValueSource::Sequence(_),
             ..
-        } => -3,
-        Change::AlterColumnNumbering { .. } => 2,
+        }) => -3,
+        Change::Column(ColumnChange::AlterColumnNumbering { .. }) => 2,
         // A recomputation is checked against the column's nullability as it
         // stands, so a relaxation goes before one and a tightening after it.
         // Measured on 17.11, `SET EXPRESSION` that yields a NULL is refused
         // under `NOT NULL` ("contains null values") and accepted once
         // `DROP NOT NULL` has run. Nothing else in the class reads nullability.
-        Change::AlterColumnNullability {
+        Change::Column(ColumnChange::AlterColumnNullability {
             to_nullable: true, ..
-        } => -1,
-        Change::AlterColumnNullability {
+        }) => -1,
+        Change::Column(ColumnChange::AlterColumnNullability {
             to_nullable: false, ..
-        } => 1,
+        }) => 1,
         // A partition's own, alike: its column's type is its parent's, which
         // no change here moves (#1581).
-        Change::SetPartitionDefault { .. } => 0,
-        Change::SetPartitionNotNull {
+        Change::Partition(PartitionChange::SetPartitionDefault { .. }) => 0,
+        Change::Partition(PartitionChange::SetPartitionNotNull {
             not_null: false, ..
-        } => -1,
-        Change::SetPartitionNotNull { not_null: true, .. } => 1,
+        }) => -1,
+        Change::Partition(PartitionChange::SetPartitionNotNull { not_null: true, .. }) => 1,
         // Rows follow the foreign keys between their tables: a referenced
         // table's rows go in first, and out last.
-        Change::InsertRow { table, .. } | Change::UpdateRow { table, .. } => {
+        Change::Row(RowChange::InsertRow { table, .. }) | Change::Row(RowChange::UpdateRow { table, .. }) => {
             data_rank.get(table).map_or(0, |r| *r as isize)
         }
-        Change::DeleteRow { table, .. } => -(data_rank.get(table).map_or(0, |r| *r as isize)),
+        Change::Row(RowChange::DeleteRow { table, .. }) => -(data_rank.get(table).map_or(0, |r| *r as isize)),
         // Two roles dropped together are ordered by membership: see
         // [`member_depth`].
-        Change::DropRole { name, .. } => role_rank.get(name).map_or(0, |r| *r as isize),
+        Change::Role(RoleChange::DropRole { name, .. }) => role_rank.get(name).map_or(0, |r| *r as isize),
         // The rest depend on nothing among themselves; a grant's target is
         // ordered by the class of the change, not by rank.
-        Change::CreateRole { .. }
-        | Change::RenameRole { .. }
-        | Change::Grant { .. }
-        | Change::Revoke { .. } => 0,
+        Change::Role(RoleChange::CreateRole { .. })
+        | Change::Role(RoleChange::RenameRole { .. })
+        | Change::Permission(GrantChange::Grant { .. })
+        | Change::Permission(GrantChange::Revoke { .. }) => 0,
         // The rank of the routine it settles, so it sorts beside that
         // routine's `CREATE` in class 14 (see `order_key`, #687).
-        Change::PublicExecution { routine, .. } => create_rank
+        Change::Permission(GrantChange::PublicExecution { routine, .. }) => create_rank
             .get(&ModuleId::Routine(routine.clone()))
             .map_or(0, |r| *r as isize),
     }
@@ -8185,21 +8280,21 @@ fn diff_roles(
     let sequence_creates: BTreeSet<_> = changes
         .iter()
         .flat_map(|change| {
-            if let Change::AddColumn {
+            if let Change::Column(ColumnChange::AddColumn {
                 table,
                 name,
                 column,
                 ..
-            } = change
+            }) = change
             {
                 return matches!(column.value_source, ValueSource::Sequence(_))
                     .then(|| table.column(name))
                     .into_iter()
                     .collect::<Vec<_>>();
             }
-            if let Change::AlterColumnNumbering {
+            if let Change::Column(ColumnChange::AlterColumnNumbering {
                 column, from, to, ..
-            } = change
+            }) = change
             {
                 return (matches!(to, ValueSource::Sequence(_))
                     && !matches!(from, ValueSource::Sequence(_)))
@@ -8207,7 +8302,7 @@ fn diff_roles(
                 .into_iter()
                 .collect();
             }
-            if let Change::CreateTable { name, table, .. } = change {
+            if let Change::Table(TableChange::CreateTable { name, table, .. }) = change {
                 return table
                     .columns
                     .iter()
@@ -8221,7 +8316,7 @@ fn diff_roles(
     let detaching: BTreeSet<_> = changes
         .iter()
         .filter_map(|change| {
-            if let Change::DetachPartition { uid, .. } = change {
+            if let Change::Partition(PartitionChange::DetachPartition { uid, .. }) = change {
                 Some(uid.clone())
             } else {
                 None
@@ -8255,7 +8350,7 @@ fn diff_roles(
     // again, or it silently does not come back.
     if dialect.rebuilds_modules() {
         dropped.extend(changes.iter().filter_map(|c| {
-            if let Change::AlterModule { id, .. } = c {
+            if let Change::Module(ModuleChange::AlterModule { id, .. }) = c {
                 Some(pbps_model::Dropped::Module(id.clone()))
             } else {
                 None
@@ -8362,12 +8457,12 @@ fn diff_roles(
             continue;
         }
         if manages_roles {
-            changes.push(Change::DropRole {
+            changes.push(Change::Role(RoleChange::DropRole {
                 uid: uid.clone(),
                 name: name.clone(),
                 // Only a connected plan can know them; see `Change::DropRole`.
                 members: Vec::new(),
-            });
+            }));
             continue;
         }
         // The role stays; what it was granted **here** does not. Anything
@@ -8403,11 +8498,11 @@ fn diff_roles(
             if permissions.is_empty() || target_dropped {
                 continue;
             }
-            changes.push(Change::Revoke {
+            changes.push(Change::Permission(GrantChange::Revoke {
                 role: name.clone(),
                 target,
                 permissions,
-            });
+            }));
         }
     }
 
@@ -8425,18 +8520,18 @@ fn diff_roles(
             // the project then declaring it, which is the only way a role ever
             // comes under management on that engine.
             if manages_roles {
-                changes.push(Change::CreateRole {
+                changes.push(Change::Role(RoleChange::CreateRole {
                     uid: uid.clone(),
                     name: name.clone(),
-                });
+                }));
             }
             for (target, permissions) in &role.grants {
                 if !permissions.is_empty() {
-                    changes.push(Change::Grant {
+                    changes.push(Change::Permission(GrantChange::Grant {
                         role: name.clone(),
                         target: target.clone(),
                         permissions: permissions.clone(),
-                    });
+                    }));
                 }
             }
             continue;
@@ -8457,11 +8552,11 @@ fn diff_roles(
         // instead, its grants went with it, the pull shows the new role
         // holding nothing, and every declared grant is planned here anyway.
         if base_name != name && manages_roles {
-            changes.push(Change::RenameRole {
+            changes.push(Change::Role(RoleChange::RenameRole {
                 uid: uid.clone(),
                 from: base_name.clone(),
                 to: name.clone(),
-            });
+            }));
         }
         // The base grants, keyed by the name the target has after this plan.
         let mut before: BTreeMap<GrantTarget, BTreeSet<Permission>> = BTreeMap::new();
@@ -8529,18 +8624,18 @@ fn diff_roles(
                 removed.remove(&Permission::Usage);
             }
             if !added.is_empty() {
-                changes.push(Change::Grant {
+                changes.push(Change::Permission(GrantChange::Grant {
                     role: name.clone(),
                     target: target.clone(),
                     permissions: added,
-                });
+                }));
             }
             if !removed.is_empty() && !target_dropped {
-                changes.push(Change::Revoke {
+                changes.push(Change::Permission(GrantChange::Revoke {
                     role: name.clone(),
                     target: target.clone(),
                     permissions: removed,
-                });
+                }));
             }
         }
     }
@@ -8590,9 +8685,9 @@ fn revoke_public_execution(
         // Written as `if let` rather than a match with a wildcard: every
         // other kind of change ends with no `CREATE`, so there is nothing to
         // enumerate and a list of them would need maintaining for nothing.
-        let id = if let Change::CreateModule { id, .. } = change {
+        let id = if let Change::Module(ModuleChange::CreateModule { id, .. }) = change {
             id
-        } else if let Change::AlterModule { id, .. } = change
+        } else if let Change::Module(ModuleChange::AlterModule { id, .. }) = change
             && rebuilds
         {
             id
@@ -8620,11 +8715,11 @@ fn revoke_public_execution(
         } else {
             RoutineOrigin::Created
         };
-        decided.push(Change::PublicExecution {
+        decided.push(Change::Permission(GrantChange::PublicExecution {
             routine: routine.clone(),
             access,
             origin,
-        });
+        }));
     }
     changes.extend(decided);
 }
@@ -8786,12 +8881,12 @@ pub fn restoration_comparison<'a>(
         }
     }
     move |change: &Change, uid: Option<&Uid>| {
-        if let Change::AlterColumnDefault { uid, .. } = change {
+        if let Change::Column(ColumnChange::AlterColumnDefault { uid, .. }) = change {
             return ordinary_default(base, uid)
                 .zip(ordinary_default(declared, uid))
                 .is_some_and(|(b, d)| !defaults_differ(b, d));
         }
-        if let Change::SetPartitionDefault { column, .. } = change {
+        if let Change::Partition(PartitionChange::SetPartitionDefault { column, .. }) = change {
             return uid.is_some_and(|u| partition_defaults.contains(&(u.clone(), column.clone())));
         }
         if let Some(id) = change.module_id() {
@@ -8839,40 +8934,40 @@ fn diff_modules(
 ) {
     for (id, module) in &declared.modules {
         match base.modules.get(id) {
-            None => changes.push(Change::CreateModule {
+            None => changes.push(Change::Module(ModuleChange::CreateModule {
                 id: id.clone(),
                 module: Box::new(module.clone()),
-            }),
+            })),
             // A trigger on a name that passes to another table: one id for
             // two triggers, the doomed or departed table's and the one this
             // plan declares on the new occupant. The first goes before the
             // table changes and the second is created after them, exactly as
             // for a trigger that changes kind (DEC-1118.1).
             Some(before) if trigger_changes_hands(id, changing_hands) => {
-                changes.push(Change::DropModule {
+                changes.push(Change::Module(ModuleChange::DropModule {
                     id: id.clone(),
                     kind: before.kind,
-                });
-                changes.push(Change::CreateModule {
+                }));
+                changes.push(Change::Module(ModuleChange::CreateModule {
                     id: id.clone(),
                     module: Box::new(module.clone()),
-                });
+                }));
             }
             Some(before) => match module_delta(before, module, dialect) {
                 ModuleDelta::Unchanged => {}
-                ModuleDelta::Alter => changes.push(Change::AlterModule {
+                ModuleDelta::Alter => changes.push(Change::Module(ModuleChange::AlterModule {
                     id: id.clone(),
                     module: Box::new(module.clone()),
-                }),
+                })),
                 ModuleDelta::Rebuild => {
-                    changes.push(Change::DropModule {
+                    changes.push(Change::Module(ModuleChange::DropModule {
                         id: id.clone(),
                         kind: before.kind,
-                    });
-                    changes.push(Change::CreateModule {
+                    }));
+                    changes.push(Change::Module(ModuleChange::CreateModule {
                         id: id.clone(),
                         module: Box::new(module.clone()),
-                    });
+                    }));
                 }
             },
         }
@@ -8880,10 +8975,10 @@ fn diff_modules(
 
     for (id, module) in &base.modules {
         if !declared.modules.contains_key(id) {
-            changes.push(Change::DropModule {
+            changes.push(Change::Module(ModuleChange::DropModule {
                 id: id.clone(),
                 kind: module.kind,
-            });
+            }));
         }
     }
 }
@@ -8922,7 +9017,7 @@ fn domain_sets_default(from: &pbps_model::ManagedType, to: &pbps_model::ManagedT
 /// stands (DEC-1635.9). Every other change sorts by its own subject.
 fn rebuild_subject(change: &Change) -> String {
     use pbps_model::EnumRebuildStep as Step;
-    let Change::EnumRebuild { step, .. } = change else {
+    let Change::TypeValue(TypeValueChange::EnumRebuild { step, .. }) = change else {
         return change.subject();
     };
     match step {
@@ -8935,67 +9030,67 @@ fn rebuild_subject(change: &Change) -> String {
 
 fn order_key(c: &Change) -> u8 {
     match c {
-        Change::RebuildPartitionedTable(_)
-        | Change::BuildPartitionedIndex(_)
-        | Change::CopyTableRows(_)
-        | Change::AnalyzeTableTree(_) => {
+        Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+        | Change::Index(IndexChange::BuildPartitionedIndex(_))
+        | Change::Partition(PartitionChange::CopyTableRows(_))
+        | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => {
             unreachable!("rebuild operations are expanded by order, never ranked by the differ")
         }
-        Change::AddEnumValue { .. }
-        | Change::RenameEnumValue { .. }
-        | Change::EnumRebuild {
+        Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+        | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+        | Change::TypeValue(TypeValueChange::EnumRebuild {
             step: pbps_model::EnumRebuildStep::Create { .. },
             ..
-        }
+        })
         // A package's own objects are what a later type, module or table of
         // the plan may use, so it goes with the type creates; the order among
         // packages is the `requires` edge, not this number (DEC-2447.6).
-        | Change::CreateType { .. }
+        | Change::Type(TypeChange::CreateType { .. })
         // Created before the tables, defaults, indexes and checks that name them by a
         // string literal, and a dictionary before the configuration that maps it
         // (DEC-2728.2).
-        | Change::CreateSearch { .. }
-        | Change::CreateExtension { .. }
-        | Change::UpdateExtension { .. }
-        | Change::SetExtensionSchema { .. } => 7,
+        | Change::Search(SearchChange::CreateSearch { .. })
+        | Change::Extension(ExtensionChange::CreateExtension { .. })
+        | Change::Extension(ExtensionChange::UpdateExtension { .. })
+        | Change::Extension(ExtensionChange::SetExtensionSchema { .. }) => 7,
         // A domain's checks and NOT NULL are dropped with a table's, before
         // the plan's rows, and added with them after the rows (DEC-1635.8).
         // A default the half sets can name a label the plan renames or adds,
         // so that half waits for the type changes (class 7); it still
         // precedes every column and row.
-        Change::AlterDomain {
+        Change::TypeValue(TypeValueChange::AlterDomain {
             half: pbps_model::DomainHalf::Loosen,
             from,
             to,
             ..
-        } => {
+        }) => {
             if domain_sets_default(from, to) {
                 7
             } else {
                 2
             }
         }
-        Change::AlterDomain {
+        Change::TypeValue(TypeValueChange::AlterDomain {
             half: pbps_model::DomainHalf::Tighten,
             ..
-        } => 13,
-        Change::EnumRebuild { .. } => COLUMN_ALTERATIONS,
+        }) => 13,
+        Change::TypeValue(TypeValueChange::EnumRebuild { .. }) => COLUMN_ALTERATIONS,
         // After every module this plan drops and the packages it requires
         // are gone: late, like the type drops (DEC-2447.8).
-        Change::DropType { .. } | Change::DropSearch { .. } | Change::DropExtension { .. } => 18,
-        Change::RenameType { .. } => 1,
+        Change::Type(TypeChange::DropType { .. }) | Change::Search(SearchChange::DropSearch { .. }) | Change::Extension(ExtensionChange::DropExtension { .. }) => 18,
+        Change::Type(TypeChange::RenameType { .. }) => 1,
         // A policy releases its bindings before module and column teardown.
-        Change::DropPolicy { .. } => 0,
+        Change::Policy(PolicyChange::DropPolicy { .. }) => 0,
         // Modules go first and last, and both ends are load-bearing. A
         // SCHEMABINDING view blocks a rename of the column it binds, so every
         // module that is going has to go before the table changes; and a view
         // can only be created once the columns it selects exist.
-        Change::DropModule { .. } => 0,
+        Change::Module(ModuleChange::DropModule { .. }) => 0,
         // A role drop needs nothing else gone first, and a plan that also
         // recreates the name wants the old one out of the way early.
-        Change::DropRole { .. } => 0,
+        Change::Role(RoleChange::DropRole { .. }) => 0,
         // A table rename, and a role rename that depends on nothing here.
-        Change::RenameTable { .. } | Change::RenameRole { .. } => 1,
+        Change::Table(TableChange::RenameTable { .. }) | Change::Role(RoleChange::RenameRole { .. }) => 1,
         // Before the column renames, and after the table rename that gives
         // these drops the name they use.
         //
@@ -9030,17 +9125,17 @@ fn order_key(c: &Change) -> u8 {
         // `dependency_rank` already keeps a foreign-key drop ahead of it
         // inside this class, which is the order the engine requires and the
         // reason that rank exists.
-        Change::DropIndex { .. }
-        | Change::DropUnique { .. }
-        | Change::DropForeignKey { .. }
-        | Change::DropCheck { .. }
-        | Change::SetExclusion { to: None, .. }
-        | Change::SetPrimaryKey { to: None, .. } => 2,
+        Change::Index(IndexChange::DropIndex { .. })
+        | Change::Constraint(ConstraintChange::DropUnique { .. })
+        | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+        | Change::Constraint(ConstraintChange::DropCheck { .. })
+        | Change::Constraint(ConstraintChange::SetExclusion { to: None, .. })
+        | Change::Constraint(ConstraintChange::SetPrimaryKey { to: None, .. }) => 2,
         // After the drops above (`sort_class` places it at the class's end),
         // since an index or check over it blocks it (4922), and before every
         // rename, drop or retype of a column its expression reads, which it
         // blocks in turn (15336, 4922; measured on 17.0, #1174).
-        Change::DropComputedColumn { .. } => 2,
+        Change::Column(ColumnChange::DropComputedColumn { .. }) => 2,
         // A class of its own, after the table renames: `sp_rename` on a column
         // names the table, and `resolve_columns` iterates the *declared*
         // schema, so a `RenameColumn` always carries the post-rename table.
@@ -9052,49 +9147,49 @@ fn order_key(c: &Change) -> u8 {
         // so the two were sorted against two different names for one table and
         // the alphabet decided: `dbo.customers` -> `dbo.clients` put the
         // column rename first, against a table that did not exist yet.
-        Change::RenameColumn { .. } => 3,
+        Change::Column(ColumnChange::RenameColumn { .. }) => 3,
         // After the renames, so a revoke names the role and the object as
         // they now are. It shared a class with the drops above until they
         // moved ahead of the renames; it has the opposite need, so it stayed
         // and took a class of its own. A revoke on an object this plan drops
         // is never emitted (see `diff_roles`).
-        Change::Revoke { .. } => 4,
-        Change::DropColumn { .. } => 5,
+        Change::Permission(GrantChange::Revoke { .. }) => 4,
+        Change::Column(ColumnChange::DropColumn { .. }) => 5,
         // A detach frees its range, as a drop does, before a partition is
         // created over it in class 7 (#1544).
-        Change::DropTable { .. } | Change::DetachPartition { .. } => 6,
+        Change::Table(TableChange::DropTable { .. }) | Change::Partition(PartitionChange::DetachPartition { .. }) => 6,
         // An attach takes its range as a created partition does, and once
         // a detach or a drop has freed it (#1545).
-        Change::CreateTable { .. } | Change::AttachPartition { .. } => 7,
-        Change::AddColumn { .. } => 8,
-        Change::AlterColumnType { .. }
-        | Change::AlterColumnNullability { .. }
-        | Change::AlterColumnDefault { .. }
-        | Change::AlterColumnNumbering { .. }
-        | Change::AlterColumnExpression { .. }
-        | Change::SetPartitionDefault { .. }
-        | Change::SetPartitionNotNull { .. } => COLUMN_ALTERATIONS,
+        Change::Table(TableChange::CreateTable { .. }) | Change::Partition(PartitionChange::AttachPartition { .. }) => 7,
+        Change::Column(ColumnChange::AddColumn { .. }) => 8,
+        Change::Column(ColumnChange::AlterColumnType { .. })
+        | Change::Column(ColumnChange::AlterColumnNullability { .. })
+        | Change::Column(ColumnChange::AlterColumnDefault { .. })
+        | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+        | Change::Column(ColumnChange::AlterColumnExpression { .. })
+        | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+        | Change::Partition(PartitionChange::SetPartitionNotNull { .. }) => COLUMN_ALTERATIONS,
         // Once every column its expression reads is there in its final type
         // (`sort_class` places it after the class's alterations), and before
         // the indexes and checks of class 13 that may be over it (#1174).
-        Change::AddComputedColumn { .. } => COLUMN_ALTERATIONS,
-        Change::SetColumnDeprecated { .. } => 10,
+        Change::Column(ColumnChange::AddComputedColumn { .. }) => COLUMN_ALTERATIONS,
+        Change::Column(ColumnChange::SetColumnDeprecated { .. }) => 10,
         // A comment is metadata too, on the object as the plan leaves it: after its
         // create (7, 8), alterations (9) and every rename (1), under its final name
         // (DEC-2729.1, measured: a drop and a create lose a comment, a rename keeps it).
-        Change::SetComment { .. } => 10,
+        Change::TableProperty(TablePropertyChange::SetComment { .. }) => 10,
         // Metadata too: no statement reads a storage parameter, and it runs
         // under the table's final name (DEC-1441.1).
-        Change::SetStorageParameters { .. } => 10,
+        Change::TableProperty(TablePropertyChange::SetStorageParameters { .. }) => 10,
         // After the foreign-key drops of class 2 and before the adds of 13:
         // the engine checks the keys that stand when it switches (#1443).
-        Change::SetTablePersistence { .. } => COLUMN_ALTERATIONS,
+        Change::TableProperty(TablePropertyChange::SetTablePersistence { .. }) => COLUMN_ALTERATIONS,
         // In place too, and nothing reads one (DEC-1442.1).
-        Change::SetIndexStorageParameters { .. } => 10,
+        Change::Index(IndexChange::SetIndexStorageParameters { .. }) => 10,
         // Rows arrive once every column they name exists and has its final
         // type, and before the constraints below: ADR-0004's "create table ->
         // insert rows -> add the foreign key that references them".
-        Change::InsertRow { .. } | Change::UpdateRow { .. } => 11,
+        Change::Row(RowChange::InsertRow { .. }) | Change::Row(RowChange::UpdateRow { .. }) => 11,
         // Rows leave after every insert and update, and after the foreign keys
         // that could block them are gone. No single order satisfies every
         // shape — a delete-then-insert on a table with a UNIQUE elsewhere
@@ -9105,20 +9200,20 @@ fn order_key(c: &Change) -> u8 {
         // at the old one when the old one goes, and `ON DELETE CASCADE` takes
         // the child with it, after which the update touches zero rows and
         // nothing says so.
-        Change::DeleteRow { .. } => ROW_DELETIONS,
-        Change::SetPrimaryKey { .. }
-        | Change::AddUnique { .. }
-        | Change::AddForeignKey { .. }
-        | Change::AddCheck { .. }
-        | Change::SetExclusion { to: Some(_), .. }
-        | Change::AddIndex { .. } => 13,
+        Change::Row(RowChange::DeleteRow { .. }) => ROW_DELETIONS,
+        Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+        | Change::Constraint(ConstraintChange::AddUnique { .. })
+        | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+        | Change::Constraint(ConstraintChange::AddCheck { .. })
+        | Change::Constraint(ConstraintChange::SetExclusion { to: Some(_), .. })
+        | Change::Index(IndexChange::AddIndex { .. }) => 13,
         // Late, it follows the index it names (DEC-1444.1); `sort_class`
         // moves the rest to the front.
-        Change::SetReplicaIdentity { .. } => 13,
-        Change::CreatePolicy { .. }
-        | Change::SetRowSecurity { .. }
-        | Change::CreateModule { .. }
-        | Change::AlterModule { .. } => 14,
+        Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. }) => 13,
+        Change::Policy(PolicyChange::CreatePolicy { .. })
+        | Change::Policy(PolicyChange::SetRowSecurity { .. })
+        | Change::Module(ModuleChange::CreateModule { .. })
+        | Change::Module(ModuleChange::AlterModule { .. }) => 14,
         // The `PUBLIC` decision for a routine travels with the routine: class
         // 14 at that routine's own create rank (`dependency_rank`), and its
         // subject is the routine's, so the sort puts it immediately after its
@@ -9129,14 +9224,14 @@ fn order_key(c: &Change) -> u8 {
         // the rest of the modules and every role create (#687). A class of its
         // own after the modules would still leave a later routine's `CREATE`
         // in between, and would renumber every ordinal below (DEC-687.1).
-        Change::PublicExecution { .. } => 14,
+        Change::Permission(GrantChange::PublicExecution { .. }) => 14,
         // A grant names an object, so it comes after every object exists —
         // and after the role does.
-        Change::CreateRole { .. } => 15,
-        Change::Grant { .. } => 16,
+        Change::Role(RoleChange::CreateRole { .. }) => 15,
+        Change::Permission(GrantChange::Grant { .. }) => 16,
         // Emits nothing; it exists so the recorded state matches the file. Last
         // keeps it out of the way of everything that does emit.
-        Change::SetDataMode { .. } | Change::SetEnsureKeys { .. } => 17,
+        Change::Row(RowChange::SetDataMode { .. }) | Change::Row(RowChange::SetEnsureKeys { .. }) => 17,
     }
 }
 /// The defaults an inserted row is left to: every column the row omits, the
@@ -9301,6 +9396,20 @@ mod tests {
     use crate::identity::Context;
     use indexmap::IndexMap;
     use pbps_dialect::MinimalDialect;
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::ExtensionChange;
+    use pbps_model::GrantChange;
+    use pbps_model::IndexChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::PartitionChange;
+    use pbps_model::PolicyChange;
+    use pbps_model::RowChange;
+    use pbps_model::SearchChange;
+    use pbps_model::TableChange;
+    use pbps_model::TablePropertyChange;
+    use pbps_model::TypeChange;
+    use pbps_model::TypeValueChange;
     use pbps_model::{
         CheckConstraint, Column, ColumnType, ForeignKey, IdsFile, Index, IndexColumn, Intent,
         PrimaryKey, ReferentialAction, RiskClass, Row, Uid, UniqueConstraint,
@@ -9363,12 +9472,12 @@ mod tests {
         );
         assert!(errors.is_empty(), "{errors:?}");
         let [
-            Change::UpdateRow {
+            Change::Row(RowChange::UpdateRow {
                 columns,
                 unchanged,
                 types,
                 ..
-            },
+            }),
         ] = changes.as_slice()
         else {
             panic!("one cell update: {changes:?}");
@@ -9666,7 +9775,7 @@ mod tests {
                 .changes
                 .iter()
                 .map(|p| match &p.change {
-                    Change::AlterDomain { half, .. } => *half,
+                    Change::TypeValue(TypeValueChange::AlterDomain { half, .. }) => *half,
                     other => panic!("{other:?}"),
                 })
                 .collect()
@@ -9709,7 +9818,7 @@ mod tests {
         let plan = alter_domain(&held, &released, &[]).unwrap();
         assert!(matches!(
             &plan.changes[..],
-            [p] if matches!(&p.change, Change::AlterDomain { half: Loosen, .. })
+            [p] if matches!(&p.change, Change::TypeValue(TypeValueChange::AlterDomain { half: Loosen, .. }))
         ));
         // Everything at once plans both halves.
         assert_eq!(
@@ -9733,10 +9842,10 @@ mod tests {
             .expect("a collation change plans the rebuild");
         assert!(
             !plan.changes.is_empty()
-                && plan
-                    .changes
-                    .iter()
-                    .all(|p| matches!(p.change, Change::EnumRebuild { .. })),
+                && plan.changes.iter().all(|p| matches!(
+                    p.change,
+                    Change::TypeValue(TypeValueChange::EnumRebuild { .. })
+                )),
             "{plan:?}"
         );
         // A base the dialect does not convert by itself is refused by name,
@@ -9798,10 +9907,10 @@ mod tests {
         );
         let plan = alter_domain(&base, &desired, &[]).unwrap();
         let name = |p: &PlannedChange| match &p.change {
-            Change::AlterDomain { half, .. } => format!("{half:?}"),
-            Change::AddColumn { .. } => "AddColumn".to_owned(),
-            Change::CreateTable { .. } => "CreateTable".to_owned(),
-            Change::InsertRow { .. } => "InsertRow".to_owned(),
+            Change::TypeValue(TypeValueChange::AlterDomain { half, .. }) => format!("{half:?}"),
+            Change::Column(ColumnChange::AddColumn { .. }) => "AddColumn".to_owned(),
+            Change::Table(TableChange::CreateTable { .. }) => "CreateTable".to_owned(),
+            Change::Row(RowChange::InsertRow { .. }) => "InsertRow".to_owned(),
             other => panic!("{other:?}"),
         };
         let order: Vec<String> = plan.changes.iter().map(name).collect();
@@ -9844,15 +9953,16 @@ mod tests {
         let no_default = code(false, None, &[], "text");
         let with_default = code(false, Some("'b'"), &[], "text");
         let with_check = code(false, None, &[("c", "VALUE <> 'a'")], "text");
-        let loosen =
-            |from: &pbps_model::ManagedType, to: &pbps_model::ManagedType| Change::AlterDomain {
+        let loosen = |from: &pbps_model::ManagedType, to: &pbps_model::ManagedType| {
+            Change::TypeValue(TypeValueChange::AlterDomain {
                 uid: "y_000001".parse().unwrap(),
                 name: "app.code".parse().unwrap(),
                 from: Box::new(from.clone()),
                 to: Box::new(to.clone()),
                 half: pbps_model::DomainHalf::Loosen,
-            };
-        let rename = Change::RenameEnumValue {
+            })
+        };
+        let rename = Change::TypeValue(TypeValueChange::RenameEnumValue {
             uid: "y_000002".parse().unwrap(),
             name: "app.e".parse().unwrap(),
             from: "a".into(),
@@ -9862,7 +9972,7 @@ mod tests {
             definition: Box::new(pbps_model::ManagedType::Enum {
                 values: vec!["b".into()],
             }),
-        };
+        });
         assert_eq!(
             order_key(&loosen(&no_default, &with_default)),
             order_key(&rename)
@@ -9903,11 +10013,11 @@ mod tests {
                 let created = run(&Schema::default(), &secured, &[]);
                 assert!(matches!(
                     created.changes[0].change,
-                    Change::CreateTable { .. }
+                    Change::Table(TableChange::CreateTable { .. })
                 ));
                 assert!(matches!(
                     created.changes[1].change,
-                    Change::CreatePolicy { .. }
+                    Change::Policy(PolicyChange::CreatePolicy { .. })
                 ));
                 assert_eq!(created.changes.len(), if enabled || forced { 3 } else { 2 });
                 assert!(created.changes.iter().all(|p| p.risks.is_empty()));
@@ -9928,7 +10038,7 @@ mod tests {
                     );
                 let change = run(&secured, &unrelated, &[]);
                 assert!(
-                    matches!(&change.changes[..], [p] if matches!(p.change, Change::AddColumn { .. }))
+                    matches!(&change.changes[..], [p] if matches!(p.change, Change::Column(ColumnChange::AddColumn { .. })))
                 );
             }
         }
@@ -9980,20 +10090,20 @@ mod tests {
                     assert_eq!(changes.changes.len(), 2, "{restrictive}, field {field}");
                     assert_eq!(
                         changes.changes[0].change,
-                        Change::DropPolicy {
+                        Change::Policy(PolicyChange::DropPolicy {
                             table: name.clone(),
                             name: "p".into(),
                             policy: old.clone(),
-                        }
+                        })
                     );
                     assert_eq!(
                         changes.changes[1].change,
-                        Change::CreatePolicy {
+                        Change::Policy(PolicyChange::CreatePolicy {
                             table: name.clone(),
                             name: "p".into(),
                             policy: new.clone(),
                             origin: RowSecurityOrigin::Standing,
-                        }
+                        })
                     );
                     assert!(
                         changes
@@ -10006,21 +10116,21 @@ mod tests {
                     (
                         &plain,
                         &declared,
-                        Change::CreatePolicy {
+                        Change::Policy(PolicyChange::CreatePolicy {
                             table: name.clone(),
                             name: "p".into(),
                             policy: new.clone(),
                             origin: RowSecurityOrigin::Standing,
-                        },
+                        }),
                     ),
                     (
                         &declared,
                         &plain,
-                        Change::DropPolicy {
+                        Change::Policy(PolicyChange::DropPolicy {
                             table: name.clone(),
                             name: "p".into(),
                             policy: new.clone(),
-                        },
+                        }),
                     ),
                 ] {
                     let changes = run(before, after, &[]);
@@ -10110,13 +10220,13 @@ mod tests {
                 if from == to {
                     assert!(changes.is_empty());
                 } else {
-                    let expected = Change::SetRowSecurity {
+                    let expected = Change::Policy(PolicyChange::SetRowSecurity {
                         uid: uid.clone(),
                         table: name.clone(),
                         from,
                         to,
                         origin: RowSecurityOrigin::Standing,
-                    };
+                    });
                     assert_eq!(changes.changes.len(), 1);
                     assert_eq!(changes.changes[0].change, expected);
                     assert_eq!(
@@ -10193,21 +10303,21 @@ mod tests {
         )
         .unwrap();
         assert!(
-            matches!(&changes.changes[0].change, Change::DropPolicy { table, policy, .. } if table == &old_name && policy == &old)
+            matches!(&changes.changes[0].change, Change::Policy(PolicyChange::DropPolicy { table, policy, .. }) if table == &old_name && policy == &old)
         );
         assert!(
-            matches!(&changes.changes[1].change, Change::RenameTable { from, to, .. } if from == &old_name && to == &new_name)
+            matches!(&changes.changes[1].change, Change::Table(TableChange::RenameTable { from, to, .. }) if from == &old_name && to == &new_name)
         );
         let installed = changes
             .changes
             .iter()
             .filter_map(|p| {
-                if let Change::CreatePolicy {
+                if let Change::Policy(PolicyChange::CreatePolicy {
                     table,
                     policy,
                     origin,
                     ..
-                } = &p.change
+                }) = &p.change
                 {
                     Some((table, policy, origin, &p.risks))
                 } else {
@@ -10231,7 +10341,7 @@ mod tests {
             .changes
             .iter()
             .find_map(|p| {
-                if let Change::RenameTable { uid, to, .. } = &p.change {
+                if let Change::Table(TableChange::RenameTable { uid, to, .. }) = &p.change {
                     Some((uid, to))
                 } else {
                     None
@@ -10239,7 +10349,7 @@ mod tests {
             })
             .unwrap();
         assert!(
-            matches!(&changes.changes.last().unwrap().change, Change::SetRowSecurity { uid, table, origin: RowSecurityOrigin::Standing, .. } if uid == table_uid && table == &new_name)
+            matches!(&changes.changes.last().unwrap().change, Change::Policy(PolicyChange::SetRowSecurity { uid, table, origin: RowSecurityOrigin::Standing, .. }) if uid == table_uid && table == &new_name)
         );
         assert_eq!(
             changes.changes[0].risks,
@@ -10251,7 +10361,7 @@ mod tests {
             .tables
             .insert(new_name, base.tables[&old_name].clone());
         assert!(
-            matches!(&run(&base, &declared, &[intent]).changes[..], [p] if matches!(p.change, Change::RenameTable { .. }))
+            matches!(&run(&base, &declared, &[intent]).changes[..], [p] if matches!(p.change, Change::Table(TableChange::RenameTable { .. })))
         );
     }
 
@@ -10275,7 +10385,7 @@ mod tests {
             }],
         );
         assert!(
-            matches!(&dropped.changes[..], [p] if matches!(p.change, Change::DropTable { .. }))
+            matches!(&dropped.changes[..], [p] if matches!(p.change, Change::Table(TableChange::DropTable { .. })))
         );
         let before_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
             .unwrap()
@@ -10306,17 +10416,17 @@ mod tests {
         );
         assert!(matches!(
             replaced.changes[2].change,
-            Change::CreatePolicy {
+            Change::Policy(PolicyChange::CreatePolicy {
                 origin: RowSecurityOrigin::Created,
                 ..
-            }
+            })
         ));
         assert!(matches!(
             replaced.changes[3].change,
-            Change::SetRowSecurity {
+            Change::Policy(PolicyChange::SetRowSecurity {
                 origin: RowSecurityOrigin::Created,
                 ..
-            }
+            })
         ));
     }
 
@@ -10402,12 +10512,12 @@ mod tests {
         assert_eq!(changes.changes.len(), 9);
         assert!(matches!(
             changes.changes[0].change,
-            Change::DropPolicy { .. }
+            Change::Policy(PolicyChange::DropPolicy { .. })
         ));
         let modules = changes.changes[1..]
             .iter()
             .map(|p| {
-                if let Change::DropModule { id, .. } = &p.change {
+                if let Change::Module(ModuleChange::DropModule { id, .. }) = &p.change {
                     id.clone()
                 } else {
                     panic!("unexpected {:?}", p.change)
@@ -10608,8 +10718,13 @@ mod tests {
                     .position(|p| wanted(&p.change))
                     .expect("the plan holds it")
             };
-            let package = position(|c| matches!(c, Change::CreateExtension { .. }));
-            let table = position(|c| matches!(c, Change::CreateTable { .. }));
+            let package = position(|c| {
+                matches!(
+                    c,
+                    Change::Extension(ExtensionChange::CreateExtension { .. })
+                )
+            });
+            let table = position(|c| matches!(c, Change::Table(TableChange::CreateTable { .. })));
             assert!(package < table, "{:#?}", plan.changes);
         }
     }
@@ -10662,8 +10777,13 @@ mod tests {
                     .position(|p| wanted(&p.change))
                     .expect("the plan holds it")
             };
-            let package = position(|c| matches!(c, Change::CreateExtension { .. }));
-            let index = position(|c| matches!(c, Change::AddIndex { .. }));
+            let package = position(|c| {
+                matches!(
+                    c,
+                    Change::Extension(ExtensionChange::CreateExtension { .. })
+                )
+            });
+            let index = position(|c| matches!(c, Change::Index(IndexChange::AddIndex { .. })));
             assert!(package < index, "{:#?}", plan.changes);
         }
         // Negative: the same index over an engine class asks nothing of a package,
@@ -10674,14 +10794,12 @@ mod tests {
         assert!(
             plan.changes
                 .iter()
-                .any(|p| matches!(p.change, Change::AddIndex { .. }))
+                .any(|p| matches!(p.change, Change::Index(IndexChange::AddIndex { .. })))
         );
-        assert!(
-            !plan
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, Change::CreateExtension { .. }))
-        );
+        assert!(!plan.changes.iter().any(|p| matches!(
+            p.change,
+            Change::Extension(ExtensionChange::CreateExtension { .. })
+        )));
     }
 
     /// A configuration that maps a dictionary a package provides waits for the plan's create
@@ -10717,8 +10835,13 @@ mod tests {
                     .expect("the plan holds it")
             };
             (
-                position(|c| matches!(c, Change::CreateExtension { .. })),
-                position(|c| matches!(c, Change::CreateSearch { .. })),
+                position(|c| {
+                    matches!(
+                        c,
+                        Change::Extension(ExtensionChange::CreateExtension { .. })
+                    )
+                }),
+                position(|c| matches!(c, Change::Search(SearchChange::CreateSearch { .. }))),
             )
         };
         for _ in 0..40 {
@@ -10777,13 +10900,18 @@ mod tests {
                     .expect("the plan holds it")
             };
             (
-                position(|c| matches!(c, Change::CreateExtension { .. })),
                 position(|c| {
-                    matches!(c, Change::CreateSearch { name, .. }
+                    matches!(
+                        c,
+                        Change::Extension(ExtensionChange::CreateExtension { .. })
+                    )
+                }),
+                position(|c| {
+                    matches!(c, Change::Search(SearchChange::CreateSearch { name, .. })
                         if name.kind == pbps_model::SearchKind::Dictionary)
                 }),
                 position(|c| {
-                    matches!(c, Change::CreateSearch { name, .. }
+                    matches!(c, Change::Search(SearchChange::CreateSearch { name, .. })
                         if name.kind == pbps_model::SearchKind::Config)
                 }),
             )
@@ -10848,15 +10976,15 @@ mod tests {
             };
             (
                 position(&|c| {
-                    matches!(c, Change::CreateSearch { name, .. }
+                    matches!(c, Change::Search(SearchChange::CreateSearch { name, .. })
                     if name.kind == pbps_model::SearchKind::Config)
                 }),
                 position(&|c| {
-                    matches!(c, Change::CreateType { name, .. }
+                    matches!(c, Change::Type(TypeChange::CreateType { name, .. })
                     if name.name() == "name")
                 }),
                 position(&|c| {
-                    matches!(c, Change::CreateType { name, .. }
+                    matches!(c, Change::Type(TypeChange::CreateType { name, .. })
                     if name.name() == "over")
                 }),
             )
@@ -10932,12 +11060,13 @@ mod tests {
         let is_package = |c: &Change| {
             matches!(
                 c,
-                Change::CreateExtension { .. } | Change::SetExtensionSchema { .. }
+                Change::Extension(ExtensionChange::CreateExtension { .. })
+                    | Change::Extension(ExtensionChange::SetExtensionSchema { .. })
             )
         };
-        let is_domain = |c: &Change| matches!(c, Change::CreateType { .. });
-        let is_table = |c: &Change| matches!(c, Change::CreateTable { .. });
-        let is_column = |c: &Change| matches!(c, Change::AddColumn { .. });
+        let is_domain = |c: &Change| matches!(c, Change::Type(TypeChange::CreateType { .. }));
+        let is_table = |c: &Change| matches!(c, Change::Table(TableChange::CreateTable { .. }));
+        let is_column = |c: &Change| matches!(c, Change::Column(ColumnChange::AddColumn { .. }));
         // Create: a new package and a domain over its type; and a move of a
         // standing package with a domain, a new table and an added column over
         // the destination's type.
@@ -10974,7 +11103,7 @@ mod tests {
             assert!(
                 matches!(
                     plan.changes[package].change,
-                    Change::SetExtensionSchema { .. }
+                    Change::Extension(ExtensionChange::SetExtensionSchema { .. })
                 ),
                 "{plan:#?}"
             );
@@ -11054,8 +11183,15 @@ mod tests {
         let at = |plan: &ChangeSet, wanted: fn(&Change) -> bool| {
             plan.changes.iter().position(|p| wanted(&p.change)).unwrap()
         };
-        let package_at = at(&planned, |c| matches!(c, Change::SetExtensionSchema { .. }));
-        let domain_at = at(&planned, |c| matches!(c, Change::CreateType { .. }));
+        let package_at = at(&planned, |c| {
+            matches!(
+                c,
+                Change::Extension(ExtensionChange::SetExtensionSchema { .. })
+            )
+        });
+        let domain_at = at(&planned, |c| {
+            matches!(c, Change::Type(TypeChange::CreateType { .. }))
+        });
         assert!(package_at < domain_at);
         let observe = |plan: &ChangeSet| {
             let (base, declared) = sides();
@@ -11541,9 +11677,11 @@ mod tests {
                 .changes
                 .iter()
                 .filter_map(|p| match &p.change {
-                    Change::DropIndex { name, .. }
-                    | Change::DropUnique { name, .. }
-                    | Change::DropCheck { name, .. } => Some(name.raw().to_owned()),
+                    Change::Index(IndexChange::DropIndex { name, .. })
+                    | Change::Constraint(ConstraintChange::DropUnique { name, .. })
+                    | Change::Constraint(ConstraintChange::DropCheck { name, .. }) => {
+                        Some(name.raw().to_owned())
+                    }
                     _ => None,
                 })
                 .collect();
@@ -11609,13 +11747,13 @@ mod tests {
             .changes
             .iter()
             .find_map(|p| match &p.change {
-                Change::AlterColumnType {
+                Change::Column(ColumnChange::AlterColumnType {
                     from,
                     to,
                     from_collation,
                     to_collation,
                     ..
-                } => Some((
+                }) => Some((
                     from.clone(),
                     to.clone(),
                     from_collation.clone(),
@@ -11666,10 +11804,10 @@ mod tests {
             matches!(
                 &cs.changes[..],
                 [PlannedChange {
-                    change: Change::AlterColumnNullability {
+                    change: Change::Column(ColumnChange::AlterColumnNullability {
                         collation: Some(_),
                         ..
-                    },
+                    }),
                     ..
                 }]
             ),
@@ -11749,12 +11887,12 @@ mod tests {
         let declared = booking(&[("no_overlap", exclusion("int4range(a, b)", "&&"))]);
         let cs = run(&base, &declared, &[]);
         let [
-            Change::SetExclusion {
+            Change::Constraint(ConstraintChange::SetExclusion {
                 table,
                 name,
                 from: None,
                 to: Some(to),
-            },
+            }),
         ] = cs
             .changes
             .iter()
@@ -11794,7 +11932,8 @@ mod tests {
         let create = names.iter().position(|k| k == "CreateTable").unwrap();
         let exclusion_at = names.iter().position(|k| k == "SetExclusion").unwrap();
         assert!(create < exclusion_at, "{names:?}");
-        let Change::CreateTable { table, .. } = &cs.changes[create].change else {
+        let Change::Table(TableChange::CreateTable { table, .. }) = &cs.changes[create].change
+        else {
             unreachable!()
         };
         assert!(table.exclude.is_empty());
@@ -11971,21 +12110,25 @@ mod tests {
         // A column the constraint holds, by key text or by predicate, is held
         // against a drop or a retype; one it does not hold is free.
         let table: TableName = "app.booking".parse().unwrap();
-        let drop = |column: &str| Change::DropColumn {
-            uid: "c_aaaaaa".parse().unwrap(),
-            column: table.column(column),
+        let drop = |column: &str| {
+            Change::Column(ColumnChange::DropColumn {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: table.column(column),
+            })
         };
-        let retype = |column: &str| Change::AlterColumnType {
-            uid: "c_aaaaaa".parse().unwrap(),
-            column: table.column(column),
-            from: ty("integer"),
-            to: ty("bigint"),
-            from_nullable: true,
-            to_nullable: true,
-            from_collation: None,
-            to_collation: None,
-            through_external_partitions: false,
-            using: None,
+        let retype = |column: &str| {
+            Change::Column(ColumnChange::AlterColumnType {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: table.column(column),
+                from: ty("integer"),
+                to: ty("bigint"),
+                from_nullable: true,
+                to_nullable: true,
+                from_collation: None,
+                to_collation: None,
+                through_external_partitions: false,
+                using: None,
+            })
         };
         let mut with_filter = held.tables[&table].clone();
         with_filter.exclude.get_mut("no_overlap").unwrap().filter = Some("c > 0".into());
@@ -12153,16 +12296,16 @@ mod tests {
         );
         assert!(matches!(
             run(&base, &tuned).as_slice(),
-            [Change::SetIndexStorageParameters {
+            [Change::Index(IndexChange::SetIndexStorageParameters {
                 method: IndexMethod::Gist,
                 ..
-            }]
+            })]
         ));
         assert!(run(&base, &base).is_empty());
         let collated = table_with(IndexMethod::Gist, Some("C"), &[("fillfactor", "70")]);
         assert!(matches!(
             run(&base, &collated).as_slice(),
-            [Change::DropIndex { .. }, Change::AddIndex { index, .. }]
+            [Change::Index(IndexChange::DropIndex { .. }), Change::Index(IndexChange::AddIndex { index, .. })]
                 if index.columns[0].collation.as_deref() == Some("C")
         ));
         // Negative: the same collation on both sides changes nothing, and a
@@ -12171,7 +12314,10 @@ mod tests {
         let btree = table_with(IndexMethod::Btree, None, &[]);
         assert!(matches!(
             run(&base, &btree).as_slice(),
-            [Change::DropIndex { .. }, Change::AddIndex { .. }]
+            [
+                Change::Index(IndexChange::DropIndex { .. }),
+                Change::Index(IndexChange::AddIndex { .. })
+            ]
         ));
     }
 
@@ -12217,7 +12363,7 @@ mod tests {
         assert!(
             matches!(
                 changes.as_slice(),
-                [Change::SetIndexStorageParameters { .. }]
+                [Change::Index(IndexChange::SetIndexStorageParameters { .. })]
             ),
             "{changes:?}"
         );
@@ -12226,7 +12372,7 @@ mod tests {
         assert!(
             matches!(
                 changes.as_slice(),
-                [Change::DropIndex { .. }, Change::AddIndex { index, .. }]
+                [Change::Index(IndexChange::DropIndex { .. }), Change::Index(IndexChange::AddIndex { index, .. })]
                     if index.storage_parameters.get("rebuilt").map(String::as_str) == Some("1")
             ),
             "{changes:?}"
@@ -12261,7 +12407,7 @@ mod tests {
             errs.is_empty()
                 && matches!(
                     changes.as_slice(),
-                    [Change::SetIndexStorageParameters { .. }]
+                    [Change::Index(IndexChange::SetIndexStorageParameters { .. })]
                 )
         );
     }
@@ -12325,7 +12471,7 @@ mod tests {
                 assert!(
                     matches!(
                         changes.as_slice(),
-                        [Change::DropIndex { .. }, Change::AddIndex { index, .. }]
+                        [Change::Index(IndexChange::DropIndex { .. }), Change::Index(IndexChange::AddIndex { index, .. })]
                             if index.storage_parameters.len() == now.len()
                     ),
                     "{method:?} {name}: {changes:?}"
@@ -12335,7 +12481,7 @@ mod tests {
                 assert!(
                     matches!(
                         changes.as_slice(),
-                        [Change::SetIndexStorageParameters { .. }]
+                        [Change::Index(IndexChange::SetIndexStorageParameters { .. })]
                     ),
                     "{method:?} {name}: {changes:?}"
                 );
@@ -12355,7 +12501,10 @@ mod tests {
             assert!(
                 matches!(
                     changes.as_slice(),
-                    [Change::DropIndex { .. }, Change::AddIndex { .. }]
+                    [
+                        Change::Index(IndexChange::DropIndex { .. }),
+                        Change::Index(IndexChange::AddIndex { .. })
+                    ]
                 ),
                 "{partitioned}: {changes:?}"
             );
@@ -12419,9 +12568,12 @@ mod tests {
             .changes
             .iter()
             .map(|p| match &p.change {
-                Change::SetIndexStorageParameters {
-                    target, set, reset, ..
-                } => {
+                Change::Index(IndexChange::SetIndexStorageParameters {
+                    target,
+                    set,
+                    reset,
+                    ..
+                }) => {
                     format!("{target:?} set {set:?} reset {reset:?}")
                 }
                 other => format!("{other:?}"),
@@ -12440,18 +12592,19 @@ mod tests {
         // A definition change rebuilds, and the `CREATE` carries them.
         let cs = run(&base, &with(&[("fillfactor", "70")], &[], true), &[]);
         let added = cs.changes.iter().find_map(|p| match &p.change {
-            Change::AddIndex { index, .. } => Some(index.storage_parameters.clone()),
+            Change::Index(IndexChange::AddIndex { index, .. }) => {
+                Some(index.storage_parameters.clone())
+            }
             _ => None,
         });
         assert_eq!(
             added,
             Some([("fillfactor".to_owned(), "70".to_owned())].into())
         );
-        assert!(
-            !cs.changes
-                .iter()
-                .any(|p| matches!(p.change, Change::SetIndexStorageParameters { .. }))
-        );
+        assert!(!cs.changes.iter().any(|p| matches!(
+            p.change,
+            Change::Index(IndexChange::SetIndexStorageParameters { .. })
+        )));
         // Negative: the same parameters plan nothing.
         assert!(run(&base, &base, &[]).changes.is_empty());
     }
@@ -12699,7 +12852,7 @@ mod tests {
                 cs.changes
                     .iter()
                     .position(|p| {
-                        matches!(&p.change, Change::SetTablePersistence { table, .. } if *table == t(name))
+                        matches!(&p.change, Change::TableProperty(TablePropertyChange::SetTablePersistence { table, .. }) if *table == t(name))
                     })
                     .unwrap_or_else(|| panic!("no switch for {name}: {:?}", cs.changes))
             };
@@ -12716,10 +12869,10 @@ mod tests {
             let last_switch = ["a", "b", "c", "d", "e"].map(at).into_iter().max().unwrap();
             for (table, key) in [("a", "fk0"), ("b", "fk1")] {
                 let drop = cs.changes.iter().position(|p| {
-                    matches!(&p.change, Change::DropForeignKey { table: tb, name } if *tb == t(table) && name.raw() == key)
+                    matches!(&p.change, Change::Constraint(ConstraintChange::DropForeignKey { table: tb, name }) if *tb == t(table) && name.raw() == key)
                 });
                 let add = cs.changes.iter().position(|p| {
-                    matches!(&p.change, Change::AddForeignKey { table: tb, name, .. } if *tb == t(table) && name.raw() == key)
+                    matches!(&p.change, Change::Constraint(ConstraintChange::AddForeignKey { table: tb, name, .. }) if *tb == t(table) && name.raw() == key)
                 });
                 assert!(
                     drop.is_some_and(|d| d < first_switch),
@@ -12735,7 +12888,7 @@ mod tests {
             // The keys outside the cycle stand through the switches.
             assert!(!cs.changes.iter().any(|p| matches!(
                 &p.change,
-                Change::DropForeignKey { name, .. } if name.raw() == "fk2" || name.raw() == "fk3"
+                Change::Constraint(ConstraintChange::DropForeignKey { name, .. }) if name.raw() == "fk2" || name.raw() == "fk3"
             )));
         }
     }
@@ -12778,9 +12931,11 @@ mod tests {
                 .changes
                 .iter()
                 .map(|p| match &p.change {
-                    Change::SetTablePersistence {
-                        table, unlogged, ..
-                    } => format!("{table} {unlogged}", table = table.shown()),
+                    Change::TableProperty(TablePropertyChange::SetTablePersistence {
+                        table,
+                        unlogged,
+                        ..
+                    }) => format!("{table} {unlogged}", table = table.shown()),
                     other => format!("{other:?}"),
                 })
                 .collect()
@@ -13836,7 +13991,7 @@ mod tests {
             &[],
         );
         assert!(
-            matches!(added.as_slice(), [Change::AddColumn { name, .. }] if name.raw() == "note"),
+            matches!(added.as_slice(), [Change::Column(ColumnChange::AddColumn { name, .. })] if name.raw() == "note"),
             "{added:?}"
         );
         // Retyped: the parent's change alone.
@@ -13851,7 +14006,10 @@ mod tests {
             &[],
         );
         assert!(
-            matches!(retyped.as_slice(), [Change::AlterColumnType { .. }]),
+            matches!(
+                retyped.as_slice(),
+                [Change::Column(ColumnChange::AlterColumnType { .. })]
+            ),
             "{retyped:?}"
         );
         // Dropped with intent: the partitions' own on it go with it.
@@ -13873,7 +14031,10 @@ mod tests {
             &drop_m,
         );
         assert!(
-            matches!(dropped.as_slice(), [Change::DropColumn { .. }]),
+            matches!(
+                dropped.as_slice(),
+                [Change::Column(ColumnChange::DropColumn { .. })]
+            ),
             "{dropped:?}"
         );
         // Renamed, the key column too: the key and the partitions' own follow.
@@ -13916,7 +14077,7 @@ mod tests {
             renamed.len() == 2
                 && renamed
                     .iter()
-                    .all(|c| matches!(c, Change::RenameColumn { .. })),
+                    .all(|c| matches!(c, Change::Column(ColumnChange::RenameColumn { .. }))),
             "{renamed:?}"
         );
         // A default set on the parent: its own default set again after it on
@@ -13936,8 +14097,8 @@ mod tests {
             matches!(
                 defaulted.as_slice(),
                 [
-                    Change::AlterColumnDefault { .. },
-                    Change::SetPartitionDefault { table, to: Some(own), fallback: Some(f), .. },
+                    Change::Column(ColumnChange::AlterColumnDefault { .. }),
+                    Change::Partition(PartitionChange::SetPartitionDefault { table, to: Some(own), fallback: Some(f), .. }),
                 ] if table.raw().to_string() == "app.a" && own == "7" && f == "1"
             ),
             "{defaulted:?}"
@@ -13957,22 +14118,22 @@ mod tests {
         assert!(
             matches!(
                 loosened.first(),
-                Some(Change::AlterColumnNullability {
+                Some(Change::Column(ColumnChange::AlterColumnNullability {
                     to_nullable: true,
                     ..
-                })
+                }))
             ),
             "{loosened:?}"
         );
         let set: Vec<(String, bool)> = loosened[1..]
             .iter()
             .filter_map(|c| match c {
-                Change::SetPartitionNotNull {
+                Change::Partition(PartitionChange::SetPartitionNotNull {
                     table,
                     column,
                     not_null,
                     ..
-                } if column.raw() == "n" => Some((table.raw().to_string(), *not_null)),
+                }) if column.raw() == "n" => Some((table.raw().to_string(), *not_null)),
                 _ => None,
             })
             .collect();
@@ -13997,10 +14158,10 @@ mod tests {
         assert!(
             matches!(
                 tightened.as_slice(),
-                [Change::AlterColumnNullability {
+                [Change::Column(ColumnChange::AlterColumnNullability {
                     to_nullable: false,
                     ..
-                }]
+                })]
             ),
             "{tightened:?}"
         );
@@ -14114,7 +14275,7 @@ mod tests {
             let changes = outcome.unwrap_or_else(|e| panic!("refused: {e:?}"));
             assert!(
                 changes.iter().any(|c| matches!(c,
-                    Change::RenameColumn { from: f, to: t, .. } if f.raw() == from && t.raw() == to)),
+                    Change::Column(ColumnChange::RenameColumn { from: f, to: t, .. }) if f.raw() == from && t.raw() == to)),
                 "{changes:?}"
             );
         };
@@ -14183,17 +14344,23 @@ mod tests {
         );
         let retype_at = retype_loosened
             .iter()
-            .position(|c| matches!(c, Change::AlterColumnType { .. }))
+            .position(|c| matches!(c, Change::Column(ColumnChange::AlterColumnType { .. })))
             .expect("the retype");
         assert!(
             retype_loosened
                 .iter()
                 .enumerate()
-                .filter(|(_, c)| matches!(c, Change::SetPartitionNotNull { .. }))
+                .filter(|(_, c)| matches!(
+                    c,
+                    Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+                ))
                 .all(|(i, _)| i > retype_at)
                 && retype_loosened
                     .iter()
-                    .filter(|c| matches!(c, Change::SetPartitionNotNull { .. }))
+                    .filter(|c| matches!(
+                        c,
+                        Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+                    ))
                     .count()
                     == 2,
             "{retype_loosened:?}"
@@ -14214,8 +14381,8 @@ mod tests {
         let grew = planned(&grown, &[]);
         let at = |kind: &dyn Fn(&Change) -> bool| grew.iter().position(kind).unwrap();
         assert!(
-            at(&|c| matches!(c, Change::AddColumn { .. }))
-                < at(&|c| matches!(c, Change::CreateTable { .. })),
+            at(&|c| matches!(c, Change::Column(ColumnChange::AddColumn { .. })))
+                < at(&|c| matches!(c, Change::Table(TableChange::CreateTable { .. }))),
             "{grew:?}"
         );
         // A non-key column dropped and the key column renamed into its name.
@@ -14370,7 +14537,10 @@ mod tests {
         own_index(&mut indexed_renamed, "m2");
         let carried = from(&indexed_base, &[(&indexed_renamed, &[renaming("m", "m2")])]);
         assert!(
-            matches!(carried.as_slice(), [Change::RenameColumn { .. }]),
+            matches!(
+                carried.as_slice(),
+                [Change::Column(ColumnChange::RenameColumn { .. })]
+            ),
             "{carried:?}"
         );
         // A partition's own check or index beside its parent's change to the
@@ -14438,10 +14608,10 @@ mod tests {
         let parents = |c: &Change| {
             matches!(
                 c,
-                Change::AlterColumnType { .. }
-                    | Change::RenameColumn { .. }
-                    | Change::AlterColumnDefault { .. }
-                    | Change::AlterColumnNullability { .. }
+                Change::Column(ColumnChange::AlterColumnType { .. })
+                    | Change::Column(ColumnChange::RenameColumn { .. })
+                    | Change::Column(ColumnChange::AlterColumnDefault { .. })
+                    | Change::Column(ColumnChange::AlterColumnNullability { .. })
             )
         };
         for (what, declared, intents) in [
@@ -14462,7 +14632,7 @@ mod tests {
             let own = changes
                 .iter()
                 .position(|c| {
-                    matches!(c, Change::AddCheck { table, .. } | Change::AddIndex { table, .. }
+                    matches!(c, Change::Constraint(ConstraintChange::AddCheck { table, .. }) | Change::Index(IndexChange::AddIndex { table, .. })
                         if *table == a)
                 })
                 .unwrap_or_else(|| panic!("{what}: {changes:?}"));
@@ -14501,7 +14671,7 @@ mod tests {
         assert!(
             matches!(
                 planned(&unretyped, &[]).as_slice(),
-                [Change::AddCheck { .. }]
+                [Change::Constraint(ConstraintChange::AddCheck { .. })]
             ),
             "the check alone"
         );
@@ -14578,7 +14748,9 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::CreateTable { name, .. } => Some(name.raw().to_string()),
+                Change::Table(TableChange::CreateTable { name, .. }) => {
+                    Some(name.raw().to_string())
+                }
                 _ => None,
             })
             .collect();
@@ -14630,7 +14802,7 @@ mod tests {
         assert!(
             dropped.changes.iter().any(|p| matches!(
                 &p.change,
-                Change::DropTable { name, detach_from: Some(parent), .. }
+                Change::Table(TableChange::DropTable { name, detach_from: Some(parent), .. })
                     if name.raw().to_string() == "app.z_rest" && parent.raw().to_string() == "app.ev"
             )),
             "{:?}",
@@ -14812,7 +14984,7 @@ mod tests {
                         .iter()
                         .map(|p| &p.change)
                         .collect::<Vec<_>>()[..],
-                    [Change::RenameEnumValue { .. }]
+                    [Change::TypeValue(TypeValueChange::RenameEnumValue { .. })]
                 ),
                 "{:?}",
                 renamed.changes
@@ -14939,11 +15111,11 @@ mod tests {
             ["RenameEnumValue", "UpdateRow"],
             "{changed:?}"
         );
-        let Some(Change::UpdateRow { key, columns, .. }) = changed
+        let Some(Change::Row(RowChange::UpdateRow { key, columns, .. })) = changed
             .changes
             .iter()
             .map(|p| &p.change)
-            .find(|c| matches!(c, Change::UpdateRow { .. }))
+            .find(|c| matches!(c, Change::Row(RowChange::UpdateRow { .. })))
         else {
             panic!("an update: {changed:?}");
         };
@@ -15069,7 +15241,9 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::CreateTable { moves_at_most, .. } => Some(*moves_at_most),
+                Change::Table(TableChange::CreateTable { moves_at_most, .. }) => {
+                    Some(*moves_at_most)
+                }
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -15162,11 +15336,11 @@ mod tests {
             cs.changes
                 .iter()
                 .filter_map(|p| match &p.change {
-                    Change::CreateTable {
+                    Change::Table(TableChange::CreateTable {
                         name,
                         beside_default,
                         ..
-                    } => Some((
+                    }) => Some((
                         name.raw().to_string(),
                         beside_default.as_ref().map(|name| name.raw().to_string()),
                     )),
@@ -15294,17 +15468,21 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| {
-                if let Change::CreateTable { name, .. } = &p.change {
+                if let Change::Table(TableChange::CreateTable { name, .. }) = &p.change {
                     Some(format!("create {name}", name = name.shown()))
-                } else if let Change::SetPartitionNotNull {
-                    table, not_null, ..
-                } = &p.change
+                } else if let Change::Partition(PartitionChange::SetPartitionNotNull {
+                    table,
+                    not_null,
+                    ..
+                }) = &p.change
                 {
                     Some(format!(
                         "not null {table} {not_null}",
                         table = table.shown()
                     ))
-                } else if let Change::AlterColumnDefault { column, .. } = &p.change {
+                } else if let Change::Column(ColumnChange::AlterColumnDefault { column, .. }) =
+                    &p.change
+                {
                     Some(format!("default {}", column.table.shown()))
                 } else {
                     None
@@ -15570,13 +15748,13 @@ mod tests {
             "{:?}",
             planned.changes
         );
-        let Change::AttachPartition {
+        let Change::Partition(PartitionChange::AttachPartition {
             table: t,
             parent: p,
             bound,
             shape,
             ..
-        } = &planned.changes[1].change
+        }) = &planned.changes[1].change
         else {
             panic!("{:?}", planned.changes)
         };
@@ -15591,11 +15769,11 @@ mod tests {
         );
         assert!(matches!(
             &planned.changes[0].change,
-            Change::DropIndex { name, .. } if name.raw() == "t_id"
+            Change::Index(IndexChange::DropIndex { name, .. }) if name.raw() == "t_id"
         ));
         assert!(matches!(
             &planned.changes[2].change,
-            Change::SetPartitionDefault { column, from: None, to: None, fallback: Some(f), .. }
+            Change::Partition(PartitionChange::SetPartitionDefault { column, from: None, to: None, fallback: Some(f), .. })
                 if column.raw() == "n" && f == "0"
         ));
         assert!(planned.changes[1].risks.contains(&RiskClass::Constraint));
@@ -15669,12 +15847,12 @@ mod tests {
                 .changes
                 .iter()
                 .map(|p| match &p.change {
-                    Change::DropIndex { name, .. } => format!(
+                    Change::Index(IndexChange::DropIndex { name, .. }) => format!(
                         "drop {name}",
                         // Preserve raw comparison-label or fixture SQL bytes in test data.
                         name = name.raw(),
                     ),
-                    Change::AddIndex { name, .. } => format!(
+                    Change::Index(IndexChange::AddIndex { name, .. }) => format!(
                         "add {name}",
                         // Preserve raw comparison-label or fixture SQL bytes in test data.
                         name = name.raw(),
@@ -15756,7 +15934,7 @@ mod tests {
             .changes
             .iter()
             .map(|p| {
-                if let Change::InsertRow { table, .. } = &p.change {
+                if let Change::Row(RowChange::InsertRow { table, .. }) = &p.change {
                     format!("insert {table}", table = table.shown())
                 } else {
                     format!("{:?}", p.change)
@@ -15822,17 +16000,25 @@ mod tests {
         let before: Vec<String> = released
             .changes
             .iter()
-            .take_while(|p| !matches!(p.change, Change::AttachPartition { .. }))
+            .take_while(|p| {
+                !matches!(
+                    p.change,
+                    Change::Partition(PartitionChange::AttachPartition { .. })
+                )
+            })
             .map(|p| {
-                if let Change::DropUnique { name, .. } = &p.change {
+                if let Change::Constraint(ConstraintChange::DropUnique { name, .. }) = &p.change {
                     format!(
                         "drop unique {name}",
                         // Preserve raw comparison-label or fixture SQL bytes in test data.
                         name = name.raw(),
                     )
-                } else if let Change::SetPrimaryKey { to: None, .. } = &p.change {
+                } else if let Change::Constraint(ConstraintChange::SetPrimaryKey {
+                    to: None, ..
+                }) = &p.change
+                {
                     "drop key".to_owned()
-                } else if let Change::DropIndex { name, .. } = &p.change {
+                } else if let Change::Index(IndexChange::DropIndex { name, .. }) = &p.change {
                     format!(
                         "drop {name}",
                         // Preserve raw comparison-label or fixture SQL bytes in test data.
@@ -15854,7 +16040,8 @@ mod tests {
         assert!(
             !plain.changes.iter().any(|p| matches!(
                 p.change,
-                Change::DropUnique { .. } | Change::SetPrimaryKey { to: None, .. }
+                Change::Constraint(ConstraintChange::DropUnique { .. })
+                    | Change::Constraint(ConstraintChange::SetPrimaryKey { to: None, .. })
             )),
             "{:?}",
             plain.changes
@@ -15901,7 +16088,8 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| {
-                if let Change::AttachPartition { table, .. } = &p.change {
+                if let Change::Partition(PartitionChange::AttachPartition { table, .. }) = &p.change
+                {
                     Some(table.raw().to_string())
                 } else {
                     None
@@ -15917,19 +16105,21 @@ mod tests {
             cs.changes
                 .iter()
                 .filter_map(|p| {
-                    if let Change::DropIndex { name, .. } = &p.change {
+                    if let Change::Index(IndexChange::DropIndex { name, .. }) = &p.change {
                         Some(format!(
                             "drop {name}",
                             // Preserve raw comparison-label or fixture SQL bytes in test data.
                             name = name.raw(),
                         ))
-                    } else if let Change::AddIndex { name, .. } = &p.change {
+                    } else if let Change::Index(IndexChange::AddIndex { name, .. }) = &p.change {
                         Some(format!(
                             "add {name}",
                             // Preserve raw comparison-label or fixture SQL bytes in test data.
                             name = name.raw(),
                         ))
-                    } else if let Change::AttachPartition { .. } = &p.change {
+                    } else if let Change::Partition(PartitionChange::AttachPartition { .. }) =
+                        &p.change
+                    {
                         Some("attach".to_owned())
                     } else {
                         None
@@ -16149,10 +16339,10 @@ mod tests {
         assert!(
             matches!(
                 &planned.changes[1].change,
-                Change::AttachPartition {
+                Change::Partition(PartitionChange::AttachPartition {
                     bound: PartitionBound::Default,
                     ..
-                }
+                })
             ),
             "{:?}",
             planned.changes
@@ -16164,16 +16354,15 @@ mod tests {
             .2
             .expect("an attach with a trigger on the table is planned");
         assert!(
-            planned
-                .changes
-                .iter()
-                .any(|c| matches!(c.change, Change::AttachPartition { .. }))
-                && !planned.changes.iter().any(|c| matches!(
-                    c.change,
-                    Change::CreateModule { .. }
-                        | Change::DropModule { .. }
-                        | Change::AlterModule { .. }
-                )),
+            planned.changes.iter().any(|c| matches!(
+                c.change,
+                Change::Partition(PartitionChange::AttachPartition { .. })
+            )) && !planned.changes.iter().any(|c| matches!(
+                c.change,
+                Change::Module(ModuleChange::CreateModule { .. })
+                    | Change::Module(ModuleChange::DropModule { .. })
+                    | Change::Module(ModuleChange::AlterModule { .. })
+            )),
             "{:?}",
             kinds(&planned)
         );
@@ -16226,11 +16415,18 @@ mod tests {
                 .position(|c| f(&c.change))
                 .unwrap_or_else(|| panic!("{:?}", planned.changes))
         };
-        let dropped =
-            at(&|c| matches!(c, Change::DropForeignKey { name, .. } if name.raw() == "t_fk"));
-        let attach = at(&|c| matches!(c, Change::AttachPartition { .. }));
-        let added =
-            at(&|c| matches!(c, Change::AddForeignKey { name, .. } if name.raw() == "t_fk"));
+        let dropped = at(
+            &|c| matches!(c, Change::Constraint(ConstraintChange::DropForeignKey { name, .. }) if name.raw() == "t_fk"),
+        );
+        let attach = at(&|c| {
+            matches!(
+                c,
+                Change::Partition(PartitionChange::AttachPartition { .. })
+            )
+        });
+        let added = at(
+            &|c| matches!(c, Change::Constraint(ConstraintChange::AddForeignKey { name, .. }) if name.raw() == "t_fk"),
+        );
         assert!(dropped < attach && attach < added, "{:?}", planned.changes);
         // Two equal to the parent's: the engine takes one by an order the
         // model does not hold, so both are dropped before the attach and
@@ -16245,14 +16441,21 @@ mod tests {
         let attach = planned
             .changes
             .iter()
-            .position(|c| matches!(c.change, Change::AttachPartition { .. }))
+            .position(|c| {
+                matches!(
+                    c.change,
+                    Change::Partition(PartitionChange::AttachPartition { .. })
+                )
+            })
             .unwrap_or_else(|| panic!("{:?}", planned.changes));
         let dropped: Vec<(usize, &str)> = planned
             .changes
             .iter()
             .enumerate()
             .filter_map(|(i, c)| match &c.change {
-                Change::DropForeignKey { name, .. } => Some((i, name.raw())),
+                Change::Constraint(ConstraintChange::DropForeignKey { name, .. }) => {
+                    Some((i, name.raw()))
+                }
                 _ => None,
             })
             .collect();
@@ -16268,10 +16471,10 @@ mod tests {
             planned.changes
         );
         assert!(
-            !planned
-                .changes
-                .iter()
-                .any(|c| matches!(c.change, Change::AddForeignKey { .. })),
+            !planned.changes.iter().any(|c| matches!(
+                c.change,
+                Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            )),
             "{:?}",
             planned.changes
         );
@@ -16279,7 +16482,8 @@ mod tests {
         let (_, _, plain) = outcome(&base, &declared, &[]);
         assert!(!plain.expect("planned").changes.iter().any(|c| matches!(
             c.change,
-            Change::DropForeignKey { .. } | Change::AddForeignKey { .. }
+            Change::Constraint(ConstraintChange::DropForeignKey { .. })
+                | Change::Constraint(ConstraintChange::AddForeignKey { .. })
         )),);
         let planned = outcome(&cascading, &declared, &[])
             .2
@@ -16287,7 +16491,7 @@ mod tests {
         assert!(
             planned.changes.iter().any(|c| matches!(
                 &c.change,
-                Change::DropForeignKey { table, name } if table.raw().to_string() == "app.t" && name.raw() == "t_fk"
+                Change::Constraint(ConstraintChange::DropForeignKey { table, name }) if table.raw().to_string() == "app.t" && name.raw() == "t_fk"
             )),
             "{:?}",
             planned.changes
@@ -16313,7 +16517,7 @@ mod tests {
         assert!(
             set_back.changes.iter().any(|p| matches!(
                 &p.change,
-                Change::SetPartitionDefault { table, column, from: Some(f), to: None, .. }
+                Change::Partition(PartitionChange::SetPartitionDefault { table, column, from: Some(f), to: None, .. })
                     if table.raw().to_string() == "x.t" && column.raw() == "n" && f == "0"
             )),
             "{:?}",
@@ -16630,12 +16834,12 @@ mod tests {
             |declared: &Schema, intents: &[Intent]| outcome_in(declared, intents, &MinimalDialect);
         let planned = outcome(&shape(&|_| {}), &[]).expect("a detach is planned");
         assert_eq!(planned.changes.len(), 1, "{:?}", planned.changes);
-        let Change::DetachPartition {
+        let Change::Partition(PartitionChange::DetachPartition {
             table: detached,
             parent: from,
             names,
             ..
-        } = &planned.changes[0].change
+        }) = &planned.changes[0].change
         else {
             panic!("{:?}", planned.changes)
         };
@@ -16706,8 +16910,8 @@ mod tests {
             .changes
             .iter()
             .map(|p| match p.change {
-                Change::DetachPartition { .. } => "detach",
-                Change::DropTable { .. } => "drop",
+                Change::Partition(PartitionChange::DetachPartition { .. }) => "detach",
+                Change::Table(TableChange::DropTable { .. }) => "drop",
                 _ => "other",
             })
             .collect();
@@ -16723,7 +16927,7 @@ mod tests {
         assert!(
             matches!(
                 planned.changes.as_slice(),
-                [p] if matches!(p.change, Change::DetachPartition { .. })
+                [p] if matches!(p.change, Change::Partition(PartitionChange::DetachPartition { .. }))
             ),
             "{:?}",
             planned.changes
@@ -16736,7 +16940,7 @@ mod tests {
         assert!(
             matches!(
                 planned.changes.as_slice(),
-                [p] if matches!(p.change, Change::DetachPartition { .. })
+                [p] if matches!(p.change, Change::Partition(PartitionChange::DetachPartition { .. }))
             ),
             "{:?}",
             planned.changes
@@ -16781,8 +16985,8 @@ mod tests {
             .changes
             .iter()
             .map(|p| match p.change {
-                Change::DetachPartition { .. } => "detach",
-                Change::RenameTable { .. } => "rename",
+                Change::Partition(PartitionChange::DetachPartition { .. }) => "detach",
+                Change::Table(TableChange::RenameTable { .. }) => "rename",
                 _ => "other",
             })
             .collect();
@@ -16924,7 +17128,7 @@ mod tests {
                 assert_eq!(kinds(&planned), ["AttachPartition", "SetPartitionDefault"]);
                 assert!(matches!(
                     &planned.changes[1].change,
-                    Change::SetPartitionDefault { to: None, fallback: Some(f), .. } if f == expected
+                    Change::Partition(PartitionChange::SetPartitionDefault { to: None, fallback: Some(f), .. }) if f == expected
                 ));
             } else {
                 assert_eq!(kinds(&planned), ["AttachPartition"]);
@@ -16951,7 +17155,7 @@ mod tests {
             assert_eq!(kinds(&own), ["AttachPartition", "SetPartitionDefault"]);
             assert!(matches!(
                 &own.changes[1].change,
-                Change::SetPartitionDefault { to: Some(value), .. } if value == "7"
+                Change::Partition(PartitionChange::SetPartitionDefault { to: Some(value), .. }) if value == "7"
             ));
 
             // Removing that override on a standing partition restores the
@@ -16970,7 +17174,7 @@ mod tests {
             assert_eq!(kinds(&planned), ["SetPartitionDefault"]);
             assert!(matches!(
                 &planned.changes[0].change,
-                Change::SetPartitionDefault { to: None, fallback: Some(f), .. } if Some(f.as_str()) == expected
+                Change::Partition(PartitionChange::SetPartitionDefault { to: None, fallback: Some(f), .. }) if Some(f.as_str()) == expected
             ));
             if let ValueSource::Sequence(sequence) = &source {
                 let mut recorded = declared.clone();
@@ -16986,7 +17190,7 @@ mod tests {
                 assert!(run_with(&SerialDefaults, &recorded, &declared, &[]).is_empty());
                 let planned = run_with(&SerialDefaults, &recorded, &restored, &[]);
                 assert!(matches!(&planned.changes[0].change,
-                    Change::SetPartitionDefault { fallback: Some(f), .. } if f == "known sequence default"));
+                    Change::Partition(PartitionChange::SetPartitionDefault { fallback: Some(f), .. }) if f == "known sequence default"));
 
                 // An ordinary table's own sequence is not an inherited
                 // copy: silently discarding its ownership would lose intent.
@@ -17133,7 +17337,7 @@ mod tests {
                         .iter()
                         .rposition(|p| p.change.table() == Some(&TableName::new("app", "p")))
                         .unwrap();
-                    let own_step = cs.changes.iter().position(|p| matches!(&p.change, Change::SetPartitionDefault { to: Some(d), .. } if d == "7"));
+                    let own_step = cs.changes.iter().position(|p| matches!(&p.change, Change::Partition(PartitionChange::SetPartitionDefault { to: Some(d), .. }) if d == "7"));
                     if own && to.is_some() && !external {
                         assert!(
                             own_step.is_some_and(|i| i > parent),
@@ -17325,7 +17529,7 @@ mod tests {
         let created = outcome(&Schema::default(), &tree).expect("a tree is created");
         assert!(created.changes.iter().any(|c| matches!(
             &c.change,
-            Change::CreateTable { name, table, .. } if *name == p && **table == own("7")
+            Change::Table(TableChange::CreateTable { name, table, .. }) if *name == p && **table == own("7")
         )));
         assert!(outcome(&tree, &tree).expect("unchanged").changes.is_empty());
 
@@ -17337,9 +17541,9 @@ mod tests {
         assert!(
             matches!(
                 planned.changes.as_slice(),
-                [c] if matches!(&c.change, Change::SetPartitionDefault {
+                [c] if matches!(&c.change, Change::Partition(PartitionChange::SetPartitionDefault {
                     table, column, from: Some(from), to: Some(to), fallback: None, ..
-                } if *table == p && column.raw() == "n" && from == "7" && to == "8")
+                }) if *table == p && column.raw() == "n" && from == "7" && to == "8")
             ),
             "{:?}",
             planned.changes
@@ -17375,8 +17579,8 @@ mod tests {
             matches!(
                 kinds.as_slice(),
                 [
-                    Change::SetPartitionNotNull { not_null: false, .. },
-                    Change::SetPartitionDefault { from: Some(_), to: None, fallback: Some(f), .. },
+                    Change::Partition(PartitionChange::SetPartitionNotNull { not_null: false, .. }),
+                    Change::Partition(PartitionChange::SetPartitionDefault { from: Some(_), to: None, fallback: Some(f), .. }),
                 ] if f == "1"
             ),
             "{kinds:?}"
@@ -17392,8 +17596,8 @@ mod tests {
             matches!(
                 kinds.as_slice(),
                 [
-                    Change::AlterColumnDefault { to: Some(d), .. },
-                    Change::SetPartitionDefault { from: Some(a), to: Some(b), fallback: Some(f), .. },
+                    Change::Column(ColumnChange::AlterColumnDefault { to: Some(d), .. }),
+                    Change::Partition(PartitionChange::SetPartitionDefault { from: Some(a), to: Some(b), fallback: Some(f), .. }),
                 ] if d == "1" && a == "7" && b == "7" && f == "1"
             ),
             "{kinds:?}"
@@ -17417,7 +17621,7 @@ mod tests {
         assert!(
             matches!(
                 planned.changes.as_slice(),
-                [c] if matches!(c.change, Change::DetachPartition { .. })
+                [c] if matches!(c.change, Change::Partition(PartitionChange::DetachPartition { .. }))
             ),
             "{:?}",
             planned.changes
@@ -17563,7 +17767,9 @@ mod tests {
             .changes
             .iter()
             .find_map(|c| match &c.change {
-                Change::CreateTable { name, table, .. } if *name == p => Some(table),
+                Change::Table(TableChange::CreateTable { name, table, .. }) if *name == p => {
+                    Some(table)
+                }
                 _ => None,
             })
             .expect("the partition is created");
@@ -17571,7 +17777,8 @@ mod tests {
         assert!(
             !created.changes.iter().any(|c| matches!(
                 c.change,
-                Change::AddCheck { .. } | Change::AddIndex { .. }
+                Change::Constraint(ConstraintChange::AddCheck { .. })
+                    | Change::Index(IndexChange::AddIndex { .. })
             ) && c.change.table() == Some(&p)),
             "{:?}",
             created.changes
@@ -17651,7 +17858,8 @@ mod tests {
         let [planned] = planned.changes.as_slice() else {
             panic!("{:?}", planned.changes)
         };
-        let Change::DetachPartition { names, .. } = &planned.change else {
+        let Change::Partition(PartitionChange::DetachPartition { names, .. }) = &planned.change
+        else {
             panic!("{planned:?}")
         };
         let pairs: Vec<(&str, Option<&str>)> = names
@@ -17784,17 +17992,17 @@ mod tests {
             .map(|c| change_in_words(&c.change))
             .collect();
         assert!(
-            planned
+            planned.changes.iter().any(|c| matches!(
+                c.change,
+                Change::Partition(PartitionChange::DetachPartition { .. })
+            )) && planned
                 .changes
                 .iter()
-                .any(|c| matches!(c.change, Change::DetachPartition { .. }))
-                && planned
-                    .changes
-                    .iter()
-                    .any(|c| matches!(c.change, Change::RenameTable { .. }))
+                .any(|c| matches!(c.change, Change::Table(TableChange::RenameTable { .. })))
                 && !planned.changes.iter().any(|c| matches!(
                     c.change,
-                    Change::DropForeignKey { .. } | Change::AddForeignKey { .. }
+                    Change::Constraint(ConstraintChange::DropForeignKey { .. })
+                        | Change::Constraint(ConstraintChange::AddForeignKey { .. })
                 )),
             "{kinds:?}"
         );
@@ -17883,9 +18091,11 @@ mod tests {
             .map(|c| change_in_words(&c.change))
             .collect();
         let at = |f: &dyn Fn(&Change) -> bool| planned.changes.iter().position(|c| f(&c.change));
-        let fk =
-            at(&|c| matches!(c, Change::DropForeignKey { name, .. } if name.raw() == "p_s_fk"));
-        let table = at(&|c| matches!(c, Change::DropTable { name, .. } if *name == p));
+        let fk = at(
+            &|c| matches!(c, Change::Constraint(ConstraintChange::DropForeignKey { name, .. }) if name.raw() == "p_s_fk"),
+        );
+        let table =
+            at(&|c| matches!(c, Change::Table(TableChange::DropTable { name, .. }) if *name == p));
         assert!(
             matches!((fk, table), (Some(fk), Some(table)) if fk < table),
             "{kinds:?}"
@@ -17989,10 +18199,10 @@ mod tests {
             )
             .expect("an attach beside the rename");
             assert!(
-                planned
-                    .changes
-                    .iter()
-                    .any(|c| matches!(c.change, Change::AttachPartition { .. })),
+                planned.changes.iter().any(|c| matches!(
+                    c.change,
+                    Change::Partition(PartitionChange::AttachPartition { .. })
+                )),
                 "{:?}",
                 planned.changes
             );
@@ -18002,7 +18212,8 @@ mod tests {
                 .filter(|c| {
                     matches!(
                         c.change,
-                        Change::DropForeignKey { .. } | Change::AddForeignKey { .. }
+                        Change::Constraint(ConstraintChange::DropForeignKey { .. })
+                            | Change::Constraint(ConstraintChange::AddForeignKey { .. })
                     )
                 })
                 .map(|c| change_in_words(&c.change))
@@ -18075,7 +18286,9 @@ mod tests {
             .changes
             .iter()
             .find_map(|c| match &c.change {
-                Change::CreateTable { name, table, .. } if *name == p => Some(table),
+                Change::Table(TableChange::CreateTable { name, table, .. }) if *name == p => {
+                    Some(table)
+                }
                 _ => None,
             })
             .expect("the partition is created");
@@ -18083,7 +18296,8 @@ mod tests {
         assert!(
             !created.changes.iter().any(|c| matches!(
                 c.change,
-                Change::SetTablePersistence { .. } | Change::SetStorageParameters { .. }
+                Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+                    | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
             )),
             "{:?}",
             created.changes
@@ -18186,7 +18400,7 @@ mod tests {
         assert!(
             matches!(
                 planned.changes.as_slice(),
-                [c] if matches!(c.change, Change::DetachPartition { .. })
+                [c] if matches!(c.change, Change::Partition(PartitionChange::DetachPartition { .. }))
             ),
             "{:?}",
             planned.changes
@@ -18529,9 +18743,24 @@ mod tests {
                 .map(|(i, _)| i)
                 .collect()
         };
-        let drops = at(&|c| matches!(c, Change::DropForeignKey { .. }));
-        let switches = at(&|c| matches!(c, Change::SetTablePersistence { .. }));
-        let adds = at(&|c| matches!(c, Change::AddForeignKey { .. }));
+        let drops = at(&|c| {
+            matches!(
+                c,
+                Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            )
+        });
+        let switches = at(&|c| {
+            matches!(
+                c,
+                Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+            )
+        });
+        let adds = at(&|c| {
+            matches!(
+                c,
+                Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            )
+        });
         assert_eq!(
             (drops.len(), switches.len(), adds.len()),
             (2, 2, 2),
@@ -18560,9 +18789,10 @@ mod tests {
         };
         let cs = run(&chain(false), &chain(true), &[]);
         assert!(
-            !cs.changes
-                .iter()
-                .any(|p| matches!(p.change, Change::DropForeignKey { .. })),
+            !cs.changes.iter().any(|p| matches!(
+                p.change,
+                Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            )),
             "{:?}",
             kinds(&cs)
         );
@@ -18598,7 +18828,9 @@ mod tests {
         let [p] = cs.changes.as_slice() else {
             panic!("{cs:#?}");
         };
-        let Change::SetStorageParameters { set, reset, .. } = &p.change else {
+        let Change::TableProperty(TablePropertyChange::SetStorageParameters { set, reset, .. }) =
+            &p.change
+        else {
             panic!("{cs:#?}");
         };
         assert_eq!(
@@ -18656,23 +18888,27 @@ mod tests {
             cs.changes
                 .iter()
                 .map(|p| match &p.change {
-                    Change::SetReplicaIdentity { table, to, .. } => format!(
+                    Change::TableProperty(TablePropertyChange::SetReplicaIdentity {
+                        table,
+                        to,
+                        ..
+                    }) => format!(
                         "identity {table} {}",
                         to.as_ref()
                             .map_or("default".to_owned(), |identity| identity.raw().to_string()),
                         table = table.shown()
                     ),
-                    Change::AddIndex { name, .. } => format!(
+                    Change::Index(IndexChange::AddIndex { name, .. }) => format!(
                         "add {name}",
                         // Preserve raw comparison-label or fixture SQL bytes in test data.
                         name = name.raw(),
                     ),
-                    Change::DropIndex { name, .. } => format!(
+                    Change::Index(IndexChange::DropIndex { name, .. }) => format!(
                         "drop {name}",
                         // Preserve raw comparison-label or fixture SQL bytes in test data.
                         name = name.raw(),
                     ),
-                    Change::AlterColumnNullability { column, .. } => {
+                    Change::Column(ColumnChange::AlterColumnNullability { column, .. }) => {
                         format!("tighten {}", column.name.shown())
                     }
                     other => format!("{other:?}"),
@@ -18794,24 +19030,24 @@ mod tests {
             .changes
             .iter()
             .map(|p| match &p.change {
-                Change::SetPrimaryKey {
+                Change::Constraint(ConstraintChange::SetPrimaryKey {
                     from,
                     to,
                     nonclustered,
                     ..
-                } => format!(
+                }) => format!(
                     "pk {}->{} nonclustered={nonclustered}",
                     from.is_some(),
                     to.is_some()
                 ),
-                Change::AddIndex {
+                Change::Index(IndexChange::AddIndex {
                     name, clustered, ..
-                } => format!(
+                }) => format!(
                     "add {name} clustered={clustered}",
                     // Preserve raw comparison-label or fixture SQL bytes in test data.
                     name = name.raw(),
                 ),
-                Change::DropIndex { name, .. } => format!(
+                Change::Index(IndexChange::DropIndex { name, .. }) => format!(
                     "drop {name}",
                     // Preserve raw comparison-label or fixture SQL bytes in test data.
                     name = name.raw(),
@@ -18840,20 +19076,20 @@ mod tests {
         let key = cs.changes.iter().position(|p| {
             matches!(
                 &p.change,
-                Change::SetPrimaryKey {
+                Change::Constraint(ConstraintChange::SetPrimaryKey {
                     to: Some(_),
                     nonclustered: false,
                     ..
-                }
+                })
             )
         });
         let index = cs.changes.iter().position(|p| {
             matches!(
                 &p.change,
-                Change::AddIndex {
+                Change::Index(IndexChange::AddIndex {
                     clustered: false,
                     ..
-                }
+                })
             )
         });
         assert!(
@@ -18889,17 +19125,17 @@ mod tests {
             assert_eq!(
                 changes,
                 [
-                    &Change::DropUnique {
+                    &Change::Constraint(ConstraintChange::DropUnique {
                         table: "dbo.t".parse().unwrap(),
                         name: "uq_code".into(),
-                    },
-                    &Change::AddUnique {
+                    }),
+                    &Change::Constraint(ConstraintChange::AddUnique {
                         table: "dbo.t".parse().unwrap(),
                         name: "uq_code".into(),
                         constraint: declared.tables[&"dbo.t".parse().unwrap()].unique["uq_code"]
                             .clone(),
                         clustered: takes_clustered,
-                    },
+                    }),
                 ]
             );
             assert!(run(declared, declared, &[]).changes.is_empty());
@@ -18923,21 +19159,21 @@ mod tests {
         assert!(
             cs.changes.iter().any(|p| matches!(
                 &p.change,
-                Change::SetPrimaryKey {
+                Change::Constraint(ConstraintChange::SetPrimaryKey {
                     to: None,
                     nonclustered: false,
                     ..
-                }
+                })
             )),
             "{cs:?}"
         );
         assert!(
             !cs.changes.iter().any(|p| matches!(
                 &p.change,
-                Change::SetPrimaryKey {
+                Change::Constraint(ConstraintChange::SetPrimaryKey {
                     nonclustered: true,
                     ..
-                }
+                })
             )),
             "{cs:?}"
         );
@@ -19002,14 +19238,14 @@ mod tests {
             .changes
             .iter()
             .map(|p| match &p.change {
-                Change::AddIndex {
+                Change::Index(IndexChange::AddIndex {
                     name, clustered, ..
-                } => format!(
+                }) => format!(
                     "add {name} clustered={clustered}",
                     // Preserve raw comparison-label or fixture SQL bytes in test data.
                     name = name.raw(),
                 ),
-                Change::DropIndex { name, .. } => format!(
+                Change::Index(IndexChange::DropIndex { name, .. }) => format!(
                     "drop {name}",
                     // Preserve raw comparison-label or fixture SQL bytes in test data.
                     name = name.raw(),
@@ -19153,21 +19389,21 @@ mod tests {
             cs.changes
                 .iter()
                 .filter_map(|p| match &p.change {
-                    Change::AlterColumnNullability { column, .. } => {
+                    Change::Column(ColumnChange::AlterColumnNullability { column, .. }) => {
                         Some(format!("tighten {}", column.table.shown()))
                     }
-                    Change::AlterColumnType {
+                    Change::Column(ColumnChange::AlterColumnType {
                         column,
                         to_nullable,
                         ..
-                    } => Some(format!(
+                    }) => Some(format!(
                         "retype {} nullable={to_nullable}",
                         column.table.shown()
                     )),
-                    Change::UpdateRow { table, .. } => {
+                    Change::Row(RowChange::UpdateRow { table, .. }) => {
                         Some(format!("update {table}", table = table.shown()))
                     }
-                    Change::DeleteRow { table, .. } => {
+                    Change::Row(RowChange::DeleteRow { table, .. }) => {
                         Some(format!("delete {table}", table = table.shown()))
                     }
                     _ => None,
@@ -19546,12 +19782,14 @@ mod tests {
         cs.changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::InsertRow { key, .. } => Some(format!("insert {key}")),
-                Change::UpdateRow { key, columns, .. } => Some(format!(
+                Change::Row(RowChange::InsertRow { key, .. }) => Some(format!("insert {key}")),
+                Change::Row(RowChange::UpdateRow { key, columns, .. }) => Some(format!(
                     "update {key} [{}]",
                     columns.keys().cloned().collect::<Vec<_>>().join(",")
                 )),
-                Change::DeleteRow { key, cause, .. } => Some(format!("delete {key} {cause:?}")),
+                Change::Row(RowChange::DeleteRow { key, cause, .. }) => {
+                    Some(format!("delete {key} {cause:?}"))
+                }
                 _ => None,
             })
             .collect()
@@ -19631,16 +19869,16 @@ mod tests {
             &schema_of("dbo.s", declared_t),
             &[],
         );
-        let Some(Change::UpdateRow {
+        let Some(Change::Row(RowChange::UpdateRow {
             columns,
             unchanged,
             types,
             ..
-        }) = cs
+        })) = cs
             .changes
             .iter()
             .map(|p| &p.change)
-            .find(|c| matches!(c, Change::UpdateRow { .. }))
+            .find(|c| matches!(c, Change::Row(RowChange::UpdateRow { .. })))
         else {
             panic!("{:?}", row_ops(&cs));
         };
@@ -19708,13 +19946,13 @@ mod tests {
             &schema_of("dbo.s", declared_t),
             &[],
         );
-        let Some(Change::UpdateRow {
+        let Some(Change::Row(RowChange::UpdateRow {
             types, after_types, ..
-        }) = cs
+        })) = cs
             .changes
             .iter()
             .map(|p| &p.change)
-            .find(|c| matches!(c, Change::UpdateRow { .. }))
+            .find(|c| matches!(c, Change::Row(RowChange::UpdateRow { .. })))
         else {
             panic!("{:?}", row_ops(&cs));
         };
@@ -19781,11 +20019,10 @@ mod tests {
         assert!(row_ops(&cs).is_empty(), "{:?}", row_ops(&cs));
         // It is still reported, so the recorded state stops claiming a mode the
         // file no longer declares.
-        assert!(
-            cs.changes
-                .iter()
-                .any(|p| matches!(&p.change, Change::SetDataMode { to: None, .. }))
-        );
+        assert!(cs.changes.iter().any(|p| matches!(
+            &p.change,
+            Change::Row(RowChange::SetDataMode { to: None, .. })
+        )));
     }
 
     #[test]
@@ -19875,7 +20112,7 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::InsertRow { table, .. } => Some(table),
+                Change::Row(RowChange::InsertRow { table, .. }) => Some(table),
                 _ => None,
             })
             .collect();
@@ -19894,7 +20131,7 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::DeleteRow { table, .. } => Some(table.raw().to_string()),
+                Change::Row(RowChange::DeleteRow { table, .. }) => Some(table.raw().to_string()),
                 _ => None,
             })
             .collect();
@@ -19920,7 +20157,7 @@ mod tests {
             &schema_of("dbo.s", declared_t),
             &[],
         );
-        let Change::UpdateRow { columns, .. } = &cs.changes[0].change else {
+        let Change::Row(RowChange::UpdateRow { columns, .. }) = &cs.changes[0].change else {
             panic!("{:?}", kinds(&cs));
         };
         assert_eq!(
@@ -20118,11 +20355,11 @@ mod tests {
             &schema_of("dbo.s", declared_t),
             &[],
         );
-        let Some(Change::UpdateRow { columns, .. }) = cs
+        let Some(Change::Row(RowChange::UpdateRow { columns, .. })) = cs
             .changes
             .iter()
             .map(|p| &p.change)
-            .find(|c| matches!(c, Change::UpdateRow { .. }))
+            .find(|c| matches!(c, Change::Row(RowChange::UpdateRow { .. })))
         else {
             panic!("{:?}", kinds(&cs));
         };
@@ -20196,12 +20433,12 @@ mod tests {
             .insert("new_code".into(), declared.columns["code"].clone());
         declared.primary_key.as_mut().unwrap().columns = vec!["new_code".into()];
         let name: TableName = "dbo.s".parse().unwrap();
-        let mut changes = vec![Change::SetPrimaryKey {
+        let mut changes = vec![Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: name.clone(),
             from: None,
             to: declared.primary_key.clone(),
             nonclustered: false,
-        }];
+        })];
         let mut errors = Vec::new();
         let mapping = [
             ("code".into(), "code".into()),
@@ -20370,11 +20607,11 @@ mod tests {
             &[rename_column("code", "kode")],
         );
         assert_eq!(row_ops(&cs), ["update new [label]"]);
-        let Some(Change::UpdateRow { key_column, .. }) = cs
+        let Some(Change::Row(RowChange::UpdateRow { key_column, .. })) = cs
             .changes
             .iter()
             .map(|p| &p.change)
-            .find(|c| matches!(c, Change::UpdateRow { .. }))
+            .find(|c| matches!(c, Change::Row(RowChange::UpdateRow { .. })))
         else {
             unreachable!()
         };
@@ -20463,7 +20700,7 @@ mod tests {
             .changes
             .iter()
             .find_map(|p| match &p.change {
-                Change::DeleteRow { row, types, .. } => Some((row, types)),
+                Change::Row(RowChange::DeleteRow { row, types, .. }) => Some((row, types)),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("{:?}", kinds(&cs)));
@@ -20528,12 +20765,12 @@ mod tests {
             .changes
             .iter()
             .find_map(|p| match &p.change {
-                Change::DeleteRow {
+                Change::Row(RowChange::DeleteRow {
                     row,
                     types,
                     dropped,
                     ..
-                } => Some((row, types, dropped)),
+                }) => Some((row, types, dropped)),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("{:?}", kinds(&cs)));
@@ -20605,23 +20842,23 @@ mod tests {
         )
         .unwrap();
         assert!(cs.changes.iter().any(
-            |p| matches!(&p.change, Change::DropColumn { column, .. } if column.name == "label".into())
+            |p| matches!(&p.change, Change::Column(ColumnChange::DropColumn { column, .. }) if column.name == "label".into())
         ));
         assert!(
             cs.changes.iter().any(
-                |p| matches!(&p.change, Change::AddColumn { name, .. } if name.raw() == "label")
+                |p| matches!(&p.change, Change::Column(ColumnChange::AddColumn { name, .. }) if name.raw() == "label")
             )
         );
         let (row, types, dropped) = cs
             .changes
             .iter()
             .find_map(|p| match &p.change {
-                Change::DeleteRow {
+                Change::Row(RowChange::DeleteRow {
                     row,
                     types,
                     dropped,
                     ..
-                } => Some((row, types, dropped)),
+                }) => Some((row, types, dropped)),
                 _ => None,
             })
             .unwrap();
@@ -20705,7 +20942,7 @@ mod tests {
 
         let mut deleted = 0;
         for p in &cs.changes {
-            let Change::DeleteRow { row, dropped, .. } = &p.change else {
+            let Change::Row(RowChange::DeleteRow { row, dropped, .. }) = &p.change else {
                 continue;
             };
             deleted += 1;
@@ -20795,12 +21032,12 @@ mod tests {
             .changes
             .iter()
             .find_map(|p| match &p.change {
-                Change::DeleteRow {
+                Change::Row(RowChange::DeleteRow {
                     row,
                     types,
                     dropped,
                     ..
-                } => Some((row, types, dropped)),
+                }) => Some((row, types, dropped)),
                 _ => None,
             })
             .unwrap();
@@ -20896,9 +21133,12 @@ mod tests {
                 .position(|p| f(&p.change))
                 .unwrap_or_else(|| panic!("{:?}", kinds(&cs)))
         };
-        let drop_at =
-            at(|c| matches!(c, Change::DropColumn { column, .. } if column.name == "note".into()));
-        let rename_at = at(|c| matches!(c, Change::RenameColumn { to, .. } if to.raw() == "note"));
+        let drop_at = at(
+            |c| matches!(c, Change::Column(ColumnChange::DropColumn { column, .. }) if column.name == "note".into()),
+        );
+        let rename_at = at(
+            |c| matches!(c, Change::Column(ColumnChange::RenameColumn { to, .. }) if to.raw() == "note"),
+        );
         assert!(
             drop_at < rename_at,
             "the drop must free the name first: {:?}",
@@ -20991,9 +21231,12 @@ mod tests {
                 .position(|p| f(&p.change))
                 .unwrap_or_else(|| panic!("{:?}", kinds(&cs)))
         };
-        let drop_at =
-            at(|c| matches!(c, Change::DropColumn { column, .. } if column.name == "note".into()));
-        let rename_at = at(|c| matches!(c, Change::RenameColumn { to, .. } if to.raw() == "Note"));
+        let drop_at = at(
+            |c| matches!(c, Change::Column(ColumnChange::DropColumn { column, .. }) if column.name == "note".into()),
+        );
+        let rename_at = at(
+            |c| matches!(c, Change::Column(ColumnChange::RenameColumn { to, .. }) if to.raw() == "Note"),
+        );
         assert!(
             drop_at < rename_at,
             "the engine reads one name where the model reads two: {:?}",
@@ -21199,12 +21442,12 @@ mod tests {
             cs.changes
                 .iter()
                 .filter_map(|p| match &p.change {
-                    Change::RenameTable { from, to, .. } => Some(format!(
+                    Change::Table(TableChange::RenameTable { from, to, .. }) => Some(format!(
                         "{from} -> {to}",
                         from = from.shown(),
                         to = to.shown()
                     )),
-                    Change::DropCheck { name, .. } => Some(format!(
+                    Change::Constraint(ConstraintChange::DropCheck { name, .. }) => Some(format!(
                         "drop check {name}",
                         // Preserve raw comparison-label or fixture SQL bytes in test data.
                         name = name.raw(),
@@ -21283,10 +21526,10 @@ mod tests {
             cs.changes
                 .iter()
                 .filter_map(|p| match &p.change {
-                    Change::DropTable { name, .. } => {
+                    Change::Table(TableChange::DropTable { name, .. }) => {
                         Some(format!("drop {name}", name = name.shown()))
                     }
-                    Change::RenameTable { from, to, .. } => Some(format!(
+                    Change::Table(TableChange::RenameTable { from, to, .. }) => Some(format!(
                         "{from} -> {to}",
                         from = from.shown(),
                         to = to.shown()
@@ -21396,7 +21639,9 @@ mod tests {
                 .changes
                 .iter()
                 .filter_map(|p| match &p.change {
-                    Change::RenameTable { from, .. } => Some(from.raw().to_string()),
+                    Change::Table(TableChange::RenameTable { from, .. }) => {
+                        Some(from.raw().to_string())
+                    }
                     _ => None,
                 })
                 .collect();
@@ -21431,7 +21676,9 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::RenameTable { from, .. } => Some(from.raw().to_string()),
+                Change::Table(TableChange::RenameTable { from, .. }) => {
+                    Some(from.raw().to_string())
+                }
                 _ => None,
             })
             .collect()
@@ -21484,7 +21731,9 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::RenameTable { from, .. } => Some(from.raw().to_string()),
+                Change::Table(TableChange::RenameTable { from, .. }) => {
+                    Some(from.raw().to_string())
+                }
                 _ => None,
             })
             .collect();
@@ -21521,7 +21770,9 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::RenameTable { from, .. } => Some(from.raw().to_string()),
+                Change::Table(TableChange::RenameTable { from, .. }) => {
+                    Some(from.raw().to_string())
+                }
                 _ => None,
             })
             .collect();
@@ -21562,7 +21813,9 @@ mod tests {
             cs.changes
                 .iter()
                 .filter_map(|p| match &p.change {
-                    Change::RenameTable { from, .. } => Some(from.raw().to_string()),
+                    Change::Table(TableChange::RenameTable { from, .. }) => {
+                        Some(from.raw().to_string())
+                    }
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -21625,8 +21878,10 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::RenameTable { from, .. } => Some(from.raw().to_string()),
-                Change::DropCheck { name, .. } => Some(format!(
+                Change::Table(TableChange::RenameTable { from, .. }) => {
+                    Some(from.raw().to_string())
+                }
+                Change::Constraint(ConstraintChange::DropCheck { name, .. }) => Some(format!(
                     "drop {name}",
                     // Preserve raw comparison-label or fixture SQL bytes in test data.
                     name = name.raw(),
@@ -21672,7 +21927,9 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::RenameTable { from, .. } => Some(from.raw().to_string()),
+                Change::Table(TableChange::RenameTable { from, .. }) => {
+                    Some(from.raw().to_string())
+                }
                 _ => None,
             })
             .collect();
@@ -21755,15 +22012,15 @@ mod tests {
                 .unwrap_or_else(|| panic!("{:?}", cs.changes))
         };
         let child_key = at(&|c| {
-            matches!(c, Change::DropForeignKey { table, name }
+            matches!(c, Change::Constraint(ConstraintChange::DropForeignKey { table, name })
                 if table.raw().to_string() == "app.child" && name.raw() == "fk_child_target")
         });
         let own_key = at(&|c| {
-            matches!(c, Change::DropForeignKey { table, name }
+            matches!(c, Change::Constraint(ConstraintChange::DropForeignKey { table, name })
                 if table.raw().to_string() == "app.target" && name.raw() == "fk_target_parent")
         });
-        let drop = at(&|c| matches!(c, Change::DropTable { .. }));
-        let rename = at(&|c| matches!(c, Change::RenameTable { .. }));
+        let drop = at(&|c| matches!(c, Change::Table(TableChange::DropTable { .. })));
+        let rename = at(&|c| matches!(c, Change::Table(TableChange::RenameTable { .. })));
         assert!(child_key < drop, "{:?}", cs.changes);
         assert!(own_key < drop, "{:?}", cs.changes);
         assert!(drop < rename, "{:?}", cs.changes);
@@ -21804,12 +22061,12 @@ mod tests {
                 .unwrap_or_else(|| panic!("{:?}", cs.changes))
         };
         let drop_key = at(
-            &|c| matches!(c, Change::DropForeignKey { name, .. } if name.raw() == "fk_child_target"),
+            &|c| matches!(c, Change::Constraint(ConstraintChange::DropForeignKey { name, .. }) if name.raw() == "fk_child_target"),
         );
-        let drop = at(&|c| matches!(c, Change::DropTable { .. }));
-        let rename = at(&|c| matches!(c, Change::RenameTable { .. }));
+        let drop = at(&|c| matches!(c, Change::Table(TableChange::DropTable { .. })));
+        let rename = at(&|c| matches!(c, Change::Table(TableChange::RenameTable { .. })));
         let add_key = at(
-            &|c| matches!(c, Change::AddForeignKey { name, .. } if name.raw() == "fk_child_target"),
+            &|c| matches!(c, Change::Constraint(ConstraintChange::AddForeignKey { name, .. }) if name.raw() == "fk_child_target"),
         );
         assert!(
             drop_key < drop && drop < rename && rename < add_key,
@@ -21863,7 +22120,7 @@ mod tests {
             .iter()
             .enumerate()
             .filter(
-                |(_, p)| matches!(&p.change, Change::DropForeignKey { name, .. } if name.raw() == "fk"),
+                |(_, p)| matches!(&p.change, Change::Constraint(ConstraintChange::DropForeignKey { name, .. }) if name.raw() == "fk"),
             )
             .map(|(i, _)| i)
             .collect();
@@ -21873,9 +22130,11 @@ mod tests {
                 .position(|p| f(&p.change))
                 .unwrap_or_else(|| panic!("{:?}", cs.changes))
         };
-        let drop = at(&|c| matches!(c, Change::DropTable { .. }));
-        let rename = at(&|c| matches!(c, Change::RenameTable { .. }));
-        let add = at(&|c| matches!(c, Change::AddForeignKey { name, .. } if name.raw() == "fk"));
+        let drop = at(&|c| matches!(c, Change::Table(TableChange::DropTable { .. })));
+        let rename = at(&|c| matches!(c, Change::Table(TableChange::RenameTable { .. })));
+        let add = at(
+            &|c| matches!(c, Change::Constraint(ConstraintChange::AddForeignKey { name, .. }) if name.raw() == "fk"),
+        );
         assert_eq!(drops.len(), 2, "{:?}", cs.changes);
         // One at each table's address as it stands when it runs: the doomed
         // table's, and the renamed table's source.
@@ -21963,15 +22222,15 @@ mod tests {
                 .unwrap_or_else(|| panic!("{:?}", cs.changes))
         };
         let key = at(&|c| {
-            matches!(c, Change::DropForeignKey { table, name }
+            matches!(c, Change::Constraint(ConstraintChange::DropForeignKey { table, name })
                 if table.raw().to_string() == "app.other" && name.raw() == "fk_other_target")
         });
         let target = at(
-            &|c| matches!(c, Change::DropTable { name, .. } if name.raw().to_string() == "app.target"),
+            &|c| matches!(c, Change::Table(TableChange::DropTable { name, .. }) if name.raw().to_string() == "app.target"),
         );
-        let rename = at(&|c| matches!(c, Change::RenameTable { .. }));
+        let rename = at(&|c| matches!(c, Change::Table(TableChange::RenameTable { .. })));
         let other = at(
-            &|c| matches!(c, Change::DropTable { name, .. } if name.raw().to_string() == "app.other"),
+            &|c| matches!(c, Change::Table(TableChange::DropTable { name, .. }) if name.raw().to_string() == "app.other"),
         );
         assert!(
             key < target && target < rename && rename < other,
@@ -22001,19 +22260,18 @@ mod tests {
             from: from.into(),
             to: to.into(),
         };
-        let order = |cs: &ChangeSet| -> Vec<String> {
-            cs.changes
-                .iter()
-                .filter_map(|p| match &p.change {
-                    Change::RenameColumn { from, to, .. } => Some(format!(
-                        "{from} -> {to}",
-                        from = from.shown(),
-                        to = to.shown(),
-                    )),
-                    _ => None,
-                })
-                .collect()
-        };
+        let order =
+            |cs: &ChangeSet| -> Vec<String> {
+                cs.changes
+                    .iter()
+                    .filter_map(|p| match &p.change {
+                        Change::Column(ColumnChange::RenameColumn { from, to, .. }) => Some(
+                            format!("{from} -> {to}", from = from.shown(), to = to.shown(),),
+                        ),
+                        _ => None,
+                    })
+                    .collect()
+            };
         // Fresh uids each time: without the link the order was theirs.
         for _ in 0..32 {
             let cs = across_revisions(
@@ -22124,7 +22382,9 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::RenameColumn { from, .. } => Some(from.raw().to_owned()),
+                Change::Column(ColumnChange::RenameColumn { from, .. }) => {
+                    Some(from.raw().to_owned())
+                }
                 _ => None,
             })
             .collect();
@@ -22181,19 +22441,18 @@ mod tests {
             from: from.into(),
             to: to.into(),
         };
-        let order = |cs: &ChangeSet| -> Vec<String> {
-            cs.changes
-                .iter()
-                .filter_map(|p| match &p.change {
-                    Change::RenameColumn { from, to, .. } => Some(format!(
-                        "{from} -> {to}",
-                        from = from.shown(),
-                        to = to.shown(),
-                    )),
-                    _ => None,
-                })
-                .collect()
-        };
+        let order =
+            |cs: &ChangeSet| -> Vec<String> {
+                cs.changes
+                    .iter()
+                    .filter_map(|p| match &p.change {
+                        Change::Column(ColumnChange::RenameColumn { from, to, .. }) => Some(
+                            format!("{from} -> {to}", from = from.shown(), to = to.shown(),),
+                        ),
+                        _ => None,
+                    })
+                    .collect()
+            };
         // Resolved afresh each time: the uids are minted, so without the
         // chain order the renames came out in either order, and one
         // resolution alone would pass half the time for the wrong reason.
@@ -22315,10 +22574,10 @@ mod tests {
             cs.changes
                 .iter()
                 .filter_map(|p| match &p.change {
-                    Change::DropTable { name, .. } => {
+                    Change::Table(TableChange::DropTable { name, .. }) => {
                         Some(format!("drop {name}", name = name.shown()))
                     }
-                    Change::RenameTable { from, to, .. } => Some(format!(
+                    Change::Table(TableChange::RenameTable { from, to, .. }) => Some(format!(
                         "{from} -> {to}",
                         from = from.shown(),
                         to = to.shown()
@@ -22624,7 +22883,7 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::RenameTable { from, to, .. } => Some(format!(
+                Change::Table(TableChange::RenameTable { from, to, .. }) => Some(format!(
                     "{from} -> {to}",
                     from = from.shown(),
                     to = to.shown()
@@ -22681,10 +22940,10 @@ mod tests {
                 .position(|p| f(&p.change))
                 .unwrap_or_else(|| panic!("{:?}", cs.changes))
         };
-        let dropped = at(&|c| matches!(c, Change::DropModule { .. }));
-        let table_dropped = at(&|c| matches!(c, Change::DropTable { .. }));
-        let rename = at(&|c| matches!(c, Change::RenameTable { .. }));
-        let created = at(&|c| matches!(c, Change::CreateModule { .. }));
+        let dropped = at(&|c| matches!(c, Change::Module(ModuleChange::DropModule { .. })));
+        let table_dropped = at(&|c| matches!(c, Change::Table(TableChange::DropTable { .. })));
+        let rename = at(&|c| matches!(c, Change::Table(TableChange::RenameTable { .. })));
+        let created = at(&|c| matches!(c, Change::Module(ModuleChange::CreateModule { .. })));
         assert!(
             dropped < table_dropped && rename < created,
             "{:?}",
@@ -22764,14 +23023,14 @@ mod tests {
             &mut changes,
         );
         let physical = vec![
-            Change::DropModule {
+            Change::Module(ModuleChange::DropModule {
                 id: id.clone(),
                 kind: module.kind,
-            },
-            Change::CreateModule {
+            }),
+            Change::Module(ModuleChange::CreateModule {
                 id,
                 module: Box::new(module),
-            },
+            }),
         ];
         if handoff {
             assert_eq!(
@@ -22852,16 +23111,16 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::Grant {
+                Change::Permission(GrantChange::Grant {
                     target,
                     permissions,
                     ..
-                } => Some(format!("grant {} {permissions:?}", target.raw())),
-                Change::Revoke {
+                }) => Some(format!("grant {} {permissions:?}", target.raw())),
+                Change::Permission(GrantChange::Revoke {
                     target,
                     permissions,
                     ..
-                } => Some(format!("revoke {} {permissions:?}", target.raw())),
+                }) => Some(format!("revoke {} {permissions:?}", target.raw())),
                 _ => None,
             })
             .collect();
@@ -22948,12 +23207,12 @@ mod tests {
             .changes
             .iter()
             .find_map(|p| match &p.change {
-                Change::DeleteRow {
+                Change::Row(RowChange::DeleteRow {
                     row,
                     types,
                     after_types,
                     ..
-                } => Some((row, types, after_types)),
+                }) => Some((row, types, after_types)),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("{:?}", kinds(&cs)));
@@ -22982,12 +23241,12 @@ mod tests {
         let mut seen = 0;
         for p in &cs.changes {
             let (key_type, types) = match &p.change {
-                Change::UpdateRow {
+                Change::Row(RowChange::UpdateRow {
                     key_type, types, ..
-                }
-                | Change::DeleteRow {
+                })
+                | Change::Row(RowChange::DeleteRow {
                     key_type, types, ..
-                } => (key_type, types),
+                }) => (key_type, types),
                 _ => continue,
             };
             seen += 1;
@@ -23016,9 +23275,9 @@ mod tests {
             .changes
             .iter()
             .find_map(|p| match &p.change {
-                Change::DeleteRow {
+                Change::Row(RowChange::DeleteRow {
                     types, after_types, ..
-                } => Some((types, after_types)),
+                }) => Some((types, after_types)),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("{:?}", kinds(&cs)));
@@ -23108,7 +23367,8 @@ mod tests {
             // And the CreateTable no longer smuggles the FK along.
             assert!(
                 cs.changes.iter().all(|p| match &p.change {
-                    Change::CreateTable { table, .. } => table.foreign_keys.is_empty(),
+                    Change::Table(TableChange::CreateTable { table, .. }) =>
+                        table.foreign_keys.is_empty(),
                     _ => true,
                 }),
                 "the FK must not also ride inside the CREATE"
@@ -23254,32 +23514,28 @@ mod tests {
         let declared = schema_of("dbo.t", table(&[("id", Column::new(ty("int")))]));
 
         let cs = run(&base, &declared, &[]);
-        let order: Vec<_> = cs
-            .changes
-            .iter()
-            .map(|p| std::mem::discriminant(&p.change))
-            .collect();
-        assert_eq!(
-            order,
-            vec![
-                std::mem::discriminant(&Change::SetPrimaryKey {
-                    table: "dbo.t".parse().unwrap(),
-                    from: None,
-                    to: None,
-                    nonclustered: false,
-                }),
-                std::mem::discriminant(&Change::AlterColumnNullability {
-                    uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
-                    column: pbps_model::ColumnRef {
-                        table: "dbo.t".parse().unwrap(),
-                        name: "id".into(),
-                    },
-                    ty: ty("int"),
-                    to_nullable: true,
-                    through_external_partitions: false,
-                    collation: None,
-                }),
-            ],
+        // The kinds are compared, not the families: both of these are one family
+        // apart from each other, but a key and a unique are one family too.
+        let order: Vec<&Change> = cs.changes.iter().map(|p| &p.change).collect();
+        let key = Change::Constraint(ConstraintChange::SetPrimaryKey {
+            table: "dbo.t".parse().unwrap(),
+            from: None,
+            to: None,
+            nonclustered: false,
+        });
+        let nullable = Change::Column(ColumnChange::AlterColumnNullability {
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+            column: pbps_model::ColumnRef {
+                table: "dbo.t".parse().unwrap(),
+                name: "id".into(),
+            },
+            ty: ty("int"),
+            to_nullable: true,
+            through_external_partitions: false,
+            collation: None,
+        });
+        assert!(
+            order.len() == 2 && order[0].same_kind(&key) && order[1].same_kind(&nullable),
             "the key has to go first: {:#?}",
             cs.changes
         );
@@ -23317,9 +23573,19 @@ mod tests {
                 .position(|p| f(&p.change))
                 .unwrap_or_else(|| panic!("not planned: {:#?}", cs.changes))
         };
-        let out = at(|c| matches!(c, Change::AlterColumnDefault { to: None, .. }));
-        let retype = at(|c| matches!(c, Change::AlterColumnType { .. }));
-        let into = at(|c| matches!(c, Change::AlterColumnDefault { to: Some(_), .. }));
+        let out = at(|c| {
+            matches!(
+                c,
+                Change::Column(ColumnChange::AlterColumnDefault { to: None, .. })
+            )
+        });
+        let retype = at(|c| matches!(c, Change::Column(ColumnChange::AlterColumnType { .. })));
+        let into = at(|c| {
+            matches!(
+                c,
+                Change::Column(ColumnChange::AlterColumnDefault { to: Some(_), .. })
+            )
+        });
         assert!(
             out < retype && retype < into,
             "out {out}, retype {retype}, into {into}: {:#?}",
@@ -23350,11 +23616,11 @@ mod tests {
         assert!(
             matches!(
                 cs.changes[0].change,
-                Change::AlterColumnDefault {
+                Change::Column(ColumnChange::AlterColumnDefault {
                     from: Some(_),
                     to: Some(_),
                     ..
-                }
+                })
             ),
             "{:#?}",
             cs.changes
@@ -23403,10 +23669,25 @@ mod tests {
                 .position(|p| f(&p.change))
                 .unwrap_or_else(|| panic!("not planned: {:#?}", cs.changes))
         };
-        let drop = at(|c| matches!(c, Change::SetPrimaryKey { to: None, .. }));
-        let relaxed = at(|c| matches!(c, Change::AlterColumnNullability { .. }));
-        let added = at(|c| matches!(c, Change::AddColumn { .. }));
-        let add = at(|c| matches!(c, Change::SetPrimaryKey { from: None, .. }));
+        let drop = at(|c| {
+            matches!(
+                c,
+                Change::Constraint(ConstraintChange::SetPrimaryKey { to: None, .. })
+            )
+        });
+        let relaxed = at(|c| {
+            matches!(
+                c,
+                Change::Column(ColumnChange::AlterColumnNullability { .. })
+            )
+        });
+        let added = at(|c| matches!(c, Change::Column(ColumnChange::AddColumn { .. })));
+        let add = at(|c| {
+            matches!(
+                c,
+                Change::Constraint(ConstraintChange::SetPrimaryKey { from: None, .. })
+            )
+        });
         assert!(
             drop < relaxed && added < add,
             "drop {drop}, relaxed {relaxed}, added {added}, add {add}: {:#?}",
@@ -23457,11 +23738,11 @@ mod tests {
             ],
         );
 
-        let Some(Change::DropColumn { column, .. }) = cs
+        let Some(Change::Column(ColumnChange::DropColumn { column, .. })) = cs
             .changes
             .iter()
             .map(|c| &c.change)
-            .find(|c| matches!(c, Change::DropColumn { .. }))
+            .find(|c| matches!(c, Change::Column(ColumnChange::DropColumn { .. })))
         else {
             panic!("no DropColumn in {cs:?}");
         };
@@ -23483,8 +23764,8 @@ mod tests {
             .changes
             .iter()
             .map(|c| match &c.change {
-                Change::RenameTable { .. } => "RenameTable",
-                Change::DropColumn { .. } => "DropColumn",
+                Change::Table(TableChange::RenameTable { .. }) => "RenameTable",
+                Change::Column(ColumnChange::DropColumn { .. }) => "DropColumn",
                 _ => "other",
             })
             .collect();
@@ -23831,10 +24112,10 @@ mod tests {
                 "{cs:?}"
             );
             assert!(
-                matches!(&cs.changes[0].change, Change::DropForeignKey {name, ..} if name.raw() == "fk_kept")
+                matches!(&cs.changes[0].change, Change::Constraint(ConstraintChange::DropForeignKey {name, ..}) if name.raw() == "fk_kept")
             );
             assert!(
-                matches!(&cs.changes[3].change, Change::AddForeignKey {name, constraint, ..}
+                matches!(&cs.changes[3].change, Change::Constraint(ConstraintChange::AddForeignKey {name, constraint, ..})
                 if name.raw() == "fk_kept" && **constraint == base.tables[&"dbo.child".parse().unwrap()].foreign_keys["fk_kept"])
             );
             assert_eq!(cs.changes[0].risks, cs.changes[0].change.intrinsic_risks());
@@ -23857,16 +24138,17 @@ mod tests {
                 removed
                     .changes
                     .iter()
-                    .filter(|p| matches!(p.change, Change::DropForeignKey { .. }))
+                    .filter(|p| matches!(
+                        p.change,
+                        Change::Constraint(ConstraintChange::DropForeignKey { .. })
+                    ))
                     .count(),
                 1
             );
-            assert!(
-                !removed
-                    .changes
-                    .iter()
-                    .any(|p| matches!(p.change, Change::AddForeignKey { .. }))
-            );
+            assert!(!removed.changes.iter().any(|p| matches!(
+                p.change,
+                Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            )));
         }
     }
 
@@ -23969,13 +24251,23 @@ mod tests {
                 .changes
                 .iter()
                 .enumerate()
-                .filter(|(_, p)| matches!(p.change, Change::DropForeignKey { .. }))
+                .filter(|(_, p)| {
+                    matches!(
+                        p.change,
+                        Change::Constraint(ConstraintChange::DropForeignKey { .. })
+                    )
+                })
                 .collect();
             let adds: Vec<_> = cs
                 .changes
                 .iter()
                 .enumerate()
-                .filter(|(_, p)| matches!(p.change, Change::AddForeignKey { .. }))
+                .filter(|(_, p)| {
+                    matches!(
+                        p.change,
+                        Change::Constraint(ConstraintChange::AddForeignKey { .. })
+                    )
+                })
                 .collect();
             assert_eq!(drops.len(), if replace { 2 } else { 0 }, "{cs:?}");
             assert_eq!(adds.len(), drops.len());
@@ -23983,21 +24275,31 @@ mod tests {
                 let key_drop = cs
                     .changes
                     .iter()
-                    .position(|p| matches!(p.change, Change::DropUnique { .. }))
+                    .position(|p| {
+                        matches!(
+                            p.change,
+                            Change::Constraint(ConstraintChange::DropUnique { .. })
+                        )
+                    })
                     .unwrap();
                 let key_add = cs
                     .changes
                     .iter()
-                    .position(|p| matches!(p.change, Change::AddUnique { .. }))
+                    .position(|p| {
+                        matches!(
+                            p.change,
+                            Change::Constraint(ConstraintChange::AddUnique { .. })
+                        )
+                    })
                     .unwrap();
                 assert!(drops.iter().all(|(i, _)| *i < key_drop));
                 for (i, p) in adds {
                     assert!(i > key_add);
-                    let Change::AddForeignKey {
+                    let Change::Constraint(ConstraintChange::AddForeignKey {
                         table,
                         name,
                         constraint,
-                    } = &p.change
+                    }) = &p.change
                     else {
                         unreachable!()
                     };
@@ -24953,7 +25255,7 @@ mod tests {
                 to: "app.new".parse().unwrap(),
             }],
         );
-        let Change::RenameTable { defaults, .. } = &cs.changes[0].change else {
+        let Change::Table(TableChange::RenameTable { defaults, .. }) = &cs.changes[0].change else {
             panic!("{cs:?}");
         };
         assert_eq!(defaults, &[pbps_model::ColumnName::from("a").to_owned()]);
@@ -24981,7 +25283,9 @@ mod tests {
             cs.changes
                 .iter()
                 .find_map(|p| match &p.change {
-                    Change::RenameColumn { table_was, .. } => Some(table_was.clone()),
+                    Change::Column(ColumnChange::RenameColumn { table_was, .. }) => {
+                        Some(table_was.clone())
+                    }
                     _ => None,
                 })
                 .unwrap_or_else(|| panic!("{cs:?}"))
@@ -25119,11 +25423,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("{:?}", cs.changes))
         };
         let key = at(&|c| {
-            matches!(c, Change::DropForeignKey { table, name }
+            matches!(c, Change::Constraint(ConstraintChange::DropForeignKey { table, name })
                 if table.raw().to_string() == "app.child" && name.raw() == "fk_child_other")
         });
-        let unique = at(&|c| matches!(c, Change::DropUnique { .. }));
-        let rename = at(&|c| matches!(c, Change::RenameTable { .. }));
+        let unique = at(&|c| matches!(c, Change::Constraint(ConstraintChange::DropUnique { .. })));
+        let rename = at(&|c| matches!(c, Change::Table(TableChange::RenameTable { .. })));
         assert!(key < unique && unique < rename, "{:?}", cs.changes);
     }
 
@@ -25368,7 +25672,7 @@ mod tests {
             "the drop must precede SET SCHEMA and carry its source address: {cs:?}"
         );
         assert!(
-            matches!(&cs.changes[0].change, Change::DropIndex { table, .. } if table.raw().to_string() == "s1.old")
+            matches!(&cs.changes[0].change, Change::Index(IndexChange::DropIndex { table, .. }) if table.raw().to_string() == "s1.old")
         );
         let mut recorded = pbps_model::Declared::from_schema(&base);
         recorded.advance(&cs);
@@ -25399,7 +25703,7 @@ mod tests {
         );
         assert_eq!(kinds(&cs), ["DropForeignKey", "DropUnique", "RenameTable"]);
         assert!(
-            matches!(&cs.changes[0].change, Change::DropForeignKey { table, .. } if table.raw().to_string() == "app.old")
+            matches!(&cs.changes[0].change, Change::Constraint(ConstraintChange::DropForeignKey { table, .. }) if table.raw().to_string() == "app.old")
         );
     }
 
@@ -25457,7 +25761,7 @@ mod tests {
                 "{cs:?}"
             );
             assert!(
-                matches!(&cs.changes[0].change, Change::RenameTable { to, .. } if to.raw().to_string() == "app.owner_new")
+                matches!(&cs.changes[0].change, Change::Table(TableChange::RenameTable { to, .. }) if to.raw().to_string() == "app.owner_new")
             );
             assert_eq!(
                 cs.changes[1].change.table().unwrap().raw().to_string(),
@@ -25800,7 +26104,7 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| {
-                if let Change::AddColumn { name, .. } = &p.change {
+                if let Change::Column(ColumnChange::AddColumn { name, .. }) = &p.change {
                     Some(name.raw().to_owned())
                 } else {
                     None
@@ -25858,11 +26162,13 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| {
-                if let Change::AddColumn { name, .. } = &p.change {
+                if let Change::Column(ColumnChange::AddColumn { name, .. }) = &p.change {
                     Some(format!("+{name}", name = name.shown(),))
-                } else if let Change::DropColumn { column, .. } = &p.change {
+                } else if let Change::Column(ColumnChange::DropColumn { column, .. }) = &p.change {
                     Some(format!("-{}", column.name.shown()))
-                } else if let Change::AlterColumnType { column, .. } = &p.change {
+                } else if let Change::Column(ColumnChange::AlterColumnType { column, .. }) =
+                    &p.change
+                {
                     Some(format!("~{}", column.name.shown()))
                 } else {
                     None
@@ -25972,16 +26278,16 @@ mod tests {
             .changes
             .iter()
             .map(|p| match &p.change {
-                Change::AlterColumnExpression { .. } => "expression",
-                Change::AlterColumnNullability {
+                Change::Column(ColumnChange::AlterColumnExpression { .. }) => "expression",
+                Change::Column(ColumnChange::AlterColumnNullability {
                     to_nullable: true, ..
-                } => "relax",
-                Change::AlterColumnNullability {
+                }) => "relax",
+                Change::Column(ColumnChange::AlterColumnNullability {
                     to_nullable: false, ..
-                } => "tighten",
-                Change::AlterColumnType {
+                }) => "tighten",
+                Change::Column(ColumnChange::AlterColumnType {
                     to_nullable: true, ..
-                } => "retype",
+                }) => "retype",
                 other => panic!("unexpected {other:?}"),
             })
             .collect::<Vec<_>>()
@@ -26044,7 +26350,7 @@ mod tests {
         assert!(
             matches!(
                 changed.changes.changes.as_slice(),
-                [p] if matches!(&p.change, Change::AlterColumnExpression { from, to, .. } if from == "a * 2" && to == "a * 3")
+                [p] if matches!(&p.change, Change::Column(ColumnChange::AlterColumnExpression { from, to, .. }) if from == "a * 2" && to == "a * 3")
             ),
             "{:?}",
             changed.changes
@@ -26461,6 +26767,12 @@ mod tests {
 
     mod roles {
         use super::*;
+        use pbps_model::ColumnChange;
+        use pbps_model::GrantChange;
+        use pbps_model::ModuleChange;
+        use pbps_model::PartitionChange;
+        use pbps_model::RoleChange;
+        use pbps_model::TableChange;
         use pbps_model::{GrantTarget, Permission, Role};
 
         fn role(grants: &[(&str, &[Permission])]) -> Role {
@@ -26519,11 +26831,11 @@ mod tests {
             .unwrap();
             assert!(matches!(
                 changes.changes[0].change,
-                Change::AddColumn { .. }
+                Change::Column(ColumnChange::AddColumn { .. })
             ));
             assert_eq!(changes.changes.len(), 2);
             assert!(
-                matches!(&changes.changes[1].change, Change::Grant { role, permissions, .. }
+                matches!(&changes.changes[1].change, Change::Permission(GrantChange::Grant { role, permissions, .. })
                 if role.raw() == "writer" && *permissions == BTreeSet::from([Permission::SerialSequences]))
             );
             let unchanged = diff(
@@ -26594,13 +26906,13 @@ mod tests {
                     .columns["id"]
                     .value_source = from.clone();
                 let creates = !matches!(from, ValueSource::Sequence(_));
-                let mut changes = vec![Change::AlterColumnNumbering {
+                let mut changes = vec![Change::Column(ColumnChange::AlterColumnNumbering {
                     uid: "c_aaaaaa".parse().unwrap(),
                     column: "dbo.customer.id".parse().unwrap(),
                     ty: ty("int"),
                     from,
                     to: ValueSource::Sequence(pbps_model::OwnedSequence::serial()),
-                }];
+                })];
                 diff_roles(
                     Side {
                         schema: &base.0,
@@ -26673,22 +26985,22 @@ mod tests {
                         .unwrap()
                         .columns
                         .insert("other".into(), column.clone());
-                    changes.push(Change::AddColumn {
+                    changes.push(Change::Column(ColumnChange::AddColumn {
                         uid: "c_bbbbbb".parse().unwrap(),
                         table: parent.clone(),
                         name: "other".into(),
                         column: Box::new(column),
-                    });
+                    }));
                 } else if shape == "convert" {
                     base.0.tables.get_mut(&parent).unwrap().columns["id"].value_source =
                         ValueSource::None;
-                    changes.push(Change::AlterColumnNumbering {
+                    changes.push(Change::Column(ColumnChange::AlterColumnNumbering {
                         uid: "c_aaaaaa".parse().unwrap(),
                         column: parent.column("id"),
                         ty: ty("int"),
                         from: ValueSource::None,
                         to: ValueSource::Sequence(pbps_model::OwnedSequence::serial()),
-                    });
+                    }));
                 } else if shape == "drop" {
                     declared.0.tables.get_mut(&parent).unwrap().columns.clear();
                     declared.1.columns.clear();
@@ -26728,7 +27040,7 @@ mod tests {
                 );
                 let grants: Vec<_> = changes
                     .iter()
-                    .filter(|c| matches!(c, Change::Grant { .. }))
+                    .filter(|c| matches!(c, Change::Permission(GrantChange::Grant { .. })))
                     .collect();
                 assert_eq!(
                     grants.len(),
@@ -26737,12 +27049,14 @@ mod tests {
                 );
                 for grant in grants {
                     assert!(
-                        matches!(grant, Change::Grant { target, permissions, .. } if *target == "dbo.p2".parse().unwrap() && *permissions == [Permission::SerialSequences].into()),
+                        matches!(grant, Change::Permission(GrantChange::Grant { target, permissions, .. }) if *target == "dbo.p2".parse().unwrap() && *permissions == [Permission::SerialSequences].into()),
                         "{grant:?}"
                     );
                 }
                 assert!(
-                    !changes.iter().any(|c| matches!(c, Change::Revoke { .. })),
+                    !changes
+                        .iter()
+                        .any(|c| matches!(c, Change::Permission(GrantChange::Revoke { .. }))),
                     "{shape}: {changes:?}"
                 );
                 // Restore the base changed for the conversion case.
@@ -26778,10 +27092,10 @@ mod tests {
                 assert!(
                     !changes.iter().any(|c| matches!(
                         c,
-                        Change::Revoke {
+                        Change::Permission(GrantChange::Revoke {
                             target: GrantTarget::Sequence(_),
                             ..
-                        }
+                        })
                     )),
                     "{changes:?}"
                 );
@@ -26859,19 +27173,19 @@ mod tests {
                 )
                 .unwrap();
                 assert!(
-                    changes
-                        .changes
-                        .iter()
-                        .any(|p| matches!(p.change, Change::DetachPartition { .. })),
+                    changes.changes.iter().any(|p| matches!(
+                        p.change,
+                        Change::Partition(PartitionChange::DetachPartition { .. })
+                    )),
                     "{changes:?}"
                 );
                 assert!(
                     !changes.changes.iter().any(|p| matches!(
                         &p.change,
-                        Change::Revoke {
+                        Change::Permission(GrantChange::Revoke {
                             target: GrantTarget::Sequence(_),
                             ..
-                        }
+                        })
                     )),
                     "{changes:?}"
                 );
@@ -26892,15 +27206,20 @@ mod tests {
             let attach = changes
                 .changes
                 .iter()
-                .position(|p| matches!(p.change, Change::AttachPartition { .. }))
+                .position(|p| {
+                    matches!(
+                        p.change,
+                        Change::Partition(PartitionChange::AttachPartition { .. })
+                    )
+                })
                 .unwrap();
-            let grant = changes.changes.iter().position(|p| matches!(&p.change, Change::Grant { target, permissions, .. } if *target == "dbo.p1".parse().unwrap() && *permissions == [Permission::SerialSequences].into())).unwrap();
+            let grant = changes.changes.iter().position(|p| matches!(&p.change, Change::Permission(GrantChange::Grant { target, permissions, .. }) if *target == "dbo.p1".parse().unwrap() && *permissions == [Permission::SerialSequences].into())).unwrap();
             assert!(attach < grant, "{changes:?}");
             assert!(
                 !changes
                     .changes
                     .iter()
-                    .any(|p| matches!(p.change, Change::Revoke { .. })),
+                    .any(|p| matches!(p.change, Change::Permission(GrantChange::Revoke { .. }))),
                 "{changes:?}"
             );
         }
@@ -26959,8 +27278,8 @@ mod tests {
                     &ClusterRoles,
                     &mut changes,
                 );
-                assert_eq!(changes.iter().any(|c| matches!(c, Change::Revoke { target: GrantTarget::Sequence(_), permissions, .. } if permissions.contains(&Usage))), revoked, "{before:?} -> {after:?}: {changes:?}");
-                assert!(!changes.iter().any(|c| matches!(c, Change::Revoke { permissions, .. } if permissions.contains(&SerialSequences))));
+                assert_eq!(changes.iter().any(|c| matches!(c, Change::Permission(GrantChange::Revoke { target: GrantTarget::Sequence(_), permissions, .. }) if permissions.contains(&Usage))), revoked, "{before:?} -> {after:?}: {changes:?}");
+                assert!(!changes.iter().any(|c| matches!(c, Change::Permission(GrantChange::Revoke { permissions, .. }) if permissions.contains(&SerialSequences))));
             }
         }
 
@@ -27019,7 +27338,7 @@ mod tests {
                 &mut changes,
             );
             assert!(
-                matches!(&changes[0], Change::Revoke { target, .. } if *target == "sequence::dbo.moved.renamed".parse().unwrap())
+                matches!(&changes[0], Change::Permission(GrantChange::Revoke { target, .. }) if *target == "sequence::dbo.moved.renamed".parse().unwrap())
             );
         }
 
@@ -27055,17 +27374,17 @@ mod tests {
                     declared.1.roles.clear();
                 }
                 let mut changes = vec![
-                    Change::DropTable {
+                    Change::Table(TableChange::DropTable {
                         uid: "t_aaaaaa".parse().unwrap(),
                         name: "dbo.customer".parse().unwrap(),
                         detach_from: None,
-                    },
-                    Change::RenameTable {
+                    }),
+                    Change::Table(TableChange::RenameTable {
                         uid: "t_bbbbbb".parse().unwrap(),
                         from: "dbo.incoming".parse().unwrap(),
                         to: "dbo.customer".parse().unwrap(),
                         defaults: Vec::new(),
-                    },
+                    }),
                 ];
                 diff_roles(
                     Side {
@@ -27086,7 +27405,7 @@ mod tests {
                 );
                 if removed_role {
                     assert!(
-                        matches!(changes.last().unwrap(), Change::Revoke { target, permissions, .. } if *target == "sequence::dbo.customer.id".parse().unwrap() && *permissions == [Permission::Usage].into())
+                        matches!(changes.last().unwrap(), Change::Permission(GrantChange::Revoke { target, permissions, .. }) if *target == "sequence::dbo.customer.id".parse().unwrap() && *permissions == [Permission::Usage].into())
                     );
                 }
             }
@@ -27199,12 +27518,12 @@ mod tests {
                             assert!(
                                 changes.changes.iter().any(|p| matches!(
                                     p.change,
-                                    Change::AlterColumnNumbering { .. }
+                                    Change::Column(ColumnChange::AlterColumnNumbering { .. })
                                 )),
                                 "{changes:?}"
                             );
                             assert!(!changes.changes.iter().any(|p| matches!(&p.change,
-                                Change::Revoke { target: revoked, .. } if *revoked == target.parse::<GrantTarget>().unwrap())),
+                                Change::Permission(GrantChange::Revoke { target: revoked, .. }) if *revoked == target.parse::<GrantTarget>().unwrap())),
                                 "source={source:?}, implied={implied}, removed role={removed_role}, renamed={renamed}: {changes:?}");
                             // An unrelated serial survives the conversion. Its
                             // permissions still need revoking with the role.
@@ -27214,7 +27533,7 @@ mod tests {
                                 "sequence::dbo.customer.other"
                             };
                             assert_eq!(changes.changes.iter().any(|p| matches!(&p.change,
-                                Change::Revoke { target, permissions, .. } if *target == other.parse::<GrantTarget>().unwrap() && permissions.contains(&Permission::Usage))), implied && removed_role, "{changes:?}");
+                                Change::Permission(GrantChange::Revoke { target, permissions, .. }) if *target == other.parse::<GrantTarget>().unwrap() && permissions.contains(&Permission::Usage))), implied && removed_role, "{changes:?}");
                         }
                     }
                 }
@@ -27242,7 +27561,7 @@ mod tests {
             .unwrap();
             assert_eq!(changes.changes.len(), 1, "{changes:?}");
             assert!(
-                matches!(&changes.changes[0].change, Change::Revoke { target, permissions, .. }
+                matches!(&changes.changes[0].change, Change::Permission(GrantChange::Revoke { target, permissions, .. })
                 if *target == "sequence::dbo.customer.id".parse().unwrap() && *permissions == rights.into())
             );
         }
@@ -27302,11 +27621,11 @@ mod tests {
                 assert_eq!(changes.changes.len(), 1, "{changes:?}");
                 assert!(matches!(
                     changes.changes[0].change,
-                    Change::AlterColumnNumbering {
+                    Change::Column(ColumnChange::AlterColumnNumbering {
                         from: ValueSource::Sequence(_),
                         to: ValueSource::Sequence(_),
                         ..
-                    }
+                    })
                 ));
                 assert!(
                     changes.changes.iter().all(|p| p.change.grant().is_none()),
@@ -27373,10 +27692,10 @@ mod tests {
                 let grant = changes.changes.iter().position(|p| {
                     matches!(
                         p.change,
-                        Change::Grant {
+                        Change::Permission(GrantChange::Grant {
                             target: GrantTarget::Sequence(_),
                             ..
-                        }
+                        })
                     )
                 });
                 if shape == "unchanged" {
@@ -27388,25 +27707,25 @@ mod tests {
                 assert!(
                     changes.changes[..grant].iter().any(|p| matches!(
                         p.change,
-                        Change::CreateTable { .. }
-                            | Change::AddColumn { .. }
-                            | Change::AlterColumnNumbering { .. }
+                        Change::Table(TableChange::CreateTable { .. })
+                            | Change::Column(ColumnChange::AddColumn { .. })
+                            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
                     )),
                     "{shape}: {changes:?}"
                 );
                 assert!(
-                    matches!(&changes.changes[grant].change, Change::Grant { permissions, .. } if *permissions == [Permission::Usage, Permission::Select, Permission::Update].into())
+                    matches!(&changes.changes[grant].change, Change::Permission(GrantChange::Grant { permissions, .. }) if *permissions == [Permission::Usage, Permission::Select, Permission::Update].into())
                 );
             }
             // Even equal textual grants need to be reapplied when an engine
             // recreates the sequence during a numbering conversion.
-            let mut changes = vec![Change::AlterColumnNumbering {
+            let mut changes = vec![Change::Column(ColumnChange::AlterColumnNumbering {
                 uid: "c_aaaaaa".parse().unwrap(),
                 column: "dbo.customer.id".parse().unwrap(),
                 ty: ty("int"),
                 from: ValueSource::None,
                 to: ValueSource::Sequence(pbps_model::OwnedSequence::serial()),
-            }];
+            })];
             diff_roles(
                 Side {
                     schema: &desired.0,
@@ -27420,7 +27739,7 @@ mod tests {
                 &mut changes,
             );
             assert!(
-                matches!(changes.last().unwrap(), Change::Grant { target: GrantTarget::Sequence(_), permissions, .. } if permissions.len() == 3)
+                matches!(changes.last().unwrap(), Change::Permission(GrantChange::Grant { target: GrantTarget::Sequence(_), permissions, .. }) if permissions.len() == 3)
             );
         }
 
@@ -27653,28 +27972,28 @@ mod tests {
 
         fn describe(c: &Change) -> String {
             match c {
-                Change::CreateRole { name, .. } => format!(
+                Change::Role(RoleChange::CreateRole { name, .. }) => format!(
                     "create {name}",
                     // Preserve the original spelling in this SQL or comparison fixture.
                     name = name.raw(),
                 ),
-                Change::DropRole { name, .. } => format!(
+                Change::Role(RoleChange::DropRole { name, .. }) => format!(
                     "drop {name}",
                     // Preserve the original spelling in this SQL or comparison fixture.
                     name = name.raw(),
                 ),
-                Change::RenameRole { from, to, .. } => format!(
+                Change::Role(RoleChange::RenameRole { from, to, .. }) => format!(
                     "rename {from}->{to}",
                     // Preserve the original spelling in this SQL or comparison fixture.
                     from = from.raw(),
                     // Preserve the original spelling in this SQL or comparison fixture.
                     to = to.raw(),
                 ),
-                Change::Grant {
+                Change::Permission(GrantChange::Grant {
                     role,
                     target,
                     permissions,
-                } => format!(
+                }) => format!(
                     "grant {role} {target} {}",
                     permissions
                         .iter()
@@ -27685,11 +28004,11 @@ mod tests {
                     role = role.raw(),
                     target = target.raw(),
                 ),
-                Change::Revoke {
+                Change::Permission(GrantChange::Revoke {
                     role,
                     target,
                     permissions,
-                } => format!(
+                }) => format!(
                     "revoke {role} {target} {}",
                     permissions
                         .iter()
@@ -27930,7 +28249,9 @@ mod tests {
                 .changes
                 .iter()
                 .filter_map(|p| match &p.change {
-                    Change::Revoke { target, .. } => Some(target.raw().to_string()),
+                    Change::Permission(GrantChange::Revoke { target, .. }) => {
+                        Some(target.raw().to_string())
+                    }
                     _ => None,
                 })
                 .collect();
@@ -27938,7 +28259,7 @@ mod tests {
             assert!(
                 cs.changes.iter().any(|p| matches!(
                     &p.change,
-                    Change::DropModule { id, .. } if id.raw().to_string() == "dbo.f(integer)"
+                    Change::Module(ModuleChange::DropModule { id, .. }) if id.raw().to_string() == "dbo.f(integer)"
                 )),
                 "{:?}",
                 kinds(&base, &declared)
@@ -27979,11 +28300,14 @@ mod tests {
             .unwrap();
             let at =
                 |pred: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| pred(&p.change));
-            let drop = at(&|c| matches!(c, Change::DropTable { .. })).expect("a drop");
-            let create = at(&|c| matches!(c, Change::CreateTable { .. })).expect("a create");
-            let grant = at(&|c| matches!(c, Change::Grant { .. })).expect("the grant again");
+            let drop =
+                at(&|c| matches!(c, Change::Table(TableChange::DropTable { .. }))).expect("a drop");
+            let create = at(&|c| matches!(c, Change::Table(TableChange::CreateTable { .. })))
+                .expect("a create");
+            let grant = at(&|c| matches!(c, Change::Permission(GrantChange::Grant { .. })))
+                .expect("the grant again");
             assert!(
-                at(&|c| matches!(c, Change::Revoke { .. })).is_none(),
+                at(&|c| matches!(c, Change::Permission(GrantChange::Revoke { .. }))).is_none(),
                 "{:?}",
                 kinds(&base, &declared)
             );
@@ -28089,10 +28413,19 @@ mod tests {
 
             let rebuilt = run(&["app.v"]);
             assert_eq!(
-                count(&rebuilt, &|c| matches!(c, Change::AlterModule { .. })),
+                count(&rebuilt, &|c| matches!(
+                    c,
+                    Change::Module(ModuleChange::AlterModule { .. })
+                )),
                 1
             );
-            assert_eq!(count(&rebuilt, &|c| matches!(c, Change::Grant { .. })), 1);
+            assert_eq!(
+                count(&rebuilt, &|c| matches!(
+                    c,
+                    Change::Permission(GrantChange::Grant { .. })
+                )),
+                1
+            );
 
             // Nothing handed back: nothing changes.
             assert!(run(&[]).changes.is_empty());
@@ -28142,20 +28475,24 @@ mod tests {
             let at = |cs: &ChangeSet, pred: &dyn Fn(&Change) -> bool| {
                 cs.changes.iter().position(|p| pred(&p.change))
             };
-            let alter =
-                at(&rebuilt, &|c| matches!(c, Change::AlterModule { .. })).expect("the alter");
-            let grant =
-                at(&rebuilt, &|c| matches!(c, Change::Grant { .. })).expect("the grant again");
+            let alter = at(&rebuilt, &|c| {
+                matches!(c, Change::Module(ModuleChange::AlterModule { .. }))
+            })
+            .expect("the alter");
+            let grant = at(&rebuilt, &|c| {
+                matches!(c, Change::Permission(GrantChange::Grant { .. }))
+            })
+            .expect("the grant again");
             assert!(
                 alter < grant,
                 "the grant must sort after the rebuild it restores"
             );
             match &rebuilt.changes[grant].change {
-                Change::Grant {
+                Change::Permission(GrantChange::Grant {
                     role,
                     target,
                     permissions,
-                } => {
+                }) => {
                     assert_eq!(role.raw(), "app_reader");
                     assert_eq!(target.raw().to_string(), "app.v");
                     assert_eq!(permissions, &[Permission::Select].into_iter().collect());
@@ -28168,7 +28505,11 @@ mod tests {
             // again would be a change nobody declared.
             let altered = run(&MinimalDialect);
             assert!(
-                at(&altered, &|c| matches!(c, Change::Grant { .. })).is_none(),
+                at(&altered, &|c| matches!(
+                    c,
+                    Change::Permission(GrantChange::Grant { .. })
+                ))
+                .is_none(),
                 "CREATE OR ALTER preserves the grant; restating it here is noise"
             );
         }
@@ -28267,6 +28608,8 @@ mod tests {
     /// ADR-0010 §5).
     mod public_execution {
         use super::*;
+        use pbps_model::GrantChange;
+        use pbps_model::ModuleChange;
 
         /// PostgreSQL's two answers, on a dialect that is otherwise
         /// `MinimalDialect` — the same isolation `Rebuilds` gives
@@ -28376,11 +28719,11 @@ mod tests {
             cs.changes
                 .iter()
                 .filter_map(|p| {
-                    if let Change::PublicExecution {
+                    if let Change::Permission(GrantChange::PublicExecution {
                         routine,
                         access,
                         origin,
-                    } = &p.change
+                    }) = &p.change
                     {
                         Some((routine.raw().to_string(), *access, *origin))
                     } else {
@@ -28457,13 +28800,15 @@ mod tests {
             );
             let mut closed = 0;
             for (at, planned) in cs.changes.iter().enumerate() {
-                if let Change::PublicExecution { routine, .. } = &planned.change {
+                if let Change::Permission(GrantChange::PublicExecution { routine, .. }) =
+                    &planned.change
+                {
                     closed += 1;
                     let before = at.checked_sub(1).map(|i| &cs.changes[i].change);
                     assert!(
                         matches!(
                             before,
-                            Some(Change::CreateModule { id: ModuleId::Routine(r), .. }) if r == routine
+                            Some(Change::Module(ModuleChange::CreateModule { id: ModuleId::Routine(r), .. })) if r == routine
                         ),
                         "{} is not settled right after its own CREATE: {:?}",
                         routine.shown(),
@@ -28697,8 +29042,8 @@ mod tests {
             matches!(
                 changes.as_slice(),
                 [
-                    Change::SetPrimaryKey { to: None, .. },
-                    Change::SetPrimaryKey { from: None, .. }
+                    Change::Constraint(ConstraintChange::SetPrimaryKey { to: None, .. }),
+                    Change::Constraint(ConstraintChange::SetPrimaryKey { from: None, .. })
                 ]
             ),
             "a replaced key is its drop and its add: {changes:?}"
@@ -28721,8 +29066,8 @@ mod tests {
             matches!(
                 changes.as_slice(),
                 [
-                    Change::SetPrimaryKey { to: None, .. },
-                    Change::SetPrimaryKey { from: None, .. }
+                    Change::Constraint(ConstraintChange::SetPrimaryKey { to: None, .. }),
+                    Change::Constraint(ConstraintChange::SetPrimaryKey { from: None, .. })
                 ]
             ),
             "a named key is compared in full: {changes:?}"
@@ -28734,13 +29079,14 @@ mod tests {
     /// away, and the engine refuses that by name.
     #[test]
     fn a_role_holding_another_dropped_role_is_dropped_before_it() {
+        use pbps_model::RoleChange;
         use pbps_model::{Change, PlannedChange};
         let drop = |name: &str, members: &[&str]| {
-            PlannedChange::new(Change::DropRole {
+            PlannedChange::new(Change::Role(RoleChange::DropRole {
                 uid: "r_aaaaaa".parse().unwrap(),
                 name: name.to_owned().into(),
                 members: members.iter().map(|m| (*m).into()).collect(),
-            })
+            }))
         };
         // `a` is a member of `z`, and `z` of `top`: the name tiebreaker alone
         // would emit them a, top, z — every one of them wrong.
@@ -28765,19 +29111,21 @@ mod tests {
     /// everything else where it was (DECISIONS 139).
     #[test]
     fn role_drops_are_reordered_parent_first_once_their_members_are_known() {
+        use pbps_model::RoleChange;
+        use pbps_model::TableChange;
         use pbps_model::{Change, ChangeSet, PlannedChange};
         let drop = |name: &str, members: &[&str]| {
-            PlannedChange::new(Change::DropRole {
+            PlannedChange::new(Change::Role(RoleChange::DropRole {
                 uid: "r_aaaaaa".parse().unwrap(),
                 name: name.to_owned().into(),
                 members: members.iter().map(|m| (*m).into()).collect(),
-            })
+            }))
         };
-        let other = PlannedChange::new(Change::DropTable {
+        let other = PlannedChange::new(Change::Table(TableChange::DropTable {
             uid: "t_aaaaaa".parse().unwrap(),
             name: TableName::new("dbo", "gone"),
             detach_from: None,
-        });
+        }));
         // As the differ left them: name order, with a table drop in between.
         let mut cs = ChangeSet {
             changes: vec![
@@ -28802,7 +29150,7 @@ mod tests {
             .changes
             .iter()
             .map(|p| match &p.change {
-                Change::DropRole { name, .. } => name.raw().to_owned(),
+                Change::Role(RoleChange::DropRole { name, .. }) => name.raw().to_owned(),
                 _ => "table".to_owned(),
             })
             .collect();
@@ -29011,42 +29359,42 @@ mod tests {
                     }
                 }
                 let restoration = match kind {
-                    Part::Computed => Change::DropComputedColumn {
+                    Part::Computed => Change::Column(ColumnChange::DropComputedColumn {
                         table: table.clone(),
                         name: "derived".into(),
                         computed: shape.computed["derived"].clone(),
-                    },
-                    Part::PrimaryKey => Change::SetPrimaryKey {
+                    }),
+                    Part::PrimaryKey => Change::Constraint(ConstraintChange::SetPrimaryKey {
                         table: table.clone(),
                         from: None,
                         to: after.primary_key.clone(),
                         nonclustered: !after.primary_key_is_clustered(),
-                    },
-                    Part::Unique => Change::AddUnique {
+                    }),
+                    Part::Unique => Change::Constraint(ConstraintChange::AddUnique {
                         table: table.clone(),
                         name: "uq".into(),
                         constraint: after.unique["uq"].clone(),
                         clustered: after.unique_is_clustered("uq"),
-                    },
+                    }),
                     // The physical rebuild can carry the engine's expression spelling.
-                    Part::Check => Change::AddCheck {
+                    Part::Check => Change::Constraint(ConstraintChange::AddCheck {
                         table: table.clone(),
                         name: "ck".into(),
                         constraint: CheckConstraint {
                             expression: if changed { "old > 10" } else { "((old)>(0))" }.into(),
                         },
-                    },
-                    Part::ForeignKey => Change::AddForeignKey {
+                    }),
+                    Part::ForeignKey => Change::Constraint(ConstraintChange::AddForeignKey {
                         table: table.clone(),
                         name: "fk".into(),
                         constraint: Box::new(after.foreign_keys["fk"].clone()),
-                    },
-                    Part::Index => Change::AddIndex {
+                    }),
+                    Part::Index => Change::Index(IndexChange::AddIndex {
                         table: table.clone(),
                         name: "ix".into(),
                         index: Box::new(after.indexes["ix"].clone()),
                         clustered: after.index_is_clustered("ix"),
-                    },
+                    }),
                     Part::Policy | Part::Exclusion => unreachable!(),
                 };
                 let compare = restoration_comparison(
@@ -29159,14 +29507,14 @@ mod tests {
                 },
                 &MinimalDialect,
             );
-            let drop = Change::DropModule {
+            let drop = Change::Module(ModuleChange::DropModule {
                 id: id.clone(),
                 kind: before.kind,
-            };
-            let create = Change::CreateModule {
+            });
+            let create = Change::Module(ModuleChange::CreateModule {
                 id: id.clone(),
                 module: Box::new(after),
-            };
+            });
             for change in [&drop, &create] {
                 assert_eq!(
                     compare(change, None),
@@ -29285,7 +29633,7 @@ mod tests {
                 );
                 for (from, to) in [(Some("app.f()".into()), None), (None, Some(desired.into()))] {
                     let change = if partition {
-                        Change::SetPartitionDefault {
+                        Change::Partition(PartitionChange::SetPartitionDefault {
                             uid: owner.clone(),
                             table: name.clone(),
                             parent: parent.clone(),
@@ -29293,14 +29641,14 @@ mod tests {
                             from,
                             to,
                             fallback: Some("app.f()".into()),
-                        }
+                        })
                     } else {
-                        Change::AlterColumnDefault {
+                        Change::Column(ColumnChange::AlterColumnDefault {
                             uid: column.clone(),
                             column: name.column("old"),
                             from,
                             to,
-                        }
+                        })
                     };
                     assert_eq!(
                         compare(&change, Some(&owner)),
@@ -29321,11 +29669,11 @@ mod tests {
                     );
                     assert!(!unavailable(&change, Some(&owner)));
                 }
-                let unrelated = Change::SetColumnDeprecated {
+                let unrelated = Change::Column(ColumnChange::SetColumnDeprecated {
                     uid: column.clone(),
                     column: name.column("old"),
                     reason: None,
-                };
+                });
                 assert!(!compare(&unrelated, Some(&owner)));
             }
         }
@@ -29394,7 +29742,7 @@ mod tests {
             ids: &ids,
         };
         let compare = restoration_comparison(base, declared, &MinimalDialect);
-        let restoration = Change::SetPartitionDefault {
+        let restoration = Change::Partition(PartitionChange::SetPartitionDefault {
             uid: child.clone(),
             table: leaf.clone(),
             parent,
@@ -29402,7 +29750,7 @@ mod tests {
             from: None,
             to: Some(default.into()),
             fallback: None,
-        };
+        });
         assert_eq!(compare(&restoration, Some(&child)), unchanged);
         // The callback must make the same logical decision as ordinary planning.
         let mut changes = Vec::new();
@@ -29426,7 +29774,7 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(
             changes.iter().any(
-                |c| matches!(c, Change::SetPartitionDefault { column, .. } if column.raw() == "n")
+                |c| matches!(c, Change::Partition(PartitionChange::SetPartitionDefault { column, .. }) if column.raw() == "n")
             ),
             !unchanged
         );
@@ -29448,6 +29796,8 @@ mod managed_type_tests {
     use super::*;
     use pbps_dialect::MinimalDialect;
     use pbps_model::ManagedType;
+    use pbps_model::TypeChange;
+    use pbps_model::TypeValueChange;
 
     fn schema(definition: ManagedType) -> Schema {
         let mut schema = Schema::default();
@@ -29495,19 +29845,22 @@ mod managed_type_tests {
         };
         let renamed = run(&base, &base_ids, &target, &ids).unwrap();
         assert!(
-            matches!(&renamed.changes[0].change, Change::RenameType { uid: got, from, to, .. } if got == &uid && from == &a && to == &b)
+            matches!(&renamed.changes[0].change, Change::Type(TypeChange::RenameType { uid: got, from, to, .. }) if got == &uid && from == &a && to == &b)
         );
         let created = run(&Schema::default(), &IdsFile::default(), &base, &base_ids).unwrap();
         assert!(matches!(
             created.changes[0].change,
-            Change::AddEnumValue { .. }
-                | Change::AlterDomain { .. }
-                | Change::RenameEnumValue { .. }
-                | Change::EnumRebuild { .. }
-                | Change::CreateType { .. }
+            Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+                | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+                | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+                | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
+                | Change::Type(TypeChange::CreateType { .. })
         ));
         let dropped = run(&base, &base_ids, &Schema::default(), &IdsFile::default()).unwrap();
-        assert!(matches!(dropped.changes[0].change, Change::DropType { .. }));
+        assert!(matches!(
+            dropped.changes[0].change,
+            Change::Type(TypeChange::DropType { .. })
+        ));
         assert_eq!(
             dropped.risks(),
             [pbps_model::change::RiskClass::Destructive].into()
@@ -29710,7 +30063,9 @@ mod managed_type_tests {
 mod type_replacement_tests {
     use super::*;
     use pbps_dialect::MinimalDialect;
+    use pbps_model::ColumnChange;
     use pbps_model::ManagedType;
+    use pbps_model::TypeChange;
 
     #[test]
     fn a_same_named_other_uid_cannot_supply_a_missing_declaration() {
@@ -29830,7 +30185,7 @@ mod type_replacement_tests {
                 assert!(
                     plan.changes
                         .iter()
-                        .any(|s| matches!(&s.change, Change::DropType { uid, .. } if uid == &old))
+                        .any(|s| matches!(&s.change, Change::Type(TypeChange::DropType { uid, .. }) if uid == &old))
                 );
                 if domain {
                     base.types.insert(
@@ -29930,24 +30285,20 @@ mod type_replacement_tests {
             .unwrap()
         };
         let plan = run(&base, &desired);
-        assert!(
-            !plan
-                .changes
-                .iter()
-                .any(|s| matches!(s.change, Change::AlterColumnType { .. }))
-        );
+        assert!(!plan.changes.iter().any(|s| matches!(
+            s.change,
+            Change::Column(ColumnChange::AlterColumnType { .. })
+        )));
         // Changing the binding to the other uid must still emit a retype.
         base.tables
             .get_mut(&"app.t".parse().unwrap())
             .unwrap()
             .columns["v"]
             .ty = "app.a[]".parse().unwrap();
-        assert!(
-            run(&base, &desired)
-                .changes
-                .iter()
-                .any(|s| matches!(s.change, Change::AlterColumnType { .. }))
-        );
+        assert!(run(&base, &desired).changes.iter().any(|s| matches!(
+            s.change,
+            Change::Column(ColumnChange::AlterColumnType { .. })
+        )));
     }
 
     #[test]
@@ -30031,6 +30382,8 @@ mod type_replacement_tests {
 mod meeting_shape_tests {
     use super::*;
     use pbps_dialect::{DialectError, MinimalDialect, TypeChangeRisk};
+    use pbps_model::PartitionChange;
+    use pbps_model::SearchChange;
     struct Engine {
         enabled: bool,
         label: &'static str,
@@ -30186,8 +30539,10 @@ mod meeting_shape_tests {
                         d.errors
                     );
                     let boundary = d.changes.changes.iter().find_map(|p| match &p.change {
-                        Change::AttachPartition { parent, .. }
-                        | Change::DetachPartition { parent, .. } => Some(parent),
+                        Change::Partition(PartitionChange::AttachPartition { parent, .. })
+                        | Change::Partition(PartitionChange::DetachPartition { parent, .. }) => {
+                            Some(parent)
+                        }
                         _ => None,
                     });
                     if enabled {
@@ -30283,17 +30638,17 @@ mod meeting_shape_tests {
         let (changes, errs) = diffed(&base, &base_ids, &declared, &declared_ids);
         assert!(errs.is_empty(), "{errs:?}");
         assert!(matches!(changes.as_slice(),
-            [Change::CreateSearch { uid, name, .. }] if uid == &new_uid && name == &new));
+            [Change::Search(SearchChange::CreateSearch { uid, name, .. })] if uid == &new_uid && name == &new));
         // A declaration the baseline holds, then gives up, is dropped.
         declared.search.remove(&same);
         declared_ids.search.remove(&uid);
         let (changes, _) = diffed(&base, &base_ids, &declared, &declared_ids);
         assert!(changes.iter().any(|c| matches!(c,
-            Change::DropSearch { uid: u, name, .. } if u == &uid && name == &same)));
+            Change::Search(SearchChange::DropSearch { uid: u, name, .. }) if u == &uid && name == &same)));
         // The target's own object with no identity is never dropped.
         assert!(
             !changes.iter().any(
-                |c| matches!(c, Change::DropSearch { name, .. } if name.name.name() == "theirs")
+                |c| matches!(c, Change::Search(SearchChange::DropSearch { name, .. }) if name.name.name() == "theirs")
             )
         );
         // A standing difference, a missing identity and a rename are refused by name.
@@ -30305,7 +30660,7 @@ mod meeting_shape_tests {
         assert!(
             !changes
                 .iter()
-                .any(|c| matches!(c, Change::DropSearch { .. }))
+                .any(|c| matches!(c, Change::Search(SearchChange::DropSearch { .. })))
         );
         assert!(
             errs.iter()
@@ -30335,7 +30690,7 @@ mod meeting_shape_tests {
             "{errs:?}"
         );
         assert!(!changes.iter().any(
-            |c| matches!(c, Change::CreateSearch { name, .. } if name.name.name() == "renamed")
+            |c| matches!(c, Change::Search(SearchChange::CreateSearch { name, .. }) if name.name.name() == "renamed")
         ));
         // Two kinds of one name are two objects: the configuration is absent though the
         // dictionary of that name is held.
@@ -30355,7 +30710,7 @@ mod meeting_shape_tests {
         assert!(
             changes
                 .iter()
-                .any(|c| matches!(c, Change::CreateSearch { name, .. } if name == &config))
+                .any(|c| matches!(c, Change::Search(SearchChange::CreateSearch { name, .. }) if name == &config))
         );
     }
 
@@ -30456,6 +30811,7 @@ mod search_tests {
     use super::*;
     use crate::identity::Context;
     use pbps_dialect::MinimalDialect;
+    use pbps_model::SearchChange;
     use pbps_model::{Column, Intent, SearchObject, SearchRef};
 
     fn ctx() -> Context {
@@ -30724,7 +31080,7 @@ mod search_tests {
                 plan_against((&base, &base_ids), (&kept, &kept_ids), target_read).unwrap();
             assert!(
                 created.changes.iter().any(
-                    |p| matches!(&p.change, Change::CreateSearch { name, .. } if *name == docs)
+                    |p| matches!(&p.change, Change::Search(SearchChange::CreateSearch { name, .. }) if *name == docs)
                 ),
                 "{created:?}"
             );
@@ -30787,7 +31143,7 @@ mod search_tests {
             !adopted
                 .changes
                 .iter()
-                .any(|p| matches!(p.change, Change::DropSearch { .. })),
+                .any(|p| matches!(p.change, Change::Search(SearchChange::DropSearch { .. }))),
             "{adopted:?}"
         );
     }
@@ -30852,7 +31208,7 @@ mod search_tests {
         assert!(
             created.changes.iter().all(|p| matches!(
                 &p.change,
-                Change::CreateSearch { unresolved, .. } if unresolved.is_empty()
+                Change::Search(SearchChange::CreateSearch { unresolved, .. }) if unresolved.is_empty()
             )),
             "{created:?}"
         );
@@ -30886,9 +31242,9 @@ mod search_tests {
                 .changes
                 .iter()
                 .find_map(|p| match &p.change {
-                    Change::CreateSearch {
+                    Change::Search(SearchChange::CreateSearch {
                         name, unresolved, ..
-                    } if *name == subject => Some(unresolved.clone()),
+                    }) if *name == subject => Some(unresolved.clone()),
                     _ => None,
                 })
                 .unwrap_or_else(|| panic!("{} not planned: {planned:?}", subject.raw()))

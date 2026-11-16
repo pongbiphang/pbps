@@ -1,5 +1,6 @@
 //! Each delayed shape has its own committed readiness frontier (DEC-2134.1).
 use super::*;
+use pbps_model::TableChange;
 
 fn interleaved_inputs(bad: bool) -> (Inputs, Vec<String>) {
     let early = format!("SELECT id FROM {EXTERNAL}.c");
@@ -67,7 +68,7 @@ async fn resolver_interleaves_independent_fills_at_their_own_ready_points() {
                     .changes
                     .iter()
                     .all(|change| !matches!(&change.change,
-                Change::CreateTable { name, .. } if name.schema == EXTERNAL)),
+                Change::Table(TableChange::CreateTable { name, .. }) if name.schema == EXTERNAL)),
                 "Fill never becomes a deployment change"
             );
         }

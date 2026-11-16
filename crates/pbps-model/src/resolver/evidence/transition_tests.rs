@@ -1,4 +1,12 @@
 use super::*;
+use crate::ColumnChange;
+use crate::ConstraintChange;
+use crate::GrantChange;
+use crate::IndexChange;
+use crate::ModuleChange;
+use crate::PartitionChange;
+use crate::RowChange;
+use crate::TableChange;
 use crate::resolver::{ObjectIdentity, ObjectOwnership, Surface};
 use crate::{ModuleKind, PlannedChange, TableName};
 
@@ -39,7 +47,7 @@ fn drop_fixture(change: Change, surface: Surface) -> (ChangeSet, ResolverEvidenc
     transition.surface = surface.clone();
     let object = transition.before.iter().next().unwrap().clone();
     own(&mut evidence.before, &object, surface);
-    if let Change::DropColumn { column, .. } = &changes.changes[0].change {
+    if let Change::Column(ColumnChange::DropColumn { column, .. }) = &changes.changes[0].change {
         // A removed column still changes its surviving parent's vector. Keep
         // that obligation separate from the existing opaque column fixture.
         let parent = crate::resolver::Prerequisite {
@@ -86,54 +94,54 @@ fn dropped_surfaces() -> Vec<(Change, Surface)> {
     let uid = "c_000000".parse().unwrap();
     vec![
         (
-            Change::DropModule {
+            Change::Module(ModuleChange::DropModule {
                 id: "app.v".parse().unwrap(),
                 kind: ModuleKind::View,
-            },
+            }),
             Surface::Module("app.v".parse().unwrap()),
         ),
         (
-            Change::AlterColumnDefault {
+            Change::Column(ColumnChange::AlterColumnDefault {
                 uid,
                 column: table.column("n"),
                 from: Some("1".into()),
                 to: None,
-            },
+            }),
             Surface::Default(table.column("n")),
         ),
         (
-            Change::DropCheck {
+            Change::Constraint(ConstraintChange::DropCheck {
                 table: table.clone(),
                 name: "positive".into(),
-            },
+            }),
             Surface::Check {
                 table: table.clone(),
                 name: "positive".into(),
             },
         ),
         (
-            Change::DropIndex {
+            Change::Index(IndexChange::DropIndex {
                 table: table.clone(),
                 name: "ix".into(),
-            },
+            }),
             Surface::Index {
                 table: table.clone(),
                 name: "ix".into(),
             },
         ),
         (
-            Change::DropColumn {
+            Change::Column(ColumnChange::DropColumn {
                 uid: "c_000000".parse().unwrap(),
                 column: table.column("n"),
-            },
+            }),
             Surface::Column(table.column("n")),
         ),
         (
-            Change::DropTable {
+            Change::Table(TableChange::DropTable {
                 uid: "t_000000".parse().unwrap(),
                 name: table.clone(),
                 detach_from: None,
-            },
+            }),
             Surface::Table(table),
         ),
     ]
@@ -213,11 +221,15 @@ fn changed_definitions_need_transitions_even_when_bindings_are_identical() {
     let PlanAnalysis::Resolved(mut evidence) = plan.analysis else {
         panic!("resolved")
     };
-    let Change::CreateModule { id, module } = plan.changes.changes[0].change.clone() else {
+    let Change::Module(ModuleChange::CreateModule { id, module }) =
+        plan.changes.changes[0].change.clone()
+    else {
         panic!("create")
     };
     let changes = ChangeSet {
-        changes: vec![PlannedChange::new(Change::AlterModule { id, module })],
+        changes: vec![PlannedChange::new(Change::Module(
+            ModuleChange::AlterModule { id, module },
+        ))],
     };
     evidence.before = super::tests::observed(&evidence, &super::tests::compiled());
     evidence.surfaces[0].current = evidence.surfaces[0].desired.clone();
@@ -250,12 +262,12 @@ fn unchanged_catalogs_do_not_need_a_transition_for_row_or_metadata_changes() {
     };
     let changes = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::SetColumnDeprecated {
+            PlannedChange::new(Change::Column(ColumnChange::SetColumnDeprecated {
                 uid: "c_000000".parse().unwrap(),
                 column: "app.v".parse::<TableName>().unwrap().column("n"),
                 reason: Some("unused".into()),
-            }),
-            PlannedChange::new(Change::UpdateRow {
+            })),
+            PlannedChange::new(Change::Row(RowChange::UpdateRow {
                 table: "app.v".parse().unwrap(),
                 key_column: "id".into(),
                 key: crate::RowKey("1".into()),
@@ -270,7 +282,7 @@ fn unchanged_catalogs_do_not_need_a_transition_for_row_or_metadata_changes() {
                 types: Default::default(),
                 after_types: Default::default(),
                 key_type: None,
-            }),
+            })),
         ],
     };
     // Without a transition the closing manifest is the opening one, record
@@ -290,12 +302,14 @@ fn renamed_surfaces_can_share_one_transition_between_their_old_and_new_names() {
     let (change, _) = dropped_surfaces().pop().unwrap();
     let (_, mut evidence) = drop_fixture(change, Surface::Table("app.v".parse().unwrap()));
     let changes = ChangeSet {
-        changes: vec![PlannedChange::new(Change::RenameTable {
-            uid: "t_000000".parse().unwrap(),
-            from: "app.v".parse().unwrap(),
-            to: "app.w".parse().unwrap(),
-            defaults: vec![],
-        })],
+        changes: vec![PlannedChange::new(Change::Table(
+            TableChange::RenameTable {
+                uid: "t_000000".parse().unwrap(),
+                from: "app.v".parse().unwrap(),
+                to: "app.w".parse().unwrap(),
+                defaults: vec![],
+            },
+        ))],
     };
     let mut desired = evidence.surfaces[0].current.clone().unwrap();
     desired.object.name[1] = "w".into();
@@ -333,15 +347,15 @@ fn a_dropped_view_can_be_replaced_by_a_table_at_the_same_logical_address() {
         "columns": {"n": {"type": "integer", "nullable": true}}
     }))
     .unwrap();
-    changes
-        .changes
-        .push(PlannedChange::new(Change::CreateTable {
+    changes.changes.push(PlannedChange::new(Change::Table(
+        TableChange::CreateTable {
             uid: "t_000000".parse().unwrap(),
             name: "app.v".parse().unwrap(),
             table: Box::new(table),
             beside_default: None,
             moves_at_most: None,
-        }));
+        },
+    )));
     let desired = evidence.surfaces[0].current.clone().unwrap();
     evidence.surfaces.insert(
         0,
@@ -384,25 +398,27 @@ fn a_dropped_view_can_be_replaced_by_a_table_at_the_same_logical_address() {
 fn removing_a_predicate_can_retain_the_plain_index_catalog_record() {
     let (change, surface) = dropped_surfaces().remove(3);
     let (mut changes, mut evidence) = drop_fixture(change, surface);
-    changes.changes.push(PlannedChange::new(Change::AddIndex {
-        table: "app.v".parse().unwrap(),
-        name: "ix".into(),
-        clustered: false,
-        index: Box::new(crate::Index {
-            columns: vec![crate::IndexColumn {
-                key: crate::IndexKey::Column("n".into()),
-                descending: false,
-                opclass: None,
-                collation: None,
-            }],
-            include: vec![],
-            unique: false,
-            filter: None,
-            method: Default::default(),
-            storage_parameters: Default::default(),
-            filegroup: None,
-        }),
-    }));
+    changes
+        .changes
+        .push(PlannedChange::new(Change::Index(IndexChange::AddIndex {
+            table: "app.v".parse().unwrap(),
+            name: "ix".into(),
+            clustered: false,
+            index: Box::new(crate::Index {
+                columns: vec![crate::IndexColumn {
+                    key: crate::IndexKey::Column("n".into()),
+                    descending: false,
+                    opclass: None,
+                    collation: None,
+                }],
+                include: vec![],
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+                filegroup: None,
+            }),
+        })));
     evidence.transitions[0].after = evidence.transitions[0].before.clone();
     // Scratch compiles the plain index as the same catalog record.
     let compiled = evidence.before.clone();
@@ -430,15 +446,16 @@ fn owner_coverage(
     use crate::resolver::{BoundSurface, Prerequisite};
     let vector_edit = matches!(
         &change,
-        Change::AddColumn { .. } | Change::DropColumn { .. }
+        Change::Column(ColumnChange::AddColumn { .. })
+            | Change::Column(ColumnChange::DropColumn { .. })
     );
     let table: TableName = "app.v".parse().unwrap();
     let (_, mut evidence) = drop_fixture(
-        Change::DropTable {
+        Change::Table(TableChange::DropTable {
             uid: "t_000000".parse().unwrap(),
             name: table.clone(),
             detach_from: None,
-        },
+        }),
         Surface::Table(table.clone()),
     );
     let table_object = evidence.surfaces[0]
@@ -639,11 +656,11 @@ fn table_drops_require_the_owner_even_with_a_child_transition() {
         Surface::Column(table.column("n")),
     ] {
         owner_coverage(
-            Change::DropTable {
+            Change::Table(TableChange::DropTable {
                 uid: "t_000000".parse().unwrap(),
                 name: table.clone(),
                 detach_from: None,
-            },
+            }),
             Surface::Table(table.clone()),
             child,
             false,
@@ -667,13 +684,13 @@ fn table_creation_requires_the_owner_even_with_a_child_transition() {
             definition.columns.get_mut("n").unwrap().value_source = crate::ValueSource::None;
         }
         owner_coverage(
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: "t_000000".parse().unwrap(),
                 name: table.clone(),
                 table: Box::new(definition),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
             Surface::Table(table.clone()),
             child,
             true,
@@ -688,12 +705,12 @@ fn adding_a_column_requires_more_than_its_default_transition() {
         serde_json::from_value(serde_json::json!({"type":"integer","nullable":true,"default":"7"}))
             .unwrap();
     owner_coverage(
-        Change::AddColumn {
+        Change::Column(ColumnChange::AddColumn {
             uid: "c_000000".parse().unwrap(),
             table: table.clone(),
             name: "n".into(),
             column: Box::new(column),
-        },
+        }),
         Surface::Column(table.column("n")),
         Surface::Default(table.column("n")),
         true,
@@ -729,13 +746,13 @@ pub(super) fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence, In
         before["membership"][0]["members"] = serde_json::json!([]);
         evidence.before = serde_json::from_value(before).unwrap();
         (
-            Change::RenameColumn {
+            Change::Column(ColumnChange::RenameColumn {
                 uid: "c_000000".parse().unwrap(),
                 table: table.clone(),
                 from: "n".into(),
                 to: "m".into(),
                 table_was: None,
-            },
+            }),
             Surface::Column(table.column("n")),
             Surface::Column(table.column("m")),
             old_object,
@@ -745,12 +762,12 @@ pub(super) fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence, In
         let mut new_object = table_object.clone();
         new_object.name[1] = "w".into();
         (
-            Change::RenameTable {
+            Change::Table(TableChange::RenameTable {
                 uid: "t_000000".parse().unwrap(),
                 from: table.clone(),
                 to: "app.w".parse().unwrap(),
                 defaults: vec![],
-            },
+            }),
             Surface::Table(table.clone()),
             Surface::Table("app.w".parse().unwrap()),
             table_object,
@@ -908,7 +925,8 @@ fn a_touched_tables_transition_carries_only_listed_table_family_references() {
                 changes.changes.iter().any(|step| {
                     matches!(
                         step.change,
-                        Change::RenameTable { .. } | Change::RenameColumn { .. }
+                        Change::Table(TableChange::RenameTable { .. })
+                            | Change::Column(ColumnChange::RenameColumn { .. })
                     ) && super::super::projection::touches(&step.change, &t.surface)
                 })
             })
@@ -1277,11 +1295,11 @@ fn aggregate_records(change: Change, owner: Surface, child: Surface, creating: b
 fn aggregate_table_drops_require_all_owned_records() {
     let table: TableName = "app.v".parse().unwrap();
     aggregate_records(
-        Change::DropTable {
+        Change::Table(TableChange::DropTable {
             uid: "t_000000".parse().unwrap(),
             name: table.clone(),
             detach_from: None,
-        },
+        }),
         Surface::Table(table.clone()),
         Surface::Default(table.column("n")),
         false,
@@ -1296,13 +1314,13 @@ fn aggregate_table_creation_requires_all_owned_records() {
     }))
     .unwrap();
     aggregate_records(
-        Change::CreateTable {
+        Change::Table(TableChange::CreateTable {
             uid: "t_000000".parse().unwrap(),
             name: table.clone(),
             table: Box::new(definition),
             beside_default: None,
             moves_at_most: None,
-        },
+        }),
         Surface::Table(table.clone()),
         Surface::Default(table.column("n")),
         true,
@@ -1317,19 +1335,19 @@ fn aggregate_column_changes_require_all_owned_records() {
             .unwrap();
     for (change, creating) in [
         (
-            Change::AddColumn {
+            Change::Column(ColumnChange::AddColumn {
                 uid: "c_000000".parse().unwrap(),
                 table: table.clone(),
                 name: "n".into(),
                 column: Box::new(column),
-            },
+            }),
             true,
         ),
         (
-            Change::DropColumn {
+            Change::Column(ColumnChange::DropColumn {
                 uid: "c_000000".parse().unwrap(),
                 column: table.column("n"),
-            },
+            }),
             false,
         ),
     ] {
@@ -1347,36 +1365,40 @@ fn aggregate_renames_require_owned_records_at_both_endpoints() {
     for column in [false, true] {
         let (changes, mut evidence, mut compiled) = rename_endpoints(column);
         let source = match &changes.changes[0].change {
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => panic!("rename fixture contains a rebuild"),
-            Change::RenameColumn { table, from, .. } => Surface::Column(table.column(from)),
-            Change::RenameTable { from, .. } => Surface::Table(from.clone()),
-            Change::CreateTable { .. }
-            | Change::DetachPartition { .. }
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => {
+                panic!("rename fixture contains a rebuild")
+            }
+            Change::Column(ColumnChange::RenameColumn { table, from, .. }) => {
+                Surface::Column(table.column(from))
+            }
+            Change::Table(TableChange::RenameTable { from, .. }) => Surface::Table(from.clone()),
+            Change::Table(TableChange::CreateTable { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
             | crate::change_family!(extensions)
             | crate::change_family!(search)
-            | Change::AttachPartition { .. }
-            | Change::DropTable { .. }
-            | Change::AddColumn { .. }
-            | Change::AddComputedColumn { .. }
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Table(TableChange::DropTable { .. })
+            | Change::Column(ColumnChange::AddColumn { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
             | crate::change_family!(policies)
             | crate::change_family!(table_properties)
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::AlterColumnNumbering { .. }
-            | Change::SetColumnDeprecated { .. }
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Column(ColumnChange::DropColumn { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
             | crate::change_family!(constraints)
-            | Change::AddIndex { .. }
-            | Change::DropIndex { .. }
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
             | crate::change_family!(rows)
             | crate::change_family!(modules)
             | crate::change_family!(type_values)
@@ -1487,11 +1509,11 @@ fn aggregate_renames_require_owned_records_at_both_endpoints() {
 fn mutation_inventory(change: Change, owner: Surface, child: Surface) {
     let table: TableName = "app.v".parse().unwrap();
     let (_, mut evidence, _) = owner_coverage(
-        Change::DropTable {
+        Change::Table(TableChange::DropTable {
             uid: "t_000000".parse().unwrap(),
             name: table.clone(),
             detach_from: None,
-        },
+        }),
         Surface::Table(table.clone()),
         Surface::Default(table.column("n")),
         false,
@@ -1544,7 +1566,8 @@ fn mutation_inventory(change: Change, owner: Surface, child: Surface) {
     evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
     if matches!(
         changes.changes[0].change,
-        Change::Grant { .. } | Change::Revoke { .. }
+        Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
     ) {
         evidence.authorization.changes = BTreeSet::from([0]);
     }
@@ -1591,7 +1614,7 @@ fn mutation_inventory(change: Change, owner: Surface, child: Surface) {
 fn column_type_mutations_require_complete_owner_inventories() {
     let table: TableName = "app.v".parse().unwrap();
     mutation_inventory(
-        Change::AlterColumnType {
+        Change::Column(ColumnChange::AlterColumnType {
             uid: "c_000000".parse().unwrap(),
             column: table.column("n"),
             from: "integer".parse().unwrap(),
@@ -1602,7 +1625,7 @@ fn column_type_mutations_require_complete_owner_inventories() {
             from_collation: None,
             to_collation: None,
             using: None,
-        },
+        }),
         Surface::Column(table.column("n")),
         Surface::Default(table.column("n")),
     );
@@ -1613,14 +1636,14 @@ fn nullability_mutations_require_complete_owner_inventories() {
     let table: TableName = "app.v".parse().unwrap();
     for to_nullable in [false, true] {
         mutation_inventory(
-            Change::AlterColumnNullability {
+            Change::Column(ColumnChange::AlterColumnNullability {
                 uid: "c_000000".parse().unwrap(),
                 column: table.column("n"),
                 ty: "integer".parse().unwrap(),
                 to_nullable,
                 through_external_partitions: false,
                 collation: None,
-            },
+            }),
             Surface::Column(table.column("n")),
             Surface::Column(table.column("n")),
         );
@@ -1631,26 +1654,26 @@ fn nullability_mutations_require_complete_owner_inventories() {
 fn table_constraint_mutations_require_complete_owner_inventories() {
     let table: TableName = "app.v".parse().unwrap();
     for change in [
-        Change::SetPrimaryKey {
+        Change::Constraint(ConstraintChange::SetPrimaryKey {
             nonclustered: false,
             table: table.clone(),
             from: None,
             to: Some(serde_json::from_value(serde_json::json!({"columns":["n"]})).unwrap()),
-        },
-        Change::AddUnique {
+        }),
+        Change::Constraint(ConstraintChange::AddUnique {
             clustered: false,
             table: table.clone(),
             name: "uq".into(),
             constraint: serde_json::from_value(serde_json::json!({"columns":["n"]})).unwrap(),
-        },
-        Change::DropUnique {
+        }),
+        Change::Constraint(ConstraintChange::DropUnique {
             table: table.clone(),
             name: "uq".into(),
-        },
-        Change::DropForeignKey {
+        }),
+        Change::Constraint(ConstraintChange::DropForeignKey {
             table: table.clone(),
             name: "fk".into(),
-        },
+        }),
     ] {
         mutation_inventory(
             change,
@@ -1663,11 +1686,17 @@ fn table_constraint_mutations_require_complete_owner_inventories() {
 #[test]
 fn module_mutations_require_complete_owned_inventories() {
     let plan = super::tests::plan();
-    let Change::CreateModule { id, module } = plan.changes.changes[0].change.clone() else {
+    let Change::Module(ModuleChange::CreateModule { id, module }) =
+        plan.changes.changes[0].change.clone()
+    else {
         panic!("module")
     };
     let owner = Surface::Module(id.clone());
-    mutation_inventory(Change::AlterModule { id, module }, owner.clone(), owner);
+    mutation_inventory(
+        Change::Module(ModuleChange::AlterModule { id, module }),
+        owner.clone(),
+        owner,
+    );
 }
 
 #[test]
@@ -1675,14 +1704,14 @@ fn mutations_of_created_or_removed_targets_use_the_planned_endpoint() {
     let table: TableName = "app.v".parse().unwrap();
     for creating in [false, true] {
         let change = if creating {
-            Change::CreateTable { uid: "t_000000".parse().unwrap(), name: table.clone(),
-                table: Box::new(serde_json::from_value(serde_json::json!({"columns":{"n":{"type":"integer","nullable":true,"default":"7"}}})).unwrap()), beside_default: None, moves_at_most: None }
+            Change::Table(TableChange::CreateTable { uid: "t_000000".parse().unwrap(), name: table.clone(),
+                table: Box::new(serde_json::from_value(serde_json::json!({"columns":{"n":{"type":"integer","nullable":true,"default":"7"}}})).unwrap()), beside_default: None, moves_at_most: None })
         } else {
-            Change::DropTable {
+            Change::Table(TableChange::DropTable {
                 uid: "t_000000".parse().unwrap(),
                 name: table.clone(),
                 detach_from: None,
-            }
+            })
         };
         let (mut changes, mut evidence, _) = owner_coverage(
             change,
@@ -1690,21 +1719,21 @@ fn mutations_of_created_or_removed_targets_use_the_planned_endpoint() {
             Surface::Default(table.column("n")),
             creating,
         );
-        let grant = Change::Grant {
+        let grant = Change::Permission(GrantChange::Grant {
             role: "reader".into(),
             target: crate::GrantTarget::Object(table.clone()),
             permissions: BTreeSet::from([crate::Permission::Select]),
-        };
+        });
         if creating {
             changes.changes.push(PlannedChange::new(grant));
-            changes
-                .changes
-                .push(PlannedChange::new(Change::SetPrimaryKey {
+            changes.changes.push(PlannedChange::new(Change::Constraint(
+                ConstraintChange::SetPrimaryKey {
                     nonclustered: false,
                     table: table.clone(),
                     from: None,
                     to: Some(serde_json::from_value(serde_json::json!({"columns":["n"]})).unwrap()),
-                }));
+                },
+            )));
             evidence.authorization.changes = BTreeSet::from([1]);
         } else {
             changes.changes.insert(0, PlannedChange::new(grant));
@@ -1717,7 +1746,8 @@ fn mutations_of_created_or_removed_targets_use_the_planned_endpoint() {
         unplanned.changes.retain(|p| {
             !matches!(
                 p.change,
-                Change::CreateTable { .. } | Change::DropTable { .. }
+                Change::Table(TableChange::CreateTable { .. })
+                    | Change::Table(TableChange::DropTable { .. })
             )
         });
         evidence.authorization.changes = BTreeSet::from([0]);
@@ -1742,19 +1772,19 @@ fn a_computed_column_add_or_drop_is_a_projected_column_lifecycle() {
     };
     for (change, creating) in [
         (
-            Change::AddComputedColumn {
+            Change::Column(ColumnChange::AddComputedColumn {
                 table: table.clone(),
                 name: "n".into(),
                 computed: computed.clone(),
-            },
+            }),
             true,
         ),
         (
-            Change::DropComputedColumn {
+            Change::Column(ColumnChange::DropComputedColumn {
                 table: table.clone(),
                 name: "n".into(),
                 computed,
-            },
+            }),
             false,
         ),
     ] {
@@ -1773,6 +1803,8 @@ fn a_computed_column_add_or_drop_is_a_projected_column_lifecycle() {
 
 mod inline_binding_floor {
     use super::*;
+    use crate::ColumnChange;
+    use crate::TableChange;
     use crate::resolver::{BoundSurface, Prerequisite};
     use crate::{Column, Generated, IdsFile, PlanOrigin, SavedPlan, Table};
 
@@ -1865,12 +1897,12 @@ mod inline_binding_floor {
     fn added_column(column: Column) -> (ChangeSet, ResolverEvidence, InputManifest) {
         let table: TableName = "app.v".parse().unwrap();
         owner_coverage(
-            Change::AddColumn {
+            Change::Column(ColumnChange::AddColumn {
                 uid: "c_000000".parse().unwrap(),
                 table: table.clone(),
                 name: "h".into(),
                 column: Box::new(column),
-            },
+            }),
             Surface::Column(table.column("h")),
             Surface::Default(table.column("h")),
             true,
@@ -1906,13 +1938,13 @@ mod inline_binding_floor {
             .columns
             .insert("n".into(), Column::new("integer".parse().unwrap()));
         owner_coverage(
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: "t_000000".parse().unwrap(),
                 name: name.clone(),
                 table: Box::new(table),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
             Surface::Table(name.clone()),
             Surface::Column(name.column("n")),
             true,
@@ -1923,7 +1955,8 @@ mod inline_binding_floor {
     fn table_creation_requires_every_distinct_inline_binding_resolution() {
         let name: TableName = "app.v".parse().unwrap();
         let (mut changes, mut evidence, compiled) = plain_table();
-        let Change::CreateTable { table, .. } = &mut changes.changes[0].change else {
+        let Change::Table(TableChange::CreateTable { table, .. }) = &mut changes.changes[0].change
+        else {
             panic!("create table fixture")
         };
         table.columns.get_mut("n").unwrap().value_source = crate::ValueSource::Default("7".into());
@@ -2077,12 +2110,12 @@ mod inline_binding_floor {
             .unwrap()
             .object
             .clone();
-        let Change::AddColumn {
+        let Change::Column(ColumnChange::AddColumn {
             table,
             name,
             column,
             ..
-        } = &mut changes.changes[0].change
+        }) = &mut changes.changes[0].change
         else {
             panic!("add column fixture")
         };
@@ -2112,6 +2145,8 @@ mod inline_binding_floor {
 
 mod column_vector_parent {
     use super::*;
+    use crate::ColumnChange;
+    use crate::TableChange;
     use crate::{Column, Generated, IdsFile, PlanOrigin, SavedPlan};
 
     fn fixtures() -> Vec<(ChangeSet, ResolverEvidence, InputManifest)> {
@@ -2133,12 +2168,12 @@ mod column_vector_parent {
                 Surface::Default(table.column("n"))
             };
             let (changes, mut evidence, compiled) = owner_coverage(
-                Change::AddColumn {
+                Change::Column(ColumnChange::AddColumn {
                     uid: "c_000000".parse().unwrap(),
                     table: table.clone(),
                     name: "n".into(),
                     column: Box::new(column),
-                },
+                }),
                 Surface::Column(table.column("n")),
                 child,
                 true,
@@ -2149,10 +2184,10 @@ mod column_vector_parent {
             fixtures.push((changes, evidence, compiled));
         }
         fixtures.push(owner_coverage(
-            Change::DropColumn {
+            Change::Column(ColumnChange::DropColumn {
                 uid: "c_000000".parse().unwrap(),
                 column: table.column("n"),
-            },
+            }),
             Surface::Column(table.column("n")),
             Surface::Default(table.column("n")),
             false,
@@ -2427,19 +2462,19 @@ mod column_vector_parent {
                 );
             }
             let lifecycle = if creating {
-                Change::CreateTable {
+                Change::Table(TableChange::CreateTable {
                     uid: "t_000000".parse().unwrap(),
                     name: table.clone(),
                     table: Box::default(),
                     beside_default: None,
                     moves_at_most: None,
-                }
+                })
             } else {
-                Change::DropTable {
+                Change::Table(TableChange::DropTable {
                     uid: "t_000000".parse().unwrap(),
                     name: table.clone(),
                     detach_from: None,
-                }
+                })
             };
             if creating {
                 changes.changes.insert(0, PlannedChange::new(lifecycle));
@@ -2483,7 +2518,7 @@ mod column_vector_parent {
         let uid: crate::Uid = "c_000000".parse().unwrap();
         for (change, surface, inventory) in [
             (
-                Change::AlterColumnType {
+                Change::Column(ColumnChange::AlterColumnType {
                     uid: uid.clone(),
                     column: table.column("n"),
                     from: "integer".parse().unwrap(),
@@ -2494,39 +2529,39 @@ mod column_vector_parent {
                     from_collation: None,
                     to_collation: None,
                     using: None,
-                },
+                }),
                 Surface::Column(table.column("n")),
                 BTreeSet::from([column.clone(), default.clone()]),
             ),
             (
-                Change::AlterColumnNullability {
+                Change::Column(ColumnChange::AlterColumnNullability {
                     uid: uid.clone(),
                     column: table.column("n"),
                     ty: "integer".parse().unwrap(),
                     to_nullable: false,
                     through_external_partitions: false,
                     collation: None,
-                },
+                }),
                 Surface::Column(table.column("n")),
                 BTreeSet::from([column.clone()]),
             ),
             (
-                Change::AlterColumnDefault {
+                Change::Column(ColumnChange::AlterColumnDefault {
                     uid: uid.clone(),
                     column: table.column("n"),
                     from: Some("7".into()),
                     to: Some("8".into()),
-                },
+                }),
                 Surface::Default(table.column("n")),
                 BTreeSet::from([default.clone()]),
             ),
             (
-                Change::AlterColumnExpression {
+                Change::Column(ColumnChange::AlterColumnExpression {
                     uid,
                     column: table.column("n"),
                     from: "1 + 4".into(),
                     to: "1 + 5".into(),
-                },
+                }),
                 Surface::Default(table.column("n")),
                 BTreeSet::from([default.clone()]),
             ),
@@ -2564,6 +2599,7 @@ mod column_vector_parent {
 /// transitions, and nothing else may differ (DEC-2143.5).
 mod scope_roots {
     use super::*;
+    use crate::ColumnChange;
 
     fn rescoped(manifest: &InputManifest, retained: &BTreeSet<ObjectIdentity>) -> InputManifest {
         let mut json = serde_json::to_value(manifest).unwrap();
@@ -2589,17 +2625,17 @@ mod scope_roots {
             not_null: false,
         };
         let change = if creating {
-            Change::AddComputedColumn {
+            Change::Column(ColumnChange::AddComputedColumn {
                 table: table.clone(),
                 name: "n".into(),
                 computed,
-            }
+            })
         } else {
-            Change::DropComputedColumn {
+            Change::Column(ColumnChange::DropComputedColumn {
                 table: table.clone(),
                 name: "n".into(),
                 computed,
-            }
+            })
         };
         let (changes, evidence, compiled) = owner_coverage(
             change,

@@ -1,5 +1,6 @@
 //! One routine-prerequisite policy for table and domain creation parts.
 use super::*;
+use pbps_model::TypeValueChange;
 pub(super) fn add(
     out: &mut Schedule,
     at: usize,
@@ -28,7 +29,11 @@ pub(super) fn add(
     // view `app.text`) is a guess, and so is a name that is no
     // function (DEC-2389.4).
     let read = part_texts(p, dialect, scratch);
-    let expressions = if matches!(p.change, Change::AlterDomain { .. }) && is_part(p) {
+    let expressions = if matches!(
+        p.change,
+        Change::TypeValue(TypeValueChange::AlterDomain { .. })
+    ) && is_part(p)
+    {
         domains::texts(&p.change)
     } else {
         expressions(&p.change)
