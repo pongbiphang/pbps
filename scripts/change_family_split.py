@@ -123,6 +123,33 @@ def function(source, name, binding='change'):
                     source.close_of[match + 2])
 
 
+def body_fingerprint(text):
+    """A body's fingerprint with rustfmt's elided arm braces undone.
+
+    rustfmt rewrites `X => { expr }` as `X => expr,` when the block holds one
+    expression and no comment, so `--check` after `cargo fmt` sees the same
+    arm without its braces. Strip one such outer block on both sides: a block
+    with a top-level `;` or a comment is a different spelling, and rustfmt
+    keeps its braces, so it still has to match exactly.
+    """
+    fp = fingerprint(text)
+    if len(fp) < 2 or fp[0][1] != '{' or fp[-1][1] != '}':
+        return fp
+    depth = 0
+    for i, (kind, value) in enumerate(fp):
+        if kind == 'comment':
+            return fp
+        if value in ('{', '(', '['):
+            depth += 1
+        elif value in ('}', ')', ']'):
+            depth -= 1
+            if depth == 0 and i != len(fp) - 1:
+                return fp
+        elif value == ';' and depth == 1:
+            return fp
+    return fp[1:-1]
+
+
 @dataclass
 class Arm:
     first: int
@@ -459,9 +486,9 @@ class Split:
                 raise ValueError(f'verification: arm multiplicity differs in {path}')
             for actual, (original, pattern, leading) in zip(copied, originals):
                 pairs = [(actual.pattern, pattern), (actual.guard, original.guard),
-                         (actual.body, original.body), (actual.leading, leading),
-                         (actual.trailing, original.trailing)]
-                if any(fingerprint(a) != fingerprint(b) for a, b in pairs):
+                         (actual.leading, leading), (actual.trailing, original.trailing)]
+                if (any(fingerprint(a) != fingerprint(b) for a, b in pairs)
+                        or body_fingerprint(actual.body) != body_fingerprint(original.body)):
                     raise ValueError(f'verification: arm content or order differs in {path}')
                 if verbatim and actual.body != original.body:
                     raise ValueError(f'verification: body was not moved verbatim in {path}')

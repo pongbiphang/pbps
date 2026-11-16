@@ -285,6 +285,31 @@ class SplitTests(unittest.TestCase):
                                                 'fn emit(table: &TableChange)'))
         self.check()
 
+    def test_check_accepts_formatter_eliding_the_braces_of_a_one_expression_arm(self):
+        self.split('        Change::Table(_) => {\n            make()\n        }')
+        path = self.result.module_path('Table')
+        moved = path.read_text()
+        path.write_text(moved.replace('_ => {\n            make()\n        }', '_ => make(),'))
+        self.check()
+
+    def test_check_still_refuses_a_changed_block_or_an_unbraced_statement_block(self):
+        self.split('        Change::Table(_) => {\n            let x = make();\n            x\n        }\n'
+                   '        Change::Column(_) => {\n            // Why.\n            make()\n        }')
+        table, column = self.result.module_path('Table'), self.result.module_path('Column')
+        for path, old, new in [
+            (table, '{\n            let x = make();\n            x\n        }', 'make(),'),
+            (column, '{\n            // Why.\n            make()\n        }', 'make(),'),
+            (table, 'x\n        }', 'other\n        }'),
+        ]:
+            with self.subTest(new=new, old=old):
+                before = path.read_text()
+                path.write_text(before.replace(old, new))
+                self.assertNotEqual(before, path.read_text())
+                with self.assertRaisesRegex(ValueError, 'arm content'):
+                    self.check()
+                path.write_text(before)
+        self.check()
+
     def test_failed_post_write_verification_restores_parent_and_removes_outputs(self):
         original = self.source('        Change::Table(_) => make(),')
         self.write(self.file, original)
