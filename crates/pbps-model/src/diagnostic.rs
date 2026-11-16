@@ -42,24 +42,18 @@ impl Declaration {
         }
     }
 
-    /// The uid `ids` holds for what this declaration names.
+    /// The uid the identity file holds for what this declaration names.
     ///
-    /// A scan of the kind's map, which is keyed by uid: the callers place
-    /// declarations once per command, and a second index kept beside the
-    /// file would be one more thing to keep in step with it.
-    pub fn uid_in<'a>(&self, ids: &'a crate::IdsFile) -> Option<&'a crate::Uid> {
-        fn held<'a, N: PartialEq>(
-            names: &'a BTreeMap<crate::Uid, N>,
-            name: &N,
-        ) -> Option<&'a crate::Uid> {
-            names.iter().find(|(_, n)| *n == name).map(|(uid, _)| uid)
-        }
+    /// Through an [`IdsIndex`](crate::IdsIndex) and not a scan of the file:
+    /// a caller asks once per declaration, and a scan per call made such a
+    /// loop quadratic in the schema (#1870).
+    pub fn uid_in<'a>(&self, ids: &crate::IdsIndex<'a>) -> Option<&'a crate::Uid> {
         match self {
-            Self::Table(n) => held(&ids.tables, n),
-            Self::Role(n) => held(&ids.roles, n),
-            Self::Type(n) => held(&ids.types, n),
-            Self::Extension(n) => held(&ids.extensions, n),
-            Self::Search(n) => held(&ids.search, n),
+            Self::Table(n) => ids.table_uid(n),
+            Self::Role(n) => ids.role_uid(n),
+            Self::Type(n) => ids.type_uid(n),
+            Self::Extension(n) => ids.extension_uid(n),
+            Self::Search(n) => ids.search_uid(n),
             Self::Module(_) | Self::Sequence(_) => None,
         }
     }
@@ -150,13 +144,13 @@ mod tests {
             // when the file can hold a uid for it.
             assert_eq!(
                 declaration.identity().is_some(),
-                declaration.uid_in(&ids).is_some(),
+                declaration.uid_in(&ids.index()).is_some(),
                 "{declaration:?}"
             );
             with_identity += usize::from(declaration.identity().is_some());
         }
         assert_eq!(with_identity, 5);
-        assert_eq!(declarations[4].uid_in(&ids), Some(&uid("s_aaaaaa")));
+        assert_eq!(declarations[4].uid_in(&ids.index()), Some(&uid("s_aaaaaa")));
         // Negative: a module and a sequence hold none, though a table of each
         // one's name is held (a sequence takes its identity with the part that
         // creates it, #2721).
@@ -166,7 +160,7 @@ mod tests {
 
     fn ids_hold_nothing_for(declaration: &Declaration, ids: &IdsFile) {
         assert_eq!(declaration.identity(), None);
-        assert_eq!(declaration.uid_in(ids), None);
+        assert_eq!(declaration.uid_in(&ids.index()), None);
     }
 
     #[test]
@@ -176,17 +170,17 @@ mod tests {
             declarations[1].identity(),
             Some((UidKind::Table, "app.orders".to_owned()))
         );
-        assert_eq!(declarations[1].uid_in(&ids), Some(&uid("t_aaaaaa")));
+        assert_eq!(declarations[1].uid_in(&ids.index()), Some(&uid("t_aaaaaa")));
         assert_eq!(
             declarations[0].identity(),
             Some((UidKind::Extension, "citext".to_owned()))
         );
-        assert_eq!(declarations[0].uid_in(&ids), Some(&uid("e_aaaaaa")));
+        assert_eq!(declarations[0].uid_in(&ids.index()), Some(&uid("e_aaaaaa")));
         // Negative: a name the file does not hold has an identity to take and
         // no uid yet; a role's uid is not found under a table of its name.
         let unknown = Declaration::Table(TableName::new("app", "reader"));
         assert!(unknown.identity().is_some());
-        assert_eq!(unknown.uid_in(&ids), None);
+        assert_eq!(unknown.uid_in(&ids.index()), None);
     }
 
     #[test]

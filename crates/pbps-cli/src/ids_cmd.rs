@@ -397,10 +397,13 @@ pub(crate) fn declared_placement(
     ids: &IdsFile,
     paths: &DeclaredPaths,
 ) -> anyhow::Result<Placement> {
+    // Built once: a lookup per declaration over the file itself is quadratic
+    // in the schema (#1870).
+    let index = ids.index();
     let mut placement = Placement::default();
     for (source, file) in &paths.files {
         // A declaration the old file never knew gets its identity from `plan`.
-        let Some(uid) = source.uid_in(ids) else {
+        let Some(uid) = source.uid_in(&index) else {
             continue;
         };
         placement
@@ -416,9 +419,8 @@ pub(crate) fn declared_placement(
             placement.order.insert(uid.clone(), order.collect());
         }
     }
-    let table = |name: &pbps_model::TableName| Source::Table(name.clone()).uid_in(ids);
     for (child, parent) in &paths.children {
-        if let (Some(c), Some(p)) = (table(child), table(parent)) {
+        if let (Some(c), Some(p)) = (index.table_uid(child), index.table_uid(parent)) {
             placement.children.insert(c.clone(), p.clone());
         }
     }
