@@ -554,13 +554,11 @@ fn declare_annotations(
     let registry = pbps_model::object_ref::Registry::new(&loaded.schema);
     for (path, written) in annotated {
         let before = errs.len();
-        for spelling in &written.spelled {
-            if let Err(message) = registry.parse(spelling, &loaded.dependencies) {
-                errs.push(LoadError::Yaml {
-                    path: path.clone(),
-                    message: format!("`depends_on` item `{spelling}`: {message}"),
-                });
-            }
+        for message in refused_spellings(&registry, &loaded.dependencies, &written) {
+            errs.push(LoadError::Yaml {
+                path: path.clone(),
+                message,
+            });
         }
         for (owner, _) in &written.deps.0 {
             let Ok(declaration) = registry.declaration(owner) else {
@@ -583,6 +581,29 @@ fn declare_annotations(
             loaded.hints.annotations.declare(written.deps);
         }
     }
+}
+
+/// What the whole project refuses in one file's `depends_on:` spellings
+/// (DEC-2469.8): a typed spelling that is also a declared module's legacy
+/// name, and a name that is an assumption outside the database.
+///
+/// It is its own function because two readers ask it. The loader asks it of
+/// today's files, and `plan --since` asks it of an older revision's: read
+/// without it, that revision's `table::app.t` would silently mean the table
+/// where its own declarations made it ambiguous.
+pub fn refused_spellings(
+    registry: &pbps_model::object_ref::Registry<'_>,
+    external: &pbps_model::dependency::Dependencies,
+    written: &Written,
+) -> Vec<String> {
+    written
+        .spelled
+        .iter()
+        .filter_map(|spelling| {
+            let message = registry.parse(spelling, external).err()?;
+            Some(format!("`depends_on` item `{spelling}`: {message}"))
+        })
+        .collect()
 }
 
 /// Lists every declaration file under a directory, in a stable order.

@@ -791,6 +791,43 @@ fn a_baseline_revisions_typed_annotation_orders_the_removal_of_what_it_names() {
 }
 
 #[test]
+fn a_baseline_revision_with_an_ambiguous_typed_spelling_is_refused() {
+    // At the older revision `table::app.t` is a table and also a view's legacy
+    // name. Read as the table, it would order a removal against the wrong
+    // object, so the revision is refused the way today's files would be.
+    let since = |spelling: &str| {
+        let p = with_default_after_function("");
+        p.file("m.yml", "view: table::app.t\ndefinition: SELECT 1 AS n\n");
+        let owner =
+            |dependency: &str| format!("view: app.v\n{dependency}definition: SELECT 1 AS n\n");
+        p.file("app.v.yml", &owner(""));
+        p.plan().unwrap();
+        p.git(&["add", "-A"]);
+        p.git(&["commit", "-qm", "base"]);
+        // The revision under test is committed as written: nothing checked it.
+        p.file(
+            "app.v.yml",
+            &owner(&format!("depends_on: [\"{spelling}\"]\n")),
+        );
+        p.git(&["commit", "-qam", "annotated"]);
+        p.file("app.v.yml", &owner(""));
+        p.plan()
+    };
+    let refusal = since("table::app.t").unwrap_err();
+    assert!(
+        refusal.contains("the baseline version itself is broken"),
+        "{refusal}"
+    );
+    assert!(
+        refusal.contains("`depends_on` item `table::app.t`"),
+        "{refusal}"
+    );
+    assert!(refusal.contains("ambiguous"), "{refusal}");
+    // Negative: the spelling that says which was meant is a readable baseline.
+    since("module::table::app.t").unwrap();
+}
+
+#[test]
 fn validate_names_each_typed_dependency_problem_from_yaml() {
     let check = |dependency: &str, expected: &[&str]| {
         let p = with_default_after_function(dependency);
