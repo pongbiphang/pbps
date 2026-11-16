@@ -551,7 +551,9 @@ indexes:
   `method:` names the access method only where it is not the default `btree`.
   An absent class is the method's default for the column's type. The first
   slice holds `method: gin` over `jsonb` columns, with the class left out or
-  `jsonb_path_ops`. SQL Server has only the default method and no classes, so
+  `jsonb_path_ops`, and over `tsvector` columns, with the class left out (its
+  only class, `tsvector_ops`, is its default and is refused when named,
+  DEC-1984.1). SQL Server has only the default method and no classes, so
   it refuses `method: gin` and any class (DEC-1169.1). A class is written bare
   (the engine's own, `pg_catalog`'s: `pg_catalog.x` is the bare `x`) or
   qualified by its schema; a qualified class is held when the project manages

@@ -8,7 +8,7 @@
 //! declaration) and `introspect` (a pull) both ask here, so a method added to
 //! the table is admitted by both or by neither, and the two cannot drift.
 
-use pbps_model::storage::MethodPolicy;
+use pbps_model::storage::{KeyType, MethodPolicy};
 use pbps_model::{Column, OpClassRef};
 
 /// Why a key's operator class is not one this model holds for the method.
@@ -26,20 +26,34 @@ pub(crate) enum ClassProblem {
     Outside,
 }
 
-/// `None` where `class` is a class this model holds for `policy`'s method.
-pub(crate) fn class_problem(policy: &MethodPolicy, class: &OpClassRef) -> Option<ClassProblem> {
+/// `None` where `class` is a class this model holds for `policy`'s method over
+/// a key of type `key` (the entry of the method's key types the column is, from
+/// [`key_type_of`]). A method held by key type reads a class against that type:
+/// `jsonb_path_ops` is not a class for a `tsvector`. A key whose type the method
+/// does not hold has no class to judge: the type is what is refused, once
+/// (DEC-1984.1).
+pub(crate) fn class_problem(
+    policy: &MethodPolicy,
+    class: &OpClassRef,
+    key: Option<&KeyType>,
+) -> Option<ClassProblem> {
     let Some(name) = class.as_bare() else {
         // A qualified class is held when a managed package provides it; whether
         // one does is the plan's pin to prove (DEC-2447.14), not the policy's.
         return (!policy.provider_classes).then_some(ClassProblem::Outside);
     };
-    if policy.classes.is_empty() && policy.default_class.is_none() {
+    let (default, classes) = match (policy.key_types.is_empty(), key) {
+        (true, _) => (None, policy.classes),
+        (false, Some(key)) => (Some(key.default_class), key.classes),
+        (false, None) => return None,
+    };
+    if classes.is_empty() && default.is_none() {
         return Some(ClassProblem::DefaultOnly);
     }
-    if policy.default_class == Some(name) {
+    if default == Some(name) {
         return Some(ClassProblem::DefaultSpelledOut);
     }
-    (!policy.classes.contains(&name)).then_some(ClassProblem::NotHeld)
+    (!classes.contains(&name)).then_some(ClassProblem::NotHeld)
 }
 
 /// Whether a key names a class a managed package provides, given the schema of
@@ -84,32 +98,60 @@ pub(crate) fn later_class(policy: &MethodPolicy, class: &OpClassRef) -> bool {
             .is_some_and(|n| n.ends_with("_minmax_multi_ops") || n.ends_with("_bloom_ops"))
 }
 
-/// Whether `column` is of the one type the method is held over, where it has
-/// one. Not an array of it, whose base is the element's (#1525 review).
+/// The key type of `policy` that `column` is: its normalised base type, and not
+/// an array of it, whose base is the element's (#1525 review). `None` where the
+/// method is not held by key type, or holds none of this column's.
+pub(crate) fn key_type_of(policy: &MethodPolicy, column: &Column) -> Option<&'static KeyType> {
+    let ty = crate::types::normalize(&column.ty).ok()?;
+    (!ty.is_array())
+        .then(|| policy.key_types.iter().find(|k| k.base == ty.base))
+        .flatten()
+}
+
+/// Whether `column` is of a type the method is held over, where it is held by
+/// type at all.
 pub(crate) fn holds_key_type(policy: &MethodPolicy, column: &Column) -> bool {
-    policy.key_type.is_none_or(|base| {
-        crate::types::normalize(&column.ty).is_ok_and(|t| t.base == base && !t.is_array())
-    })
+    policy.key_types.is_empty() || key_type_of(policy, column).is_some()
 }
 
-/// How a message names the one type a method is held over, e.g. "`jsonb`
-/// columns".
+/// How a message names the types a method is held over, e.g. "`jsonb` or
+/// `tsvector` columns".
 pub(crate) fn key_scope(policy: &MethodPolicy) -> String {
-    match policy.key_type {
-        Some(base) => format!("`{base}` columns"),
-        None => "columns".to_owned(),
+    if policy.key_types.is_empty() {
+        return "columns".to_owned();
     }
+    let types: Vec<String> = policy
+        .key_types
+        .iter()
+        .map(|k| format!("`{}`", k.base))
+        .collect();
+    format!("{} columns", types.join(" or "))
 }
 
-/// The classes a message offers: the default (by leaving the class out) and
-/// the held ones, as the user writes them.
-pub(crate) fn offered(policy: &MethodPolicy) -> String {
-    let mut words: Vec<String> = policy
-        .default_class
-        .iter()
-        .map(|d| format!("`{d}`"))
-        .collect();
-    words.extend(policy.classes.iter().map(|c| format!("`pg_catalog.{c}`")));
+/// The classes a message offers for a key of type `key` (every key type's, where
+/// it is not known): the default (by leaving the class out) and the held ones,
+/// as the user writes them.
+pub(crate) fn offered(policy: &MethodPolicy, key: Option<&KeyType>) -> String {
+    let mut words: Vec<String> = Vec::new();
+    let mut add = |default: Option<&str>, classes: &[&str]| {
+        for word in default
+            .map(|d| format!("`{d}`"))
+            .into_iter()
+            .chain(classes.iter().map(|c| format!("`pg_catalog.{c}`")))
+        {
+            if !words.contains(&word) {
+                words.push(word);
+            }
+        }
+    };
+    match (policy.key_types.is_empty(), key) {
+        (true, _) => add(None, policy.classes),
+        (false, Some(key)) => add(Some(key.default_class), key.classes),
+        (false, None) => policy
+            .key_types
+            .iter()
+            .for_each(|k| add(Some(k.default_class), k.classes)),
+    }
     words.join(" or ")
 }
 
@@ -129,17 +171,21 @@ mod tests {
         let policy = IndexMethod::Btree.policy();
         for text in ["text_pattern_ops", "pg_catalog.text_pattern_ops"] {
             assert_eq!(
-                class_problem(policy, &class(text)),
+                class_problem(policy, &class(text), None),
                 Some(ClassProblem::DefaultOnly),
                 "{text}"
             );
         }
         // A provider's class is the pin's to prove under a method that holds one.
-        assert_eq!(class_problem(policy, &class("ext.int4_ops")), None);
+        assert_eq!(class_problem(policy, &class("ext.int4_ops"), None), None);
         assert_eq!(
-            class_problem(IndexMethod::Brin.policy(), &class("ext.int4_ops")),
+            class_problem(IndexMethod::Brin.policy(), &class("ext.int4_ops"), None),
             Some(ClassProblem::Outside)
         );
+    }
+
+    fn column(ty: &str) -> Column {
+        Column::new(ty.parse().unwrap())
     }
 
     /// GIN over `jsonb` holds `jsonb_path_ops`, and its default only by being
@@ -147,33 +193,82 @@ mod tests {
     #[test]
     fn a_gin_key_holds_its_path_class_and_not_its_default_or_a_namesake() {
         let policy = IndexMethod::Gin.policy();
-        assert_eq!(class_problem(policy, &class("jsonb_path_ops")), None);
+        let jsonb = key_type_of(policy, &column("jsonb"));
+        assert!(jsonb.is_some());
+        assert_eq!(class_problem(policy, &class("jsonb_path_ops"), jsonb), None);
         assert_eq!(
-            class_problem(policy, &class("pg_catalog.jsonb_path_ops")),
+            class_problem(policy, &class("pg_catalog.jsonb_path_ops"), jsonb),
             None
         );
         assert_eq!(
-            class_problem(policy, &class("jsonb_ops")),
+            class_problem(policy, &class("jsonb_ops"), jsonb),
             Some(ClassProblem::DefaultSpelledOut)
         );
         assert_eq!(
-            class_problem(policy, &class("array_ops")),
+            class_problem(policy, &class("array_ops"), jsonb),
             Some(ClassProblem::NotHeld)
         );
         // A namesake of an engine class in another schema is a provider's class
         // to be proved, never the engine's.
-        assert_eq!(class_problem(policy, &class("app.jsonb_path_ops")), None);
+        assert_eq!(
+            class_problem(policy, &class("app.jsonb_path_ops"), jsonb),
+            None
+        );
     }
 
-    /// The key type is the method's, and an array of it is not it.
+    /// GIN over `tsvector` holds its one class, `tsvector_ops`, as the default
+    /// only: naming it is refused as `jsonb_ops` is, and another type's class is
+    /// not one of its classes (DEC-1984.1).
     #[test]
-    fn the_key_type_is_the_policys_and_never_an_array_of_it() {
-        let column = |ty: &str| Column::new(ty.parse().unwrap());
+    fn a_gin_tsvector_key_holds_its_default_only_and_no_other_types_class() {
+        let policy = IndexMethod::Gin.policy();
+        let tsvector = key_type_of(policy, &column("tsvector"));
+        assert_eq!(tsvector.map(|k| k.default_class), Some("tsvector_ops"));
+        assert_eq!(
+            class_problem(policy, &class("tsvector_ops"), tsvector),
+            Some(ClassProblem::DefaultSpelledOut)
+        );
+        assert_eq!(
+            class_problem(policy, &class("pg_catalog.tsvector_ops"), tsvector),
+            Some(ClassProblem::DefaultSpelledOut)
+        );
+        // Negatives: `jsonb_path_ops` is jsonb's, `jsonb_ops` and `tsvector_ops`
+        // each the other's default.
+        for other in ["jsonb_path_ops", "jsonb_ops", "array_ops"] {
+            assert_eq!(
+                class_problem(policy, &class(other), tsvector),
+                Some(ClassProblem::NotHeld),
+                "{other}"
+            );
+        }
+        let jsonb = key_type_of(policy, &column("jsonb"));
+        assert_eq!(
+            class_problem(policy, &class("tsvector_ops"), jsonb),
+            Some(ClassProblem::NotHeld)
+        );
+        // A type the method does not hold has no class to judge: the type is
+        // what is refused.
+        assert_eq!(class_problem(policy, &class("tsvector_ops"), None), None);
+        // A schema's class is the pin's to prove, as for jsonb.
+        assert_eq!(
+            class_problem(policy, &class("app.tsvector_ops"), tsvector),
+            None
+        );
+    }
+
+    /// The key types are the method's, and an array of one is not it.
+    #[test]
+    fn the_key_types_are_the_policys_and_never_an_array_of_one() {
         let gin = IndexMethod::Gin.policy();
         assert!(holds_key_type(gin, &column("jsonb")));
+        assert!(holds_key_type(gin, &column("tsvector")));
         assert!(!holds_key_type(gin, &column("jsonb[]")));
+        assert!(!holds_key_type(gin, &column("tsvector[]")));
         assert!(!holds_key_type(gin, &column("text")));
+        assert!(!holds_key_type(gin, &column("tsquery")));
+        assert!(!holds_key_type(gin, &column("inet")));
         assert!(holds_key_type(IndexMethod::Btree.policy(), &column("text")));
+        assert!(key_type_of(IndexMethod::Btree.policy(), &column("text")).is_none());
     }
 
     /// One rule for the declaration and the pull: a key naming a package's class is
@@ -223,11 +318,21 @@ mod tests {
 
     #[test]
     fn messages_name_what_the_policy_offers() {
+        let gin = IndexMethod::Gin.policy();
+        let of = |ty: &str| key_type_of(gin, &column(ty));
         assert_eq!(
-            offered(IndexMethod::Gin.policy()),
+            offered(gin, of("jsonb")),
             "`jsonb_ops` or `pg_catalog.jsonb_path_ops`"
         );
-        assert_eq!(key_scope(IndexMethod::Gin.policy()), "`jsonb` columns");
+        assert_eq!(offered(gin, of("tsvector")), "`tsvector_ops`");
+        assert_eq!(
+            offered(gin, None),
+            "`jsonb_ops` or `pg_catalog.jsonb_path_ops` or `tsvector_ops`"
+        );
+        assert_eq!(
+            key_scope(IndexMethod::Gin.policy()),
+            "`jsonb` or `tsvector` columns"
+        );
         assert_eq!(key_scope(IndexMethod::Btree.policy()), "columns");
     }
 }

@@ -127,6 +127,8 @@ mod retained2354;
 #[path = "support/domain_defaults2537.rs"]
 mod domain_defaults2537;
 
+#[path = "support/gin_tsvector1984.rs"]
+mod gin_tsvector1984;
 #[path = "support/managed_types.rs"]
 mod managed_types;
 #[path = "support/sequences2721.rs"]

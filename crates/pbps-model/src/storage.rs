@@ -122,6 +122,18 @@ pub struct IndexParameter {
     pub lock: Option<IndexLock>,
 }
 
+/// One key type a method is held over, as a normalised base type, and the
+/// engine's own classes for it (DEC-1984.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyType {
+    pub base: &'static str,
+    /// The type's default class under the method, which a declaration leaves
+    /// out and never spells.
+    pub default_class: &'static str,
+    /// The engine's own non-default classes the model holds for it, bare.
+    pub classes: &'static [&'static str],
+}
+
 /// What this model holds of one index access method: the capabilities the
 /// engine reports for it, the key types and operator classes it is held over,
 /// and its storage parameters with their change verdicts (DEC-2448.1).
@@ -136,14 +148,14 @@ pub struct MethodPolicy {
     pub ordered: bool,
     /// Whether a key may be an expression rather than a column.
     pub expression_keys: bool,
-    /// The one key type the method is held over, as a normalised base type;
-    /// `None` for any type its default class covers.
-    pub key_type: Option<&'static str>,
-    /// The engine's own non-default classes the model holds, bare.
+    /// The key types the method is held over, each with the classes the engine
+    /// takes for it; empty for any type its default class covers (B-tree).
+    /// A type outside the list is refused, and a class is read against the
+    /// type of the key it names, never the method's (DEC-1984.1).
+    pub key_types: &'static [KeyType],
+    /// The engine's own non-default classes the model holds, bare, for a method
+    /// that is not held by key type (`key_types` is empty): GiST's `inet_ops`.
     pub classes: &'static [&'static str],
-    /// The method's default class for `key_type`, which a declaration leaves
-    /// out and never spells; `None` where it depends on the key's type.
-    pub default_class: Option<&'static str>,
     /// Whether a column key may be compared under a collation of its own
     /// (`COLLATE` on a key). GIN's `jsonb` has none.
     pub collation: bool,
@@ -249,9 +261,8 @@ static BTREE: MethodPolicy = MethodPolicy {
     include: true,
     ordered: true,
     expression_keys: true,
-    key_type: None,
+    key_types: &[],
     classes: &[],
-    default_class: None,
     collation: true,
     exclusion: true,
     provider_classes: true,
@@ -269,9 +280,21 @@ static GIN: MethodPolicy = MethodPolicy {
     include: false,
     ordered: false,
     expression_keys: false,
-    key_type: Some("jsonb"),
-    classes: &["jsonb_path_ops"],
-    default_class: Some("jsonb_ops"),
+    key_types: &[
+        KeyType {
+            base: "jsonb",
+            default_class: "jsonb_ops",
+            classes: &["jsonb_path_ops"],
+        },
+        // The ordinary full-text index: `tsvector_ops` is the only class the
+        // engine has for it, and it is the default (measured on 16.15 and 18.6).
+        KeyType {
+            base: "tsvector",
+            default_class: "tsvector_ops",
+            classes: &[],
+        },
+    ],
+    classes: &[],
     collation: false,
     exclusion: false,
     provider_classes: true,
@@ -299,9 +322,8 @@ static GIST: MethodPolicy = MethodPolicy {
     include: true,
     ordered: false,
     expression_keys: true,
-    key_type: None,
+    key_types: &[],
     classes: &["inet_ops"],
-    default_class: None,
     collation: true,
     exclusion: true,
     provider_classes: true,
@@ -335,9 +357,8 @@ static BRIN: MethodPolicy = MethodPolicy {
     expression_keys: true,
     exclusion: false,
     provider_classes: false,
-    key_type: None,
+    key_types: &[],
     classes: &[],
-    default_class: None,
     collation: false,
     typed_columns: &[
         ("smallint", None),
@@ -547,19 +568,24 @@ mod tests {
         let b = IndexMethod::Btree.policy();
         assert_eq!(b.method, IndexMethod::Btree);
         assert!(b.unique && b.include && b.ordered && b.expression_keys);
-        assert_eq!(
-            (b.key_type, b.classes, b.default_class),
-            (None, &[][..], None)
-        );
+        assert_eq!((b.key_types, b.classes), (&[][..], &[][..]));
         assert_eq!(b.lock, IndexLock::ShareUpdateExclusive);
         let g = IndexMethod::Gin.policy();
         assert_eq!(g.method, IndexMethod::Gin);
         assert!(!g.unique && !g.include && !g.ordered && !g.expression_keys);
-        assert_eq!(g.key_type, Some("jsonb"));
+        let held: Vec<_> = g
+            .key_types
+            .iter()
+            .map(|k| (k.base, k.default_class, k.classes))
+            .collect();
         assert_eq!(
-            (g.classes, g.default_class),
-            (&["jsonb_path_ops"][..], Some("jsonb_ops"))
+            held,
+            [
+                ("jsonb", "jsonb_ops", &["jsonb_path_ops"][..]),
+                ("tsvector", "tsvector_ops", &[][..]),
+            ]
         );
+        assert!(g.classes.is_empty());
         assert_eq!(g.lock, IndexLock::AccessExclusive);
         let names = |p: &MethodPolicy| p.parameters.iter().map(|x| x.name).collect::<Vec<_>>();
         assert_eq!(names(b), ["deduplicate_items", "fillfactor"]);
@@ -597,7 +623,7 @@ mod tests {
         );
         assert_eq!(g.lock_of([]), g.lock);
         assert_eq!(g.classes, &["inet_ops"]);
-        assert_eq!(g.default_class, None);
+        assert!(g.key_types.is_empty());
         assert_eq!(
             g.typed_columns,
             &[
@@ -627,7 +653,7 @@ mod tests {
         let b = IndexMethod::Brin.policy();
         assert_eq!(b.method, IndexMethod::Brin);
         assert!(!b.unique && !b.include && !b.ordered && b.expression_keys && !b.collation);
-        assert_eq!((b.classes, b.default_class), (&[][..], None));
+        assert_eq!((b.classes, b.key_types), (&[][..], &[][..]));
         assert_eq!(b.lock, IndexLock::AccessExclusive);
         assert_eq!(
             b.change_of(["pages_per_range"]),

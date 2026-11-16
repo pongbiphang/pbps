@@ -9786,3 +9786,36 @@ and `validate` refuses a declaration whose index names the table's filegroup,
 by the model's equality; so the pull now leaves that table out and names the
 index and the filegroup, where it used to write a table that quietly lost the
 placement. A second pull says the same and writes nothing new.
+
+<a id="dec-1984-1"></a>
+
+**DEC-1984.1. GIN is held over `tsvector` as well as `jsonb`, under a key-type list that carries each type's classes (#1984).**
+A GIN index over a `tsvector` column is the ordinary full-text index. Measured on
+16.15 and 18.6, identical: `CREATE INDEX .. USING gin (tsv)` is accepted,
+`pg_get_indexdef` omits the class because `tsvector_ops` is the access method's
+default for the type (`pg_opclass.opcdefault`), and it is the only GIN class there
+is for `tsvector`. So the key is held exactly as a `jsonb` one under `jsonb_ops` is:
+declared with the class left out, **refused when named** with the message
+`jsonb_ops` gets ("is GIN's default for `tsvector`; leave the class out"), and read
+back as no class. `unique`, `include` and `desc` stay refused on it, as on any GIN
+index; GIN over `text`, `tsquery`, `inet` or an array of either type stays refused,
+now naming both types.
+
+The gate is a list, not one type. `MethodPolicy.key_type` and `default_class` become
+`key_types: &[KeyType { base, default_class, classes }]`, so a class is read against
+the type of the key it names: `jsonb_path_ops` is not a class for a `tsvector`, and
+`tsvector_ops` is not one for a `jsonb` (`NotHeld`, with each type's own wording).
+`classes` remains for a method not held by type (GiST's `inet_ops`). Declaration
+and pull read it through `index_policy` (`key_type_of`, `class_problem`, `offered`),
+so a type is admitted by both or neither. A part that gives a type a default class
+the engine's own list does not hold (a package's, #2765) adds an entry, or a source
+of entries, in that one place and in no reader.
+
+Out of this slice and unchanged: GIN over an expression (`to_tsvector(..)`), GiST
+over `tsvector` (held already as a typed column), and package-provided default
+classes. A btree over a `tsvector` is as before.
+
+Formats: none. No saved plan, state or published schema document changes. The
+declaration schema's descriptions of `method: gin` still say "over `jsonb`"; updating
+that wording moves the published schema set, so it waits for a number of its own.
+

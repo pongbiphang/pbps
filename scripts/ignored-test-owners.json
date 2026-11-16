@@ -941,6 +941,8 @@
         "partition_trigger1811::a_clone_in_another_enabled_mode_leaves_the_tree_out_by_name",
         "partition_trigger1811::an_own_trigger_named_like_the_parents_row_trigger_is_refused_by_name",
         "exclude2448::a_retype_of_a_quoted_key_column_in_an_expression_is_refused_by_name",
+        "gin_tsvector1984::a_gin_index_over_a_tsvector_pulls_re_plans_empty_and_bootstraps",
+        "gin_tsvector1984::a_declared_gin_index_over_a_tsvector_is_created_and_a_named_default_or_another_type_is_refused",
         "exclude2448::an_enum_rebuild_that_retypes_a_held_column_is_refused_by_name",
         "extensions2447_update::an_update_is_rehearsed_sealed_gated_applied_and_the_next_plan_waits_for_the_externals_file",
         "extensions2447_update::an_update_offline_or_without_a_rehearsal_is_refused_by_name_and_writes_nothing",

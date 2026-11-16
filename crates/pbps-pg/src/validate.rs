@@ -378,8 +378,8 @@ fn exclusion(
 /// has no default GIN class at all.
 fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
     use crate::index_policy::{
-        ClassProblem, class_problem, holds_expression_key, holds_key_type, key_scope, later_class,
-        offered, provider_key,
+        ClassProblem, class_problem, holds_expression_key, holds_key_type, key_scope, key_type_of,
+        later_class, offered, provider_key,
     };
     let policy = index.method.policy();
     let method = index.method.as_str().to_ascii_uppercase();
@@ -441,6 +441,11 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
             found.extend(typed);
         }
         let Some(class) = &key.opclass else { continue };
+        // The type a class is read against: the key column's entry of the
+        // method's key types (DEC-1984.1).
+        let key_type = column
+            .and_then(|c| table.columns.get(c))
+            .and_then(|c| key_type_of(policy, c));
         let at = format!("`{shown}`");
         let named = class.shown();
         if later_class(policy, class) {
@@ -461,7 +466,7 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
         if spoke && policy.classes.is_empty() {
             continue;
         }
-        found.push(invalid(match class_problem(policy, class) {
+        found.push(invalid(match class_problem(policy, class, key_type) {
             None => continue,
             // The B-tree's own wording: its direction words are the likelier slip.
             Some(ClassProblem::DefaultOnly) if method == "BTREE" => format!(
@@ -476,24 +481,33 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
             Some(ClassProblem::DefaultSpelledOut) => format!(
                 "{what} names `{named}` for {at}, which is {method}'s default for \
                  `{}`; leave the class out",
-                policy.key_type.unwrap_or("its key type")
+                key_type.map_or("its key type", |k| k.base)
             ),
+            // A type with no class beside its default has nothing to offer but it.
+            Some(ClassProblem::NotHeld) if key_type.is_some_and(|k| k.classes.is_empty()) => {
+                let key = key_type.expect("checked");
+                format!(
+                    "{what} indexes {at} with operator class `{named}`; a {method} index \
+                     over `{}` here takes only its default `{}`, so leave the class out",
+                    key.base, key.default_class
+                )
+            }
             Some(ClassProblem::NotHeld) => format!(
                 "{what} indexes {at} with operator class `{named}`; a {method} index \
                  over `{}` here takes `{}` or, by leaving it out, the \
                  default `{}`",
-                policy.key_type.unwrap_or("its key type"),
-                policy.classes.join("` or `"),
-                policy.default_class.unwrap_or("its default"),
+                key_type.map_or("its key type", |k| k.base),
+                key_type.map_or(policy.classes, |k| k.classes).join("` or `"),
+                key_type.map_or("its default", |k| k.default_class),
             ),
             Some(ClassProblem::Outside) => format!(
                 "{what} indexes {at} with operator class `{named}`, which a schema owns; a {method} \
                  index here holds only the engine's own classes ({}), because no package \
                  provides one for it",
-                if policy.classes.is_empty() && policy.default_class.is_none() {
+                if policy.classes.is_empty() && policy.key_types.is_empty() {
                     "none, for a B-tree".to_owned()
                 } else {
-                    offered(policy)
+                    offered(policy, key_type)
                 }
             ),
         }));
@@ -1266,6 +1280,11 @@ mod tests {
             "n".into(),
             pbps_model::Column::new("integer".parse().unwrap()),
         );
+        for (name, ty) in [("tsv", "tsvector"), ("q", "tsquery"), ("t", "text")] {
+            table
+                .columns
+                .insert(name.into(), pbps_model::Column::new(ty.parse().unwrap()));
+        }
         table.indexes.insert(
             "ix".into(),
             Index {
@@ -1742,7 +1761,78 @@ mod tests {
         );
         refused(
             indexed(IndexMethod::Gin, &[("n", None, false)]),
-            &["only over `jsonb` columns"],
+            &["only over `jsonb` or `tsvector` columns"],
+        );
+    }
+
+    /// GIN over `tsvector` is the ordinary full-text index: held under its default
+    /// class, which a declaration leaves out; naming it is refused as `jsonb_ops` is,
+    /// and everything the engine refuses for GIN stays refused. A btree over a
+    /// `tsvector`, GIN over a type with no GIN class and an expression are as before
+    /// (DEC-1984.1).
+    #[test]
+    fn a_gin_index_over_a_tsvector_is_held_under_its_default_class() {
+        use IndexMethod::{Btree, Gin};
+        assert!(structure(&indexed(Gin, &[("tsv", None, false)])).is_empty());
+        let mut filtered = indexed(Gin, &[("tsv", None, false)]);
+        filtered.indexes.get_mut("ix").unwrap().filter = Some("n > 0".into());
+        assert!(structure(&filtered).is_empty());
+        // A jsonb one is as it was.
+        assert!(structure(&indexed(Gin, &[("body", None, false)])).is_empty());
+        let refused = |table: Table, expected: &[&str]| {
+            let found = structure(&table);
+            for part in expected {
+                assert!(
+                    found.iter().any(|m| m.contains(part)),
+                    "expected `{part}` in {found:?}"
+                );
+            }
+            assert!(!found.is_empty(), "{expected:?}");
+        };
+        // Naming the default is refused, with the message `jsonb_ops` gets.
+        let named = structure(&indexed(Gin, &[("tsv", Some("tsvector_ops"), false)]));
+        let jsonb = structure(&indexed(Gin, &[("body", Some("jsonb_ops"), false)]));
+        assert!(
+            named
+                .iter()
+                .any(|m| m.contains("is GIN's default for `tsvector`; leave the class out")),
+            "{named:?}"
+        );
+        assert!(
+            jsonb
+                .iter()
+                .any(|m| m.contains("is GIN's default for `jsonb`; leave the class out")),
+            "{jsonb:?}"
+        );
+        refused(
+            indexed(Gin, &[("tsv", Some("pg_catalog.tsvector_ops"), false)]),
+            &["leave the class out"],
+        );
+        // Another type's class is no class of a tsvector.
+        refused(
+            indexed(Gin, &[("tsv", Some("jsonb_path_ops"), false)]),
+            &["takes only its default `tsvector_ops`"],
+        );
+        // What stays refused on this index, as on a jsonb one.
+        refused(indexed(Gin, &[("tsv", None, true)]), &["has no order"]);
+        let mut unique = indexed(Gin, &[("tsv", None, false)]);
+        unique.indexes.get_mut("ix").unwrap().unique = true;
+        refused(unique, &["cannot be unique"]);
+        let mut include = indexed(Gin, &[("tsv", None, false)]);
+        include.indexes.get_mut("ix").unwrap().include = vec!["n".into()];
+        refused(include, &["cannot include"]);
+        // Types GIN has no class for here, and the names of the held ones.
+        for column in ["t", "n", "q"] {
+            refused(
+                indexed(Gin, &[(column, None, false)]),
+                &["only over `jsonb` or `tsvector` columns"],
+            );
+        }
+        // A btree over a tsvector is unchanged: held, under its default class.
+        assert!(structure(&indexed(Btree, &[("tsv", None, false)])).is_empty());
+        refused(
+            indexed(Btree, &[("tsv", Some("tsvector_ops"), false)]),
+            &["takes only its type's default class"],
         );
     }
 
