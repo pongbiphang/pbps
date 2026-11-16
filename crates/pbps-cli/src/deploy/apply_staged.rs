@@ -3,7 +3,7 @@
 
 use super::*;
 
-pub(super) async fn apply_staged_under_lock<D: crate::emission::Engine>(
+pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
     conn: &mut Conn,
     d: &Deployment<'_, D>,
     resume: bool,
@@ -941,8 +941,22 @@ pub(super) async fn refuse_recreated_tables(
     statements: &[pbps_dialect::Statement],
     unmanaged: &[TableName],
 ) -> anyhow::Result<()> {
+    let selected = crate::engine::apply_session::selected(conn.driver());
+    pbps_cli::with_plan_dialect!(&selected, |session| {
+        refuse_recreated_tables_with_session(session, conn, changes, statements, unmanaged).await
+    })
+}
+
+pub(super) async fn refuse_recreated_tables_with_session<D: crate::engine::ApplySession>(
+    session: &D,
+    conn: &mut Conn,
+    changes: &pbps_model::ChangeSet,
+    statements: &[pbps_dialect::Statement],
+    unmanaged: &[TableName],
+) -> anyhow::Result<()> {
     let absent = removed_table_names(changes, statements);
-    if let Some(name) = crate::engine::matching_table_names(conn, &absent, unmanaged)
+    if let Some(name) = session
+        .removed_name_matches(conn, &absent, unmanaged)
         .await?
         .first()
     {

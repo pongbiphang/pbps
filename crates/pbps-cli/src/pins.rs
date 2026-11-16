@@ -265,25 +265,45 @@ pub async fn check(
     managed: &Managed,
     at: Check<'_>,
 ) -> anyhow::Result<()> {
-    crate::engine::check_declared_type_pins(conn, project, plan, managed, at).await?;
-    crate::engine::check_type_pins(
-        conn,
-        plan,
-        &project.config.trusted_roles,
-        &managed.references,
-        matches!(at.within(), pbps_pg::pins::Within::CallersTransaction),
-    )
-    .await?;
-    check_selected(conn, project, target, plan, at).await?;
-    let pins = plan.routine_pins.as_ref();
-    let Some(read) = crate::engine::read_pinned_routines(conn, at.within())
+    let selected = crate::engine::apply_session::selected(conn.driver());
+    pbps_cli::with_plan_dialect!(&selected, |session| {
+        check_with_session(
+            session,
+            conn,
+            &Approved {
+                project,
+                target,
+                plan,
+                managed,
+            },
+            at,
+        )
         .await
-        .with_context(|| {
-            format!(
-                "could not read the routines this plan pins, {} (DEC-319.1)",
-                at.when()
-            )
-        })?
+    })
+}
+
+pub(crate) async fn check_with_session<D: crate::engine::ApplySession>(
+    session: &D,
+    conn: &mut Conn,
+    approved: &Approved<'_>,
+    at: Check<'_>,
+) -> anyhow::Result<()> {
+    let Approved {
+        project,
+        target,
+        plan,
+        managed,
+    } = *approved;
+    session.declared_type_replay(conn, approved, at).await?;
+    session.external_catalog(conn, approved, at).await?;
+    check_selected(session, conn, approved, at).await?;
+    let pins = plan.routine_pins.as_ref();
+    let Some(read) = session.replaceable_rows(conn, at).await.with_context(|| {
+        format!(
+            "could not read the routines this plan pins, {} (DEC-319.1)",
+            at.when()
+        )
+    })?
     else {
         return Ok(());
     };
@@ -380,24 +400,22 @@ pub async fn seal_selected(
     Ok((sources, Some(pins)))
 }
 
-async fn check_selected(
+async fn check_selected<D: crate::engine::ApplySession>(
+    session: &D,
     conn: &mut Conn,
-    project: &Project,
-    target: &Target,
-    plan: &pbps_model::SavedPlan,
+    approved: &Approved<'_>,
     at: Check<'_>,
 ) -> anyhow::Result<()> {
+    let Approved {
+        project,
+        target,
+        plan,
+        ..
+    } = *approved;
     if project.config.pin_type_routines != plan.pin_type_routines {
         bail!("pin_type_routines changed since planning; plan again against the database");
     }
-    let roots = crate::engine::type_input_routines(
-        conn,
-        &plan.type_pins,
-        &project.config.trusted_roles,
-        plan.pin_type_routines,
-        matches!(at.within(), pbps_pg::pins::Within::CallersTransaction),
-    )
-    .await?;
+    let roots = session.reviewed_input_roots(conn, approved, at).await?;
     // The plan also holds what its expressions reached; the sites that run them
     // check that set themselves (`Admission::approving`).
     let expected: BTreeSet<_> = plan.type_routines.iter().map(|r| r.oid).collect();
@@ -410,9 +428,9 @@ async fn check_selected(
         }
         bail!("the plan has no reviewed type routine pins; plan again");
     };
-    let (read, sources) =
-        pbps_pg::pins::selected(conn, at.within(), &expected.into_iter().collect::<Vec<_>>())
-            .await?;
+    let (read, sources) = session
+        .selected_rows(conn, at, &expected.into_iter().collect::<Vec<_>>())
+        .await?;
     let key = key(project, target).map_err(anyhow::Error::msg)?;
     let now = digests(&key, &unmanaged(read.routines, &BTreeSet::new()));
     let changed = differing(&pins.routines, &now);

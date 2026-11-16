@@ -1597,7 +1597,7 @@ pub(super) fn blocking_history_occupants<'a>(
 /// to the engine: given an existing table whose columns match, SQL Server
 /// takes it as the history, rows, layout and all, where any other `CREATE`
 /// would be refused (measured on 17.0).
-pub(super) async fn refuse_taken_history_names(
+pub(crate) async fn refuse_taken_history_names(
     conn: &mut Conn,
     cs: &pbps_model::ChangeSet,
     label: &str,
@@ -1671,6 +1671,18 @@ pub(super) async fn refuse_taken_role_names(
     wanted: &[pbps_model::RoleName],
     vacated: &[pbps_model::RoleName],
 ) -> anyhow::Result<()> {
+    let selected = crate::engine::apply_session::selected(conn.driver());
+    pbps_cli::with_plan_dialect!(&selected, |session| {
+        refuse_taken_role_names_with_session(session, conn, wanted, vacated).await
+    })
+}
+
+pub(super) async fn refuse_taken_role_names_with_session<D: crate::engine::ApplySession>(
+    session: &D,
+    conn: &mut Conn,
+    wanted: &[pbps_model::RoleName],
+    vacated: &[pbps_model::RoleName],
+) -> anyhow::Result<()> {
     if wanted.is_empty() {
         return Ok(());
     }
@@ -1680,7 +1692,8 @@ pub(super) async fn refuse_taken_role_names(
     // database reads as one name pass every check against the catalog, and
     // the second `CREATE ROLE` fails after everything before it has run
     // (DECISIONS 123).
-    let alike = crate::engine::names_alike(conn, &wanted)
+    let alike = session
+        .alike_role_names(conn, &wanted)
         .await
         .context("cannot compare the declared role names")?;
     if !alike.is_empty() {
@@ -1696,7 +1709,8 @@ pub(super) async fn refuse_taken_role_names(
             pairs.join(", ")
         );
     }
-    let held = crate::engine::principals_holding(conn, &wanted, &vacated)
+    let held = session
+        .principal_name_holders(conn, &wanted, &vacated)
         .await
         .context("cannot read the database principals")?;
     if held.is_empty() {
