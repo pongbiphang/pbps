@@ -5,6 +5,7 @@ use crate::deploy::{
     ApplyRequest, Deployment, apply_staged_under_lock, apply_under_lock, record_failed_apply,
     reject_non_transactional,
 };
+use crate::engine::ApplySession as _;
 use anyhow::{Context as _, bail};
 use pbps_config::Project;
 use pbps_dialect::Dialect as _;
@@ -109,7 +110,7 @@ pub(in crate::deploy) async fn apply_async(
         }
 
         let statements = crate::statements(plan, dialect)?;
-        crate::engine::require_transactional_rebuilds(target.driver(), &plan.changes, staged)?;
+        dialect.rebuild_mode(&plan.changes, staged)?;
         // Only for a transactional plan. A staged one exists *because* its
         // statement cannot run inside a transaction (ADR-0003): `plan --db
         // --staged` accepts it deliberately, and rejecting it here would leave
@@ -122,7 +123,7 @@ pub(in crate::deploy) async fn apply_async(
             reject_non_transactional(&statements)?;
         }
         let names = pbps_model::plan_names::PlanNames::of(&plan.changes.changes, &plan.ids)?;
-        let targets = crate::engine::rename_targets(target.driver(), &names);
+        let targets = dialect.rename_targets(&names);
         // A resolved plan's key, before anything connects: evidence sealed under
         // another key, or none, is no evidence here (#616, DEC-952.1).
         let keyed = pbps_cli::resolver::apply::Keyed::check(
@@ -130,6 +131,7 @@ pub(in crate::deploy) async fn apply_async(
             pbps_cli::resolver::sealing::environment_key(project, target.environment()),
             &target.label,
         )?;
+        let mut session = Default::default();
         let deployment = Deployment {
             project,
             target,
@@ -147,8 +149,7 @@ pub(in crate::deploy) async fn apply_async(
 
             // This capability is constant for the connection and needs no ledger
             // lock. Check before any writes, including staged resumes.
-            crate::engine::permission_support(&mut conn, &plan.changes, &plan.ids).await?;
-            crate::engine::generation_support(&mut conn, &plan.changes, &plan.ids).await?;
+            dialect.connection_support(&mut conn, plan).await?;
             // A resolved plan's cluster, constant for the connection like the
             // checks above: the evidence describes one cluster (#616, DEC-1685.1).
             let resolved = match &keyed {
@@ -165,7 +166,7 @@ pub(in crate::deploy) async fn apply_async(
                     .await
                     .map(Some)
             } else {
-                apply_under_lock(&mut conn, &deployment, resolved.as_ref()).await
+                apply_under_lock(&mut conn, &deployment, &mut session, resolved.as_ref()).await
             };
             if let Err(error) = &result {
                 record_failed_apply(&mut conn, &deployment, error).await;

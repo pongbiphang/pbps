@@ -2,6 +2,8 @@
 //! around them.
 
 use super::*;
+use crate::engine::ApplySession as _;
+use crate::engine::apply_session::Execution;
 
 /// What this plan implies about the data, asked of the engine (SPEC §7.5).
 ///
@@ -50,14 +52,40 @@ pub(crate) async fn run_probes_observed(
     // A recorded conversion's expression is judged before any probe evaluates
     // it: the probe would run non-built-in code as the deployer, unvetted.
     let mark = admission.mark();
-    let immutable = crate::engine::vet_conversions(conn, admission, names.changes()).await?;
-    crate::engine::vet_drop_requirements(conn, admission, names).await?;
+    let selected = crate::engine::apply_session::selected(conn.driver());
+    let immutable = pbps_cli::with_plan_dialect!(&selected, |session| {
+        session
+            .conversions(conn, admission, names.changes())
+            .await?
+    });
+    for (index, step) in names.changes().iter().enumerate() {
+        let Some(guard) = &step.drop_guard else {
+            continue;
+        };
+        // The UID survives renames and address reuse. Never fall back to an
+        // address when the target has no stored evidence for this identity.
+        let table = names
+            .table_at(&guard.table_uid, pbps_model::plan_names::At::Start)
+            .ok_or_else(|| {
+                anyhow::anyhow!("the requirement's table identity has no stored target")
+            })?;
+        for requirement in guard.requirements.values() {
+            let columns = pbps_cli::with_plan_dialect!(&selected, |session| {
+                session
+                    .requirement(conn, admission, table, &requirement.predicate)
+                    .await?
+            });
+            pbps_diff::drop_requirements::check_columns(guard, index, names, &columns)
+                .map_err(anyhow::Error::msg)?;
+        }
+    }
     // The expressions the plan gives a table are evaluated by the probes too, so
     // they are judged first. One that is not admitted yet, or cannot be bound
     // before the plan creates what it uses, is left to the check just before its
     // statement; the probes that would run it are skipped, not run unjudged.
-    let table_unjudged =
-        crate::engine::table_expressions_left_unjudged(conn, admission, names.changes()).await;
+    let table_unjudged = pbps_cli::with_plan_dialect!(&selected, |session| {
+        session.table_sites(conn, admission, names.changes()).await
+    });
     if table_unjudged || admission.relied_since(mark) {
         // Plan time, and a conversion or requirement is admitted only by the
         // review: no probe evaluates it before the human has read the source.
@@ -300,19 +328,21 @@ pub(super) async fn execute_transaction_body(
     Ok(())
 }
 
-pub(super) async fn execute_statements(
+pub(super) async fn execute_statements<D: crate::engine::ApplySession>(
     conn: &mut Conn,
+    dialect: &D,
+    session: &D::State,
     statements: &crate::emission::LoweredPlan,
-    data_guard: &crate::engine::DataWriteGuard,
     reviewed: &crate::pins::Approved<'_>,
     progress: Option<&services::Progress>,
 ) -> anyhow::Result<()> {
     for position in 0..statements.len() {
-        execute_statement(
+        execute_statement_with_session(
+            dialect,
             conn,
             statements,
             position,
-            data_guard,
+            &dialect.evidence(session).data_guard,
             Some(reviewed),
             &reviewed.plan.changes,
             &reviewed.project.config.trusted_roles,
@@ -336,43 +366,53 @@ pub(super) async fn execute_statement(
     trusted: &BTreeSet<pbps_model::RoleName>,
     progress: Option<&services::Progress>,
 ) -> anyhow::Result<()> {
+    let selected = crate::engine::apply_session::selected(conn.driver());
+    pbps_cli::with_plan_dialect!(&selected, |session| {
+        execute_statement_with_session(
+            session, conn, statements, position, data_guard, reviewed, changes, trusted, progress,
+        )
+        .await
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_statement_with_session<D: crate::engine::ApplySession>(
+    session: &D,
+    conn: &mut Conn,
+    statements: &crate::emission::LoweredPlan,
+    position: usize,
+    data_guard: &crate::engine::DataWriteGuard,
+    reviewed: Option<&crate::pins::Approved<'_>>,
+    changes: &pbps_model::ChangeSet,
+    trusted: &BTreeSet<pbps_model::RoleName>,
+    progress: Option<&services::Progress>,
+) -> anyhow::Result<()> {
     let stmt = &statements[position];
     if let Some(approved) = reviewed {
-        approved
-            .check(
-                conn,
-                crate::pins::Check::BeforeStatements {
-                    executed: &statements[..position],
-                },
-            )
-            .await
-            .context("Nothing has been applied — the transaction was rolled back.")?;
+        crate::pins::check_with_session(
+            session,
+            conn,
+            approved,
+            crate::pins::Check::BeforeStatements {
+                executed: &statements[..position],
+            },
+        )
+        .await
+        .context("Nothing has been applied — the transaction was rolled back.")?;
     }
     let admission = reviewed.map_or_else(
         || pbps_pg::admission::Admission::without_review(trusted.iter().cloned()),
         crate::pins::Approved::admission,
     );
-    crate::engine::check_data_write(conn, &admission, stmt, data_guard).await?;
-    crate::engine::check_drop_requirement(conn, &admission, stmt).await?;
-    // The routines a table expression calls are judged just before the statement
-    // that introduces it, with what the plan created earlier in place (DEC-2563.4).
-    if let Some(change) = &stmt.introduces {
-        pbps_pg::table_expressions::vet_change(
+    session
+        .before_transactional_statement(
             conn,
             &admission,
-            pbps_pg::pins::Within::CallersTransaction,
-            pbps_pg::table_expressions::Moment::Statement,
-            change,
+            stmt,
+            data_guard,
+            reviewed.map(|a| a.plan),
         )
-        .await
-        .and_then(pbps_pg::table_expressions::Vetted::admitted)
-        .map_err(anyhow::Error::msg)?;
-    }
-    // A drop is vetted before it runs: what it would delete is judged while
-    // it can still be refused, not after (DEC-2447.8).
-    if let Some(extension) = &stmt.extension {
-        vet_before_extension(conn, extension, reviewed.map(|a| a.plan)).await?;
-    }
+        .await?;
     if let Some(progress) = progress {
         progress.started.set(true);
     }
@@ -391,27 +431,24 @@ pub(super) async fn execute_statement(
             stmt.sql
         )));
     }
-    if let Some(type_statement) = &stmt.declared_type {
-        pbps_pg::type_refs::declared::vet(
+    session
+        .after_statement(
             conn,
-            type_statement,
             &admission,
-            reviewed.map_or(&[][..], |a| a.plan.declared_type_pins.as_slice()),
+            stmt,
+            reviewed.map(|a| a.plan),
             changes,
             &statements[..=position],
+            Execution::Transactional,
         )
         .await?;
-    }
-    if let Some(extension) = &stmt.extension {
-        vet_after_extension(conn, extension, reviewed.map(|a| a.plan)).await?;
-    }
     Ok(())
 }
 
 /// What an extension statement is held to before it runs, by what it does:
 /// a drop's manifest and reach (DEC-2447.8), an update's manifest, versions
 /// and dependents (DEC-2447.10). An install is vetted after only.
-pub(super) async fn vet_before_extension(
+pub(crate) async fn vet_before_extension(
     conn: &mut Conn,
     extension: &pbps_dialect::ExtensionStatement,
     plan: Option<&pbps_model::SavedPlan>,
@@ -426,7 +463,7 @@ pub(super) async fn vet_before_extension(
         ExtensionPhase::Update { from } | ExtensionPhase::SetSchema { from } => {
             let pin = sealed_change(plan, extension, "vetted")?;
             let moving = matches!(extension.phase, ExtensionPhase::SetSchema { .. });
-            pbps_pg::extension_provider::vet_before_change(
+            crate::engine::apply_session::extensions::vet_before_change(
                 conn,
                 extension.name.raw(),
                 pin,
@@ -461,7 +498,7 @@ pub(super) fn sealed_change<'a>(
 }
 
 /// What it is held to right after, before its transaction commits.
-pub(super) async fn vet_after_extension(
+pub(crate) async fn vet_after_extension(
     conn: &mut Conn,
     extension: &pbps_dialect::ExtensionStatement,
     plan: Option<&pbps_model::SavedPlan>,
@@ -476,12 +513,17 @@ pub(super) async fn vet_after_extension(
         ExtensionPhase::Update { .. } | ExtensionPhase::SetSchema { .. } => {
             let pin = sealed_change(plan, extension, "confirmed")?;
             let moving = matches!(extension.phase, ExtensionPhase::SetSchema { .. });
-            pbps_pg::extension_provider::confirm_changed(conn, extension.name.raw(), pin, moving)
-                .await
-                .map_err(|error| {
-                    anyhow::Error::new(error)
-                        .context("the change was rolled back and nothing was recorded")
-                })
+            crate::engine::apply_session::extensions::confirm_changed(
+                conn,
+                extension.name.raw(),
+                pin,
+                moving,
+            )
+            .await
+            .map_err(|error| {
+                anyhow::Error::new(error)
+                    .context("the change was rolled back and nothing was recorded")
+            })
         }
     }
 }
@@ -504,7 +546,7 @@ pub(super) async fn vet_installed_extension(
                 installed.name.shown()
             )
         })?;
-    pbps_pg::extension_provider::vet(conn, installed.name.raw(), &pin.manifest)
+    crate::engine::apply_session::extensions::vet(conn, installed.name.raw(), &pin.manifest)
         .await
         .map_err(|error| {
             anyhow::Error::new(error)
@@ -515,7 +557,7 @@ pub(super) async fn vet_installed_extension(
 /// The check before a `DROP EXTENSION` runs, in the statement's own
 /// transaction: the manifest and the objects outside it must be what the plan
 /// was approved over, and a pin must exist (DEC-2447.8).
-pub(super) async fn vet_before_extension_drop(
+pub(crate) async fn vet_before_extension_drop(
     conn: &mut Conn,
     dropped: &pbps_dialect::ExtensionStatement,
     pins: &[pbps_model::ExtensionDropPin],
@@ -529,7 +571,7 @@ pub(super) async fn vet_before_extension_drop(
                 dropped.name.shown()
             )
         })?;
-    pbps_pg::extension_provider::vet_before_drop(conn, dropped.name.raw(), pin)
+    crate::engine::apply_session::extensions::vet_before_drop(conn, dropped.name.raw(), pin)
         .await
         .map_err(|error| {
             anyhow::Error::new(error).context("nothing was dropped and nothing was recorded")
@@ -543,7 +585,7 @@ pub(super) async fn confirm_extension_dropped(
     conn: &mut Conn,
     dropped: &pbps_dialect::ExtensionStatement,
 ) -> anyhow::Result<()> {
-    pbps_pg::extension_provider::confirm_dropped(conn, dropped.name.raw())
+    crate::engine::apply_session::extensions::confirm_dropped(conn, dropped.name.raw())
         .await
         .map_err(|error| {
             anyhow::Error::new(error).context("the drop was rolled back and nothing was recorded")
@@ -553,7 +595,7 @@ pub(super) async fn confirm_extension_dropped(
 /// The opening check of an apply that installs packages, under the lock: the
 /// target must still be one the plan was made against, with the same sentences
 /// the planner gives. Nothing has run when it refuses.
-pub(super) async fn recheck_extension_creates(
+pub(crate) async fn recheck_extension_creates(
     conn: &mut Conn,
     plan: &pbps_model::SavedPlan,
 ) -> anyhow::Result<()> {
@@ -566,8 +608,9 @@ pub(super) async fn recheck_extension_creates(
             .iter()
             .map(|p| p.name.raw().to_owned())
             .collect();
-        let mut problems = pbps_pg::extension_provider::drop_problems(conn, &names).await?;
-        let held = pbps_pg::extension_provider::installed(conn).await?;
+        let mut problems =
+            crate::engine::apply_session::extensions::drop_problems(conn, &names).await?;
+        let held = crate::engine::apply_session::extensions::installed(conn).await?;
         for pin in &plan.extension_drops {
             if held
                 .get(pin.name.raw())
@@ -612,9 +655,10 @@ pub(super) async fn recheck_extension_creates(
             .map(|p| (p.name.raw().to_owned(), p.definition.clone()))
             .collect();
         let mut problems =
-            pbps_pg::extension_provider::update_problems(conn, &updates, &creating).await?;
+            crate::engine::apply_session::extensions::update_problems(conn, &updates, &creating)
+                .await?;
         problems.extend(
-            pbps_pg::extension_provider::move_problems(
+            crate::engine::apply_session::extensions::move_problems(
                 conn,
                 &moves,
                 &updates.keys().cloned().collect(),
@@ -630,7 +674,7 @@ pub(super) async fn recheck_extension_creates(
     if plan.extension_pins.is_empty() {
         return Ok(());
     }
-    let target = pbps_pg::extension_provider::target(conn).await?;
+    let target = crate::engine::apply_session::extensions::target(conn).await?;
     let pinned: BTreeMap<String, pbps_model::Extension> = plan
         .extension_pins
         .iter()
@@ -640,7 +684,7 @@ pub(super) async fn recheck_extension_creates(
         .extension_pins
         .iter()
         .flat_map(|p| {
-            pbps_pg::extension_provider::create_problems(
+            crate::engine::apply_session::extensions::create_problems(
                 &target,
                 p.name.raw(),
                 &p.definition,

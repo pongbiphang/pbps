@@ -532,10 +532,23 @@ pub(super) async fn refuse_moved_database_collation(
     plan: &pbps_model::SavedPlan,
     label: &str,
 ) -> anyhow::Result<()> {
+    let selected = crate::engine::apply_session::selected(conn.driver());
+    pbps_cli::with_plan_dialect!(&selected, |session| {
+        refuse_moved_database_collation_with_session(session, conn, plan, label).await
+    })
+}
+
+pub(super) async fn refuse_moved_database_collation_with_session<D: crate::engine::ApplySession>(
+    session: &D,
+    conn: &mut Conn,
+    plan: &pbps_model::SavedPlan,
+    label: &str,
+) -> anyhow::Result<()> {
     let Some(planned) = &plan.baseline.database_collation else {
         return Ok(());
     };
-    let now = crate::engine::database_collation(conn)
+    let now = session
+        .baseline_collation(conn)
         .await
         .context("cannot read the database's default collation")?;
     if now.as_deref() != Some(planned.as_str()) {

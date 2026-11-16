@@ -216,9 +216,10 @@ pub(super) struct Deployment<'a, D: crate::emission::Engine> {
 /// Everything between taking the lock and releasing it. Returns the ledger id.
 /// `resolved` holds a resolved plan's checks, its key and cluster already
 /// passed (#616).
-pub(super) async fn apply_under_lock<D: crate::emission::Engine>(
+pub(super) async fn apply_under_lock<D: crate::engine::ApplySession>(
     conn: &mut Conn,
     d: &Deployment<'_, D>,
+    session: &mut D::State,
     resolved: Option<&pbps_cli::resolver::apply::Guard<'_>>,
 ) -> anyhow::Result<Option<i64>> {
     // Destructured straight back into the names the body below already uses:
@@ -247,13 +248,14 @@ pub(super) async fn apply_under_lock<D: crate::emission::Engine>(
     refuse_mid_deployment(&entry, &target.label)?;
     // Under the lock, before anything runs: a table made at a history's name
     // since the plan was computed would be adopted, not refused (#1176).
-    refuse_taken_history_names(conn, &plan.changes, &target.label).await?;
-    // Nothing binds a saved plan to a server: asked again here (#1502).
-    crate::engine::refuse_unsupported_temporal(conn, &plan.changes).await?;
+    dialect
+        .history_before_intent(conn, &plan.changes, &target.label)
+        .await?;
     let original_ids = entry.snapshot.ids.clone();
     pbps_diff::drop_requirements::validate(&plan.changes, &original_ids, &plan.ids)
         .map_err(anyhow::Error::msg)?;
-    let role_renames = crate::engine::external_role_renames(conn, &original_ids, &plan.ids)
+    let role_renames = dialect
+        .external_roles(conn, &original_ids, &plan.ids)
         .await?
         .renames;
     let pinned_managed = pinned_managed(&entry.snapshot, &plan.changes, &plan.ids);
@@ -271,12 +273,15 @@ pub(super) async fn apply_under_lock<D: crate::emission::Engine>(
             || !plan.provider_pins.is_empty()
             || !plan.declared_type_pins.is_empty()
         {
-            crate::pins::check(
+            crate::pins::check_with_session(
+                dialect,
                 conn,
-                project,
-                target,
-                plan,
-                &pinned_managed,
+                &crate::pins::Approved {
+                    project,
+                    target,
+                    plan,
+                    managed: &pinned_managed,
+                },
                 crate::pins::Check::BeforeProbes,
             )
             .await?;
@@ -335,7 +340,7 @@ pub(super) async fn apply_under_lock<D: crate::emission::Engine>(
             plan.baseline.checksum
         );
     }
-    refuse_moved_database_collation(conn, plan, &target.label).await?;
+    refuse_moved_database_collation_with_session(dialect, conn, plan, &target.label).await?;
     crate::row_security::check_dropped_policies(&plan.changes, &plan.ids, &scoped.schema)?;
 
     // And the same guard the recording commands use (110): a permission the
@@ -348,30 +353,21 @@ pub(super) async fn apply_under_lock<D: crate::emission::Engine>(
     // OWNER TO` the grantee after planning reaches here as a clean baseline.
     // The same question `plan` asked, of the database as it stands now
     // (#692): a grant to a target's owner is a no-op no `REVOKE` undoes.
-    crate::engine::owned_targets(
-        conn.driver(),
-        &plan.changes,
-        &plan.ids,
-        &scoped.owners,
-        &scoped.session_role,
-    )?;
-    // And whether *this* connection can take back what the plan revokes,
-    // which `plan` asked of the connection it planned over (#1057). A plan
-    // made as the owner and applied as a least-privilege deployer otherwise
-    // passes the baseline and fails at its `REVOKE`, after earlier statements
-    // of a staged run are already committed.
-    crate::engine::unrevocable_grants(conn.driver(), &plan.changes, &plan.ids, &unrevocable)?;
+    dialect.baseline_grants(conn.driver(), plan, &scoped, &unrevocable)?;
 
     // Before the probes, which run declared expressions and so the routines
     // they call (DEC-319.1). Every module the plan holds at any point of its
     // run is managed here, so its own creates, rebuilds and drops are the
     // read-back's to compare, not the pins'.
-    crate::pins::check(
+    crate::pins::check_with_session(
+        dialect,
         conn,
-        project,
-        target,
-        plan,
-        &pinned_managed,
+        &crate::pins::Approved {
+            project,
+            target,
+            plan,
+            managed: &pinned_managed,
+        },
         crate::pins::Check::BeforeProbes,
     )
     .await?;
@@ -414,60 +410,27 @@ pub(super) async fn apply_under_lock<D: crate::emission::Engine>(
     let result = async {
         conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
             .await?;
-        let admission = approved.admission();
-        crate::engine::rebuild_window(
-            conn,
-            &admission,
-            pbps_diff::Side {
-                schema: &entry.snapshot.schema,
-                ids: &recorded_ids,
-            },
-            &plan.changes,
-        )
-        .await?;
-        let retained = crate::engine::hold_retained(
-            conn,
-            &plan.changes,
-            Some(&entry.snapshot.declared.overlay(&before)),
-        )
-        .await?;
-        crate::engine::external_role_renames(conn, &original_ids, &plan.ids).await?;
-        crate::engine::check_module_dependents(
-            conn,
-            plan,
-            &scoped.schema,
-            &plan.ids,
-            &recorded_ids,
-        )
-        .await?;
-        crate::engine::check_module_rebuilds(conn, &plan.changes, false).await?;
-        recheck_enum_rebuilds(conn, &plan.changes, &recorded_ids, false).await?;
-        recheck_domain_alterations(conn, &plan.changes, &recorded_ids).await?;
-        recheck_extension_creates(conn, plan).await?;
-        crate::engine::check_drop_blockers(
-            conn,
-            &plan.changes,
-            &plan.ids,
-            &scoped.schema,
-            &recorded_ids,
-        )
-        .await?;
-        let data_guard = crate::engine::prepare_data_writes(
-            conn,
-            &approved.admission(),
-            &plan.changes,
-            &entry.snapshot,
-            &plan.ids,
-        )
-        .await?;
+        dialect
+            .transaction_opened(
+                session,
+                conn,
+                plan,
+                crate::engine::apply_session::Opening {
+                    approved: &approved,
+                    baseline: &entry.snapshot,
+                    before: &before,
+                    scoped: &scoped.schema,
+                    recorded_ids: &recorded_ids,
+                    original_ids: &original_ids,
+                },
+            )
+            .await?;
         // Again, because the probes ran in transactions of their own and a
         // routine could be replaced after them.
-        crate::pins::check(
+        crate::pins::check_with_session(
+            dialect,
             conn,
-            project,
-            target,
-            plan,
-            &pinned_managed,
+            &approved,
             crate::pins::Check::BeforeStatements { executed: &[] },
         )
         .await?;
@@ -477,22 +440,16 @@ pub(super) async fn apply_under_lock<D: crate::emission::Engine>(
         if let Some(resolved) = resolved {
             resolved.before_statements(conn).await?;
         }
-        let domain_defaults = pbps_pg::type_refs::declared::capture_defaults(
-            conn,
-            &plan.declared_type_pins,
-            &plan.changes,
-            pbps_pg::pins::Within::CallersTransaction,
-        )
-        .await?;
-        execute_statements(conn, statements, &data_guard, &approved, progress).await?;
-        crate::engine::check_module_rebuilds(conn, &plan.changes, true).await?;
-        crate::engine::refuse_unsafe_definers(
-            conn,
-            &crate::engine::written_routines(&plan.changes),
-            crate::engine::Absent::Refused,
-        )
-        .await?;
-        crate::engine::external_role_renames(conn, &original_ids, &plan.ids).await?;
+        dialect
+            .capture_physical_defaults(
+                session,
+                conn,
+                plan,
+                crate::pins::Check::BeforeStatements { executed: &[] },
+            )
+            .await?;
+        execute_statements(conn, dialect, session, statements, &approved, progress).await?;
+        dialect.after_statements(conn, plan, &original_ids).await?;
 
         // What gets recorded is the database read back, not the plan applied to
         // the old state. Expressions come back in the engine's stored form, and
@@ -521,19 +478,17 @@ pub(super) async fn apply_under_lock<D: crate::emission::Engine>(
         // its effects inside this transaction, after every planned write: an
         // earlier flush can refuse a constraint that the full plan satisfies,
         // while a later one records rows that the commit then changes (473).
-        crate::pins::check(
+        crate::pins::check_with_session(
+            dialect,
             conn,
-            project,
-            target,
-            plan,
-            &pinned_managed,
+            &approved,
             crate::pins::Check::BeforeRecording {
                 executed: statements.statements(),
             },
         )
         .await
         .context("Nothing has been applied — the transaction was rolled back.")?;
-        if crate::engine::settle_data_writes(conn).await? {
+        if dialect.settle_writes(conn).await? {
             let settled = managed_state(
                 conn,
                 &plan.ids,
@@ -555,13 +510,17 @@ pub(super) async fn apply_under_lock<D: crate::emission::Engine>(
             }
             after = settled;
         }
-        refuse_recreated_tables(conn, &plan.changes, statements, &after.unmanaged)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "{e:#}\n\nNothing has been applied — the transaction was rolled back."
-                )
-            })?;
+        refuse_recreated_tables_with_session(
+            dialect,
+            conn,
+            &plan.changes,
+            statements,
+            &after.unmanaged,
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("{e:#}\n\nNothing has been applied — the transaction was rolled back.")
+        })?;
         // Everything this plan does not touch has to be what the baseline
         // held, down to the rows of a table it does touch that no change of
         // it names (DECISIONS 150, 153). The read above is what gets
@@ -570,16 +529,18 @@ pub(super) async fn apply_under_lock<D: crate::emission::Engine>(
         // the recording commands follow: a permission the declarations cannot
         // express stops a state being written down, whether it was there at
         // the start or arrived during the run (110).
-        let verified =
-            crate::engine::verify_retained(conn, retained.as_ref(), &after.schema).await?;
+        dialect
+            .verify_retained(session, conn, &after.schema)
+            .await?;
+        let evidence = dialect.evidence(session);
         refuse_pinned_movement(
             dialect,
             guard::Read::transactional(guard::Plan {
                 changes: &plan.changes,
                 ids: &plan.ids,
             })
-            .with_retained(verified.as_ref())
-            .with_domain_defaults(Some(&domain_defaults)),
+            .with_retained(evidence.verified.as_ref())
+            .with_domain_defaults(Some(&evidence.defaults)),
             &before,
             &after.schema,
             &target.label,
@@ -595,12 +556,10 @@ pub(super) async fn apply_under_lock<D: crate::emission::Engine>(
         refuse_unexpressible(&after, &target.label, "apply again")?;
         // And a last time before recording: a routine replaced while the
         // statements ran was run by them, and the rollback is still available.
-        crate::pins::check(
+        crate::pins::check_with_session(
+            dialect,
             conn,
-            project,
-            target,
-            plan,
-            &pinned_managed,
+            &approved,
             crate::pins::Check::BeforeRecording {
                 executed: statements.statements(),
             },
@@ -643,12 +602,10 @@ pub(super) async fn apply_under_lock<D: crate::emission::Engine>(
             .declared
             .advance_with_partitions(&plan.changes, &snapshot.schema);
         let id = crate::engine::record(conn, &snapshot).await?;
-        crate::pins::check(
+        crate::pins::check_with_session(
+            dialect,
             conn,
-            project,
-            target,
-            plan,
-            &pinned_managed,
+            &approved,
             crate::pins::Check::BeforeCommit {
                 executed: statements.statements(),
             },
@@ -859,15 +816,21 @@ pub(super) async fn check_role_drops(
     conn: &mut Conn,
     expected: &[(pbps_model::RoleName, Vec<pbps_model::RoleName>)],
 ) -> anyhow::Result<()> {
+    let selected = crate::engine::apply_session::selected(conn.driver());
+    pbps_cli::with_plan_dialect!(&selected, |session| {
+        check_role_drops_with_session(session, conn, expected).await
+    })
+}
+
+pub(super) async fn check_role_drops_with_session<D: crate::engine::ApplySession>(
+    session: &D,
+    conn: &mut Conn,
+    expected: &[(pbps_model::RoleName, Vec<pbps_model::RoleName>)],
+) -> anyhow::Result<()> {
     if expected.is_empty() {
         return Ok(());
     }
-    let members_now = crate::engine::role_members(conn)
-        .await
-        .context("cannot read the role memberships")?;
-    let owned_now = crate::engine::role_owned_securables(conn)
-        .await
-        .context("cannot read what the roles own")?;
+    let (members_now, owned_now) = session.role_drop_facts(conn).await?;
     for (name, listed) in expected {
         let listed: std::collections::BTreeSet<&pbps_model::RoleName> = listed.iter().collect();
         let now: std::collections::BTreeSet<&pbps_model::RoleName> = members_now
@@ -974,7 +937,7 @@ pub(super) async fn drop_preflight(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn preflight<D: crate::emission::Engine>(
+pub(super) async fn preflight<D: crate::engine::ApplySession>(
     conn: &mut Conn,
     dialect: &D,
     plan: &pbps_diff::order::AdmittedPlan<D>,
@@ -996,27 +959,20 @@ pub(super) async fn preflight<D: crate::emission::Engine>(
     // caller that gets the old bug back, and this function is the one whose
     // answers depend on it.
     pin_session(conn, dialect).await?;
-    drop_preflight(conn, dialect, &plan.changes, &plan.ids, stored, stored_ids).await?;
+    conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
+        .await?;
+    let result = dialect.drop_blockers(conn, plan, stored, stored_ids).await;
+    let rollback = conn
+        .rollback(&dialect.transaction_framing(&pin_zone(conn)))
+        .await;
+    result?;
+    rollback?;
     pbps_diff::drop_requirements::validate(&plan.changes, stored_ids, &plan.ids)
         .map_err(anyhow::Error::msg)?;
     // Asked again, as the edition is below: a table outside the declarations
     // can gain a key to the parent between the plan and this apply, and the
     // engine takes the unlogged partition under it all the same (#1595).
-    crate::engine::refuse_unlogged_partition_referencers(
-        conn,
-        &plan.changes,
-        &plan.ids,
-        plan.mode.is_staged(),
-    )
-    .await?;
-    // A publication can list the table between the plan and this apply (#1489).
-    crate::engine::refuse_published_unlogged(conn, &plan.changes, &plan.ids).await?;
-    // The edition, asked again. `plan --db` checked it, but nothing binds a
-    // saved plan to an environment: the same file can be applied to a different
-    // server, or to the same one after an edition change, and an `ONLINE = ON`
-    // statement rejected halfway through an apply is precisely what the check
-    // at plan time exists to prevent (ADR-0003).
-    let verdict = crate::engine::edition_verdict(conn, &plan.changes).await?;
+    let verdict = dialect.preflight_limits(conn, plan).await?;
     if !verdict.refused_online.is_empty() {
         bail!(
             "this plan carries `strategy: online` for {}, and this server runs {}, which has no \
@@ -1038,13 +994,18 @@ pub(super) async fn preflight<D: crate::emission::Engine>(
     // environment's own and outside the managed state on purpose. Read
     // again here, before statement one (DECISIONS 92), and again on a
     // resume, for the members whose statements have not run yet (102).
-    check_role_drops(conn, &role_drop_expectations(plan, dialect, plan.mode, 0)?).await?;
+    check_role_drops_with_session(
+        dialect,
+        conn,
+        &role_drop_expectations(plan, dialect, plan.mode, 0)?,
+    )
+    .await?;
     // The same for a name this plan needs free: a user created since the
     // plan is outside the managed state, so the checksum above cannot see
     // it either, and `CREATE ROLE` would meet it after everything ordered
     // before had run (119).
     let (wanted, vacated) = role_name_expectations(plan, dialect, plan.mode, 0)?;
-    refuse_taken_role_names(conn, &wanted, &vacated).await?;
+    refuse_taken_role_names_with_session(dialect, conn, &wanted, &vacated).await?;
 
     // A SCHEMABINDING referrer this plan is about to drop is not a blocker: the
     // module changes sort before the table changes precisely so that the drop
@@ -1056,7 +1017,7 @@ pub(super) async fn preflight<D: crate::emission::Engine>(
 
     let mut blocked = Vec::new();
     for target in rename_targets {
-        let mut report = crate::engine::rename_impact(conn, target).await?;
+        let mut report = dialect.rename_report(conn, target).await?;
         excuse_dropped_referrers(&mut report, &dropped, &dropped_modules);
         if report.is_empty() {
             continue;
@@ -1066,10 +1027,7 @@ pub(super) async fn preflight<D: crate::emission::Engine>(
             "apply.preflight",
             format!("\n{} {} affects:", target.verb(), report.target),
         );
-        for line in impact_lines(
-            &report,
-            &crate::engine::impact_notes(conn.driver(), &report),
-        ) {
+        for line in impact_lines(&report, &dialect.rename_notes(conn.driver(), &report)) {
             services::notice(progress, "apply.preflight", line);
         }
         for r in &report.blocking {
