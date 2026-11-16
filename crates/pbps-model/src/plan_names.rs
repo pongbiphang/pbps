@@ -374,20 +374,20 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
             Some(from.clone()),
             Some(to.clone()),
         )),
-        crate::change_family!(type_values)
-        | crate::change_family!(extensions)
-        | crate::change_family!(search)
+        Change::TypeValue(_)
+        | Change::Extension(_)
+        | Change::Search(_)
         | Change::Column(ColumnChange::AddComputedColumn { .. })
         | Change::Column(ColumnChange::DropComputedColumn { .. })
-        | crate::change_family!(constraints)
+        | Change::Constraint(_)
         | Change::Index(IndexChange::SetIndexStorageParameters { .. })
         | Change::Policy(PolicyChange::DropPolicy { .. })
         | Change::Policy(PolicyChange::CreatePolicy { .. })
         | Change::Index(IndexChange::AddIndex { .. })
         | Change::Index(IndexChange::DropIndex { .. })
-        | crate::change_family!(rows)
-        | crate::change_family!(modules)
-        | crate::change_family!(permissions) => Other,
+        | Change::Row(_)
+        | Change::Module(_)
+        | Change::Permission(_) => Other,
     }
 }
 

@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use pbps_model::ColumnChange;
 use pbps_model::ColumnName;
 use pbps_model::ConstraintChange;
-use pbps_model::GrantChange;
 use pbps_model::IndexChange;
 use pbps_model::PartitionChange;
 use pbps_model::RowChange;
@@ -245,7 +244,7 @@ impl<'p> PlanFacts<'p> {
                 | Change::Column(ColumnChange::AlterColumnDefault { .. })
                 | Change::Column(ColumnChange::AlterColumnNumbering { .. })
                 | Change::Column(ColumnChange::SetColumnDeprecated { .. })
-                | pbps_model::change_family!(table_properties)
+                | Change::TableProperty(_)
                 | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
                 | Change::Constraint(ConstraintChange::AddUnique { .. })
                 | Change::Constraint(ConstraintChange::DropUnique { .. })
@@ -255,17 +254,18 @@ impl<'p> PlanFacts<'p> {
                 | Change::Index(IndexChange::AddIndex { .. })
                 | Change::Index(IndexChange::DropIndex { .. })
                 | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-                | pbps_model::change_family!(policies)
+                | Change::Policy(_)
                 | Change::Partition(PartitionChange::SetPartitionDefault { .. })
                 | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
                 | Change::Row(RowChange::SetDataMode { .. })
                 | Change::Row(RowChange::SetEnsureKeys { .. })
-                | pbps_model::change_family!(modules)
-                | pbps_model::change_family!(type_values)
-                | pbps_model::catalog_change!()
-                | Change::Permission(GrantChange::Grant { .. })
-                | Change::Permission(GrantChange::Revoke { .. })
-                | Change::Permission(GrantChange::PublicExecution { .. }) => continue,
+                | Change::Module(_)
+                | Change::TypeValue(_)
+                | Change::Role(_)
+                | Change::Type(_)
+                | Change::Search(_)
+                | Change::Extension(_)
+                | Change::Permission(_) => continue,
             };
             let removal = match event {
                 Event::DropTable { name } => Some((name, None)),

@@ -1,5 +1,5 @@
 //! Which changes create, drop or rename a database-global named object, and
-//! that the classifier and the `catalog_change!` pattern say the same thing
+//! that the classifier and the catalog family patterns pattern say the same thing
 //! (#2447).
 
 use pbps_model::ExtensionChange;
@@ -9,7 +9,7 @@ use pbps_model::SearchChange;
 use pbps_model::TableChange;
 use pbps_model::TypeChange;
 use pbps_model::TypeValueChange;
-use pbps_model::{CatalogObject, Change, GrantTarget, ManagedType, Permission, catalog_change};
+use pbps_model::{CatalogObject, Change, GrantTarget, ManagedType, Permission};
 #[path = "support/change_kinds.rs"]
 mod change_kinds_of_file;
 
@@ -235,39 +235,51 @@ fn a_change_that_is_not_a_catalog_object_maps_to_none() {
 }
 
 /// The pattern and the classifier are one list: a change matches
-/// `catalog_change!()` exactly when it has a kind, and `roles`/`types` split it
+/// `Change::Role(_) | Change::Type(_) | Change::Search(_) | Change::Extension(_)` exactly when it has a kind, and `roles`/`types` split it
 /// the way the classifier does.
 #[test]
 fn the_pattern_agrees_with_the_classifier_and_splits_by_kind() {
     for (change, kind) in catalog() {
-        assert!(matches!(change, catalog_change!()), "{change:?}");
+        assert!(
+            matches!(
+                change,
+                Change::Role(_) | Change::Type(_) | Change::Search(_) | Change::Extension(_)
+            ),
+            "{change:?}"
+        );
         assert_eq!(
-            matches!(change, catalog_change!(roles)),
+            matches!(change, Change::Role(_)),
             kind == CatalogObject::Role,
             "{change:?}"
         );
         assert_eq!(
-            matches!(change, catalog_change!(types)),
+            matches!(change, Change::Type(_)),
             kind == CatalogObject::Type,
             "{change:?}"
         );
         assert_eq!(
-            matches!(change, catalog_change!(search)),
+            matches!(change, Change::Search(_)),
             kind == CatalogObject::Search,
             "{change:?}"
         );
         assert_eq!(
-            matches!(change, catalog_change!(extensions)),
+            matches!(change, Change::Extension(_)),
             kind == CatalogObject::Extension,
             "{change:?}"
         );
     }
     for change in others() {
-        assert!(!matches!(change, catalog_change!()), "{change:?}");
-        assert!(!matches!(change, catalog_change!(roles)), "{change:?}");
-        assert!(!matches!(change, catalog_change!(types)), "{change:?}");
-        assert!(!matches!(change, catalog_change!(search)), "{change:?}");
-        assert!(!matches!(change, catalog_change!(extensions)), "{change:?}");
+        assert!(
+            !matches!(
+                change,
+                Change::Role(_) | Change::Type(_) | Change::Search(_) | Change::Extension(_)
+            ),
+            "{change:?}"
+        );
+        assert!(!matches!(change, Change::Role(_)), "{change:?}");
+        assert!(!matches!(change, Change::Type(_)), "{change:?}");
+        assert!(!matches!(change, Change::Search(_)), "{change:?}");
+        assert!(!matches!(change, Change::Extension(_)), "{change:?}");
     }
 }
 
@@ -281,27 +293,43 @@ fn every_variant_is_listed_in_exactly_one_family() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/change.rs");
     let text = std::fs::read_to_string(path).unwrap();
     let file = syn::parse_file(&text).unwrap();
-    let variants = change_kinds_of_file::change_kinds(&file);
-    let body_of = |opening: &str, closing: &str| {
-        let start = text.find(opening).unwrap();
-        &text[start..text[start..].find(closing).map(|n| start + n).unwrap()]
-    };
+    let kinds = change_kinds_of_file::change_kinds(&file);
+    let unique: std::collections::BTreeSet<_> = kinds.iter().collect();
+    assert_eq!(
+        kinds.len(),
+        unique.len(),
+        "a kind belongs to exactly one family"
+    );
+    assert!(kinds.len() > 3);
+    let change = file
+        .items
+        .iter()
+        .find_map(|item| {
+            if let syn::Item::Enum(e) = item
+                && e.ident == "Change"
+            {
+                Some(e)
+            } else {
+                None
+            }
+        })
+        .unwrap();
     for classifier in ["pub fn catalog_object", "pub fn family"] {
-        let body = body_of(classifier, "\n    }\n");
+        let start = text.find(classifier).unwrap();
+        let body = &text[start..];
+        let body = &body[..body.find("\n    }\n").unwrap()];
         assert!(
             !body.contains("_ =>"),
-            "a wildcard arm in `{classifier}` hides new variants"
+            "a wildcard arm in `{classifier}` hides new families"
         );
-        assert!(
-            !body.contains("Change::"),
-            "`{classifier}` names families, so a kind is listed once"
-        );
+        for family in &change.variants {
+            let pattern = format!("Change::{}(_)", family.ident);
+            assert_eq!(
+                body.matches(&pattern).count(),
+                1,
+                "`{classifier}` must decide family `{}` exactly once",
+                family.ident
+            );
+        }
     }
-    let families = body_of("macro_rules! change_family", "\n}\n");
-    for variant in &variants {
-        let listed = families.matches(&format!("Change::{variant} ")).count()
-            + families.matches(&format!("Change::{variant}(")).count();
-        assert_eq!(listed, 1, "`{variant}` must be in exactly one family");
-    }
-    assert!(variants.len() > 3);
 }

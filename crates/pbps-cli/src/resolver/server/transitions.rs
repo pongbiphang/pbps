@@ -12,7 +12,6 @@ use pbps_model::GrantChange;
 use pbps_model::IndexChange;
 use pbps_model::ModuleChange;
 use pbps_model::PartitionChange;
-use pbps_model::PolicyChange;
 use pbps_model::RoleChange;
 use pbps_model::RowChange;
 use pbps_model::SearchChange;
@@ -550,7 +549,7 @@ Change::Partition(PartitionChange::RebuildPartitionedTable(_)) | Change::Index(I
             }
             // #1172 permits policy predicates with a named #595 coverage
             // limitation. Do not claim a policy binding transition here.
-            Change::Policy(PolicyChange::DropPolicy { .. }) | Change::Policy(PolicyChange::CreatePolicy { .. }) | Change::Policy(PolicyChange::SetRowSecurity { .. }) => continue,
+            Change::Policy(_) => continue,
             Change::Constraint(ConstraintChange::AddCheck { table, name, .. }) => (
                 Surface::Check {
                     table: table.clone(),

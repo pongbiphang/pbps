@@ -4003,7 +4003,7 @@ name = name.shown(),
         | Change::TypeValue(TypeValueChange::AlterDomain { .. })
         | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
         | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
-         | pbps_model::catalog_change!() | Change::Permission(GrantChange::Grant { .. }) | Change::Permission(GrantChange::Revoke { .. }) | Change::Index(IndexChange::SetIndexStorageParameters { .. }) | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. }) | Change::Partition(PartitionChange::SetPartitionDefault { .. }) | Change::Partition(PartitionChange::SetPartitionNotNull { .. }) | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. }) | Change::Policy(PolicyChange::DropPolicy { .. }) | Change::Policy(PolicyChange::CreatePolicy { .. }) | Change::Policy(PolicyChange::SetRowSecurity { .. }) | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. }) | Change::Partition(PartitionChange::DetachPartition { .. }) | Change::Partition(PartitionChange::AttachPartition { .. }) | Change::Permission(GrantChange::PublicExecution { .. }) => Ok(Vec::new()),
+         | Change::Role(_) | Change::Type(_) | Change::Search(_) | Change::Extension(_) | Change::Permission(GrantChange::Grant { .. }) | Change::Permission(GrantChange::Revoke { .. }) | Change::Index(IndexChange::SetIndexStorageParameters { .. }) | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. }) | Change::Partition(PartitionChange::SetPartitionDefault { .. }) | Change::Partition(PartitionChange::SetPartitionNotNull { .. }) | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. }) | Change::Policy(PolicyChange::DropPolicy { .. }) | Change::Policy(PolicyChange::CreatePolicy { .. }) | Change::Policy(PolicyChange::SetRowSecurity { .. }) | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. }) | Change::Partition(PartitionChange::DetachPartition { .. }) | Change::Partition(PartitionChange::AttachPartition { .. }) | Change::Permission(GrantChange::PublicExecution { .. }) => Ok(Vec::new()),
     }
 }
 
@@ -4418,13 +4418,13 @@ pub(crate) fn probes(
                 .collect(),
             Change::Table(TableChange::DropTable { .. })
             | Change::Table(TableChange::RenameTable { .. })
-            | pbps_model::change_family!(columns)
-            | pbps_model::change_family!(table_properties)
+            | Change::Column(_)
+            | Change::TableProperty(_)
             | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
             | Change::Index(IndexChange::SetIndexStorageParameters { .. })
             | Change::Partition(PartitionChange::SetPartitionDefault { .. })
             | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
-            | pbps_model::change_family!(policies)
+            | Change::Policy(_)
             | Change::Constraint(ConstraintChange::AddUnique { .. })
             | Change::Constraint(ConstraintChange::DropUnique { .. })
             | Change::Constraint(ConstraintChange::SetExclusion { .. })
@@ -4433,15 +4433,16 @@ pub(crate) fn probes(
             | Change::Constraint(ConstraintChange::DropCheck { .. })
             | Change::Index(IndexChange::AddIndex { .. })
             | Change::Index(IndexChange::DropIndex { .. })
-            | pbps_model::change_family!(rows)
-            | pbps_model::change_family!(modules)
-            | pbps_model::change_family!(type_values)
-            | pbps_model::catalog_change!()
-            | Change::Permission(GrantChange::Grant { .. })
-            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Row(_)
+            | Change::Module(_)
+            | Change::TypeValue(_)
+            | Change::Role(_)
+            | Change::Type(_)
+            | Change::Search(_)
+            | Change::Extension(_)
+            | Change::Permission(_)
             | Change::Partition(PartitionChange::DetachPartition { .. })
-            | Change::Partition(PartitionChange::AttachPartition { .. })
-            | Change::Permission(GrantChange::PublicExecution { .. }) => Vec::new(),
+            | Change::Partition(PartitionChange::AttachPartition { .. }) => Vec::new(),
         };
         if !keys.is_empty() {
             // Inline keys see the columns defined by their own CREATE. Row

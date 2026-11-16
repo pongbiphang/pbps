@@ -315,20 +315,20 @@ pub(super) fn classify(
         | Change::Partition(PartitionChange::AnalyzeTableTree(_))
         | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
         | Change::Type(TypeChange::CreateType { .. })
-        | pbps_model::change_family!(extensions)
-        | pbps_model::change_family!(search)
+        | Change::Extension(_)
+        | Change::Search(_)
         | Change::Column(ColumnChange::AddComputedColumn { .. })
         | Change::Column(ColumnChange::SetColumnDeprecated { .. })
-        | pbps_model::change_family!(table_properties)
+        | Change::TableProperty(_)
         | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-        | pbps_model::change_family!(policies)
+        | Change::Policy(_)
         | Change::Constraint(ConstraintChange::DropUnique { .. })
         | Change::Constraint(ConstraintChange::SetExclusion { to: None, .. })
         | Change::Constraint(ConstraintChange::DropForeignKey { .. })
         | Change::Constraint(ConstraintChange::DropCheck { .. })
         | Change::Index(IndexChange::DropIndex { .. })
-        | pbps_model::change_family!(rows)
-        | pbps_model::change_family!(roles)
-        | pbps_model::change_family!(permissions) => None,
+        | Change::Row(_)
+        | Change::Role(_)
+        | Change::Permission(_) => None,
     }
 }

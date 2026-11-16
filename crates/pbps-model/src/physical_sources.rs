@@ -10,7 +10,6 @@ use crate::ColumnName;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ColumnChange;
-use crate::GrantChange;
 use crate::IndexChange;
 use crate::PartitionChange;
 use crate::TableChange;
@@ -666,21 +665,22 @@ impl Build<'_, '_> {
             | Change::Column(ColumnChange::AlterColumnExpression { .. })
             | Change::Column(ColumnChange::AlterColumnNumbering { .. })
             | Change::Column(ColumnChange::SetColumnDeprecated { .. })
-            | crate::change_family!(constraints)
+            | Change::Constraint(_)
             | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-            | crate::change_family!(table_properties)
+            | Change::TableProperty(_)
             | Change::Partition(PartitionChange::SetPartitionDefault { .. })
             | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
-            | crate::change_family!(policies)
+            | Change::Policy(_)
             | Change::Index(IndexChange::AddIndex { .. })
             | Change::Index(IndexChange::DropIndex { .. })
-            | crate::change_family!(rows)
-            | crate::change_family!(modules)
-            | crate::change_family!(type_values)
-            | crate::catalog_change!()
-            | Change::Permission(GrantChange::Grant { .. })
-            | Change::Permission(GrantChange::Revoke { .. })
-            | Change::Permission(GrantChange::PublicExecution { .. }) => {}
+            | Change::Row(_)
+            | Change::Module(_)
+            | Change::TypeValue(_)
+            | Change::Role(_)
+            | Change::Type(_)
+            | Change::Search(_)
+            | Change::Extension(_)
+            | Change::Permission(_) => {}
         }
         Ok(())
     }

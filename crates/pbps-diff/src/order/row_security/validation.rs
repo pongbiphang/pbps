@@ -21,20 +21,17 @@ pub fn validate(
     dialect: &(impl pbps_dialect::Dialect + ?Sized),
 ) -> Result<(), AdmissionError> {
     if !changes.changes.iter().any(|step| {
-        matches!(
-            &step.change,
-            Change::Policy(PolicyChange::DropPolicy { .. })
-                | Change::Policy(PolicyChange::CreatePolicy { .. })
-                | Change::Policy(PolicyChange::SetRowSecurity { .. })
-        ) || if let Change::Table(TableChange::CreateTable { table, .. }) = &step.change {
-            table.has_row_security()
-        } else if let Change::Partition(PartitionChange::AttachPartition { shape, .. })
-        | Change::Partition(PartitionChange::DetachPartition { shape, .. }) = &step.change
-        {
-            shape.has_row_security()
-        } else {
-            false
-        }
+        matches!(&step.change, Change::Policy(_))
+            || if let Change::Table(TableChange::CreateTable { table, .. }) = &step.change {
+                table.has_row_security()
+            } else if let Change::Partition(PartitionChange::AttachPartition { shape, .. })
+            | Change::Partition(PartitionChange::DetachPartition { shape, .. }) =
+                &step.change
+            {
+                shape.has_row_security()
+            } else {
+                false
+            }
     }) {
         return Ok(());
     }

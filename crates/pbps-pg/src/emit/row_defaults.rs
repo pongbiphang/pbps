@@ -1,7 +1,5 @@
 //! Execution-position context for catalog-backed row defaults (DEC-2456.1).
 use crate::type_refs::renames::TypeRenames;
-use pbps_model::TypeChange;
-use pbps_model::TypeValueChange;
 use pbps_model::{Change, ChangeSet, ColumnName, ColumnRef, IdsFile, TableName};
 use std::collections::BTreeMap;
 
@@ -26,16 +24,7 @@ impl RowDefaultIndex {
         for (position, planned) in changes.changes.iter().enumerate() {
             // The identity walk sees only lifecycle events after its one base
             // reconstruction, never a row-filled prefix (DEC-2456.1).
-            if matches!(
-                planned.change,
-                Change::Type(TypeChange::CreateType { .. })
-                    | Change::Type(TypeChange::DropType { .. })
-                    | Change::Type(TypeChange::RenameType { .. })
-                    | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
-                    | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
-                    | Change::TypeValue(TypeValueChange::AlterDomain { .. })
-                    | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
-            ) {
+            if matches!(planned.change, Change::Type(_) | Change::TypeValue(_)) {
                 now = pbps_diff::identity::type_refs::after_steps(
                     &now,
                     std::slice::from_ref(planned),

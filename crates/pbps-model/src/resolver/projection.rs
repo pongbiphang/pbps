@@ -9,8 +9,6 @@ use crate::IndexChange;
 use crate::ModuleChange;
 use crate::PartitionChange;
 use crate::PolicyChange;
-use crate::RoleChange;
-use crate::RowChange;
 use crate::TableChange;
 use crate::TablePropertyChange;
 use crate::TypeChange;
@@ -841,13 +839,13 @@ Change::Partition(PartitionChange::RebuildPartitionedTable(_)) | Change::Index(I
             step: crate::EnumRebuildStep::Create { .. } | crate::EnumRebuildStep::Swap { .. },
             ..
         }) => (Exact(Surface::Type(name.clone())), true, true),
-        crate::change_family!(rows)
+        Change::Row(_)
         | Change::Column(ColumnChange::SetColumnDeprecated { .. })
         | Change::TableProperty(TablePropertyChange::SetComment { .. })
-        | crate::change_family!(roles)
-        | crate::change_family!(extensions)
-        | crate::change_family!(search)
-        | crate::change_family!(permissions) => return None,
+        | Change::Role(_)
+        | Change::Extension(_)
+        | Change::Search(_)
+        | Change::Permission(_) => return None,
     };
     Some((vec![owner], opening, closing))
 }
@@ -1042,19 +1040,11 @@ fn grant_target(c: &Change) -> Option<&GrantTarget> {
 fn changes_catalog(c: &Change) -> bool {
     !matches!(
         c,
-        Change::Permission(GrantChange::Grant { .. })
-            | Change::Permission(GrantChange::Revoke { .. })
-            | Change::Permission(GrantChange::PublicExecution { .. })
-            | Change::Row(RowChange::InsertRow { .. })
-            | Change::Row(RowChange::UpdateRow { .. })
-            | Change::Row(RowChange::DeleteRow { .. })
-            | Change::Row(RowChange::SetDataMode { .. })
-            | Change::Row(RowChange::SetEnsureKeys { .. })
+        Change::Permission(_)
+            | Change::Row(_)
             | Change::Column(ColumnChange::SetColumnDeprecated { .. })
             | Change::TableProperty(TablePropertyChange::SetComment { .. })
-            | Change::Role(RoleChange::CreateRole { .. })
-            | Change::Role(RoleChange::RenameRole { .. })
-            | Change::Role(RoleChange::DropRole { .. })
+            | Change::Role(_)
     )
 }
 

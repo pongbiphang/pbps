@@ -61,10 +61,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use pbps_db::{Conn, DbError};
 use pbps_model::ColumnChange;
 use pbps_model::ConstraintChange;
-use pbps_model::GrantChange;
 use pbps_model::IndexChange;
 use pbps_model::PartitionChange;
-use pbps_model::PolicyChange;
 use pbps_model::TableChange;
 use pbps_model::TablePropertyChange;
 use pbps_model::{Change, ColumnType, Strategy, TableName};
@@ -1068,9 +1066,7 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         Change::Table(TableChange::DropTable {
             detach_from: None, ..
         })
-        | Change::Policy(PolicyChange::DropPolicy { .. })
-        | Change::Policy(PolicyChange::CreatePolicy { .. })
-        | Change::Policy(PolicyChange::SetRowSecurity { .. })
+        | Change::Policy(_)
         | Change::Column(ColumnChange::SetColumnDeprecated { .. })
         | Change::TableProperty(TablePropertyChange::SetComment { .. })
         | Change::Constraint(ConstraintChange::SetPrimaryKey { to: None, .. })
@@ -1081,13 +1077,14 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         | Change::Index(IndexChange::DropIndex { .. })
         | Change::Column(ColumnChange::AddComputedColumn { .. })
         | Change::Column(ColumnChange::DropComputedColumn { .. })
-        | pbps_model::change_family!(modules)
-        | pbps_model::change_family!(rows)
-        | pbps_model::change_family!(type_values)
-        | pbps_model::catalog_change!()
-        | Change::Permission(GrantChange::Grant { .. })
-        | Change::Permission(GrantChange::Revoke { .. })
-        | Change::Permission(GrantChange::PublicExecution { .. }) => None,
+        | Change::Module(_)
+        | Change::Row(_)
+        | Change::TypeValue(_)
+        | Change::Role(_)
+        | Change::Type(_)
+        | Change::Search(_)
+        | Change::Extension(_)
+        | Change::Permission(_) => None,
     }
 }
 

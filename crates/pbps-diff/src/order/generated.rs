@@ -154,7 +154,7 @@ Change::Partition(PartitionChange::AnalyzeTableTree(a)) => TableUse { complete: 
         | Change::TypeValue(TypeValueChange::AlterDomain { .. })
         | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
         | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
-        | pbps_model::catalog_change!()
+        | Change::Role(_) | Change::Type(_) | Change::Search(_) | Change::Extension(_)
         | Change::Permission(GrantChange::Grant { .. })
         | Change::Permission(GrantChange::Revoke { .. })
         | Change::Permission(GrantChange::PublicExecution { .. }) => TableUse::default(),
@@ -1101,7 +1101,7 @@ fn gather(change: &Change, types: Types) -> Vec<&str> {
         | Change::Column(ColumnChange::AlterColumnNumbering { .. })
         | Change::Column(ColumnChange::DropComputedColumn { .. })
         | Change::Column(ColumnChange::SetColumnDeprecated { .. })
-        | pbps_model::change_family!(table_properties)
+        | Change::TableProperty(_)
         | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
         | Change::Index(IndexChange::SetIndexStorageParameters { .. })
         | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
@@ -1115,12 +1115,13 @@ fn gather(change: &Change, types: Types) -> Vec<&str> {
         | Change::Row(RowChange::SetEnsureKeys { .. })
         | Change::Policy(PolicyChange::DropPolicy { .. })
         | Change::Policy(PolicyChange::SetRowSecurity { .. })
-        | pbps_model::change_family!(modules)
-        | pbps_model::change_family!(type_values)
-        | pbps_model::catalog_change!()
-        | Change::Permission(GrantChange::Grant { .. })
-        | Change::Permission(GrantChange::Revoke { .. })
-        | Change::Permission(GrantChange::PublicExecution { .. }) => Vec::new(),
+        | Change::Module(_)
+        | Change::TypeValue(_)
+        | Change::Role(_)
+        | Change::Type(_)
+        | Change::Search(_)
+        | Change::Extension(_)
+        | Change::Permission(_) => Vec::new(),
     }
 }
 

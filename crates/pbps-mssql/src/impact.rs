@@ -27,7 +27,6 @@ use pbps_db::{Conn, DbError};
 use pbps_dialect::DialectError;
 use pbps_model::ColumnChange;
 use pbps_model::ConstraintChange;
-use pbps_model::GrantChange;
 use pbps_model::IndexChange;
 use pbps_model::PartitionChange;
 use pbps_model::TableChange;
@@ -87,12 +86,12 @@ pub async fn key_drop_blockers(
                     (table, "UQ", name.raw())
                 }
                 Change::Index(IndexChange::DropIndex { table, name }) => (table, "IX", name.raw()),
-                pbps_model::change_family!(tables)
-                | pbps_model::change_family!(columns)
-                | pbps_model::change_family!(table_properties)
+                Change::Table(_)
+                | Change::Column(_)
+                | Change::TableProperty(_)
                 | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
                 | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-                | pbps_model::change_family!(policies)
+                | Change::Policy(_)
                 | Change::Constraint(ConstraintChange::AddUnique { .. })
                 | Change::Constraint(ConstraintChange::SetExclusion { .. })
                 | Change::Constraint(ConstraintChange::AddForeignKey { .. })
@@ -100,17 +99,18 @@ pub async fn key_drop_blockers(
                 | Change::Constraint(ConstraintChange::AddCheck { .. })
                 | Change::Constraint(ConstraintChange::DropCheck { .. })
                 | Change::Index(IndexChange::AddIndex { .. })
-                | pbps_model::change_family!(rows)
-                | pbps_model::change_family!(modules)
-                | pbps_model::change_family!(type_values)
-                | pbps_model::catalog_change!()
-                | Change::Permission(GrantChange::Grant { .. })
-                | Change::Permission(GrantChange::Revoke { .. })
+                | Change::Row(_)
+                | Change::Module(_)
+                | Change::TypeValue(_)
+                | Change::Role(_)
+                | Change::Type(_)
+                | Change::Search(_)
+                | Change::Extension(_)
+                | Change::Permission(_)
                 | Change::Partition(PartitionChange::DetachPartition { .. })
                 | Change::Partition(PartitionChange::AttachPartition { .. })
                 | Change::Partition(PartitionChange::SetPartitionDefault { .. })
-                | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
-                | Change::Permission(GrantChange::PublicExecution { .. }) => return None,
+                | Change::Partition(PartitionChange::SetPartitionNotNull { .. }) => return None,
             };
             let stored = stored_key_table(names, index, table)?;
             Some((index, stored, kind, name))
@@ -242,11 +242,11 @@ pub async fn key_drop_blockers(
             Change::Table(TableChange::DropTable { name, .. }) => (name, None),
             Change::Table(TableChange::CreateTable { .. })
             | Change::Table(TableChange::RenameTable { .. })
-            | pbps_model::change_family!(columns)
-            | pbps_model::change_family!(table_properties)
+            | Change::Column(_)
+            | Change::TableProperty(_)
             | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
             | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-            | pbps_model::change_family!(policies)
+            | Change::Policy(_)
             | Change::Constraint(ConstraintChange::AddUnique { .. })
             | Change::Constraint(ConstraintChange::DropUnique { .. })
             | Change::Constraint(ConstraintChange::SetExclusion { .. })
@@ -255,17 +255,18 @@ pub async fn key_drop_blockers(
             | Change::Constraint(ConstraintChange::DropCheck { .. })
             | Change::Index(IndexChange::AddIndex { .. })
             | Change::Index(IndexChange::DropIndex { .. })
-            | pbps_model::change_family!(rows)
-            | pbps_model::change_family!(modules)
-            | pbps_model::change_family!(type_values)
-            | pbps_model::catalog_change!()
-            | Change::Permission(GrantChange::Grant { .. })
-            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Row(_)
+            | Change::Module(_)
+            | Change::TypeValue(_)
+            | Change::Role(_)
+            | Change::Type(_)
+            | Change::Search(_)
+            | Change::Extension(_)
+            | Change::Permission(_)
             | Change::Partition(PartitionChange::DetachPartition { .. })
             | Change::Partition(PartitionChange::AttachPartition { .. })
             | Change::Partition(PartitionChange::SetPartitionDefault { .. })
-            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
-            | Change::Permission(GrantChange::PublicExecution { .. }) => continue,
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. }) => continue,
         };
         let Some(table) = stored_key_table(names, index, table) else {
             continue;

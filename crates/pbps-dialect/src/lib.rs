@@ -55,10 +55,8 @@ pub mod types;
 use pbps_model::ChangeSet;
 use pbps_model::ColumnChange;
 use pbps_model::ConstraintChange;
-use pbps_model::GrantChange;
 use pbps_model::IndexChange;
 use pbps_model::PartitionChange;
-use pbps_model::PolicyChange;
 use pbps_model::RowChange;
 use pbps_model::TablePropertyChange;
 use pbps_model::module::{CodeToken, code_tokens};
@@ -762,11 +760,7 @@ impl Unchecked {
             Change::Column(ColumnChange::AddColumn { table, name, .. }) => {
                 format!("new NOT NULL column {}", table.column(name).shown())
             }
-            Change::Policy(PolicyChange::DropPolicy { .. })
-            | Change::Policy(PolicyChange::CreatePolicy { .. })
-            | Change::Policy(PolicyChange::SetRowSecurity { .. }) => {
-                pbps_model::escape::Escaped(&change.subject()).to_string()
-            }
+            Change::Policy(_) => pbps_model::escape::Escaped(&change.subject()).to_string(),
             Change::TableProperty(TablePropertyChange::SetReplicaIdentity { table, .. }) => {
                 format!("replica identity of {table}", table = table.shown())
             }
@@ -824,7 +818,7 @@ impl Unchecked {
                     parent = parent.shown()
                 )
             }
-            pbps_model::change_family!(tables)
+            Change::Table(_)
             | Change::Column(ColumnChange::DropColumn { .. })
             | Change::Column(ColumnChange::RenameColumn { .. })
             | Change::Column(ColumnChange::AlterColumnDefault { .. })
@@ -840,14 +834,13 @@ impl Unchecked {
             | Change::Row(RowChange::UpdateRow { .. })
             | Change::Row(RowChange::SetDataMode { .. })
             | Change::Row(RowChange::SetEnsureKeys { .. })
-            | pbps_model::change_family!(modules)
-            | pbps_model::change_family!(type_values)
-            | pbps_model::catalog_change!()
-            | Change::Permission(GrantChange::Grant { .. })
-            | Change::Permission(GrantChange::Revoke { .. })
-            | Change::Permission(GrantChange::PublicExecution { .. }) => {
-                pbps_model::escape::Escaped(&change.subject()).to_string()
-            }
+            | Change::Module(_)
+            | Change::TypeValue(_)
+            | Change::Role(_)
+            | Change::Type(_)
+            | Change::Search(_)
+            | Change::Extension(_)
+            | Change::Permission(_) => pbps_model::escape::Escaped(&change.subject()).to_string(),
         };
         Self::new(description, reason)
     }

@@ -80,14 +80,12 @@ use crate::order::{Schedule, Source};
 use pbps_dialect::Dialect;
 use pbps_model::ColumnChange;
 use pbps_model::ConstraintChange;
-use pbps_model::ExtensionChange;
 use pbps_model::IndexChange;
 use pbps_model::ModuleChange;
 use pbps_model::PartitionChange;
 use pbps_model::RowChange;
 use pbps_model::TableChange;
 use pbps_model::TablePropertyChange;
-use pbps_model::TypeChange;
 use pbps_model::TypeValueChange;
 use pbps_model::resolver::OrderReason;
 use pbps_model::{
@@ -1987,10 +1985,10 @@ pub fn before_its_partitions_indexes(
             Change::Index(IndexChange::AddIndex { .. })
                 | Change::Index(IndexChange::DropIndex { .. })
                 | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-                | pbps_model::change_family!(constraints)
-                | pbps_model::change_family!(policies)
+                | Change::Constraint(_)
+                | Change::Policy(_)
                 | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
-                | pbps_model::change_family!(permissions)
+                | Change::Permission(_)
         )
     };
     let mut schedule = Schedule::new(cs.changes.len());
@@ -3257,13 +3255,8 @@ fn touches(change: &Change, table: &TableName) -> bool {
                     | pbps_model::EnumRebuildStep::Swap { .. },
                 ..
             })
-            | Change::Type(TypeChange::CreateType { .. })
-            | Change::Type(TypeChange::DropType { .. })
-            | Change::Type(TypeChange::RenameType { .. })
-            | Change::Extension(ExtensionChange::CreateExtension { .. })
-            | Change::Extension(ExtensionChange::DropExtension { .. })
-            | Change::Extension(ExtensionChange::UpdateExtension { .. })
-            | Change::Extension(ExtensionChange::SetExtensionSchema { .. })
+            | Change::Type(_)
+            | Change::Extension(_)
     ) {
         return false;
     }

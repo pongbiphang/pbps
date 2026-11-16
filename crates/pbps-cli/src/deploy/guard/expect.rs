@@ -3,7 +3,6 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_model::ColumnChange;
-use pbps_model::GrantChange;
 use pbps_model::IndexChange;
 use pbps_model::PartitionChange;
 use pbps_model::PolicyChange;
@@ -309,16 +308,17 @@ impl<'a> TableChanges<'a> {
                 | Change::Column(ColumnChange::SetColumnDeprecated { .. })
                 | Change::TableProperty(TablePropertyChange::SetComment { .. })
                 | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-                | pbps_model::change_family!(constraints)
+                | Change::Constraint(_)
                 | Change::Index(IndexChange::AddIndex { .. })
                 | Change::Index(IndexChange::DropIndex { .. })
-                | pbps_model::change_family!(rows)
-                | pbps_model::change_family!(modules)
-                | pbps_model::change_family!(type_values)
-                | pbps_model::catalog_change!()
-                | Change::Permission(GrantChange::Grant { .. })
-                | Change::Permission(GrantChange::Revoke { .. })
-                | Change::Permission(GrantChange::PublicExecution { .. }) => {}
+                | Change::Row(_)
+                | Change::Module(_)
+                | Change::TypeValue(_)
+                | Change::Role(_)
+                | Change::Type(_)
+                | Change::Search(_)
+                | Change::Extension(_)
+                | Change::Permission(_) => {}
             }
         }
         use pbps_model::plan_names::{At, Holder};

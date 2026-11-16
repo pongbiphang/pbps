@@ -29,7 +29,6 @@ use pbps_model::ModuleChange;
 use pbps_model::PartitionChange;
 use pbps_model::RoleChange;
 use pbps_model::TableChange;
-use pbps_model::TypeChange;
 use pbps_model::TypeValueChange;
 use pbps_model::{Change, ChangeSet, ModuleDeps, ModuleId, Schema};
 
@@ -411,9 +410,7 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
                 Change::TypeValue(TypeValueChange::AddEnumValue { .. })
                     | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
                     | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
-                    | Change::Type(TypeChange::CreateType { .. })
-                    | Change::Type(TypeChange::DropType { .. })
-                    | Change::Type(TypeChange::RenameType { .. })
+                    | Change::Type(_)
             )
         };
         if cs.changes.iter().any(|p| type_change(&p.change))

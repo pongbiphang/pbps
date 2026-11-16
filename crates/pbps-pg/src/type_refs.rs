@@ -7,11 +7,9 @@ use std::collections::BTreeSet;
 
 use pbps_db::{Conn, DbError};
 use pbps_model::ColumnChange;
-use pbps_model::ExtensionChange;
 use pbps_model::IndexChange;
 use pbps_model::PartitionChange;
 use pbps_model::RowChange;
-use pbps_model::SearchChange;
 use pbps_model::TableChange;
 use pbps_model::TypeChange;
 use pbps_model::TypeValueChange;
@@ -77,12 +75,8 @@ fn reference_uses<'a>(
             }
             Change::Index(IndexChange::BuildPartitionedIndex(_))
             | Change::Partition(PartitionChange::AnalyzeTableTree(_))
-            | Change::Search(SearchChange::CreateSearch { .. })
-            | Change::Search(SearchChange::DropSearch { .. })
-            | Change::Extension(ExtensionChange::CreateExtension { .. })
-            | Change::Extension(ExtensionChange::DropExtension { .. })
-            | Change::Extension(ExtensionChange::UpdateExtension { .. })
-            | Change::Extension(ExtensionChange::SetExtensionSchema { .. }) => {}
+            | Change::Search(_)
+            | Change::Extension(_) => {}
             Change::Table(TableChange::CreateTable { table, .. })
             | Change::Partition(PartitionChange::AttachPartition { shape: table, .. })
             | Change::Partition(PartitionChange::DetachPartition { shape: table, .. }) => {
@@ -141,20 +135,20 @@ fn reference_uses<'a>(
             | Change::Column(ColumnChange::AddComputedColumn { .. })
             | Change::Column(ColumnChange::DropComputedColumn { .. })
             | Change::Column(ColumnChange::SetColumnDeprecated { .. })
-            | pbps_model::change_family!(table_properties)
-            | pbps_model::change_family!(policies)
+            | Change::TableProperty(_)
+            | Change::Policy(_)
             | Change::Partition(PartitionChange::SetPartitionDefault { .. })
             | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
             | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-            | pbps_model::change_family!(constraints)
+            | Change::Constraint(_)
             | Change::Index(IndexChange::AddIndex { .. })
             | Change::Index(IndexChange::DropIndex { .. })
             | Change::Row(RowChange::SetDataMode { .. })
             | Change::Row(RowChange::SetEnsureKeys { .. })
-            | pbps_model::change_family!(modules)
+            | Change::Module(_)
             | Change::Type(TypeChange::DropType { .. })
-            | pbps_model::change_family!(roles)
-            | pbps_model::change_family!(permissions) => {}
+            | Change::Role(_)
+            | Change::Permission(_) => {}
         }
     }
     types

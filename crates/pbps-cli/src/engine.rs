@@ -1965,9 +1965,7 @@ fn keep_ahead(
 fn after_the_alterations(change: &pbps_model::Change) -> bool {
     matches!(
         change,
-        pbps_model::Change::Row(pbps_model::RowChange::InsertRow { .. })
-            | pbps_model::Change::Row(pbps_model::RowChange::UpdateRow { .. })
-            | pbps_model::Change::Row(pbps_model::RowChange::DeleteRow { .. })
+        pbps_model::Change::Row(_)
             | pbps_model::Change::Constraint(pbps_model::ConstraintChange::SetPrimaryKey {
                 to: Some(_),
                 ..
@@ -1981,12 +1979,10 @@ fn after_the_alterations(change: &pbps_model::Change) -> bool {
             | pbps_model::Change::TypeValue(pbps_model::TypeValueChange::AddEnumValue { .. })
             | pbps_model::Change::TypeValue(pbps_model::TypeValueChange::RenameEnumValue { .. })
             | pbps_model::Change::TypeValue(pbps_model::TypeValueChange::EnumRebuild { .. })
-            | pbps_model::change_family!(types)
+            | pbps_model::Change::Type(_)
             | pbps_model::Change::Role(pbps_model::RoleChange::CreateRole { .. })
             | pbps_model::Change::Permission(pbps_model::GrantChange::Grant { .. })
             | pbps_model::Change::Permission(pbps_model::GrantChange::PublicExecution { .. })
-            | pbps_model::Change::Row(pbps_model::RowChange::SetDataMode { .. })
-            | pbps_model::Change::Row(pbps_model::RowChange::SetEnsureKeys { .. })
     )
 }
 
