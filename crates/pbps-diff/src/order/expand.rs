@@ -358,8 +358,7 @@ impl State {
                     let Some(old) = self.changes.get_mut(at) else {
                         return Err(format!("{rule}: respells step {at} of {n}"));
                     };
-                    if std::mem::discriminant(&old.change) != std::mem::discriminant(&change.change)
-                    {
+                    if !old.change.same_kind(&change.change) {
                         return Err(format!(
                             "{rule}: respelling `{}` changed what kind of step it is",
                             pbps_model::escape::Escaped(&old.change.subject())

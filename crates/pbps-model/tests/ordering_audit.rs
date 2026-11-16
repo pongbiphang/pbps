@@ -3,32 +3,42 @@
 //! classified, which is how ordering corners were found one review round at a
 //! time.
 
-use std::path::Path;
+#[path = "support/change_kinds.rs"]
+mod change_kinds_of_file;
 
-use syn::Item;
+use std::path::Path;
 
 /// The variants of `pbps_model::Change`, read from its source rather than
 /// listed here, so the list cannot fall behind the enum.
 fn change_kinds() -> Vec<String> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/change.rs");
     let file = syn::parse_file(&std::fs::read_to_string(path).unwrap()).unwrap();
-    file.items
-        .iter()
-        .find_map(|item| {
-            if let Item::Enum(e) = item
-                && e.ident == "Change"
-            {
-                Some(
-                    e.variants
-                        .iter()
-                        .map(|v| v.ident.to_string())
-                        .collect::<Vec<_>>(),
-                )
-            } else {
-                None
-            }
-        })
-        .expect("`Change` is an enum in change.rs")
+    change_kinds_of_file::change_kinds(&file)
+}
+
+/// The helper must give the same list for today's flat enum and for a nested one
+/// (#2790), and must not take a boxed payload or an enum of another name for a family.
+#[test]
+fn the_kinds_of_change_are_the_same_flat_or_nested() {
+    let flat: syn::File = syn::parse_str("pub enum Change { A { x: u8 }, B(Box<P>), C }").unwrap();
+    let nested: syn::File = syn::parse_str(
+        "pub enum Change { Fam(FamChange), B(Box<P>), C } pub enum FamChange { A { x: u8 } }",
+    )
+    .unwrap();
+    let sorted = |file: &syn::File| {
+        let mut kinds = change_kinds_of_file::change_kinds(file);
+        kinds.sort();
+        kinds
+    };
+    assert_eq!(sorted(&flat), ["A", "B", "C"]);
+    assert_eq!(sorted(&nested), sorted(&flat));
+    // Negative: a newtype over an enum that is not in the file, or a boxed
+    // one, is a kind of its own and is not expanded.
+    let opaque: syn::File = syn::parse_str(
+        "pub enum Change { Fam(Elsewhere), B(Box<FamChange>) } pub enum FamChange { A }",
+    )
+    .unwrap();
+    assert_eq!(sorted(&opaque), ["B", "Fam"]);
 }
 
 /// The requires table of `docs/ORDERING.md`: the lines between its heading

@@ -1,3 +1,5 @@
+#[path = "support/change_kinds.rs"]
+mod change_kinds_of_file;
 #[path = "support/part_effect_cases.rs"]
 mod corpus;
 
@@ -7,19 +9,9 @@ use std::collections::BTreeSet;
 #[test]
 fn the_equivalence_corpus_covers_every_change_kind() {
     let file = syn::parse_file(include_str!("../src/change.rs")).unwrap();
-    let expected: BTreeSet<_> = file
-        .items
-        .iter()
-        .find_map(|item| {
-            if let syn::Item::Enum(item) = item
-                && item.ident == "Change"
-            {
-                Some(item.variants.iter().map(|v| v.ident.to_string()).collect())
-            } else {
-                None
-            }
-        })
-        .unwrap();
+    let expected: BTreeSet<_> = change_kinds_of_file::change_kinds(&file)
+        .into_iter()
+        .collect();
     let cases = corpus::cases();
     let actual = cases
         .iter()

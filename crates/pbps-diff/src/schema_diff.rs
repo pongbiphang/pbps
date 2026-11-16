@@ -3057,7 +3057,7 @@ pub(crate) fn diff_partial_rebuilding(
             } else {
                 0
             },
-            format!("{:?}", p.change),
+            tie_break_text(&p.change),
         )
     });
     for cycle in crate::order::rename_order::order(&mut planned, base, &renames, dialect) {
@@ -6246,10 +6246,20 @@ fn partition_default(
     }
 }
 
+/// The text that orders two changes tied in class, rank and subject: the kind and
+/// its payload as `Debug` writes them, so changes of one kind sit together and
+/// kinds sit in alphabetical order, across families (a saved plan's order
+/// depends on it). A named function so that the move of the kinds into family
+/// enums (#2790) cannot change it by changing `Debug`; `change_in_words` reads
+/// the kind's own name from it.
+fn tie_break_text(change: &Change) -> String {
+    format!("{change:?}")
+}
+
 /// A change's kind as words, `drop column` for `DropColumn`: the variant's
 /// own name, so a kind added later is named without anyone remembering to.
 fn change_in_words(change: &Change) -> String {
-    let debug = format!("{change:?}");
+    let debug = tie_break_text(change);
     let kind = debug
         .split(|c: char| !c.is_ascii_alphanumeric())
         .next()
@@ -19313,6 +19323,217 @@ mod tests {
         let mut by_debug = changes.clone();
         by_debug.sort();
         assert_eq!(changes, by_debug);
+    }
+
+    /// `MinimalDialect` where descriptions are comments, as PostgreSQL's are.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct HoldsDescriptions;
+
+    impl Dialect for HoldsDescriptions {
+        fn name(&self) -> &'static str {
+            "holds-descriptions"
+        }
+        fn holds_descriptions(&self) -> bool {
+            true
+        }
+        fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
+            MinimalDialect.quote_ident(ident)
+        }
+        fn intermediate_tables(
+            &self,
+            change: &Change,
+            strategy: pbps_model::Strategy,
+        ) -> Result<Vec<pbps_model::TableName>, pbps_dialect::DialectError> {
+            MinimalDialect.intermediate_tables(change, strategy)
+        }
+        fn normalize_type(
+            &self,
+            ty: &pbps_model::ColumnType,
+        ) -> Result<pbps_model::ColumnType, pbps_dialect::DialectError> {
+            MinimalDialect.normalize_type(ty)
+        }
+        fn type_change_risk(
+            &self,
+            from: &pbps_model::ColumnType,
+            to: &pbps_model::ColumnType,
+        ) -> pbps_dialect::TypeChangeRisk {
+            MinimalDialect.type_change_risk(from, to)
+        }
+        fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+            MinimalDialect.fold_ident(ident)
+        }
+        fn lexicon(&self) -> pbps_dialect::Lexicon {
+            MinimalDialect.lexicon()
+        }
+        fn validate_table(
+            &self,
+            name: &pbps_model::TableName,
+            table: &Table,
+        ) -> Vec<pbps_dialect::DialectError> {
+            MinimalDialect.validate_table(name, table)
+        }
+        fn transaction_framing(
+            &self,
+            zone: &pbps_model::SessionZone,
+        ) -> pbps_dialect::TransactionFraming {
+            MinimalDialect.transaction_framing(zone)
+        }
+        fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+            MinimalDialect.probe_framing()
+        }
+    }
+
+    /// The tie-break text decides across families: a column's deprecation, a
+    /// table's comment and storage parameters and an index's storage parameters,
+    /// all one table's and all in one class and rank, come out in the alphabetical
+    /// order of their kinds, not grouped by what they belong to (#2790). Three
+    /// families, so a `Debug` that names the family first (`Column(`, `Index(`,
+    /// `TableProperty(`) would put the index's parameters before the comment.
+    #[test]
+    fn metadata_changes_tied_on_class_and_table_are_ordered_by_kind_across_families() {
+        let with = |fillfactor: &str, described: bool| {
+            let mut t = table(&[
+                ("id", Column::new(ty("int")).not_null()),
+                ("v", Column::new(ty("int"))),
+            ]);
+            t.indexes.insert(
+                "ix_v".into(),
+                Index {
+                    columns: vec![IndexColumn {
+                        key: pbps_model::IndexKey::Column("v".into()),
+                        descending: false,
+                        opclass: None,
+                        collation: None,
+                    }],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                    method: Default::default(),
+                    storage_parameters: [("fillfactor".to_owned(), fillfactor.to_owned())]
+                        .into_iter()
+                        .collect(),
+                    filegroup: None,
+                },
+            );
+            t.storage_parameters = [("fillfactor".to_owned(), fillfactor.to_owned())]
+                .into_iter()
+                .collect();
+            if described {
+                t.description = Some("a table".into());
+                t.columns["v"].deprecated = Some("old".into());
+            }
+            schema_of("public.t", t)
+        };
+        let planned = run_with(
+            &HoldsDescriptions,
+            &with("70", false),
+            &with("80", true),
+            &[],
+        );
+        let changed = kinds(&planned);
+        assert_eq!(
+            changed,
+            [
+                "SetColumnDeprecated",
+                "SetComment",
+                "SetIndexStorageParameters",
+                "SetStorageParameters"
+            ],
+            "{:?}",
+            planned.changes
+        );
+        // Negative: not the order a grouping by family would give, so the test
+        // cannot pass by accident.
+        assert_ne!(
+            changed,
+            [
+                "SetColumnDeprecated",
+                "SetIndexStorageParameters",
+                "SetComment",
+                "SetStorageParameters"
+            ]
+        );
+    }
+
+    /// `change_in_words` reads the kind's own name, for one kind of every family,
+    /// so a refusal says `drop check` and not the family's name (#2790).
+    #[test]
+    fn a_kind_is_put_in_words_by_its_own_name_in_every_family() {
+        fn plan_files(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    plan_files(&path, found);
+                } else if path.extension().is_some_and(|e| e == "json") {
+                    found.push(path);
+                }
+            }
+        }
+        fn objects(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
+            if let serde_json::Value::Object(map) = value {
+                if map.get("op").is_some_and(serde_json::Value::is_string) {
+                    out.push(value.clone());
+                } else {
+                    map.values().for_each(|v| objects(v, out));
+                }
+            } else if let serde_json::Value::Array(items) = value {
+                items.iter().for_each(|v| objects(v, out));
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut files = Vec::new();
+        for place in [
+            "pbps-cli/tests/fixtures/name-compatibility",
+            "pbps-model/tests/fixtures",
+            "pbps-model/tests/support",
+        ] {
+            plan_files(&root.join(place), &mut files);
+        }
+        let mut by_op: std::collections::BTreeMap<String, Change> = Default::default();
+        for file in files {
+            let Ok(value) = serde_json::from_str(&std::fs::read_to_string(file).unwrap()) else {
+                continue;
+            };
+            let mut found = Vec::new();
+            objects(&value, &mut found);
+            for object in found {
+                let op = object["op"].as_str().unwrap().to_owned();
+                if let Ok(planned) = serde_json::from_value::<pbps_model::PlannedChange>(object) {
+                    by_op.entry(op).or_insert(planned.change);
+                }
+            }
+        }
+        // One kind of each family, in `ChangeFamily` order.
+        let expected = [
+            ("create_table", "create table"),
+            ("set_replica_identity", "set replica identity"),
+            ("detach_partition", "detach partition"),
+            ("drop_column", "drop column"),
+            ("drop_check", "drop check"),
+            ("drop_index", "drop index"),
+            ("drop_policy", "drop policy"),
+            ("set_data_mode", "set data mode"),
+            ("drop_module", "drop module"),
+            ("revoke", "revoke"),
+            ("alter_domain", "alter domain"),
+            ("drop_role", "drop role"),
+            ("rename_type", "rename type"),
+            ("drop_extension", "drop extension"),
+        ];
+        let mut families = std::collections::BTreeSet::new();
+        for (op, words) in expected {
+            let change = by_op
+                .get(op)
+                .unwrap_or_else(|| panic!("no fixture holds a `{op}`; add one"));
+            assert_eq!(change_in_words(change), words, "{op}");
+            families.insert(change.family());
+        }
+        assert_eq!(families.len(), 14, "one kind of every family: {families:?}");
+        // Negative: the words are the kind's, so two kinds of one family differ.
+        assert_ne!(
+            change_in_words(&by_op["drop_check"]),
+            change_in_words(&by_op["add_check"])
+        );
     }
 
     fn row_ops(cs: &ChangeSet) -> Vec<String> {
