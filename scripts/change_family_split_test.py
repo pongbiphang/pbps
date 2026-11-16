@@ -105,7 +105,7 @@ class SplitTests(unittest.TestCase):
         self.check()
 
     def test_generic_parameter_types_are_not_split_at_inner_commas(self):
-        self.split('        Change::Table(_) => make(values),',
+        self.split('        Change::Table(TableChange::First) => make(values),',
                    'values: &BTreeMap<A, Vec<B>>, change: &Change')
         self.assertIn('values: &BTreeMap<A, Vec<B>>', self.family('Table'))
         self.check()
@@ -113,7 +113,7 @@ class SplitTests(unittest.TestCase):
     def test_file_function_parameter_types_and_return_type_are_not_pg_specific(self):
         self.file = 'crates/other-engine/src/preflight.rs'
         self.path = self.root / self.file
-        original = self.source('        Change::Table(_) => check(dialect),',
+        original = self.source('        Change::Table(TableChange::First) => check(dialect),',
                                'dialect: &OtherEngine, change: &Change').replace('-> Sql', '-> Result<()>')
         self.write(self.file, original)
         result = cfs.run(self.root, self.file, 'target', out=io.StringIO())
@@ -125,9 +125,9 @@ class SplitTests(unittest.TestCase):
 
     def test_whole_family_wildcard_and_binding_are_unwrapped(self):
         self.split('''        Change::Table(inner) => make(inner),
-        Change::Column(_) => make(),''')
+        Change::Column(_) if ready() => make(),''')
         self.assertIn('        inner => make(inner),', self.family('Table'))
-        self.assertIn('        _ => make(),', self.family('Column'))
+        self.assertIn('        _ if ready() => make(),', self.family('Column'))
         self.assertEqual([p.name for p in self.result.parameters['Table']], ['table'])
         self.check()
 
@@ -195,7 +195,7 @@ class SplitTests(unittest.TestCase):
                 _ => use_char('}'),
             }
         }'''
-        self.split('        Change::Table(_) =>' + body)
+        self.split('        Change::Table(TableChange::First) =>' + body)
         self.assertIn('=>' + body, self.family('Table'))
         self.assertEqual(self.result.families, ['Table'])
         self.check()
@@ -205,7 +205,7 @@ class SplitTests(unittest.TestCase):
            It continues on this line. */
         Change::Table(TableChange::First) => first(), // Trailing first.
         // This explains the second family.
-        Change::Column(_) => second(),''')
+        Change::Column(ColumnChange::First) => second(),''')
         self.assertIn('It continues on this line.', self.family('Table'))
         self.assertIn('// Trailing first.', self.family('Table'))
         self.assertNotIn('Trailing first', self.family('Column'))
@@ -213,9 +213,9 @@ class SplitTests(unittest.TestCase):
         self.check()
 
     def test_unresolvable_target_and_nested_only_match_are_refused(self):
-        self.assert_refused_without_writes(self.source('        Change::Table(_) => make(),'),
+        self.assert_refused_without_writes(self.source('        Change::Table(TableChange::First) => make(),'),
                                           'cannot resolve', name='missing')
-        original = HEADER + 'fn target(change: &Change) -> Sql { helper(|| { match change { Change::Table(_) => make() } }) }'
+        original = HEADER + 'fn target(change: &Change) -> Sql { helper(|| { match change { Change::Table(TableChange::First) => make() } }) }'
         self.assert_refused_without_writes(original, 'cannot resolve exactly one top-level match')
 
     def test_unknown_or_unattributed_patterns_refuse_every_output(self):
@@ -227,15 +227,15 @@ class SplitTests(unittest.TestCase):
 
     def test_clashes_with_declared_or_existing_modules_are_refused(self):
         self.assert_refused_without_writes(
-            self.source('        Change::Table(_) => make(),').replace('mod helpers;', 'mod helpers;\nmod table;'),
+            self.source('        Change::Table(TableChange::First) => make(),').replace('mod helpers;', 'mod helpers;\nmod table;'),
             'clashes')
         self.write('crates/engine/src/emit/table.rs', '// Owned elsewhere.\n')
-        self.assert_refused_without_writes(self.source('        Change::Table(_) => make(),'), 'clashes')
+        self.assert_refused_without_writes(self.source('        Change::Table(TableChange::First) => make(),'), 'clashes')
 
     def test_an_unattached_comment_refuses_instead_of_disappearing(self):
         self.assert_refused_without_writes(self.source('''        // Detached explanation.
 
-        Change::Table(_) => make(),'''), 'unattached comments')
+        Change::Table(TableChange::First) => make(),'''), 'unattached comments')
 
     def test_check_detects_wrong_duplication_order_guard_and_comment_ownership(self):
         self.split('''        // First owns this.
@@ -264,37 +264,37 @@ class SplitTests(unittest.TestCase):
         self.check()
 
     def test_check_rejects_parent_changes_outside_match_and_mods(self):
-        self.split('        Change::Table(_) => make(),')
+        self.split('        Change::Table(TableChange::First) => make(),')
         self.path.write_text(self.path.read_text().replace('keep_every_byte', 'changed'))
         with self.assertRaisesRegex(ValueError, 'parent changed outside'):
             self.check()
 
     def test_check_accepts_rust_whitespace_but_preserves_literal_and_comment_bytes(self):
-        self.split('        Change::Table(_) => make("unchanged text"),')
+        self.split('        Change::Table(TableChange::First) => make("unchanged text"),')
         path = self.result.module_path('Table')
-        path.write_text(path.read_text().replace('        _ => make', '    _  =>  make'))
+        path.write_text(path.read_text().replace('        TableChange::First => make', '    TableChange::First  =>  make'))
         self.check()
         path.write_text(path.read_text().replace('unchanged text', 'unchanged  text'))
         with self.assertRaisesRegex(ValueError, 'arm content'):
             self.check()
 
     def test_check_accepts_formatter_removing_a_signature_trailing_comma(self):
-        self.split('        Change::Table(_) => make(),')
+        self.split('        Change::Table(TableChange::First) => make(),')
         path = self.result.module_path('Table')
         path.write_text(path.read_text().replace('fn emit(\n    table: &TableChange,\n)',
                                                 'fn emit(table: &TableChange)'))
         self.check()
 
     def test_check_accepts_formatter_eliding_the_braces_of_a_one_expression_arm(self):
-        self.split('        Change::Table(_) => {\n            make()\n        }')
+        self.split('        Change::Table(TableChange::First) => {\n            make()\n        }')
         path = self.result.module_path('Table')
         moved = path.read_text()
-        path.write_text(moved.replace('_ => {\n            make()\n        }', '_ => make(),'))
+        path.write_text(moved.replace('TableChange::First => {\n            make()\n        }', 'TableChange::First => make(),'))
         self.check()
 
     def test_check_still_refuses_a_changed_block_or_an_unbraced_statement_block(self):
-        self.split('        Change::Table(_) => {\n            let x = make();\n            x\n        }\n'
-                   '        Change::Column(_) => {\n            // Why.\n            make()\n        }')
+        self.split('        Change::Table(TableChange::First) => {\n            let x = make();\n            x\n        }\n'
+                   '        Change::Column(ColumnChange::First) => {\n            // Why.\n            make()\n        }')
         table, column = self.result.module_path('Table'), self.result.module_path('Column')
         for path, old, new in [
             (table, '{\n            let x = make();\n            x\n        }', 'make(),'),
@@ -310,8 +310,47 @@ class SplitTests(unittest.TestCase):
                 path.write_text(before)
         self.check()
 
+    def test_a_parent_without_out_of_line_modules_takes_them_after_its_last_use(self):
+        header = HEADER.replace('mod helpers;\n', '')
+        self.assertNotEqual(header, HEADER)
+        original = (header + 'fn target(change: &Change) -> Sql {\n    match change {\n'
+                    '        Change::Table(TableChange::First) => make(),\n        Change::Column(ColumnChange::First) => make(),\n'
+                    '    }\n}\n')
+        self.write(self.file, original)
+        self.original = original
+        cfs.run(self.root, self.file, 'target', out=io.StringIO())
+        parent = self.path.read_text()
+        last_use = parent.index('use pbps_model::*;\n')
+        declared = parent.index('mod column;\nmod table;\n')
+        self.assertGreater(declared, last_use)
+        self.assertLess(declared, parent.index('fn target'))
+        self.check()
+
+    def test_a_family_answered_by_one_whole_family_arm_stays_in_the_dispatch(self):
+        self.split('        // Not on this engine.\n        Change::Table(_) => refuse(),\n'
+                   '        Change::Column(_) => make(),\n        Change::Column(ColumnChange::First) => never(),')
+        self.assertFalse(self.result.module_path('Table').exists())
+        self.assertTrue(self.result.module_path('Column').exists())
+        parent = self.path.read_text()
+        self.assertIn('        // Not on this engine.\n        Change::Table(_) => refuse(),\n', parent)
+        self.assertNotIn('mod table;', parent)
+        self.check()
+        self.path.write_text(parent.replace('refuse()', 'other()'))
+        with self.assertRaisesRegex(ValueError, 'incorrect dispatch for Table'):
+            self.check()
+
+    def test_a_guarded_or_shared_whole_family_arm_still_moves(self):
+        self.split('        Change::Table(_) if ready(change) => make(),\n        Change::Table(_) => wait(),')
+        self.assertTrue(self.result.module_path('Table').exists())
+        self.check()
+
+    def test_a_parent_with_neither_modules_nor_uses_is_refused(self):
+        self.assert_refused_without_writes(
+            'fn target(change: &Change) -> Sql {\n    match change {\n        Change::Table(TableChange::First) => make(),\n    }\n}\n',
+            'no module declaration or top-level use')
+
     def test_failed_post_write_verification_restores_parent_and_removes_outputs(self):
-        original = self.source('        Change::Table(_) => make(),')
+        original = self.source('        Change::Table(TableChange::First) => make(),')
         self.write(self.file, original)
         original_verify = cfs.Split.verify
         calls = []
@@ -330,7 +369,7 @@ class SplitTests(unittest.TestCase):
         self.assertTrue((self.path.with_suffix('') / 'helpers.rs').exists())
 
     def test_cli_check_requires_original_and_returns_nonzero_on_unresolved_target(self):
-        self.write(self.file, self.source('        Change::Table(_) => make(),'))
+        self.write(self.file, self.source('        Change::Table(TableChange::First) => make(),'))
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as error:
                 cfs.main([str(self.root), '--file', self.file, '--function', 'target', '--check'])
