@@ -3,9 +3,16 @@ use super::*;
 use pbps_db::{Driver, query::EvidenceCell};
 use pbps_mssql::assertions::{AssertionResult, Target, run_target};
 use std::time::Duration;
-// Admission now audits every accessible system database as well as the target.
-// Give the native fixture room on shared hosts; the 200 ms timeout case is separate.
-const DEADLINE: Duration = Duration::from_secs(30);
+// Admission audits every accessible system database as well as the target: about
+// a second on an idle host, under five with sixty-four busy loops beside it, so
+// the work does not need this room (#2901). The room is for host stalls. In a
+// full gate a docker call stalled for 32 s while the other shards started and
+// killed containers, and a stall of that size inside one admission outlasted the
+// former 30 s. A stall in an established connection is now outlasted with a wide
+// margin; one in the connection handshake meets `pbps_db`'s own bound first and
+// is not this constant's to absorb. The deadline itself is specified by the
+// 1 ns and 200 ms cases below, which do not use it.
+const DEADLINE: Duration = Duration::from_secs(120);
 // The census reads the whole instance, so these cases must not run beside any
 // other test. `scripts/live-tests.sh` and the CI `live (dialect)` job give the
 // `assertions2401::` cases an invocation of their own with one test thread (#2631):
