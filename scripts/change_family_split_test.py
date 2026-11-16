@@ -358,6 +358,109 @@ class SplitTests(unittest.TestCase):
         self.assertTrue(self.result.module_path('Table').exists())
         self.check()
 
+    def test_generics_go_to_a_family_whose_parameters_name_them(self):
+        original = (HEADER + "fn target<'v, 'p: 'v>(change: &Change, names: &impl Names<'v, 'p>) -> Sql {\n"
+                    '    match change {\n'
+                    '        Change::Table(TableChange::First) => first(names),\n'
+                    '        Change::Column(ColumnChange::First) => other(),\n    }\n}\n')
+        self.write(self.file, original)
+        self.original = original
+        self.result = cfs.run(self.root, self.file, 'target', out=io.StringIO())
+        self.assertIn("fn emit<'v, 'p: 'v>(\n", self.family('Table'))
+        self.assertIn('fn emit(\n', self.family('Column'))
+        self.check()
+
+    def test_a_generic_named_only_in_an_arm_body_is_still_declared(self):
+        original = (HEADER + "fn target<'v>(change: &Change, names: &Names<'v>) -> Sql {\n"
+                    '    match change {\n'
+                    "        Change::Table(TableChange::First) => { let x: &'v str = pick(); make(x) }\n"
+                    '        Change::Column(ColumnChange::First) => other(names),\n    }\n}\n')
+        self.write(self.file, original)
+        self.original = original
+        self.result = cfs.run(self.root, self.file, 'target', out=io.StringIO())
+        self.assertIn("fn emit<'v>(\n", self.family('Table'))
+        self.check()
+
+    def test_a_type_parameter_no_family_parameter_names_is_refused(self):
+        self.assert_refused_without_writes(
+            HEADER + 'fn target<T: Probe>(change: &Change, probe: T) -> Sql {\n    match change {\n'
+            '        Change::Table(TableChange::First) => T::default().run(),\n'
+            '        Change::Column(ColumnChange::First) => probe.run(),\n    }\n}\n',
+            'could not be inferred')
+
+    def test_a_match_that_is_not_the_tail_is_refused(self):
+        # A moved `return` or `?` would leave the family function and run
+        # what follows the match: a different program.
+        self.assert_refused_without_writes(
+            HEADER + 'fn target(change: &Change) -> Sql {\n    let x = match change {\n'
+            '        Change::Table(TableChange::First) => make()?,\n    };\n    x\n}\n',
+            'tail expression')
+        self.assert_refused_without_writes(
+            HEADER + 'fn target(change: &Change) -> Sql {\n    match change {\n'
+            '        Change::Table(TableChange::First) => make()?,\n    }\n    after()\n}\n',
+            'tail expression')
+
+    def test_the_parent_file_names_the_family_function(self):
+        self.file = 'crates/engine/src/preflight.rs'
+        self.path = self.root / self.file
+        self.write('crates/engine/src/preflight/helpers.rs', '// Existing helpers.\n')
+        self.split('        Change::Table(TableChange::First) => make(),')
+        table = self.family('Table')
+        self.assertIn('pub(super) fn preflight(', table)
+        self.assertIn('//! Probes the table family of changes before apply', table)
+        self.assertIn('table::preflight(table)', self.path.read_text())
+        self.check()
+
+    def test_a_parent_without_wording_is_refused(self):
+        self.file = 'crates/engine/src/rows.rs'
+        self.path = self.root / self.file
+        self.assert_refused_without_writes(self.source('        Change::Table(TableChange::First) => make(),'),
+                                           'no family-module wording')
+
+    def test_a_comment_between_alternatives_moves_with_the_next_one(self):
+        self.split('''        // Everything else is free.
+        Change::Table(TableChange::First)
+        // Columns: nothing to count.
+        | Change::Column(ColumnChange::First)
+        | Change::Table(TableChange::Last)
+        // The last column too.
+        | Change::Column(ColumnChange::Last) => free(),''')
+        table, column = self.family('Table'), self.family('Column')
+        self.assertIn('Everything else is free.', table)
+        self.assertNotIn('Columns: nothing', table)
+        self.assertNotIn('Everything else', column)
+        # The first column alternative's comment opens the arm; the later one
+        # stays in the pattern, before its alternative.
+        self.assertLess(column.index('Columns: nothing'), column.index('ColumnChange::First'))
+        self.assertLess(column.index('ColumnChange::First'), column.index('The last column too.'))
+        self.assertLess(column.index('The last column too.'), column.index('ColumnChange::Last'))
+        self.check()
+
+    def test_check_accepts_rustfmt_trailing_commas_and_nested_arm_braces(self):
+        self.split('        Change::Table(TableChange::First) => { let x = S { a, b }; match x { A => { ok() } B => no(), } }')
+        path = self.result.module_path('Table')
+        moved = path.read_text()
+        for old, new in [('S { a, b }', 'S { a, b, }'),
+                         ('A => { ok() } B => no(), }', 'A => ok(), B => no() }')]:
+            with self.subTest(new=new):
+                self.assertIn(old, moved)
+                path.write_text(moved.replace(old, new))
+                self.check()
+        for old, new in [('S { a, b }', 'S { a; b }'),
+                         ('A => { ok() }', 'A => { ok(); }'),
+                         ('A => { ok() }', 'A => { /* why */ ok() }')]:
+            with self.subTest(new=new):
+                path.write_text(moved.replace(old, new))
+                with self.assertRaisesRegex(ValueError, 'arm content'):
+                    self.check()
+        path.write_text(moved)
+
+    def test_a_one_element_tuple_keeps_its_comma(self):
+        fp = cfs.fingerprint
+        self.assertNotEqual(fp('(a,)'), fp('(a)'))
+        self.assertEqual(fp('f(a, b,)'), fp('f(a, b)'))
+        self.assertEqual(fp('g((a,), b,)'), fp('g((a,), b)'))
+
     def test_a_parent_with_neither_modules_nor_uses_is_refused(self):
         self.assert_refused_without_writes(
             'fn target(change: &Change) -> Sql {\n    match change {\n        Change::Table(TableChange::First) => make(),\n    }\n}\n',

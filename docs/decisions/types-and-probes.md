@@ -6116,3 +6116,10 @@ out-of-line module yet takes the new `mod` lines after its last top-level
 `use`; and a family answered by one unguarded whole-family arm (`Change::Policy(_)
 => refuse`) keeps that arm in the dispatch, since a module would hold only
 `match policy { _ => .. }` around it.
+
+Both preflights' `build` follow (`crates/<engine>/src/preflight/<family>.rs`,
+each family function named `preflight`). The tool takes them under rules that
+hold for any target: the match must be the function's tail expression, since a
+moved `return` or `?` would otherwise run what follows it; generic parameters go
+to a family function whose parameters name them; and a comment between the
+alternatives of a shared arm moves with the alternative after it.
