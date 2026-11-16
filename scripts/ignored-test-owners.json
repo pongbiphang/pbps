@@ -2483,7 +2483,7 @@
         "a_staged_checkpoint_survives_the_ledger",
         "a_stored_generated_column_round_trips_and_changes_its_expression",
         "inet_cidr_macaddr_tsvector_and_xml_columns_pull_recreate_and_repull_to_an_empty_plan",
-        "macaddr8_and_a_gin_over_a_tsvector_stay_reported_limitations",
+        "macaddr8_stays_a_reported_limitation_and_a_gin_over_a_tsvector_is_held",
         "inet_into_cidr_is_a_narrowing_whose_probe_counts_the_rows_with_host_bits",
         "a_declared_xml_or_network_value_is_read_under_the_pins_and_not_the_sessions_xmloption",
         "a_dropped_parent_trigger_takes_its_clones_out_of_the_data_guards_widening",
