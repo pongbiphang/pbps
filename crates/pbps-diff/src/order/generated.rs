@@ -1602,11 +1602,22 @@ fn scratch_rules(
                     Change::AlterDomain { .. } if is_part(p) => domains::texts(&p.change),
                     _ => Vec::new(),
                 };
+                // A configuration reads the dictionaries it maps, a thesaurus the one it names:
+                // each is spelled as a name in its text (DEC-2728.2).
+                let search = match &p.change {
+                    Change::CreateSearch { definition, .. } => definition
+                        .dictionaries()
+                        .iter()
+                        .map(|used| std::borrow::Cow::Owned(used.name.raw().to_string()))
+                        .collect(),
+                    _ => Vec::new(),
+                };
                 let all = gather(&p.change, types)
                     .into_iter()
                     .chain(domain)
                     .map(std::borrow::Cow::Borrowed)
                     .chain(module)
+                    .chain(search)
                     .collect();
                 (i, all)
             })
@@ -1621,6 +1632,23 @@ fn scratch_rules(
             if texts
                 .iter()
                 .any(|t| dialect.generation_may_call(t, name.name()))
+            {
+                guess(out, at, *reader);
+            }
+        }
+    }
+    // A text search object precedes every change whose text names it. An expression names a
+    // configuration or a dictionary by a string literal the engine resolves when the index,
+    // generated column or routine is created (`'app.docs'::regconfig`), so the literal scan
+    // that finds a function by `may_call` finds it too (DEC-2728.2, DEC-1364.1).
+    for (at, p) in cs.changes.iter().enumerate() {
+        let Change::CreateSearch { name, .. } = &p.change else {
+            continue;
+        };
+        for (reader, texts) in &type_readers {
+            if texts
+                .iter()
+                .any(|t| dialect.generation_may_call(t, name.name.name()))
             {
                 guess(out, at, *reader);
             }

@@ -738,6 +738,36 @@
     }
   },
   {
+    "name": "CreateSearch",
+    "change": {
+      "op": "create_search",
+      "uid": "s_aaaaaa",
+      "name": "config app.docs",
+      "definition": {
+        "kind": "config",
+        "parser": "pg_catalog.\"default\"",
+        "mappings": {
+          "asciiword": [
+            "app.words"
+          ]
+        }
+      }
+    }
+  },
+  {
+    "name": "DropSearch",
+    "change": {
+      "op": "drop_search",
+      "uid": "s_aaaaaa",
+      "name": "dictionary app.words",
+      "definition": {
+        "kind": "dictionary",
+        "template": "pg_catalog.simple",
+        "options": {}
+      }
+    }
+  },
+  {
     "name": "CreateExtension",
     "change": {
       "op": "create_extension",

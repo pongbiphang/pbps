@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use pbps_model::{SearchKind, SearchObject, SearchRef, TypeRef};
+use pbps_model::{SearchKind, SearchName, SearchObject, SearchRef, TypeRef};
 
 use crate::{
     LoadError,
@@ -16,8 +16,11 @@ pub struct LoadedSearch {
     pub definition: SearchObject,
 }
 
-fn reference(text: &str, what: &str) -> Result<TypeRef, String> {
-    text.parse::<TypeRef>()
+fn reference<T: std::str::FromStr<Err = pbps_model::TypeParseError>>(
+    text: &str,
+    what: &str,
+) -> Result<T, String> {
+    text.parse::<T>()
         .map_err(|e| format!("{what} `{}`: {e}", pbps_model::escape::Escaped(text)))
 }
 
@@ -36,9 +39,9 @@ pub fn load_search_str(path: &Path, text: &str) -> Result<LoadedSearch, Vec<Load
         (Some(_), None) => {
             let dto: SearchConfigDto =
                 serde_saphyr::from_str(text).map_err(|e| fail(e.to_string()))?;
-            let name =
+            let name: SearchName =
                 reference(&dto.text_search_config, "text search configuration").map_err(fail)?;
-            let parser = reference(&dto.parser, "parser").map_err(fail)?;
+            let parser: TypeRef = reference(&dto.parser, "parser").map_err(fail)?;
             let mut mappings = std::collections::BTreeMap::new();
             for (alias, dictionaries) in dto.mappings {
                 if dictionaries.is_empty() {
@@ -50,7 +53,7 @@ pub fn load_search_str(path: &Path, text: &str) -> Result<LoadedSearch, Vec<Load
                 }
                 let parsed = dictionaries
                     .iter()
-                    .map(|d| reference(d, "dictionary"))
+                    .map(|d| reference::<SearchName>(d, "dictionary"))
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(fail)?;
                 mappings.insert(alias, parsed);
@@ -63,15 +66,27 @@ pub fn load_search_str(path: &Path, text: &str) -> Result<LoadedSearch, Vec<Load
         (None, Some(_)) => {
             let dto: SearchDictionaryDto =
                 serde_saphyr::from_str(text).map_err(|e| fail(e.to_string()))?;
-            let name =
+            let name: SearchName =
                 reference(&dto.text_search_dictionary, "text search dictionary").map_err(fail)?;
-            let template = reference(&dto.template, "template").map_err(fail)?;
+            let template: TypeRef = reference(&dto.template, "template").map_err(fail)?;
+            let definition = SearchObject::Dictionary {
+                template,
+                options: dto.options,
+            };
+            // The engine resolves an unqualified sub-dictionary by the search path of whoever
+            // uses it, so the create order and the drop guard could not see the edge. It is
+            // refused here, by name, rather than dropped from the dependencies without a word.
+            if let Some(value) = definition.unqualified_sub_dictionary() {
+                return Err(fail(format!(
+                    "text search dictionary `{}`: the option `dictionary` names `{}`, which is \
+                     not `schema.name`; qualify it as `schema.name`",
+                    name.shown(),
+                    pbps_model::escape::Escaped(value)
+                )));
+            }
             Ok(LoadedSearch {
                 name: SearchRef::new(SearchKind::Dictionary, name),
-                definition: SearchObject::Dictionary {
-                    template,
-                    options: dto.options,
-                },
+                definition,
             })
         }
         _ => Err(fail(
@@ -179,6 +194,26 @@ mod tests {
         assert_eq!(config(&render_search(&name, &empty)).definition, empty);
     }
 
+    /// A name that starts with an underscore is a text search name like any other: declared,
+    /// mapped and rendered back (ready round 2). Negative: an unqualified name is refused.
+    #[test]
+    fn a_text_search_name_with_a_leading_underscore_loads_and_renders() {
+        let text = "text_search_config: app._docs\nparser: pg_catalog.\"default\"\n\
+                    mappings:\n  word: [app._words]\n";
+        let loaded = config(text);
+        assert_eq!(loaded.name.name.name(), "_docs");
+        let rendered = render_search(&loaded.name, &loaded.definition);
+        assert!(
+            rendered.contains("app._docs") && rendered.contains("[app._words]"),
+            "{rendered}"
+        );
+        assert_eq!(config(&rendered), loaded);
+        assert!(
+            refusal("text_search_config: _docs\nparser: pg_catalog.\"default\"\n")
+                .contains("_docs")
+        );
+    }
+
     /// Negatives: no leading kind, both, an unqualified or malformed name, an empty
     /// mapping, an unknown key (a rename is not part of this first slice).
     #[test]
@@ -210,6 +245,32 @@ mod tests {
             let said = refusal(text);
             assert!(said.contains(expected), "{text:?}: {said}");
         }
+    }
+
+    /// A thesaurus names its sub-dictionary in the `dictionary` option. Spelled without its
+    /// schema it would drop out of the create order and the drop guard, so the file is refused
+    /// by the dictionary's name and the remedy. Negative: the qualified spelling loads, and so
+    /// does a dictionary with no such option.
+    #[test]
+    fn an_unqualified_sub_dictionary_is_refused_with_its_remedy() {
+        let thesaurus = |value: &str| {
+            format!(
+                "text_search_dictionary: app.thes\ntemplate: pg_catalog.thesaurus\noptions:\n  \
+                 dictfile: mythes\n  dictionary: {value}\n"
+            )
+        };
+        for value in ["english_stem", "a.b.c"] {
+            let said = refusal(&thesaurus(value));
+            assert!(
+                said.contains("app.thes")
+                    && said.contains(value)
+                    && said.contains("qualify it as `schema.name`"),
+                "{value}: {said}"
+            );
+        }
+        let loaded = config(&thesaurus("pg_catalog.english_stem"));
+        assert_eq!(loaded.definition.dictionaries().len(), 1);
+        config("text_search_dictionary: app.d\ntemplate: pg_catalog.simple\n");
     }
 
     /// The file kind is the leading key, so the two kinds of one name, and a domain of

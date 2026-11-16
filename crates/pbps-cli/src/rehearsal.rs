@@ -218,6 +218,7 @@ pub fn lower_from_empty<D: crate::emission::Engine>(
         .cloned()
         .collect();
     let ids = &ids.without_types(&absent);
+    let schema = &*schema.buildable(ids);
     let (prerequisites, prerequisite_ids) =
         pbps_diff::bootstrap_base(pbps_diff::Side { schema, ids });
     lower_between(
@@ -243,9 +244,12 @@ pub fn lower_between<D: crate::emission::Engine>(
     pbps_model::operation::Operations,
 )> {
     let dialect = selected.as_ref();
-    // The buildable form of both ends (DEC-2855.1): a kind no plan can build, a text search
-    // object, is not built, and a held one no longer makes the differ refuse the base.
-    let (before_schema, after_schema) = (before.schema.buildable(), after.schema.buildable());
+    // The buildable form of both ends (DEC-2855.1): a text search object no identity names
+    // is not built, and a held one no longer makes the differ refuse the base.
+    let (before_schema, after_schema) = (
+        before.schema.buildable(before.ids),
+        after.schema.buildable(after.ids),
+    );
     let before = pbps_diff::Side {
         schema: &before_schema,
         ids: before.ids,
@@ -1144,6 +1148,41 @@ mod tests {
             "{:?}",
             lowered.statements()
         );
+    }
+
+    /// The target's scoped read keeps every text search object the database holds, but a
+    /// build from nothing may create only what an identity names: an object nobody manages
+    /// does not stop a plan that touches a table from rehearsing (ready round 2). Negative:
+    /// a managed one is still built, with its identity.
+    #[test]
+    fn an_unmanaged_text_search_object_does_not_stop_the_base_building() {
+        let pg = pbps_pg::Postgres::new();
+        let dictionary = |name: &str| {
+            (
+                format!("dictionary app.{name}")
+                    .parse::<pbps_model::SearchRef>()
+                    .unwrap(),
+                pbps_model::SearchObject::Dictionary {
+                    template: "pg_catalog.simple".parse().unwrap(),
+                    options: Default::default(),
+                },
+            )
+        };
+        let (kept, kept_object) = dictionary("kept");
+        let (other, other_object) = dictionary("someone_elses");
+        let schema = Schema {
+            search: [(kept.clone(), kept_object), (other, other_object)].into(),
+            ..Default::default()
+        };
+        let mut ids = IdsFile::default();
+        ids.search.insert(
+            pbps_model::Uid::generate(pbps_model::uid::UidKind::Search),
+            kept,
+        );
+        let (lowered, _) = lower_from_empty(&pg, &schema, &ids, &Default::default()).unwrap();
+        let sql: Vec<_> = lowered.statements().iter().map(|s| s.sql.clone()).collect();
+        assert!(sql.iter().any(|s| s.contains("\"kept\"")), "{sql:?}");
+        assert!(!sql.iter().any(|s| s.contains("someone_elses")), "{sql:?}");
     }
 
     fn declarations() -> (Schema, IdsFile) {

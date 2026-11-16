@@ -40,6 +40,7 @@ macro_rules! each_name_map {
             columns,
             roles,
             types,
+            search,
             extensions,
             tombstones: _,
             moves: _,
@@ -48,7 +49,7 @@ macro_rules! each_name_map {
         } = $ids;
         each_name_map!(@each $kind, $map, $body;
             Table => tables, Column => columns, Role => roles, Type => types,
-            Extension => extensions);
+            Search => search, Extension => extensions);
     }};
     // Two files side by side: the same map of each.
     ($ids:expr, $other:expr, |$map:ident, $theirs:ident| $body:expr) => {{
@@ -58,6 +59,7 @@ macro_rules! each_name_map {
             columns: own_columns,
             roles: own_roles,
             types: own_types,
+            search: own_search,
             extensions: own_extensions,
             tombstones: _,
             moves: _,
@@ -70,6 +72,7 @@ macro_rules! each_name_map {
             columns,
             roles,
             types,
+            search,
             extensions,
             tombstones: _,
             moves: _,
@@ -78,7 +81,7 @@ macro_rules! each_name_map {
         } = $other;
         each_name_map!(@each $map, $theirs, $body;
             own_tables => tables, own_columns => columns, own_roles => roles,
-            own_types => types, own_extensions => extensions);
+            own_types => types, own_search => search, own_extensions => extensions);
     }};
     (@each $x:ident, $y:ident, $body:expr; $($left:ident => $right:ident),+) => {
         $(
@@ -93,6 +96,7 @@ macro_rules! each_name_map {
     (@left Column) => { UidKind::Column };
     (@left Role) => { UidKind::Role };
     (@left Type) => { UidKind::Type };
+    (@left Search) => { UidKind::Search };
     (@left Extension) => { UidKind::Extension };
     (@left $other:ident) => { $other };
 }
@@ -189,6 +193,11 @@ pub struct IdsFile {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extensions: BTreeMap<Uid, crate::ObjectLocalName>,
 
+    /// Text search configurations and dictionaries, `s_`-prefixed (#2728): a compatible
+    /// evolution under version 1, as `types` and `extensions` were.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub search: BTreeMap<Uid, crate::SearchRef>,
+
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tombstones: BTreeMap<Uid, Tombstone>,
 
@@ -223,6 +232,7 @@ impl Default for IdsFile {
             roles: BTreeMap::new(),
             types: BTreeMap::new(),
             extensions: BTreeMap::new(),
+            search: BTreeMap::new(),
             tombstones: BTreeMap::new(),
             moves: BTreeMap::new(),
             rebuilds: BTreeMap::new(),
@@ -364,6 +374,14 @@ impl IdsFile {
                 });
             }
         }
+        for (uid, name) in &self.search {
+            if !schema.search.contains_key(name) {
+                return Err(IdsError::NotHeld {
+                    uid: uid.clone(),
+                    name: name.raw().to_string(),
+                });
+            }
+        }
         for (uid, name) in &self.tables {
             if !schema.tables.contains_key(name) {
                 return Err(IdsError::NotHeld {
@@ -472,6 +490,10 @@ impl IdsFile {
 
     pub fn type_uid(&self, name: &crate::TypeRef) -> Option<&Uid> {
         self.types.iter().find(|(_, n)| *n == name).map(|(u, _)| u)
+    }
+
+    pub fn search_uid(&self, name: &crate::SearchRef) -> Option<&Uid> {
+        self.search.iter().find(|(_, n)| *n == name).map(|(u, _)| u)
     }
 
     /// Reverse lookups over this file, built once in one pass (#1870).
@@ -1827,5 +1849,74 @@ mod extension_tests {
         let back = crate::StateSnapshot::from_json(&serde_json::to_string(&new).unwrap()).unwrap();
         assert_eq!(back.schema, new.schema);
         assert_eq!(back.version, crate::state::CURRENT_VERSION);
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    /// Text search identities are a compatible evolution under version 1, own the `s_`
+    /// prefix, and are as strict about ownership as a type's (DEC-2728.2).
+    #[test]
+    fn search_identities_are_compatible_and_strict_about_kind_and_name() {
+        let mut ids: IdsFile = serde_json::from_value(
+            serde_json::json!({"version": CURRENT_VERSION, "tables": {}, "columns": {}}),
+        )
+        .unwrap();
+        assert!(ids.search.is_empty());
+        assert!(!serde_json::to_string(&ids).unwrap().contains("search"));
+        let uid: Uid = "s_000001".parse().unwrap();
+        assert_eq!(uid.kind(), UidKind::Search);
+        let name: crate::SearchRef = "config app.docs".parse().unwrap();
+        ids.search.insert(uid.clone(), name.clone());
+        ids.validate().unwrap();
+        assert!(ids.contains_uid(&uid));
+        assert_eq!(ids.search_uid(&name), Some(&uid));
+        // A dictionary of the same name is another object.
+        assert_eq!(
+            ids.search_uid(&"dictionary app.docs".parse().unwrap()),
+            None
+        );
+        assert!(ids.check_held_by(&crate::Schema::default()).is_err());
+        let mut schema = crate::Schema::default();
+        schema.search.insert(
+            name.clone(),
+            crate::SearchObject::Config {
+                parser: "pg_catalog.\"default\"".parse().unwrap(),
+                mappings: BTreeMap::new(),
+            },
+        );
+        ids.check_held_by(&schema).unwrap();
+        assert_eq!(
+            serde_json::from_str::<IdsFile>(&serde_json::to_string(&ids).unwrap()).unwrap(),
+            ids
+        );
+        let mut bad = ids.clone();
+        bad.search.insert("s_000002".parse().unwrap(), name);
+        assert!(matches!(
+            bad.validate(),
+            Err(IdsError::DuplicateName { .. })
+        ));
+        let mut bad = ids.clone();
+        bad.search.insert(
+            "y_000002".parse().unwrap(),
+            "config app.other".parse().unwrap(),
+        );
+        assert!(matches!(bad.validate(), Err(IdsError::KindMismatch { .. })));
+        ids.tombstones.insert(
+            uid,
+            Tombstone {
+                require: None,
+                was: "config app.docs".into(),
+                dropped_at: "2026-11-11".into(),
+                reason: "retired".into(),
+                operator: "operator".into(),
+            },
+        );
+        assert!(matches!(
+            ids.validate(),
+            Err(IdsError::LiveAndTombstoned { .. })
+        ));
     }
 }

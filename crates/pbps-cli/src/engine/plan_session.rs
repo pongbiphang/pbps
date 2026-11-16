@@ -2700,6 +2700,7 @@ mod tests {
             requirers: Default::default(),
             releases: Default::default(),
             index_releases: Default::default(),
+            search_releases: Default::default(),
         }]);
         let message = refusal(defaults::extension_seals(THIRD, &ext));
         assert!(message.contains("packages"), "{message}");

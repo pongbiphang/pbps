@@ -54,6 +54,11 @@ pub enum Blocker {
     DropExtensionNeedsReason {
         name: pbps_model::ObjectLocalName,
     },
+    /// A text search object vanished from the declarations with no reason for dropping
+    /// it (DEC-2728.2).
+    DropSearchNeedsReason {
+        name: pbps_model::SearchRef,
+    },
     /// A later diagnosis depends on this contested table rename having won.
     /// Keep the diagnosis visible without presenting declaration order as intent.
     ProvisionalTableIdentity {
@@ -210,6 +215,7 @@ pub struct Resolution {
     pub created_roles: Vec<(Uid, pbps_model::RoleName)>,
     pub dropped_roles: Vec<(Uid, pbps_model::RoleName)>,
     pub dropped_extensions: Vec<(Uid, pbps_model::ObjectLocalName)>,
+    pub dropped_search: Vec<(Uid, pbps_model::SearchRef)>,
     /// `(uid, old name, new name)`
     pub renamed_roles: Vec<(Uid, pbps_model::RoleName, pbps_model::RoleName)>,
 }
@@ -231,7 +237,7 @@ pub fn resolve(
     intents: &[Intent],
     ctx: &Context,
 ) -> Result<Resolution, Vec<Blocker>> {
-    resolve_with_provenance(declared, ids, intents, 0, ctx)
+    resolve_with_provenance(declared, ids, intents, 0, ctx).map_err(|blocked| blocked.0)
 }
 
 /// Resolves a pulled schema without publishing an orphaned type identity.
@@ -277,6 +283,7 @@ pub fn resolve_with_annotations(
         "annotation count cannot exceed the intent count"
     );
     resolve_with_provenance(declared, ids, intents, annotation_count, ctx)
+        .map_err(|blocked| blocked.0)
 }
 
 /// Resolve against both the reviewed checkout and what the baseline holds.
@@ -290,8 +297,20 @@ pub fn resolve_with_baseline(
     baseline: crate::Side<'_>,
     ctx: &Context,
 ) -> Result<Resolution, Vec<Blocker>> {
-    let resolved = resolve_with_annotations(declared, ids, intents, annotation_count, ctx)?;
-    let blockers: Vec<_> = removals::inventory(baseline, &resolved.ids, declared, &[])
+    // The resolver's own blockers and the baseline's are one answer: stopping at
+    // the first set would name a table's remedy and leave the user to run the plan
+    // again to learn the package's or the search object's. A blocked resolution
+    // still says which packages and search objects it forgot (it forgets them
+    // before it blocks), but its other identities are provisional, so only those
+    // two kinds, which no resolver blocker covers, are read from it.
+    let (resolved, mut blockers, partial) =
+        match resolve_with_provenance(declared, ids, intents, annotation_count, ctx) {
+            Ok(r) => (Some(r), Vec::new(), None),
+            Err(blocked) => (None, blocked.0, Some(blocked.1)),
+        };
+    let local = resolved.as_ref().map(|r| &r.ids).or(partial.as_ref());
+    let local = local.expect("a resolution or a blocked one");
+    let baseline_blockers = removals::inventory(baseline, local, declared, &[])
         .into_iter()
         .filter_map(|removal| {
             use removals::Removal;
@@ -307,16 +326,22 @@ pub fn resolve_with_baseline(
                 Removal::Extension { uid, name } => {
                     (uid, Blocker::DropExtensionNeedsReason { name })
                 }
+                Removal::Search { uid, name } => (uid, Blocker::DropSearchNeedsReason { name }),
                 // Computed columns keep their non-UID boundary (DEC-1174.1).
                 Removal::ComputedColumn { .. } => return None,
             };
-            (!resolved.ids.tombstones.contains_key(&uid)).then_some(blocker)
-        })
-        .collect();
-    if blockers.is_empty() {
-        Ok(resolved)
-    } else {
-        Err(blockers)
+            let kept_by_resolver = resolved.is_none()
+                && !matches!(
+                    blocker,
+                    Blocker::DropExtensionNeedsReason { .. }
+                        | Blocker::DropSearchNeedsReason { .. }
+                );
+            (!kept_by_resolver && !local.tombstones.contains_key(&uid)).then_some(blocker)
+        });
+    blockers.extend(baseline_blockers);
+    match resolved {
+        Some(resolved) if blockers.is_empty() => Ok(resolved),
+        _ => Err(blockers),
     }
 }
 
@@ -330,7 +355,7 @@ fn resolve_with_provenance(
     intents: &[Intent],
     annotation_count: usize,
     ctx: &Context,
-) -> Result<Resolution, Vec<Blocker>> {
+) -> Result<Resolution, Box<(Vec<Blocker>, IdsFile)>> {
     let mut r = Resolution {
         ids: ids.clone(),
         ..Default::default()
@@ -381,6 +406,50 @@ fn resolve_with_provenance(
         if r.ids.extension_uid(name).is_none() {
             let uid = fresh_uid(&r.ids, UidKind::Extension);
             r.ids.extensions.insert(uid, name.clone());
+        }
+    }
+
+    // Text search objects follow the packages' rule: no rename inference, and a drop
+    // needs a recorded intent (DEC-2728.2). A rename is a later part.
+    let gone: Vec<(Uid, pbps_model::SearchRef)> = r
+        .ids
+        .search
+        .iter()
+        .filter(|(_, name)| !declared.search.contains_key(*name))
+        .map(|(uid, name)| (uid.clone(), name.clone()))
+        .collect();
+    for (uid, name) in gone {
+        r.ids.search.remove(&uid);
+        if let Some((i, reason)) = intents.iter().enumerate().find_map(|(i, intent)| {
+            if let Intent::DropSearch {
+                name: named,
+                reason,
+            } = intent
+                && *named == name
+            {
+                Some((i, reason))
+            } else {
+                None
+            }
+        }) {
+            r.ids.tombstones.insert(
+                uid.clone(),
+                Tombstone {
+                    require: None,
+                    was: name.raw().to_string(),
+                    dropped_at: ctx.today.clone(),
+                    reason: reason.to_string(),
+                    operator: ctx.operator.clone(),
+                },
+            );
+            r.dropped_search.push((uid, name));
+            used.insert(i);
+        }
+    }
+    for name in declared.search.keys() {
+        if r.ids.search_uid(name).is_none() {
+            let uid = fresh_uid(&r.ids, UidKind::Search);
+            r.ids.search.insert(uid, name.clone());
         }
     }
 
@@ -527,6 +596,7 @@ fn resolve_with_provenance(
             | Intent::RenameRole { .. }
             | Intent::DropRole { .. }
             | Intent::DropExtension { .. }
+            | Intent::DropSearch { .. }
             | Intent::MoveRows { .. } => None,
         };
         // The identities are read in the namespace this annotation was written
@@ -571,6 +641,7 @@ fn resolve_with_provenance(
             | Intent::DropType { .. }
             | Intent::DropRole { .. }
             | Intent::DropExtension { .. }
+            | Intent::DropSearch { .. }
             | Intent::MoveRows { .. } => {
                 intent_is_absorbed(original_intent.as_ref().unwrap_or(intent), ids, source)
             }
@@ -612,6 +683,7 @@ fn resolve_with_provenance(
                     | Intent::DropType { .. }
                     | Intent::DropRole { .. }
                     | Intent::DropExtension { .. }
+                    | Intent::DropSearch { .. }
                     | Intent::MoveRows { .. } => None,
                 },
                 Blocker::RenameTargetExists { target } if column_blockers.contains(&index) => {
@@ -628,6 +700,7 @@ fn resolve_with_provenance(
                 | Blocker::DropTypeNeedsReason { .. }
                 | Blocker::DropRoleNeedsReason { .. }
                 | Blocker::DropExtensionNeedsReason { .. }
+                | Blocker::DropSearchNeedsReason { .. }
                 | Blocker::RenameTargetExists { .. }
                 | Blocker::UnrepresentableName { .. }
                 | Blocker::MissingType { .. }
@@ -645,7 +718,7 @@ fn resolve_with_provenance(
                 }
             }
         }
-        Err(blockers)
+        Err(Box::new((blockers, r.ids)))
     }
 }
 
@@ -814,6 +887,9 @@ pub fn intent_is_absorbed(intent: &Intent, ids: &IdsFile, source: RenameSource) 
         Intent::DropExtension { name, .. } => {
             ids.extension_uid(name).is_none() && retired(UidKind::Extension, name.raw())
         }
+        Intent::DropSearch { name, .. } => {
+            ids.search_uid(name).is_none() && retired(UidKind::Search, &name.raw().to_string())
+        }
         // Recorded already, with this bound.
         Intent::MoveRows {
             table, max_rows, ..
@@ -874,6 +950,7 @@ impl RenameSource {
             Intent::DropType { name, .. } => declared.types.contains_key(name),
             Intent::DropRole { role, .. } => declared.roles.contains_key(role),
             Intent::DropExtension { name, .. } => declared.extensions.contains_key(name),
+            Intent::DropSearch { name, .. } => declared.search.contains_key(name),
             Intent::MoveRows { .. } => false,
         };
         if redeclared {
@@ -1763,6 +1840,7 @@ fn sort_resolution(r: &mut Resolution) {
     r.created_roles.sort();
     r.dropped_roles.sort();
     r.dropped_extensions.sort();
+    r.dropped_search.sort();
     r.renamed_roles.sort();
 }
 

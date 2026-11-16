@@ -15,6 +15,7 @@ use pbps_model::{Change, ChangeSet, DriftReport, Intent, RiskClass, TableName};
 /// The command that records a package's drop, and its batch spelling: the one
 /// place the name lives, so a rename is a one-line change (DEC-2447.9).
 pub(crate) const DROP_EXTENSION: &str = "drop-extension";
+pub(crate) const DROP_SEARCH: &str = "drop-search";
 
 /// One intent in the user's own vocabulary.
 ///
@@ -59,6 +60,9 @@ pub fn intent(i: &Intent) -> String {
         }
         Intent::DropExtension { name, reason } => {
             format!("drop extension {} (reason: {reason})", name.shown())
+        }
+        Intent::DropSearch { name, reason } => {
+            format!("drop {} (reason: {reason})", name.shown())
         }
         Intent::MoveRows {
             table,
@@ -119,6 +123,7 @@ fn decision_count(blocker: &Blocker) -> Option<usize> {
         Blocker::DropColumnNeedsReason { .. }
         | Blocker::DropTableNeedsReason { .. }
         | Blocker::DropExtensionNeedsReason { .. }
+        | Blocker::DropSearchNeedsReason { .. }
         | Blocker::DropRoleNeedsReason { .. } => Some(1),
         Blocker::ProvisionalTableIdentity { blocker, .. } => decision_count(blocker),
         Blocker::UnusedIntent { .. }
@@ -194,6 +199,12 @@ fn supplied_flag(intent: &Intent) -> Option<String> {
         Intent::DropExtension { name, reason } => pair_flag(
             &format!("--{DROP_EXTENSION}"),
             name.raw(),
+            reason.as_ref(),
+            "why",
+        ),
+        Intent::DropSearch { name, reason } => pair_flag(
+            &format!("--{DROP_SEARCH}"),
+            &name.raw().to_string(),
             reason.as_ref(),
             "why",
         ),
@@ -329,6 +340,12 @@ fn batch_flags(blocker: &Blocker, fixed: &mut Vec<String>, choices: &mut Vec<Str
         Blocker::DropExtensionNeedsReason { name } => fixed.push(pair_flag(
             &format!("--{DROP_EXTENSION}"),
             name.raw(),
+            "",
+            "why",
+        )),
+        Blocker::DropSearchNeedsReason { name } => fixed.push(pair_flag(
+            &format!("--{DROP_SEARCH}"),
+            &name.raw().to_string(),
             "",
             "why",
         )),
@@ -722,6 +739,7 @@ pub fn blocker_finding(b: &Blocker) -> crate::output::Finding {
             Blocker::AmbiguousRoles { .. } => "identity.ambiguous-roles",
             Blocker::DropRoleNeedsReason { .. } => "identity.drop-role-needs-reason",
             Blocker::DropExtensionNeedsReason { .. } => "identity.drop-extension-needs-reason",
+            Blocker::DropSearchNeedsReason { .. } => "identity.drop-search-needs-reason",
             Blocker::UnusedIntent { .. } => "identity.unused-intent",
             Blocker::ConflictingRenameIntents { .. } => "identity.conflicting-rename-intents",
             Blocker::RenameTargetExists { .. } => "identity.rename-target-exists",
@@ -916,6 +934,13 @@ fn one_blocker(b: &Blocker) -> String {
             argument = shell_arg(name.raw()).unwrap_or_else(|| placeholder("extension")),
             name = name.shown(),
         ),
+        Blocker::DropSearchNeedsReason { name } => format!(
+            "  {name} disappeared from the declarations, but a drop must record why — an \
+             index or generated column that names it by a string literal must go first\n\n    \
+             pbps {DROP_SEARCH} {argument} --reason {why}\n",
+            argument = shell_arg(&name.raw().to_string()).unwrap_or_else(|| placeholder("object")),
+            name = name.shown(),
+        ),
         Blocker::UnusedIntent { intent: i } => {
             format!(
                 "  this intent matches nothing in either the declarations or the identity file, likely a typo:\n    {}\n\n    correct the names where this intent was supplied: edit its declaration annotation, fix and rerun the command, or retry with a corrected prompt answer\n",
@@ -1062,7 +1087,7 @@ pub fn touched(names: &PlanNames<'_>) -> (usize, usize) {
 fn role_of(change: &Change) -> Option<&pbps_model::RoleName> {
     match change {
 Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => None,
-        Change::AddEnumValue { .. } | Change::AlterDomain { .. } | Change::RenameEnumValue { .. } | Change::EnumRebuild { .. } | Change::CreateType { .. } | Change::DropType { .. } | Change::RenameType { .. } | Change::CreateExtension { .. } | Change::DropExtension { .. } | Change::UpdateExtension { .. } | Change::SetExtensionSchema { .. } => None,
+        Change::AddEnumValue { .. } | Change::AlterDomain { .. } | Change::RenameEnumValue { .. } | Change::EnumRebuild { .. } | Change::CreateType { .. } | Change::DropType { .. } | Change::RenameType { .. } | Change::CreateSearch { .. } | Change::DropSearch { .. } | Change::CreateExtension { .. } | Change::DropExtension { .. } | Change::UpdateExtension { .. } | Change::SetExtensionSchema { .. } => None,
         Change::CreateRole { name, .. }
         | Change::DropRole { name, .. }
         | Change::Grant { role: name, .. }
@@ -1621,6 +1646,45 @@ pub fn describe(c: &Change) -> String {
         Change::RenameType { from, to, .. } => {
             format!("~ rename type {} -> {}", from.shown(), to.shown())
         }
+        // The files a dictionary reads are the server's, not the project's: the create is
+        // what opens them, so the plan names each before it is applied (DEC-2728.2).
+        Change::CreateSearch {
+            name,
+            definition,
+            unresolved,
+            ..
+        } => {
+            let files = definition.server_files();
+            let mut note = String::new();
+            if !files.is_empty() {
+                note = format!(
+                    " (reads server file {}, which pbps does not manage)",
+                    files
+                        .iter()
+                        .map(|(option, file)| format!(
+                            "`{}` for {}",
+                            Escaped(file),
+                            Escaped(option)
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            // An offline plan could not look for these; the plan against the database does.
+            if !unresolved.is_empty() {
+                note.push_str(&format!(
+                    " (uses dictionary {}, which this plan could not check; it is resolved when \
+                     planned against the database)",
+                    unresolved
+                        .iter()
+                        .map(|used| used.name.shown().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            format!("+ create {}{note}", name.shown())
+        }
+        Change::DropSearch { name, .. } => format!("- drop {}", name.shown()),
         // A partition has no columns of its own to count; what it is, is its
         // parent and the rows it takes (#1170).
         Change::CreateTable {

@@ -233,8 +233,8 @@ pub(super) async fn managed_state_once(
     scoped.unmanaged.sort();
     scoped.unmanaged.dedup();
     // The recorded form: a kind held by name only is kept only where `reference` names it
-    // (the declarations, for a recording from them; nothing, for an apply, which carries
-    // the previous record forward instead). Done here, at the one read every recorder and
+    // (the declarations, for a recording from them; what the plan creates, for an apply,
+    // which carries the previous record forward instead). Done here, at the one read every recorder and
     // the stability comparison below go through, so none of them has to remember it.
     scoped.schema = scoped
         .schema

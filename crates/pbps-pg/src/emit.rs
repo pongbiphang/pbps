@@ -4108,6 +4108,13 @@ fn emit_statements(
             });
             Ok(vec![statement])
         }
+        Change::CreateSearch {
+            uid,
+            name,
+            definition,
+            ..
+        } => crate::search::create(uid, name, definition),
+        Change::DropSearch { uid, name, .. } => crate::search::drop(uid, name),
         Change::DropType {
             uid,
             name,

@@ -66,6 +66,8 @@ fn reference_uses<'a>(
             })),
             Change::BuildPartitionedIndex(_)
             | Change::AnalyzeTableTree(_)
+            | Change::CreateSearch { .. }
+            | Change::DropSearch { .. }
             | Change::CreateExtension { .. }
             | Change::DropExtension { .. }
             | Change::UpdateExtension { .. }

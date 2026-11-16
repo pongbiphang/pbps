@@ -299,6 +299,8 @@ pub enum Grantee {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ObjectKey {
     Type(Recorded),
+    /// A text search configuration or dictionary, in a namespace of its own (DEC-2728.2).
+    Search(Recorded),
     Table(Recorded),
     Column(ColumnKey),
     Role(Recorded),
@@ -697,6 +699,9 @@ impl Operation {
             | Change::CreateType { uid, .. }
             | Change::DropType { uid, .. }
             | Change::RenameType { uid, .. } => ObjectKey::Type(recorded(uid)),
+            Change::CreateSearch { uid, .. } | Change::DropSearch { uid, .. } => {
+                ObjectKey::Search(recorded(uid))
+            }
             Change::CreateTable { uid, .. }
             | Change::DropTable { uid, .. }
             | Change::DetachPartition { uid, .. }
@@ -918,6 +923,7 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
                 out
             }
             Change::DropType { .. }
+            | Change::DropSearch { .. }
             | Change::DropTable { .. }
             | Change::DropColumn { .. }
             | Change::DropComputedColumn { .. }
@@ -931,6 +937,7 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
             | Change::DropExtension { .. }
             | Change::DropRole { .. } => exists(true, false)?,
             Change::CreateType { .. }
+            | Change::CreateSearch { .. }
             | Change::AddComputedColumn { .. }
             | Change::AddUnique { .. }
             | Change::AddForeignKey { .. }

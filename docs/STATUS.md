@@ -532,7 +532,7 @@ How each kind is handled today:
 | `gist` indexes (held, DEC-2448.2) and `EXCLUDE` constraints (read, declare and add held, DEC-2448.3; drop, replace, rebuild and partitions next) | partly held | #2448 |
 | `brin` indexes | named | #2449 |
 | Standalone sequences (read, declared and pulled, DEC-2721.1; their current value is never schema; create, drop, alter and rename next) | partly held | #2721 |
-| Text search configurations and dictionaries (a user's, over the built-in parser and templates, are held and pulled, DEC-2728.1; create, alter, rename and drop next) | partly held | #2728 |
+| Text search configurations and dictionaries (a user's, over the built-in parser and templates, are held and pulled, DEC-2728.1; create and drop planned, DEC-2728.2; alter and rename next) | partly held | #2728 |
 <!-- /generated:postgres-planned -->
 
 ### Silent today (bugs)

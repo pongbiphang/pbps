@@ -398,6 +398,11 @@ impl Reconstruction {
                         None,
                     )?);
                 }
+                // Named by string literals alone, so it binds no name, but the scratch
+                // builds it ahead of the expressions that mention it (DEC-2728.2).
+                Change::CreateSearch { name, .. } => {
+                    steps.push(make(&name.shown().to_string(), Vec::new(), None)?);
+                }
                 Change::AlterDomain { name, .. } if is_part => {
                     steps.push(make(&format!("domain {}", name.shown()), Vec::new(), None)?);
                 }
@@ -442,6 +447,7 @@ impl Reconstruction {
                 // alterations; one that does is not a bootstrap.
                 pbps_model::change_family!(type_values)
                 | Change::DropType { .. }
+                | Change::DropSearch { .. }
                 | Change::RenameType { .. }
                 | Change::DropTable { .. }
                 | Change::DetachPartition { .. }
@@ -1143,6 +1149,9 @@ fn part(
                 }
                 Change::CreateType { name, .. } | Change::AlterDomain { name, .. } => {
                     Some(pbps_model::diagnostic::Declaration::Type(name.clone()))
+                }
+                Change::CreateSearch { name, .. } => {
+                    Some(pbps_model::diagnostic::Declaration::Search(name.clone()))
                 }
                 other => other
                     .table()

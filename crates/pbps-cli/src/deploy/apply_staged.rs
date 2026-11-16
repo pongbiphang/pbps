@@ -595,6 +595,15 @@ pub(super) async fn apply_staged_under_lock<D: crate::emission::Engine>(
                 live_ids.types.remove(&type_statement.uid);
             }
         }
+        if let Some(search) = &stmt.search {
+            if search.created {
+                live_ids
+                    .search
+                    .insert(search.uid.clone(), search.name.clone());
+            } else {
+                live_ids.search.remove(&search.uid);
+            }
+        }
         if let Some(installed) = &stmt.extension {
             match installed.phase {
                 pbps_dialect::ExtensionPhase::Drop => {
@@ -656,7 +665,7 @@ pub(super) async fn apply_staged_under_lock<D: crate::emission::Engine>(
             // read is, so a row the renames leave unmanaged is not compared
             // (DEC-2346.2).
             &scopes_at(plan, &live_ids),
-            &Schema::default(),
+            &Schema::naming_what_identities_name(&live_ids),
             crate::engine::Read::Snapshot,
             CatalogWarnings::for_progress(d.progress),
         )
@@ -670,8 +679,13 @@ pub(super) async fn apply_staged_under_lock<D: crate::emission::Engine>(
         let object_deps = dependency_hints_for_schema(&entry.snapshot, plan, &after.schema);
         let mut checkpoint = pbps_model::StateSnapshot::new(
             StateKind::Staged,
-            // Carried forward, as the closing entry's is (DEC-2855.1).
-            after.schema.as_recorded_after_apply(&entry.snapshot.schema),
+            // Recorded as the closing entry is (DEC-2855.1), by what has run: the statement
+            // loop keeps `live_ids` as the database holds the identities now, so a search
+            // object is recorded once its create ran and left out once its drop ran, and
+            // one whose change has not run yet stays as it was.
+            after
+                .schema
+                .as_recorded_after_apply(&entry.snapshot.schema, &plan.changes, &live_ids),
             live_ids.clone(),
             operator,
         );
@@ -764,7 +778,7 @@ pub(super) async fn apply_staged_under_lock<D: crate::emission::Engine>(
             &externals_under(&externals, &plan.ids),
             target.catalog_policy(project.config.unmanaged),
             &plan.data,
-            &Schema::default(),
+            &Schema::naming_what_identities_name(&plan.ids),
             if retaining {
                 crate::engine::Read::InsideOwnTransaction
             } else {
@@ -843,9 +857,12 @@ pub(super) async fn apply_staged_under_lock<D: crate::emission::Engine>(
         })?;
         let mut snapshot = pbps_model::StateSnapshot::new(
             pbps_model::StateKind::Apply,
-            // No plan changes a text search object: the previous record is carried
-            // forward, not the read-back (DEC-2855.1).
-            after.schema.as_recorded_after_apply(&entry.snapshot.schema),
+            // No plan alters a text search object: an object is recorded when its identity
+            // is held and the database holds it, and one the previous record holds keeps its
+            // recorded definition, not the read-back's (DEC-2855.1).
+            after
+                .schema
+                .as_recorded_after_apply(&entry.snapshot.schema, &plan.changes, &plan.ids),
             plan.ids.clone(),
             operator,
         );

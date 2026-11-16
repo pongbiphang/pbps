@@ -367,6 +367,7 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
         )),
         crate::change_family!(type_values)
         | crate::change_family!(extensions)
+        | crate::change_family!(search)
         | Change::AddComputedColumn { .. }
         | Change::DropComputedColumn { .. }
         | crate::change_family!(constraints)

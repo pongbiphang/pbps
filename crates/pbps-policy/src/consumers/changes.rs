@@ -303,6 +303,7 @@ pub(super) fn classify(
         | Change::AddEnumValue { .. }
         | Change::CreateType { .. }
         | pbps_model::change_family!(extensions)
+        | pbps_model::change_family!(search)
         | Change::AddComputedColumn { .. }
         | Change::SetColumnDeprecated { .. }
         | pbps_model::change_family!(table_properties)

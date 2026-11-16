@@ -374,6 +374,7 @@ fn drop_plan() -> SavedPlan {
             requirers: Default::default(),
             releases: Default::default(),
             index_releases: Default::default(),
+            search_releases: Default::default(),
         }),
         PlannedChange::new(Change::DropExtension {
             uid: "e_000001".parse().unwrap(),
@@ -382,6 +383,7 @@ fn drop_plan() -> SavedPlan {
             requirers: ["e_000002".parse().unwrap()].into(),
             releases: Default::default(),
             index_releases: Default::default(),
+            search_releases: Default::default(),
         }),
     ];
     plan.ids.tombstones = [("e_000001", "cube"), ("e_000002", "earthdistance")]
@@ -767,4 +769,79 @@ fn every_move_has_one_pin_over_its_whole_chain_and_each_drift_is_refused() {
             "{what}: {error}"
         );
     }
+}
+
+fn dictionary() -> pbps_model::SearchObject {
+    pbps_model::SearchObject::Dictionary {
+        template: "pg_catalog.simple".parse().unwrap(),
+        options: Default::default(),
+    }
+}
+
+fn with_search(change: Change, ids: IdsFile) -> SavedPlan {
+    let mut plan = wire();
+    plan.changes = ChangeSet {
+        changes: vec![PlannedChange::new(change)],
+    };
+    plan.ids = ids;
+    plan
+}
+
+fn create_search(uid: &str, name: &str) -> Change {
+    Change::CreateSearch {
+        uid: uid.parse().unwrap(),
+        name: name.parse().unwrap(),
+        definition: Box::new(dictionary()),
+        unresolved: Vec::new(),
+    }
+}
+
+/// A saved plan's text search payload is held to the identity mapping it carries: a create
+/// needs its uid recorded under that name, a drop needs the uid gone (DEC-2728.2). A plan
+/// edited by hand to create what the declarations never held, or to drop what they still
+/// hold, is refused at admission, whatever its checksum. Negative: the honest plan is admitted.
+#[test]
+fn admission_holds_text_search_payloads_to_the_identity_mapping() {
+    let admit_text = |plan: SavedPlan| {
+        let checksum = plan.wire_fingerprint();
+        admit(plan, &MinimalDialect, Path::new("plan.json"), &checksum).map(|_| ())
+    };
+    let name: pbps_model::SearchRef = "dictionary app.words".parse().unwrap();
+    let mut ids = IdsFile::default();
+    ids.search.insert("s_aaaaaa".parse().unwrap(), name.clone());
+    // The minimal dialect holds no text search objects, so a create the mapping records is
+    // refused for that, after the identity check it passes, and not for the payload.
+    let error = admit_text(with_search(
+        create_search("s_aaaaaa", "dictionary app.words"),
+        ids.clone(),
+    ))
+    .unwrap_err()
+    .to_string();
+    assert!(!error.contains("text search payload"), "{error}");
+    // The uid is not recorded under that name, or is not a text search uid at all.
+    for (uid, text) in [
+        ("s_bbbbbb", "dictionary app.words"),
+        ("s_aaaaaa", "dictionary app.other"),
+        ("y_aaaaaa", "dictionary app.words"),
+    ] {
+        let error = admit_text(with_search(create_search(uid, text), ids.clone()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("text search payload"),
+            "{uid} {text}: {error}"
+        );
+    }
+    // A drop of an identity the plan still records is a lie about the declarations.
+    let drop = Change::DropSearch {
+        uid: "s_aaaaaa".parse().unwrap(),
+        name,
+        definition: Box::new(dictionary()),
+    };
+    let error = admit_text(with_search(drop.clone(), ids))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("text search drop"), "{error}");
+    admit_text(with_search(drop, IdsFile::default()))
+        .expect("a drop of a released uid is admitted");
 }

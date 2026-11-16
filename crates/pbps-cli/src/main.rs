@@ -442,6 +442,15 @@ enum Command {
         reason: pbps_model::Reason,
     },
 
+    /// Record a text search configuration or dictionary drop (DEC-2728.2)
+    DropSearch {
+        /// `config app.docs` or `dictionary app.words`
+        search: String,
+        /// Why it is being dropped; required for audit
+        #[arg(long)]
+        reason: pbps_model::Reason,
+    },
+
     /// Allow a new range partition to take its rows from the DEFAULT partition
     /// beside it (#1788)
     MoveRows {
@@ -691,6 +700,7 @@ impl Command {
             | Command::RenameRole { .. }
             | Command::DropRole { .. }
             | Command::DropExtension { .. }
+            | Command::DropSearch { .. }
             | Command::MoveRows { .. }
             | Command::Convert { .. }
             | Command::RebuildTable { .. }
@@ -1015,6 +1025,7 @@ fn run() -> anyhow::Result<()> {
     | Command::DropTable { reason, .. }
     | Command::DropRole { reason, .. }
     | Command::DropExtension { reason, .. }
+    | Command::DropSearch { reason, .. }
     | Command::MoveRows { reason, .. }
     | Command::RebuildTable {
         reason: Some(reason),
@@ -1046,6 +1057,7 @@ fn run() -> anyhow::Result<()> {
         | Command::DropTable { .. }
         | Command::DropRole { .. }
         | Command::DropExtension { .. }
+        | Command::DropSearch { .. }
         | Command::MoveRows { .. }
         | Command::Convert { .. }
         | Command::RebuildTable { .. }
@@ -1647,6 +1659,14 @@ fn run() -> anyhow::Result<()> {
             }
             .into(),
         ),
+        Command::DropSearch { search, reason } => cmd_intent(
+            &project,
+            Intent::DropSearch {
+                name: search.parse().map_err(anyhow::Error::msg)?,
+                reason,
+            }
+            .into(),
+        ),
         Command::MoveRows {
             table,
             max_rows,
@@ -1949,6 +1969,7 @@ fn cmd_pull(
                 || !ids.columns.is_empty()
                 || !ids.roles.is_empty()
                 || !ids.types.is_empty()
+                || !ids.search.is_empty()
                 || !ids.extensions.is_empty()
                 || !ids.tombstones.is_empty()
         });
@@ -2307,6 +2328,7 @@ fn cmd_pull(
         + res.added_columns.len()
         + res.created_roles.len()
         + res.ids.types.len().saturating_sub(ids.types.len())
+        + res.ids.search.len().saturating_sub(ids.search.len())
         + res
             .ids
             .extensions
@@ -2316,6 +2338,7 @@ fn cmd_pull(
         + ids.columns.len()
         + ids.roles.len()
         + ids.types.len()
+        + ids.search.len()
         + ids.extensions.len();
     println!("Preserved {kept} existing identities; minted {minted} new identities.");
     println!(

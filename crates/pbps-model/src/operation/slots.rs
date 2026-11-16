@@ -41,6 +41,9 @@ pub enum NameKind {
     /// Only the package's own name is claimed; the objects it brings are read
     /// back and checked after the rehearsal, not ordered (DEC-2447.7).
     Extension,
+    /// A text search configuration or dictionary: each kind its own namespace in a schema
+    /// (DEC-2728.2).
+    Search(crate::SearchKind),
 }
 
 /// A name as a step spells it, with what scopes it.
@@ -316,6 +319,14 @@ pub fn names(
         Change::DropType { uid, name, .. } => {
             nx.release(type_address(name), ObjectKey::Type(Recorded(uid.clone())))
         }
+        Change::CreateSearch { uid, name, .. } => nx.claim(
+            search_address(name),
+            ObjectKey::Search(Recorded(uid.clone())),
+        ),
+        Change::DropSearch { uid, name, .. } => nx.release(
+            search_address(name),
+            ObjectKey::Search(Recorded(uid.clone())),
+        ),
         // The replacement holds its temporary name from its creation to the
         // swap, which hands the type back its own (DEC-1635.7).
         Change::EnumRebuild {
@@ -657,6 +668,16 @@ fn type_address(name: &crate::TypeRef) -> Address {
     }
 }
 
+fn search_address(name: &crate::SearchRef) -> Address {
+    Address {
+        kind: NameKind::Search(name.kind),
+        schema: name.name.schema().to_owned(),
+        table: None,
+        name: name.name.name().to_owned(),
+        signature: None,
+    }
+}
+
 fn role_address(name: &crate::RoleName) -> Address {
     Address {
         kind: NameKind::Role,
@@ -687,6 +708,14 @@ pub fn baseline_names(owners: &dyn Owners, before: super::Snapshot<'_>) -> Vec<N
             out.push(Named {
                 address: type_address(name),
                 holder: ObjectKey::Type(Recorded(uid)),
+            });
+        }
+    }
+    for name in before.schema.search.keys() {
+        if let Some(uid) = before.ids.search_uid(name) {
+            out.push(Named {
+                address: search_address(name),
+                holder: ObjectKey::Search(Recorded(uid.clone())),
             });
         }
     }

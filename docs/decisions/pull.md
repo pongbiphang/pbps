@@ -1465,3 +1465,117 @@ one arrive in the parts that follow, and SQL Server's sequences in the last.
 Formats: state moves to 49 (a snapshot may hold `sequences`; an older one truthfully holds
 none), and schema set 109 gains the `sequence:` file kind in the declaration schema. The plan
 does not move, and neither does the identity file.
+
+<a id="dec-2728-2"></a>
+
+**DEC-2728.2. A text search configuration or dictionary is created and dropped by recorded identity; a change to a standing one is still refused by name.**
+Part B of #2728. The model, loader and pull are DEC-2728.1's; this part plans
+them, so a declaration of `app.docs` and the index that names it by a literal
+reach an empty database in one plan.
+
+- **Identity.** `UidKind::Search` (`s_`) and an ids section `search`, a compatible
+  evolution under ids version 1 as `types` and `extensions` were. Resolution
+  follows the packages' rule, not the types': no rename is inferred, and a
+  vanished object needs `pbps drop-search "config app.docs" --reason ...`
+  (`--drop-search` in an `intent` batch) or it is a `DropSearchNeedsReason`
+  blocker. The argument is the canonical `SearchRef` spelling, which the ids
+  files and the plan print. A connected plan names that blocker beside a table's
+  or any other: the baseline's removals of packages and search objects are read
+  even when the resolver is already blocked, so the remedies come in one answer.
+- **Drift.** The identities arrive, so the state checksum takes the text search
+  objects an identity names in and still leaves out the rest (DEC-2728.1 deferred
+  this): a managed object that changed after a plan was approved fails apply's
+  baseline guard, and one only the database holds is not drift. A state that
+  recorded no search identity hashes as it did, so no recorded checksum moves and
+  no format number is needed. A NUL in a dictionary option name or value, the only
+  free text these objects emit, is refused at validation by name.
+- **Held by name.** The kind stays in `NameOnly` (DEC-2855.1): no plan alters one,
+  and the record, the compared form and the drift report are the ones the
+  kind already has, so this change keeps no copy of them. What a plan does to one
+  joins that path in two places only. An apply records an object exactly when
+  its identity is held and the database holds it (`as_recorded_after_apply` takes
+  the identities as the database holds them: the plan's for a finished apply, the
+  statement loop's for a staged checkpoint), so a created object is recorded once
+  its create ran, a dropped one is gone once its drop ran, and a declaration that
+  adopts a matching object, which makes no change, records it with its new
+  identity; an object the previous record holds keeps its recorded definition,
+  except one the plan creates, which takes the read-back's (a resumed staged
+  create has the checkpoint's half-made one as its previous record). The
+  buildable form keeps the objects an identity names, where it left out every one
+  before (`buildable` takes the identities). The kind leaves `NameOnly` when a
+  plan can alter one, and `refuse_pinned_movement` gains its rule then.
+- **Changes.** `CreateSearch` and `DropSearch` carry the whole definition, as
+  `CreateType` does, in the `search` family of `change_family!`; they join
+  `catalog_change!` (`CatalogObject::Search`). A create is none in risk class; a
+  drop is `destructive`. A standing object that differs, or that moved name, is
+  refused by name (parts C and D). A mapping to a dictionary that is neither
+  declared, nor in `pg_catalog`, nor in the schema of a declared package is
+  refused when the plan is made against the database and does not hold it, and
+  offline, where the baseline only stands for the target, it is an advisory on
+  the create's plan line (`unresolved`) that the plan against the database
+  settles.
+- **References.** A reference resolves only to a dictionary the plan keeps: one the
+  plan drops is refused at plan by name, offline and connected alike, whether a new
+  configuration or a standing one maps it (the create runs before the drop, and
+  `RESTRICT` fails while anything maps it). The pull holds a parser and a template by
+  the same name test `validate` applies, one definition (`builtin_parser!`,
+  `builtin_templates!`) that the pull's SQL, the census and `validate` all read; a
+  `pg_catalog` parser or template outside it is a limitation, left out and named.
+  An object retired and declared again before its drop reached the target (the
+  declarations carry a new identity for a name the base holds under another) is
+  refused by name, as a package is: drop it in one plan, declare it in the next.
+- **Order.** A search object's rank is its depth among the objects it uses, composed
+  with the package floor: one that waits for a package starts at the floor, and what
+  maps it sits one rank behind.
+  A domain whose check or default names a configuration the plan creates by a literal
+  (`'app.docs'::regconfig`) ranks behind every created search object, found by the
+  literal scan the scratch order uses (`may_call`); a plan whose domains name none
+  leaves them where they were.
+- **Identities.** Every uid reservation (observed identities, the project-wide pool)
+  holds the search uids, as it holds a type's.
+- **Names.** A search object's name is a qualified name without a type's array-name
+  rule, so a part may start with an underscore (`app._words`): it has no array type to
+  be mistaken for. The scratch bootstrap of a target builds only the objects an
+  identity names, as it builds only the types, packages and tables one names.
+  An object is refused by name in a schema the pull never reads (`pg_catalog`,
+  `information_schema`, `pg_*`: `catalog::a_projects_schema`, the test types, tables and
+  modules share). A thesaurus's `dictionary` option must be `schema.name`: the engine
+  resolves a bare name by the search path of whoever uses it, so the create order and the
+  drop guard could not see the edge. The loader refuses it with that remedy, and the pull
+  leaves such a thesaurus out with the configurations that map it, naming the fix.
+- **Packages.** A configuration that maps a dictionary a package provides waits for
+  the plan's create of that package (`package_input`, the rule that serves a type or
+  an operator class a package provides), and ranks behind the packages in the draft as
+  a domain does. A package's drop carries the configurations the plan retires with it
+  (`DropExtension.search_releases`, beside `releases` and `index_releases`) and waits
+  for them, where the target reports them as blockers; one the plan keeps is refused
+  by name.
+- **Emit.** A dictionary is one `CREATE TEXT SEARCH DICTIONARY` with its options
+  as quoted values. A configuration is its `CREATE` and one `ADD MAPPING` per
+  group of token types that share their dictionaries; the catalog's order is
+  `(token type, position)` whatever the order of groups (measured). A drop is
+  `DROP TEXT SEARCH ... RESTRICT`, with no `IF EXISTS`. Every name is qualified.
+  The first statement carries the uid, so a staged apply records identity per
+  statement. An option that reads a server file (`dictfile`, `afffile`,
+  `stopwords`, `synonyms`) is an advisory on the plan line; there is no policy
+  rule for it (a rule id would change the published policy schema).
+- **Order.** Class 7, with the types and before tables, and class 18, with the
+  type drops. A depth rank makes a dictionary precede the configuration that maps
+  it (and a thesaurus's sub-dictionary named qualified in its `dictionary` option)
+  and the reverse for drops; `Is(Search, Final)` and `Absent(Search)` state the same
+  in the effects. The scratch rules add the literal edge: a created object precedes
+  every change whose text names it, found by `may_call`, which reads string
+  literals as OID-alias names (DEC-1364.1) and, since #2436, a delimited name as
+  one whole name. The name slots are one namespace per kind and schema, apart from
+  the types'.
+- **Saved plans** are admitted only if a create's uid is recorded under its name
+  and a drop's uid is not.
+- **SQL Server** keeps A's refusal at validation; its emit also refuses.
+- **Externals.** An externals file that creates a declared configuration or
+  dictionary is refused by the existing "which is in the managed set" rule of
+  `staged::compare`, now that `Managed` names the two catalogs.
+
+Formats: plan 79 (an older build refuses the new changes); ids file: the
+compatible `search` section, version unchanged; state: none, since A's state 42
+already serialises `Schema.search`; schema set: none, since a plan's changes are not in
+the published schemas (regenerated, only the version stamp differed).

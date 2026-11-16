@@ -118,6 +118,29 @@ impl ProviderMember {
             .find(|(table, index)| table.schema == *schema && index.raw() == name)
     }
 
+    /// The text search object of `removed` this member is: the engine names a
+    /// configuration or a dictionary by its schema and its own name. `None` is any
+    /// other object, which a caller must treat as not one the plan removes
+    /// (DEC-2447.8, DEC-2728.2).
+    pub fn search<'a>(
+        &self,
+        removed: impl IntoIterator<Item = &'a crate::SearchRef>,
+    ) -> Option<&'a crate::SearchRef> {
+        let (kind, [schema, name]) = (
+            match self.class.as_str() {
+                "text search configuration" => crate::SearchKind::Config,
+                "text search dictionary" => crate::SearchKind::Dictionary,
+                _ => return None,
+            },
+            self.names.as_slice(),
+        ) else {
+            return None;
+        };
+        removed
+            .into_iter()
+            .find(|r| r.kind == kind && r.name.schema() == schema && r.name.name() == name)
+    }
+
     /// The module of `ids` this object is, where it is one a plan manages: a
     /// routine by its full signature, a view or materialized view by name, a
     /// trigger by its table and name, and a view's rule as the view it makes
