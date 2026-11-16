@@ -463,3 +463,79 @@ fn expansions_keep_sources_assigned_before_an_earlier_settlement() {
     }
     once.proof().validate(once.changes()).unwrap();
 }
+
+/// A rule that respells the first step named `a` as `with`, adding nothing.
+struct Respeller(PlannedChange);
+
+impl Expansion for Respeller {
+    type Obligation = usize;
+
+    fn rule(&self) -> &'static str {
+        "respeller"
+    }
+
+    fn unmet(&self, plan: &[PlannedChange]) -> Result<Vec<usize>, String> {
+        Ok(plan
+            .iter()
+            .position(|p| name(p) == Some(("a", true)))
+            .into_iter()
+            .collect())
+    }
+
+    fn expand(&self, _: &[PlannedChange], at: &usize) -> Result<Rewrite, String> {
+        Ok(Rewrite::Add {
+            added: Vec::new(),
+            respelled: vec![(*at, self.0.clone())],
+            edges: Vec::new(),
+        })
+    }
+
+    fn order(&self, _: &[PlannedChange]) -> Result<Vec<Order>, String> {
+        Ok(Vec::new())
+    }
+}
+
+/// A respelling may change what a step says, never what kind of step it is
+/// (#2790): the guard compares the kinds of the two changes, and a kind that
+/// shares a family with another, or a refactor that compares families, must not
+/// make `CreateRole` and `DropRole` the same kind.
+#[test]
+fn a_respelling_keeps_the_kind_of_the_step() {
+    let done = expand(plan(&["a", "b"]), &Respeller(create("z")), FACTOR).unwrap();
+    let order: Vec<_> = done.changes.changes.iter().filter_map(name).collect();
+    assert_eq!(
+        order,
+        [("z", true), ("b", true)],
+        "the same kind may be respelled"
+    );
+}
+
+#[test]
+fn a_respelling_into_another_kind_of_the_same_family_is_refused() {
+    let into = drop("a");
+    assert_eq!(
+        into.change.family(),
+        create("a").change.family(),
+        "the two kinds share a family, which is the case this guards"
+    );
+    let err = expand(plan(&["a"]), &Respeller(into), FACTOR).unwrap_err();
+    assert_eq!(
+        err,
+        "respeller: respelling `role a` changed what kind of step it is"
+    );
+}
+
+#[test]
+fn a_respelling_into_a_kind_of_another_family_is_refused() {
+    let into = PlannedChange::new(Change::DropTable {
+        uid: "t_aaaaaa".parse().unwrap(),
+        name: "app.t".parse().unwrap(),
+        detach_from: None,
+    });
+    assert_ne!(into.change.family(), create("a").change.family());
+    let err = expand(plan(&["a"]), &Respeller(into), FACTOR).unwrap_err();
+    assert_eq!(
+        err,
+        "respeller: respelling `role a` changed what kind of step it is"
+    );
+}

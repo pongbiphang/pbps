@@ -1748,6 +1748,17 @@ pub enum ChangeFamily {
 }
 
 impl Change {
+    /// Whether both are the same kind of change, the way a respelling is allowed
+    /// to keep it (`CreateRole` and `DropRole` are not, though they share a
+    /// family). A named function so that the move of the kinds into family enums
+    /// (#2790) changes one body and not every comparison of discriminants.
+    #[must_use]
+    pub fn same_kind(&self, other: &Change) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other)
+    }
+}
+
+impl Change {
     /// The family this kind belongs to.
     ///
     /// Total on purpose, like [`Change::catalog_object`]: every variant is

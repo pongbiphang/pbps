@@ -15,7 +15,13 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
     let shape = Box::new(Table::default());
     let mut seen = std::collections::HashSet::new();
     let mut pin = |change: Change, complete: Vec<&TableName>, writes: Vec<&TableName>, seed| {
-        seen.insert(std::mem::discriminant(&change));
+        // The wire name is the kind whatever family it sits in (#2790).
+        seen.insert(
+            serde_json::to_value(&change).unwrap()["op"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
         assert_eq!(
             table_use(&change),
             TableUse {
@@ -906,21 +912,41 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
 
     // A missing pin must fail even if a new variant was classified to compile.
     let source = include_str!("../../../pbps-model/src/change.rs");
-    let variants = source
-        .split("pub enum Change {")
-        .nth(1)
-        .unwrap()
-        .split("\n}")
-        .next()
-        .unwrap()
-        .lines()
-        .filter(|line| {
-            line.starts_with("    ")
-                && !line.starts_with("        ")
-                && line.trim_end().ends_with(" {")
-                && !line.trim_start().starts_with('/')
+    // The kinds are the variants of `Change` and, once it is an enum of
+    // families, those of the enums its newtype variants hold (#2790).
+    let body_of = |header: &str| {
+        source
+            .split(header)
+            .nth(1)
+            .unwrap()
+            .split("\n}")
+            .next()
+            .unwrap()
+    };
+    let change_body = body_of("pub enum Change {");
+    let mut bodies = vec![change_body];
+    for line in change_body.lines().map(str::trim) {
+        if let Some(inner) = line
+            .split_once('(')
+            .and_then(|(_, rest)| rest.strip_suffix("),"))
+            .filter(|inner| inner.ends_with("Change") && inner.chars().all(char::is_alphanumeric))
+        {
+            bodies.push(body_of(&format!("pub enum {inner} {{")));
+        }
+    }
+    let variants: usize = bodies
+        .iter()
+        .map(|body| {
+            body.lines()
+                .filter(|line| {
+                    line.starts_with("    ")
+                        && !line.starts_with("        ")
+                        && line.trim_end().ends_with(" {")
+                        && !line.trim_start().starts_with('/')
+                })
+                .count()
         })
-        .count();
+        .sum();
     assert_eq!(
         seen.len(),
         variants,

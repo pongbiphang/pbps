@@ -3,8 +3,10 @@
 //! (#2447).
 
 use pbps_model::{CatalogObject, Change, GrantTarget, ManagedType, Permission, catalog_change};
+#[path = "support/change_kinds.rs"]
+mod change_kinds_of_file;
+
 use std::path::Path;
-use syn::Item;
 
 fn enumeration() -> Box<ManagedType> {
     Box::new(ManagedType::Enum {
@@ -272,19 +274,7 @@ fn every_variant_is_listed_in_exactly_one_family() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/change.rs");
     let text = std::fs::read_to_string(path).unwrap();
     let file = syn::parse_file(&text).unwrap();
-    let variants: Vec<String> = file
-        .items
-        .iter()
-        .find_map(|item| {
-            if let Item::Enum(e) = item
-                && e.ident == "Change"
-            {
-                Some(e.variants.iter().map(|v| v.ident.to_string()).collect())
-            } else {
-                None
-            }
-        })
-        .expect("`Change` is an enum in change.rs");
+    let variants = change_kinds_of_file::change_kinds(&file);
     let body_of = |opening: &str, closing: &str| {
         let start = text.find(opening).unwrap();
         &text[start..text[start..].find(closing).map(|n| start + n).unwrap()]
