@@ -339,6 +339,20 @@ class SplitTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'incorrect dispatch for Table'):
             self.check()
 
+    def test_an_inline_family_may_share_its_name_with_a_parameter(self):
+        # No binding is made for an inline family, so nothing can clash.
+        self.split('        Change::Table(_) => refuse(table),\n'
+                   '        Change::Column(ColumnChange::First) => make(),',
+                   parameters='change: &Change, table: &str')
+        self.assertFalse(self.result.module_path('Table').exists())
+        self.check()
+
+    def test_a_moved_family_still_refuses_a_parameter_of_its_name(self):
+        self.assert_refused_without_writes(
+            self.source('        Change::Table(TableChange::First) => make(),',
+                        parameters='change: &Change, table: &str'),
+            'clashes with a source parameter')
+
     def test_a_guarded_or_shared_whole_family_arm_still_moves(self):
         self.split('        Change::Table(_) if ready(change) => make(),\n        Change::Table(_) => wait(),')
         self.assertTrue(self.result.module_path('Table').exists())

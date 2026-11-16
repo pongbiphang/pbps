@@ -342,7 +342,7 @@ class Split:
                        and not self.by_family[outer][0][0].guard.strip()}
         self.modules = [outer for outer in self.families if outer not in self.inline]
         self.parameters = {}
-        for outer in self.families:
+        for outer in self.modules:
             used = set().union(*(identifiers(arm.guard + ' ' + arm.body)
                                  for arm, _, _ in self.by_family[outer]))
             params = []
