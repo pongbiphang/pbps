@@ -149,13 +149,137 @@ impl fmt::Debug for Change {
     }
 }
 
+/// A JSON value whose maps keep every entry, including repeated keys. Using
+/// `Value` here would erase nested duplicate fields before the family's derive
+/// could refuse them; maps that intentionally replace entries still do so in
+/// their own deserializer.
+enum Held {
+    Null,
+    Bool(bool),
+    Number(serde_json::Number),
+    String(String),
+    Seq(Vec<Held>),
+    Map(Vec<(String, Held)>),
+}
+
+impl<'de> de::Deserialize<'de> for Held {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(HeldVisitor)
+    }
+}
+
+struct HeldVisitor;
+
+impl<'de> Visitor<'de> for HeldVisitor {
+    type Value = Held;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any valid JSON value")
+    }
+
+    fn visit_bool<E: de::Error>(self, value: bool) -> Result<Held, E> {
+        Ok(Held::Bool(value))
+    }
+
+    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Held, E> {
+        Ok(Held::Number(value.into()))
+    }
+
+    fn visit_i128<E: de::Error>(self, value: i128) -> Result<Held, E> {
+        de::Deserialize::deserialize(de::value::I128Deserializer::new(value)).map(Held::Number)
+    }
+
+    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Held, E> {
+        Ok(Held::Number(value.into()))
+    }
+
+    fn visit_u128<E: de::Error>(self, value: u128) -> Result<Held, E> {
+        de::Deserialize::deserialize(de::value::U128Deserializer::new(value)).map(Held::Number)
+    }
+
+    fn visit_f64<E: de::Error>(self, value: f64) -> Result<Held, E> {
+        Ok(serde_json::Number::from_f64(value).map_or(Held::Null, Held::Number))
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Held, E> {
+        Ok(Held::String(value.to_owned()))
+    }
+
+    fn visit_string<E: de::Error>(self, value: String) -> Result<Held, E> {
+        Ok(Held::String(value))
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Held, E> {
+        Ok(Held::Null)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Held, D::Error> {
+        de::Deserialize::deserialize(deserializer)
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Held, E> {
+        Ok(Held::Null)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Held, A::Error> {
+        let mut values = Vec::new();
+        while let Some(value) = seq.next_element()? {
+            values.push(value);
+        }
+        Ok(Held::Seq(values))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Held, A::Error> {
+        let mut entries = Vec::new();
+        while let Some(entry) = map.next_entry()? {
+            entries.push(entry);
+        }
+        Ok(Held::Map(entries))
+    }
+}
+
+impl<'de> IntoDeserializer<'de, serde_json::Error> for Held {
+    type Deserializer = Self;
+
+    fn into_deserializer(self) -> Self::Deserializer {
+        self
+    }
+}
+
+impl<'de> Deserializer<'de> for Held {
+    type Error = serde_json::Error;
+
+    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        match self {
+            Held::Null => visitor.visit_unit(),
+            Held::Bool(value) => visitor.visit_bool(value),
+            // Number uses the same u64/i64/f64 dispatch as Value's deserializer,
+            // preserving integer bounds, floating-point values and diagnostics.
+            Held::Number(value) => value.deserialize_any(visitor),
+            Held::String(value) => visitor.visit_string(value),
+            Held::Seq(values) => {
+                de::value::SeqDeserializer::new(values.into_iter()).deserialize_any(visitor)
+            }
+            Held::Map(entries) => Entries(entries).deserialize_any(visitor),
+        }
+    }
+
+    // The family's internally tagged derive collects deserialize_any content
+    // first; that buffer supplies typed option, newtype and enum decoding.
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf
+        option unit unit_struct newtype_struct seq tuple tuple_struct map struct enum identifier
+        ignored_any
+    }
+}
+
 /// The entries of a change's object as they were read, repeats included, so that
 /// the family's own derive sees (and refuses) a field written twice.
-struct Entries(Vec<(String, Value)>);
+struct Entries(Vec<(String, Held)>);
 
 struct EntriesAccess {
-    entries: std::vec::IntoIter<(String, Value)>,
-    value: Option<Value>,
+    entries: std::vec::IntoIter<(String, Held)>,
+    value: Option<Held>,
 }
 
 impl<'de> Deserializer<'de> for Entries {
@@ -204,7 +328,7 @@ impl<'de> MapAccess<'de> for EntriesAccess {
 /// family's derive dispatches on.
 fn family_of(
     family: ChangeFamily,
-    entries: Vec<(String, Value)>,
+    entries: Vec<(String, Held)>,
 ) -> Result<Change, serde_json::Error> {
     use serde::Deserialize as _;
     let entries = Entries(entries);
@@ -268,7 +392,7 @@ impl Visitor<'_> for OpVisitor {
 }
 
 /// What the first pass found: the family and every entry, not yet read as a kind.
-struct Pending(ChangeFamily, Vec<(String, Value)>);
+struct Pending(ChangeFamily, Vec<(String, Held)>);
 
 struct ChangeVisitor;
 
@@ -287,7 +411,7 @@ impl<'de> Visitor<'de> for ChangeVisitor {
     /// are the ones the flat enum gave. No `op` at all is refused at the end.
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Pending, A::Error> {
         let mut family: Option<ChangeFamily> = None;
-        let mut entries: Vec<(String, Value)> = Vec::new();
+        let mut entries: Vec<(String, Held)> = Vec::new();
         while let Some(key) = map.next_key::<String>()? {
             if key == "op" {
                 if family.is_some() {
@@ -296,9 +420,9 @@ impl<'de> Visitor<'de> for ChangeVisitor {
                 let Op(at) = map.next_value()?;
                 family = Some(OPS[at].1);
                 // The kind's own enum is told the op by name, whatever the index was.
-                entries.push((key, Value::String(OPS[at].0.to_owned())));
+                entries.push((key, Held::String(OPS[at].0.to_owned())));
             } else {
-                let value: Value = map.next_value()?;
+                let value: Held = map.next_value()?;
                 entries.push((key, value));
             }
         }

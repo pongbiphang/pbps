@@ -161,6 +161,30 @@ const ACCEPTED: &[(&str, &str, &str)] = &[
 /// flattens `Change` and so reads the object itself first; both are pinned.
 const REFUSED: &[(&str, &str, &str, &str)] = &[
     (
+        r"nested definition duplicate",
+        r#"{"op":"create_extension","uid":"e_aaaaaa","name":"citext","definition":{"schema":"public","schema":"ext","version":"1.6"}}"#,
+        r"duplicate field `schema` at line 1 column 122",
+        r"duplicate field `schema`",
+    ),
+    (
+        r"two levels duplicate",
+        r#"{"op":"create_table","uid":"t_aaaaaa","name":"app.t","table":{"columns":{},"primary_key":{"name":"pk","name":"other","columns":["id"]}}}"#,
+        r"duplicate field `name` at line 1 column 136",
+        r"duplicate field `name`",
+    ),
+    (
+        r"array element duplicate",
+        r#"{"op":"add_index","table":"app.t","name":"ix","index":{"columns":[{"name":"id","descending":false,"descending":true}],"unique":false}}"#,
+        r"duplicate field `descending` at line 1 column 134",
+        r"duplicate field `descending`",
+    ),
+    (
+        r"nested duplicate after null",
+        r#"{"op":"create_table","uid":"t_aaaaaa","name":"app.t","table":{"columns":{},"primary_key":{"name":null,"name":"pk","columns":["id"]}}}"#,
+        r"duplicate field `name` at line 1 column 133",
+        r"duplicate field `name`",
+    ),
+    (
         r"planned ext create bad risk",
         r#"{"op":"create_extension","uid":"e_aaaaaa","name":"citext","definition":{"schema":"public","version":"1.6"},"risks":["nope"]}"#,
         r"unknown variant `nope`, expected one of `rename`, `destructive`, `narrowing`, `not-null`, `constraint`, `data-update`, `data-delete`, `revoke`, `grant-widen`, `numbering`, `row-security`, `type-rebuild`, `extension-code` at line 1 column 122",
@@ -359,6 +383,44 @@ fn a_refused_change_is_refused_with_the_words_it_always_was() {
                 .to_string(),
             change,
             "{what}, as a Change"
+        );
+    }
+}
+
+/// The remaining old-enum probes pin map order and replacement, optional and
+/// required nulls, number categories and bounds, escaped strings and op placement.
+/// Expected outcomes were measured at 02a3f3d43, not derived from this adapter.
+#[test]
+fn buffered_values_preserve_the_flat_enums_other_readings() {
+    #[derive(serde::Deserialize)]
+    struct Reading {
+        name: String,
+        input: String,
+        change: Result<String, String>,
+        planned: Result<String, String>,
+    }
+
+    fn read<T: serde::de::DeserializeOwned + serde::Serialize>(
+        input: &str,
+    ) -> Result<String, String> {
+        serde_json::from_str::<T>(input)
+            .map(|value| serde_json::to_string(&value).unwrap())
+            .map_err(|error| error.to_string())
+    }
+
+    for line in include_str!("fixtures/change-wire-agreement.jsonl").lines() {
+        let expected: Reading = serde_json::from_str(line).unwrap();
+        assert_eq!(
+            read::<Change>(&expected.input),
+            expected.change,
+            "{}, as a Change",
+            expected.name
+        );
+        assert_eq!(
+            read::<PlannedChange>(&expected.input),
+            expected.planned,
+            "{}, as a PlannedChange",
+            expected.name
         );
     }
 }
