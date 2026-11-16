@@ -56,11 +56,33 @@ def rust_name(outer):
 
 
 def fingerprint(text):
-    """Keep literal and comment bytes; only Rust whitespace is insignificant."""
+    """Keep literal and comment bytes; only Rust whitespace is insignificant.
+
+    A trailing comma is insignificant too: rustfmt adds one when it breaks a
+    struct literal or a call over lines, and a source line it never formatted
+    has none. Kept only where it means something, the one in `(x,)`.
+    """
     tokens, comments = cfr.lex(text)
-    return [(kind, value) for _, kind, value in sorted(
+    items = [(kind, value) for _, kind, value in sorted(
         [(t.start, t.kind, t.text) for t in tokens]
         + [(c.start, 'comment', text[c.start:c.end]) for c in comments])]
+    pairs = {')': '(', ']': '[', '}': '{'}
+    out, commas = [], []  # commas: count per open bracket
+    for i, (kind, value) in enumerate(items):
+        if value in ('(', '[', '{'):
+            commas.append(0)
+        elif value in pairs and commas:
+            commas.pop()
+        elif value == ',':
+            if commas:
+                commas[-1] += 1
+            following = next((v for k, v in items[i + 1:] if k != 'comment'), None)
+            if following in pairs:
+                one_tuple = following == ')' and commas and commas[-1] == 1
+                if not one_tuple:
+                    continue
+        out.append((kind, value))
+    return out
 
 
 @dataclass
@@ -72,6 +94,7 @@ class Parameter:
 
 @dataclass
 class Function:
+    generics: str
     parameters: list
     result: str
     arguments: int
@@ -89,9 +112,20 @@ def function(source, name, binding='change'):
     if len(found) != 1:
         raise ValueError(f'{source.path}: cannot resolve exactly one top-level function {name}')
     start = found[0]
-    args = start + 2
-    if ts[args].text != '(':
-        source.refuse(args, 'generic function signatures are not supported')
+    args, generics = start + 2, ''
+    if ts[args].text == '<':
+        # Angle brackets are not in the bracket map; count them. The list is
+        # copied verbatim to a family function whose parameters name it.
+        depth, i = 0, args
+        while i < len(ts):
+            depth += (ts[i].text == '<') - (ts[i].text == '>')
+            if depth == 0:
+                break
+            i += 1
+        generics = source.text(args, i + 1)
+        args = i + 1
+    if args >= len(ts) or ts[args].text != '(':
+        source.refuse(args, 'cannot read the function signature')
     end_args = source.close_of[args]
     parameters, first, angle = [], args + 1, 0
     # The reused bracket walker skips tuples and callbacks; angle depth keeps
@@ -119,8 +153,57 @@ def function(source, name, binding='change'):
     if len(candidates) != 1:
         source.refuse(start, f'cannot resolve exactly one top-level match {binding}')
     match = candidates[0]
-    return Function(parameters, result, args, end_args, body, match, match + 2,
+    # A moved arm's `return` or `?` leaves the family function, not the source
+    # one; that is the same only when the match is the source's tail.
+    if source.close_of[match + 2] + 1 != source.close_of[body]:
+        source.refuse(match, 'the match must be the function\'s tail expression')
+    return Function(generics, parameters, result, args, end_args, body, match, match + 2,
                     source.close_of[match + 2])
+
+
+def arm_blocks(fp):
+    """Canonical spelling of every `=> { expr }` arm in a token list.
+
+    rustfmt writes a match arm whose block holds one expression and no
+    comment as `=> expr,`, at any depth. Spell each such arm that way on both
+    sides; a block with a top-level `;` or a comment keeps its braces and
+    loses the optional comma after it.
+    """
+    close, stack = {}, []
+    for i, (_, value) in enumerate(fp):
+        if value in ('(', '[', '{'):
+            stack.append(i)
+        elif value in (')', ']', '}') and stack:
+            close[stack.pop()] = i
+
+    def walk(lo, hi):
+        out, i = [], lo
+        while i < hi:
+            kind, value = fp[i]
+            if value == '=>' and i + 1 < hi and fp[i + 1][1] == '{' and i + 1 in close:
+                j = close[i + 1]
+                inner = fp[i + 2:j]
+                depth, plain = 0, bool(inner)
+                for k, v in inner:
+                    if k == 'comment' or (v == ';' and depth == 0):
+                        plain = False
+                        break
+                    depth += (v in ('(', '[', '{')) - (v in (')', ']', '}'))
+                after = j + 1
+                if after < hi and fp[after][1] == ',':
+                    after += 1
+                closer = after >= hi or fp[after][1] in (')', ']', '}')
+                if plain:
+                    out += [fp[i]] + walk(i + 2, j) + ([] if closer else [('punct', ',')])
+                else:
+                    out += [fp[i], fp[i + 1]] + walk(i + 2, j) + [fp[j]]
+                i = after
+                continue
+            out.append(fp[i])
+            i += 1
+        return out
+
+    return walk(0, len(fp))
 
 
 def body_fingerprint(text):
@@ -130,9 +213,10 @@ def body_fingerprint(text):
     expression and no comment, so `--check` after `cargo fmt` sees the same
     arm without its braces. Strip one such outer block on both sides: a block
     with a top-level `;` or a comment is a different spelling, and rustfmt
-    keeps its braces, so it still has to match exactly.
+    keeps its braces, so it still has to match exactly. Arms nested in the
+    body are spelled canonically first (`arm_blocks`).
     """
-    fp = fingerprint(text)
+    fp = arm_blocks(fingerprint(text))
     if len(fp) < 2 or fp[0][1] != '{' or fp[-1][1] != '}':
         return fp
     depth = 0
@@ -259,7 +343,7 @@ def alternatives(source, arm, types):
     bars = [i for i in source.children(arm.first, arm.pattern_end) if ts[i].text == '|']
     starts = [arm.first] + [i + 1 for i in bars]
     ends = bars + [arm.pattern_end]
-    result = []
+    result, spans = [], []
     for a, b in zip(starts, ends):
         if a == b:  # Rust permits a leading bar.
             continue
@@ -273,13 +357,20 @@ def alternatives(source, arm, types):
         if a + 4 == inner_end:
             source.refuse(a, 'empty family payload pattern')
         lo, hi = ts[a + 4].start, ts[inner_end - 1].end
+        # A comment between alternatives explains the one after it (the
+        # preflights' "cannot fail on the data" arm groups its alternatives
+        # under such comments), so it moves with that alternative.
+        prior = ts[ends[starts.index(a) - 1] - 1].end if a != starts[0] else None
+        owned = [c for c in source.comments if prior is not None and prior <= c.start < ts[a].start]
         # Comments in the inner pattern move with it. Erased wrappers and
         # separators must not hide an explanation that would otherwise vanish.
         if any(ts[a].start <= c.start < ts[b - 1].end and not lo <= c.start < hi
                for c in source.comments):
             source.refuse(a, 'comment in an erased outer wrapper')
-        result.append((ts[a + 2].text, source.src[lo:hi]))
-    spans = [(ts[a].start, ts[b - 1].end) for a, b in zip(starts, ends) if a < b]
+        prefix = ''.join(source.src[c.start:c.end] + '\n' for c in owned)
+        result.append((ts[a + 2].text, prefix, source.src[lo:hi]))
+        spans.extend((c.start, c.end) for c in owned)
+    spans += [(ts[a].start, ts[b - 1].end) for a, b in zip(starts, ends) if a < b]
     if any(ts[arm.first].start <= c.start < ts[arm.pattern_end - 1].end
            and not any(a <= c.start < b for a, b in spans) for c in source.comments):
         source.refuse(arm.first, 'comment between family alternatives has no unique owner')
@@ -294,10 +385,19 @@ def bindings(pattern):
     """Conservative binding diagnostics; never repair a copied pattern."""
     ts = cfr.lex(pattern)[0]
     return {t.text for i, t in enumerate(ts) if t.kind == 'ident'
-            and t.text not in ('ref', 'mut', '_')
+            and t.text not in ('ref', 'mut', '_', 'true', 'false')
             and (t.text[0].islower() or t.text.startswith('r#'))
             and (i == 0 or ts[i - 1].text != '::')
             and (i + 1 == len(ts) or ts[i + 1].text not in ('::', ':', '(', '{'))}
+
+
+# The parent file's stem names the family functions and their wording, so
+# `emit.rs` keeps the spelling of #2916 and #2917 and a new kind of parent
+# says what it does before the tool writes for it.
+ROLES = {
+    'emit': ('Emits the {} family of changes', 'emitter'),
+    'preflight': ('Probes the {} family of changes before apply', 'preflight'),
+}
 
 
 class Split:
@@ -306,6 +406,11 @@ class Split:
         self.path = root / file
         self.source = source = Source(self.path, original)
         self.target = target = function(source, name)
+        role = ROLES.get(self.path.stem)
+        if role is None:
+            raise ValueError(f'{self.path}: no family-module wording for a {self.path.stem}.rs parent')
+        self.verb, self.parent_noun = role
+        self.fn_name = self.path.stem
         self.types, order = inventory(root)
         matched = [p for p in target.parameters if p.name == 'change']
         if len(matched) != 1 or fingerprint(matched[0].type_text) != fingerprint('&Change'):
@@ -314,14 +419,19 @@ class Split:
         self.shared, self.reports = [], []
         for arm in arms(source, target):
             alts = alternatives(source, arm, self.types)
-            families = list(dict.fromkeys(outer for outer, _ in alts))
+            families = list(dict.fromkeys(outer for outer, _, _ in alts))
             if len(families) > 1:
                 self.shared.append((source.line(source.toks[arm.first].start), families))
-            all_bindings = set().union(*(bindings(pat) for _, pat in alts))
+            all_bindings = set().union(*(bindings(pat) for _, _, pat in alts))
             referenced = identifiers(arm.guard + ' ' + arm.body)
             for outer in families:
-                pattern = ' | '.join(pat for family, pat in alts if family == outer)
+                mine = [(prefix, pat) for family, prefix, pat in alts if family == outer]
+                # The first alternative's comments open the family's arm, where
+                # a reader (and a re-parse) finds an arm's explanation.
+                pattern = mine[0][1] + ''.join(' | ' + prefix + pat for prefix, pat in mine[1:])
                 leading = arm.leading if outer == families[0] else ''
+                if mine[0][0]:
+                    leading += mine[0][0].replace('\n', '\n        ')
                 self.by_family[outer].append((arm, pattern, leading))
                 bound = bindings(pattern)
                 for missing in sorted((all_bindings - bound) & referenced):
@@ -357,15 +467,27 @@ class Split:
                                             f'&{self.types[outer]}'))
             self.parameters[outer] = params
 
+    def generics(self, outer):
+        """The source's generic list, when a parameter this family takes names it."""
+        if not self.target.generics:
+            return ''
+        names = re.findall(r"(?:<|,)\s*('?[A-Za-z_]\w*)", self.target.generics)
+        for p in self.parameters[outer]:
+            text = p.type_text
+            if any((re.search(re.escape(n) + r"\b", text) if n.startswith("'")
+                    else n in identifiers(text)) for n in names):
+                return self.target.generics
+        return ''
+
     def module_path(self, outer):
         return self.path.with_suffix('') / (snake(outer) + '.rs')
 
     def module(self, outer):
         local = rust_name(outer)
-        header = (f'//! Emits the {snake(outer)} family of changes (DEC-2790.4).\n\n'
-                  '// The moved arms use the parent emitter\'s private helpers, which stay there.\n'
+        header = (f'//! {self.verb.format(snake(outer))} (DEC-2790.4).\n\n'
+                  f'// The moved arms use the parent {self.parent_noun}\'s private helpers, which stay there.\n'
                   'use super::*;\n\n'
-                  'pub(super) fn emit(\n'
+                  f'pub(super) fn {self.fn_name}{self.generics(outer)}(\n'
                   + ''.join(f'    {p.declaration},\n' for p in self.parameters[outer])
                   + f') {self.target.result} {{\n    match {local} {{\n')
         chunks = []
@@ -389,7 +511,7 @@ class Split:
                 continue
             local = rust_name(outer)
             args = ', '.join(p.name for p in self.parameters[outer])
-            lines.append(f'{indent}    Change::{outer}({local}) => {local}::emit({args}),\n')
+            lines.append(f'{indent}    Change::{outer}({local}) => {local}::{self.fn_name}({args}),\n')
         return ''.join(lines) + indent + '}'
 
     def declarations(self):
@@ -461,7 +583,7 @@ class Split:
             args = ', '.join(p.name for p in self.parameters[outer])
             if (fingerprint(arm.pattern) != fingerprint(f'Change::{outer}({local})')
                     or arm.guard.strip() or arm.leading or arm.trailing
-                    or fingerprint(arm.body) != fingerprint(f'{local}::emit({args})')):
+                    or body_fingerprint(arm.body) != fingerprint(f'{local}::{self.fn_name}({args})')):
                 raise ValueError(f'verification: incorrect dispatch for {outer}')
 
         def outside(source, fn):
@@ -488,9 +610,9 @@ class Split:
         for outer in self.modules:
             path = self.module_path(outer)
             moved = Source(path, texts[path])
-            fn = function(moved, 'emit', rust_name(outer))
+            fn = function(moved, self.fn_name, rust_name(outer))
             expected = Source(path, self.module(outer))
-            expected_fn = function(expected, 'emit', rust_name(outer))
+            expected_fn = function(expected, self.fn_name, rust_name(outer))
 
             def skeleton(source, target):
                 # Formatting a short signature onto one line removes its
