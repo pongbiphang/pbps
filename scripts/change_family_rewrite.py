@@ -11,6 +11,12 @@ Usage:
 
     change_family_rewrite.py extensions Extension ExtensionChange . --check
 
+The tool rewrites what it can prove and reports the rest, and a final pass
+reports every `X::K` of the family that was neither rewritten, reported nor
+shown to be another type's variant. The compiler is the complete check: a kind
+that has moved no longer exists on `Change`, so a mention the tool did not
+rewrite does not compile.
+
 `--move-enum` is the step before the rewrite: it moves the variants that
 `change_family!(FAMILY)` names, with their docs and attributes, out of
 `enum Change` into a new `enum INNER`, adds `#[serde(untagged)] OUTER(INNER)`
@@ -811,6 +817,7 @@ class Project:
                     variant_imports.add(segs[-1])
                     self.report(f, stmt.use_start, f"imports the variant {segs[-1]}", None)
 
+        decided = set()  # token indices of `X::K` this pass rewrote, reported or proved foreign
         for i, t in enumerate(toks):
             if t.kind != "ident" or i + 2 >= len(toks):
                 continue
@@ -821,6 +828,7 @@ class Project:
             if word == "Self":
                 if f.impl_change[i] and kind_tok.text in kinds:
                     self.report(f, t.start, f"`Self::{kind_tok.text}` inside `impl Change`")
+                    decided.add(i)
                 continue
             if word not in names:
                 continue
@@ -829,7 +837,12 @@ class Project:
                 continue
             if kind_tok.text not in kinds:
                 continue
+            before = (sum(self.rewrites.values()), len(self.reports), sum(self.skipped_other.values()))
             self.site(f, path, in_model, i, names, edits, needs_inner)
+            if before != (sum(self.rewrites.values()), len(self.reports), sum(self.skipped_other.values())):
+                decided.add(i)
+
+        self.residue(f, path, names, decided)
 
         # bare kind names after a variant import
         if variant_imports:
@@ -848,6 +861,60 @@ class Project:
         self.scan_mentions(f)
 
         self.finish_imports(f, path, needs_inner)
+
+    def residue(self, f, path, names, decided):
+        """The pass that makes the tool's silence mean something. After every
+        decision, a `X::K` (K a kind of the family) that was not rewritten, not
+        reported and not proved to be another type's variant is reported, so a
+        name the resolution above cannot see (a crate that re-exports `Change`, an
+        alias inherited through a glob) is listed and never skipped. The proof of
+        a foreign variant is the tool's own: `X` is imported or declared as
+        something that is not `Change`, or it is written with a qualifier and a
+        type name other than `Change` or one of its spellings."""
+        toks = f.toks
+        for i, t in enumerate(toks):
+            if t.kind != "ident" or i + 2 >= len(toks) or i in decided:
+                continue
+            if toks[i + 1].text != "::" or toks[i + 2].kind != "ident" or toks[i + 2].text not in self.kinds:
+                continue
+            if any(s.use_start <= t.start and toks[i + 2].end <= s.end for s in f.uses):
+                continue  # an import: reported with the variant imports
+            word = t.text
+            if word == "Self":
+                continue  # an `impl Change` was reported above; any other Self is another type
+            qualified = i > 0 and toks[i - 1].text == "::"
+            if word[:1].islower() or word.startswith("$"):
+                continue  # `crate::K`, `pbps_model::K`: a module's item, not a variant of any enum
+            if word != "Change" and word not in names:
+                spellings = self.change_spellings()
+                if word not in spellings[1]:
+                    if qualified:
+                        continue  # `x::Other::K`: a type of another name
+                    kind, _, _ = self.resolve(path, f.scope_of[i], word)
+                    if kind == "other" or word in spellings[0]:
+                        continue  # imported or declared as another type, or an enum of the repository
+                # else `word` is a spelling of `Change` somewhere in the repository: unresolved here
+            self.report(
+                f,
+                t.start,
+                "unresolved mention of a kind of this family: not rewritten; the compiler will reject it "
+                "after the move if it names Change",
+            )
+
+    def change_spellings(self):
+        """(names of every enum the repository declares, names that stand for
+        `Change` anywhere in it: `Change as X`, `type X = ...Change;`). An
+        identifier in the first set and not in the second is a different enum."""
+        if not hasattr(self, "_spellings"):
+            enums, aliases = set(), set()
+            for path in rust_files(self.root):
+                text = path.read_text()
+                enums.update(re.findall(r"\benum\s+(\w+)", text))
+                aliases.update(re.findall(r"\bChange\s+as\s+(\w+)", text))
+                aliases.update(re.findall(r"\btype\s+(\w+)\s*=\s*[\w:]*\bChange\s*;", text))
+            enums.discard("Change")
+            self._spellings = (enums - aliases, aliases)
+        return self._spellings
 
     def scan_mentions(self, f):
         pat = re.compile(r"\bChange::(" + "|".join(sorted(self.kinds)) + r")\b")
@@ -904,8 +971,7 @@ class Project:
             elif s0 in ("crate", "$crate", "super", "self") and in_model_file:
                 pass
             elif s0 in ("crate", "$crate", "super", "self"):
-                self.skipped_other[self.rel(path)] += 1
-                return
+                return  # which crate's `Change` this is cannot be seen; the residue pass reports it
             elif alias == "foreign":
                 self.report(f, toks[ps].start, f"`{s0}` is not the model crate where this is written: it names another item")
                 return

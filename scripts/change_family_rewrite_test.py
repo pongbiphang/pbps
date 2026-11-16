@@ -635,6 +635,79 @@ class SiteScope(Tree):
         return self.read(name), project, [r[2] for r in project.reports if r[0] == name]
 
 
+class Residue(Tree):
+    """The last pass: a mention of a kind that was neither rewritten, reported
+    nor shown to be another enum's variant is reported, so silence means
+    something. The shapes name resolution does not follow end up here."""
+
+    UNRESOLVED = (
+        "unresolved mention of a kind of this family: not rewritten; the compiler will reject it "
+        "after the move if it names Change"
+    )
+
+    def residue(self, files):
+        for name, body in files.items():
+            self.write(name, body)
+        project, _ = self.run_tool()
+        return project, {name: [r[2] for r in project.reports if r[0] == name] for name in files}
+
+    def test_a_crate_relative_path_outside_the_model_crate_is_reported_not_skipped(self):
+        body = "fn f() -> crate::Change { crate::Change::DropExtension { uid } }\n"
+        _, reasons = self.residue({"crates/pbps-cli/src/a.rs": body})
+        self.assertEqual(reasons["crates/pbps-cli/src/a.rs"], [self.UNRESOLVED])
+        self.assertEqual(self.read("crates/pbps-cli/src/a.rs"), body)
+
+    def test_an_alias_inherited_through_a_glob_is_reported_not_missed(self):
+        self.write("crates/pbps-cli/src/lib.rs", "mod parent;\n")
+        parent = "use pbps_model::Change as C;\n#[cfg(test)]\nmod tests;\n"
+        child = "use super::*;\nfn t() -> C { C::DropExtension { uid } }\n"
+        _, reasons = self.residue({"crates/pbps-cli/src/parent.rs": parent, "crates/pbps-cli/src/parent/tests.rs": child})
+        self.assertEqual(reasons["crates/pbps-cli/src/parent/tests.rs"], [self.UNRESOLVED])
+        self.assertEqual(self.read("crates/pbps-cli/src/parent/tests.rs"), child, "the site is left as it was")
+
+    def test_another_enums_variant_of_the_same_name_is_not_reported(self):
+        files = {
+            "crates/pbps-model/src/intent.rs": "pub enum Intent { DropExtension { name: u8 } }\n",
+            "crates/pbps-cli/src/a.rs": (
+                "use pbps_model::*;\nfn f() -> Intent { Intent::DropExtension { name: 1 } }\n"
+                "fn g() -> pbps_model::Intent { pbps_model::Intent::DropExtension { name: 2 } }\n"
+                "impl Other { fn h() -> Self { Self::DropExtension { name: 3 } } }\n"
+                "fn s() -> pbps_model::DropExtension { pbps_model::DropExtension { name: 4 } }\n"
+            ),
+        }
+        _, reasons = self.residue(files)
+        self.assertEqual(reasons["crates/pbps-cli/src/a.rs"], [])
+        self.assertEqual(self.read("crates/pbps-cli/src/a.rs"), files["crates/pbps-cli/src/a.rs"])
+
+    def test_a_rewritten_site_is_not_reported_as_well(self):
+        _, reasons = self.residue(
+            {"crates/pbps-cli/src/a.rs": "use pbps_model::Change;\nfn f() -> Change { Change::DropExtension { uid } }\n"}
+        )
+        self.assertEqual(reasons["crates/pbps-cli/src/a.rs"], [])
+
+    def test_a_site_that_was_reported_is_not_reported_twice(self):
+        _, reasons = self.residue(
+            {"crates/pbps-cli/src/a.rs": "use pbps_model::Change;\nfn f() { check!(Change::DropExtension { uid }); }\n"}
+        )
+        self.assertEqual(reasons["crates/pbps-cli/src/a.rs"], ["inside an invocation of the macro `check!`"])
+
+    def test_an_enum_that_is_also_a_spelling_of_change_is_not_taken_for_foreign(self):
+        # `Alias` is declared as an enum in one place and is `Change as Alias` in another.
+        files = {
+            "crates/pbps-model/src/x.rs": "pub enum Alias { A }\n",
+            "crates/pbps-cli/src/b.rs": "use pbps_model::Change as Alias;\n",
+            "crates/pbps-cli/src/a.rs": "use pbps_model::*;\nfn f() { let _ = Alias::DropExtension { uid }; }\n",
+        }
+        _, reasons = self.residue(files)
+        self.assertEqual(reasons["crates/pbps-cli/src/a.rs"], [self.UNRESOLVED])
+
+    def test_a_mention_in_an_import_is_left_to_the_variant_import_report(self):
+        _, reasons = self.residue({"crates/pbps-cli/src/a.rs": "use pbps_model::Change::DropExtension;\n"})
+        got = reasons["crates/pbps-cli/src/a.rs"]
+        self.assertIn("imports the variant DropExtension", got)
+        self.assertNotIn(self.UNRESOLVED, got)
+
+
 class AllOrNothing(Tree):
     """A run that cannot finish writes nothing: every text is computed and every
     guard passed before the first file is written."""
