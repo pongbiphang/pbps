@@ -6035,3 +6035,22 @@ new family gets an enum of its own, a variant of `Change`, a row in the op table
 and a `ChangeFamily` variant, and the pins say where each is missing. The rewrite
 tool `scripts/change_family_rewrite.py` stays until the freeze of #2790 is over,
 so that a branch opened before the move can be carried across it.
+
+<a id="dec-2790-3"></a>
+
+**DEC-2790.3. Whole-family patterns replace the transitional macros, and decide
+for every member of the family, including future ones (#2790).** The
+`change_family!` and `catalog_change!` macros are removed. A whole-family
+pattern `Change::<Outer>(_)` decides for every member of that family, including
+a future one, in match arms and in `matches!` and `if let` alike. When adding a
+kind, read every such pattern of its family and name the members wherever one
+differs. Inner matches keep naming the members and remain exhaustive.
+
+The mechanical collapse replaces macro sites and complete sets of payload-free
+member alternatives with outer-family patterns. It leaves member sets with any
+field binding, guards or partial membership alone; those keep their individual
+decisions. Wrapper patterns collapse only when the complete set occupies the
+same nesting position with the same wrapper. Comments between alternatives are
+retained with their member patterns. An arm whose leading comment says
+"rather than a wildcard" keeps its member listings; macro substitution
+still applies there because it preserves the accepted kinds.

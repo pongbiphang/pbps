@@ -900,28 +900,27 @@ decision or the issue named in its row.
   family enums and refuses one this file does not name, and
   `the_requires_table_states_the_effects_of_each_kind_it_names` refuses a last
   column the code disagrees with.
-- A new database-global named object (today roles, types and extensions,
-  `CatalogObject`)
-  is added to `catalog_change!` and to `Change::catalog_object` in
-  `pbps_model::change`, which names every other variant. Every exhaustive match
-  that lists the kinds alike uses `catalog_change!()`, so the new kind joins
-  those arms without a compile error: read each `catalog_change!()` site and
-  take the new kind out of the ones where it differs (DEC-2447.5). A
-  `matches!` or `if let` does not use the macro, so a new kind never joins it
-  unseen.
-- Every kind of change belongs to one family (`change_family!`, `ChangeFamily`,
-  DEC-2790.1), and its enum is the family's (DEC-2790.2); `Change::family` does
-  not compile until a new family is listed. A match arm that names a family,
-  `Change::Table(_)` or `change_family!(tables)`, is joined by a new kind of that
-  family without a compile error: read each such site and name the members there
-  where the new kind differs.
+- A new database-global named object (today roles, types, search objects and
+  extensions, `CatalogObject`) is classified by `Change::catalog_object` in
+  `pbps_model::change`, which explicitly decides every outer family. Consumers
+  that treat a catalog family alike use `Change::Role(_)`, `Change::Type(_)`,
+  `Change::Search(_)` or `Change::Extension(_)`. Read every arm of the affected
+  family when adding a kind, and name the members wherever the new kind differs
+  (DEC-2447.5, DEC-2790.2). This includes patterns in `matches!` and `if let`:
+  an outer family pattern there also accepts a future member.
+- Every kind of change belongs to one family (`ChangeFamily`, DEC-2790.1), and
+  its enum is the family's (DEC-2790.2); `Change::family` does not compile until
+  a new family is listed. An arm such as `Change::Table(_)` decides for every
+  member of that family, including a future one. When adding a kind, read every
+  `Change::<Outer>(_)` arm of its family and name the members wherever one
+  differs. Inner matches name the members and stay exhaustive.
 - A kind that waits for another kind of its own class (a package for the
   packages it requires, DEC-2447.6) needs two things: the effect edge, and a
   rank in the differ's draft so that the draft does not contradict the effects.
   Without the rank the order shadow in debug builds refuses the plan, naming the
   edge.
 - The wildcard-allowed functions are where a new kind defaults silently, and
-  neither the compiler nor the macro finds them. Search for every function
+  the compiler does not find them. Search for every function
   marked `#[allow(clippy::wildcard_enum_match_arm)]` whose body names a role or
   type variant, and decide each (the list for extensions is in DEC-2447.6).
 - A new ordering rule states an effect on existing resources, or supplies a
