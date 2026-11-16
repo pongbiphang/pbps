@@ -370,6 +370,24 @@ class SplitTests(unittest.TestCase):
         self.assertIn('fn emit(\n', self.family('Column'))
         self.check()
 
+    def test_a_generic_named_only_in_an_arm_body_is_still_declared(self):
+        original = (HEADER + "fn target<'v>(change: &Change, names: &Names<'v>) -> Sql {\n"
+                    '    match change {\n'
+                    "        Change::Table(TableChange::First) => { let x: &'v str = pick(); make(x) }\n"
+                    '        Change::Column(ColumnChange::First) => other(names),\n    }\n}\n')
+        self.write(self.file, original)
+        self.original = original
+        self.result = cfs.run(self.root, self.file, 'target', out=io.StringIO())
+        self.assertIn("fn emit<'v>(\n", self.family('Table'))
+        self.check()
+
+    def test_a_type_parameter_no_family_parameter_names_is_refused(self):
+        self.assert_refused_without_writes(
+            HEADER + 'fn target<T: Probe>(change: &Change, probe: T) -> Sql {\n    match change {\n'
+            '        Change::Table(TableChange::First) => T::default().run(),\n'
+            '        Change::Column(ColumnChange::First) => probe.run(),\n    }\n}\n',
+            'could not be inferred')
+
     def test_a_match_that_is_not_the_tail_is_refused(self):
         # A moved `return` or `?` would leave the family function and run
         # what follows the match: a different program.

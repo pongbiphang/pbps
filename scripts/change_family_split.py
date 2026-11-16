@@ -468,16 +468,32 @@ class Split:
             self.parameters[outer] = params
 
     def generics(self, outer):
-        """The source's generic list, when a parameter this family takes names it."""
+        """The source's generic list, when this family's function names one of it.
+
+        The whole function is read (parameters, return type, every moved arm),
+        not only the parameters: a generic named in an arm body alone must
+        still be declared. A type parameter no family parameter names could not
+        be inferred at the dispatch call, so that is refused, not guessed.
+        """
         if not self.target.generics:
             return ''
         names = re.findall(r"(?:<|,)\s*('?[A-Za-z_]\w*)", self.target.generics)
-        for p in self.parameters[outer]:
-            text = p.type_text
-            if any((re.search(re.escape(n) + r"\b", text) if n.startswith("'")
-                    else n in identifiers(text)) for n in names):
-                return self.target.generics
-        return ''
+        params = ' '.join(p.type_text for p in self.parameters[outer])
+        whole = ' '.join([params, self.target.result] + [
+            pattern + ' ' + arm.guard + ' ' + arm.body for arm, pattern, _ in self.by_family[outer]])
+
+        def named(name, text):
+            if name.startswith("'"):
+                return re.search(re.escape(name) + r"(?![\w'])", text) is not None
+            return name in identifiers(text)
+
+        if not any(named(n, whole) for n in names):
+            return ''
+        for n in names:
+            if not n.startswith("'") and not named(n, params):
+                raise ValueError(f'{self.path}: {outer}: generic {n} is not named by a parameter '
+                                 'and could not be inferred at the dispatch')
+        return self.target.generics
 
     def module_path(self, outer):
         return self.path.with_suffix('') / (snake(outer) + '.rs')
