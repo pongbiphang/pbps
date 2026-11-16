@@ -224,8 +224,11 @@ fn a_refused_rehearsal_names_each_written_file_once_in_both_formats() {
     );
     let err = stderr(&human);
     assert_eq!(err.matches(UNVERIFIED).count(), 2, "{err}");
+    // A person reads the path as shown text, where a backslash is doubled
+    // (DEC-2032.1); the JSON location above is the path itself.
     for file in [out_arg, sql_arg] {
-        assert_eq!(err.matches(file).count(), 1, "{file}: {err}");
+        let shown = pbps_model::Text::new(file).shown().to_string();
+        assert_eq!(err.matches(&shown).count(), 1, "{shown}: {err}");
     }
     // After the refusal text, on the stream that text uses.
     assert!(err.find("the baseline cannot be expressed").unwrap() < err.find(UNVERIFIED).unwrap());
@@ -314,7 +317,8 @@ fn a_rehearsal_that_does_not_converge_names_the_written_file_in_both_formats() {
     );
     let err = stderr(&human);
     assert_eq!(err.matches(UNVERIFIED).count(), 1, "{err}");
-    assert_eq!(err.matches(sql_arg).count(), 1, "{err}");
+    let shown = pbps_model::Text::new(sql_arg).shown().to_string();
+    assert_eq!(err.matches(&shown).count(), 1, "{err}");
     assert!(err.find("does not converge").unwrap() < err.find(UNVERIFIED).unwrap());
 }
 
