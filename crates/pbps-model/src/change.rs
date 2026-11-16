@@ -265,66 +265,74 @@ pub enum DetachedKind {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Change {
-    /// Planning-only until the complete rebuild route is admitted.
-    RebuildPartitionedTable(Box<crate::RebuildPartitionedTable>),
-    CopyTableRows(Box<crate::CopyTableRows>),
-    AnalyzeTableTree(Box<crate::AnalyzeTableTree>),
-    BuildPartitionedIndex(Box<crate::BuildPartitionedIndex>),
-    /// One additive label, carrying the definition immediately after this step.
-    AddEnumValue {
-        uid: Uid,
-        name: crate::TypeRef,
-        value: String,
-        placement: Option<crate::EnumPlacement>,
-        ordinal: usize,
-        definition: Box<crate::ManagedType>,
-    },
-    /// Explicit label intent changes the text returned by existing rows.
-    RenameEnumValue {
-        uid: Uid,
-        name: crate::TypeRef,
-        from: String,
-        to: String,
-        ordinal: usize,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        retained: Vec<crate::RetainedExpression>,
-        definition: Box<crate::ManagedType>,
-    },
-    /// One half of an in-place domain alteration (DEC-1635.8). The statements
-    /// derive from `(from, to, half)` alone: `Loosen` drops what the
-    /// declaration no longer holds and sets the default, `Tighten` adds what
-    /// it newly holds and validates it.
-    AlterDomain {
-        uid: Uid,
-        name: crate::TypeRef,
-        from: Box<crate::ManagedType>,
-        to: Box<crate::ManagedType>,
-        half: crate::DomainHalf,
-    },
-    /// A label removal or reorder, done by rebuilding the enum under the same
-    /// uid (DEC-1635.7). `name` is the live name, `tmp` the replacement's.
-    EnumRebuild {
-        uid: Uid,
-        name: crate::TypeRef,
-        tmp: crate::TypeRef,
-        step: crate::EnumRebuildStep,
-    },
-    CreateType {
-        uid: Uid,
-        name: crate::TypeRef,
-        definition: Box<crate::ManagedType>,
-    },
-    DropType {
-        uid: Uid,
-        name: crate::TypeRef,
-        definition: Box<crate::ManagedType>,
-    },
-    RenameType {
-        uid: Uid,
-        from: crate::TypeRef,
-        to: crate::TypeRef,
-        definition: Box<crate::ManagedType>,
-    },
+    /// The kinds of the `tables` family (#2790). Serialised as the inner kind alone:
+    /// each change stays one flat object tagged by `op`.
+    #[serde(untagged)]
+    Table(TableChange),
+    /// The kinds of the `table_properties` family (#2790). Serialised as the inner kind alone:
+    /// each change stays one flat object tagged by `op`.
+    #[serde(untagged)]
+    TableProperty(TablePropertyChange),
+    /// The kinds of the `partitions` family (#2790). Serialised as the inner kind alone:
+    /// each change stays one flat object tagged by `op`.
+    #[serde(untagged)]
+    Partition(PartitionChange),
+    /// The kinds of the `columns` family (#2790). Serialised as the inner kind alone:
+    /// each change stays one flat object tagged by `op`.
+    #[serde(untagged)]
+    Column(ColumnChange),
+    /// The kinds of the `constraints` family (#2790). Serialised as the inner kind alone:
+    /// each change stays one flat object tagged by `op`.
+    #[serde(untagged)]
+    Constraint(ConstraintChange),
+    /// The kinds of the `indexes` family (#2790). Serialised as the inner kind alone:
+    /// each change stays one flat object tagged by `op`.
+    #[serde(untagged)]
+    Index(IndexChange),
+    /// The kinds of the `policies` family (#2790). Serialised as the inner kind alone:
+    /// each change stays one flat object tagged by `op`.
+    #[serde(untagged)]
+    Policy(PolicyChange),
+    /// The kinds of the `rows` family (#2790). Serialised as the inner kind alone:
+    /// each change stays one flat object tagged by `op`.
+    #[serde(untagged)]
+    Row(RowChange),
+    /// The kinds of the `modules` family (#2790). Serialised as the inner kind alone:
+    /// each change stays one flat object tagged by `op`.
+    #[serde(untagged)]
+    Module(ModuleChange),
+    /// The kinds of the `permissions` family (#2790). Serialised as the inner kind alone:
+    /// each change stays one flat object tagged by `op`.
+    #[serde(untagged)]
+    Permission(GrantChange),
+    /// The kinds of the `type_values` family (#2790). Serialised as the inner kind alone:
+    /// each change stays one flat object tagged by `op`.
+    #[serde(untagged)]
+    TypeValue(TypeValueChange),
+    /// The kinds of the `roles` family (#2790). Serialised as the inner kind alone:
+    /// each change stays one flat object tagged by `op`.
+    #[serde(untagged)]
+    Role(RoleChange),
+    /// The kinds of the `types` family (#2790). Serialised as the inner kind alone:
+    /// each change stays one flat object tagged by `op`.
+    #[serde(untagged)]
+    Type(TypeChange),
+    /// The kinds of the `extensions` family (#2790). Serialised as the inner kind alone:
+    /// each change stays one flat object tagged by `op`.
+    #[serde(untagged)]
+    Extension(ExtensionChange),
+    /// The kinds of the `search` family (#2790). Serialised as the inner kind alone:
+    /// each change stays one flat object tagged by `op`.
+    #[serde(untagged)]
+    Search(SearchChange),
+}
+
+/// The kinds of change of the `search` family (#2790): the enum `change_family!(search)`
+/// names. [`Change::Search`] holds one and serialises as it does, so a saved plan
+/// keeps its shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SearchChange {
     /// `CREATE TEXT SEARCH DICTIONARY`, or `CREATE TEXT SEARCH CONFIGURATION` and
     /// its `ADD MAPPING` groups, of an object the declarations hold under an `s_` uid
     /// and the target lacks (DEC-2728.2). The payload is the whole definition, as
@@ -347,6 +355,14 @@ pub enum Change {
         name: crate::SearchRef,
         definition: Box<crate::SearchObject>,
     },
+}
+
+/// The kinds of change of the `extensions` family (#2790): the enum `change_family!(extensions)`
+/// names. [`Change::Extension`] holds one and serialises as it does, so a saved plan
+/// keeps its shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExtensionChange {
     /// `CREATE EXTENSION name SCHEMA schema VERSION version` of a package the
     /// declaration holds under an `e_` uid and the target lacks (DEC-2447.6).
     /// It runs package code, so it is `extension-code` risk and is sealed with
@@ -436,413 +452,202 @@ pub enum Change {
         #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
         releases: BTreeSet<crate::ModuleId>,
     },
-    CreateTable {
-        uid: Uid,
-        name: TableName,
-        table: Box<Table>,
-        /// The DEFAULT partition of the standing parent a new range partition
-        /// goes under (#1547, DEC-1547.1): the partition is made as a plain
-        /// table, filled with the DEFAULT's rows in its range, and attached.
-        /// `None` for any other table, which an older plan's creates all are.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        beside_default: Option<TableName>,
-        /// Beside a DEFAULT, the most of its rows the move may take, as a
-        /// human allowed it (`pbps move-rows`, #1788); `None` allows none, and
-        /// the moving statement refuses if it finds any. Ignored with no
-        /// `beside_default`, where nothing moves.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        moves_at_most: Option<u64>,
-    },
-    DropTable {
-        uid: Uid,
-        name: TableName,
-        /// The partitioned table this one is a partition of, which the drop
-        /// detaches it from first (#1171): a partition a foreign key to its
-        /// parent reaches cannot be dropped while attached. `None` for any
-        /// other table, which an older plan's drops all are.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        detach_from: Option<TableName>,
-    },
-    /// A partition leaves its parent and stays, as an ordinary table of the
-    /// declared shape, which is its parent's under names of its own (#1544,
-    /// DEC-1544.1). Its rows leave the parent with it.
-    DetachPartition {
-        uid: Uid,
-        table: TableName,
-        parent: TableName,
-        /// The name each of the parent's objects takes on the detached table.
-        names: Vec<DetachedName>,
-        /// The table the detach leaves, as declared: what the apply holds
-        /// the read-back to, as it holds a created table to its `CREATE`.
-        shape: Box<Table>,
-    },
-    /// An ordinary table becomes a partition of a standing parent and keeps
-    /// its rows (#1545, DEC-1545.1). Its columns become the parent's; what it
-    /// holds of them otherwise, and its own indexes and checks, are brought
-    /// to the declaration by the partition's own changes after it.
-    AttachPartition {
-        uid: Uid,
-        table: TableName,
-        parent: TableName,
-        bound: crate::schema::PartitionBound,
-        /// The parent's key columns, in order, as the plan was made against
-        /// them. A staged attach writes a CHECK on them that implies the
-        /// bound, so the attach skips its scan (#1638, DEC-1638.1). Empty in
-        /// a plan made before it, or when live constraint names prevent the
-        /// temporary CHECK (DEC-2126.1); either uses the single statement.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        key: Vec<ColumnName>,
-        /// The partition as declared: what the apply holds the read-back to
-        /// once every statement has run, as it holds a created table to its
-        /// `CREATE`.
-        shape: Box<Table>,
-    },
-    RenameTable {
-        uid: Uid,
-        from: TableName,
-        to: TableName,
-        /// The columns that carry a default when the table is renamed, by the
-        /// names they have then (a column rename runs after the table's).
-        /// SQL Server names each default it creates after its table and column
-        /// (`DF_pbps_…`, DEC-496.1), and a rename leaves that name behind: a
-        /// new table declared under the old name then generates it again and
-        /// is refused (#975). The emitter renames each generated default with
-        /// its table. Empty on a plan written before this field existed.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        defaults: Vec<ColumnName>,
-    },
+}
 
-    AddColumn {
+/// The kinds of change of the `types` family (#2790): the enum `change_family!(types)`
+/// names. [`Change::Type`] holds one and serialises as it does, so a saved plan
+/// keeps its shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TypeChange {
+    CreateType {
         uid: Uid,
-        table: TableName,
-        name: ColumnName,
-        column: Box<Column>,
+        name: crate::TypeRef,
+        definition: Box<crate::ManagedType>,
     },
-    DropColumn {
+    DropType {
         uid: Uid,
-        column: ColumnRef,
+        name: crate::TypeRef,
+        definition: Box<crate::ManagedType>,
     },
-    RenameColumn {
+    RenameType {
         uid: Uid,
-        table: TableName,
-        from: ColumnName,
-        to: ColumnName,
-        /// The table's name before this plan renamed it, when it did. The
-        /// table rename leaves a generated default under the name built from
-        /// this one when the name it would move to is taken, so the column
-        /// rename looks for both (#975).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        table_was: Option<TableName>,
+        from: crate::TypeRef,
+        to: crate::TypeRef,
+        definition: Box<crate::ManagedType>,
     },
-    AlterColumnType {
+}
+
+/// The kinds of change of the `roles` family (#2790): the enum `change_family!(roles)`
+/// names. [`Change::Role`] holds one and serialises as it does, so a saved plan
+/// keeps its shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RoleChange {
+    // Roles (ADR-0005). Identity-tracked like tables: a rename is `ALTER ROLE
+    // ... WITH NAME`, never drop + add, because membership lives only in the
+    // environment. Grants are split out of the create, as foreign keys are
+    // out of `CreateTable`: they sort after the objects they name exist.
+    CreateRole {
         uid: Uid,
-        column: ColumnRef,
-        from: ColumnType,
-        to: ColumnType,
-        /// Nullability before and after, carried even when it is not what
-        /// changed.
-        ///
-        /// `ALTER COLUMN` restates the entire column definition, and SQL Server
-        /// reads an omitted `NULL` / `NOT NULL` as `NULL` — so a type change
-        /// emitted without the nullability silently drops a `NOT NULL`. The
-        /// differ therefore never emits a separate
-        /// [`Change::AlterColumnNullability`] beside a type change on the same
-        /// column, and carrying both ends keeps the `not-null` risk derivable
-        /// from the change alone.
-        from_nullable: bool,
-        to_nullable: bool,
-        /// Explicit collation before and after (#1175), `None` being the
-        /// database default. Carried for the reason the nullability is: SQL
-        /// Server's `ALTER COLUMN` restates the whole definition and reads an
-        /// omitted `COLLATE` as the database default — measured on 17.0, a
-        /// column `COLLATE Latin1_General_CI_AS` altered to `varchar(20)`
-        /// came back under the database's collation. A collation change on
-        /// a column whose type stays is this change too, with `from == to`:
-        /// the statement is the same `ALTER COLUMN`, and so are the
-        /// dependents it has to take down and put back.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        from_collation: Option<Collation>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        to_collation: Option<Collation>,
-        /// The table is a parent whose partitions are external (#1533), and
-        /// the change drops its NOT NULL: a NOT NULL a partition keeps of its
-        /// own, which PostgreSQL 18 leaves behind (DEC-1687.1), is dropped
-        /// after the parent's, since no declaration lists the partition to
-        /// bring it back (DEC-1533.1).
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        through_external_partitions: bool,
-        /// The expression a human recorded for exactly this `from` to `to`
-        /// change (`pbps convert`, #2331), verbatim. The only source of a
-        /// `USING` clause (ADR-0012 section 5, DEC-2331.1): the differ copies
-        /// it from the identity file when the change is the one the record
-        /// names, and it is sealed by the plan's checksum like the rest of the
-        /// change. Absent for every other change, so a plan without a
-        /// conversion serializes as it did before.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        using: Option<String>,
+        name: crate::RoleName,
     },
-    AlterColumnNullability {
+    /// Dropping a role that still has members is refused by the engine, and
+    /// membership is each environment's own — so a connected plan lists the
+    /// members it found and removes them first, by name, where the reviewer
+    /// can see who loses what. An offline plan has no environment to ask and
+    /// leaves the list empty (ADR-0005).
+    DropRole {
         uid: Uid,
-        column: ColumnRef,
-        /// The column's type, unchanged, restated for the same reason
-        /// [`Change::AlterColumnType`] carries the nullability: `ALTER COLUMN`
-        /// takes a whole column definition, and there is no way to say "keep the
-        /// type, change only this".
-        ty: ColumnType,
-        /// Whether the column is nullable after the change.
-        to_nullable: bool,
-        /// The column's explicit collation, unchanged, restated for the
-        /// reason [`Change::AlterColumnType`] carries it (#1175).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        collation: Option<Collation>,
-        /// The table is a parent whose partitions are external (#1533), and
-        /// the change drops its NOT NULL: a NOT NULL a partition keeps of its
-        /// own, which PostgreSQL 18 leaves behind (DEC-1687.1), is dropped
-        /// after the parent's, since no declaration lists the partition to
-        /// bring it back (DEC-1533.1).
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        through_external_partitions: bool,
+        name: crate::RoleName,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        members: Vec<crate::RoleName>,
     },
-    AlterColumnDefault {
+    RenameRole {
         uid: Uid,
-        column: ColumnRef,
-        from: Option<String>,
-        to: Option<String>,
+        from: crate::RoleName,
+        to: crate::RoleName,
     },
-    /// A generated column's expression, changed in place (DEC-1168.1).
-    /// PostgreSQL 17 and later recompute every row under the new expression
-    /// (`SET EXPRESSION`); older servers have no in-place form, and a plan
-    /// that needs one is refused before it runs.
-    AlterColumnExpression {
+}
+
+/// The kinds of change of the `type_values` family (#2790): the enum `change_family!(type_values)`
+/// names. [`Change::TypeValue`] holds one and serialises as it does, so a saved plan
+/// keeps its shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TypeValueChange {
+    /// One additive label, carrying the definition immediately after this step.
+    AddEnumValue {
         uid: Uid,
-        column: ColumnRef,
+        name: crate::TypeRef,
+        value: String,
+        placement: Option<crate::EnumPlacement>,
+        ordinal: usize,
+        definition: Box<crate::ManagedType>,
+    },
+    /// Explicit label intent changes the text returned by existing rows.
+    RenameEnumValue {
+        uid: Uid,
+        name: crate::TypeRef,
         from: String,
         to: String,
+        ordinal: usize,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        retained: Vec<crate::RetainedExpression>,
+        definition: Box<crate::ManagedType>,
     },
-    /// A PostgreSQL column's numbering source added, removed, retuned or
-    /// converted (#1889, DEC-1889.1): an identity or an owned sequence
-    /// (`serial`) on at least one side, and on the other one of them, a
-    /// plain default or nothing. Never a generated column.
+    /// One half of an in-place domain alteration (DEC-1635.8). The statements
+    /// derive from `(from, to, half)` alone: `Loosen` drops what the
+    /// declaration no longer holds and sets the default, `Tighten` adds what
+    /// it newly holds and validates it.
+    AlterDomain {
+        uid: Uid,
+        name: crate::TypeRef,
+        from: Box<crate::ManagedType>,
+        to: Box<crate::ManagedType>,
+        half: crate::DomainHalf,
+    },
+    /// A label removal or reorder, done by rebuilding the enum under the same
+    /// uid (DEC-1635.7). `name` is the live name, `tmp` the replacement's.
+    EnumRebuild {
+        uid: Uid,
+        name: crate::TypeRef,
+        tmp: crate::TypeRef,
+        step: crate::EnumRebuildStep,
+    },
+}
+
+/// The kinds of change of the `permissions` family (#2790): the enum `change_family!(permissions)`
+/// names. [`Change::Permission`] holds one and serialises as it does, so a saved plan
+/// keeps its shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GrantChange {
+    /// Permissions added on one target. Only the ones that are new: restating
+    /// what the role already holds would make the plan claim a widening that
+    /// is not one.
+    Grant {
+        role: crate::RoleName,
+        target: GrantTarget,
+        permissions: BTreeSet<Permission>,
+    },
+    /// Permissions removed from one target — the ones the declaration no
+    /// longer lists.
+    Revoke {
+        role: crate::RoleName,
+        target: GrantTarget,
+        permissions: BTreeSet<Permission>,
+    },
+    /// What this plan settles about the engine's default `EXECUTE` to
+    /// `PUBLIC` on a routine it brings into being (ADR-0010 §5).
     ///
-    /// No number already issued is renumbered or reissued: a source put on a
-    /// column that holds values continues past them, from the greater of its
-    /// declared start, the column's values and, for a conversion, the old
-    /// source's counter. Its start and increment change in place without
-    /// `RESTART`.
-    AlterColumnNumbering {
-        uid: Uid,
-        column: ColumnRef,
-        /// The column's type once the plan has run. A sequence is created
-        /// `AS` it, and an owned sequence kept through a retype is moved to
-        /// it, which the engine does for an identity's on its own.
-        ty: ColumnType,
-        from: ValueSource,
-        to: ValueSource,
+    /// # Why this is its own variant and not a `Revoke` from a role called
+    /// `PUBLIC`
+    ///
+    /// Because `PUBLIC` is not a role this model has, and a string field that
+    /// held the word would be a sentinel every reader had to know about: a
+    /// declaration may name a role `PUBLIC`, and the two would then be the
+    /// same value meaning two different things. ADR-0010 §5 names the gap as
+    /// "a grantee the model does not have", so this is that grantee — given
+    /// the narrowest shape that can express the decision and nothing else.
+    /// There is no permission set (`EXECUTE` is the only default `PUBLIC`
+    /// holds on a routine) and no [`GrantTarget`] (a view or a trigger cannot
+    /// be one), so a plan cannot ask about a grantee or a permission that is
+    /// not this one.
+    ///
+    /// # Why keeping the default is a change of its own
+    ///
+    /// [`PublicAccess::Kept`] is here because a plan that stayed silent could
+    /// not be told apart from one that had no opinion — and the connected
+    /// rebuild guard has to tell those apart. A routine somebody closed, whose
+    /// declaration now asks for the default back, is a *valid* rebuild, and
+    /// silence would have it refused with the missing default it was asked to
+    /// restore (ADR-0009 §3). Positive evidence, not an absence, is also what
+    /// a reviewer reads: "this routine stays executable by everyone" is a
+    /// line worth seeing.
+    ///
+    /// It renders a statement rather than trusting the `CREATE`, because the
+    /// engine's default is not the only thing deciding what a new routine
+    /// arrives holding: a cluster's own `ALTER DEFAULT PRIVILEGES` can revoke
+    /// it (DECISIONS 517).
+    PublicExecution {
+        routine: RoutineId,
+        access: PublicAccess,
+        origin: RoutineOrigin,
     },
-    /// A SQL Server computed column created (#1174, DEC-1174.1), at the end
-    /// of its table. An expression or persisted change is this after a
-    /// [`Change::DropComputedColumn`]: the engine changes neither in place
-    /// (`ALTER COLUMN … AS` is a syntax error, measured on 17.0).
-    AddComputedColumn {
-        table: TableName,
-        name: ColumnName,
-        computed: ComputedColumn,
-    },
-    /// A SQL Server computed column dropped, carrying what it was. Its values
-    /// are derived, so dropping one loses nothing a re-add cannot compute.
-    DropComputedColumn {
-        table: TableName,
-        name: ColumnName,
-        computed: ComputedColumn,
-    },
-    /// Deprecation flag changed. Produces no structural change; may optionally be
-    /// written to an extended property.
-    SetColumnDeprecated {
-        uid: Uid,
-        column: ColumnRef,
-        reason: Option<crate::Text>,
-    },
+}
 
-    /// A PostgreSQL table's replica identity (#1444): `ALTER TABLE …
-    /// REPLICA IDENTITY …`, with `None` for `DEFAULT`. Planned where the
-    /// declared identity differs from the database's, and again wherever the
-    /// plan re-adds the index it names, which a drop loses (DEC-1444.1).
-    SetReplicaIdentity {
-        uid: Uid,
-        table: TableName,
-        to: Option<ReplicaIdentity>,
+/// The kinds of change of the `modules` family (#2790): the enum `change_family!(modules)`
+/// names. [`Change::Module`] holds one and serialises as it does, so a saved plan
+/// keeps its shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModuleChange {
+    // Modules (ADR-0002) carry no uid: they carry no data either, so a rename
+    // is drop + add and the audit trail is git.
+    CreateModule {
+        id: ModuleId,
+        module: Box<Module>,
     },
+    /// Re-stated in full. `CREATE OR ALTER` is idempotent and — unlike drop plus
+    /// create — preserves the permissions granted on the object, which is the
+    /// DACPAC pain point this avoids.
+    AlterModule {
+        id: ModuleId,
+        module: Box<Module>,
+    },
+    DropModule {
+        id: ModuleId,
+        kind: ModuleKind,
+    },
+}
 
-    /// `COMMENT ON … IS …` for an object whose declaration has a `description`
-    /// (#2729, DEC-2729.1). `None` is `IS NULL`: the declared `""`, which the engine
-    /// stores as no comment. One variant for every kind of object, so a kind added
-    /// later is a [`CommentTarget`] arm and not a new `Change`.
-    SetComment {
-        target: CommentTarget,
-        text: Option<crate::Text>,
-    },
-
-    /// A PostgreSQL table's heap storage parameters (#1441): `ALTER TABLE …
-    /// SET (…)` for `set`, in canonical spelling, and `RESET (…)` for
-    /// `reset`. Only what changes: a parameter the plan leaves alone is not
-    /// restated (DEC-1441.1).
-    SetStorageParameters {
-        uid: Uid,
-        table: TableName,
-        set: BTreeMap<String, String>,
-        reset: BTreeSet<String>,
-    },
-
-    /// A PostgreSQL table switched between permanent and `UNLOGGED` (#1443):
-    /// `ALTER TABLE … SET LOGGED` or `SET UNLOGGED`, which rewrites the table
-    /// and its indexes under `AccessExclusiveLock` in either direction
-    /// (measured on 16 and 18). Ordered by the foreign keys between the
-    /// tables it switches (DEC-1443.1).
-    SetTablePersistence {
-        uid: Uid,
-        table: TableName,
-        unlogged: bool,
-    },
-
-    /// A partition's own default on a column it inherits (#1581, DEC-1581.1):
-    /// `ALTER TABLE <partition> ALTER COLUMN … SET DEFAULT` or `DROP
-    /// DEFAULT`. A partition declares no column and so has no column uid; it
-    /// is keyed by its table uid and the column's name. `from` and `to` are
-    /// the partition's own default as declared, and `fallback` is what the
-    /// partition holds without one: its parent's default, which the engine
-    /// copies into every partition, or none. The statement sets `to`, else
-    /// `fallback`, else drops the default. With both `None` it takes the
-    /// default off entirely, which is how a function rebuild releases it
-    /// (#1588). `parent` is where `fallback` was written: it is resolved under
-    /// the parent's schema, and `to` under the partition's, which may be
-    /// another. Function rebuilds also use this table-keyed form before an
-    /// attach when restoring a parent-derived expression: the plain table's
-    /// column UID cannot carry the parent's expression scope (DEC-1875.1).
-    SetPartitionDefault {
-        uid: Uid,
-        table: TableName,
-        parent: TableName,
-        column: ColumnName,
-        from: Option<String>,
-        to: Option<String>,
-        fallback: Option<String>,
-    },
-    /// A partition's own NOT NULL on a column its parent leaves nullable
-    /// (#1581): `ALTER TABLE <partition> ALTER COLUMN … SET NOT NULL` or
-    /// `DROP NOT NULL`, keyed as [`Change::SetPartitionDefault`] is.
-    SetPartitionNotNull {
-        uid: Uid,
-        table: TableName,
-        column: ColumnName,
-        not_null: bool,
-    },
-
-    /// A PostgreSQL index's storage parameters (#1442): `ALTER INDEX … SET
-    /// (…), RESET (…)`, in place, which every supported parameter of both
-    /// methods is (measured on 16 and 18). Only what changes; an index
-    /// rebuilt for another reason carries its parameters in its `CREATE`
-    /// (DEC-1442.1).
-    SetIndexStorageParameters {
-        table: TableName,
-        target: IndexPart,
-        method: IndexMethod,
-        set: BTreeMap<String, String>,
-        reset: BTreeSet<String>,
-    },
-
-    /// Policies are separate from CREATE TABLE so their routines already exist.
-    CreatePolicy {
-        table: TableName,
-        name: String,
-        policy: crate::RowPolicy,
-        origin: RowSecurityOrigin,
-    },
-    /// The dropped definition pins risk classification, including latent policies.
-    DropPolicy {
-        table: TableName,
-        name: String,
-        policy: crate::RowPolicy,
-    },
-    /// Independent PostgreSQL ENABLE and FORCE transitions.
-    SetRowSecurity {
-        uid: Uid,
-        table: TableName,
-        from: crate::RowSecurity,
-        to: crate::RowSecurity,
-        origin: RowSecurityOrigin,
-    },
-
-    // Constraints and indexes are always drop + add, never modified in place —
-    // that is how the database itself implements it, and pretending otherwise
-    // would only give the emitter one more path that can fail.
-    SetPrimaryKey {
-        table: TableName,
-        from: Option<PrimaryKey>,
-        to: Option<PrimaryKey>,
-        /// The key `to` adds is nonclustered: its table declares another
-        /// layout ([`Table::clustered`]). `false` is the default layout, a
-        /// clustered key, which is what a change written before the field
-        /// existed meant. The table-level selector cannot travel here — the
-        /// change carries the key, not its table — so the differ resolves it
-        /// into the one fact the emitter needs.
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        nonclustered: bool,
-    },
-    AddUnique {
-        table: TableName,
-        name: ObjectLocalName,
-        constraint: UniqueConstraint,
-        /// This constraint's index is the table's clustered one
-        /// ([`Table::clustered`]).
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        clustered: bool,
-    },
-    DropUnique {
-        table: TableName,
-        name: ObjectLocalName,
-    },
-    /// Adds (`from: None`), or drops (`to: None`), an exclusion constraint
-    /// (DEC-2448.3). One variant for both, as [`Change::SetPrimaryKey`] is: a
-    /// replacement is the drop half and the add half as two changes, each in the
-    /// ordering class its direction needs. Adding takes the `constraint` risk,
-    /// dropping the `destructive` one.
-    SetExclusion {
-        table: TableName,
-        name: ObjectLocalName,
-        from: Option<Box<ExclusionConstraint>>,
-        to: Option<Box<ExclusionConstraint>>,
-    },
-    AddForeignKey {
-        table: TableName,
-        name: ObjectLocalName,
-        constraint: Box<ForeignKey>,
-    },
-    DropForeignKey {
-        table: TableName,
-        name: ObjectLocalName,
-    },
-    AddCheck {
-        table: TableName,
-        name: ObjectLocalName,
-        constraint: CheckConstraint,
-    },
-    DropCheck {
-        table: TableName,
-        name: ObjectLocalName,
-    },
-    AddIndex {
-        table: TableName,
-        name: ObjectLocalName,
-        index: Box<Index>,
-        /// This index is the table's clustered one ([`Table::clustered`]).
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        clustered: bool,
-    },
-    DropIndex {
-        table: TableName,
-        name: ObjectLocalName,
-    },
-
+/// The kinds of change of the `rows` family (#2790): the enum `change_family!(rows)`
+/// names. [`Change::Row`] holds one and serialises as it does, so a saved plan
+/// keeps its shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RowChange {
     // Reference data (ADR-0004). No uid, and no rename intent: a row's entire
     // content is declared, so recreating one is lossless — the generalized
     // identity criterion of ADR-0005. The identity is the primary-key value,
@@ -1033,7 +838,6 @@ pub enum Change {
         from: Option<DataMode>,
         to: Option<DataMode>,
     },
-
     /// The keys an existing `ensure` declaration manages. Matching live rows
     /// need no DML, but the new scope must still reach the ordinary recording
     /// gate; observed row membership cannot stand in for it (DEC-1808.1).
@@ -1042,101 +846,463 @@ pub enum Change {
         from: BTreeSet<RowKey>,
         to: BTreeSet<RowKey>,
     },
+}
 
-    // Modules (ADR-0002) carry no uid: they carry no data either, so a rename
-    // is drop + add and the audit trail is git.
-    CreateModule {
-        id: ModuleId,
-        module: Box<Module>,
+/// The kinds of change of the `policies` family (#2790): the enum `change_family!(policies)`
+/// names. [`Change::Policy`] holds one and serialises as it does, so a saved plan
+/// keeps its shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PolicyChange {
+    /// Policies are separate from CREATE TABLE so their routines already exist.
+    CreatePolicy {
+        table: TableName,
+        name: String,
+        policy: crate::RowPolicy,
+        origin: RowSecurityOrigin,
     },
-    /// Re-stated in full. `CREATE OR ALTER` is idempotent and — unlike drop plus
-    /// create — preserves the permissions granted on the object, which is the
-    /// DACPAC pain point this avoids.
-    AlterModule {
-        id: ModuleId,
-        module: Box<Module>,
+    /// The dropped definition pins risk classification, including latent policies.
+    DropPolicy {
+        table: TableName,
+        name: String,
+        policy: crate::RowPolicy,
     },
-    DropModule {
-        id: ModuleId,
-        kind: ModuleKind,
+    /// Independent PostgreSQL ENABLE and FORCE transitions.
+    SetRowSecurity {
+        uid: Uid,
+        table: TableName,
+        from: crate::RowSecurity,
+        to: crate::RowSecurity,
+        origin: RowSecurityOrigin,
     },
+}
 
-    // Roles (ADR-0005). Identity-tracked like tables: a rename is `ALTER ROLE
-    // ... WITH NAME`, never drop + add, because membership lives only in the
-    // environment. Grants are split out of the create, as foreign keys are
-    // out of `CreateTable`: they sort after the objects they name exist.
-    CreateRole {
-        uid: Uid,
-        name: crate::RoleName,
+/// The kinds of change of the `indexes` family (#2790): the enum `change_family!(indexes)`
+/// names. [`Change::Index`] holds one and serialises as it does, so a saved plan
+/// keeps its shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum IndexChange {
+    BuildPartitionedIndex(Box<crate::BuildPartitionedIndex>),
+    /// A PostgreSQL index's storage parameters (#1442): `ALTER INDEX … SET
+    /// (…), RESET (…)`, in place, which every supported parameter of both
+    /// methods is (measured on 16 and 18). Only what changes; an index
+    /// rebuilt for another reason carries its parameters in its `CREATE`
+    /// (DEC-1442.1).
+    SetIndexStorageParameters {
+        table: TableName,
+        target: IndexPart,
+        method: IndexMethod,
+        set: BTreeMap<String, String>,
+        reset: BTreeSet<String>,
     },
-    /// Dropping a role that still has members is refused by the engine, and
-    /// membership is each environment's own — so a connected plan lists the
-    /// members it found and removes them first, by name, where the reviewer
-    /// can see who loses what. An offline plan has no environment to ask and
-    /// leaves the list empty (ADR-0005).
-    DropRole {
+    AddIndex {
+        table: TableName,
+        name: ObjectLocalName,
+        index: Box<Index>,
+        /// This index is the table's clustered one ([`Table::clustered`]).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        clustered: bool,
+    },
+    DropIndex {
+        table: TableName,
+        name: ObjectLocalName,
+    },
+}
+
+/// The kinds of change of the `constraints` family (#2790): the enum `change_family!(constraints)`
+/// names. [`Change::Constraint`] holds one and serialises as it does, so a saved plan
+/// keeps its shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ConstraintChange {
+    // Constraints and indexes are always drop + add, never modified in place —
+    // that is how the database itself implements it, and pretending otherwise
+    // would only give the emitter one more path that can fail.
+    SetPrimaryKey {
+        table: TableName,
+        from: Option<PrimaryKey>,
+        to: Option<PrimaryKey>,
+        /// The key `to` adds is nonclustered: its table declares another
+        /// layout ([`Table::clustered`]). `false` is the default layout, a
+        /// clustered key, which is what a change written before the field
+        /// existed meant. The table-level selector cannot travel here — the
+        /// change carries the key, not its table — so the differ resolves it
+        /// into the one fact the emitter needs.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        nonclustered: bool,
+    },
+    AddUnique {
+        table: TableName,
+        name: ObjectLocalName,
+        constraint: UniqueConstraint,
+        /// This constraint's index is the table's clustered one
+        /// ([`Table::clustered`]).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        clustered: bool,
+    },
+    DropUnique {
+        table: TableName,
+        name: ObjectLocalName,
+    },
+    /// Adds (`from: None`), or drops (`to: None`), an exclusion constraint
+    /// (DEC-2448.3). One variant for both, as [`Change::SetPrimaryKey`] is: a
+    /// replacement is the drop half and the add half as two changes, each in the
+    /// ordering class its direction needs. Adding takes the `constraint` risk,
+    /// dropping the `destructive` one.
+    SetExclusion {
+        table: TableName,
+        name: ObjectLocalName,
+        from: Option<Box<ExclusionConstraint>>,
+        to: Option<Box<ExclusionConstraint>>,
+    },
+    AddForeignKey {
+        table: TableName,
+        name: ObjectLocalName,
+        constraint: Box<ForeignKey>,
+    },
+    DropForeignKey {
+        table: TableName,
+        name: ObjectLocalName,
+    },
+    AddCheck {
+        table: TableName,
+        name: ObjectLocalName,
+        constraint: CheckConstraint,
+    },
+    DropCheck {
+        table: TableName,
+        name: ObjectLocalName,
+    },
+}
+
+/// The kinds of change of the `columns` family (#2790): the enum `change_family!(columns)`
+/// names. [`Change::Column`] holds one and serialises as it does, so a saved plan
+/// keeps its shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ColumnChange {
+    AddColumn {
         uid: Uid,
-        name: crate::RoleName,
+        table: TableName,
+        name: ColumnName,
+        column: Box<Column>,
+    },
+    DropColumn {
+        uid: Uid,
+        column: ColumnRef,
+    },
+    RenameColumn {
+        uid: Uid,
+        table: TableName,
+        from: ColumnName,
+        to: ColumnName,
+        /// The table's name before this plan renamed it, when it did. The
+        /// table rename leaves a generated default under the name built from
+        /// this one when the name it would move to is taken, so the column
+        /// rename looks for both (#975).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        table_was: Option<TableName>,
+    },
+    AlterColumnType {
+        uid: Uid,
+        column: ColumnRef,
+        from: ColumnType,
+        to: ColumnType,
+        /// Nullability before and after, carried even when it is not what
+        /// changed.
+        ///
+        /// `ALTER COLUMN` restates the entire column definition, and SQL Server
+        /// reads an omitted `NULL` / `NOT NULL` as `NULL` — so a type change
+        /// emitted without the nullability silently drops a `NOT NULL`. The
+        /// differ therefore never emits a separate
+        /// [`Change::AlterColumnNullability`] beside a type change on the same
+        /// column, and carrying both ends keeps the `not-null` risk derivable
+        /// from the change alone.
+        from_nullable: bool,
+        to_nullable: bool,
+        /// Explicit collation before and after (#1175), `None` being the
+        /// database default. Carried for the reason the nullability is: SQL
+        /// Server's `ALTER COLUMN` restates the whole definition and reads an
+        /// omitted `COLLATE` as the database default — measured on 17.0, a
+        /// column `COLLATE Latin1_General_CI_AS` altered to `varchar(20)`
+        /// came back under the database's collation. A collation change on
+        /// a column whose type stays is this change too, with `from == to`:
+        /// the statement is the same `ALTER COLUMN`, and so are the
+        /// dependents it has to take down and put back.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_collation: Option<Collation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_collation: Option<Collation>,
+        /// The table is a parent whose partitions are external (#1533), and
+        /// the change drops its NOT NULL: a NOT NULL a partition keeps of its
+        /// own, which PostgreSQL 18 leaves behind (DEC-1687.1), is dropped
+        /// after the parent's, since no declaration lists the partition to
+        /// bring it back (DEC-1533.1).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        through_external_partitions: bool,
+        /// The expression a human recorded for exactly this `from` to `to`
+        /// change (`pbps convert`, #2331), verbatim. The only source of a
+        /// `USING` clause (ADR-0012 section 5, DEC-2331.1): the differ copies
+        /// it from the identity file when the change is the one the record
+        /// names, and it is sealed by the plan's checksum like the rest of the
+        /// change. Absent for every other change, so a plan without a
+        /// conversion serializes as it did before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        using: Option<String>,
+    },
+    AlterColumnNullability {
+        uid: Uid,
+        column: ColumnRef,
+        /// The column's type, unchanged, restated for the same reason
+        /// [`Change::AlterColumnType`] carries the nullability: `ALTER COLUMN`
+        /// takes a whole column definition, and there is no way to say "keep the
+        /// type, change only this".
+        ty: ColumnType,
+        /// Whether the column is nullable after the change.
+        to_nullable: bool,
+        /// The column's explicit collation, unchanged, restated for the
+        /// reason [`Change::AlterColumnType`] carries it (#1175).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        collation: Option<Collation>,
+        /// The table is a parent whose partitions are external (#1533), and
+        /// the change drops its NOT NULL: a NOT NULL a partition keeps of its
+        /// own, which PostgreSQL 18 leaves behind (DEC-1687.1), is dropped
+        /// after the parent's, since no declaration lists the partition to
+        /// bring it back (DEC-1533.1).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        through_external_partitions: bool,
+    },
+    AlterColumnDefault {
+        uid: Uid,
+        column: ColumnRef,
+        from: Option<String>,
+        to: Option<String>,
+    },
+    /// A generated column's expression, changed in place (DEC-1168.1).
+    /// PostgreSQL 17 and later recompute every row under the new expression
+    /// (`SET EXPRESSION`); older servers have no in-place form, and a plan
+    /// that needs one is refused before it runs.
+    AlterColumnExpression {
+        uid: Uid,
+        column: ColumnRef,
+        from: String,
+        to: String,
+    },
+    /// A PostgreSQL column's numbering source added, removed, retuned or
+    /// converted (#1889, DEC-1889.1): an identity or an owned sequence
+    /// (`serial`) on at least one side, and on the other one of them, a
+    /// plain default or nothing. Never a generated column.
+    ///
+    /// No number already issued is renumbered or reissued: a source put on a
+    /// column that holds values continues past them, from the greater of its
+    /// declared start, the column's values and, for a conversion, the old
+    /// source's counter. Its start and increment change in place without
+    /// `RESTART`.
+    AlterColumnNumbering {
+        uid: Uid,
+        column: ColumnRef,
+        /// The column's type once the plan has run. A sequence is created
+        /// `AS` it, and an owned sequence kept through a retype is moved to
+        /// it, which the engine does for an identity's on its own.
+        ty: ColumnType,
+        from: ValueSource,
+        to: ValueSource,
+    },
+    /// A SQL Server computed column created (#1174, DEC-1174.1), at the end
+    /// of its table. An expression or persisted change is this after a
+    /// [`Change::DropComputedColumn`]: the engine changes neither in place
+    /// (`ALTER COLUMN … AS` is a syntax error, measured on 17.0).
+    AddComputedColumn {
+        table: TableName,
+        name: ColumnName,
+        computed: ComputedColumn,
+    },
+    /// A SQL Server computed column dropped, carrying what it was. Its values
+    /// are derived, so dropping one loses nothing a re-add cannot compute.
+    DropComputedColumn {
+        table: TableName,
+        name: ColumnName,
+        computed: ComputedColumn,
+    },
+    /// Deprecation flag changed. Produces no structural change; may optionally be
+    /// written to an extended property.
+    SetColumnDeprecated {
+        uid: Uid,
+        column: ColumnRef,
+        reason: Option<crate::Text>,
+    },
+}
+
+/// The kinds of change of the `partitions` family (#2790): the enum `change_family!(partitions)`
+/// names. [`Change::Partition`] holds one and serialises as it does, so a saved plan
+/// keeps its shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PartitionChange {
+    /// Planning-only until the complete rebuild route is admitted.
+    RebuildPartitionedTable(Box<crate::RebuildPartitionedTable>),
+    CopyTableRows(Box<crate::CopyTableRows>),
+    AnalyzeTableTree(Box<crate::AnalyzeTableTree>),
+    /// A partition leaves its parent and stays, as an ordinary table of the
+    /// declared shape, which is its parent's under names of its own (#1544,
+    /// DEC-1544.1). Its rows leave the parent with it.
+    DetachPartition {
+        uid: Uid,
+        table: TableName,
+        parent: TableName,
+        /// The name each of the parent's objects takes on the detached table.
+        names: Vec<DetachedName>,
+        /// The table the detach leaves, as declared: what the apply holds
+        /// the read-back to, as it holds a created table to its `CREATE`.
+        shape: Box<Table>,
+    },
+    /// An ordinary table becomes a partition of a standing parent and keeps
+    /// its rows (#1545, DEC-1545.1). Its columns become the parent's; what it
+    /// holds of them otherwise, and its own indexes and checks, are brought
+    /// to the declaration by the partition's own changes after it.
+    AttachPartition {
+        uid: Uid,
+        table: TableName,
+        parent: TableName,
+        bound: crate::schema::PartitionBound,
+        /// The parent's key columns, in order, as the plan was made against
+        /// them. A staged attach writes a CHECK on them that implies the
+        /// bound, so the attach skips its scan (#1638, DEC-1638.1). Empty in
+        /// a plan made before it, or when live constraint names prevent the
+        /// temporary CHECK (DEC-2126.1); either uses the single statement.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        members: Vec<crate::RoleName>,
+        key: Vec<ColumnName>,
+        /// The partition as declared: what the apply holds the read-back to
+        /// once every statement has run, as it holds a created table to its
+        /// `CREATE`.
+        shape: Box<Table>,
     },
-    RenameRole {
+    /// A partition's own default on a column it inherits (#1581, DEC-1581.1):
+    /// `ALTER TABLE <partition> ALTER COLUMN … SET DEFAULT` or `DROP
+    /// DEFAULT`. A partition declares no column and so has no column uid; it
+    /// is keyed by its table uid and the column's name. `from` and `to` are
+    /// the partition's own default as declared, and `fallback` is what the
+    /// partition holds without one: its parent's default, which the engine
+    /// copies into every partition, or none. The statement sets `to`, else
+    /// `fallback`, else drops the default. With both `None` it takes the
+    /// default off entirely, which is how a function rebuild releases it
+    /// (#1588). `parent` is where `fallback` was written: it is resolved under
+    /// the parent's schema, and `to` under the partition's, which may be
+    /// another. Function rebuilds also use this table-keyed form before an
+    /// attach when restoring a parent-derived expression: the plain table's
+    /// column UID cannot carry the parent's expression scope (DEC-1875.1).
+    SetPartitionDefault {
         uid: Uid,
-        from: crate::RoleName,
-        to: crate::RoleName,
+        table: TableName,
+        parent: TableName,
+        column: ColumnName,
+        from: Option<String>,
+        to: Option<String>,
+        fallback: Option<String>,
     },
-    /// Permissions added on one target. Only the ones that are new: restating
-    /// what the role already holds would make the plan claim a widening that
-    /// is not one.
-    Grant {
-        role: crate::RoleName,
-        target: GrantTarget,
-        permissions: BTreeSet<Permission>,
+    /// A partition's own NOT NULL on a column its parent leaves nullable
+    /// (#1581): `ALTER TABLE <partition> ALTER COLUMN … SET NOT NULL` or
+    /// `DROP NOT NULL`, keyed as [`Change::SetPartitionDefault`] is.
+    SetPartitionNotNull {
+        uid: Uid,
+        table: TableName,
+        column: ColumnName,
+        not_null: bool,
     },
-    /// Permissions removed from one target — the ones the declaration no
-    /// longer lists.
-    Revoke {
-        role: crate::RoleName,
-        target: GrantTarget,
-        permissions: BTreeSet<Permission>,
-    },
+}
 
-    /// What this plan settles about the engine's default `EXECUTE` to
-    /// `PUBLIC` on a routine it brings into being (ADR-0010 §5).
-    ///
-    /// # Why this is its own variant and not a `Revoke` from a role called
-    /// `PUBLIC`
-    ///
-    /// Because `PUBLIC` is not a role this model has, and a string field that
-    /// held the word would be a sentinel every reader had to know about: a
-    /// declaration may name a role `PUBLIC`, and the two would then be the
-    /// same value meaning two different things. ADR-0010 §5 names the gap as
-    /// "a grantee the model does not have", so this is that grantee — given
-    /// the narrowest shape that can express the decision and nothing else.
-    /// There is no permission set (`EXECUTE` is the only default `PUBLIC`
-    /// holds on a routine) and no [`GrantTarget`] (a view or a trigger cannot
-    /// be one), so a plan cannot ask about a grantee or a permission that is
-    /// not this one.
-    ///
-    /// # Why keeping the default is a change of its own
-    ///
-    /// [`PublicAccess::Kept`] is here because a plan that stayed silent could
-    /// not be told apart from one that had no opinion — and the connected
-    /// rebuild guard has to tell those apart. A routine somebody closed, whose
-    /// declaration now asks for the default back, is a *valid* rebuild, and
-    /// silence would have it refused with the missing default it was asked to
-    /// restore (ADR-0009 §3). Positive evidence, not an absence, is also what
-    /// a reviewer reads: "this routine stays executable by everyone" is a
-    /// line worth seeing.
-    ///
-    /// It renders a statement rather than trusting the `CREATE`, because the
-    /// engine's default is not the only thing deciding what a new routine
-    /// arrives holding: a cluster's own `ALTER DEFAULT PRIVILEGES` can revoke
-    /// it (DECISIONS 517).
-    PublicExecution {
-        routine: RoutineId,
-        access: PublicAccess,
-        origin: RoutineOrigin,
+/// The kinds of change of the `table_properties` family (#2790): the enum `change_family!(table_properties)`
+/// names. [`Change::TableProperty`] holds one and serialises as it does, so a saved plan
+/// keeps its shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TablePropertyChange {
+    /// A PostgreSQL table's replica identity (#1444): `ALTER TABLE …
+    /// REPLICA IDENTITY …`, with `None` for `DEFAULT`. Planned where the
+    /// declared identity differs from the database's, and again wherever the
+    /// plan re-adds the index it names, which a drop loses (DEC-1444.1).
+    SetReplicaIdentity {
+        uid: Uid,
+        table: TableName,
+        to: Option<ReplicaIdentity>,
+    },
+    /// `COMMENT ON … IS …` for an object whose declaration has a `description`
+    /// (#2729, DEC-2729.1). `None` is `IS NULL`: the declared `""`, which the engine
+    /// stores as no comment. One variant for every kind of object, so a kind added
+    /// later is a [`CommentTarget`] arm and not a new `Change`.
+    SetComment {
+        target: CommentTarget,
+        text: Option<crate::Text>,
+    },
+    /// A PostgreSQL table's heap storage parameters (#1441): `ALTER TABLE …
+    /// SET (…)` for `set`, in canonical spelling, and `RESET (…)` for
+    /// `reset`. Only what changes: a parameter the plan leaves alone is not
+    /// restated (DEC-1441.1).
+    SetStorageParameters {
+        uid: Uid,
+        table: TableName,
+        set: BTreeMap<String, String>,
+        reset: BTreeSet<String>,
+    },
+    /// A PostgreSQL table switched between permanent and `UNLOGGED` (#1443):
+    /// `ALTER TABLE … SET LOGGED` or `SET UNLOGGED`, which rewrites the table
+    /// and its indexes under `AccessExclusiveLock` in either direction
+    /// (measured on 16 and 18). Ordered by the foreign keys between the
+    /// tables it switches (DEC-1443.1).
+    SetTablePersistence {
+        uid: Uid,
+        table: TableName,
+        unlogged: bool,
+    },
+}
+
+/// The kinds of change of the `tables` family (#2790): the enum `change_family!(tables)`
+/// names. [`Change::Table`] holds one and serialises as it does, so a saved plan
+/// keeps its shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TableChange {
+    CreateTable {
+        uid: Uid,
+        name: TableName,
+        table: Box<Table>,
+        /// The DEFAULT partition of the standing parent a new range partition
+        /// goes under (#1547, DEC-1547.1): the partition is made as a plain
+        /// table, filled with the DEFAULT's rows in its range, and attached.
+        /// `None` for any other table, which an older plan's creates all are.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        beside_default: Option<TableName>,
+        /// Beside a DEFAULT, the most of its rows the move may take, as a
+        /// human allowed it (`pbps move-rows`, #1788); `None` allows none, and
+        /// the moving statement refuses if it finds any. Ignored with no
+        /// `beside_default`, where nothing moves.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        moves_at_most: Option<u64>,
+    },
+    DropTable {
+        uid: Uid,
+        name: TableName,
+        /// The partitioned table this one is a partition of, which the drop
+        /// detaches it from first (#1171): a partition a foreign key to its
+        /// parent reaches cannot be dropped while attached. `None` for any
+        /// other table, which an older plan's drops all are.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detach_from: Option<TableName>,
+    },
+    RenameTable {
+        uid: Uid,
+        from: TableName,
+        to: TableName,
+        /// The columns that carry a default when the table is renamed, by the
+        /// names they have then (a column rename runs after the table's).
+        /// SQL Server names each default it creates after its table and column
+        /// (`DF_pbps_…`, DEC-496.1), and a rename leaves that name behind: a
+        /// new table declared under the old name then generates it again and
+        /// is refused (#975). The emitter renames each generated default with
+        /// its table. Empty on a plan written before this field existed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        defaults: Vec<ColumnName>,
     },
 }
 
