@@ -26,6 +26,8 @@ const OPS: &[&str] = &[
     "create_type",
     "drop_type",
     "rename_type",
+    "create_search",
+    "drop_search",
     "create_extension",
     "drop_extension",
     "update_extension",
@@ -141,6 +143,16 @@ const ACCEPTED: &[(&str, &str, &str)] = &[
         r"ok set_data_mode",
         r#"{"op":"set_data_mode","table":"app.t","from":null,"to":"exact"}"#,
         r#"{"op":"set_data_mode","table":"app.t","from":null,"to":"exact"}"#,
+    ),
+    (
+        r"create_search",
+        r#"{"op":"create_search","uid":"s_aaaaaa","name":"config app.docs","definition":{"kind":"config","parser":"pg_catalog.\"default\"","mappings":{"asciiword":["app.words"]}}}"#,
+        r#"{"op":"create_search","uid":"s_aaaaaa","name":"config app.docs","definition":{"kind":"config","parser":"pg_catalog.default","mappings":{"asciiword":["app.words"]}}}"#,
+    ),
+    (
+        r"drop_search",
+        r#"{"op":"drop_search","uid":"s_aaaaaa","name":"dictionary app.words","definition":{"kind":"dictionary","template":"pg_catalog.simple","options":{}}}"#,
+        r#"{"op":"drop_search","uid":"s_aaaaaa","name":"dictionary app.words","definition":{"kind":"dictionary","template":"pg_catalog.simple","options":{}}}"#,
     ),
 ];
 
@@ -291,6 +303,24 @@ const REFUSED: &[(&str, &str, &str, &str)] = &[
         r#"{"op":"set_data_mode","table":"app.t","from":null,"to":null,"bogus":1}"#,
         r"unknown field `bogus`, expected one of `table`, `from`, `to` at line 1 column 70",
         r"unknown field `bogus`, expected one of `table`, `from`, `to`",
+    ),
+    (
+        r"err search unknown field",
+        r#"{"op":"create_search","uid":"s_aaaaaa","name":"dictionary app.words","definition":{"kind":"dictionary","template":"pg_catalog.simple","options":{}},"bogus":1}"#,
+        r"unknown field `bogus`, expected one of `uid`, `name`, `definition`, `unresolved` at line 1 column 158",
+        r"unknown field `bogus`, expected one of `uid`, `name`, `definition`, `unresolved`",
+    ),
+    (
+        r"err search field of another kind",
+        r#"{"op":"drop_search","uid":"s_aaaaaa","name":"dictionary app.words","definition":{"kind":"dictionary","template":"pg_catalog.simple","options":{}},"unresolved":[]}"#,
+        r"unknown field `unresolved`, expected one of `uid`, `name`, `definition` at line 1 column 162",
+        r"unknown field `unresolved`, expected one of `uid`, `name`, `definition`",
+    ),
+    (
+        r"err search missing definition",
+        r#"{"op":"drop_search","uid":"s_aaaaaa","name":"dictionary app.words"}"#,
+        r"missing field `definition` at line 1 column 67",
+        r"missing field `definition`",
     ),
 ];
 

@@ -19455,7 +19455,8 @@ mod tests {
         );
     }
 
-    /// `change_in_words` reads the kind's own name, for one kind of every family,
+    /// `change_in_words` reads the kind's own name, for one kind of every family (the list
+    /// is held to the families the fixtures have kinds of),
     /// so a refusal says `drop check` and not the family's name (#2790).
     #[test]
     fn a_kind_is_put_in_words_by_its_own_name_in_every_family() {
@@ -19519,6 +19520,7 @@ mod tests {
             ("drop_role", "drop role"),
             ("rename_type", "rename type"),
             ("drop_extension", "drop extension"),
+            ("drop_search", "drop search"),
         ];
         let mut families = std::collections::BTreeSet::new();
         for (op, words) in expected {
@@ -19528,7 +19530,11 @@ mod tests {
             assert_eq!(change_in_words(change), words, "{op}");
             families.insert(change.family());
         }
-        assert_eq!(families.len(), 14, "one kind of every family: {families:?}");
+        // Every family the fixtures hold a kind of is one of those above, so a family
+        // added later fails here until a kind of it is listed; the fixtures hold every
+        // kind (`part-effects.json` is the corpus of all of them).
+        let held: std::collections::BTreeSet<_> = by_op.values().map(Change::family).collect();
+        assert_eq!(held, families, "one kind of every family");
         // Negative: the words are the kind's, so two kinds of one family differ.
         assert_ne!(
             change_in_words(&by_op["drop_check"]),
