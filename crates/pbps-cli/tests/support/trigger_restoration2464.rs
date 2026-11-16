@@ -3,6 +3,7 @@ use pbps_diff::{
     Side,
     schema_diff::{ModuleDelta, module_delta, restoration_comparison},
 };
+use pbps_model::ModuleChange;
 use pbps_model::{Change, ChangeSet, ModuleId, StateSnapshot, TableName};
 
 pub fn check(
@@ -22,8 +23,14 @@ pub fn check(
         })
         .collect();
     assert_eq!(modules.len(), 2, "{changes:?}");
-    assert!(matches!(modules[0].0, Change::DropModule { .. }));
-    assert!(matches!(modules[1].0, Change::CreateModule { .. }));
+    assert!(matches!(
+        modules[0].0,
+        Change::Module(ModuleChange::DropModule { .. })
+    ));
+    assert!(matches!(
+        modules[1].0,
+        Change::Module(ModuleChange::CreateModule { .. })
+    ));
     let base = Side {
         schema: &before.schema,
         ids: &before.ids,

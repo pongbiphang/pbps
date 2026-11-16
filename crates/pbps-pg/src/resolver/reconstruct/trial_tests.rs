@@ -1,6 +1,8 @@
 //! Real-engine trial, barrier and publication contracts for DEC-2465.1.
 use super::*;
 use pbps_db::{Conn, Driver, transport::ExecuteConnection};
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
 use pbps_model::{Column, Generated, Module, Table, TableName, Uid, UidKind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -39,7 +41,7 @@ impl Reconstruction {
     }
 }
 pub(crate) fn module(id: &str, kind: ModuleKind, definition: &str) -> Change {
-    Change::CreateModule {
+    Change::Module(ModuleChange::CreateModule {
         id: id.parse().unwrap(),
         module: Box::new(Module {
             kind,
@@ -47,7 +49,7 @@ pub(crate) fn module(id: &str, kind: ModuleKind, definition: &str) -> Change {
             definition: definition.into(),
             options: Default::default(),
         }),
-    }
+    })
 }
 fn function(name: &str, body: &str) -> Change {
     module(
@@ -68,13 +70,13 @@ pub(crate) fn table(expression: &str) -> Change {
     t.columns.insert("g".into(), g);
     t.columns
         .insert("z".into(), Column::new("integer".parse().unwrap()));
-    Change::CreateTable {
+    Change::Table(TableChange::CreateTable {
         uid: Uid::derived(UidKind::Table, "t", 0),
         name: TableName::new("app", "t"),
         table: Box::new(t),
         beside_default: None,
         moves_at_most: None,
-    }
+    })
 }
 pub(crate) fn build(
     pg: &crate::Postgres,
@@ -180,7 +182,7 @@ async fn the_three_call_counterexamples_compile_deterministically() {
             for _ in 0..2 {
                 let (mut admin, mut conn, name, pg) = database(&server).await;
                 let mut t = table(["f + 1", "ext.f(z)", "app.f(z)"][case]);
-                if let Change::CreateTable { table, .. } = &mut t {
+                if let Change::Table(TableChange::CreateTable { table, .. }) = &mut t {
                     table
                         .columns
                         .insert("f".into(), Column::new("integer".parse().unwrap()));
@@ -207,10 +209,10 @@ async fn the_three_call_counterexamples_compile_deterministically() {
                 let mut schema = pbps_model::Schema::default();
                 for c in &changes {
                     match c {
-                        Change::CreateTable { name, table, .. } => {
+                        Change::Table(TableChange::CreateTable { name, table, .. }) => {
                             schema.tables.insert(name.clone(), *table.clone());
                         }
-                        Change::CreateModule { id, module } => {
+                        Change::Module(ModuleChange::CreateModule { id, module }) => {
                             schema.modules.insert(id.clone(), *module.clone());
                         }
                         _ => unreachable!(),
@@ -662,7 +664,7 @@ async fn retries_roll_back_whole_groups_but_can_repeat_sequence_side_effects() {
         let (mut admin, mut conn, name, pg) = database(&server).await;
         conn.execute("CREATE SEQUENCE public.attempts; CREATE FUNCTION public.count_attempt() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM nextval('public.attempts'); END $$; CREATE EVENT TRIGGER count_attempt ON ddl_command_start WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION public.count_attempt()").await.unwrap();
         let mut t = table("a+1");
-        if let Change::CreateTable { table, .. } = &mut t {
+        if let Change::Table(TableChange::CreateTable { table, .. }) = &mut t {
             table.indexes.insert(
                 "missing_class".into(),
                 pbps_model::Index {

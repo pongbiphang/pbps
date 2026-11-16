@@ -99,53 +99,59 @@ impl Dropped {
         stored_column: &dyn Fn(&pbps_model::ColumnRef) -> String,
     ) {
         use pbps_model::Change;
+        use pbps_model::ColumnChange;
+        use pbps_model::ConstraintChange;
+        use pbps_model::IndexChange;
+        use pbps_model::PartitionChange;
+        use pbps_model::PolicyChange;
+        use pbps_model::TypeValueChange;
         match change {
-            Change::DropCheck { table, name } => {
+            Change::Constraint(ConstraintChange::DropCheck { table, name }) => {
                 if let Some(old) = stored(table) {
                     self.checks.insert((old, name.raw().to_owned()));
                 }
             }
-            Change::DropIndex { table, name } => {
+            Change::Index(IndexChange::DropIndex { table, name }) => {
                 if let Some(old) = stored(table) {
                     self.indexes.insert((old, name.raw().to_owned()));
                 }
             }
-            Change::DropPolicy { table, name, .. } => {
+            Change::Policy(PolicyChange::DropPolicy { table, name, .. }) => {
                 if let Some(old) = stored(table) {
                     self.policies.insert((old, name.clone()));
                 }
             }
-            Change::DropColumn { column, .. }
-            | Change::AlterColumnDefault { column, .. }
-            | Change::AlterColumnExpression { column, .. } => {
+            Change::Column(ColumnChange::DropColumn { column, .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { column, .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { column, .. }) => {
                 if let Some(old) = stored(&column.table) {
                     self.values.insert((old.clone(), stored_column(column)));
                     // A dropped column takes its domain with it; a column whose
                     // default or expression changes keeps the domain's checks.
-                    if matches!(change, Change::DropColumn { .. }) {
+                    if matches!(change, Change::Column(ColumnChange::DropColumn { .. })) {
                         self.columns.insert((old, stored_column(column)));
                     }
                 }
             }
             // Retyped, a column is no longer the domain it is now; its own
             // default and expressions stay (re-cast), and so are not excused.
-            Change::AlterColumnType { column, .. } => {
+            Change::Column(ColumnChange::AlterColumnType { column, .. }) => {
                 if let Some(old) = stored(&column.table) {
                     self.columns.insert((old, stored_column(column)));
                 }
             }
-            Change::DetachPartition { table, .. } => {
+            Change::Partition(PartitionChange::DetachPartition { table, .. }) => {
                 if let Some(old) = stored(table) {
                     self.detached.insert(old);
                 }
             }
-            Change::AlterDomain {
+            Change::TypeValue(TypeValueChange::AlterDomain {
                 name,
                 from,
                 to,
                 half: pbps_model::DomainHalf::Loosen,
                 ..
-            } => {
+            }) => {
                 if let Some(delta) = pbps_model::DomainDelta::of(from, to) {
                     for check in delta.drop_checks {
                         self.domain_checks
@@ -1966,6 +1972,9 @@ mod tests {
 
     #[test]
     fn every_step_that_removes_an_expression_is_noted_under_the_name_the_catalog_holds() {
+        use pbps_model::ColumnChange;
+        use pbps_model::PartitionChange;
+        use pbps_model::TypeValueChange;
         use pbps_model::{Change, DomainHalf};
         let column: pbps_model::ColumnRef = "app.t.v".parse().unwrap();
         let table = TableName::new("app", "t");
@@ -1973,14 +1982,14 @@ mod tests {
         let held = BTreeSet::from([(table.clone(), "v".to_owned())]);
         // A dropped column loses its default or generated expression and the
         // domain it has now.
-        let gone = noted(&Change::DropColumn {
+        let gone = noted(&Change::Column(ColumnChange::DropColumn {
             uid: uid.clone(),
             column: column.clone(),
-        });
+        }));
         assert_eq!((&gone.values, &gone.columns), (&held, &held));
         // A retyped column keeps its default and expressions (re-cast) and
         // loses the domain; a changed default or expression keeps the domain.
-        let retyped = noted(&Change::AlterColumnType {
+        let retyped = noted(&Change::Column(ColumnChange::AlterColumnType {
             uid: uid.clone(),
             column: column.clone(),
             from: "app.dm".parse().unwrap(),
@@ -1991,21 +2000,21 @@ mod tests {
             from_collation: None,
             to_collation: None,
             using: None,
-        });
+        }));
         assert_eq!((retyped.values.len(), &retyped.columns), (0, &held));
         for change in [
-            Change::AlterColumnDefault {
+            Change::Column(ColumnChange::AlterColumnDefault {
                 uid: uid.clone(),
                 column: column.clone(),
                 from: Some("1".into()),
                 to: None,
-            },
-            Change::AlterColumnExpression {
+            }),
+            Change::Column(ColumnChange::AlterColumnExpression {
                 uid: uid.clone(),
                 column: column.clone(),
                 from: "a".into(),
                 to: "b".into(),
-            },
+            }),
         ] {
             let noted = noted(&change);
             assert_eq!((&noted.values, noted.columns.len()), (&held, 0));
@@ -2013,12 +2022,14 @@ mod tests {
         // A domain's default is gone when the loosening half sets or drops it;
         // its checks when that half drops them; the tightening half drops none.
         let name: pbps_model::TypeRef = "app.dm".parse().unwrap();
-        let alter = |from, to, half| Change::AlterDomain {
-            uid: uid.clone(),
-            name: name.clone(),
-            from: Box::new(from),
-            to: Box::new(to),
-            half,
+        let alter = |from, to, half| {
+            Change::TypeValue(TypeValueChange::AlterDomain {
+                uid: uid.clone(),
+                name: name.clone(),
+                from: Box::new(from),
+                to: Box::new(to),
+                half,
+            })
         };
         let set = noted(&alter(
             domain(None, &[]),
@@ -2051,13 +2062,13 @@ mod tests {
         ));
         assert!(tightened.domain_defaults.is_empty() && tightened.domain_checks.is_empty());
         // A detached partition is no longer reached through its parent.
-        let detached = noted(&Change::DetachPartition {
+        let detached = noted(&Change::Partition(PartitionChange::DetachPartition {
             uid,
             table: table.clone(),
             parent: TableName::new("app", "parent"),
             names: Vec::new(),
             shape: Box::default(),
-        });
+        }));
         assert_eq!(detached.detached, BTreeSet::from([table]));
     }
 

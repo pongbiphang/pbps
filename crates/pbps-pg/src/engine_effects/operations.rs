@@ -1,6 +1,8 @@
 //! Normalize portable statement outputs; no membership cut is chosen here.
 use super::{columns, facts};
 use crate::Postgres;
+use pbps_model::ColumnChange;
+use pbps_model::TableChange;
 use pbps_model::change::{ColumnProperty, ColumnTransition, ColumnValue};
 use pbps_model::operation::{
     ColumnKey, Effects, ObjectKey, Operation, OwnerError, Owners, Recorded, Snapshot, symbolic::*,
@@ -65,13 +67,18 @@ pub(crate) fn with_lineage(
             };
             (parent, Some(ColumnKey::Recorded(c)))
         }
-        ObjectKey::Table(parent) if matches!(op.change(), Change::RenameTable { .. }) => {
+        ObjectKey::Table(parent)
+            if matches!(op.change(), Change::Table(TableChange::RenameTable { .. })) =>
+        {
             (parent, None)
         }
         _ => return Ok(fx),
     };
     let source = !facts.parents.contains(&parent)
-        && matches!(op.change(), Change::AlterColumnDefault { .. })
+        && matches!(
+            op.change(),
+            Change::Column(ColumnChange::AlterColumnDefault { .. })
+        )
         && lineage.families().any(|(p, f)| {
             facts.parents.contains(p)
                 && f.standing(&parent, pbps_model::operation::End::Goal)
@@ -104,7 +111,7 @@ pub(crate) fn with_lineage(
         // DROP's payload cannot say whether an owned sequence existed. Known
         // absence retires no sequence; an unread value must remain an obligation.
         if transition.property == ColumnProperty::Column(Attribute::Numbering)
-            && matches!(op.change(), Change::DropColumn { .. })
+            && matches!(op.change(), Change::Column(ColumnChange::DropColumn { .. }))
         {
             match &input.value {
                 Fact::Known(v) if v.datum == Datum::Absent => continue,
@@ -170,7 +177,7 @@ pub(super) fn output(
         }
         ColumnValue::Nullable(nullable) => facts::value(Datum::NotNull(!nullable), Ownership::Own),
         ColumnValue::Definition(column) => {
-            let Change::AddColumn { table, name, .. } = change else {
+            let Change::Column(ColumnChange::AddColumn { table, name, .. }) = change else {
                 unreachable!()
             };
             let ColumnProperty::Column(attribute) = &transition.property else {

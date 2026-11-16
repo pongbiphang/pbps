@@ -41,6 +41,9 @@
 use pbps_diff::order::PlanningPlan;
 use std::collections::BTreeSet;
 
+use pbps_model::ColumnChange;
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
 use pbps_model::{
     Change, ChangeSet, IdsFile, PlannedChange, TableName,
     plan_names::{At, PlanNames},
@@ -94,30 +97,31 @@ pub(crate) fn spellings(cs: &ChangeSet, edges: &[ExpressionEdge]) -> BTreeSet<St
     }
     for p in &cs.changes {
         match &p.change {
-            Change::RenameTable { from, to, .. } => {
+            Change::Table(TableChange::RenameTable { from, to, .. }) => {
                 object(from, &mut out);
                 object(to, &mut out);
             }
-            Change::RenameColumn {
+            Change::Column(ColumnChange::RenameColumn {
                 table, from, to, ..
-            } => {
+            }) => {
                 object(table, &mut out);
                 out.insert(from.raw().to_owned());
                 out.insert(to.raw().to_owned());
             }
-            Change::DropColumn { column, .. }
-            | Change::AlterColumnType { column, .. }
-            | Change::AlterColumnNullability { column, .. } => {
+            Change::Column(ColumnChange::DropColumn { column, .. })
+            | Change::Column(ColumnChange::AlterColumnType { column, .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { column, .. }) => {
                 object(&column.table, &mut out);
                 out.insert(column.name.raw().to_owned());
             }
-            Change::AddComputedColumn { table, name, .. }
-            | Change::DropComputedColumn { table, name, .. } => {
+            Change::Column(ColumnChange::AddComputedColumn { table, name, .. })
+            | Change::Column(ColumnChange::DropComputedColumn { table, name, .. }) => {
                 object(table, &mut out);
                 out.insert(name.raw().to_owned());
             }
-            Change::DropTable { name, .. } => object(name, &mut out),
-            Change::AlterModule { id, .. } | Change::DropModule { id, .. } => {
+            Change::Table(TableChange::DropTable { name, .. }) => object(name, &mut out),
+            Change::Module(ModuleChange::AlterModule { id, .. })
+            | Change::Module(ModuleChange::DropModule { id, .. }) => {
                 object(&id.object_name(), &mut out);
             }
             _ => {}
@@ -140,13 +144,13 @@ fn input_change(
     change: &Change,
     names: &PlanNames<'_>,
 ) -> Option<(TableName, pbps_model::ColumnName, &'static str)> {
-    let (uid, what) = if let Change::RenameColumn { uid, .. } = change {
+    let (uid, what) = if let Change::Column(ColumnChange::RenameColumn { uid, .. }) = change {
         (uid, "renames")
-    } else if let Change::DropColumn { uid, .. } = change {
+    } else if let Change::Column(ColumnChange::DropColumn { uid, .. }) = change {
         (uid, "drops")
-    } else if let Change::AlterColumnType { uid, .. } = change {
+    } else if let Change::Column(ColumnChange::AlterColumnType { uid, .. }) = change {
         (uid, "retypes or recollates")
-    } else if let Change::AlterColumnNullability { uid, .. } = change {
+    } else if let Change::Column(ColumnChange::AlterColumnNullability { uid, .. }) = change {
         (uid, "changes the nullability of")
     } else {
         return None;
@@ -176,16 +180,16 @@ pub(crate) fn order_by_edges<S: Clone>(
     let mut tables_dropped: Vec<TableName> = Vec::new();
     let mut modules_dropped: Vec<TableName> = Vec::new();
     for (at, p) in cs.changes.iter().enumerate() {
-        if let Change::DropComputedColumn { table, name, .. } = &p.change {
+        if let Change::Column(ColumnChange::DropComputedColumn { table, name, .. }) = &p.change {
             dropped.push((catalog_table(&names, table, at), name.clone()));
         }
-        if let Change::AddComputedColumn { table, name, .. } = &p.change {
+        if let Change::Column(ColumnChange::AddComputedColumn { table, name, .. }) = &p.change {
             added.push((catalog_table(&names, table, at), name.clone()));
         }
-        if let Change::DropTable { name, .. } = &p.change {
+        if let Change::Table(TableChange::DropTable { name, .. }) = &p.change {
             tables_dropped.push(name.clone());
         }
-        if let Change::DropModule { id, .. } = &p.change {
+        if let Change::Module(ModuleChange::DropModule { id, .. }) = &p.change {
             modules_dropped.push(id.object_name());
         }
     }
@@ -227,9 +231,9 @@ pub(crate) fn order_by_edges<S: Clone>(
                 }
             }
         }
-        let module = if let Change::AlterModule { id, .. } = &p.change {
+        let module = if let Change::Module(ModuleChange::AlterModule { id, .. }) = &p.change {
             Some((id.object_name(), "alters"))
-        } else if let Change::DropModule { id, .. } = &p.change {
+        } else if let Change::Module(ModuleChange::DropModule { id, .. }) = &p.change {
             Some((id.object_name(), "drops"))
         } else {
             None
@@ -252,7 +256,7 @@ pub(crate) fn order_by_edges<S: Clone>(
                 }
             }
         }
-        if let Change::DropComputedColumn { table, name, .. } = &p.change {
+        if let Change::Column(ColumnChange::DropComputedColumn { table, name, .. }) = &p.change {
             let table = catalog_table(&names, table, at);
             for e in edges {
                 if e.from_column.is_none()
@@ -291,17 +295,17 @@ fn functions_changed(cs: &ChangeSet) -> Vec<(TableName, &'static str)> {
     let function = pbps_model::ModuleKind::Function;
     let mut out = Vec::new();
     for p in &cs.changes {
-        if let Change::CreateModule { id, module } = &p.change
+        if let Change::Module(ModuleChange::CreateModule { id, module }) = &p.change
             && module.kind == function
         {
             out.push((id.object_name(), "creates"));
         }
-        if let Change::AlterModule { id, module } = &p.change
+        if let Change::Module(ModuleChange::AlterModule { id, module }) = &p.change
             && module.kind == function
         {
             out.push((id.object_name(), "alters"));
         }
-        if let Change::DropModule { id, kind } = &p.change
+        if let Change::Module(ModuleChange::DropModule { id, kind }) = &p.change
             && *kind == function
         {
             out.push((id.object_name(), "drops"));
@@ -354,11 +358,11 @@ fn added_calls(
     };
     let mut out = Vec::new();
     for (at, p) in cs.changes.iter().enumerate() {
-        if let Change::AddComputedColumn {
+        if let Change::Column(ColumnChange::AddComputedColumn {
             table,
             name,
             computed,
-        } = &p.change
+        }) = &p.change
         {
             out.push(AddedCall {
                 at,
@@ -368,7 +372,7 @@ fn added_calls(
                 receivers: receivers_of(table),
             });
         }
-        if let Change::CreateTable { name, table, .. } = &p.change {
+        if let Change::Table(TableChange::CreateTable { name, table, .. }) = &p.change {
             for (column, computed) in &table.computed {
                 out.push(AddedCall {
                     at,
@@ -447,12 +451,15 @@ pub(crate) fn refuse_added_calls_in<S>(
     let mut last = std::collections::BTreeMap::new();
     for (at, p) in plan.changes.iter().enumerate() {
         match &p.change {
-            Change::CreateModule { id, module } | Change::AlterModule { id, module }
+            Change::Module(ModuleChange::CreateModule { id, module })
+            | Change::Module(ModuleChange::AlterModule { id, module })
                 if module.kind == pbps_model::ModuleKind::Function =>
             {
                 last.insert(id.object_name(), (at, true));
             }
-            Change::DropModule { id, kind } if *kind == pbps_model::ModuleKind::Function => {
+            Change::Module(ModuleChange::DropModule { id, kind })
+                if *kind == pbps_model::ModuleKind::Function =>
+            {
                 last.insert(id.object_name(), (at, false));
             }
             _ => {}
@@ -463,14 +470,14 @@ pub(crate) fn refuse_added_calls_in<S>(
         if edge.before >= edge.after {
             continue;
         }
-        if let Change::CreateModule {
+        if let Change::Module(ModuleChange::CreateModule {
             id: pbps_model::ModuleId::Named(name),
             module,
-        }
-        | Change::AlterModule {
+        })
+        | Change::Module(ModuleChange::AlterModule {
             id: pbps_model::ModuleId::Named(name),
             module,
-        } = &plan.changes[edge.before].change
+        }) = &plan.changes[edge.before].change
             && module.kind == pbps_model::ModuleKind::Function
         {
             let function = TableName::new(&name.schema, &name.name);
@@ -554,9 +561,9 @@ fn refuse_added_calls_with(
 
 /// What a change drops, by its catalog name: a module or a table.
 fn dropped_object(change: &Change) -> Option<TableName> {
-    if let Change::DropModule { id, .. } = change {
+    if let Change::Module(ModuleChange::DropModule { id, .. }) = change {
         Some(id.object_name())
-    } else if let Change::DropTable { name, .. } = change {
+    } else if let Change::Table(TableChange::DropTable { name, .. }) = change {
         Some(name.clone())
     } else {
         None
@@ -584,10 +591,10 @@ fn waits_for(
             .filter(|&p| p != at && waits(p, &changes[p].change))
             .collect()
     };
-    if let Change::DropComputedColumn { table, name, .. } = change {
+    if let Change::Column(ColumnChange::DropComputedColumn { table, name, .. }) = change {
         let table = catalog_table(names, table, at);
         return among(&|_, c: &Change| {
-            matches!(c, Change::DropModule { id, .. } if edges.iter().any(|e| {
+            matches!(c, Change::Module(ModuleChange::DropModule { id, .. }) if edges.iter().any(|e| {
                 e.from_column.is_none()
                     && e.from_schema_bound
                     && alike.object(&e.from, &id.object_name())
@@ -596,13 +603,13 @@ fn waits_for(
             }))
         });
     }
-    if let Change::DropColumn { uid, column } = change {
+    if let Change::Column(ColumnChange::DropColumn { uid, column }) = change {
         let table = catalog_table(names, &column.table, at);
         let read = names
             .column_at(uid, At::Start)
             .map_or(column.name.clone(), |(_, name)| name.into());
         return among(&|position, c: &Change| {
-            matches!(c, Change::DropComputedColumn { table: t, name: computed, .. }
+            matches!(c, Change::Column(ColumnChange::DropComputedColumn { table: t, name: computed, .. })
             if alike.object(&catalog_table(names, t, position), &table)
                 && edges.iter().any(|e| {
                     alike.object(&e.from, &table)
@@ -615,16 +622,16 @@ fn waits_for(
     let Some(object) = dropped_object(change) else {
         return Vec::new();
     };
-    let is_function = matches!(change, Change::DropModule { .. });
+    let is_function = matches!(change, Change::Module(ModuleChange::DropModule { .. }));
     // Whether a change removes a computed column that calls `object`.
     let releases = |position, change: &Change| {
         edges.iter().any(|e| {
             e.from_column.is_some()
                 && alike.object(&e.to, &object)
-                && (matches!(change, Change::DropComputedColumn { table, name, .. }
+                && (matches!(change, Change::Column(ColumnChange::DropComputedColumn { table, name, .. })
                     if alike.object(&catalog_table(names, table, position), &e.from)
                         && e.from_column.as_ref().map(pbps_model::ColumnName::raw).is_some_and(|c| alike.same(c, name.raw())))
-                    || matches!(change, Change::DropTable { name, .. } if alike.object(name, &e.from)))
+                    || matches!(change, Change::Table(TableChange::DropTable { name, .. }) if alike.object(name, &e.from)))
         })
     };
     let bound = |change: &Change| {
@@ -732,6 +739,9 @@ mod tests {
     }
 
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::TableChange;
     use pbps_model::{ComputedColumn, ModuleId, ModuleKind};
 
     fn t(s: &str) -> TableName {
@@ -808,34 +818,34 @@ mod tests {
     }
 
     fn drop_computed(table: &str, name: &str) -> PlannedChange {
-        PlannedChange::new(Change::DropComputedColumn {
+        PlannedChange::new(Change::Column(ColumnChange::DropComputedColumn {
             table: t(table),
             name: name.into(),
             computed: computed(),
-        })
+        }))
     }
 
     fn add_computed(table: &str, name: &str) -> PlannedChange {
-        PlannedChange::new(Change::AddComputedColumn {
+        PlannedChange::new(Change::Column(ColumnChange::AddComputedColumn {
             table: t(table),
             name: name.into(),
             computed: computed(),
-        })
+        }))
     }
 
     fn drop_module(name: &str) -> PlannedChange {
-        PlannedChange::new(Change::DropModule {
+        PlannedChange::new(Change::Module(ModuleChange::DropModule {
             id: ModuleId::Named(t(name)),
             kind: ModuleKind::Function,
-        })
+        }))
     }
 
     fn drop_table(name: &str) -> PlannedChange {
-        PlannedChange::new(Change::DropTable {
+        PlannedChange::new(Change::Table(TableChange::DropTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, name, 0),
             name: t(name),
             detach_from: None,
-        })
+        }))
     }
 
     fn order(changes: Vec<PlannedChange>, edges: &[ExpressionEdge]) -> Result<Vec<String>, String> {
@@ -855,7 +865,7 @@ mod tests {
     #[test]
     fn an_added_computed_column_is_refused_by_the_collations_reading_of_its_calls() {
         let add = |expression: &str| {
-            PlannedChange::new(Change::AddComputedColumn {
+            PlannedChange::new(Change::Column(ColumnChange::AddComputedColumn {
                 table: t("dbo.t"),
                 name: "c".into(),
                 computed: ComputedColumn {
@@ -863,7 +873,7 @@ mod tests {
                     persisted: false,
                     not_null: false,
                 },
-            })
+            }))
         };
         let plan = |expression: &str, change: PlannedChange| ChangeSet {
             changes: vec![add(expression), change],
@@ -967,10 +977,10 @@ mod tests {
             .is_ok()
         );
         // A view is not what a computed column calls.
-        let view = PlannedChange::new(Change::DropModule {
+        let view = PlannedChange::new(Change::Module(ModuleChange::DropModule {
             id: ModuleId::Named(t("dbo.café")),
             kind: ModuleKind::View,
-        });
+        }));
         assert!(
             refuse_added_calls(&plan("[dbo].[cafe]([a])", view), &plain, &dialect, &ai).is_ok()
         );
@@ -1073,10 +1083,10 @@ mod tests {
             computed_edge("dbo.b", "c", "dbo.b", Some("x")),
         ];
         let drop_x = || {
-            PlannedChange::new(Change::DropColumn {
+            PlannedChange::new(Change::Column(ColumnChange::DropColumn {
                 uid: "c_000000".parse().unwrap(),
                 column: t("dbo.b").column("x"),
-            })
+            }))
         };
         let plan = || {
             vec![
@@ -1135,10 +1145,10 @@ mod tests {
     fn names_match_by_the_catalogs_collation_not_a_fold() {
         let reads = [computed_edge("dbo.t", "c", "dbo.t", Some("a"))];
         let drop_upper = || {
-            PlannedChange::new(Change::DropColumn {
+            PlannedChange::new(Change::Column(ColumnChange::DropColumn {
                 uid: "c_000000".parse().unwrap(),
                 column: t("dbo.t").column("A"),
-            })
+            }))
         };
         let sensitive = Alike::default();
         let mut cs = ChangeSet {
@@ -1158,10 +1168,10 @@ mod tests {
     #[test]
     fn the_edges_refuse_what_the_engine_would() {
         let input = [computed_edge("dbo.t", "c", "dbo.t", Some("café"))];
-        let retype = PlannedChange::new(Change::DropColumn {
+        let retype = PlannedChange::new(Change::Column(ColumnChange::DropColumn {
             uid: "c_000000".parse().unwrap(),
             column: t("dbo.t").column("café"),
-        });
+        }));
         let e = order(vec![retype.clone()], &input).unwrap_err();
         assert!(e.contains("reads `café`"), "{e}");
         // Dropped with it, the computed column is out of the way first.
@@ -1211,6 +1221,7 @@ mod tests {
 #[cfg(test)]
 mod plan_name_tests {
     use super::*;
+    use pbps_model::ColumnChange;
     fn order_by_edges(
         cs: &mut ChangeSet,
         ids: &IdsFile,
@@ -1223,16 +1234,16 @@ mod plan_name_tests {
     #[test]
     fn a_computed_reader_keeps_its_input_through_table_and_column_rename_chains() {
         let (mut changes, ids) = crate::plan_fixture::chain();
-        changes
-            .changes
-            .push(PlannedChange::new(Change::AlterColumnNullability {
+        changes.changes.push(PlannedChange::new(Change::Column(
+            ColumnChange::AlterColumnNullability {
                 uid: "c_aaaaaa".parse().unwrap(),
                 column: TableName::new("app", "final_table").column("final_column"),
                 ty: "int".parse().unwrap(),
                 to_nullable: false,
                 through_external_partitions: false,
                 collation: None,
-            }));
+            },
+        )));
         let edge = ExpressionEdge {
             from: TableName::new("app", "original_table"),
             from_column: Some("g".into()),

@@ -266,18 +266,22 @@ pub fn finish<S, T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::PartitionChange;
+    use pbps_model::RoleChange;
+    use pbps_model::RowChange;
     use pbps_model::operation::{ModuleEdits, Operations, Origin, Source};
     use pbps_model::{Change, ChangeSet, PlannedChange};
     #[test]
     fn scope_tails_and_woven_additions_keep_resolver_ids_without_collisions() {
         let column = pbps_model::TableName::new("app", "t").column("n");
         let default = |value: &str| {
-            PlannedChange::new(Change::AlterColumnDefault {
+            PlannedChange::new(Change::Column(ColumnChange::AlterColumnDefault {
                 uid: "c_aaaaaa".parse().unwrap(),
                 column: column.clone(),
                 from: None,
                 to: Some(value.into()),
-            })
+            }))
         };
         let origin = Origin::Restoration(Source::Rebinding(
             pbps_model::resolver::Surface::Default(column.clone()),
@@ -293,11 +297,11 @@ mod tests {
             ModuleEdits::Rebuilt,
         ));
         let before = crate::order::plan::canonical(before, &pbps_dialect::MinimalDialect).unwrap();
-        let scope = PlannedChange::new(Change::SetDataMode {
+        let scope = PlannedChange::new(Change::Row(RowChange::SetDataMode {
             table: column.table.clone(),
             from: None,
             to: Some(pbps_model::data::DataMode::Exact),
-        });
+        }));
         let mut after = crate::order::writebacks::ScopeInput::new(vec![scope])
             .unwrap()
             .append_to(before.clone(), &pbps_dialect::MinimalDialect);
@@ -333,7 +337,7 @@ mod tests {
     /// A partition's default, which `weave` splits into a release and a
     /// restoration when the function it calls is dropped (#1896).
     fn edit(from: Option<&str>, to: Option<&str>, fallback: Option<&str>) -> PlannedChange {
-        PlannedChange::new(Change::SetPartitionDefault {
+        PlannedChange::new(Change::Partition(PartitionChange::SetPartitionDefault {
             uid: "t_aaaaaa".parse().unwrap(),
             table: pbps_model::TableName::new("app", "p"),
             parent: pbps_model::TableName::new("app", "tree"),
@@ -341,14 +345,14 @@ mod tests {
             from: from.map(Into::into),
             to: to.map(Into::into),
             fallback: fallback.map(Into::into),
-        })
+        }))
     }
 
     fn role(name: &str) -> PlannedChange {
-        PlannedChange::new(Change::CreateRole {
+        PlannedChange::new(Change::Role(RoleChange::CreateRole {
             uid: pbps_model::Uid::generate(pbps_model::UidKind::Role),
             name: name.into(),
-        })
+        }))
     }
 
     fn edge(before: usize, after: usize, reason: OrderReason) -> OrderEdge {
@@ -504,15 +508,16 @@ mod tests {
         );
         assert!(lone.unwrap_err().contains("removed"));
         // Negative: halves of another object are not this step's.
-        let elsewhere = PlannedChange::new(Change::SetPartitionDefault {
-            uid: "t_bbbbbb".parse().unwrap(),
-            table: pbps_model::TableName::new("app", "q"),
-            parent: pbps_model::TableName::new("app", "tree"),
-            column: pbps_model::ColumnName::from("d"),
-            from: Some("app.f(1)".into()),
-            to: None,
-            fallback: None,
-        });
+        let elsewhere =
+            PlannedChange::new(Change::Partition(PartitionChange::SetPartitionDefault {
+                uid: "t_bbbbbb".parse().unwrap(),
+                table: pbps_model::TableName::new("app", "q"),
+                parent: pbps_model::TableName::new("app", "tree"),
+                column: pbps_model::ColumnName::from("d"),
+                from: Some("app.f(1)".into()),
+                to: None,
+                fallback: None,
+            }));
         let stranger = carried(
             (&before, &before_origins),
             (

@@ -1,5 +1,7 @@
 use super::{refusal::*, *};
 use pbps_db::{DbError, DriverDiagnostic, ErrorPosition};
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
 use pbps_model::{ObjectName, diagnostic::Declaration};
 
 fn error(position: Option<ErrorPosition>) -> DbError {
@@ -302,13 +304,13 @@ async fn true_refusals_render_every_pending_declaration_on_both_majors() {
                     ),
                 ],
                 _ => vec![
-                    Change::CreateTable {
+                    Change::Table(TableChange::CreateTable {
                         name: ObjectName::new("app", "t"),
                         uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
                         table: Box::new(super::rule_tests::held_table()),
                         beside_default: None,
                         moves_at_most: None,
-                    },
+                    }),
                     module(
                         "app.f(integer)",
                         ModuleKind::Function,
@@ -345,13 +347,15 @@ async fn true_refusals_render_every_pending_declaration_on_both_majors() {
             std::fs::create_dir(&files).unwrap();
             for (at, change) in changes.iter().enumerate() {
                 let yaml = match change {
-                    Change::CreateModule { id, module } => pbps_load::render_module(
-                        id,
-                        module,
-                        deps.get(id).unwrap_or(&Default::default()),
-                        false,
-                    ),
-                    Change::CreateTable { name, table, .. } => {
+                    Change::Module(ModuleChange::CreateModule { id, module }) => {
+                        pbps_load::render_module(
+                            id,
+                            module,
+                            deps.get(id).unwrap_or(&Default::default()),
+                            false,
+                        )
+                    }
+                    Change::Table(TableChange::CreateTable { name, table, .. }) => {
                         pbps_load::render(name, table, &[], None)
                     }
                     _ => unreachable!(),

@@ -1,5 +1,7 @@
 use super::*;
 
+use pbps_model::ConstraintChange;
+use pbps_model::TableChange;
 use pbps_model::{Change, PlannedChange, plan_names::PlanNames};
 
 #[test]
@@ -18,15 +20,14 @@ fn a_referencing_key_is_removed_from_its_original_table_after_multiple_renames()
     let leaf = TableName::new("app", "leaf");
     let leaf_uid: pbps_model::Uid = "t_bbbbbb".parse().unwrap();
     ids.tables.insert(leaf_uid.clone(), leaf.clone());
-    changes
-        .changes
-        .push(PlannedChange::new(Change::DropForeignKey {
+    changes.changes.push(PlannedChange::new(Change::Constraint(
+        ConstraintChange::DropForeignKey {
             table: TableName::new("app", "final_table"),
             name: "fk".into(),
-        }));
-    changes
-        .changes
-        .push(PlannedChange::new(Change::CreateTable {
+        },
+    )));
+    changes.changes.push(PlannedChange::new(Change::Table(
+        TableChange::CreateTable {
             uid: leaf_uid,
             name: leaf,
             table: Box::new(pbps_model::Table {
@@ -40,7 +41,8 @@ fn a_referencing_key_is_removed_from_its_original_table_after_multiple_renames()
             }),
             beside_default: None,
             moves_at_most: None,
-        }));
+        },
+    )));
     let stored = TableName::new("app", "original_table");
     let found = pbps_pg::catalog::PermanentReferencer {
         parent,
@@ -68,7 +70,7 @@ fn unlogged_parent_reads_use_the_holder_at_creation_not_the_final_spelling() {
     let leaf_uid: pbps_model::Uid = "t_bbbbbb".parse().unwrap();
     ids.tables.insert(leaf_uid.clone(), leaf.clone());
     let create_leaf = |parent: &str| {
-        PlannedChange::new(Change::CreateTable {
+        PlannedChange::new(Change::Table(TableChange::CreateTable {
             uid: leaf_uid.clone(),
             name: leaf.clone(),
             table: Box::new(pbps_model::Table {
@@ -82,7 +84,7 @@ fn unlogged_parent_reads_use_the_holder_at_creation_not_the_final_spelling() {
             }),
             beside_default: None,
             moves_at_most: None,
-        })
+        }))
     };
     let mut after_renames = chain.changes.clone();
     after_renames.push(create_leaf("final_table"));
@@ -102,13 +104,13 @@ fn unlogged_parent_reads_use_the_holder_at_creation_not_the_final_spelling() {
     );
     after_renames.insert(
         0,
-        PlannedChange::new(Change::CreateTable {
+        PlannedChange::new(Change::Table(TableChange::CreateTable {
             uid: "t_aaaaaa".parse().unwrap(),
             name: TableName::new("app", "original_table"),
             table: Box::new(shape),
             beside_default: None,
             moves_at_most: None,
-        }),
+        })),
     );
     let names = PlanNames::of(&after_renames, &ids).unwrap();
     assert!(

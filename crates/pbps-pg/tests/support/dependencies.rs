@@ -621,8 +621,8 @@ fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
         }],
         ..Default::default()
     };
-    let logical = [PlannedChange::new(Change::RebuildPartitionedTable(
-        Box::new(root.clone()),
+    let logical = [PlannedChange::new(Change::Partition(
+        PartitionChange::RebuildPartitionedTable(Box::new(root.clone())),
     ))];
     let owners = PlanOwners::new(PlanNames::of(&logical, &desired).unwrap(), &base, &desired)
         .with_rebuild_addresses(&root, &desired, &addresses)
@@ -632,26 +632,26 @@ fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
         ids: &base,
     };
     let parts = [
-        Change::AddIndex {
+        Change::Index(IndexChange::AddIndex {
             table: "app.tmp_p1".parse().unwrap(),
             name: "p1_k_idx".into(),
             index: Box::new(index),
             clustered: false,
-        },
-        Change::DropIndex {
+        }),
+        Change::Index(IndexChange::DropIndex {
             table: root.table.clone(),
             name: "p_idx".into(),
-        },
-        Change::DropTable {
+        }),
+        Change::Table(TableChange::DropTable {
             uid: old_leaf,
             name: "app.old_p1".parse().unwrap(),
             detach_from: None,
-        },
-        Change::DropTable {
+        }),
+        Change::Table(TableChange::DropTable {
             uid: base.table_uid(&root.table).unwrap().clone(),
             name: "app.old_p".parse().unwrap(),
             detach_from: None,
-        },
+        }),
     ];
     for order in [[0, 1, 2, 3], [1, 0, 2, 3]] {
         let ops = Operations::expanded(
@@ -890,7 +890,7 @@ fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
     }
     // A reintroduced incarnation still belongs to its eventual container drop.
     let ordinary = PlanOwners::new(PlanNames::of(&[], &base).unwrap(), &base, &base);
-    let Change::AddIndex { index, .. } = &parts[0] else {
+    let Change::Index(IndexChange::AddIndex { index, .. }) = &parts[0] else {
         panic!()
     };
     let returned = Operations::expanded(
@@ -899,20 +899,20 @@ fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
             (Origin::Teardown(OriginSource::Change(0)), parts[1].clone()),
             (
                 Origin::Restoration(OriginSource::Change(0)),
-                Change::AddIndex {
+                Change::Index(IndexChange::AddIndex {
                     table: root.table.clone(),
                     name: "p_idx".into(),
                     index: index.clone(),
                     clustered: false,
-                },
+                }),
             ),
             (
                 Origin::SplitPart(0),
-                Change::DropTable {
+                Change::Table(TableChange::DropTable {
                     uid: base.table_uid(&root.table).unwrap().clone(),
                     name: root.table.clone(),
                     detach_from: None,
-                },
+                }),
             ),
         ]
         .map(|(origin, change)| (origin, PlannedChange::new(change))),

@@ -1,6 +1,8 @@
 //! Pending source lookups expose templates, never a tentative execution
 //! position. The selected boundary is checked before certification.
 use super::{Dependent, Holds, Part, Sources};
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
 use pbps_model::operation::{End, Lineage, Snapshot};
 use pbps_model::physical_sources::{ColumnAt, Located, Owner, PhysicalSources};
 use pbps_model::plan_names::{At, PlanNames};
@@ -259,13 +261,13 @@ impl<'p> Projection<'p> {
         let moving: BTreeSet<_> = changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::AttachPartition { uid, .. }
-                | Change::DetachPartition { uid, .. }
-                | Change::DropTable {
+                Change::Partition(PartitionChange::AttachPartition { uid, .. })
+                | Change::Partition(PartitionChange::DetachPartition { uid, .. })
+                | Change::Table(TableChange::DropTable {
                     uid,
                     detach_from: Some(_),
                     ..
-                } => Some(uid),
+                }) => Some(uid),
                 _ => None,
             })
             .collect();
@@ -466,6 +468,9 @@ fn template_names<'p>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::PartitionChange;
+    use pbps_model::TableChange;
     use pbps_model::{Column, ModuleId, PartitionBound, PartitionBy, PartitionOf, Table};
     fn uid(value: &str) -> pbps_model::Uid {
         value.parse().unwrap()
@@ -534,21 +539,21 @@ mod tests {
         ids.columns.remove(&uid("c_dddddd"));
         ids.columns.insert(uid("c_bbbbbb"), p.column("e"));
         let changes = vec![
-            PlannedChange::new(Change::AttachPartition {
+            PlannedChange::new(Change::Partition(PartitionChange::AttachPartition {
                 uid: uid("t_bbbbbb"),
                 table: a.clone(),
                 parent: p.clone(),
                 bound: PartitionBound::Default,
                 key: vec![],
                 shape: Box::new(after.tables[&a].clone()),
-            }),
-            PlannedChange::new(Change::RenameColumn {
+            })),
+            PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
                 uid: uid("c_bbbbbb"),
                 table: p.clone(),
                 from: "d".into(),
                 to: "e".into(),
                 table_was: None,
-            }),
+            })),
         ];
         let deps = [
             (p, Part::Default("d".into())),
@@ -613,12 +618,12 @@ mod tests {
             after: &ids,
         };
         let removal = |column: &str| {
-            PlannedChange::new(Change::AlterColumnDefault {
+            PlannedChange::new(Change::Column(ColumnChange::AlterColumnDefault {
                 uid: uid("c_bbbbbb"),
                 column: format!("app.p.{column}").parse().unwrap(),
                 from: Some("app.f()".into()),
                 to: None,
-            })
+            }))
         };
         steps.push(removal("e"));
         let holds = &found.values().next().unwrap()[0].holds;
@@ -722,12 +727,14 @@ mod tests {
         ids.tables.insert(uid("t_cccccc"), new.clone());
         base.columns.insert(uid("c_eeeeee"), old.column("n"));
         ids.columns.insert(uid("c_eeeeee"), new.column("n"));
-        steps.push(PlannedChange::new(Change::RenameTable {
-            uid: uid("t_cccccc"),
-            from: old.clone(),
-            to: new.clone(),
-            defaults: vec![],
-        }));
+        steps.push(PlannedChange::new(Change::Table(
+            TableChange::RenameTable {
+                uid: uid("t_cccccc"),
+                from: old.clone(),
+                to: new.clone(),
+                defaults: vec![],
+            },
+        )));
         found.values_mut().next().unwrap().push(Dependent {
             described: "unrelated default".into(),
             holds: Holds::TablePart {

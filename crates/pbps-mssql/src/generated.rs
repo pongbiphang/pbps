@@ -17,6 +17,10 @@
 use crate::Mssql;
 use crate::validate::may_be_same_name;
 use pbps_dialect::{Dialect, DialectError};
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::TableChange;
 use pbps_model::{Change, IdsFile, ModuleId, ValueSource};
 use std::collections::BTreeSet;
 use unicode_normalization::char::is_combining_mark;
@@ -115,13 +119,13 @@ fn parts_in(
     functions: &[ModuleId],
     demand: &mut pbps_dialect::creation::Demand,
 ) -> Result<Option<Vec<Change>>, DialectError> {
-    let Change::CreateTable {
+    let Change::Table(TableChange::CreateTable {
         uid,
         name,
         table,
         beside_default,
         moves_at_most,
-    } = change
+    }) = change
     else {
         return Ok(None);
     };
@@ -185,11 +189,11 @@ fn parts_in(
         .collect();
     let mut tail = Vec::new();
     for (column, expression) in table.computed.iter().skip(cut) {
-        tail.push(Change::AddComputedColumn {
+        tail.push(Change::Column(ColumnChange::AddComputedColumn {
             table: name.clone(),
             name: column.clone(),
             computed: expression.clone(),
-        });
+        }));
     }
     if bare.primary_key.as_ref().is_some_and(|key| {
         !demand
@@ -197,12 +201,12 @@ fn parts_in(
             .keeps_part(name, &pbps_model::operation::PartKey::PrimaryKey)
             && late_column(&key.columns)
     }) {
-        tail.push(Change::SetPrimaryKey {
+        tail.push(Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: name.clone(),
             from: None,
             to: bare.primary_key.take(),
             nonclustered: !table.primary_key_is_clustered(),
-        });
+        }));
     }
     for (key, constraint) in std::mem::take(&mut bare.unique) {
         if !demand
@@ -210,12 +214,12 @@ fn parts_in(
             .keeps_part(name, &pbps_model::operation::PartKey::Unique(key.clone()))
             && late_column(&constraint.columns)
         {
-            tail.push(Change::AddUnique {
+            tail.push(Change::Constraint(ConstraintChange::AddUnique {
                 table: name.clone(),
                 clustered: table.unique_is_clustered(key.raw()),
                 name: key,
                 constraint,
-            });
+            }));
         } else {
             bare.unique.insert(key, constraint);
         }
@@ -236,12 +240,12 @@ fn parts_in(
                 .inline
                 .keeps_part(name, &pbps_model::operation::PartKey::Index(key.clone()))
         {
-            tail.push(Change::AddIndex {
+            tail.push(Change::Index(IndexChange::AddIndex {
                 table: name.clone(),
                 clustered: table.index_is_clustered(key.raw()),
                 name: key,
                 index: Box::new(index),
-            });
+            }));
         } else {
             bare.indexes.insert(key, index);
         }
@@ -255,11 +259,11 @@ fn parts_in(
         ) {
             bare.foreign_keys.insert(key, constraint);
         } else {
-            tail.push(Change::AddForeignKey {
+            tail.push(Change::Constraint(ConstraintChange::AddForeignKey {
                 table: name.clone(),
                 name: key,
                 constraint: Box::new(constraint),
-            });
+            }));
         }
     }
     for (key, constraint) in std::mem::take(&mut bare.checks) {
@@ -268,11 +272,11 @@ fn parts_in(
             .keeps_part(name, &pbps_model::operation::PartKey::Check(key.clone()))
             && late_text(&constraint.expression)
         {
-            tail.push(Change::AddCheck {
+            tail.push(Change::Constraint(ConstraintChange::AddCheck {
                 table: name.clone(),
                 name: key,
                 constraint,
-            });
+            }));
         } else {
             bare.checks.insert(key, constraint);
         }
@@ -295,21 +299,21 @@ fn parts_in(
         {
             let to = std::mem::take(text);
             spec.value_source = ValueSource::None;
-            tail.push(Change::AlterColumnDefault {
+            tail.push(Change::Column(ColumnChange::AlterColumnDefault {
                 uid: column_uid(column)?,
                 column: name.column(column.clone()),
                 from: None,
                 to: Some(to),
-            });
+            }));
         }
     }
-    let mut parts = vec![Change::CreateTable {
+    let mut parts = vec![Change::Table(TableChange::CreateTable {
         uid: uid.clone(),
         name: name.clone(),
         table: Box::new(bare),
         beside_default: beside_default.clone(),
         moves_at_most: *moves_at_most,
-    }];
+    })];
     parts.extend(tail);
     demand.inline.check(&parts, "mssql")?;
     Ok(Some(parts))

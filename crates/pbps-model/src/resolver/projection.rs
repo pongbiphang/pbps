@@ -2,6 +2,19 @@
 
 use super::ownership::{at_endpoint, transition_at_endpoint};
 use super::{InputManifest, ManifestError, ObjectIdentity, ObjectOwnership, Surface};
+use crate::ColumnChange;
+use crate::ConstraintChange;
+use crate::GrantChange;
+use crate::IndexChange;
+use crate::ModuleChange;
+use crate::PartitionChange;
+use crate::PolicyChange;
+use crate::RoleChange;
+use crate::RowChange;
+use crate::TableChange;
+use crate::TablePropertyChange;
+use crate::TypeChange;
+use crate::TypeValueChange;
 use crate::{Change, ChangeSet, GrantTarget, ModuleId};
 use schemars::JsonSchema;
 use std::collections::{BTreeMap, BTreeSet};
@@ -566,9 +579,11 @@ impl OwnerScope {
 }
 
 fn column_parent(change: &Change) -> Option<Surface> {
-    if let Change::AddColumn { table, .. } | Change::RenameColumn { table, .. } = change {
+    if let Change::Column(ColumnChange::AddColumn { table, .. })
+    | Change::Column(ColumnChange::RenameColumn { table, .. }) = change
+    {
         Some(Surface::Table(table.clone()))
-    } else if let Change::DropColumn { column, .. } = change {
+    } else if let Change::Column(ColumnChange::DropColumn { column, .. }) = change {
         Some(Surface::Table(column.table.clone()))
     } else {
         None
@@ -640,12 +655,12 @@ fn vector_inventory_permitted(
 fn changed_owners(change: &Change) -> Option<(Vec<OwnerScope>, bool, bool)> {
     use OwnerScope::{Exact, WithChildren};
     let (owner, opening, closing) = match change {
-Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => return None,
-        Change::CreateTable { name, .. } => {
+Change::Partition(PartitionChange::RebuildPartitionedTable(_)) | Change::Index(IndexChange::BuildPartitionedIndex(_)) | Change::Partition(PartitionChange::CopyTableRows(_)) | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => return None,
+        Change::Table(TableChange::CreateTable { name, .. }) => {
             (WithChildren(Surface::Table(name.clone())), false, true)
         }
-        Change::DropTable { name, .. } => (WithChildren(Surface::Table(name.clone())), true, false),
-        Change::RenameTable { from, .. } => {
+        Change::Table(TableChange::DropTable { name, .. }) => (WithChildren(Surface::Table(name.clone())), true, false),
+        Change::Table(TableChange::RenameTable { from, .. }) => {
             (WithChildren(Surface::Table(from.clone())), true, true)
         }
         // The detached table and everything on it change: its columns turn
@@ -653,8 +668,8 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
         // membership (#1544).
         // And the attached one, mirrored: its columns turn inherited and
         // its matching indexes and keys become clones (#1545).
-        Change::DetachPartition { table, parent, .. }
-        | Change::AttachPartition { table, parent, .. } => {
+        Change::Partition(PartitionChange::DetachPartition { table, parent, .. })
+        | Change::Partition(PartitionChange::AttachPartition { table, parent, .. }) => {
             return Some((
                 vec![
                     WithChildren(Surface::Table(table.clone())),
@@ -664,67 +679,67 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                 true,
             ));
         }
-        Change::AddColumn { table, name, .. } => (
+        Change::Column(ColumnChange::AddColumn { table, name, .. }) => (
             WithChildren(Surface::Column(table.column(name))),
             false,
             true,
         ),
-        Change::DropColumn { column, .. } => {
+        Change::Column(ColumnChange::DropColumn { column, .. }) => {
             (WithChildren(Surface::Column(column.clone())), true, false)
         }
         // A computed column is the Default-compatible surface of its column,
         // as a generated column is (#1174, DEC-2143.2): its record is the
         // column's own.
-        Change::AddComputedColumn { table, name, .. } => (
+        Change::Column(ColumnChange::AddComputedColumn { table, name, .. }) => (
             Exact(Surface::Default(table.column(name))),
             false,
             true,
         ),
-        Change::DropComputedColumn { table, name, .. } => (
+        Change::Column(ColumnChange::DropComputedColumn { table, name, .. }) => (
             Exact(Surface::Default(table.column(name))),
             true,
             false,
         ),
-        Change::RenameColumn { table, from, .. } => (
+        Change::Column(ColumnChange::RenameColumn { table, from, .. }) => (
             WithChildren(Surface::Column(table.column(from))),
             true,
             true,
         ),
-        Change::EnumRebuild {
+        Change::TypeValue(TypeValueChange::EnumRebuild {
             step: crate::EnumRebuildStep::Retype { column, .. },
             ..
-        }
-        | Change::AlterColumnType { column, .. } => {
+        })
+        | Change::Column(ColumnChange::AlterColumnType { column, .. }) => {
             (WithChildren(Surface::Column(column.clone())), true, true)
         }
-        Change::AlterColumnNullability { column, .. } => {
+        Change::Column(ColumnChange::AlterColumnNullability { column, .. }) => {
             (Exact(Surface::Column(column.clone())), true, true)
         }
         // The column's identity, its default, and the sequence either one
         // numbers it from, which the column owns (#1889).
-        Change::AlterColumnNumbering { column, .. } => {
+        Change::Column(ColumnChange::AlterColumnNumbering { column, .. }) => {
             (WithChildren(Surface::Column(column.clone())), true, true)
         }
-        Change::AlterColumnDefault {
+        Change::Column(ColumnChange::AlterColumnDefault {
             column, from, to, ..
-        } => (
+        }) => (
             Exact(Surface::Default(column.clone())),
             from.is_some(),
             to.is_some(),
         ),
         // A generation expression is the column's `pg_attrdef` row, as a
         // default is, replaced in place (DEC-1168.1).
-        Change::AlterColumnExpression { column, .. } => {
+        Change::Column(ColumnChange::AlterColumnExpression { column, .. }) => {
             (Exact(Surface::Default(column.clone())), true, true)
         }
         // A standalone index's parameters are its own catalog row, as its
         // creation is; a key's or a unique constraint's index is the table's
         // constraint surface, as their changes are (#1442, #1483 review).
-        Change::SetIndexStorageParameters {
+        Change::Index(IndexChange::SetIndexStorageParameters {
             table,
             target: crate::change::IndexPart::Index(name),
             ..
-        } => (
+        }) => (
             Exact(Surface::Index {
                 table: table.clone(),
                 name: name.clone(),
@@ -732,33 +747,33 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             true,
             true,
         ),
-        Change::SetPrimaryKey { table, .. }
-        | Change::SetIndexStorageParameters { table, .. }
-        | Change::SetTablePersistence { table, .. }
-        | Change::SetStorageParameters { table, .. }
+        Change::Constraint(ConstraintChange::SetPrimaryKey { table, .. })
+        | Change::Index(IndexChange::SetIndexStorageParameters { table, .. })
+        | Change::TableProperty(TablePropertyChange::SetTablePersistence { table, .. })
+        | Change::TableProperty(TablePropertyChange::SetStorageParameters { table, .. })
         // A partition has no column of its own to name: its own default and
         // NOT NULL are the partition's (#1581).
-        | Change::SetPartitionDefault { table, .. }
-        | Change::SetPartitionNotNull { table, .. }
-        | Change::DropPolicy { table, .. }
-        | Change::CreatePolicy { table, .. }
-            | Change::SetRowSecurity { table, .. }
-            | Change::SetReplicaIdentity { table, .. }
-        | Change::AddUnique { table, .. }
-        | Change::DropUnique { table, .. }
-        | Change::SetExclusion {
+        | Change::Partition(PartitionChange::SetPartitionDefault { table, .. })
+        | Change::Partition(PartitionChange::SetPartitionNotNull { table, .. })
+        | Change::Policy(PolicyChange::DropPolicy { table, .. })
+        | Change::Policy(PolicyChange::CreatePolicy { table, .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { table, .. })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { table, .. })
+        | Change::Constraint(ConstraintChange::AddUnique { table, .. })
+        | Change::Constraint(ConstraintChange::DropUnique { table, .. })
+        | Change::Constraint(ConstraintChange::SetExclusion {
             table,
             from: Some(_),
             ..
-        }
-        | Change::SetExclusion {
+        })
+        | Change::Constraint(ConstraintChange::SetExclusion {
             table, to: None, ..
-        }
-        | Change::AddForeignKey { table, .. }
-        | Change::DropForeignKey { table, .. } => {
+        })
+        | Change::Constraint(ConstraintChange::AddForeignKey { table, .. })
+        | Change::Constraint(ConstraintChange::DropForeignKey { table, .. }) => {
             (Exact(Surface::Table(table.clone())), true, true)
         }
-        Change::AddCheck { table, name, .. } => (
+        Change::Constraint(ConstraintChange::AddCheck { table, name, .. }) => (
             Exact(Surface::Check {
                 table: table.clone(),
                 name: name.clone(),
@@ -766,7 +781,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             false,
             true,
         ),
-        Change::DropCheck { table, name } => (
+        Change::Constraint(ConstraintChange::DropCheck { table, name }) => (
             Exact(Surface::Check {
                 table: table.clone(),
                 name: name.clone(),
@@ -774,7 +789,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             true,
             false,
         ),
-        Change::AddIndex { table, name, .. } => (
+        Change::Index(IndexChange::AddIndex { table, name, .. }) => (
             Exact(Surface::Index {
                 table: table.clone(),
                 name: name.clone(),
@@ -786,12 +801,12 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
         // constraint's name, and ends nothing a binding holds, as an index does: it is not a
         // change of the table's surface, so a project with kept bindings does not need its
         // resolver to add one (#2448 C1b). A replacement or a drop is the table's (C2).
-        Change::SetExclusion {
+        Change::Constraint(ConstraintChange::SetExclusion {
             table,
             name,
             from: None,
             to: Some(_),
-        } => (
+        }) => (
             Exact(Surface::Index {
                 table: table.clone(),
                 name: name.clone(),
@@ -799,7 +814,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             false,
             true,
         ),
-        Change::DropIndex { table, name } => (
+        Change::Index(IndexChange::DropIndex { table, name }) => (
             Exact(Surface::Index {
                 table: table.clone(),
                 name: name.clone(),
@@ -807,28 +822,28 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             true,
             false,
         ),
-        Change::CreateModule { id, .. } => (Exact(Surface::Module(id.clone())), false, true),
-        Change::AlterModule { id, .. } => (Exact(Surface::Module(id.clone())), true, true),
-        Change::DropModule { id, .. } => (Exact(Surface::Module(id.clone())), true, false),
+        Change::Module(ModuleChange::CreateModule { id, .. }) => (Exact(Surface::Module(id.clone())), false, true),
+        Change::Module(ModuleChange::AlterModule { id, .. }) => (Exact(Surface::Module(id.clone())), true, true),
+        Change::Module(ModuleChange::DropModule { id, .. }) => (Exact(Surface::Module(id.clone())), true, false),
         // A declared type is one surface: its `pg_type` row and its array
         // type. A label operation and a rebuild's create and swap change it
         // in place; a rename moves it (#2407).
-        Change::CreateType { name, .. } => (Exact(Surface::Type(name.clone())), false, true),
-        Change::DropType { name, .. } => (Exact(Surface::Type(name.clone())), true, false),
-        Change::RenameType { from, .. } => (Exact(Surface::Type(from.clone())), true, true),
-        Change::AddEnumValue { name, .. }
-        | Change::AlterDomain { name, .. }
-        | Change::RenameEnumValue { name, .. } => {
+        Change::Type(TypeChange::CreateType { name, .. }) => (Exact(Surface::Type(name.clone())), false, true),
+        Change::Type(TypeChange::DropType { name, .. }) => (Exact(Surface::Type(name.clone())), true, false),
+        Change::Type(TypeChange::RenameType { from, .. }) => (Exact(Surface::Type(from.clone())), true, true),
+        Change::TypeValue(TypeValueChange::AddEnumValue { name, .. })
+        | Change::TypeValue(TypeValueChange::AlterDomain { name, .. })
+        | Change::TypeValue(TypeValueChange::RenameEnumValue { name, .. }) => {
             (Exact(Surface::Type(name.clone())), true, true)
         }
-        Change::EnumRebuild {
+        Change::TypeValue(TypeValueChange::EnumRebuild {
             name,
             step: crate::EnumRebuildStep::Create { .. } | crate::EnumRebuildStep::Swap { .. },
             ..
-        } => (Exact(Surface::Type(name.clone())), true, true),
+        }) => (Exact(Surface::Type(name.clone())), true, true),
         crate::change_family!(rows)
-        | Change::SetColumnDeprecated { .. }
-        | Change::SetComment { .. }
+        | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+        | Change::TableProperty(TablePropertyChange::SetComment { .. })
         | crate::change_family!(roles)
         | crate::change_family!(extensions)
         | crate::change_family!(search)
@@ -845,39 +860,59 @@ fn planned_absence(owner: &Surface, changes: &ChangeSet, before: bool) -> bool {
     let ownership = super::ObjectOwnership::Surface(owner.clone());
     changes.changes.iter().enumerate().any(|(index, step)| {
         let boundary = match &step.change {
-            Change::CreateTable { name, .. } if before => Surface::Table(name.clone()),
-            Change::DropTable { name, .. } if !before => Surface::Table(name.clone()),
-            Change::AddColumn { table, name, .. } if before => Surface::Column(table.column(name)),
-            Change::DropColumn { column, .. } if !before => Surface::Column(column.clone()),
-            Change::CreateModule { id, .. } if before => Surface::Module(id.clone()),
-            Change::DropModule { id, .. } if !before => Surface::Module(id.clone()),
-            Change::CreateType { name, .. } if before => Surface::Type(name.clone()),
-            Change::DropType { name, .. } if !before => Surface::Type(name.clone()),
-            Change::AddCheck { table, name, .. } if before => Surface::Check {
-                table: table.clone(),
-                name: name.clone(),
-            },
-            Change::DropCheck { table, name } if !before => Surface::Check {
-                table: table.clone(),
-                name: name.clone(),
-            },
-            Change::AddIndex { table, name, .. }
-            | Change::SetExclusion {
+            Change::Table(TableChange::CreateTable { name, .. }) if before => {
+                Surface::Table(name.clone())
+            }
+            Change::Table(TableChange::DropTable { name, .. }) if !before => {
+                Surface::Table(name.clone())
+            }
+            Change::Column(ColumnChange::AddColumn { table, name, .. }) if before => {
+                Surface::Column(table.column(name))
+            }
+            Change::Column(ColumnChange::DropColumn { column, .. }) if !before => {
+                Surface::Column(column.clone())
+            }
+            Change::Module(ModuleChange::CreateModule { id, .. }) if before => {
+                Surface::Module(id.clone())
+            }
+            Change::Module(ModuleChange::DropModule { id, .. }) if !before => {
+                Surface::Module(id.clone())
+            }
+            Change::Type(TypeChange::CreateType { name, .. }) if before => {
+                Surface::Type(name.clone())
+            }
+            Change::Type(TypeChange::DropType { name, .. }) if !before => {
+                Surface::Type(name.clone())
+            }
+            Change::Constraint(ConstraintChange::AddCheck { table, name, .. }) if before => {
+                Surface::Check {
+                    table: table.clone(),
+                    name: name.clone(),
+                }
+            }
+            Change::Constraint(ConstraintChange::DropCheck { table, name }) if !before => {
+                Surface::Check {
+                    table: table.clone(),
+                    name: name.clone(),
+                }
+            }
+            Change::Index(IndexChange::AddIndex { table, name, .. })
+            | Change::Constraint(ConstraintChange::SetExclusion {
                 table,
                 name,
                 from: None,
                 to: Some(_),
-            } if before => Surface::Index {
+            }) if before => Surface::Index {
                 table: table.clone(),
                 name: name.clone(),
             },
-            Change::DropIndex { table, name } if !before => Surface::Index {
+            Change::Index(IndexChange::DropIndex { table, name }) if !before => Surface::Index {
                 table: table.clone(),
                 name: name.clone(),
             },
-            Change::AlterColumnDefault {
+            Change::Column(ColumnChange::AlterColumnDefault {
                 column, from, to, ..
-            } if (before && from.is_none() && to.is_some())
+            }) if (before && from.is_none() && to.is_some())
                 || (!before && from.is_some() && to.is_none()) =>
             {
                 Surface::Default(column.clone())
@@ -895,16 +930,18 @@ fn planned_absence(owner: &Surface, changes: &ChangeSet, before: bool) -> bool {
 fn covers_change(c: &Change, surface: &Surface) -> bool {
     touches(c, surface)
         && match surface {
-            Surface::Column(_) => {
-                !matches!(c, Change::CreateTable { .. } | Change::DropTable { .. })
-            }
+            Surface::Column(_) => !matches!(
+                c,
+                Change::Table(TableChange::CreateTable { .. })
+                    | Change::Table(TableChange::DropTable { .. })
+            ),
             Surface::Default(_) => matches!(
                 c,
-                Change::AlterColumnDefault { .. }
-                    | Change::AlterColumnExpression { .. }
-                    | Change::AlterColumnNumbering { .. }
-                    | Change::AddComputedColumn { .. }
-                    | Change::DropComputedColumn { .. }
+                Change::Column(ColumnChange::AlterColumnDefault { .. })
+                    | Change::Column(ColumnChange::AlterColumnExpression { .. })
+                    | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+                    | Change::Column(ColumnChange::AddComputedColumn { .. })
+                    | Change::Column(ColumnChange::DropComputedColumn { .. })
             ),
             Surface::Namespace(_)
             | Surface::Table(_)
@@ -937,46 +974,46 @@ pub(super) fn touches(c: &Change, surface: &Surface) -> bool {
             c.columns_redefined().iter().any(|(r, _)| r == column)
                 // A computed column's lifecycle, which is a part's change and
                 // so outside `columns_redefined` (#1174).
-                || matches!(c, Change::AddComputedColumn { table, name, .. }
-                    | Change::DropComputedColumn { table, name, .. }
+                || matches!(c, Change::Column(ColumnChange::AddComputedColumn { table, name, .. })
+                    | Change::Column(ColumnChange::DropComputedColumn { table, name, .. })
                     if &table.column(name) == column)
-                || matches!(c, Change::CreateTable { name, .. } | Change::DropTable { name, .. } if name == &column.table)
+                || matches!(c, Change::Table(TableChange::CreateTable { name, .. }) | Change::Table(TableChange::DropTable { name, .. }) if name == &column.table)
         }
         Surface::Default(column) => {
-            matches!(c, Change::AlterColumnDefault { column: r, .. } | Change::AlterColumnExpression { column: r, .. } | Change::AlterColumnNumbering { column: r, .. } if r == column)
-                || matches!(c, Change::CreateTable { name, .. } | Change::DropTable { name, .. } if name == &column.table)
-                || matches!(c, Change::AddColumn { table, name, .. } if &table.column(name) == column)
+            matches!(c, Change::Column(ColumnChange::AlterColumnDefault { column: r, .. }) | Change::Column(ColumnChange::AlterColumnExpression { column: r, .. }) | Change::Column(ColumnChange::AlterColumnNumbering { column: r, .. }) if r == column)
+                || matches!(c, Change::Table(TableChange::CreateTable { name, .. }) | Change::Table(TableChange::DropTable { name, .. }) if name == &column.table)
+                || matches!(c, Change::Column(ColumnChange::AddColumn { table, name, .. }) if &table.column(name) == column)
                 // A SQL Server computed column is the Default-compatible
                 // surface of its column (DEC-2143.2).
-                || matches!(c, Change::AddComputedColumn { table, name, .. }
-                    | Change::DropComputedColumn { table, name, .. }
+                || matches!(c, Change::Column(ColumnChange::AddComputedColumn { table, name, .. })
+                    | Change::Column(ColumnChange::DropComputedColumn { table, name, .. })
                     if &table.column(name) == column)
         }
         Surface::Check { table, name } => {
-            matches!(c, Change::AddCheck { table: t, name: n, .. } | Change::DropCheck { table: t, name: n } if t == table && n == name)
+            matches!(c, Change::Constraint(ConstraintChange::AddCheck { table: t, name: n, .. }) | Change::Constraint(ConstraintChange::DropCheck { table: t, name: n }) if t == table && n == name)
         }
         Surface::Index { table, name } => {
-            matches!(c, Change::AddIndex { table: t, name: n, .. } | Change::DropIndex { table: t, name: n } if t == table && n == name)
-                || matches!(c, Change::SetExclusion { table: t, name: n, from: None, to: Some(_) } if t == table && n == name)
-                || matches!(c, Change::SetIndexStorageParameters { table: t, target: crate::change::IndexPart::Index(n), .. } if t == table && n == name)
+            matches!(c, Change::Index(IndexChange::AddIndex { table: t, name: n, .. }) | Change::Index(IndexChange::DropIndex { table: t, name: n }) if t == table && n == name)
+                || matches!(c, Change::Constraint(ConstraintChange::SetExclusion { table: t, name: n, from: None, to: Some(_) }) if t == table && n == name)
+                || matches!(c, Change::Index(IndexChange::SetIndexStorageParameters { table: t, target: crate::change::IndexPart::Index(n), .. }) if t == table && n == name)
         }
         Surface::Type(name) => match c {
-            Change::CreateType { name: n, .. }
-            | Change::DropType { name: n, .. }
-            | Change::AddEnumValue { name: n, .. }
-            | Change::AlterDomain { name: n, .. }
-            | Change::RenameEnumValue { name: n, .. } => n == name,
-            Change::EnumRebuild {
+            Change::Type(TypeChange::CreateType { name: n, .. })
+            | Change::Type(TypeChange::DropType { name: n, .. })
+            | Change::TypeValue(TypeValueChange::AddEnumValue { name: n, .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { name: n, .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { name: n, .. }) => n == name,
+            Change::TypeValue(TypeValueChange::EnumRebuild {
                 name: n,
                 step: crate::EnumRebuildStep::Create { .. } | crate::EnumRebuildStep::Swap { .. },
                 ..
-            } => n == name,
-            Change::RenameType { from, to, .. } => from == name || to == name,
+            }) => n == name,
+            Change::Type(TypeChange::RenameType { from, to, .. }) => from == name || to == name,
             _ => false,
         },
         Surface::Module(id) => {
             c.module_id() == Some(id)
-                || matches!((c, id), (Change::PublicExecution { routine, .. }, ModuleId::Routine(r)) if routine == r)
+                || matches!((c, id), (Change::Permission(GrantChange::PublicExecution { routine, .. }), ModuleId::Routine(r)) if routine == r)
                 || grant_target(c).is_some_and(|g| match (g, id) {
                     (GrantTarget::Routine(a), ModuleId::Routine(b)) => a == b,
                     (GrantTarget::Object(a), ModuleId::Named(b)) => a == b,
@@ -987,7 +1024,9 @@ pub(super) fn touches(c: &Change, surface: &Surface) -> bool {
 }
 
 fn grant_target(c: &Change) -> Option<&GrantTarget> {
-    if let Change::Grant { target, .. } | Change::Revoke { target, .. } = c {
+    if let Change::Permission(GrantChange::Grant { target, .. })
+    | Change::Permission(GrantChange::Revoke { target, .. }) = c
+    {
         Some(target)
     } else {
         None
@@ -1003,35 +1042,39 @@ fn grant_target(c: &Change) -> Option<&GrantTarget> {
 fn changes_catalog(c: &Change) -> bool {
     !matches!(
         c,
-        Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetComment { .. }
-            | Change::CreateRole { .. }
-            | Change::RenameRole { .. }
-            | Change::DropRole { .. }
+        Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. })
+            | Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::UpdateRow { .. })
+            | Change::Row(RowChange::DeleteRow { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+            | Change::TableProperty(TablePropertyChange::SetComment { .. })
+            | Change::Role(RoleChange::CreateRole { .. })
+            | Change::Role(RoleChange::RenameRole { .. })
+            | Change::Role(RoleChange::DropRole { .. })
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ConstraintChange;
+    use crate::IndexChange;
+    use crate::TypeChange;
+    use crate::TypeValueChange;
     use crate::{IndexMethod, IndexPart, TableName};
 
     fn set(target: IndexPart) -> Change {
-        Change::SetIndexStorageParameters {
+        Change::Index(IndexChange::SetIndexStorageParameters {
             table: TableName::new("app", "t"),
             target,
             method: IndexMethod::Btree,
             set: [("fillfactor".to_owned(), "80".to_owned())].into(),
             reset: BTreeSet::new(),
-        }
+        })
     }
 
     /// A standalone index's parameters are its own surface's, as its
@@ -1075,11 +1118,13 @@ mod tests {
                 timing: crate::ExclusionTiming::Immediate,
             })
         };
-        let change = |from, to| Change::SetExclusion {
-            table: TableName::new("app", "t"),
-            name: "no_overlap".into(),
-            from,
-            to,
+        let change = |from, to| {
+            Change::Constraint(ConstraintChange::SetExclusion {
+                table: TableName::new("app", "t"),
+                name: "no_overlap".into(),
+                from,
+                to,
+            })
         };
         let index = Surface::Index {
             table: TableName::new("app", "t"),
@@ -1128,12 +1173,12 @@ mod tests {
     }
 
     fn rebuild(step: crate::EnumRebuildStep) -> Change {
-        Change::EnumRebuild {
+        Change::TypeValue(TypeValueChange::EnumRebuild {
             uid: uid(),
             name: mood(),
             tmp: "app.tmp".parse().unwrap(),
             step,
-        }
+        })
     }
 
     /// Every change of a declared type touches that type's surface and no
@@ -1142,32 +1187,32 @@ mod tests {
     #[test]
     fn a_types_changes_touch_its_surface_and_no_other() {
         let surface = Surface::Type(mood());
-        let rename = Change::RenameType {
+        let rename = Change::Type(TypeChange::RenameType {
             uid: uid(),
             from: "app.old".parse().unwrap(),
             to: mood(),
             definition: definition(),
-        };
+        });
         let own = [
-            Change::CreateType {
+            Change::Type(TypeChange::CreateType {
                 uid: uid(),
                 name: mood(),
                 definition: definition(),
-            },
-            Change::DropType {
+            }),
+            Change::Type(TypeChange::DropType {
                 uid: uid(),
                 name: mood(),
                 definition: definition(),
-            },
-            Change::AddEnumValue {
+            }),
+            Change::TypeValue(TypeValueChange::AddEnumValue {
                 uid: uid(),
                 name: mood(),
                 value: "b".into(),
                 placement: None,
                 ordinal: 0,
                 definition: definition(),
-            },
-            Change::RenameEnumValue {
+            }),
+            Change::TypeValue(TypeValueChange::RenameEnumValue {
                 uid: uid(),
                 name: mood(),
                 from: "a".into(),
@@ -1175,7 +1220,7 @@ mod tests {
                 ordinal: 0,
                 retained: Vec::new(),
                 definition: definition(),
-            },
+            }),
             rebuild(crate::EnumRebuildStep::Create {
                 definition: definition(),
                 removed: Vec::new(),
@@ -1222,24 +1267,24 @@ mod tests {
     #[test]
     fn a_types_changes_are_owned_by_its_exact_surface() {
         let owner = |c: &Change| changed_owners(c).expect("an owned change");
-        let create = Change::CreateType {
+        let create = Change::Type(TypeChange::CreateType {
             uid: uid(),
             name: mood(),
             definition: definition(),
-        };
-        let drop = Change::DropType {
+        });
+        let drop = Change::Type(TypeChange::DropType {
             uid: uid(),
             name: mood(),
             definition: definition(),
-        };
-        let label = Change::AddEnumValue {
+        });
+        let label = Change::TypeValue(TypeValueChange::AddEnumValue {
             uid: uid(),
             name: mood(),
             value: "b".into(),
             placement: None,
             ordinal: 0,
             definition: definition(),
-        };
+        });
         for (change, opening, closing) in [
             (&create, false, true),
             (&drop, true, false),
@@ -1282,18 +1327,22 @@ mod tests {
     #[test]
     fn a_type_is_absent_only_where_the_plan_creates_or_drops_it() {
         let create = ChangeSet {
-            changes: vec![crate::PlannedChange::new(Change::CreateType {
-                uid: uid(),
-                name: mood(),
-                definition: definition(),
-            })],
+            changes: vec![crate::PlannedChange::new(Change::Type(
+                TypeChange::CreateType {
+                    uid: uid(),
+                    name: mood(),
+                    definition: definition(),
+                },
+            ))],
         };
         let drop = ChangeSet {
-            changes: vec![crate::PlannedChange::new(Change::DropType {
-                uid: uid(),
-                name: mood(),
-                definition: definition(),
-            })],
+            changes: vec![crate::PlannedChange::new(Change::Type(
+                TypeChange::DropType {
+                    uid: uid(),
+                    name: mood(),
+                    definition: definition(),
+                },
+            ))],
         };
         let surface = Surface::Type(mood());
         assert!(planned_absence(&surface, &create, true));

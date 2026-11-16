@@ -35,6 +35,10 @@
 use std::collections::BTreeMap;
 
 use pbps_db::Conn;
+use pbps_model::ColumnChange;
+use pbps_model::PartitionChange;
+use pbps_model::TablePropertyChange;
+use pbps_model::TypeValueChange;
 use pbps_model::{Change, TableName};
 
 use crate::admission::Admission;
@@ -171,7 +175,7 @@ pub(crate) async fn judge(
 pub fn rewrite_write(change: &Change) -> Option<pbps_dialect::RowWrite> {
     use pbps_dialect::{RowOperation, RowWrite};
     match change {
-        Change::CopyTableRows(copy) => Some(RowWrite {
+        Change::Partition(PartitionChange::CopyTableRows(copy)) => Some(RowWrite {
             table: copy.target.name.clone(),
             operation: RowOperation::Copy {
                 // The columns its `INSERT ... SELECT` lists.
@@ -182,7 +186,7 @@ pub fn rewrite_write(change: &Change) -> Option<pbps_dialect::RowWrite> {
                     .collect(),
             },
         }),
-        Change::AnalyzeTableTree(tree) => Some(RowWrite {
+        Change::Partition(PartitionChange::AnalyzeTableTree(tree)) => Some(RowWrite {
             table: tree.parent.name.clone(),
             operation: RowOperation::Rewrite {
                 scope: RewriteScope::Indexes,
@@ -193,11 +197,11 @@ pub fn rewrite_write(change: &Change) -> Option<pbps_dialect::RowWrite> {
         // an `ALTER COLUMN TYPE` with `USING`, a rewrite that rebuilds the
         // indexes and revalidates the CHECKs that mention the column (measured
         // on 16 and 18, DEC-2563.9). The column becomes the rebuilt type.
-        Change::EnumRebuild {
+        Change::TypeValue(TypeValueChange::EnumRebuild {
             tmp,
             step: pbps_model::EnumRebuildStep::Retype { column, .. },
             ..
-        } => Some(RowWrite {
+        }) => Some(RowWrite {
             table: column.table.clone(),
             operation: RowOperation::Rewrite {
                 scope: RewriteScope::Column {
@@ -228,26 +232,32 @@ pub fn rewrite_write(change: &Change) -> Option<pbps_dialect::RowWrite> {
 fn scope_of(change: &Change) -> RewriteScope {
     match change {
         // The CHECKs that mention the column, and the domain it has after.
-        Change::AlterColumnType { column, to, .. } => RewriteScope::Column {
+        Change::Column(ColumnChange::AlterColumnType { column, to, .. }) => RewriteScope::Column {
             column: column.name.clone(),
             domain: to
                 .type_ref()
                 .map_or(ColumnDomain::Leaves, |ty| ColumnDomain::Becomes(ty.clone())),
         },
-        Change::AlterColumnExpression { column, .. } => RewriteScope::Column {
-            column: column.name.clone(),
-            domain: ColumnDomain::Unchanged,
-        },
+        Change::Column(ColumnChange::AlterColumnExpression { column, .. }) => {
+            RewriteScope::Column {
+                column: column.name.clone(),
+                domain: ColumnDomain::Unchanged,
+            }
+        }
         // A column of a domain: the domain's CHECK may read every row, which
         // is what `estimate` says of it.
-        Change::AddColumn { name, column, .. } => match column.ty.type_ref() {
-            Some(ty) => RewriteScope::Column {
-                column: name.clone(),
-                domain: ColumnDomain::Becomes(ty.clone()),
-            },
-            None => RewriteScope::Indexes,
-        },
-        Change::SetTablePersistence { .. } => RewriteScope::Indexes,
+        Change::Column(ColumnChange::AddColumn { name, column, .. }) => {
+            match column.ty.type_ref() {
+                Some(ty) => RewriteScope::Column {
+                    column: name.clone(),
+                    domain: ColumnDomain::Becomes(ty.clone()),
+                },
+                None => RewriteScope::Indexes,
+            }
+        }
+        Change::TableProperty(TablePropertyChange::SetTablePersistence { .. }) => {
+            RewriteScope::Indexes
+        }
         _ => RewriteScope::Unmeasured,
     }
 }
@@ -261,6 +271,10 @@ pub fn rewritten_table(change: &Change) -> Option<TableName> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::GrantChange;
+    use pbps_model::TablePropertyChange;
+    use pbps_model::TypeValueChange;
 
     fn site(kind: Kind, oid: i64, name: &str) -> Site {
         Site {
@@ -291,7 +305,7 @@ mod tests {
     }
 
     fn alter(from: &str, to: &str) -> Change {
-        Change::AlterColumnType {
+        Change::Column(ColumnChange::AlterColumnType {
             uid: "c_aaaaaa".parse().unwrap(),
             column: "app.t.v".parse().unwrap(),
             from: from.parse().unwrap(),
@@ -302,18 +316,18 @@ mod tests {
             from_collation: None,
             to_collation: None,
             using: None,
-        }
+        })
     }
 
     fn add(source: pbps_model::ValueSource) -> Change {
         let mut column = pbps_model::Column::new("integer".parse().unwrap());
         column.value_source = source;
-        Change::AddColumn {
+        Change::Column(ColumnChange::AddColumn {
             uid: "c_bbbbbb".parse().unwrap(),
             table: "app.t".parse().unwrap(),
             name: "v".into(),
             column: Box::new(column),
-        }
+        })
     }
 
     #[test]
@@ -403,70 +417,70 @@ mod tests {
                     let mut domain =
                         pbps_model::Column::new(ColumnType::reference("app.dm".parse().unwrap()));
                     domain.value_source = ValueSource::None;
-                    Change::AddColumn {
+                    Change::Column(ColumnChange::AddColumn {
                         uid: uid.clone(),
                         table: table.clone(),
                         name: "d".into(),
                         column: Box::new(domain),
-                    }
+                    })
                 },
                 true,
             ),
             (
                 "a persistence switch",
-                Change::SetTablePersistence {
+                Change::TableProperty(TablePropertyChange::SetTablePersistence {
                     uid: uid.clone(),
                     table: table.clone(),
                     unlogged: true,
-                },
+                }),
                 true,
             ),
             (
                 "a stored generated expression changed in place (PostgreSQL 17 and later)",
-                Change::AlterColumnExpression {
+                Change::Column(ColumnChange::AlterColumnExpression {
                     uid: uid.clone(),
                     column: column.clone(),
                     from: "a".into(),
                     to: "b".into(),
-                },
+                }),
                 true,
             ),
             (
                 "a default changed",
-                Change::AlterColumnDefault {
+                Change::Column(ColumnChange::AlterColumnDefault {
                     uid: uid.clone(),
                     column: column.clone(),
                     from: Some("1".into()),
                     to: None,
-                },
+                }),
                 false,
             ),
             (
                 "a column dropped",
-                Change::DropColumn {
+                Change::Column(ColumnChange::DropColumn {
                     uid: uid.clone(),
                     column: column.clone(),
-                },
+                }),
                 false,
             ),
             (
                 "a column renamed",
-                Change::RenameColumn {
+                Change::Column(ColumnChange::RenameColumn {
                     uid: uid.clone(),
                     table: table.clone(),
                     from: "v".into(),
                     to: "w".into(),
                     table_was: None,
-                },
+                }),
                 false,
             ),
             (
                 "a replica identity",
-                Change::SetReplicaIdentity {
+                Change::TableProperty(TablePropertyChange::SetReplicaIdentity {
                     uid: uid.clone(),
                     table: table.clone(),
                     to: None,
-                },
+                }),
                 false,
             ),
         ];
@@ -503,11 +517,11 @@ mod tests {
         }
         // A change `estimate` has no answer for touches no stored row it
         // estimates: a grant, a module, a row of the plan's own.
-        let grant = Change::Grant {
+        let grant = Change::Permission(GrantChange::Grant {
             role: "app_reader".into(),
             target: "app.t".parse().unwrap(),
             permissions: Default::default(),
-        };
+        });
         assert!(crate::estimate::estimate(&grant, pbps_model::Strategy::default()).is_none());
         assert_eq!(rewrite_write(&grant), None);
     }
@@ -541,25 +555,25 @@ mod tests {
         );
         // `SET EXPRESSION` recomputes the column in place, so the domain it has
         // now validates the new values.
-        let in_place = Change::AlterColumnExpression {
+        let in_place = Change::Column(ColumnChange::AlterColumnExpression {
             uid: uid.clone(),
             column: "app.t.v".parse().unwrap(),
             from: "a".into(),
             to: "b".into(),
-        };
+        });
         assert_eq!(scope(&in_place), column(ColumnDomain::Unchanged));
         // A kind nobody measured is judged in full.
-        let dropped = Change::DropColumn {
+        let dropped = Change::Column(ColumnChange::DropColumn {
             uid: "c_aaaaab".parse().unwrap(),
             column: "app.t.v".parse().unwrap(),
-        };
+        });
         assert_eq!(scope_of(&dropped), RewriteScope::Unmeasured);
         // A persistence switch and an ordinary `ADD COLUMN` rebuild the indexes alone.
-        let persistence = Change::SetTablePersistence {
+        let persistence = Change::TableProperty(TablePropertyChange::SetTablePersistence {
             uid,
             table: "app.t".parse().unwrap(),
             unlogged: true,
-        };
+        });
         assert_eq!(scope(&persistence), RewriteScope::Indexes);
         assert_eq!(
             scope(&add(ValueSource::Generated(pbps_model::Generated {
@@ -572,12 +586,12 @@ mod tests {
         let mut of_a_domain =
             pbps_model::Column::new(ColumnType::reference("app.dm".parse().unwrap()));
         of_a_domain.value_source = ValueSource::None;
-        let added = Change::AddColumn {
+        let added = Change::Column(ColumnChange::AddColumn {
             uid: "c_ffffff".parse().unwrap(),
             table: "app.t".parse().unwrap(),
             name: "d".into(),
             column: Box::new(of_a_domain),
-        };
+        });
         assert_eq!(
             scope(&added),
             RewriteScope::Column {
@@ -589,7 +603,7 @@ mod tests {
 
     #[test]
     fn the_retype_of_a_type_rebuild_is_a_rewrite_though_estimate_has_no_answer_for_it() {
-        let retype = Change::EnumRebuild {
+        let retype = Change::TypeValue(TypeValueChange::EnumRebuild {
             uid: "y_000001".parse().unwrap(),
             name: "app.mood".parse().unwrap(),
             tmp: "app.pbps_rebuild_y_000001".parse().unwrap(),
@@ -600,7 +614,7 @@ mod tests {
                 array: false,
                 values: Box::new(pbps_model::ValueChange::Relabel { removed: vec![] }),
             },
-        };
+        });
         assert!(crate::estimate::estimate(&retype, pbps_model::Strategy::default()).is_none());
         let write = rewrite_write(&retype).expect("the retype rewrites the table");
         assert_eq!(write.table, "app.t".parse().unwrap());
@@ -620,7 +634,7 @@ mod tests {
         assert_eq!(first.rewrites, Some(write));
         assert!(first.transactional);
         // The type steps touch no row.
-        let create = Change::EnumRebuild {
+        let create = Change::TypeValue(TypeValueChange::EnumRebuild {
             uid: "y_000001".parse().unwrap(),
             name: "app.mood".parse().unwrap(),
             tmp: "app.pbps_rebuild_y_000001".parse().unwrap(),
@@ -632,7 +646,7 @@ mod tests {
                 depth: 0,
                 over: None,
             },
-        };
+        });
         assert_eq!(rewrite_write(&create), None);
     }
 
@@ -656,10 +670,10 @@ mod tests {
 
     #[test]
     fn a_row_change_or_a_drop_is_not_a_rewrite_write() {
-        let drop = Change::DropColumn {
+        let drop = Change::Column(ColumnChange::DropColumn {
             uid: "c_cccccc".parse().unwrap(),
             column: "app.t.v".parse().unwrap(),
-        };
+        });
         assert_eq!(rewrite_write(&drop), None);
         assert_eq!(rewritten_table(&drop), None);
         assert_eq!(

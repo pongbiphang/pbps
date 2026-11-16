@@ -519,7 +519,12 @@ async fn required_inline_groups_preserve_create_options_and_late_columns() {
         .changes()
         .changes
         .iter()
-        .position(|p| matches!(p.change, pbps_model::Change::CreateModule { .. }))
+        .position(|p| {
+            matches!(
+                p.change,
+                pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule { .. })
+            )
+        })
         .unwrap();
     let ordered = plan.ordered(PlanMode::Transactional, &engine);
     let lowered = lower_all(&ordered as &dyn pbps_diff::order::PlanView<Engine>, &engine).unwrap();

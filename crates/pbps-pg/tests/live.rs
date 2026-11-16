@@ -1231,7 +1231,7 @@ async fn temporal_modifiers_keep_the_engine_bounds_and_do_not_shorten_the_calend
         let to = Postgres::new()
             .normalize_type(&ty(&format!("{base}(3)")))
             .unwrap();
-        let change = pbps_model::Change::AlterColumnType {
+        let change = pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType {
             uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
             column: pbps_model::TableName::new("pg_temp", &table).column("c"),
             from: from.clone(),
@@ -1242,7 +1242,7 @@ async fn temporal_modifiers_keep_the_engine_bounds_and_do_not_shorten_the_calend
             from_collation: None,
             to_collation: None,
             using: None,
-        };
+        });
         let changes = pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange::new(change)],
         };
@@ -2992,6 +2992,7 @@ async fn an_index_key_with_opclass_parameters_is_left_out_not_read_as_the_plain_
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_gin_index_over_jsonb_round_trips_and_changes_as_a_typed_plan() {
+    use pbps_model::IndexChange;
     use pbps_model::{Change, Index, IndexColumn, IndexMethod};
     let s = emit_schema("gin1169");
     let doc = TableName::new(&s, "doc");
@@ -3053,9 +3054,9 @@ async fn a_gin_index_over_jsonb_round_trips_and_changes_as_a_typed_plan() {
         .changes
         .iter()
         .filter_map(|p| {
-            if let Change::DropIndex { name, .. } = &p.change {
+            if let Change::Index(IndexChange::DropIndex { name, .. }) = &p.change {
                 Some(("drop", name.raw()))
-            } else if let Change::AddIndex { name, .. } = &p.change {
+            } else if let Change::Index(IndexChange::AddIndex { name, .. }) = &p.change {
                 Some(("add", name.raw()))
             } else {
                 None
@@ -3104,7 +3105,7 @@ async fn a_gin_index_over_jsonb_round_trips_and_changes_as_a_typed_plan() {
     assert!(
         replaced.changes.iter().any(|p| matches!(
             &p.change,
-            Change::AddIndex { name, index, .. } if name.raw() == "ix_body" && index.method.is_btree()
+            Change::Index(IndexChange::AddIndex { name, index, .. }) if name.raw() == "ix_body" && index.method.is_btree()
         )),
         "{replaced:#?}"
     );
@@ -3118,6 +3119,7 @@ async fn a_gin_index_over_jsonb_round_trips_and_changes_as_a_typed_plan() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_btree_expression_index_round_trips_and_changes_as_a_typed_plan() {
+    use pbps_model::IndexChange;
     use pbps_model::{Change, Index, IndexColumn, IndexKey};
     let s = emit_schema("expr1169");
     let t = TableName::new(&s, "t");
@@ -3184,7 +3186,9 @@ async fn a_btree_expression_index_round_trips_and_changes_as_a_typed_plan() {
         .changes
         .iter()
         .filter_map(|p| {
-            if let Change::DropIndex { name, .. } | Change::AddIndex { name, .. } = &p.change {
+            if let Change::Index(IndexChange::DropIndex { name, .. })
+            | Change::Index(IndexChange::AddIndex { name, .. }) = &p.change
+            {
                 Some(name.raw())
             } else {
                 None
@@ -3218,7 +3222,7 @@ async fn a_btree_expression_index_round_trips_and_changes_as_a_typed_plan() {
     assert!(
         replaced.changes.iter().any(|p| matches!(
             &p.change,
-            Change::AddIndex { name, index, .. }
+            Change::Index(IndexChange::AddIndex { name, index, .. })
                 if name.raw() == "ix_lower" && index.columns[0].key == IndexKey::Column("email".into())
         )),
         "{replaced:#?}"
@@ -3345,6 +3349,7 @@ async fn a_generated_columns_inputs_leave_out_its_own_column() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_stored_generated_column_round_trips_and_changes_its_expression() {
+    use pbps_model::ColumnChange;
     use pbps_model::{Change, Generated};
     let s = emit_schema("gen1168");
     let t = TableName::new(&s, "t");
@@ -3412,7 +3417,7 @@ async fn a_stored_generated_column_round_trips_and_changes_its_expression() {
     assert!(
         matches!(
             step.changes.as_slice(),
-            [p] if matches!(&p.change, Change::AlterColumnExpression { to, .. } if to == "(a * 3)")
+            [p] if matches!(&p.change, Change::Column(ColumnChange::AlterColumnExpression { to, .. }) if to == "(a * 3)")
         ),
         "{step:#?}"
     );
@@ -3615,23 +3620,26 @@ async fn macaddr8_and_a_gin_over_a_tsvector_stay_reported_limitations() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn inet_into_cidr_is_a_narrowing_whose_probe_counts_the_rows_with_host_bits() {
+    use pbps_model::ColumnChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let s = emit_schema("net1634c");
     let mut conn = connect().await;
     fresh(&mut conn, &s).await;
     let column = TableName::new(&s, "t").column("v");
-    let change = |from: &str, to: &str| Change::AlterColumnType {
-        uid: "c_aaaaaa".parse().expect("a uid"),
-        column: column.clone(),
-        from: ty(from),
-        to: ty(to),
-        from_nullable: true,
-        to_nullable: true,
-        through_external_partitions: false,
-        from_collation: None,
-        to_collation: None,
-        using: None,
+    let change = |from: &str, to: &str| {
+        Change::Column(ColumnChange::AlterColumnType {
+            uid: "c_aaaaaa".parse().expect("a uid"),
+            column: column.clone(),
+            from: ty(from),
+            to: ty(to),
+            from_nullable: true,
+            to_nullable: true,
+            through_external_partitions: false,
+            from_collation: None,
+            to_collation: None,
+            using: None,
+        })
     };
     let pg = Postgres::new();
     let risk = |from: &str, to: &str| {
@@ -3718,7 +3726,7 @@ async fn inet_into_cidr_is_a_narrowing_whose_probe_counts_the_rows_with_host_bit
         assert!(
             matches!(
                 step.changes.as_slice(),
-                [p] if matches!(&p.change, Change::AlterColumnType { from: f, to: t, .. }
+                [p] if matches!(&p.change, Change::Column(ColumnChange::AlterColumnType { from: f, to: t, .. })
                     if f.raw().to_string() == from && t.raw().to_string() == to)
             ),
             "{from} -> {to}: {step:#?}"
@@ -4403,8 +4411,12 @@ async fn sequence_options_round_trip_and_a_counter_past_a_new_bound_is_counted()
             .iter()
             .position(|p| {
                 p.change.table().is_some_and(|t| t.name == table)
-                    && matches!(p.change, pbps_model::Change::AlterColumnNumbering { .. })
-                        == numbering
+                    && matches!(
+                        p.change,
+                        pbps_model::Change::Column(
+                            pbps_model::ColumnChange::AlterColumnNumbering { .. }
+                        )
+                    ) == numbering
             })
             .unwrap()
     };
@@ -4609,6 +4621,7 @@ async fn a_serial_added_to_another_roles_table_is_that_roles() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_serial_round_trips_and_numbers_the_rows_it_is_added_to() {
+    use pbps_model::ColumnChange;
     use pbps_model::{Change, OwnedSequence};
     let s = emit_schema("ser1631");
     let t = TableName::new(&s, "t");
@@ -4759,7 +4772,7 @@ async fn a_serial_round_trips_and_numbers_the_rows_it_is_added_to() {
     assert!(
         matches!(
             step.changes.as_slice(),
-            [p] if matches!(&p.change, Change::AddColumn { name, .. } if name.raw() == "n")
+            [p] if matches!(&p.change, Change::Column(ColumnChange::AddColumn { name, .. }) if name.raw() == "n")
         ),
         "{step:#?}"
     );
@@ -4786,6 +4799,9 @@ async fn a_serial_round_trips_and_numbers_the_rows_it_is_added_to() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 async fn every_replica_identity_round_trips_and_moves_as_a_typed_plan() {
+    use pbps_model::ConstraintChange;
+    use pbps_model::IndexChange;
+    use pbps_model::TablePropertyChange;
     use pbps_model::{Change, ReplicaIdentity as R};
     let s = emit_schema("ri1444");
     let t = |n: &str| TableName::new(&s, n);
@@ -4872,7 +4888,7 @@ async fn every_replica_identity_round_trips_and_moves_as_a_typed_plan() {
     };
     let identity_of = |n: &str| {
         let n = t(n);
-        move |c: &Change| matches!(c, Change::SetReplicaIdentity { table, .. } if *table == n)
+        move |c: &Change| matches!(c, Change::TableProperty(TablePropertyChange::SetReplicaIdentity { table, .. }) if *table == n)
     };
     // `indexed`: FULL before its old index goes, its new index, then the
     // identity on it (#1467 review).
@@ -4882,17 +4898,23 @@ async fn every_replica_identity_round_trips_and_moves_as_a_typed_plan() {
         .rposition(|p| identity_of("indexed")(&p.change))
         .unwrap();
     assert!(
-        at(&|c| matches!(c, Change::AddIndex { name, .. } if name.raw() == "indexed_id")) < last,
+        at(
+            &|c| matches!(c, Change::Index(IndexChange::AddIndex { name, .. }) if name.raw() == "indexed_id")
+        ) < last,
         "{step:#?}"
     );
     assert!(
         at(&identity_of("indexed"))
-            < at(&|c| matches!(c, Change::DropIndex { name, .. } if name.raw() == "indexed_code")),
+            < at(
+                &|c| matches!(c, Change::Index(IndexChange::DropIndex { name, .. }) if name.raw() == "indexed_code")
+            ),
         "{step:#?}"
     );
     assert!(
         at(&identity_of("coded"))
-            < at(&|c| matches!(c, Change::DropUnique { name, .. } if name.raw() == "coded_code")),
+            < at(
+                &|c| matches!(c, Change::Constraint(ConstraintChange::DropUnique { name, .. }) if name.raw() == "coded_code")
+            ),
         "{step:#?}"
     );
     apply(&mut target, &Postgres::new(), &step).await;
@@ -4915,9 +4937,10 @@ async fn every_replica_identity_round_trips_and_moves_as_a_typed_plan() {
         .descending = true;
     let step = plan(&after, &ids, &rebuilt_index, &ids);
     assert!(
-        step.changes
-            .iter()
-            .any(|p| matches!(&p.change, Change::SetReplicaIdentity { .. })),
+        step.changes.iter().any(|p| matches!(
+            &p.change,
+            Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
+        )),
         "{step:#?}"
     );
     apply(&mut target, &Postgres::new(), &step).await;
@@ -4938,6 +4961,7 @@ async fn every_replica_identity_round_trips_and_moves_as_a_typed_plan() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 async fn storage_parameters_round_trip_and_change_as_a_typed_plan() {
     use pbps_model::Change;
+    use pbps_model::TablePropertyChange;
     let s = emit_schema("sp1441");
     let t = TableName::new(&s, "t");
     let params = |schema: &Schema| -> Vec<(String, String)> {
@@ -5002,7 +5026,7 @@ async fn storage_parameters_round_trip_and_change_as_a_typed_plan() {
     }
     let step = plan(&rebuilt, &ids, &changed, &ids);
     assert!(
-        matches!(step.changes.as_slice(), [p] if matches!(p.change, Change::SetStorageParameters { .. })),
+        matches!(step.changes.as_slice(), [p] if matches!(p.change, Change::TableProperty(TablePropertyChange::SetStorageParameters { .. }))),
         "{step:#?}"
     );
     apply(&mut target, &Postgres::new(), &step).await;
@@ -5047,6 +5071,7 @@ async fn storage_parameters_round_trip_and_change_as_a_typed_plan() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 async fn index_storage_parameters_round_trip_and_change_in_place() {
     use pbps_model::Change;
+    use pbps_model::IndexChange;
     let s = emit_schema("isp1442");
     let t = TableName::new(&s, "t");
     let params = |m: &std::collections::BTreeMap<String, String>| -> Vec<(String, String)> {
@@ -5133,9 +5158,10 @@ async fn index_storage_parameters_round_trip_and_change_in_place() {
     let step = plan(&rebuilt, &ids, &changed, &ids);
     assert_eq!(step.changes.len(), 3, "{step:#?}");
     assert!(
-        step.changes
-            .iter()
-            .all(|p| matches!(p.change, Change::SetIndexStorageParameters { .. })),
+        step.changes.iter().all(|p| matches!(
+            p.change,
+            Change::Index(IndexChange::SetIndexStorageParameters { .. })
+        )),
         "{step:#?}"
     );
     apply(&mut target, &Postgres::new(), &step).await;
@@ -5158,7 +5184,7 @@ async fn index_storage_parameters_round_trip_and_change_in_place() {
     assert!(
         step.changes
             .iter()
-            .any(|p| matches!(p.change, Change::DropIndex { .. })),
+            .any(|p| matches!(p.change, Change::Index(IndexChange::DropIndex { .. }))),
         "{step:#?}"
     );
     apply(&mut target, &Postgres::new(), &step).await;
@@ -5220,6 +5246,7 @@ async fn index_storage_parameters_round_trip_and_change_in_place() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 async fn unlogged_tables_round_trip_and_switch_in_foreign_key_order() {
     use pbps_model::Change;
+    use pbps_model::TablePropertyChange;
     let s = emit_schema("ul1443");
     let pa = TableName::new(&s, "pa");
     let ch = TableName::new(&s, "ch");
@@ -5273,7 +5300,11 @@ async fn unlogged_tables_round_trip_and_switch_in_foreign_key_order() {
         step.changes
             .iter()
             .filter_map(|p| {
-                if let Change::SetTablePersistence { table, .. } = &p.change {
+                if let Change::TableProperty(TablePropertyChange::SetTablePersistence {
+                    table,
+                    ..
+                }) = &p.change
+                {
                     Some(table.clone())
                 } else {
                     None
@@ -5944,6 +5975,7 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
 #[tokio::test]
 #[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
 async fn list_and_hash_partition_trees_round_trip_and_take_rows() {
+    use pbps_model::PartitionChange;
     use pbps_model::{
         Change, ListDatum as L, PartitionBound as B, PartitionOf, PartitionStrategy as S,
     };
@@ -6307,14 +6339,16 @@ async fn list_and_hash_partition_trees_round_trip_and_take_rows() {
         .await
         .expect("the tables to attach");
         let attach = |table: &str, parent: &str, bound: B| pbps_model::ChangeSet {
-            changes: vec![pbps_model::PlannedChange::new(Change::AttachPartition {
-                uid: "t_aaaaaa".parse().unwrap(),
-                table: t(table),
-                parent: t(parent),
-                bound,
-                key: Vec::new(),
-                shape: Box::default(),
-            })],
+            changes: vec![pbps_model::PlannedChange::new(Change::Partition(
+                PartitionChange::AttachPartition {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    table: t(table),
+                    parent: t(parent),
+                    bound,
+                    key: Vec::new(),
+                    shape: Box::default(),
+                },
+            ))],
         };
         // The rows of `h` the engine routes to remainder 3 of 4, `h_x`'s
         // copy of them: every other row of `h_x` is outside its bound.
@@ -6967,7 +7001,8 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         // An unlogged partition is in no publication: the same move into
         // one goes, and its pre-flight does not ask (#1763 review).
         let mut unlogged_step = over_step.clone();
-        if let pbps_model::Change::CreateTable { table, .. } = &mut unlogged_step.changes[0].change
+        if let pbps_model::Change::Table(pbps_model::TableChange::CreateTable { table, .. }) =
+            &mut unlogged_step.changes[0].change
         {
             table.unlogged = true;
         }
@@ -7092,9 +7127,14 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             .changes
             .iter()
             .map(|p| {
-                if let pbps_model::Change::CreateTable { .. } = &p.change {
+                if let pbps_model::Change::Table(pbps_model::TableChange::CreateTable { .. }) =
+                    &p.change
+                {
                     "create"
-                } else if let pbps_model::Change::AddCheck { .. } = &p.change {
+                } else if let pbps_model::Change::Constraint(
+                    pbps_model::ConstraintChange::AddCheck { .. },
+                ) = &p.change
+                {
                     "check"
                 } else {
                     "other"
@@ -7646,7 +7686,10 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             .changes
             .iter()
             .filter_map(|p| {
-                if let pbps_model::Change::DropTable { name, .. } = &p.change {
+                if let pbps_model::Change::Table(pbps_model::TableChange::DropTable {
+                    name, ..
+                }) = &p.change
+                {
                     Some(name.name.clone())
                 } else {
                     None
@@ -8169,6 +8212,8 @@ async fn a_partition_is_detached_and_kept_under_its_declared_names() {
 #[tokio::test]
 #[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
 async fn an_attach_counts_the_rows_its_range_does_not_take() {
+    use pbps_model::ConstraintChange;
+    use pbps_model::PartitionChange;
     use pbps_model::{BoundDatum as D, Change, PartitionBound as B};
 
     let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
@@ -8204,14 +8249,16 @@ async fn an_attach_counts_the_rows_its_range_does_not_take() {
         let pg = Postgres::new();
         let value = |v: &str| D::Value(v.to_owned());
         let attach = |table: &str, from: Vec<D>, to: Vec<D>| pbps_model::ChangeSet {
-            changes: vec![pbps_model::PlannedChange::new(Change::AttachPartition {
-                uid: "t_aaaaaa".parse().unwrap(),
-                table: TableName::new(&s, table),
-                parent: TableName::new(&s, "m"),
-                bound: B::Range { from, to },
-                key: Vec::new(),
-                shape: Box::default(),
-            })],
+            changes: vec![pbps_model::PlannedChange::new(Change::Partition(
+                PartitionChange::AttachPartition {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    table: TableName::new(&s, table),
+                    parent: TableName::new(&s, "m"),
+                    bound: B::Range { from, to },
+                    key: Vec::new(),
+                    shape: Box::default(),
+                },
+            ))],
         };
         for (table, step, outside, cleared) in [
             (
@@ -8327,28 +8374,32 @@ async fn an_attach_counts_the_rows_its_range_does_not_take() {
         .expect("a keyed parent, its table and a referencing one");
         let keyed = pbps_model::ChangeSet {
             changes: vec![
-                pbps_model::PlannedChange::new(Change::AttachPartition {
-                    uid: "t_bbbbbb".parse().unwrap(),
-                    table: TableName::new(&s, "kt"),
-                    parent: TableName::new(&s, "k"),
-                    bound: B::Range {
-                        from: vec![value("0")],
-                        to: vec![value("10")],
+                pbps_model::PlannedChange::new(Change::Partition(
+                    PartitionChange::AttachPartition {
+                        uid: "t_bbbbbb".parse().unwrap(),
+                        table: TableName::new(&s, "kt"),
+                        parent: TableName::new(&s, "k"),
+                        bound: B::Range {
+                            from: vec![value("0")],
+                            to: vec![value("10")],
+                        },
+                        key: Vec::new(),
+                        shape: Box::default(),
                     },
-                    key: Vec::new(),
-                    shape: Box::default(),
-                }),
-                pbps_model::PlannedChange::new(Change::AddForeignKey {
-                    table: TableName::new(&s, "r"),
-                    name: "r_k".into(),
-                    constraint: Box::new(pbps_model::ForeignKey {
-                        columns: vec!["a".into(), "b".into()],
-                        references_table: TableName::new(&s, "k"),
-                        references_columns: vec!["a".into(), "b".into()],
-                        on_delete: Default::default(),
-                        on_update: Default::default(),
-                    }),
-                }),
+                )),
+                pbps_model::PlannedChange::new(Change::Constraint(
+                    ConstraintChange::AddForeignKey {
+                        table: TableName::new(&s, "r"),
+                        name: "r_k".into(),
+                        constraint: Box::new(pbps_model::ForeignKey {
+                            columns: vec!["a".into(), "b".into()],
+                            references_table: TableName::new(&s, "k"),
+                            references_columns: vec!["a".into(), "b".into()],
+                            on_delete: Default::default(),
+                            on_update: Default::default(),
+                        }),
+                    },
+                )),
             ],
         };
         let sql: Vec<String> = keyed
@@ -8396,6 +8447,8 @@ async fn an_attach_counts_the_rows_its_range_does_not_take() {
 #[tokio::test]
 #[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
 async fn a_default_attach_counts_the_rows_another_partition_takes() {
+    use pbps_model::PartitionChange;
+    use pbps_model::TableChange;
     use pbps_model::{BoundDatum as D, Change, PartitionBound as B};
 
     let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
@@ -8435,13 +8488,15 @@ async fn a_default_attach_counts_the_rows_another_partition_takes() {
         .expect("the tables");
         let pg = Postgres::new();
         let name = |t: &str| TableName::new(&s, t);
-        let attach = |table: &str, parent: &str| Change::AttachPartition {
-            uid: "t_aaaaaa".parse().unwrap(),
-            table: name(table),
-            parent: name(parent),
-            bound: B::Default,
-            key: Vec::new(),
-            shape: Box::default(),
+        let attach = |table: &str, parent: &str| {
+            Change::Partition(PartitionChange::AttachPartition {
+                uid: "t_aaaaaa".parse().unwrap(),
+                table: name(table),
+                parent: name(parent),
+                bound: B::Default,
+                key: Vec::new(),
+                shape: Box::default(),
+            })
         };
         let plan = |changes: Vec<Change>| pbps_model::ChangeSet {
             changes: changes
@@ -8477,7 +8532,7 @@ async fn a_default_attach_counts_the_rows_another_partition_takes() {
         assert_eq!(probes(&alone).len(), 4, "{:?}", probes(&alone));
         assert_eq!(counted(&mut conn, &rows(&probes(&alone))).await, 2);
         // A range the plan creates beside it counts its rows too.
-        let m3 = Change::CreateTable {
+        let m3 = Change::Table(TableChange::CreateTable {
             uid: "t_bbbbbb".parse().unwrap(),
             name: name("m3"),
             table: Box::new(pbps_model::Table {
@@ -8493,16 +8548,18 @@ async fn a_default_attach_counts_the_rows_another_partition_takes() {
             }),
             beside_default: None,
             moves_at_most: None,
-        };
+        });
         let created = plan(vec![attach("t", "m"), m3]);
         assert_eq!(counted(&mut conn, &rows(&probes(&created))).await, 3);
         // A partition the plan detaches first takes none of them.
-        let detach = |table: &str, parent: &str| Change::DetachPartition {
-            uid: "t_cccccc".parse().unwrap(),
-            table: name(table),
-            parent: name(parent),
-            names: Vec::new(),
-            shape: Box::default(),
+        let detach = |table: &str, parent: &str| {
+            Change::Partition(PartitionChange::DetachPartition {
+                uid: "t_cccccc".parse().unwrap(),
+                table: name(table),
+                parent: name(parent),
+                names: Vec::new(),
+                shape: Box::default(),
+            })
         };
         let detached = plan(vec![detach("m2", "m"), attach("t", "m")]);
         assert_eq!(counted(&mut conn, &rows(&probes(&detached))).await, 1);
@@ -8618,7 +8675,7 @@ async fn a_detach_takes_the_parent_before_the_partition() {
     .expect("the tree");
     let detach = Postgres::new()
         .fixture_emit(
-            &pbps_model::Change::DetachPartition {
+            &pbps_model::Change::Partition(pbps_model::PartitionChange::DetachPartition {
                 uid: "t_aaaaaa".parse().unwrap(),
                 table: TableName::new(&s, "ev_1"),
                 parent: TableName::new(&s, "ev"),
@@ -8628,7 +8685,7 @@ async fn a_detach_takes_the_parent_before_the_partition() {
                     name: Some("arch_pk".into()),
                 }],
                 shape: Box::default(),
-            },
+            }),
             Default::default(),
         )
         .expect("emit");
@@ -8733,7 +8790,7 @@ async fn a_detach_calls_no_operator_a_schema_user_could_add() {
     use pbps_model::DetachedKind as K;
     let detach = Postgres::new()
         .fixture_emit(
-            &pbps_model::Change::DetachPartition {
+            &pbps_model::Change::Partition(pbps_model::PartitionChange::DetachPartition {
                 uid: "t_aaaaaa".parse().unwrap(),
                 table: TableName::new(&s, "ev_1"),
                 parent: TableName::new(&s, "ev"),
@@ -8743,7 +8800,7 @@ async fn a_detach_calls_no_operator_a_schema_user_could_add() {
                     named(K::Index, "ev_v", "arch_v"),
                 ],
                 shape: Box::default(),
-            },
+            }),
             Default::default(),
         )
         .expect("emit");
@@ -8823,13 +8880,13 @@ async fn a_detach_takes_free_temporaries_and_refuses_a_held_name_by_name() {
         let emit = |table: &str, names: Vec<DetachedName>| {
             Postgres::new()
                 .fixture_emit(
-                    &pbps_model::Change::DetachPartition {
+                    &pbps_model::Change::Partition(pbps_model::PartitionChange::DetachPartition {
                         uid: "t_aaaaaa".parse().unwrap(),
                         table: TableName::new(&s, table),
                         parent: TableName::new(&s, "ev"),
                         names,
                         shape: Box::default(),
-                    },
+                    }),
                     Default::default(),
                 )
                 .expect("emit")
@@ -9170,9 +9227,10 @@ async fn a_created_table_with_a_foreign_key_reads_back_as_declared() {
     let ids = mint_ids(&declared, &IdsFile::default(), &[]);
     let cs = plan(&Schema::default(), &IdsFile::default(), &declared, &ids);
     assert!(
-        cs.changes
-            .iter()
-            .any(|p| matches!(p.change, pbps_model::Change::CreateTable { .. })),
+        cs.changes.iter().any(|p| matches!(
+            p.change,
+            pbps_model::Change::Table(pbps_model::TableChange::CreateTable { .. })
+        )),
         "the plan has to create the tables it is about to read back"
     );
 
@@ -9403,12 +9461,14 @@ async fn temporary_relations_and_types_follow_the_declared_write_path() {
         .await
     }
 
-    let change = |schema: &str| pbps_model::Change::CreateTable {
-        uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
-        name: TableName::new(schema, "bound"),
-        table: Box::new(table.clone()),
-        beside_default: None,
-        moves_at_most: None,
+    let change = |schema: &str| {
+        pbps_model::Change::Table(pbps_model::TableChange::CreateTable {
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
+            name: TableName::new(schema, "bound"),
+            table: Box::new(table.clone()),
+            beside_default: None,
+            moves_at_most: None,
+        })
     };
     // The same emitted statement without the final entry is the negative
     // control, even in a session whose explicit path names only the project.
@@ -9720,13 +9780,13 @@ async fn the_framing_pins_the_settings_that_decide_what_a_definition_means() {
             expression: r"label <> 'it\'s  here'".into(),
         },
     );
-    let change = pbps_model::Change::CreateTable {
+    let change = pbps_model::Change::Table(pbps_model::TableChange::CreateTable {
         uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
         name: TableName::new(&s, "pinned"),
         table: Box::new(t),
         beside_default: None,
         moves_at_most: None,
-    };
+    });
     let statements = Postgres::new()
         .fixture_emit(&change, Strategy::default())
         .expect("emit");
@@ -9832,11 +9892,13 @@ async fn an_online_index_is_built_concurrently_and_says_it_leaves_the_transactio
     };
 
     let online = Strategy { online: true };
-    let add = |name: &str, index: &Index| pbps_model::Change::AddIndex {
-        table: table.clone(),
-        name: name.into(),
-        index: Box::new(index.clone()),
-        clustered: false,
+    let add = |name: &str, index: &Index| {
+        pbps_model::Change::Index(pbps_model::IndexChange::AddIndex {
+            table: table.clone(),
+            name: name.into(),
+            index: Box::new(index.clone()),
+            clustered: false,
+        })
     };
 
     let concurrent = Postgres::new()
@@ -9992,13 +10054,13 @@ async fn a_default_whose_value_the_session_decides_is_refused_and_the_resolved_o
         let mut d = Column::new(ty("date"));
         d.value_source = pbps_model::ValueSource::Default(default.to_owned());
         t.columns.insert("d".into(), d);
-        pbps_model::Change::CreateTable {
+        pbps_model::Change::Table(pbps_model::TableChange::CreateTable {
             uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
             name: TableName::new(&s, "t"),
             table: Box::new(t),
             beside_default: None,
             moves_at_most: None,
-        }
+        })
     };
     for spelling in [
         "'01/02/2026'",
@@ -10031,13 +10093,13 @@ async fn a_default_whose_value_the_session_decides_is_refused_and_the_resolved_o
     plain.columns.insert("n".into(), n);
     Postgres::new()
         .fixture_emit(
-            &pbps_model::Change::CreateTable {
+            &pbps_model::Change::Table(pbps_model::TableChange::CreateTable {
                 uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
                 name: TableName::new(&s, "plain"),
                 table: Box::new(plain),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
             Strategy::default(),
         )
         .expect("a bare literal on an integer is not setting-sensitive");
@@ -10070,7 +10132,7 @@ async fn a_type_change_that_would_need_a_using_clause_is_refused_by_name() {
     let column = TableName::new(&s, "t").column("c");
     let refusal = Postgres::new()
         .fixture_emit(
-            &pbps_model::Change::AlterColumnType {
+            &pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType {
                 uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
                 column: column.clone(),
                 from: ty("varchar(10)"),
@@ -10081,7 +10143,7 @@ async fn a_type_change_that_would_need_a_using_clause_is_refused_by_name() {
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            },
+            }),
             Strategy::default(),
         )
         .expect_err("a conversion the engine refuses outright");
@@ -10091,7 +10153,7 @@ async fn a_type_change_that_would_need_a_using_clause_is_refused_by_name() {
     // And nothing here emits one.
     let widened = Postgres::new()
         .fixture_emit(
-            &pbps_model::Change::AlterColumnType {
+            &pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType {
                 uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
                 column,
                 from: ty("varchar(10)"),
@@ -10102,7 +10164,7 @@ async fn a_type_change_that_would_need_a_using_clause_is_refused_by_name() {
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            },
+            }),
             Strategy::default(),
         )
         .expect("a widening the engine makes on its own");
@@ -10775,13 +10837,13 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
         );
         let statements = pg
             .fixture_emit(
-                &pbps_model::Change::CreateTable {
+                &pbps_model::Change::Table(pbps_model::TableChange::CreateTable {
                     uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
                     name: name.clone(),
                     table: Box::new(table),
                     beside_default: None,
                     moves_at_most: None,
-                },
+                }),
                 Strategy::default(),
             )
             .expect("emitter spells structural errors for the engine");
@@ -10887,13 +10949,13 @@ async fn installed_default_operator_classes_can_make_json_keys_valid() {
         );
         let statements = pg
             .fixture_emit(
-                &pbps_model::Change::CreateTable {
+                &pbps_model::Change::Table(pbps_model::TableChange::CreateTable {
                     uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
                     name,
                     table: Box::new(table),
                     beside_default: None,
                     moves_at_most: None,
-                },
+                }),
                 Strategy::default(),
             )
             .unwrap();
@@ -10929,12 +10991,12 @@ async fn a_rename_across_schemas_is_two_statements_that_each_say_where_the_table
     let to = TableName::new(&to_schema, "after");
     let statements = Postgres::new()
         .fixture_emit(
-            &pbps_model::Change::RenameTable {
+            &pbps_model::Change::Table(pbps_model::TableChange::RenameTable {
                 uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
                 from: from.clone(),
                 to: to.clone(),
                 defaults: Vec::new(),
-            },
+            }),
             Strategy::default(),
         )
         .expect("emit");
@@ -10980,7 +11042,7 @@ async fn an_unnamed_primary_key_is_dropped_by_the_name_the_catalog_holds() {
     let table = TableName::new(&s, odd);
     let statements = Postgres::new()
         .fixture_emit(
-            &pbps_model::Change::SetPrimaryKey {
+            &pbps_model::Change::Constraint(pbps_model::ConstraintChange::SetPrimaryKey {
                 table: table.clone(),
                 from: Some(PrimaryKey {
                     name: None,
@@ -10990,7 +11052,7 @@ async fn an_unnamed_primary_key_is_dropped_by_the_name_the_catalog_holds() {
                 }),
                 to: None,
                 nonclustered: false,
-            },
+            }),
             Strategy::default(),
         )
         .expect("emit");
@@ -11105,10 +11167,10 @@ async fn a_migration_that_renames_widens_retypes_and_drops_converges() {
     let ids_b = mint_ids(&b, &ids_a, &intents);
     let migration = plan(&state_a, &ids_a, &b, &ids_b);
     assert!(
-        migration
-            .changes
-            .iter()
-            .any(|p| matches!(p.change, pbps_model::Change::RenameColumn { .. })),
+        migration.changes.iter().any(|p| matches!(
+            p.change,
+            pbps_model::Change::Column(pbps_model::ColumnChange::RenameColumn { .. })
+        )),
         "the rename must plan as a rename, not a drop plus an add: {migration:#?}"
     );
 
@@ -11174,13 +11236,13 @@ async fn the_framing_pins_what_an_ambiguous_temporal_literal_means() {
             },
         );
     }
-    let change = pbps_model::Change::CreateTable {
+    let change = pbps_model::Change::Table(pbps_model::TableChange::CreateTable {
         uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
         name: TableName::new(&s, "temporal"),
         table: Box::new(t),
         beside_default: None,
         moves_at_most: None,
-    };
+    });
     let statements = Postgres::new()
         .fixture_emit(&change, Strategy::default())
         .expect("emit");
@@ -11351,7 +11413,7 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
     // two-step remedy, because a refusal a reader cannot act on is a wall.
     let refusal = Postgres::new()
         .fixture_emit(
-            &pbps_model::Change::AlterColumnType {
+            &pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType {
                 uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
                 column: pbps_model::ColumnRef {
                     table: TableName::new(&s, "z"),
@@ -11365,7 +11427,7 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            },
+            }),
             Strategy::default(),
         )
         .expect_err("the zone is not pbps's to choose");
@@ -11403,7 +11465,7 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
     assert!(
         Postgres::new()
             .fixture_emit(
-                &pbps_model::Change::AlterColumnType {
+                &pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType {
                     uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
                     column: pbps_model::ColumnRef {
                         table: TableName::new(&s, "z"),
@@ -11417,7 +11479,7 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
                     from_collation: None,
                     to_collation: None,
                     using: None,
-                },
+                }),
                 Strategy::default(),
             )
             .is_ok(),
@@ -11426,7 +11488,7 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
 
     let kept_refusal = Postgres::new()
         .fixture_emit(
-            &pbps_model::Change::AlterColumnType {
+            &pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType {
                 uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
                 column: pbps_model::ColumnRef {
                     table: TableName::new(&s, "z"),
@@ -11440,7 +11502,7 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            },
+            }),
             Strategy::default(),
         )
         .expect_err("keeping the offset does not make it pbps's to choose");
@@ -11610,20 +11672,22 @@ async fn a_conversion_to_text_renders_under_the_framings_settings_and_not_the_op
 
     let table = TableName::new(&s, "t");
     let pg = Postgres::new();
-    let retype = |column: &str, from: &str| pbps_model::Change::AlterColumnType {
-        uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
-        column: pbps_model::ColumnRef {
-            table: table.clone(),
-            name: column.into(),
-        },
-        from: ty(from),
-        to: ty("text"),
-        from_nullable: true,
-        to_nullable: true,
-        through_external_partitions: false,
-        from_collation: None,
-        to_collation: None,
-        using: None,
+    let retype = |column: &str, from: &str| {
+        pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType {
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+            column: pbps_model::ColumnRef {
+                table: table.clone(),
+                name: column.into(),
+            },
+            from: ty(from),
+            to: ty("text"),
+            from_nullable: true,
+            to_nullable: true,
+            through_external_partitions: false,
+            from_collation: None,
+            to_collation: None,
+            using: None,
+        })
     };
 
     let framing = pg.transaction_framing(&pbps_model::SessionZone::utc());
@@ -11816,10 +11880,11 @@ async fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
             .unwrap_or_else(|| panic!("{migration:?}"))
     };
     let drop_at = at(
-        |c| matches!(c, pbps_model::Change::DropColumn { column, .. } if column.name == "note".into()),
+        |c| matches!(c, pbps_model::Change::Column(pbps_model::ColumnChange::DropColumn { column, .. }) if column.name == "note".into()),
     );
-    let rename_at =
-        at(|c| matches!(c, pbps_model::Change::RenameColumn { to, .. } if to.raw() == "note"));
+    let rename_at = at(
+        |c| matches!(c, pbps_model::Change::Column(pbps_model::ColumnChange::RenameColumn { to, .. }) if to.raw() == "note"),
+    );
     assert!(
         drop_at < rename_at,
         "the drop must free the name first: {migration:?}"
@@ -15261,10 +15326,10 @@ async fn a_module_of_every_kind_survives_the_round_trip_as_the_same_object() {
         let kind = first[id].kind;
         for stmt in pg
             .fixture_emit(
-                &pbps_model::Change::DropModule {
+                &pbps_model::Change::Module(pbps_model::ModuleChange::DropModule {
                     id: id.clone(),
                     kind,
-                },
+                }),
                 pbps_model::Strategy::default(),
             )
             .expect("emit a drop")
@@ -15320,7 +15385,7 @@ async fn non_ascii_identifier_edits_plan_and_apply_a_module_change() {
         let changes = plan(&before, &ids, &after, &ids);
         assert!(
             matches!(changes.changes.as_slice(), [change]
-            if matches!(&change.change, pbps_model::Change::AlterModule { id: changed, .. } if changed == &id)),
+            if matches!(&change.change, pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule { id: changed, .. }) if changed == &id)),
             "the declaration changed the output column to {alias:?}: {:?}",
             changes.changes
         );
@@ -15397,10 +15462,10 @@ async fn two_overloads_of_one_name_are_two_objects_and_each_drop_names_one() {
     // And with the signature, exactly one goes.
     for stmt in pg
         .fixture_emit(
-            &pbps_model::Change::DropModule {
+            &pbps_model::Change::Module(pbps_model::ModuleChange::DropModule {
                 id: format!("{s}.f(integer)").parse().expect("a module id"),
                 kind: pbps_model::ModuleKind::Function,
-            },
+            }),
             pbps_model::Strategy::default(),
         )
         .expect("emit")
@@ -15863,13 +15928,15 @@ async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
     // above still refuses into one the plan is about to restate — so it must
     // not refuse at all.
     let grant_of = |name: &str, permissions: &[pbps_model::Permission]| {
-        pbps_model::PlannedChange::new(pbps_model::Change::Grant {
-            role: reader.clone().into(),
-            target: pbps_model::GrantTarget::Object(
-                format!("{s}.{name}").parse().expect("an object name"),
-            ),
-            permissions: permissions.iter().copied().collect(),
-        })
+        pbps_model::PlannedChange::new(pbps_model::Change::Permission(
+            pbps_model::GrantChange::Grant {
+                role: reader.clone().into(),
+                target: pbps_model::GrantTarget::Object(
+                    format!("{s}.{name}").parse().expect("an object name"),
+                ),
+                permissions: permissions.iter().copied().collect(),
+            },
+        ))
     };
     let declaring = |name: &str, permissions: &[pbps_model::Permission]| pbps_model::ChangeSet {
         changes: vec![grant_of(name, permissions)],
@@ -18027,14 +18094,18 @@ async fn a_shadow_this_plan_introduces_rebuilds_the_module_in_the_same_plan() {
         .collect();
     assert_eq!(modules.len(), 2, "{cs:#?}");
     assert!(matches!(modules[0],
-        pbps_model::Change::CreateModule { id, .. } if id == &shadow));
+        pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule { id, .. }) if id == &shadow));
     assert!(matches!(modules[1],
-        pbps_model::Change::AlterModule { id, .. } if id == &caller));
+        pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule { id, .. }) if id == &caller));
     let closed: std::collections::BTreeSet<String> = cs
         .changes
         .iter()
         .filter_map(|p| {
-            if let pbps_model::Change::PublicExecution { routine, .. } = &p.change {
+            if let pbps_model::Change::Permission(pbps_model::GrantChange::PublicExecution {
+                routine,
+                ..
+            }) = &p.change
+            {
                 Some(routine.raw().to_string())
             } else {
                 None
@@ -18069,9 +18140,12 @@ async fn a_shadow_this_plan_introduces_rebuilds_the_module_in_the_same_plan() {
     // Deliberately omit the approved rebuild first to measure the bad middle
     // state; the actual CLI regression applies the whole plan atomically.
     let mut without_rebuild = cs.clone();
-    without_rebuild
-        .changes
-        .retain(|p| !matches!(p.change, pbps_model::Change::AlterModule { .. }));
+    without_rebuild.changes.retain(|p| {
+        !matches!(
+            p.change,
+            pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule { .. })
+        )
+    });
     apply(&mut conn, &pg, &without_rebuild).await;
     assert_eq!(
         text(&mut conn, &format!("SELECT {s}.caller()")).await,
@@ -18082,7 +18156,12 @@ async fn a_shadow_this_plan_introduces_rebuilds_the_module_in_the_same_plan() {
     let rebuild = cs
         .changes
         .iter()
-        .find(|p| matches!(p.change, pbps_model::Change::AlterModule { .. }))
+        .find(|p| {
+            matches!(
+                p.change,
+                pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule { .. })
+            )
+        })
         .expect("the synthesized rebuild");
     for stmt in pg
         .fixture_emit(&rebuild.change, rebuild.strategy)
@@ -18746,10 +18825,10 @@ async fn the_identity_a_routine_body_creates_is_the_key_the_gate_accepts_it_unde
         );
         for statement in pg
             .fixture_emit(
-                &pbps_model::Change::CreateModule {
+                &pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule {
                     id: id.clone(),
                     module: Box::new(module.clone()),
-                },
+                }),
                 Strategy::default(),
             )
             .expect("emit the create")
@@ -19182,10 +19261,10 @@ async fn a_triggers_on_clause_is_what_decides_where_it_lands() {
         );
         for stmt in pg
             .fixture_emit(
-                &pbps_model::Change::CreateModule {
+                &pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule {
                     id: id.clone(),
                     module: Box::new(m),
-                },
+                }),
                 pbps_model::Strategy::default(),
             )
             .expect("emit")
@@ -19794,10 +19873,10 @@ async fn a_bodys_trailing_non_ascii_byte_reaches_the_engine() {
     let view = module(pbps_model::ModuleKind::View, " \n SELECT 1 AS x\u{a0}\n ");
     for statement in pg
         .fixture_emit(
-            &pbps_model::Change::CreateModule {
+            &pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule {
                 id: id.clone(),
                 module: Box::new(view),
-            },
+            }),
             Strategy::default(),
         )
         .expect("emit the create")
@@ -19859,7 +19938,10 @@ async fn a_view_named_by_a_reserved_word_is_created_after_the_view_it_selects_fr
         .changes
         .iter()
         .filter_map(|c| {
-            if let pbps_model::Change::CreateModule { id, .. } = &c.change {
+            if let pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule {
+                id, ..
+            }) = &c.change
+            {
                 Some(id.raw().to_string())
             } else {
                 None
@@ -19907,7 +19989,10 @@ async fn a_view_over_an_array_of_a_routine_is_created_after_the_routine() {
         .changes
         .iter()
         .filter_map(|c| {
-            if let pbps_model::Change::CreateModule { id, .. } = &c.change {
+            if let pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule {
+                id, ..
+            }) = &c.change
+            {
                 Some(id.raw().to_string())
             } else {
                 None
@@ -20021,7 +20106,10 @@ async fn a_bare_name_means_the_first_schema_of_the_path_that_has_it() {
         .changes
         .iter()
         .filter_map(|c| {
-            if let pbps_model::Change::CreateModule { id, .. } = &c.change {
+            if let pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule {
+                id, ..
+            }) = &c.change
+            {
                 Some(id.raw().to_string())
             } else {
                 None
@@ -20071,7 +20159,10 @@ async fn a_quote_inside_a_name_is_read_as_part_of_it() {
         .changes
         .iter()
         .filter_map(|c| {
-            if let pbps_model::Change::CreateModule { id, .. } = &c.change {
+            if let pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule {
+                id, ..
+            }) = &c.change
+            {
                 Some(id.raw().to_string())
             } else {
                 None
@@ -20124,7 +20215,10 @@ async fn a_uescape_clause_does_not_order_the_view_that_holds_it() {
         .changes
         .iter()
         .filter_map(|c| {
-            if let pbps_model::Change::CreateModule { id, .. } = &c.change {
+            if let pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule {
+                id, ..
+            }) = &c.change
+            {
                 Some(id.raw().to_string())
             } else {
                 None
@@ -20176,7 +20270,10 @@ async fn a_bare_name_in_another_schema_is_not_an_edge() {
         .changes
         .iter()
         .filter_map(|c| {
-            if let pbps_model::Change::CreateModule { id, .. } = &c.change {
+            if let pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule {
+                id, ..
+            }) = &c.change
+            {
                 Some(id.raw().to_string())
             } else {
                 None
@@ -20229,7 +20326,10 @@ async fn a_bodys_dollar_tags_are_not_the_name_of_a_module() {
         .changes
         .iter()
         .filter_map(|c| {
-            if let pbps_model::Change::CreateModule { id, .. } = &c.change {
+            if let pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule {
+                id, ..
+            }) = &c.change
+            {
                 Some(id.raw().to_string())
             } else {
                 None
@@ -20284,7 +20384,10 @@ async fn a_view_named_by_a_unicode_escape_is_created_after_the_view_it_names() {
         .changes
         .iter()
         .filter_map(|c| {
-            if let pbps_model::Change::CreateModule { id, .. } = &c.change {
+            if let pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule {
+                id, ..
+            }) = &c.change
+            {
                 Some(id.raw().to_string())
             } else {
                 None
@@ -20347,7 +20450,10 @@ async fn a_name_inside_an_escape_string_does_not_order_the_view_that_holds_it() 
         .changes
         .iter()
         .filter_map(|c| {
-            if let pbps_model::Change::CreateModule { id, .. } = &c.change {
+            if let pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule {
+                id, ..
+            }) = &c.change
+            {
                 Some(id.raw().to_string())
             } else {
                 None
@@ -20401,7 +20507,10 @@ async fn a_literals_prefix_and_a_non_ascii_byte_are_not_names_the_order_is_decid
         .changes
         .iter()
         .filter_map(|c| {
-            if let pbps_model::Change::CreateModule { id, .. } = &c.change {
+            if let pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule {
+                id, ..
+            }) = &c.change
+            {
                 Some(id.raw().to_string())
             } else {
                 None
@@ -20593,7 +20702,10 @@ async fn declared_rows_reach_the_engine_and_read_back_as_declared() {
         creation
             .changes
             .iter()
-            .filter(|p| matches!(p.change, pbps_model::Change::InsertRow { .. }))
+            .filter(|p| matches!(
+                p.change,
+                pbps_model::Change::Row(pbps_model::RowChange::InsertRow { .. })
+            ))
             .count(),
         2,
         "{creation:#?}"
@@ -20677,7 +20789,10 @@ async fn a_hand_edited_row_is_seen_and_the_update_holds_what_the_plan_recorded()
     let fix = plan(&base, &ids, &declared, &ids);
     assert_eq!(fix.changes.len(), 1, "{fix:#?}");
     assert!(
-        matches!(fix.changes[0].change, pbps_model::Change::UpdateRow { .. }),
+        matches!(
+            fix.changes[0].change,
+            pbps_model::Change::Row(pbps_model::RowChange::UpdateRow { .. })
+        ),
         "{fix:#?}"
     );
 
@@ -20868,7 +20983,10 @@ async fn the_pre_delete_probe_counts_a_foreign_key_this_engine_never_stopped_enf
     let cs = plan(&base, &ids, &declared, &ids);
     assert_eq!(cs.changes.len(), 1, "{cs:#?}");
     assert!(
-        matches!(cs.changes[0].change, pbps_model::Change::DeleteRow { .. }),
+        matches!(
+            cs.changes[0].change,
+            pbps_model::Change::Row(pbps_model::RowChange::DeleteRow { .. })
+        ),
         "{cs:#?}"
     );
 
@@ -21367,7 +21485,10 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
     let mut statements = Vec::new();
     for p in &creation.changes {
         statements.push((
-            matches!(p.change, pbps_model::Change::InsertRow { .. }),
+            matches!(
+                p.change,
+                pbps_model::Change::Row(pbps_model::RowChange::InsertRow { .. })
+            ),
             pg.fixture_emit(&p.change, p.strategy).expect("emit"),
         ));
     }
@@ -21569,7 +21690,10 @@ async fn a_cell_left_to_a_default_is_compared_as_the_column_stores_it() {
     let fix = plan(&after, &ids, &declared, &ids);
     assert_eq!(fix.changes.len(), 1, "{fix:#?}");
     assert!(
-        matches!(fix.changes[0].change, pbps_model::Change::UpdateRow { .. }),
+        matches!(
+            fix.changes[0].change,
+            pbps_model::Change::Row(pbps_model::RowChange::UpdateRow { .. })
+        ),
         "{fix:#?}"
     );
     apply(&mut conn, &pg, &fix).await;
@@ -21934,7 +22058,10 @@ async fn a_cell_a_collation_calls_equal_to_its_default_is_still_drift() {
     let fix = plan(&base, &ids, &declared, &ids);
     assert_eq!(fix.changes.len(), 1, "{fix:#?}");
     assert!(
-        matches!(fix.changes[0].change, pbps_model::Change::UpdateRow { .. }),
+        matches!(
+            fix.changes[0].change,
+            pbps_model::Change::Row(pbps_model::RowChange::UpdateRow { .. })
+        ),
         "{fix:#?}"
     );
     let pg = Postgres::new();
@@ -22015,7 +22142,10 @@ async fn a_row_that_references_only_itself_can_be_deleted() {
     let cs = plan(&base, &ids, &declared, &ids);
     assert_eq!(cs.changes.len(), 1, "{cs:#?}");
     assert!(
-        matches!(cs.changes[0].change, pbps_model::Change::DeleteRow { .. }),
+        matches!(
+            cs.changes[0].change,
+            pbps_model::Change::Row(pbps_model::RowChange::DeleteRow { .. })
+        ),
         "{cs:#?}"
     );
 
@@ -22053,7 +22183,7 @@ async fn a_row_that_references_only_itself_can_be_deleted() {
         .changes
         .iter()
         .find(|c| {
-            matches!(&c.change, pbps_model::Change::DeleteRow { key, .. } if key.as_str() == "loop")
+            matches!(&c.change, pbps_model::Change::Row(pbps_model::RowChange::DeleteRow { key, .. }) if key.as_str() == "loop")
         })
         .expect("the plan deletes `loop`");
     let stmt = pg
@@ -22160,7 +22290,7 @@ async fn a_write_to_a_default_no_probe_can_evaluate_is_refused_where_a_key_spans
     assert!(
         cs.changes.iter().any(|c| matches!(
             &c.change,
-            pbps_model::Change::DeleteRow { key, .. } if key.as_str() == "old"
+            pbps_model::Change::Row(pbps_model::RowChange::DeleteRow { key, .. }) if key.as_str() == "old"
         )),
         "{cs:#?}"
     );
@@ -22230,7 +22360,7 @@ async fn a_write_to_a_default_no_probe_can_evaluate_is_refused_where_a_key_spans
         .changes
         .iter()
         .find(|c| {
-            matches!(&c.change, pbps_model::Change::DeleteRow { key, .. } if key.as_str() == "old")
+            matches!(&c.change, pbps_model::Change::Row(pbps_model::RowChange::DeleteRow { key, .. }) if key.as_str() == "old")
         })
         .expect("the delete");
     let stmt = pg
@@ -22312,7 +22442,10 @@ async fn a_json_cell_at_its_default_is_told_from_a_hand_edited_one() {
     let fix = plan(&after, &ids, &declared, &ids);
     assert_eq!(fix.changes.len(), 1, "{fix:#?}");
     assert!(
-        matches!(fix.changes[0].change, pbps_model::Change::UpdateRow { .. }),
+        matches!(
+            fix.changes[0].change,
+            pbps_model::Change::Row(pbps_model::RowChange::UpdateRow { .. })
+        ),
         "{fix:#?}"
     );
     apply(&mut conn, &pg, &fix).await;
@@ -22537,7 +22670,7 @@ async fn a_referencing_relation_is_counted_only_where_its_key_reaches() {
         .changes
         .iter()
         .find(|c| {
-            matches!(&c.change, pbps_model::Change::DeleteRow { key, .. } if key.as_str() == "keep")
+            matches!(&c.change, pbps_model::Change::Row(pbps_model::RowChange::DeleteRow { key, .. }) if key.as_str() == "keep")
         })
         .expect("the plan deletes `keep`");
     let probes = pg.fixture_preflight(&cs).probes;
@@ -22876,7 +23009,7 @@ async fn a_child_left_to_a_null_default_is_not_counted_against_its_parents_delet
     assert!(
         cs.changes.iter().any(|c| matches!(
             &c.change,
-            pbps_model::Change::UpdateRow { columns, .. }
+            pbps_model::Change::Row(pbps_model::RowChange::UpdateRow { columns, .. })
                 if matches!(columns.get("parent"), Some((_, pbps_model::Cell::Default(_))))
         )),
         "the child goes back to its default: {cs:#?}"
@@ -22991,13 +23124,16 @@ async fn a_foreign_key_this_plan_adds_is_counted_before_the_delete_that_would_br
     let cs = plan(&base, &ids, &declared, &ids);
     assert_eq!(cs.changes.len(), 2, "{cs:#?}");
     assert!(
-        matches!(cs.changes[0].change, pbps_model::Change::DeleteRow { .. }),
+        matches!(
+            cs.changes[0].change,
+            pbps_model::Change::Row(pbps_model::RowChange::DeleteRow { .. })
+        ),
         "the delete runs first: {cs:#?}"
     );
     assert!(
         matches!(
             cs.changes[1].change,
-            pbps_model::Change::AddForeignKey { .. }
+            pbps_model::Change::Constraint(pbps_model::ConstraintChange::AddForeignKey { .. })
         ),
         "and the key is added after it: {cs:#?}"
     );
@@ -23209,21 +23345,24 @@ async fn narrowed_integer_key(from: &str, to: &str, overflow: i64) {
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
     assert!(
-        cs.changes
-            .iter()
-            .any(|c| matches!(c.change, pbps_model::Change::AlterColumnType { .. })),
+        cs.changes.iter().any(|c| matches!(
+            c.change,
+            pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType { .. })
+        )),
         "the column is narrowed: {cs:#?}"
     );
     assert!(
-        cs.changes
-            .iter()
-            .any(|c| matches!(c.change, pbps_model::Change::AddForeignKey { .. })),
+        cs.changes.iter().any(|c| matches!(
+            c.change,
+            pbps_model::Change::Constraint(pbps_model::ConstraintChange::AddForeignKey { .. })
+        )),
         "and the key is added in the same plan: {cs:#?}"
     );
     assert!(
-        cs.changes
-            .iter()
-            .any(|c| matches!(c.change, pbps_model::Change::DeleteRow { .. })),
+        cs.changes.iter().any(|c| matches!(
+            c.change,
+            pbps_model::Change::Row(pbps_model::RowChange::DeleteRow { .. })
+        )),
         "over a parent row this same plan deletes: {cs:#?}"
     );
 
@@ -23397,9 +23536,10 @@ async fn a_narrowed_parent_column_is_probed_without_raising_on_either_alias() {
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
     assert!(
-        cs.changes
-            .iter()
-            .any(|c| matches!(c.change, pbps_model::Change::AlterColumnType { .. })),
+        cs.changes.iter().any(|c| matches!(
+            c.change,
+            pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType { .. })
+        )),
         "the referenced column is what narrows: {cs:#?}"
     );
     let pg = Postgres::new();
@@ -23560,21 +23700,24 @@ async fn a_foreign_key_this_plan_adds_on_a_narrowing_pair_still_counts_a_row_who
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
     assert!(
-        cs.changes
-            .iter()
-            .any(|c| matches!(c.change, pbps_model::Change::AlterColumnType { .. })),
+        cs.changes.iter().any(|c| matches!(
+            c.change,
+            pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType { .. })
+        )),
         "the column is narrowed: {cs:#?}"
     );
     assert!(
-        cs.changes
-            .iter()
-            .any(|c| matches!(c.change, pbps_model::Change::AddForeignKey { .. })),
+        cs.changes.iter().any(|c| matches!(
+            c.change,
+            pbps_model::Change::Constraint(pbps_model::ConstraintChange::AddForeignKey { .. })
+        )),
         "and the key is added in the same plan: {cs:#?}"
     );
     assert!(
-        cs.changes
-            .iter()
-            .any(|c| matches!(c.change, pbps_model::Change::DeleteRow { .. })),
+        cs.changes.iter().any(|c| matches!(
+            c.change,
+            pbps_model::Change::Row(pbps_model::RowChange::DeleteRow { .. })
+        )),
         "over a parent row this same plan deletes: {cs:#?}"
     );
 
@@ -23612,7 +23755,7 @@ async fn a_foreign_key_this_plan_adds_on_a_narrowing_pair_still_counts_a_row_who
 }
 
 fn narrowing_projection_change(column: &str, from: &str, to: &str) -> pbps_model::Change {
-    pbps_model::Change::AlterColumnType {
+    pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType {
         uid: "c_aaaaaa".parse().unwrap(),
         column: column.parse().unwrap(),
         from: ty(from),
@@ -23623,7 +23766,7 @@ fn narrowing_projection_change(column: &str, from: &str, to: &str) -> pbps_model
         from_collation: None,
         to_collation: None,
         using: None,
-    }
+    })
 }
 
 fn narrowing_projection_plan(changes: Vec<pbps_model::Change>) -> pbps_model::ChangeSet {
@@ -23654,6 +23797,8 @@ async fn narrowing_projection_verdict(db: &mut Conn, cs: &pbps_model::ChangeSet)
 #[ignore = "needs live PostgreSQL"]
 async fn narrowing_projection_counts_rounding_collisions_without_losing_nulls() {
     use pbps_model::Change;
+    use pbps_model::ConstraintChange;
+    use pbps_model::IndexChange;
     // Duplicate probes count affected rows, not collision groups (375).
     for (to, extra, kind, duplicates, nulls, conversion, verdict) in [
         ("numeric(5,1)", "", "unique", 2, 0, 0, Some("23505")),
@@ -23682,7 +23827,7 @@ async fn narrowing_projection_counts_rounding_collisions_without_losing_nulls() 
         db.execute(&format!("CREATE TABLE public.t (v numeric(5,2)); INSERT INTO public.t VALUES (1.04),(1.00),(NULL){extra}")).await.unwrap();
         let table = TableName::new("public", "t");
         let constraint = match kind {
-            "unique" => Change::AddUnique {
+            "unique" => Change::Constraint(ConstraintChange::AddUnique {
                 table,
                 name: "uq_projection".into(),
                 constraint: pbps_model::UniqueConstraint {
@@ -23691,8 +23836,8 @@ async fn narrowing_projection_counts_rounding_collisions_without_losing_nulls() 
                     filegroup: None,
                 },
                 clustered: false,
-            },
-            "index" => Change::AddIndex {
+            }),
+            "index" => Change::Index(IndexChange::AddIndex {
                 table,
                 name: "uq_projection".into(),
                 index: Box::new(pbps_model::Index {
@@ -23710,8 +23855,8 @@ async fn narrowing_projection_counts_rounding_collisions_without_losing_nulls() 
                     filegroup: None,
                 }),
                 clustered: false,
-            },
-            _ => Change::SetPrimaryKey {
+            }),
+            _ => Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table,
                 from: None,
                 to: Some(PrimaryKey {
@@ -23721,7 +23866,7 @@ async fn narrowing_projection_counts_rounding_collisions_without_losing_nulls() 
                     filegroup: None,
                 }),
                 nonclustered: false,
-            },
+            }),
         };
         let cs = narrowing_projection_plan(vec![
             narrowing_projection_change("public.t.v", "numeric(5,2)", to),
@@ -23765,6 +23910,9 @@ async fn narrowing_projection_counts_rounding_collisions_without_losing_nulls() 
 #[ignore = "needs live PostgreSQL"]
 async fn narrowing_projection_keeps_added_foreign_key_checks_for_fitting_rows() {
     use pbps_model::Change;
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::TableChange;
     for (side, mixed, orphan, renamed) in [
         ("child", false, true, false),
         ("child", true, true, false),
@@ -23795,19 +23943,19 @@ async fn narrowing_projection_keeps_added_foreign_key_checks_for_fitting_rows() 
         let child = TableName::new("public", if renamed { "renamed" } else { "child" });
         let child_column = if renamed { "renamed_v" } else { "v" };
         if renamed {
-            changes.push(Change::RenameTable {
+            changes.push(Change::Table(TableChange::RenameTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 from: TableName::new("public", "child"),
                 to: child.clone(),
                 defaults: Vec::new(),
-            });
-            changes.push(Change::RenameColumn {
+            }));
+            changes.push(Change::Column(ColumnChange::RenameColumn {
                 uid: "c_aaaaaa".parse().unwrap(),
                 table: child.clone(),
                 from: "v".into(),
                 to: child_column.into(),
                 table_was: None,
-            });
+            }));
         }
         let column = if side == "child" {
             child.column(child_column).raw().to_string()
@@ -23819,7 +23967,7 @@ async fn narrowing_projection_keeps_added_foreign_key_checks_for_fitting_rows() 
             "numeric(20,0)",
             "integer",
         ));
-        changes.push(Change::AddForeignKey {
+        changes.push(Change::Constraint(ConstraintChange::AddForeignKey {
             table: child,
             name: "fk_projection".into(),
             constraint: Box::new(ForeignKey {
@@ -23829,7 +23977,7 @@ async fn narrowing_projection_keeps_added_foreign_key_checks_for_fitting_rows() 
                 on_delete: ReferentialAction::NoAction,
                 on_update: ReferentialAction::NoAction,
             }),
-        });
+        }));
         let cs = narrowing_projection_plan(changes);
         let report = Postgres::new().fixture_preflight(&cs);
         let mut counts = Vec::new();
@@ -23864,6 +24012,8 @@ async fn narrowing_projection_keeps_added_foreign_key_checks_for_fitting_rows() 
 #[tokio::test]
 #[ignore = "needs live PostgreSQL"]
 async fn narrowing_projection_keeps_inserted_and_updated_rows_in_composite_keys() {
+    use pbps_model::ConstraintChange;
+    use pbps_model::RowChange;
     use pbps_model::{Cell, Change};
     for overflow in [false, true] {
         let mut db = TestDb::create("projection281_writes").await;
@@ -23871,7 +24021,7 @@ async fn narrowing_projection_keeps_inserted_and_updated_rows_in_composite_keys(
         let table = TableName::new("public", "t");
         let cs = narrowing_projection_plan(vec![
             narrowing_projection_change("public.t.v", "numeric(5,2)", "numeric(4,1)"),
-            Change::UpdateRow {
+            Change::Row(RowChange::UpdateRow {
                 table: table.clone(),
                 key_column: "code".into(),
                 key: "a".into(),
@@ -23884,8 +24034,8 @@ async fn narrowing_projection_keeps_inserted_and_updated_rows_in_composite_keys(
                 types: [("tag".into(), ty("integer"))].into(),
                 after_types: Default::default(),
                 key_type: None,
-            },
-            Change::InsertRow {
+            }),
+            Change::Row(RowChange::InsertRow {
                 table: table.clone(),
                 key_column: "code".into(),
                 identity_key: false,
@@ -23897,8 +24047,8 @@ async fn narrowing_projection_keeps_inserted_and_updated_rows_in_composite_keys(
                     ("tag".into(), ty("integer")),
                 ]
                 .into(),
-            },
-            Change::AddUnique {
+            }),
+            Change::Constraint(ConstraintChange::AddUnique {
                 table,
                 name: "uq_projection".into(),
                 constraint: pbps_model::UniqueConstraint {
@@ -23907,7 +24057,7 @@ async fn narrowing_projection_keeps_inserted_and_updated_rows_in_composite_keys(
                     filegroup: None,
                 },
                 clustered: false,
-            },
+            }),
         ]);
         let report = Postgres::new().fixture_preflight(&cs);
         let mut counts = Vec::new();
@@ -24039,7 +24189,10 @@ async fn a_key_this_plan_adds_on_a_column_it_adds_counts_the_backfilled_rows() {
     let cs = plan(&base, &base_ids, &declared, &ids);
     assert_eq!(cs.changes.len(), 3, "{cs:#?}");
     assert!(
-        matches!(cs.changes[0].change, pbps_model::Change::AddColumn { .. }),
+        matches!(
+            cs.changes[0].change,
+            pbps_model::Change::Column(pbps_model::ColumnChange::AddColumn { .. })
+        ),
         "the column comes first: {cs:#?}"
     );
     let probes = pg.fixture_preflight(&cs).probes;
@@ -24225,7 +24378,9 @@ async fn a_row_updated_to_a_null_beside_an_unprobeable_default_leaves_the_count(
         .changes
         .iter()
         .find_map(|c| {
-            if let pbps_model::Change::UpdateRow { columns, .. } = &c.change {
+            if let pbps_model::Change::Row(pbps_model::RowChange::UpdateRow { columns, .. }) =
+                &c.change
+            {
                 Some(columns)
             } else {
                 None
@@ -24718,9 +24873,10 @@ async fn a_surviving_parent_row_is_the_row_this_plan_leaves_there() {
     let ids = mint_ids(&declared, &base_ids, &[]);
     let cs = plan(&base, &base_ids, &declared, &ids);
     assert!(
-        cs.changes
-            .iter()
-            .any(|c| matches!(c.change, pbps_model::Change::UpdateRow { .. })),
+        cs.changes.iter().any(|c| matches!(
+            c.change,
+            pbps_model::Change::Row(pbps_model::RowChange::UpdateRow { .. })
+        )),
         "the survivor is updated: {cs:#?}"
     );
     let probes = pg.fixture_preflight(&cs).probes;
@@ -25025,9 +25181,10 @@ async fn an_identity_column_this_plan_adds_is_a_backfill_no_probe_can_evaluate()
         let ids = mint_ids(&declared, &base_ids, &[]);
         let cs = plan(&base, &base_ids, &declared, &ids);
         assert!(
-            cs.changes
-                .iter()
-                .any(|c| matches!(c.change, pbps_model::Change::AddColumn { .. })),
+            cs.changes.iter().any(|c| matches!(
+                c.change,
+                pbps_model::Change::Column(pbps_model::ColumnChange::AddColumn { .. })
+            )),
             "the identity column is added: {cs:#?}"
         );
         let probes = pg.fixture_preflight(&cs).probes;
@@ -25161,7 +25318,10 @@ async fn a_key_this_plan_adds_on_a_column_it_retypes_compares_the_converted_valu
     assert_eq!(
         cs.changes
             .iter()
-            .filter(|c| matches!(c.change, pbps_model::Change::AlterColumnType { .. }))
+            .filter(|c| matches!(
+                c.change,
+                pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType { .. })
+            ))
             .count(),
         2,
         "both columns are retyped: {cs:#?}"
@@ -25741,9 +25901,10 @@ async fn a_child_this_plan_creates_arrives_on_the_parent_before_its_key_exists()
     let ids = mint_ids(&declared, &base_ids, &[]);
     let cs = plan(&base, &base_ids, &declared, &ids);
     assert!(
-        cs.changes
-            .iter()
-            .any(|c| matches!(c.change, pbps_model::Change::AddForeignKey { .. })),
+        cs.changes.iter().any(|c| matches!(
+            c.change,
+            pbps_model::Change::Constraint(pbps_model::ConstraintChange::AddForeignKey { .. })
+        )),
         "the key is its own change, after the delete: {cs:#?}"
     );
     let probes = pg.fixture_preflight(&cs).probes;
@@ -26819,9 +26980,11 @@ async fn a_null_an_update_leaves_alone_is_a_null_of_the_tuple_it_writes() {
         .changes
         .iter()
         .find_map(|c| {
-            if let pbps_model::Change::UpdateRow {
-                columns, unchanged, ..
-            } = &c.change
+            if let pbps_model::Change::Row(pbps_model::RowChange::UpdateRow {
+                columns,
+                unchanged,
+                ..
+            }) = &c.change
             {
                 Some((columns, unchanged))
             } else {
@@ -26983,9 +27146,10 @@ async fn a_null_an_update_leaves_alone_decides_for_a_key_this_plan_adds_too() {
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
     assert!(
-        cs.changes
-            .iter()
-            .any(|c| matches!(c.change, pbps_model::Change::AddForeignKey { .. })),
+        cs.changes.iter().any(|c| matches!(
+            c.change,
+            pbps_model::Change::Constraint(pbps_model::ConstraintChange::AddForeignKey { .. })
+        )),
         "the key is this plan's to add: {cs:#?}"
     );
     let pg = Postgres::new();
@@ -27123,7 +27287,9 @@ async fn a_default_cast_from_null_is_the_null_the_row_is_left_to() {
         .changes
         .iter()
         .find_map(|c| {
-            if let pbps_model::Change::UpdateRow { columns, .. } = &c.change {
+            if let pbps_model::Change::Row(pbps_model::RowChange::UpdateRow { columns, .. }) =
+                &c.change
+            {
                 Some(columns)
             } else {
                 None
@@ -27302,11 +27468,11 @@ async fn a_null_default_is_one_this_engine_does_not_keep() {
         .changes
         .iter()
         .filter_map(|c| {
-            if let pbps_model::Change::AlterColumnDefault {
+            if let pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnDefault {
                 column,
                 to: Some(_),
                 ..
-            } = &c.change
+            }) = &c.change
             {
                 Some(column.name.raw())
             } else {
@@ -27344,7 +27510,10 @@ async fn a_null_default_is_one_this_engine_does_not_keep() {
         again
             .changes
             .iter()
-            .filter(|c| matches!(c.change, pbps_model::Change::AlterColumnDefault { .. }))
+            .filter(|c| matches!(
+                c.change,
+                pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnDefault { .. })
+            ))
             .count(),
         12,
         "and the next plan sets the erased ones again, and only those: {again:#?}"
@@ -27556,9 +27725,10 @@ async fn an_inserted_survivor_meets_an_arriving_child_under_the_referenced_colla
         let base = connected_base(&mut conn, &declared, &s).await;
         let cs = plan(&base, &ids, &declared, &ids);
         assert!(
-            cs.changes
-                .iter()
-                .any(|c| matches!(c.change, pbps_model::Change::AddForeignKey { .. })),
+            cs.changes.iter().any(|c| matches!(
+                c.change,
+                pbps_model::Change::Constraint(pbps_model::ConstraintChange::AddForeignKey { .. })
+            )),
             "the key is this plan's to add: {cs:#?}"
         );
         let probes = pg.fixture_preflight(&cs).probes;
@@ -27682,9 +27852,10 @@ async fn a_planned_key_across_collations_is_counted_under_the_referenced_collati
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
     assert!(
-        cs.changes
-            .iter()
-            .any(|c| matches!(c.change, pbps_model::Change::AddForeignKey { .. })),
+        cs.changes.iter().any(|c| matches!(
+            c.change,
+            pbps_model::Change::Constraint(pbps_model::ConstraintChange::AddForeignKey { .. })
+        )),
         "the key is this plan's to add: {cs:#?}"
     );
     let pg = Postgres::new();
@@ -27734,6 +27905,7 @@ async fn a_planned_key_across_collations_is_counted_under_the_referenced_collati
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 async fn planned_key_collation_guards_match_the_engine_for_every_collation_pair() {
+    use pbps_model::ConstraintChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
     let mut conn = TestDb::create("key_collation_pairs").await;
     let s = data_schema("key_collation_pairs");
@@ -27756,17 +27928,19 @@ async fn planned_key_collation_guards_match_the_engine_for_every_collation_pair(
                  CREATE TABLE {s}.child (id integer, ref text COLLATE {child_collation});"
             )).await.unwrap();
             let cs = ChangeSet {
-                changes: vec![PlannedChange::new(Change::AddForeignKey {
-                    table: TableName::new(&s, "child"),
-                    name: "fk_collations".into(),
-                    constraint: Box::new(ForeignKey {
-                        columns: vec!["id".into(), "ref".into()],
-                        references_table: TableName::new(&s, "parent"),
-                        references_columns: vec!["id".into(), "code".into()],
-                        on_delete: ReferentialAction::NoAction,
-                        on_update: ReferentialAction::NoAction,
-                    }),
-                })],
+                changes: vec![PlannedChange::new(Change::Constraint(
+                    ConstraintChange::AddForeignKey {
+                        table: TableName::new(&s, "child"),
+                        name: "fk_collations".into(),
+                        constraint: Box::new(ForeignKey {
+                            columns: vec!["id".into(), "ref".into()],
+                            references_table: TableName::new(&s, "parent"),
+                            references_columns: vec!["id".into(), "code".into()],
+                            on_delete: ReferentialAction::NoAction,
+                            on_update: ReferentialAction::NoAction,
+                        }),
+                    },
+                ))],
             };
             let report = Postgres::new().fixture_preflight(&cs);
             let probe = report
@@ -27802,6 +27976,9 @@ async fn planned_key_collation_guards_match_the_engine_for_every_collation_pair(
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 async fn planned_key_collation_guards_use_renamed_added_created_and_retyped_columns() {
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
     let mut conn = TestDb::create("key_collation_projection").await;
     let s = data_schema("key_collation_projection");
@@ -27840,19 +28017,19 @@ async fn planned_key_collation_guards_use_renamed_added_created_and_retyped_colu
             match mode {
                 "rename" => {
                     child = TableName::new(&s, "renamed");
-                    changes.push(Change::RenameTable {
+                    changes.push(Change::Table(TableChange::RenameTable {
                         uid: "t_aaaaaa".parse().unwrap(),
                         from: TableName::new(&s, "child"),
                         to: child.clone(),
                         defaults: Vec::new(),
-                    });
-                    changes.push(Change::RenameColumn {
+                    }));
+                    changes.push(Change::Column(ColumnChange::RenameColumn {
                         uid: "c_aaaaaa".parse().unwrap(),
                         table: child.clone(),
                         from: "ref".into(),
                         to: column.into(),
                         table_was: None,
-                    });
+                    }));
                 }
                 "add" | "add_default" => {
                     let mut added = Column::new(ty("text"));
@@ -27860,12 +28037,12 @@ async fn planned_key_collation_guards_use_renamed_added_created_and_retyped_colu
                         added.value_source =
                             pbps_model::ValueSource::Default("lower('PARENT'::text)".into());
                     }
-                    changes.push(Change::AddColumn {
+                    changes.push(Change::Column(ColumnChange::AddColumn {
                         uid: "c_bbbbbb".parse().unwrap(),
                         table: child.clone(),
                         name: column.into(),
                         column: Box::new(added),
-                    });
+                    }));
                 }
                 "create" => {
                     let mut table = Table::default();
@@ -27873,15 +28050,15 @@ async fn planned_key_collation_guards_use_renamed_added_created_and_retyped_colu
                     table
                         .foreign_keys
                         .insert("fk_collations".into(), fk.clone());
-                    changes.push(Change::CreateTable {
+                    changes.push(Change::Table(TableChange::CreateTable {
                         uid: "t_aaaaaa".parse().unwrap(),
                         name: child.clone(),
                         table: Box::new(table),
                         beside_default: None,
                         moves_at_most: None,
-                    });
+                    }));
                 }
-                "retype" => changes.push(Change::AlterColumnType {
+                "retype" => changes.push(Change::Column(ColumnChange::AlterColumnType {
                     uid: "c_aaaaaa".parse().unwrap(),
                     column: child.column(column),
                     from: ty("text"),
@@ -27892,15 +28069,15 @@ async fn planned_key_collation_guards_use_renamed_added_created_and_retyped_colu
                     from_collation: None,
                     to_collation: None,
                     using: None,
-                }),
+                })),
                 _ => unreachable!(),
             }
             if mode != "create" {
-                changes.push(Change::AddForeignKey {
+                changes.push(Change::Constraint(ConstraintChange::AddForeignKey {
                     table: child.clone(),
                     name: "fk_collations".into(),
                     constraint: Box::new(fk),
-                });
+                }));
             }
             let cs = ChangeSet {
                 changes: changes.into_iter().map(PlannedChange::new).collect(),
@@ -28180,7 +28357,7 @@ async fn a_default_spelled_as_an_escape_string_is_the_literal_it_is() {
         assert!(
             cs.changes
                 .iter()
-                .any(|c| matches!(&c.change, pbps_model::Change::UpdateRow { columns, .. }
+                .any(|c| matches!(&c.change, pbps_model::Change::Row(pbps_model::RowChange::UpdateRow { columns, .. })
                     if matches!(columns.get("ref"), Some((_, pbps_model::Cell::Default(d))) if d == default))),
             "{default}: the row is left to the declared spelling: {cs:#?}"
         );
@@ -28529,6 +28706,7 @@ async fn a_grant_without_usage_on_the_schema_reaches_nothing() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn every_grant_the_emitter_writes_is_one_this_engine_runs() {
+    use pbps_model::GrantChange;
     use pbps_model::{Change, GrantTarget, Permission, Strategy};
 
     let mut db = TestDb::create("emitgrant").await;
@@ -28575,16 +28753,16 @@ async fn every_grant_the_emitter_writes_is_one_this_engine_runs() {
         let permissions: std::collections::BTreeSet<Permission> =
             permissions.iter().copied().collect();
         for change in [
-            Change::Grant {
+            Change::Permission(GrantChange::Grant {
                 role: role.clone().into(),
                 target: target.clone(),
                 permissions: permissions.clone(),
-            },
-            Change::Revoke {
+            }),
+            Change::Permission(GrantChange::Revoke {
                 role: role.clone().into(),
                 target: target.clone(),
                 permissions: permissions.clone(),
-            },
+            }),
         ] {
             for stmt in pg.fixture_emit(&change, Strategy::default()).expect("emit") {
                 db.conn
@@ -28611,6 +28789,7 @@ async fn every_grant_the_emitter_writes_is_one_this_engine_runs() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_bare_name_in_both_namespaces_grants_in_the_one_its_permissions_name() {
+    use pbps_model::GrantChange;
     use pbps_model::{Change, GrantTarget, Module, ModuleKind, Permission, Role, Strategy, Table};
 
     let mut db = TestDb::create("bothns").await;
@@ -28669,11 +28848,11 @@ async fn a_bare_name_in_both_namespaces_grants_in_the_one_its_permissions_name()
             &declared,
         );
         assert!(problems.is_empty(), "{spelled}: {problems:?}");
-        let change = Change::Grant {
+        let change = Change::Permission(GrantChange::Grant {
             role: role.clone().into(),
             target: spelled.parse::<GrantTarget>().expect("a grant target"),
             permissions: [permission].into_iter().collect(),
-        };
+        });
         for stmt in pg.fixture_emit(&change, Strategy::default()).expect("emit") {
             db.conn
                 .execute(&stmt.sql)
@@ -30074,6 +30253,8 @@ fn one(counts: &[(String, i64)], needle: &str) -> i64 {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn preflight_probes_count_the_rows_this_engine_would_refuse() {
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let mut conn = connect().await;
@@ -30101,22 +30282,22 @@ async fn preflight_probes_count_the_rows_this_engine_would_refuse() {
 
     let table = TableName::new(&s, "customer");
     let changes = vec![
-        Change::AlterColumnNullability {
+        Change::Column(ColumnChange::AlterColumnNullability {
             uid: "c_aaaaaa".parse().expect("a uid"),
             column: table.column("email"),
             ty: ty("text"),
             to_nullable: false,
             through_external_partitions: false,
             collation: None,
-        },
-        Change::AddCheck {
+        }),
+        Change::Constraint(ConstraintChange::AddCheck {
             table: table.clone(),
             name: "ck_customer_amount".into(),
             constraint: CheckConstraint {
                 expression: "amount >= 0".into(),
             },
-        },
-        Change::AddForeignKey {
+        }),
+        Change::Constraint(ConstraintChange::AddForeignKey {
             table: table.clone(),
             name: "fk_customer_region".into(),
             constraint: Box::new(ForeignKey {
@@ -30126,8 +30307,8 @@ async fn preflight_probes_count_the_rows_this_engine_would_refuse() {
                 on_delete: ReferentialAction::NoAction,
                 on_update: ReferentialAction::NoAction,
             }),
-        },
-        Change::AddUnique {
+        }),
+        Change::Constraint(ConstraintChange::AddUnique {
             table: table.clone(),
             name: "uq_customer_id".into(),
             constraint: UniqueConstraint {
@@ -30136,8 +30317,8 @@ async fn preflight_probes_count_the_rows_this_engine_would_refuse() {
                 filegroup: None,
             },
             clustered: false,
-        },
-        Change::AlterColumnType {
+        }),
+        Change::Column(ColumnChange::AlterColumnType {
             uid: "c_bbbbbb".parse().expect("a uid"),
             column: TableName::new(&s, "ticket").column("label"),
             from: ty("text"),
@@ -30148,7 +30329,7 @@ async fn preflight_probes_count_the_rows_this_engine_would_refuse() {
             from_collation: None,
             to_collation: None,
             using: None,
-        },
+        }),
     ];
     let cs = ChangeSet {
         changes: changes.iter().cloned().map(PlannedChange::new).collect(),
@@ -30229,6 +30410,8 @@ async fn preflight_probes_count_the_rows_this_engine_would_refuse() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_key_into_a_created_empty_parent_counts_every_reference_the_child_holds() {
+    use pbps_model::ConstraintChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let mut conn = connect().await;
@@ -30257,14 +30440,14 @@ async fn a_key_into_a_created_empty_parent_counts_every_reference_the_child_hold
         filegroup: None,
     });
     let changes = [
-        Change::CreateTable {
+        Change::Table(TableChange::CreateTable {
             uid: "t_aaaaaa".parse().expect("a uid"),
             name: parent.clone(),
             table: Box::new(declared),
             beside_default: None,
             moves_at_most: None,
-        },
-        Change::AddForeignKey {
+        }),
+        Change::Constraint(ConstraintChange::AddForeignKey {
             table: TableName::new(&s, "child"),
             name: "fk_child_status".into(),
             constraint: Box::new(ForeignKey {
@@ -30274,7 +30457,7 @@ async fn a_key_into_a_created_empty_parent_counts_every_reference_the_child_hold
                 on_delete: ReferentialAction::NoAction,
                 on_update: ReferentialAction::NoAction,
             }),
-        },
+        }),
     ];
     let cs = ChangeSet {
         changes: changes.iter().cloned().map(PlannedChange::new).collect(),
@@ -30360,6 +30543,7 @@ async fn a_key_into_a_created_empty_parent_counts_every_reference_the_child_hold
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn nulls_are_distinct_under_this_engines_unique_and_the_count_says_so() {
+    use pbps_model::ConstraintChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let mut conn = connect().await;
@@ -30387,7 +30571,7 @@ async fn nulls_are_distinct_under_this_engines_unique_and_the_count_says_so() {
     );
 
     let table = TableName::new(&s, "t");
-    let single = Change::AddUnique {
+    let single = Change::Constraint(ConstraintChange::AddUnique {
         table: table.clone(),
         name: "uq_a".into(),
         constraint: UniqueConstraint {
@@ -30396,8 +30580,8 @@ async fn nulls_are_distinct_under_this_engines_unique_and_the_count_says_so() {
             filegroup: None,
         },
         clustered: false,
-    };
-    let composite = Change::AddUnique {
+    });
+    let composite = Change::Constraint(ConstraintChange::AddUnique {
         table: table.clone(),
         name: "uq_ab".into(),
         constraint: UniqueConstraint {
@@ -30406,7 +30590,7 @@ async fn nulls_are_distinct_under_this_engines_unique_and_the_count_says_so() {
             filegroup: None,
         },
         clustered: false,
-    };
+    });
     let cs = ChangeSet {
         changes: vec![
             PlannedChange::new(single.clone()),
@@ -30443,6 +30627,7 @@ async fn nulls_are_distinct_under_this_engines_unique_and_the_count_says_so() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn integer_narrowing_conversion_probes_match_both_engine_boundaries() {
+    use pbps_model::ColumnChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let mut conn = connect().await;
@@ -30454,18 +30639,20 @@ async fn integer_narrowing_conversion_probes_match_both_engine_boundaries() {
         ("integer", "smallint", -32768, 32767),
     ] {
         let cs = ChangeSet {
-            changes: vec![PlannedChange::new(Change::AlterColumnType {
-                uid: "c_aaaaaa".parse().expect("a uid"),
-                column: TableName::new(&s, "t").column("v"),
-                from: ty(from),
-                to: ty(to),
-                from_nullable: true,
-                to_nullable: true,
-                through_external_partitions: false,
-                from_collation: None,
-                to_collation: None,
-                using: None,
-            })],
+            changes: vec![PlannedChange::new(Change::Column(
+                ColumnChange::AlterColumnType {
+                    uid: "c_aaaaaa".parse().expect("a uid"),
+                    column: TableName::new(&s, "t").column("v"),
+                    from: ty(from),
+                    to: ty(to),
+                    from_nullable: true,
+                    to_nullable: true,
+                    through_external_partitions: false,
+                    from_collation: None,
+                    to_collation: None,
+                    using: None,
+                },
+            ))],
         };
         for (value, rejected) in [(min - 1, true), (min, false), (max, false), (max + 1, true)] {
             conn.execute(&format!(
@@ -30523,6 +30710,7 @@ async fn integer_narrowing_conversion_probes_match_both_engine_boundaries() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_value_a_cast_would_truncate_is_one_the_alter_refuses() {
+    use pbps_model::ColumnChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let mut conn = connect().await;
@@ -30547,17 +30735,19 @@ async fn a_value_a_cast_would_truncate_is_one_the_alter_refuses() {
         "a cast-shaped probe reports this table clean"
     );
 
-    let narrow = |to: &str| Change::AlterColumnType {
-        uid: "c_aaaaaa".parse().expect("a uid"),
-        column: TableName::new(&s, "t").column("v"),
-        from: ty("text"),
-        to: ty(to),
-        from_nullable: true,
-        to_nullable: true,
-        through_external_partitions: false,
-        from_collation: None,
-        to_collation: None,
-        using: None,
+    let narrow = |to: &str| {
+        Change::Column(ColumnChange::AlterColumnType {
+            uid: "c_aaaaaa".parse().expect("a uid"),
+            column: TableName::new(&s, "t").column("v"),
+            from: ty("text"),
+            to: ty(to),
+            from_nullable: true,
+            to_nullable: true,
+            through_external_partitions: false,
+            from_collation: None,
+            to_collation: None,
+            using: None,
+        })
     };
     let cs = ChangeSet {
         changes: vec![PlannedChange::new(narrow("varchar(4)"))],
@@ -30629,6 +30819,8 @@ async fn a_value_a_cast_would_truncate_is_one_the_alter_refuses() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_plan_that_supplies_the_parent_row_first_is_not_refused_for_its_absence() {
+    use pbps_model::ConstraintChange;
+    use pbps_model::RowChange;
     use pbps_model::{Change, ChangeSet, DataMode, Value};
 
     let mut conn = TestDb::create("pull_data_supplied_parent").await;
@@ -30699,12 +30891,17 @@ async fn a_plan_that_supplies_the_parent_row_first_is_not_refused_for_its_absenc
     let inserts = cs
         .changes
         .iter()
-        .filter(|p| matches!(p.change, Change::InsertRow { .. }))
+        .filter(|p| matches!(p.change, Change::Row(RowChange::InsertRow { .. })))
         .count();
     let keys = cs
         .changes
         .iter()
-        .filter(|p| matches!(p.change, Change::AddForeignKey { .. }))
+        .filter(|p| {
+            matches!(
+                p.change,
+                Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            )
+        })
         .count();
     assert_eq!((inserts, keys), (1, 1), "{cs:#?}");
 
@@ -30713,7 +30910,12 @@ async fn a_plan_that_supplies_the_parent_row_first_is_not_refused_for_its_absenc
         changes: cs
             .changes
             .iter()
-            .filter(|p| matches!(p.change, Change::AddForeignKey { .. }))
+            .filter(|p| {
+                matches!(
+                    p.change,
+                    Change::Constraint(ConstraintChange::AddForeignKey { .. })
+                )
+            })
             .cloned()
             .collect(),
     };
@@ -30770,6 +30972,7 @@ async fn a_plan_that_supplies_the_parent_row_first_is_not_refused_for_its_absenc
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn an_orphan_is_counted_under_the_referenced_columns_own_collation() {
+    use pbps_model::ConstraintChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let mut conn = connect().await;
@@ -30795,7 +30998,7 @@ async fn an_orphan_is_counted_under_the_referenced_columns_own_collation() {
         "a bare comparison across the two collations must be the error this splice avoids"
     );
 
-    let key = Change::AddForeignKey {
+    let key = Change::Constraint(ConstraintChange::AddForeignKey {
         table: TableName::new(&s, "c"),
         name: "fk_c_p".into(),
         constraint: Box::new(ForeignKey {
@@ -30805,7 +31008,7 @@ async fn an_orphan_is_counted_under_the_referenced_columns_own_collation() {
             on_delete: ReferentialAction::NoAction,
             on_update: ReferentialAction::NoAction,
         }),
-    };
+    });
     let cs = ChangeSet {
         changes: vec![PlannedChange::new(key.clone())],
     };
@@ -32079,6 +32282,7 @@ async fn the_generated_relation_names_are_the_ones_the_engine_uses() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
+    use pbps_model::ColumnChange;
     use pbps_model::{Change, PlannedChange};
     use pbps_pg::estimate::{Lock, Reads, Rewrite};
 
@@ -32174,7 +32378,7 @@ async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
         if engine {
             rebuilt += 1;
         }
-        let change = Change::AlterColumnType {
+        let change = Change::Column(ColumnChange::AlterColumnType {
             uid: "c_aaaaaa".parse().expect("a uid"),
             column: TableName::new(&s, "m").column("c"),
             from: ty(src),
@@ -32185,7 +32389,7 @@ async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
             from_collation: None,
             to_collation: None,
             using: None,
-        };
+        });
         let ours = one_estimate(&change, Strategy::default())
             .expect("every column change has an estimate")
             .rewrite;
@@ -32249,7 +32453,7 @@ async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
         );
     }
     conn.execute("RESET TimeZone").await.expect("reset");
-    let change = Change::AlterColumnType {
+    let change = Change::Column(ColumnChange::AlterColumnType {
         uid: "c_aaaaaa".parse().expect("a uid"),
         column: TableName::new(&s, "z").column("c"),
         from: ty("timestamp"),
@@ -32260,7 +32464,7 @@ async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
         from_collation: None,
         to_collation: None,
         using: None,
-    };
+    });
     assert!(
         matches!(
             one_estimate(&change, Strategy::default())
@@ -32307,12 +32511,12 @@ async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
             let node =
                 format!("SELECT relfilenode::int FROM pg_class WHERE oid = '{s}.added'::regclass");
             let before = number(&mut conn, &node).await;
-            let change = Change::AddColumn {
+            let change = Change::Column(ColumnChange::AddColumn {
                 uid: "c_aaaaaa".parse().expect("a uid"),
                 table: TableName::new(&s, "added"),
                 name: "n".into(),
                 column: Box::new(column.clone()),
-            };
+            });
             let ours = one_estimate(&change, Strategy::default()).expect("an estimate");
             for statement in Postgres::new()
                 .fixture_emit(&change, Strategy::default())
@@ -32382,6 +32586,7 @@ async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_temporal_precision_change_is_estimated_as_the_engine_rebuilds_it() {
     use pbps_model::Change;
+    use pbps_model::ColumnChange;
     use pbps_pg::estimate::Rewrite;
 
     let mut conn = connect().await;
@@ -32463,7 +32668,7 @@ async fn a_temporal_precision_change_is_estimated_as_the_engine_rebuilds_it() {
             "{src} -> {dst} (populated={populated}): indexes rebuilt={indexes}, table={engine}"
         );
         rebuilt += usize::from(engine);
-        let change = Change::AlterColumnType {
+        let change = Change::Column(ColumnChange::AlterColumnType {
             uid: "c_aaaaaa".parse().expect("a uid"),
             column: TableName::new(&s, "m").column("c"),
             from: ty(src),
@@ -32474,7 +32679,7 @@ async fn a_temporal_precision_change_is_estimated_as_the_engine_rebuilds_it() {
             from_collation: None,
             to_collation: None,
             using: None,
-        };
+        });
         let ours = one_estimate(&change, Strategy::default())
             .expect("every column change has an estimate")
             .rewrite;
@@ -32518,7 +32723,7 @@ async fn a_temporal_precision_change_is_estimated_as_the_engine_rebuilds_it() {
     .await
     .expect("an indexed temporal column");
     for (to, widening) in [("timestamp(6)", true), ("timestamp(0)", false)] {
-        let change = Change::AlterColumnType {
+        let change = Change::Column(ColumnChange::AlterColumnType {
             uid: "c_aaaaaa".parse().expect("a uid"),
             column: TableName::new(&s, "m").column("c"),
             from: ty("timestamp(3)"),
@@ -32529,7 +32734,7 @@ async fn a_temporal_precision_change_is_estimated_as_the_engine_rebuilds_it() {
             from_collation: None,
             to_collation: None,
             using: None,
-        };
+        });
         let mut ours = one_estimate(&change, Strategy::default()).expect("an estimate");
         pbps_pg::estimate::against(&mut conn, &mut ours)
             .await
@@ -32561,6 +32766,7 @@ async fn a_temporal_precision_change_is_estimated_as_the_engine_rebuilds_it() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_change_that_rebuilds_nothing_may_still_read_every_row() {
     use pbps_model::Change;
+    use pbps_model::ColumnChange;
     use pbps_pg::estimate::{Reads, Rewrite};
 
     let mut conn = connect().await;
@@ -32579,15 +32785,15 @@ async fn a_change_that_rebuilds_nothing_may_still_read_every_row() {
         .expect("settle the statistics");
 
     let column = TableName::new(&s, "t");
-    let tighten = Change::AlterColumnNullability {
+    let tighten = Change::Column(ColumnChange::AlterColumnNullability {
         uid: "c_aaaaaa".parse().expect("a uid"),
         column: column.column("v"),
         ty: ty("integer"),
         to_nullable: false,
         through_external_partitions: false,
         collation: None,
-    };
-    let widen = Change::AlterColumnType {
+    });
+    let widen = Change::Column(ColumnChange::AlterColumnType {
         uid: "c_bbbbbb".parse().expect("a uid"),
         column: column.column("w"),
         from: ty("varchar(10)"),
@@ -32598,9 +32804,9 @@ async fn a_change_that_rebuilds_nothing_may_still_read_every_row() {
         from_collation: None,
         to_collation: None,
         using: None,
-    };
+    });
 
-    let folded = Change::AlterColumnType {
+    let folded = Change::Column(ColumnChange::AlterColumnType {
         uid: "c_cccccc".parse().unwrap(),
         column: column.column("x"),
         from: ty("varchar(10)"),
@@ -32611,7 +32817,7 @@ async fn a_change_that_rebuilds_nothing_may_still_read_every_row() {
         from_collation: None,
         to_collation: None,
         using: None,
-    };
+    });
 
     for (change, expected_reads, sql) in [
         (
@@ -32689,6 +32895,7 @@ async fn a_change_that_rebuilds_nothing_may_still_read_every_row() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_check_the_engine_may_prove_the_column_from_takes_the_scan_back_to_unknown() {
     use pbps_model::Change;
+    use pbps_model::ColumnChange;
     use pbps_pg::estimate::{Lock, Reads, Rewrite, against};
 
     let mut conn = connect().await;
@@ -32717,13 +32924,15 @@ async fn a_check_the_engine_may_prove_the_column_from_takes_the_scan_back_to_unk
             .expect("an unvalidated check");
         }
         let table = TableName::new(&s, name);
-        let tighten = |column: &str, to_nullable| Change::AlterColumnNullability {
-            uid: "c_aaaaaa".parse().expect("a uid"),
-            column: table.column(column),
-            ty: ty("integer"),
-            to_nullable,
-            through_external_partitions: false,
-            collation: None,
+        let tighten = |column: &str, to_nullable| {
+            Change::Column(ColumnChange::AlterColumnNullability {
+                uid: "c_aaaaaa".parse().expect("a uid"),
+                column: table.column(column),
+                ty: ty("integer"),
+                to_nullable,
+                through_external_partitions: false,
+                collation: None,
+            })
         };
         let mut ours =
             one_estimate(&tighten("v", false), Strategy::default()).expect("an estimate");
@@ -32802,10 +33011,11 @@ async fn nullability_scan(conn: &mut Conn, table: &TableName, sql: &str) -> (i32
 #[ignore = "needs live PostgreSQL"]
 async fn nullability_folded_into_widening_keeps_unparsed_check_uncertainty() {
     use pbps_model::Change;
+    use pbps_model::ColumnChange;
     use pbps_pg::estimate::{Reads, Rewrite, against};
     let mut db = TestDb::create("folded_check271").await;
     db.execute("CREATE TABLE public.t (v varchar(10), CONSTRAINT nonempty CHECK (v <> '')) WITH (autovacuum_enabled = false); INSERT INTO public.t SELECT g::text FROM generate_series(1,100000) g").await.unwrap();
-    let change = Change::AlterColumnType {
+    let change = Change::Column(ColumnChange::AlterColumnType {
         uid: "c_aaaaaa".parse().unwrap(),
         column: "public.t.v".parse().unwrap(),
         from: ty("varchar(10)"),
@@ -32816,7 +33026,7 @@ async fn nullability_folded_into_widening_keeps_unparsed_check_uncertainty() {
         from_collation: None,
         to_collation: None,
         using: None,
-    };
+    });
     let mut ours = one_estimate(&change, Strategy::default()).unwrap();
     against(&mut db, &mut ours).await.unwrap();
     let sql = Postgres::new()
@@ -32840,6 +33050,8 @@ async fn nullability_folded_into_widening_keeps_unparsed_check_uncertainty() {
 #[tokio::test]
 #[ignore = "needs live PostgreSQL"]
 async fn nullability_estimates_use_only_checks_surviving_to_the_statement() {
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
     use pbps_pg::estimate::{Lock, Reads, Rewrite, against};
     let check = "a_removed\"check";
@@ -32928,7 +33140,12 @@ async fn nullability_estimates_use_only_checks_surviving_to_the_statement() {
             let i = cs
                 .changes
                 .iter()
-                .position(|p| matches!(&p.change, Change::DropCheck { .. }))
+                .position(|p| {
+                    matches!(
+                        &p.change,
+                        Change::Constraint(ConstraintChange::DropCheck { .. })
+                    )
+                })
                 .unwrap();
             let drop = cs.changes.remove(i);
             cs.changes.push(drop);
@@ -32936,19 +33153,32 @@ async fn nullability_estimates_use_only_checks_surviving_to_the_statement() {
         let tighten = cs
             .changes
             .iter()
-            .position(|p| matches!(&p.change, Change::AlterColumnNullability { .. }))
+            .position(|p| {
+                matches!(
+                    &p.change,
+                    Change::Column(ColumnChange::AlterColumnNullability { .. })
+                )
+            })
             .unwrap();
         let drop = cs
             .changes
             .iter()
-            .position(|p| matches!(&p.change, Change::DropCheck { .. }))
+            .position(|p| {
+                matches!(
+                    &p.change,
+                    Change::Constraint(ConstraintChange::DropCheck { .. })
+                )
+            })
             .unwrap();
         assert_eq!(drop < tighten, case != "later_drop", "{case}: {cs:#?}");
         if case == "replaced" {
             assert!(
                 cs.changes
                     .iter()
-                    .position(|p| matches!(&p.change, Change::AddCheck { .. }))
+                    .position(|p| matches!(
+                        &p.change,
+                        Change::Constraint(ConstraintChange::AddCheck { .. })
+                    ))
                     .unwrap()
                     > tighten
             );
@@ -33046,6 +33276,9 @@ async fn locks_held(conn: &mut Conn, schema: &str, sql: &str, relation: &str) ->
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
     use pbps_model::Change;
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::IndexChange;
     use pbps_pg::estimate::Lock;
 
     let mut conn = connect().await;
@@ -33054,7 +33287,7 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
     let table = TableName::new(&s, "t");
     let cases: Vec<(Change, String)> = vec![
         (
-            Change::AlterColumnType {
+            Change::Column(ColumnChange::AlterColumnType {
                 uid: "c_aaaaaa".parse().expect("a uid"),
                 column: table.column("v"),
                 from: ty("integer"),
@@ -33065,21 +33298,21 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            },
+            }),
             format!("ALTER TABLE {s}.t ALTER COLUMN v TYPE bigint"),
         ),
         (
-            Change::AddCheck {
+            Change::Constraint(ConstraintChange::AddCheck {
                 table: table.clone(),
                 name: "ck".into(),
                 constraint: CheckConstraint {
                     expression: "v > 0".into(),
                 },
-            },
+            }),
             format!("ALTER TABLE {s}.t ADD CONSTRAINT ck CHECK (v > 0)"),
         ),
         (
-            Change::AddIndex {
+            Change::Index(IndexChange::AddIndex {
                 table: table.clone(),
                 name: "ix".into(),
                 index: Box::new(Index {
@@ -33097,7 +33330,7 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
                     filegroup: None,
                 }),
                 clustered: false,
-            },
+            }),
             format!("CREATE INDEX ix ON {s}.t (v) WHERE v > 0"),
         ),
         // The unfiltered build, with no `online` asked for. It is the case an
@@ -33105,7 +33338,7 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
         // it named the lock that blocks nothing for a statement that blocks
         // every writer.
         (
-            Change::AddIndex {
+            Change::Index(IndexChange::AddIndex {
                 table: table.clone(),
                 name: "ix_plain".into(),
                 index: Box::new(Index {
@@ -33123,7 +33356,7 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
                     filegroup: None,
                 }),
                 clustered: false,
-            },
+            }),
             format!("CREATE INDEX ix_plain ON {s}.t (v)"),
         ),
     ];
@@ -33138,7 +33371,7 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
     }
 
     // The foreign key, and the table it locks that nobody named.
-    let key = Change::AddForeignKey {
+    let key = Change::Constraint(ConstraintChange::AddForeignKey {
         table: table.clone(),
         name: "fk".into(),
         constraint: Box::new(ForeignKey {
@@ -33148,7 +33381,7 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
             on_delete: ReferentialAction::NoAction,
             on_update: ReferentialAction::NoAction,
         }),
-    };
+    });
     let ours = one_estimate(&key, Strategy::default()).expect("an estimate");
     assert_eq!(ours.lock, Lock::ShareRowExclusive);
     assert_eq!(ours.also_locks, [TableName::new(&s, "p")]);
@@ -33180,6 +33413,7 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_shape_the_measurements_never_covered_is_not_answered_from_them() {
     use pbps_model::Change;
+    use pbps_model::ColumnChange;
     use pbps_pg::estimate::{Rewrite, Rows, against};
 
     let mut conn = connect().await;
@@ -33197,17 +33431,19 @@ async fn a_shape_the_measurements_never_covered_is_not_answered_from_them() {
     .await
     .expect("the fixture");
 
-    let widen = |table: &str| Change::AlterColumnType {
-        uid: "c_aaaaaa".parse().expect("a uid"),
-        column: TableName::new(&s, table).column("v"),
-        from: ty("integer"),
-        to: ty("bigint"),
-        from_nullable: true,
-        to_nullable: true,
-        through_external_partitions: false,
-        from_collation: None,
-        to_collation: None,
-        using: None,
+    let widen = |table: &str| {
+        Change::Column(ColumnChange::AlterColumnType {
+            uid: "c_aaaaaa".parse().expect("a uid"),
+            column: TableName::new(&s, table).column("v"),
+            from: ty("integer"),
+            to: ty("bigint"),
+            from_nullable: true,
+            to_nullable: true,
+            through_external_partitions: false,
+            from_collation: None,
+            to_collation: None,
+            using: None,
+        })
     };
 
     // The static answer is the same for all of them, and the table decides
@@ -33268,6 +33504,7 @@ async fn a_shape_the_measurements_never_covered_is_not_answered_from_them() {
 #[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
 async fn index_expressions_and_predicates_keep_unmeasured_costs_unknown() {
     use pbps_model::Change;
+    use pbps_model::ColumnChange;
     use pbps_pg::estimate::{Reads, Rewrite, Rows, against};
 
     let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
@@ -33296,7 +33533,7 @@ async fn index_expressions_and_predicates_keep_unmeasured_costs_unknown() {
             ))
             .await
             .unwrap();
-            let change = Change::AlterColumnType {
+            let change = Change::Column(ColumnChange::AlterColumnType {
                 uid: "c_aaaaaa".parse().unwrap(),
                 column: TableName::new(&s, "t").column("v"),
                 from: ty("integer"),
@@ -33307,7 +33544,7 @@ async fn index_expressions_and_predicates_keep_unmeasured_costs_unknown() {
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            };
+            });
             let mut estimate = one_estimate(&change, Strategy::default()).unwrap();
             assert_eq!(estimate.rewrite, Rewrite::Yes);
             against(&mut conn, &mut estimate).await.unwrap();
@@ -33361,6 +33598,8 @@ async fn index_expressions_and_predicates_keep_unmeasured_costs_unknown() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_table_this_plan_creates_is_not_reported_as_missing() {
+    use pbps_model::ConstraintChange;
+    use pbps_model::TableChange;
     use pbps_model::{
         Change, ChangeSet, Column, ForeignKey, IdsFile, PlannedChange, PrimaryKey,
         ReferentialAction, Schema, Table,
@@ -33416,7 +33655,7 @@ async fn a_table_this_plan_creates_is_not_reported_as_missing() {
     assert!(
         cs.changes
             .iter()
-            .any(|p| matches!(&p.change, Change::CreateTable { name, .. } if name == &child_name)),
+            .any(|p| matches!(&p.change, Change::Table(TableChange::CreateTable { name, .. }) if name == &child_name)),
         "the plan creates the table whose key is estimated: {cs:#?}"
     );
 
@@ -33439,17 +33678,19 @@ async fn a_table_this_plan_creates_is_not_reported_as_missing() {
     );
 
     let missing = ChangeSet {
-        changes: vec![PlannedChange::new(Change::AddForeignKey {
-            table: child_name,
-            name: "child_parent".into(),
-            constraint: Box::new(ForeignKey {
-                columns: vec!["parent_id".into()],
-                references_table: TableName::new(&s, "parent"),
-                references_columns: vec!["id".into()],
-                on_delete: ReferentialAction::NoAction,
-                on_update: ReferentialAction::NoAction,
-            }),
-        })],
+        changes: vec![PlannedChange::new(Change::Constraint(
+            ConstraintChange::AddForeignKey {
+                table: child_name,
+                name: "child_parent".into(),
+                constraint: Box::new(ForeignKey {
+                    columns: vec!["parent_id".into()],
+                    references_table: TableName::new(&s, "parent"),
+                    references_columns: vec!["id".into()],
+                    on_delete: ReferentialAction::NoAction,
+                    on_update: ReferentialAction::NoAction,
+                }),
+            },
+        ))],
     };
     let mut absent = fixture_estimates(&missing, Strategy::default())
         .pop()
@@ -33501,6 +33742,7 @@ async fn printed(conn: &mut Conn, set: &str, schema: &str, table: &str) -> i64 {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_length_probe_is_measured_in_the_session_the_statement_will_run_in() {
+    use pbps_model::ColumnChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let mut conn = connect().await;
@@ -33536,7 +33778,7 @@ async fn a_length_probe_is_measured_in_the_session_the_statement_will_run_in() {
     );
 
     let alter = |column: &str, from: &str, to: &str| {
-        PlannedChange::new(Change::AlterColumnType {
+        PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
             uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
             column: column.parse().expect("a column reference"),
             from: ty(from),
@@ -33547,7 +33789,7 @@ async fn a_length_probe_is_measured_in_the_session_the_statement_will_run_in() {
             from_collation: None,
             to_collation: None,
             using: None,
-        })
+        }))
     };
     let cs = ChangeSet {
         changes: vec![
@@ -33616,6 +33858,8 @@ async fn a_length_probe_is_measured_in_the_session_the_statement_will_run_in() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 async fn estimate_provenance_follows_renamed_columns_for_indexes_and_checks() {
+    use pbps_model::ColumnChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
     use pbps_pg::estimate::{Reads, Rewrite, Rows, against};
     let mut db = TestDb::create("estimate_rename267").await;
@@ -33629,27 +33873,27 @@ async fn estimate_provenance_follows_renamed_columns_for_indexes_and_checks() {
     let new = TableName::new("app", "renamed");
     let cs = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::RenameTable {
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 from: old,
                 to: new.clone(),
                 defaults: Vec::new(),
-            }),
-            PlannedChange::new(Change::RenameColumn {
+            })),
+            PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
                 uid: "c_aaaaaa".parse().unwrap(),
                 table: new.clone(),
                 from: "v".into(),
                 to: "amount".into(),
                 table_was: None,
-            }),
-            PlannedChange::new(Change::RenameColumn {
+            })),
+            PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
                 uid: "c_bbbbbb".parse().unwrap(),
                 table: new.clone(),
                 from: "n".into(),
                 to: "required".into(),
                 table_was: None,
-            }),
-            PlannedChange::new(Change::AlterColumnType {
+            })),
+            PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
                 uid: "c_aaaaaa".parse().unwrap(),
                 column: new.column("amount"),
                 from: ty("integer"),
@@ -33660,16 +33904,16 @@ async fn estimate_provenance_follows_renamed_columns_for_indexes_and_checks() {
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            }),
-            PlannedChange::new(Change::AlterColumnNullability {
+            })),
+            PlannedChange::new(Change::Column(ColumnChange::AlterColumnNullability {
                 uid: "c_bbbbbb".parse().unwrap(),
                 column: new.column("required"),
                 ty: ty("integer"),
                 to_nullable: false,
                 through_external_partitions: false,
                 collation: None,
-            }),
-            PlannedChange::new(Change::AlterColumnType {
+            })),
+            PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
                 uid: "c_cccccc".parse().unwrap(),
                 column: new.column("plain"),
                 from: ty("integer"),
@@ -33680,7 +33924,7 @@ async fn estimate_provenance_follows_renamed_columns_for_indexes_and_checks() {
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            }),
+            })),
         ],
     };
     let mut es = fixture_planned_estimates(&cs);
@@ -33730,6 +33974,7 @@ async fn estimate_provenance_follows_renamed_columns_for_indexes_and_checks() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 async fn estimate_provenance_does_not_measure_a_vacated_names_old_identity() {
     use pbps_model::Change;
+    use pbps_model::TableChange;
     use pbps_pg::estimate::{Reads, Rewrite, Rows, against};
     let mut db = TestDb::create("estimate_created296").await;
     db.conn.execute("CREATE SCHEMA app").await.unwrap();
@@ -33788,9 +34033,9 @@ async fn estimate_provenance_does_not_measure_a_vacated_names_old_identity() {
     let declared_ids = mint_ids(&declared, &renamed_ids, &[]);
     let cs = plan(&base, &ids, &declared, &declared_ids);
     assert!(
-        cs.changes
-            .iter()
-            .any(|p| matches!(&p.change,Change::CreateTable{name,..} if name==&old)),
+        cs.changes.iter().any(
+            |p| matches!(&p.change,Change::Table(TableChange::CreateTable{name,..}) if name==&old)
+        ),
         "{cs:#?}"
     );
     let mut es = fixture_planned_estimates(&cs);
@@ -33820,7 +34065,12 @@ async fn estimate_provenance_does_not_measure_a_vacated_names_old_identity() {
     assert_eq!(key.reads, Reads::EveryRow);
     let rename = &es
         .iter()
-        .find(|(i, _)| matches!(&cs.changes[*i].change, Change::RenameTable { .. }))
+        .find(|(i, _)| {
+            matches!(
+                &cs.changes[*i].change,
+                Change::Table(TableChange::RenameTable { .. })
+            )
+        })
         .unwrap()
         .1;
     assert_eq!(
@@ -33842,6 +34092,8 @@ async fn estimate_provenance_does_not_measure_a_vacated_names_old_identity() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn an_estimate_for_a_renamed_table_is_measured_against_the_one_that_exists() {
+    use pbps_model::ColumnChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
     use pbps_pg::estimate::{Rewrite, Rows, against};
 
@@ -33860,13 +34112,13 @@ async fn an_estimate_for_a_renamed_table_is_measured_against_the_one_that_exists
 
     let cs = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::RenameTable {
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: "t_aaaaaa".parse().expect("a uid"),
                 from: TableName::new(&s, "client"),
                 to: TableName::new(&s, "customer"),
                 defaults: Vec::new(),
-            }),
-            PlannedChange::new(Change::AlterColumnType {
+            })),
+            PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
                 uid: "c_aaaaaa".parse().expect("a uid"),
                 column: TableName::new(&s, "customer").column("v"),
                 from: ty("integer"),
@@ -33877,7 +34129,7 @@ async fn an_estimate_for_a_renamed_table_is_measured_against_the_one_that_exists
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            }),
+            })),
         ],
     };
     let mut es = fixture_estimates(&cs, Strategy::default());
@@ -33917,6 +34169,8 @@ async fn an_estimate_for_a_renamed_table_is_measured_against_the_one_that_exists
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_check_probe_over_values_a_conversion_replaces_would_refuse_a_valid_plan() {
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let mut conn = connect().await;
@@ -33930,14 +34184,14 @@ async fn a_check_probe_over_values_a_conversion_replaces_would_refuse_a_valid_pl
     .expect("the fixture");
 
     let table = TableName::new(&s, "t");
-    let check = Change::AddCheck {
+    let check = Change::Constraint(ConstraintChange::AddCheck {
         table: table.clone(),
         name: "t_rounded".into(),
         constraint: CheckConstraint {
             expression: "v = round(v)".to_owned(),
         },
-    };
-    let retype = Change::AlterColumnType {
+    });
+    let retype = Change::Column(ColumnChange::AlterColumnType {
         uid: "c_aaaaaa".parse().expect("a uid"),
         column: table.column("v"),
         from: ty("numeric(10,2)"),
@@ -33948,7 +34202,7 @@ async fn a_check_probe_over_values_a_conversion_replaces_would_refuse_a_valid_pl
         from_collation: None,
         to_collation: None,
         using: None,
-    };
+    });
 
     // The probe this plan would have produced, had the skip not been there.
     // Run by hand, so the count is the engine's and not the test's opinion.
@@ -34019,6 +34273,7 @@ async fn a_check_probe_over_values_a_conversion_replaces_would_refuse_a_valid_pl
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_date_the_engine_carries_across_is_not_counted_out_of_range() {
+    use pbps_model::ColumnChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let mut conn = connect().await;
@@ -34044,18 +34299,20 @@ async fn a_date_the_engine_carries_across_is_not_counted_out_of_range() {
         .expect("the fixture");
 
         let cs = ChangeSet {
-            changes: vec![PlannedChange::new(Change::AlterColumnType {
-                uid: "c_aaaaaa".parse().expect("a uid"),
-                column: TableName::new(&s, "t").column("v"),
-                from: ty("date"),
-                to: ty("timestamp without time zone"),
-                from_nullable: true,
-                to_nullable: true,
-                through_external_partitions: false,
-                from_collation: None,
-                to_collation: None,
-                using: None,
-            })],
+            changes: vec![PlannedChange::new(Change::Column(
+                ColumnChange::AlterColumnType {
+                    uid: "c_aaaaaa".parse().expect("a uid"),
+                    column: TableName::new(&s, "t").column("v"),
+                    from: ty("date"),
+                    to: ty("timestamp without time zone"),
+                    from_nullable: true,
+                    to_nullable: true,
+                    through_external_partitions: false,
+                    from_collation: None,
+                    to_collation: None,
+                    using: None,
+                },
+            ))],
         };
         let measured = counts(&mut conn, &cs).await;
         // Not `counted`: the free helper of that name is called again below.
@@ -34109,6 +34366,7 @@ async fn a_date_the_engine_carries_across_is_not_counted_out_of_range() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_float_on_the_boundary_is_judged_as_the_engine_judges_it() {
+    use pbps_model::ColumnChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let mut conn = connect().await;
@@ -34139,18 +34397,20 @@ async fn a_float_on_the_boundary_is_judged_as_the_engine_judges_it() {
         .expect("the fixture");
 
         let cs = ChangeSet {
-            changes: vec![PlannedChange::new(Change::AlterColumnType {
-                uid: "c_aaaaaa".parse().expect("a uid"),
-                column: TableName::new(&s, "t").column("v"),
-                from: ty("double precision"),
-                to: ty(to),
-                from_nullable: true,
-                to_nullable: true,
-                through_external_partitions: false,
-                from_collation: None,
-                to_collation: None,
-                using: None,
-            })],
+            changes: vec![PlannedChange::new(Change::Column(
+                ColumnChange::AlterColumnType {
+                    uid: "c_aaaaaa".parse().expect("a uid"),
+                    column: TableName::new(&s, "t").column("v"),
+                    from: ty("double precision"),
+                    to: ty(to),
+                    from_nullable: true,
+                    to_nullable: true,
+                    through_external_partitions: false,
+                    from_collation: None,
+                    to_collation: None,
+                    using: None,
+                },
+            ))],
         };
         let measured = counts(&mut conn, &cs).await;
         let counted = one(&measured, "cannot become");
@@ -34386,6 +34646,7 @@ async fn a_default_this_engine_fills_every_row_from_is_not_counted_as_missing() 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_length_probe_agrees_with_the_engine_for_every_rendering_the_pins_decide() {
+    use pbps_model::ColumnChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let mut conn = connect().await;
@@ -34428,18 +34689,20 @@ async fn a_length_probe_agrees_with_the_engine_for_every_rendering_the_pins_deci
             conn.execute(&fixture).await.expect("the fixture");
             let to = format!("character varying({bound})");
             let cs = ChangeSet {
-                changes: vec![PlannedChange::new(Change::AlterColumnType {
-                    uid: "c_aaaaaa".parse().expect("a uid"),
-                    column: TableName::new(&s, "t").column("v"),
-                    from: ty(declared),
-                    to: ty(&to),
-                    from_nullable: true,
-                    to_nullable: true,
-                    through_external_partitions: false,
-                    from_collation: None,
-                    to_collation: None,
-                    using: None,
-                })],
+                changes: vec![PlannedChange::new(Change::Column(
+                    ColumnChange::AlterColumnType {
+                        uid: "c_aaaaaa".parse().expect("a uid"),
+                        column: TableName::new(&s, "t").column("v"),
+                        from: ty(declared),
+                        to: ty(&to),
+                        from_nullable: true,
+                        to_nullable: true,
+                        through_external_partitions: false,
+                        from_collation: None,
+                        to_collation: None,
+                        using: None,
+                    },
+                ))],
             };
             let measured = counts(&mut conn, &cs).await;
             assert_eq!(
@@ -34697,25 +34960,25 @@ fn drop_changes(changes: Vec<pbps_model::Change>) -> pbps_model::ChangeSet {
 }
 
 fn dropping_column(s: &str, name: &str) -> pbps_model::Change {
-    pbps_model::Change::DropColumn {
+    pbps_model::Change::Column(pbps_model::ColumnChange::DropColumn {
         uid: "c_aaaaaa".parse().unwrap(),
         column: TableName::new(s, "t").column(name),
-    }
+    })
 }
 
 fn dropping_table(s: &str, name: &str) -> pbps_model::Change {
-    pbps_model::Change::DropTable {
+    pbps_model::Change::Table(pbps_model::TableChange::DropTable {
         uid: "t_aaaaaa".parse().unwrap(),
         name: TableName::new(s, name),
         detach_from: None,
-    }
+    })
 }
 
 fn dropping_view(s: &str, name: &str) -> pbps_model::Change {
-    pbps_model::Change::DropModule {
+    pbps_model::Change::Module(pbps_model::ModuleChange::DropModule {
         id: format!("{s}.{name}").parse().unwrap(),
         kind: pbps_model::ModuleKind::View,
-    }
+    })
 }
 
 #[tokio::test]
@@ -34807,10 +35070,10 @@ async fn drop_blockers_predict_restrict_and_allow_earlier_removal_and_automatic_
     let ordered = drop_changes(vec![
         dropping_view(&s, "w"),
         dropping_view(&s, "v"),
-        pbps_model::Change::DropForeignKey {
+        pbps_model::Change::Constraint(pbps_model::ConstraintChange::DropForeignKey {
             table: TableName::new(&s, "child"),
             name: "child_id_fkey".into(),
-        },
+        }),
         dropping_table(&s, "t"),
     ]);
     in_a_transaction(&mut conn).await;
@@ -34871,6 +35134,9 @@ async fn drop_blockers_keep_row_type_domain_rule_and_unenumerated_catalog_paths(
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 async fn drop_blockers_follow_prior_renames_and_refuse_missing_existing_targets() {
+    use pbps_model::ColumnChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, Module, ModuleKind};
     let s = emit_schema("drop_names");
     let mut conn = connect().await;
@@ -34882,23 +35148,23 @@ async fn drop_blockers_follow_prior_renames_and_refuse_missing_existing_targets(
     .await
     .unwrap();
     let cs = drop_changes(vec![
-        Change::RenameTable {
+        Change::Table(TableChange::RenameTable {
             uid: "t_aaaaaa".parse().unwrap(),
             from: TableName::new(&s, "t"),
             to: TableName::new(&s, "renamed"),
             defaults: Vec::new(),
-        },
-        Change::RenameColumn {
+        }),
+        Change::Column(ColumnChange::RenameColumn {
             uid: "c_aaaaaa".parse().unwrap(),
             table: TableName::new(&s, "renamed"),
             from: "id".into(),
             to: "ident".into(),
             table_was: None,
-        },
-        Change::DropColumn {
+        }),
+        Change::Column(ColumnChange::DropColumn {
             uid: "c_aaaaaa".parse().unwrap(),
             column: TableName::new(&s, "renamed").column("ident"),
-        },
+        }),
     ]);
     in_a_transaction(&mut conn).await;
     let report = physical_sources::reports(&mut conn, &cs).await.unwrap();
@@ -34911,7 +35177,7 @@ async fn drop_blockers_follow_prior_renames_and_refuse_missing_existing_targets(
     // Replacing a view to cease reading the column removes its old edges.
     // A blanket rule that excludes only DropModule refuses this valid plan.
     let cs = drop_changes(vec![
-        Change::AlterModule {
+        Change::Module(ModuleChange::AlterModule {
             id: format!("{s}.v").parse().unwrap(),
             module: Box::new(Module {
                 kind: ModuleKind::View,
@@ -34919,7 +35185,7 @@ async fn drop_blockers_follow_prior_renames_and_refuse_missing_existing_targets(
                 description: None,
                 options: Default::default(),
             }),
-        },
+        }),
         dropping_column(&s, "id"),
     ]);
     in_a_transaction(&mut conn).await;
@@ -35738,6 +36004,9 @@ async fn constraint_name_validation_preserves_legal_index_sharing() {
 #[tokio::test]
 #[ignore = "needs a live database; run the engine's live-test script"]
 async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
+    use pbps_model::ConstraintChange;
+    use pbps_model::IndexChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, PlannedChange, TableName};
     let mut conn = connect().await;
     conn.begin(&Postgres::new().transaction_framing(&pbps_model::SessionZone::utc()))
@@ -35747,17 +36016,21 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
     conn.execute("CREATE TABLE key_guard177.parent (id integer NOT NULL, CONSTRAINT old_key UNIQUE(id)); CREATE TABLE key_guard177.child (id integer CONSTRAINT child_fk REFERENCES key_guard177.parent(id)); ALTER TABLE key_guard177.parent ADD CONSTRAINT other_key UNIQUE(id);").await.unwrap();
     let parent = TableName::new("key_guard177", "parent");
     let child = TableName::new("key_guard177", "child");
-    let drop_key = |name: &str| Change::DropUnique {
-        table: parent.clone(),
-        name: name.into(),
+    let drop_key = |name: &str| {
+        Change::Constraint(ConstraintChange::DropUnique {
+            table: parent.clone(),
+            name: name.into(),
+        })
     };
     let plan = |changes: Vec<Change>| ChangeSet {
         changes: changes.into_iter().map(PlannedChange::new).collect(),
     };
     conn.execute("CREATE TABLE key_guard177.indexed (id integer NOT NULL); CREATE UNIQUE INDEX standalone_key ON key_guard177.indexed(id); CREATE TABLE key_guard177.index_child (id integer CONSTRAINT index_fk REFERENCES key_guard177.indexed(id)); CREATE UNIQUE INDEX other_standalone ON key_guard177.indexed(id); CREATE INDEX ordinary_index ON key_guard177.indexed(id); CREATE UNIQUE INDEX filtered_index ON key_guard177.indexed(id) WHERE id > 0;").await.unwrap();
-    let drop_index = |name: &str| Change::DropIndex {
-        table: TableName::new("key_guard177", "indexed"),
-        name: name.into(),
+    let drop_index = |name: &str| {
+        Change::Index(IndexChange::DropIndex {
+            table: TableName::new("key_guard177", "indexed"),
+            name: name.into(),
+        })
     };
     for (name, blocked) in [
         ("standalone_key", true),
@@ -35775,10 +36048,10 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
         );
     }
     let removed = plan(vec![
-        Change::DropForeignKey {
+        Change::Constraint(ConstraintChange::DropForeignKey {
             table: TableName::new("key_guard177", "index_child"),
             name: "index_fk".into(),
-        },
+        }),
         drop_index("standalone_key"),
     ]);
     assert!(
@@ -35808,10 +36081,10 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
         reports[0].blocking.iter().any(|b| b.contains("child_fk")),
         "{reports:?}"
     );
-    let fk = Change::DropForeignKey {
+    let fk = Change::Constraint(ConstraintChange::DropForeignKey {
         table: child.clone(),
         name: "child_fk".into(),
-    };
+    });
     let reports =
         physical_sources::reports(&mut conn, &plan(vec![fk.clone(), drop_key("old_key")]))
             .await
@@ -35827,26 +36100,26 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
     let renamed_parent = TableName::new("key_guard177", "renamed_parent");
     let renamed_child = TableName::new("key_guard177", "renamed_child");
     let renamed = plan(vec![
-        Change::RenameTable {
+        Change::Table(TableChange::RenameTable {
             uid: "t_aaaaaa".parse().unwrap(),
             from: parent.clone(),
             to: renamed_parent.clone(),
             defaults: Vec::new(),
-        },
-        Change::RenameTable {
+        }),
+        Change::Table(TableChange::RenameTable {
             uid: "t_bbbbbb".parse().unwrap(),
             from: child.clone(),
             to: renamed_child.clone(),
             defaults: Vec::new(),
-        },
-        Change::DropForeignKey {
+        }),
+        Change::Constraint(ConstraintChange::DropForeignKey {
             table: renamed_child,
             name: "child_fk".into(),
-        },
-        Change::DropUnique {
+        }),
+        Change::Constraint(ConstraintChange::DropUnique {
             table: renamed_parent,
             name: "old_key".into(),
-        },
+        }),
     ]);
     assert!(
         physical_sources::reports(&mut conn, &renamed)
@@ -35870,13 +36143,14 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 async fn concurrent_build_recovery_preserves_existing_objects_and_quotes_its_own_artifact() {
+    use pbps_model::IndexChange;
     use pbps_model::{Change, Index, IndexColumn, Strategy, TableName};
     let mut db = TestDb::create("index_recovery186").await;
     db.execute("CREATE SCHEMA app; CREATE TABLE app.t(id integer); CREATE TABLE app.u(id integer); INSERT INTO app.t VALUES (1),(1); INSERT INTO app.u VALUES (2),(2)").await.unwrap();
     let emitted = |name: &str, unique: bool, online: bool| {
         Postgres::new()
             .fixture_emit(
-                &Change::AddIndex {
+                &Change::Index(IndexChange::AddIndex {
                     table: TableName::new("app", "t"),
                     name: name.into(),
                     index: Box::new(Index {
@@ -35894,7 +36168,7 @@ async fn concurrent_build_recovery_preserves_existing_objects_and_quotes_its_own
                         filegroup: None,
                     }),
                     clustered: false,
-                },
+                }),
                 Strategy { online },
             )
             .unwrap()
@@ -36531,7 +36805,10 @@ async fn doctor_adopted_acl_scope_matches_the_differ_and_keeps_recorded_targets(
         .changes
         .iter()
         .filter_map(|c| {
-            if let pbps_model::Change::Revoke { target, .. } = &c.change {
+            if let pbps_model::Change::Permission(pbps_model::GrantChange::Revoke {
+                target, ..
+            }) = &c.change
+            {
                 Some(target.raw().to_string())
             } else {
                 None
@@ -36681,7 +36958,7 @@ async fn doctor_data_diagnosis(
 }
 
 fn doctor_data_insert(name: &str, key: &str, row: Row) -> pbps_model::Change {
-    pbps_model::Change::InsertRow {
+    pbps_model::Change::Row(pbps_model::RowChange::InsertRow {
         table: name.parse().unwrap(),
         key_column: "id".into(),
         identity_key: false,
@@ -36689,7 +36966,7 @@ fn doctor_data_insert(name: &str, key: &str, row: Row) -> pbps_model::Change {
         row,
         defaults: [("label".into(), "'seed'".into())].into(),
         types: [("label".into(), "text".parse().unwrap())].into(),
-    }
+    })
 }
 
 async fn doctor_execute_change(
@@ -36831,13 +37108,13 @@ async fn doctor_data_column_acl_follows_recorded_identity_not_a_reused_name() {
     let restored = doctor_data_diagnosis(&mut theirs, "public.t", &declared, &project).await;
     let rename = doctor_execute_change(
         &mut theirs,
-        &pbps_model::Change::RenameColumn {
+        &pbps_model::Change::Column(pbps_model::ColumnChange::RenameColumn {
             uid: cuid,
             table: "public.t".parse().unwrap(),
             from: "old_label".into(),
             to: "label".into(),
             table_was: None,
-        },
+        }),
     )
     .await;
     let inserted =
@@ -36893,12 +37170,12 @@ async fn doctor_data_table_acl_follows_recorded_identity_and_retains_missing_obj
     let restored = doctor_data_diagnosis(&mut theirs, "public.new_name", &declared, &project).await;
     let rename = doctor_execute_change(
         &mut theirs,
-        &pbps_model::Change::RenameTable {
+        &pbps_model::Change::Table(pbps_model::TableChange::RenameTable {
             uid,
             from: "public.old_name".parse().unwrap(),
             to: "public.new_name".parse().unwrap(),
             defaults: Vec::new(),
-        },
+        }),
     )
     .await;
     let inserted = doctor_execute_change(
@@ -38388,6 +38665,8 @@ use plan_fixture::FixturePreflight as _;
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; run scripts/live-tests-pg.sh"]
 async fn rename_chains_report_each_identity_once_without_changing_dependency_decisions() {
+    use pbps_model::ColumnChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, IdsFile, PlannedChange, plan_names::PlanNames};
     use pbps_pg::impact::{RenameTarget, rename_impact, rename_targets};
 
@@ -38401,21 +38680,21 @@ async fn rename_chains_report_each_identity_once_without_changing_dependency_dec
         .await
         .unwrap();
     let table = |from: &str, to: &str| {
-        PlannedChange::new(Change::RenameTable {
+        PlannedChange::new(Change::Table(TableChange::RenameTable {
             uid: "t_aaaaaa".parse().unwrap(),
             from: from.parse().unwrap(),
             to: to.parse().unwrap(),
             defaults: vec![],
-        })
+        }))
     };
     let column = |owner: &str, from: &str, to: &str| {
-        PlannedChange::new(Change::RenameColumn {
+        PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
             uid: "c_aaaaaa".parse().unwrap(),
             table: owner.parse().unwrap(),
             from: from.into(),
             to: to.into(),
             table_was: None,
-        })
+        }))
     };
     let changes = [
         table("public.client", "public.tmp"),

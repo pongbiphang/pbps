@@ -26,6 +26,8 @@ use pbps_dialect::PlanDialect;
 use std::borrow::Cow;
 
 use pbps_dialect::{Dialect, DialectError, Lexicon, Statement, TransactionFraming, TypeChangeRisk};
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
 use pbps_model::{
     Change, ColumnType, Module, ModuleId, RiskClass, Role, Schema, Strategy, Table, TableName,
 };
@@ -172,12 +174,13 @@ pub fn schema_bound_call_names(
         }
     };
     for planned in &changes.changes {
-        if let Change::CreateModule { module, .. } | Change::AlterModule { module, .. } =
-            &planned.change
+        if let Change::Module(ModuleChange::CreateModule { module, .. })
+        | Change::Module(ModuleChange::AlterModule { module, .. }) = &planned.change
         {
             calls(module);
         }
-        if let Change::AlterModule { id, .. } | Change::DropModule { id, .. } = &planned.change
+        if let Change::Module(ModuleChange::AlterModule { id, .. })
+        | Change::Module(ModuleChange::DropModule { id, .. }) = &planned.change
             && let Some(old) = before.modules.get(id)
         {
             calls(old);
@@ -282,10 +285,10 @@ impl Dialect for Mssql {
         let mut demand = pbps_dialect::creation::Demand::for_request(change, request, self);
         if matches!(
             change,
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 beside_default: Some(_),
                 ..
-            }
+            })
         ) {
             return Ok(None);
         }
@@ -351,6 +354,8 @@ impl Dialect for Mssql {
         captured: &pbps_model::operation::Captured,
     ) -> Result<pbps_model::operation::Effects, pbps_model::operation::OwnerError> {
         use pbps_model::Change;
+        use pbps_model::ColumnChange;
+        use pbps_model::ModuleChange;
         use pbps_model::operation::{
             Incarnation, ObjectKey, PartKey, Requirement, base_table, base_table_named, final_table,
         };
@@ -367,7 +372,7 @@ impl Dialect for Mssql {
             fx.requires
                 .push(Requirement::Absent(ObjectKey::Module(bound)));
         }
-        if let Change::CreateModule { id, module } | Change::AlterModule { id, module } = op.change()
+        if let Change::Module(ModuleChange::CreateModule { id, module }) | Change::Module(ModuleChange::AlterModule { id, module }) = op.change()
             // A function keeps its header options in its text and a view in
             // its flag (DEC-2329.1). Read this step's payload, not its
             // endpoint.
@@ -384,13 +389,14 @@ impl Dialect for Mssql {
         }
         // The old binding survives until this payload releases it. A split
         // caller releases at DROP, never at its later CREATE (DEC-2228.1).
-        let releasing = if let Change::AlterModule { id, module } = op.change() {
-            Some((id, Some(module.as_ref())))
-        } else if let Change::DropModule { id, .. } = op.change() {
-            Some((id, None))
-        } else {
-            None
-        };
+        let releasing =
+            if let Change::Module(ModuleChange::AlterModule { id, module }) = op.change() {
+                Some((id, Some(module.as_ref())))
+            } else if let Change::Module(ModuleChange::DropModule { id, .. }) = op.change() {
+                Some((id, None))
+            } else {
+                None
+            };
         if let Some((id, replacement)) = releasing
             && let Some(old) = before.schema.modules.get(id)
             && binding::is_schema_bound(old)
@@ -425,12 +431,13 @@ impl Dialect for Mssql {
         };
         #[allow(clippy::wildcard_enum_match_arm)]
         match op.change() {
-            Change::AlterModule { .. } | Change::DropModule { .. } => {
+            Change::Module(ModuleChange::AlterModule { .. })
+            | Change::Module(ModuleChange::DropModule { .. }) => {
                 // A SQL Server function is addressed by its name
                 // (`ModuleId::Named`); its kind is in the payload.
                 let (id, kind) = match op.change() {
-                    Change::AlterModule { id, module } => (id, module.kind),
-                    Change::DropModule { id, kind } => (id, *kind),
+                    Change::Module(ModuleChange::AlterModule { id, module }) => (id, module.kind),
+                    Change::Module(ModuleChange::DropModule { id, kind }) => (id, *kind),
                     _ => unreachable!("matched above"),
                 };
                 let function = match id {
@@ -463,9 +470,9 @@ impl Dialect for Mssql {
                     }
                 }
             }
-            Change::DropColumn { column, .. }
-            | Change::AlterColumnType { column, .. }
-            | Change::AlterColumnNullability { column, .. } => {
+            Change::Column(ColumnChange::DropColumn { column, .. })
+            | Change::Column(ColumnChange::AlterColumnType { column, .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { column, .. }) => {
                 if let Some(table) = base_table(op, owners, before, &column.table)? {
                     for (name, computed) in &table.table.computed {
                         let reads = |text: &str| self.may_name(text, column.name.raw());
@@ -481,7 +488,7 @@ impl Dialect for Mssql {
             // A check whose text may name a computed column stands in the
             // way of dropping it, as it does an ordinary column's drop
             // (ORDERING.md, #1998).
-            Change::DropComputedColumn { table, name, .. } => {
+            Change::Column(ColumnChange::DropComputedColumn { table, name, .. }) => {
                 if let Some(base) = base_table(op, owners, before, table)? {
                     let replaced = final_table(after, &base);
                     for (check_name, check) in &base.table.checks {
@@ -496,7 +503,7 @@ impl Dialect for Mssql {
                     }
                 }
             }
-            Change::RenameColumn { table, from, .. } => {
+            Change::Column(ColumnChange::RenameColumn { table, from, .. }) => {
                 if let Some(base) = base_table(op, owners, before, table)? {
                     for (name, computed) in &base.table.computed {
                         let reads = |text: &str| self.may_name(text, from.raw());
@@ -842,6 +849,7 @@ mod order_observation_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::ColumnChange;
 
     /// A delimited name is one name (#2436): `[Order Details Extended]` is
     /// no reference to `Order Details`, whichever delimiter, qualified or not,
@@ -924,19 +932,21 @@ mod tests {
     /// takes no class of its own (#1175).
     #[test]
     fn only_a_non_unicode_collation_change_is_narrowing() {
-        let change = |ty: &str| Change::AlterColumnType {
-            uid: "c_aaaaaa".parse().unwrap(),
-            column: "dbo.t.c".parse().unwrap(),
-            from: ty.parse().unwrap(),
-            to: ty.parse().unwrap(),
-            from_nullable: true,
-            to_nullable: true,
-            through_external_partitions: false,
-            from_collation: None,
-            to_collation: Some(pbps_model::Collation::new(
-                "Latin1_General_100_CI_AS_SC_UTF8",
-            )),
-            using: None,
+        let change = |ty: &str| {
+            Change::Column(ColumnChange::AlterColumnType {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: "dbo.t.c".parse().unwrap(),
+                from: ty.parse().unwrap(),
+                to: ty.parse().unwrap(),
+                from_nullable: true,
+                to_nullable: true,
+                through_external_partitions: false,
+                from_collation: None,
+                to_collation: Some(pbps_model::Collation::new(
+                    "Latin1_General_100_CI_AS_SC_UTF8",
+                )),
+                using: None,
+            })
         };
         for ty in ["varchar(10)", "char(3)", "text"] {
             assert!(
@@ -1343,6 +1353,7 @@ mod certified_emission_tests {
 
     use super::*;
     use pbps_diff::order::{PlanView, admit, seal, singleton};
+    use pbps_model::TableChange;
     use pbps_model::{
         Change, ChangeSet, IdsFile, PlanBaseline, PlanMode, PlanOrigin, PlannedChange, SavedPlan,
     };
@@ -1351,12 +1362,14 @@ mod certified_emission_tests {
     fn certified_lowering_preserves_statement_bytes_and_mode() {
         let dialect = Mssql;
         let changes = ChangeSet {
-            changes: vec![PlannedChange::new(Change::RenameTable {
-                uid: "t_aaaaaa".parse().unwrap(),
-                from: "dbo.old_name".parse().unwrap(),
-                to: "dbo.new_name".parse().unwrap(),
-                defaults: Vec::new(),
-            })],
+            changes: vec![PlannedChange::new(Change::Table(
+                TableChange::RenameTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    from: "dbo.old_name".parse().unwrap(),
+                    to: "dbo.new_name".parse().unwrap(),
+                    defaults: Vec::new(),
+                },
+            ))],
         };
         let expected = dialect
             .fixture_emit(&changes.changes[0].change, changes.changes[0].strategy)

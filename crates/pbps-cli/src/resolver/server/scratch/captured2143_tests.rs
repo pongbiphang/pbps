@@ -4,6 +4,7 @@
 
 use super::reconstruct2374::{both, declared, exec, int, module};
 use super::*;
+use pbps_model::ModuleChange;
 use pbps_model::{Change, ModuleKind};
 use std::pin::Pin;
 
@@ -64,10 +65,15 @@ async fn mssql_a_changed_schema_bound_callee_is_rebuilt_around_by_its_bound_call
                     .iter()
                     .position(|planned| wanted(&planned.change))
             };
-            let drop_view = at(&|c| matches!(c, Change::DropModule { id, .. } if id == &view_id));
-            let alter = at(&|c| matches!(c, Change::AlterModule { id, .. } if id == &function_id));
-            let create_view =
-                at(&|c| matches!(c, Change::CreateModule { id, .. } if id == &view_id));
+            let drop_view = at(
+                &|c| matches!(c, Change::Module(ModuleChange::DropModule { id, .. }) if id == &view_id),
+            );
+            let alter = at(
+                &|c| matches!(c, Change::Module(ModuleChange::AlterModule { id, .. }) if id == &function_id),
+            );
+            let create_view = at(
+                &|c| matches!(c, Change::Module(ModuleChange::CreateModule { id, .. }) if id == &view_id),
+            );
             let (Some(drop_view), Some(alter), Some(create_view)) = (drop_view, alter, create_view)
             else {
                 panic!(
@@ -122,7 +128,7 @@ async fn mssql_an_alias_column_spelled_like_a_view_is_no_call_of_it() {
                 .unwrap_or_else(|error| panic!("the run should seal a plan: {error}"));
             let at = |id: &pbps_model::ModuleId| {
                 plan.changes.changes().changes.iter().position(|planned| {
-                    matches!(&planned.change, Change::CreateModule { id: made, .. } if made == id)
+                    matches!(&planned.change, Change::Module(ModuleChange::CreateModule { id: made, .. }) if made == id)
                 })
             };
             let (Some(function), Some(view)) = (at(&function_id), at(&view_id)) else {

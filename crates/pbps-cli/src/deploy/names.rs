@@ -12,17 +12,18 @@ use super::*;
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn created_relation_names(cs: &pbps_model::ChangeSet) -> Vec<TableName> {
     use pbps_model::Change;
+    use pbps_model::ModuleChange;
     let dropped: BTreeSet<&ModuleId> = cs
         .changes
         .iter()
         .filter_map(|p| match &p.change {
-            Change::DropModule { id, .. } => Some(id),
+            Change::Module(ModuleChange::DropModule { id, .. }) => Some(id),
             _ => None,
         })
         .collect();
     cs.changes
         .iter()
-        .filter(|p| !matches!(&p.change, Change::CreateModule { id, .. } if dropped.contains(id)))
+        .filter(|p| !matches!(&p.change, Change::Module(ModuleChange::CreateModule { id, .. }) if dropped.contains(id)))
         .flat_map(|p| {
             relation_names_created(&p.change).into_iter().chain(
                 sequence_names_claimed(&p.change)
@@ -42,6 +43,8 @@ pub(crate) fn created_relation_names(cs: &pbps_model::ChangeSet) -> Vec<TableNam
 pub(crate) fn sequence_names_claimed(
     change: &pbps_model::Change,
 ) -> Vec<(TableName, pbps_model::ColumnRef)> {
+    use pbps_model::ColumnChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ColumnRef, ValueSource};
     let named = |column: ColumnRef, source: &ValueSource| {
         let ValueSource::Sequence(sequence) = source else {
@@ -53,7 +56,7 @@ pub(crate) fn sequence_names_claimed(
         Some((TableName::new(&column.table.schema, name), column))
     };
     match change {
-        Change::CreateTable { name, table, .. } => table
+        Change::Table(TableChange::CreateTable { name, table, .. }) => table
             .columns
             .iter()
             .filter_map(|(column, declared)| {
@@ -63,20 +66,20 @@ pub(crate) fn sequence_names_claimed(
                 )
             })
             .collect(),
-        Change::AddColumn {
+        Change::Column(ColumnChange::AddColumn {
             table,
             name,
             column,
             ..
-        } => named(
+        }) => named(
             ColumnRef::new(table.clone(), name.clone()),
             &column.value_source,
         )
         .into_iter()
         .collect(),
-        Change::AlterColumnNumbering {
+        Change::Column(ColumnChange::AlterColumnNumbering {
             column, from, to, ..
-        } => {
+        }) => {
             if let (ValueSource::Sequence(was), ValueSource::Sequence(now)) = (from, to)
                 && !(was.name.is_some() && now.name.is_some() && was.name != now.name)
             {
@@ -96,12 +99,14 @@ pub(crate) fn sequence_names_claimed(
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn relation_names_created(change: &pbps_model::Change) -> Vec<TableName> {
     use pbps_model::Change;
+    use pbps_model::ModuleChange;
+    use pbps_model::TableChange;
     let mut out = match change {
-        Change::CreateTable { name, .. } => vec![name.clone()],
-        Change::CreateModule {
+        Change::Table(TableChange::CreateTable { name, .. }) => vec![name.clone()],
+        Change::Module(ModuleChange::CreateModule {
             id: ModuleId::Named(name),
             module,
-        } if module.kind == pbps_model::ModuleKind::View => vec![name.clone()],
+        }) if module.kind == pbps_model::ModuleKind::View => vec![name.clone()],
         _ => Vec::new(),
     };
     out.extend(index_names_created(change));
@@ -128,21 +133,26 @@ pub(super) fn created_index_names(cs: &pbps_model::ChangeSet) -> Vec<TableName> 
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(super) fn index_names_created(change: &pbps_model::Change) -> Vec<TableName> {
     use pbps_model::Change;
+    use pbps_model::ConstraintChange;
+    use pbps_model::IndexChange;
+    use pbps_model::PartitionChange;
+    use pbps_model::TableChange;
     let in_schema = |t: &TableName, name: &str| TableName::new(t.schema.clone(), name);
     match change {
-        Change::AddIndex { table, name, .. } | Change::AddUnique { table, name, .. } => {
+        Change::Index(IndexChange::AddIndex { table, name, .. })
+        | Change::Constraint(ConstraintChange::AddUnique { table, name, .. }) => {
             vec![in_schema(table, name.raw())]
         }
-        Change::SetPrimaryKey {
+        Change::Constraint(ConstraintChange::SetPrimaryKey {
             table,
             to: Some(key),
             ..
-        } => key
+        }) => key
             .name
             .iter()
             .map(|name| in_schema(table, name.raw()))
             .collect(),
-        Change::DetachPartition { table, names, .. } => names
+        Change::Partition(PartitionChange::DetachPartition { table, names, .. }) => names
             .iter()
             .filter(|n| {
                 matches!(
@@ -155,7 +165,7 @@ pub(super) fn index_names_created(change: &pbps_model::Change) -> Vec<TableName>
             .filter_map(|n| n.name.as_ref().map(pbps_model::ObjectLocalName::raw))
             .map(|name| in_schema(table, name))
             .collect(),
-        Change::CreateTable { name, table, .. } => table
+        Change::Table(TableChange::CreateTable { name, table, .. }) => table
             .primary_key
             .iter()
             .filter_map(|k| k.name.as_ref().map(pbps_model::ObjectLocalName::raw))
@@ -196,11 +206,12 @@ pub(crate) fn refuse_uninventoried_occupants(
     }
     // A detach's clone-name claim needs a separate-deployment remedy,
     // naming the detach.
-    let remedy = if cs
-        .changes
-        .iter()
-        .any(|p| matches!(p.change, pbps_model::Change::DetachPartition { .. }))
-    {
+    let remedy = if cs.changes.iter().any(|p| {
+        matches!(
+            p.change,
+            pbps_model::Change::Partition(pbps_model::PartitionChange::DetachPartition { .. })
+        )
+    }) {
         "Each creation, schema move, or detach name change above would be refused at apply. \
          Free that name in a plan of its own first (another partition's clone: detach that \
          partition first), or declare another name (DEC-1565.1)."
@@ -244,6 +255,9 @@ pub(crate) fn order_carried_moves<S: Clone>(
     dialect: &dyn pbps_dialect::Dialect,
     catalog: &pbps_dialect::slots::CatalogFacts,
 ) {
+    use pbps_model::ColumnChange;
+    use pbps_model::PartitionChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ValueSource};
 
     let clashes = name_clashes(&cs.changes, occupants, relations, catalog);
@@ -266,15 +280,15 @@ pub(crate) fn order_carried_moves<S: Clone>(
     for (before, release) in cs.changes.iter().enumerate() {
         detach_steps[before] = matches!(
             &release.change,
-            Change::DetachPartition { .. }
-                | Change::DropTable {
+            Change::Partition(PartitionChange::DetachPartition { .. })
+                | Change::Table(TableChange::DropTable {
                     detach_from: Some(_),
                     ..
-                }
+                })
         ) && present.iter().any(|o| o.freed_by(&release.change));
-        if matches!(&release.change, Change::AlterColumnNumbering {
+        if matches!(&release.change, Change::Column(ColumnChange::AlterColumnNumbering {
             from: ValueSource::Identity(_), to, ..
-        } if !matches!(to, ValueSource::Identity(_)))
+        }) if !matches!(to, ValueSource::Identity(_)))
         {
             for (after, claim) in cs.changes.iter().enumerate() {
                 if relation_names_created(&claim.change).iter().any(|name| {
@@ -294,12 +308,12 @@ pub(crate) fn order_carried_moves<S: Clone>(
         }
         present.retain(|o| !o.freed_by(&release.change));
         for o in &mut present {
-            if let Change::RenameTable { from, to, .. } = &release.change {
+            if let Change::Table(TableChange::RenameTable { from, to, .. }) = &release.change {
                 o.moved(from, to);
             }
-            if let Change::RenameColumn {
+            if let Change::Column(ColumnChange::RenameColumn {
                 table, from, to, ..
-            } = &release.change
+            }) = &release.change
             {
                 o.column_renamed(table, from, to);
             }
@@ -311,8 +325,10 @@ pub(crate) fn order_carried_moves<S: Clone>(
     for edge in schedule.constraints() {
         if edge.source == pbps_diff::order::Source::Catalog
             && detach_steps[edge.before]
-            && (matches!(cs.changes[edge.after].change, Change::RenameTable { .. })
-                || !relation_names_created(&cs.changes[edge.after].change).is_empty())
+            && (matches!(
+                cs.changes[edge.after].change,
+                Change::Table(TableChange::RenameTable { .. })
+            ) || !relation_names_created(&cs.changes[edge.after].change).is_empty())
         {
             moving[edge.after] = true;
         }
@@ -323,7 +339,12 @@ pub(crate) fn order_carried_moves<S: Clone>(
     let renames: Vec<bool> = cs
         .changes
         .iter()
-        .map(|p| matches!(p.change, pbps_model::Change::RenameTable { .. }))
+        .map(|p| {
+            matches!(
+                p.change,
+                pbps_model::Change::Table(pbps_model::TableChange::RenameTable { .. })
+            )
+        })
         .collect();
     if !only_crossed_by(&settled.sequence, &renames) {
         use pbps_diff::order::{Baseline, Checks, Schedule, analyse_with_catalog, graph};
@@ -504,7 +525,12 @@ pub(crate) fn rename_claims(cs: &pbps_model::ChangeSet) -> Vec<TableName> {
         .changes
         .iter()
         .filter_map(|p| {
-            if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
+            if let pbps_model::Change::Table(pbps_model::TableChange::RenameTable {
+                from,
+                to,
+                ..
+            }) = &p.change
+            {
                 Some(claims_of(from, to))
             } else {
                 None
@@ -542,15 +568,21 @@ pub(super) fn name_clashes(
     for (at, p) in changes.iter().enumerate() {
         present.retain(|o| !o.freed_by(&p.change));
         held.retain(|(name, _)| !relation_freed_by(&p.change, name));
-        if let pbps_model::Change::RenameColumn {
-            table, from, to, ..
-        } = &p.change
+        if let pbps_model::Change::Column(pbps_model::ColumnChange::RenameColumn {
+            table,
+            from,
+            to,
+            ..
+        }) = &p.change
         {
             for o in &mut present {
                 o.column_renamed(table, from, to);
             }
         }
-        if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
+        if let pbps_model::Change::Table(pbps_model::TableChange::RenameTable {
+            from, to, ..
+        }) = &p.change
+        {
             let moved: Vec<usize> = (0..present.len())
                 .filter(|&k| present[k].moved(from, to))
                 .collect();
@@ -662,12 +694,14 @@ pub(super) fn name_clashes(
                     ),
                 ));
             }
-            let detaching =
-                if let pbps_model::Change::DetachPartition { uid, table, .. } = &p.change {
-                    Some((uid, table))
-                } else {
-                    None
-                };
+            let detaching = if let pbps_model::Change::Partition(
+                pbps_model::PartitionChange::DetachPartition { uid, table, .. },
+            ) = &p.change
+            {
+                Some((uid, table))
+            } else {
+                None
+            };
             // Moving clones were released above. Only an exact retained
             // clone may still hold its batch's name: ownership alone also
             // includes sequences and indexes the detach never renames
@@ -762,14 +796,15 @@ pub(super) fn name_clashes(
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(super) fn relation_freed_by(change: &pbps_model::Change, name: &TableName) -> bool {
     use pbps_model::Change;
+    use pbps_model::ModuleChange;
+    use pbps_model::TableChange;
     match change {
-        Change::DropTable { name: table, .. } | Change::RenameTable { from: table, .. } => {
-            table == name
-        }
-        Change::DropModule {
+        Change::Table(TableChange::DropTable { name: table, .. })
+        | Change::Table(TableChange::RenameTable { from: table, .. }) => table == name,
+        Change::Module(ModuleChange::DropModule {
             id: ModuleId::Named(view),
             ..
-        } => view == name,
+        }) => view == name,
         _ => false,
     }
 }
@@ -786,7 +821,10 @@ pub(crate) fn carried_names(
     let mut out = Vec::new();
     for p in &cs.changes {
         present.retain(|o| !o.freed_by(&p.change));
-        if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
+        if let pbps_model::Change::Table(pbps_model::TableChange::RenameTable {
+            from, to, ..
+        }) = &p.change
+        {
             for o in &mut present {
                 if o.moved(from, to) {
                     out.push(o.name.clone());
@@ -857,21 +895,27 @@ impl<'a> Occupant<'a> {
     #[allow(clippy::wildcard_enum_match_arm)]
     fn freed_by(&self, change: &pbps_model::Change) -> bool {
         use pbps_model::Change;
+        use pbps_model::ColumnChange;
+        use pbps_model::ConstraintChange;
+        use pbps_model::IndexChange;
+        use pbps_model::PartitionChange;
+        use pbps_model::TableChange;
         let owned_by = |t: &TableName| self.owner.as_ref() == Some(t);
         let at = |t: &TableName, name: &str| self.name.schema == t.schema && self.name.name == name;
         match change {
-            Change::DropIndex { table, name } | Change::DropUnique { table, name } => {
+            Change::Index(IndexChange::DropIndex { table, name })
+            | Change::Constraint(ConstraintChange::DropUnique { table, name }) => {
                 at(table, name.raw())
             }
             // A connected plan reads each key with the name its index has,
             // a numbered `<table>_pkey1` included (measured, #1723). An
             // unnamed one's is named after its table as the catalog read it,
             // which a rename does not change (#1082 review).
-            Change::SetPrimaryKey {
+            Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table,
                 from: Some(key),
                 ..
-            } => match &key.name {
+            }) => match &key.name {
                 Some(name) => at(table, name.raw()),
                 None => {
                     owned_by(table)
@@ -881,18 +925,18 @@ impl<'a> Occupant<'a> {
                         })
                 }
             },
-            Change::DetachPartition { uid, table, .. } => {
+            Change::Partition(PartitionChange::DetachPartition { uid, table, .. }) => {
                 owned_by(table) && self.detached_by.as_ref() == Some(uid)
             }
-            Change::DropTable { name, .. } => owned_by(name),
-            Change::DropColumn { column, .. } => {
+            Change::Table(TableChange::DropTable { name, .. }) => owned_by(name),
+            Change::Column(ColumnChange::DropColumn { column, .. }) => {
                 owned_by(&column.table) && self.owner_column.as_ref() == Some(&column.name)
             }
             // A numbering change that drops its column's sequence, or renames
             // it, frees the name it had (#1930 review).
-            Change::AlterColumnNumbering {
+            Change::Column(ColumnChange::AlterColumnNumbering {
                 column, from, to, ..
-            } => {
+            }) => {
                 use pbps_model::ValueSource;
                 let frees = match (from, to) {
                     (ValueSource::Identity(_), ValueSource::Identity(_)) => false,
@@ -1002,19 +1046,21 @@ pub(crate) fn stored_unlogged_parents(
 /// so, or a table it attaches that the plan leaves so, which is a new
 /// partition under the parent's referencing keys all the same (#1545).
 pub(crate) fn unlogged_partition(change: &pbps_model::Change) -> Option<(&TableName, &TableName)> {
-    if let pbps_model::Change::CreateTable { name, table, .. } = change {
+    if let pbps_model::Change::Table(pbps_model::TableChange::CreateTable { name, table, .. }) =
+        change
+    {
         return table
             .partition_of
             .as_ref()
             .filter(|_| table.unlogged)
             .map(|of| (name, &of.parent));
     }
-    if let pbps_model::Change::AttachPartition {
+    if let pbps_model::Change::Partition(pbps_model::PartitionChange::AttachPartition {
         table,
         parent,
         shape,
         ..
-    } = change
+    }) = change
     {
         return shape.unlogged.then_some((table, parent));
     }
@@ -1037,6 +1083,10 @@ pub(crate) fn refuse_permanent_referencers(
     referencers: &[pbps_pg::catalog::PermanentReferencer],
     staged: bool,
 ) -> anyhow::Result<()> {
+    use pbps_model::ConstraintChange;
+    use pbps_model::PartitionChange;
+    use pbps_model::TableChange;
+    use pbps_model::TablePropertyChange;
     use pbps_model::{
         Change,
         plan_names::{At, Holder},
@@ -1058,21 +1108,21 @@ pub(crate) fn refuse_permanent_referencers(
     let mut removals: Vec<(usize, TableName, Option<&str>)> = Vec::new();
     for (at, p) in cs.changes.iter().enumerate() {
         match &p.change {
-            Change::DropTable { uid, .. } => {
+            Change::Table(TableChange::DropTable { uid, .. }) => {
                 if let Some(table) = names.table_at(uid, At::Start) {
                     removals.push((at, table.clone(), None));
                 }
             }
-            Change::SetTablePersistence {
+            Change::TableProperty(TablePropertyChange::SetTablePersistence {
                 uid,
                 unlogged: true,
                 ..
-            } => {
+            }) => {
                 if let Some(table) = names.table_at(uid, At::Start) {
                     removals.push((at, table.clone(), None));
                 }
             }
-            Change::DropForeignKey { table, name } => {
+            Change::Constraint(ConstraintChange::DropForeignKey { table, name }) => {
                 // Only earlier renames decide which stored table owns this
                 // removal; a later name handoff must not change it (DEC-1770.1).
                 let stored = match names.holder(table, At::Before(at)) {
@@ -1123,7 +1173,10 @@ pub(crate) fn refuse_permanent_referencers(
                 "{partition} would be {} unlogged under {parent}, which {}'s foreign key \
                  `{}`{through} references; a crash would empty {partition} and leave rows of {} \
                  referencing nothing",
-                if matches!(p.change, Change::AttachPartition { .. }) {
+                if matches!(
+                    p.change,
+                    Change::Partition(PartitionChange::AttachPartition { .. })
+                ) {
                     "attached"
                 } else {
                     "created"
@@ -1154,11 +1207,13 @@ pub(crate) fn refuse_permanent_referencers(
 pub(crate) fn unlogged_table(
     change: &pbps_model::Change,
 ) -> Option<(&pbps_model::Uid, &TableName)> {
-    if let pbps_model::Change::SetTablePersistence {
-        uid,
-        table,
-        unlogged: true,
-    } = change
+    if let pbps_model::Change::TableProperty(
+        pbps_model::TablePropertyChange::SetTablePersistence {
+            uid,
+            table,
+            unlogged: true,
+        },
+    ) = change
     {
         Some((uid, table))
     } else {
@@ -1242,10 +1297,15 @@ pub(crate) fn refuse_published_unlogged(
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn transferred_tables(cs: &pbps_model::ChangeSet) -> Vec<TableName> {
     use pbps_model::Change;
+    use pbps_model::TableChange;
     cs.changes
         .iter()
         .filter_map(|p| match &p.change {
-            Change::RenameTable { from, to, .. } if from.schema != to.schema => Some(from.clone()),
+            Change::Table(TableChange::RenameTable { from, to, .. })
+                if from.schema != to.schema =>
+            {
+                Some(from.clone())
+            }
             _ => None,
         })
         .collect()
@@ -1260,18 +1320,20 @@ pub(crate) fn transferred_tables(cs: &pbps_model::ChangeSet) -> Vec<TableName> {
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn created_object_names(cs: &pbps_model::ChangeSet) -> Vec<TableName> {
     use pbps_model::Change;
+    use pbps_model::ModuleChange;
+    use pbps_model::TableChange;
     let dropped: BTreeSet<&ModuleId> = cs
         .changes
         .iter()
         .filter_map(|p| match &p.change {
-            Change::DropModule { id, .. } => Some(id),
+            Change::Module(ModuleChange::DropModule { id, .. }) => Some(id),
             _ => None,
         })
         .collect();
     cs.changes
         .iter()
         .flat_map(|p| match &p.change {
-            Change::CreateTable { name, table, .. } => {
+            Change::Table(TableChange::CreateTable { name, table, .. }) => {
                 let history = table
                     .system_time
                     .as_ref()
@@ -1279,7 +1341,9 @@ pub(crate) fn created_object_names(cs: &pbps_model::ChangeSet) -> Vec<TableName>
                     .map(|v| v.history.clone());
                 std::iter::once(name.clone()).chain(history).collect()
             }
-            Change::CreateModule { id, .. } if !dropped.contains(id) => vec![module_object(id)],
+            Change::Module(ModuleChange::CreateModule { id, .. }) if !dropped.contains(id) => {
+                vec![module_object(id)]
+            }
             _ => Vec::new(),
         })
         .collect()
@@ -1309,6 +1373,9 @@ pub(crate) fn object_reads(
     index: &pbps_model::plan_names::PlanNames<'_>,
 ) -> (Vec<TableName>, Vec<TableName>) {
     use pbps_model::Change;
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::TableChange;
     use pbps_mssql::emit::default_constraint_name as generated;
     use pbps_mssql::emit::fallback_default_constraint_name as fallback_name;
     let in_schema = |t: &TableName, name: pbps_model::ObjectLocalName| {
@@ -1323,9 +1390,9 @@ pub(crate) fn object_reads(
                 .unwrap_or_else(|| t.clone())
         };
         match &p.change {
-            Change::RenameTable {
+            Change::Table(TableChange::RenameTable {
                 from, to, defaults, ..
-            } => {
+            }) => {
                 parents.push(now(from));
                 // The target itself, so the walk sees an object the project
                 // does not record holding it (DEC-981.2).
@@ -1340,14 +1407,16 @@ pub(crate) fn object_reads(
                     names.push(in_schema(to, fallback_name(to, c.raw())));
                 }
             }
-            Change::RenameColumn { table, to, .. } => {
+            Change::Column(ColumnChange::RenameColumn { table, to, .. }) => {
                 parents.push(now(table));
                 names.push(in_schema(table, generated(table, to.raw())));
                 names.push(in_schema(table, fallback_name(table, to.raw())));
             }
-            Change::DropTable { name, .. } => parents.push(now(name)),
-            Change::DropColumn { column, .. } => parents.push(now(&column.table)),
-            Change::AlterColumnDefault { column, to, .. } => {
+            Change::Table(TableChange::DropTable { name, .. }) => parents.push(now(name)),
+            Change::Column(ColumnChange::DropColumn { column, .. }) => {
+                parents.push(now(&column.table))
+            }
+            Change::Column(ColumnChange::AlterColumnDefault { column, to, .. }) => {
                 parents.push(now(&column.table));
                 if to.is_some() {
                     names.push(in_schema(
@@ -1356,10 +1425,12 @@ pub(crate) fn object_reads(
                     ));
                 }
             }
-            Change::DropUnique { table, .. }
-            | Change::DropForeignKey { table, .. }
-            | Change::DropCheck { table, .. } => parents.push(now(table)),
-            Change::SetPrimaryKey { table, to, .. } => {
+            Change::Constraint(ConstraintChange::DropUnique { table, .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { table, .. })
+            | Change::Constraint(ConstraintChange::DropCheck { table, .. }) => {
+                parents.push(now(table))
+            }
+            Change::Constraint(ConstraintChange::SetPrimaryKey { table, to, .. }) => {
                 parents.push(now(table));
                 if let Some(name) = to
                     .as_ref()
@@ -1368,17 +1439,17 @@ pub(crate) fn object_reads(
                     names.push(in_schema(table, name.into()));
                 }
             }
-            Change::AddUnique { table, name, .. }
-            | Change::AddForeignKey { table, name, .. }
-            | Change::AddCheck { table, name, .. } => {
+            Change::Constraint(ConstraintChange::AddUnique { table, name, .. })
+            | Change::Constraint(ConstraintChange::AddForeignKey { table, name, .. })
+            | Change::Constraint(ConstraintChange::AddCheck { table, name, .. }) => {
                 names.push(in_schema(table, name.clone()));
             }
-            Change::AddColumn {
+            Change::Column(ColumnChange::AddColumn {
                 table,
                 name,
                 column,
                 ..
-            } if (match column.value_source {
+            }) if (match column.value_source {
                 pbps_model::ValueSource::Default(_) => true,
                 pbps_model::ValueSource::None
                 | pbps_model::ValueSource::Identity(_)
@@ -1388,7 +1459,7 @@ pub(crate) fn object_reads(
             {
                 names.push(in_schema(table, generated(table, name.raw())))
             }
-            Change::CreateTable { name, table, .. } => {
+            Change::Table(TableChange::CreateTable { name, table, .. }) => {
                 for (column, spec) in &table.columns {
                     if match spec.value_source {
                         pbps_model::ValueSource::Default(_) => true,
@@ -1434,6 +1505,8 @@ pub(crate) fn alike_candidates(
     occupants: &[pbps_mssql::catalog::NameOccupant],
 ) -> Vec<TableName> {
     use pbps_model::Change;
+    use pbps_model::ModuleChange;
+    use pbps_model::TableChange;
     let mut out: Vec<TableName> = names.to_vec();
     out.extend(occupants.iter().map(|o| o.name.clone()));
     for p in &cs.changes {
@@ -1441,8 +1514,8 @@ pub(crate) fn alike_candidates(
         // and every module the plan creates, a rebuilt one included, which
         // `created_object_names` leaves out of the read (review of #1240).
         match &p.change {
-            Change::RenameTable { to, .. } => out.push(to.clone()),
-            Change::CreateModule { id, .. } => out.push(module_object(id)),
+            Change::Table(TableChange::RenameTable { to, .. }) => out.push(to.clone()),
+            Change::Module(ModuleChange::CreateModule { id, .. }) => out.push(module_object(id)),
             _ => {}
         }
     }
@@ -1463,9 +1536,10 @@ pub(crate) fn carried_destinations(
     occupants: &[pbps_mssql::catalog::NameOccupant],
 ) -> Vec<TableName> {
     use pbps_model::Change;
+    use pbps_model::TableChange;
     let mut out = Vec::new();
     for p in &cs.changes {
-        if let Change::RenameTable { from, to, .. } = &p.change
+        if let Change::Table(TableChange::RenameTable { from, to, .. }) = &p.change
             && from.schema != to.schema
         {
             out.extend(
@@ -1494,7 +1568,12 @@ pub(super) fn blocking_history_occupants<'a>(
         .changes
         .iter()
         .filter_map(|p| {
-            if let pbps_model::Change::CreateTable { name, table, .. } = &p.change {
+            if let pbps_model::Change::Table(pbps_model::TableChange::CreateTable {
+                name,
+                table,
+                ..
+            }) = &p.change
+            {
                 let v = table.system_time.as_ref()?.versioning.as_ref()?;
                 Some((&v.history, name))
             } else {
@@ -1527,7 +1606,10 @@ pub(super) async fn refuse_taken_history_names(
         .changes
         .iter()
         .filter_map(|p| {
-            if let pbps_model::Change::CreateTable { table, .. } = &p.change {
+            if let pbps_model::Change::Table(pbps_model::TableChange::CreateTable {
+                table, ..
+            }) = &p.change
+            {
                 Some(
                     table
                         .system_time

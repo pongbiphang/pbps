@@ -17,6 +17,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
 use pbps_model::operation::{
     Address, NameKind, Named, Names, ObjectKey, Operation, OwnerError, Owners, Snapshot,
     base_table_named,
@@ -189,10 +192,12 @@ fn constraint_names(
 #[allow(clippy::wildcard_enum_match_arm)]
 fn partition(op: &Operation) -> Option<(&TableName, &TableName)> {
     match op.change() {
-        Change::CreateTable { name, table, .. } => {
+        Change::Table(TableChange::CreateTable { name, table, .. }) => {
             table.partition_of.as_ref().map(|of| (name, &of.parent))
         }
-        Change::AttachPartition { table, parent, .. } => Some((table, parent)),
+        Change::Partition(PartitionChange::AttachPartition { table, parent, .. }) => {
+            Some((table, parent))
+        }
         _ => None,
     }
 }
@@ -236,11 +241,14 @@ fn arriving_clones(
                 .input_owners(owners)
                 .table(on, earlier.origin().spelling())?;
             let key = (owner, name.clone());
-            if let Change::CreateModule { module, .. } | Change::AlterModule { module, .. } =
-                earlier.change()
+            if let Change::Module(ModuleChange::CreateModule { module, .. })
+            | Change::Module(ModuleChange::AlterModule { module, .. }) = earlier.change()
             {
                 triggers.insert(key, (id, module));
-            } else if matches!(earlier.change(), Change::DropModule { .. }) {
+            } else if matches!(
+                earlier.change(),
+                Change::Module(ModuleChange::DropModule { .. })
+            ) {
                 triggers.remove(&key);
             }
         }
@@ -263,7 +271,12 @@ fn arriving_clones(
             });
         }
     }
-    if !clones.is_empty() && matches!(op.change(), Change::AttachPartition { .. }) {
+    if !clones.is_empty()
+        && matches!(
+            op.change(),
+            Change::Partition(PartitionChange::AttachPartition { .. })
+        )
+    {
         // An attach keeps the table's own constraints. Restate only the
         // ones a clone would collide with, as they stand at this operation;
         // using the final shape would also claim checks installed later.
@@ -318,7 +331,9 @@ pub fn names(
                 .map(|table| table.table_key()),
             ModuleId::Named(_) | ModuleId::Routine(_) => None,
         });
-    if let Change::DropModule { id, .. } | Change::AlterModule { id, .. } = op.change() {
+    if let Change::Module(ModuleChange::DropModule { id, .. })
+    | Change::Module(ModuleChange::AlterModule { id, .. }) = op.change()
+    {
         let old_id = match id {
             ModuleId::Trigger { on, name } => op
                 .input_owners(owners)
@@ -343,7 +358,9 @@ pub fn names(
             ));
         }
     }
-    if let Change::CreateModule { id, module } | Change::AlterModule { id, module } = op.change() {
+    if let Change::Module(ModuleChange::CreateModule { id, module })
+    | Change::Module(ModuleChange::AlterModule { id, module }) = op.change()
+    {
         out.claims.extend(constraint_names(
             dialect,
             id,

@@ -1,4 +1,5 @@
 use super::*;
+use pbps_model::ModuleChange;
 use std::cell::Cell;
 
 thread_local! {
@@ -15,10 +16,10 @@ fn dependent_checks_project_each_saved_step_once() {
     let mut changes = ChangeSet {
         changes: (0..32)
             .map(|i| {
-                PlannedChange::new(Change::DropModule {
+                PlannedChange::new(Change::Module(ModuleChange::DropModule {
                     id: format!("app.root{i}").parse().unwrap(),
                     kind: ModuleKind::View,
-                })
+                }))
             })
             .collect(),
     };
@@ -36,10 +37,10 @@ fn dependent_checks_project_each_saved_step_once() {
         if removed {
             changes.changes.insert(
                 0,
-                PlannedChange::new(Change::DropModule {
+                PlannedChange::new(Change::Module(ModuleChange::DropModule {
                     id: "app.dependent0".parse().unwrap(),
                     kind: ModuleKind::View,
-                }),
+                })),
             );
         }
         PROJECTIONS.set(0);

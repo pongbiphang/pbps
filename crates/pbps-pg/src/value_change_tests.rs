@@ -1,9 +1,11 @@
 use super::*;
 use pbps_dialect::{ConversionRequired, ValueProbe};
+use pbps_model::ColumnChange;
+use pbps_model::TypeValueChange;
 use pbps_model::{Change, EnumRebuildStep, ValueChange};
 
 fn column(from: &str, to: &str, using: Option<&str>) -> Change {
-    Change::AlterColumnType {
+    Change::Column(ColumnChange::AlterColumnType {
         uid: "c_aaaaaa".parse().unwrap(),
         column: pbps_model::TableName::new("app", "t").column("v"),
         from: from.parse().unwrap(),
@@ -14,7 +16,7 @@ fn column(from: &str, to: &str, using: Option<&str>) -> Change {
         to_collation: None,
         through_external_partitions: false,
         using: using.map(str::to_owned),
-    }
+    })
 }
 
 #[test]
@@ -60,7 +62,7 @@ fn columns_and_rebuilds_share_admission_risk_and_probe_material() {
             arrays: usize::from(target.is_array()),
             using: using.map(str::to_owned),
         };
-        let rebuild = Change::EnumRebuild {
+        let rebuild = Change::TypeValue(TypeValueChange::EnumRebuild {
             uid: "y_000001".parse().unwrap(),
             name: "app.d".parse().unwrap(),
             tmp: "app.tmp".parse().unwrap(),
@@ -71,7 +73,7 @@ fn columns_and_rebuilds_share_admission_risk_and_probe_material() {
                 array: false,
                 values: Box::new(values),
             },
-        };
+        });
         assert_eq!(column.value_change(), rebuild.value_change());
         let verdict = pg.value_change(&column.value_change().unwrap(), "\"v\"");
         assert_eq!(

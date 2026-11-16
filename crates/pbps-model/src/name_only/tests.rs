@@ -2,6 +2,7 @@
 //! property below runs over it.
 
 use super::*;
+use crate::SearchChange;
 use crate::{
     Change, ChangeSet, Column, IdsFile, PlannedChange, SearchKind, Table, TableName, Uid, UidKind,
 };
@@ -198,12 +199,12 @@ fn creating(schema: &Schema) -> ChangeSet {
             .search
             .iter()
             .map(|(name, object)| {
-                PlannedChange::new(Change::CreateSearch {
+                PlannedChange::new(Change::Search(SearchChange::CreateSearch {
                     uid: Uid::generate(UidKind::Search),
                     name: name.clone(),
                     definition: Box::new(object.clone()),
                     unresolved: Vec::new(),
-                })
+                }))
             })
             .collect(),
     }

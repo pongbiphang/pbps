@@ -137,13 +137,13 @@ pub async fn vet_conversions(
         return Ok(immutable);
     }
     for planned in changes {
-        let pbps_model::Change::AlterColumnType {
+        let pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType {
             column,
             from,
             to,
             using: Some(using),
             ..
-        } = &planned.change
+        }) = &planned.change
         else {
             continue;
         };
@@ -946,6 +946,7 @@ mod type_slot_tests {
 
     #[test]
     fn a_type_move_refuses_an_undeclared_intermediate_catalog_holder_by_name() {
+        use pbps_model::TypeChange;
         use pbps_model::{Change, ChangeSet, IdsFile, ManagedType, PlannedChange, Schema};
         let from: pbps_model::TypeRef = "app.a".parse().unwrap();
         let to: pbps_model::TypeRef = "dst.b".parse().unwrap();
@@ -982,12 +983,12 @@ mod type_slot_tests {
             dialect: &dialect,
         };
         let mut cs = pbps_diff::order::propose(ChangeSet {
-            changes: vec![PlannedChange::new(Change::RenameType {
+            changes: vec![PlannedChange::new(Change::Type(TypeChange::RenameType {
                 uid,
                 from,
                 to,
                 definition: Box::new(definition),
-            })],
+            }))],
         });
         let mut facts = NameFacts {
             type_occupants: vec![TableName::new("dst", "a")],
@@ -1367,10 +1368,10 @@ pub(in crate::engine) fn tightens_a_domain(changes: &ChangeSet) -> bool {
     changes.changes.iter().any(|p| {
         matches!(
             p.change,
-            pbps_model::Change::AlterDomain {
+            pbps_model::Change::TypeValue(pbps_model::TypeValueChange::AlterDomain {
                 half: pbps_model::DomainHalf::Tighten,
                 ..
-            }
+            })
         )
     })
 }
@@ -1577,7 +1578,7 @@ fn release_of(
             &pbps_model::ColumnRef::new(named.table.clone(), base),
         );
     changes.changes.iter().position(|p| {
-        matches!(&p.change, pbps_model::Change::AlterColumnExpression { column, to, .. }
+        matches!(&p.change, pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnExpression { column, to, .. })
             if stored_column(names, column) == (table.clone(), generated.clone())
                 && (base_is_another || !pbps_pg::generated::may_read(to, base.raw()))
                 && !pbps_pg::generated::may_read(to, named.name.raw()))
@@ -1621,6 +1622,8 @@ pub(crate) fn order_after_releases<S: Clone>(
     declared: &pbps_model::ModuleDeps,
 ) -> Result<usize, String> {
     use pbps_model::Change;
+    use pbps_model::ColumnChange;
+    use pbps_model::ModuleChange;
     use pbps_pg::generated::may_read;
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, after.ids)
         .map_err(|e| e.to_string())?;
@@ -1635,8 +1638,8 @@ pub(crate) fn order_after_releases<S: Clone>(
     let trigger_change_at = |table: &TableName| {
         changes.changes.iter().position(|p| {
             matches!(&p.change,
-                Change::DropModule { id: pbps_model::ModuleId::Trigger { on, .. }, .. }
-                | Change::AlterModule { id: pbps_model::ModuleId::Trigger { on, .. }, .. }
+                Change::Module(ModuleChange::DropModule { id: pbps_model::ModuleId::Trigger { on, .. }, .. })
+                | Change::Module(ModuleChange::AlterModule { id: pbps_model::ModuleId::Trigger { on, .. }, .. })
                     if on.schema == table.schema && on.name == table.name)
         })
     };
@@ -1697,15 +1700,17 @@ pub(crate) fn order_after_releases<S: Clone>(
             // (DEC-1168.1), so only a drop has to look at it: a retype runs
             // before it already.
             let (c, to, added) = match &q.change {
-                Change::AlterColumnExpression { column: c, to, .. } => (c.clone(), to, false),
-                Change::AddColumn {
+                Change::Column(ColumnChange::AlterColumnExpression { column: c, to, .. }) => {
+                    (c.clone(), to, false)
+                }
+                Change::Column(ColumnChange::AddColumn {
                     table: t,
                     name,
                     column: added,
                     ..
-                } => match &added.value_source {
+                }) => match &added.value_source {
                     pbps_model::ValueSource::Generated(generated)
-                        if matches!(p.change, Change::DropColumn { .. }) =>
+                        if matches!(p.change, Change::Column(ColumnChange::DropColumn { .. })) =>
                     {
                         (
                             pbps_model::ColumnRef::new(t.clone(), name.clone()),
@@ -1729,7 +1734,10 @@ pub(crate) fn order_after_releases<S: Clone>(
             {
                 continue;
             }
-            if matches!(p.change, Change::AlterColumnType { .. }) {
+            if matches!(
+                p.change,
+                Change::Column(ColumnChange::AlterColumnType { .. })
+            ) {
                 waits[j].entry(i).or_insert(Source::Lexical);
             } else if !reused(changes, column) {
                 let what = if added {
@@ -1747,10 +1755,10 @@ pub(crate) fn order_after_releases<S: Clone>(
                 ));
             }
         }
-        if let Change::AlterColumnType { uid, .. } = &p.change {
+        if let Change::Column(ColumnChange::AlterColumnType { uid, .. }) = &p.change {
             for (j, q) in changes.changes.iter().enumerate() {
                 if matches!(&q.change,
-                    Change::AlterColumnDefault { uid: u, to: Some(_), .. } if u == uid)
+                    Change::Column(ColumnChange::AlterColumnDefault { uid: u, to: Some(_), .. }) if u == uid)
                 {
                     waits[j].entry(i).or_insert(Source::Effect);
                 }
@@ -1849,9 +1857,9 @@ pub(crate) fn order_after_releases<S: Clone>(
 /// of that name then reads the new one.
 fn reused(changes: &ChangeSet, column: &pbps_model::ColumnRef) -> bool {
     changes.changes.iter().any(|p| {
-        matches!(&p.change, pbps_model::Change::AddColumn { table, name, .. }
+        matches!(&p.change, pbps_model::Change::Column(pbps_model::ColumnChange::AddColumn { table, name, .. })
             if *table == column.table && *name == column.name)
-            || matches!(&p.change, pbps_model::Change::RenameColumn { table, to, .. }
+            || matches!(&p.change, pbps_model::Change::Column(pbps_model::ColumnChange::RenameColumn { table, to, .. })
                 if *table == column.table && *to == column.name)
     })
 }
@@ -1885,11 +1893,13 @@ fn keep_ahead(
     // #2086 states why an omitted required input must be gone. Move every
     // affected insert with its effect consumers, rather than refusing the
     // crossing or moving the row away from its child rows and keys (#2174).
-    if matches!(change, pbps_model::Change::DropColumn { .. })
-        && let Some(&from) = required.get(&(table, live))
+    if matches!(
+        change,
+        pbps_model::Change::Column(pbps_model::ColumnChange::DropColumn { .. })
+    ) && let Some(&from) = required.get(&(table, live))
     {
         for (i, _) in later().filter(|(i, c)| {
-            matches!(c, pbps_model::Change::InsertRow { table, .. } if *table == column.table)
+            matches!(c, pbps_model::Change::Row(pbps_model::RowChange::InsertRow { table, .. }) if *table == column.table)
                 && from.is_none_or(|j| j < *i)
         }) {
             schedule.edge(
@@ -1904,9 +1914,9 @@ fn keep_ahead(
     // A drop holds its name until it runs: a change taking the name needs it
     // free, and the release needs the column still there.
     if let Some((i, taker)) = later().find(|(_, c)| {
-        matches!(c, pbps_model::Change::AddColumn { table, name, .. }
+        matches!(c, pbps_model::Change::Column(pbps_model::ColumnChange::AddColumn { table, name, .. })
             if *table == column.table && *name == column.name)
-            || matches!(c, pbps_model::Change::RenameColumn { table, to, .. }
+            || matches!(c, pbps_model::Change::Column(pbps_model::ColumnChange::RenameColumn { table, to, .. })
             if *table == column.table && *to == column.name)
     }) {
         schedule.keep(
@@ -1928,8 +1938,10 @@ fn keep_ahead(
     // type: a row writing a value only it accepts, a function whose body
     // is checked against it. The retype cannot both follow the release and
     // precede them, so the plan is refused by name (DEC-1316.1).
-    if matches!(change, pbps_model::Change::AlterColumnType { .. })
-        && let Some((i, past)) = later().find(|(_, c)| after_the_alterations(c))
+    if matches!(
+        change,
+        pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType { .. })
+    ) && let Some((i, past)) = later().find(|(_, c)| after_the_alterations(c))
     {
         schedule.keep(
             held,
@@ -1953,25 +1965,28 @@ fn keep_ahead(
 fn after_the_alterations(change: &pbps_model::Change) -> bool {
     matches!(
         change,
-        pbps_model::Change::InsertRow { .. }
-            | pbps_model::Change::UpdateRow { .. }
-            | pbps_model::Change::DeleteRow { .. }
-            | pbps_model::Change::SetPrimaryKey { to: Some(_), .. }
-            | pbps_model::Change::AddUnique { .. }
-            | pbps_model::Change::AddForeignKey { .. }
-            | pbps_model::Change::AddCheck { .. }
-            | pbps_model::Change::AddIndex { .. }
-            | pbps_model::Change::CreateModule { .. }
-            | pbps_model::Change::AlterModule { .. }
-            | pbps_model::Change::AddEnumValue { .. }
-            | pbps_model::Change::RenameEnumValue { .. }
-            | pbps_model::Change::EnumRebuild { .. }
+        pbps_model::Change::Row(pbps_model::RowChange::InsertRow { .. })
+            | pbps_model::Change::Row(pbps_model::RowChange::UpdateRow { .. })
+            | pbps_model::Change::Row(pbps_model::RowChange::DeleteRow { .. })
+            | pbps_model::Change::Constraint(pbps_model::ConstraintChange::SetPrimaryKey {
+                to: Some(_),
+                ..
+            })
+            | pbps_model::Change::Constraint(pbps_model::ConstraintChange::AddUnique { .. })
+            | pbps_model::Change::Constraint(pbps_model::ConstraintChange::AddForeignKey { .. })
+            | pbps_model::Change::Constraint(pbps_model::ConstraintChange::AddCheck { .. })
+            | pbps_model::Change::Index(pbps_model::IndexChange::AddIndex { .. })
+            | pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule { .. })
+            | pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule { .. })
+            | pbps_model::Change::TypeValue(pbps_model::TypeValueChange::AddEnumValue { .. })
+            | pbps_model::Change::TypeValue(pbps_model::TypeValueChange::RenameEnumValue { .. })
+            | pbps_model::Change::TypeValue(pbps_model::TypeValueChange::EnumRebuild { .. })
             | pbps_model::change_family!(types)
-            | pbps_model::Change::CreateRole { .. }
-            | pbps_model::Change::Grant { .. }
-            | pbps_model::Change::PublicExecution { .. }
-            | pbps_model::Change::SetDataMode { .. }
-            | pbps_model::Change::SetEnsureKeys { .. }
+            | pbps_model::Change::Role(pbps_model::RoleChange::CreateRole { .. })
+            | pbps_model::Change::Permission(pbps_model::GrantChange::Grant { .. })
+            | pbps_model::Change::Permission(pbps_model::GrantChange::PublicExecution { .. })
+            | pbps_model::Change::Row(pbps_model::RowChange::SetDataMode { .. })
+            | pbps_model::Change::Row(pbps_model::RowChange::SetEnsureKeys { .. })
     )
 }
 
@@ -1990,7 +2005,9 @@ fn unreleased(
         .changes
         .iter()
         .filter_map(|p| {
-            if let pbps_model::Change::DropColumn { .. } = &p.change {
+            if let pbps_model::Change::Column(pbps_model::ColumnChange::DropColumn { .. }) =
+                &p.change
+            {
                 changed_column(names, &p.change).map(|(table, name, ..)| (table, name))
             } else {
                 None
@@ -2174,12 +2191,12 @@ async fn refuse_missing_policy_roles(conn: &mut Conn, changes: &ChangeSet) -> an
         .changes
         .iter()
         .filter_map(|step| {
-            if let pbps_model::Change::CreatePolicy {
+            if let pbps_model::Change::Policy(pbps_model::PolicyChange::CreatePolicy {
                 table,
                 name,
                 policy,
                 ..
-            } = &step.change
+            }) = &step.change
                 && let pbps_model::PolicyRoles::Roles(roles) = &policy.to
             {
                 Some((table, name, roles))
@@ -2537,11 +2554,12 @@ fn rebuilt_modules(
     changes: &ChangeSet,
 ) -> BTreeMap<pbps_model::ModuleId, (pbps_model::ModuleKind, pbps_model::ModuleKind)> {
     use pbps_model::Change;
+    use pbps_model::ModuleChange;
     let dropped: BTreeMap<_, _> = changes
         .changes
         .iter()
         .filter_map(|p| match &p.change {
-            Change::DropModule { id, kind } => Some((id, *kind)),
+            Change::Module(ModuleChange::DropModule { id, kind }) => Some((id, *kind)),
             _ => None,
         })
         .collect();
@@ -2549,8 +2567,10 @@ fn rebuilt_modules(
         .changes
         .iter()
         .filter_map(|p| match &p.change {
-            Change::AlterModule { id, module } => Some((id.clone(), (module.kind, module.kind))),
-            Change::CreateModule { id, module } => dropped
+            Change::Module(ModuleChange::AlterModule { id, module }) => {
+                Some((id.clone(), (module.kind, module.kind)))
+            }
+            Change::Module(ModuleChange::CreateModule { id, module }) => dropped
                 .get(id)
                 .map(|kind| (id.clone(), (*kind, module.kind))),
             _ => None,
@@ -2673,10 +2693,10 @@ async fn module_dependents(
             .changes
             .iter()
             .filter_map(|p| {
-                if let pbps_model::Change::DropModule {
+                if let pbps_model::Change::Module(pbps_model::ModuleChange::DropModule {
                     id,
                     kind: pbps_model::ModuleKind::Function,
-                } = &p.change
+                }) = &p.change
                 {
                     Some(id.clone())
                 } else {
@@ -2966,11 +2986,12 @@ mod tests {
         dependences: &BTreeMap<TableName, Vec<pbps_pg::generated::Dependence>>,
     ) -> Result<usize, String> {
         let mut ids = crate::plan_fixture::ids(changes);
-        if !changes
-            .changes
-            .iter()
-            .any(|p| matches!(p.change, pbps_model::Change::InsertRow { .. }))
-        {
+        if !changes.changes.iter().any(|p| {
+            matches!(
+                p.change,
+                pbps_model::Change::Row(pbps_model::RowChange::InsertRow { .. })
+            )
+        }) {
             // Older name-only fixtures do not enter the carried-row graph.
             let schema = pbps_model::Schema::default();
             return crate::test_planning(changes, |plan| {
@@ -3031,7 +3052,8 @@ mod tests {
         }
         let mut after = before.clone();
         for p in &changes.changes {
-            if let pbps_model::Change::AlterModule { id, module } = &p.change
+            if let pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule { id, module }) =
+                &p.change
                 && module.kind == pbps_model::ModuleKind::Trigger
             {
                 // A declared trigger stands at both ends even when the catalog
@@ -3039,7 +3061,11 @@ mod tests {
                 before.modules.insert(id.clone(), (**module).clone());
                 after.modules.insert(id.clone(), (**module).clone());
             }
-            if let pbps_model::Change::DropColumn { uid, column } = &p.change {
+            if let pbps_model::Change::Column(pbps_model::ColumnChange::DropColumn {
+                uid,
+                column,
+            }) = &p.change
+            {
                 base_ids.columns.retain(|_, c| c != column);
                 base_ids.columns.insert(uid.clone(), column.clone());
                 ids.columns.retain(|_, c| c != column);
@@ -3085,6 +3111,7 @@ mod tests {
     /// connected check feeds.
     #[test]
     fn an_answered_temporal_refusal_is_a_finding_with_exit_two() {
+        use pbps_model::TableChange;
         use pbps_model::{
             Change, PlannedChange, Retention, RetentionUnit, SystemTime, SystemVersioning, Table,
         };
@@ -3104,13 +3131,15 @@ mod tests {
             ..Default::default()
         };
         let cs = ChangeSet {
-            changes: vec![PlannedChange::new(Change::CreateTable {
-                uid: "t_aaaaaa".parse().unwrap(),
-                name: "dbo.t".parse().unwrap(),
-                table: Box::new(table),
-                beside_default: None,
-                moves_at_most: None,
-            })],
+            changes: vec![PlannedChange::new(Change::Table(
+                TableChange::CreateTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: "dbo.t".parse().unwrap(),
+                    table: Box::new(table),
+                    beside_default: None,
+                    moves_at_most: None,
+                },
+            ))],
         };
         let problems = pbps_mssql::temporal::refused_without_retention(&cs, &Default::default());
         let refusal = temporal_refusal(&problems).expect("a finite retention is refused");
@@ -3182,6 +3211,8 @@ mod tests {
     /// without a default has no such requirement and keeps its original order.
     #[test]
     fn crossed_inserts_follow_their_actual_default_requirements() {
+        use pbps_model::ColumnChange;
+        use pbps_model::RowChange;
         use pbps_model::{
             Change, Column, Generated, IdsFile, PlannedChange, Schema, Table, UidKind, ValueSource,
         };
@@ -3226,11 +3257,11 @@ mod tests {
                 stored: true,
             });
             let changes = vec![
-                Change::DropColumn {
+                Change::Column(ColumnChange::DropColumn {
                     uid: a,
                     column: table.column("a"),
-                },
-                Change::InsertRow {
+                }),
+                Change::Row(RowChange::InsertRow {
                     table: table.clone(),
                     key_column: "id".into(),
                     identity_key: false,
@@ -3238,13 +3269,13 @@ mod tests {
                     row: pbps_model::Row::default(),
                     defaults: Default::default(),
                     types: Default::default(),
-                },
-                Change::AlterColumnExpression {
+                }),
+                Change::Column(ColumnChange::AlterColumnExpression {
                     uid: g,
                     column: table.column("g"),
                     from: "a * 2".into(),
                     to: "b * 2".into(),
-                },
+                }),
             ];
             let needs_default_gone = defaulted;
             let expected = if needs_default_gone {
@@ -3324,35 +3355,44 @@ mod tests {
     #[allow(clippy::wildcard_enum_match_arm)]
     #[test]
     fn a_released_input_is_retyped_or_dropped_after_its_release() {
+        use pbps_model::ColumnChange;
+        use pbps_model::ModuleChange;
+        use pbps_model::RowChange;
         use pbps_model::{Change, ColumnRef, PlannedChange};
         let t: TableName = "app.t".parse().unwrap();
         let col = |name: &str| ColumnRef::new(t.clone(), name);
         let uid = |u: &str| -> pbps_model::Uid { u.parse().unwrap() };
-        let drop = |name: &str| Change::DropColumn {
-            uid: uid("c_aaaaaa"),
-            column: col(name),
+        let drop = |name: &str| {
+            Change::Column(ColumnChange::DropColumn {
+                uid: uid("c_aaaaaa"),
+                column: col(name),
+            })
         };
-        let retype = |name: &str| Change::AlterColumnType {
-            uid: uid(if matches!(name, "a" | "x") {
-                "c_bbbbbb"
-            } else {
-                "c_ffffff"
-            }),
-            column: col(name),
-            from: "integer".parse().unwrap(),
-            to: "bigint".parse().unwrap(),
-            from_nullable: true,
-            to_nullable: true,
-            through_external_partitions: false,
-            from_collation: None,
-            to_collation: None,
-            using: None,
+        let retype = |name: &str| {
+            Change::Column(ColumnChange::AlterColumnType {
+                uid: uid(if matches!(name, "a" | "x") {
+                    "c_bbbbbb"
+                } else {
+                    "c_ffffff"
+                }),
+                column: col(name),
+                from: "integer".parse().unwrap(),
+                to: "bigint".parse().unwrap(),
+                from_nullable: true,
+                to_nullable: true,
+                through_external_partitions: false,
+                from_collation: None,
+                to_collation: None,
+                using: None,
+            })
         };
-        let recompute = |to: &str| Change::AlterColumnExpression {
-            uid: uid("c_dddddd"),
-            column: col("g"),
-            from: "(a * 2)".into(),
-            to: to.into(),
+        let recompute = |to: &str| {
+            Change::Column(ColumnChange::AlterColumnExpression {
+                uid: uid("c_dddddd"),
+                column: col("g"),
+                from: "(a * 2)".into(),
+                to: to.into(),
+            })
         };
         let plan = |c: Vec<Change>| ChangeSet {
             changes: c.into_iter().map(PlannedChange::new).collect(),
@@ -3370,13 +3410,13 @@ mod tests {
             cs.changes
                 .iter()
                 .map(|p| match &p.change {
-                    Change::DropColumn { .. } => "drop",
-                    Change::AlterColumnType { .. } => "retype",
-                    Change::AlterColumnExpression { .. } => "expression",
-                    Change::AddColumn { .. } => "add",
-                    Change::AlterColumnDefault { .. } => "default",
-                    Change::RenameColumn { .. } => "rename",
-                    Change::UpdateRow { .. } => "update",
+                    Change::Column(ColumnChange::DropColumn { .. }) => "drop",
+                    Change::Column(ColumnChange::AlterColumnType { .. }) => "retype",
+                    Change::Column(ColumnChange::AlterColumnExpression { .. }) => "expression",
+                    Change::Column(ColumnChange::AddColumn { .. }) => "add",
+                    Change::Column(ColumnChange::AlterColumnDefault { .. }) => "default",
+                    Change::Column(ColumnChange::RenameColumn { .. }) => "rename",
+                    Change::Row(RowChange::UpdateRow { .. }) => "update",
                     other => panic!("unexpected {other:?}"),
                 })
                 .collect()
@@ -3389,11 +3429,13 @@ mod tests {
         }
         // A retype takes the default written for its new type along, in
         // order; a default of another column stays.
-        let set_default = |u: &str, name: &str| Change::AlterColumnDefault {
-            uid: uid(u),
-            column: col(name),
-            from: None,
-            to: Some("5000000000".into()),
+        let set_default = |u: &str, name: &str| {
+            Change::Column(ColumnChange::AlterColumnDefault {
+                uid: uid(u),
+                column: col(name),
+                from: None,
+                to: Some("5000000000".into()),
+            })
         };
         let mut cs = plan(vec![
             retype("a"),
@@ -3414,7 +3456,7 @@ mod tests {
         assert_eq!(order_after_releases(&mut cs, &reads_a), Ok(0));
         assert_eq!(cs, settled);
         assert!(matches!(&cs.changes[3].change,
-            Change::AlterColumnDefault { column, .. } if column.name == "a".into()));
+            Change::Column(ColumnChange::AlterColumnDefault { column, .. }) if column.name == "a".into()));
         // Released, the check has nothing left to refuse; unreleased, it
         // does.
         let mut cs = plan(vec![retype("a"), recompute("b * 2")]);
@@ -3423,12 +3465,14 @@ mod tests {
         assert!(unreleased(&cs, &reads_a).is_empty());
         // The input renamed to `x` in the same plan, and the new text naming
         // `x`: it still reads the column, whatever the catalog calls it.
-        let rename = |from: &str, to: &str| Change::RenameColumn {
-            uid: uid(if from == "a" { "c_bbbbbb" } else { "c_cccccc" }),
-            table: t.clone(),
-            from: from.into(),
-            to: to.into(),
-            table_was: None,
+        let rename = |from: &str, to: &str| {
+            Change::Column(ColumnChange::RenameColumn {
+                uid: uid(if from == "a" { "c_bbbbbb" } else { "c_cccccc" }),
+                table: t.clone(),
+                from: from.into(),
+                to: to.into(),
+                table_was: None,
+            })
         };
         let mut cs = plan(vec![rename("a", "x"), retype("x"), recompute("x * 2")]);
         assert_eq!(order_after_releases(&mut cs, &reads_a), Ok(0));
@@ -3445,18 +3489,21 @@ mod tests {
         // Another generated column starting to read `a`, sorted ahead of the
         // release: it follows the retype, or the retype is refused once it
         // reads `a`.
-        let start_reading = Change::AlterColumnExpression {
+        let start_reading = Change::Column(ColumnChange::AlterColumnExpression {
             uid: uid("c_gggggg"),
             column: col("h"),
             from: "b".into(),
             to: "a + 1".into(),
-        };
+        });
         let mut cs = plan(vec![retype("a"), start_reading, recompute("b * 2")]);
         assert_eq!(order_after_releases(&mut cs, &reads_a), Ok(2));
         assert!(
-            matches!(&cs.changes[0].change, Change::AlterColumnExpression { column, .. } if column.name == "g".into())
-                && matches!(cs.changes[1].change, Change::AlterColumnType { .. })
-                && matches!(&cs.changes[2].change, Change::AlterColumnExpression { column, .. } if column.name == "h".into()),
+            matches!(&cs.changes[0].change, Change::Column(ColumnChange::AlterColumnExpression { column, .. }) if column.name == "g".into())
+                && matches!(
+                    cs.changes[1].change,
+                    Change::Column(ColumnChange::AlterColumnType { .. })
+                )
+                && matches!(&cs.changes[2].change, Change::Column(ColumnChange::AlterColumnExpression { column, .. }) if column.name == "h".into()),
             "{:?}",
             cs.changes
         );
@@ -3481,11 +3528,13 @@ mod tests {
                 },
             ],
         )]);
-        let swap = |g: &str, to: &str| Change::AlterColumnExpression {
-            uid: uid(if g == "g" { "c_gggggg" } else { "c_hhhhhh" }),
-            column: col(g),
-            from: String::new(),
-            to: to.into(),
+        let swap = |g: &str, to: &str| {
+            Change::Column(ColumnChange::AlterColumnExpression {
+                uid: uid(if g == "g" { "c_gggggg" } else { "c_hhhhhh" }),
+                column: col(g),
+                from: String::new(),
+                to: to.into(),
+            })
         };
         let mut cs = plan(vec![
             retype("a"),
@@ -3505,21 +3554,23 @@ mod tests {
         // A row writing `a` that runs before the release, as it does when the
         // release follows a function create: the retype cannot both follow the
         // release and precede the row, so the plan is refused by name.
-        let update = |column: &str| Change::UpdateRow {
-            table: t.clone(),
-            key_column: "id".into(),
-            key: pbps_model::RowKey::from("1"),
-            columns: BTreeMap::from([(
-                column.into(),
-                (
-                    pbps_model::Cell::Value(pbps_model::Value::Int(1)),
-                    pbps_model::Cell::Value(pbps_model::Value::Int(2)),
-                ),
-            )]),
-            unchanged: BTreeMap::new(),
-            types: BTreeMap::new(),
-            after_types: BTreeMap::new(),
-            key_type: None,
+        let update = |column: &str| {
+            Change::Row(RowChange::UpdateRow {
+                table: t.clone(),
+                key_column: "id".into(),
+                key: pbps_model::RowKey::from("1"),
+                columns: BTreeMap::from([(
+                    column.into(),
+                    (
+                        pbps_model::Cell::Value(pbps_model::Value::Int(1)),
+                        pbps_model::Cell::Value(pbps_model::Value::Int(2)),
+                    ),
+                )]),
+                unchanged: BTreeMap::new(),
+                types: BTreeMap::new(),
+                after_types: BTreeMap::new(),
+                key_type: None,
+            })
         };
         let mut cs = plan(vec![retype("a"), update("a"), recompute("b * 2")]);
         let refusal = order_after_releases(&mut cs, &reads_a).unwrap_err();
@@ -3528,14 +3579,16 @@ mod tests {
         // release follows a function create: a `NOT NULL` input with no
         // default refuses the row while it stands. The row follows the
         // release and drop through an edge now (#2174).
-        let insert = |table: &TableName| Change::InsertRow {
-            table: table.clone(),
-            key_column: "id".into(),
-            identity_key: false,
-            key: pbps_model::RowKey::from("1"),
-            row: pbps_model::Row::default(),
-            defaults: BTreeMap::new(),
-            types: BTreeMap::new(),
+        let insert = |table: &TableName| {
+            Change::Row(RowChange::InsertRow {
+                table: table.clone(),
+                key_column: "id".into(),
+                identity_key: false,
+                key: pbps_model::RowKey::from("1"),
+                row: pbps_model::Row::default(),
+                defaults: BTreeMap::new(),
+                types: BTreeMap::new(),
+            })
         };
         let requires_a = BTreeMap::from([(
             t.clone(),
@@ -3550,10 +3603,16 @@ mod tests {
         assert_eq!(order_after_releases(&mut cs, &requires_a), Ok(2));
         assert!(matches!(
             cs.changes[0].change,
-            Change::AlterColumnExpression { .. }
+            Change::Column(ColumnChange::AlterColumnExpression { .. })
         ));
-        assert!(matches!(cs.changes[1].change, Change::DropColumn { .. }));
-        assert!(matches!(cs.changes[2].change, Change::InsertRow { .. }));
+        assert!(matches!(
+            cs.changes[1].change,
+            Change::Column(ColumnChange::DropColumn { .. })
+        ));
+        assert!(matches!(
+            cs.changes[2].change,
+            Change::Row(RowChange::InsertRow { .. })
+        ));
         // Negatives: a nullable input without a default lets the row in,
         // another table is no concern of the column, and an insert after the
         // release is never passed.
@@ -3581,26 +3640,37 @@ mod tests {
             on: table.parse().unwrap(),
             name: "fill".into(),
         };
-        let drop_trigger = |table: &str| Change::DropModule {
-            id: trigger_on(table),
-            kind: pbps_model::ModuleKind::Trigger,
+        let drop_trigger = |table: &str| {
+            Change::Module(ModuleChange::DropModule {
+                id: trigger_on(table),
+                kind: pbps_model::ModuleKind::Trigger,
+            })
         };
         let mut cs = plan(vec![drop("a"), insert(&t), recompute("b * 2")]);
         assert_eq!(order_after_releases(&mut cs, &filled_a), Ok(1));
-        let alter_trigger = || Change::AlterModule {
-            id: trigger_on("app.t"),
-            module: Box::new(pbps_model::Module {
-                kind: pbps_model::ModuleKind::Trigger,
-                description: None,
-                definition: "BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f()".into(),
-                options: Default::default(),
-            }),
+        let alter_trigger = || {
+            Change::Module(ModuleChange::AlterModule {
+                id: trigger_on("app.t"),
+                module: Box::new(pbps_model::Module {
+                    kind: pbps_model::ModuleKind::Trigger,
+                    description: None,
+                    definition: "BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f()"
+                        .into(),
+                    options: Default::default(),
+                }),
+            })
         };
         for change in [drop_trigger("app.t"), alter_trigger()] {
             let mut cs = plan(vec![change, drop("a"), insert(&t), recompute("b * 2")]);
             assert_eq!(order_after_releases(&mut cs, &filled_a), Ok(2));
-            assert!(matches!(cs.changes[2].change, Change::DropColumn { .. }));
-            assert!(matches!(cs.changes[3].change, Change::InsertRow { .. }));
+            assert!(matches!(
+                cs.changes[2].change,
+                Change::Column(ColumnChange::DropColumn { .. })
+            ));
+            assert!(matches!(
+                cs.changes[3].change,
+                Change::Row(RowChange::InsertRow { .. })
+            ));
         }
         // A trigger rewritten after the row still stands when the row is
         // written, as the differ puts a module change after the rows.
@@ -3640,12 +3710,12 @@ mod tests {
         // A new column taking the name between the drop and the release.
         let mut cs = plan(vec![
             drop("a"),
-            Change::AddColumn {
+            Change::Column(ColumnChange::AddColumn {
                 uid: uid("c_eeeeee"),
                 table: t.clone(),
                 name: "a".into(),
                 column: Box::new(pbps_model::Column::new("text".parse().unwrap())),
-            },
+            }),
             recompute("b * 2"),
         ]);
         let refusal = order_after_releases(&mut cs, &reads_a).unwrap_err();
@@ -3653,18 +3723,23 @@ mod tests {
         // A new reader sorted ahead of the retype it has to follow: held
         // back until the retype has run, which itself waits for its release
         // (DEC-1391.1).
-        let reader = || Change::AlterColumnExpression {
-            uid: uid("c_gggggg"),
-            column: col("h"),
-            from: "b".into(),
-            to: "a + 1".into(),
+        let reader = || {
+            Change::Column(ColumnChange::AlterColumnExpression {
+                uid: uid("c_gggggg"),
+                column: col("h"),
+                from: "b".into(),
+                to: "a + 1".into(),
+            })
         };
         let mut cs = plan(vec![reader(), retype("a"), recompute("b * 2")]);
         assert_eq!(order_after_releases(&mut cs, &reads_a), Ok(2));
         assert!(
-            matches!(&cs.changes[0].change, Change::AlterColumnExpression { column, .. } if column.name == "g".into())
-                && matches!(cs.changes[1].change, Change::AlterColumnType { .. })
-                && matches!(&cs.changes[2].change, Change::AlterColumnExpression { column, .. } if column.name == "h".into()),
+            matches!(&cs.changes[0].change, Change::Column(ColumnChange::AlterColumnExpression { column, .. }) if column.name == "g".into())
+                && matches!(
+                    cs.changes[1].change,
+                    Change::Column(ColumnChange::AlterColumnType { .. })
+                )
+                && matches!(&cs.changes[2].change, Change::Column(ColumnChange::AlterColumnExpression { column, .. }) if column.name == "h".into()),
             "{:?}",
             cs.changes
         );
@@ -3683,12 +3758,12 @@ mod tests {
         // new text then reads.
         let mut cs = plan(vec![
             drop("a"),
-            Change::AddColumn {
+            Change::Column(ColumnChange::AddColumn {
                 uid: uid("c_eeeeee"),
                 table: t.clone(),
                 name: "a".into(),
                 column: Box::new(pbps_model::Column::new("text".parse().unwrap())),
-            },
+            }),
             reader(),
         ]);
         assert_eq!(order_after_releases(&mut cs, &BTreeMap::new()), Ok(0));
@@ -3696,17 +3771,19 @@ mod tests {
         // moment it exists, so one reading a dropped column has no order
         // either; the differ would run the drop first and the `ADD COLUMN`
         // would fail. Unless the name goes to a new column it reads instead.
-        let generated_h = |expression: &str| Change::AddColumn {
-            uid: uid("c_hhhhhh"),
-            table: t.clone(),
-            name: "h".into(),
-            column: Box::new(pbps_model::Column {
-                value_source: pbps_model::ValueSource::Generated(pbps_model::Generated {
-                    expression: expression.into(),
-                    stored: true,
+        let generated_h = |expression: &str| {
+            Change::Column(ColumnChange::AddColumn {
+                uid: uid("c_hhhhhh"),
+                table: t.clone(),
+                name: "h".into(),
+                column: Box::new(pbps_model::Column {
+                    value_source: pbps_model::ValueSource::Generated(pbps_model::Generated {
+                        expression: expression.into(),
+                        stored: true,
+                    }),
+                    ..pbps_model::Column::new("integer".parse().unwrap())
                 }),
-                ..pbps_model::Column::new("integer".parse().unwrap())
-            }),
+            })
         };
         let mut cs = plan(vec![drop("a"), generated_h("a + 1")]);
         let refusal = order_after_releases(&mut cs, &BTreeMap::new()).unwrap_err();
@@ -3718,12 +3795,12 @@ mod tests {
         assert_eq!(order_after_releases(&mut cs, &BTreeMap::new()), Ok(0));
         let mut cs = plan(vec![
             drop("a"),
-            Change::AddColumn {
+            Change::Column(ColumnChange::AddColumn {
                 uid: uid("c_eeeeee"),
                 table: t.clone(),
                 name: "a".into(),
                 column: Box::new(pbps_model::Column::new("integer".parse().unwrap())),
-            },
+            }),
             generated_h("a + 1"),
         ]);
         assert_eq!(order_after_releases(&mut cs, &BTreeMap::new()), Ok(0));
@@ -3751,12 +3828,12 @@ mod tests {
         )]);
         let mut cs = plan(vec![
             rename("a", "x"),
-            Change::AddColumn {
+            Change::Column(ColumnChange::AddColumn {
                 uid: uid("c_eeeeee"),
                 table: t.clone(),
                 name: "a".into(),
                 column: Box::new(pbps_model::Column::new("integer".parse().unwrap())),
-            },
+            }),
             retype("x"),
             retype("b"),
             swap("g", "b * 2"),
@@ -3766,8 +3843,8 @@ mod tests {
         let at = |what: &dyn Fn(&Change) -> bool| {
             cs.changes.iter().position(|p| what(&p.change)).unwrap()
         };
-        let retyped = |name: &'static str| move |c: &Change| matches!(c, Change::AlterColumnType { column, .. } if column.name == name.into());
-        let expression = |name: &'static str| move |c: &Change| matches!(c, Change::AlterColumnExpression { column, .. } if column.name == name.into());
+        let retyped = |name: &'static str| move |c: &Change| matches!(c, Change::Column(ColumnChange::AlterColumnType { column, .. }) if column.name == name.into());
+        let expression = |name: &'static str| move |c: &Change| matches!(c, Change::Column(ColumnChange::AlterColumnExpression { column, .. }) if column.name == name.into());
         assert!(
             at(&expression("h")) < at(&retyped("b"))
                 && at(&retyped("b")) < at(&expression("g"))
@@ -3780,12 +3857,12 @@ mod tests {
         // which releases `x`.
         let mut cs = plan(vec![
             rename("a", "x"),
-            Change::AddColumn {
+            Change::Column(ColumnChange::AddColumn {
                 uid: uid("c_eeeeee"),
                 table: t.clone(),
                 name: "a".into(),
                 column: Box::new(pbps_model::Column::new("integer".parse().unwrap())),
-            },
+            }),
             retype("x"),
             recompute("a * 2"),
         ]);
@@ -3800,10 +3877,12 @@ mod tests {
     /// only the first, the one its refusal names.
     #[test]
     fn a_released_retype_keeps_only_the_changes_it_would_pass() {
+        use pbps_model::ColumnChange;
+        use pbps_model::RowChange;
         use pbps_model::{Change, ColumnRef, PlannedChange};
         let t: TableName = "app.t".parse().unwrap();
         let uid = |u: &str| -> pbps_model::Uid { u.parse().unwrap() };
-        let retype = PlannedChange::new(Change::AlterColumnType {
+        let retype = PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
             uid: uid("c_bbbbbb"),
             column: ColumnRef::new(t.clone(), "a"),
             from: "integer".parse().unwrap(),
@@ -3814,15 +3893,15 @@ mod tests {
             from_collation: None,
             to_collation: None,
             using: None,
-        });
-        let release = PlannedChange::new(Change::AlterColumnExpression {
+        }));
+        let release = PlannedChange::new(Change::Column(ColumnChange::AlterColumnExpression {
             uid: uid("c_dddddd"),
             column: ColumnRef::new(t.clone(), "g"),
             from: "(a * 2)".into(),
             to: "b * 2".into(),
-        });
+        }));
         let update = |key: usize| {
-            PlannedChange::new(Change::UpdateRow {
+            PlannedChange::new(Change::Row(RowChange::UpdateRow {
                 table: t.clone(),
                 key_column: "id".into(),
                 key: pbps_model::RowKey::from(key.to_string().as_str()),
@@ -3837,7 +3916,7 @@ mod tests {
                 types: BTreeMap::new(),
                 after_types: BTreeMap::new(),
                 key_type: None,
-            })
+            }))
         };
         let rows = 200;
         let kept = |changes: Vec<PlannedChange>, held: usize, reach: usize| {
@@ -3918,7 +3997,7 @@ mod tests {
             overtakes: vec![],
             pending: vec![Pending {
                 declaration: "view app.v".into(),
-                subject: pbps_model::Change::CreateModule {
+                subject: pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule {
                     id: "app.v".parse().unwrap(),
                     module: Box::new(pbps_model::Module {
                         kind: pbps_model::ModuleKind::View,
@@ -3926,7 +4005,7 @@ mod tests {
                         definition: "SELECT 1 AS n".into(),
                         options: Default::default(),
                     }),
-                },
+                }),
                 owner: None,
                 dependency: None,
                 blocked: vec![],
@@ -4288,23 +4367,28 @@ mod tests {
 
     #[test]
     fn replacement_checks_include_paired_drops_but_not_ordinary_drops() {
+        use pbps_model::ModuleChange;
         use pbps_model::{Change, Module, ModuleKind, PlannedChange};
         let id: pbps_model::ModuleId = "app.v".parse().unwrap();
         let mut cs = ChangeSet::default();
-        cs.changes.push(PlannedChange::new(Change::DropModule {
-            id: id.clone(),
-            kind: ModuleKind::View,
-        }));
+        cs.changes.push(PlannedChange::new(Change::Module(
+            ModuleChange::DropModule {
+                id: id.clone(),
+                kind: ModuleKind::View,
+            },
+        )));
         assert!(rebuilt_modules(&cs).is_empty());
-        cs.changes.push(PlannedChange::new(Change::CreateModule {
-            id: id.clone(),
-            module: Box::new(Module {
-                kind: ModuleKind::Function,
-                description: None,
-                definition: "SELECT 1".into(),
-                options: Default::default(),
-            }),
-        }));
+        cs.changes.push(PlannedChange::new(Change::Module(
+            ModuleChange::CreateModule {
+                id: id.clone(),
+                module: Box::new(Module {
+                    kind: ModuleKind::Function,
+                    description: None,
+                    definition: "SELECT 1".into(),
+                    options: Default::default(),
+                }),
+            },
+        )));
         assert_eq!(
             rebuilt_modules(&cs)[&id],
             (ModuleKind::View, ModuleKind::Function)
@@ -4322,13 +4406,16 @@ mod tests {
     /// reaches a plan for an engine that has the default.
     #[test]
     fn a_staged_plan_that_closes_a_routine_to_public_is_refused_on_either_driver() {
+        use pbps_model::GrantChange;
         use pbps_model::{Change, PlannedChange};
         let mut cs = ChangeSet::default();
-        cs.changes.push(PlannedChange::new(Change::PublicExecution {
-            routine: "app.f(integer)".parse().unwrap(),
-            access: pbps_model::PublicAccess::Revoked,
-            origin: pbps_model::RoutineOrigin::Created,
-        }));
+        cs.changes.push(PlannedChange::new(Change::Permission(
+            GrantChange::PublicExecution {
+                routine: "app.f(integer)".parse().unwrap(),
+                access: pbps_model::PublicAccess::Revoked,
+                origin: pbps_model::RoutineOrigin::Created,
+            },
+        )));
         for driver in [Driver::Postgres, Driver::Mssql] {
             let e = require_transactional_rebuilds(driver, &cs, true)
                 .expect_err("a staged run leaves the routine open")
@@ -4341,12 +4428,13 @@ mod tests {
         // The other decision's window leaves the routine closed rather than
         // open, which is not the exposure this rule is about.
         let mut kept = ChangeSet::default();
-        kept.changes
-            .push(PlannedChange::new(Change::PublicExecution {
+        kept.changes.push(PlannedChange::new(Change::Permission(
+            GrantChange::PublicExecution {
                 routine: "app.f(integer)".parse().unwrap(),
                 access: pbps_model::PublicAccess::Kept,
                 origin: pbps_model::RoutineOrigin::Created,
-            }));
+            },
+        )));
         assert!(require_transactional_rebuilds(Driver::Postgres, &kept, true).is_ok());
     }
 
@@ -4355,14 +4443,17 @@ mod tests {
     /// #2035). Negative: a Unicode name is shown as it is.
     #[test]
     fn the_staged_refusal_shows_the_routine_name_escaped() {
+        use pbps_model::GrantChange;
         use pbps_model::{Change, PlannedChange};
         let closing = |name: &str| {
             let mut cs = ChangeSet::default();
-            cs.changes.push(PlannedChange::new(Change::PublicExecution {
-                routine: format!("app.{name}(integer)").parse().unwrap(),
-                access: pbps_model::PublicAccess::Revoked,
-                origin: pbps_model::RoutineOrigin::Created,
-            }));
+            cs.changes.push(PlannedChange::new(Change::Permission(
+                GrantChange::PublicExecution {
+                    routine: format!("app.{name}(integer)").parse().unwrap(),
+                    access: pbps_model::PublicAccess::Revoked,
+                    origin: pbps_model::RoutineOrigin::Created,
+                },
+            )));
             require_transactional_rebuilds(Driver::Postgres, &cs, true)
                 .expect_err("a staged run leaves the routine open")
                 .to_string()
@@ -4490,8 +4581,8 @@ mod tests {
             conn.execute("BEGIN").await.unwrap();
             assert!(conn.execute("SELECT 1 / 0").await.is_err());
             let cs = ChangeSet {
-                changes: vec![pbps_model::PlannedChange::new(
-                    pbps_model::Change::AlterColumnType {
+                changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Column(
+                    pbps_model::ColumnChange::AlterColumnType {
                         uid: "c_aaaaaa".parse().unwrap(),
                         column: "public.t.v".parse().unwrap(),
                         from: "integer".parse().unwrap(),
@@ -4503,7 +4594,7 @@ mod tests {
                         to_collation: None,
                         using: None,
                     },
-                )],
+                ))],
             };
             let ids = IdsFile {
                 tables: [("t_aaaaaa".parse().unwrap(), "public.t".parse().unwrap())].into(),
@@ -4694,6 +4785,8 @@ mod plan_name_tests {
         })
     }
 
+    use pbps_model::ColumnChange;
+    use pbps_model::GrantChange;
     use pbps_model::{Change, GrantTarget, Permission, PlannedChange};
 
     #[test]
@@ -4722,7 +4815,7 @@ mod plan_name_tests {
         let generated: pbps_model::Uid = "c_bbbbbb".parse().unwrap();
         ids.columns.insert(generated.clone(), table.column("g"));
         changes.changes.extend([
-            PlannedChange::new(Change::AlterColumnType {
+            PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
                 uid: "c_aaaaaa".parse().unwrap(),
                 column: table.column("final_column"),
                 from: "integer".parse().unwrap(),
@@ -4733,13 +4826,13 @@ mod plan_name_tests {
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            }),
-            PlannedChange::new(Change::AlterColumnExpression {
+            })),
+            PlannedChange::new(Change::Column(ColumnChange::AlterColumnExpression {
                 uid: generated,
                 column: table.column("g"),
                 from: "final_column * 2".into(),
                 to: "0".into(),
-            }),
+            })),
         ]);
         let reads = BTreeMap::from([(
             TableName::new("app", "original_table"),
@@ -4757,18 +4850,20 @@ mod plan_name_tests {
         assert_eq!(order_after_releases(&mut changes, &ids, &reads), Ok(1));
         assert!(matches!(
             changes.changes[4].change,
-            Change::AlterColumnExpression { .. }
+            Change::Column(ColumnChange::AlterColumnExpression { .. })
         ));
     }
 
     #[test]
     fn sequence_revocability_evidence_follows_both_table_and_column_renames() {
         let (mut changes, ids) = crate::plan_fixture::chain();
-        changes.changes.push(PlannedChange::new(Change::Revoke {
-            role: "writer".into(),
-            target: "sequence::app.final_table.final_column".parse().unwrap(),
-            permissions: [Permission::Usage].into(),
-        }));
+        changes.changes.push(PlannedChange::new(Change::Permission(
+            GrantChange::Revoke {
+                role: "writer".into(),
+                target: "sequence::app.final_table.final_column".parse().unwrap(),
+                permissions: [Permission::Usage].into(),
+            },
+        )));
         let mut found = pbps_db::catalog::Unrevocable {
             role: "writer".into(),
             target: "sequence::app.original_table.original_column"
@@ -4790,11 +4885,13 @@ mod plan_name_tests {
     #[test]
     fn serial_revocability_evidence_follows_its_table_through_renames() {
         let (mut changes, ids) = crate::plan_fixture::chain();
-        changes.changes.push(PlannedChange::new(Change::Revoke {
-            role: "writer".into(),
-            target: GrantTarget::Object(TableName::new("app", "final_table")),
-            permissions: [Permission::SerialSequences].into(),
-        }));
+        changes.changes.push(PlannedChange::new(Change::Permission(
+            GrantChange::Revoke {
+                role: "writer".into(),
+                target: GrantTarget::Object(TableName::new("app", "final_table")),
+                permissions: [Permission::SerialSequences].into(),
+            },
+        )));
         let mut found = pbps_db::catalog::Unrevocable {
             role: "writer".into(),
             target: GrantTarget::Object(TableName::new("app", "original_table")),
@@ -4814,11 +4911,13 @@ mod plan_name_tests {
         let (mut changes, ids) = crate::plan_fixture::chain();
         let target = GrantTarget::Object(TableName::new("app", "final_table"));
         let stored = GrantTarget::Object(TableName::new("app", "original_table"));
-        changes.changes.push(PlannedChange::new(Change::Grant {
-            role: "owner".into(),
-            target: target.clone(),
-            permissions: [Permission::Select].into(),
-        }));
+        changes
+            .changes
+            .push(PlannedChange::new(Change::Permission(GrantChange::Grant {
+                role: "owner".into(),
+                target: target.clone(),
+                permissions: [Permission::Select].into(),
+            })));
         let owners = [(stored.clone(), "owner".into())].into();
         assert!(
             owned_targets(
@@ -4840,11 +4939,13 @@ mod plan_name_tests {
             )
             .is_ok()
         );
-        changes.changes.push(PlannedChange::new(Change::Revoke {
-            role: "reader".into(),
-            target,
-            permissions: [Permission::Select].into(),
-        }));
+        changes.changes.push(PlannedChange::new(Change::Permission(
+            GrantChange::Revoke {
+                role: "reader".into(),
+                target,
+                permissions: [Permission::Select].into(),
+            },
+        )));
         let found = pbps_db::catalog::Unrevocable {
             role: "reader".into(),
             target: stored,
@@ -4871,34 +4972,47 @@ async fn policy_dependents(
         let Some(uid) = crate::row_security::policy_target_uid(&step.change) else {
             continue;
         };
-        let mut policies = if let pbps_model::Change::DropTable { uid, .. } = &step.change {
-            if let Some(table) = names.table_at(uid, pbps_model::plan_names::At::Start) {
-                pbps_pg::modules::policies_on_table(conn, table).await?
+        let mut policies =
+            if let pbps_model::Change::Table(pbps_model::TableChange::DropTable { uid, .. }) =
+                &step.change
+            {
+                if let Some(table) = names.table_at(uid, pbps_model::plan_names::At::Start) {
+                    pbps_pg::modules::policies_on_table(conn, table).await?
+                } else {
+                    Vec::new()
+                }
+            } else if let pbps_model::Change::Table(pbps_model::TableChange::RenameTable {
+                to,
+                ..
+            }) = &step.change
+            {
+                if let Some(table) = names.table_at(uid, pbps_model::plan_names::At::Start) {
+                    pbps_pg::modules::policies_affected_by_table_rename(conn, table, to, managed)
+                        .await?
+                } else {
+                    Vec::new()
+                }
+            } else if let Some((owner, column)) =
+                names.column_at(uid, pbps_model::plan_names::At::Start)
+                && let Some(table) = names.table_at(owner, pbps_model::plan_names::At::Start)
+            {
+                let column = table.column(column);
+                if matches!(
+                    &step.change,
+                    pbps_model::Change::Column(pbps_model::ColumnChange::DropColumn { .. })
+                ) {
+                    pbps_pg::modules::policies_on_column_removal(conn, &column).await?
+                } else {
+                    pbps_pg::modules::policies_on_column(conn, &column).await?
+                }
             } else {
+                // A newly created column has no old catalog bindings.
                 Vec::new()
-            }
-        } else if let pbps_model::Change::RenameTable { to, .. } = &step.change {
-            if let Some(table) = names.table_at(uid, pbps_model::plan_names::At::Start) {
-                pbps_pg::modules::policies_affected_by_table_rename(conn, table, to, managed)
-                    .await?
-            } else {
-                Vec::new()
-            }
-        } else if let Some((owner, column)) =
-            names.column_at(uid, pbps_model::plan_names::At::Start)
-            && let Some(table) = names.table_at(owner, pbps_model::plan_names::At::Start)
-        {
-            let column = table.column(column);
-            if matches!(&step.change, pbps_model::Change::DropColumn { .. }) {
-                pbps_pg::modules::policies_on_column_removal(conn, &column).await?
-            } else {
-                pbps_pg::modules::policies_on_column(conn, &column).await?
-            }
-        } else {
-            // A newly created column has no old catalog bindings.
-            Vec::new()
-        };
-        if matches!(&step.change, pbps_model::Change::RenameColumn { .. }) {
+            };
+        if matches!(
+            &step.change,
+            pbps_model::Change::Column(pbps_model::ColumnChange::RenameColumn { .. })
+        ) {
             // A rename carries unmanaged policies cleanly; only a modeled
             // policy's changed deparse fails the typed closing guard. Drops
             // and retypes still need every physical catalog dependency.

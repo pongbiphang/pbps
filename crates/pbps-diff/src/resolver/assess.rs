@@ -3,6 +3,14 @@
 //! alone where that is sound. No SQL is read and no catalog is asked.
 
 use super::prepare::{forward, invalidates, surfaces};
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
+use pbps_model::TypeValueChange;
 use pbps_model::part_effects::PartEffect;
 use pbps_model::resolver::Surface;
 use pbps_model::{Change, ChangeSet, GrantTarget, IdsIndex};
@@ -162,7 +170,9 @@ fn recreates(
     desired: crate::Side<'_>,
     engine: &Engine<'_>,
 ) -> bool {
-    if let (Change::AlterModule { id, .. }, Surface::Module(m)) = (change, kept) {
+    if let (Change::Module(ModuleChange::AlterModule { id, .. }), Surface::Module(m)) =
+        (change, kept)
+    {
         return id == m && declared_differently(id, base, desired, engine);
     }
     // A change names a surface by whichever spelling it acts under; a kept
@@ -200,71 +210,71 @@ fn moves_bindings(
     engine: &Engine<'_>,
 ) -> bool {
     match change {
-Change::RebuildPartitionedTable(_) => true,
-Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => false,
+Change::Partition(PartitionChange::RebuildPartitionedTable(_)) => true,
+Change::Index(IndexChange::BuildPartitionedIndex(_)) | Change::Partition(PartitionChange::CopyTableRows(_)) | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => false,
         // Relations, their row types and their columns.
-        Change::CreateTable { .. }
-        | Change::DropTable { .. }
-        | Change::RenameTable { .. }
-        | Change::AddColumn { .. }
-        | Change::DropColumn { .. }
-        | Change::RenameColumn { .. }
-        | Change::AlterColumnType { .. }
-        | Change::AddComputedColumn { .. }
-        | Change::DropComputedColumn { .. }
+        Change::Table(TableChange::CreateTable { .. })
+        | Change::Table(TableChange::DropTable { .. })
+        | Change::Table(TableChange::RenameTable { .. })
+        | Change::Column(ColumnChange::AddColumn { .. })
+        | Change::Column(ColumnChange::DropColumn { .. })
+        | Change::Column(ColumnChange::RenameColumn { .. })
+        | Change::Column(ColumnChange::AlterColumnType { .. })
+        | Change::Column(ColumnChange::AddComputedColumn { .. })
+        | Change::Column(ColumnChange::DropComputedColumn { .. })
         // Renames the clones of its parent's indexes and keys to the
         // declaration's names, and its table leaves the parent's inheritance;
         // or, attached, builds whichever of them the table lacks under names
         // the engine chooses, and its table joins it (#1545). Partitions are
         // PostgreSQL's alone, where an index's name is a relation's.
-        | Change::DetachPartition { .. }
-        | Change::AttachPartition { .. }
+        | Change::Partition(PartitionChange::DetachPartition { .. })
+        | Change::Partition(PartitionChange::AttachPartition { .. })
         // Creates, renames or drops a sequence, a relation in its schema's
         // namespace that an unqualified relation lookup on the path finds
         // (#1889). PostgreSQL's alone.
-        | Change::AlterColumnNumbering { .. }
+        | Change::Column(ColumnChange::AlterColumnNumbering { .. })
         // A routine's identity, a view's columns, a type's existence. A
         // rebuild brings a type's temporary name in, moves columns to it and
         // takes the old one out (DEC-1635.7).
-        | Change::EnumRebuild { .. }
-        | Change::CreateModule { .. }
-        | Change::DropModule { .. } => true,
+        | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
+        | Change::Module(ModuleChange::CreateModule { .. })
+        | Change::Module(ModuleChange::DropModule { .. }) => true,
         // Each creates or drops an index. Where an index's name is a
         // relation's (PostgreSQL), an unqualified relation lookup on the path
         // finds it first, and one that bound it, such as a `regclass`
         // constant, finds another relation once it is gone. Where an index
         // is named per table (SQL Server), no lookup reaches it.
-        Change::SetPrimaryKey { .. }
-        | Change::AddUnique { .. }
-        | Change::DropUnique { .. }
-        | Change::SetExclusion { .. }
-        | Change::AddIndex { .. }
-        | Change::DropIndex { .. } => engine.indexes_are_relations,
-        Change::AlterModule { id, .. } => declared_differently(id, base, desired, engine),
+        Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+        | Change::Constraint(ConstraintChange::AddUnique { .. })
+        | Change::Constraint(ConstraintChange::DropUnique { .. })
+        | Change::Constraint(ConstraintChange::SetExclusion { .. })
+        | Change::Index(IndexChange::AddIndex { .. })
+        | Change::Index(IndexChange::DropIndex { .. }) => engine.indexes_are_relations,
+        Change::Module(ModuleChange::AlterModule { id, .. }) => declared_differently(id, base, desired, engine),
         // A schema the creating role may not use is skipped by the lookup.
-        Change::Grant { target, .. } | Change::Revoke { target, .. } => {
+        Change::Permission(GrantChange::Grant { target, .. }) | Change::Permission(GrantChange::Revoke { target, .. }) => {
             matches!(target, GrantTarget::Schema(_))
         }
         // An expression's own definition is its own question; changing it
         // brings no name anywhere. A check's or foreign key's name is a
         // constraint's, which no lookup in an expression reaches.
-        Change::AlterColumnDefault { .. }
-        | Change::SetPartitionDefault { .. }
-        | Change::AlterColumnExpression { .. }
-        | Change::AddCheck { .. }
-        | Change::DropCheck { .. }
-        | Change::AddForeignKey { .. }
-        | Change::DropForeignKey { .. }
-        | Change::AlterColumnNullability { .. }
-        | Change::SetColumnDeprecated { .. }
+        Change::Column(ColumnChange::AlterColumnDefault { .. })
+        | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+        | Change::Column(ColumnChange::AlterColumnExpression { .. })
+        | Change::Constraint(ConstraintChange::AddCheck { .. })
+        | Change::Constraint(ConstraintChange::DropCheck { .. })
+        | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+        | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+        | Change::Column(ColumnChange::AlterColumnNullability { .. })
+        | Change::Column(ColumnChange::SetColumnDeprecated { .. })
         | pbps_model::change_family!(table_properties)
         | pbps_model::change_family!(policies)
-        | Change::SetIndexStorageParameters { .. }
-        | Change::SetPartitionNotNull { .. }
+        | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+        | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
         | pbps_model::change_family!(rows)
-        | Change::AddEnumValue { .. }
-        | Change::AlterDomain { .. }
-        | Change::RenameEnumValue { .. }
+        | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+        | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+        | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
         // Roles, types and extensions (`catalog_change!`). A role or type moves
         // no existing lookup. A package create **can**: it may add an operator
         // or function that matches an argument type better than what the path
@@ -295,7 +305,7 @@ Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTab
         // the version the target holds, so a plan that also needs the resolver is
         // refused by name first (DEC-2447.10).
         | pbps_model::catalog_change!()
-        | Change::PublicExecution { .. } => false,
+        | Change::Permission(GrantChange::PublicExecution { .. }) => false,
     }
 }
 
@@ -304,6 +314,15 @@ Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTab
 mod tests {
     use super::*;
     use pbps_dialect::{Dialect as _, MinimalDialect};
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::ExtensionChange;
+    use pbps_model::GrantChange;
+    use pbps_model::IndexChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::PartitionChange;
+    use pbps_model::RoleChange;
+    use pbps_model::TableChange;
     use pbps_model::{
         CheckConstraint, Column, Hints, IdsFile, Module, ModuleKind, Permission, PlannedChange,
         Schema, Table,
@@ -425,19 +444,21 @@ mod tests {
     #[test]
     fn a_plan_that_moves_no_name_answers_every_question_without_an_engine() {
         let base = bound();
-        let grant = |target| Change::Grant {
-            role: "reader".into(),
-            target,
-            permissions: BTreeSet::from([Permission::Select]),
+        let grant = |target| {
+            Change::Permission(GrantChange::Grant {
+                role: "reader".into(),
+                target,
+                permissions: BTreeSet::from([Permission::Select]),
+            })
         };
         let found = with(
             &base,
             vec![
                 grant(GrantTarget::Object("app.t".parse().unwrap())),
-                Change::CreateRole {
+                Change::Role(RoleChange::CreateRole {
                     uid: "r_aaaaaa".parse().unwrap(),
                     name: "reader".into(),
-                },
+                }),
             ],
         );
         assert!(!found.requires_resolution(), "{found:?}");
@@ -453,23 +474,27 @@ mod tests {
     #[test]
     fn a_package_create_alone_needs_no_resolver_and_a_table_change_still_does() {
         let base = bound();
-        let package = || Change::CreateExtension {
-            uid: "e_aaaaaa".parse().unwrap(),
-            name: "citext".into(),
-            definition: pbps_model::Extension {
-                schema: "ext".into(),
-                version: "1.6".into(),
-            },
-            requires: BTreeSet::new(),
+        let package = || {
+            Change::Extension(ExtensionChange::CreateExtension {
+                uid: "e_aaaaaa".parse().unwrap(),
+                name: "citext".into(),
+                definition: pbps_model::Extension {
+                    schema: "ext".into(),
+                    version: "1.6".into(),
+                },
+                requires: BTreeSet::new(),
+            })
         };
         let alone = with(&base, vec![package()]);
         assert!(!alone.requires_resolution(), "{alone:?}");
         assert_eq!(alone.count(Answer::Unaffected), 3, "{alone:?}");
-        let table = || Change::AddColumn {
-            uid: "c_aaaaaa".parse().unwrap(),
-            table: "app.t".parse().unwrap(),
-            name: "extra".into(),
-            column: Box::new(Column::new("int".parse().unwrap())),
+        let table = || {
+            Change::Column(ColumnChange::AddColumn {
+                uid: "c_aaaaaa".parse().unwrap(),
+                table: "app.t".parse().unwrap(),
+                name: "extra".into(),
+                column: Box::new(Column::new("int".parse().unwrap())),
+            })
         };
         assert!(with(&base, vec![table()]).requires_resolution());
         assert!(with(&base, vec![package(), table()]).requires_resolution());
@@ -487,7 +512,7 @@ mod tests {
             schema: "ext".into(),
             version: "1.6".into(),
         };
-        let drop = Change::DropExtension {
+        let drop = Change::Extension(ExtensionChange::DropExtension {
             uid: "e_aaaaaa".parse().unwrap(),
             name: "citext".into(),
             definition: definition.clone(),
@@ -495,18 +520,18 @@ mod tests {
             releases: BTreeSet::new(),
             index_releases: Default::default(),
             search_releases: Default::default(),
-        };
+        });
         let found = with(&base, vec![drop]);
         assert!(!found.requires_resolution(), "{found:?}");
         assert_eq!(found.count(Answer::Unaffected), 3, "{found:?}");
         // Negative: a table change beside it still does.
-        let table = Change::AddColumn {
+        let table = Change::Column(ColumnChange::AddColumn {
             uid: "c_aaaaaa".parse().unwrap(),
             table: "app.t".parse().unwrap(),
             name: "extra".into(),
             column: Box::new(Column::new("int".parse().unwrap())),
-        };
-        let drop = Change::DropExtension {
+        });
+        let drop = Change::Extension(ExtensionChange::DropExtension {
             uid: "e_aaaaaa".parse().unwrap(),
             name: "citext".into(),
             definition,
@@ -514,7 +539,7 @@ mod tests {
             releases: BTreeSet::new(),
             index_releases: Default::default(),
             search_releases: Default::default(),
-        };
+        });
         assert!(with(&base, vec![drop, table]).requires_resolution());
     }
 
@@ -547,7 +572,7 @@ mod tests {
         let found = with(
             &base,
             vec![
-                Change::CreateModule {
+                Change::Module(ModuleChange::CreateModule {
                     id: "app.f()".parse().unwrap(),
                     module: Box::new(Module {
                         kind: ModuleKind::Function,
@@ -555,11 +580,11 @@ mod tests {
                         definition: "RETURNS int LANGUAGE sql RETURN 1".into(),
                         options: Default::default(),
                     }),
-                },
-                Change::AlterModule {
+                }),
+                Change::Module(ModuleChange::AlterModule {
                     id: "app.v".parse().unwrap(),
                     module: Box::new(view("SELECT id FROM app.t")),
-                },
+                }),
             ],
         );
         assert_eq!(found.questions[&surface("view")], Answer::Resolve);
@@ -611,7 +636,7 @@ mod tests {
             let desired_ids = ids(&desired, &base_ids);
             let ordinary = ChangeSet {
                 changes: [
-                    Change::CreateModule {
+                    Change::Module(ModuleChange::CreateModule {
                         id: "app.f()".parse().unwrap(),
                         module: Box::new(Module {
                             kind: ModuleKind::Function,
@@ -619,11 +644,11 @@ mod tests {
                             definition: "RETURNS int LANGUAGE sql RETURN 1".into(),
                             options: Default::default(),
                         }),
-                    },
-                    Change::AlterModule {
+                    }),
+                    Change::Module(ModuleChange::AlterModule {
                         id: "app.v".parse().unwrap(),
                         module: Box::new(view(definition)),
-                    },
+                    }),
                 ]
                 .into_iter()
                 .map(PlannedChange::new)
@@ -763,14 +788,14 @@ mod tests {
         let base = bound();
         let table: pbps_model::TableName = "app.t".parse().unwrap();
         for change in [
-            Change::DropIndex {
+            Change::Index(IndexChange::DropIndex {
                 table: table.clone(),
                 name: "ix_gone".into(),
-            },
-            Change::DropUnique {
+            }),
+            Change::Constraint(ConstraintChange::DropUnique {
                 table: table.clone(),
                 name: "uq_gone".into(),
-            },
+            }),
         ] {
             assert!(
                 with(&base, vec![change.clone()]).requires_resolution(),
@@ -778,14 +803,14 @@ mod tests {
             );
         }
         for change in [
-            Change::DropCheck {
+            Change::Constraint(ConstraintChange::DropCheck {
                 table: table.clone(),
                 name: "ck_gone".into(),
-            },
-            Change::DropForeignKey {
+            }),
+            Change::Constraint(ConstraintChange::DropForeignKey {
                 table,
                 name: "fk_gone".into(),
-            },
+            }),
         ] {
             assert!(
                 !with(&base, vec![change.clone()]).requires_resolution(),
@@ -822,18 +847,18 @@ mod tests {
         }
         let ordinary = ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::DropTable {
+                PlannedChange::new(Change::Table(TableChange::DropTable {
                     name: table.clone(),
                     uid: old,
                     detach_from: None,
-                }),
-                PlannedChange::new(Change::CreateTable {
+                })),
+                PlannedChange::new(Change::Table(TableChange::CreateTable {
                     uid: desired_ids.table_uid(&table).unwrap().clone(),
                     name: table.clone(),
                     table: Box::new(base_only.tables[&table].clone()),
                     beside_default: None,
                     moves_at_most: None,
-                }),
+                })),
             ],
         };
         let assessment = assessed_with(
@@ -873,14 +898,14 @@ mod tests {
         let base = bound();
         let table: pbps_model::TableName = "app.t".parse().unwrap();
         for change in [
-            Change::DropIndex {
+            Change::Index(IndexChange::DropIndex {
                 table: table.clone(),
                 name: "ix_gone".into(),
-            },
-            Change::DropUnique {
+            }),
+            Change::Constraint(ConstraintChange::DropUnique {
                 table: table.clone(),
                 name: "uq_gone".into(),
-            },
+            }),
         ] {
             assert!(
                 !with_indexes(&base, vec![change.clone()], false).requires_resolution(),
@@ -900,7 +925,7 @@ mod tests {
     fn a_detached_partition_moves_lookups() {
         let base = bound();
         let table: pbps_model::TableName = "app.t_2026".parse().unwrap();
-        let detach = Change::DetachPartition {
+        let detach = Change::Partition(PartitionChange::DetachPartition {
             uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
             table: table.clone(),
             parent: "app.t".parse().unwrap(),
@@ -910,14 +935,14 @@ mod tests {
                 name: Some("ix_t_2026".into()),
             }],
             shape: Box::new(base.tables[&"app.t".parse().unwrap()].clone()),
-        };
+        });
         let found = with(&base, vec![detach]);
         assert!(found.requires_resolution(), "{found:?}");
-        let grant = Change::Grant {
+        let grant = Change::Permission(GrantChange::Grant {
             role: "reader".into(),
             target: GrantTarget::Object(table),
             permissions: BTreeSet::from([Permission::Select]),
-        };
+        });
         assert!(!with(&base, vec![grant]).requires_resolution());
     }
 
@@ -926,15 +951,19 @@ mod tests {
     #[test]
     fn a_schema_grant_moves_lookups_and_an_object_grant_does_not() {
         let base = bound();
-        let grant = |target| Change::Grant {
-            role: "owner".into(),
-            target,
-            permissions: BTreeSet::from([Permission::Usage]),
+        let grant = |target| {
+            Change::Permission(GrantChange::Grant {
+                role: "owner".into(),
+                target,
+                permissions: BTreeSet::from([Permission::Usage]),
+            })
         };
-        let revoke = |target| Change::Revoke {
-            role: "owner".into(),
-            target,
-            permissions: BTreeSet::from([Permission::Usage]),
+        let revoke = |target| {
+            Change::Permission(GrantChange::Revoke {
+                role: "owner".into(),
+                target,
+                permissions: BTreeSet::from([Permission::Usage]),
+            })
         };
         for change in [
             grant(GrantTarget::Schema("ext".into())),

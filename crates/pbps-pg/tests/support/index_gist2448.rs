@@ -7,6 +7,7 @@
 use super::{sqlstate, text, truth};
 use crate::certified_fixture::FixtureEmission as _;
 use pbps_db::{Conn, Driver};
+use pbps_model::IndexChange;
 use pbps_model::{
     Change, Index, IndexColumn, IndexKey, IndexMethod, IndexPart, ObjectLocalName, OpClassRef,
     Strategy, TableName,
@@ -118,12 +119,12 @@ fn index(method: IndexMethod, columns: Vec<IndexColumn>) -> Index {
 }
 
 fn add(name: &str, index: Index) -> Change {
-    Change::AddIndex {
+    Change::Index(IndexChange::AddIndex {
         table: table(),
         name: name.into(),
         index: Box::new(index),
         clustered: false,
-    }
+    })
 }
 
 async fn pull_indexes(db: &mut Conn) -> BTreeMap<ObjectLocalName, Index> {
@@ -392,7 +393,7 @@ async fn a_gist_option_change_alters_in_place_and_a_drop_needs_nothing_else() {
         ranged.storage_parameters = [("fillfactor".to_owned(), "70".to_owned())].into();
         db.apply(&add("ix_span", ranged)).await;
         let before = file_of(db.conn(), "ix_span").await;
-        db.apply(&Change::SetIndexStorageParameters {
+        db.apply(&Change::Index(IndexChange::SetIndexStorageParameters {
             table: table(),
             target: IndexPart::Index("ix_span".into()),
             method: IndexMethod::Gist,
@@ -402,20 +403,20 @@ async fn a_gist_option_change_alters_in_place_and_a_drop_needs_nothing_else() {
             ]
             .into(),
             reset: BTreeSet::new(),
-        })
+        }))
         .await;
         assert_eq!(file_of(db.conn(), "ix_span").await, before, "no rebuild");
         let read = pull_indexes(db.conn()).await;
         let span = &read[&ObjectLocalName::from("ix_span")];
         assert_eq!(span.storage_parameters["fillfactor"], "80");
         assert_eq!(span.storage_parameters["buffering"], "off");
-        db.apply(&Change::SetIndexStorageParameters {
+        db.apply(&Change::Index(IndexChange::SetIndexStorageParameters {
             table: table(),
             target: IndexPart::Index("ix_span".into()),
             method: IndexMethod::Gist,
             set: BTreeMap::new(),
             reset: ["buffering".to_owned()].into(),
-        })
+        }))
         .await;
         assert_eq!(file_of(db.conn(), "ix_span").await, before);
         let read = pull_indexes(db.conn()).await;
@@ -432,10 +433,10 @@ async fn a_gist_option_change_alters_in_place_and_a_drop_needs_nothing_else() {
                 .await,
             "22023"
         );
-        db.apply(&Change::DropIndex {
+        db.apply(&Change::Index(IndexChange::DropIndex {
             table: table(),
             name: "ix_span".into(),
-        })
+        }))
         .await;
         assert!(!truth(db.conn(), "SELECT to_regclass('app.ix_span') IS NOT NULL").await);
         db.finish().await;

@@ -173,7 +173,7 @@ fn foreign_key_probe_prose_shows_raw_row_keys_and_defaulted_columns_once() {
         let parent = TableName::new("app", "parent");
         for insert in [false, true] {
             let row = if insert {
-                Change::InsertRow {
+                Change::Row(RowChange::InsertRow {
                     table: child.clone(),
                     key_column: "code".into(),
                     identity_key: false,
@@ -181,9 +181,9 @@ fn foreign_key_probe_prose_shows_raw_row_keys_and_defaulted_columns_once() {
                     row: Default::default(),
                     defaults: [(name.into(), "lower('OLD')".into())].into(),
                     types: [(name.into(), "text".parse().unwrap())].into(),
-                }
+                })
             } else {
-                Change::UpdateRow {
+                Change::Row(RowChange::UpdateRow {
                     table: child.clone(),
                     key_column: "code".into(),
                     key: name.into(),
@@ -199,11 +199,11 @@ fn foreign_key_probe_prose_shows_raw_row_keys_and_defaulted_columns_once() {
                     types: Default::default(),
                     after_types: Default::default(),
                     key_type: None,
-                }
+                })
             };
             let changes = ChangeSet {
                 changes: vec![
-                    PlannedChange::new(Change::AddForeignKey {
+                    PlannedChange::new(Change::Constraint(ConstraintChange::AddForeignKey {
                         table: child.clone(),
                         name: "fk".into(),
                         constraint: Box::new(ForeignKey {
@@ -213,9 +213,9 @@ fn foreign_key_probe_prose_shows_raw_row_keys_and_defaulted_columns_once() {
                             on_delete: ReferentialAction::NoAction,
                             on_update: ReferentialAction::NoAction,
                         }),
-                    }),
+                    })),
                     PlannedChange::new(row),
-                    PlannedChange::new(Change::DeleteRow {
+                    PlannedChange::new(Change::Row(RowChange::DeleteRow {
                         table: parent.clone(),
                         key_column: "code".into(),
                         key: name.into(),
@@ -225,7 +225,7 @@ fn foreign_key_probe_prose_shows_raw_row_keys_and_defaulted_columns_once() {
                         types: Default::default(),
                         after_types: Default::default(),
                         key_type: None,
-                    }),
+                    })),
                 ],
             };
             for dialect in [

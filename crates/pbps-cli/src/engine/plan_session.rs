@@ -905,17 +905,33 @@ pub(in crate::engine) fn computed_edge_objects(
     let mut objects: Vec<pbps_model::TableName> = Vec::new();
     for (at, p) in cs.changes.iter().enumerate() {
         let touched = match &p.change {
-            pbps_model::Change::AddComputedColumn { table, .. }
-            | pbps_model::Change::DropComputedColumn { table, .. }
-            | pbps_model::Change::RenameColumn { table, .. } => Some(catalog(at, table)),
-            pbps_model::Change::DropTable { name, .. } => Some(name.clone()),
-            pbps_model::Change::DropColumn { column, .. }
-            | pbps_model::Change::AlterColumnType { column, .. }
-            | pbps_model::Change::AlterColumnNullability { column, .. } => {
-                Some(catalog(at, &column.table))
+            pbps_model::Change::Column(pbps_model::ColumnChange::AddComputedColumn {
+                table,
+                ..
+            })
+            | pbps_model::Change::Column(pbps_model::ColumnChange::DropComputedColumn {
+                table,
+                ..
+            })
+            | pbps_model::Change::Column(pbps_model::ColumnChange::RenameColumn {
+                table, ..
+            }) => Some(catalog(at, table)),
+            pbps_model::Change::Table(pbps_model::TableChange::DropTable { name, .. }) => {
+                Some(name.clone())
             }
-            pbps_model::Change::AlterModule { id, .. }
-            | pbps_model::Change::DropModule { id, .. } => Some(id.object_name()),
+            pbps_model::Change::Column(pbps_model::ColumnChange::DropColumn { column, .. })
+            | pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType {
+                column,
+                ..
+            })
+            | pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnNullability {
+                column,
+                ..
+            }) => Some(catalog(at, &column.table)),
+            pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule { id, .. })
+            | pbps_model::Change::Module(pbps_model::ModuleChange::DropModule { id, .. }) => {
+                Some(id.object_name())
+            }
             _ => None,
         };
         if let Some(object) = touched
@@ -1058,9 +1074,11 @@ pub(crate) mod defaults {
             || changes.changes.iter().any(|p| {
                 matches!(
                     p.change,
-                    pbps_model::Change::CreateType { .. }
-                        | pbps_model::Change::RenameType { .. }
-                        | pbps_model::Change::DetachPartition { .. }
+                    pbps_model::Change::Type(pbps_model::TypeChange::CreateType { .. })
+                        | pbps_model::Change::Type(pbps_model::TypeChange::RenameType { .. })
+                        | pbps_model::Change::Partition(
+                            pbps_model::PartitionChange::DetachPartition { .. }
+                        )
                 )
             })
     }
@@ -1071,10 +1089,10 @@ pub(crate) mod defaults {
     pub(crate) fn occupied_relation_names(engine: &str, changes: &ChangeSet) -> anyhow::Result<()> {
         anyhow::ensure!(
             crate::deploy::created_relation_names(changes).is_empty()
-                && !changes
-                    .changes
-                    .iter()
-                    .any(|p| matches!(p.change, pbps_model::Change::CreateModule { .. })),
+                && !changes.changes.iter().any(|p| matches!(
+                    p.change,
+                    pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule { .. })
+                )),
             "{engine} has no step that checks whether a name this plan creates is already in use"
         );
         Ok(())
@@ -1082,10 +1100,12 @@ pub(crate) mod defaults {
 
     /// Whether the plan drops a role, whose members the schedule writes in.
     pub(in crate::engine) fn drops_a_role(changes: &ChangeSet) -> bool {
-        changes
-            .changes
-            .iter()
-            .any(|p| matches!(p.change, pbps_model::Change::DropRole { .. }))
+        changes.changes.iter().any(|p| {
+            matches!(
+                p.change,
+                pbps_model::Change::Role(pbps_model::RoleChange::DropRole { .. })
+            )
+        })
     }
 
     /// What the schedule is given of the declarations and of the roles the
@@ -1128,10 +1148,12 @@ pub(crate) mod defaults {
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
             !staged
-                || !changes
-                    .changes
-                    .iter()
-                    .any(|p| matches!(p.change, pbps_model::Change::RebuildPartitionedTable(_))),
+                || !changes.changes.iter().any(|p| matches!(
+                    p.change,
+                    pbps_model::Change::Partition(
+                        pbps_model::PartitionChange::RebuildPartitionedTable(_)
+                    )
+                )),
             "table rebuild requires transactional mode; --staged is unsupported"
         );
         module_check()?;
@@ -1152,11 +1174,11 @@ pub(crate) mod defaults {
                 // `CREATE` and that grant is a routine *less* reachable than the
                 // declaration asks for — a caller sees a permission error, not
                 // somebody else's privileges — so staging it is merely slow.
-                if let pbps_model::Change::PublicExecution {
+                if let pbps_model::Change::Permission(pbps_model::GrantChange::PublicExecution {
                     routine,
                     access: pbps_model::PublicAccess::Revoked,
                     ..
-                } = &p.change
+                }) = &p.change
                 {
                     Some(routine.shown().to_string())
                 } else {
@@ -1211,17 +1233,17 @@ pub(crate) mod defaults {
     /// The role members and the enum dependents the schedule needs.
     pub(crate) fn schedule_reads(engine: &str, changes: &ChangeSet) -> anyhow::Result<()> {
         anyhow::ensure!(
-            !changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, pbps_model::Change::DropRole { .. })),
+            !changes.changes.iter().any(|p| matches!(
+                p.change,
+                pbps_model::Change::Role(pbps_model::RoleChange::DropRole { .. })
+            )),
             "{engine} has no step that reads the members of a role this plan drops"
         );
         anyhow::ensure!(
-            !changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, pbps_model::Change::EnumRebuild { .. })),
+            !changes.changes.iter().any(|p| matches!(
+                p.change,
+                pbps_model::Change::TypeValue(pbps_model::TypeValueChange::EnumRebuild { .. })
+            )),
             "{engine} has no step that reads what depends on an enum this plan rebuilds"
         );
         Ok(())
@@ -1235,10 +1257,12 @@ pub(crate) mod defaults {
             "{engine} has no step that reads what depends on a module this plan drops or rebuilds"
         );
         anyhow::ensure!(
-            !changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, pbps_model::Change::RebuildPartitionedTable(_))),
+            !changes.changes.iter().any(|p| matches!(
+                p.change,
+                pbps_model::Change::Partition(
+                    pbps_model::PartitionChange::RebuildPartitionedTable(_)
+                )
+            )),
             "{engine} has no step that plans a table rebuild"
         );
         Ok(())
@@ -1317,13 +1341,20 @@ pub(crate) mod defaults {
         anyhow::ensure!(
             !changes.changes.iter().any(|p| matches!(
                 p.change,
-                pbps_model::Change::DropTable { .. }
-                    | pbps_model::Change::DropColumn { .. }
-                    | pbps_model::Change::DropUnique { .. }
-                    | pbps_model::Change::DropIndex { .. }
-                    | pbps_model::Change::AlterColumnNumbering { .. }
-                    | pbps_model::Change::AlterColumnType { .. }
-                    | pbps_model::Change::SetPrimaryKey { from: Some(_), .. }
+                pbps_model::Change::Table(pbps_model::TableChange::DropTable { .. })
+                    | pbps_model::Change::Column(pbps_model::ColumnChange::DropColumn { .. })
+                    | pbps_model::Change::Constraint(
+                        pbps_model::ConstraintChange::DropUnique { .. }
+                    )
+                    | pbps_model::Change::Index(pbps_model::IndexChange::DropIndex { .. })
+                    | pbps_model::Change::Column(
+                        pbps_model::ColumnChange::AlterColumnNumbering { .. }
+                    )
+                    | pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType { .. })
+                    | pbps_model::Change::Constraint(pbps_model::ConstraintChange::SetPrimaryKey {
+                        from: Some(_),
+                        ..
+                    })
             )),
             "{engine} has no step that reads what depends on an object this plan drops or retypes"
         );
@@ -1341,10 +1372,10 @@ pub(crate) mod defaults {
         anyhow::ensure!(
             !changes.changes.iter().any(|p| matches!(
                 p.change,
-                pbps_model::Change::CreateTable {
+                pbps_model::Change::Table(pbps_model::TableChange::CreateTable {
                     beside_default: Some(_),
                     ..
-                }
+                })
             )),
             "{engine} has no step that lists the logical slots that would decode the rows a new partition takes from its DEFAULT"
         );
@@ -1362,7 +1393,7 @@ pub(crate) mod defaults {
         anyhow::ensure!(
             !changes.changes.iter().any(|p| matches!(
                 &p.change,
-                pbps_model::Change::AddColumn { column, .. }
+                pbps_model::Change::Column(pbps_model::ColumnChange::AddColumn { column, .. })
                     if matches!(
                         column.value_source,
                         pbps_model::ValueSource::Identity(_) | pbps_model::ValueSource::Sequence(_)
@@ -1383,9 +1414,9 @@ pub(crate) mod defaults {
         anyhow::ensure!(
             !changes.changes.iter().any(|p| matches!(
                 p.change,
-                pbps_model::Change::InsertRow { .. }
-                    | pbps_model::Change::UpdateRow { .. }
-                    | pbps_model::Change::DeleteRow { .. }
+                pbps_model::Change::Row(pbps_model::RowChange::InsertRow { .. })
+                    | pbps_model::Change::Row(pbps_model::RowChange::UpdateRow { .. })
+                    | pbps_model::Change::Row(pbps_model::RowChange::DeleteRow { .. })
             ) || pbps_pg::existing_expressions::rewrite_write(
                 &p.change
             )
@@ -1427,7 +1458,10 @@ pub(crate) mod defaults {
         anyhow::ensure!(
             !changes.iter().any(|p| matches!(
                 p.change,
-                pbps_model::Change::AlterColumnType { using: Some(_), .. }
+                pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType {
+                    using: Some(_),
+                    ..
+                })
             )),
             "{engine} has no step that vets a recorded conversion's expression"
         );
@@ -1467,7 +1501,8 @@ pub(crate) mod defaults {
         anyhow::ensure!(
             !any(&|c| matches!(
                 c,
-                pbps_model::Change::Grant { .. } | pbps_model::change_family!(policies)
+                pbps_model::Change::Permission(pbps_model::GrantChange::Grant { .. })
+                    | pbps_model::change_family!(policies)
             )) && crate::row_security::standing_owners(changes, ids)?.is_empty(),
             "{engine} has no step that checks the permissions a plan grants or the policies it writes"
         );
@@ -1477,10 +1512,10 @@ pub(crate) mod defaults {
             "the plan grants nothing and writes no policy",
         );
         anyhow::ensure!(
-            !any(
-                &|c| matches!(c, pbps_model::Change::AlterColumnExpression { .. })
-                    || crate::row_security::column_edit(c).is_some()
-            ),
+            !any(&|c| matches!(
+                c,
+                pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnExpression { .. })
+            ) || crate::row_security::column_edit(c).is_some()),
             "{engine} has no step that checks the generated-column changes a plan makes"
         );
         let generation_support = not_applicable(
@@ -1492,7 +1527,10 @@ pub(crate) mod defaults {
         // check above has already refused.
         let owned_targets = not_applicable(engine, "owned_targets", "the plan grants nothing");
         anyhow::ensure!(
-            !any(&|c| matches!(c, pbps_model::Change::Revoke { .. })),
+            !any(&|c| matches!(
+                c,
+                pbps_model::Change::Permission(pbps_model::GrantChange::Revoke { .. })
+            )),
             "{engine} has no step that checks a revoke against the grants it could take away"
         );
         let unrevocable_grants =
@@ -1827,13 +1865,15 @@ mod tests {
 
     #[test]
     fn a_created_table_is_refused_by_the_name_defaults_naming_the_engine() {
-        let changes = plan(vec![pbps_model::Change::CreateTable {
-            uid: uid(pbps_model::UidKind::Table, "app.t"),
-            name: table_name(),
-            table: Default::default(),
-            beside_default: None,
-            moves_at_most: None,
-        }]);
+        let changes = plan(vec![pbps_model::Change::Table(
+            pbps_model::TableChange::CreateTable {
+                uid: uid(pbps_model::UidKind::Table, "app.t"),
+                name: table_name(),
+                table: Default::default(),
+                beside_default: None,
+                moves_at_most: None,
+            },
+        )]);
         let message = refusal(defaults::occupied_relation_names(THIRD, &changes));
         assert!(
             message.contains(THIRD) && message.contains("name this plan creates"),
@@ -1845,22 +1885,26 @@ mod tests {
 
     #[test]
     fn a_table_made_unlogged_is_refused_by_the_catalog_names_default() {
-        let changes = plan(vec![pbps_model::Change::SetTablePersistence {
-            uid: uid(pbps_model::UidKind::Table, "app.t"),
-            table: table_name(),
-            unlogged: true,
-        }]);
+        let changes = plan(vec![pbps_model::Change::TableProperty(
+            pbps_model::TablePropertyChange::SetTablePersistence {
+                uid: uid(pbps_model::UidKind::Table, "app.t"),
+                table: table_name(),
+                unlogged: true,
+            },
+        )]);
         let message = refusal(defaults::catalog_names(THIRD, &changes));
         assert!(
             message.contains(THIRD) && message.contains("unlogged"),
             "{message}"
         );
         // Made logged again, it asks nothing of the target.
-        let changes = plan(vec![pbps_model::Change::SetTablePersistence {
-            uid: uid(pbps_model::UidKind::Table, "app.t"),
-            table: table_name(),
-            unlogged: false,
-        }]);
+        let changes = plan(vec![pbps_model::Change::TableProperty(
+            pbps_model::TablePropertyChange::SetTablePersistence {
+                uid: uid(pbps_model::UidKind::Table, "app.t"),
+                table: table_name(),
+                unlogged: false,
+            },
+        )]);
         defaults::catalog_names(THIRD, &changes).unwrap();
     }
 
@@ -1871,11 +1915,13 @@ mod tests {
         // Not staged: nothing is refused.
         defaults::transactional_rebuilds(THIRD, &ChangeSet::default(), false).unwrap();
         // The shared refusals do not depend on the engine's module check.
-        let rebuild = plan(vec![pbps_model::Change::PublicExecution {
-            routine: "app.f(integer)".parse().expect("a routine id"),
-            access: pbps_model::PublicAccess::Revoked,
-            origin: pbps_model::RoutineOrigin::Created,
-        }]);
+        let rebuild = plan(vec![pbps_model::Change::Permission(
+            pbps_model::GrantChange::PublicExecution {
+                routine: "app.f(integer)".parse().expect("a routine id"),
+                access: pbps_model::PublicAccess::Revoked,
+                origin: pbps_model::RoutineOrigin::Created,
+            },
+        )]);
         let message = refusal(defaults::transactional_rebuilds(THIRD, &rebuild, true));
         assert!(message.contains("DECISIONS 517"), "{message}");
         defaults::transactional_rebuilds(THIRD, &rebuild, false).unwrap();
@@ -1901,11 +1947,13 @@ mod tests {
     #[test]
     fn a_dropped_role_or_rebuilt_enum_is_refused_by_the_schedule_reads_default() {
         defaults::schedule_reads(THIRD, &ChangeSet::default()).unwrap();
-        let drop_role = plan(vec![pbps_model::Change::DropRole {
-            uid: uid(pbps_model::UidKind::Role, "old"),
-            name: pbps_model::RoleName::new("old"),
-            members: Vec::new(),
-        }]);
+        let drop_role = plan(vec![pbps_model::Change::Role(
+            pbps_model::RoleChange::DropRole {
+                uid: uid(pbps_model::UidKind::Role, "old"),
+                name: pbps_model::RoleName::new("old"),
+                members: Vec::new(),
+            },
+        )]);
         let message = refusal(defaults::schedule_reads(THIRD, &drop_role));
         assert!(
             message.contains(THIRD) && message.contains("role"),
@@ -1918,10 +1966,12 @@ mod tests {
     #[test]
     fn a_dropped_module_or_table_rebuild_is_refused_by_the_schedule_default() {
         defaults::module_dependents(THIRD, &ChangeSet::default()).unwrap();
-        let drop_module = plan(vec![pbps_model::Change::DropModule {
-            id: pbps_model::ModuleId::Named(table_name()),
-            kind: pbps_model::ModuleKind::View,
-        }]);
+        let drop_module = plan(vec![pbps_model::Change::Module(
+            pbps_model::ModuleChange::DropModule {
+                id: pbps_model::ModuleId::Named(table_name()),
+                kind: pbps_model::ModuleKind::View,
+            },
+        )]);
         let message = refusal(defaults::module_dependents(THIRD, &drop_module));
         assert!(
             message.contains(THIRD) && message.contains("module"),
@@ -1947,33 +1997,39 @@ mod tests {
 
     #[test]
     fn each_final_order_default_refuses_the_thing_it_covers() {
-        let drop_table = plan(vec![pbps_model::Change::DropTable {
-            uid: uid(pbps_model::UidKind::Table, "app.t"),
-            name: table_name(),
-            detach_from: None,
-        }]);
+        let drop_table = plan(vec![pbps_model::Change::Table(
+            pbps_model::TableChange::DropTable {
+                uid: uid(pbps_model::UidKind::Table, "app.t"),
+                name: table_name(),
+                detach_from: None,
+            },
+        )]);
         let message = refusal(defaults::drop_blockers(THIRD, &drop_table));
         assert!(
             message.contains(THIRD) && message.contains("depends"),
             "{message}"
         );
-        let beside = plan(vec![pbps_model::Change::CreateTable {
-            uid: uid(pbps_model::UidKind::Table, "app.d"),
-            name: table_name(),
-            table: Default::default(),
-            beside_default: Some(TableName::new("app", "d")),
-            moves_at_most: None,
-        }]);
+        let beside = plan(vec![pbps_model::Change::Table(
+            pbps_model::TableChange::CreateTable {
+                uid: uid(pbps_model::UidKind::Table, "app.d"),
+                name: table_name(),
+                table: Default::default(),
+                beside_default: Some(TableName::new("app", "d")),
+                moves_at_most: None,
+            },
+        )]);
         let message = refusal(defaults::logical_slots(THIRD, &beside));
         assert!(message.contains("logical slots"), "{message}");
-        let numbered = plan(vec![pbps_model::Change::AddColumn {
-            uid: uid(pbps_model::UidKind::Column, "app.t.n"),
-            table: table_name(),
-            name: "n".into(),
-            column: Box::new(column_named(pbps_model::ValueSource::Identity(
-                pbps_model::Identity::new(1, 1),
-            ))),
-        }]);
+        let numbered = plan(vec![pbps_model::Change::Column(
+            pbps_model::ColumnChange::AddColumn {
+                uid: uid(pbps_model::UidKind::Column, "app.t.n"),
+                table: table_name(),
+                name: "n".into(),
+                column: Box::new(column_named(pbps_model::ValueSource::Identity(
+                    pbps_model::Identity::new(1, 1),
+                ))),
+            },
+        )]);
         let message = refusal(defaults::numbered_column_fills(THIRD, &numbered));
         assert!(message.contains("identity or serial"), "{message}");
         let rewrite = retype_plan();
@@ -1983,11 +2039,13 @@ mod tests {
             "{message}"
         );
         // The row checks are asked in order: the first refusal wins.
-        let mut both = plan(vec![pbps_model::Change::DropTable {
-            uid: uid(pbps_model::UidKind::Table, "app.t"),
-            name: table_name(),
-            detach_from: None,
-        }]);
+        let mut both = plan(vec![pbps_model::Change::Table(
+            pbps_model::TableChange::DropTable {
+                uid: uid(pbps_model::UidKind::Table, "app.t"),
+                name: table_name(),
+                detach_from: None,
+            },
+        )]);
         both.changes.extend(retype_plan().changes);
         let message = refusal(defaults::final_order(THIRD, &both));
         assert!(message.contains("depends"), "{message}");
@@ -2004,18 +2062,20 @@ mod tests {
     }
 
     fn retype_plan() -> ChangeSet {
-        plan(vec![pbps_model::Change::AlterColumnType {
-            uid: uid(pbps_model::UidKind::Column, "app.t.a"),
-            column: column_ref("a"),
-            from: "integer".parse().unwrap(),
-            to: "bigint".parse().unwrap(),
-            from_nullable: true,
-            to_nullable: true,
-            from_collation: None,
-            to_collation: None,
-            through_external_partitions: false,
-            using: None,
-        }])
+        plan(vec![pbps_model::Change::Column(
+            pbps_model::ColumnChange::AlterColumnType {
+                uid: uid(pbps_model::UidKind::Column, "app.t.a"),
+                column: column_ref("a"),
+                from: "integer".parse().unwrap(),
+                to: "bigint".parse().unwrap(),
+                from_nullable: true,
+                to_nullable: true,
+                from_collation: None,
+                to_collation: None,
+                through_external_partitions: false,
+                using: None,
+            },
+        )])
     }
 
     fn column_ref(name: &str) -> pbps_model::ColumnRef {
@@ -2027,21 +2087,25 @@ mod tests {
         ordering(&ChangeSet::default(), &Schema::default()).unwrap();
         // The generated columns that read a column are in the catalog, not
         // necessarily in the declarations: any retype or drop is refused.
-        let drop = plan(vec![pbps_model::Change::DropColumn {
-            uid: uid(pbps_model::UidKind::Column, "app.t.a"),
-            column: column_ref("a"),
-        }]);
+        let drop = plan(vec![pbps_model::Change::Column(
+            pbps_model::ColumnChange::DropColumn {
+                uid: uid(pbps_model::UidKind::Column, "app.t.a"),
+                column: column_ref("a"),
+            },
+        )]);
         let message = refusal(ordering(&drop, &Schema::default()));
         assert!(
             message.contains(THIRD) && message.contains("generated column"),
             "{message}"
         );
         // Negative: a change of persistence reads no generated column.
-        let nullable = plan(vec![pbps_model::Change::SetTablePersistence {
-            uid: uid(pbps_model::UidKind::Table, "app.t"),
-            table: table_name(),
-            unlogged: false,
-        }]);
+        let nullable = plan(vec![pbps_model::Change::TableProperty(
+            pbps_model::TablePropertyChange::SetTablePersistence {
+                uid: uid(pbps_model::UidKind::Table, "app.t"),
+                table: table_name(),
+                unlogged: false,
+            },
+        )]);
         ordering(&nullable, &Schema::default()).unwrap();
     }
 
@@ -2050,72 +2114,84 @@ mod tests {
         // A computed column's function drops after it: the edge read is made
         // for a module change, and for a rename, though no schema holds a
         // computed column.
-        let rebuilt = plan(vec![pbps_model::Change::AlterModule {
-            id: pbps_model::ModuleId::Routine("app.f(integer)".parse().unwrap()),
-            module: Box::new(pbps_model::Module {
-                kind: pbps_model::ModuleKind::Function,
-                description: None,
-                definition: "SELECT 1".into(),
-                options: Default::default(),
-            }),
-        }]);
+        let rebuilt = plan(vec![pbps_model::Change::Module(
+            pbps_model::ModuleChange::AlterModule {
+                id: pbps_model::ModuleId::Routine("app.f(integer)".parse().unwrap()),
+                module: Box::new(pbps_model::Module {
+                    kind: pbps_model::ModuleKind::Function,
+                    description: None,
+                    definition: "SELECT 1".into(),
+                    options: Default::default(),
+                }),
+            },
+        )]);
         let message = refusal(ordering(&rebuilt, &Schema::default()));
         assert!(
             message.contains(THIRD) && message.contains("computed column"),
             "{message}"
         );
-        let renamed = plan(vec![pbps_model::Change::RenameColumn {
-            uid: uid(pbps_model::UidKind::Column, "app.t.a"),
-            table: table_name(),
-            from: "a".into(),
-            to: "b".into(),
-            table_was: None,
-        }]);
+        let renamed = plan(vec![pbps_model::Change::Column(
+            pbps_model::ColumnChange::RenameColumn {
+                uid: uid(pbps_model::UidKind::Column, "app.t.a"),
+                table: table_name(),
+                from: "a".into(),
+                to: "b".into(),
+                table_was: None,
+            },
+        )]);
         refusal(ordering(&renamed, &Schema::default()));
         // Negative: a change of persistence touches no table, column or module an edge names.
-        let persistence = plan(vec![pbps_model::Change::SetTablePersistence {
-            uid: uid(pbps_model::UidKind::Table, "app.t"),
-            table: table_name(),
-            unlogged: false,
-        }]);
+        let persistence = plan(vec![pbps_model::Change::TableProperty(
+            pbps_model::TablePropertyChange::SetTablePersistence {
+                uid: uid(pbps_model::UidKind::Table, "app.t"),
+                table: table_name(),
+                unlogged: false,
+            },
+        )]);
         ordering(&persistence, &Schema::default()).unwrap();
     }
 
     #[test]
     fn the_catalog_ordering_default_refuses_what_the_name_walk_selects() {
-        let created = plan(vec![pbps_model::Change::CreateTable {
-            uid: uid(pbps_model::UidKind::Table, "app.t"),
-            name: table_name(),
-            table: Default::default(),
-            beside_default: None,
-            moves_at_most: None,
-        }]);
+        let created = plan(vec![pbps_model::Change::Table(
+            pbps_model::TableChange::CreateTable {
+                uid: uid(pbps_model::UidKind::Table, "app.t"),
+                name: table_name(),
+                table: Default::default(),
+                beside_default: None,
+                moves_at_most: None,
+            },
+        )]);
         let message = refusal(ordering(&created, &Schema::default()));
         assert!(
             message.contains("names this plan creates or moves"),
             "{message}"
         );
         // A table dropped is a parent whose constraints and defaults move.
-        let dropped = plan(vec![pbps_model::Change::DropTable {
-            uid: uid(pbps_model::UidKind::Table, "app.t"),
-            name: table_name(),
-            detach_from: None,
-        }]);
+        let dropped = plan(vec![pbps_model::Change::Table(
+            pbps_model::TableChange::DropTable {
+                uid: uid(pbps_model::UidKind::Table, "app.t"),
+                name: table_name(),
+                detach_from: None,
+            },
+        )]);
         refusal(ordering(&dropped, &Schema::default()));
     }
 
     #[test]
     fn a_rebuilt_module_is_refused_by_the_schedule_default_like_a_dropped_one() {
         // `AlterModule` is a drop and a create to the schedule's own classifier.
-        let rebuilt = plan(vec![pbps_model::Change::AlterModule {
-            id: pbps_model::ModuleId::Named(table_name()),
-            module: Box::new(pbps_model::Module {
-                kind: pbps_model::ModuleKind::View,
-                description: None,
-                definition: "SELECT 1".into(),
-                options: Default::default(),
-            }),
-        }]);
+        let rebuilt = plan(vec![pbps_model::Change::Module(
+            pbps_model::ModuleChange::AlterModule {
+                id: pbps_model::ModuleId::Named(table_name()),
+                module: Box::new(pbps_model::Module {
+                    kind: pbps_model::ModuleKind::View,
+                    description: None,
+                    definition: "SELECT 1".into(),
+                    options: Default::default(),
+                }),
+            },
+        )]);
         assert!(!pbps_diff::order::deployment::dropped_modules(&rebuilt).is_empty());
         let message = refusal(defaults::module_dependents(THIRD, &rebuilt));
         assert!(
@@ -2123,15 +2199,17 @@ mod tests {
             "{message}"
         );
         // Negative: a module created from nothing has no dependents yet.
-        let created = plan(vec![pbps_model::Change::CreateModule {
-            id: pbps_model::ModuleId::Named(table_name()),
-            module: Box::new(pbps_model::Module {
-                kind: pbps_model::ModuleKind::View,
-                description: None,
-                definition: "SELECT 1".into(),
-                options: Default::default(),
-            }),
-        }]);
+        let created = plan(vec![pbps_model::Change::Module(
+            pbps_model::ModuleChange::CreateModule {
+                id: pbps_model::ModuleId::Named(table_name()),
+                module: Box::new(pbps_model::Module {
+                    kind: pbps_model::ModuleKind::View,
+                    description: None,
+                    definition: "SELECT 1".into(),
+                    options: Default::default(),
+                }),
+            },
+        )]);
         assert!(pbps_diff::order::deployment::dropped_modules(&created).is_empty());
         defaults::module_dependents(THIRD, &created).unwrap();
     }
@@ -2151,26 +2229,30 @@ mod tests {
     #[test]
     fn a_partition_created_or_attached_unlogged_is_refused_by_the_catalog_names_default() {
         let created = |unlogged| {
-            plan(vec![pbps_model::Change::CreateTable {
-                uid: uid(pbps_model::UidKind::Table, "app.t"),
-                name: table_name(),
-                table: Box::new(partition(unlogged)),
-                beside_default: None,
-                moves_at_most: None,
-            }])
+            plan(vec![pbps_model::Change::Table(
+                pbps_model::TableChange::CreateTable {
+                    uid: uid(pbps_model::UidKind::Table, "app.t"),
+                    name: table_name(),
+                    table: Box::new(partition(unlogged)),
+                    beside_default: None,
+                    moves_at_most: None,
+                },
+            )])
         };
         let attached = |unlogged| {
-            plan(vec![pbps_model::Change::AttachPartition {
-                uid: uid(pbps_model::UidKind::Table, "app.t"),
-                table: table_name(),
-                parent: TableName::new("app", "ev"),
-                bound: pbps_model::PartitionBound::Default,
-                key: Vec::new(),
-                shape: Box::new(pbps_model::Table {
-                    unlogged,
-                    ..Default::default()
-                }),
-            }])
+            plan(vec![pbps_model::Change::Partition(
+                pbps_model::PartitionChange::AttachPartition {
+                    uid: uid(pbps_model::UidKind::Table, "app.t"),
+                    table: table_name(),
+                    parent: TableName::new("app", "ev"),
+                    bound: pbps_model::PartitionBound::Default,
+                    key: Vec::new(),
+                    shape: Box::new(pbps_model::Table {
+                        unlogged,
+                        ..Default::default()
+                    }),
+                },
+            )])
         };
         // Only the persistence read is asked of an attach: the name read is
         // not, so the message names unlogged tables and not names.
@@ -2190,20 +2272,24 @@ mod tests {
 
     #[test]
     fn a_table_moved_between_schemas_or_a_type_renamed_is_refused_by_the_catalog_names_default() {
-        let moved = plan(vec![pbps_model::Change::RenameTable {
-            uid: uid(pbps_model::UidKind::Table, "app.t"),
-            from: table_name(),
-            to: TableName::new("other", "t"),
-            defaults: Vec::new(),
-        }]);
+        let moved = plan(vec![pbps_model::Change::Table(
+            pbps_model::TableChange::RenameTable {
+                uid: uid(pbps_model::UidKind::Table, "app.t"),
+                from: table_name(),
+                to: TableName::new("other", "t"),
+                defaults: Vec::new(),
+            },
+        )]);
         let message = refusal(defaults::catalog_names(THIRD, &moved));
         assert!(message.contains(THIRD), "{message}");
         // Negative: a change of persistence names nothing.
-        let nullable = plan(vec![pbps_model::Change::SetTablePersistence {
-            uid: uid(pbps_model::UidKind::Table, "app.t"),
-            table: table_name(),
-            unlogged: false,
-        }]);
+        let nullable = plan(vec![pbps_model::Change::TableProperty(
+            pbps_model::TablePropertyChange::SetTablePersistence {
+                uid: uid(pbps_model::UidKind::Table, "app.t"),
+                table: table_name(),
+                unlogged: false,
+            },
+        )]);
         defaults::catalog_names(THIRD, &nullable).unwrap();
     }
 
@@ -2211,43 +2297,51 @@ mod tests {
     fn any_created_module_is_refused_by_the_occupied_names_default() {
         // A routine is no relation, but the namespace check compares it with
         // the modules the project cannot read.
-        let routine = plan(vec![pbps_model::Change::CreateModule {
-            id: pbps_model::ModuleId::Routine("app.f(integer)".parse().unwrap()),
-            module: Box::new(pbps_model::Module {
-                kind: pbps_model::ModuleKind::Function,
-                description: None,
-                definition: "SELECT 1".into(),
-                options: Default::default(),
-            }),
-        }]);
+        let routine = plan(vec![pbps_model::Change::Module(
+            pbps_model::ModuleChange::CreateModule {
+                id: pbps_model::ModuleId::Routine("app.f(integer)".parse().unwrap()),
+                module: Box::new(pbps_model::Module {
+                    kind: pbps_model::ModuleKind::Function,
+                    description: None,
+                    definition: "SELECT 1".into(),
+                    options: Default::default(),
+                }),
+            },
+        )]);
         assert!(crate::deploy::created_relation_names(&routine).is_empty());
         let message = refusal(defaults::occupied_relation_names(THIRD, &routine));
         assert!(message.contains(THIRD), "{message}");
         // Negative: dropping a module creates no name.
-        let dropped = plan(vec![pbps_model::Change::DropModule {
-            id: pbps_model::ModuleId::Routine("app.f(integer)".parse().unwrap()),
-            kind: pbps_model::ModuleKind::Function,
-        }]);
+        let dropped = plan(vec![pbps_model::Change::Module(
+            pbps_model::ModuleChange::DropModule {
+                id: pbps_model::ModuleId::Routine("app.f(integer)".parse().unwrap()),
+                kind: pbps_model::ModuleKind::Function,
+            },
+        )]);
         defaults::occupied_relation_names(THIRD, &dropped).unwrap();
     }
 
     #[test]
     fn a_numbering_change_and_a_table_rewrite_are_read_by_the_final_order_defaults() {
-        let renumbered = plan(vec![pbps_model::Change::AlterColumnNumbering {
-            uid: uid(pbps_model::UidKind::Column, "app.t.a"),
-            column: column_ref("a"),
-            ty: "integer".parse().unwrap(),
-            from: pbps_model::ValueSource::Identity(pbps_model::Identity::new(1, 1)),
-            to: pbps_model::ValueSource::None,
-        }]);
+        let renumbered = plan(vec![pbps_model::Change::Column(
+            pbps_model::ColumnChange::AlterColumnNumbering {
+                uid: uid(pbps_model::UidKind::Column, "app.t.a"),
+                column: column_ref("a"),
+                ty: "integer".parse().unwrap(),
+                from: pbps_model::ValueSource::Identity(pbps_model::Identity::new(1, 1)),
+                to: pbps_model::ValueSource::None,
+            },
+        )]);
         let message = refusal(defaults::drop_blockers(THIRD, &renumbered));
         assert!(message.contains(THIRD), "{message}");
         // Negative: dropping a foreign key or a check is not a drop these
         // readers ask about.
-        let check = plan(vec![pbps_model::Change::DropCheck {
-            table: table_name(),
-            name: "c".into(),
-        }]);
+        let check = plan(vec![pbps_model::Change::Constraint(
+            pbps_model::ConstraintChange::DropCheck {
+                table: table_name(),
+                name: "c".into(),
+            },
+        )]);
         defaults::drop_blockers(THIRD, &check).unwrap();
         // A column type change rewrites the table's rows, which the guard
         // authenticates the triggers for even though no row is written.
@@ -2303,11 +2397,13 @@ mod tests {
     }
 
     fn guarded_drop() -> ChangeSet {
-        let mut changes = plan(vec![pbps_model::Change::DropTable {
-            uid: uid(pbps_model::UidKind::Table, "app.t"),
-            name: table_name(),
-            detach_from: None,
-        }]);
+        let mut changes = plan(vec![pbps_model::Change::Table(
+            pbps_model::TableChange::DropTable {
+                uid: uid(pbps_model::UidKind::Table, "app.t"),
+                name: table_name(),
+                detach_from: None,
+            },
+        )]);
         changes.changes[0].drop_guard = Some(pbps_model::DropGuard {
             table_uid: uid(pbps_model::UidKind::Table, "app.t"),
             table: table_name(),
@@ -2333,7 +2429,9 @@ mod tests {
     #[test]
     fn a_recorded_conversion_or_a_table_expression_is_refused_by_the_site_vetting_default() {
         let mut conversion = retype_plan();
-        if let pbps_model::Change::AlterColumnType { using, .. } = &mut conversion.changes[0].change
+        if let pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType {
+            using, ..
+        }) = &mut conversion.changes[0].change
         {
             *using = Some("a::bigint".into());
         }
@@ -2342,12 +2440,14 @@ mod tests {
         // Negative: a retype with no recorded expression is no conversion.
         defaults::plan_sites(THIRD, &retype_plan().changes).unwrap();
         let default = |to: Option<&str>| {
-            plan(vec![pbps_model::Change::AlterColumnDefault {
-                uid: uid(pbps_model::UidKind::Column, "app.t.a"),
-                column: column_ref("a"),
-                from: None,
-                to: to.map(str::to_owned),
-            }])
+            plan(vec![pbps_model::Change::Column(
+                pbps_model::ColumnChange::AlterColumnDefault {
+                    uid: uid(pbps_model::UidKind::Column, "app.t.a"),
+                    column: column_ref("a"),
+                    from: None,
+                    to: to.map(str::to_owned),
+                },
+            )])
         };
         let message = refusal(defaults::plan_sites(THIRD, &default(Some("1")).changes));
         assert!(message.contains("expressions a table gains"), "{message}");
@@ -2356,18 +2456,20 @@ mod tests {
     }
 
     fn enum_retype(removed: Vec<String>) -> ChangeSet {
-        plan(vec![pbps_model::Change::EnumRebuild {
-            uid: uid(pbps_model::UidKind::Type, "app.mood"),
-            name: "app.mood".parse().unwrap(),
-            tmp: "app.tmp".parse().unwrap(),
-            step: pbps_model::EnumRebuildStep::Retype {
-                column_uid: uid(pbps_model::UidKind::Column, "app.t.a"),
-                column: column_ref("a"),
-                to: pbps_model::ColumnType::reference("app.mood".parse().unwrap()),
-                array: false,
-                values: Box::new(pbps_model::ValueChange::Relabel { removed }),
+        plan(vec![pbps_model::Change::TypeValue(
+            pbps_model::TypeValueChange::EnumRebuild {
+                uid: uid(pbps_model::UidKind::Type, "app.mood"),
+                name: "app.mood".parse().unwrap(),
+                tmp: "app.tmp".parse().unwrap(),
+                step: pbps_model::EnumRebuildStep::Retype {
+                    column_uid: uid(pbps_model::UidKind::Column, "app.t.a"),
+                    column: column_ref("a"),
+                    to: pbps_model::ColumnType::reference("app.mood".parse().unwrap()),
+                    array: false,
+                    values: Box::new(pbps_model::ValueChange::Relabel { removed }),
+                },
             },
-        }])
+        )])
     }
 
     #[test]
@@ -2388,11 +2490,11 @@ mod tests {
     }
 
     fn grant() -> pbps_model::Change {
-        pbps_model::Change::Grant {
+        pbps_model::Change::Permission(pbps_model::GrantChange::Grant {
             role: pbps_model::RoleName::new("app"),
             target: pbps_model::GrantTarget::Object(table_name()),
             permissions: Default::default(),
-        }
+        })
     }
 
     #[test]
@@ -2414,11 +2516,13 @@ mod tests {
         let message = refusal(defaults::support_rows(THIRD, &granted, &ids_of(&granted)));
         assert!(message.contains("permissions"), "{message}");
         // A revoke by the unrevocable-grant check alone.
-        let revoke = plan(vec![pbps_model::Change::Revoke {
-            role: pbps_model::RoleName::new("app"),
-            target: pbps_model::GrantTarget::Object(table_name()),
-            permissions: Default::default(),
-        }]);
+        let revoke = plan(vec![pbps_model::Change::Permission(
+            pbps_model::GrantChange::Revoke {
+                role: pbps_model::RoleName::new("app"),
+                target: pbps_model::GrantTarget::Object(table_name()),
+                permissions: Default::default(),
+            },
+        )]);
         let message = refusal(defaults::support_rows(THIRD, &revoke, &ids_of(&revoke)));
         assert!(message.contains("revoke"), "{message}");
         // A changed generated expression and a column edit by the generation
@@ -2426,12 +2530,14 @@ mod tests {
         let retype = retype_plan();
         let message = refusal(defaults::support_rows(THIRD, &retype, &ids_of(&retype)));
         assert!(message.contains("generated-column"), "{message}");
-        let expression = plan(vec![pbps_model::Change::AlterColumnExpression {
-            uid: uid(pbps_model::UidKind::Column, "app.t.g"),
-            column: column_ref("g"),
-            from: "a".into(),
-            to: "b".into(),
-        }]);
+        let expression = plan(vec![pbps_model::Change::Column(
+            pbps_model::ColumnChange::AlterColumnExpression {
+                uid: uid(pbps_model::UidKind::Column, "app.t.g"),
+                column: column_ref("g"),
+                from: "a".into(),
+                to: "b".into(),
+            },
+        )]);
         let message = refusal(defaults::support_rows(
             THIRD,
             &expression,
@@ -2439,19 +2545,23 @@ mod tests {
         ));
         assert!(message.contains("generated-column"), "{message}");
         // A policy is read by the permission check (its owner and recipients).
-        let policy = plan(vec![pbps_model::Change::DropPolicy {
-            table: table_name(),
-            name: "p".into(),
-            policy: Default::default(),
-        }]);
+        let policy = plan(vec![pbps_model::Change::Policy(
+            pbps_model::PolicyChange::DropPolicy {
+                table: table_name(),
+                name: "p".into(),
+                policy: Default::default(),
+            },
+        )]);
         let message = refusal(defaults::support_rows(THIRD, &policy, &ids));
         assert!(message.contains("policies"), "{message}");
         // Negative: a change of persistence asks none of the four.
-        let persistence = plan(vec![pbps_model::Change::SetTablePersistence {
-            uid: uid(pbps_model::UidKind::Table, "app.t"),
-            table: table_name(),
-            unlogged: false,
-        }]);
+        let persistence = plan(vec![pbps_model::Change::TableProperty(
+            pbps_model::TablePropertyChange::SetTablePersistence {
+                uid: uid(pbps_model::UidKind::Table, "app.t"),
+                table: table_name(),
+                unlogged: false,
+            },
+        )]);
         defaults::support_rows(THIRD, &persistence, &ids_of(&persistence)).unwrap();
     }
 
@@ -2466,12 +2576,14 @@ mod tests {
         required.nullable = false;
         required.value_source = pbps_model::ValueSource::Default("1".into());
         let added = |column: pbps_model::Column| {
-            plan(vec![pbps_model::Change::AddColumn {
-                uid: uid(pbps_model::UidKind::Column, "app.t.n"),
-                table: table_name(),
-                name: "n".into(),
-                column: Box::new(column),
-            }])
+            plan(vec![pbps_model::Change::Column(
+                pbps_model::ColumnChange::AddColumn {
+                    uid: uid(pbps_model::UidKind::Column, "app.t.n"),
+                    table: table_name(),
+                    name: "n".into(),
+                    column: Box::new(column),
+                },
+            )])
         };
         let message = refusal(defaults::server_limits(THIRD, &added(required.clone())));
         assert!(
@@ -2490,35 +2602,41 @@ mod tests {
         assert!(!pbps_mssql::edition::online_requests(&online).is_empty());
         refusal(defaults::server_limits(THIRD, &online));
         // A cascading key is a question for a server that keeps no history.
-        let cascading = plan(vec![pbps_model::Change::AddForeignKey {
-            table: table_name(),
-            name: "fk".into(),
-            constraint: Box::new(pbps_model::ForeignKey {
-                columns: vec!["a".into()],
-                references_table: TableName::new("app", "u"),
-                references_columns: vec!["id".into()],
-                on_delete: pbps_model::ReferentialAction::Cascade,
-                on_update: Default::default(),
-            }),
-        }]);
+        let cascading = plan(vec![pbps_model::Change::Constraint(
+            pbps_model::ConstraintChange::AddForeignKey {
+                table: table_name(),
+                name: "fk".into(),
+                constraint: Box::new(pbps_model::ForeignKey {
+                    columns: vec!["a".into()],
+                    references_table: TableName::new("app", "u"),
+                    references_columns: vec!["id".into()],
+                    on_delete: pbps_model::ReferentialAction::Cascade,
+                    on_update: Default::default(),
+                }),
+            },
+        )]);
         assert!(pbps_mssql::temporal::needs_the_question(&cascading));
         let message = refusal(defaults::server_limits(THIRD, &cascading));
         assert!(message.contains("system-versioned"), "{message}");
         // Negative: a key that restricts asks it nothing.
         let mut restricting = cascading.clone();
-        if let pbps_model::Change::AddForeignKey { constraint, .. } =
-            &mut restricting.changes[0].change
+        if let pbps_model::Change::Constraint(pbps_model::ConstraintChange::AddForeignKey {
+            constraint,
+            ..
+        }) = &mut restricting.changes[0].change
         {
             constraint.on_delete = Default::default();
         }
         assert!(!pbps_mssql::temporal::needs_the_question(&restricting));
         defaults::server_limits(THIRD, &restricting).unwrap();
         // Negative: the hint on a change that takes no `ONLINE` asks nothing.
-        let mut inert = plan(vec![pbps_model::Change::SetTablePersistence {
-            uid: uid(pbps_model::UidKind::Table, "app.t"),
-            table: table_name(),
-            unlogged: false,
-        }]);
+        let mut inert = plan(vec![pbps_model::Change::TableProperty(
+            pbps_model::TablePropertyChange::SetTablePersistence {
+                uid: uid(pbps_model::UidKind::Table, "app.t"),
+                table: table_name(),
+                unlogged: false,
+            },
+        )]);
         inert.changes[0].strategy.online = true;
         assert!(pbps_mssql::edition::online_requests(&inert).is_empty());
         defaults::server_limits(THIRD, &inert).unwrap();
@@ -2560,13 +2678,15 @@ mod tests {
             .or_default()
             .columns
             .insert("m".into(), column);
-        let created = plan(vec![pbps_model::Change::CreateTable {
-            uid: uid(pbps_model::UidKind::Table, "app.t"),
-            name: table_name(),
-            table: Box::new(declared.tables[&table_name()].clone()),
-            beside_default: None,
-            moves_at_most: None,
-        }]);
+        let created = plan(vec![pbps_model::Change::Table(
+            pbps_model::TableChange::CreateTable {
+                uid: uid(pbps_model::UidKind::Table, "app.t"),
+                name: table_name(),
+                table: Box::new(declared.tables[&table_name()].clone()),
+                beside_default: None,
+                moves_at_most: None,
+            },
+        )]);
         let ids = crate::plan_fixture::ids(&created);
         let referenced = pbps_pg::type_refs::external_references(
             side(&schema, &ids),
@@ -2674,34 +2794,38 @@ mod tests {
      {
         defaults::domain_code(THIRD, &ChangeSet::default()).unwrap();
         let domain = |default: Option<&str>| {
-            plan(vec![pbps_model::Change::CreateType {
-                uid: uid(pbps_model::UidKind::Type, "app.d"),
-                name: "app.d".parse().unwrap(),
-                definition: Box::new(pbps_model::ManagedType::Domain {
-                    base: "integer".parse().unwrap(),
-                    not_null: false,
-                    default: default.map(Into::into),
-                    checks: Default::default(),
-                    collation: None,
-                }),
-            }])
+            plan(vec![pbps_model::Change::Type(
+                pbps_model::TypeChange::CreateType {
+                    uid: uid(pbps_model::UidKind::Type, "app.d"),
+                    name: "app.d".parse().unwrap(),
+                    definition: Box::new(pbps_model::ManagedType::Domain {
+                        base: "integer".parse().unwrap(),
+                        not_null: false,
+                        default: default.map(Into::into),
+                        checks: Default::default(),
+                        collation: None,
+                    }),
+                },
+            )])
         };
         let message = refusal(defaults::domain_code(THIRD, &domain(Some("1"))));
         assert!(message.contains("declared domain"), "{message}");
         // Negative: a domain with no code is not vetted on the scratch.
         defaults::domain_code(THIRD, &domain(None)).unwrap();
-        let ext = plan(vec![pbps_model::Change::DropExtension {
-            uid: uid(pbps_model::UidKind::Extension, "cube"),
-            name: "cube".into(),
-            definition: pbps_model::Extension {
-                schema: "public".into(),
-                version: "1".into(),
+        let ext = plan(vec![pbps_model::Change::Extension(
+            pbps_model::ExtensionChange::DropExtension {
+                uid: uid(pbps_model::UidKind::Extension, "cube"),
+                name: "cube".into(),
+                definition: pbps_model::Extension {
+                    schema: "public".into(),
+                    version: "1".into(),
+                },
+                requirers: Default::default(),
+                releases: Default::default(),
+                index_releases: Default::default(),
+                search_releases: Default::default(),
             },
-            requirers: Default::default(),
-            releases: Default::default(),
-            index_releases: Default::default(),
-            search_releases: Default::default(),
-        }]);
+        )]);
         let message = refusal(defaults::extension_seals(THIRD, &ext));
         assert!(message.contains("packages"), "{message}");
         defaults::extension_seals(THIRD, &ChangeSet::default()).unwrap();
@@ -2733,13 +2857,15 @@ mod tests {
         // Negative: a declared type the ids file does not name is not pinned.
         defaults::declared_types(THIRD, &schema, &ids, &declared, &ids, &none).unwrap();
         let domain = |half| {
-            plan(vec![pbps_model::Change::AlterDomain {
-                uid: uid(pbps_model::UidKind::Type, "app.d"),
-                name: "app.d".parse().unwrap(),
-                from: Box::new(pbps_model::ManagedType::Enum { values: Vec::new() }),
-                to: Box::new(pbps_model::ManagedType::Enum { values: Vec::new() }),
-                half,
-            }])
+            plan(vec![pbps_model::Change::TypeValue(
+                pbps_model::TypeValueChange::AlterDomain {
+                    uid: uid(pbps_model::UidKind::Type, "app.d"),
+                    name: "app.d".parse().unwrap(),
+                    from: Box::new(pbps_model::ManagedType::Enum { values: Vec::new() }),
+                    to: Box::new(pbps_model::ManagedType::Enum { values: Vec::new() }),
+                    half,
+                },
+            )])
         };
         let tighten = domain(pbps_model::DomainHalf::Tighten);
         assert!(tightens_a_domain(&tighten));

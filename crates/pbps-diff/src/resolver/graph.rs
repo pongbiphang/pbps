@@ -1,4 +1,12 @@
 use crate::order::{Constraint, Source};
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
 use pbps_model::operation::{Origin, OwnerError, Owners};
 use pbps_model::part_effects::{DefaultChange, Effect, Part as DependencyPart, PartEffect};
 use pbps_model::resolver::{OrderReason, Surface, SurfaceResolution};
@@ -126,18 +134,20 @@ fn release(parts: &[PartEffect<'_>], surface: &Surface) -> bool {
 #[allow(clippy::wildcard_enum_match_arm)]
 fn writes_attrdef(c: &Change) -> bool {
     match c {
-        Change::AddColumn { column, .. } => match column.value_source {
+        Change::Column(ColumnChange::AddColumn { column, .. }) => match column.value_source {
             ValueSource::Default(_) | ValueSource::Generated(_) => true,
             ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) => false,
         },
-        Change::CreateTable { table, .. } => table.columns.values().any(|c| match c.value_source {
-            ValueSource::Generated(_) => true,
-            ValueSource::None
-            | ValueSource::Default(_)
-            | ValueSource::Identity(_)
-            | ValueSource::Sequence(_) => false,
-        }),
-        Change::AlterColumnExpression { .. } => true,
+        Change::Table(TableChange::CreateTable { table, .. }) => {
+            table.columns.values().any(|c| match c.value_source {
+                ValueSource::Generated(_) => true,
+                ValueSource::None
+                | ValueSource::Default(_)
+                | ValueSource::Identity(_)
+                | ValueSource::Sequence(_) => false,
+            })
+        }
+        Change::Column(ColumnChange::AlterColumnExpression { .. }) => true,
         _ => false,
     }
 }
@@ -156,12 +166,15 @@ fn table_of(s: &Surface) -> Option<&TableName> {
 #[allow(clippy::wildcard_enum_match_arm)]
 fn installs_expression(c: &Change) -> bool {
     match c {
-        Change::AlterColumnDefault { to, .. } => to.is_some(),
-        Change::SetPartitionDefault { to, fallback, .. } => to.is_some() || fallback.is_some(),
-        Change::AddCheck { .. } | Change::AddIndex { .. } => true,
+        Change::Column(ColumnChange::AlterColumnDefault { to, .. }) => to.is_some(),
+        Change::Partition(PartitionChange::SetPartitionDefault { to, fallback, .. }) => {
+            to.is_some() || fallback.is_some()
+        }
+        Change::Constraint(ConstraintChange::AddCheck { .. })
+        | Change::Index(IndexChange::AddIndex { .. }) => true,
         // A new exclusion's filter and key expressions are installed with it, as an
         // index's are (#2448 C1b).
-        Change::SetExclusion { to: Some(_), .. } => true,
+        Change::Constraint(ConstraintChange::SetExclusion { to: Some(_), .. }) => true,
         _ => false,
     }
 }
@@ -194,9 +207,9 @@ pub(super) fn constraints(
         .map(|(at, (c, facts))| {
             let mut surfaces = provides(facts);
             match c {
-                Change::CreateTable {
+                Change::Table(TableChange::CreateTable {
                     uid, name, table, ..
-                } if desired_names.table_uid(name) == Some(uid) => {
+                }) if desired_names.table_uid(name) == Some(uid) => {
                     // A placeholder creates an attrdef, but not its desired
                     // binding. That observation belongs to the installation
                     // from the same logical CREATE (DEC-1503.5).
@@ -215,7 +228,7 @@ pub(super) fn constraints(
                             continue;
                         };
                         if current != wanted && steps.iter().zip(origins).any(|(step, origin)| {
-                            matches!(step, Change::AlterColumnExpression { uid, column, from, to }
+                            matches!(step, Change::Column(ColumnChange::AlterColumnExpression { uid, column, from, to })
                                 if column == &reference
                                     && desired_names.column_uid(column) == Some(uid)
                                     && from == &current.expression && to == &wanted.expression
@@ -225,17 +238,17 @@ pub(super) fn constraints(
                         }
                     }
                 }
-                Change::RenameTable { to, .. } => {
+                Change::Table(TableChange::RenameTable { to, .. }) => {
                     surfaces.insert(Surface::Table(to.clone()));
                     if let Some(table) = desired.schema.tables.get(to) {
                         surfaces
                             .extend(table.columns.keys().map(|n| Surface::Column(to.column(n))));
                     }
                 }
-                Change::RenameColumn { table, to, .. } => {
+                Change::Column(ColumnChange::RenameColumn { table, to, .. }) => {
                     surfaces.insert(Surface::Column(table.column(to)));
                 }
-                Change::AlterColumnType { column, .. } => {
+                Change::Column(ColumnChange::AlterColumnType { column, .. }) => {
                     surfaces.insert(Surface::Column(column.clone()));
                 }
                 _ => {}
@@ -256,9 +269,9 @@ pub(super) fn constraints(
         .iter()
         .zip(origins)
         .map(|(c, origin)| match c {
-            Change::CreateTable { uid, .. }
-            | Change::DropTable { uid, .. }
-            | Change::RenameTable { uid, .. } => Some(uid.clone()),
+            Change::Table(TableChange::CreateTable { uid, .. })
+            | Change::Table(TableChange::DropTable { uid, .. })
+            | Change::Table(TableChange::RenameTable { uid, .. }) => Some(uid.clone()),
             other => other
                 .table()
                 .and_then(|t| match table_owners.table(t, origin.spelling()) {
@@ -294,17 +307,19 @@ pub(super) fn constraints(
     for (i, change) in steps.iter().enumerate() {
         let schema_grant = matches!(
             change,
-            Change::Grant {
+            Change::Permission(GrantChange::Grant {
                 target: GrantTarget::Schema(_),
                 ..
-            } | Change::Revoke {
+            }) | Change::Permission(GrantChange::Revoke {
                 target: GrantTarget::Schema(_),
                 ..
-            }
+            })
         );
         let target = match change {
-            Change::Grant { target, .. } => Some(target.clone()),
-            Change::PublicExecution { routine, .. } => Some(GrantTarget::Routine(routine.clone())),
+            Change::Permission(GrantChange::Grant { target, .. }) => Some(target.clone()),
+            Change::Permission(GrantChange::PublicExecution { routine, .. }) => {
+                Some(GrantTarget::Routine(routine.clone()))
+            }
             _ => None,
         };
         if !schema_grant && target.is_none() {
@@ -329,7 +344,7 @@ pub(super) fn constraints(
                                 .iter()
                                 .any(|input| grant_matches(target, input))
                         })
-                }) || (matches!(change, Change::Grant { .. })
+                }) || (matches!(change, Change::Permission(GrantChange::Grant { .. }))
                     && !steps.iter().any(|c| creates_target(c, target))))
             {
                 state(i, j, Source::Execution, OrderReason::Authorization);
@@ -411,28 +426,30 @@ pub(super) fn constraints(
 fn row(c: &Change) -> bool {
     matches!(
         c,
-        Change::InsertRow { .. } | Change::UpdateRow { .. } | Change::DeleteRow { .. }
+        Change::Row(RowChange::InsertRow { .. })
+            | Change::Row(RowChange::UpdateRow { .. })
+            | Change::Row(RowChange::DeleteRow { .. })
     )
 }
 #[allow(clippy::wildcard_enum_match_arm)]
 fn creates_target(c: &Change, target: &GrantTarget) -> bool {
     match target {
         GrantTarget::Object(object) => match c {
-            Change::CreateTable { name, .. } => object == name,
-            Change::RenameTable { to, .. } => object == to,
-            Change::CreateModule { id, .. } => {
+            Change::Table(TableChange::CreateTable { name, .. }) => object == name,
+            Change::Table(TableChange::RenameTable { to, .. }) => object == to,
+            Change::Module(ModuleChange::CreateModule { id, .. }) => {
                 id.schema() == object.schema && id.name() == object.name
             }
             _ => false,
         },
         GrantTarget::Routine(routine) => {
-            matches!(c, Change::CreateModule { id, .. } if id == &pbps_model::ModuleId::Routine(routine.clone()))
+            matches!(c, Change::Module(ModuleChange::CreateModule { id, .. }) if id == &pbps_model::ModuleId::Routine(routine.clone()))
         }
         GrantTarget::Sequence(column) => {
-            matches!(c, Change::CreateTable { name, .. } | Change::RenameTable { to: name, .. } if name == &column.table)
-                || matches!(c, Change::RenameColumn { table, to, .. } if table == &column.table && to == &column.name)
-                || matches!(c, Change::AddColumn { table, name, .. } if table == &column.table && name == &column.name)
-                || matches!(c, Change::AlterColumnNumbering { column: changed, .. } if changed == column)
+            matches!(c, Change::Table(TableChange::CreateTable { name, .. }) | Change::Table(TableChange::RenameTable { to: name, .. }) if name == &column.table)
+                || matches!(c, Change::Column(ColumnChange::RenameColumn { table, to, .. }) if table == &column.table && to == &column.name)
+                || matches!(c, Change::Column(ColumnChange::AddColumn { table, name, .. }) if table == &column.table && name == &column.name)
+                || matches!(c, Change::Column(ColumnChange::AlterColumnNumbering { column: changed, .. }) if changed == column)
         }
         GrantTarget::Schema(_) => false,
     }
@@ -452,11 +469,13 @@ fn grant_matches(target: &GrantTarget, surface: &Surface) -> bool {
 #[test]
 fn a_prepared_default_rewrite_releases_then_provides_its_binding() {
     let column = "app.t.n".parse::<pbps_model::ColumnRef>().unwrap();
-    let change = |from: Option<&str>, to: Option<&str>| Change::AlterColumnDefault {
-        uid: "c_aaaaaa".parse().unwrap(),
-        column: column.clone(),
-        from: from.map(str::to_owned),
-        to: to.map(str::to_owned),
+    let change = |from: Option<&str>, to: Option<&str>| {
+        Change::Column(ColumnChange::AlterColumnDefault {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: column.clone(),
+            from: from.map(str::to_owned),
+            to: to.map(str::to_owned),
+        })
     };
     let target = Surface::Default(column.clone());
     let rewrite = change(Some("app.old()"), Some("app.new()"));
@@ -476,19 +495,19 @@ fn a_prepared_default_rewrite_releases_then_provides_its_binding() {
 #[test]
 fn sequence_grants_follow_the_existing_table_and_column_rename_dependencies() {
     let target = "sequence::app.new.new_id".parse().unwrap();
-    let table_rename = Change::RenameTable {
+    let table_rename = Change::Table(TableChange::RenameTable {
         uid: "t_aaaaaa".parse().unwrap(),
         from: "app.old".parse().unwrap(),
         to: "app.new".parse().unwrap(),
         defaults: Vec::new(),
-    };
-    let column_rename = Change::RenameColumn {
+    });
+    let column_rename = Change::Column(ColumnChange::RenameColumn {
         uid: "c_aaaaaa".parse().unwrap(),
         table: "app.new".parse().unwrap(),
         from: "old_id".into(),
         to: "new_id".into(),
         table_was: None,
-    };
+    });
     assert!(creates_target(&table_rename, &target));
     assert!(creates_target(&column_rename, &target));
     assert!(!creates_target(
@@ -516,17 +535,17 @@ fn named_dependency_effects_keep_raw_check_and_index_surfaces_distinct_from_show
     let table = pbps_model::TableName::new("app", "t");
     for (create, remove, surface, lookalike) in [
         (
-            Change::AddCheck {
+            Change::Constraint(ConstraintChange::AddCheck {
                 table: table.clone(),
                 name: RAW.into(),
                 constraint: pbps_model::CheckConstraint {
                     expression: "id > 0".into(),
                 },
-            },
-            Change::DropCheck {
+            }),
+            Change::Constraint(ConstraintChange::DropCheck {
                 table: table.clone(),
                 name: RAW.into(),
-            },
+            }),
             Surface::Check {
                 table: table.clone(),
                 name: RAW.into(),
@@ -537,7 +556,7 @@ fn named_dependency_effects_keep_raw_check_and_index_surfaces_distinct_from_show
             },
         ),
         (
-            Change::AddIndex {
+            Change::Index(IndexChange::AddIndex {
                 table: table.clone(),
                 name: RAW.into(),
                 clustered: false,
@@ -550,11 +569,11 @@ fn named_dependency_effects_keep_raw_check_and_index_surfaces_distinct_from_show
                     storage_parameters: Default::default(),
                     filegroup: None,
                 }),
-            },
-            Change::DropIndex {
+            }),
+            Change::Index(IndexChange::DropIndex {
                 table: table.clone(),
                 name: RAW.into(),
-            },
+            }),
             Surface::Index {
                 table: table.clone(),
                 name: RAW.into(),
@@ -583,11 +602,13 @@ fn a_new_exclusion_installs_an_expression_and_a_drop_does_not() {
         storage_parameters: Default::default(),
         timing: pbps_model::ExclusionTiming::Immediate,
     };
-    let set = |from, to| Change::SetExclusion {
-        table: TableName::new("app", "t"),
-        name: "no_overlap".into(),
-        from,
-        to,
+    let set = |from, to| {
+        Change::Constraint(ConstraintChange::SetExclusion {
+            table: TableName::new("app", "t"),
+            name: "no_overlap".into(),
+            from,
+            to,
+        })
     };
     assert!(installs_expression(&set(
         None,

@@ -30,6 +30,10 @@ use pbps_dialect::Dialect;
 use pbps_dialect::slots::{
     CatalogFacts, Same, SlotKey, baseline_names, names, same, slots as slots_of,
 };
+use pbps_model::ColumnChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
+use pbps_model::TypeChange;
 use pbps_model::operation::{
     ObjectKey, Operation, OperationId, OwnerError, Owners, Snapshot, base_table_named,
 };
@@ -113,7 +117,8 @@ pub fn analyse(
                 fx.releases.retain(|r| !kept.contains(r));
                 if matches!(
                     op.change(),
-                    Change::CreateTable { .. } | Change::AttachPartition { .. }
+                    Change::Table(TableChange::CreateTable { .. })
+                        | Change::Partition(PartitionChange::AttachPartition { .. })
                 ) {
                     fx.inherited = fx
                         .claims
@@ -125,7 +130,7 @@ pub fn analyse(
             }
             Err(error) => out.unowned.push((op.id(), error)),
         }
-        if let Change::RenameTable { from, to, .. } = op.change()
+        if let Change::Table(TableChange::RenameTable { from, to, .. }) = op.change()
             && from.schema != to.schema
         {
             match dialect.intermediate_tables(op.change(), op.planned().strategy) {
@@ -138,7 +143,7 @@ pub fn analyse(
                 Err(_) => out.unlowered.push(op.id()),
             }
         }
-        if let Change::RenameType { from, to, .. } = op.change()
+        if let Change::Type(TypeChange::RenameType { from, to, .. }) = op.change()
             && from.schema() != to.schema()
         {
             match dialect.intermediate_types(op.change(), op.planned().strategy) {
@@ -159,12 +164,12 @@ pub fn analyse(
     let dropped: BTreeSet<ObjectKey> = operations
         .iter()
         .zip(&out.effects)
-        .filter(|(op, _)| !matches!(op.change(), Change::RenameTable { .. }))
+        .filter(|(op, _)| !matches!(op.change(), Change::Table(TableChange::RenameTable { .. })))
         .flat_map(|(_, fx)| fx.releases.iter().map(|(_, h)| h.clone()))
         .filter(|h| matches!(h, ObjectKey::Part { .. }))
         .collect();
     for (op, fx) in operations.iter().zip(&mut out.effects) {
-        if matches!(op.change(), Change::RenameTable { .. }) {
+        if matches!(op.change(), Change::Table(TableChange::RenameTable { .. })) {
             fx.claims.retain(|(_, h)| !dropped.contains(h));
             fx.releases.retain(|(_, h)| !dropped.contains(h));
         }
@@ -440,8 +445,18 @@ pub fn carried(
             .collect();
         let ranked: [&dyn Fn(usize) -> bool; 3] = [
             &|i| moves(&operations[i], keys[i].as_ref(), &who),
-            &|i| matches!(operations[i].change(), Change::DropTable { .. }),
-            &|i| matches!(operations[i].change(), Change::DropColumn { .. }),
+            &|i| {
+                matches!(
+                    operations[i].change(),
+                    Change::Table(TableChange::DropTable { .. })
+                )
+            },
+            &|i| {
+                matches!(
+                    operations[i].change(),
+                    Change::Column(ColumnChange::DropColumn { .. })
+                )
+            },
         ];
         let steps: Vec<usize> = ranked
             .iter()
@@ -452,7 +467,8 @@ pub fn carried(
         // As in the replay, an occupant the step takes out of its schema
         // does not land anywhere: a default renamed with its table's move.
         let key = keys[step].as_ref();
-        let lands = if let Change::RenameTable { from, to, .. } = operations[step].change()
+        let lands = if let Change::Table(TableChange::RenameTable { from, to, .. }) =
+            operations[step].change()
             && from.schema != to.schema
             && !leaves(&operations[step], key, &who)
             && moves(&operations[step], key, &who)
@@ -983,7 +999,7 @@ pub fn verify(
                 && !(matches!(who, Occupier::Catalog { .. })
                     && detached_release(op, key.as_ref(), slot, facts))
         });
-        if let Change::RenameTable { from, to, .. } = op.change()
+        if let Change::Table(TableChange::RenameTable { from, to, .. }) = op.change()
             && from.schema != to.schema
         {
             let (moving, staying): (Vec<_>, Vec<_>) = std::mem::take(&mut held)
@@ -1058,8 +1074,10 @@ fn detached_release(
     slot: &SlotKey,
     facts: Option<&CatalogFacts>,
 ) -> bool {
-    matches!(op.change(), Change::DetachPartition { .. })
-        && matches!(key, Some(ObjectKey::Table(owner))
+    matches!(
+        op.change(),
+        Change::Partition(PartitionChange::DetachPartition { .. })
+    ) && matches!(key, Some(ObjectKey::Table(owner))
             if facts.and_then(|f| f.detach_releases.get(slot)) == Some(owner.uid()))
 }
 
@@ -1076,22 +1094,22 @@ fn leaves(op: &Operation, key: Option<&ObjectKey>, who: &Occupier) -> bool {
         return false;
     };
     let owned = owner.is_some() && owner.as_ref() == key;
-    if let Change::DropTable { .. } = op.change() {
+    if let Change::Table(TableChange::DropTable { .. }) = op.change() {
         return owned;
     }
     let Some((column, column_name)) = column else {
         return false;
     };
-    if let Change::RenameTable { defaults, .. } = op.change() {
+    if let Change::Table(TableChange::RenameTable { defaults, .. }) = op.change() {
         return owned && defaults.contains(column_name);
     }
     matches!(
         op.change(),
-        Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnNumbering { .. }
+        Change::Column(ColumnChange::DropColumn { .. })
+            | Change::Column(ColumnChange::RenameColumn { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
     ) && key
         .and_then(column_of)
         .is_some_and(|k| Some(k) == column_of(column))
@@ -1123,7 +1141,7 @@ fn moves(op: &Operation, key: Option<&ObjectKey>, who: &Occupier) -> bool {
     let Occupier::Catalog { owner, .. } = who else {
         return false;
     };
-    matches!(op.change(), Change::RenameTable { from, to, .. } if from.schema != to.schema)
+    matches!(op.change(), Change::Table(TableChange::RenameTable { from, to, .. }) if from.schema != to.schema)
         && owner.is_some()
         && owner.as_ref() == key
 }

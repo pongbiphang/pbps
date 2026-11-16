@@ -1,5 +1,6 @@
 //! Approval is enforced before connecting for standing-policy delivery.
 use super::*;
+use pbps_model::PolicyChange;
 use pbps_model::{
     Change, ChangeSet, IdsFile, PlanBaseline, PlanOrigin, PlannedChange, RowPolicy, RowSecurity,
     RowSecurityOrigin, SavedPlan, TableName, Uid,
@@ -41,24 +42,28 @@ fn row_security_apply_requires_approval_before_connecting() {
         using: Some("id > 0".into()),
         ..Default::default()
     };
-    let create = |restrictive| Change::CreatePolicy {
-        table: table.clone(),
-        name: "p".into(),
-        policy: RowPolicy {
-            restrictive,
-            ..policy.clone()
-        },
-        origin: RowSecurityOrigin::Standing,
+    let create = |restrictive| {
+        Change::Policy(PolicyChange::CreatePolicy {
+            table: table.clone(),
+            name: "p".into(),
+            policy: RowPolicy {
+                restrictive,
+                ..policy.clone()
+            },
+            origin: RowSecurityOrigin::Standing,
+        })
     };
-    let drop = |restrictive| Change::DropPolicy {
-        table: table.clone(),
-        name: "p".into(),
-        policy: RowPolicy {
-            restrictive,
-            ..policy.clone()
-        },
+    let drop = |restrictive| {
+        Change::Policy(PolicyChange::DropPolicy {
+            table: table.clone(),
+            name: "p".into(),
+            policy: RowPolicy {
+                restrictive,
+                ..policy.clone()
+            },
+        })
     };
-    let flags = Change::SetRowSecurity {
+    let flags = Change::Policy(PolicyChange::SetRowSecurity {
         uid,
         table: table.clone(),
         from: RowSecurity {
@@ -67,7 +72,7 @@ fn row_security_apply_requires_approval_before_connecting() {
         },
         to: RowSecurity::default(),
         origin: RowSecurityOrigin::Standing,
-    };
+    });
     for (changes, required) in [
         (vec![create(false)], "row-security"),
         (vec![drop(true)], "row-security"),
@@ -124,11 +129,11 @@ fn row_security_apply_requires_approval_before_connecting() {
 fn standing_policy_plans_require_the_current_plan_version() {
     let d = Demo::new("row-security-version1173");
     std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
-    let change = Change::DropPolicy {
+    let change = Change::Policy(PolicyChange::DropPolicy {
         table: TableName::new("app", "docs"),
         name: "p".into(),
         policy: RowPolicy::default(),
-    };
+    });
     for version in [
         pbps_model::plan::CURRENT_VERSION - 1,
         pbps_model::plan::CURRENT_VERSION + 1,

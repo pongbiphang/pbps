@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use pbps_model::TableChange;
 use pbps_model::{
     Change, Presence, Renames, Schema, TableName,
     plan_names::{At, Holder, PlanNames},
@@ -35,10 +36,10 @@ impl<'a> Tables<'a> {
             let change = &planned.change;
             final_presence.extend(change.tables_after());
             touched.extend(change.table());
-            if let Change::RenameTable { from, to, .. } = change {
+            if let Change::Table(TableChange::RenameTable { from, to, .. }) = change {
                 renamed.insert(from, to);
             }
-            if let Change::DropTable { name, .. } = change {
+            if let Change::Table(TableChange::DropTable { name, .. }) = change {
                 dropped_tables.insert(name);
             }
         }

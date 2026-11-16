@@ -5,6 +5,8 @@ use crate::order::deployment::Sources;
 use crate::order::deployment::schedule::{Declarations, Facts, schedule};
 use crate::{DiffError, Side};
 use pbps_dialect::MinimalDialect;
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
 use pbps_model::object_ref::Annotations;
 use pbps_model::{ComputedColumn, Hints};
 
@@ -88,9 +90,9 @@ fn plan(schema: &Schema, ids: &IdsFile, annotations: Annotations) -> Result<Vec<
         .changes
         .iter()
         .map(|p| {
-            if let Change::CreateModule { id, .. } = &p.change {
+            if let Change::Module(ModuleChange::CreateModule { id, .. }) = &p.change {
                 format!("module {}", id.shown())
-            } else if let Change::CreateTable { name, .. } = &p.change {
+            } else if let Change::Table(TableChange::CreateTable { name, .. }) = &p.change {
                 format!("table {}", name.shown())
             } else {
                 "other".into()

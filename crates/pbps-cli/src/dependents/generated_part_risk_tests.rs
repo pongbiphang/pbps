@@ -29,43 +29,43 @@ fn fixture(kind: &str, writer: &str, late: bool) -> SavedPlan {
             filegroup: None,
         });
     }
-    let create = PlannedChange::new(Change::CreateTable {
+    let create = PlannedChange::new(Change::Table(TableChange::CreateTable {
         uid: table_uid,
         name: name.clone(),
         table: Box::new(table),
         beside_default: None,
         moves_at_most: None,
-    });
+    }));
     let mut g = Column::new("integer".parse().unwrap());
     g.value_source = ValueSource::Generated(Generated {
         expression: "id * 2".into(),
         stored: true,
     });
-    let installation = PlannedChange::new(Change::AddColumn {
+    let installation = PlannedChange::new(Change::Column(ColumnChange::AddColumn {
         uid: g_uid,
         table: name.clone(),
         name: "g".into(),
         column: Box::new(g),
-    });
+    }));
     let part = match kind {
         "column" => {
             let uid: Uid = "c_015033".parse().unwrap();
             ids.columns.insert(uid.clone(), name.column("z"));
-            Change::AddColumn {
+            Change::Column(ColumnChange::AddColumn {
                 uid,
                 table: name.clone(),
                 name: "z".into(),
                 column: Box::new(Column::new("integer".parse().unwrap()).not_null()),
-            }
+            })
         }
-        "check" => Change::AddCheck {
+        "check" => Change::Constraint(ConstraintChange::AddCheck {
             table: name.clone(),
             name: "positive".into(),
             constraint: CheckConstraint {
                 expression: "g > 0".into(),
             },
-        },
-        "primary" => Change::SetPrimaryKey {
+        }),
+        "primary" => Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: name.clone(),
             from: None,
             to: Some(PrimaryKey {
@@ -75,8 +75,8 @@ fn fixture(kind: &str, writer: &str, late: bool) -> SavedPlan {
                 filegroup: None,
             }),
             nonclustered: false,
-        },
-        "unique" => Change::AddUnique {
+        }),
+        "unique" => Change::Constraint(ConstraintChange::AddUnique {
             table: name.clone(),
             name: "a_uq".into(),
             constraint: UniqueConstraint {
@@ -85,8 +85,8 @@ fn fixture(kind: &str, writer: &str, late: bool) -> SavedPlan {
                 filegroup: None,
             },
             clustered: false,
-        },
-        "index" => Change::AddIndex {
+        }),
+        "index" => Change::Index(IndexChange::AddIndex {
             table: name.clone(),
             name: "a_ix".into(),
             index: Box::new(Index {
@@ -104,8 +104,8 @@ fn fixture(kind: &str, writer: &str, late: bool) -> SavedPlan {
                 filegroup: None,
             }),
             clustered: false,
-        },
-        "foreign" => Change::AddForeignKey {
+        }),
+        "foreign" => Change::Constraint(ConstraintChange::AddForeignKey {
             table: name.clone(),
             name: "a_fk".into(),
             constraint: Box::new(ForeignKey {
@@ -115,11 +115,11 @@ fn fixture(kind: &str, writer: &str, late: bool) -> SavedPlan {
                 on_delete: Default::default(),
                 on_update: Default::default(),
             }),
-        },
+        }),
         _ => panic!("unknown fixture part"),
     };
     let write = match writer {
-        "insert" => Change::InsertRow {
+        "insert" => Change::Row(RowChange::InsertRow {
             table: name.clone(),
             key_column: "id".into(),
             identity_key: false,
@@ -131,8 +131,8 @@ fn fixture(kind: &str, writer: &str, late: bool) -> SavedPlan {
             },
             defaults: Default::default(),
             types: Default::default(),
-        },
-        "update" => Change::UpdateRow {
+        }),
+        "update" => Change::Row(RowChange::UpdateRow {
             table: name.clone(),
             key_column: "id".into(),
             key: "1".into(),
@@ -141,8 +141,8 @@ fn fixture(kind: &str, writer: &str, late: bool) -> SavedPlan {
             types: Default::default(),
             after_types: Default::default(),
             key_type: None,
-        },
-        "delete" => Change::DeleteRow {
+        }),
+        "delete" => Change::Row(RowChange::DeleteRow {
             table: name.clone(),
             key_column: "id".into(),
             key: "1".into(),
@@ -152,34 +152,34 @@ fn fixture(kind: &str, writer: &str, late: bool) -> SavedPlan {
             types: Default::default(),
             after_types: Default::default(),
             key_type: None,
-        },
+        }),
         "attach" => {
             ids.tables.insert(child_uid.clone(), child.clone());
-            Change::AttachPartition {
+            Change::Partition(PartitionChange::AttachPartition {
                 uid: child_uid,
                 table: child,
                 parent: name,
                 bound: PartitionBound::Default,
                 key: vec!["id".into()],
                 shape: Box::default(),
-            }
+            })
         }
         "detach" => {
             ids.tables.insert(child_uid.clone(), child.clone());
-            Change::DetachPartition {
+            Change::Partition(PartitionChange::DetachPartition {
                 uid: child_uid,
                 table: child,
                 parent: name,
                 names: vec![],
                 shape: Box::default(),
-            }
+            })
         }
         "move" => {
             ids.tables.insert(child_uid.clone(), child.clone());
             let source = TableName::new("app", "old_default");
             ids.tables
                 .insert("t_015035".parse().unwrap(), source.clone());
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: child_uid,
                 name: child,
                 table: Box::new(Table {
@@ -192,7 +192,7 @@ fn fixture(kind: &str, writer: &str, late: bool) -> SavedPlan {
                 }),
                 beside_default: Some(source),
                 moves_at_most: Some(1),
-            }
+            })
         }
         _ => panic!("unknown fixture writer"),
     };
@@ -334,12 +334,17 @@ fn resolver_creation_risks_follow_the_settled_parts_and_seal_that_order() {
         let row = cs
             .changes
             .iter()
-            .position(|p| matches!(p.change, Change::InsertRow { .. }))
+            .position(|p| matches!(p.change, Change::Row(RowChange::InsertRow { .. })))
             .unwrap();
         let check = cs
             .changes
             .iter()
-            .position(|p| matches!(p.change, Change::AddCheck { .. }))
+            .position(|p| {
+                matches!(
+                    p.change,
+                    Change::Constraint(ConstraintChange::AddCheck { .. })
+                )
+            })
             .unwrap();
         assert!(row < check);
         assert!(cs.changes[check].risks.contains(&RiskClass::Constraint));
@@ -356,13 +361,10 @@ fn resolver_creation_risks_follow_the_settled_parts_and_seal_that_order() {
             assert_eq!(operation.planned(), part);
         }
         let ordinary = super::ordinary(&schema, &ids, &pg).unwrap();
-        assert!(
-            ordinary
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, Change::AddCheck { .. })
-                    && p.risks.contains(&RiskClass::Constraint))
-        );
+        assert!(ordinary.changes.iter().any(|p| matches!(
+            p.change,
+            Change::Constraint(ConstraintChange::AddCheck { .. })
+        ) && p.risks.contains(&RiskClass::Constraint)));
     }
 }
 

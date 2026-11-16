@@ -2,6 +2,7 @@
 //! schema-bound caller the capture read whole brings its own callees, and a
 //! caller it did not read keeps the lexical match.
 
+use pbps_model::ModuleChange;
 use pbps_model::operation::Captured;
 use pbps_model::resolver::{BoundSurface, ObjectIdentity, Surface, SurfaceResolution};
 use pbps_model::{Change, IdsFile, Module, ModuleId, ModuleKind, Schema, TableName};
@@ -84,7 +85,8 @@ fn plan(
         .changes
         .iter()
         .filter_map(|planned| match &planned.change {
-            Change::AlterModule { id, .. } | Change::CreateModule { id, .. } => Some(id.clone()),
+            Change::Module(ModuleChange::AlterModule { id, .. })
+            | Change::Module(ModuleChange::CreateModule { id, .. }) => Some(id.clone()),
             _ => None,
         })
         .collect())
@@ -255,7 +257,7 @@ fn a_bootstrap_of_modules_whose_texts_name_each_other_is_not_judged_as_an_order(
         .changes
         .iter()
         .filter_map(|planned| match &planned.change {
-            Change::CreateModule { id, .. } => Some(id.clone()),
+            Change::Module(ModuleChange::CreateModule { id, .. }) => Some(id.clone()),
             _ => None,
         })
         .collect();

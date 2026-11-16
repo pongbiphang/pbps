@@ -1,6 +1,7 @@
 use super::*;
 use crate::order::rebuild_tests::fixture;
 use pbps_dialect::MinimalDialect;
+use pbps_model::PartitionChange;
 
 #[test]
 fn inventory_checks_risk_strategy_scope_progress_and_budget() {
@@ -26,9 +27,9 @@ fn inventory_checks_risk_strategy_scope_progress_and_budget() {
         ..PlannedChange::new(change)
     };
     let prepared = Prepared {
-        logical: vec![planned(Change::RebuildPartitionedTable(Box::new(
-            root.clone(),
-        )))],
+        logical: vec![planned(Change::Partition(
+            PartitionChange::RebuildPartitionedTable(Box::new(root.clone())),
+        ))],
         target: target.validated().unwrap(),
         addresses,
         parts: fixture::changes()

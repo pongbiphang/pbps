@@ -1,14 +1,21 @@
 //! Creation-order hints, never catalog binding evidence (DEC-2541.1).
 use super::*;
 use crate::resolver::capture::ExternalInputs;
+use pbps_model::ConstraintChange;
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
 
 #[allow(clippy::wildcard_enum_match_arm)]
 fn structural(change: &Change, external: &ObjectIdentity) -> bool {
     let referenced = |name: &pbps_model::TableName| object(&name.schema, &name.name) == *external;
     match change {
-        Change::CreateModule { id, .. } => id.attached_to().is_some_and(referenced),
-        Change::AddForeignKey { constraint, .. } => referenced(&constraint.references_table),
-        Change::CreateTable { table, .. } => table
+        Change::Module(ModuleChange::CreateModule { id, .. }) => {
+            id.attached_to().is_some_and(referenced)
+        }
+        Change::Constraint(ConstraintChange::AddForeignKey { constraint, .. }) => {
+            referenced(&constraint.references_table)
+        }
+        Change::Table(TableChange::CreateTable { table, .. }) => table
             .foreign_keys
             .values()
             .any(|fk| referenced(&fk.references_table)),
@@ -55,7 +62,7 @@ fn needs(
         ))
     };
     let (names, home) = match change {
-        Change::CreateModule { id, module } => (
+        Change::Module(ModuleChange::CreateModule { id, module }) => (
             ExternalInputs::module_names(module).map_err(refusal)?,
             id.schema(),
         ),

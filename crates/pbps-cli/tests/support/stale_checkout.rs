@@ -320,16 +320,14 @@ pub fn acceptance(server: &str, pg: bool) {
     extra(&d, schema, &role.name, pg);
     offline(&d);
     let additive = plan(&d, connection, &artifact);
-    assert!(
-        additive
-            .changes
-            .changes
-            .iter()
-            .any(|c| matches!(c.change, pbps_model::Change::AddColumn { .. }))
-    );
+    assert!(additive.changes.changes.iter().any(|c| matches!(
+        c.change,
+        pbps_model::Change::Column(pbps_model::ColumnChange::AddColumn { .. })
+    )));
     assert!(!additive.changes.changes.iter().any(|c| matches!(
         c.change,
-        pbps_model::Change::DropColumn { .. } | pbps_model::Change::DropTable { .. }
+        pbps_model::Change::Column(pbps_model::ColumnChange::DropColumn { .. })
+            | pbps_model::Change::Table(pbps_model::TableChange::DropTable { .. })
     )));
     drop_all(&d, schema, &role.name);
     refused(&d, connection, pg, &expected(&deployed, &list, false));
@@ -383,13 +381,10 @@ pub fn acceptance(server: &str, pg: bool) {
     d.git(&["checkout", "-q", "--detach", &deployed]);
     drop_all(&d, schema, &role.name);
     let legitimate = plan(&d, connection, &artifact);
-    assert!(
-        legitimate
-            .changes
-            .changes
-            .iter()
-            .any(|c| matches!(c.change, pbps_model::Change::DropColumn { .. }))
-    );
+    assert!(legitimate.changes.changes.iter().any(|c| matches!(
+        c.change,
+        pbps_model::Change::Column(pbps_model::ColumnChange::DropColumn { .. })
+    )));
     let export = Demo::new("stale2397-export");
     std::fs::remove_dir_all(&export.dir).unwrap();
     git(
@@ -487,7 +482,8 @@ fn absorbed_rename_still_allows_a_modification(server: &str, pg: bool) {
     assert!(!planned.changes.is_empty());
     assert!(!planned.changes.changes.iter().any(|change| matches!(
         change.change,
-        pbps_model::Change::DropColumn { .. } | pbps_model::Change::DropTable { .. }
+        pbps_model::Change::Column(pbps_model::ColumnChange::DropColumn { .. })
+            | pbps_model::Change::Table(pbps_model::TableChange::DropTable { .. })
     )));
 }
 

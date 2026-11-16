@@ -93,30 +93,30 @@ fn role_subject_keys_and_grantee_identity_keep_original_spelling() {
     let name = RoleName::from(NAME);
     let target = GrantTarget::Schema("app".into());
     let changes = [
-        Change::CreateRole {
+        Change::Role(RoleChange::CreateRole {
             uid: uid("r_aaaaaa"),
             name: name.clone(),
-        },
-        Change::DropRole {
+        }),
+        Change::Role(RoleChange::DropRole {
             uid: uid("r_aaaaaa"),
             name: name.clone(),
             members: Vec::new(),
-        },
-        Change::RenameRole {
+        }),
+        Change::Role(RoleChange::RenameRole {
             uid: uid("r_aaaaaa"),
             from: name.clone(),
             to: "new".into(),
-        },
-        Change::Grant {
+        }),
+        Change::Permission(GrantChange::Grant {
             role: name.clone(),
             target: target.clone(),
             permissions: [Permission::Usage].into(),
-        },
-        Change::Revoke {
+        }),
+        Change::Permission(GrantChange::Revoke {
             role: name.clone(),
             target,
             permissions: [Permission::Usage].into(),
-        },
+        }),
     ];
     for change in changes {
         assert_eq!(change.subject(), format!("role {NAME}"));
@@ -141,15 +141,15 @@ fn role_subject_keys_and_grantee_identity_keep_original_spelling() {
 fn role_history_collision_keeps_the_previous_string_debug_message() {
     let name = RoleName::from("role\\path\nline");
     let changes = [
-        PlannedChange::new(Change::CreateRole {
+        PlannedChange::new(Change::Role(RoleChange::CreateRole {
             uid: uid("r_bbbbbb"),
             name: name.clone(),
-        }),
-        PlannedChange::new(Change::RenameRole {
+        })),
+        PlannedChange::new(Change::Role(RoleChange::RenameRole {
             uid: uid("r_aaaaaa"),
             from: name.clone(),
             to: "new".into(),
-        }),
+        })),
     ];
     let ids = IdsFile {
         roles: [(uid("r_aaaaaa"), "new".into()), (uid("r_bbbbbb"), name)].into(),
@@ -168,7 +168,7 @@ fn owner_errors_show_names_once_without_changing_raw_holder_lookups() {
     let column = table.column(NAME);
     let role = RoleName::from(NAME);
     let changes = [
-        PlannedChange::new(Change::CreateTable {
+        PlannedChange::new(Change::Table(TableChange::CreateTable {
             uid: uid("t_aaaaaa"),
             name: table.clone(),
             table: Box::new(Table {
@@ -177,11 +177,11 @@ fn owner_errors_show_names_once_without_changing_raw_holder_lookups() {
             }),
             beside_default: None,
             moves_at_most: None,
-        }),
-        PlannedChange::new(Change::CreateRole {
+        })),
+        PlannedChange::new(Change::Role(RoleChange::CreateRole {
             uid: uid("r_aaaaaa"),
             name: role.clone(),
-        }),
+        })),
     ];
     let ids = IdsFile {
         tables: [(uid("t_aaaaaa"), table.clone())].into(),

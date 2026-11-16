@@ -1,5 +1,8 @@
 use super::transition_scope_tests::{fixture, object, refuses, seal};
 use super::*;
+use crate::ColumnChange;
+use crate::ConstraintChange;
+use crate::GrantChange;
 use crate::resolver::ObjectOwnership;
 use crate::{GrantTarget, Permission, PlannedChange, TableName};
 
@@ -12,17 +15,17 @@ fn grant(revoke: bool) -> Change {
     let target = GrantTarget::Object(table());
     let permissions = BTreeSet::from([Permission::Select]);
     if revoke {
-        Change::Revoke {
+        Change::Permission(GrantChange::Revoke {
             role,
             target,
             permissions,
-        }
+        })
     } else {
-        Change::Grant {
+        Change::Permission(GrantChange::Grant {
             role,
             target,
             permissions,
-        }
+        })
     }
 }
 
@@ -37,7 +40,8 @@ fn owner_fixture(change: Change, root: &str) -> (ChangeSet, ResolverEvidence) {
     evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
     if matches!(
         changes.changes[0].change,
-        Change::Grant { .. } | Change::Revoke { .. }
+        Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
     ) {
         evidence.authorization.changes = BTreeSet::from([0]);
         evidence.authorization.object_grants = super::super::AuthorizationGrant::fixtures(&changes);
@@ -107,12 +111,12 @@ fn table_authorization_mutations_leave_every_fingerprint_untouched() {
 fn table_constraint_mutations_preserve_unchanged_child_fingerprints() {
     let pk = serde_json::from_value(serde_json::json!({"columns":["n"]})).unwrap();
     for change in [
-        Change::SetPrimaryKey { table: table(), from: None, to: Some(pk), nonclustered: false },
-        Change::SetPrimaryKey { table: table(), from: Some(serde_json::from_value(serde_json::json!({"columns":["n"]})).unwrap()), to: None, nonclustered: false },
-        Change::AddUnique { table: table(), name: "uq".into(), constraint: serde_json::from_value(serde_json::json!({"columns":["n"]})).unwrap(), clustered: false },
-        Change::DropUnique { table: table(), name: "uq".into() },
-        Change::AddForeignKey { table: table(), name: "fk".into(), constraint: Box::new(serde_json::from_value(serde_json::json!({"columns":["n"],"references_table":"app.parent","references_columns":["id"]})).unwrap()) },
-        Change::DropForeignKey { table: table(), name: "fk".into() },
+        Change::Constraint(ConstraintChange::SetPrimaryKey { table: table(), from: None, to: Some(pk), nonclustered: false }),
+        Change::Constraint(ConstraintChange::SetPrimaryKey { table: table(), from: Some(serde_json::from_value(serde_json::json!({"columns":["n"]})).unwrap()), to: None, nonclustered: false }),
+        Change::Constraint(ConstraintChange::AddUnique { table: table(), name: "uq".into(), constraint: serde_json::from_value(serde_json::json!({"columns":["n"]})).unwrap(), clustered: false }),
+        Change::Constraint(ConstraintChange::DropUnique { table: table(), name: "uq".into() }),
+        Change::Constraint(ConstraintChange::AddForeignKey { table: table(), name: "fk".into(), constraint: Box::new(serde_json::from_value(serde_json::json!({"columns":["n"],"references_table":"app.parent","references_columns":["id"]})).unwrap()) }),
+        Change::Constraint(ConstraintChange::DropForeignKey { table: table(), name: "fk".into() }),
     ] {
         let (changes, evidence) = owner_fixture(change, "table");
         preserves_children(&changes, &evidence);
@@ -123,14 +127,14 @@ fn table_constraint_mutations_preserve_unchanged_child_fingerprints() {
 fn nullability_mutations_preserve_unchanged_default_fingerprints() {
     for to_nullable in [false, true] {
         let (changes, evidence) = owner_fixture(
-            Change::AlterColumnNullability {
+            Change::Column(ColumnChange::AlterColumnNullability {
                 uid: "c_000000".parse().unwrap(),
                 column: table().column("n"),
                 ty: "integer".parse().unwrap(),
                 to_nullable,
                 through_external_partitions: false,
                 collation: None,
-            },
+            }),
             "column",
         );
         preserves_children(&changes, &evidence);
@@ -183,10 +187,10 @@ fn saved_table_grants_cannot_authorize_sibling_fingerprint_changes() {
 #[test]
 fn owner_mutations_still_require_every_directly_owned_internal_record() {
     let (changes, evidence) = owner_fixture(
-        Change::DropUnique {
+        Change::Constraint(ConstraintChange::DropUnique {
             table: table(),
             name: "uq".into(),
-        },
+        }),
         "table",
     );
     let valid = seal(&changes, &evidence).expect("owner-only valid mutation was refused");

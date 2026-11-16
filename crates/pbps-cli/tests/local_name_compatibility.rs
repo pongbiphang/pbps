@@ -104,57 +104,57 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
         ..Default::default()
     };
     let mut changes = vec![
-        Change::CreateTable {
+        Change::Table(TableChange::CreateTable {
             uid: table_uid.clone(),
             name: name.clone(),
             table: Box::new(table.clone()),
             beside_default: None,
             moves_at_most: None,
-        },
-        Change::SetPrimaryKey {
+        }),
+        Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: name.clone(),
             from: None,
             to: Some(pk),
             nonclustered: false,
-        },
-        Change::AddUnique {
+        }),
+        Change::Constraint(ConstraintChange::AddUnique {
             table: name.clone(),
             name: format!("{text}uq").into(),
             constraint: unique,
             clustered: false,
-        },
-        Change::DropUnique {
+        }),
+        Change::Constraint(ConstraintChange::DropUnique {
             table: name.clone(),
             name: format!("{text}uq").into(),
-        },
-        Change::AddForeignKey {
+        }),
+        Change::Constraint(ConstraintChange::AddForeignKey {
             table: name.clone(),
             name: format!("{text}fk").into(),
             constraint: Box::new(foreign),
-        },
-        Change::DropForeignKey {
+        }),
+        Change::Constraint(ConstraintChange::DropForeignKey {
             table: name.clone(),
             name: format!("{text}fk").into(),
-        },
-        Change::AddCheck {
+        }),
+        Change::Constraint(ConstraintChange::AddCheck {
             table: name.clone(),
             name: format!("{text}ck").into(),
             constraint: check,
-        },
-        Change::DropCheck {
+        }),
+        Change::Constraint(ConstraintChange::DropCheck {
             table: name.clone(),
             name: format!("{text}ck").into(),
-        },
-        Change::AddIndex {
+        }),
+        Change::Index(IndexChange::AddIndex {
             table: name.clone(),
             name: format!("{text}ix").into(),
             index: Box::new(index),
             clustered: false,
-        },
-        Change::DropIndex {
+        }),
+        Change::Index(IndexChange::DropIndex {
             table: name.clone(),
             name: format!("{text}ix").into(),
-        },
+        }),
     ];
     if dialect.name() == "postgres" {
         for target in [
@@ -162,25 +162,27 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
             IndexPart::Unique(format!("{text}uq").into()),
             IndexPart::Index(format!("{text}ix").into()),
         ] {
-            changes.push(Change::SetIndexStorageParameters {
+            changes.push(Change::Index(IndexChange::SetIndexStorageParameters {
                 table: name.clone(),
                 target,
                 method: Default::default(),
                 set: [("fillfactor".into(), "80".into())].into(),
                 reset: Default::default(),
-            });
+            }));
         }
         for to in [
             ReplicaIdentity::Unique(format!("{text}uq").into()),
             ReplicaIdentity::Index(format!("{text}ix").into()),
         ] {
-            changes.push(Change::SetReplicaIdentity {
-                uid: table_uid.clone(),
-                table: name.clone(),
-                to: Some(to),
-            });
+            changes.push(Change::TableProperty(
+                TablePropertyChange::SetReplicaIdentity {
+                    uid: table_uid.clone(),
+                    table: name.clone(),
+                    to: Some(to),
+                },
+            ));
         }
-        changes.push(Change::DetachPartition {
+        changes.push(Change::Partition(PartitionChange::DetachPartition {
             uid: table_uid,
             table: name.clone(),
             parent,
@@ -200,7 +202,7 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
             })
             .collect(),
             shape: Box::new(table),
-        });
+        }));
     }
     let plan = SavedPlan::new(
         PlanOrigin::Database,
@@ -608,12 +610,12 @@ fn diff_matches_raw_local_names_and_keeps_their_shown_lookalikes_distinct() {
             (format!("{NAME}ix"), format!("{SHOWN}ix")),
         ] {
             assert!(changes.changes.iter().any(|p| matches!(&p.change,
-                Change::DropUnique { name, .. } | Change::DropForeignKey { name, .. } |
-                Change::DropCheck { name, .. } | Change::DropIndex { name, .. } if name.raw() == old
+                Change::Constraint(ConstraintChange::DropUnique { name, .. }) | Change::Constraint(ConstraintChange::DropForeignKey { name, .. }) |
+                Change::Constraint(ConstraintChange::DropCheck { name, .. }) | Change::Index(IndexChange::DropIndex { name, .. }) if name.raw() == old
             )), "{changes:?}");
             assert!(changes.changes.iter().any(|p| matches!(&p.change,
-                Change::AddUnique { name, .. } | Change::AddForeignKey { name, .. } |
-                Change::AddCheck { name, .. } | Change::AddIndex { name, .. } if name.raw() == new
+                Change::Constraint(ConstraintChange::AddUnique { name, .. }) | Change::Constraint(ConstraintChange::AddForeignKey { name, .. }) |
+                Change::Constraint(ConstraintChange::AddCheck { name, .. }) | Change::Index(IndexChange::AddIndex { name, .. }) if name.raw() == new
             )), "{changes:?}");
         }
     }

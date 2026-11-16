@@ -10,6 +10,7 @@
 //! statement, and the same read names the tables the validation scans.
 
 use pbps_db::{Conn, DbError, Param};
+use pbps_model::TypeValueChange;
 use pbps_model::{Change, ChangeSet, DomainDelta, DomainHalf, IdsFile, TypeRef};
 
 /// The domains a plan tightens and what the validation reads.
@@ -69,13 +70,13 @@ pub async fn census(
 ) -> Result<Tightened, DbError> {
     let mut out = Tightened::default();
     for planned in &changes.changes {
-        let Change::AlterDomain {
+        let Change::TypeValue(TypeValueChange::AlterDomain {
             uid,
             name,
             from,
             to,
             half: DomainHalf::Tighten,
-        } = &planned.change
+        }) = &planned.change
         else {
             continue;
         };

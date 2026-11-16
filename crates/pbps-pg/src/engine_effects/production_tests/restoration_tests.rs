@@ -1,5 +1,7 @@
 //! Restoration intent cannot replace the statement's actual output.
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::PartitionChange;
 use pbps_model::operation::{
     BoundInput, Incarnation, ObjectKey, Origin, Recorded, Source,
     symbolic::{Attribute, Clause, Facts, Property, Restoration},
@@ -20,7 +22,7 @@ fn inherited() -> Scene {
 }
 
 fn default(to: Option<&str>, fallback: Option<&str>) -> Change {
-    Change::SetPartitionDefault {
+    Change::Partition(PartitionChange::SetPartitionDefault {
         uid: "t_bbbbbb".parse().unwrap(),
         table: "app.a".parse().unwrap(),
         parent: "app.p".parse().unwrap(),
@@ -28,7 +30,7 @@ fn default(to: Option<&str>, fallback: Option<&str>) -> Change {
         from: Some("9".into()),
         to: to.map(str::to_owned),
         fallback: fallback.map(str::to_owned),
-    }
+    })
 }
 
 fn inspect(
@@ -99,12 +101,12 @@ fn a_partition_fallback_models_the_emitted_value_and_refuses_the_wrong_goal() {
     assert_eq!(restored(&clauses).value, facts::definition("3"));
 
     let steps: Vec<_> = [
-        Change::AlterColumnDefault {
+        Change::Column(ColumnChange::AlterColumnDefault {
             uid: "c_bbbbbb".parse().unwrap(),
             column: "app.p.d".parse().unwrap(),
             from: Some("1".into()),
             to: Some("7".into()),
-        },
+        }),
         attach(&s),
         change,
     ]
@@ -249,12 +251,12 @@ fn a_partition_not_null_restoration_checks_its_output_before_reusing_the_goal() 
         .get_mut("d")
         .unwrap()
         .not_null = true;
-    let change = Change::SetPartitionNotNull {
+    let change = Change::Partition(PartitionChange::SetPartitionNotNull {
         uid: "t_bbbbbb".parse().unwrap(),
         table: "app.a".parse().unwrap(),
         column: "d".into(),
         not_null: true,
-    };
+    });
     let clauses = inspect(&s, change.clone(), Origin::Whole(1), |f, key| {
         f.goal.cells.get_mut(key).unwrap().value =
             facts::value(Datum::NotNull(false), Ownership::Inherited);

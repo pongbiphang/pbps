@@ -1,12 +1,14 @@
 use super::*;
+use pbps_model::RoleChange;
+use pbps_model::TableChange;
 use pbps_model::{PlannedChange, TableName, Uid, UidKind};
 
 fn drop(name: &str, members: &[&str], salt: u32) -> PlannedChange {
-    PlannedChange::new(Change::DropRole {
+    PlannedChange::new(Change::Role(RoleChange::DropRole {
         uid: Uid::derived(UidKind::Role, name, salt),
         name: name.into(),
         members: members.iter().map(|m| (*m).into()).collect(),
-    })
+    }))
 }
 
 // The mixed-slot fixture deliberately includes changes irrelevant to role names.
@@ -16,7 +18,7 @@ fn names(changes: &ChangeSet) -> Vec<&str> {
         .changes
         .iter()
         .filter_map(|p| match &p.change {
-            Change::DropRole { name, .. } => Some(name.raw()),
+            Change::Role(RoleChange::DropRole { name, .. }) => Some(name.raw()),
             _ => None,
         })
         .collect()
@@ -71,11 +73,11 @@ fn role_depths_and_peer_order_match_the_legacy_sort_across_multiple_branches() {
 #[test]
 fn role_drops_leave_every_non_role_slot_and_payload_unchanged() {
     let other = |name: &str| {
-        PlannedChange::new(Change::DropTable {
+        PlannedChange::new(Change::Table(TableChange::DropTable {
             uid: Uid::derived(UidKind::Table, name, 0),
             name: TableName::new("dbo", name),
             detach_from: None,
-        })
+        }))
     };
     let plan = ChangeSet {
         changes: vec![

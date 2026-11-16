@@ -318,7 +318,8 @@ impl Schedule {
         context: &BTreeMap<pbps_model::Uid, String>,
     ) {
         for (at, p) in changes.changes.iter().enumerate() {
-            if let pbps_model::Change::CreateTable { uid, .. } = &p.change
+            if let pbps_model::Change::Table(pbps_model::TableChange::CreateTable { uid, .. }) =
+                &p.change
                 && let Some(reason) = context.get(uid)
             {
                 self.creation_contexts.insert(at, reason.clone());
@@ -782,9 +783,13 @@ pub fn reason(edge: &Edge, operations: &[Operation]) -> OrderReason {
                     operations.get(i).is_some_and(|op| {
                         matches!(
                             op.change(),
-                            pbps_model::Change::RenameTable { .. }
-                                | pbps_model::Change::RenameColumn { .. }
-                                | pbps_model::Change::RenameRole { .. }
+                            pbps_model::Change::Table(pbps_model::TableChange::RenameTable { .. })
+                                | pbps_model::Change::Column(
+                                    pbps_model::ColumnChange::RenameColumn { .. }
+                                )
+                                | pbps_model::Change::Role(
+                                    pbps_model::RoleChange::RenameRole { .. }
+                                )
                         )
                     })
                 };

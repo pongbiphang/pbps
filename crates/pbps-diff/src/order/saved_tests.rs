@@ -1,5 +1,10 @@
 use super::{ArtifactView, PlanView, admit, seal, singleton};
 use pbps_dialect::MinimalDialect;
+use pbps_model::ExtensionChange;
+use pbps_model::IndexChange;
+use pbps_model::RoleChange;
+use pbps_model::SearchChange;
+use pbps_model::TypeValueChange;
 use pbps_model::{
     Change, ChangeSet, IdsFile, PlanBaseline, PlanMode, PlanOrigin, PlannedChange, SavedPlan,
 };
@@ -17,10 +22,10 @@ fn wire() -> SavedPlan {
             time_zone: None,
         },
         ChangeSet {
-            changes: vec![PlannedChange::new(Change::CreateRole {
+            changes: vec![PlannedChange::new(Change::Role(RoleChange::CreateRole {
                 uid: "r_aaaaaa".parse().unwrap(),
                 name: "reader".into(),
-            })],
+            }))],
         },
         IdsFile::default(),
     )
@@ -173,9 +178,9 @@ fn rebuild_parts_without_an_intent_record_are_still_refused_at_admission() {
     use super::rebuild_tests::fixture as recipe_fixture;
     for change in changes
         .into_iter()
-        .chain([Change::BuildPartitionedIndex(Box::new(
+        .chain([Change::Index(IndexChange::BuildPartitionedIndex(Box::new(
             recipe_fixture::index_recipe(),
-        ))])
+        )))])
     {
         let name = change.table().unwrap().shown().to_string();
         let mut plan = wire();
@@ -198,12 +203,12 @@ fn rebuild_step(uid: &str, tmp: &str, step: pbps_model::EnumRebuildStep) -> (Ids
         types: [("y_000001".parse().unwrap(), name.clone())].into(),
         ..Default::default()
     };
-    let change = Change::EnumRebuild {
+    let change = Change::TypeValue(TypeValueChange::EnumRebuild {
         uid,
         name,
         tmp: tmp.parse().unwrap(),
         step,
-    };
+    });
     (ids, change)
 }
 
@@ -254,18 +259,18 @@ fn package_plan() -> SavedPlan {
     };
     let mut plan = wire();
     plan.changes.changes = vec![
-        PlannedChange::new(Change::CreateExtension {
+        PlannedChange::new(Change::Extension(ExtensionChange::CreateExtension {
             uid: "e_000001".parse().unwrap(),
             name: "cube".into(),
             definition: definition.clone(),
             requires: Default::default(),
-        }),
-        PlannedChange::new(Change::CreateExtension {
+        })),
+        PlannedChange::new(Change::Extension(ExtensionChange::CreateExtension {
             uid: "e_000002".parse().unwrap(),
             name: "earthdistance".into(),
             definition: definition.clone(),
             requires: ["e_000001".parse().unwrap()].into(),
-        }),
+        })),
     ];
     plan.ids.extensions = [
         ("e_000001".parse().unwrap(), "cube".into()),
@@ -321,12 +326,16 @@ fn every_create_has_exactly_its_own_pin_and_every_pin_its_create() {
             p.ids.extensions.remove(&"e_000001".parse().unwrap());
         }),
         ("an edge to a package the plan does not create", |p| {
-            if let Change::CreateExtension { requires, .. } = &mut p.changes.changes[1].change {
+            if let Change::Extension(ExtensionChange::CreateExtension { requires, .. }) =
+                &mut p.changes.changes[1].change
+            {
                 requires.insert("e_000009".parse().unwrap());
             }
         }),
         ("an edge to itself", |p| {
-            if let Change::CreateExtension { requires, .. } = &mut p.changes.changes[0].change {
+            if let Change::Extension(ExtensionChange::CreateExtension { requires, .. }) =
+                &mut p.changes.changes[0].change
+            {
                 requires.insert("e_000001".parse().unwrap());
             }
         }),
@@ -367,7 +376,7 @@ fn drop_plan() -> SavedPlan {
     };
     let mut plan = wire();
     plan.changes.changes = vec![
-        PlannedChange::new(Change::DropExtension {
+        PlannedChange::new(Change::Extension(ExtensionChange::DropExtension {
             uid: "e_000002".parse().unwrap(),
             name: "earthdistance".into(),
             definition: definition.clone(),
@@ -375,8 +384,8 @@ fn drop_plan() -> SavedPlan {
             releases: Default::default(),
             index_releases: Default::default(),
             search_releases: Default::default(),
-        }),
-        PlannedChange::new(Change::DropExtension {
+        })),
+        PlannedChange::new(Change::Extension(ExtensionChange::DropExtension {
             uid: "e_000001".parse().unwrap(),
             name: "cube".into(),
             definition: definition.clone(),
@@ -384,7 +393,7 @@ fn drop_plan() -> SavedPlan {
             releases: Default::default(),
             index_releases: Default::default(),
             search_releases: Default::default(),
-        }),
+        })),
     ];
     plan.ids.tombstones = [("e_000001", "cube"), ("e_000002", "earthdistance")]
         .into_iter()
@@ -460,7 +469,9 @@ fn every_drop_has_exactly_its_own_pin_a_tombstone_and_the_requirers_it_waits_for
                 .insert("e_000001".parse().unwrap(), "cube".into());
         }),
         ("a requirer the plan does not drop", |p| {
-            if let Change::DropExtension { requirers, .. } = &mut p.changes.changes[1].change {
+            if let Change::Extension(ExtensionChange::DropExtension { requirers, .. }) =
+                &mut p.changes.changes[1].change
+            {
                 requirers.insert("e_000009".parse().unwrap());
             }
         }),
@@ -506,20 +517,20 @@ fn update_plan() -> SavedPlan {
     };
     let mut plan = wire();
     plan.changes.changes = vec![
-        PlannedChange::new(Change::CreateExtension {
+        PlannedChange::new(Change::Extension(ExtensionChange::CreateExtension {
             uid: "e_000001".parse().unwrap(),
             name: "cube".into(),
             definition: at("1.5"),
             requires: Default::default(),
-        }),
-        PlannedChange::new(Change::UpdateExtension {
+        })),
+        PlannedChange::new(Change::Extension(ExtensionChange::UpdateExtension {
             uid: "e_000002".parse().unwrap(),
             name: "earthdistance".into(),
             from: at("1.1"),
             to: at("1.3"),
             requires: ["e_000001".parse().unwrap()].into(),
             releases: Default::default(),
-        }),
+        })),
     ];
     plan.ids.extensions = [("e_000001", "cube"), ("e_000002", "earthdistance")]
         .into_iter()
@@ -593,7 +604,9 @@ fn every_update_has_exactly_its_own_pin_a_path_and_the_packages_it_requires() {
                 .insert("e_000002".parse().unwrap(), "other".into());
         }),
         ("another schema for the whole update", |p| {
-            if let Change::UpdateExtension { to, .. } = &mut p.changes.changes[1].change {
+            if let Change::Extension(ExtensionChange::UpdateExtension { to, .. }) =
+                &mut p.changes.changes[1].change
+            {
                 to.schema = "other".into();
             }
             p.extension_changes[0].to.schema = "other".into();
@@ -666,24 +679,28 @@ fn move_plan(with_update: bool) -> SavedPlan {
     if with_update {
         plan.changes
             .changes
-            .push(PlannedChange::new(Change::UpdateExtension {
-                uid: uid.clone(),
-                name: "earthdistance".into(),
-                from: at("ext", first),
-                to: at("ext", last),
-                requires: Default::default(),
-                releases: Default::default(),
-            }));
+            .push(PlannedChange::new(Change::Extension(
+                ExtensionChange::UpdateExtension {
+                    uid: uid.clone(),
+                    name: "earthdistance".into(),
+                    from: at("ext", first),
+                    to: at("ext", last),
+                    requires: Default::default(),
+                    releases: Default::default(),
+                },
+            )));
     }
     plan.changes
         .changes
-        .push(PlannedChange::new(Change::SetExtensionSchema {
-            uid: uid.clone(),
-            name: "earthdistance".into(),
-            from: at("ext", last),
-            to: at("app", last),
-            releases: Default::default(),
-        }));
+        .push(PlannedChange::new(Change::Extension(
+            ExtensionChange::SetExtensionSchema {
+                uid: uid.clone(),
+                name: "earthdistance".into(),
+                from: at("ext", last),
+                to: at("app", last),
+                releases: Default::default(),
+            },
+        )));
     plan.ids.extensions = [(uid.clone(), "earthdistance".into())].into();
     plan.extension_changes = vec![pbps_model::ExtensionChangePin {
         uid,
@@ -726,12 +743,16 @@ fn every_move_has_one_pin_over_its_whole_chain_and_each_drift_is_refused() {
             p.extension_changes[0].path = vec!["1.3".into()];
         }),
         ("a move that changes the version", false, |p| {
-            if let Change::SetExtensionSchema { to, .. } = &mut p.changes.changes[0].change {
+            if let Change::Extension(ExtensionChange::SetExtensionSchema { to, .. }) =
+                &mut p.changes.changes[0].change
+            {
                 to.version = "1.4".into();
             }
         }),
         ("a move that stays in its schema", false, |p| {
-            if let Change::SetExtensionSchema { to, .. } = &mut p.changes.changes[0].change {
+            if let Change::Extension(ExtensionChange::SetExtensionSchema { to, .. }) =
+                &mut p.changes.changes[0].change
+            {
                 to.schema = "ext".into();
             }
         }),
@@ -746,7 +767,9 @@ fn every_move_has_one_pin_over_its_whole_chain_and_each_drift_is_refused() {
             "a move that starts elsewhere than the update ends",
             true,
             |p| {
-                if let Change::SetExtensionSchema { from, .. } = &mut p.changes.changes[1].change {
+                if let Change::Extension(ExtensionChange::SetExtensionSchema { from, .. }) =
+                    &mut p.changes.changes[1].change
+                {
                     from.version = "1.2".into();
                 }
             },
@@ -788,12 +811,12 @@ fn with_search(change: Change, ids: IdsFile) -> SavedPlan {
 }
 
 fn create_search(uid: &str, name: &str) -> Change {
-    Change::CreateSearch {
+    Change::Search(SearchChange::CreateSearch {
         uid: uid.parse().unwrap(),
         name: name.parse().unwrap(),
         definition: Box::new(dictionary()),
         unresolved: Vec::new(),
-    }
+    })
 }
 
 /// A saved plan's text search payload is held to the identity mapping it carries: a create
@@ -833,11 +856,11 @@ fn admission_holds_text_search_payloads_to_the_identity_mapping() {
         );
     }
     // A drop of an identity the plan still records is a lie about the declarations.
-    let drop = Change::DropSearch {
+    let drop = Change::Search(SearchChange::DropSearch {
         uid: "s_aaaaaa".parse().unwrap(),
         name,
         definition: Box::new(dictionary()),
-    };
+    });
     let error = admit_text(with_search(drop.clone(), ids))
         .unwrap_err()
         .to_string();

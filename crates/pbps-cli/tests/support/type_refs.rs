@@ -3334,20 +3334,14 @@ fn generated_expression_replacement_rechecks_domains_on_18_and_is_refused_on_16(
             let path = plan(&d, db);
             let saved: pbps_model::SavedPlan =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            assert!(
-                saved
-                    .changes
-                    .changes
-                    .iter()
-                    .any(|p| matches!(p.change, pbps_model::Change::AlterColumnExpression { .. }))
-            );
-            assert!(
-                !saved
-                    .changes
-                    .changes
-                    .iter()
-                    .any(|p| matches!(p.change, pbps_model::Change::AddColumn { .. }))
-            );
+            assert!(saved.changes.changes.iter().any(|p| matches!(
+                p.change,
+                pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnExpression { .. })
+            )));
+            assert!(!saved.changes.changes.iter().any(|p| matches!(
+                p.change,
+                pbps_model::Change::Column(pbps_model::ColumnChange::AddColumn { .. })
+            )));
             succeeds(approved_apply(&d, db, &path, &["--allow", "narrowing"]));
             assert_eq!(scalar(db, "SELECT last_value::bigint FROM app.calls"), 2);
         }
@@ -3404,11 +3398,10 @@ fn existing_type_eligibility_covers_metadata_scans_rebuilds_and_baseline_only_re
             let saved: pbps_model::SavedPlan =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             assert!(
-                !saved
-                    .changes
-                    .changes
-                    .iter()
-                    .any(|p| matches!(p.change, pbps_model::Change::AddColumn { .. })),
+                !saved.changes.changes.iter().any(|p| matches!(
+                    p.change,
+                    pbps_model::Change::Column(pbps_model::ColumnChange::AddColumn { .. })
+                )),
                 "{case}"
             );
             succeeds(approved_apply(
@@ -3457,20 +3450,14 @@ fn an_existing_reference_cannot_be_unpinned_from_a_saved_default_change() {
         let path = plan(&d, db);
         let mut saved: pbps_model::SavedPlan =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert!(
-            saved
-                .changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, pbps_model::Change::AlterColumnDefault { .. }))
-        );
-        assert!(
-            !saved
-                .changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, pbps_model::Change::AddColumn { .. }))
-        );
+        assert!(saved.changes.changes.iter().any(|p| matches!(
+            p.change,
+            pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnDefault { .. })
+        )));
+        assert!(!saved.changes.changes.iter().any(|p| matches!(
+            p.change,
+            pbps_model::Change::Column(pbps_model::ColumnChange::AddColumn { .. })
+        )));
         saved.type_pins.clear();
         std::fs::write(&path, serde_json::to_vec_pretty(&saved).unwrap()).unwrap();
         let out = apply_plan(&d, db, &path, false);

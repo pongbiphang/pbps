@@ -1,4 +1,6 @@
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::ModuleChange;
 #[path = "../../../pbps-diff/tests/fixtures/creation2469.rs"]
 pub(crate) mod fixture;
 use fixture::Fixture;
@@ -67,13 +69,18 @@ fn only_checked_current_annotation_order_discharges_the_class_order_guard() {
         .changes()
         .changes
         .iter()
-        .position(|p| matches!(p.change, Change::CreateModule { .. }))
+        .position(|p| matches!(p.change, Change::Module(ModuleChange::CreateModule { .. })))
         .unwrap();
     let owner = input
         .changes()
         .changes
         .iter()
-        .position(|p| matches!(p.change, Change::AddComputedColumn { .. }))
+        .position(|p| {
+            matches!(
+                p.change,
+                Change::Column(ColumnChange::AddComputedColumn { .. })
+            )
+        })
         .unwrap();
     reverse.edge(
         owner,
@@ -100,23 +107,30 @@ fn a_changed_alias_or_a_removed_function_never_gains_the_new_capability() {
         .changes
         .iter()
         .find_map(|p| {
-            if let Change::CreateModule { module, .. } = &p.change {
+            if let Change::Module(ModuleChange::CreateModule { module, .. }) = &p.change {
                 Some(module.clone())
             } else {
                 None
             }
         })
         .unwrap();
-    steps.changes.push(PlannedChange::new(Change::CreateModule {
-        id: "app.F".parse().unwrap(),
-        module,
-    }));
+    steps.changes.push(PlannedChange::new(Change::Module(
+        ModuleChange::CreateModule {
+            id: "app.F".parse().unwrap(),
+            module,
+        },
+    )));
     let mut alike = observed(&steps, &f.schema);
     alike.0.insert(("f".into(), "F".into()));
     let owner = steps
         .changes
         .iter()
-        .position(|p| matches!(p.change, Change::AddComputedColumn { .. }))
+        .position(|p| {
+            matches!(
+                p.change,
+                Change::Column(ColumnChange::AddComputedColumn { .. })
+            )
+        })
         .unwrap();
     assert!(
         refuse_added_calls_with(
@@ -132,12 +146,12 @@ fn a_changed_alias_or_a_removed_function_never_gains_the_new_capability() {
     let install = removed
         .changes
         .iter_mut()
-        .find(|p| matches!(p.change, Change::CreateModule { .. }))
+        .find(|p| matches!(p.change, Change::Module(ModuleChange::CreateModule { .. })))
         .unwrap();
-    install.change = Change::DropModule {
+    install.change = Change::Module(ModuleChange::DropModule {
         id: "app.f".parse().unwrap(),
         kind: pbps_model::ModuleKind::Function,
-    };
+    });
     assert!(
         refuse_added_calls(
             &removed,

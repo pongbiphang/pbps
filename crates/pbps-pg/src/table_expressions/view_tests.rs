@@ -3,6 +3,7 @@
 //! reasons, for a trusted routine, an untrusted one and a constant call.
 
 use pbps_db::{Conn, Driver};
+use pbps_model::ConstraintChange;
 use pbps_model::{Change, CheckConstraint, ObjectLocalName, RoleName, TableName};
 
 use super::{Moment, Vetted, vet_change};
@@ -187,13 +188,13 @@ async fn vet(
 }
 
 fn add_check(expression: &str) -> Change {
-    Change::AddCheck {
+    Change::Constraint(ConstraintChange::AddCheck {
         table: TableName::new("app", "t"),
         name: ObjectLocalName::new("ck"),
         constraint: CheckConstraint {
             expression: expression.to_owned(),
         },
-    }
+    })
 }
 
 /// What the binder says about a CHECK, as a role that holds `USAGE` on the

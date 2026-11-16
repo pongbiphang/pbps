@@ -7,6 +7,10 @@
 use super::connect_live;
 use indexmap::IndexMap;
 use pbps_db::Conn;
+use pbps_model::ConstraintChange;
+use pbps_model::ModuleChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
 use pbps_model::{
     Change, ChangeSet, Column, ComputedColumn, IdsFile, Module, ModuleDeps, ModuleId, ModuleKind,
     PlannedChange, RoutineId, Table, TableName, Uid, UidKind,
@@ -65,13 +69,13 @@ fn table(table: &str, spec: impl FnOnce(&mut Table)) -> Change {
         ..Default::default()
     };
     spec(&mut made);
-    Change::CreateTable {
+    Change::Table(TableChange::CreateTable {
         uid: Uid::derived(UidKind::Table, table, 0),
         name: name(table),
         table: Box::new(made),
         beside_default: None,
         moves_at_most: None,
-    }
+    })
 }
 
 fn computed(expression: &str) -> ComputedColumn {
@@ -89,7 +93,7 @@ fn module(kind: ModuleKind, id: &str, definition: &str) -> Change {
             ModuleId::Routine(RoutineId::new(name(id), Vec::new()))
         }
     };
-    Change::CreateModule {
+    Change::Module(ModuleChange::CreateModule {
         id,
         module: Box::new(Module {
             kind,
@@ -97,7 +101,7 @@ fn module(kind: ModuleKind, id: &str, definition: &str) -> Change {
             description: None,
             options: Default::default(),
         }),
-    }
+    })
 }
 
 fn reconstruction(
@@ -107,7 +111,7 @@ fn reconstruction(
     // The identities the declarations record: a split default names its column.
     let mut declared = pbps_model::Schema::default();
     for change in &changes {
-        if let Change::CreateTable { name, table, .. } = change {
+        if let Change::Table(TableChange::CreateTable { name, table, .. }) = change {
             declared.tables.insert(name.clone(), (**table).clone());
         }
     }
@@ -317,7 +321,7 @@ async fn a_seed_row_beside_a_split_computed_column_is_skipped_and_compiles() {
                     t.computed.insert("c".into(), computed("app.f(v)"));
                 }),
                 module(ModuleKind::Function, "f", FUNCTION),
-                Change::InsertRow {
+                Change::Row(RowChange::InsertRow {
                     table: TableName::new("app", "t"),
                     key_column: "id".into(),
                     identity_key: false,
@@ -325,7 +329,7 @@ async fn a_seed_row_beside_a_split_computed_column_is_skipped_and_compiles() {
                     defaults: Default::default(),
                     types: Default::default(),
                     row: Default::default(),
-                },
+                }),
             ],
         )
         .await
@@ -693,7 +697,7 @@ async fn a_primary_key_and_foreign_key_over_computed_columns_compile_in_either_t
             if child_first {
                 changes.reverse();
             }
-            changes.push(Change::AddForeignKey {
+            changes.push(Change::Constraint(ConstraintChange::AddForeignKey {
                 table: name("child"),
                 name: "fk_child".into(),
                 constraint: Box::new(pbps_model::ForeignKey {
@@ -703,9 +707,9 @@ async fn a_primary_key_and_foreign_key_over_computed_columns_compile_in_either_t
                     on_delete: Default::default(),
                     on_update: Default::default(),
                 }),
-            });
+            }));
             // The other end alone: a plain column referencing the computed key.
-            changes.push(Change::AddForeignKey {
+            changes.push(Change::Constraint(ConstraintChange::AddForeignKey {
                 table: name("child"),
                 name: "fk_to_key".into(),
                 constraint: Box::new(pbps_model::ForeignKey {
@@ -715,7 +719,7 @@ async fn a_primary_key_and_foreign_key_over_computed_columns_compile_in_either_t
                     on_delete: Default::default(),
                     on_update: Default::default(),
                 }),
-            });
+            }));
             changes.push(module(ModuleKind::Function, "f", FUNCTION));
             compile(&mut conn, changes).await.unwrap();
             let layout = if clustered.is_some() {
@@ -918,7 +922,7 @@ async fn names_that_only_look_like_a_read_or_a_call_make_no_cycle() {
     case("alike_d", |mut conn| async move {
         // `c` calls `other.f`; `app.f` shares the leaf name and reads `c`.
         conn.execute("CREATE SCHEMA other;").await.unwrap();
-        let other = Change::CreateModule {
+        let other = Change::Module(ModuleChange::CreateModule {
             id: ModuleId::Routine(RoutineId::new(TableName::new("other", "f"), Vec::new())),
             module: Box::new(Module {
                 kind: ModuleKind::Function,
@@ -926,7 +930,7 @@ async fn names_that_only_look_like_a_read_or_a_call_make_no_cycle() {
                 description: None,
                 options: Default::default(),
             }),
-        };
+        });
         compile(
             &mut conn,
             vec![
@@ -1006,7 +1010,7 @@ async fn a_mid_table_computed_column_keeps_the_target_s_column_positions() {
 
 fn bound_view(id: &str, definition: &str) -> Change {
     let mut change = module(ModuleKind::View, id, definition);
-    if let Change::CreateModule { module, .. } = &mut change {
+    if let Change::Module(ModuleChange::CreateModule { module, .. }) = &mut change {
         module.options.schemabinding = true;
     }
     change

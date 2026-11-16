@@ -850,12 +850,12 @@ mod tests {
     }
 
     fn create_change(name: &str, definition: SearchObject) -> pbps_model::Change {
-        pbps_model::Change::CreateSearch {
+        pbps_model::Change::Search(pbps_model::SearchChange::CreateSearch {
             uid: "s_aaaaaa".parse().unwrap(),
             name: name.parse().unwrap(),
             definition: Box::new(definition),
             unresolved: Vec::new(),
-        }
+        })
     }
 
     /// A dictionary is one `CREATE` that names its template and writes each option as a
@@ -941,11 +941,13 @@ mod tests {
                     mappings: Default::default(),
                 }
             };
-            let sql = emitted(&pbps_model::Change::DropSearch {
-                uid: "s_aaaaaa".parse().unwrap(),
-                name: name.parse().unwrap(),
-                definition: Box::new(object),
-            });
+            let sql = emitted(&pbps_model::Change::Search(
+                pbps_model::SearchChange::DropSearch {
+                    uid: "s_aaaaaa".parse().unwrap(),
+                    name: name.parse().unwrap(),
+                    definition: Box::new(object),
+                },
+            ));
             assert_eq!(sql.len(), 1);
             let expected = format!(
                 "DROP TEXT SEARCH {word} \"app\".\"{}\" RESTRICT;",

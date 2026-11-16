@@ -20,6 +20,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::Dialect;
+use pbps_model::TypeValueChange;
 use pbps_model::{
     Change, ColumnType, EnumRebuildStep, Hints, ManagedType, TypeRef, Uid, ValueChange,
 };
@@ -85,14 +86,14 @@ pub(crate) fn plan(
     // The enums rebuilt: replacement, labels removed, and where it is created.
     let mut rebuilt: BTreeMap<Uid, Replaced> = BTreeMap::new();
     for change in enum_steps {
-        if let Change::EnumRebuild {
+        if let Change::TypeValue(TypeValueChange::EnumRebuild {
             uid,
             tmp,
             step: EnumRebuildStep::Create {
                 removed, ordinal, ..
             },
             ..
-        } = change
+        }) = change
         {
             rebuilt.insert(
                 uid.clone(),
@@ -117,8 +118,8 @@ pub(crate) fn plan(
     // its default or a check may name a label they rename or add.
     let mut label_operations: BTreeMap<Uid, usize> = BTreeMap::new();
     for change in enum_steps {
-        if let Change::AddEnumValue { uid, ordinal, .. }
-        | Change::RenameEnumValue { uid, ordinal, .. } = change
+        if let Change::TypeValue(TypeValueChange::AddEnumValue { uid, ordinal, .. })
+        | Change::TypeValue(TypeValueChange::RenameEnumValue { uid, ordinal, .. }) = change
         {
             let seen = label_operations.entry(uid.clone()).or_default();
             *seen = (*seen).max(ordinal + 1);
@@ -406,7 +407,9 @@ pub(crate) fn plan(
                 },
             ) {
                 Ok(steps) => {
-                    if let Some(Change::EnumRebuild { tmp, .. }) = steps.first() {
+                    if let Some(Change::TypeValue(TypeValueChange::EnumRebuild { tmp, .. })) =
+                        steps.first()
+                    {
                         rebuilt.insert(
                             d.uid.clone(),
                             Replaced {
@@ -455,6 +458,7 @@ struct Replaced {
 mod tests {
     use super::*;
     use pbps_dialect::{MinimalDialect, TypeChangeRisk};
+    use pbps_model::TypeValueChange;
     use pbps_model::{Column, ColumnRef, IdsFile, Schema, Table, TableName, UidKind};
 
     /// A dialect that converts every pair of built-in bases but one with an
@@ -602,7 +606,9 @@ mod tests {
             .changes
             .iter()
             .filter_map(|c| match c {
-                Change::EnumRebuild { uid, step, .. } if uid == of => Some(step.clone()),
+                Change::TypeValue(TypeValueChange::EnumRebuild { uid, step, .. }) if uid == of => {
+                    Some(step.clone())
+                }
                 _ => None,
             })
             .collect()
@@ -810,10 +816,10 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::EnumRebuild {
+                Change::TypeValue(TypeValueChange::EnumRebuild {
                     step: EnumRebuildStep::Swap { depth, .. },
                     ..
-                } => Some(*depth),
+                }) => Some(*depth),
                 _ => None,
             })
             .collect()
@@ -886,7 +892,7 @@ mod tests {
             .collect::<String>();
         assert!(said.contains("renamed or moved in this plan"), "{said}");
         assert!(out.changes.iter().all(|c| match c {
-            Change::EnumRebuild { uid: u, .. } => *u != uid(2),
+            Change::TypeValue(TypeValueChange::EnumRebuild { uid: u, .. }) => *u != uid(2),
             _ => true,
         }));
         let mut kept = over("app.d");
@@ -904,10 +910,10 @@ mod tests {
             .changes
             .iter()
             .filter_map(|c| match c {
-                Change::EnumRebuild {
+                Change::TypeValue(TypeValueChange::EnumRebuild {
                     step: EnumRebuildStep::Retype { column, values, .. },
                     ..
-                } => Some((
+                }) => Some((
                     column.name.raw().to_owned(),
                     match values.as_ref() {
                         ValueChange::Cast { from, to, .. } if from != to => {
@@ -927,13 +933,13 @@ mod tests {
             .changes
             .iter()
             .filter_map(|c| match c {
-                Change::EnumRebuild {
+                Change::TypeValue(TypeValueChange::EnumRebuild {
                     step:
                         EnumRebuildStep::Retype {
                             column, values, to, ..
                         },
                     ..
-                } => {
+                }) => {
                     let arrays = match values.as_ref() {
                         ValueChange::Cast { arrays, .. } => *arrays,
                         ValueChange::Relabel { .. } => {
@@ -942,11 +948,11 @@ mod tests {
                             for _ in 0..=rebuilt.changes.len() {
                                 arrays += usize::from(ty.is_array());
                                 let next = rebuilt.changes.iter().find_map(|c| match c {
-                                    Change::EnumRebuild {
+                                    Change::TypeValue(TypeValueChange::EnumRebuild {
                                         name,
                                         step: EnumRebuildStep::Create { definition, .. },
                                         ..
-                                    } if Some(name) == ty.type_ref() => match &**definition {
+                                    }) if Some(name) == ty.type_ref() => match &**definition {
                                         ManagedType::Domain { base, .. } => Some(base),
                                         _ => None,
                                     },
@@ -995,10 +1001,10 @@ mod tests {
         // A built-in root: the derived column rides the assignment cast too.
         assert!(out.changes.iter().any(|c| matches!(
             c,
-            Change::EnumRebuild {
+            Change::TypeValue(TypeValueChange::EnumRebuild {
                 step: EnumRebuildStep::Retype { column, values, .. },
                 ..
-            } if column.name.raw() == "w" && matches!(values.as_ref(), ValueChange::Cast { .. })
+            }) if column.name.raw() == "w" && matches!(values.as_ref(), ValueChange::Cast { .. })
         )));
         // Through a third level, the same pair.
         let deeper = |base: &str| {
@@ -1015,11 +1021,11 @@ mod tests {
             .changes
             .iter()
             .filter_map(|c| match c {
-                Change::EnumRebuild {
+                Change::TypeValue(TypeValueChange::EnumRebuild {
                     uid: u,
                     step: EnumRebuildStep::Create { .. },
                     ..
-                } => Some(u.clone()),
+                }) => Some(u.clone()),
                 _ => None,
             })
             .collect();
@@ -1148,10 +1154,10 @@ mod tests {
         // root's do.
         assert!(out.changes.iter().any(|c| matches!(
             c,
-            Change::EnumRebuild {
+            Change::TypeValue(TypeValueChange::EnumRebuild {
                 step: EnumRebuildStep::Retype { column, values, .. },
                 ..
-            } if column.name.raw() == "w" && matches!(values.as_ref(), ValueChange::Cast { .. })
+            }) if column.name.raw() == "w" && matches!(values.as_ref(), ValueChange::Cast { .. })
         )));
         // An array link: the pair stays of the element types and the
         // columns' values are arrays of them, which the shape says
@@ -1286,13 +1292,17 @@ mod tests {
                 .changes
                 .iter()
                 .map(|p| match &p.change {
-                    Change::RenameEnumValue { uid, .. } => format!("rename {uid}"),
-                    Change::AddEnumValue { uid, .. } => format!("add {uid}"),
-                    Change::EnumRebuild {
+                    Change::TypeValue(TypeValueChange::RenameEnumValue { uid, .. }) => {
+                        format!("rename {uid}")
+                    }
+                    Change::TypeValue(TypeValueChange::AddEnumValue { uid, .. }) => {
+                        format!("add {uid}")
+                    }
+                    Change::TypeValue(TypeValueChange::EnumRebuild {
                         uid,
                         step: EnumRebuildStep::Create { .. },
                         ..
-                    } => format!("create {uid}"),
+                    }) => format!("create {uid}"),
                     _ => "other".to_owned(),
                 })
                 .collect()
@@ -1380,10 +1390,10 @@ mod tests {
         assert_eq!(out.uids.get(&uid(2)), Some(&Why::Array));
         assert!(out.changes.iter().any(|c| matches!(
             c,
-            Change::EnumRebuild {
+            Change::TypeValue(TypeValueChange::EnumRebuild {
                 step: EnumRebuildStep::Create { ordinal: 0, .. },
                 ..
-            }
+            })
         )));
     }
 
@@ -1408,11 +1418,11 @@ mod tests {
         assert!(
             out.changes.iter().any(|c| matches!(
                 c,
-                Change::EnumRebuild {
+                Change::TypeValue(TypeValueChange::EnumRebuild {
                     uid: u,
                     step: EnumRebuildStep::Create { ordinal: 1, .. },
                     ..
-                } if *u == uid(2)
+                }) if *u == uid(2)
             )),
             "{:?}",
             out.changes
@@ -1465,10 +1475,10 @@ mod tests {
             "{arrays:?}"
         );
         for change in &out.changes {
-            if let Change::EnumRebuild {
+            if let Change::TypeValue(TypeValueChange::EnumRebuild {
                 step: EnumRebuildStep::Retype { array, values, .. },
                 ..
-            } = change
+            }) = change
             {
                 assert!(!array, "none of these columns is itself `[]`");
                 assert!(
@@ -1529,10 +1539,10 @@ mod tests {
             .changes
             .iter()
             .filter_map(|c| match c {
-                Change::EnumRebuild {
+                Change::TypeValue(TypeValueChange::EnumRebuild {
                     step: EnumRebuildStep::Retype { column, values, .. },
                     ..
-                } => Some((
+                }) => Some((
                     column.name.raw().to_owned(),
                     matches!(values.as_ref(), ValueChange::Cast { .. }),
                 )),

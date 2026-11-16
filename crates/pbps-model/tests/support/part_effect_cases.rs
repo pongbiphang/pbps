@@ -2,6 +2,7 @@
 //! product APIs: test fixtures must not become another source of model facts.
 
 use pbps_model::Change;
+use pbps_model::IndexChange;
 #[path = "rebuild.rs"]
 mod rebuild;
 
@@ -28,7 +29,9 @@ pub fn cases() -> Vec<(String, Change)> {
         )
         .chain(std::iter::once((
             "BuildPartitionedIndex".into(),
-            Change::BuildPartitionedIndex(Box::new(rebuild::index_recipe())),
+            Change::Index(IndexChange::BuildPartitionedIndex(Box::new(
+                rebuild::index_recipe(),
+            ))),
         )))
         .collect()
 }

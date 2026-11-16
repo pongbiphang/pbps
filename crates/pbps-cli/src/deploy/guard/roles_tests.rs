@@ -1,5 +1,9 @@
 use super::{Plan, Read, Staged};
 use crate::deploy::{StagedRead, refuse_pinned_movement};
+use pbps_model::ColumnChange;
+use pbps_model::GrantChange;
+use pbps_model::PartitionChange;
+use pbps_model::RoleChange;
 use pbps_model::{
     Change, ChangeSet, GrantTarget, IdsFile, Permission, PlannedChange, Role, Schema,
 };
@@ -38,19 +42,19 @@ fn changes(steps: Vec<Change>) -> ChangeSet {
 }
 
 fn rename(uid: &str, from: &str, to: &str) -> Change {
-    Change::RenameRole {
+    Change::Role(RoleChange::RenameRole {
         uid: uid.parse().unwrap(),
         from: from.into(),
         to: to.into(),
-    }
+    })
 }
 
 fn drop_role(uid: &str, name: &str) -> Change {
-    Change::DropRole {
+    Change::Role(RoleChange::DropRole {
         uid: uid.parse().unwrap(),
         name: name.into(),
         members: vec![],
-    }
+    })
 }
 
 fn ids(roles: &[(&str, &str)]) -> IdsFile {
@@ -98,15 +102,15 @@ fn a_replacement_role_starts_without_the_retired_holders_grants() {
     use Permission::{Insert, Select};
     let cs = changes(vec![
         drop_role("r_aaaaaa", "a"),
-        Change::CreateRole {
+        Change::Role(RoleChange::CreateRole {
             uid: "r_bbbbbb".parse().unwrap(),
             name: "a".into(),
-        },
-        Change::Grant {
+        }),
+        Change::Permission(GrantChange::Grant {
             role: "a".into(),
             target: GrantTarget::Schema("dbo".into()),
             permissions: [Select].into(),
-        },
+        }),
     ]);
     let ids = ids(&[("r_bbbbbb", "a")]);
     let before = schema(&[("a", &[Insert])]);
@@ -121,15 +125,15 @@ fn a_new_role_at_a_vacated_name_is_not_forwarded_through_the_old_rename() {
     use Permission::{Insert, Select};
     let cs = changes(vec![
         rename("r_aaaaaa", "a", "b"),
-        Change::CreateRole {
+        Change::Role(RoleChange::CreateRole {
             uid: "r_bbbbbb".parse().unwrap(),
             name: "a".into(),
-        },
-        Change::Grant {
+        }),
+        Change::Permission(GrantChange::Grant {
             role: "a".into(),
             target: GrantTarget::Schema("dbo".into()),
             permissions: [Insert].into(),
-        },
+        }),
     ]);
     let ids = ids(&[("r_aaaaaa", "b"), ("r_bbbbbb", "a")]);
     let before = schema(&[("a", &[Select])]);
@@ -208,7 +212,7 @@ fn staged_role_reads_keep_grants_at_the_observed_boundary() {
     // Membership removal precedes DROP ROLE; retiring the planned UID must
     // not hide permission movement while the role is still observed.
     let mut step = drop_role("r_aaaaaa", "a");
-    if let Change::DropRole { members, .. } = &mut step {
+    if let Change::Role(RoleChange::DropRole { members, .. }) = &mut step {
         members.push("member".into());
     }
     let dropped = changes(vec![step]);
@@ -298,11 +302,11 @@ fn serial_usage_readback_tracks_the_union_and_refuses_missing_or_unplanned_acces
                 ..Default::default()
             },
         );
-        let cs = changes(vec![Change::Revoke {
+        let cs = changes(vec![Change::Permission(GrantChange::Revoke {
             role: "writer".into(),
             target: target.parse().unwrap(),
             permissions: [Permission::Insert].into(),
-        }]);
+        })]);
         let mut ids = ids(&[("r_aaaaaa", "writer")]);
         ids.tables
             .insert("t_aaaaaa".parse().unwrap(), "dbo.t".parse().unwrap());
@@ -341,11 +345,11 @@ fn serial_usage_readback_tracks_the_union_and_refuses_missing_or_unplanned_acces
                 .contains("update")
         );
         // Adding INSERT folds the same physical entry into the marker.
-        let cs = changes(vec![Change::Grant {
+        let cs = changes(vec![Change::Permission(GrantChange::Grant {
             role: "writer".into(),
             target: target.parse().unwrap(),
             permissions: [Permission::Insert, Permission::SerialSequences].into(),
-        }]);
+        })]);
         compare(&cs, &ids, &preserved, &before).unwrap();
     }
 }
@@ -423,13 +427,13 @@ fn a_detach_preserves_the_roots_usage_and_an_attach_checks_its_new_marker() {
         ),
     ]
     .into();
-    let cs = changes(vec![Change::DetachPartition {
+    let cs = changes(vec![Change::Partition(PartitionChange::DetachPartition {
         uid: "t_bbbbbb".parse().unwrap(),
         table: "dbo.p1".parse().unwrap(),
         parent: "dbo.t".parse().unwrap(),
         names: vec![],
         shape: Box::new(detached.tables[&"dbo.p1".parse().unwrap()].clone()),
-    }]);
+    })]);
     compare(&cs, &ids, &before, &detached).unwrap();
     let mut missing = detached.clone();
     missing
@@ -440,19 +444,19 @@ fn a_detach_preserves_the_roots_usage_and_an_attach_checks_its_new_marker() {
         .remove(&"sequence::dbo.t.id".parse().unwrap());
     assert!(compare(&cs, &ids, &before, &missing).is_err());
     let cs = changes(vec![
-        Change::AttachPartition {
+        Change::Partition(PartitionChange::AttachPartition {
             uid: "t_bbbbbb".parse().unwrap(),
             table: "dbo.p1".parse().unwrap(),
             parent: "dbo.t".parse().unwrap(),
             bound: PartitionBound::Default,
             key: vec![],
             shape: Box::new(before.tables[&"dbo.p1".parse().unwrap()].clone()),
-        },
-        Change::Grant {
+        }),
+        Change::Permission(GrantChange::Grant {
             role: "writer".into(),
             target: "dbo.p1".parse().unwrap(),
             permissions: [Permission::SerialSequences].into(),
-        },
+        }),
     ]);
     ids.columns.remove(&"c_bbbbbb".parse().unwrap());
     compare(&cs, &ids, &missing, &before).unwrap();
@@ -585,7 +589,7 @@ fn serial_sequence_grants_disappear_with_the_column_uid_across_renames() {
                         "{cs:?}"
                     );
                     assert!(cs.changes.iter().any(|p| matches!(&p.change,
-                        Change::DropColumn { uid, column } if *uid == "c_aaaaaa".parse().unwrap() && column == &to.column("id"))), "{cs:?}");
+                        Change::Column(ColumnChange::DropColumn { uid, column }) if *uid == "c_aaaaaa".parse().unwrap() && column == &to.column("id"))), "{cs:?}");
                 }
                 let check = |after: &Schema| {
                     refuse_pinned_movement(

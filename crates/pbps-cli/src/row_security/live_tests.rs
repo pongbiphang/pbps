@@ -1,6 +1,11 @@
 use pbps_db::{Conn, Driver};
 use pbps_dialect::Dialect;
 use pbps_dialect::PlanDialect;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::ModuleChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
 use pbps_model::{
     Change, ChangeSet, ColumnRef, ForeignKey, IdsFile, PlannedChange, TableName, Uid, UidKind,
 };
@@ -68,29 +73,31 @@ async fn check(connection: String, owner: String) {
     }
     ids.columns
         .insert(column_uid("parent.id"), parent.column("id"));
-    let retype = |name: &str| Change::AlterColumnType {
-        uid: column_uid(name),
-        column: t.column(name),
-        from: "integer".parse().unwrap(),
-        to: "smallint".parse().unwrap(),
-        through_external_partitions: false,
-        from_nullable: true,
-        to_nullable: true,
-        from_collation: None,
-        to_collation: None,
-        using: None,
+    let retype = |name: &str| {
+        Change::Column(ColumnChange::AlterColumnType {
+            uid: column_uid(name),
+            column: t.column(name),
+            from: "integer".parse().unwrap(),
+            to: "smallint".parse().unwrap(),
+            through_external_partitions: false,
+            from_nullable: true,
+            to_nullable: true,
+            from_collation: None,
+            to_collation: None,
+            using: None,
+        })
     };
     let changes = ChangeSet {
         changes: vec![
-            Change::AlterColumnNullability {
+            Change::Column(ColumnChange::AlterColumnNullability {
                 uid: column_uid("n"),
                 column: t.column("n"),
                 to_nullable: false,
                 ty: "integer".parse().unwrap(),
                 collation: None,
                 through_external_partitions: false,
-            },
-            Change::AddUnique {
+            }),
+            Change::Constraint(ConstraintChange::AddUnique {
                 table: t.clone(),
                 name: "unique_d".into(),
                 constraint: pbps_model::UniqueConstraint {
@@ -99,16 +106,16 @@ async fn check(connection: String, owner: String) {
                     filegroup: None,
                 },
                 clustered: false,
-            },
-            Change::AddCheck {
+            }),
+            Change::Constraint(ConstraintChange::AddCheck {
                 table: t.clone(),
                 name: "positive_chk".into(),
                 constraint: pbps_model::CheckConstraint {
                     expression: "chk > 0".into(),
                 },
-            },
+            }),
             retype("wide"),
-            Change::AddForeignKey {
+            Change::Constraint(ConstraintChange::AddForeignKey {
                 table: t.clone(),
                 name: "parent_fk".into(),
                 constraint: Box::new(ForeignKey {
@@ -118,7 +125,7 @@ async fn check(connection: String, owner: String) {
                     on_delete: Default::default(),
                     on_update: Default::default(),
                 }),
-            },
+            }),
         ]
         .into_iter()
         .map(PlannedChange::new)
@@ -164,13 +171,15 @@ async fn check(connection: String, owner: String) {
     let mut now = was;
     now.options.max = Some(100);
     let number_changes = ChangeSet {
-        changes: vec![PlannedChange::new(Change::AlterColumnNumbering {
-            uid: number_uid,
-            column: numbered.column("id"),
-            ty: "integer".parse().unwrap(),
-            from: pbps_model::ValueSource::Identity(was),
-            to: pbps_model::ValueSource::Identity(now),
-        })],
+        changes: vec![PlannedChange::new(Change::Column(
+            ColumnChange::AlterColumnNumbering {
+                uid: number_uid,
+                column: numbered.column("id"),
+                ty: "integer".parse().unwrap(),
+                from: pbps_model::ValueSource::Identity(was),
+                to: pbps_model::ValueSource::Identity(now),
+            },
+        ))],
     };
     let number_names =
         pbps_model::plan_names::PlanNames::of(&number_changes.changes, &number_ids).unwrap();
@@ -260,10 +269,12 @@ async fn check(connection: String, owner: String) {
     );
     for name in ["id", "extra"] {
         let drop = ChangeSet {
-            changes: vec![PlannedChange::new(Change::DropColumn {
-                uid: column_uid(name),
-                column: ColumnRef::new(t.clone(), name),
-            })],
+            changes: vec![PlannedChange::new(Change::Column(
+                ColumnChange::DropColumn {
+                    uid: column_uid(name),
+                    column: ColumnRef::new(t.clone(), name),
+                },
+            ))],
         };
         let mut final_ids = ids.clone();
         final_ids.columns.remove(&column_uid(name));
@@ -311,24 +322,24 @@ async fn check(connection: String, owner: String) {
         .columns
         .insert(column_uid("id"), renamed.column("renamed_id"));
     let mut altered = retype("id");
-    if let Change::AlterColumnType { column, .. } = &mut altered {
+    if let Change::Column(ColumnChange::AlterColumnType { column, .. }) = &mut altered {
         *column = renamed.column("renamed_id");
     }
     let renamed_change = ChangeSet {
         changes: vec![
-            Change::RenameTable {
+            Change::Table(TableChange::RenameTable {
                 uid: table_uid,
                 from: t.clone(),
                 to: renamed.clone(),
                 defaults: vec![],
-            },
-            Change::RenameColumn {
+            }),
+            Change::Column(ColumnChange::RenameColumn {
                 uid: column_uid("id"),
                 table: renamed.clone(),
                 from: "id".into(),
                 to: "renamed_id".into(),
                 table_was: Some(t.clone()),
-            },
+            }),
             altered,
         ]
         .into_iter()
@@ -401,7 +412,7 @@ async fn delete_visibility_guards(conn: &mut Conn, owner: &str) {
             child.column("refid"),
         );
         let mut changes = ChangeSet {
-            changes: vec![PlannedChange::new(Change::DeleteRow {
+            changes: vec![PlannedChange::new(Change::Row(RowChange::DeleteRow {
                 table: parent.clone(),
                 key_column: "id".into(),
                 key: "1".into(),
@@ -411,12 +422,11 @@ async fn delete_visibility_guards(conn: &mut Conn, owner: &str) {
                 types: Default::default(),
                 after_types: Default::default(),
                 key_type: None,
-            })],
+            }))],
         };
         if planned {
-            changes
-                .changes
-                .push(PlannedChange::new(Change::AddForeignKey {
+            changes.changes.push(PlannedChange::new(Change::Constraint(
+                ConstraintChange::AddForeignKey {
                     table: child.clone(),
                     name: "delete_fk".into(),
                     constraint: Box::new(ForeignKey {
@@ -426,7 +436,8 @@ async fn delete_visibility_guards(conn: &mut Conn, owner: &str) {
                         on_delete: pbps_model::ReferentialAction::Cascade,
                         on_update: Default::default(),
                     }),
-                }));
+                },
+            )));
         }
         let names = pbps_model::plan_names::PlanNames::of(&changes.changes, &ids).unwrap();
         let pg = pbps_pg::Postgres::new();
@@ -529,10 +540,12 @@ async fn policy_sequence_bindings(conn: &mut Conn) {
         let mut final_ids = ids.clone();
         final_ids.columns.remove(&column_uid);
         let changes = ChangeSet {
-            changes: vec![PlannedChange::new(Change::DropColumn {
-                uid: column_uid,
-                column,
-            })],
+            changes: vec![PlannedChange::new(Change::Column(
+                ColumnChange::DropColumn {
+                    uid: column_uid,
+                    column,
+                },
+            ))],
         };
         let error = crate::engine::check_module_dependents_fixture(
             conn,
@@ -695,19 +708,19 @@ async fn policy_owner_drop_releases_column(conn: &mut Conn) {
         .retain(|uid, column| uid != &target_uid && column.table != owner);
     let changes = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::DropColumn {
+            PlannedChange::new(Change::Column(ColumnChange::DropColumn {
                 uid: target_uid,
                 column: input.column("target"),
-            }),
-            PlannedChange::new(Change::DropModule {
+            })),
+            PlannedChange::new(Change::Module(ModuleChange::DropModule {
                 id: "app.policy_value(integer)".parse().unwrap(),
                 kind: pbps_model::ModuleKind::Function,
-            }),
-            PlannedChange::new(Change::DropTable {
+            })),
+            PlannedChange::new(Change::Table(TableChange::DropTable {
                 uid: owner_uid,
                 name: owner.clone(),
                 detach_from: None,
-            }),
+            })),
         ],
     };
     let wrong = crate::engine::check_module_dependents_fixture(
@@ -741,14 +754,16 @@ async fn policy_owner_drop_releases_column(conn: &mut Conn) {
     )
     .await
     .unwrap();
-    assert!(matches!(&changes.changes[0].change, Change::DropTable { name, .. } if name == &owner));
+    assert!(
+        matches!(&changes.changes[0].change, Change::Table(TableChange::DropTable { name, .. }) if name == &owner)
+    );
     assert!(matches!(
         &changes.changes[1].change,
-        Change::DropColumn { .. }
+        Change::Column(ColumnChange::DropColumn { .. })
     ));
     assert!(matches!(
         &changes.changes[2].change,
-        Change::DropModule { .. }
+        Change::Module(ModuleChange::DropModule { .. })
     ));
     crate::engine::check_module_dependents_fixture(
         conn,
@@ -845,10 +860,10 @@ async fn policy_owner_teardowns(conn: &mut Conn) {
                         ..Default::default()
                     },
                 );
-            changes.push(Change::DropModule {
+            changes.push(Change::Module(ModuleChange::DropModule {
                 id: "app.policy_gate()".parse().unwrap(),
                 kind: pbps_model::ModuleKind::Function,
-            });
+            }));
         } else {
             // Relation-only edges really block DROP TABLE, while a column
             // drop must not mistake them for references to every attribute.
@@ -868,17 +883,17 @@ async fn policy_owner_teardowns(conn: &mut Conn) {
         }
         if replace {
             let id = "app.policy_gate()".parse().unwrap();
-            changes.push(Change::CreateModule {
+            changes.push(Change::Module(ModuleChange::CreateModule {
                 id,
                 module: Box::new(before.modules[&"app.policy_gate()".parse().unwrap()].clone()),
-            });
+            }));
         }
         for table in &names {
-            changes.push(Change::DropTable {
+            changes.push(Change::Table(TableChange::DropTable {
                 uid: Uid::derived(UidKind::Table, &table.name, 0),
                 name: table.clone(),
                 detach_from: None,
-            });
+            }));
         }
         let plan = ChangeSet {
             changes: changes.into_iter().map(PlannedChange::new).collect(),
@@ -939,7 +954,7 @@ async fn policy_owner_teardowns(conn: &mut Conn) {
                 .changes
                 .iter()
                 .filter_map(|p| {
-                    if let Change::DropTable { name, .. } = &p.change {
+                    if let Change::Table(TableChange::DropTable { name, .. }) = &p.change {
                         Some(name.name.as_str())
                     } else {
                         None
@@ -954,7 +969,10 @@ async fn policy_owner_teardowns(conn: &mut Conn) {
                     vec!["m", "z", "a"]
                 }
             );
-            assert!(matches!(&plan.changes[0].change, Change::DropTable { .. }));
+            assert!(matches!(
+                &plan.changes[0].change,
+                Change::Table(TableChange::DropTable { .. })
+            ));
             for step in &plan.changes {
                 for statement in pbps_pg::Postgres::new().emit(
                     &pbps_diff::order::singleton(

@@ -1,3 +1,5 @@
+use super::ColumnChange;
+use super::PartitionChange;
 use super::*;
 use crate::{Column, OwnedSequence};
 
@@ -19,13 +21,13 @@ fn sequence_lifetimes_and_retunes_are_statement_properties() {
         ),
         (sequence.clone(), sequence, vec![(Numbering, Retain)]),
     ] {
-        let change = Change::AlterColumnNumbering {
+        let change = Change::Column(ColumnChange::AlterColumnNumbering {
             uid: "c_aaaaaa".parse().unwrap(),
             column: "app.p.d".parse().unwrap(),
             ty: "integer".parse().unwrap(),
             from,
             to,
-        };
+        });
         assert_eq!(change.parent_column_uid().unwrap().as_str(), "c_aaaaaa");
         assert_eq!(
             change
@@ -43,7 +45,7 @@ fn sequence_lifetimes_and_retunes_are_statement_properties() {
 
 #[test]
 fn recollation_does_not_invent_type_default_or_nullability_events() {
-    let mut change = Change::AlterColumnType {
+    let mut change = Change::Column(ColumnChange::AlterColumnType {
         uid: "c_aaaaaa".parse().unwrap(),
         column: "app.p.d".parse().unwrap(),
         from: "text".parse().unwrap(),
@@ -54,14 +56,14 @@ fn recollation_does_not_invent_type_default_or_nullability_events() {
         to_collation: Some(Collation::new("pg_catalog.C")),
         through_external_partitions: false,
         using: None,
-    };
+    });
     let transitions = change.column_transitions();
     assert_eq!(transitions.len(), 1);
     assert_eq!(
         transitions[0].property,
         ColumnProperty::Column(Attribute::Collation)
     );
-    if let Change::AlterColumnType { to_collation, .. } = &mut change {
+    if let Change::Column(ColumnChange::AlterColumnType { to_collation, .. }) = &mut change {
         *to_collation = None;
     }
     assert!(change.column_transitions().is_empty());
@@ -69,7 +71,7 @@ fn recollation_does_not_invent_type_default_or_nullability_events() {
 
 #[test]
 fn partition_local_changes_do_not_acquire_parent_writes() {
-    let change = Change::SetPartitionDefault {
+    let change = Change::Partition(PartitionChange::SetPartitionDefault {
         uid: "t_bbbbbb".parse().unwrap(),
         table: "app.a".parse().unwrap(),
         parent: "app.p".parse().unwrap(),
@@ -77,14 +79,14 @@ fn partition_local_changes_do_not_acquire_parent_writes() {
         from: None,
         to: None,
         fallback: None,
-    };
+    });
     assert!(change.parent_column_uid().is_none());
     assert!(change.column_transitions().is_empty());
-    let change = Change::AddColumn {
+    let change = Change::Column(ColumnChange::AddColumn {
         uid: "c_aaaaaa".parse().unwrap(),
         table: "app.p".parse().unwrap(),
         name: "d".into(),
         column: Box::new(Column::new("integer".parse().unwrap())),
-    };
+    });
     assert_eq!(change.column_transitions().len(), 6);
 }

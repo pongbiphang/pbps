@@ -2,6 +2,13 @@
 
 use super::{PlanningPlan, Schedule, Source};
 use pbps_dialect::Dialect;
+use pbps_model::ColumnChange;
+use pbps_model::GrantChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::PolicyChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
 use pbps_model::resolver::OrderReason;
 use pbps_model::{
     Change, ChangeSet, IdsFile, ModuleDeps, Uid,
@@ -144,17 +151,23 @@ pub fn edges<'a>(changes: impl IntoIterator<Item = &'a Change>) -> Vec<(usize, u
     let policies: Vec<_> = changes
         .iter()
         .enumerate()
-        .filter_map(|(i, c)| matches!(c, Change::CreatePolicy { .. }).then_some(i))
+        .filter_map(|(i, c)| {
+            matches!(c, Change::Policy(PolicyChange::CreatePolicy { .. })).then_some(i)
+        })
         .collect();
     let flags: Vec<_> = changes
         .iter()
         .enumerate()
-        .filter_map(|(i, c)| matches!(c, Change::SetRowSecurity { .. }).then_some(i))
+        .filter_map(|(i, c)| {
+            matches!(c, Change::Policy(PolicyChange::SetRowSecurity { .. })).then_some(i)
+        })
         .collect();
     let drops: Vec<_> = changes
         .iter()
         .enumerate()
-        .filter_map(|(i, c)| matches!(c, Change::DropPolicy { .. }).then_some(i))
+        .filter_map(|(i, c)| {
+            matches!(c, Change::Policy(PolicyChange::DropPolicy { .. })).then_some(i)
+        })
         .collect();
     if drops.is_empty() && policies.is_empty() && flags.is_empty() {
         return Vec::new();
@@ -165,16 +178,16 @@ pub fn edges<'a>(changes: impl IntoIterator<Item = &'a Change>) -> Vec<(usize, u
         .filter_map(|(i, c)| {
             (!matches!(
                 c,
-                Change::CreatePolicy { .. }
-                    | Change::SetRowSecurity { .. }
-                    | Change::SetDataMode { .. }
-                    | Change::SetEnsureKeys { .. }
+                Change::Policy(PolicyChange::CreatePolicy { .. })
+                    | Change::Policy(PolicyChange::SetRowSecurity { .. })
+                    | Change::Row(RowChange::SetDataMode { .. })
+                    | Change::Row(RowChange::SetEnsureKeys { .. })
             ) && (c.table().is_some()
                 || matches!(
                     c,
-                    Change::CreateModule { .. }
-                        | Change::AlterModule { .. }
-                        | Change::PublicExecution { .. }
+                    Change::Module(ModuleChange::CreateModule { .. })
+                        | Change::Module(ModuleChange::AlterModule { .. })
+                        | Change::Permission(GrantChange::PublicExecution { .. })
                 )))
             .then_some(i)
         })
@@ -183,7 +196,9 @@ pub fn edges<'a>(changes: impl IntoIterator<Item = &'a Change>) -> Vec<(usize, u
     for (later, change) in changes.iter().enumerate() {
         if matches!(
             change,
-            Change::DropModule { .. } | Change::DropColumn { .. } | Change::AlterColumnType { .. }
+            Change::Module(ModuleChange::DropModule { .. })
+                | Change::Column(ColumnChange::DropColumn { .. })
+                | Change::Column(ColumnChange::AlterColumnType { .. })
         ) {
             out.extend(drops.iter().map(|&earlier| (earlier, later)));
         }
@@ -211,9 +226,9 @@ pub type PolicyDependents = BTreeMap<Uid, Vec<super::catalog::PolicyDependent>>;
 /// Destructive column edits shared with engine probes. Rename dependencies
 /// are read separately, without invoking drop/retype-only probes.
 pub fn column_edit(change: &Change) -> Option<(&Uid, &pbps_model::ColumnRef, &'static str)> {
-    if let Change::DropColumn { uid, column } = change {
+    if let Change::Column(ColumnChange::DropColumn { uid, column }) = change {
         Some((uid, column, "dropped"))
-    } else if let Change::AlterColumnType { uid, column, .. } = change {
+    } else if let Change::Column(ColumnChange::AlterColumnType { uid, column, .. }) = change {
         Some((uid, column, "retyped"))
     } else {
         None
@@ -221,9 +236,9 @@ pub fn column_edit(change: &Change) -> Option<(&Uid, &pbps_model::ColumnRef, &'s
 }
 
 pub fn policy_target_uid(change: &Change) -> Option<&Uid> {
-    if let Change::DropTable { uid, .. }
-    | Change::RenameTable { uid, .. }
-    | Change::RenameColumn { uid, .. } = change
+    if let Change::Table(TableChange::DropTable { uid, .. })
+    | Change::Table(TableChange::RenameTable { uid, .. })
+    | Change::Column(ColumnChange::RenameColumn { uid, .. }) = change
     {
         Some(uid)
     } else {
@@ -250,18 +265,22 @@ pub fn policy_releases(
         }
         let (subject, what, dropped_table) = if matches!(
             &step.change,
-            Change::DropTable { .. } | Change::RenameTable { .. }
+            Change::Table(TableChange::DropTable { .. })
+                | Change::Table(TableChange::RenameTable { .. })
         ) {
             let table = names.table_at(uid, At::Start).ok_or_else(|| {
                 release_refusal!("policy dependent table {uid} has no opening catalog identity")
             })?;
-            if matches!(&step.change, Change::DropTable { .. }) {
+            if matches!(&step.change, Change::Table(TableChange::DropTable { .. })) {
                 (table.shown().to_string(), "dropped", Some(table))
             } else {
                 (table.shown().to_string(), "renamed", None)
             }
         } else {
-            let what = if matches!(&step.change, Change::RenameColumn { .. }) {
+            let what = if matches!(
+                &step.change,
+                Change::Column(ColumnChange::RenameColumn { .. })
+            ) {
                 "renamed"
             } else {
                 column_edit(&step.change)
@@ -292,9 +311,11 @@ pub fn policy_releases(
             // Resolve each explicit removal at its statement boundary, then
             // compare the opening catalog identity used by pg_depend.
             let Some(before) = changes.changes.iter().enumerate().position(|(i, p)| {
-                if let Change::DropTable { uid, .. } = &p.change {
+                if let Change::Table(TableChange::DropTable { uid, .. }) = &p.change {
                     names.table_at(uid, At::Start) == Some(&policy.table)
-                } else if let Change::DropPolicy { table, name, .. } = &p.change {
+                } else if let Change::Policy(PolicyChange::DropPolicy { table, name, .. }) =
+                    &p.change
+                {
                     name == &policy.name
                         && if let pbps_model::plan_names::Holder::Tracked(uid) =
                             names.holder(table, At::Before(i))
@@ -341,11 +362,13 @@ pub fn requires_transaction(changes: &ChangeSet) -> bool {
     changes.changes.iter().any(|step| {
         matches!(
             step.change,
-            Change::DropPolicy { .. } | Change::CreatePolicy { .. } | Change::SetRowSecurity { .. }
-        ) || if let Change::CreateTable { table, .. } = &step.change {
+            Change::Policy(PolicyChange::DropPolicy { .. })
+                | Change::Policy(PolicyChange::CreatePolicy { .. })
+                | Change::Policy(PolicyChange::SetRowSecurity { .. })
+        ) || if let Change::Table(TableChange::CreateTable { table, .. }) = &step.change {
             table.has_row_security()
-        } else if let Change::AttachPartition { shape, .. }
-        | Change::DetachPartition { shape, .. } = &step.change
+        } else if let Change::Partition(PartitionChange::AttachPartition { shape, .. })
+        | Change::Partition(PartitionChange::DetachPartition { shape, .. }) = &step.change
         {
             shape.has_row_security()
         } else {

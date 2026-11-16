@@ -19,27 +19,27 @@ fn intermediate_type_owners_preserve_uids_through_create_rename_drop_and_reuse()
     let old: TypeRef = "app.d".parse().unwrap();
     let new: TypeRef = "app.renamed".parse().unwrap();
     let changes: Vec<_> = vec![
-        Change::CreateType {
+        Change::Type(TypeChange::CreateType {
             uid: a.clone(),
             name: old.clone(),
             definition: definition(),
-        },
-        Change::RenameType {
+        }),
+        Change::Type(TypeChange::RenameType {
             uid: a.clone(),
             from: old.clone(),
             to: new.clone(),
             definition: definition(),
-        },
-        Change::DropType {
+        }),
+        Change::Type(TypeChange::DropType {
             uid: a.clone(),
             name: new.clone(),
             definition: definition(),
-        },
-        Change::CreateType {
+        }),
+        Change::Type(TypeChange::CreateType {
             uid: b.clone(),
             name: new.clone(),
             definition: definition(),
-        },
+        }),
     ]
     .into_iter()
     .map(PlannedChange::new)
@@ -93,11 +93,11 @@ fn intermediate_type_owners_preserve_uids_through_create_rename_drop_and_reuse()
 fn unreadable_type_history_is_not_an_unknown_or_vacant_name() {
     let uid: Uid = "y_aaaaaa".parse().unwrap();
     let name: TypeRef = "app.d".parse().unwrap();
-    let changes = vec![PlannedChange::new(Change::CreateType {
+    let changes = vec![PlannedChange::new(Change::Type(TypeChange::CreateType {
         uid: uid.clone(),
         name: name.clone(),
         definition: definition(),
-    })];
+    }))];
     let ids = IdsFile::default();
     // Unrelated legacy readers need no intermediate type proof. Asking for
     // that proof must report the inconsistent final mapping explicitly.

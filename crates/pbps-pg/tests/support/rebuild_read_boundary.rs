@@ -76,21 +76,21 @@ fn one_split_origin_orders_source_temp_and_backup_reads_through_shared_slots() {
     let child = address(target.table_uid(&leaf).unwrap());
     let mut bare_leaf = desired.tables[&leaf].clone();
     bare_leaf.partition_of.as_mut().unwrap().parent = new.name.clone();
-    let create_parent = Change::CreateTable {
+    let create_parent = Change::Table(TableChange::CreateTable {
         uid: new.uid.clone(),
         name: new.name.clone(),
         table: Box::new(desired.tables[&parent].clone()),
         beside_default: None,
         moves_at_most: None,
-    };
-    let create_leaf = Change::CreateTable {
+    });
+    let create_leaf = Change::Table(TableChange::CreateTable {
         uid: child.uid.clone(),
         name: child.name.clone(),
         table: Box::new(bare_leaf),
         beside_default: None,
         moves_at_most: None,
-    };
-    let copy = Change::CopyTableRows(Box::new(CopyTableRows {
+    });
+    let copy = Change::Partition(PartitionChange::CopyTableRows(Box::new(CopyTableRows {
         source: old.clone(),
         target: new.clone(),
         max_rows: 10,
@@ -114,35 +114,37 @@ fn one_split_origin_orders_source_temp_and_backup_reads_through_shared_slots() {
                 collation: None,
             })
             .collect(),
-    }));
-    let analyze = Change::AnalyzeTableTree(Box::new(AnalyzeTableTree {
-        parent: new.clone(),
-        partitions: vec![child],
-    }));
-    let old_swap = Change::RenameTable {
+    })));
+    let analyze = Change::Partition(PartitionChange::AnalyzeTableTree(Box::new(
+        AnalyzeTableTree {
+            parent: new.clone(),
+            partitions: vec![child],
+        },
+    )));
+    let old_swap = Change::Table(TableChange::RenameTable {
         uid: old.uid.clone(),
         from: parent.clone(),
         to: address(&old.uid).name.clone(),
         defaults: vec![],
-    };
-    let new_swap = Change::RenameTable {
+    });
+    let new_swap = Change::Table(TableChange::RenameTable {
         uid: new.uid.clone(),
         from: new.name.clone(),
         to: parent.clone(),
         defaults: vec![],
-    };
-    let drop_old = Change::DropTable {
+    });
+    let drop_old = Change::Table(TableChange::DropTable {
         uid: old.uid.clone(),
         name: address(&old.uid).name,
         detach_from: None,
-    };
-    let backup_read = Change::DropTable {
+    });
+    let backup_read = Change::Table(TableChange::DropTable {
         uid: base.table_uid(&leaf).unwrap().clone(),
         name: leaf.clone(),
         detach_from: Some(address(&old.uid).name),
-    };
-    let logical = [PlannedChange::new(Change::RebuildPartitionedTable(
-        Box::new(root.clone()),
+    });
+    let logical = [PlannedChange::new(Change::Partition(
+        PartitionChange::RebuildPartitionedTable(Box::new(root.clone())),
     ))];
     let owners = PlanOwners::new(PlanNames::of(&logical, &target).unwrap(), &base, &target)
         .with_rebuild_addresses(&root, &approval, &addresses)

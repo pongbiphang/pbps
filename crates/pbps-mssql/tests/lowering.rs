@@ -8,6 +8,9 @@ use crate::certified_fixture::FixtureEmission as _;
 
 use pbps_dialect::Released;
 use pbps_dialect::lower::{Batch, Lowered, Transaction, lower};
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
 use pbps_model::{
     Change, Column, Index, IndexColumn, IndexKey, Module, ModuleId, ModuleKind, PlannedChange,
     Strategy, Table, TableName,
@@ -34,12 +37,12 @@ fn one(change: Change, strategy: Strategy) -> Lowered {
 }
 
 fn rename(from: &str, to: &str) -> Change {
-    Change::RenameTable {
+    Change::Table(TableChange::RenameTable {
         uid: "t_aaaaaa".parse().unwrap(),
         from: t(from),
         to: t(to),
         defaults: vec![],
-    }
+    })
 }
 
 fn view() -> (ModuleId, Module) {
@@ -77,10 +80,10 @@ fn a_cross_schema_rename_lowers_to_two_statements_and_shows_the_name_between() {
 fn a_statement_in_its_own_batch_stays_inside_the_transaction() {
     let (id, module) = view();
     let created = one(
-        Change::CreateModule {
+        Change::Module(ModuleChange::CreateModule {
             id,
             module: Box::new(module),
-        },
+        }),
         Strategy::default(),
     );
     let steps: Vec<_> = created.steps().map(|s| s.execution).collect();
@@ -90,7 +93,7 @@ fn a_statement_in_its_own_batch_stays_inside_the_transaction() {
     // Negative: an online index build is neither; SQL Server's `ONLINE = ON`
     // is an option of an ordinary transactional statement.
     let online = one(
-        Change::AddIndex {
+        Change::Index(IndexChange::AddIndex {
             table: t("app.t"),
             name: "ix".into(),
             index: Box::new(Index {
@@ -108,7 +111,7 @@ fn a_statement_in_its_own_batch_stays_inside_the_transaction() {
                 filegroup: None,
             }),
             clustered: false,
-        },
+        }),
         ONLINE,
     );
     assert!(
@@ -125,10 +128,10 @@ fn a_statement_in_its_own_batch_stays_inside_the_transaction() {
 fn a_module_drop_releases_the_module_and_a_create_does_not() {
     let (id, module) = view();
     let dropped = one(
-        Change::DropModule {
+        Change::Module(ModuleChange::DropModule {
             id: id.clone(),
             kind: ModuleKind::View,
-        },
+        }),
         Strategy::default(),
     );
     assert_eq!(
@@ -136,10 +139,10 @@ fn a_module_drop_releases_the_module_and_a_create_does_not() {
         [(0, &Released::Module(id.clone()))]
     );
     let altered = one(
-        Change::AlterModule {
+        Change::Module(ModuleChange::AlterModule {
             id,
             module: Box::new(module),
-        },
+        }),
         Strategy::default(),
     );
     // `CREATE OR ALTER` keeps the object: nothing is released.
@@ -155,7 +158,7 @@ fn lowering_a_plan_writes_exactly_the_statements_emit_writes() {
     table
         .columns
         .insert("n".into(), Column::new("int".parse().unwrap()));
-    let index = Change::AddIndex {
+    let index = Change::Index(IndexChange::AddIndex {
         table: t("app.t"),
         name: "ix".into(),
         index: Box::new(Index {
@@ -173,32 +176,32 @@ fn lowering_a_plan_writes_exactly_the_statements_emit_writes() {
             filegroup: None,
         }),
         clustered: false,
-    };
+    });
     let changes = [
         planned(
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: "t_bbbbbb".parse().unwrap(),
                 name: t("app.t"),
                 table: Box::new(table),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
             Strategy::default(),
         ),
         planned(index, ONLINE),
         planned(rename("dbo.a", "app.b"), Strategy::default()),
         planned(
-            Change::CreateModule {
+            Change::Module(ModuleChange::CreateModule {
                 id: id.clone(),
                 module: Box::new(module),
-            },
+            }),
             Strategy::default(),
         ),
         planned(
-            Change::DropModule {
+            Change::Module(ModuleChange::DropModule {
                 id,
                 kind: ModuleKind::View,
-            },
+            }),
             Strategy::default(),
         ),
     ];

@@ -10,6 +10,8 @@
 use std::collections::BTreeSet;
 
 use pbps_db::{Conn, DbError};
+use pbps_model::ConstraintChange;
+use pbps_model::TableChange;
 use pbps_model::{
     Change, ChangeSet, ProviderKind, ProviderMember, ProviderPin, Schema, Table, TypeProvider,
 };
@@ -70,17 +72,19 @@ fn named_by(changes: &ChangeSet) -> BTreeSet<Wanted> {
     let mut out = Vec::new();
     for planned in &changes.changes {
         match &planned.change {
-            Change::SetExclusion {
+            Change::Constraint(ConstraintChange::SetExclusion {
                 table,
                 name,
                 to: Some(x),
                 ..
-            } => {
+            }) => {
                 let mut one = Table::default();
                 one.exclude.insert(name.clone(), (**x).clone());
                 uses_in_table(table, &one, &mut out);
             }
-            Change::CreateTable { name, table, .. } => uses_in_table(name, table, &mut out),
+            Change::Table(TableChange::CreateTable { name, table, .. }) => {
+                uses_in_table(name, table, &mut out)
+            }
             _ => {}
         }
     }
@@ -228,6 +232,8 @@ pub async fn check(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::ConstraintChange;
+    use pbps_model::TableChange;
     use pbps_model::{ExclusionConstraint, ExclusionKey, ExclusionTiming, IndexColumn, IndexKey};
 
     fn exclusion(operators: &[Option<&str>]) -> ExclusionConstraint {
@@ -261,11 +267,13 @@ mod tests {
     #[test]
     fn a_plan_names_the_package_operators_of_a_new_exclusion_and_never_the_engines() {
         let table = pbps_model::TableName::new("app", "docs");
-        let set = |from, to| Change::SetExclusion {
-            table: table.clone(),
-            name: "no_dup".into(),
-            from,
-            to,
+        let set = |from, to| {
+            Change::Constraint(ConstraintChange::SetExclusion {
+                table: table.clone(),
+                name: "no_dup".into(),
+                from,
+                to,
+            })
         };
         let planned = |c| ChangeSet {
             changes: vec![pbps_model::PlannedChange::new(c)],
@@ -283,13 +291,13 @@ mod tests {
         let mut created = Table::default();
         created.exclude.insert("no_dup".into(), both);
         assert_eq!(
-            named(Change::CreateTable {
+            named(Change::Table(TableChange::CreateTable {
                 uid: "t_000001".parse().unwrap(),
                 name: table,
                 table: Box::new(created),
                 beside_default: None,
                 moves_at_most: None,
-            }),
+            })),
             ["ext.%"]
         );
     }

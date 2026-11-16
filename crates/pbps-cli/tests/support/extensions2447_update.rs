@@ -122,7 +122,13 @@ fn an_update_is_rehearsed_sealed_gated_applied_and_the_next_plan_waits_for_the_e
         let [only] = plan.changes.changes.as_slice() else {
             panic!("{:#?}", plan.changes)
         };
-        let pbps_model::Change::UpdateExtension { name, from, to, .. } = &only.change else {
+        let pbps_model::Change::Extension(pbps_model::ExtensionChange::UpdateExtension {
+            name,
+            from,
+            to,
+            ..
+        }) = &only.change
+        else {
             panic!("{:#?}", only.change)
         };
         assert_eq!(
@@ -432,9 +438,14 @@ fn an_update_waits_for_the_package_its_target_version_requires() {
             .changes
             .iter()
             .filter_map(|p| {
-                if let pbps_model::Change::CreateExtension { name, .. } = &p.change {
+                if let pbps_model::Change::Extension(
+                    pbps_model::ExtensionChange::CreateExtension { name, .. },
+                ) = &p.change
+                {
                     Some(format!("create {}", name.shown()))
-                } else if let pbps_model::Change::UpdateExtension { name, requires, .. } = &p.change
+                } else if let pbps_model::Change::Extension(
+                    pbps_model::ExtensionChange::UpdateExtension { name, requires, .. },
+                ) = &p.change
                 {
                     Some(format!(
                         "update {} ({} required)",
@@ -729,9 +740,14 @@ fn an_update_waits_for_a_package_only_a_version_on_its_path_requires() {
             .changes
             .iter()
             .filter_map(|p| {
-                if let pbps_model::Change::CreateExtension { name, .. } = &p.change {
+                if let pbps_model::Change::Extension(
+                    pbps_model::ExtensionChange::CreateExtension { name, .. },
+                ) = &p.change
+                {
                     Some(format!("create {}", name.shown()))
-                } else if let pbps_model::Change::UpdateExtension { name, requires, .. } = &p.change
+                } else if let pbps_model::Change::Extension(
+                    pbps_model::ExtensionChange::UpdateExtension { name, requires, .. },
+                ) = &p.change
                 {
                     Some(format!(
                         "update {} ({} required)",

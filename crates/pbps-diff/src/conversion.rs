@@ -11,6 +11,8 @@
 //! a plan uses one is the differ's question, asked of the change it is making.
 
 use pbps_dialect::Dialect;
+use pbps_model::ColumnChange;
+use pbps_model::PartitionChange;
 use pbps_model::{Change, ColumnRef, ColumnType, Conversion, IdsFile, PlannedChange, Schema, Uid};
 
 use crate::{Context, Side};
@@ -68,15 +70,15 @@ pub fn check_change(
     dialect: &(impl Dialect + ?Sized),
 ) -> Result<(), ConversionError> {
     let mut expressions = Vec::new();
-    if let Change::AlterColumnType {
+    if let Change::Column(ColumnChange::AlterColumnType {
         column,
         using: Some(using),
         ..
-    } = change
+    }) = change
     {
         expressions.push((column, using.as_str()));
     }
-    if let Change::CopyTableRows(copy) = change {
+    if let Change::Partition(PartitionChange::CopyTableRows(copy)) = change {
         expressions.extend(copy.columns.iter().flat_map(|column| {
             column
                 .stages
@@ -249,14 +251,14 @@ pub fn needed(changes: &[PlannedChange], dialect: &(impl Dialect + ?Sized)) -> V
     changes
         .iter()
         .filter_map(|p| {
-            let Change::AlterColumnType {
+            let Change::Column(ColumnChange::AlterColumnType {
                 uid,
                 column,
                 from,
                 to,
                 using: None,
                 ..
-            } = &p.change
+            }) = &p.change
             else {
                 return None;
             };
@@ -304,6 +306,7 @@ mod tests {
     use super::*;
     use crate::{DiffError, diff};
     use pbps_dialect::{Dialect, DialectError, MinimalDialect};
+    use pbps_model::ColumnChange;
     use pbps_model::{Column, Hints, Table, TableName};
 
     /// `MinimalDialect` that records conversions, as PostgreSQL does, and
@@ -452,7 +455,7 @@ mod tests {
         changes
             .iter()
             .filter_map(|c| {
-                let Change::AlterColumnType { using, .. } = c else {
+                let Change::Column(ColumnChange::AlterColumnType { using, .. }) = c else {
                     return None;
                 };
                 Some(using.as_deref())

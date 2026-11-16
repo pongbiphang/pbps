@@ -1,4 +1,7 @@
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::PolicyChange;
+use pbps_model::RoleChange;
 #[path = "../../../../pbps-diff/tests/fixtures/creation2469.rs"]
 mod fixture;
 
@@ -54,7 +57,7 @@ fn scratch_facets_and_external_setup_boundaries_are_not_conflated() {
         !built
             .steps
             .iter()
-            .any(|s| matches!(s.subject, Change::CreateRole { .. }))
+            .any(|s| matches!(s.subject, Change::Role(RoleChange::CreateRole { .. })))
     );
 }
 
@@ -67,7 +70,12 @@ fn demanded_default_paths_survive_a_real_skipped_policy_vertex() {
     let default = built
         .steps
         .iter()
-        .position(|s| matches!(s.subject, Change::AlterColumnDefault { .. }))
+        .position(|s| {
+            matches!(
+                s.subject,
+                Change::Column(ColumnChange::AlterColumnDefault { .. })
+            )
+        })
         .unwrap();
     let after = built
         .steps
@@ -78,7 +86,7 @@ fn demanded_default_paths_survive_a_real_skipped_policy_vertex() {
         !built
             .steps
             .iter()
-            .any(|s| matches!(s.subject, Change::CreatePolicy { .. }))
+            .any(|s| matches!(s.subject, Change::Policy(PolicyChange::CreatePolicy { .. })))
     );
     assert!(!built.trial.can_precede(after, default));
     assert!(built.trial.can_precede(default, after));

@@ -4,6 +4,14 @@
 
 use super::scratch::fixtures::ids;
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
+use pbps_model::TypeChange;
+use pbps_model::TypeValueChange;
 use pbps_model::resolver::{ObjectOwnership, Surface};
 use pbps_model::{Change, ChangeSet, IdsFile, Schema};
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,10 +50,12 @@ fn an_object_grant_after_a_same_name_replacement_names_the_replacement() {
         ownership: ObjectOwnership::Surface(surface),
         bindings: vec![],
     };
-    let grant = || Change::Grant {
-        role: "reader".into(),
-        target: GrantTarget::Object(name.clone()),
-        permissions: BTreeSet::from([Permission::Select]),
+    let grant = || {
+        Change::Permission(GrantChange::Grant {
+            role: "reader".into(),
+            target: GrantTarget::Object(name.clone()),
+            permissions: BTreeSet::from([Permission::Select]),
+        })
     };
     let mut with_table = Schema::default();
     with_table.tables.insert(name.clone(), table.clone());
@@ -63,32 +73,32 @@ fn an_object_grant_after_a_same_name_replacement_names_the_replacement() {
         let (replace, expected) = if to_view {
             (
                 vec![
-                    Change::DropTable {
+                    Change::Table(TableChange::DropTable {
                         uid: uid.clone(),
                         name: name.clone(),
                         detach_from: None,
-                    },
-                    Change::CreateModule {
+                    }),
+                    Change::Module(ModuleChange::CreateModule {
                         id: view_id.clone(),
                         module: Box::new(view.clone()),
-                    },
+                    }),
                 ],
                 Surface::Module(view_id.clone()),
             )
         } else {
             (
                 vec![
-                    Change::DropModule {
+                    Change::Module(ModuleChange::DropModule {
                         id: view_id.clone(),
                         kind: ModuleKind::View,
-                    },
-                    Change::CreateTable {
+                    }),
+                    Change::Table(TableChange::CreateTable {
                         uid: uid.clone(),
                         name: name.clone(),
                         table: Box::new(table.clone()),
                         beside_default: None,
                         moves_at_most: None,
-                    },
+                    }),
                 ],
                 Surface::Table(name.clone()),
             )
@@ -214,20 +224,20 @@ fn a_child_dropped_after_its_tables_rename_keeps_its_opening_inventory() {
     let compiled = vec![owned(relation(&new), Surface::Table(new.clone()))];
     let changes = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::RenameTable {
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid,
                 from: old.clone(),
                 to: new.clone(),
                 defaults: vec![],
-            }),
-            PlannedChange::new(Change::DropCheck {
+            })),
+            PlannedChange::new(Change::Constraint(ConstraintChange::DropCheck {
                 table: new.clone(),
                 name: "c".into(),
-            }),
-            PlannedChange::new(Change::DropIndex {
+            })),
+            PlannedChange::new(Change::Index(IndexChange::DropIndex {
                 table: new.clone(),
                 name: "ix".into(),
-            }),
+            })),
         ],
     };
     let transitions = super::transitions::derive(
@@ -327,17 +337,17 @@ fn a_computed_column_dropped_after_its_tables_rename_keeps_its_opening_inventory
     let compiled = vec![owned(relation(&new), Surface::Table(new.clone()))];
     let changes = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::RenameTable {
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid,
                 from: old.clone(),
                 to: new.clone(),
                 defaults: vec![],
-            }),
-            PlannedChange::new(Change::DropComputedColumn {
+            })),
+            PlannedChange::new(Change::Column(ColumnChange::DropComputedColumn {
                 table: new.clone(),
                 name: "n".into(),
                 computed,
-            }),
+            })),
         ],
     };
     let transitions = super::transitions::derive(
@@ -443,7 +453,7 @@ fn a_column_edit_carries_its_whole_table_and_nothing_beyond_it() {
     records.push(owned(view_edge.clone(), Some(routine)));
     records.push(owned(stranger.clone(), None));
     let uid = ids.column_uid(&edited.column("n")).unwrap().clone();
-    let retype = Change::AlterColumnType {
+    let retype = Change::Column(ColumnChange::AlterColumnType {
         uid: uid.clone(),
         column: edited.column("n"),
         from: "integer".parse().unwrap(),
@@ -454,13 +464,13 @@ fn a_column_edit_carries_its_whole_table_and_nothing_beyond_it() {
         from_collation: None,
         to_collation: None,
         using: None,
-    };
-    let default = Change::AlterColumnDefault {
+    });
+    let default = Change::Column(ColumnChange::AlterColumnDefault {
         uid,
         column: edited.column("n"),
         from: None,
         to: Some("1".into()),
-    };
+    });
     let tree = BTreeSet::from([relation(&edited), column(&edited), index(&edited)]);
     for change in [retype, default] {
         let side = pbps_diff::Side {
@@ -600,12 +610,14 @@ fn a_rename_carries_the_records_that_name_the_renamed_table() {
         let mut desired_ids = base_ids.clone();
         desired_ids.rename_table(from, to);
         let changes = ChangeSet {
-            changes: vec![PlannedChange::new(Change::RenameTable {
-                uid,
-                from: from.clone(),
-                to: to.clone(),
-                defaults: vec![],
-            })],
+            changes: vec![PlannedChange::new(Change::Table(
+                TableChange::RenameTable {
+                    uid,
+                    from: from.clone(),
+                    to: to.clone(),
+                    defaults: vec![],
+                },
+            ))],
         };
         let (opening, compiled) = if from == &parent {
             (opening.clone(), compiled.clone())
@@ -702,17 +714,17 @@ fn a_rename_into_a_dropped_tables_name_inventories_both_opening_tables() {
     };
     let changes = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::DropTable {
+            PlannedChange::new(Change::Table(TableChange::DropTable {
                 uid: dropped_uid,
                 name: target.clone(),
                 detach_from: None,
-            }),
-            PlannedChange::new(Change::RenameTable {
+            })),
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: renamed_uid,
                 from: other.clone(),
                 to: target.clone(),
                 defaults: vec![],
-            }),
+            })),
         ],
     };
     let transitions = super::transitions::derive(
@@ -818,22 +830,22 @@ fn reused_table_spelling_does_not_duplicate_an_opening_child_inventory() {
     ];
     let changes = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::DropCheck {
+            PlannedChange::new(Change::Constraint(ConstraintChange::DropCheck {
                 table: old.clone(),
                 name: "ck".into(),
-            }),
-            PlannedChange::new(Change::RenameTable {
+            })),
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: first_uid,
                 from: old.clone(),
                 to: renamed.clone(),
                 defaults: vec![],
-            }),
-            PlannedChange::new(Change::RenameTable {
+            })),
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: second_uid,
                 from: other,
                 to: old.clone(),
                 defaults: vec![],
-            }),
+            })),
         ],
     };
     let transitions = super::transitions::derive(
@@ -930,25 +942,25 @@ fn final_coordinate_default_removal_uses_the_recorded_opening_uid() {
     }];
     let changes = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::RenameTable {
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: table_uid.clone(),
                 from: old.clone(),
                 to: renamed.clone(),
                 defaults: vec!["id".into()],
-            }),
-            PlannedChange::new(Change::RenameColumn {
+            })),
+            PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
                 uid: column_uid.clone(),
                 table: renamed.clone(),
                 from: "id".into(),
                 to: "n".into(),
                 table_was: Some(old.clone()),
-            }),
-            PlannedChange::new(Change::AlterColumnDefault {
+            })),
+            PlannedChange::new(Change::Column(ColumnChange::AlterColumnDefault {
                 uid: column_uid,
                 column: renamed.column("n"),
                 from: Some("1".into()),
                 to: None,
-            }),
+            })),
         ],
     };
     let derive = |plan: &ChangeSet| {
@@ -974,7 +986,9 @@ fn final_coordinate_default_removal_uses_the_recorded_opening_uid() {
     assert_eq!(removal.before, BTreeSet::from([default]));
     assert!(removal.after.is_empty());
     let mut wrong_uid = changes.clone();
-    let Change::AlterColumnDefault { uid, .. } = &mut wrong_uid.changes[2].change else {
+    let Change::Column(ColumnChange::AlterColumnDefault { uid, .. }) =
+        &mut wrong_uid.changes[2].change
+    else {
         panic!("the final typed step removes the default");
     };
     *uid = table_uid;
@@ -1153,29 +1167,29 @@ fn generated_expression_transitions_keep_exact_inventory_and_recorded_rename_ide
         let mut changes = ChangeSet::default();
         if rename {
             changes.changes.extend([
-                PlannedChange::new(Change::RenameTable {
+                PlannedChange::new(Change::Table(TableChange::RenameTable {
                     uid: table_uid.clone(),
                     from: old.clone(),
                     to: final_table.clone(),
                     defaults: vec!["d".into()],
-                }),
-                PlannedChange::new(Change::RenameColumn {
+                })),
+                PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
                     uid: column_uid.clone(),
                     table: final_table.clone(),
                     from: "g".into(),
                     to: final_name.into(),
                     table_was: Some(old.clone()),
-                }),
+                })),
             ]);
         }
-        changes
-            .changes
-            .push(PlannedChange::new(Change::AlterColumnExpression {
+        changes.changes.push(PlannedChange::new(Change::Column(
+            ColumnChange::AlterColumnExpression {
                 uid: column_uid.clone(),
                 column: final_table.column(final_name),
                 from: "a * 2 + 1".into(),
                 to: "a * 3".into(),
-            }));
+            },
+        )));
         let derive = |changes: &ChangeSet, opening_ids: &IdsFile| {
             super::transitions::derive(
                 changes,
@@ -1232,7 +1246,7 @@ fn generated_expression_transitions_keep_exact_inventory_and_recorded_rename_ide
         // It must not select that input column's empty attrdef inventory.
         for wrong in [table_uid, source_uid] {
             let mut invalid = changes.clone();
-            let Change::AlterColumnExpression { uid, .. } =
+            let Change::Column(ColumnChange::AlterColumnExpression { uid, .. }) =
                 &mut invalid.changes.last_mut().unwrap().change
             else {
                 unreachable!()
@@ -1284,13 +1298,13 @@ fn create_and_add_stored_generation_keep_the_attrdef_child_inventory() {
         let (surface, change, expected) = if create {
             (
                 Surface::Table(table.clone()),
-                Change::CreateTable {
+                Change::Table(TableChange::CreateTable {
                     uid: desired_ids.table_uid(&table).unwrap().clone(),
                     name: table.clone(),
                     table: Box::new(desired.tables[&table].clone()),
                     beside_default: None,
                     moves_at_most: None,
-                },
+                }),
                 compiled
                     .iter()
                     .map(|record| record.object.clone())
@@ -1300,12 +1314,12 @@ fn create_and_add_stored_generation_keep_the_attrdef_child_inventory() {
             let [column, attrdef, owner, reference] = generation_objects(&table, "g");
             (
                 Surface::Column(table.column("g")),
-                Change::AddColumn {
+                Change::Column(ColumnChange::AddColumn {
                     uid: desired_ids.column_uid(&table.column("g")).unwrap().clone(),
                     table: table.clone(),
                     name: "g".into(),
                     column: Box::new(desired.tables[&table].columns["g"].clone()),
-                },
+                }),
                 BTreeSet::from([column, attrdef, owner, reference]),
             )
         };
@@ -1790,6 +1804,8 @@ fn a_reused_name_keeps_two_removed_surfaces_distinct() {
 
 mod column_vector_parent {
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::TableChange;
     use pbps_model::{Column, Generated, PlannedChange, TableName};
     use pbps_pg::resolver::capture::BindingRecord;
 
@@ -1853,10 +1869,10 @@ mod column_vector_parent {
                     desired_ids.columns.remove(&uid);
                     let objects = generation_objects(&table, "g");
                     (
-                        Change::DropColumn {
+                        Change::Column(ColumnChange::DropColumn {
                             uid,
                             column: table.column("g"),
-                        },
+                        }),
                         Surface::Column(table.column("g")),
                         BTreeSet::from(objects),
                         BTreeSet::new(),
@@ -1872,13 +1888,13 @@ mod column_vector_parent {
                     let mut desired_ids = base_ids.clone();
                     desired_ids.columns.get_mut(&uid).unwrap().name = "h".into();
                     (
-                        Change::RenameColumn {
+                        Change::Column(ColumnChange::RenameColumn {
                             uid,
                             table: table.clone(),
                             from: "g".into(),
                             to: "h".into(),
                             table_was: None,
-                        },
+                        }),
                         Surface::Column(table.column("h")),
                         BTreeSet::from(generation_objects(&table, "g")),
                         BTreeSet::from(generation_objects(&table, "h")),
@@ -1936,12 +1952,12 @@ mod column_vector_parent {
                     let mut compiled = opening.clone();
                     compiled.extend(additions);
                     (
-                        Change::AddColumn {
+                        Change::Column(ColumnChange::AddColumn {
                             uid: desired_ids.column_uid(&table.column("h")).unwrap().clone(),
                             table: table.clone(),
                             name: "h".into(),
                             column: Box::new(column),
-                        },
+                        }),
                         Surface::Column(table.column("h")),
                         BTreeSet::new(),
                         after,
@@ -2021,22 +2037,22 @@ mod column_vector_parent {
             .remove(base_ids.column_uid(&old.column("g")).unwrap());
         let changes = ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::DropColumn {
+                PlannedChange::new(Change::Column(ColumnChange::DropColumn {
                     uid: base_ids.column_uid(&old.column("g")).unwrap().clone(),
                     column: old.column("g"),
-                }),
-                PlannedChange::new(Change::RenameTable {
+                })),
+                PlannedChange::new(Change::Table(TableChange::RenameTable {
                     uid: base_ids.table_uid(&old).unwrap().clone(),
                     from: old.clone(),
                     to: renamed.clone(),
                     defaults: vec!["d".into()],
-                }),
-                PlannedChange::new(Change::RenameTable {
+                })),
+                PlannedChange::new(Change::Table(TableChange::RenameTable {
                     uid: base_ids.table_uid(&other).unwrap().clone(),
                     from: other.clone(),
                     to: old.clone(),
                     defaults: vec!["d".into(), "g".into()],
-                }),
+                })),
             ],
         };
         let mut opening = generation_records(&old, "g");
@@ -2104,7 +2120,7 @@ mod column_vector_parent {
         let uid = ids.column_uid(&table.column("g")).unwrap().clone();
         let records = generation_records(&table, "g");
         for change in [
-            Change::AlterColumnType {
+            Change::Column(ColumnChange::AlterColumnType {
                 uid: uid.clone(),
                 column: table.column("g"),
                 from: "integer".parse().unwrap(),
@@ -2115,27 +2131,27 @@ mod column_vector_parent {
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            },
-            Change::AlterColumnNullability {
+            }),
+            Change::Column(ColumnChange::AlterColumnNullability {
                 uid: uid.clone(),
                 column: table.column("g"),
                 ty: "integer".parse().unwrap(),
                 to_nullable: false,
                 through_external_partitions: false,
                 collation: None,
-            },
-            Change::AlterColumnExpression {
+            }),
+            Change::Column(ColumnChange::AlterColumnExpression {
                 uid,
                 column: table.column("g"),
                 from: "a * 2 + 1".into(),
                 to: "a * 3".into(),
-            },
-            Change::AlterColumnDefault {
+            }),
+            Change::Column(ColumnChange::AlterColumnDefault {
                 uid: ids.column_uid(&table.column("d")).unwrap().clone(),
                 column: table.column("d"),
                 from: Some("7".into()),
                 to: Some("8".into()),
-            },
+            }),
         ] {
             let changes = ChangeSet {
                 changes: vec![PlannedChange::new(change)],
@@ -2223,19 +2239,19 @@ fn a_generated_placeholder_created_in_the_plan_has_no_opening_inventory() {
         unreachable!()
     };
     let to = std::mem::replace(&mut g.expression, "NULL::integer".into());
-    let create = PlannedChange::new(Change::CreateTable {
+    let create = PlannedChange::new(Change::Table(TableChange::CreateTable {
         uid: recorded.table_uid(&name).unwrap().clone(),
         name: name.clone(),
         table: Box::new(placeholder),
         beside_default: None,
         moves_at_most: None,
-    });
-    let install = PlannedChange::new(Change::AlterColumnExpression {
+    }));
+    let install = PlannedChange::new(Change::Column(ColumnChange::AlterColumnExpression {
         uid: recorded.column_uid(&name.column("g")).unwrap().clone(),
         column: name.column("g"),
         from: "NULL::integer".into(),
         to,
-    });
+    }));
     let empty = Schema::default();
     let no_ids = IdsFile::default();
     let derive = |changes: &ChangeSet| {
@@ -2269,7 +2285,9 @@ fn a_generated_placeholder_created_in_the_plan_has_no_opening_inventory() {
         assert!(derive(&ChangeSet { changes }).is_err());
     }
     let mut wrong = cs;
-    let Change::AlterColumnExpression { from, .. } = &mut wrong.changes[1].change else {
+    let Change::Column(ColumnChange::AlterColumnExpression { from, .. }) =
+        &mut wrong.changes[1].change
+    else {
         unreachable!()
     };
     *from = "0".into();
@@ -2350,11 +2368,11 @@ fn a_declared_types_transition_inventories_the_records_it_owns() {
 
     // Created: the compiled records of the type, and not another's.
     let created = derive(
-        vec![Change::CreateType {
+        vec![Change::Type(TypeChange::CreateType {
             uid: uid.clone(),
             name: mood.clone(),
             definition: Box::new(definition()),
-        }],
+        })],
         &Schema::default(),
         &schema_with(&[&mood]),
         &[],
@@ -2369,11 +2387,11 @@ fn a_declared_types_transition_inventories_the_records_it_owns() {
 
     // Dropped: the opening records, and nothing is installed.
     let dropped = derive(
-        vec![Change::DropType {
+        vec![Change::Type(TypeChange::DropType {
             uid: uid.clone(),
             name: mood.clone(),
             definition: Box::new(definition()),
-        }],
+        })],
         &schema_with(&[&mood]),
         &Schema::default(),
         &[mood_record.clone(), other_record.clone()],
@@ -2387,14 +2405,14 @@ fn a_declared_types_transition_inventories_the_records_it_owns() {
 
     // A label operation replaces the records in place.
     let altered = derive(
-        vec![Change::AddEnumValue {
+        vec![Change::TypeValue(TypeValueChange::AddEnumValue {
             uid: uid.clone(),
             name: mood.clone(),
             value: "b".into(),
             placement: None,
             ordinal: 0,
             definition: Box::new(definition()),
-        }],
+        })],
         &schema_with(&[&mood]),
         &schema_with(&[&mood]),
         std::slice::from_ref(&mood_record),
@@ -2407,14 +2425,14 @@ fn a_declared_types_transition_inventories_the_records_it_owns() {
     assert_eq!(transition.after, BTreeSet::from([mood_row.clone()]));
     // Negative: a type the desired schema does not declare is not installed.
     let undeclared = derive(
-        vec![Change::AddEnumValue {
+        vec![Change::TypeValue(TypeValueChange::AddEnumValue {
             uid,
             name: mood.clone(),
             value: "b".into(),
             placement: None,
             ordinal: 0,
             definition: Box::new(definition()),
-        }],
+        })],
         &schema_with(&[&mood]),
         &Schema::default(),
         std::slice::from_ref(&mood_record),
@@ -2432,12 +2450,12 @@ fn a_declared_types_transition_inventories_the_records_it_owns() {
     let desired = schema_with(&[&mood]);
     let renamed = super::transitions::derive(
         &ChangeSet {
-            changes: vec![PlannedChange::new(Change::RenameType {
+            changes: vec![PlannedChange::new(Change::Type(TypeChange::RenameType {
                 uid: renamed_uid,
                 from: old.clone(),
                 to: mood.clone(),
                 definition: Box::new(definition()),
-            })],
+            }))],
         },
         pbps_diff::Side {
             schema: &base,

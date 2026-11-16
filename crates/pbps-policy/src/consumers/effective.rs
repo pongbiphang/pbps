@@ -3,6 +3,8 @@ use super::{
     Side,
     binding::{Target, column_target},
 };
+use pbps_model::ColumnChange;
+use pbps_model::TableChange;
 use pbps_model::{
     Change, ChangeSet, Column, ColumnRef, DomainDelta, ManagedType, ObjectLocalName, TypeRef, Uid,
     ValueSource,
@@ -128,16 +130,16 @@ impl Interfaces {
         let mut created = BTreeSet::new();
         let mut added_columns = BTreeSet::new();
         for p in &cs.changes {
-            if let Change::AddColumn {
+            if let Change::Column(ColumnChange::AddColumn {
                 uid, table, name, ..
-            } = &p.change
+            }) = &p.change
             {
                 added_columns.insert(table.column(name.clone()));
                 if !sides[0].ids.columns.contains_key(uid) {
                     added.insert(uid.clone());
                 }
             }
-            if let Change::CreateTable { uid, .. } = &p.change
+            if let Change::Table(TableChange::CreateTable { uid, .. }) = &p.change
                 && sides[0].table(Some(uid)).is_none()
             {
                 created.insert(uid.clone());

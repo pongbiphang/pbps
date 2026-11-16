@@ -5,6 +5,9 @@ use super::{
 };
 use pbps_dialect::lower::{Lowering, lower_all};
 use pbps_dialect::{DialectError, MinimalDialect, Statement};
+use pbps_model::ColumnChange;
+use pbps_model::RoleChange;
+use pbps_model::TableChange;
 use pbps_model::operation::Origin;
 use pbps_model::resolver::OrderReason;
 use pbps_model::{
@@ -25,7 +28,7 @@ impl Expansion for GeneratedParts {
             .iter()
             .enumerate()
             .filter_map(|(at, planned)| {
-                if let Change::CreateTable { table, .. } = &planned.change {
+                if let Change::Table(TableChange::CreateTable { table, .. }) = &planned.change {
                     table.columns.contains_key("g").then_some(at)
                 } else {
                     None
@@ -35,16 +38,16 @@ impl Expansion for GeneratedParts {
     }
     fn expand(&self, plan: &[PlannedChange], at: &usize) -> Result<Rewrite, String> {
         let mut bare = plan[*at].clone();
-        let Change::CreateTable { name, table, .. } = &mut bare.change else {
+        let Change::Table(TableChange::CreateTable { name, table, .. }) = &mut bare.change else {
             unreachable!("the fixture's obligation names its generated table")
         };
         let generated = table.columns.shift_remove("g").unwrap();
-        let add = PlannedChange::new(Change::AddColumn {
+        let add = PlannedChange::new(Change::Column(ColumnChange::AddColumn {
             uid: "c_aaaaab".parse().unwrap(),
             table: name.clone(),
             name: "g".into(),
             column: Box::new(generated),
-        });
+        }));
         Ok(Rewrite::Split {
             at: *at,
             parts: Box::new([bare, add]),
@@ -85,17 +88,17 @@ fn expanded_and_reordered() -> PlanningPlan {
     table.columns.insert("g".into(), generated);
     let input = propose(ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::CreateTable {
+            PlannedChange::new(Change::Table(TableChange::CreateTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: TableName::new("app", "t"),
                 table: Box::new(table),
                 beside_default: None,
                 moves_at_most: None,
-            }),
-            PlannedChange::new(Change::CreateRole {
+            })),
+            PlannedChange::new(Change::Role(RoleChange::CreateRole {
                 uid: "r_aaaaaa".parse().unwrap(),
                 name: "reader".into(),
-            }),
+            })),
         ],
     });
     let expanded = super::expand::expand(input, &GeneratedParts, super::expand::FACTOR).unwrap();

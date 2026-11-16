@@ -1,6 +1,9 @@
 use pbps_model::ColumnName;
 use std::collections::{BTreeMap, BTreeSet};
 
+use pbps_model::ColumnChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
 use pbps_model::{
     Change, ChangeSet, ReplicaIdentity, Table, TableName, Uid, ValueSource,
     plan_names::{At, Holder, PlanNames},
@@ -38,13 +41,13 @@ impl<'a> CreatedChanges<'a> {
         let mut tables = BTreeMap::new();
         for (i, p) in changes.changes.iter().enumerate() {
             let shape = match &p.change {
-                Change::CreateTable {
+                Change::Table(TableChange::CreateTable {
                     uid, name, table, ..
-                } => Some((name, table.as_ref(), Kind::Create(uid), At::After(i))),
-                Change::AttachPartition { table, shape, .. } => {
+                }) => Some((name, table.as_ref(), Kind::Create(uid), At::After(i))),
+                Change::Partition(PartitionChange::AttachPartition { table, shape, .. }) => {
                     Some((table, shape.as_ref(), Kind::Attach, At::Before(i)))
                 }
-                Change::DetachPartition { table, shape, .. } => {
+                Change::Partition(PartitionChange::DetachPartition { table, shape, .. }) => {
                     Some((table, shape.as_ref(), Kind::Detach, At::Before(i)))
                 }
                 // These changes establish or adopt a shape. A CREATE's
@@ -80,12 +83,12 @@ impl<'a> CreatedChanges<'a> {
         }
         for (i, p) in changes.changes.iter().enumerate() {
             let at = At::Before(i);
-            if let Change::AddColumn {
+            if let Change::Column(ColumnChange::AddColumn {
                 table,
                 name,
                 column,
                 ..
-            } = &p.change
+            }) = &p.change
                 && let Some(table_name) = final_table(names, table, at)
                 && let Some(created) = tables.get_mut(&table_name)
                 && matches!(created.kind, Kind::Create(_))
@@ -96,7 +99,7 @@ impl<'a> CreatedChanges<'a> {
                 // columns_after still checks each part's field promises.
                 created.finished.columns.insert(name, (**column).clone());
             }
-            if let Change::AlterColumnDefault { column, to, .. } = &p.change
+            if let Change::Column(ColumnChange::AlterColumnDefault { column, to, .. }) = &p.change
                 && let Some(table) = final_table(names, &column.table, at)
                 && let Some(created) = tables.get_mut(&table)
                 && let Some(column) = final_column(names, &column.table, &column.name, at)
@@ -119,15 +122,18 @@ impl<'a> CreatedChanges<'a> {
                 }
             }
             let own = match &p.change {
-                Change::SetPartitionDefault {
-                    table, column, to, ..
-                } => Some((table, column, Some(to), None)),
-                Change::SetPartitionNotNull {
+                Change::Partition(PartitionChange::SetPartitionDefault {
+                    table,
+                    column,
+                    to,
+                    ..
+                }) => Some((table, column, Some(to), None)),
+                Change::Partition(PartitionChange::SetPartitionNotNull {
                     table,
                     column,
                     not_null,
                     ..
-                } => Some((table, column, None, Some(*not_null))),
+                }) => Some((table, column, None, Some(*not_null))),
                 _ => None,
             };
             if let Some((table, column, default, not_null)) = own

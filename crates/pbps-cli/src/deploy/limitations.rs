@@ -230,7 +230,9 @@ pub(super) fn external_uids(
         .map(|(uid, _)| uid.clone())
         .collect();
     for p in &changes.changes {
-        if let pbps_model::Change::CreateTable { uid, table, .. } = &p.change
+        if let pbps_model::Change::Table(pbps_model::TableChange::CreateTable {
+            uid, table, ..
+        }) = &p.change
             && table.partition_by.as_ref().is_some_and(|by| by.external)
         {
             set.insert(uid.clone());
@@ -279,7 +281,12 @@ pub(super) fn modules_after(
         // Keeping it needs no knowledge of which statements have run: one
         // already dropped is simply absent from the catalog, which the read
         // records truthfully, and one still standing stays watched.
-        if settled.whole() && matches!(p.change, pbps_model::Change::DropModule { .. }) {
+        if settled.whole()
+            && matches!(
+                p.change,
+                pbps_model::Change::Module(pbps_model::ModuleChange::DropModule { .. })
+            )
+        {
             set.remove(id);
         } else {
             set.insert(id.clone());
@@ -316,7 +323,12 @@ pub(super) fn dependency_hints_for_schema(
         .changes
         .changes
         .iter()
-        .filter(|planned| matches!(planned.change, pbps_model::Change::DropModule { .. }))
+        .filter(|planned| {
+            matches!(
+                planned.change,
+                pbps_model::Change::Module(pbps_model::ModuleChange::DropModule { .. })
+            )
+        })
         .filter_map(|planned| planned.change.module_id())
         .collect();
     let of_dropped = |edge: &&pbps_model::object_ref::ObjectEdge| {

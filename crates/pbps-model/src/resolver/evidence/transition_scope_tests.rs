@@ -1,4 +1,5 @@
 use super::*;
+use crate::ColumnChange;
 use crate::resolver::{BoundSurface, ObjectIdentity, ObjectOwnership, Prerequisite, Surface};
 use crate::{PlannedChange, TableName};
 
@@ -57,12 +58,14 @@ pub(super) fn fixture() -> (ChangeSet, ResolverEvidence) {
     }
     evidence.after = serde_json::from_value(json).unwrap();
     let changes = ChangeSet {
-        changes: vec![PlannedChange::new(Change::AlterColumnDefault {
-            uid: "c_000000".parse().unwrap(),
-            column: table.column("n"),
-            from: Some("1".into()),
-            to: Some("2".into()),
-        })],
+        changes: vec![PlannedChange::new(Change::Column(
+            ColumnChange::AlterColumnDefault {
+                uid: "c_000000".parse().unwrap(),
+                column: table.column("n"),
+                from: Some("1".into()),
+                to: Some("2".into()),
+            },
+        ))],
     };
     let bound = BoundSurface {
         object: object("changed-default"),
@@ -188,14 +191,14 @@ fn aggregate_inventories_cannot_add_or_remove_unaffected_siblings() {
 fn one_aggregate_can_account_for_multiple_explicit_default_changes() {
     let (mut changes, mut evidence) = fixture();
     let column = "app.v".parse::<TableName>().unwrap().column("other");
-    changes
-        .changes
-        .push(PlannedChange::new(Change::AlterColumnDefault {
+    changes.changes.push(PlannedChange::new(Change::Column(
+        ColumnChange::AlterColumnDefault {
             uid: "c_000001".parse().unwrap(),
             column: column.clone(),
             from: Some("7".into()),
             to: Some("8".into()),
-        }));
+        },
+    )));
     let bound = BoundSurface {
         object: object("sibling-default"),
         bindings: vec![],
@@ -262,7 +265,9 @@ fn saved_aggregate_inventory_cannot_rewrite_an_untouched_sibling() {
 fn default_inventories_respect_creation_and_removal_endpoints() {
     for creating in [false, true] {
         let (mut changes, mut evidence) = fixture();
-        if let Change::AlterColumnDefault { from, to, .. } = &mut changes.changes[0].change {
+        if let Change::Column(ColumnChange::AlterColumnDefault { from, to, .. }) =
+            &mut changes.changes[0].change
+        {
             if creating {
                 *from = None;
             } else {
@@ -304,12 +309,12 @@ fn default_inventories_respect_creation_and_removal_endpoints() {
 #[test]
 fn a_generation_expression_change_accounts_for_its_record_and_nothing_else() {
     let (mut changes, mut evidence) = fixture();
-    changes.changes[0] = PlannedChange::new(Change::AlterColumnExpression {
+    changes.changes[0] = PlannedChange::new(Change::Column(ColumnChange::AlterColumnExpression {
         uid: "c_000000".parse().unwrap(),
         column: "app.v".parse::<TableName>().unwrap().column("n"),
         from: "(a * 2)".into(),
         to: "a * 3".into(),
-    });
+    }));
     evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
     // Aggregated under the table, and named exactly as the record's own
     // surface, which only a change to that surface authorizes.

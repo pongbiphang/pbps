@@ -1,5 +1,8 @@
 use super::*;
 use crate::order::{PlanningPlan, Refusal, Schedule, propose};
+use pbps_model::ColumnChange;
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
 use pbps_model::operation::Snapshot;
 use pbps_model::{ChangeSet, Column, IdsFile, Module, ModuleKind, PlannedChange, Schema, Table};
 
@@ -57,17 +60,17 @@ impl Fixture {
     }
     fn creates(&self) -> Vec<Change> {
         vec![
-            Change::CreateModule {
+            Change::Module(ModuleChange::CreateModule {
                 id: "app.f".parse().unwrap(),
                 module: Box::new(view()),
-            },
-            Change::CreateTable {
+            }),
+            Change::Table(TableChange::CreateTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: "app.t".parse().unwrap(),
                 table: Box::new(self.after.tables[&"app.t".parse().unwrap()].clone()),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
         ]
     }
     fn plan(
@@ -141,10 +144,10 @@ fn explicit_intent_displaces_a_text_guess_but_never_a_typed_or_catalog_fact() {
     let mut changes = f.creates();
     changes.insert(
         1,
-        Change::CreateModule {
+        Change::Module(ModuleChange::CreateModule {
             id: "app.middle".parse().unwrap(),
             module: Box::new(view()),
-        },
+        }),
     );
     let mut f = f;
     f.after
@@ -193,16 +196,16 @@ fn parts_use_exposed_boundaries_and_otherwise_hold_the_indivisible_group() {
     let whole = f.plan(f.creates(), &ObjectDeps::default(), &goal).unwrap();
     assert_eq!(Schedule::new(2).settle(whole).unwrap().sequence, [0, 1]);
     let mut changes = f.creates();
-    let Change::CreateTable { table, .. } = &mut changes[1] else {
+    let Change::Table(TableChange::CreateTable { table, .. }) = &mut changes[1] else {
         panic!()
     };
     table.columns["x"].value_source = pbps_model::ValueSource::None;
-    changes.push(Change::AlterColumnDefault {
+    changes.push(Change::Column(ColumnChange::AlterColumnDefault {
         uid: "c_aaaaaa".parse().unwrap(),
         column: "app.t.x".parse().unwrap(),
         from: None,
         to: Some("1".into()),
-    });
+    }));
     let goal = dependencies(&[
         ("default::app.t.x", &["app.f"]),
         ("app.f", &["table::app.t"]),
@@ -259,26 +262,26 @@ fn baseline_edges_end_the_old_incarnation_without_gating_the_reused_name() {
     let old = dependencies(&[("app.f", &["table::app.t"])]);
     let table = f.after.tables[&"app.t".parse().unwrap()].clone();
     let changes = vec![
-        Change::DropModule {
+        Change::Module(ModuleChange::DropModule {
             id: "app.f".parse().unwrap(),
             kind: ModuleKind::View,
-        },
-        Change::DropTable {
+        }),
+        Change::Table(TableChange::DropTable {
             uid: "t_aaaaaa".parse().unwrap(),
             name: "app.t".parse().unwrap(),
             detach_from: None,
-        },
-        Change::CreateTable {
+        }),
+        Change::Table(TableChange::CreateTable {
             uid: "t_bbbbbb".parse().unwrap(),
             name: "app.t".parse().unwrap(),
             table: Box::new(table),
             beside_default: None,
             moves_at_most: None,
-        },
-        Change::CreateModule {
+        }),
+        Change::Module(ModuleChange::CreateModule {
             id: "app.f".parse().unwrap(),
             module: Box::new(view()),
-        },
+        }),
     ];
     let removed = f
         .plan(changes.clone(), &old, &ObjectDeps::default())
@@ -320,10 +323,10 @@ fn legacy_projection_is_hard_and_does_not_filter_equal_leaf_names() {
     let creates: Vec<_> = ["left.v", "right.v"]
         .into_iter()
         .map(|id| {
-            PlannedChange::new(Change::CreateModule {
+            PlannedChange::new(Change::Module(ModuleChange::CreateModule {
                 id: id.parse().unwrap(),
                 module: Box::new(view()),
-            })
+            }))
         })
         .collect();
     let ops = pbps_model::operation::Operations::of_plan(

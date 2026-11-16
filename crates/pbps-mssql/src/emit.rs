@@ -20,6 +20,21 @@ use pbps_model::ColumnName;
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::{Created, DialectError, Statement};
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::ExtensionChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::PolicyChange;
+use pbps_model::RoleChange;
+use pbps_model::RowChange;
+use pbps_model::SearchChange;
+use pbps_model::TableChange;
+use pbps_model::TablePropertyChange;
+use pbps_model::TypeChange;
+use pbps_model::TypeValueChange;
 use pbps_model::{
     Cell, Change, Collation, Column, ColumnType, ForeignKey, GrantTarget, Index, Module, ModuleId,
     ModuleKind, Permission, PrimaryKey, ReferentialAction, Row, RowKey, Strategy, Table, TableName,
@@ -289,10 +304,10 @@ pub fn takes_online(change: &Change) -> bool {
 
 pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
     match change {
-        Change::RebuildPartitionedTable(_)
-        | Change::BuildPartitionedIndex(_)
-        | Change::CopyTableRows(_)
-        | Change::AnalyzeTableTree(_) => {
+        Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+        | Change::Index(IndexChange::BuildPartitionedIndex(_))
+        | Change::Partition(PartitionChange::CopyTableRows(_))
+        | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => {
             let (operation, table) = change.pending_rebuild().expect("explicit rebuild variant");
             Err(DialectError::RebuildUnavailable {
                 operation,
@@ -300,38 +315,43 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             })
         }
 
-        Change::AddEnumValue { name, .. }
-        | Change::AlterDomain { name, .. }
-        | Change::RenameEnumValue { name, .. }
-        | Change::EnumRebuild { name, .. }
-        | Change::CreateType { name, .. }
-        | Change::DropType { name, .. }
-        | Change::RenameType { from: name, .. } => Err(DialectError::Unsupported {
-            dialect: crate::types::DIALECT,
-            feature: format!("declared type {}", name.shown()),
-        }),
-        // An exclusion constraint is PostgreSQL's: SQL Server has no such
-        // constraint, and the declaration is refused by name before any plan.
-        Change::SetExclusion { name, .. } => Err(DialectError::Unsupported {
-            dialect: crate::types::DIALECT,
-            feature: format!("exclusion constraint {}", name.shown()),
-        }),
-        Change::CreateSearch { name, .. } | Change::DropSearch { name, .. } => {
+        Change::TypeValue(TypeValueChange::AddEnumValue { name, .. })
+        | Change::TypeValue(TypeValueChange::AlterDomain { name, .. })
+        | Change::TypeValue(TypeValueChange::RenameEnumValue { name, .. })
+        | Change::TypeValue(TypeValueChange::EnumRebuild { name, .. })
+        | Change::Type(TypeChange::CreateType { name, .. })
+        | Change::Type(TypeChange::DropType { name, .. })
+        | Change::Type(TypeChange::RenameType { from: name, .. }) => {
             Err(DialectError::Unsupported {
                 dialect: crate::types::DIALECT,
-                feature: format!("{}", name.shown()),
+                feature: format!("declared type {}", name.shown()),
             })
         }
-        Change::CreateExtension { name, .. }
-        | Change::DropExtension { name, .. }
-        | Change::UpdateExtension { name, .. }
-        | Change::SetExtensionSchema { name, .. } => Err(DialectError::Unsupported {
+        // An exclusion constraint is PostgreSQL's: SQL Server has no such
+        // constraint, and the declaration is refused by name before any plan.
+        Change::Constraint(ConstraintChange::SetExclusion { name, .. }) => {
+            Err(DialectError::Unsupported {
+                dialect: crate::types::DIALECT,
+                feature: format!("exclusion constraint {}", name.shown()),
+            })
+        }
+        Change::Search(SearchChange::CreateSearch { name, .. })
+        | Change::Search(SearchChange::DropSearch { name, .. }) => Err(DialectError::Unsupported {
             dialect: crate::types::DIALECT,
-            feature: format!("extension {}", name.shown()),
+            feature: format!("{}", name.shown()),
         }),
+        Change::Extension(ExtensionChange::CreateExtension { name, .. })
+        | Change::Extension(ExtensionChange::DropExtension { name, .. })
+        | Change::Extension(ExtensionChange::UpdateExtension { name, .. })
+        | Change::Extension(ExtensionChange::SetExtensionSchema { name, .. }) => {
+            Err(DialectError::Unsupported {
+                dialect: crate::types::DIALECT,
+                feature: format!("extension {}", name.shown()),
+            })
+        }
         // The first statement is the one that brings the table into being;
         // it says so, and a staged checkpoint adopts the table from there.
-        Change::CreateTable { name, table, .. } => {
+        Change::Table(TableChange::CreateTable { name, table, .. }) => {
             let mut out = create_table(name, table)?;
             if let Some(first) = out.first_mut() {
                 first.creates.push(Created::Table(name.clone()));
@@ -339,32 +359,34 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             Ok(out)
         }
 
-        Change::DropTable {
+        Change::Table(TableChange::DropTable {
             name,
             detach_from: None,
             ..
-        } => one(format!("DROP TABLE {};", qualified(name)?)),
+        }) => one(format!("DROP TABLE {};", qualified(name)?)),
         // A partition is PostgreSQL's in this model, refused on this engine
         // by validation; a plan that carries one anyway is not run (#1171,
         // #1544).
-        Change::DropTable {
+        Change::Table(TableChange::DropTable {
             name: table,
             detach_from: Some(parent),
             ..
+        })
+        | Change::Partition(PartitionChange::DetachPartition { table, parent, .. })
+        | Change::Partition(PartitionChange::AttachPartition { table, parent, .. }) => {
+            Err(DialectError::Invalid {
+                dialect: crate::types::DIALECT,
+                message: format!(
+                    "{table} is a partition of {parent}, which SQL Server's model does not hold",
+                    table = table.shown(),
+                    parent = parent.shown()
+                ),
+            })
         }
-        | Change::DetachPartition { table, parent, .. }
-        | Change::AttachPartition { table, parent, .. } => Err(DialectError::Invalid {
-            dialect: crate::types::DIALECT,
-            message: format!(
-                "{table} is a partition of {parent}, which SQL Server's model does not hold",
-                table = table.shown(),
-                parent = parent.shown()
-            ),
-        }),
 
         // Reference data (ADR-0004). The only DML this tool emits, and it
         // reaches here only for a table that declared a `data:` block.
-        Change::InsertRow {
+        Change::Row(RowChange::InsertRow {
             table,
             key_column,
             identity_key,
@@ -372,7 +394,7 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             row,
             defaults,
             types,
-        } => insert_row(
+        }) => insert_row(
             table,
             key_column.raw(),
             *identity_key,
@@ -382,7 +404,7 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             types,
         ),
 
-        Change::UpdateRow {
+        Change::Row(RowChange::UpdateRow {
             table,
             key_column,
             key,
@@ -393,7 +415,7 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             // T-SQL has no user-defined operators: a key's `=` is the
             // engine's whatever the session (DEC-1564.2).
             key_type: _,
-        } => update_row(
+        }) => update_row(
             table,
             key_column.raw(),
             key,
@@ -406,7 +428,7 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
         // The row's content is not carried (the pinned baseline holds it),
         // so the delete holds the row to its existence: a row already gone
         // is a baseline this plan was not reviewed against (DECISIONS 122).
-        Change::DeleteRow {
+        Change::Row(RowChange::DeleteRow {
             table,
             key_column,
             key,
@@ -414,7 +436,7 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             types,
             after_types,
             ..
-        } => {
+        }) => {
             // Keyed *and* held to the row the plan recorded. The checksum
             // pins the state only up to the moment `apply` reads it, so a
             // key-only DELETE removes whatever an application session left
@@ -457,18 +479,19 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
         // The mode is a property of the declaration, not of the database: it
         // decides what future plans do about undeclared rows. The row changes
         // it implies are separate entries in this same plan.
-        Change::SetDataMode { .. } | Change::SetEnsureKeys { .. } => Ok(Vec::new()),
+        Change::Row(RowChange::SetDataMode { .. })
+        | Change::Row(RowChange::SetEnsureKeys { .. }) => Ok(Vec::new()),
 
         // Roles (ADR-0005). `ALTER ROLE ... WITH NAME` keeps the membership,
         // which is the reason a role rename is intent rather than drop + add.
-        Change::CreateRole { name, .. } => Ok(vec![
+        Change::Role(RoleChange::CreateRole { name, .. }) => Ok(vec![
             Statement::new(format!("CREATE ROLE {};", quote(name.raw())?))
                 .creating(Created::Role(name.clone())),
         ]),
         // The members go first, each in a statement of its own, and the role
         // last: the engine refuses to drop a role that still has members, and
         // a plan that listed them is a plan the reviewer saw.
-        Change::DropRole { name, members, .. } => {
+        Change::Role(RoleChange::DropRole { name, members, .. }) => {
             let mut out = Vec::new();
             for member in members {
                 out.push(Statement::new(format!(
@@ -482,7 +505,7 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
         }
         // The statement says what it does to the name (`Statement::renaming_role`),
         // as a table rename does, so a staged checkpoint finds the role again.
-        Change::RenameRole { from, to, .. } => Ok(vec![
+        Change::Role(RoleChange::RenameRole { from, to, .. }) => Ok(vec![
             Statement::new(format!(
                 "ALTER ROLE {} WITH NAME = {};",
                 quote(from.raw())?,
@@ -490,21 +513,21 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             ))
             .renaming_role(from.clone(), to.clone()),
         ]),
-        Change::Grant {
+        Change::Permission(GrantChange::Grant {
             role,
             target,
             permissions,
-        } => one(format!(
+        }) => one(format!(
             "GRANT {} ON {} TO {};",
             permission_list(permissions)?,
             securable(target)?,
             quote(role.raw())?
         )),
-        Change::Revoke {
+        Change::Permission(GrantChange::Revoke {
             role,
             target,
             permissions,
-        } => one(format!(
+        }) => one(format!(
             "REVOKE {} ON {} FROM {};",
             permission_list(permissions)?,
             securable(target)?,
@@ -526,29 +549,36 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
         // This engine does not hold descriptions (`holds_descriptions`), so no plan
         // carries one here; a change that does came from somewhere else and has no
         // statement. `MS_Description` follows in its own issue (#2729).
-        Change::SetComment { target, .. } => Err(DialectError::Unsupported {
-            dialect: DIALECT,
-            feature: format!(
-                "a comment on `{table}`, which this engine does not hold yet",
-                table = target.table().shown()
-            ),
-        }),
-        Change::SetReplicaIdentity { table, .. } => Err(DialectError::Unsupported {
-            dialect: DIALECT,
-            feature: format!(
-                "a replica identity on `{table}`, which is PostgreSQL's",
-                table = table.shown()
-            ),
-        }),
-        Change::SetStorageParameters { table, .. } => Err(DialectError::Unsupported {
-            dialect: DIALECT,
-            feature: format!(
-                "storage parameters on `{table}`, which are PostgreSQL's",
-                table = table.shown()
-            ),
-        }),
+        Change::TableProperty(TablePropertyChange::SetComment { target, .. }) => {
+            Err(DialectError::Unsupported {
+                dialect: DIALECT,
+                feature: format!(
+                    "a comment on `{table}`, which this engine does not hold yet",
+                    table = target.table().shown()
+                ),
+            })
+        }
+        Change::TableProperty(TablePropertyChange::SetReplicaIdentity { table, .. }) => {
+            Err(DialectError::Unsupported {
+                dialect: DIALECT,
+                feature: format!(
+                    "a replica identity on `{table}`, which is PostgreSQL's",
+                    table = table.shown()
+                ),
+            })
+        }
+        Change::TableProperty(TablePropertyChange::SetStorageParameters { table, .. }) => {
+            Err(DialectError::Unsupported {
+                dialect: DIALECT,
+                feature: format!(
+                    "storage parameters on `{table}`, which are PostgreSQL's",
+                    table = table.shown()
+                ),
+            })
+        }
         // A partition is PostgreSQL's in this model (#1581).
-        Change::SetPartitionDefault { table, .. } | Change::SetPartitionNotNull { table, .. } => {
+        Change::Partition(PartitionChange::SetPartitionDefault { table, .. })
+        | Change::Partition(PartitionChange::SetPartitionNotNull { table, .. }) => {
             Err(DialectError::Invalid {
                 dialect: crate::types::DIALECT,
                 message: format!(
@@ -557,45 +587,51 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
                 ),
             })
         }
-        Change::SetTablePersistence { table, .. } => Err(DialectError::Unsupported {
-            dialect: DIALECT,
-            feature: format!(
-                "an unlogged `{table}`, which is PostgreSQL's",
-                table = table.shown()
-            ),
-        }),
-        Change::SetIndexStorageParameters { table, .. } => Err(DialectError::Unsupported {
-            dialect: DIALECT,
-            feature: format!(
-                "index storage parameters on `{table}`, which are PostgreSQL's",
-                table = table.shown()
-            ),
-        }),
-        Change::DropPolicy { .. } | Change::CreatePolicy { .. } | Change::SetRowSecurity { .. } => {
+        Change::TableProperty(TablePropertyChange::SetTablePersistence { table, .. }) => {
             Err(DialectError::Unsupported {
                 dialect: DIALECT,
-                feature: "PostgreSQL row-security operations".into(),
+                feature: format!(
+                    "an unlogged `{table}`, which is PostgreSQL's",
+                    table = table.shown()
+                ),
             })
         }
-        Change::PublicExecution { routine, .. } => Err(DialectError::Unsupported {
+        Change::Index(IndexChange::SetIndexStorageParameters { table, .. }) => {
+            Err(DialectError::Unsupported {
+                dialect: DIALECT,
+                feature: format!(
+                    "index storage parameters on `{table}`, which are PostgreSQL's",
+                    table = table.shown()
+                ),
+            })
+        }
+        Change::Policy(PolicyChange::DropPolicy { .. })
+        | Change::Policy(PolicyChange::CreatePolicy { .. })
+        | Change::Policy(PolicyChange::SetRowSecurity { .. }) => Err(DialectError::Unsupported {
             dialect: DIALECT,
-            feature: format!(
-                "settling PUBLIC execution on `{routine}`: this engine grants none to revoke or \
-                 keep, and `public` here is an ordinary database role",
-                routine = routine.shown()
-            ),
+            feature: "PostgreSQL row-security operations".into(),
         }),
+        Change::Permission(GrantChange::PublicExecution { routine, .. }) => {
+            Err(DialectError::Unsupported {
+                dialect: DIALECT,
+                feature: format!(
+                    "settling PUBLIC execution on `{routine}`: this engine grants none to revoke or \
+                 keep, and `public` here is an ordinary database role",
+                    routine = routine.shown()
+                ),
+            })
+        }
 
-        Change::RenameTable {
+        Change::Table(TableChange::RenameTable {
             from, to, defaults, ..
-        } => rename_table(from, to, defaults),
+        }) => rename_table(from, to, defaults),
 
-        Change::AddColumn {
+        Change::Column(ColumnChange::AddColumn {
             table,
             name,
             column,
             ..
-        } => {
+        }) => {
             // Its own batch: a statement later in the same batch that mentions
             // the new column fails to compile, because the batch is parsed
             // before any of it runs.
@@ -610,7 +646,7 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             ])
         }
 
-        Change::DropColumn { column, .. } => Ok(vec![
+        Change::Column(ColumnChange::DropColumn { column, .. }) => Ok(vec![
             Statement::new(format!(
                 "{}\nALTER TABLE {} DROP COLUMN {};",
                 drop_default_block(&column.table, column.name.raw())?,
@@ -628,13 +664,13 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
         // from the new table, or — if the table rename found its target taken
         // and left it — the one built from the old table. Both are tried; the
         // second finds nothing once the first has renamed it.
-        Change::RenameColumn {
+        Change::Column(ColumnChange::RenameColumn {
             table,
             from,
             to,
             table_was,
             ..
-        } => {
+        }) => {
             let mut sql = format!(
                 "EXEC sp_rename {}, {}, 'COLUMN';",
                 literal(&format!("{}.{}", qualified(table)?, quote(from.raw())?)),
@@ -657,13 +693,13 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             Ok(vec![Statement::new(sql).own_batch()])
         }
 
-        Change::AlterColumnType {
+        Change::Column(ColumnChange::AlterColumnType {
             column,
             to,
             to_nullable,
             to_collation,
             ..
-        } => {
+        }) => {
             let normalized = types::normalize(to)?;
             let alter = format!(
                 "ALTER TABLE {} ALTER COLUMN {} {}{} {}{};",
@@ -684,13 +720,13 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             ])
         }
 
-        Change::AlterColumnNullability {
+        Change::Column(ColumnChange::AlterColumnNullability {
             column,
             ty,
             to_nullable,
             collation,
             ..
-        } => {
+        }) => {
             // `CREATE TABLE` accepts nullable timestamp / rowversion, but the
             // engine refuses every ALTER COLUMN that names either spelling —
             // including one whose only change is nullability (DECISIONS 298).
@@ -723,17 +759,17 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
         // syntax error, measured on 17.0), so a change of either is this
         // statement after the drop below, and the column is re-added at the
         // end of its table.
-        Change::AddComputedColumn {
+        Change::Column(ColumnChange::AddComputedColumn {
             table,
             name,
             computed,
-        } => one(format!(
+        }) => one(format!(
             "ALTER TABLE {} ADD {};",
             qualified(table)?,
             computed_definition(name.raw(), computed)?
         )),
         // No default can stand on a computed column, so none is looked for.
-        Change::DropComputedColumn { table, name, .. } => one(format!(
+        Change::Column(ColumnChange::DropComputedColumn { table, name, .. }) => one(format!(
             "ALTER TABLE {} DROP COLUMN {};",
             qualified(table)?,
             quote(name.raw())?
@@ -742,28 +778,32 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
         // Refused by validation: this model holds generated columns for
         // PostgreSQL only (DEC-1168.1). An error rather than a statement for a
         // column this engine was never given.
-        Change::AlterColumnExpression { column, .. } => Err(DialectError::Invalid {
-            dialect: DIALECT,
-            message: format!(
-                "{column} is a generated column, which this model holds for PostgreSQL only",
-                column = column.shown()
-            ),
-        }),
+        Change::Column(ColumnChange::AlterColumnExpression { column, .. }) => {
+            Err(DialectError::Invalid {
+                dialect: DIALECT,
+                message: format!(
+                    "{column} is a generated column, which this model holds for PostgreSQL only",
+                    column = column.shown()
+                ),
+            })
+        }
 
         // PostgreSQL only (#1889): the differ refuses an identity change on
         // this engine, which has no `ALTER` for one.
-        Change::AlterColumnNumbering { column, .. } => Err(DialectError::Invalid {
-            dialect: DIALECT,
-            message: format!(
-                "{column}: a change to its identity has no ALTER on SQL Server, and this model \
+        Change::Column(ColumnChange::AlterColumnNumbering { column, .. }) => {
+            Err(DialectError::Invalid {
+                dialect: DIALECT,
+                message: format!(
+                    "{column}: a change to its identity has no ALTER on SQL Server, and this model \
                  changes one on PostgreSQL only",
-                column = column.shown()
-            ),
-        }),
+                    column = column.shown()
+                ),
+            })
+        }
 
-        Change::AlterColumnDefault {
+        Change::Column(ColumnChange::AlterColumnDefault {
             column, from, to, ..
-        } => {
+        }) => {
             let table = qualified(&column.table)?;
             let mut sql = String::new();
             if from.is_some() {
@@ -791,14 +831,14 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
         // Recording it as an extended property is a Phase 5 decision; until then
         // the honest output is nothing at all, rather than a statement that
         // pretends to do something.
-        Change::SetColumnDeprecated { .. } => Ok(Vec::new()),
+        Change::Column(ColumnChange::SetColumnDeprecated { .. }) => Ok(Vec::new()),
 
-        Change::SetPrimaryKey {
+        Change::Constraint(ConstraintChange::SetPrimaryKey {
             table,
             from,
             to,
             nonclustered,
-        } => {
+        }) => {
             let mut out = Vec::new();
             if let Some(pk) = from {
                 out.push(drop_primary_key(table, pk)?);
@@ -814,33 +854,33 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             Ok(out)
         }
 
-        Change::AddUnique {
+        Change::Constraint(ConstraintChange::AddUnique {
             table,
             name,
             constraint,
             clustered,
-        } => one(format!(
+        }) => one(format!(
             "ALTER TABLE {} ADD {}{};",
             qualified(table)?,
             unique_clause(name.raw(), constraint, *clustered)?,
             online(strategy)
         )),
 
-        Change::AddForeignKey {
+        Change::Constraint(ConstraintChange::AddForeignKey {
             table,
             name,
             constraint,
-        } => one(format!(
+        }) => one(format!(
             "ALTER TABLE {} ADD {};",
             qualified(table)?,
             foreign_key_clause(name.raw(), constraint)?
         )),
 
-        Change::AddCheck {
+        Change::Constraint(ConstraintChange::AddCheck {
             table,
             name,
             constraint,
-        } => one(format!(
+        }) => one(format!(
             "ALTER TABLE {} ADD CONSTRAINT {} CHECK ({});",
             qualified(table)?,
             quote(name.raw())?,
@@ -859,20 +899,20 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
         // heap while holding its lock, which the operational note on the
         // layout change says (#1178). Building one online is a different
         // matter: see AddUnique.
-        Change::DropUnique { table, name }
-        | Change::DropForeignKey { table, name }
-        | Change::DropCheck { table, name } => one(format!(
+        Change::Constraint(ConstraintChange::DropUnique { table, name })
+        | Change::Constraint(ConstraintChange::DropForeignKey { table, name })
+        | Change::Constraint(ConstraintChange::DropCheck { table, name }) => one(format!(
             "ALTER TABLE {} DROP CONSTRAINT {};",
             qualified(table)?,
             quote(name.raw())?
         )),
 
-        Change::AddIndex {
+        Change::Index(IndexChange::AddIndex {
             table,
             name,
             index,
             clustered,
-        } => one(create_index(
+        }) => one(create_index(
             table,
             name.raw(),
             index,
@@ -889,7 +929,7 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
         // costs nothing on a nonclustered index, whose drop is metadata; on a
         // clustered one it is the heap rebuild under the table lock that the
         // layout change's operational note names.
-        Change::DropIndex { table, name } => one(format!(
+        Change::Index(IndexChange::DropIndex { table, name }) => one(format!(
             "DROP INDEX {} ON {};",
             quote(name.raw())?,
             qualified(table)?
@@ -898,7 +938,8 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
         // `CREATE OR ALTER` (2016 SP1+) rather than drop + create, and not only
         // because it is idempotent: it **preserves the permissions** granted on
         // the object, which drop + create silently destroys (ADR-0002).
-        Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
+        Change::Module(ModuleChange::CreateModule { id, module })
+        | Change::Module(ModuleChange::AlterModule { id, module }) => {
             let mut statements = vec![Statement::new(module_definition(id, module)?).own_batch()];
             statements.extend(view_indexes(id, module)?);
             Ok(statements)
@@ -907,7 +948,7 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
         // The object's own name, without a signature: nothing overloads on
         // this engine (ADR-0009 §1), so `DROP FUNCTION app.f` names exactly
         // one object — and a signature in the statement is a syntax error.
-        Change::DropModule { id, kind } => Ok(vec![
+        Change::Module(ModuleChange::DropModule { id, kind }) => Ok(vec![
             Statement::new(format!(
                 "DROP {} {};",
                 keyword(*kind),
@@ -2415,9 +2456,9 @@ fn rebuild_parts_are_refused_by_name_before_sql_emission() {
     mod recipe_fixture;
     for change in changes
         .into_iter()
-        .chain([Change::BuildPartitionedIndex(Box::new(
+        .chain([Change::Index(IndexChange::BuildPartitionedIndex(Box::new(
             recipe_fixture::index_recipe(),
-        ))])
+        )))])
     {
         let (operation, table) = change.pending_rebuild().unwrap();
         let error = emit(&change, Strategy::default()).unwrap_err();
@@ -2443,6 +2484,16 @@ mod tests {
     }
 
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::ExtensionChange;
+    use pbps_model::GrantChange;
+    use pbps_model::IndexChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::RoleChange;
+    use pbps_model::RowChange;
+    use pbps_model::SearchChange;
+    use pbps_model::TableChange;
     use pbps_model::{CheckConstraint, ColumnRef, ColumnType, Identity, IndexColumn, Uid};
 
     /// SQL Server has no packages: neither the install nor the drop of one is
@@ -2454,13 +2505,13 @@ mod tests {
             version: "1.0".into(),
         };
         for change in [
-            Change::CreateExtension {
+            Change::Extension(ExtensionChange::CreateExtension {
                 uid: "e_aaaaaa".parse().unwrap(),
                 name: "citext".into(),
                 definition: definition.clone(),
                 requires: Default::default(),
-            },
-            Change::DropExtension {
+            }),
+            Change::Extension(ExtensionChange::DropExtension {
                 uid: "e_aaaaaa".parse().unwrap(),
                 name: "citext".into(),
                 definition: definition.clone(),
@@ -2468,8 +2519,8 @@ mod tests {
                 releases: Default::default(),
                 index_releases: Default::default(),
                 search_releases: Default::default(),
-            },
-            Change::UpdateExtension {
+            }),
+            Change::Extension(ExtensionChange::UpdateExtension {
                 uid: "e_aaaaaa".parse().unwrap(),
                 name: "citext".into(),
                 from: definition.clone(),
@@ -2479,8 +2530,8 @@ mod tests {
                 },
                 requires: Default::default(),
                 releases: Default::default(),
-            },
-            Change::SetExtensionSchema {
+            }),
+            Change::Extension(ExtensionChange::SetExtensionSchema {
                 uid: "e_aaaaaa".parse().unwrap(),
                 name: "citext".into(),
                 from: definition.clone(),
@@ -2489,7 +2540,7 @@ mod tests {
                     ..definition.clone()
                 },
                 releases: Default::default(),
-            },
+            }),
         ] {
             let error = super::emit(&change, Strategy::default())
                 .unwrap_err()
@@ -2507,17 +2558,17 @@ mod tests {
             options: Default::default(),
         };
         for change in [
-            Change::CreateSearch {
+            Change::Search(SearchChange::CreateSearch {
                 uid: "s_aaaaaa".parse().unwrap(),
                 name: "dictionary app.words".parse().unwrap(),
                 definition: Box::new(definition.clone()),
                 unresolved: Vec::new(),
-            },
-            Change::DropSearch {
+            }),
+            Change::Search(SearchChange::DropSearch {
                 uid: "s_aaaaaa".parse().unwrap(),
                 name: "dictionary app.words".parse().unwrap(),
                 definition: Box::new(definition.clone()),
-            },
+            }),
         ] {
             let error = super::emit(&change, Strategy::default())
                 .unwrap_err()
@@ -2615,14 +2666,14 @@ mod tests {
     fn an_indexed_view_restates_its_indexes_after_every_create_and_alter() {
         let (id, module) = indexed_view();
         for change in [
-            Change::CreateModule {
+            Change::Module(ModuleChange::CreateModule {
                 id: id.clone(),
                 module: Box::new(module.clone()),
-            },
-            Change::AlterModule {
+            }),
+            Change::Module(ModuleChange::AlterModule {
                 id: id.clone(),
                 module: Box::new(module.clone()),
-            },
+            }),
         ] {
             let sql: Vec<String> = super::emit(&change, Strategy::default())
                 .unwrap()
@@ -2644,10 +2695,10 @@ mod tests {
         let mut plain = module;
         plain.options = Default::default();
         let sql = super::emit(
-            &Change::AlterModule {
+            &Change::Module(ModuleChange::AlterModule {
                 id,
                 module: Box::new(plain),
-            },
+            }),
             Strategy::default(),
         )
         .unwrap();
@@ -2660,17 +2711,17 @@ mod tests {
             let target = "sequence::dbo.t.id".parse().unwrap();
             let permissions = [Permission::Select].into();
             let change = if revoke {
-                Change::Revoke {
+                Change::Permission(GrantChange::Revoke {
                     role: "r".into(),
                     target,
                     permissions,
-                }
+                })
             } else {
-                Change::Grant {
+                Change::Permission(GrantChange::Grant {
                     role: "r".into(),
                     target,
                     permissions,
-                }
+                })
             };
             let error = emit(&change, Strategy::default()).unwrap_err().to_string();
             assert!(
@@ -2680,11 +2731,11 @@ mod tests {
         }
         assert!(
             emit(
-                &Change::Grant {
+                &Change::Permission(GrantChange::Grant {
                     role: "r".into(),
                     target: "dbo.t".parse().unwrap(),
                     permissions: [Permission::Select].into()
-                },
+                }),
                 Strategy::default()
             )
             .is_ok()
@@ -2732,13 +2783,13 @@ mod tests {
             storage_parameters: Default::default(),
             filegroup: None,
         });
-        let sql = sql_of(&Change::CreateTable {
+        let sql = sql_of(&Change::Table(TableChange::CreateTable {
             uid: uid("t_k7x2mq"),
             name: tname("dbo.customer"),
             table: Box::new(t),
             beside_default: None,
             moves_at_most: None,
-        });
+        }));
         assert_eq!(
             sql[0],
             "CREATE TABLE [dbo].[customer] (\n    [id] bigint NOT NULL,\n    [email] nvarchar(255) NULL,\n    CONSTRAINT [pk_customer] PRIMARY KEY CLUSTERED ([id])\n);"
@@ -2759,18 +2810,18 @@ mod tests {
         let mut t = Table::default();
         t.columns.insert("a".into(), Column::new(ty("int")));
         t.computed.insert("c".into(), stored.clone());
-        let sql = sql_of(&Change::CreateTable {
+        let sql = sql_of(&Change::Table(TableChange::CreateTable {
             uid: uid("t_k7x2mq"),
             name: tname("dbo.t"),
             table: Box::new(t),
             beside_default: None,
             moves_at_most: None,
-        });
+        }));
         assert_eq!(
             sql[0],
             "CREATE TABLE [dbo].[t] (\n    [a] int NULL,\n    [c] AS (a * 2\n) PERSISTED NOT NULL\n);"
         );
-        let added = sql_of(&Change::AddComputedColumn {
+        let added = sql_of(&Change::Column(ColumnChange::AddComputedColumn {
             table: tname("dbo.t"),
             name: "c".into(),
             computed: pbps_model::ComputedColumn {
@@ -2778,13 +2829,13 @@ mod tests {
                 not_null: false,
                 ..stored.clone()
             },
-        });
+        }));
         assert_eq!(added, ["ALTER TABLE [dbo].[t] ADD [c] AS (a * 2\n);"]);
-        let dropped = sql_of(&Change::DropComputedColumn {
+        let dropped = sql_of(&Change::Column(ColumnChange::DropComputedColumn {
             table: tname("dbo.t"),
             name: "c".into(),
             computed: stored,
-        });
+        }));
         assert_eq!(dropped, ["ALTER TABLE [dbo].[t] DROP COLUMN [c];"]);
     }
 
@@ -2804,13 +2855,13 @@ mod tests {
         t.columns.get_mut("vf").unwrap().value_source =
             pbps_model::ValueSource::Default("SYSUTCDATETIME()".into());
         let create = |t: &Table| {
-            sql_of(&Change::CreateTable {
+            sql_of(&Change::Table(TableChange::CreateTable {
                 uid: uid("t_k7x2mq"),
                 name: tname("dbo.t"),
                 table: Box::new(t.clone()),
                 beside_default: None,
                 moves_at_most: None,
-            })
+            }))
         };
         // Negative first: an ordinary table says none of it.
         let plain = create(&t);
@@ -2932,13 +2983,13 @@ mod tests {
         };
         t.indexes.insert("ix_code".into(), index.clone());
         let create = |t: &Table| {
-            sql_of(&Change::CreateTable {
+            sql_of(&Change::Table(TableChange::CreateTable {
                 uid: uid("t_k7x2mq"),
                 name: tname("dbo.t"),
                 table: Box::new(t.clone()),
                 beside_default: None,
                 moves_at_most: None,
-            })
+            }))
         };
         // No filegroup on the table: nothing after its column list.
         let plain = create(&t);
@@ -2965,12 +3016,12 @@ mod tests {
             keyed[0]
         );
         // After `WITH (ONLINE = ON)`, where the grammar has it.
-        let online = online_sql_of(&Change::AddIndex {
+        let online = online_sql_of(&Change::Index(IndexChange::AddIndex {
             table: tname("dbo.t"),
             name: "ix_code".into(),
             index: Box::new(index),
             clustered: false,
-        });
+        }));
         assert_eq!(
             online[0],
             "CREATE INDEX [ix_code] ON [dbo].[t] ([code] ASC) WITH (ONLINE = ON) ON [a]]b];"
@@ -3027,13 +3078,13 @@ mod tests {
         let create = |layout: Option<Clustered>| {
             let mut t = t.clone();
             t.clustered = layout;
-            sql_of(&Change::CreateTable {
+            sql_of(&Change::Table(TableChange::CreateTable {
                 uid: uid("t_k7x2mq"),
                 name: tname("dbo.t"),
                 table: Box::new(t),
                 beside_default: None,
                 moves_at_most: None,
-            })
+            }))
         };
         let sql = create(None);
         assert!(
@@ -3066,12 +3117,12 @@ mod tests {
 
         // The same through the changes that alter an existing table.
         let key = |nonclustered| {
-            sql_of(&Change::SetPrimaryKey {
+            sql_of(&Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table: tname("dbo.t"),
                 from: None,
                 to: t.primary_key.clone(),
                 nonclustered,
-            })
+            }))
         };
         assert_eq!(
             key(false),
@@ -3082,12 +3133,12 @@ mod tests {
             ["ALTER TABLE [dbo].[t] ADD PRIMARY KEY NONCLUSTERED ([id]);"]
         );
         let index = |clustered| {
-            sql_of(&Change::AddIndex {
+            sql_of(&Change::Index(IndexChange::AddIndex {
                 table: tname("dbo.t"),
                 name: "ix_a".into(),
                 index: Box::new(t.indexes["ix_a"].clone()),
                 clustered,
-            })
+            }))
         };
         assert_eq!(
             index(true),
@@ -3104,12 +3155,12 @@ mod tests {
         filtered.filter = Some("code > 0".into());
         assert!(
             emit(
-                &Change::AddIndex {
+                &Change::Index(IndexChange::AddIndex {
                     table: tname("dbo.t"),
                     name: "ix_a".into(),
                     index: Box::new(filtered),
                     clustered: true,
-                },
+                }),
                 Strategy::default()
             )
             .is_err()
@@ -3142,19 +3193,19 @@ mod tests {
             filegroup: None,
         };
         for build in [
-            Change::SetPrimaryKey {
+            Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table: tname("dbo.t"),
                 from: None,
                 to: Some(key.clone()),
                 nonclustered: false,
-            },
-            Change::AddIndex {
+            }),
+            Change::Index(IndexChange::AddIndex {
                 table: tname("dbo.t"),
                 name: "cx".into(),
                 index: Box::new(index.clone()),
                 clustered: true,
-            },
-            Change::AddUnique {
+            }),
+            Change::Constraint(ConstraintChange::AddUnique {
                 table: tname("dbo.t"),
                 name: "uq".into(),
                 constraint: UniqueConstraint {
@@ -3163,25 +3214,25 @@ mod tests {
                     filegroup: None,
                 },
                 clustered: true,
-            },
+            }),
         ] {
             assert!(takes_online(&build), "{build:?}");
         }
         for drop in [
-            Change::SetPrimaryKey {
+            Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table: tname("dbo.t"),
                 from: Some(key),
                 to: None,
                 nonclustered: false,
-            },
-            Change::DropIndex {
+            }),
+            Change::Index(IndexChange::DropIndex {
                 table: tname("dbo.t"),
                 name: "cx".into(),
-            },
-            Change::DropUnique {
+            }),
+            Change::Constraint(ConstraintChange::DropUnique {
                 table: tname("dbo.t"),
                 name: "uq".into(),
-            },
+            }),
         ] {
             assert!(!takes_online(&drop), "{drop:?}");
         }
@@ -3198,19 +3249,19 @@ mod tests {
         c.collation = cs.clone();
         let mut t = Table::default();
         t.columns.insert("code".into(), c.clone());
-        let created = sql_of(&Change::CreateTable {
+        let created = sql_of(&Change::Table(TableChange::CreateTable {
             uid: uid("t_k7x2mq"),
             name: tname("dbo.t"),
             table: Box::new(t),
             beside_default: None,
             moves_at_most: None,
-        });
+        }));
         assert!(
             created[0].contains("[code] varchar(10) COLLATE Latin1_General_CS_AS NOT NULL"),
             "{}",
             created[0]
         );
-        let retyped = sql_of(&Change::AlterColumnType {
+        let retyped = sql_of(&Change::Column(ColumnChange::AlterColumnType {
             uid: uid("c_k7x2mq"),
             column: cref("dbo.t.code"),
             from: ty("varchar(10)"),
@@ -3221,21 +3272,21 @@ mod tests {
             from_collation: cs.clone(),
             to_collation: cs.clone(),
             using: None,
-        });
+        }));
         assert!(
             retyped[0]
                 .contains("ALTER COLUMN [code] varchar(20) COLLATE Latin1_General_CS_AS NOT NULL"),
             "{}",
             retyped[0]
         );
-        let relaxed = sql_of(&Change::AlterColumnNullability {
+        let relaxed = sql_of(&Change::Column(ColumnChange::AlterColumnNullability {
             uid: uid("c_k7x2mq"),
             column: cref("dbo.t.code"),
             ty: ty("varchar(10)"),
             to_nullable: true,
             through_external_partitions: false,
             collation: cs,
-        });
+        }));
         assert_eq!(
             relaxed,
             [
@@ -3244,14 +3295,14 @@ mod tests {
         );
         // The default collation writes nothing: the column follows the
         // database it is created in.
-        let plain = sql_of(&Change::AlterColumnNullability {
+        let plain = sql_of(&Change::Column(ColumnChange::AlterColumnNullability {
             uid: uid("c_k7x2mq"),
             column: cref("dbo.t.code"),
             ty: ty("varchar(10)"),
             to_nullable: true,
             through_external_partitions: false,
             collation: None,
-        });
+        }));
         assert_eq!(
             plain,
             ["ALTER TABLE [dbo].[t] ALTER COLUMN [code] varchar(10) NULL;"]
@@ -3268,13 +3319,13 @@ mod tests {
         t.columns.insert("a".into(), Column::new(ty("int")));
         t.columns
             .insert("b".into(), Column::new(ty("int")).not_null());
-        let sql = sql_of(&Change::CreateTable {
+        let sql = sql_of(&Change::Table(TableChange::CreateTable {
             uid: uid("t_k7x2mq"),
             name: tname("dbo.t"),
             table: Box::new(t),
             beside_default: None,
             moves_at_most: None,
-        });
+        }));
         assert!(sql[0].contains("[a] int NULL"));
         assert!(sql[0].contains("[b] int NOT NULL"));
     }
@@ -3292,13 +3343,13 @@ mod tests {
         let mut status = Column::new(ty("tinyint")).not_null();
         status.value_source = pbps_model::ValueSource::Default("0".into());
         t.columns.insert("status".into(), status);
-        let sql = sql_of(&Change::CreateTable {
+        let sql = sql_of(&Change::Table(TableChange::CreateTable {
             uid: uid("t_k7x2mq"),
             name: tname("dbo.t"),
             table: Box::new(t),
             beside_default: None,
             moves_at_most: None,
-        });
+        }));
         assert!(sql[0].contains("[id] bigint IDENTITY(1,1) NOT NULL"));
         assert!(
             sql[0]
@@ -3312,12 +3363,12 @@ mod tests {
     /// must not leak through into a statement.
     #[test]
     fn emitted_types_are_normalized() {
-        let sql = sql_of(&Change::AddColumn {
+        let sql = sql_of(&Change::Column(ColumnChange::AddColumn {
             uid: uid("c_p3n8vd"),
             table: tname("dbo.t"),
             name: "n".into(),
             column: Box::new(Column::new(ty("integer"))),
-        });
+        }));
         assert_eq!(sql[0], "ALTER TABLE [dbo].[t] ADD [n] int NULL;");
     }
 
@@ -3325,7 +3376,7 @@ mod tests {
     /// or SQL Server reads the omission as NULL and drops the NOT NULL.
     #[test]
     fn a_type_change_restates_not_null() {
-        let sql = sql_of(&Change::AlterColumnType {
+        let sql = sql_of(&Change::Column(ColumnChange::AlterColumnType {
             uid: uid("c_k7x2mq"),
             column: cref("dbo.t.amount"),
             from: ty("int"),
@@ -3336,21 +3387,21 @@ mod tests {
             from_collation: None,
             to_collation: None,
             using: None,
-        });
+        }));
         assert_eq!(sql.len(), 1);
         assert!(sql[0].contains("ALTER TABLE [dbo].[t] ALTER COLUMN [amount] bigint NOT NULL;"));
     }
 
     #[test]
     fn a_nullability_change_restates_the_type() {
-        let sql = sql_of(&Change::AlterColumnNullability {
+        let sql = sql_of(&Change::Column(ColumnChange::AlterColumnNullability {
             uid: uid("c_k7x2mq"),
             column: cref("dbo.t.email"),
             ty: ty("nvarchar(255)"),
             to_nullable: false,
             through_external_partitions: false,
             collation: None,
-        });
+        }));
         assert_eq!(
             sql,
             ["ALTER TABLE [dbo].[t] ALTER COLUMN [email] nvarchar(255) NOT NULL;"]
@@ -3360,14 +3411,14 @@ mod tests {
     #[test]
     fn a_timestamp_nullability_change_is_refused_before_sql() {
         for spelling in ["timestamp", "rowversion"] {
-            let change = Change::AlterColumnNullability {
+            let change = Change::Column(ColumnChange::AlterColumnNullability {
                 uid: uid("c_k7x2mq"),
                 column: cref("dbo.t.version"),
                 ty: ty(spelling),
                 to_nullable: true,
                 through_external_partitions: false,
                 collation: None,
-            };
+            });
             let msg = emit(&change, Strategy::default()).unwrap_err().to_string();
             assert!(msg.contains("`dbo.t.version`"), "{spelling}: {msg}");
             assert!(msg.contains(&format!("`{spelling}`")), "{spelling}: {msg}");
@@ -3378,14 +3429,14 @@ mod tests {
         }
 
         assert_eq!(
-            sql_of(&Change::AlterColumnNullability {
+            sql_of(&Change::Column(ColumnChange::AlterColumnNullability {
                 uid: uid("c_k7x2mq"),
                 column: cref("dbo.t.version"),
                 ty: ty("varbinary(8)"),
                 to_nullable: false,
                 through_external_partitions: false,
                 collation: None,
-            }),
+            })),
             ["ALTER TABLE [dbo].[t] ALTER COLUMN [version] varbinary(8) NOT NULL;"]
         );
     }
@@ -3426,13 +3477,13 @@ mod tests {
 
     #[test]
     fn renames_go_through_sp_rename() {
-        let sql = sql_of(&Change::RenameColumn {
+        let sql = sql_of(&Change::Column(ColumnChange::RenameColumn {
             uid: uid("c_k7x2mq"),
             table: tname("dbo.customer"),
             from: "customer_name".into(),
             to: "full_name".into(),
             table_was: None,
-        });
+        }));
         assert_eq!(sql.len(), 1, "{sql:?}");
         assert!(
             sql[0].starts_with(
@@ -3464,24 +3515,24 @@ mod tests {
     /// `pbps` gave it. A table renamed with no defaults gets no such batch.
     #[test]
     fn a_renamed_tables_generated_defaults_follow_it() {
-        let sql = sql_of(&Change::RenameTable {
+        let sql = sql_of(&Change::Table(TableChange::RenameTable {
             uid: uid("t_k7x2mq"),
             from: tname("dbo.t"),
             to: tname("app.u"),
             defaults: vec!["c".into()],
-        });
+        }));
         assert_eq!(sql.len(), 3, "transfer, rename, defaults: {sql:?}");
         assert!(sql[2].contains("OBJECT_ID(N'[app].[u]', N'U')"), "{sql:?}");
         assert!(
             sql[2].contains("EXEC sp_rename N'[app].[DF_pbps_t_c]', N'DF_pbps_u_c', 'OBJECT'"),
             "{sql:?}"
         );
-        let bare = sql_of(&Change::RenameTable {
+        let bare = sql_of(&Change::Table(TableChange::RenameTable {
             uid: uid("t_k7x2mq"),
             from: tname("dbo.t"),
             to: tname("dbo.u"),
             defaults: Vec::new(),
-        });
+        }));
         assert_eq!(bare.len(), 1, "{bare:?}");
     }
 
@@ -3490,13 +3541,13 @@ mod tests {
     /// one's, which the table rename leaves when its target is taken (#975).
     #[test]
     fn a_renamed_columns_default_is_sought_under_both_table_names() {
-        let sql = sql_of(&Change::RenameColumn {
+        let sql = sql_of(&Change::Column(ColumnChange::RenameColumn {
             uid: uid("c_k7x2mq"),
             table: tname("dbo.u"),
             from: "a".into(),
             to: "b".into(),
             table_was: Some(tname("dbo.t")),
-        });
+        }));
         assert_eq!(sql.len(), 1, "one batch: {sql:?}");
         for old in ["DF_pbps_u_a", "DF_pbps_t_a"] {
             assert!(
@@ -3506,13 +3557,13 @@ mod tests {
                 "{old}: {sql:?}"
             );
         }
-        let alone = sql_of(&Change::RenameColumn {
+        let alone = sql_of(&Change::Column(ColumnChange::RenameColumn {
             uid: uid("c_k7x2mq"),
             table: tname("dbo.u"),
             from: "a".into(),
             to: "b".into(),
             table_was: None,
-        });
+        }));
         assert!(!alone[0].contains("DF_pbps_t_a"), "{alone:?}");
         // Sought under this table's two names for it, the generated one and
         // the digested one a taken target leaves it at (#981).
@@ -3523,12 +3574,12 @@ mod tests {
     /// qualification as part of the name.
     #[test]
     fn the_new_name_in_a_table_rename_is_not_qualified() {
-        let sql = sql_of(&Change::RenameTable {
+        let sql = sql_of(&Change::Table(TableChange::RenameTable {
             uid: uid("t_k7x2mq"),
             from: tname("dbo.old_name"),
             to: tname("dbo.new_name"),
             defaults: Vec::new(),
-        });
+        }));
         assert_eq!(
             sql,
             ["EXEC sp_rename N'[dbo].[old_name]', N'new_name', 'OBJECT';"]
@@ -3539,12 +3590,12 @@ mod tests {
     /// that does both needs both, transfer first.
     #[test]
     fn a_cross_schema_rename_transfers_then_renames() {
-        let sql = sql_of(&Change::RenameTable {
+        let sql = sql_of(&Change::Table(TableChange::RenameTable {
             uid: uid("t_k7x2mq"),
             from: tname("dbo.old_name"),
             to: tname("app.new_name"),
             defaults: Vec::new(),
-        });
+        }));
         assert_eq!(
             sql,
             [
@@ -3561,12 +3612,12 @@ mod tests {
     #[test]
     fn a_cross_schema_rename_declares_both_halves_of_the_move() {
         let stmts = emit(
-            &Change::RenameTable {
+            &Change::Table(TableChange::RenameTable {
                 uid: uid("t_k7x2mq"),
                 from: tname("dbo.old_name"),
                 to: tname("app.new_name"),
                 defaults: Vec::new(),
-            },
+            }),
             Strategy::default(),
         )
         .expect("emit");
@@ -3581,12 +3632,12 @@ mod tests {
 
         // A rename within one schema is one statement and has no intermediate.
         let stmts = emit(
-            &Change::RenameTable {
+            &Change::Table(TableChange::RenameTable {
                 uid: uid("t_k7x2mq"),
                 from: tname("dbo.old_name"),
                 to: tname("dbo.new_name"),
                 defaults: Vec::new(),
-            },
+            }),
             Strategy::default(),
         )
         .expect("emit");
@@ -3608,10 +3659,10 @@ mod tests {
     /// looked up because a column pbps did not create carries a generated one.
     #[test]
     fn dropping_a_column_clears_its_default_first() {
-        let sql = sql_of(&Change::DropColumn {
+        let sql = sql_of(&Change::Column(ColumnChange::DropColumn {
             uid: uid("c_k7x2mq"),
             column: cref("dbo.t.legacy"),
-        });
+        }));
         assert!(sql[0].contains("sys.default_constraints"), "{}", sql[0]);
         assert!(sql[0].contains("QUOTENAME(@df)"), "{}", sql[0]);
         assert!(
@@ -3659,25 +3710,25 @@ mod tests {
         column.value_source = pbps_model::ValueSource::Default("0".into());
         let mut t = Table::default();
         t.columns.insert(long_column.clone().into(), column);
-        let created = sql_of(&Change::CreateTable {
+        let created = sql_of(&Change::Table(TableChange::CreateTable {
             uid: uid("t_k7x2mq"),
             name: table.clone(),
             table: Box::new(t),
             beside_default: None,
             moves_at_most: None,
-        });
+        }));
         assert!(created[0].contains(&format!(
             "CONSTRAINT [{name}] DEFAULT (0\n)",
             // Preserve raw comparison-label or fixture SQL bytes in test data.
             name = name.raw(),
         )));
 
-        let altered = sql_of(&Change::AlterColumnDefault {
+        let altered = sql_of(&Change::Column(ColumnChange::AlterColumnDefault {
             uid: uid("c_k7x2mq"),
             column: ColumnRef::new(table.clone(), long_column.clone()),
             from: Some("0".into()),
             to: Some("1".into()),
-        });
+        }));
         assert!(
             altered[0].contains(&format!(
                 "ADD CONSTRAINT [{name}] DEFAULT (1\n) FOR",
@@ -3912,21 +3963,21 @@ mod tests {
 
     #[test]
     fn changing_a_default_drops_the_old_one_and_adds_a_named_one() {
-        let sql = sql_of(&Change::AlterColumnDefault {
+        let sql = sql_of(&Change::Column(ColumnChange::AlterColumnDefault {
             uid: uid("c_k7x2mq"),
             column: cref("dbo.t.status"),
             from: Some("0".into()),
             to: Some("1".into()),
-        });
+        }));
         assert!(sql[0].contains("sys.default_constraints"));
         assert!(sql[0].contains("ADD CONSTRAINT [DF_pbps_t_status] DEFAULT (1\n) FOR [status]"));
 
-        let add_only = sql_of(&Change::AlterColumnDefault {
+        let add_only = sql_of(&Change::Column(ColumnChange::AlterColumnDefault {
             uid: uid("c_k7x2mq"),
             column: cref("dbo.t.status"),
             from: None,
             to: Some("1".into()),
-        });
+        }));
         assert!(
             !add_only[0].contains("sys.default_constraints"),
             "nothing to drop"
@@ -3936,11 +3987,11 @@ mod tests {
     #[test]
     fn deprecation_emits_nothing() {
         assert!(
-            sql_of(&Change::SetColumnDeprecated {
+            sql_of(&Change::Column(ColumnChange::SetColumnDeprecated {
                 uid: uid("c_k7x2mq"),
                 column: cref("dbo.t.x"),
                 reason: Some("gone".into()),
-            })
+            }))
             .is_empty()
         );
     }
@@ -3949,7 +4000,7 @@ mod tests {
     /// look the name up rather than guess.
     #[test]
     fn dropping_an_unnamed_primary_key_looks_the_name_up() {
-        let sql = sql_of(&Change::SetPrimaryKey {
+        let sql = sql_of(&Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: tname("dbo.t"),
             from: Some(PrimaryKey {
                 name: None,
@@ -3959,10 +4010,10 @@ mod tests {
             }),
             to: None,
             nonclustered: false,
-        });
+        }));
         assert!(sql[0].contains("sys.key_constraints"), "{}", sql[0]);
 
-        let named = sql_of(&Change::SetPrimaryKey {
+        let named = sql_of(&Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: tname("dbo.t"),
             from: Some(PrimaryKey {
                 name: Some("pk_t".into()),
@@ -3972,7 +4023,7 @@ mod tests {
             }),
             to: None,
             nonclustered: false,
-        });
+        }));
         assert_eq!(named, ["ALTER TABLE [dbo].[t] DROP CONSTRAINT [pk_t];"]);
     }
 
@@ -3994,13 +4045,13 @@ mod tests {
                 expression: "amount > 0 -- reason".into(),
             },
         );
-        let created = sql_of(&Change::CreateTable {
+        let created = sql_of(&Change::Table(TableChange::CreateTable {
             uid: uid("t_k7x2mq"),
             name: tname("dbo.t"),
             table: Box::new(t),
             beside_default: None,
             moves_at_most: None,
-        });
+        }));
         assert!(
             created[0].contains("DEFAULT (0 -- why\n)"),
             "{}",
@@ -4016,12 +4067,12 @@ mod tests {
         );
 
         // A default added on its own: `) FOR [column];` follows it.
-        let altered = sql_of(&Change::AlterColumnDefault {
+        let altered = sql_of(&Change::Column(ColumnChange::AlterColumnDefault {
             uid: uid("c_k7x2mq"),
             column: cref("dbo.t.status"),
             from: None,
             to: Some("1 -- why".into()),
-        });
+        }));
         assert!(
             altered[0].contains("DEFAULT (1 -- why\n) FOR [status];"),
             "{}",
@@ -4029,13 +4080,13 @@ mod tests {
         );
 
         // A check added on its own.
-        let check = sql_of(&Change::AddCheck {
+        let check = sql_of(&Change::Constraint(ConstraintChange::AddCheck {
             table: tname("dbo.t"),
             name: "ck_positive".into(),
             constraint: CheckConstraint {
                 expression: "amount > 0 -- reason".into(),
             },
-        });
+        }));
         assert_eq!(
             check,
             ["ALTER TABLE [dbo].[t] ADD CONSTRAINT [ck_positive] CHECK (amount > 0 -- reason\n);"]
@@ -4043,7 +4094,7 @@ mod tests {
 
         // An index filter, which has both the closing parenthesis and whatever
         // `ONLINE` clause the strategy asks for behind it.
-        let index = sql_of(&Change::AddIndex {
+        let index = sql_of(&Change::Index(IndexChange::AddIndex {
             table: tname("dbo.t"),
             name: "ix_t_a".into(),
             index: Box::new(Index {
@@ -4061,7 +4112,7 @@ mod tests {
                 filegroup: None,
             }),
             clustered: false,
-        });
+        }));
         assert_eq!(
             index,
             [
@@ -4072,7 +4123,7 @@ mod tests {
 
     #[test]
     fn indexes_render_direction_include_and_filter() {
-        let sql = sql_of(&Change::AddIndex {
+        let sql = sql_of(&Change::Index(IndexChange::AddIndex {
             table: tname("dbo.t"),
             name: "ix_t_a".into(),
             index: Box::new(Index {
@@ -4098,7 +4149,7 @@ mod tests {
                 filegroup: None,
             }),
             clustered: false,
-        });
+        }));
         assert_eq!(
             sql,
             [
@@ -4124,13 +4175,13 @@ mod tests {
 
     #[test]
     fn check_constraints_render_their_expression_verbatim() {
-        let sql = sql_of(&Change::AddCheck {
+        let sql = sql_of(&Change::Constraint(ConstraintChange::AddCheck {
             table: tname("dbo.t"),
             name: "ck_positive".into(),
             constraint: CheckConstraint {
                 expression: "amount > 0".into(),
             },
-        });
+        }));
         assert_eq!(
             sql,
             ["ALTER TABLE [dbo].[t] ADD CONSTRAINT [ck_positive] CHECK (amount > 0\n);"]
@@ -4144,19 +4195,19 @@ mod tests {
         // A partition is PostgreSQL's: a plan carrying one is not run here
         // (#1171).
         let refused = emit(
-            &Change::DropTable {
+            &Change::Table(TableChange::DropTable {
                 uid: uid("t_k7x2mq"),
                 name: TableName::new("dbo", "p1"),
                 detach_from: Some(TableName::new("dbo", "p")),
-            },
+            }),
             Strategy::default(),
         );
         assert!(refused.is_err(), "{refused:?}");
-        let sql = sql_of(&Change::DropTable {
+        let sql = sql_of(&Change::Table(TableChange::DropTable {
             uid: uid("t_k7x2mq"),
             name: TableName::new("dbo", "x]; DROP TABLE users; --"),
             detach_from: None,
-        });
+        }));
         assert_eq!(sql, ["DROP TABLE [dbo].[x]]; DROP TABLE users; --];"]);
     }
 
@@ -4168,7 +4219,7 @@ mod tests {
     /// checked, because the shape is written out twice.
     #[test]
     fn a_name_with_an_apostrophe_cannot_break_out_of_a_dynamic_statement() {
-        let looked_up_pk = sql_of(&Change::SetPrimaryKey {
+        let looked_up_pk = sql_of(&Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: tname("dbo.o'brien"),
             from: Some(PrimaryKey {
                 name: None,
@@ -4178,11 +4229,11 @@ mod tests {
             }),
             to: None,
             nonclustered: false,
-        });
-        let looked_up_default = sql_of(&Change::DropColumn {
+        }));
+        let looked_up_default = sql_of(&Change::Column(ColumnChange::DropColumn {
             uid: uid("c_k7x2mq"),
             column: cref("dbo.o'brien.legacy"),
-        });
+        }));
 
         for sql in [&looked_up_pk[0], &looked_up_default[0]] {
             // Every line that is building a string — the `OBJECT_ID` argument
@@ -4215,10 +4266,10 @@ mod tests {
     #[test]
     fn statements_that_declare_variables_get_their_own_batch() {
         let stmts = emit(
-            &Change::DropColumn {
+            &Change::Column(ColumnChange::DropColumn {
                 uid: uid("c_k7x2mq"),
                 column: cref("dbo.t.legacy"),
-            },
+            }),
             Strategy::default(),
         )
         .unwrap();
@@ -4228,13 +4279,13 @@ mod tests {
     #[test]
     fn a_table_with_no_columns_is_refused() {
         let r = emit(
-            &Change::CreateTable {
+            &Change::Table(TableChange::CreateTable {
                 uid: uid("t_k7x2mq"),
                 name: tname("dbo.empty"),
                 table: Box::new(Table::default()),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
             Strategy::default(),
         );
         assert!(r.is_err());
@@ -4243,7 +4294,7 @@ mod tests {
     // ---- strategy: online (ADR-0003) ----
 
     fn an_index() -> Change {
-        Change::AddIndex {
+        Change::Index(IndexChange::AddIndex {
             table: tname("dbo.order_line"),
             name: "ix_order_line_order".into(),
             index: Box::new(Index {
@@ -4261,7 +4312,7 @@ mod tests {
                 filegroup: None,
             }),
             clustered: false,
-        }
+        })
     }
 
     /// The hint is what a user wrote to keep a large table in service; if the
@@ -4276,20 +4327,20 @@ mod tests {
             ]
         );
         assert_eq!(
-            online_sql_of(&Change::AlterColumnNullability {
+            online_sql_of(&Change::Column(ColumnChange::AlterColumnNullability {
                 uid: uid("c_k7x2mq"),
                 column: cref("dbo.order_line.note"),
                 ty: ty("nvarchar(100)"),
                 to_nullable: false,
                 through_external_partitions: false,
                 collation: None,
-            }),
+            })),
             [
                 "ALTER TABLE [dbo].[order_line] ALTER COLUMN [note] nvarchar(100) NOT NULL WITH (ONLINE = ON);"
             ]
         );
         assert_eq!(
-            online_sql_of(&Change::AddUnique {
+            online_sql_of(&Change::Constraint(ConstraintChange::AddUnique {
                 table: tname("dbo.order_line"),
                 name: "uq_line".into(),
                 constraint: UniqueConstraint {
@@ -4298,7 +4349,7 @@ mod tests {
                     filegroup: None,
                 },
                 clustered: false,
-            }),
+            })),
             [
                 "ALTER TABLE [dbo].[order_line] ADD CONSTRAINT [uq_line] UNIQUE ([order_id]) WITH (ONLINE = ON);"
             ]
@@ -4313,19 +4364,21 @@ mod tests {
     fn an_expression_that_mentions_online_is_not_an_online_statement() {
         let mut column = Column::new(ty("nvarchar(20)"));
         column.value_source = pbps_model::ValueSource::Default("'ONLINE = ON'".into());
-        assert!(!takes_online(&Change::AddColumn {
+        assert!(!takes_online(&Change::Column(ColumnChange::AddColumn {
             uid: uid("c_k7x2mq"),
             table: tname("dbo.order_line"),
             name: "note".into(),
             column: Box::new(column),
-        }));
-        assert!(!takes_online(&Change::AddCheck {
-            table: tname("dbo.order_line"),
-            name: "ck_note".into(),
-            constraint: pbps_model::CheckConstraint {
-                expression: "note <> 'ONLINE = ON'".into(),
-            },
-        }));
+        })));
+        assert!(!takes_online(&Change::Constraint(
+            ConstraintChange::AddCheck {
+                table: tname("dbo.order_line"),
+                name: "ck_note".into(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "note <> 'ONLINE = ON'".into(),
+                },
+            }
+        )));
         // And a statement that really takes it still says so.
         assert!(takes_online(&an_index()));
     }
@@ -4339,29 +4392,29 @@ mod tests {
             // The two nonclustered drops belong here too: the option exists on
             // a drop only for a clustered index, and the emitter creates no
             // clustered ones.
-            Change::DropUnique {
+            Change::Constraint(ConstraintChange::DropUnique {
                 table: tname("dbo.order_line"),
                 name: "uq_line".into(),
-            },
-            Change::DropIndex {
+            }),
+            Change::Index(IndexChange::DropIndex {
                 table: tname("dbo.order_line"),
                 name: "ix_old".into(),
-            },
-            Change::DropForeignKey {
+            }),
+            Change::Constraint(ConstraintChange::DropForeignKey {
                 table: tname("dbo.order_line"),
                 name: "fk_line_order".into(),
-            },
-            Change::DropCheck {
+            }),
+            Change::Constraint(ConstraintChange::DropCheck {
                 table: tname("dbo.order_line"),
                 name: "ck_line_qty".into(),
-            },
-            Change::AddCheck {
+            }),
+            Change::Constraint(ConstraintChange::AddCheck {
                 table: tname("dbo.order_line"),
                 name: "ck_line_qty".into(),
                 constraint: CheckConstraint {
                     expression: "qty > 0".into(),
                 },
-            },
+            }),
         ] {
             for sql in online_sql_of(&change) {
                 assert!(!sql.contains("ONLINE"), "{sql}");
@@ -4393,13 +4446,13 @@ mod tests {
                 filegroup: None,
             },
         );
-        let sql = online_sql_of(&Change::CreateTable {
+        let sql = online_sql_of(&Change::Table(TableChange::CreateTable {
             uid: uid("t_k7x2mq"),
             name: tname("dbo.order_line"),
             table: Box::new(t),
             beside_default: None,
             moves_at_most: None,
-        });
+        }));
         assert!(sql.iter().all(|s| !s.contains("ONLINE")), "{sql:?}");
     }
 
@@ -4424,7 +4477,7 @@ mod tests {
 
     #[test]
     fn an_insert_names_its_columns_and_leads_with_the_key() {
-        let sql = sql_of(&Change::InsertRow {
+        let sql = sql_of(&Change::Row(RowChange::InsertRow {
             table: tname("dbo.order_status"),
             key_column: "code".into(),
             identity_key: false,
@@ -4432,7 +4485,7 @@ mod tests {
             defaults: Default::default(),
             types: Default::default(),
             row: row(&[("label", Value::Text("New".to_owned()))]),
-        });
+        }));
         assert_eq!(sql.len(), 1, "{sql:?}");
         assert!(
             sql[0].contains(
@@ -4465,7 +4518,7 @@ mod tests {
     /// a trigger rewriting a spelled cell (DECISIONS 133).
     #[test]
     fn an_insert_holds_the_columns_it_left_to_their_defaults() {
-        let sql = sql_of(&Change::InsertRow {
+        let sql = sql_of(&Change::Row(RowChange::InsertRow {
             table: tname("dbo.t"),
             key_column: "code".into(),
             identity_key: false,
@@ -4505,7 +4558,7 @@ mod tests {
             .into_iter()
             .map(|(c, t)| (c.into(), ty(t)))
             .collect(),
-        });
+        }));
         let sql = sql[0].replace("\n)", ")");
         for held in [
             "CONVERT(nvarchar(max), [label]) = N'New' COLLATE Latin1_General_BIN2",
@@ -4544,7 +4597,7 @@ mod tests {
     /// setting and at most one table may hold it.
     #[test]
     fn an_identity_key_is_pinned_inside_one_statement_that_turns_the_switch_off_again() {
-        let sql = sql_of(&Change::InsertRow {
+        let sql = sql_of(&Change::Row(RowChange::InsertRow {
             table: tname("dbo.t"),
             key_column: "id".into(),
             identity_key: true,
@@ -4552,7 +4605,7 @@ mod tests {
             defaults: Default::default(),
             types: Default::default(),
             row: row(&[("label", Value::Text("Seven".to_owned()))]),
-        });
+        }));
         assert_eq!(sql.len(), 1, "{sql:?}");
         assert!(
             sql[0].contains(concat!(
@@ -4576,7 +4629,7 @@ mod tests {
     /// would itself be an error on a table with no identity column.
     #[test]
     fn a_plain_key_gets_no_identity_switch() {
-        let sql = sql_of(&Change::InsertRow {
+        let sql = sql_of(&Change::Row(RowChange::InsertRow {
             table: tname("dbo.t"),
             key_column: "code".into(),
             identity_key: false,
@@ -4584,7 +4637,7 @@ mod tests {
             defaults: Default::default(),
             types: Default::default(),
             row: Row::default(),
-        });
+        }));
         assert!(!sql[0].contains("IDENTITY_INSERT"), "{sql:?}");
     }
 
@@ -4593,7 +4646,7 @@ mod tests {
     /// into the wrong columns.
     #[test]
     fn an_insert_always_writes_the_column_list() {
-        let sql = sql_of(&Change::InsertRow {
+        let sql = sql_of(&Change::Row(RowChange::InsertRow {
             table: tname("dbo.t"),
             key_column: "code".into(),
             identity_key: false,
@@ -4601,13 +4654,13 @@ mod tests {
             defaults: Default::default(),
             types: Default::default(),
             row: Row::default(),
-        });
+        }));
         assert!(sql[0].contains("([code])"), "{sql:?}");
     }
 
     #[test]
     fn an_update_restates_only_the_changed_columns() {
-        let sql = sql_of(&Change::UpdateRow {
+        let sql = sql_of(&Change::Row(RowChange::UpdateRow {
             unchanged: Default::default(),
             types: Default::default(),
             after_types: Default::default(),
@@ -4624,7 +4677,7 @@ mod tests {
             .into_iter()
             .collect(),
             key_type: None,
-        });
+        }));
         // No type carried (an older plan): the key alone holds the row, and
         // the count still has to be one. The postcondition is the key alone
         // for the same reason — a cell with no type has no rendering to be
@@ -4666,7 +4719,7 @@ mod tests {
     fn an_update_holds_the_row_to_what_the_plan_recorded() {
         let cell = |from: Cell, to: Cell| (from, to);
         let text = |s: &str| Cell::Value(Value::Text(s.to_owned()));
-        let sql = sql_of(&Change::UpdateRow {
+        let sql = sql_of(&Change::Row(RowChange::UpdateRow {
             table: tname("dbo.t"),
             key_column: "code".into(),
             key: RowKey::from("a"),
@@ -4718,7 +4771,7 @@ mod tests {
             .collect(),
             after_types: Default::default(),
             key_type: None,
-        });
+        }));
         let sql = sql[0].replace("\n)", ")");
         let body = sql
             .strip_prefix("BEGIN TRANSACTION;\nBEGIN TRY\n")
@@ -4779,7 +4832,7 @@ mod tests {
     #[test]
     fn an_update_holds_the_cells_it_leaves_alone_too() {
         let text = |s: &str| Cell::Value(Value::Text(s.to_owned()));
-        let sql = sql_of(&Change::UpdateRow {
+        let sql = sql_of(&Change::Row(RowChange::UpdateRow {
             table: tname("dbo.t"),
             key_column: "code".into(),
             key: RowKey::from("a"),
@@ -4807,7 +4860,7 @@ mod tests {
             .collect(),
             after_types: Default::default(),
             key_type: None,
-        });
+        }));
         let sql = sql[0].replace("\n)", ")");
         let update = sql
             .lines()
@@ -4855,7 +4908,7 @@ mod tests {
             ("geometry", "geography", "POINT (1 2)"),
             ("geography", "geometry", "POINT (1 2)"),
         ] {
-            let retyped = sql_of(&Change::UpdateRow {
+            let retyped = sql_of(&Change::Row(RowChange::UpdateRow {
                 table: tname("dbo.t"),
                 key_column: "code".into(),
                 key: RowKey::from("a"),
@@ -4872,7 +4925,7 @@ mod tests {
                     .map(|(c, t)| (c.into(), ty(t)))
                     .collect(),
                 key_type: None,
-            });
+            }));
             assert!(
                 !retyped[0].contains(&format!("TRY_CONVERT({before}")),
                 "no statement may rebuild a {before} from its own rendering:\n{}",
@@ -4886,7 +4939,7 @@ mod tests {
                 .1;
             assert!(!precondition.contains("[blob]"), "{before}: {precondition}");
         }
-        let retyped = sql_of(&Change::UpdateRow {
+        let retyped = sql_of(&Change::Row(RowChange::UpdateRow {
             table: tname("dbo.t"),
             key_column: "code".into(),
             key: RowKey::from("a"),
@@ -4903,7 +4956,7 @@ mod tests {
                 .map(|(c, t)| (c.into(), ty(t)))
                 .collect(),
             key_type: None,
-        });
+        }));
         // The postcondition still names it, and needs no inverse — it reads
         // the column as the type the `ALTER` left and compares the recorded
         // text, which is the same `0x02` either type renders.
@@ -4915,7 +4968,7 @@ mod tests {
 
         // Unretyped, the same cell is held: the recorded text *is* what the
         // read-back rendered, and no conversion stands between them.
-        let held = sql_of(&Change::UpdateRow {
+        let held = sql_of(&Change::Row(RowChange::UpdateRow {
             table: tname("dbo.t"),
             key_column: "code".into(),
             key: RowKey::from("a"),
@@ -4929,7 +4982,7 @@ mod tests {
                 .collect(),
             after_types: Default::default(),
             key_type: None,
-        });
+        }));
         assert!(
             held[0].contains(
                 "CONVERT(nvarchar(max), CONVERT(varbinary(max), [blob]), 1) = N'0x02' \
@@ -4950,7 +5003,7 @@ mod tests {
     #[test]
     fn a_column_the_plan_adds_is_held_after_the_write_but_not_before() {
         let text = |s: &str| Cell::Value(Value::Text(s.to_owned()));
-        let sql = sql_of(&Change::UpdateRow {
+        let sql = sql_of(&Change::Row(RowChange::UpdateRow {
             table: tname("dbo.t"),
             key_column: "code".into(),
             key: RowKey::from("a"),
@@ -4979,7 +5032,7 @@ mod tests {
                 .map(|(c, t)| (c.into(), ty(t)))
                 .collect(),
             key_type: None,
-        });
+        }));
         let sql = &sql[0];
         let update = sql
             .lines()
@@ -5032,7 +5085,7 @@ mod tests {
     /// declaration said "the default".
     #[test]
     fn an_update_to_the_default_says_default_not_null() {
-        let sql = sql_of(&Change::UpdateRow {
+        let sql = sql_of(&Change::Row(RowChange::UpdateRow {
             unchanged: Default::default(),
             types: Default::default(),
             after_types: Default::default(),
@@ -5046,7 +5099,7 @@ mod tests {
             .into_iter()
             .collect(),
             key_type: None,
-        });
+        }));
         assert!(
             sql[0].contains("UPDATE [dbo].[t] SET @pbps_key_before = CONVERT(nvarchar(max), [code]), [sort] = DEFAULT WHERE [code] = N'a';"),
             "{}",
@@ -5066,7 +5119,7 @@ mod tests {
     fn an_update_with_no_changed_column_is_refused() {
         assert!(
             emit(
-                &Change::UpdateRow {
+                &Change::Row(RowChange::UpdateRow {
                     unchanged: Default::default(),
                     types: Default::default(),
                     after_types: Default::default(),
@@ -5075,7 +5128,7 @@ mod tests {
                     key: RowKey::from("a"),
                     columns: BTreeMap::new(),
                     key_type: None,
-                },
+                }),
                 Strategy::default()
             )
             .is_err()
@@ -5087,7 +5140,7 @@ mod tests {
     /// rewrote in between is not the row that was reviewed (DECISIONS 143).
     #[test]
     fn a_delete_holds_the_row_to_what_the_plan_recorded() {
-        let sql = sql_of(&Change::DeleteRow {
+        let sql = sql_of(&Change::Row(RowChange::DeleteRow {
             table: tname("dbo.order_status"),
             key_column: "code".into(),
             key: RowKey::from("old"),
@@ -5120,7 +5173,7 @@ mod tests {
             .collect(),
             after_types: Default::default(),
             key_type: None,
-        });
+        }));
         assert_eq!(sql.len(), 1, "{sql:?}");
         assert!(!sql[0].contains("Dropped baseline"), "{sql:?}");
         assert!(!sql[0].contains("dropped_only"), "{sql:?}");
@@ -5140,7 +5193,7 @@ mod tests {
 
     #[test]
     fn a_delete_is_keyed_on_the_primary_key_column() {
-        let sql = sql_of(&Change::DeleteRow {
+        let sql = sql_of(&Change::Row(RowChange::DeleteRow {
             table: tname("dbo.order_status"),
             key_column: "code".into(),
             key: RowKey::from("old"),
@@ -5150,7 +5203,7 @@ mod tests {
             types: BTreeMap::new(),
             after_types: Default::default(),
             key_type: None,
-        });
+        }));
         assert_eq!(sql.len(), 1, "{sql:?}");
         let sql = &sql[0];
         assert!(
@@ -5185,28 +5238,28 @@ mod tests {
     fn a_role_is_created_dropped_and_renamed_in_place() {
         let uid: pbps_model::Uid = "r_aaaaaa".parse().unwrap();
         assert_eq!(
-            sql_of(&Change::CreateRole {
+            sql_of(&Change::Role(RoleChange::CreateRole {
                 uid: uid.clone(),
                 name: "app_reader".into()
-            }),
+            })),
             ["CREATE ROLE [app_reader];"]
         );
         assert_eq!(
-            sql_of(&Change::DropRole {
+            sql_of(&Change::Role(RoleChange::DropRole {
                 uid: uid.clone(),
                 name: "app_reader".into(),
                 members: Vec::new(),
-            }),
+            })),
             ["DROP ROLE [app_reader];"]
         );
         // Members first, by name, then the role: the engine refuses the drop
         // while any remain, and the plan says exactly who is removed.
         assert_eq!(
-            sql_of(&Change::DropRole {
+            sql_of(&Change::Role(RoleChange::DropRole {
                 uid: uid.clone(),
                 name: "app_reader".into(),
                 members: vec!["app_svc".into(), "reporting".into()],
-            }),
+            })),
             [
                 "ALTER ROLE [app_reader] DROP MEMBER [app_svc];",
                 "ALTER ROLE [app_reader] DROP MEMBER [reporting];",
@@ -5214,21 +5267,21 @@ mod tests {
             ]
         );
         // ALTER, never drop + add: the membership has to survive.
-        let sql = sql_of(&Change::RenameRole {
+        let sql = sql_of(&Change::Role(RoleChange::RenameRole {
             uid: uid.clone(),
             from: "reader".into(),
             to: "app_reader".into(),
-        });
+        }));
         assert_eq!(sql, ["ALTER ROLE [reader] WITH NAME = [app_reader];"]);
         assert!(!sql[0].contains("DROP"), "{sql:?}");
         // And the statement says what it did to the name, as a table rename's
         // do, so a staged checkpoint finds the role again (DECISIONS 93).
         let stmts = emit(
-            &Change::RenameRole {
+            &Change::Role(RoleChange::RenameRole {
                 uid: uid.clone(),
                 from: "reader".into(),
                 to: "app_reader".into(),
-            },
+            }),
             Strategy::default(),
         )
         .unwrap();
@@ -5240,10 +5293,10 @@ mod tests {
         // And a created role says so, for the checkpoint to adopt it
         // (DECISIONS 100).
         let created = emit(
-            &Change::CreateRole {
+            &Change::Role(RoleChange::CreateRole {
                 uid: uid.clone(),
                 name: "auditors".into(),
-            },
+            }),
             Strategy::default(),
         )
         .unwrap();
@@ -5252,20 +5305,20 @@ mod tests {
 
     #[test]
     fn grants_name_the_securable_class_and_spell_permissions_the_engines_way() {
-        let sql = sql_of(&Change::Grant {
+        let sql = sql_of(&Change::Permission(GrantChange::Grant {
             role: "app_reader".into(),
             target: "dbo.customer".parse().unwrap(),
             permissions: perms(&[Permission::ViewDefinition, Permission::Select]),
-        });
+        }));
         assert_eq!(
             sql,
             ["GRANT SELECT, VIEW DEFINITION ON OBJECT::[dbo].[customer] TO [app_reader];"]
         );
-        let sql = sql_of(&Change::Revoke {
+        let sql = sql_of(&Change::Permission(GrantChange::Revoke {
             role: "app_reader".into(),
             target: "schema::app".parse().unwrap(),
             permissions: perms(&[Permission::Execute]),
-        });
+        }));
         assert_eq!(sql, ["REVOKE EXECUTE ON SCHEMA::[app] FROM [app_reader];"]);
     }
 
@@ -5283,11 +5336,11 @@ mod tests {
             pbps_model::PublicAccess::Kept,
         ] {
             let e = emit(
-                &Change::PublicExecution {
+                &Change::Permission(GrantChange::PublicExecution {
                     routine: "dbo.charge(int)".parse().unwrap(),
                     access,
                     origin: pbps_model::RoutineOrigin::Created,
-                },
+                }),
                 Strategy::default(),
             )
             .unwrap_err();
@@ -5305,16 +5358,18 @@ mod tests {
     #[test]
     fn a_restrict_foreign_key_action_is_refused_not_rendered_as_no_action() {
         use pbps_model::ReferentialAction::{NoAction, Restrict};
-        let add = |on_delete, on_update| Change::AddForeignKey {
-            table: tname("dbo.t"),
-            name: "fk_t".into(),
-            constraint: Box::new(pbps_model::ForeignKey {
-                columns: vec!["a".into()],
-                references_table: tname("dbo.p"),
-                references_columns: vec!["id".into()],
-                on_delete,
-                on_update,
-            }),
+        let add = |on_delete, on_update| {
+            Change::Constraint(ConstraintChange::AddForeignKey {
+                table: tname("dbo.t"),
+                name: "fk_t".into(),
+                constraint: Box::new(pbps_model::ForeignKey {
+                    columns: vec!["a".into()],
+                    references_table: tname("dbo.p"),
+                    references_columns: vec!["id".into()],
+                    on_delete,
+                    on_update,
+                }),
+            })
         };
         for change in [add(Restrict, NoAction), add(NoAction, Restrict)] {
             let e = emit(&change, Strategy::default()).unwrap_err();
@@ -5335,16 +5390,16 @@ mod tests {
     #[test]
     fn a_permission_this_engine_lacks_is_refused_not_rendered() {
         for change in [
-            Change::Grant {
+            Change::Permission(GrantChange::Grant {
                 role: "app_reader".into(),
                 target: "dbo.customer".parse().unwrap(),
                 permissions: perms(&[Permission::Select, Permission::Usage]),
-            },
-            Change::Revoke {
+            }),
+            Change::Permission(GrantChange::Revoke {
                 role: "app_reader".into(),
                 target: "schema::app".parse().unwrap(),
                 permissions: perms(&[Permission::Truncate]),
-            },
+            }),
         ] {
             let e = emit(&change, Strategy::default()).unwrap_err();
             let DialectError::Unsupported { feature, .. } = &e else {
@@ -5376,7 +5431,7 @@ mod tests {
     /// the one place in this tool where user *data* is written into SQL text.
     #[test]
     fn a_quote_in_a_value_cannot_escape_the_literal() {
-        let sql = sql_of(&Change::InsertRow {
+        let sql = sql_of(&Change::Row(RowChange::InsertRow {
             table: tname("dbo.t"),
             key_column: "code".into(),
             identity_key: false,
@@ -5387,7 +5442,7 @@ mod tests {
                 "label",
                 Value::Text("'); DROP TABLE [dbo].[t]; --".to_owned()),
             )]),
-        });
+        }));
         // Pinned exactly rather than by substring: what matters is that the
         // injected text is *inside* the literal, and only the whole statement
         // shows that. Every quote the value contained is doubled, so none of it
@@ -5424,7 +5479,7 @@ mod tests {
     /// store "1" where the declaration said "true".
     #[test]
     fn a_boolean_goes_out_as_a_word_and_an_integer_bare() {
-        let sql = sql_of(&Change::InsertRow {
+        let sql = sql_of(&Change::Row(RowChange::InsertRow {
             table: tname("dbo.t"),
             key_column: "code".into(),
             identity_key: false,
@@ -5436,7 +5491,7 @@ mod tests {
                 ("n", Value::Int(-7)),
                 ("nothing", Value::Null),
             ]),
-        });
+        }));
         assert!(sql[0].contains("N'true'"), "{sql:?}");
         assert!(sql[0].contains(", -7,"), "{sql:?}");
         assert!(sql[0].contains("NULL"), "{sql:?}");
@@ -5449,11 +5504,11 @@ mod tests {
     #[test]
     fn setting_the_data_mode_emits_nothing() {
         assert!(
-            sql_of(&Change::SetDataMode {
+            sql_of(&Change::Row(RowChange::SetDataMode {
                 table: tname("dbo.t"),
                 from: Some(pbps_model::DataMode::Ensure),
                 to: Some(pbps_model::DataMode::Exact),
-            })
+            }))
             .is_empty()
         );
     }
@@ -5462,7 +5517,7 @@ mod tests {
     #[test]
     fn row_changes_are_never_online() {
         for c in [
-            Change::InsertRow {
+            Change::Row(RowChange::InsertRow {
                 table: tname("dbo.t"),
                 key_column: "code".into(),
                 identity_key: false,
@@ -5470,8 +5525,8 @@ mod tests {
                 defaults: Default::default(),
                 types: Default::default(),
                 row: Row::default(),
-            },
-            Change::DeleteRow {
+            }),
+            Change::Row(RowChange::DeleteRow {
                 table: tname("dbo.t"),
                 key_column: "code".into(),
                 key: RowKey::from("a"),
@@ -5481,7 +5536,7 @@ mod tests {
                 types: BTreeMap::new(),
                 after_types: Default::default(),
                 key_type: None,
-            },
+            }),
         ] {
             assert!(!takes_online(&c), "{c:?}");
         }
@@ -5491,6 +5546,8 @@ mod tests {
 #[cfg(test)]
 mod enum_label_tests {
     use super::*;
+    use pbps_model::RoleChange;
+    use pbps_model::TypeValueChange;
     #[test]
     fn enum_label_changes_refuse_sql_server_by_type_name() {
         let uid = "y_000001".parse().unwrap();
@@ -5498,24 +5555,24 @@ mod enum_label_tests {
         let definition = Box::new(pbps_model::ManagedType::Enum {
             values: vec!["blue".into()],
         });
-        let add = Change::AddEnumValue {
+        let add = Change::TypeValue(TypeValueChange::AddEnumValue {
             uid,
             name,
             value: "blue".into(),
             placement: None,
             ordinal: 0,
             definition,
-        };
-        let Change::AddEnumValue {
+        });
+        let Change::TypeValue(TypeValueChange::AddEnumValue {
             uid,
             name,
             definition,
             ..
-        } = add.clone()
+        }) = add.clone()
         else {
             unreachable!()
         };
-        let rename = Change::RenameEnumValue {
+        let rename = Change::TypeValue(TypeValueChange::RenameEnumValue {
             uid,
             name,
             from: "sad".into(),
@@ -5523,7 +5580,7 @@ mod enum_label_tests {
             ordinal: 0,
             retained: Vec::new(),
             definition,
-        };
+        });
         let domain = |checks: bool| {
             Box::new(pbps_model::ManagedType::Domain {
                 base: "text".parse().unwrap(),
@@ -5539,12 +5596,14 @@ mod enum_label_tests {
         };
         // A domain alteration is a declared-type change like the others: this
         // dialect holds none (DEC-1635.8).
-        let alter = |half| Change::AlterDomain {
-            uid: "y_000002".parse().unwrap(),
-            name: "app.e".parse().unwrap(),
-            from: domain(false),
-            to: domain(true),
-            half,
+        let alter = |half| {
+            Change::TypeValue(TypeValueChange::AlterDomain {
+                uid: "y_000002".parse().unwrap(),
+                name: "app.e".parse().unwrap(),
+                from: domain(false),
+                to: domain(true),
+                half,
+            })
         };
         for step in [
             add,
@@ -5558,10 +5617,10 @@ mod enum_label_tests {
         }
         assert!(
             emit(
-                &Change::CreateRole {
+                &Change::Role(RoleChange::CreateRole {
                     uid: "r_000001".parse().unwrap(),
                     name: "reader".into()
-                },
+                }),
                 Strategy::default()
             )
             .is_ok()

@@ -14,6 +14,7 @@
 //! promising something it cannot check.
 
 use pbps_db::{Conn, DbError};
+use pbps_model::ColumnChange;
 use pbps_model::ValueSource;
 use pbps_model::{Change, ChangeSet};
 
@@ -157,12 +158,12 @@ pub fn size_of_data_warnings(changes: &ChangeSet, edition: &Edition) -> Vec<Stri
 pub fn rewrites_every_row_on_standard(
     change: &Change,
 ) -> Option<(&pbps_model::TableName, &pbps_model::ColumnName)> {
-    if let Change::AddColumn {
+    if let Change::Column(ColumnChange::AddColumn {
         table,
         name,
         column,
         ..
-    } = change
+    }) = change
         && !column.nullable
         && (match &column.value_source {
             ValueSource::Default(_) => true,
@@ -181,6 +182,8 @@ pub fn rewrites_every_row_on_standard(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
 
     #[test]
     fn the_full_editions_are_recognised_with_their_suffixes() {
@@ -220,25 +223,25 @@ mod tests {
         column.value_source = default.map_or(pbps_model::ValueSource::None, |text| {
             pbps_model::ValueSource::Default(text.into())
         });
-        pbps_model::PlannedChange::new(Change::AddColumn {
+        pbps_model::PlannedChange::new(Change::Column(ColumnChange::AddColumn {
             uid: "c_a1b2c3".parse().unwrap(),
             table: "dbo.customer".parse().unwrap(),
             name: "score".into(),
             column: Box::new(column),
-        })
+        }))
     }
 
     /// `ALTER COLUMN` is one of the statements the emitter really writes
     /// `WITH (ONLINE = ON)` on.
     fn alter_nullability() -> pbps_model::PlannedChange {
-        pbps_model::PlannedChange::new(Change::AlterColumnNullability {
+        pbps_model::PlannedChange::new(Change::Column(ColumnChange::AlterColumnNullability {
             uid: "c_a1b2c3".parse().unwrap(),
             column: "dbo.customer.score".parse().unwrap(),
             ty: "int".parse().unwrap(),
             to_nullable: true,
             through_external_partitions: false,
             collation: None,
-        })
+        }))
     }
 
     fn online(c: pbps_model::PlannedChange) -> pbps_model::PlannedChange {
@@ -280,13 +283,13 @@ mod tests {
         let e = Edition::classify("Standard Edition (64-bit)");
         for c in [
             add_column(true, None),
-            pbps_model::PlannedChange::new(Change::AddCheck {
+            pbps_model::PlannedChange::new(Change::Constraint(ConstraintChange::AddCheck {
                 table: "dbo.customer".parse().unwrap(),
                 name: "ck_score".into(),
                 constraint: pbps_model::CheckConstraint {
                     expression: "score > 0".into(),
                 },
-            }),
+            })),
         ] {
             let cs = ChangeSet {
                 changes: vec![online(c)],

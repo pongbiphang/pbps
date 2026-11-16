@@ -34,6 +34,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::{Dialect, DialectError, Lexicon, Statement, TransactionFraming, TypeChangeRisk};
+use pbps_model::TableChange;
 use pbps_model::{
     Change, ColumnType, Module, ModuleId, ModuleKind, Role, RoutineArg, Schema, SessionZone,
     Strategy, Table, TableName,
@@ -1346,10 +1347,10 @@ impl Dialect for Postgres {
         demand.required_columns = required_columns.clone();
         if matches!(
             change,
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 beside_default: Some(_),
                 ..
-            }
+            })
         ) {
             return Ok(None);
         }
@@ -2835,13 +2836,15 @@ impl Dialect for Postgres {
         _captured: &pbps_model::operation::Captured,
     ) -> Result<pbps_model::operation::Effects, pbps_model::operation::OwnerError> {
         use pbps_model::Change;
+        use pbps_model::ColumnChange;
+        use pbps_model::TableChange;
         use pbps_model::operation::{Incarnation, PartKey, Resource, base_table};
         let mut fx =
             pbps_dialect::engine_effects::text_dependents(self, op, owners, before, after, false)?
                 .merged(pbps_dialect::engine_effects::retype_blockers(
                     self, op, owners, before, after,
                 )?);
-        if let Change::RenameTable { from, to, .. } = op.change()
+        if let Change::Table(TableChange::RenameTable { from, to, .. }) = op.change()
             && from.schema != to.schema
             && let Some(base) = base_table(op, owners, before, from)?
         {
@@ -2864,12 +2867,12 @@ impl Dialect for Postgres {
         // refused on the narrower column (DEC-1921.1, measured on 16 and 18).
         // The portable effects leave the retune free of the column's
         // rewrites; this puts it after them unless the retype narrows.
-        if let Change::AlterColumnNumbering {
+        if let Change::Column(ColumnChange::AlterColumnNumbering {
             uid,
             from: pbps_model::ValueSource::Identity(_),
             to: pbps_model::ValueSource::Identity(_),
             ..
-        } = op.change()
+        }) = op.change()
             && let Some((was, will)) = pbps_model::operation::column_types(uid, before, after)
             && self.type_change_risk(was, will) == TypeChangeRisk::Safe
         {
@@ -3237,6 +3240,7 @@ mod tests {
     #[test]
     fn an_occupied_attach_check_name_keeps_the_single_statement() {
         use pbps_dialect::Dialect;
+        use pbps_model::PartitionChange;
         use pbps_model::{BoundDatum, Change, ColumnName, PartitionBound, Uid};
         let uid: Uid = "t_aaaaaa".parse().unwrap();
         let other: Uid = "t_bbbbbb".parse().unwrap();
@@ -3252,7 +3256,7 @@ mod tests {
         ] {
             let pg = super::Postgres::new()
                 .with_attach_constraint_names([(owner, [held].into())].into());
-            let change = Change::AttachPartition {
+            let change = Change::Partition(PartitionChange::AttachPartition {
                 uid: uid.clone(),
                 table: "app.t".parse().unwrap(),
                 parent: "app.ev".parse().unwrap(),
@@ -3262,7 +3266,7 @@ mod tests {
                 },
                 key: pg.attach_scan_key(&uid, &typed, &Default::default()),
                 shape: Box::default(),
-            };
+            });
             // Only the optional proof key is sealed. A fresh emitter at apply
             // must reproduce the planning choice without another catalog read.
             let sql = super::Postgres::new()
@@ -4870,10 +4874,10 @@ mod tests {
             result.expect("a rename").changes.iter().any(|p| {
                 matches!(
                     &p.change,
-                    pbps_model::Change::AlterColumnNumbering {
+                    pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnNumbering {
                         to: pbps_model::ValueSource::Sequence(s),
                         ..
-                    } if s.name.as_deref() == Some(to)
+                    }) if s.name.as_deref() == Some(to)
                 )
             })
         };
@@ -4890,7 +4894,7 @@ mod tests {
         assert!(
             matches!(
                 kept.changes.as_slice(),
-                [p] if matches!(p.change, pbps_model::Change::RenameTable { .. })
+                [p] if matches!(p.change, pbps_model::Change::Table(pbps_model::TableChange::RenameTable { .. }))
             ),
             "{kept:#?}"
         );
@@ -4926,6 +4930,8 @@ mod tests {
     /// deletes, which may remove the rows holding NULL.
     #[test]
     fn an_identity_put_on_keeps_its_tightening_ahead_of_the_rows() {
+        use pbps_model::ColumnChange;
+        use pbps_model::RowChange;
         use pbps_model::{
             Change, Column, DataMode, Hints, Identity, IdsFile, PrimaryKey, Row, RowKey, Schema,
             Table, TableData, TableName, Value, ValueSource,
@@ -4995,15 +5001,21 @@ mod tests {
                 .changes
                 .iter()
                 .filter_map(|p| {
-                    if let Change::AlterColumnNullability { .. } = &p.change {
+                    if let Change::Column(ColumnChange::AlterColumnNullability { .. }) = &p.change {
                         Some("tighten".to_owned())
-                    } else if let Change::AlterColumnType { to_nullable, .. } = &p.change {
+                    } else if let Change::Column(ColumnChange::AlterColumnType {
+                        to_nullable,
+                        ..
+                    }) = &p.change
+                    {
                         Some(format!("retype nullable={to_nullable}"))
-                    } else if let Change::AlterColumnNumbering { .. } = &p.change {
+                    } else if let Change::Column(ColumnChange::AlterColumnNumbering { .. }) =
+                        &p.change
+                    {
                         Some("identity".to_owned())
-                    } else if let Change::InsertRow { .. } = &p.change {
+                    } else if let Change::Row(RowChange::InsertRow { .. }) = &p.change {
                         Some("insert".to_owned())
-                    } else if let Change::DeleteRow { .. } = &p.change {
+                    } else if let Change::Row(RowChange::DeleteRow { .. }) = &p.change {
                         Some("delete".to_owned())
                     } else {
                         None
@@ -5163,6 +5175,7 @@ mod tests {
     /// for an `UNLOGGED` table. To or from generated has no in-place form.
     #[test]
     fn a_numbering_change_is_one_change_gated_only_where_a_writer_can_fail() {
+        use pbps_model::ColumnChange;
         use pbps_model::{
             Change, Column, Hints, Identity, IdsFile, OwnedSequence, RiskClass, Schema, Table,
             TableName, ValueSource,
@@ -5257,7 +5270,7 @@ mod tests {
                 panic!("{from:?} -> {to:?}: {planned:#?}");
             };
             assert!(
-                matches!(&p.change, Change::AlterColumnNumbering { from: f, to: t, .. }
+                matches!(&p.change, Change::Column(ColumnChange::AlterColumnNumbering { from: f, to: t, .. })
                     if *f == from && *t == to),
                 "{p:#?}"
             );
@@ -5283,14 +5296,18 @@ mod tests {
                 .changes
                 .iter()
                 .map(|p| {
-                    if let Change::AlterColumnNumbering { from, to, .. } = &p.change {
+                    if let Change::Column(ColumnChange::AlterColumnNumbering { from, to, .. }) =
+                        &p.change
+                    {
                         assert!(
                             !matches!(from, ValueSource::Default(_))
                                 && !matches!(to, ValueSource::Default(_)),
                             "{p:#?}"
                         );
                         "numbering"
-                    } else if let Change::AlterColumnDefault { .. } = &p.change {
+                    } else if let Change::Column(ColumnChange::AlterColumnDefault { .. }) =
+                        &p.change
+                    {
                         "default"
                     } else {
                         panic!("{p:?}")
@@ -5314,7 +5331,7 @@ mod tests {
         assert!(
             retyped.changes.iter().any(|p| matches!(
                 &p.change,
-                Change::AlterColumnNumbering { ty, .. } if ty.raw().to_string() == "bigint"
+                Change::Column(ColumnChange::AlterColumnNumbering { ty, .. }) if ty.raw().to_string() == "bigint"
             )),
             "{retyped:#?}"
         );
@@ -5514,18 +5531,19 @@ mod tests {
     /// them, and no `RESTART` anywhere, which would reissue numbers.
     #[test]
     fn a_numbering_change_reads_under_the_lock_on_the_catalogs_operators() {
+        use pbps_model::ColumnChange;
         use pbps_model::{Change, Identity, OwnedSequence, Strategy, TableName, ValueSource};
         let column = TableName::new("app", "t").column("id");
         let emit = |from: ValueSource, to: ValueSource| {
             super::Postgres::new()
                 .fixture_emit(
-                    &Change::AlterColumnNumbering {
+                    &Change::Column(ColumnChange::AlterColumnNumbering {
                         uid: "c_a1b2c3".parse().unwrap(),
                         column: column.clone(),
                         ty: "integer".parse().unwrap(),
                         from,
                         to,
-                    },
+                    }),
                     Strategy::default(),
                 )
                 .unwrap()
@@ -5593,7 +5611,7 @@ mod tests {
         assert!(
             super::Postgres::new()
                 .fixture_emit(
-                    &Change::AlterColumnNumbering {
+                    &Change::Column(ColumnChange::AlterColumnNumbering {
                         uid: "c_a1b2c3".parse().unwrap(),
                         column: column.clone(),
                         ty: "integer".parse().unwrap(),
@@ -5602,7 +5620,7 @@ mod tests {
                             stored: true,
                         }),
                         to: identity,
-                    },
+                    }),
                     Strategy::default(),
                 )
                 .is_err()
@@ -5667,6 +5685,7 @@ mod tests {
     #[test]
     fn required_add_risks_follow_the_dialects_identifier_boundary() {
         use pbps_dialect::{Dialect, MinimalDialect};
+        use pbps_model::ColumnChange;
         use pbps_model::{Change, Column, RiskClass, Uid, UidKind};
 
         for (default, pg_risky) in [
@@ -5678,12 +5697,12 @@ mod tests {
             column.value_source = default.map_or(pbps_model::ValueSource::None, |text| {
                 pbps_model::ValueSource::Default(text.into())
             });
-            let change = Change::AddColumn {
+            let change = Change::Column(ColumnChange::AddColumn {
                 uid: Uid::generate(UidKind::Column),
                 table: "app.t".parse().unwrap(),
                 name: "added".into(),
                 column: Box::new(column),
-            };
+            });
             assert_eq!(
                 super::Postgres::new()
                     .change_risks(&change)
@@ -5701,6 +5720,8 @@ mod tests {
         }
     }
     use super::*;
+    use pbps_model::RoleChange;
+    use pbps_model::RowChange;
 
     #[test]
     fn a_plan_rebuilds_each_caller_once_and_leaves_other_paths_alone() {
@@ -5834,11 +5855,11 @@ mod tests {
         // separate entries in this same plan.
         assert!(
             pg.fixture_emit(
-                &Change::SetDataMode {
+                &Change::Row(RowChange::SetDataMode {
                     table: "app.t".parse().expect("a table name parses"),
                     from: None,
                     to: Some(pbps_model::DataMode::Exact),
-                },
+                }),
                 Strategy::default(),
             )
             .expect("the mode is built")
@@ -5849,20 +5870,20 @@ mod tests {
         // principal" from reading as "there was nothing to do" (ADR-0010 §3).
         let uid = pbps_model::Uid::generate(pbps_model::UidKind::Role);
         for change in [
-            Change::CreateRole {
+            Change::Role(RoleChange::CreateRole {
                 uid: uid.clone(),
                 name: "analyst".to_owned().into(),
-            },
-            Change::DropRole {
+            }),
+            Change::Role(RoleChange::DropRole {
                 uid: uid.clone(),
                 name: "analyst".to_owned().into(),
                 members: Vec::new(),
-            },
-            Change::RenameRole {
+            }),
+            Change::Role(RoleChange::RenameRole {
                 uid,
                 from: "analyst".to_owned().into(),
                 to: "reader".to_owned().into(),
-            },
+            }),
         ] {
             pg.fixture_emit(&change, Strategy::default())
                 .expect_err("the principal is the cluster's");
@@ -7386,6 +7407,7 @@ mod tests {
     /// identity conversions still name their partition limitation (DEC-2219.1).
     #[test]
     fn a_standing_parents_serial_changes_plan_but_identity_conversions_are_refused() {
+        use pbps_model::ColumnChange;
         use pbps_model::{
             Change, Column, Hints, IdsFile, Intent, OwnedSequence, Schema, ValueSource,
         };
@@ -7504,13 +7526,16 @@ mod tests {
                     assert!(
                         changes.changes.iter().any(|p| matches!(
                             (what, &p.change),
-                            ("adding a `serial` column", Change::AddColumn { .. })
-                                | (
-                                    "changing numbering to or from a `serial`"
-                                        | "identity conversion",
-                                    Change::AlterColumnNumbering { .. }
-                                )
-                                | ("dropping a `serial` column", Change::DropColumn { .. })
+                            (
+                                "adding a `serial` column",
+                                Change::Column(ColumnChange::AddColumn { .. })
+                            ) | (
+                                "changing numbering to or from a `serial`" | "identity conversion",
+                                Change::Column(ColumnChange::AlterColumnNumbering { .. })
+                            ) | (
+                                "dropping a `serial` column",
+                                Change::Column(ColumnChange::DropColumn { .. })
+                            )
                         )),
                         "{changes:?}"
                     );
@@ -7768,6 +7793,7 @@ mod tests {
     /// removed, a cycle turned on, and a cache changed are not gated.
     #[test]
     fn a_retune_is_gated_only_where_its_numbers_end_sooner() {
+        use pbps_model::ColumnChange;
         use pbps_model::{
             Change, Hints, Identity, IdsFile, OwnedSequence, RiskClass, Schema, SequenceOptions,
             TableName, ValueSource,
@@ -7813,7 +7839,7 @@ mod tests {
             assert_eq!(cs.changes.len(), 1, "{cs:?}");
             assert!(matches!(
                 cs.changes[0].change,
-                Change::AlterColumnNumbering { .. }
+                Change::Column(ColumnChange::AlterColumnNumbering { .. })
             ));
             cs.changes[0].risks.contains(&RiskClass::Numbering)
         };
@@ -8331,6 +8357,8 @@ mod certified_emission_tests {
     }
 
     use super::*;
+    use pbps_model::PartitionChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, PlanMode, PlannedChange};
 
     #[test]
@@ -8354,11 +8382,11 @@ mod certified_emission_tests {
             .into(),
         };
         for guarded in [false, true] {
-            let mut change = PlannedChange::new(Change::DropTable {
+            let mut change = PlannedChange::new(Change::Table(TableChange::DropTable {
                 uid: uid.clone(),
                 name: table.clone(),
                 detach_from: None,
-            });
+            }));
             change.drop_guard = guarded.then(|| guard.clone());
             for mode in [PlanMode::Transactional, PlanMode::Staged] {
                 let ordered = pbps_diff::order::singleton(change.clone(), mode, &dialect);
@@ -8387,12 +8415,14 @@ mod certified_emission_tests {
     fn certified_lowering_preserves_statement_bytes_and_mode() {
         let dialect = Postgres::new();
         let changes = ChangeSet {
-            changes: vec![PlannedChange::new(Change::RenameTable {
-                uid: "t_aaaaaa".parse().unwrap(),
-                from: "dbo.old_name".parse().unwrap(),
-                to: "dbo.new_name".parse().unwrap(),
-                defaults: Vec::new(),
-            })],
+            changes: vec![PlannedChange::new(Change::Table(
+                TableChange::RenameTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    from: "dbo.old_name".parse().unwrap(),
+                    to: "dbo.new_name".parse().unwrap(),
+                    defaults: Vec::new(),
+                },
+            ))],
         };
         let expected = dialect
             .fixture_emit(&changes.changes[0].change, changes.changes[0].strategy)
@@ -8416,7 +8446,7 @@ mod certified_emission_tests {
         };
 
         let dialect = Postgres::new();
-        let change = PlannedChange::new(Change::AttachPartition {
+        let change = PlannedChange::new(Change::Partition(PartitionChange::AttachPartition {
             uid: "t_aaaaaa".parse().unwrap(),
             table: "app.child".parse().unwrap(),
             parent: "app.parent".parse().unwrap(),
@@ -8426,7 +8456,7 @@ mod certified_emission_tests {
             },
             key: vec!["id".into()],
             shape: Box::default(),
-        });
+        }));
         let transactional = emit::emit(&dialect, &change.change, change.strategy).unwrap();
         let staged = emit::staged_attach(&change.change).unwrap().unwrap();
         assert_eq!(transactional.len(), 1);
@@ -9161,28 +9191,31 @@ mod enum_rebuild_dependents_tests {
     /// carry only the rebuild's (DEC-1635.9).
     #[test]
     fn a_domain_rebuilds_retype_carries_the_narrowing_risk_of_its_base_change() {
+        use pbps_model::TypeValueChange;
         use pbps_model::{Change, EnumRebuildStep, RiskClass};
         let pg = Postgres::new();
         let ty = |text: &str| pg.normalize_type(&text.parse().unwrap()).unwrap();
-        let retype = |base_change: Option<Box<(ColumnType, ColumnType)>>| Change::EnumRebuild {
-            uid: "y_000002".parse().unwrap(),
-            name: "app.d".parse().unwrap(),
-            tmp: "app.tmp".parse().unwrap(),
-            step: EnumRebuildStep::Retype {
-                column_uid: "c_aaaaaa".parse().unwrap(),
-                column: pbps_model::TableName::new("app", "t").column("v"),
-                to: pbps_model::ColumnType::reference("app.d".parse().unwrap()),
-                array: false,
-                values: Box::new(match base_change {
-                    Some(pair) => pbps_model::ValueChange::Cast {
-                        from: pair.0,
-                        to: pair.1,
-                        arrays: 0,
-                        using: None,
-                    },
-                    None => pbps_model::ValueChange::Relabel { removed: vec![] },
-                }),
-            },
+        let retype = |base_change: Option<Box<(ColumnType, ColumnType)>>| {
+            Change::TypeValue(TypeValueChange::EnumRebuild {
+                uid: "y_000002".parse().unwrap(),
+                name: "app.d".parse().unwrap(),
+                tmp: "app.tmp".parse().unwrap(),
+                step: EnumRebuildStep::Retype {
+                    column_uid: "c_aaaaaa".parse().unwrap(),
+                    column: pbps_model::TableName::new("app", "t").column("v"),
+                    to: pbps_model::ColumnType::reference("app.d".parse().unwrap()),
+                    array: false,
+                    values: Box::new(match base_change {
+                        Some(pair) => pbps_model::ValueChange::Cast {
+                            from: pair.0,
+                            to: pair.1,
+                            arrays: 0,
+                            using: None,
+                        },
+                        None => pbps_model::ValueChange::Relabel { removed: vec![] },
+                    }),
+                },
+            })
         };
         let risks = |change| pg.change_risks(&change);
         assert_eq!(

@@ -2,6 +2,12 @@
 //! Explicit UIDs remain authoritative: invalid reuse is a fixture error, never
 //! a reason for production to fall back to an observed same-named object.
 
+use pbps_model::ColumnChange;
+use pbps_model::PartitionChange;
+use pbps_model::PolicyChange;
+use pbps_model::RoleChange;
+use pbps_model::TableChange;
+use pbps_model::TablePropertyChange;
 use pbps_model::{Change, ChangeSet, ColumnRef, IdsFile, Schema, TableName, Uid, UidKind};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -35,74 +41,84 @@ pub(crate) fn ids(changes: &ChangeSet, before: &Schema) -> IdsFile {
     let mut scopes = Vec::new();
     for (i, p) in changes.changes.iter().enumerate() {
         match &p.change {
-            Change::CreateTable { uid, name, .. } => {
+            Change::Table(TableChange::CreateTable { uid, name, .. }) => {
                 tables.push((i, uid.clone(), None, Some(name.clone())))
             }
-            Change::DropTable { uid, name, .. } => {
+            Change::Table(TableChange::DropTable { uid, name, .. }) => {
                 tables.push((i, uid.clone(), Some(name.clone()), None))
             }
-            Change::RenameTable { uid, from, to, .. } => {
+            Change::Table(TableChange::RenameTable { uid, from, to, .. }) => {
                 tables.push((i, uid.clone(), Some(from.clone()), Some(to.clone())))
             }
-            Change::SetRowSecurity { uid, table, .. }
-            | Change::SetTablePersistence { uid, table, .. }
-            | Change::SetStorageParameters { uid, table, .. }
-            | Change::SetReplicaIdentity { uid, table, .. }
-            | Change::SetPartitionDefault { uid, table, .. }
-            | Change::SetPartitionNotNull { uid, table, .. }
-            | Change::AttachPartition { uid, table, .. }
-            | Change::DetachPartition { uid, table, .. } => {
+            Change::Policy(PolicyChange::SetRowSecurity { uid, table, .. })
+            | Change::TableProperty(TablePropertyChange::SetTablePersistence {
+                uid, table, ..
+            })
+            | Change::TableProperty(TablePropertyChange::SetStorageParameters {
+                uid, table, ..
+            })
+            | Change::TableProperty(TablePropertyChange::SetReplicaIdentity {
+                uid, table, ..
+            })
+            | Change::Partition(PartitionChange::SetPartitionDefault { uid, table, .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { uid, table, .. })
+            | Change::Partition(PartitionChange::AttachPartition { uid, table, .. })
+            | Change::Partition(PartitionChange::DetachPartition { uid, table, .. }) => {
                 tables.push((i, uid.clone(), Some(table.clone()), Some(table.clone())))
             }
-            Change::AddColumn {
+            Change::Column(ColumnChange::AddColumn {
                 uid, table, name, ..
-            } => columns.push((i, uid.clone(), None, Some(table.column(name)))),
-            Change::DropColumn { uid, column } => {
+            }) => columns.push((i, uid.clone(), None, Some(table.column(name)))),
+            Change::Column(ColumnChange::DropColumn { uid, column }) => {
                 columns.push((i, uid.clone(), Some(column.clone()), None))
             }
-            Change::RenameColumn {
+            Change::Column(ColumnChange::RenameColumn {
                 uid,
                 table,
                 from,
                 to,
                 ..
-            } => columns.push((
+            }) => columns.push((
                 i,
                 uid.clone(),
                 Some(table.column(from)),
                 Some(table.column(to)),
             )),
-            Change::AlterColumnType { uid, column, .. }
-            | Change::AlterColumnNullability { uid, column, .. }
-            | Change::AlterColumnDefault { uid, column, .. }
-            | Change::AlterColumnExpression { uid, column, .. }
-            | Change::AlterColumnNumbering { uid, column, .. }
-            | Change::SetColumnDeprecated { uid, column, .. } => {
+            Change::Column(ColumnChange::AlterColumnType { uid, column, .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { uid, column, .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { uid, column, .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { uid, column, .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { uid, column, .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { uid, column, .. }) => {
                 columns.push((i, uid.clone(), Some(column.clone()), Some(column.clone())))
             }
-            Change::SetComment {
+            Change::TableProperty(TablePropertyChange::SetComment {
                 target: pbps_model::CommentTarget::Table { uid, table },
                 ..
-            } => tables.push((i, uid.clone(), Some(table.clone()), Some(table.clone()))),
-            Change::SetComment {
+            }) => tables.push((i, uid.clone(), Some(table.clone()), Some(table.clone()))),
+            Change::TableProperty(TablePropertyChange::SetComment {
                 target: pbps_model::CommentTarget::Column { uid, column },
                 ..
-            } => columns.push((i, uid.clone(), Some(column.clone()), Some(column.clone()))),
-            Change::CreateRole { uid, name } => {
+            }) => columns.push((i, uid.clone(), Some(column.clone()), Some(column.clone()))),
+            Change::Role(RoleChange::CreateRole { uid, name }) => {
                 roles.push((i, uid.clone(), None, Some(name.clone())))
             }
-            Change::DropRole { uid, name, .. } => {
+            Change::Role(RoleChange::DropRole { uid, name, .. }) => {
                 roles.push((i, uid.clone(), Some(name.clone()), None))
             }
-            Change::RenameRole { uid, from, to } => {
+            Change::Role(RoleChange::RenameRole { uid, from, to }) => {
                 roles.push((i, uid.clone(), Some(from.clone()), Some(to.clone())))
             }
             _ => {}
         }
         match &p.change {
-            Change::AttachPartition { table, .. } => scopes.push((i, table, None)),
-            Change::CreateTable { name, table, .. } => scopes.push((i, name, Some(table.as_ref()))),
-            Change::DetachPartition { table, shape, .. } => {
+            Change::Partition(PartitionChange::AttachPartition { table, .. }) => {
+                scopes.push((i, table, None))
+            }
+            Change::Table(TableChange::CreateTable { name, table, .. }) => {
+                scopes.push((i, name, Some(table.as_ref())))
+            }
+            Change::Partition(PartitionChange::DetachPartition { table, shape, .. }) => {
                 scopes.push((i, table, Some(shape.as_ref())))
             }
             _ => {}

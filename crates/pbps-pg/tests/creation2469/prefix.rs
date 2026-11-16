@@ -1,4 +1,6 @@
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::ModuleChange;
 #[path = "../../../pbps-diff/tests/fixtures/prefix2469.rs"]
 mod prefix_fixture;
 
@@ -64,11 +66,11 @@ fn final_generation_installers_follow_inputs_instead_of_declaration_slots() {
         .compile(&pbps_pg::Postgres::new().with_server_version(180006))
         .unwrap();
     let steps = &plan.changes().changes;
-    let a = steps.iter().position(|p| matches!(&p.change, Change::AlterColumnExpression { column, .. } if column.name.raw() == "a")).unwrap();
-    let c = steps.iter().position(|p| matches!(&p.change, Change::AlterColumnExpression { column, .. } if column.name.raw() == "c")).unwrap();
+    let a = steps.iter().position(|p| matches!(&p.change, Change::Column(ColumnChange::AlterColumnExpression { column, .. }) if column.name.raw() == "a")).unwrap();
+    let c = steps.iter().position(|p| matches!(&p.change, Change::Column(ColumnChange::AlterColumnExpression { column, .. }) if column.name.raw() == "c")).unwrap();
     let function = steps
         .iter()
-        .position(|p| matches!(&p.change, Change::CreateModule { id, .. } if id.name() == "f"))
+        .position(|p| matches!(&p.change, Change::Module(ModuleChange::CreateModule { id, .. }) if id.name() == "f"))
         .unwrap();
     assert!(c < function && function < a);
     let why = f
@@ -84,12 +86,12 @@ fn empty_not_null_needs_the_placeholder_column_and_can_unlock_its_generation() {
         .compile(&pbps_pg::Postgres::new().with_server_version(180006))
         .unwrap();
     let changes = &plan.changes().changes;
-    let nn = changes.iter().position(|p| matches!(&p.change, Change::AlterColumnNullability { column, .. } if column.name.raw() == "g")).unwrap();
+    let nn = changes.iter().position(|p| matches!(&p.change, Change::Column(ColumnChange::AlterColumnNullability { column, .. }) if column.name.raw() == "g")).unwrap();
     let function = changes
         .iter()
-        .position(|p| matches!(&p.change, Change::CreateModule { id, .. } if id.name() == "f"))
+        .position(|p| matches!(&p.change, Change::Module(ModuleChange::CreateModule { id, .. }) if id.name() == "f"))
         .unwrap();
-    let generation = changes.iter().position(|p| matches!(&p.change, Change::AlterColumnExpression { column, .. } if column.name.raw() == "g")).unwrap();
+    let generation = changes.iter().position(|p| matches!(&p.change, Change::Column(ColumnChange::AlterColumnExpression { column, .. }) if column.name.raw() == "g")).unwrap();
     assert!(nn < function && function < generation);
     assert!(
         f.compile(&pbps_pg::Postgres::new().with_server_version(160015))

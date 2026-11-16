@@ -1,4 +1,6 @@
 //! Existing draft ordering and subsumption, owned by order (DEC-1959.5).
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
 use pbps_model::{Change, IndexPart, PlannedChange, TableName};
 use std::collections::BTreeSet;
 
@@ -17,20 +19,20 @@ pub fn drop_parameter_changes_of_rebuilt_indexes<T>(
     let rebuilt: BTreeSet<(TableName, IndexPart)> = changes
         .iter()
         .filter_map(|c| match change(c) {
-            Change::AddIndex { table, name, .. } => {
+            Change::Index(IndexChange::AddIndex { table, name, .. }) => {
                 Some((table.clone(), IndexPart::Index(name.clone())))
             }
-            Change::AddUnique { table, name, .. } => {
+            Change::Constraint(ConstraintChange::AddUnique { table, name, .. }) => {
                 Some((table.clone(), IndexPart::Unique(name.clone())))
             }
-            Change::SetPrimaryKey {
+            Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table, to: Some(_), ..
-            } => Some((table.clone(), IndexPart::PrimaryKey)),
+            }) => Some((table.clone(), IndexPart::PrimaryKey)),
             _ => None,
         })
         .collect();
     changes.retain(|c| {
-        !matches!(change(c), Change::SetIndexStorageParameters { table, target, .. }
+        !matches!(change(c), Change::Index(IndexChange::SetIndexStorageParameters { table, target, .. })
             if rebuilt.contains(&(table.clone(), target.clone())))
     });
 }

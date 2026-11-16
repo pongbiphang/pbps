@@ -1,10 +1,15 @@
 use super::*;
 use crate::order::{Baseline, Checks, graph, propose};
+use pbps_model::ColumnChange;
+use pbps_model::GrantChange;
+use pbps_model::ModuleChange;
+use pbps_model::PolicyChange;
+use pbps_model::RowChange;
 use pbps_model::operation::{Effects, ModuleEdits, Operations};
 use pbps_model::*;
 
 fn policy(table: &str, name: &str, origin: RowSecurityOrigin) -> Change {
-    Change::CreatePolicy {
+    Change::Policy(PolicyChange::CreatePolicy {
         table: table.parse().unwrap(),
         name: name.into(),
         policy: RowPolicy {
@@ -12,22 +17,22 @@ fn policy(table: &str, name: &str, origin: RowSecurityOrigin) -> Change {
             ..Default::default()
         },
         origin,
-    }
+    })
 }
 
 fn drop_policy() -> Change {
-    Change::DropPolicy {
+    Change::Policy(PolicyChange::DropPolicy {
         table: TableName::new("app", "t"),
         name: "p".into(),
         policy: RowPolicy {
             using: Some("app.allowed(id)".into()),
             ..Default::default()
         },
-    }
+    })
 }
 
 fn flags(table: &str, origin: RowSecurityOrigin) -> Change {
-    Change::SetRowSecurity {
+    Change::Policy(PolicyChange::SetRowSecurity {
         uid: if table == "app.other" {
             "t_117302"
         } else {
@@ -42,7 +47,7 @@ fn flags(table: &str, origin: RowSecurityOrigin) -> Change {
             forced: true,
         },
         origin,
-    }
+    })
 }
 
 // Start with the dependent first: the differ's sort cannot mask a missing
@@ -91,21 +96,21 @@ fn settles_before(first: Change, second: Change) {
 fn policy_drop_only_plans_release_modules_and_columns_before_teardown() {
     settles_before(
         drop_policy(),
-        Change::DropModule {
+        Change::Module(ModuleChange::DropModule {
             id: "app.allowed(integer)".parse().unwrap(),
             kind: ModuleKind::Function,
-        },
+        }),
     );
     settles_before(
         drop_policy(),
-        Change::DropColumn {
+        Change::Column(ColumnChange::DropColumn {
             uid: "c_117301".parse().unwrap(),
             column: TableName::new("app", "t").column("id"),
-        },
+        }),
     );
     settles_before(
         drop_policy(),
-        Change::AlterColumnType {
+        Change::Column(ColumnChange::AlterColumnType {
             uid: "c_117301".parse().unwrap(),
             column: TableName::new("app", "t").column("id"),
             from: "integer".parse().unwrap(),
@@ -116,7 +121,7 @@ fn policy_drop_only_plans_release_modules_and_columns_before_teardown() {
             to_collation: None,
             through_external_partitions: false,
             using: None,
-        },
+        }),
     );
 }
 
@@ -129,25 +134,25 @@ fn policy_setup_follows_modules_and_columns_for_both_origins() {
         options: Default::default(),
     });
     let suppliers = [
-        Change::CreateModule {
+        Change::Module(ModuleChange::CreateModule {
             id: "app.allowed(integer)".parse().unwrap(),
             module: module.clone(),
-        },
-        Change::AlterModule {
+        }),
+        Change::Module(ModuleChange::AlterModule {
             id: "app.allowed(integer)".parse().unwrap(),
             module,
-        },
-        Change::PublicExecution {
+        }),
+        Change::Permission(GrantChange::PublicExecution {
             routine: "app.allowed(integer)".parse().unwrap(),
             access: PublicAccess::Revoked,
             origin: RoutineOrigin::Rebuilt,
-        },
-        Change::AddColumn {
+        }),
+        Change::Column(ColumnChange::AddColumn {
             uid: "c_117301".parse().unwrap(),
             table: TableName::new("app", "t"),
             name: "id".into(),
             column: Box::new(Column::new("integer".parse().unwrap())),
-        },
+        }),
     ];
     for origin in [RowSecurityOrigin::Created, RowSecurityOrigin::Standing] {
         for supplier in &suppliers {
@@ -165,7 +170,7 @@ fn replacement_teardown_and_row_deletes_finish_before_policy_flags() {
     settles_before(drop_policy(), changed_flags.clone());
     settles_before(installed, changed_flags.clone());
     settles_before(
-        Change::DeleteRow {
+        Change::Row(RowChange::DeleteRow {
             table: TableName::new("app", "other"),
             key_column: "id".into(),
             key: "1".into(),
@@ -175,7 +180,7 @@ fn replacement_teardown_and_row_deletes_finish_before_policy_flags() {
             dropped: Default::default(),
             after_types: Default::default(),
             key_type: Some("integer".parse().unwrap()),
-        },
+        }),
         changed_flags,
     );
 }

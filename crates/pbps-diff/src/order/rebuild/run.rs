@@ -4,6 +4,9 @@ use crate::order::{
     self, PlanningPlan, Source,
     expand::{self, Added, Addition, Anchor, Expansion, Order, Rewrite, Step},
 };
+use pbps_model::IndexChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
 use pbps_model::resolver::OrderReason;
 use std::fmt;
 
@@ -318,10 +321,13 @@ impl Expansion for Rule<'_> {
         for &parent in &own {
             if matches!(
                 ops.as_slice()[parent].change(),
-                Change::BuildPartitionedIndex(_)
+                Change::Index(IndexChange::BuildPartitionedIndex(_))
             ) {
                 for &leaf in &own {
-                    if matches!(ops.as_slice()[leaf].change(), Change::AddIndex { .. }) {
+                    if matches!(
+                        ops.as_slice()[leaf].change(),
+                        Change::Index(IndexChange::AddIndex { .. })
+                    ) {
                         edge(parent, leaf, Source::Effect);
                     }
                 }
@@ -357,7 +363,7 @@ impl Expansion for Rule<'_> {
         let parent = retire
             .iter()
             .copied()
-            .find(|&i| matches!(ops.as_slice()[i].change(),Change::DropTable {uid,..} if uid==old))
+            .find(|&i| matches!(ops.as_slice()[i].change(),Change::Table(TableChange::DropTable {uid,..}) if uid==old))
             .ok_or("missing parent retirement")?;
         for &leaf in &retire {
             edge(leaf, parent, Source::Effect);
@@ -416,9 +422,9 @@ pub fn expand(
                 .map_err(|e| e.to_string())?;
         if target != prepared.target
             || prepared.logical.first().map(|p| &p.change)
-                != Some(&Change::RebuildPartitionedTable(Box::new(
-                    input.root.clone(),
-                )))
+                != Some(&Change::Partition(
+                    PartitionChange::RebuildPartitionedTable(Box::new(input.root.clone())),
+                ))
         {
             return Err("prepared rebuild no longer matches its input".into());
         }

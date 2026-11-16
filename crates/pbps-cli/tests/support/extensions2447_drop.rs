@@ -133,7 +133,7 @@ fn a_recorded_package_is_dropped_with_its_member_table_by_a_pinned_gated_plan() 
         };
         assert!(matches!(
             &only.change,
-            pbps_model::Change::DropExtension { uid: u, name, .. } if *u == uid && name.raw() == "tabled2447"
+            pbps_model::Change::Extension(pbps_model::ExtensionChange::DropExtension { uid: u, name, .. }) if *u == uid && name.raw() == "tabled2447"
         ));
         assert!(
             only.risks.contains(&pbps_model::RiskClass::Destructive),
@@ -277,9 +277,15 @@ fn a_managed_module_that_hangs_off_the_package_is_dropped_first_by_the_same_plan
             .changes
             .iter()
             .map(|p| {
-                if matches!(&p.change, pbps_model::Change::DropModule { .. }) {
+                if matches!(
+                    &p.change,
+                    pbps_model::Change::Module(pbps_model::ModuleChange::DropModule { .. })
+                ) {
                     "module"
-                } else if let pbps_model::Change::DropExtension { releases, .. } = &p.change {
+                } else if let pbps_model::Change::Extension(
+                    pbps_model::ExtensionChange::DropExtension { releases, .. },
+                ) = &p.change
+                {
                     assert_eq!(releases.len(), 1, "{releases:?}");
                     "package"
                 } else {
@@ -344,9 +350,11 @@ fn a_package_another_package_requires_is_dropped_only_with_it_and_after_it() {
             .changes
             .iter()
             .filter_map(|p| {
-                if let pbps_model::Change::DropExtension {
-                    name, requirers, ..
-                } = &p.change
+                if let pbps_model::Change::Extension(pbps_model::ExtensionChange::DropExtension {
+                    name,
+                    requirers,
+                    ..
+                }) = &p.change
                 {
                     Some((name.raw().to_owned(), requirers.len()))
                 } else {

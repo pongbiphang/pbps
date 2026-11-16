@@ -1,5 +1,7 @@
 //! Side-specific type identity, shared by planning and execution (DEC-2321.1).
 
+use pbps_model::TypeChange;
+use pbps_model::TypeValueChange;
 use pbps_model::{Change, ChangeSet, ColumnType, IdsFile, ManagedType, Schema, TypeRef, Uid};
 
 #[derive(Clone, Copy)]
@@ -198,23 +200,23 @@ pub fn before_changes(desired: &IdsFile, changes: &ChangeSet) -> IdsFile {
     let mut base = desired.clone();
     for step in &changes.changes {
         match &step.change {
-            Change::CreateType { uid, .. } => {
+            Change::Type(TypeChange::CreateType { uid, .. }) => {
                 base.types.remove(uid);
             }
-            Change::AddEnumValue { uid, name, .. }
-            | Change::AlterDomain { uid, name, .. }
-            | Change::RenameEnumValue { uid, name, .. }
-            | Change::EnumRebuild { uid, name, .. } => {
+            Change::TypeValue(TypeValueChange::AddEnumValue { uid, name, .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { uid, name, .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { uid, name, .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { uid, name, .. }) => {
                 // The label operation certifies an existing holder even when
                 // only statement metadata, rather than a pin bundle, is present.
                 base.types
                     .entry(uid.clone())
                     .or_insert_with(|| name.clone());
             }
-            Change::DropType { uid, name, .. }
-            | Change::RenameType {
+            Change::Type(TypeChange::DropType { uid, name, .. })
+            | Change::Type(TypeChange::RenameType {
                 uid, from: name, ..
-            } => {
+            }) => {
                 base.types.insert(uid.clone(), name.clone());
             }
             _ => {}
@@ -234,15 +236,15 @@ pub fn after_steps(base: &IdsFile, changes: &[pbps_model::PlannedChange]) -> Ids
     let mut desired = base.clone();
     for step in changes {
         match &step.change {
-            Change::DropType { uid, .. } => {
+            Change::Type(TypeChange::DropType { uid, .. }) => {
                 desired.types.remove(uid);
             }
-            Change::AddEnumValue { uid, name, .. }
-            | Change::AlterDomain { uid, name, .. }
-            | Change::RenameEnumValue { uid, name, .. }
-            | Change::EnumRebuild { uid, name, .. }
-            | Change::CreateType { uid, name, .. }
-            | Change::RenameType { uid, to: name, .. } => {
+            Change::TypeValue(TypeValueChange::AddEnumValue { uid, name, .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { uid, name, .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { uid, name, .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { uid, name, .. })
+            | Change::Type(TypeChange::CreateType { uid, name, .. })
+            | Change::Type(TypeChange::RenameType { uid, to: name, .. }) => {
                 desired.types.insert(uid.clone(), name.clone());
             }
             _ => {}
@@ -254,23 +256,26 @@ pub fn after_steps(base: &IdsFile, changes: &[pbps_model::PlannedChange]) -> Ids
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::TypeValueChange;
 
     #[test]
     fn label_only_operations_reconstruct_their_declared_holder_without_inventing_other_types() {
         let uid: Uid = "y_000001".parse().unwrap();
         let name: TypeRef = "app.e".parse().unwrap();
         let steps = ChangeSet {
-            changes: vec![pbps_model::PlannedChange::new(Change::RenameEnumValue {
-                uid: uid.clone(),
-                name: name.clone(),
-                from: "old".into(),
-                to: "new".into(),
-                ordinal: 0,
-                retained: Vec::new(),
-                definition: Box::new(ManagedType::Enum {
-                    values: vec!["new".into()],
-                }),
-            })],
+            changes: vec![pbps_model::PlannedChange::new(Change::TypeValue(
+                TypeValueChange::RenameEnumValue {
+                    uid: uid.clone(),
+                    name: name.clone(),
+                    from: "old".into(),
+                    to: "new".into(),
+                    ordinal: 0,
+                    retained: Vec::new(),
+                    definition: Box::new(ManagedType::Enum {
+                        values: vec!["new".into()],
+                    }),
+                },
+            ))],
         };
         for ids in [
             before_changes(&IdsFile::default(), &steps),

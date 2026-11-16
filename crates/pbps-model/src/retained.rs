@@ -1,4 +1,7 @@
 //! Approved expression spelling changes whose bound objects are retained.
+use crate::ColumnChange;
+use crate::ConstraintChange;
+use crate::TypeValueChange;
 use crate::{Change, ChangeSet, ColumnRef, ObjectLocalName, Schema, TableName, Uid, ValueSource};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -84,7 +87,7 @@ pub struct RetainedExpression {
 
 pub fn expressions(changes: &ChangeSet) -> impl Iterator<Item = &RetainedExpression> {
     changes.changes.iter().flat_map(|p| {
-        if let Change::RenameEnumValue { retained, .. } = &p.change {
+        if let Change::TypeValue(TypeValueChange::RenameEnumValue { retained, .. }) = &p.change {
             retained.as_slice()
         } else {
             &[]
@@ -99,7 +102,9 @@ pub fn validate(plan: &crate::SavedPlan) -> Result<(), String> {
         .changes
         .iter()
         .filter_map(|p| {
-            if let Change::RenameEnumValue { uid, ordinal, .. } = &p.change {
+            if let Change::TypeValue(TypeValueChange::RenameEnumValue { uid, ordinal, .. }) =
+                &p.change
+            {
                 Some(RenameAnchor {
                     uid: uid.clone(),
                     ordinal: *ordinal,
@@ -110,12 +115,12 @@ pub fn validate(plan: &crate::SavedPlan) -> Result<(), String> {
         })
         .collect();
     for p in &plan.changes.changes {
-        if let Change::RenameEnumValue {
+        if let Change::TypeValue(TypeValueChange::RenameEnumValue {
             uid,
             ordinal,
             retained,
             ..
-        } = &p.change
+        }) = &p.change
         {
             for e in retained {
                 let identity_matches = match &e.target {
@@ -133,14 +138,16 @@ pub fn validate(plan: &crate::SavedPlan) -> Result<(), String> {
                     .any(|p| match (&e.target, &p.change) {
                         (
                             ExpressionTarget::Check { table, name, .. },
-                            Change::DropCheck { table: t, name: n }
-                            | Change::AddCheck {
-                                table: t, name: n, ..
-                            },
+                            Change::Constraint(ConstraintChange::DropCheck { table: t, name: n })
+                            | Change::Constraint(ConstraintChange::AddCheck {
+                                table: t,
+                                name: n,
+                                ..
+                            }),
                         ) => t == table && n == name,
                         (
                             ExpressionTarget::ColumnDefault { column, .. },
-                            Change::AlterColumnDefault { column: c, .. },
+                            Change::Column(ColumnChange::AlterColumnDefault { column: c, .. }),
                         ) => c == column,
                         _ => false,
                     });

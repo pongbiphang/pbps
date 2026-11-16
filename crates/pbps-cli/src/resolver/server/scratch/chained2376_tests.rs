@@ -663,17 +663,25 @@ async fn mssql_chained_views_wait_only_for_the_foreign_keys_actual_key() {
                 let function_id: pbps_model::ModuleId = "dbo.f()".parse().unwrap();
                 let plan = pbps_diff::order::propose(pbps_model::ChangeSet {
                     changes: vec![
-                        pbps_model::PlannedChange::new(pbps_model::Change::CreateTable {
-                            uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "managed", 0),
-                            name: table_name.clone(),
-                            table: Box::new(schema.desired.tables[&table_name].clone()),
-                            beside_default: None,
-                            moves_at_most: None,
-                        }),
-                        pbps_model::PlannedChange::new(pbps_model::Change::CreateModule {
-                            id: function_id.clone(),
-                            module: Box::new(schema.desired.modules[&function_id].clone()),
-                        }),
+                        pbps_model::PlannedChange::new(pbps_model::Change::Table(
+                            pbps_model::TableChange::CreateTable {
+                                uid: pbps_model::Uid::derived(
+                                    pbps_model::UidKind::Table,
+                                    "managed",
+                                    0,
+                                ),
+                                name: table_name.clone(),
+                                table: Box::new(schema.desired.tables[&table_name].clone()),
+                                beside_default: None,
+                                moves_at_most: None,
+                            },
+                        )),
+                        pbps_model::PlannedChange::new(pbps_model::Change::Module(
+                            pbps_model::ModuleChange::CreateModule {
+                                id: function_id.clone(),
+                                module: Box::new(schema.desired.modules[&function_id].clone()),
+                            },
+                        )),
                     ],
                 });
                 let inputs = capture::required_externals(

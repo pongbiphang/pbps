@@ -15,6 +15,8 @@
 use std::collections::BTreeSet;
 
 use pbps_db::{Conn, DbError};
+use pbps_model::ConstraintChange;
+use pbps_model::TableChange;
 use pbps_model::{Change, ChangeSet, ReferentialAction, TableName};
 
 use crate::catalog::get;
@@ -69,14 +71,16 @@ pub async fn system_versioned_tables(conn: &mut Conn) -> Result<BTreeSet<TableNa
 /// plan with no system-versioned table pays for no catalog read.
 pub fn needs_the_question(changes: &ChangeSet) -> bool {
     changes.changes.iter().any(|p| {
-        if let Change::CreateTable { table, .. } = &p.change {
+        if let Change::Table(TableChange::CreateTable { table, .. }) = &p.change {
             table
                 .system_time
                 .as_ref()
                 .and_then(|st| st.versioning.as_ref())
                 .is_some_and(|v| v.retention.is_some())
                 || table.foreign_keys.values().any(cascades)
-        } else if let Change::AddForeignKey { constraint, .. } = &p.change {
+        } else if let Change::Constraint(ConstraintChange::AddForeignKey { constraint, .. }) =
+            &p.change
+        {
             cascades(constraint)
         } else {
             false
@@ -90,7 +94,7 @@ pub fn needs_the_question(changes: &ChangeSet) -> bool {
 pub fn needs_the_catalog(changes: &ChangeSet) -> bool {
     let created = created_tables(changes);
     changes.changes.iter().any(|p| {
-        matches!(&p.change, Change::AddForeignKey { table, constraint, .. }
+        matches!(&p.change, Change::Constraint(ConstraintChange::AddForeignKey { table, constraint, .. })
             if cascades(constraint) && !created.contains_key(table))
     })
 }
@@ -111,7 +115,7 @@ pub fn refused_without_retention(
         .changes
         .iter()
         .filter_map(|p| {
-            let Change::RenameTable { from, to, .. } = &p.change else {
+            let Change::Table(TableChange::RenameTable { from, to, .. }) = &p.change else {
                 return None;
             };
             Some((from, to))
@@ -131,7 +135,7 @@ pub fn refused_without_retention(
     };
     let mut problems = Vec::new();
     for p in &changes.changes {
-        if let Change::CreateTable { name, table, .. } = &p.change {
+        if let Change::Table(TableChange::CreateTable { name, table, .. }) = &p.change {
             if let Some(retention) = table
                 .system_time
                 .as_ref()
@@ -152,11 +156,11 @@ pub fn refused_without_retention(
                     problems.push(cascade_refusal(name, key));
                 }
             }
-        } else if let Change::AddForeignKey {
+        } else if let Change::Constraint(ConstraintChange::AddForeignKey {
             table,
             name,
             constraint,
-        } = &p.change
+        }) = &p.change
             && cascades(constraint)
             && is_versioned(table)
         {
@@ -186,7 +190,7 @@ fn created_tables(changes: &ChangeSet) -> std::collections::BTreeMap<&TableName,
         .changes
         .iter()
         .filter_map(|p| {
-            let Change::CreateTable { name, table, .. } = &p.change else {
+            let Change::Table(TableChange::CreateTable { name, table, .. }) = &p.change else {
                 return None;
             };
             Some((
@@ -203,6 +207,8 @@ fn created_tables(changes: &ChangeSet) -> std::collections::BTreeMap<&TableName,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::ConstraintChange;
+    use pbps_model::TableChange;
     use pbps_model::{
         ForeignKey, PlannedChange, Retention, RetentionUnit, SystemTime, SystemVersioning, Table,
     };
@@ -227,17 +233,17 @@ mod tests {
     }
 
     fn create(name: &str, table: Table) -> PlannedChange {
-        PlannedChange::new(Change::CreateTable {
+        PlannedChange::new(Change::Table(TableChange::CreateTable {
             uid: "t_aaaaaa".parse().unwrap(),
             name: tname(name),
             table: Box::new(table),
             beside_default: None,
             moves_at_most: None,
-        })
+        }))
     }
 
     fn key(table: &str, on_delete: ReferentialAction) -> PlannedChange {
-        PlannedChange::new(Change::AddForeignKey {
+        PlannedChange::new(Change::Constraint(ConstraintChange::AddForeignKey {
             table: tname(table),
             name: "fk_t_p".into(),
             constraint: Box::new(ForeignKey {
@@ -247,7 +253,7 @@ mod tests {
                 on_delete,
                 on_update: ReferentialAction::NoAction,
             }),
-        })
+        }))
     }
 
     fn plan(changes: Vec<PlannedChange>) -> ChangeSet {
@@ -309,12 +315,12 @@ mod tests {
         // Already in the database, renamed by this plan: the chain
         // a -> b, b -> c leaves `b` naming the table that was `a`.
         let rename = |uid: &str, from: &str, to: &str| {
-            PlannedChange::new(Change::RenameTable {
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: uid.parse().unwrap(),
                 from: tname(from),
                 to: tname(to),
                 defaults: Vec::new(),
-            })
+            }))
         };
         let renamed = plan(vec![
             rename("t_bbbbbb", "dbo.b", "dbo.c"),
@@ -371,7 +377,8 @@ mod tests {
     #[test]
     fn a_temporal_cascade_refusal_escapes_the_local_name_once() {
         let mut change = key("dbo.t", ReferentialAction::Cascade);
-        let Change::AddForeignKey { name, .. } = &mut change.change else {
+        let Change::Constraint(ConstraintChange::AddForeignKey { name, .. }) = &mut change.change
+        else {
             unreachable!()
         };
         *name = "fk\nline\\slash".into();

@@ -1,6 +1,10 @@
 //! The reference's pending DEFAULT inventory, before positional settlement or
 //! spelling qualification. Full certified order/spelling remains DEC-2296.5.
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
 use pbps_model::{Column, Module, ModuleKind, Table};
 
 // Share the existing class input and explicit operation builder below diff;
@@ -82,17 +86,17 @@ fn dependent_meetings_keep_the_reference_pending_default_templates() {
                             part: Part::Default("n".into()),
                         },
                     });
-                    let mut changes = vec![Change::RenameTable {
+                    let mut changes = vec![Change::Table(TableChange::RenameTable {
                         uid: uid("t_cccccc"),
                         from: old,
                         to: new,
                         defaults: vec![],
-                    }];
+                    })];
                     changes.extend(steps(&s, kind, motion));
-                    changes.push(Change::AlterModule {
+                    changes.push(Change::Module(ModuleChange::AlterModule {
                         id: id.clone(),
                         module: Box::new(s.after.modules[&id].clone()),
-                    });
+                    }));
                     let mut plan = crate::order::propose(ChangeSet {
                         changes: changes.into_iter().map(PlannedChange::new).collect(),
                     });
@@ -130,8 +134,10 @@ fn dependent_meetings_keep_the_reference_pending_default_templates() {
                         .filter(|p| {
                             matches!(
                                 p.change,
-                                Change::AlterColumnDefault { .. }
-                                    | Change::SetPartitionDefault { .. }
+                                Change::Column(ColumnChange::AlterColumnDefault { .. })
+                                    | Change::Partition(
+                                        PartitionChange::SetPartitionDefault { .. }
+                                    )
                             )
                         })
                         .map(|p| format!("{:?}", p.change))

@@ -5,6 +5,8 @@ use super::*;
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; run scripts/live-tests-pg.sh"]
 async fn estimates_measure_each_occupant_before_and_after_name_reuse() {
+    use pbps_model::ColumnChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, IdsFile, PlannedChange, plan_names::PlanNames};
     use pbps_pg::estimate::{self, Rows};
     let mut db = TestDb::create("estimate_reuse1868").await;
@@ -12,21 +14,21 @@ async fn estimates_measure_each_occupant_before_and_after_name_reuse() {
     // The differ normally folds a column drop into its table drop. This
     // consistent typed chain exercises the consumer's statement boundary.
     let changes = [
-        Change::DropColumn {
+        Change::Column(ColumnChange::DropColumn {
             uid: "c_aaaaaa".parse().unwrap(),
             column: "public.a.v".parse().unwrap(),
-        },
-        Change::DropTable {
+        }),
+        Change::Table(TableChange::DropTable {
             uid: "t_aaaaaa".parse().unwrap(),
             name: "public.a".parse().unwrap(),
             detach_from: None,
-        },
-        Change::RenameTable {
+        }),
+        Change::Table(TableChange::RenameTable {
             uid: "t_bbbbbb".parse().unwrap(),
             from: "public.b".parse().unwrap(),
             to: "public.a".parse().unwrap(),
             defaults: vec![],
-        },
+        }),
     ]
     .map(PlannedChange::new);
     let ids = IdsFile {
@@ -81,6 +83,8 @@ async fn estimates_measure_each_occupant_before_and_after_name_reuse() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; run scripts/live-tests-pg.sh"]
 async fn a_detached_columns_estimate_keeps_its_catalog_spelling_after_rename() {
+    use pbps_model::ColumnChange;
+    use pbps_model::PartitionChange;
     use pbps_model::{
         Change, Column, IdsFile, PlannedChange, Table, TableName, plan_names::PlanNames,
     };
@@ -98,28 +102,28 @@ async fn a_detached_columns_estimate_keeps_its_catalog_spelling_after_rename() {
         .columns
         .insert("v".into(), Column::new("integer".parse().unwrap()));
     let changes = [
-        Change::DetachPartition {
+        Change::Partition(PartitionChange::DetachPartition {
             uid: "t_bbbbbb".parse().unwrap(),
             table: child.clone(),
             parent: parent.clone(),
             names: vec![],
             shape: Box::new(shape),
-        },
-        Change::RenameColumn {
+        }),
+        Change::Column(ColumnChange::RenameColumn {
             uid: "c_dddddd".parse().unwrap(),
             table: child.clone(),
             from: "v".into(),
             to: "amount".into(),
             table_was: None,
-        },
-        Change::AlterColumnNullability {
+        }),
+        Change::Column(ColumnChange::AlterColumnNullability {
             uid: "c_dddddd".parse().unwrap(),
             column: child.column("amount"),
             ty: "integer".parse().unwrap(),
             to_nullable: false,
             through_external_partitions: false,
             collation: None,
-        },
+        }),
     ]
     .map(PlannedChange::new);
     let ids = IdsFile {

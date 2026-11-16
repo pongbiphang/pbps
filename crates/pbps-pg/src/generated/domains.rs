@@ -1,4 +1,6 @@
 //! Domain creation facets use the standing-domain delta, not a second SQL recipe.
+use pbps_model::TypeChange;
+use pbps_model::TypeValueChange;
 use pbps_model::object_ref::{ObjectRef, Root, Selector};
 use pbps_model::{Change, DomainHalf, ManagedType, operation::PartKey};
 use std::collections::BTreeSet;
@@ -8,11 +10,11 @@ pub(crate) fn parts(
     functions: &[pbps_model::ModuleId],
     demanded: &BTreeSet<ObjectRef>,
 ) -> Option<Vec<Change>> {
-    let Change::CreateType {
+    let Change::Type(TypeChange::CreateType {
         uid,
         name,
         definition,
-    } = change
+    }) = change
     else {
         return None;
     };
@@ -72,19 +74,19 @@ pub(crate) fn parts(
             checks.remove(name);
         }
     }
-    let mut out = vec![Change::CreateType {
+    let mut out = vec![Change::Type(TypeChange::CreateType {
         uid: uid.clone(),
         name: name.clone(),
         definition: Box::new(now.clone()),
-    }];
+    })];
     let install = |now: &mut ManagedType, out: &mut Vec<Change>, next: ManagedType, half| {
-        out.push(Change::AlterDomain {
+        out.push(Change::TypeValue(TypeValueChange::AlterDomain {
             uid: uid.clone(),
             name: name.clone(),
             from: Box::new(now.clone()),
             to: Box::new(next.clone()),
             half,
-        });
+        }));
         *now = next;
     };
     if take_default {

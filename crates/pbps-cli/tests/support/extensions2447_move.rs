@@ -49,7 +49,13 @@ fn a_move_is_rehearsed_sealed_gated_applied_and_the_next_plan_waits_for_the_exte
         let [only] = plan.changes.changes.as_slice() else {
             panic!("{:#?}", plan.changes)
         };
-        let pbps_model::Change::SetExtensionSchema { name, from, to, .. } = &only.change else {
+        let pbps_model::Change::Extension(pbps_model::ExtensionChange::SetExtensionSchema {
+            name,
+            from,
+            to,
+            ..
+        }) = &only.change
+        else {
             panic!("{:#?}", only.change)
         };
         assert_eq!(name.raw(), "upd2447");
@@ -117,12 +123,18 @@ fn a_version_and_a_schema_change_in_one_plan_update_first_then_move_under_one_pi
             .changes
             .iter()
             .filter_map(|p| {
-                if let pbps_model::Change::UpdateExtension { from, to, .. } = &p.change {
+                if let pbps_model::Change::Extension(
+                    pbps_model::ExtensionChange::UpdateExtension { from, to, .. },
+                ) = &p.change
+                {
                     Some(format!(
                         "update {} {} to {} {}",
                         from.version, from.schema, to.version, to.schema
                     ))
-                } else if let pbps_model::Change::SetExtensionSchema { from, to, .. } = &p.change {
+                } else if let pbps_model::Change::Extension(
+                    pbps_model::ExtensionChange::SetExtensionSchema { from, to, .. },
+                ) = &p.change
+                {
                     Some(format!(
                         "move {} {} to {}",
                         from.version, from.schema, to.schema
@@ -313,7 +325,7 @@ fn a_destination_name_an_unmanaged_object_holds_is_refused_until_the_plan_before
         assert_eq!(code(&out), 0, "{}", said(&out));
         assert!(matches!(
             saved(&f).changes.changes.as_slice(),
-            [p] if matches!(p.change, pbps_model::Change::SetExtensionSchema { .. })
+            [p] if matches!(p.change, pbps_model::Change::Extension(pbps_model::ExtensionChange::SetExtensionSchema { .. }))
         ));
         let applied = f.apply(MOVE);
         assert_eq!(code(&applied), 0, "{}", said(&applied));

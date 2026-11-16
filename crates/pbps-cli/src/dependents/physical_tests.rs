@@ -3,6 +3,10 @@ use crate::certified_fixture::FixtureEmission as _;
 
 use super::test_adapters::weave;
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
 use pbps_model::{Column, Module, PartitionBound, PartitionColumn, PartitionOf, Table, Uid};
 
 fn uid(s: &str) -> Uid {
@@ -66,24 +70,24 @@ fn ids(attached: bool) -> IdsFile {
 }
 fn changes(detach: bool, rebuild_first: bool) -> ChangeSet {
     let transition = if detach {
-        Change::DetachPartition {
+        Change::Partition(PartitionChange::DetachPartition {
             uid: uid("t_bbbbbb"),
             table: table("child"),
             parent: table("parent"),
             names: vec![],
             shape: Box::new(ordinary()),
-        }
+        })
     } else {
-        Change::AttachPartition {
+        Change::Partition(PartitionChange::AttachPartition {
             uid: uid("t_bbbbbb"),
             table: table("child"),
             parent: table("parent"),
             bound: PartitionBound::Default,
             key: Vec::new(),
             shape: Box::new(partition()),
-        }
+        })
     };
-    let rebuild = Change::AlterModule {
+    let rebuild = Change::Module(ModuleChange::AlterModule {
         id: function(),
         module: Box::new(Module {
             kind: ModuleKind::Function,
@@ -91,7 +95,7 @@ fn changes(detach: bool, rebuild_first: bool) -> ChangeSet {
             definition: "(x integer) RETURNS integer LANGUAGE sql AS $$ SELECT x + 1 $$".into(),
             options: Default::default(),
         }),
-    };
+    });
     let changes = if rebuild_first {
         vec![rebuild, transition]
     } else {
@@ -121,7 +125,8 @@ fn assert_owner(cs: &ChangeSet, attached_at_rebuild: bool) {
         .filter(|p| {
             matches!(
                 p.change,
-                Change::AlterColumnDefault { .. } | Change::SetPartitionDefault { .. }
+                Change::Column(ColumnChange::AlterColumnDefault { .. })
+                    | Change::Partition(PartitionChange::SetPartitionDefault { .. })
             )
         })
         .collect();
@@ -129,14 +134,14 @@ fn assert_owner(cs: &ChangeSet, attached_at_rebuild: bool) {
     for p in defaults {
         if attached_at_rebuild {
             assert!(
-                matches!(&p.change, Change::SetPartitionDefault { uid: u, table: t, .. }
+                matches!(&p.change, Change::Partition(PartitionChange::SetPartitionDefault { uid: u, table: t, .. })
                 if *u == uid("t_bbbbbb") && *t == table("child")),
                 "{:?}",
                 p.change
             );
         } else {
             assert!(
-                matches!(&p.change, Change::AlterColumnDefault { uid: u, column, .. }
+                matches!(&p.change, Change::Column(ColumnChange::AlterColumnDefault { uid: u, column, .. })
                 if *u == uid("c_dddddd") && *column == table("child").column("n")),
                 "{:?}",
                 p.change
@@ -168,7 +173,7 @@ fn each_default_uses_the_owner_at_its_insertion_boundary_on_both_sides_of_attach
                 if detach { ordinary() } else { partition() },
             );
             let mut cs = changes(detach, rebuild_first);
-            if let Change::AlterModule { id, module } =
+            if let Change::Module(ModuleChange::AlterModule { id, module }) =
                 &cs.changes[usize::from(!rebuild_first)].change
             {
                 after.modules.insert(id.clone(), module.as_ref().clone());
@@ -233,11 +238,11 @@ fn connected_weaving_executes_defaults_around_both_sides_of_each_ownership_trans
                 }
                 let mut cs = changes(detach, rebuild_first);
                 if transition.is_none() {
-                    cs.changes[usize::from(rebuild_first)] = PlannedChange::new(Change::RenameColumn {
+                    cs.changes[usize::from(rebuild_first)] = PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
                         uid: uid("c_bbbbbb"), table: table("parent"), from: "n".into(), to: "n2".into(), table_was: None,
-                    });
+                    }));
                 }
-                if let Change::AlterModule { id, module } = &cs.changes[usize::from(!rebuild_first)].change {
+                if let Change::Module(ModuleChange::AlterModule { id, module }) = &cs.changes[usize::from(!rebuild_first)].change {
                     after.modules.insert(id.clone(), module.as_ref().clone());
                 }
                 let before_ids = ids(detach); let mut after_ids = ids(!detach);
@@ -350,22 +355,22 @@ fn parent_release(before: &Schema) -> (Schema, IdsFile, ChangeSet) {
     }
     let cs = ChangeSet {
         changes: vec![
-            Change::DropModule {
+            Change::Module(ModuleChange::DropModule {
                 id: function(),
                 kind: ModuleKind::Function,
-            },
-            Change::RenameTable {
+            }),
+            Change::Table(TableChange::RenameTable {
                 uid: uid("t_aaaaaa"),
                 from: table("parent"),
                 to: table("renamed"),
                 defaults: vec![],
-            },
-            Change::AlterColumnDefault {
+            }),
+            Change::Column(ColumnChange::AlterColumnDefault {
                 uid: uid("c_bbbbbb"),
                 column: table("renamed").column("n"),
                 from: Some("0".into()),
                 to: None,
-            },
+            }),
         ]
         .into_iter()
         .map(PlannedChange::new)
@@ -376,7 +381,7 @@ fn parent_release(before: &Schema) -> (Schema, IdsFile, ChangeSet) {
 
 fn assert_parent_release(cs: &ChangeSet) {
     assert!(
-        matches!(&cs.changes[0].change, Change::AlterColumnDefault { uid: u, column, to: None, .. }
+        matches!(&cs.changes[0].change, Change::Column(ColumnChange::AlterColumnDefault { uid: u, column, to: None, .. })
         if *u == uid("c_bbbbbb") && *column == table("parent").column("n")),
         "{cs:?}"
     );
@@ -468,18 +473,18 @@ async fn inherited_scope_case(rebuild_first: bool, conflicting_function: bool) {
     };
     let mut after_ids = before_ids.clone();
     after_ids.columns.retain(|_, c| c.table != child);
-    let rebuild = Change::AlterModule {
+    let rebuild = Change::Module(ModuleChange::AlterModule {
         id: root,
         module: Box::new(module),
-    };
-    let attach = Change::AttachPartition {
+    });
+    let attach = Change::Partition(PartitionChange::AttachPartition {
         uid: uid("t_bbbbbb"),
         table: child.clone(),
         parent,
         bound: PartitionBound::Default,
         key: Vec::new(),
         shape: Box::new(attached),
-    };
+    });
     let changes = if rebuild_first {
         vec![rebuild, attach]
     } else {

@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use pbps_model::RoleChange;
 use pbps_model::resolver::OrderReason;
 use pbps_model::{Change, ChangeSet};
 
@@ -16,7 +17,9 @@ pub fn role_drops(mut changes: super::PlanningPlan) -> Result<super::PlanningPla
         .changes
         .iter()
         .enumerate()
-        .filter_map(|(i, p)| matches!(p.change, Change::DropRole { .. }).then_some(i))
+        .filter_map(|(i, p)| {
+            matches!(p.change, Change::Role(RoleChange::DropRole { .. })).then_some(i)
+        })
         .collect();
     let drops = ChangeSet {
         changes: slots.iter().map(|&i| changes.changes[i].clone()).collect(),
@@ -47,14 +50,14 @@ fn constraints(drops: &ChangeSet) -> Schedule {
     let mut by_name = BTreeMap::new();
     let mut levels = BTreeMap::<_, Vec<_>>::new();
     for (i, p) in drops.changes.iter().enumerate() {
-        let Change::DropRole { name, .. } = &p.change else {
+        let Change::Role(RoleChange::DropRole { name, .. }) = &p.change else {
             unreachable!("the projection contains only role drops");
         };
         by_name.insert(name, i);
         levels.entry(depth[name]).or_default().push(i);
     }
     for (i, p) in drops.changes.iter().enumerate() {
-        let Change::DropRole { members, .. } = &p.change else {
+        let Change::Role(RoleChange::DropRole { members, .. }) = &p.change else {
             unreachable!("the projection contains only role drops");
         };
         for member in members {

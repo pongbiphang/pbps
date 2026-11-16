@@ -1,6 +1,11 @@
 //! Applications of existing ordering proposals and closed payload edits.
 //! Callers supply facts; only order writes the resulting operation sequence.
 use pbps_dialect::Dialect;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::RoleChange;
+use pbps_model::RowChange;
 use pbps_model::{Change, Finding, IdsFile, PlannedChange, RoleName, TableName};
 use std::collections::BTreeMap;
 
@@ -54,16 +59,16 @@ pub fn addressed<S>(
 #[allow(clippy::wildcard_enum_match_arm)]
 fn address(change: &mut Change, table: &TableName) {
     match change {
-        Change::DropIndex { table: at, .. }
-        | Change::DropUnique { table: at, .. }
-        | Change::DropForeignKey { table: at, .. }
-        | Change::DropCheck { table: at, .. }
-        | Change::DropComputedColumn { table: at, .. }
-        | Change::SetPrimaryKey {
+        Change::Index(IndexChange::DropIndex { table: at, .. })
+        | Change::Constraint(ConstraintChange::DropUnique { table: at, .. })
+        | Change::Constraint(ConstraintChange::DropForeignKey { table: at, .. })
+        | Change::Constraint(ConstraintChange::DropCheck { table: at, .. })
+        | Change::Column(ColumnChange::DropComputedColumn { table: at, .. })
+        | Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: at,
             to: None,
             ..
-        } => *at = table.clone(),
+        }) => *at = table.clone(),
         _ => {}
     }
 }
@@ -73,9 +78,9 @@ pub fn role_members(
     members: &BTreeMap<RoleName, Vec<RoleName>>,
 ) {
     for planned in &mut changes.payload.changes {
-        if let Change::DropRole {
+        if let Change::Role(RoleChange::DropRole {
             name, members: of, ..
-        } = &mut planned.change
+        }) = &mut planned.change
         {
             *of = members.get(name).cloned().unwrap_or_default();
         }
@@ -177,7 +182,8 @@ impl ScopeInput {
             .all(|p| {
                 matches!(
                     p.change,
-                    Change::SetDataMode { .. } | Change::SetEnsureKeys { .. }
+                    Change::Row(RowChange::SetDataMode { .. })
+                        | Change::Row(RowChange::SetEnsureKeys { .. })
                 )
             })
             .then_some(Self { changes })
@@ -195,29 +201,31 @@ impl ScopeInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::RoleChange;
+    use pbps_model::RowChange;
     use pbps_model::data::DataMode;
 
     fn takeover() -> PlannedChange {
-        PlannedChange::new(Change::SetDataMode {
+        PlannedChange::new(Change::Row(RowChange::SetDataMode {
             table: TableName::new("app", "holdings"),
             from: None,
             to: Some(DataMode::Exact),
-        })
+        }))
     }
 
     fn keys() -> PlannedChange {
-        PlannedChange::new(Change::SetEnsureKeys {
+        PlannedChange::new(Change::Row(RowChange::SetEnsureKeys {
             table: TableName::new("app", "country"),
             from: ["TW"].into_iter().map(Into::into).collect(),
             to: ["TW", "JP"].into_iter().map(Into::into).collect(),
-        })
+        }))
     }
 
     fn role() -> PlannedChange {
-        PlannedChange::new(Change::CreateRole {
+        PlannedChange::new(Change::Role(RoleChange::CreateRole {
             uid: pbps_model::Uid::generate(pbps_model::UidKind::Role),
             name: "reader".into(),
-        })
+        }))
     }
 
     #[test]
@@ -249,9 +257,9 @@ mod tests {
             .iter()
             .map(|planned| {
                 (
-                    matches!(planned.change, Change::CreateRole { .. }),
-                    matches!(planned.change, Change::SetDataMode { .. }),
-                    matches!(planned.change, Change::SetEnsureKeys { .. }),
+                    matches!(planned.change, Change::Role(RoleChange::CreateRole { .. })),
+                    matches!(planned.change, Change::Row(RowChange::SetDataMode { .. })),
+                    matches!(planned.change, Change::Row(RowChange::SetEnsureKeys { .. })),
                 )
             })
             .collect();

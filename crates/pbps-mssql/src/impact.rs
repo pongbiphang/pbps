@@ -25,6 +25,12 @@
 
 use pbps_db::{Conn, DbError};
 use pbps_dialect::DialectError;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
 use pbps_model::{
     Change, TableName,
     plan_names::{At, Holder, PlanNames},
@@ -68,41 +74,43 @@ pub async fn key_drop_blockers(
         .enumerate()
         .filter_map(|(index, p)| {
             let (table, kind, name) = match &p.change {
-                Change::RebuildPartitionedTable(_)
-                | Change::BuildPartitionedIndex(_)
-                | Change::CopyTableRows(_)
-                | Change::AnalyzeTableTree(_) => return None,
-                Change::SetPrimaryKey {
+                Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+                | Change::Index(IndexChange::BuildPartitionedIndex(_))
+                | Change::Partition(PartitionChange::CopyTableRows(_))
+                | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => return None,
+                Change::Constraint(ConstraintChange::SetPrimaryKey {
                     table,
                     from: Some(_),
                     ..
-                } => (table, "PK", ""),
-                Change::DropUnique { table, name } => (table, "UQ", name.raw()),
-                Change::DropIndex { table, name } => (table, "IX", name.raw()),
+                }) => (table, "PK", ""),
+                Change::Constraint(ConstraintChange::DropUnique { table, name }) => {
+                    (table, "UQ", name.raw())
+                }
+                Change::Index(IndexChange::DropIndex { table, name }) => (table, "IX", name.raw()),
                 pbps_model::change_family!(tables)
                 | pbps_model::change_family!(columns)
                 | pbps_model::change_family!(table_properties)
-                | Change::SetPrimaryKey { .. }
-                | Change::SetIndexStorageParameters { .. }
+                | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+                | Change::Index(IndexChange::SetIndexStorageParameters { .. })
                 | pbps_model::change_family!(policies)
-                | Change::AddUnique { .. }
-                | Change::SetExclusion { .. }
-                | Change::AddForeignKey { .. }
-                | Change::DropForeignKey { .. }
-                | Change::AddCheck { .. }
-                | Change::DropCheck { .. }
-                | Change::AddIndex { .. }
+                | Change::Constraint(ConstraintChange::AddUnique { .. })
+                | Change::Constraint(ConstraintChange::SetExclusion { .. })
+                | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+                | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+                | Change::Constraint(ConstraintChange::AddCheck { .. })
+                | Change::Constraint(ConstraintChange::DropCheck { .. })
+                | Change::Index(IndexChange::AddIndex { .. })
                 | pbps_model::change_family!(rows)
                 | pbps_model::change_family!(modules)
                 | pbps_model::change_family!(type_values)
                 | pbps_model::catalog_change!()
-                | Change::Grant { .. }
-                | Change::Revoke { .. }
-                | Change::DetachPartition { .. }
-                | Change::AttachPartition { .. }
-                | Change::SetPartitionDefault { .. }
-                | Change::SetPartitionNotNull { .. }
-                | Change::PublicExecution { .. } => return None,
+                | Change::Permission(GrantChange::Grant { .. })
+                | Change::Permission(GrantChange::Revoke { .. })
+                | Change::Partition(PartitionChange::DetachPartition { .. })
+                | Change::Partition(PartitionChange::AttachPartition { .. })
+                | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+                | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+                | Change::Permission(GrantChange::PublicExecution { .. }) => return None,
             };
             let stored = stored_key_table(names, index, table)?;
             Some((index, stored, kind, name))
@@ -168,9 +176,9 @@ pub async fn key_drop_blockers(
     }
     let mut retypes = Vec::new();
     for (index, p) in names.changes().iter().enumerate() {
-        let Change::AlterColumnType {
+        let Change::Column(ColumnChange::AlterColumnType {
             column, from, to, ..
-        } = &p.change
+        }) = &p.change
         else {
             continue;
         };
@@ -224,38 +232,40 @@ pub async fn key_drop_blockers(
     let mut removals = Vec::new();
     for (index, p) in names.changes().iter().enumerate() {
         let (table, fk) = match &p.change {
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => continue,
-            Change::DropForeignKey { table, name } => (table, Some(name)),
-            Change::DropTable { name, .. } => (name, None),
-            Change::CreateTable { .. }
-            | Change::RenameTable { .. }
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => continue,
+            Change::Constraint(ConstraintChange::DropForeignKey { table, name }) => {
+                (table, Some(name))
+            }
+            Change::Table(TableChange::DropTable { name, .. }) => (name, None),
+            Change::Table(TableChange::CreateTable { .. })
+            | Change::Table(TableChange::RenameTable { .. })
             | pbps_model::change_family!(columns)
             | pbps_model::change_family!(table_properties)
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
+            | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
             | pbps_model::change_family!(policies)
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::SetExclusion { .. }
-            | Change::AddForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::DropIndex { .. }
+            | Change::Constraint(ConstraintChange::AddUnique { .. })
+            | Change::Constraint(ConstraintChange::DropUnique { .. })
+            | Change::Constraint(ConstraintChange::SetExclusion { .. })
+            | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            | Change::Constraint(ConstraintChange::AddCheck { .. })
+            | Change::Constraint(ConstraintChange::DropCheck { .. })
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
             | pbps_model::change_family!(rows)
             | pbps_model::change_family!(modules)
             | pbps_model::change_family!(type_values)
             | pbps_model::catalog_change!()
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::PublicExecution { .. } => continue,
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. }) => continue,
         };
         let Some(table) = stored_key_table(names, index, table) else {
             continue;
@@ -798,6 +808,9 @@ fn mentions(definition: &str, column: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::TableChange;
     use pbps_model::{ChangeSet, PlannedChange, TableName};
 
     fn tname(s: &str) -> TableName {
@@ -862,11 +875,11 @@ mod tests {
     fn a_module_drop_is_a_target_and_a_create_is_not() {
         let changes = ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::DropModule {
+                PlannedChange::new(Change::Module(ModuleChange::DropModule {
                     id: "dbo.active_customer".parse().unwrap(),
                     kind: pbps_model::ModuleKind::View,
-                }),
-                PlannedChange::new(Change::CreateModule {
+                })),
+                PlannedChange::new(Change::Module(ModuleChange::CreateModule {
                     id: "dbo.live_customer".parse().unwrap(),
                     module: Box::new(pbps_model::Module {
                         kind: pbps_model::ModuleKind::View,
@@ -874,7 +887,7 @@ mod tests {
                         definition: "SELECT 1".into(),
                         options: Default::default(),
                     }),
-                }),
+                })),
             ],
         };
         let ids = pbps_model::IdsFile::default();
@@ -902,24 +915,24 @@ mod tests {
     fn targets_are_taken_from_the_old_names() {
         let cs = ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::RenameTable {
+                PlannedChange::new(Change::Table(TableChange::RenameTable {
                     uid: "t_aaaaaa".parse().unwrap(),
                     from: tname("dbo.client"),
                     to: tname("dbo.customer"),
                     defaults: Vec::new(),
-                }),
-                PlannedChange::new(Change::RenameColumn {
+                })),
+                PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
                     uid: "c_aaaaaa".parse().unwrap(),
                     table: tname("dbo.customer"),
                     from: "email".into(),
                     to: "contact_email".into(),
                     table_was: None,
-                }),
-                PlannedChange::new(Change::DropTable {
+                })),
+                PlannedChange::new(Change::Table(TableChange::DropTable {
                     uid: "t_bbbbbb".parse().unwrap(),
                     name: tname("dbo.old"),
                     detach_from: None,
-                }),
+                })),
             ],
         };
         let after = pbps_model::IdsFile {
@@ -948,13 +961,15 @@ mod tests {
     #[test]
     fn a_column_rename_without_a_table_rename_keeps_its_table() {
         let cs = ChangeSet {
-            changes: vec![PlannedChange::new(Change::RenameColumn {
-                uid: "c_aaaaaa".parse().unwrap(),
-                table: tname("dbo.customer"),
-                from: "email".into(),
-                to: "contact_email".into(),
-                table_was: None,
-            })],
+            changes: vec![PlannedChange::new(Change::Column(
+                ColumnChange::RenameColumn {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    table: tname("dbo.customer"),
+                    from: "email".into(),
+                    to: "contact_email".into(),
+                    table_was: None,
+                },
+            ))],
         };
 
         let after = pbps_model::IdsFile {
@@ -1145,6 +1160,8 @@ mod tests {
 #[cfg(test)]
 mod plan_name_tests {
     use super::*;
+    use pbps_model::IndexChange;
+    use pbps_model::TableChange;
     use pbps_model::{IdsFile, PlannedChange, Uid};
 
     #[test]
@@ -1154,21 +1171,21 @@ mod plan_name_tests {
         let old: Uid = "t_aaaaaa".parse().unwrap();
         let survivor: Uid = "t_bbbbbb".parse().unwrap();
         let changes = vec![
-            PlannedChange::new(Change::DropTable {
+            PlannedChange::new(Change::Table(TableChange::DropTable {
                 uid: old,
                 name: a.clone(),
                 detach_from: None,
-            }),
-            PlannedChange::new(Change::RenameTable {
+            })),
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: survivor.clone(),
                 from: b.clone(),
                 to: a.clone(),
                 defaults: vec![],
-            }),
-            PlannedChange::new(Change::DropIndex {
+            })),
+            PlannedChange::new(Change::Index(IndexChange::DropIndex {
                 table: a.clone(),
                 name: "key".into(),
-            }),
+            })),
         ];
         let ids = IdsFile {
             tables: [(survivor, a.clone())].into(),

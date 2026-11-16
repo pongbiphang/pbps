@@ -38,14 +38,14 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
         values: vec!["ok".into()],
     });
     pin(
-        Change::AddEnumValue {
+        Change::TypeValue(TypeValueChange::AddEnumValue {
             uid: type_uid.clone(),
             name: type_name.clone(),
             value: "new".into(),
             placement: None,
             ordinal: 0,
             definition: definition.clone(),
-        },
+        }),
         vec![],
         vec![],
         None,
@@ -73,12 +73,12 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
         ),
     ] {
         pin(
-            Change::EnumRebuild {
+            Change::TypeValue(TypeValueChange::EnumRebuild {
                 uid: type_uid.clone(),
                 name: type_name.clone(),
                 tmp: "app.pbps_rebuild_y_000001".parse().unwrap(),
                 step,
-            },
+            }),
             complete,
             vec![],
             None,
@@ -90,20 +90,20 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
         pbps_model::DomainHalf::Tighten,
     ] {
         pin(
-            Change::AlterDomain {
+            Change::TypeValue(TypeValueChange::AlterDomain {
                 uid: type_uid.clone(),
                 name: type_name.clone(),
                 from: definition.clone(),
                 to: definition.clone(),
                 half,
-            },
+            }),
             vec![],
             vec![],
             None,
         );
     }
     pin(
-        Change::RenameEnumValue {
+        Change::TypeValue(TypeValueChange::RenameEnumValue {
             uid: type_uid.clone(),
             name: type_name.clone(),
             from: "old".into(),
@@ -111,27 +111,27 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
             ordinal: 0,
             retained: Vec::new(),
             definition: definition.clone(),
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     pin(
-        Change::CreateType {
+        Change::Type(TypeChange::CreateType {
             uid: type_uid.clone(),
             name: type_name.clone(),
             definition: definition.clone(),
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     pin(
-        Change::DropType {
+        Change::Type(TypeChange::DropType {
             uid: type_uid.clone(),
             name: type_name.clone(),
             definition: definition.clone(),
-        },
+        }),
         vec![],
         vec![],
         None,
@@ -142,45 +142,45 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
         options: Default::default(),
     };
     pin(
-        Change::CreateSearch {
+        Change::Search(SearchChange::CreateSearch {
             uid: "s_aaaaaa".parse().unwrap(),
             name: "dictionary app.words".parse().unwrap(),
             definition: Box::new(search.clone()),
             unresolved: Vec::new(),
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     pin(
-        Change::DropSearch {
+        Change::Search(SearchChange::DropSearch {
             uid: "s_aaaaaa".parse().unwrap(),
             name: "dictionary app.words".parse().unwrap(),
             definition: Box::new(search),
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     pin(
-        Change::RenameType {
+        Change::Type(TypeChange::RenameType {
             uid: type_uid,
             from: type_name,
             to: "app.feeling".parse().unwrap(),
             definition,
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     pin(
-        Change::CreateTable {
+        Change::Table(TableChange::CreateTable {
             uid: uid.clone(),
             name: table.clone(),
             table: shape.clone(),
             beside_default: None,
             moves_at_most: None,
-        },
+        }),
         vec![],
         vec![],
         None,
@@ -192,119 +192,119 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
         columns: Default::default(),
     });
     pin(
-        Change::CreateTable {
+        Change::Table(TableChange::CreateTable {
             uid: uid.clone(),
             name: table.clone(),
             table: partition.clone(),
             beside_default: None,
             moves_at_most: None,
-        },
+        }),
         vec![&parent],
         vec![],
         None,
     );
     pin(
-        Change::CreateTable {
+        Change::Table(TableChange::CreateTable {
             uid: uid.clone(),
             name: table.clone(),
             table: partition,
             beside_default: Some(source.clone()),
             moves_at_most: Some(1),
-        },
+        }),
         vec![&parent],
         vec![&table, &source, &parent],
         None,
     );
     pin(
-        Change::DropTable {
+        Change::Table(TableChange::DropTable {
             uid: uid.clone(),
             name: table.clone(),
             detach_from: None,
-        },
+        }),
         vec![],
         vec![&table],
         None,
     );
     pin(
-        Change::DropTable {
+        Change::Table(TableChange::DropTable {
             uid: uid.clone(),
             name: table.clone(),
             detach_from: Some(parent.clone()),
-        },
+        }),
         vec![],
         vec![&table, &parent],
         None,
     );
     pin(
-        Change::AttachPartition {
+        Change::Partition(PartitionChange::AttachPartition {
             uid: uid.clone(),
             table: table.clone(),
             parent: parent.clone(),
             bound: PartitionBound::Default,
             key: vec![],
             shape: shape.clone(),
-        },
+        }),
         vec![&table, &parent],
         vec![&table, &parent],
         None,
     );
     pin(
-        Change::DetachPartition {
+        Change::Partition(PartitionChange::DetachPartition {
             uid: uid.clone(),
             table: table.clone(),
             parent: parent.clone(),
             names: vec![],
             shape,
-        },
+        }),
         vec![&table, &parent],
         vec![&table, &parent],
         None,
     );
     pin(
-        Change::RenameTable {
+        Change::Table(TableChange::RenameTable {
             uid: uid.clone(),
             from: table.clone(),
             to: source.clone(),
             defaults: vec![],
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     pin(
-        Change::AddColumn {
+        Change::Column(ColumnChange::AddColumn {
             uid: column_uid.clone(),
             table: table.clone(),
             name: "id".into(),
             column: Box::new(Column::new(ty.clone())),
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::DropColumn {
+        Change::Column(ColumnChange::DropColumn {
             uid: column_uid.clone(),
             column: column.clone(),
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::RenameColumn {
+        Change::Column(ColumnChange::RenameColumn {
             uid: column_uid.clone(),
             table: table.clone(),
             from: "id".into(),
             to: "other".into(),
             table_was: None,
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::AlterColumnType {
+        Change::Column(ColumnChange::AlterColumnType {
             uid: column_uid.clone(),
             column: column.clone(),
             from: ty.clone(),
@@ -315,54 +315,54 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
             to_collation: None,
             through_external_partitions: false,
             using: None,
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::AlterColumnNullability {
+        Change::Column(ColumnChange::AlterColumnNullability {
             uid: column_uid.clone(),
             column: column.clone(),
             ty: ty.clone(),
             to_nullable: false,
             collation: None,
             through_external_partitions: false,
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::AlterColumnDefault {
+        Change::Column(ColumnChange::AlterColumnDefault {
             uid: column_uid.clone(),
             column: column.clone(),
             from: None,
             to: Some("1".into()),
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::AlterColumnExpression {
+        Change::Column(ColumnChange::AlterColumnExpression {
             uid: column_uid.clone(),
             column: column.clone(),
             from: "NULL::integer".into(),
             to: "1".into(),
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::AlterColumnNumbering {
+        Change::Column(ColumnChange::AlterColumnNumbering {
             uid: column_uid.clone(),
             column: column.clone(),
             ty,
             from: ValueSource::None,
             to: ValueSource::None,
-        },
+        }),
         vec![&table],
         vec![],
         None,
@@ -373,80 +373,80 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
         not_null: false,
     };
     pin(
-        Change::AddComputedColumn {
+        Change::Column(ColumnChange::AddComputedColumn {
             table: table.clone(),
             name: "c".into(),
             computed: computed.clone(),
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::DropComputedColumn {
+        Change::Column(ColumnChange::DropComputedColumn {
             table: table.clone(),
             name: "c".into(),
             computed,
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::SetColumnDeprecated {
+        Change::Column(ColumnChange::SetColumnDeprecated {
             uid: column_uid,
             column,
             reason: None,
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::SetComment {
+        Change::TableProperty(TablePropertyChange::SetComment {
             target: pbps_model::CommentTarget::Table {
                 uid: uid.clone(),
                 table: table.clone(),
             },
             text: None,
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     pin(
-        Change::SetReplicaIdentity {
+        Change::TableProperty(TablePropertyChange::SetReplicaIdentity {
             uid: uid.clone(),
             table: table.clone(),
             to: None,
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     pin(
-        Change::SetStorageParameters {
+        Change::TableProperty(TablePropertyChange::SetStorageParameters {
             uid: uid.clone(),
             table: table.clone(),
             set: Default::default(),
             reset: Default::default(),
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     pin(
-        Change::SetTablePersistence {
+        Change::TableProperty(TablePropertyChange::SetTablePersistence {
             uid: uid.clone(),
             table: table.clone(),
             unlogged: true,
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     pin(
-        Change::SetPartitionDefault {
+        Change::Partition(PartitionChange::SetPartitionDefault {
             uid: uid.clone(),
             table: table.clone(),
             parent: parent.clone(),
@@ -454,47 +454,47 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
             from: None,
             to: None,
             fallback: None,
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::SetPartitionNotNull {
+        Change::Partition(PartitionChange::SetPartitionNotNull {
             uid: uid.clone(),
             table: table.clone(),
             column: "id".into(),
             not_null: true,
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::SetIndexStorageParameters {
+        Change::Index(IndexChange::SetIndexStorageParameters {
             table: table.clone(),
             target: IndexPart::PrimaryKey,
             method: Default::default(),
             set: Default::default(),
             reset: Default::default(),
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     pin(
-        Change::SetPrimaryKey {
+        Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: table.clone(),
             from: None,
             to: None,
             nonclustered: false,
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::AddUnique {
+        Change::Constraint(ConstraintChange::AddUnique {
             table: table.clone(),
             name: "uq".into(),
             constraint: UniqueConstraint {
@@ -503,22 +503,22 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
                 filegroup: None,
             },
             clustered: false,
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::DropUnique {
+        Change::Constraint(ConstraintChange::DropUnique {
             table: table.clone(),
             name: "uq".into(),
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::SetExclusion {
+        Change::Constraint(ConstraintChange::SetExclusion {
             table: table.clone(),
             name: "xc".into(),
             from: None,
@@ -533,13 +533,13 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
                 storage_parameters: Default::default(),
                 timing: pbps_model::ExclusionTiming::Immediate,
             })),
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::AddForeignKey {
+        Change::Constraint(ConstraintChange::AddForeignKey {
             table: table.clone(),
             name: "fk".into(),
             constraint: Box::new(ForeignKey {
@@ -549,43 +549,43 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
                 on_delete: Default::default(),
                 on_update: Default::default(),
             }),
-        },
+        }),
         vec![&table, &parent],
         vec![],
         None,
     );
     pin(
-        Change::DropForeignKey {
+        Change::Constraint(ConstraintChange::DropForeignKey {
             table: table.clone(),
             name: "fk".into(),
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::AddCheck {
+        Change::Constraint(ConstraintChange::AddCheck {
             table: table.clone(),
             name: "ck".into(),
             constraint: CheckConstraint {
                 expression: "id > 0".into(),
             },
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::DropCheck {
+        Change::Constraint(ConstraintChange::DropCheck {
             table: table.clone(),
             name: "ck".into(),
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::AddIndex {
+        Change::Index(IndexChange::AddIndex {
             table: table.clone(),
             name: "ix".into(),
             index: Box::new(Index {
@@ -598,22 +598,22 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
                 filegroup: None,
             }),
             clustered: false,
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::DropIndex {
+        Change::Index(IndexChange::DropIndex {
             table: table.clone(),
             name: "ix".into(),
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::InsertRow {
+        Change::Row(RowChange::InsertRow {
             table: table.clone(),
             key_column: "id".into(),
             identity_key: false,
@@ -621,13 +621,13 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
             row: Row::default(),
             defaults: Default::default(),
             types: Default::default(),
-        },
+        }),
         vec![&table],
         vec![&table],
         Some(&table),
     );
     pin(
-        Change::UpdateRow {
+        Change::Row(RowChange::UpdateRow {
             table: table.clone(),
             key_column: "id".into(),
             key: "1".into(),
@@ -636,13 +636,13 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
             types: Default::default(),
             after_types: Default::default(),
             key_type: None,
-        },
+        }),
         vec![&table],
         vec![&table],
         Some(&table),
     );
     pin(
-        Change::DeleteRow {
+        Change::Row(RowChange::DeleteRow {
             table: table.clone(),
             key_column: "id".into(),
             key: "1".into(),
@@ -652,27 +652,27 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
             types: Default::default(),
             after_types: Default::default(),
             key_type: None,
-        },
+        }),
         vec![&table],
         vec![&table],
         Some(&table),
     );
     pin(
-        Change::SetDataMode {
+        Change::Row(RowChange::SetDataMode {
             table: table.clone(),
             from: None,
             to: None,
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     pin(
-        Change::SetEnsureKeys {
+        Change::Row(RowChange::SetEnsureKeys {
             table: table.clone(),
             from: Default::default(),
             to: Default::default(),
-        },
+        }),
         vec![],
         vec![],
         None,
@@ -685,19 +685,19 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
         options: Default::default(),
     });
     pin(
-        Change::CreateModule {
+        Change::Module(ModuleChange::CreateModule {
             id: function.clone(),
             module: module.clone(),
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     pin(
-        Change::AlterModule {
+        Change::Module(ModuleChange::AlterModule {
             id: function.clone(),
             module: module.clone(),
-        },
+        }),
         vec![],
         vec![],
         None,
@@ -711,65 +711,65 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
     trigger_module.definition =
         "AFTER INSERT ON app.a FOR EACH ROW EXECUTE FUNCTION app.write_rows()".into();
     pin(
-        Change::CreateModule {
+        Change::Module(ModuleChange::CreateModule {
             id: trigger.clone(),
             module: trigger_module.clone(),
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::AlterModule {
+        Change::Module(ModuleChange::AlterModule {
             id: trigger,
             module: trigger_module,
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::DropModule {
+        Change::Module(ModuleChange::DropModule {
             id: function,
             kind: ModuleKind::Function,
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     let role_uid: Uid = "r_015032".parse().unwrap();
     pin(
-        Change::CreateRole {
+        Change::Role(RoleChange::CreateRole {
             uid: role_uid.clone(),
             name: "reader".into(),
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     pin(
-        Change::DropRole {
+        Change::Role(RoleChange::DropRole {
             uid: role_uid.clone(),
             name: "reader".into(),
             members: vec![],
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     pin(
-        Change::RenameRole {
+        Change::Role(RoleChange::RenameRole {
             uid: role_uid,
             from: "reader".into(),
             to: "writer".into(),
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     // A package names no table and no row: nothing here reads or writes either.
     pin(
-        Change::CreateExtension {
+        Change::Extension(ExtensionChange::CreateExtension {
             uid: "e_015032".parse().unwrap(),
             name: "citext".into(),
             definition: pbps_model::Extension {
@@ -777,13 +777,13 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
                 version: "1.6".into(),
             },
             requires: Default::default(),
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     pin(
-        Change::DropExtension {
+        Change::Extension(ExtensionChange::DropExtension {
             uid: "e_015032".parse().unwrap(),
             name: "citext".into(),
             definition: pbps_model::Extension {
@@ -794,13 +794,13 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
             releases: Default::default(),
             index_releases: Default::default(),
             search_releases: Default::default(),
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     pin(
-        Change::UpdateExtension {
+        Change::Extension(ExtensionChange::UpdateExtension {
             uid: "e_015033".parse().unwrap(),
             name: "citext".into(),
             from: pbps_model::Extension {
@@ -813,13 +813,13 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
             },
             requires: Default::default(),
             releases: Default::default(),
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     pin(
-        Change::SetExtensionSchema {
+        Change::Extension(ExtensionChange::SetExtensionSchema {
             uid: "e_015033".parse().unwrap(),
             name: "citext".into(),
             from: pbps_model::Extension {
@@ -831,57 +831,57 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
                 version: "1.6".into(),
             },
             releases: Default::default(),
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     pin(
-        Change::Grant {
+        Change::Permission(GrantChange::Grant {
             role: "reader".into(),
             target: GrantTarget::Schema("app".into()),
             permissions: Default::default(),
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     pin(
-        Change::Revoke {
+        Change::Permission(GrantChange::Revoke {
             role: "reader".into(),
             target: GrantTarget::Schema("app".into()),
             permissions: Default::default(),
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     pin(
-        Change::PublicExecution {
+        Change::Permission(GrantChange::PublicExecution {
             routine: "app.f(integer)".parse().unwrap(),
             access: PublicAccess::Kept,
             origin: RoutineOrigin::Created,
-        },
+        }),
         vec![],
         vec![],
         None,
     );
 
     pin(
-        Change::DropPolicy {
+        Change::Policy(PolicyChange::DropPolicy {
             table: table.clone(),
             name: "visible".into(),
             policy: RowPolicy {
                 using: Some("id > 0".into()),
                 ..Default::default()
             },
-        },
+        }),
         vec![],
         vec![],
         None,
     );
     pin(
-        Change::CreatePolicy {
+        Change::Policy(PolicyChange::CreatePolicy {
             table: table.clone(),
             name: "visible".into(),
             policy: RowPolicy {
@@ -889,13 +889,13 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
                 ..Default::default()
             },
             origin: RowSecurityOrigin::Created,
-        },
+        }),
         vec![&table],
         vec![],
         None,
     );
     pin(
-        Change::SetRowSecurity {
+        Change::Policy(PolicyChange::SetRowSecurity {
             uid,
             table: table.clone(),
             from: RowSecurity::default(),
@@ -904,7 +904,7 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
                 forced: true,
             },
             origin: RowSecurityOrigin::Created,
-        },
+        }),
         vec![&table],
         vec![],
         None,
@@ -983,7 +983,7 @@ fn policy_setup_waits_for_complete_generated_columns_without_invalidating_emptin
         p
     };
     let policy = |owner| {
-        PlannedChange::new(Change::CreatePolicy {
+        PlannedChange::new(Change::Policy(PolicyChange::CreatePolicy {
             table: owner,
             name: "visible".into(),
             policy: RowPolicy {
@@ -992,19 +992,19 @@ fn policy_setup_waits_for_complete_generated_columns_without_invalidating_emptin
                 ..Default::default()
             },
             origin: RowSecurityOrigin::Created,
-        })
+        }))
     };
     let cs = ChangeSet {
         changes: vec![
-            part(Change::CreateTable {
+            part(Change::Table(TableChange::CreateTable {
                 uid: uid.clone(),
                 name: table.clone(),
                 table: Box::new(full),
                 beside_default: None,
                 moves_at_most: None,
-            }),
+            })),
             policy(table.clone()),
-            PlannedChange::new(Change::SetRowSecurity {
+            PlannedChange::new(Change::Policy(PolicyChange::SetRowSecurity {
                 uid,
                 table: table.clone(),
                 from: RowSecurity::default(),
@@ -1013,14 +1013,14 @@ fn policy_setup_waits_for_complete_generated_columns_without_invalidating_emptin
                     forced: true,
                 },
                 origin: RowSecurityOrigin::Created,
-            }),
+            })),
             policy(TableName::new("app", "other")),
-            part(Change::AddColumn {
+            part(Change::Column(ColumnChange::AddColumn {
                 uid: "c_011722".parse().unwrap(),
                 table,
                 name: "g".into(),
                 column: Box::new(generated),
-            }),
+            })),
         ],
     };
     let pg = pbps_dialect::MinimalDialect;
@@ -1060,17 +1060,17 @@ fn every_policy_replacement_carries_both_risks_including_mode_flips() {
             }
             let cs = ChangeSet {
                 changes: vec![
-                    PlannedChange::new(Change::DropPolicy {
+                    PlannedChange::new(Change::Policy(PolicyChange::DropPolicy {
                         table: table.clone(),
                         name: "p".into(),
                         policy: old.clone(),
-                    }),
-                    PlannedChange::new(Change::CreatePolicy {
+                    })),
+                    PlannedChange::new(Change::Policy(PolicyChange::CreatePolicy {
                         table: table.clone(),
                         name: "p".into(),
                         policy: new,
                         origin: RowSecurityOrigin::Standing,
-                    }),
+                    })),
                 ],
             };
             let both = [RiskClass::Revoke, RiskClass::RowSecurity].into();
@@ -1094,19 +1094,21 @@ fn policy_replacement_follows_table_uid_across_rename_but_not_name_reuse() {
         using: Some("id > 0".into()),
         ..Default::default()
     };
-    let drop = Change::DropPolicy {
+    let drop = Change::Policy(PolicyChange::DropPolicy {
         table: a.clone(),
         name: "p".into(),
         policy: policy.clone(),
-    };
-    let create = |table, name: &str| Change::CreatePolicy {
-        table,
-        name: name.into(),
-        policy: RowPolicy {
-            restrictive: true,
-            ..policy.clone()
-        },
-        origin: RowSecurityOrigin::Standing,
+    });
+    let create = |table, name: &str| {
+        Change::Policy(PolicyChange::CreatePolicy {
+            table,
+            name: name.into(),
+            policy: RowPolicy {
+                restrictive: true,
+                ..policy.clone()
+            },
+            origin: RowSecurityOrigin::Standing,
+        })
     };
     let pg = pbps_dialect::MinimalDialect;
     let cs = |changes: Vec<Change>| ChangeSet {
@@ -1116,12 +1118,12 @@ fn policy_replacement_follows_table_uid_across_rename_but_not_name_reuse() {
     ids.tables.insert(first.clone(), b.clone());
     let renamed = cs(vec![
         drop.clone(),
-        Change::RenameTable {
+        Change::Table(TableChange::RenameTable {
             uid: first.clone(),
             from: a.clone(),
             to: b.clone(),
             defaults: vec![],
-        },
+        }),
         create(b.clone(), "p"),
     ]);
     let risks = super::risks(&renamed, &ids, &pg);
@@ -1132,18 +1134,18 @@ fn policy_replacement_follows_table_uid_across_rename_but_not_name_reuse() {
     ids.tables.insert(second.clone(), a.clone());
     let handed = cs(vec![
         drop.clone(),
-        Change::RenameTable {
+        Change::Table(TableChange::RenameTable {
             uid: first.clone(),
             from: a.clone(),
             to: old_name,
             defaults: vec![],
-        },
-        Change::RenameTable {
+        }),
+        Change::Table(TableChange::RenameTable {
             uid: second.clone(),
             from: b.clone(),
             to: a.clone(),
             defaults: vec![],
-        },
+        }),
         create(a.clone(), "p"),
     ]);
     let risks = super::risks(&handed, &ids, &pg);
@@ -1174,20 +1176,22 @@ fn empty_column_effects_end_at_the_first_write_even_across_a_rename() {
         .into(),
         ..Default::default()
     };
-    let add = |name, uid: &str| Change::AddColumn {
-        uid: uid.parse().unwrap(),
-        table: new.clone(),
-        name,
-        column: Box::new(Column::new("integer".parse().unwrap())),
+    let add = |name, uid: &str| {
+        Change::Column(ColumnChange::AddColumn {
+            uid: uid.parse().unwrap(),
+            table: new.clone(),
+            name,
+            column: Box::new(Column::new("integer".parse().unwrap())),
+        })
     };
-    let create = Change::CreateTable {
+    let create = Change::Table(TableChange::CreateTable {
         uid: uid.clone(),
         name: old.clone(),
         table: Box::default(),
         beside_default: None,
         moves_at_most: None,
-    };
-    let row = Change::InsertRow {
+    });
+    let row = Change::Row(RowChange::InsertRow {
         table: new.clone(),
         key_column: "id".into(),
         identity_key: false,
@@ -1195,18 +1199,18 @@ fn empty_column_effects_end_at_the_first_write_even_across_a_rename() {
         row: Row::default(),
         defaults: Default::default(),
         types: Default::default(),
-    };
+    });
     let changes = |steps: Vec<Change>| ChangeSet {
         changes: steps.into_iter().map(PlannedChange::new).collect(),
     };
     let cs = changes(vec![
         create.clone(),
-        Change::RenameTable {
+        Change::Table(TableChange::RenameTable {
             uid,
             from: old,
             to: new.clone(),
             defaults: Default::default(),
-        },
+        }),
         add("x".into(), "c_aaaaaa"),
         row,
         add("y".into(), "c_bbbbbb"),
@@ -1219,11 +1223,11 @@ fn empty_column_effects_end_at_the_first_write_even_across_a_rename() {
         "standing ADD COLUMN can write existing rows"
     );
     let mut moving = create;
-    if let Change::CreateTable {
+    if let Change::Table(TableChange::CreateTable {
         name,
         beside_default,
         ..
-    } = &mut moving
+    }) = &mut moving
     {
         *name = new.clone();
         *beside_default = Some("app.default_rows".parse().unwrap());
@@ -1251,13 +1255,14 @@ fn a_new_exclusion_reads_its_key_expressions_and_predicate_and_a_drop_reads_none
         storage_parameters: Default::default(),
         timing: ExclusionTiming::Immediate,
     };
-    let change =
-        |from: Option<ExclusionConstraint>, to: Option<ExclusionConstraint>| Change::SetExclusion {
+    let change = |from: Option<ExclusionConstraint>, to: Option<ExclusionConstraint>| {
+        Change::Constraint(ConstraintChange::SetExclusion {
             table: TableName::new("app", "booking"),
             name: "xc".into(),
             from: from.map(Box::new),
             to: to.map(Box::new),
-        };
+        })
+    };
     let call = IndexColumn {
         key: IndexKey::Expression("app.slot(a)".into()),
         descending: false,

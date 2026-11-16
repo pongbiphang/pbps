@@ -24,6 +24,17 @@ use crate::ColumnName;
 use schemars::JsonSchema;
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::change::ColumnChange;
+use crate::change::ConstraintChange;
+use crate::change::ExtensionChange;
+use crate::change::IndexChange;
+use crate::change::ModuleChange;
+use crate::change::PartitionChange;
+use crate::change::PolicyChange;
+use crate::change::SearchChange;
+use crate::change::TableChange;
+use crate::change::TypeChange;
+use crate::change::TypeValueChange;
 use crate::change::{Change, ChangeSet};
 use crate::module::ModuleId;
 use crate::name::TableName;
@@ -419,7 +430,9 @@ impl Declared {
                 .collect()
         };
         for planned in &changes.changes {
-            if let Change::RenameEnumValue { retained, .. } = &planned.change {
+            if let Change::TypeValue(TypeValueChange::RenameEnumValue { retained, .. }) =
+                &planned.change
+            {
                 for expression in retained {
                     match &expression.target {
                         crate::ExpressionTarget::Check { table, name, .. } => {
@@ -442,55 +455,55 @@ impl Declared {
                 }
             }
             match &planned.change {
-                Change::RebuildPartitionedTable(_)
-                | Change::BuildPartitionedIndex(_)
-                | Change::CopyTableRows(_)
-                | Change::AnalyzeTableTree(_)
+                Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+                | Change::Index(IndexChange::BuildPartitionedIndex(_))
+                | Change::Partition(PartitionChange::CopyTableRows(_))
+                | Change::Partition(PartitionChange::AnalyzeTableTree(_))
                 // A text search object holds no expression text either (DEC-2728.2).
-                | Change::CreateSearch { .. }
-                | Change::DropSearch { .. }
+                | Change::Search(SearchChange::CreateSearch { .. })
+                | Change::Search(SearchChange::DropSearch { .. })
                 // A package declares no expression text; its members are not
                 // read as declared types or defaults (DEC-2447.6).
-                | Change::CreateExtension { .. }
-                | Change::DropExtension { .. }
-                | Change::UpdateExtension { .. }
-                | Change::SetExtensionSchema { .. } => {}
-                Change::AlterDomain {
+                | Change::Extension(ExtensionChange::CreateExtension { .. })
+                | Change::Extension(ExtensionChange::DropExtension { .. })
+                | Change::Extension(ExtensionChange::UpdateExtension { .. })
+                | Change::Extension(ExtensionChange::SetExtensionSchema { .. }) => {}
+                Change::TypeValue(TypeValueChange::AlterDomain {
                     name,
                     from,
                     to,
                     half,
                     ..
-                } => {
+                }) => {
                     let current = self.types.get(name).unwrap_or(from);
                     let definition = crate::DomainDelta::of(from, to)
                         .and_then(|delta| delta.apply_to(current, *half))
                         .unwrap_or_else(|| (**to).clone());
                     self.types.insert(name.clone(), definition);
                 }
-                Change::AddEnumValue {
+                Change::TypeValue(TypeValueChange::AddEnumValue {
                     name, definition, ..
-                }
-                | Change::RenameEnumValue {
+                })
+                | Change::TypeValue(TypeValueChange::RenameEnumValue {
                     name, definition, ..
-                }
-                | Change::CreateType {
+                })
+                | Change::Type(TypeChange::CreateType {
                     name, definition, ..
-                } => {
+                }) => {
                     self.types.insert(name.clone(), (**definition).clone());
                 }
-                Change::EnumRebuild {
+                Change::TypeValue(TypeValueChange::EnumRebuild {
                     name,
                     step: crate::EnumRebuildStep::Swap { definition, .. },
                     ..
-                } => {
+                }) => {
                     self.types.insert(name.clone(), (**definition).clone());
                 }
-                Change::EnumRebuild { .. } => {}
-                Change::DropType { name, .. } => {
+                Change::TypeValue(TypeValueChange::EnumRebuild { .. }) => {}
+                Change::Type(TypeChange::DropType { name, .. }) => {
                     self.types.remove(name);
                 }
-                Change::RenameType { from, to, .. } => {
+                Change::Type(TypeChange::RenameType { from, to, .. }) => {
                     // A rename writes no expression. Adopted domains and old
                     // states must retain their engine-text fallback.
                     if let Some(definition) = self.types.remove(from) {
@@ -498,7 +511,7 @@ impl Declared {
                     }
                 }
 
-                Change::CreateTable { name, table, .. } => {
+                Change::Table(TableChange::CreateTable { name, table, .. }) => {
                     let fresh = Self::from_schema(&Schema {
                         tables: [(name.clone(), (**table).clone())].into_iter().collect(),
                         ..Schema::default()
@@ -520,17 +533,17 @@ impl Declared {
                         .extend(fresh.expressions.exclusion_keys);
                     self.expressions.policies.extend(fresh.expressions.policies);
                 }
-                Change::DropTable { name, .. } => self.forget_table(name),
+                Change::Table(TableChange::DropTable { name, .. }) => self.forget_table(name),
                 // The detached table holds its parent's expressions, which
                 // the engine copied into it, under its own name, and its
                 // checks and index filters under the declared names (#1544).
-                Change::DetachPartition {
+                Change::Partition(PartitionChange::DetachPartition {
                     table,
                     parent,
                     names,
                     shape,
                     ..
-                } => {
+                }) => {
                     // The declared text is the shape's, as a created table's
                     // is its payload's. The bindings are its parent's, which
                     // the engine copied into it, under the declared names.
@@ -581,7 +594,7 @@ impl Declared {
                 // shape's, as a created table's is its payload's, and a
                 // binding stays only with an object the shape still holds as
                 // its own: the partition's later changes re-record the rest.
-                Change::AttachPartition { table, shape, .. } => {
+                Change::Partition(PartitionChange::AttachPartition { table, shape, .. }) => {
                     let fresh = Self::from_schema(&Schema {
                         tables: [(table.clone(), (**shape).clone())].into_iter().collect(),
                         ..Schema::default()
@@ -626,7 +639,7 @@ impl Declared {
                         .exclusion_keys
                         .extend(fresh.expressions.exclusion_keys);
                 }
-                Change::RenameTable { from, to, .. } => {
+                Change::Table(TableChange::RenameTable { from, to, .. }) => {
                     rekey_table(&mut self.expressions.defaults, from, to);
                     rekey_table(&mut self.expressions.generated, from, to);
                     rekey_table(&mut self.expressions.computed, from, to);
@@ -640,12 +653,12 @@ impl Declared {
                     rekey_table(&mut self.bindings.checks, from, to);
                     rekey_table(&mut self.bindings.filters, from, to);
                 }
-                Change::AddColumn {
+                Change::Column(ColumnChange::AddColumn {
                     table,
                     name,
                     column,
                     ..
-                } => {
+                }) => {
                     remove_nested(&mut self.expressions.defaults, table, name);
                     remove_nested(&mut self.expressions.generated, table, name);
                     remove_nested(&mut self.bindings.defaults, table, name);
@@ -668,7 +681,7 @@ impl Declared {
                         }
                     }
                 }
-                Change::DropColumn { column, .. } => {
+                Change::Column(ColumnChange::DropColumn { column, .. }) => {
                     remove_nested(&mut self.expressions.defaults, &column.table, &column.name);
                     remove_nested(&mut self.expressions.generated, &column.table, &column.name);
                     remove_nested(&mut self.bindings.defaults, &column.table, &column.name);
@@ -677,9 +690,9 @@ impl Declared {
                         remove_nested(&mut self.bindings.defaults, &partition, &column.name);
                     }
                 }
-                Change::RenameColumn {
+                Change::Column(ColumnChange::RenameColumn {
                     table, from, to, ..
-                } => {
+                }) => {
                     rekey_nested(&mut self.expressions.defaults, table, from, to);
                     rekey_nested(&mut self.expressions.generated, table, from, to);
                     rekey_nested(&mut self.bindings.defaults, table, from, to);
@@ -688,7 +701,7 @@ impl Declared {
                         rekey_nested(&mut self.bindings.defaults, &partition, from, to);
                     }
                 }
-                Change::AlterColumnDefault { column, to, .. } => {
+                Change::Column(ColumnChange::AlterColumnDefault { column, to, .. }) => {
                     remove_nested(&mut self.expressions.defaults, &column.table, &column.name);
                     remove_nested(&mut self.bindings.defaults, &column.table, &column.name);
                     if let Some(default) = to {
@@ -701,9 +714,9 @@ impl Declared {
                 }
                 // A partition's own default, recorded where `from_schema`
                 // records it: under the partition and the column (#1581).
-                Change::SetPartitionDefault {
+                Change::Partition(PartitionChange::SetPartitionDefault {
                     table, column, to, ..
-                } => {
+                }) => {
                     remove_nested(&mut self.expressions.defaults, table, column);
                     remove_nested(&mut self.bindings.defaults, table, column);
                     if let Some(default) = to {
@@ -716,7 +729,7 @@ impl Declared {
                 }
                 // A plain default given up or taken, as `AlterColumnDefault`
                 // records one; a numbering source is no text (#1889).
-                Change::AlterColumnNumbering { column, to, .. } => {
+                Change::Column(ColumnChange::AlterColumnNumbering { column, to, .. }) => {
                     remove_nested(&mut self.expressions.defaults, &column.table, &column.name);
                     remove_nested(&mut self.bindings.defaults, &column.table, &column.name);
                     if let crate::ValueSource::Default(default) = to {
@@ -727,32 +740,32 @@ impl Declared {
                             .insert(column.name.clone(), default.clone());
                     }
                 }
-                Change::AlterColumnExpression { column, to, .. } => {
+                Change::Column(ColumnChange::AlterColumnExpression { column, to, .. }) => {
                     self.expressions
                         .generated
                         .entry(column.table.clone())
                         .or_default()
                         .insert(column.name.clone(), to.clone());
                 }
-                Change::AddComputedColumn {
+                Change::Column(ColumnChange::AddComputedColumn {
                     table,
                     name,
                     computed,
-                } => {
+                }) => {
                     self.expressions
                         .computed
                         .entry(table.clone())
                         .or_default()
                         .insert(name.clone(), computed.expression.clone());
                 }
-                Change::DropComputedColumn { table, name, .. } => {
+                Change::Column(ColumnChange::DropComputedColumn { table, name, .. }) => {
                     remove_nested(&mut self.expressions.computed, table, name);
                 }
-                Change::AddCheck {
+                Change::Constraint(ConstraintChange::AddCheck {
                     table,
                     name,
                     constraint,
-                } => {
+                }) => {
                     remove_nested(&mut self.bindings.checks, table, name);
                     self.expressions
                         .checks
@@ -760,13 +773,13 @@ impl Declared {
                         .or_default()
                         .insert(name.clone(), constraint.expression.clone());
                 }
-                Change::DropCheck { table, name } => {
+                Change::Constraint(ConstraintChange::DropCheck { table, name }) => {
                     remove_nested(&mut self.expressions.checks, table, name);
                     remove_nested(&mut self.bindings.checks, table, name);
                 }
-                Change::AddIndex {
+                Change::Index(IndexChange::AddIndex {
                     table, name, index, ..
-                } => {
+                }) => {
                     remove_nested(&mut self.expressions.filters, table, name);
                     remove_nested(&mut self.expressions.keys, table, name);
                     remove_nested(&mut self.bindings.filters, table, name);
@@ -785,56 +798,56 @@ impl Declared {
                             .insert(name.clone(), keys);
                     }
                 }
-                Change::SetExclusion {
+                Change::Constraint(ConstraintChange::SetExclusion {
                     table, name, to, ..
-                } => {
+                }) => {
                     remove_nested(&mut self.expressions.exclusion_filters, table, name);
                     remove_nested(&mut self.expressions.exclusion_keys, table, name);
                     if let Some(spec) = to {
                         self.record_exclusion(table, name, spec);
                     }
                 }
-                Change::DropIndex { table, name } => {
+                Change::Index(IndexChange::DropIndex { table, name }) => {
                     remove_nested(&mut self.expressions.filters, table, name);
                     remove_nested(&mut self.expressions.keys, table, name);
                     remove_nested(&mut self.bindings.filters, table, name);
                 }
-                Change::DropPolicy { table, name, .. } => {
+                Change::Policy(PolicyChange::DropPolicy { table, name, .. }) => {
                     remove_nested(&mut self.expressions.policies, table, name);
                 }
-                Change::CreatePolicy {
+                Change::Policy(PolicyChange::CreatePolicy {
                     table,
                     name,
                     policy,
                     ..
-                } => {
+                }) => {
                     self.expressions
                         .policies
                         .entry(table.clone())
                         .or_default()
                         .insert(name.clone(), policy.into());
                 }
-                Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
+                Change::Module(ModuleChange::CreateModule { id, module }) | Change::Module(ModuleChange::AlterModule { id, module }) => {
                     self.bindings.modules.remove(id);
                     self.modules.insert(id.clone(), module.definition.clone());
                 }
-                Change::DropModule { id, .. } => {
+                Change::Module(ModuleChange::DropModule { id, .. }) => {
                     self.modules.remove(id);
                     self.bindings.modules.remove(id);
                 }
                 // Nothing these write is compared as text against a declaration.
-                Change::SetRowSecurity { .. }
-                | Change::AlterColumnType { .. }
-                | Change::AlterColumnNullability { .. }
-                | Change::SetColumnDeprecated { .. }
-                | Change::SetPrimaryKey { .. }
-                | Change::SetIndexStorageParameters { .. }
+                Change::Policy(PolicyChange::SetRowSecurity { .. })
+                | Change::Column(ColumnChange::AlterColumnType { .. })
+                | Change::Column(ColumnChange::AlterColumnNullability { .. })
+                | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+                | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+                | Change::Index(IndexChange::SetIndexStorageParameters { .. })
                 | crate::change_family!(table_properties)
-                | Change::SetPartitionNotNull { .. }
-                | Change::AddUnique { .. }
-                | Change::DropUnique { .. }
-                | Change::AddForeignKey { .. }
-                | Change::DropForeignKey { .. }
+                | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+                | Change::Constraint(ConstraintChange::AddUnique { .. })
+                | Change::Constraint(ConstraintChange::DropUnique { .. })
+                | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+                | Change::Constraint(ConstraintChange::DropForeignKey { .. })
                 | crate::change_family!(rows)
                 | crate::change_family!(roles)
                 | crate::change_family!(permissions) => {}
@@ -1038,7 +1051,15 @@ impl Declared {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::change::ColumnChange;
+    use crate::change::ConstraintChange;
+    use crate::change::IndexChange;
+    use crate::change::ModuleChange;
+    use crate::change::PartitionChange;
     use crate::change::PlannedChange;
+    use crate::change::TableChange;
+    use crate::change::TypeChange;
+    use crate::change::TypeValueChange;
     use crate::module::{Module, ModuleKind};
     use crate::name::ColumnRef;
     use crate::schema::{CheckConstraint, Column, Index, IndexColumn, Table};
@@ -1059,12 +1080,12 @@ mod tests {
         let to: crate::TypeRef = "other.selected".parse().unwrap();
         let definition = domain(Some("'a'"), "VALUE IN ('a','b')");
         let uid = crate::Uid::generate(crate::UidKind::Type);
-        let create = Change::CreateType {
+        let create = Change::Type(TypeChange::CreateType {
             uid: uid.clone(),
             name: from.clone(),
             definition: Box::new(definition.clone()),
-        };
-        let rename = Change::RenameType {
+        });
+        let rename = Change::Type(TypeChange::RenameType {
             uid: uid.clone(),
             from: from.clone(),
             to: to.clone(),
@@ -1073,18 +1094,18 @@ mod tests {
                 Some("'a'::text"),
                 "(VALUE = ANY (ARRAY['a'::text, 'b'::text]))",
             )),
-        };
+        });
         let mut record = Declared::default();
         record.advance(&changes(vec![create]));
         assert_eq!(record.types.get(&from), Some(&definition));
         record.advance(&changes(vec![rename.clone()]));
         assert!(!record.types.contains_key(&from));
         assert_eq!(record.types.get(&to), Some(&definition));
-        record.advance(&changes(vec![Change::DropType {
+        record.advance(&changes(vec![Change::Type(TypeChange::DropType {
             uid,
             name: to,
             definition: Box::new(definition),
-        }]));
+        })]));
         assert!(record.is_empty());
 
         // Baseline/pull and older snapshots have no authored text to move.
@@ -1100,11 +1121,13 @@ mod tests {
         let enumeration = |labels: &[&str]| ManagedType::Enum {
             values: labels.iter().map(|l| (*l).into()).collect(),
         };
-        let step = |step| Change::EnumRebuild {
-            uid: uid.clone(),
-            name: name.clone(),
-            tmp: "app.pbps_rebuild_e".parse().unwrap(),
-            step,
+        let step = |step| {
+            Change::TypeValue(TypeValueChange::EnumRebuild {
+                uid: uid.clone(),
+                name: name.clone(),
+                tmp: "app.pbps_rebuild_e".parse().unwrap(),
+                step,
+            })
         };
         let mut record = Declared::default();
         record
@@ -1419,28 +1442,28 @@ mod tests {
 
         // A plan's index changes and a table rename carry the record.
         let mut advanced = Declared::default();
-        advanced.advance(&changes(vec![Change::AddIndex {
+        advanced.advance(&changes(vec![Change::Index(IndexChange::AddIndex {
             table: t(),
             name: "ix_expr".into(),
             index: Box::new(expression_index("lower(x)")),
             clustered: false,
-        }]));
+        })]));
         assert_eq!(
             advanced.expressions.keys[&t()]["ix_expr"][0].as_deref(),
             Some("lower(x)")
         );
         let u: TableName = "dbo.u".parse().unwrap();
-        advanced.advance(&changes(vec![Change::RenameTable {
+        advanced.advance(&changes(vec![Change::Table(TableChange::RenameTable {
             uid: "t_a1b2c3".parse().unwrap(),
             from: t(),
             to: u.clone(),
             defaults: Vec::new(),
-        }]));
+        })]));
         assert!(advanced.expressions.keys[&u].contains_key("ix_expr"));
-        advanced.advance(&changes(vec![Change::DropIndex {
+        advanced.advance(&changes(vec![Change::Index(IndexChange::DropIndex {
             table: u.clone(),
             name: "ix_expr".into(),
-        }]));
+        })]));
         assert!(
             advanced
                 .expressions
@@ -1512,14 +1535,16 @@ mod tests {
             }),
             ..Table::default()
         };
-        d.advance(&changes(vec![Change::AttachPartition {
-            uid: "t_a1b2c3".parse().unwrap(),
-            table: t(),
-            parent: "dbo.p".parse().unwrap(),
-            bound: crate::PartitionBound::Default,
-            key: Vec::new(),
-            shape: Box::new(shape),
-        }]));
+        d.advance(&changes(vec![Change::Partition(
+            PartitionChange::AttachPartition {
+                uid: "t_a1b2c3".parse().unwrap(),
+                table: t(),
+                parent: "dbo.p".parse().unwrap(),
+                bound: crate::PartitionBound::Default,
+                key: Vec::new(),
+                shape: Box::new(shape),
+            },
+        )]));
         assert_eq!(
             d.expressions.keys[&t()]["ix_expr"],
             [Some("n+m".to_owned())]
@@ -1572,17 +1597,17 @@ mod tests {
             d
         };
         let plan = changes(vec![
-            Change::RenameColumn {
+            Change::Column(ColumnChange::RenameColumn {
                 uid: "c_a1b2c3".parse().unwrap(),
                 table: parent.clone(),
                 from: "m".into(),
                 to: "m2".into(),
                 table_was: None,
-            },
-            Change::DropColumn {
+            }),
+            Change::Column(ColumnChange::DropColumn {
                 uid: "c_d4e5f6".parse().unwrap(),
                 column: crate::ColumnRef::new(parent.clone(), "n"),
-            },
+            }),
         ]);
         let mut d = recorded();
         d.advance_with_partitions(&plan, &state);
@@ -1632,12 +1657,14 @@ mod tests {
         let plain = d.overlay(&schema());
         assert!(!plain.tables[&t()].columns.contains_key("b"));
         let mut advanced = d.clone();
-        advanced.advance(&changes(vec![Change::AlterColumnExpression {
-            uid: "c_a1b2c3".parse().unwrap(),
-            column: t().column("b"),
-            from: "n*2".into(),
-            to: "n*3".into(),
-        }]));
+        advanced.advance(&changes(vec![Change::Column(
+            ColumnChange::AlterColumnExpression {
+                uid: "c_a1b2c3".parse().unwrap(),
+                column: t().column("b"),
+                from: "n*2".into(),
+                to: "n*3".into(),
+            },
+        )]));
         assert_eq!(advanced.expressions.generated[&t()]["b"], "n*3");
     }
 
@@ -1674,13 +1701,13 @@ mod tests {
         );
         let u: TableName = "dbo.u".parse().unwrap();
         d.advance(&changes(vec![
-            Change::AlterColumnDefault {
+            Change::Column(ColumnChange::AlterColumnDefault {
                 uid: "c_aaaaaa".parse().unwrap(),
                 column: ColumnRef::new(t(), "n"),
                 from: Some("0".to_owned()),
                 to: Some("1".to_owned()),
-            },
-            Change::AddColumn {
+            }),
+            Change::Column(ColumnChange::AddColumn {
                 uid: "c_bbbbbb".parse().unwrap(),
                 table: t(),
                 name: "k".into(),
@@ -1689,39 +1716,39 @@ mod tests {
                     c.value_source = crate::ValueSource::Default("GETDATE()".to_owned());
                     c
                 }),
-            },
-            Change::DropCheck {
+            }),
+            Change::Constraint(ConstraintChange::DropCheck {
                 table: t(),
                 name: "ck_n".into(),
-            },
-            Change::AddCheck {
+            }),
+            Change::Constraint(ConstraintChange::AddCheck {
                 table: t(),
                 name: "ck_n".into(),
                 constraint: CheckConstraint {
                     expression: "n > 1".to_owned(),
                 },
-            },
-            Change::RenameColumn {
+            }),
+            Change::Column(ColumnChange::RenameColumn {
                 uid: "c_bbbbbb".parse().unwrap(),
                 table: t(),
                 from: "k".into(),
                 to: "kk".into(),
                 table_was: None,
-            },
-            Change::RenameTable {
+            }),
+            Change::Table(TableChange::RenameTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 from: t(),
                 to: u.clone(),
                 defaults: Vec::new(),
-            },
-            Change::AlterModule {
+            }),
+            Change::Module(ModuleChange::AlterModule {
                 id: "dbo.v".parse().unwrap(),
                 module: Box::new(view("SELECT 2")),
-            },
-            Change::CreateModule {
+            }),
+            Change::Module(ModuleChange::CreateModule {
                 id: "dbo.w".parse().unwrap(),
                 module: Box::new(view("SELECT 3")),
-            },
+            }),
         ]));
         assert!(!d.expressions.defaults.contains_key(&t()), "{d:?}");
         assert_eq!(d.expressions.defaults[&u]["n"], "1");
@@ -1742,15 +1769,15 @@ mod tests {
         assert_eq!(d.modules[&"dbo.w".parse::<ModuleId>().unwrap()], "SELECT 3");
 
         d.advance(&changes(vec![
-            Change::DropTable {
+            Change::Table(TableChange::DropTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: u.clone(),
                 detach_from: None,
-            },
-            Change::DropModule {
+            }),
+            Change::Module(ModuleChange::DropModule {
                 id: "dbo.v".parse().unwrap(),
                 kind: ModuleKind::View,
-            },
+            }),
         ]));
         assert!(d.expressions.is_empty(), "{d:?}");
         assert_eq!(d.modules.len(), 1);
@@ -1890,24 +1917,28 @@ mod tests {
         assert_eq!(x.filter, None);
         // A plan that drops it forgets the record; one that adds it records it.
         let drop = ChangeSet {
-            changes: vec![PlannedChange::new(Change::SetExclusion {
-                table: t(),
-                name: "no_overlap".into(),
-                from: Some(Box::new(excluded())),
-                to: None,
-            })],
+            changes: vec![PlannedChange::new(Change::Constraint(
+                ConstraintChange::SetExclusion {
+                    table: t(),
+                    name: "no_overlap".into(),
+                    from: Some(Box::new(excluded())),
+                    to: None,
+                },
+            ))],
         };
         let mut advanced = declared.clone();
         advanced.advance(&drop);
         assert!(advanced.expressions.exclusion_keys.is_empty());
         assert!(advanced.expressions.exclusion_filters.is_empty());
         let add = ChangeSet {
-            changes: vec![PlannedChange::new(Change::SetExclusion {
-                table: t(),
-                name: "no_overlap".into(),
-                from: None,
-                to: Some(Box::new(excluded())),
-            })],
+            changes: vec![PlannedChange::new(Change::Constraint(
+                ConstraintChange::SetExclusion {
+                    table: t(),
+                    name: "no_overlap".into(),
+                    from: None,
+                    to: Some(Box::new(excluded())),
+                },
+            ))],
         };
         let mut fresh = Declared::default();
         fresh.advance(&add);

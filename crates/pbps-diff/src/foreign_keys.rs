@@ -18,6 +18,9 @@
 use std::collections::BTreeSet;
 
 use pbps_dialect::Dialect;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::TableChange;
 use pbps_model::{Change, ColumnRef, ColumnType, ObjectLocalName, Schema, TableName};
 
 /// A foreign key, as the declarations leave it, whose two ends the engine
@@ -71,7 +74,7 @@ pub fn unjoinable(
     let retyped: BTreeSet<&ColumnRef> = changes
         .iter()
         .filter_map(|change| {
-            if let Change::AlterColumnType { column, .. } = change {
+            if let Change::Column(ColumnChange::AlterColumnType { column, .. }) = change {
                 Some(column)
             } else {
                 None
@@ -80,10 +83,10 @@ pub fn unjoinable(
         .collect();
     let mut introduced = BTreeSet::new();
     for change in changes {
-        if let Change::AddForeignKey { table, name, .. } = change {
+        if let Change::Constraint(ConstraintChange::AddForeignKey { table, name, .. }) = change {
             introduced.insert((table, name));
         }
-        if let Change::CreateTable { name, table, .. } = change {
+        if let Change::Table(TableChange::CreateTable { name, table, .. }) = change {
             introduced.extend(table.foreign_keys.keys().map(|key| (name, key)));
         }
     }
@@ -132,6 +135,8 @@ mod tests {
     use super::*;
     use crate::{Context, DiffError, Side, diff};
     use pbps_dialect::{Dialect, DialectError, MinimalDialect, RetypeDependents};
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
     use pbps_model::{Column, ForeignKey, Hints, IdsFile, Table};
 
     /// `MinimalDialect` with the two answers a dialect gives about keys: which
@@ -299,11 +304,21 @@ mod tests {
         (
             changes
                 .iter()
-                .filter(|c| matches!(c, Change::DropForeignKey { .. }))
+                .filter(|c| {
+                    matches!(
+                        c,
+                        Change::Constraint(ConstraintChange::DropForeignKey { .. })
+                    )
+                })
                 .count(),
             changes
                 .iter()
-                .filter(|c| matches!(c, Change::AddForeignKey { .. }))
+                .filter(|c| {
+                    matches!(
+                        c,
+                        Change::Constraint(ConstraintChange::AddForeignKey { .. })
+                    )
+                })
                 .count(),
         )
     }
@@ -469,7 +484,7 @@ mod tests {
         assert_eq!(
             changes
                 .iter()
-                .filter(|c| matches!(c, Change::AlterColumnType { .. }))
+                .filter(|c| matches!(c, Change::Column(ColumnChange::AlterColumnType { .. })))
                 .count(),
             2
         );

@@ -8,6 +8,9 @@ use crate::certified_fixture::FixtureEmission as _;
 
 use pbps_dialect::Released;
 use pbps_dialect::lower::{Batch, Execution, Lowered, Transaction, lower};
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::TableChange;
 use pbps_model::{
     Change, Column, Index, IndexColumn, IndexKey, Module, ModuleId, ModuleKind, PlannedChange,
     Strategy, Table, TableName,
@@ -39,16 +42,16 @@ fn planned(change: Change, strategy: Strategy) -> PlannedChange {
 }
 
 fn rename(from: &str, to: &str) -> Change {
-    Change::RenameTable {
+    Change::Table(TableChange::RenameTable {
         uid: "t_aaaaaa".parse().unwrap(),
         from: t(from),
         to: t(to),
         defaults: vec![],
-    }
+    })
 }
 
 fn index(key: IndexKey, filter: Option<&str>) -> Change {
-    Change::AddIndex {
+    Change::Index(IndexChange::AddIndex {
         table: t("app.t"),
         name: "ix".into(),
         index: Box::new(Index {
@@ -66,7 +69,7 @@ fn index(key: IndexKey, filter: Option<&str>) -> Change {
             filegroup: None,
         }),
         clustered: false,
-    }
+    })
 }
 
 fn function() -> (ModuleId, Module) {
@@ -156,10 +159,10 @@ fn a_concurrent_index_build_runs_alone_and_outside_the_transaction() {
 fn a_module_change_lowers_to_a_drop_that_releases_it_and_a_create() {
     let (id, module) = function();
     let altered = one(
-        Change::AlterModule {
+        Change::Module(ModuleChange::AlterModule {
             id: id.clone(),
             module: Box::new(module.clone()),
-        },
+        }),
         Strategy::default(),
     );
     assert_eq!(altered.statements().len(), 2, "{altered:?}");
@@ -168,10 +171,10 @@ fn a_module_change_lowers_to_a_drop_that_releases_it_and_a_create() {
         [(0, &Released::Module(id.clone()))]
     );
     let dropped = one(
-        Change::DropModule {
+        Change::Module(ModuleChange::DropModule {
             id: id.clone(),
             kind: ModuleKind::Function,
-        },
+        }),
         Strategy::default(),
     );
     assert_eq!(
@@ -180,10 +183,10 @@ fn a_module_change_lowers_to_a_drop_that_releases_it_and_a_create() {
     );
     // Negative: a create releases nothing.
     let created = one(
-        Change::CreateModule {
+        Change::Module(ModuleChange::CreateModule {
             id,
             module: Box::new(module),
-        },
+        }),
         Strategy::default(),
     );
     assert_eq!(created.releases().count(), 0);
@@ -198,13 +201,13 @@ fn corpus() -> Vec<PlannedChange> {
         .insert("n".into(), Column::new("int".parse().unwrap()));
     vec![
         planned(
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: "t_bbbbbb".parse().unwrap(),
                 name: t("app.t"),
                 table: Box::new(table),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
             Strategy::default(),
         ),
         planned(index(IndexKey::Column("n".into()), None), ONLINE),
@@ -212,25 +215,25 @@ fn corpus() -> Vec<PlannedChange> {
         planned(rename("app.a", "dst.b"), Strategy::default()),
         planned(rename("app.c", "app.d"), Strategy::default()),
         planned(
-            Change::AlterModule {
+            Change::Module(ModuleChange::AlterModule {
                 id: id.clone(),
                 module: Box::new(module),
-            },
+            }),
             Strategy::default(),
         ),
         planned(
-            Change::DropModule {
+            Change::Module(ModuleChange::DropModule {
                 id,
                 kind: ModuleKind::Function,
-            },
+            }),
             Strategy::default(),
         ),
         planned(
-            Change::DropTable {
+            Change::Table(TableChange::DropTable {
                 uid: "t_cccccc".parse().unwrap(),
                 name: t("app.gone"),
                 detach_from: None,
-            },
+            }),
             Strategy::default(),
         ),
     ]

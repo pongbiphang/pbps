@@ -183,7 +183,12 @@ pub fn published(server: &str) {
         .changes
         .iter()
         .filter_map(|p| {
-            if let pbps_model::Change::SetEnsureKeys { table, from, to } = &p.change {
+            if let pbps_model::Change::Row(pbps_model::RowChange::SetEnsureKeys {
+                table,
+                from,
+                to,
+            }) = &p.change
+            {
                 Some((table.raw().to_string(), from.clone(), to.clone()))
             } else {
                 None
@@ -1637,12 +1642,13 @@ pub fn row_security(server: &str, scratch_server: &str) {
     let saved: pbps_model::SavedPlan =
         serde_json::from_str(&std::fs::read_to_string(&artifact).unwrap()).unwrap();
     assert!(saved.changes.changes.iter().any(|step| matches!(
-        &step.change, pbps_model::Change::AddColumn { table, name, .. }
+        &step.change, pbps_model::Change::Column(pbps_model::ColumnChange::AddColumn { table, name, .. })
         if table == &pbps_model::TableName::new("app", "t") && name.raw() == "label"
     )));
     assert!(!saved.changes.changes.iter().any(|step| matches!(
         step.change,
-        pbps_model::Change::CreatePolicy { .. } | pbps_model::Change::SetRowSecurity { .. }
+        pbps_model::Change::Policy(pbps_model::PolicyChange::CreatePolicy { .. })
+            | pbps_model::Change::Policy(pbps_model::PolicyChange::SetRowSecurity { .. })
     )));
     apply();
     assert_eq!(text_of(connection, catalog), before);
@@ -1682,20 +1688,14 @@ row_policies:
         serde_json::from_str(&std::fs::read_to_string(&artifact).unwrap()).unwrap();
     assert_eq!(saved["origin"], "resolved_database", "{saved}");
     let saved: pbps_model::SavedPlan = serde_json::from_value(saved).unwrap();
-    assert!(
-        saved
-            .changes
-            .changes
-            .iter()
-            .any(|p| matches!(p.change, pbps_model::Change::CreatePolicy { .. }))
-    );
-    assert!(
-        saved
-            .changes
-            .changes
-            .iter()
-            .any(|p| matches!(p.change, pbps_model::Change::SetRowSecurity { .. }))
-    );
+    assert!(saved.changes.changes.iter().any(|p| matches!(
+        p.change,
+        pbps_model::Change::Policy(pbps_model::PolicyChange::CreatePolicy { .. })
+    )));
+    assert!(saved.changes.changes.iter().any(|p| matches!(
+        p.change,
+        pbps_model::Change::Policy(pbps_model::PolicyChange::SetRowSecurity { .. })
+    )));
     apply();
     successful(run(&d, &["verify", "--env", "prod"], Some(&targets)));
     assert_eq!(text_of(connection, catalog), before);
@@ -1722,8 +1722,8 @@ row_policies:
     let replacement: pbps_model::SavedPlan =
         serde_json::from_slice(&std::fs::read(&artifact).unwrap()).unwrap();
     assert!(matches!(&replacement.changes.changes[..],[drop,create]
-        if matches!(drop.change,pbps_model::Change::DropPolicy {..})
-        && matches!(create.change,pbps_model::Change::CreatePolicy {..})));
+        if matches!(drop.change,pbps_model::Change::Policy(pbps_model::PolicyChange::DropPolicy {..}))
+        && matches!(create.change,pbps_model::Change::Policy(pbps_model::PolicyChange::CreatePolicy {..}))));
     assert_eq!(
         replacement.changes.gated_risks(),
         [
@@ -2008,6 +2008,9 @@ mod partition1566;
 /// The #1911 round-3/#1896 shape reaches the real producer's final remap,
 /// rather than only comparing hand-built before/after change sets.
 pub fn in_place_default_edits(server: &str, drop_function: bool) {
+    use pbps_model::ColumnChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::PartitionChange;
     use pbps_model::{Change, SavedPlan, resolver::PlanAnalysis};
 
     let slug = format!("in-place-default-1896-{drop_function}");
@@ -2073,17 +2076,20 @@ pub fn in_place_default_edits(server: &str, drop_function: bool) {
             .filter_map(|(i, p)| {
                 // No wildcard arm: a new kind of change is not an edit.
                 if !partition
-                    && let Change::AlterColumnDefault {
+                    && let Change::Column(ColumnChange::AlterColumnDefault {
                         column, from, to, ..
-                    } = &p.change
+                    }) = &p.change
                     && column.table == column_owner
                 {
                     return Some((i, from.clone(), to.clone()));
                 }
                 if partition
-                    && let Change::SetPartitionDefault {
-                        table, from, to, ..
-                    } = &p.change
+                    && let Change::Partition(PartitionChange::SetPartitionDefault {
+                        table,
+                        from,
+                        to,
+                        ..
+                    }) = &p.change
                     && table == &partition_owner
                 {
                     return Some((i, from.clone(), to.clone()));
@@ -2116,7 +2122,9 @@ pub fn in_place_default_edits(server: &str, drop_function: bool) {
         .changes
         .iter()
         .enumerate()
-        .filter_map(|(i, p)| matches!(&p.change, Change::DropModule { .. }).then_some(i))
+        .filter_map(|(i, p)| {
+            matches!(&p.change, Change::Module(ModuleChange::DropModule { .. })).then_some(i)
+        })
         .collect();
     assert_eq!(drops.len(), usize::from(drop_function), "{saved:?}");
     if drop_function {
@@ -2389,7 +2397,8 @@ fn scope_changes(sealed: &Sealed) -> (Vec<pbps_model::Change>, pbps_model::Saved
         .filter(|change| {
             matches!(
                 change,
-                pbps_model::Change::SetDataMode { .. } | pbps_model::Change::SetEnsureKeys { .. }
+                pbps_model::Change::Row(pbps_model::RowChange::SetDataMode { .. })
+                    | pbps_model::Change::Row(pbps_model::RowChange::SetEnsureKeys { .. })
             )
         })
         .collect();
@@ -2399,7 +2408,8 @@ fn scope_changes(sealed: &Sealed) -> (Vec<pbps_model::Change>, pbps_model::Saved
     assert!(
         typed.changes.changes[tail..].iter().all(|planned| matches!(
             planned.change,
-            pbps_model::Change::SetDataMode { .. } | pbps_model::Change::SetEnsureKeys { .. }
+            pbps_model::Change::Row(pbps_model::RowChange::SetDataMode { .. })
+                | pbps_model::Change::Row(pbps_model::RowChange::SetEnsureKeys { .. })
         )),
         "{typed:?}"
     );
@@ -2463,7 +2473,9 @@ pub fn scope_survives_resolution(server: &str) {
     let takeovers: Vec<_> = scope
         .iter()
         .filter_map(|change| {
-            if let pbps_model::Change::SetDataMode { table, from, to } = change {
+            if let pbps_model::Change::Row(pbps_model::RowChange::SetDataMode { table, from, to }) =
+                change
+            {
                 Some((table.raw().to_string(), *from, *to))
             } else {
                 None
@@ -2482,7 +2494,12 @@ pub fn scope_survives_resolution(server: &str) {
     let transitions: Vec<_> = scope
         .iter()
         .filter_map(|change| {
-            if let pbps_model::Change::SetEnsureKeys { table, from, to } = change {
+            if let pbps_model::Change::Row(pbps_model::RowChange::SetEnsureKeys {
+                table,
+                from,
+                to,
+            }) = change
+            {
                 Some((table.raw().to_string(), from.clone(), to.clone()))
             } else {
                 None
@@ -2501,7 +2518,7 @@ pub fn scope_survives_resolution(server: &str) {
     assert!(
         typed.changes.changes.iter().any(|planned| matches!(
             &planned.change,
-            pbps_model::Change::RenameTable { to, .. } if to.raw().to_string() == "app.holdings"
+            pbps_model::Change::Table(pbps_model::TableChange::RenameTable { to, .. }) if to.raw().to_string() == "app.holdings"
         )),
         "the plan renames the table the takeover names: {typed:?}"
     );
@@ -2560,10 +2577,18 @@ pub fn removed_ensure_key_survives_resolution(server: &str) {
         .iter()
         .filter_map(|change| {
             assert!(
-                !matches!(change, pbps_model::Change::SetDataMode { .. }),
+                !matches!(
+                    change,
+                    pbps_model::Change::Row(pbps_model::RowChange::SetDataMode { .. })
+                ),
                 "no takeover is declared: {scope:?}"
             );
-            if let pbps_model::Change::SetEnsureKeys { table, from, to } = change {
+            if let pbps_model::Change::Row(pbps_model::RowChange::SetEnsureKeys {
+                table,
+                from,
+                to,
+            }) = change
+            {
                 Some((table.raw().to_string(), from.clone(), to.clone()))
             } else {
                 None

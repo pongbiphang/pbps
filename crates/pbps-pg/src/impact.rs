@@ -678,6 +678,9 @@ fn mentions_by(body: &str, name: &str, reserved_words_apply: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     fn tname(s: &str) -> TableName {
@@ -696,24 +699,24 @@ mod tests {
     fn targets_are_taken_from_the_old_names() {
         let cs = ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::RenameTable {
+                PlannedChange::new(Change::Table(TableChange::RenameTable {
                     uid: "t_aaaaaa".parse().expect("a uid"),
                     from: tname("app.client"),
                     to: tname("app.customer"),
                     defaults: Vec::new(),
-                }),
-                PlannedChange::new(Change::RenameColumn {
+                })),
+                PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
                     uid: "c_aaaaaa".parse().expect("a uid"),
                     table: tname("app.customer"),
                     from: "email".into(),
                     to: "contact_email".into(),
                     table_was: None,
-                }),
-                PlannedChange::new(Change::DropTable {
+                })),
+                PlannedChange::new(Change::Table(TableChange::DropTable {
                     uid: "t_bbbbbb".parse().expect("a uid"),
                     name: tname("app.old"),
                     detach_from: None,
-                }),
+                })),
             ],
         };
         let after = pbps_model::IdsFile {
@@ -745,19 +748,19 @@ mod tests {
     fn a_column_rename_alone_keeps_the_table_it_names() {
         let cs = ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::RenameTable {
+                PlannedChange::new(Change::Table(TableChange::RenameTable {
                     uid: "t_aaaaaa".parse().expect("a uid"),
                     from: tname("app.order"),
                     to: tname("app.purchase"),
                     defaults: Vec::new(),
-                }),
-                PlannedChange::new(Change::RenameColumn {
+                })),
+                PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
                     uid: "c_aaaaaa".parse().expect("a uid"),
                     table: tname("app.customer"),
                     from: "email".into(),
                     to: "contact_email".into(),
                     table_was: None,
-                }),
+                })),
             ],
         };
         let after = pbps_model::IdsFile {
@@ -790,10 +793,12 @@ mod tests {
     #[test]
     fn a_module_drop_is_left_to_the_module_reader() {
         let cs = ChangeSet {
-            changes: vec![PlannedChange::new(Change::DropModule {
-                id: "app.active_customer".parse().expect("a module id"),
-                kind: pbps_model::ModuleKind::View,
-            })],
+            changes: vec![PlannedChange::new(Change::Module(
+                ModuleChange::DropModule {
+                    id: "app.active_customer".parse().expect("a module id"),
+                    kind: pbps_model::ModuleKind::View,
+                },
+            ))],
         };
         let ids = pbps_model::IdsFile::default();
         let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &ids).unwrap();

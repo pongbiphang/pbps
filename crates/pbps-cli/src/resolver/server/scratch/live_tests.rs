@@ -13,6 +13,7 @@ use super::super::{Error, ProduceError, ResolvedPlan};
 use super::fixtures::{self as cases, ENVIRONMENT, Inputs, ProjectKey, view};
 use pbps_db::{Conn, Driver};
 use pbps_model::Change;
+use pbps_model::ModuleChange;
 use pbps_pg::resolver::standard::Standard;
 
 /// The two pinned servers of `scripts/live-tests-pg.sh`, 18 and 16.
@@ -303,8 +304,8 @@ fn assert_answers_the_overload_from(
         let id: pbps_model::ModuleId = format!("{}.{name}", cases::SCHEMA).parse().unwrap();
         plan.changes.changes.iter().any(|step| {
             matches!(&step.change,
-                Change::DropModule { id: m, .. } | Change::CreateModule { id: m, .. }
-                    | Change::AlterModule { id: m, .. } if *m == id)
+                Change::Module(ModuleChange::DropModule { id: m, .. }) | Change::Module(ModuleChange::CreateModule { id: m, .. })
+                    | Change::Module(ModuleChange::AlterModule { id: m, .. }) if *m == id)
         })
     };
     assert!(touches("v"), "the rebound view is rebuilt");
@@ -1304,7 +1305,7 @@ async fn resolver_answers_xml_fragments_for_a_target_whose_xmloption_is_document
                 assert!(
                     plan.changes.changes.iter().any(|step| matches!(
                         &step.change,
-                        Change::CreateModule { id, .. } if id.name().starts_with(name)
+                        Change::Module(ModuleChange::CreateModule { id, .. }) if id.name().starts_with(name)
                     )),
                     "{server} {how}: the plan creates {name}"
                 );
@@ -2072,7 +2073,7 @@ fn assert_staged(result: Result<ResolvedPlan, ProduceError>, staged: &str, conte
     assert!(sealed, "{context}: {staged} is sealed");
     let created =
         plan.changes.changes.iter().any(
-            |step| matches!(&step.change, Change::CreateModule { id, .. } if id.name() == "b"),
+            |step| matches!(&step.change, Change::Module(ModuleChange::CreateModule { id, .. }) if id.name() == "b"),
         );
     assert!(created, "{context}: the plan creates b");
 }
@@ -2117,7 +2118,7 @@ async fn resolver_a_plan_that_drops_a_managed_view_seals_and_reads_back() {
         plan.changes
             .changes
             .iter()
-            .any(|step| matches!(&step.change, Change::DropModule { id, .. } if id.name() == "b")),
+            .any(|step| matches!(&step.change, Change::Module(ModuleChange::DropModule { id, .. }) if id.name() == "b")),
         "the plan drops b"
     );
     assert_eq!(
@@ -3422,7 +3423,7 @@ async fn resolver_stages_a_routine_in_a_system_schema_by_its_header() {
     plan.evidence.validate(&plan.changes).unwrap();
     let created =
         plan.changes.changes.iter().any(
-            |step| matches!(&step.change, Change::CreateModule { id, .. } if id.name() == "b"),
+            |step| matches!(&step.change, Change::Module(ModuleChange::CreateModule { id, .. }) if id.name() == "b"),
         );
     assert!(created, "the plan creates b");
 }
@@ -4383,7 +4384,7 @@ async fn resolver_stages_an_operator_over_built_in_types_in_the_externals_file()
     plan.evidence.validate(&plan.changes).unwrap();
     let created =
         plan.changes.changes.iter().any(
-            |step| matches!(&step.change, Change::CreateModule { id, .. } if id.name() == "b"),
+            |step| matches!(&step.change, Change::Module(ModuleChange::CreateModule { id, .. }) if id.name() == "b"),
         );
     assert!(created, "the plan creates b");
 }
@@ -5880,7 +5881,9 @@ async fn resolver_generated_table_parts_seal_and_close_plain_exception_and_row_s
                     assert_eq!(
                         plan.changes.changes.iter().any(|p| matches!(
                             p.change,
-                            pbps_model::Change::AlterColumnExpression { .. }
+                            pbps_model::Change::Column(
+                                pbps_model::ColumnChange::AlterColumnExpression { .. }
+                            )
                         )),
                         case == "chain"
                     );

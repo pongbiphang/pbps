@@ -1,5 +1,13 @@
 use super::*;
 use pbps_db::resolver::capture::ObjectIdentity;
+use pbps_model::ConstraintChange;
+use pbps_model::GrantChange;
+use pbps_model::ModuleChange;
+use pbps_model::PolicyChange;
+use pbps_model::RoleChange;
+use pbps_model::TableChange;
+use pbps_model::TypeChange;
+use pbps_model::TypeValueChange;
 use pbps_model::{
     CheckConstraint, Column, ForeignKey, GrantTarget, Index, IndexColumn, Module, Table, TableName,
     Uid, UidKind,
@@ -64,7 +72,7 @@ fn table() -> Table {
 }
 
 fn module(id: &str, kind: ModuleKind, definition: &str) -> Change {
-    Change::CreateModule {
+    Change::Module(ModuleChange::CreateModule {
         id: id.parse().unwrap(),
         module: Box::new(Module {
             kind,
@@ -72,18 +80,18 @@ fn module(id: &str, kind: ModuleKind, definition: &str) -> Change {
             definition: definition.into(),
             options: Default::default(),
         }),
-    }
+    })
 }
 
 fn bootstrap() -> Vec<Change> {
     vec![
-        Change::CreateTable {
+        Change::Table(TableChange::CreateTable {
             uid: Uid::generate(UidKind::Table),
             name: TableName::new("app", "t"),
             table: Box::new(table()),
             beside_default: None,
             moves_at_most: None,
-        },
+        }),
         module(
             "app.f(integer)",
             ModuleKind::Function,
@@ -95,11 +103,11 @@ fn bootstrap() -> Vec<Change> {
             "AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.g()",
         ),
         module("app.v", ModuleKind::View, "SELECT app.f(1) AS x"),
-        Change::Grant {
+        Change::Permission(GrantChange::Grant {
             role: "reader".into(),
             target: GrantTarget::Schema("app".into()),
             permissions: Default::default(),
-        },
+        }),
     ]
 }
 
@@ -171,13 +179,13 @@ fn scratch_table_parts_lower_with_their_source_and_after_change_spelling() {
     table.indexes.remove("plain");
     let reconstruction = build_reconstruction(
         &crate::Postgres::new(),
-        &[Change::CreateTable {
+        &[Change::Table(TableChange::CreateTable {
             uid: Uid::derived(UidKind::Table, "app.t", 0),
             name: TableName::new("app", "t"),
             table: Box::new(table),
             beside_default: None,
             moves_at_most: None,
-        }],
+        })],
     )
     .unwrap();
     let groups = reconstruction.lowered.groups();
@@ -334,21 +342,21 @@ fn a_split_foreign_key_follows_every_table() {
         pbps_model::Column::new("integer".parse().unwrap()),
     );
     let bootstrap = vec![
-        Change::CreateTable {
+        Change::Table(TableChange::CreateTable {
             uid: Uid::generate(UidKind::Table),
             name: child.clone(),
             table: Box::new(referencing),
             beside_default: None,
             moves_at_most: None,
-        },
-        Change::CreateTable {
+        }),
+        Change::Table(TableChange::CreateTable {
             uid: Uid::generate(UidKind::Table),
             name: parent.clone(),
             table: Box::new(keyed),
             beside_default: None,
             moves_at_most: None,
-        },
-        Change::AddForeignKey {
+        }),
+        Change::Constraint(ConstraintChange::AddForeignKey {
             table: child,
             name: "c_fk".into(),
             constraint: Box::new(pbps_model::ForeignKey {
@@ -358,7 +366,7 @@ fn a_split_foreign_key_follows_every_table() {
                 on_delete: Default::default(),
                 on_update: Default::default(),
             }),
-        },
+        }),
         module(
             "app.f()",
             ModuleKind::Function,
@@ -717,19 +725,21 @@ fn a_split_exclusion_is_a_step_of_its_own_after_its_table_and_a_drop_is_refused(
         storage_parameters: Default::default(),
         timing: pbps_model::ExclusionTiming::Immediate,
     };
-    let set = |from, to| Change::SetExclusion {
-        table: table.clone(),
-        name: "one_per_room".into(),
-        from,
-        to,
+    let set = |from, to| {
+        Change::Constraint(ConstraintChange::SetExclusion {
+            table: table.clone(),
+            name: "one_per_room".into(),
+            from,
+            to,
+        })
     };
-    let create = Change::CreateTable {
+    let create = Change::Table(TableChange::CreateTable {
         uid: Uid::generate(UidKind::Table),
         name: table.clone(),
         table: Box::new(created),
         beside_default: None,
         moves_at_most: None,
-    };
+    });
     let reconstruction = build_reconstruction(
         &crate::Postgres::new(),
         &[create.clone(), set(None, Some(Box::new(exclusion.clone())))],
@@ -769,11 +779,11 @@ fn a_split_exclusion_is_a_step_of_its_own_after_its_table_and_a_drop_is_refused(
 fn a_change_no_bootstrap_contains_is_refused_by_kind() {
     let refused = build_reconstruction(
         &crate::Postgres::new(),
-        &[Change::DropTable {
+        &[Change::Table(TableChange::DropTable {
             uid: Uid::generate(UidKind::Table),
             name: TableName::new("app", "t"),
             detach_from: None,
-        }],
+        })],
     )
     .unwrap_err();
     assert!(matches!(refused, ReconstructError::Unsupported(ref op) if op == "drop_table"));
@@ -807,13 +817,13 @@ fn an_index_replica_identity_is_set_after_its_index() {
         },
     );
     t.replica_identity = Some(pbps_model::ReplicaIdentity::Index("t_id".into()));
-    let bootstrap = [Change::CreateTable {
+    let bootstrap = [Change::Table(TableChange::CreateTable {
         uid: Uid::derived(UidKind::Table, "app.t", 0),
         name: TableName::new("app", "t"),
         table: Box::new(t),
         beside_default: None,
         moves_at_most: None,
-    }];
+    })];
     let reconstruction = build_reconstruction(&crate::Postgres::new(), &bootstrap).unwrap();
     // Nothing in it holds an expression, so it is one step, and its own
     // statements put the identity after the index it names.
@@ -1247,13 +1257,13 @@ fn placeholder_bindings_are_measured_at_the_real_expression_and_fill_uses_the_co
         .columns
         .insert("z".into(), Column::new("integer".parse().unwrap()));
     let changes = vec![
-        Change::CreateTable {
+        Change::Table(TableChange::CreateTable {
             uid: Uid::generate(UidKind::Table),
             name: TableName::new("app", "a"),
             table: Box::new(table),
             beside_default: None,
             moves_at_most: None,
-        },
+        }),
         module(
             "app.f(integer)",
             ModuleKind::Function,
@@ -1314,13 +1324,13 @@ fn scratch_transitive_readers_share_lexical_and_declared_dependency_closures() {
         .insert("z".into(), Column::new("integer".parse().unwrap()));
     for declared in [false, true] {
         let changes = vec![
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid: Uid::generate(UidKind::Table),
                 name: TableName::new("app", "a"),
                 table: Box::new(table.clone()),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
             module(
                 "app.g(integer)",
                 ModuleKind::Function,
@@ -1402,9 +1412,9 @@ fn row_security_bootstraps_keep_the_namespace_without_claiming_policy_bindings()
         (true, true, true),
     ] {
         let mut changes = bootstrap();
-        let Change::CreateTable {
+        let Change::Table(TableChange::CreateTable {
             uid, name, table, ..
-        } = &mut changes[0]
+        }) = &mut changes[0]
         else {
             panic!("the fixture starts with a table");
         };
@@ -1419,21 +1429,21 @@ fn row_security_bootstraps_keep_the_namespace_without_claiming_policy_bindings()
         };
         if with_policy {
             table.row_policies.insert("visible".into(), policy.clone());
-            changes.push(Change::CreatePolicy {
+            changes.push(Change::Policy(PolicyChange::CreatePolicy {
                 table: name.clone(),
                 name: "visible".into(),
                 policy,
                 origin: RowSecurityOrigin::Created,
-            });
+            }));
         }
         if !flags.is_default() {
-            changes.push(Change::SetRowSecurity {
+            changes.push(Change::Policy(PolicyChange::SetRowSecurity {
                 uid,
                 table: name,
                 from: RowSecurity::default(),
                 to: flags,
                 origin: RowSecurityOrigin::Created,
-            });
+            }));
         }
         let recipe = build_reconstruction(&dialect, &changes).unwrap();
         assert_eq!(statements(&recipe), expected);
@@ -1446,17 +1456,17 @@ fn an_earlier_emission_refusal_precedes_a_later_unsupported_change() {
     let pg = crate::Postgres::new();
     let table = TableName::new("app", "bad\0name");
     let changes = [
-        Change::CreateTable {
+        Change::Table(TableChange::CreateTable {
             uid: "t_aaaaaa".parse().unwrap(),
             name: table.clone(),
             table: Box::new(Table::default()),
             beside_default: None,
             moves_at_most: None,
-        },
-        Change::CreateRole {
+        }),
+        Change::Role(RoleChange::CreateRole {
             uid: "r_aaaaaa".parse().unwrap(),
             name: "later".into(),
-        },
+        }),
     ];
     let reason = crate::emit::emit(&pg, &changes[0], pbps_model::Strategy::default())
         .unwrap_err()
@@ -1469,11 +1479,11 @@ fn an_earlier_emission_refusal_precedes_a_later_unsupported_change() {
 }
 
 fn create_type(name: &str, definition: pbps_model::ManagedType) -> Change {
-    Change::CreateType {
+    Change::Type(TypeChange::CreateType {
         uid: Uid::generate(UidKind::Type),
         name: name.parse().unwrap(),
         definition: Box::new(definition),
-    }
+    })
 }
 
 fn mood() -> pbps_model::ManagedType {
@@ -1506,13 +1516,13 @@ fn a_declared_type_is_created_before_the_tables_and_modules_that_name_it() {
         .columns
         .insert("s".into(), Column::new("app.moody".parse().unwrap()));
     let changes = [
-        Change::CreateTable {
+        Change::Table(TableChange::CreateTable {
             uid: Uid::generate(UidKind::Table),
             name: TableName::new("app", "t"),
             table: Box::new(typed),
             beside_default: None,
             moves_at_most: None,
-        },
+        }),
         module("app.v", ModuleKind::View, "SELECT m FROM app.t"),
         create_type("app.mood", mood()),
         create_type("app.moody", domain_over("app.mood")),
@@ -1558,22 +1568,22 @@ fn only_the_creation_of_a_type_is_part_of_a_bootstrap() {
     let pg = crate::Postgres::new();
     for (change, op) in [
         (
-            Change::DropType {
+            Change::Type(TypeChange::DropType {
                 uid: Uid::generate(UidKind::Type),
                 name: "app.mood".parse().unwrap(),
                 definition: Box::new(mood()),
-            },
+            }),
             "drop_type",
         ),
         (
-            Change::AddEnumValue {
+            Change::TypeValue(TypeValueChange::AddEnumValue {
                 uid: Uid::generate(UidKind::Type),
                 name: "app.mood".parse().unwrap(),
                 value: "meh".into(),
                 placement: None,
                 ordinal: 0,
                 definition: Box::new(mood()),
-            },
+            }),
             "add_enum_value",
         ),
     ] {
@@ -1758,16 +1768,16 @@ fn fills_follow_annotated_facets_and_cannot_bypass_a_creation_cycle() {
     column.value_source = ValueSource::Default("1".into());
     shape.columns.insert("x".into(), column);
     let changes = [
-        Change::CreateTable {
+        Change::Table(TableChange::CreateTable {
             uid: "t_aaaaaa".parse().unwrap(),
             name: "app.t".parse().unwrap(),
             table: Box::new(shape.clone()),
             beside_default: None,
             moves_at_most: None,
-        },
+        }),
         module("app.v", ModuleKind::View, "SELECT 1 AS x"),
     ];
-    let Change::CreateModule { id, module } = &changes[1] else {
+    let Change::Module(ModuleChange::CreateModule { id, module }) = &changes[1] else {
         panic!()
     };
     let schema = Schema {

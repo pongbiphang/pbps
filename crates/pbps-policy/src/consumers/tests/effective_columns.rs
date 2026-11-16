@@ -1,4 +1,8 @@
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
+use pbps_model::TypeValueChange;
 
 #[test]
 fn real_collation_changes_are_unproven_for_readers_and_writers() {
@@ -22,7 +26,7 @@ fn real_collation_changes_are_unproven_for_readers_and_writers() {
         .get_mut("old")
         .unwrap()
         .collation = to.clone();
-    let change = Change::AlterColumnType {
+    let change = Change::Column(ColumnChange::AlterColumnType {
         uid: uid("c_aaaaaa"),
         column: name().column("old"),
         from: ColumnType::simple("text"),
@@ -33,7 +37,7 @@ fn real_collation_changes_are_unproven_for_readers_and_writers() {
         to_collation: to,
         through_external_partitions: false,
         using: None,
-    };
+    });
     for writes in [false, true] {
         let found = findings(
             &before,
@@ -140,23 +144,23 @@ fn ordinary_edits_classify_the_effective_interface_with_literal_cells() {
         column(&mut after).nullable = now_nullable;
         column(&mut after).value_source =
             now.map_or(ValueSource::None, |v| ValueSource::Default(v.into()));
-        let mut changes = vec![Change::AlterColumnDefault {
+        let mut changes = vec![Change::Column(ColumnChange::AlterColumnDefault {
             uid: uid("c_aaaaaa"),
             column: name().column("old"),
             from: was.map(str::to_owned),
             to: now.map(str::to_owned),
-        }];
+        })];
         if was_nullable != now_nullable {
             changes = vec![
-                Change::AlterColumnNullability {
+                Change::Column(ColumnChange::AlterColumnNullability {
                     uid: uid("c_aaaaaa"),
                     column: name().column("old"),
                     ty: column(&mut after).ty.clone(),
                     to_nullable: now_nullable,
                     collation: None,
                     through_external_partitions: false,
-                },
-                Change::AlterColumnType {
+                }),
+                Change::Column(ColumnChange::AlterColumnType {
                     uid: uid("c_aaaaaa"),
                     column: name().column("old"),
                     from: "app.d".parse().unwrap(),
@@ -167,7 +171,7 @@ fn ordinary_edits_classify_the_effective_interface_with_literal_cells() {
                     to_collation: None,
                     through_external_partitions: false,
                     using: None,
-                },
+                }),
             ];
         }
         for change in changes {
@@ -235,7 +239,7 @@ fn domain_value_contexts_keep_null_arrays_and_nested_elements_separate() {
             .insert(uid("y_aaaaaa"), "app.outer".parse().unwrap());
         for rebuild in [false, true] {
             let change = if rebuild {
-                Change::EnumRebuild {
+                Change::TypeValue(TypeValueChange::EnumRebuild {
                     uid: uid("y_aaaaaa"),
                     name: "app.outer".parse().unwrap(),
                     tmp: "app.tmp".parse().unwrap(),
@@ -246,9 +250,9 @@ fn domain_value_contexts_keep_null_arrays_and_nested_elements_separate() {
                         over: None,
                         why: Some("array element constraint".into()),
                     },
-                }
+                })
             } else {
-                Change::AlterDomain {
+                Change::TypeValue(TypeValueChange::AlterDomain {
                     uid: uid("y_aaaaaa"),
                     name: "app.outer".parse().unwrap(),
                     from: Box::new(outer.clone()),
@@ -258,7 +262,7 @@ fn domain_value_contexts_keep_null_arrays_and_nested_elements_separate() {
                     } else {
                         pbps_model::DomainHalf::Loosen
                     },
-                }
+                })
             };
             for (writes, count) in [false, true].into_iter().zip(expected) {
                 let found = findings(
@@ -310,12 +314,12 @@ fn new_columns_use_effective_nullability_and_only_whole_value_supply() {
             .columns
             .insert("added".into(), spec.clone());
         new.columns.insert(uid("c_bbbbbb"), name().column("added"));
-        let change = Change::AddColumn {
+        let change = Change::Column(ColumnChange::AddColumn {
             uid: uid("c_bbbbbb"),
             table: name(),
             name: "added".into(),
             column: Box::new(spec),
-        };
+        });
         for (writes, count) in [(false, 0), (true, expected)] {
             let found = findings(
                 &before,
@@ -333,13 +337,13 @@ fn new_columns_use_effective_nullability_and_only_whole_value_supply() {
         }
         let mut empty = before.clone();
         empty.tables.clear();
-        let created = Change::CreateTable {
+        let created = Change::Table(TableChange::CreateTable {
             uid: uid("t_aaaaaa"),
             name: name(),
             table: Box::new(after.tables[&name()].clone()),
             beside_default: None,
             moves_at_most: None,
-        };
+        });
         assert!(
             findings(
                 &empty,
@@ -394,20 +398,20 @@ fn partition_local_overrides_compare_before_and_after_on_the_owning_uid() {
         .entry("old".into())
         .or_default()
         .not_null = true;
-    let local = Change::SetPartitionNotNull {
+    let local = Change::Partition(PartitionChange::SetPartitionNotNull {
         uid: uid("t_bbbbbb"),
         table: leaf.clone(),
         column: "old".into(),
         not_null: true,
-    };
-    let parent = Change::AlterColumnNullability {
+    });
+    let parent = Change::Column(ColumnChange::AlterColumnNullability {
         uid: uid("c_aaaaaa"),
         column: name().column("old"),
         ty: ColumnType::simple("integer"),
         to_nullable: true,
         collation: None,
         through_external_partitions: false,
-    };
+    });
     for (entry, writes, count) in [
         ("app.leaf.old", false, 0),
         ("app.leaf.old", true, 0),
@@ -454,7 +458,7 @@ fn partition_local_overrides_compare_before_and_after_on_the_owning_uid() {
         .entry("old".into())
         .or_default()
         .default = Some("1".into());
-    let edit = Change::SetPartitionDefault {
+    let edit = Change::Partition(PartitionChange::SetPartitionDefault {
         uid: uid("t_bbbbbb"),
         table: leaf.clone(),
         parent: name(),
@@ -462,7 +466,7 @@ fn partition_local_overrides_compare_before_and_after_on_the_owning_uid() {
         from: Some("1".into()),
         to: None,
         fallback: Some("1".into()),
-    };
+    });
     assert!(
         findings(
             &before,
@@ -476,7 +480,7 @@ fn partition_local_overrides_compare_before_and_after_on_the_owning_uid() {
     );
     column(&mut after).value_source = ValueSource::Default("2".into());
     let mut edit = edit;
-    if let Change::SetPartitionDefault { fallback, .. } = &mut edit {
+    if let Change::Partition(PartitionChange::SetPartitionDefault { fallback, .. }) = &mut edit {
         *fallback = Some("2".into());
     }
     assert_eq!(
@@ -537,12 +541,12 @@ fn inherited_column_addresses_follow_the_source_uid_across_a_rename() {
         let mut new = old.clone();
         new.columns
             .insert(uid("c_aaaaaa"), name().column("renamed"));
-        let change = Change::SetPartitionNotNull {
+        let change = Change::Partition(PartitionChange::SetPartitionNotNull {
             uid: uid("t_bbbbbb"),
             table: leaf,
             column: "old".into(),
             not_null: true,
-        };
+        });
         assert_eq!(
             findings(
                 &before,
@@ -591,28 +595,28 @@ fn ordinary_column_uids_do_not_follow_a_reused_name() {
         new.columns.insert(uid("c_bbbbbb"), name().column("x"));
         let changes = ChangeSet {
             changes: vec![
-                Change::RenameColumn {
+                Change::Column(ColumnChange::RenameColumn {
                     uid: uid("c_aaaaaa"),
                     table: name(),
                     from: "x".into(),
                     to: "z".into(),
                     table_was: None,
-                },
-                Change::RenameColumn {
+                }),
+                Change::Column(ColumnChange::RenameColumn {
                     uid: uid("c_bbbbbb"),
                     table: name(),
                     from: "y".into(),
                     to: "x".into(),
                     table_was: None,
-                },
-                Change::AlterColumnNullability {
+                }),
+                Change::Column(ColumnChange::AlterColumnNullability {
                     uid: uid(changed_uid),
                     column: name().column(changed_name),
                     ty: ColumnType::simple("integer"),
                     to_nullable: true,
                     collation: None,
                     through_external_partitions: false,
-                },
+                }),
             ]
             .into_iter()
             .map(PlannedChange::new)

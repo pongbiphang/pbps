@@ -61,8 +61,8 @@ pub fn creates(
         .collect();
     created
         .iter()
-        .map(
-            |(name, (uid, definition))| pbps_model::Change::CreateExtension {
+        .map(|(name, (uid, definition))| {
+            pbps_model::Change::Extension(pbps_model::ExtensionChange::CreateExtension {
                 uid: (*uid).clone(),
                 name: (*name).clone(),
                 definition: (*definition).clone(),
@@ -73,8 +73,8 @@ pub fn creates(
                     .filter_map(|required| created.get(required))
                     .map(|(uid, _)| (*uid).clone())
                     .collect(),
-            },
-        )
+            })
+        })
         .collect()
 }
 
@@ -211,15 +211,17 @@ pub fn drops(
             });
             continue;
         }
-        changes.push(pbps_model::Change::DropExtension {
-            uid: (*uid).clone(),
-            name: (*name).clone(),
-            definition: (*definition).clone(),
-            requirers,
-            releases,
-            index_releases,
-            search_releases,
-        });
+        changes.push(pbps_model::Change::Extension(
+            pbps_model::ExtensionChange::DropExtension {
+                uid: (*uid).clone(),
+                name: (*name).clone(),
+                definition: (*definition).clone(),
+                requirers,
+                releases,
+                index_releases,
+                search_releases,
+            },
+        ));
     }
     (changes, errors)
 }
@@ -285,27 +287,29 @@ pub fn updates(
                 .filter_map(|m| m.module(removed.iter().copied()).cloned())
                 .collect::<Vec<_>>()
         };
-        changes.push(pbps_model::Change::UpdateExtension {
-            uid: uid.clone(),
-            name: name.clone(),
-            from: from.clone(),
-            // Beside a move the update runs first, in the schema the package
-            // holds now, and the move starts from where it leaves it
-            // (DEC-2447.11).
-            to: pbps_model::Extension {
-                schema: from.schema.clone(),
-                version: to.version.clone(),
+        changes.push(pbps_model::Change::Extension(
+            pbps_model::ExtensionChange::UpdateExtension {
+                uid: uid.clone(),
+                name: name.clone(),
+                from: from.clone(),
+                // Beside a move the update runs first, in the schema the package
+                // holds now, and the move starts from where it leaves it
+                // (DEC-2447.11).
+                to: pbps_model::Extension {
+                    schema: from.schema.clone(),
+                    version: to.version.clone(),
+                },
+                requires: facts
+                    .requires
+                    .iter()
+                    .filter_map(|required| created.get(required).map(|uid| (*uid).clone()))
+                    .collect(),
+                releases: carried(&facts.reach.outside)
+                    .into_iter()
+                    .chain(carried(&facts.reach.blockers))
+                    .collect(),
             },
-            requires: facts
-                .requires
-                .iter()
-                .filter_map(|required| created.get(required).map(|uid| (*uid).clone()))
-                .collect(),
-            releases: carried(&facts.reach.outside)
-                .into_iter()
-                .chain(carried(&facts.reach.blockers))
-                .collect(),
-        });
+        ));
     }
     (changes, errors)
 }
@@ -356,19 +360,21 @@ pub fn moves(
             });
             continue;
         };
-        changes.push(pbps_model::Change::SetExtensionSchema {
-            uid: uid.clone(),
-            name: name.clone(),
-            from: pbps_model::Extension {
-                schema: from.schema.clone(),
-                version: to.version.clone(),
+        changes.push(pbps_model::Change::Extension(
+            pbps_model::ExtensionChange::SetExtensionSchema {
+                uid: uid.clone(),
+                name: name.clone(),
+                from: pbps_model::Extension {
+                    schema: from.schema.clone(),
+                    version: to.version.clone(),
+                },
+                to: to.clone(),
+                releases: members
+                    .iter()
+                    .filter_map(|m| m.module(removed.iter().copied()).cloned())
+                    .collect(),
             },
-            to: to.clone(),
-            releases: members
-                .iter()
-                .filter_map(|m| m.module(removed.iter().copied()).cloned())
-                .collect(),
-        });
+        ));
     }
     (changes, errors)
 }
@@ -736,7 +742,12 @@ pub fn package_moves(changes: &pbps_model::ChangeSet) -> Vec<(&str, &str)> {
         .changes
         .iter()
         .filter_map(|p| {
-            let pbps_model::Change::SetExtensionSchema { from, to, .. } = &p.change else {
+            let pbps_model::Change::Extension(pbps_model::ExtensionChange::SetExtensionSchema {
+                from,
+                to,
+                ..
+            }) = &p.change
+            else {
                 return None;
             };
             Some((from.schema.as_str(), to.schema.as_str()))
@@ -752,21 +763,29 @@ pub fn package_moves(changes: &pbps_model::ChangeSet) -> Vec<(&str, &str)> {
 pub(crate) fn depths<'a>(
     changes: impl Iterator<Item = &'a pbps_model::Change>,
 ) -> std::collections::BTreeMap<pbps_model::Uid, isize> {
-    let requires: std::collections::BTreeMap<_, _> = changes
-        .filter_map(|c| {
-            if let pbps_model::Change::CreateExtension { uid, requires, .. }
-            | pbps_model::Change::UpdateExtension { uid, requires, .. } = c
-            {
-                Some((uid, requires))
-            // A drop waits for the drops of the packages that require it: the
-            // same shape, from the other side (DEC-2447.8).
-            } else if let pbps_model::Change::DropExtension { uid, requirers, .. } = c {
-                Some((uid, requirers))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let requires: std::collections::BTreeMap<_, _> =
+        changes
+            .filter_map(|c| {
+                if let pbps_model::Change::Extension(
+                    pbps_model::ExtensionChange::CreateExtension { uid, requires, .. },
+                )
+                | pbps_model::Change::Extension(
+                    pbps_model::ExtensionChange::UpdateExtension { uid, requires, .. },
+                ) = c
+                {
+                    Some((uid, requires))
+                // A drop waits for the drops of the packages that require it: the
+                // same shape, from the other side (DEC-2447.8).
+                } else if let pbps_model::Change::Extension(
+                    pbps_model::ExtensionChange::DropExtension { uid, requirers, .. },
+                ) = c
+                {
+                    Some((uid, requirers))
+                } else {
+                    None
+                }
+            })
+            .collect();
     fn depth<'a>(
         uid: &'a pbps_model::Uid,
         requires: &std::collections::BTreeMap<&'a pbps_model::Uid, &'a BTreeSet<pbps_model::Uid>>,
@@ -905,7 +924,11 @@ pub fn prerequisite_differences(
         }
     }
     for change in creates(base, desired, dialect, &Default::default()) {
-        if let pbps_model::Change::CreateExtension { name, .. } = change {
+        if let pbps_model::Change::Extension(pbps_model::ExtensionChange::CreateExtension {
+            name,
+            ..
+        }) = change
+        {
             errors.push(DiffError::ExtensionLifecycleUnsupported {
                 name,
                 action: "CREATE EXTENSION".into(),
@@ -963,7 +986,7 @@ mod tests {
                 assert!(
                     matches!(
                         planned.as_slice(),
-                        [pbps_model::Change::CreateExtension { name: n, .. }] if n.raw() == name
+                        [pbps_model::Change::Extension(pbps_model::ExtensionChange::CreateExtension { name: n, .. })] if n.raw() == name
                     ),
                     "{planned:?}"
                 );
@@ -1317,7 +1340,7 @@ mod tests {
         let (changes, errors) = w.drops(&facts("citext", &[], &[]));
         assert!(errors.is_empty(), "{errors:?}");
         let [
-            pbps_model::Change::DropExtension {
+            pbps_model::Change::Extension(pbps_model::ExtensionChange::DropExtension {
                 uid: u,
                 name,
                 definition,
@@ -1325,7 +1348,7 @@ mod tests {
                 releases,
                 index_releases: _,
                 search_releases: _,
-            },
+            }),
         ] = changes.as_slice()
         else {
             panic!("{changes:?}")
@@ -1422,7 +1445,13 @@ mod tests {
         };
         let (changes, errors) = w.drops(&facts("citext", std::slice::from_ref(&marked), &[]));
         assert!(errors.is_empty(), "{errors:?}");
-        let [pbps_model::Change::DropExtension { releases, .. }] = changes.as_slice() else {
+        let [
+            pbps_model::Change::Extension(pbps_model::ExtensionChange::DropExtension {
+                releases,
+                ..
+            }),
+        ] = changes.as_slice()
+        else {
             panic!("{changes:?}")
         };
         assert_eq!(releases.iter().collect::<Vec<_>>(), [&routine("marked")]);
@@ -1459,7 +1488,7 @@ mod tests {
         let (changes, errors) = with_view.drops(&facts("citext", &[], &[rule]));
         assert!(errors.is_empty(), "{errors:?}");
         assert!(
-            matches!(changes.as_slice(), [pbps_model::Change::DropExtension { releases, .. }] if releases.len() == 1)
+            matches!(changes.as_slice(), [pbps_model::Change::Extension(pbps_model::ExtensionChange::DropExtension { releases, .. })] if releases.len() == 1)
         );
     }
 
@@ -1483,9 +1512,10 @@ mod tests {
         let (changes, errors) = w.drops(&facts("dict_int", &[], std::slice::from_ref(&blocker)));
         assert!(errors.is_empty(), "{errors:?}");
         let [
-            pbps_model::Change::DropExtension {
-                search_releases, ..
-            },
+            pbps_model::Change::Extension(pbps_model::ExtensionChange::DropExtension {
+                search_releases,
+                ..
+            }),
         ] = changes.as_slice()
         else {
             panic!("{changes:?}")
@@ -1535,7 +1565,13 @@ mod tests {
         w.desired.tables.insert(table.clone(), Table::default());
         let (changes, errors) = w.drops(&facts("pg_trgm", &[], std::slice::from_ref(&blocker)));
         assert!(errors.is_empty(), "{errors:?}");
-        let [pbps_model::Change::DropExtension { index_releases, .. }] = changes.as_slice() else {
+        let [
+            pbps_model::Change::Extension(pbps_model::ExtensionChange::DropExtension {
+                index_releases,
+                ..
+            }),
+        ] = changes.as_slice()
+        else {
             panic!("{changes:?}")
         };
         assert_eq!(
@@ -1584,9 +1620,11 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         let by_name = |wanted: &str| {
             changes.iter().find_map(|c| {
-                if let pbps_model::Change::DropExtension {
-                    name, requirers, ..
-                } = c
+                if let pbps_model::Change::Extension(pbps_model::ExtensionChange::DropExtension {
+                    name,
+                    requirers,
+                    ..
+                }) = c
                     && name.raw() == wanted
                 {
                     Some(requirers.clone())
@@ -1826,13 +1864,13 @@ mod tests {
         let (changes, errors) = run(&base, &base_ids, &desired, &desired_ids, &facts);
         assert!(errors.is_empty(), "{errors:?}");
         let [
-            pbps_model::Change::UpdateExtension {
+            pbps_model::Change::Extension(pbps_model::ExtensionChange::UpdateExtension {
                 from,
                 to,
                 requires,
                 releases,
                 ..
-            },
+            }),
         ] = changes.as_slice()
         else {
             panic!("{changes:?}")
@@ -1877,7 +1915,12 @@ mod tests {
             ..Default::default()
         };
         let (beside, _) = run(&base, &base_ids, &moved, &desired_ids, &facts);
-        let [pbps_model::Change::UpdateExtension { to, .. }] = beside.as_slice() else {
+        let [
+            pbps_model::Change::Extension(pbps_model::ExtensionChange::UpdateExtension {
+                to, ..
+            }),
+        ] = beside.as_slice()
+        else {
             panic!("{beside:?}")
         };
         assert_eq!((to.schema.as_str(), to.version.as_str()), ("ext", "1.6"));
@@ -2503,9 +2546,12 @@ mod tests {
         let (changes, errors) = run(&base, &desired, &facts, "postgres");
         assert!(errors.is_empty(), "{errors:?}");
         let [
-            pbps_model::Change::SetExtensionSchema {
-                from, to, releases, ..
-            },
+            pbps_model::Change::Extension(pbps_model::ExtensionChange::SetExtensionSchema {
+                from,
+                to,
+                releases,
+                ..
+            }),
         ] = changes.as_slice()
         else {
             panic!("{changes:?}")
@@ -2521,7 +2567,14 @@ mod tests {
             ..desired.clone()
         };
         let (beside, _) = run(&base, &newer, &facts, "postgres");
-        let [pbps_model::Change::SetExtensionSchema { from, to, .. }] = beside.as_slice() else {
+        let [
+            pbps_model::Change::Extension(pbps_model::ExtensionChange::SetExtensionSchema {
+                from,
+                to,
+                ..
+            }),
+        ] = beside.as_slice()
+        else {
             panic!("a move beside an update: {beside:?}")
         };
         assert_eq!((from.version.as_str(), to.version.as_str()), ("1.6", "1.6"));

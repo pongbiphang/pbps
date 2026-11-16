@@ -1,4 +1,6 @@
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::ModuleChange;
 use pbps_model::operation::{ModuleEdits, Operations};
 
 #[test]
@@ -12,14 +14,14 @@ fn provider_availability_uses_the_module_edit_policy_not_two_boundaries() {
     f.after.modules.remove(&"app.f".parse().unwrap());
     let base = dependencies(&[("app.f", &["app.provider"])]);
     let changes = vec![
-        Change::AlterModule {
+        Change::Module(ModuleChange::AlterModule {
             id: "app.provider".parse().unwrap(),
             module: Box::new(view()),
-        },
-        Change::DropModule {
+        }),
+        Change::Module(ModuleChange::DropModule {
             id: "app.f".parse().unwrap(),
             kind: ModuleKind::View,
-        },
+        }),
     ];
     for modules in [ModuleEdits::Rebuilt, ModuleEdits::InPlace] {
         for tracked in [false, true] {
@@ -61,14 +63,14 @@ fn in_place_availability_does_not_remove_install_or_consumer_release_edges() {
         let plan = f
             .plan_with_modules(
                 vec![
-                    Change::AlterModule {
+                    Change::Module(ModuleChange::AlterModule {
                         id: "app.provider".parse().unwrap(),
                         module: Box::new(view()),
-                    },
-                    Change::AlterModule {
+                    }),
+                    Change::Module(ModuleChange::AlterModule {
                         id: "app.f".parse().unwrap(),
                         module: Box::new(view()),
-                    },
+                    }),
                 ],
                 &ObjectDeps::default(),
                 &deps,
@@ -83,14 +85,14 @@ fn in_place_availability_does_not_remove_install_or_consumer_release_edges() {
     let plan = f
         .plan_with_modules(
             vec![
-                Change::DropModule {
+                Change::Module(ModuleChange::DropModule {
                     id: "app.provider".parse().unwrap(),
                     kind: ModuleKind::View,
-                },
-                Change::AlterModule {
+                }),
+                Change::Module(ModuleChange::AlterModule {
                     id: "app.f".parse().unwrap(),
                     module: Box::new(view()),
-                },
+                }),
             ],
             &deps,
             &ObjectDeps::default(),
@@ -146,16 +148,16 @@ fn replacing_a_facet_does_not_prove_continuous_provider_availability() {
     let plan = f
         .plan_with_modules(
             vec![
-                Change::AlterColumnDefault {
+                Change::Column(ColumnChange::AlterColumnDefault {
                     uid: "c_aaaaaa".parse().unwrap(),
                     column: "app.t.x".parse().unwrap(),
                     from: Some("1".into()),
                     to: Some("2".into()),
-                },
-                Change::DropModule {
+                }),
+                Change::Module(ModuleChange::DropModule {
                     id: "app.f".parse().unwrap(),
                     kind: ModuleKind::View,
-                },
+                }),
             ],
             &dependencies(&[("app.f", &["default::app.t.x"])]),
             &ObjectDeps::default(),

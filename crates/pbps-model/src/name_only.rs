@@ -28,6 +28,7 @@
 //! Moving a kind from here to the planned kinds is one edit in [`Schema::classify`]
 //! and its inverse, and every consumer follows.
 
+use crate::SearchChange;
 use crate::{
     Change, ChangeSet, ColumnType, IdsFile, ManagedType, ObjectName, Schema, SearchObject,
     SearchRef, Sequence,
@@ -236,7 +237,7 @@ impl NameOnly {
             .changes
             .iter()
             .filter_map(|planned| {
-                if let Change::CreateSearch { name, .. } = &planned.change {
+                if let Change::Search(SearchChange::CreateSearch { name, .. }) = &planned.change {
                     Some(name)
                 } else {
                     None

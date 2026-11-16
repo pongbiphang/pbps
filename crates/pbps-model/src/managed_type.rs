@@ -290,6 +290,7 @@ fn is_zero(n: &usize) -> bool {
 #[cfg(test)]
 mod label_tests {
     use super::*;
+    use crate::TypeValueChange;
     use crate::{Change, RiskClass};
 
     #[test]
@@ -299,24 +300,24 @@ mod label_tests {
         let definition = Box::new(ManagedType::Enum {
             values: vec!["blue".into()],
         });
-        let addition = Change::AddEnumValue {
+        let addition = Change::TypeValue(TypeValueChange::AddEnumValue {
             uid,
             name,
             value: "blue".into(),
             placement: None,
             ordinal: 0,
             definition,
-        };
-        let Change::AddEnumValue {
+        });
+        let Change::TypeValue(TypeValueChange::AddEnumValue {
             uid,
             name,
             definition,
             ..
-        } = addition.clone()
+        }) = addition.clone()
         else {
             unreachable!()
         };
-        let rename = Change::RenameEnumValue {
+        let rename = Change::TypeValue(TypeValueChange::RenameEnumValue {
             uid,
             name,
             from: "sad".into(),
@@ -324,7 +325,7 @@ mod label_tests {
             ordinal: 0,
             retained: Vec::new(),
             definition,
-        };
+        });
         assert!(addition.intrinsic_risks().is_empty());
         assert_eq!(rename.intrinsic_risks(), [RiskClass::Rename].into());
         for step in [addition, rename] {
@@ -342,6 +343,7 @@ mod label_tests {
 #[cfg(test)]
 mod domain_tests {
     use super::*;
+    use crate::TypeValueChange;
     use crate::{Change, RiskClass};
 
     fn domain(not_null: bool, default: Option<&str>, checks: &[(&str, &str)]) -> ManagedType {
@@ -398,12 +400,14 @@ mod domain_tests {
     /// changed and `not-null` for NOT NULL, each only when it has one.
     #[test]
     fn the_halves_carry_the_risk_classes_of_the_statements_they_hold() {
-        let alter = |from: ManagedType, to: ManagedType, half| Change::AlterDomain {
-            uid: "y_000001".parse().unwrap(),
-            name: "app.code".parse().unwrap(),
-            from: Box::new(from),
-            to: Box::new(to),
-            half,
+        let alter = |from: ManagedType, to: ManagedType, half| {
+            Change::TypeValue(TypeValueChange::AlterDomain {
+                uid: "y_000001".parse().unwrap(),
+                name: "app.code".parse().unwrap(),
+                from: Box::new(from),
+                to: Box::new(to),
+                half,
+            })
         };
         let plain = domain(false, None, &[]);
         let checked = domain(false, None, &[("c", "VALUE <> ''")]);
@@ -446,13 +450,13 @@ mod domain_tests {
     #[test]
     fn a_domain_alteration_round_trips_and_names_its_type_and_no_table() {
         for half in [DomainHalf::Loosen, DomainHalf::Tighten] {
-            let change = Change::AlterDomain {
+            let change = Change::TypeValue(TypeValueChange::AlterDomain {
                 uid: "y_000001".parse().unwrap(),
                 name: "app.code".parse().unwrap(),
                 from: Box::new(domain(false, None, &[])),
                 to: Box::new(domain(true, Some("'a'"), &[("c", "VALUE <> ''")])),
                 half,
-            };
+            });
             let json = serde_json::to_value(&change).unwrap();
             assert_eq!(json["op"], "alter_domain");
             assert_eq!(
@@ -473,6 +477,7 @@ mod domain_tests {
 #[cfg(test)]
 mod rebuild_tests {
     use super::*;
+    use crate::TypeValueChange;
     use crate::{Change, ColumnRef, RiskClass};
 
     fn steps() -> [Change; 3] {
@@ -482,11 +487,13 @@ mod rebuild_tests {
         let definition = Box::new(ManagedType::Enum {
             values: vec!["ok".into(), "sad".into()],
         });
-        let step = |step| Change::EnumRebuild {
-            uid: uid.clone(),
-            name: name.clone(),
-            tmp: tmp.clone(),
-            step,
+        let step = |step| {
+            Change::TypeValue(TypeValueChange::EnumRebuild {
+                uid: uid.clone(),
+                name: name.clone(),
+                tmp: tmp.clone(),
+                step,
+            })
         };
         [
             step(EnumRebuildStep::Create {
@@ -560,10 +567,10 @@ mod rebuild_tests {
             assert!(!text.contains(field), "{text}");
         }
         let mut domain = retype.clone();
-        if let Change::EnumRebuild {
+        if let Change::TypeValue(TypeValueChange::EnumRebuild {
             step: EnumRebuildStep::Retype { values, .. },
             ..
-        } = &mut domain
+        }) = &mut domain
         {
             **values = crate::ValueChange::Cast {
                 from: "varchar(20)".parse().unwrap(),
@@ -593,10 +600,10 @@ mod rebuild_tests {
         }
 
         let mut over = swap.clone();
-        if let Change::EnumRebuild {
+        if let Change::TypeValue(TypeValueChange::EnumRebuild {
             step: EnumRebuildStep::Swap { over, depth, .. },
             ..
-        } = &mut over
+        }) = &mut over
         {
             *over = Some("app.pbps_rebuild_y_000009".parse().unwrap());
             *depth = 2;
@@ -621,10 +628,10 @@ mod rebuild_tests {
         assert!(serde_json::from_str::<Change>(&tampered).is_err());
         // A swap without a comment writes no field at all.
         let mut bare = steps()[2].clone();
-        if let Change::EnumRebuild {
+        if let Change::TypeValue(TypeValueChange::EnumRebuild {
             step: EnumRebuildStep::Swap { comment, .. },
             ..
-        } = &mut bare
+        }) = &mut bare
         {
             *comment = None;
         }

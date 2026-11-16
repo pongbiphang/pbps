@@ -2,6 +2,9 @@
 //! New scope-transition tests supply their real before and after sides directly.
 
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
 
 use crate::test_plan_ids as plan_ids;
 
@@ -16,7 +19,7 @@ fn inputs(
     let mut before = declared.clone();
     for p in cs.changes.iter().rev() {
         match &p.change {
-            Change::RenameTable { from, to, .. } => {
+            Change::Table(TableChange::RenameTable { from, to, .. }) => {
                 if let Some(shape) = before.tables.remove(to) {
                     before.tables.insert(from.clone(), shape);
                 }
@@ -28,16 +31,16 @@ fn inputs(
                     }
                 }
             }
-            Change::RenameColumn {
+            Change::Column(ColumnChange::RenameColumn {
                 table, from, to, ..
-            } => {
+            }) => {
                 if let Some(shape) = before.tables.get_mut(table)
                     && let Some(column) = shape.columns.shift_remove(to)
                 {
                     shape.columns.insert(from.clone(), column);
                 }
             }
-            Change::DetachPartition { table, parent, .. } => {
+            Change::Partition(PartitionChange::DetachPartition { table, parent, .. }) => {
                 before.tables.entry(table.clone()).or_default().partition_of =
                     Some(pbps_model::PartitionOf {
                         parent: parent.clone(),
@@ -45,7 +48,7 @@ fn inputs(
                         columns: Default::default(),
                     });
             }
-            Change::AttachPartition { table, shape, .. } => {
+            Change::Partition(PartitionChange::AttachPartition { table, shape, .. }) => {
                 before.tables.insert(table.clone(), shape.as_ref().clone());
             }
             _ => {}

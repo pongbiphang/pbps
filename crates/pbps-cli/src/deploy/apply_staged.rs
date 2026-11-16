@@ -1013,9 +1013,11 @@ pub(super) fn refuse_unmet_public_execution(
 ) -> anyhow::Result<()> {
     let mut unmet = Vec::new();
     for planned in &changes.changes {
-        let pbps_model::Change::PublicExecution {
-            routine, access, ..
-        } = &planned.change
+        let pbps_model::Change::Permission(pbps_model::GrantChange::PublicExecution {
+            routine,
+            access,
+            ..
+        }) = &planned.change
         else {
             continue;
         };

@@ -140,6 +140,17 @@ use pbps_dialect::plan_rows::{Event, PlanFacts, Removal, RowWrites, View, Writte
 use pbps_dialect::{Dialect, DialectError, Preflight, Probe, Unchecked};
 #[cfg(test)]
 use pbps_model::ChangeSet;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::PolicyChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
+use pbps_model::TablePropertyChange;
+use pbps_model::TypeValueChange;
 use pbps_model::plan_names::PlanNames;
 use pbps_model::{Cell, Change, ColumnRef, RowKey, TableName, Value};
 
@@ -3103,34 +3114,34 @@ fn reads_recomputed<'v, 'p: 'v>(
     };
     let anywhere = |table: &TableName| names.recomputed.iter().any(|c| c.table == *table);
     match change {
-        Change::AlterColumnNullability {
+        Change::Column(ColumnChange::AlterColumnNullability {
             column,
             to_nullable: false,
             ..
-        } => names.recomputed.contains(column),
-        Change::AddCheck { table, .. } => anywhere(table),
-        Change::AddIndex { table, index, .. } => {
+        }) => names.recomputed.contains(column),
+        Change::Constraint(ConstraintChange::AddCheck { table, .. }) => anywhere(table),
+        Change::Index(IndexChange::AddIndex { table, index, .. }) => {
             (index.holds_expression() && anywhere(table))
                 || index.column_keys().is_some_and(|keys| named(table, &keys))
         }
-        Change::AddUnique {
+        Change::Constraint(ConstraintChange::AddUnique {
             table, constraint, ..
-        } => named(table, &constraint.columns),
-        Change::SetExclusion {
+        }) => named(table, &constraint.columns),
+        Change::Constraint(ConstraintChange::SetExclusion {
             table, to: Some(x), ..
-        } => {
+        }) => {
             ((x.filter.is_some() || x.keys.iter().any(|k| k.key.key.expression().is_some()))
                 && anywhere(table))
                 || x.key_columns().is_some_and(|keys| named(table, &keys))
         }
-        Change::SetPrimaryKey {
+        Change::Constraint(ConstraintChange::SetPrimaryKey {
             table,
             to: Some(pk),
             ..
-        } => named(table, &pk.columns),
-        Change::AddForeignKey {
+        }) => named(table, &pk.columns),
+        Change::Constraint(ConstraintChange::AddForeignKey {
             table, constraint, ..
-        } => {
+        }) => {
             named(table, &constraint.columns)
                 || named(&constraint.references_table, &constraint.references_columns)
         }
@@ -3186,7 +3197,7 @@ fn carried_counter(from: &ValueSource, to: &ValueSource) -> Option<i64> {
 /// Numbering emits its catalog counter check first, then its table-row check.
 /// Active RLS leaves the former checkable just like FK collation metadata.
 fn counter_probe(change: &Change, ordinal: usize) -> bool {
-    matches!(change, Change::AlterColumnNumbering { from, to, .. }
+    matches!(change, Change::Column(ColumnChange::AlterColumnNumbering { from, to, .. })
         if ordinal == 0 && (moved_bounds(from, to).is_some()
             || carried_counter(from, to).is_some()))
 }
@@ -3207,13 +3218,13 @@ fn build<'v, 'p: 'v>(
         ));
     }
     match change {
-        Change::RebuildPartitionedTable(_) => { let (operation, table) = change.pending_rebuild().expect("rebuild variant"); Err(DialectError::RebuildUnavailable { operation, table: table.clone() }) },
-        Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => Ok(skip(change, "the complete rebuild is recertified under its source-tree lock", unchecked)),
+        Change::Partition(PartitionChange::RebuildPartitionedTable(_)) => { let (operation, table) = change.pending_rebuild().expect("rebuild variant"); Err(DialectError::RebuildUnavailable { operation, table: table.clone() }) },
+        Change::Index(IndexChange::BuildPartitionedIndex(_)) | Change::Partition(PartitionChange::CopyTableRows(_)) | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => Ok(skip(change, "the complete rebuild is recertified under its source-tree lock", unchecked)),
         // A new column the declarations require a value in, with nothing to
         // put there. Every existing row breaks it, so the count is the table's
         // own — and it is a count rather than a yes, because "4,213 rows"
         // is what tells an operator what backfilling this will cost.
-        Change::AddColumn {
+        Change::Column(ColumnChange::AddColumn {
             table,
             name,
             column,
@@ -3227,7 +3238,7 @@ fn build<'v, 'p: 'v>(
         // distinction could move out of the probe it builds, so this is
         // defence-in-depth against that inner screen ever being relaxed, not
         // a change this arm's own output can prove (DECISIONS 433).
-        } if !column.nullable
+        }) if !column.nullable
             && !column.has_required_add_value_source_with(crate::LEXICON.identifier_continues) =>
         {
             let Some(stored) = names.view().table(table) else {
@@ -3281,11 +3292,11 @@ fn build<'v, 'p: 'v>(
         // The preceding writes may fill or remove stored NULLs. Using the
         // same relation as key probes also handles a tightening before those
         // writes, without copying the planner's sort predicate (DEC-1775.1).
-        Change::AlterColumnNullability {
+        Change::Column(ColumnChange::AlterColumnNullability {
             column,
             to_nullable: false,
             ..
-        } => {
+        }) => {
             if let Some(sources) = sources {
                 let (from, reads) = scalar_read(sources)?;
                 return Ok(vec![null_probe(column, &from, &reads)]);
@@ -3305,12 +3316,12 @@ fn build<'v, 'p: 'v>(
         }
         // A partition's own NOT NULL reads the partition's rows, as a
         // column's reads its table's (#1581).
-        Change::SetPartitionNotNull {
+        Change::Partition(PartitionChange::SetPartitionNotNull {
             table,
             column,
             not_null: true,
             ..
-        } => {
+        }) => {
             let column = table.column(column);
             // A column the parent adds in this plan is not in the stored
             // rows, or is there under its name as the column leaving it.
@@ -3329,7 +3340,7 @@ fn build<'v, 'p: 'v>(
         // The cast to the replacement refuses a label it does not have, naming
         // the row only at apply: count them now, by the labels as stored today
         // (DEC-1635.7). An array counts its elements.
-        Change::EnumRebuild {
+        Change::TypeValue(TypeValueChange::EnumRebuild {
             step:
                 pbps_model::EnumRebuildStep::Retype {
                     column,
@@ -3337,7 +3348,7 @@ fn build<'v, 'p: 'v>(
                     ..
                 },
             ..
-        } => {
+        }) => {
             let Some(stored) = names.column(column) else {
                 return Ok(skip(change, "the column does not exist before apply", unchecked));
             };
@@ -3418,7 +3429,7 @@ fn build<'v, 'p: 'v>(
             ));
             Ok(probes)
         }
-        Change::AlterColumnType {
+        Change::Column(ColumnChange::AlterColumnType {
             column,
             from,
             to,
@@ -3426,7 +3437,7 @@ fn build<'v, 'p: 'v>(
             to_nullable,
             using,
             ..
-        } => {
+        }) => {
             let Some(stored) = names.column(column) else {
                 return Ok(skip(change, "the column does not exist before apply", unchecked));
             };
@@ -3561,11 +3572,11 @@ fn build<'v, 'p: 'v>(
             Ok(out)
         }
 
-        Change::AddCheck {
+        Change::Constraint(ConstraintChange::AddCheck {
             table,
             name,
             constraint,
-        } => {
+        }) => {
             let Some(stored) = names.view().table(table) else {
                 return Ok(skip(change, "the table does not exist before apply", unchecked));
             };
@@ -3660,19 +3671,19 @@ name = name.shown(),
         // lock, and the rehearsal runs that build. A pairwise probe here would
         // be expensive and stale by apply, and the operator may be any the
         // engine accepts, so it is reported as unchecked (DEC-2448.3).
-        Change::SetExclusion { to: Some(_), .. } => Ok(skip(
+        Change::Constraint(ConstraintChange::SetExclusion { to: Some(_), .. }) => Ok(skip(
             change,
             "an exclusion constraint's conflicts are found by the engine while it builds the \
              constraint, which the rehearsal runs",
             unchecked,
         )),
-        Change::SetExclusion { to: None, .. } => Ok(Vec::new()),
+        Change::Constraint(ConstraintChange::SetExclusion { to: None, .. }) => Ok(Vec::new()),
 
-        Change::AddUnique {
+        Change::Constraint(ConstraintChange::AddUnique {
             table,
             name,
             constraint, ..
-        } => {
+        }) => {
             let Some(rows) = rows_after(names, table, &constraint.columns, "c", &Applies::AllRows, StoredConversions::Unchecked)?
             else {
                 return Ok(skip(change, "the planned unique-key values cannot be evaluated before apply", unchecked));
@@ -3688,7 +3699,7 @@ name = name.shown(),
 
         // A unique index asks the same question, over the rows its predicate
         // keeps. A plain index constrains nothing and falls to the arm below.
-        Change::AddIndex { table, name, index, .. } if index.unique => {
+        Change::Index(IndexChange::AddIndex { table, name, index, .. }) if index.unique => {
             // The key columns only. `INCLUDE` is payload the engine carries in
             // the leaf and never compares, so counting it would group rows the
             // index will still collide.
@@ -3718,11 +3729,11 @@ name = name.shown(),
             )])
         }
 
-        Change::SetPrimaryKey {
+        Change::Constraint(ConstraintChange::SetPrimaryKey {
             table,
             to: Some(pk),
             ..
-        } => {
+        }) => {
             let Some(rows) = rows_after(names, table, &pk.columns, "c", &Applies::AllRows, StoredConversions::Unchecked)? else {
                 return Ok(skip(change, "the planned primary-key values cannot be evaluated before apply", unchecked));
             };
@@ -3745,11 +3756,11 @@ name = name.shown(),
             Ok(out)
         }
 
-        Change::AddForeignKey {
+        Change::Constraint(ConstraintChange::AddForeignKey {
             table,
             name,
             constraint,
-        } => {
+        }) => {
             let probes = orphan_probe(names, table, name, constraint)?;
             if probes.is_empty() {
                 return Ok(skip(change, "the planned foreign-key values cannot be evaluated before apply", unchecked));
@@ -3764,7 +3775,7 @@ name = name.shown(),
         // (DEC-1168.1). The plan does not say what reads the column, so the
         // change is reported whatever does: absent from the report would read
         // as checked (#1318).
-        Change::AlterColumnExpression { .. } => Ok(skip(
+        Change::Column(ColumnChange::AlterColumnExpression { .. }) => Ok(skip(
             change,
             "a generated column's recomputed values cannot be evaluated before apply",
             unchecked,
@@ -3784,9 +3795,9 @@ name = name.shown(),
         // session may not `SELECT` is counted as in the way, never read as
         // inside the bounds (DECISIONS 335); the `CASE` keeps the read from
         // running, and failing, on one it may not.
-        Change::AlterColumnNumbering {
+        Change::Column(ColumnChange::AlterColumnNumbering {
             column, ty, from, to, ..
-        } if moved_bounds(from, to).is_some() => {
+        }) if moved_bounds(from, to).is_some() => {
             let Some((increment, options)) = moved_bounds(from, to) else {
                 return Ok(Vec::new());
             };
@@ -3827,9 +3838,9 @@ name = name.shown(),
         // (DEC-1889.1), and a value too near the type's bound leaves no
         // number to continue at: the block's `setval` is then refused
         // mid-apply. Counted here, the values that leave no room.
-        Change::AlterColumnNumbering {
+        Change::Column(ColumnChange::AlterColumnNumbering {
             column, ty, from, to, ..
-        } if pbps_model::NumberingKind::installed(from, to) => {
+        }) if pbps_model::NumberingKind::installed(from, to) => {
             let increment = match to {
                 ValueSource::Identity(id) => id.increment,
                 ValueSource::Sequence(sequence) => sequence.increment,
@@ -3949,50 +3960,50 @@ name = name.shown(),
         }
 
         // Everything else either cannot fail on the data or cannot be counted.
-        Change::CreateTable { .. }
-        | Change::DropTable { .. }
-        | Change::RenameTable { .. }
-        | Change::AddColumn { .. }
-        | Change::DropColumn { .. }
-        | Change::RenameColumn { .. }
-        | Change::AlterColumnNullability {
+        Change::Table(TableChange::CreateTable { .. })
+        | Change::Table(TableChange::DropTable { .. })
+        | Change::Table(TableChange::RenameTable { .. })
+        | Change::Column(ColumnChange::AddColumn { .. })
+        | Change::Column(ColumnChange::DropColumn { .. })
+        | Change::Column(ColumnChange::RenameColumn { .. })
+        | Change::Column(ColumnChange::AlterColumnNullability {
             to_nullable: true, ..
-        }
-        | Change::AlterColumnDefault { .. }
-        | Change::AlterColumnNumbering { .. }
-        | Change::SetColumnDeprecated { .. }
-        | Change::SetComment { .. }
-        | Change::SetPrimaryKey { to: None, .. }
-        | Change::DropUnique { .. }
-        | Change::DropForeignKey { .. }
-        | Change::DropCheck { .. }
+        })
+        | Change::Column(ColumnChange::AlterColumnDefault { .. })
+        | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+        | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+        | Change::TableProperty(TablePropertyChange::SetComment { .. })
+        | Change::Constraint(ConstraintChange::SetPrimaryKey { to: None, .. })
+        | Change::Constraint(ConstraintChange::DropUnique { .. })
+        | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+        | Change::Constraint(ConstraintChange::DropCheck { .. })
         // The unique ones are counted above; a plain index refuses nothing.
-        | Change::AddIndex { .. }
-        | Change::AddComputedColumn { .. }
-        | Change::DropComputedColumn { .. }
-        | Change::DropIndex { .. }
+        | Change::Index(IndexChange::AddIndex { .. })
+        | Change::Column(ColumnChange::AddComputedColumn { .. })
+        | Change::Column(ColumnChange::DropComputedColumn { .. })
+        | Change::Index(IndexChange::DropIndex { .. })
         // A module holds no rows. A definition the engine will not compile
         // fails inside the plan's transaction, where the rollback is total.
-        | Change::CreateModule { .. }
-        | Change::AlterModule { .. }
-        | Change::DropModule { .. }
+        | Change::Module(ModuleChange::CreateModule { .. })
+        | Change::Module(ModuleChange::AlterModule { .. })
+        | Change::Module(ModuleChange::DropModule { .. })
         // The whole content of a declared row is in the plan, and anything the
         // engine refuses about it rolls the plan back.
-        | Change::InsertRow { .. }
-        | Change::UpdateRow { .. }
-        | Change::SetDataMode { .. }
-        | Change::SetEnsureKeys { .. }
+        | Change::Row(RowChange::InsertRow { .. })
+        | Change::Row(RowChange::UpdateRow { .. })
+        | Change::Row(RowChange::SetDataMode { .. })
+        | Change::Row(RowChange::SetEnsureKeys { .. })
         // The pre-delete probe of ADR-0004 is built by `probes` itself, beside
         // the refusals that go with it.
-        | Change::DeleteRow { .. }
+        | Change::Row(RowChange::DeleteRow { .. })
         // Roles and grants are Phase 5 step 6, and `emit` refuses every one of
         // them by name until it lands. The securable probe the other dialect
         // asks for a schema target belongs with that step, not ahead of it.
-        | Change::AddEnumValue { .. }
-        | Change::AlterDomain { .. }
-        | Change::RenameEnumValue { .. }
-        | Change::EnumRebuild { .. }
-         | pbps_model::catalog_change!() | Change::Grant { .. } | Change::Revoke { .. } | Change::SetIndexStorageParameters { .. } | Change::SetTablePersistence { .. } | Change::SetPartitionDefault { .. } | Change::SetPartitionNotNull { .. } | Change::SetStorageParameters { .. } | Change::DropPolicy { .. } | Change::CreatePolicy { .. } | Change::SetRowSecurity { .. } | Change::SetReplicaIdentity { .. } | Change::DetachPartition { .. } | Change::AttachPartition { .. } | Change::PublicExecution { .. } => Ok(Vec::new()),
+        | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+        | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+        | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+        | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
+         | pbps_model::catalog_change!() | Change::Permission(GrantChange::Grant { .. }) | Change::Permission(GrantChange::Revoke { .. }) | Change::Index(IndexChange::SetIndexStorageParameters { .. }) | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. }) | Change::Partition(PartitionChange::SetPartitionDefault { .. }) | Change::Partition(PartitionChange::SetPartitionNotNull { .. }) | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. }) | Change::Policy(PolicyChange::DropPolicy { .. }) | Change::Policy(PolicyChange::CreatePolicy { .. }) | Change::Policy(PolicyChange::SetRowSecurity { .. }) | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. }) | Change::Partition(PartitionChange::DetachPartition { .. }) | Change::Partition(PartitionChange::AttachPartition { .. }) | Change::Permission(GrantChange::PublicExecution { .. }) => Ok(Vec::new()),
     }
 }
 
@@ -4195,10 +4206,10 @@ fn without_filtered_rows(
     if let Some(table) = change.table() {
         relations.insert(table.clone());
     }
-    if let Change::AddForeignKey { constraint, .. } = change {
+    if let Change::Constraint(ConstraintChange::AddForeignKey { constraint, .. }) = change {
         relations.insert(constraint.references_table.clone());
     }
-    if let Change::CreateTable { table, .. } = change {
+    if let Change::Table(TableChange::CreateTable { table, .. }) = change {
         relations.extend(
             table
                 .foreign_keys
@@ -4246,10 +4257,10 @@ fn without_filtered_rows(
 /// `Relabel` (#2461). Every domain over a rebuilt enum is rebuilt with it.
 #[allow(clippy::wildcard_enum_match_arm)] // Only rebuild declarations contribute label shape.
 fn relabel_arrays(change: &Change, plan: &PlanNames<'_>) -> usize {
-    let Change::EnumRebuild {
+    let Change::TypeValue(TypeValueChange::EnumRebuild {
         step: pbps_model::EnumRebuildStep::Retype { to, .. },
         ..
-    } = change
+    }) = change
     else {
         return 0;
     };
@@ -4261,11 +4272,11 @@ fn relabel_arrays(change: &Change, plan: &PlanNames<'_>) -> usize {
             break;
         };
         let base = plan.changes().iter().find_map(|p| match &p.change {
-            Change::EnumRebuild {
+            Change::TypeValue(TypeValueChange::EnumRebuild {
                 name,
                 step: pbps_model::EnumRebuildStep::Create { definition, .. },
                 ..
-            } if name == reference => match &**definition {
+            }) if name == reference => match &**definition {
                 pbps_model::ManagedType::Domain { base, .. } => Some(base),
                 pbps_model::ManagedType::Enum { .. } => None,
             },
@@ -4309,12 +4320,12 @@ pub(crate) fn probes(
             // Names and column facts belong to the preceding prefix. The
             // current DELETE also removes its own reference and cannot leave
             // its target as a surviving parent (DEC-1977.1).
-            if let Change::DeleteRow {
+            if let Change::Row(RowChange::DeleteRow {
                 table,
                 key_column,
                 key,
                 ..
-            } = &p.change
+            }) = &p.change
             {
                 names
                     .moved
@@ -4379,63 +4390,63 @@ pub(crate) fn probes(
             }
             Err(error) => unchecked.push(Unchecked::for_change(&p.change, error.to_string())),
         }
-        if let Change::CreateTable {
+        if let Change::Table(TableChange::CreateTable {
             beside_default: Some(default),
             ..
-        } = &p.change
+        }) = &p.change
         {
             moved_out.push(default);
         }
         // Metadata compatibility remains checkable when the row projection
         // is unchecked. Include keys carried by a created table as well.
         let keys: Vec<_> = match &p.change {
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => Vec::new(),
-            Change::AddForeignKey {
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => Vec::new(),
+            Change::Constraint(ConstraintChange::AddForeignKey {
                 table,
                 name,
                 constraint,
-            } => {
+            }) => {
                 vec![(table, name, constraint.as_ref())]
             }
-            Change::CreateTable { name, table, .. } => table
+            Change::Table(TableChange::CreateTable { name, table, .. }) => table
                 .foreign_keys
                 .iter()
                 .map(|(key, constraint)| (name, key, constraint))
                 .collect(),
-            Change::DropTable { .. }
-            | Change::RenameTable { .. }
+            Change::Table(TableChange::DropTable { .. })
+            | Change::Table(TableChange::RenameTable { .. })
             | pbps_model::change_family!(columns)
             | pbps_model::change_family!(table_properties)
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
+            | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
             | pbps_model::change_family!(policies)
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::SetExclusion { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::DropIndex { .. }
+            | Change::Constraint(ConstraintChange::AddUnique { .. })
+            | Change::Constraint(ConstraintChange::DropUnique { .. })
+            | Change::Constraint(ConstraintChange::SetExclusion { .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            | Change::Constraint(ConstraintChange::AddCheck { .. })
+            | Change::Constraint(ConstraintChange::DropCheck { .. })
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
             | pbps_model::change_family!(rows)
             | pbps_model::change_family!(modules)
             | pbps_model::change_family!(type_values)
             | pbps_model::catalog_change!()
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::PublicExecution { .. } => Vec::new(),
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. }) => Vec::new(),
         };
         if !keys.is_empty() {
             // Inline keys see the columns defined by their own CREATE. Row
             // probes still use only the statements preceding this one.
-            let created_names = matches!(&p.change, Change::CreateTable { .. })
+            let created_names = matches!(&p.change, Change::Table(TableChange::CreateTable { .. }))
                 .then(|| AsStored::of(facts.before(step + 1), partitions, immutable));
             let key_names = created_names.as_ref().unwrap_or(&names);
             for (table, name, constraint) in keys {
@@ -4447,11 +4458,11 @@ pub(crate) fn probes(
                 }
             }
         }
-        if let Change::AddForeignKey {
+        if let Change::Constraint(ConstraintChange::AddForeignKey {
             table,
             name,
             constraint,
-        } = &p.change
+        }) = &p.change
         {
             // Validation belongs to this key's statement. A preceding delete
             // cannot see the future key, while its earlier row/column changes
@@ -4488,12 +4499,12 @@ pub(crate) fn probes(
                 }
             }
         }
-        if let Change::DeleteRow {
+        if let Change::Row(RowChange::DeleteRow {
             table,
             key_column,
             key,
             ..
-        } = &p.change
+        }) = &p.change
         {
             let Some(stored) = names.column(&table.column(key_column)) else {
                 skip(
@@ -4607,16 +4618,16 @@ fn partition_probes(
             changes[..step]
                 .iter()
                 .filter_map(|p| {
-                    if let Change::DropTable {
+                    if let Change::Table(TableChange::DropTable {
                         name,
                         detach_from: Some(parent),
                         ..
-                    }
-                    | Change::DetachPartition {
+                    })
+                    | Change::Partition(PartitionChange::DetachPartition {
                         table: name,
                         parent,
                         ..
-                    } = &p.change
+                    }) = &p.change
                     {
                         (parent == of).then_some(name)
                     } else {
@@ -4625,13 +4636,13 @@ fn partition_probes(
                 })
                 .collect::<Vec<_>>()
         };
-        let probe = if let Change::CreateTable {
+        let probe = if let Change::Table(TableChange::CreateTable {
             name,
             table,
             beside_default: Some(default),
             moves_at_most,
             ..
-        } = &p.change
+        }) = &p.change
             && let Some(of) = &table.partition_of
             && let bound @ (pbps_model::PartitionBound::Range { .. }
             | pbps_model::PartitionBound::List { .. }) = &of.bound
@@ -4714,7 +4725,7 @@ fn partition_probes(
                 }
             }
             continue;
-        } else if let Change::CreateTable { name, table, .. } = &p.change
+        } else if let Change::Table(TableChange::CreateTable { name, table, .. }) = &p.change
             && let Some(of) = &table.partition_of
             // A HASH parent has no DEFAULT to hold rows of a new remainder,
             // and no row is stored without a partition to take it (#1632).
@@ -4738,22 +4749,25 @@ fn partition_probes(
                     "create a partition",
                 ),
             )
-        } else if let Change::DropTable {
+        } else if let Change::Table(TableChange::DropTable {
             name,
             detach_from: Some(parent),
             ..
-        } = &p.change
+        }) = &p.change
         {
             let probe = partition_reference_probe(name, parent, names, &dropped_before);
             dropped_before.push(name);
             probe
-        } else if let Change::DetachPartition { table, parent, .. } = &p.change {
+        } else if let Change::Partition(PartitionChange::DetachPartition {
+            table, parent, ..
+        }) = &p.change
+        {
             // Refused while rows reference it, as a drop's detach is. Its own
             // rows are not left out of a later count: a referencing
             // partition's key becomes its own on the detach, and still
             // references the parent (#1544).
             partition_reference_probe(table, parent, names, &dropped_before)
-        } else if let Change::AttachPartition {
+        } else if let Change::Partition(PartitionChange::AttachPartition {
             table,
             parent,
             bound:
@@ -4761,7 +4775,7 @@ fn partition_probes(
                 | pbps_model::PartitionBound::List { .. }
                 | pbps_model::PartitionBound::Hash { .. }),
             ..
-        } = &p.change
+        }) = &p.change
         {
             // Four questions, a created partition's one among them: the
             // table's own rows outside the bound, which the engine refuses to
@@ -4791,12 +4805,12 @@ fn partition_probes(
                 &[parent],
                 partition_range_probe(table, parent, bound, &leaving, "attach a table"),
             )
-        } else if let Change::AttachPartition {
+        } else if let Change::Partition(PartitionChange::AttachPartition {
             table,
             parent,
             bound: pbps_model::PartitionBound::Default,
             ..
-        } = &p.change
+        }) = &p.change
         {
             // As the DEFAULT partition (#1639, DEC-1639.1): the table's rows
             // another partition takes, and a DEFAULT the parent keeps, which
@@ -4809,14 +4823,16 @@ fn partition_probes(
             let beside: Vec<pbps_model::PartitionBound> = changes
                 .iter()
                 .filter_map(|c| {
-                    if let Change::CreateTable { table: t, .. } = &c.change {
+                    if let Change::Table(TableChange::CreateTable { table: t, .. }) = &c.change {
                         t.partition_of
                             .as_ref()
                             .filter(|of| of.parent == *parent)
                             .map(|of| &of.bound)
-                    } else if let Change::AttachPartition {
-                        parent: of, bound, ..
-                    } = &c.change
+                    } else if let Change::Partition(PartitionChange::AttachPartition {
+                        parent: of,
+                        bound,
+                        ..
+                    }) = &c.change
                     {
                         (of == parent).then_some(bound)
                     } else {
@@ -5336,10 +5352,10 @@ fn dropped_triggers(
     let clauses: Vec<String> = changes
         .iter()
         .filter_map(|p| {
-            if let Change::DropModule {
+            if let Change::Module(ModuleChange::DropModule {
                 id: pbps_model::ModuleId::Trigger { on, name },
                 ..
-            } = &p.change
+            }) = &p.change
             {
                 let own = on.schema == default.schema && on.name == default.name;
                 let cloned = on.schema == parent.schema && on.name == parent.name;
@@ -5706,14 +5722,14 @@ fn attach_trigger_probe(
     let planned: BTreeSet<&str> = after
         .iter()
         .filter_map(|p| {
-            if let Change::CreateModule {
+            if let Change::Module(ModuleChange::CreateModule {
                 id: pbps_model::ModuleId::Trigger { on, name },
                 module,
-            }
-            | Change::AlterModule {
+            })
+            | Change::Module(ModuleChange::AlterModule {
                 id: pbps_model::ModuleId::Trigger { on, name },
                 module,
-            } = &p.change
+            }) = &p.change
                 && on == parent
                 && crate::Postgres::new().clones_to_partitions(module)
             {
@@ -5751,10 +5767,10 @@ fn attach_trigger_probe(
         let clauses: Vec<String> = before
             .iter()
             .filter_map(|p| {
-                if let Change::DropModule {
+                if let Change::Module(ModuleChange::DropModule {
                     id: pbps_model::ModuleId::Trigger { on, name },
                     ..
-                } = &p.change
+                }) = &p.change
                     && on.schema == on_table.schema
                     && on.name == on_table.name
                 {
@@ -5913,6 +5929,15 @@ mod tests {
     fn probes_with(changes: &ChangeSet, partitions: &pbps_model::Partitions) -> Preflight {
         crate::Postgres::new().fixture_preflight_with(changes, partitions)
     }
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::IndexChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::PartitionChange;
+    use pbps_model::RowChange;
+    use pbps_model::TableChange;
+    use pbps_model::TypeChange;
+    use pbps_model::TypeValueChange;
     use pbps_model::{Change, PlannedChange};
 
     fn preflight_with_immutable(changes: &ChangeSet, immutable: &BTreeSet<ColumnRef>) -> Preflight {
@@ -5927,7 +5952,7 @@ mod tests {
     }
 
     fn recorded_retype(column: &str, expression: &str) -> Change {
-        Change::AlterColumnType {
+        Change::Column(ColumnChange::AlterColumnType {
             uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
             column: column.parse().unwrap(),
             from: "bigint".parse().unwrap(),
@@ -5938,7 +5963,7 @@ mod tests {
             from_collation: None,
             to_collation: None,
             using: Some(expression.into()),
-        }
+        })
     }
 
     #[test]
@@ -5950,7 +5975,7 @@ mod tests {
                     changes.push(recorded_retype(column, "v % 100 /* keep v verbatim */"));
                 }
             }
-            changes.push(Change::AddForeignKey {
+            changes.push(Change::Constraint(ConstraintChange::AddForeignKey {
                 table: "app.c".parse().unwrap(),
                 name: "fk_recorded".into(),
                 constraint: Box::new(pbps_model::ForeignKey {
@@ -5960,13 +5985,14 @@ mod tests {
                     on_delete: pbps_model::ReferentialAction::NoAction,
                     on_update: pbps_model::ReferentialAction::NoAction,
                 }),
-            });
+            }));
             let changes = set(changes);
             let immutable = changes
                 .changes
                 .iter()
                 .filter_map(|p| {
-                    if let Change::AlterColumnType { column, .. } = &p.change {
+                    if let Change::Column(ColumnChange::AlterColumnType { column, .. }) = &p.change
+                    {
                         Some(column.clone())
                     } else {
                         None
@@ -6011,7 +6037,7 @@ mod tests {
         for expression in ["random()", "now()", "v % 100"] {
             let changes = set(vec![
                 recorded_retype("app.c.v", expression),
-                Change::AddForeignKey {
+                Change::Constraint(ConstraintChange::AddForeignKey {
                     table: "app.c".parse().unwrap(),
                     name: "fk_self".into(),
                     constraint: Box::new(pbps_model::ForeignKey {
@@ -6021,7 +6047,7 @@ mod tests {
                         on_delete: pbps_model::ReferentialAction::NoAction,
                         on_update: pbps_model::ReferentialAction::NoAction,
                     }),
-                },
+                }),
             ]);
             let report = preflight(&changes);
             assert!(
@@ -6047,7 +6073,7 @@ mod tests {
     fn recorded_foreign_key_projection_does_not_enable_unique_or_check_probes() {
         let report = preflight(&set(vec![
             recorded_retype("app.c.v", "v % 100"),
-            Change::AddUnique {
+            Change::Constraint(ConstraintChange::AddUnique {
                 table: "app.c".parse().unwrap(),
                 name: "uq_recorded".into(),
                 constraint: pbps_model::UniqueConstraint {
@@ -6056,14 +6082,14 @@ mod tests {
                     filegroup: None,
                 },
                 clustered: false,
-            },
-            Change::AddCheck {
+            }),
+            Change::Constraint(ConstraintChange::AddCheck {
                 table: "app.c".parse().unwrap(),
                 name: "ck_recorded".into(),
                 constraint: pbps_model::CheckConstraint {
                     expression: "v > 0".into(),
                 },
-            },
+            }),
         ]));
         assert_eq!(report.unchecked.len(), 2, "{:?}", report.unchecked);
         assert!(
@@ -6084,7 +6110,7 @@ mod tests {
     #[test]
     fn narrowing_projection_reports_each_constraint_instead_of_unchecked() {
         let table: TableName = "app.t".parse().unwrap();
-        let retype = Change::AlterColumnType {
+        let retype = Change::Column(ColumnChange::AlterColumnType {
             uid: "c_aaaaaa".parse().unwrap(),
             column: table.column("v"),
             from: "numeric(5,2)".parse().unwrap(),
@@ -6095,10 +6121,10 @@ mod tests {
             from_collation: None,
             to_collation: None,
             using: None,
-        };
+        });
         let columns = vec![pbps_model::ColumnName::from("v")];
         let constraints = [
-            Change::AddUnique {
+            Change::Constraint(ConstraintChange::AddUnique {
                 table: table.clone(),
                 name: "uq".into(),
                 constraint: pbps_model::UniqueConstraint {
@@ -6107,8 +6133,8 @@ mod tests {
                     filegroup: None,
                 },
                 clustered: false,
-            },
-            Change::AddIndex {
+            }),
+            Change::Index(IndexChange::AddIndex {
                 table: table.clone(),
                 name: "ix".into(),
                 index: Box::new(pbps_model::Index {
@@ -6126,8 +6152,8 @@ mod tests {
                     filegroup: None,
                 }),
                 clustered: false,
-            },
-            Change::SetPrimaryKey {
+            }),
+            Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table: table.clone(),
                 from: None,
                 to: Some(pbps_model::PrimaryKey {
@@ -6137,8 +6163,8 @@ mod tests {
                     filegroup: None,
                 }),
                 nonclustered: false,
-            },
-            Change::AddForeignKey {
+            }),
+            Change::Constraint(ConstraintChange::AddForeignKey {
                 table,
                 name: "fk".into(),
                 constraint: Box::new(pbps_model::ForeignKey {
@@ -6148,7 +6174,7 @@ mod tests {
                     on_delete: pbps_model::ReferentialAction::NoAction,
                     on_update: pbps_model::ReferentialAction::NoAction,
                 }),
-            },
+            }),
         ];
         for constraint in constraints {
             let report = preflight(&set(vec![retype.clone(), constraint]));
@@ -6183,22 +6209,24 @@ mod tests {
     fn a_domains_narrowing_rebuild_counts_the_rows_that_do_not_fit() {
         let table: TableName = "app.t".parse().unwrap();
         let ty = |text: &str| crate::types::normalize(&text.parse().unwrap()).unwrap();
-        let retype_with = |array: bool, from: &str, to: &str| Change::EnumRebuild {
-            uid: "y_000001".parse().unwrap(),
-            name: "app.name".parse().unwrap(),
-            tmp: "app.tmp".parse().unwrap(),
-            step: pbps_model::EnumRebuildStep::Retype {
-                column_uid: "c_aaaaaa".parse().unwrap(),
-                column: table.column("v"),
-                to: pbps_model::ColumnType::reference("app.name".parse().unwrap()),
-                array,
-                values: Box::new(pbps_model::ValueChange::Cast {
-                    from: ty(from),
-                    to: ty(to),
-                    arrays: usize::from(array),
-                    using: None,
-                }),
-            },
+        let retype_with = |array: bool, from: &str, to: &str| {
+            Change::TypeValue(TypeValueChange::EnumRebuild {
+                uid: "y_000001".parse().unwrap(),
+                name: "app.name".parse().unwrap(),
+                tmp: "app.tmp".parse().unwrap(),
+                step: pbps_model::EnumRebuildStep::Retype {
+                    column_uid: "c_aaaaaa".parse().unwrap(),
+                    column: table.column("v"),
+                    to: pbps_model::ColumnType::reference("app.name".parse().unwrap()),
+                    array,
+                    values: Box::new(pbps_model::ValueChange::Cast {
+                        from: ty(from),
+                        to: ty(to),
+                        arrays: usize::from(array),
+                        using: None,
+                    }),
+                },
+            })
         };
         let retype = |array, from: &str, to: &str| retype_with(array, from, to);
         let report = preflight(&set(vec![retype(false, "varchar(20)", "varchar(10)")]));
@@ -6242,10 +6270,10 @@ mod tests {
         // array column. The pair stays of the element types; the shape is the
         // step's `ValueChange::Cast.arrays`.
         let mut through_array = retype_with(false, "varchar(20)", "varchar(10)");
-        if let Change::EnumRebuild {
+        if let Change::TypeValue(TypeValueChange::EnumRebuild {
             step: pbps_model::EnumRebuildStep::Retype { values, .. },
             ..
-        } = &mut through_array
+        }) = &mut through_array
         {
             let pbps_model::ValueChange::Cast { arrays, .. } = values.as_mut() else {
                 panic!("{values:?}");
@@ -6265,23 +6293,25 @@ mod tests {
     #[test]
     fn a_rebuilds_retype_counts_rows_and_array_elements_holding_a_removed_label() {
         let table: TableName = "app.t".parse().unwrap();
-        let retype = |array: bool, removed: &[&str]| Change::EnumRebuild {
-            uid: "y_000001".parse().unwrap(),
-            name: "app.e".parse().unwrap(),
-            tmp: "app.tmp".parse().unwrap(),
-            step: pbps_model::EnumRebuildStep::Retype {
-                column_uid: "c_aaaaaa".parse().unwrap(),
-                column: table.column("m"),
-                to: if array {
-                    pbps_model::ColumnType::reference("app.e".parse().unwrap()).into_array()
-                } else {
-                    pbps_model::ColumnType::reference("app.e".parse().unwrap())
+        let retype = |array: bool, removed: &[&str]| {
+            Change::TypeValue(TypeValueChange::EnumRebuild {
+                uid: "y_000001".parse().unwrap(),
+                name: "app.e".parse().unwrap(),
+                tmp: "app.tmp".parse().unwrap(),
+                step: pbps_model::EnumRebuildStep::Retype {
+                    column_uid: "c_aaaaaa".parse().unwrap(),
+                    column: table.column("m"),
+                    to: if array {
+                        pbps_model::ColumnType::reference("app.e".parse().unwrap()).into_array()
+                    } else {
+                        pbps_model::ColumnType::reference("app.e".parse().unwrap())
+                    },
+                    array,
+                    values: Box::new(pbps_model::ValueChange::Relabel {
+                        removed: removed.iter().map(|l| (*l).to_owned()).collect(),
+                    }),
                 },
-                array,
-                values: Box::new(pbps_model::ValueChange::Relabel {
-                    removed: removed.iter().map(|l| (*l).to_owned()).collect(),
-                }),
-            },
+            })
         };
         let report = preflight(&set(vec![retype(false, &["sad", "it's"])]));
         assert!(report.unchecked.is_empty(), "{report:#?}");
@@ -6328,7 +6358,7 @@ mod tests {
         let through = |levels: usize, removed: &[&str]| {
             let mut changes = vec![retype(false, removed)];
             for level in 0..levels {
-                changes.push(Change::EnumRebuild {
+                changes.push(Change::TypeValue(TypeValueChange::EnumRebuild {
                     uid: "y_000001".parse().unwrap(),
                     name: if level == 0 {
                         "app.e".parse().unwrap()
@@ -6349,7 +6379,7 @@ mod tests {
                         over: None,
                         why: None,
                     },
-                });
+                }));
             }
             preflight(&set(changes))
         };
@@ -6386,7 +6416,7 @@ mod tests {
             "{report:#?}"
         );
         // The other steps hold no rows to read.
-        let create = Change::EnumRebuild {
+        let create = Change::TypeValue(TypeValueChange::EnumRebuild {
             uid: "y_000001".parse().unwrap(),
             name: "app.e".parse().unwrap(),
             tmp: "app.tmp".parse().unwrap(),
@@ -6396,7 +6426,7 @@ mod tests {
                 depth: 0,
                 over: None,
             },
-        };
+        });
         let report = preflight(&set(vec![create]));
         assert!(
             report.probes.is_empty() && report.unchecked.is_empty(),
@@ -6405,7 +6435,7 @@ mod tests {
     }
 
     fn deleting(table: &str, key: &str) -> Change {
-        Change::DeleteRow {
+        Change::Row(RowChange::DeleteRow {
             table: table.parse().expect("a table name"),
             key_column: "code".into(),
             key: RowKey::from(key),
@@ -6415,7 +6445,7 @@ mod tests {
             types: BTreeMap::new(),
             after_types: BTreeMap::new(),
             key_type: None,
-        }
+        })
     }
 
     fn set(changes: Vec<Change>) -> ChangeSet {
@@ -6432,43 +6462,47 @@ mod tests {
     #[test]
     fn what_reads_a_recomputed_generated_column_is_unchecked_not_judged() {
         let table: TableName = "app.t".parse().unwrap();
-        let recompute = Change::AlterColumnExpression {
+        let recompute = Change::Column(ColumnChange::AlterColumnExpression {
             uid: "c_aaaaaa".parse().unwrap(),
             column: table.column("g"),
             from: "a".into(),
             to: "COALESCE(a, 0)".into(),
+        });
+        let tighten = |column: &str| {
+            Change::Column(ColumnChange::AlterColumnNullability {
+                uid: if column == "g" {
+                    "c_aaaaaa"
+                } else {
+                    "c_bbbbbb"
+                }
+                .parse()
+                .unwrap(),
+                column: table.column(column),
+                ty: "integer".parse().unwrap(),
+                to_nullable: false,
+                through_external_partitions: false,
+                collation: None,
+            })
         };
-        let tighten = |column: &str| Change::AlterColumnNullability {
-            uid: if column == "g" {
-                "c_aaaaaa"
-            } else {
-                "c_bbbbbb"
-            }
-            .parse()
-            .unwrap(),
-            column: table.column(column),
-            ty: "integer".parse().unwrap(),
-            to_nullable: false,
-            through_external_partitions: false,
-            collation: None,
+        let unique = |column: &str| {
+            Change::Constraint(ConstraintChange::AddUnique {
+                table: table.clone(),
+                name: format!("uq_{column}").into(),
+                constraint: pbps_model::UniqueConstraint {
+                    columns: vec![column.into()],
+                    storage_parameters: Default::default(),
+                    filegroup: None,
+                },
+                clustered: false,
+            })
         };
-        let unique = |column: &str| Change::AddUnique {
-            table: table.clone(),
-            name: format!("uq_{column}").into(),
-            constraint: pbps_model::UniqueConstraint {
-                columns: vec![column.into()],
-                storage_parameters: Default::default(),
-                filegroup: None,
-            },
-            clustered: false,
-        };
-        let check = Change::AddCheck {
+        let check = Change::Constraint(ConstraintChange::AddCheck {
             table: table.clone(),
             name: "ck".into(),
             constraint: pbps_model::CheckConstraint {
                 expression: "g >= 0".into(),
             },
-        };
+        });
         let report = preflight(&set(vec![
             recompute.clone(),
             tighten("g"),
@@ -6505,12 +6539,14 @@ mod tests {
     #[test]
     fn a_recomputed_generated_column_is_listed_as_unchecked() {
         let table: TableName = "app.t".parse().unwrap();
-        let report = preflight(&set(vec![Change::AlterColumnExpression {
-            uid: "c_aaaaaa".parse().unwrap(),
-            column: table.column("g"),
-            from: "a".into(),
-            to: "COALESCE(a, 0)".into(),
-        }]));
+        let report = preflight(&set(vec![Change::Column(
+            ColumnChange::AlterColumnExpression {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: table.column("g"),
+                from: "a".into(),
+                to: "COALESCE(a, 0)".into(),
+            },
+        )]));
         assert!(report.probes.is_empty(), "{report:#?}");
         assert_eq!(
             report
@@ -6526,12 +6562,14 @@ mod tests {
         );
         // Negative: an ordinary default change can refuse nothing stored, and
         // is not listed.
-        let report = preflight(&set(vec![Change::AlterColumnDefault {
-            uid: "c_aaaaaa".parse().unwrap(),
-            column: table.column("a"),
-            from: None,
-            to: Some("0".into()),
-        }]));
+        let report = preflight(&set(vec![Change::Column(
+            ColumnChange::AlterColumnDefault {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: table.column("a"),
+                from: None,
+                to: Some("0".into()),
+            },
+        )]));
         assert!(report.probes.is_empty(), "{report:#?}");
         assert!(report.unchecked.is_empty(), "{report:#?}");
     }
@@ -6582,9 +6620,9 @@ mod tests {
                 options: Default::default(),
             });
             pbps_model::PlannedChange::new(if alter {
-                Change::AlterModule { id, module }
+                Change::Module(ModuleChange::AlterModule { id, module })
             } else {
-                Change::CreateModule { id, module }
+                Change::Module(ModuleChange::CreateModule { id, module })
             })
         };
         let probe = attach_trigger_probe(
@@ -6628,19 +6666,21 @@ mod tests {
     #[test]
     fn a_partition_change_under_a_standing_parent_is_probed() {
         use pbps_model::{PartitionBound as B, PartitionOf};
-        let partition = |bound: B| Change::CreateTable {
-            uid: "t_bbbbbb".parse().unwrap(),
-            name: "app.ev_1".parse().unwrap(),
-            table: Box::new(pbps_model::Table {
-                partition_of: Some(PartitionOf {
-                    parent: "app.ev".parse().unwrap(),
-                    bound,
-                    columns: Default::default(),
+        let partition = |bound: B| {
+            Change::Table(TableChange::CreateTable {
+                uid: "t_bbbbbb".parse().unwrap(),
+                name: "app.ev_1".parse().unwrap(),
+                table: Box::new(pbps_model::Table {
+                    partition_of: Some(PartitionOf {
+                        parent: "app.ev".parse().unwrap(),
+                        bound,
+                        columns: Default::default(),
+                    }),
+                    ..Default::default()
                 }),
-                ..Default::default()
-            }),
-            beside_default: None,
-            moves_at_most: None,
+                beside_default: None,
+                moves_at_most: None,
+            })
         };
         let range = B::Range {
             from: vec![pbps_model::BoundDatum::Value("1".into())],
@@ -6661,23 +6701,25 @@ mod tests {
         // With its parent created in the same plan, nothing to count.
         let with_parent = probes(&ChangeSet {
             changes: vec![
-                pbps_model::PlannedChange::new(Change::CreateTable {
+                pbps_model::PlannedChange::new(Change::Table(TableChange::CreateTable {
                     uid: "t_aaaaaa".parse().unwrap(),
                     name: "app.ev".parse().unwrap(),
                     table: Box::default(),
                     beside_default: None,
                     moves_at_most: None,
-                }),
+                })),
                 pbps_model::PlannedChange::new(partition(range)),
             ],
         });
         assert!(with_parent.is_empty(), "{with_parent:?}");
         let dropped = probes(&ChangeSet {
-            changes: vec![pbps_model::PlannedChange::new(Change::DropTable {
-                uid: "t_bbbbbb".parse().unwrap(),
-                name: "app.ev_1".parse().unwrap(),
-                detach_from: Some("app.ev".parse().unwrap()),
-            })],
+            changes: vec![pbps_model::PlannedChange::new(Change::Table(
+                TableChange::DropTable {
+                    uid: "t_bbbbbb".parse().unwrap(),
+                    name: "app.ev_1".parse().unwrap(),
+                    detach_from: Some("app.ev".parse().unwrap()),
+                },
+            ))],
         });
         assert_eq!(dropped.len(), 1, "{dropped:?}");
         assert!(dropped[0].description.contains("reference app.ev_1"));
@@ -6687,14 +6729,16 @@ mod tests {
         // asks too.
         let attach = |bound: B| {
             probes(&ChangeSet {
-                changes: vec![pbps_model::PlannedChange::new(Change::AttachPartition {
-                    uid: "t_cccccc".parse().unwrap(),
-                    table: "app.t".parse().unwrap(),
-                    parent: "app.ev".parse().unwrap(),
-                    bound,
-                    key: Vec::new(),
-                    shape: Box::default(),
-                })],
+                changes: vec![pbps_model::PlannedChange::new(Change::Partition(
+                    PartitionChange::AttachPartition {
+                        uid: "t_cccccc".parse().unwrap(),
+                        table: "app.t".parse().unwrap(),
+                        parent: "app.ev".parse().unwrap(),
+                        bound,
+                        key: Vec::new(),
+                        shape: Box::default(),
+                    },
+                ))],
             })
         };
         let attached = attach(B::Range {
@@ -6767,10 +6811,10 @@ mod tests {
         // parent, is gone by the attach, and left out (#1632); one on a third
         // table is not.
         let drop = |on: &str, name: &str| {
-            pbps_model::PlannedChange::new(Change::DropModule {
+            pbps_model::PlannedChange::new(Change::Module(ModuleChange::DropModule {
                 id: format!("{on}.{name}").parse().unwrap(),
                 kind: pbps_model::ModuleKind::Trigger,
-            })
+            }))
         };
         let probe = attach_trigger_probe(
             &"app.t".parse().unwrap(),
@@ -6835,7 +6879,7 @@ mod tests {
             pbps_model::Partitions::of(&schema)
         };
         let rename = |uid: &str, ty: &str, from: &str, to: &str, ordinal: usize| {
-            PlannedChange::new(Change::RenameEnumValue {
+            PlannedChange::new(Change::TypeValue(TypeValueChange::RenameEnumValue {
                 uid: uid.parse().unwrap(),
                 name: ty.parse().unwrap(),
                 from: from.into(),
@@ -6843,7 +6887,7 @@ mod tests {
                 ordinal,
                 retained: Vec::new(),
                 definition: Box::new(pbps_model::ManagedType::Enum { values: vec![] }),
-            })
+            }))
         };
         let list = |label: &str| PartitionBound::List {
             values: [ListDatum::Value(label.into())].into(),
@@ -6857,22 +6901,22 @@ mod tests {
             ..Default::default()
         };
         let creates = |beside: bool| {
-            PlannedChange::new(Change::CreateTable {
+            PlannedChange::new(Change::Table(TableChange::CreateTable {
                 uid: "t_bbbbbb".parse().unwrap(),
                 name: "app.ev_b".parse().unwrap(),
                 table: Box::new(partition(list("b"))),
                 beside_default: beside.then(|| "app.ev_rest".parse().unwrap()),
                 moves_at_most: None,
-            })
+            }))
         };
-        let attaches = PlannedChange::new(Change::AttachPartition {
+        let attaches = PlannedChange::new(Change::Partition(PartitionChange::AttachPartition {
             uid: "t_bbbbbb".parse().unwrap(),
             table: "app.ev_b".parse().unwrap(),
             parent: "app.ev".parse().unwrap(),
             bound: list("b"),
             key: vec![],
             shape: Box::new(partition(list("b"))),
-        });
+        }));
         // The finding's plan: `b` becomes `c`, `a` becomes `b`, and a partition
         // takes `b`, the label the rows now called `a` will have.
         let chain = |other: &str| {
@@ -6938,14 +6982,15 @@ mod tests {
         }
         // A table attached as the DEFAULT counts its rows against the
         // partitions made beside it, which are declared in the same labels.
-        let default_attach = PlannedChange::new(Change::AttachPartition {
-            uid: "t_dddddd".parse().unwrap(),
-            table: "app.ev_d".parse().unwrap(),
-            parent: "app.ev".parse().unwrap(),
-            bound: PartitionBound::Default,
-            key: vec![],
-            shape: Box::new(partition(PartitionBound::Default)),
-        });
+        let default_attach =
+            PlannedChange::new(Change::Partition(PartitionChange::AttachPartition {
+                uid: "t_dddddd".parse().unwrap(),
+                table: "app.ev_d".parse().unwrap(),
+                parent: "app.ev".parse().unwrap(),
+                bound: PartitionBound::Default,
+                key: vec![],
+                shape: Box::new(partition(PartitionBound::Default)),
+            }));
         for (case, renames, partitions) in [
             ("renamed", chain("app.mood"), key("app.mood")),
             ("no renames", vec![], key("app.mood")),
@@ -6974,12 +7019,12 @@ mod tests {
         let mut moved_type = chain("app.feeling");
         moved_type.insert(
             0,
-            PlannedChange::new(Change::RenameType {
+            PlannedChange::new(Change::Type(TypeChange::RenameType {
                 uid: "y_000001".parse().unwrap(),
                 from: "app.mood".parse().unwrap(),
                 to: "app.feeling".parse().unwrap(),
                 definition: Box::new(pbps_model::ManagedType::Enum { values: vec![] }),
-            }),
+            })),
         );
         let followed = asked(moved_type, creates(true), &key("app.mood"));
         assert!(
@@ -6996,7 +7041,7 @@ mod tests {
     /// the name the catalog has before the plan's renames (#1547).
     #[test]
     fn a_partition_beside_a_default_asks_what_its_move_would_fire() {
-        let create = Change::CreateTable {
+        let create = Change::Table(TableChange::CreateTable {
             uid: "t_bbbbbb".parse().unwrap(),
             name: "app.ev_1".parse().unwrap(),
             table: Box::new(pbps_model::Table {
@@ -7012,13 +7057,13 @@ mod tests {
             }),
             beside_default: Some("app.ev_rest".parse().unwrap()),
             moves_at_most: None,
-        };
-        let renamed = Change::RenameTable {
+        });
+        let renamed = Change::Table(TableChange::RenameTable {
             uid: "t_cccccc".parse().unwrap(),
             from: "app.ev_old".parse().unwrap(),
             to: "app.ev".parse().unwrap(),
             defaults: Default::default(),
-        };
+        });
         let asked_plan = ChangeSet {
             changes: vec![
                 pbps_model::PlannedChange::new(renamed),
@@ -7047,7 +7092,7 @@ mod tests {
         );
         let mut allowed = asked_plan.clone();
         for p in &mut allowed.changes {
-            if let Change::CreateTable { moves_at_most, .. } = &mut p.change {
+            if let Change::Table(TableChange::CreateTable { moves_at_most, .. }) = &mut p.change {
                 *moves_at_most = Some(3_000_000_000);
             }
         }
@@ -7064,7 +7109,7 @@ mod tests {
         // asked about (#1763 review).
         let mut unlogged = asked_plan.clone();
         for p in &mut unlogged.changes {
-            if let Change::CreateTable { table, .. } = &mut p.change {
+            if let Change::Table(TableChange::CreateTable { table, .. }) = &mut p.change {
                 table.unlogged = true;
             }
         }
@@ -7171,14 +7216,14 @@ mod tests {
         // A trigger the plan drops first, on the DEFAULT or cloned from the
         // parent, is not asked about (#1547 review).
         let mut dropping = vec![
-            pbps_model::PlannedChange::new(Change::DropModule {
+            pbps_model::PlannedChange::new(Change::Module(ModuleChange::DropModule {
                 id: "app.ev_rest.own_tr".parse().unwrap(),
                 kind: pbps_model::ModuleKind::Trigger,
-            }),
-            pbps_model::PlannedChange::new(Change::DropModule {
+            })),
+            pbps_model::PlannedChange::new(Change::Module(ModuleChange::DropModule {
                 id: "app.ev_old.parent_tr".parse().unwrap(),
                 kind: pbps_model::ModuleKind::Trigger,
-            }),
+            })),
         ];
         dropping.extend(asked_plan.changes.iter().cloned());
         let without = probes(&ChangeSet { changes: dropping });
@@ -7196,11 +7241,13 @@ mod tests {
         );
         // A referencing table's partition the plan drops first takes its
         // rows with it, and they are not counted (#1763 review).
-        let mut leaf_dropped = vec![pbps_model::PlannedChange::new(Change::DropTable {
-            uid: "t_dddddd".parse().unwrap(),
-            name: "ext.child_1".parse().unwrap(),
-            detach_from: Some("ext.child".parse().unwrap()),
-        })];
+        let mut leaf_dropped = vec![pbps_model::PlannedChange::new(Change::Table(
+            TableChange::DropTable {
+                uid: "t_dddddd".parse().unwrap(),
+                name: "ext.child_1".parse().unwrap(),
+                detach_from: Some("ext.child".parse().unwrap()),
+            },
+        ))];
         leaf_dropped.extend(asked_plan.changes.iter().cloned());
         let after_drop = probes(&ChangeSet {
             changes: leaf_dropped,
@@ -7264,7 +7311,7 @@ mod tests {
     /// the old values, and the rest is still asked (#1763 review).
     #[test]
     fn a_move_beside_a_rewrite_leaves_its_reference_count_unchecked() {
-        let create = Change::CreateTable {
+        let create = Change::Table(TableChange::CreateTable {
             uid: "t_bbbbbb".parse().unwrap(),
             name: "app.ev_1".parse().unwrap(),
             table: Box::new(pbps_model::Table {
@@ -7280,13 +7327,13 @@ mod tests {
             }),
             beside_default: Some("app.ev_rest".parse().unwrap()),
             moves_at_most: None,
-        };
-        let recomputed = Change::AlterColumnExpression {
+        });
+        let recomputed = Change::Column(ColumnChange::AlterColumnExpression {
             uid: "c_cccccc".parse().unwrap(),
             column: "ext.child.ev_id".parse().unwrap(),
             from: "id".into(),
             to: "NULL::integer".into(),
-        };
+        });
         let asked = preflight(&ChangeSet {
             changes: vec![
                 pbps_model::PlannedChange::new(recomputed),
@@ -7312,7 +7359,7 @@ mod tests {
         // A retype rewrites the values too (#1763 review).
         let retyped = preflight(&ChangeSet {
             changes: vec![
-                pbps_model::PlannedChange::new(Change::AlterColumnType {
+                pbps_model::PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
                     uid: "c_dddddd".parse().unwrap(),
                     column: "ext.child.ev_id".parse().unwrap(),
                     from: "numeric(10,2)".parse().unwrap(),
@@ -7323,7 +7370,7 @@ mod tests {
                     from_collation: None,
                     to_collation: None,
                     using: None,
-                }),
+                })),
                 pbps_model::PlannedChange::new(create.clone()),
             ],
         });
@@ -7364,27 +7411,27 @@ mod tests {
         let cases = [
             (
                 "required addition",
-                Change::AddColumn {
+                Change::Column(ColumnChange::AddColumn {
                     uid: "c_aaaaaa".parse().unwrap(),
                     table: table.clone(),
                     name: "new_value".into(),
                     column: Box::new(required),
-                },
+                }),
             ),
             (
                 "nullability",
-                Change::AlterColumnNullability {
+                Change::Column(ColumnChange::AlterColumnNullability {
                     uid: "c_aaaaaa".parse().unwrap(),
                     column: table.column("v"),
                     ty: "integer".parse().unwrap(),
                     to_nullable: false,
                     through_external_partitions: false,
                     collation: None,
-                },
+                }),
             ),
             (
                 "conversion and folded nullability",
-                Change::AlterColumnType {
+                Change::Column(ColumnChange::AlterColumnType {
                     uid: "c_aaaaaa".parse().unwrap(),
                     column: table.column("v"),
                     from: "varchar(10)".parse().unwrap(),
@@ -7395,21 +7442,21 @@ mod tests {
                     from_collation: None,
                     to_collation: None,
                     using: None,
-                },
+                }),
             ),
             (
                 "check",
-                Change::AddCheck {
+                Change::Constraint(ConstraintChange::AddCheck {
                     table: table.clone(),
                     name: "positive".into(),
                     constraint: pbps_model::CheckConstraint {
                         expression: "v > 0".into(),
                     },
-                },
+                }),
             ),
             (
                 "unique constraint",
-                Change::AddUnique {
+                Change::Constraint(ConstraintChange::AddUnique {
                     table: table.clone(),
                     name: "uq".into(),
                     constraint: pbps_model::UniqueConstraint {
@@ -7418,11 +7465,11 @@ mod tests {
                         filegroup: None,
                     },
                     clustered: false,
-                },
+                }),
             ),
             (
                 "unique index",
-                Change::AddIndex {
+                Change::Index(IndexChange::AddIndex {
                     table: table.clone(),
                     name: "ix".into(),
                     index: Box::new(pbps_model::Index {
@@ -7440,11 +7487,11 @@ mod tests {
                         filegroup: None,
                     }),
                     clustered: false,
-                },
+                }),
             ),
             (
                 "primary key",
-                Change::SetPrimaryKey {
+                Change::Constraint(ConstraintChange::SetPrimaryKey {
                     table: table.clone(),
                     from: None,
                     to: Some(pbps_model::PrimaryKey {
@@ -7454,11 +7501,11 @@ mod tests {
                         filegroup: None,
                     }),
                     nonclustered: false,
-                },
+                }),
             ),
             (
                 "foreign key",
-                Change::AddForeignKey {
+                Change::Constraint(ConstraintChange::AddForeignKey {
                     table: table.clone(),
                     name: "fk".into(),
                     constraint: Box::new(pbps_model::ForeignKey {
@@ -7468,7 +7515,7 @@ mod tests {
                         on_delete: pbps_model::ReferentialAction::NoAction,
                         on_update: pbps_model::ReferentialAction::NoAction,
                     }),
-                },
+                }),
             ),
             ("pre-delete", deleting("app.parent", "old")),
         ];
@@ -7513,14 +7560,16 @@ mod tests {
         }
         // Changes without a count question must not gain a synthetic probe.
         assert!(preflight(&set(vec![])).probes.is_empty());
-        let relaxed = preflight(&set(vec![Change::AlterColumnNullability {
-            uid: "c_aaaaaa".parse().unwrap(),
-            column: table.column("v"),
-            ty: "integer".parse().unwrap(),
-            to_nullable: true,
-            through_external_partitions: false,
-            collation: None,
-        }]));
+        let relaxed = preflight(&set(vec![Change::Column(
+            ColumnChange::AlterColumnNullability {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: table.column("v"),
+                ty: "integer".parse().unwrap(),
+                to_nullable: true,
+                through_external_partitions: false,
+                collation: None,
+            },
+        )]));
         assert!(relaxed.probes.is_empty() && relaxed.unchecked.is_empty());
     }
 
@@ -7559,24 +7608,28 @@ mod tests {
     #[test]
     fn a_check_on_a_table_this_plan_retypes_is_not_probed_against_the_old_values() {
         let table: TableName = "app.t".parse().expect("a table name");
-        let check = |t: &TableName| Change::AddCheck {
-            table: t.clone(),
-            name: "t_rounded".into(),
-            constraint: pbps_model::CheckConstraint {
-                expression: "v = round(v)".to_owned(),
-            },
+        let check = |t: &TableName| {
+            Change::Constraint(ConstraintChange::AddCheck {
+                table: t.clone(),
+                name: "t_rounded".into(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "v = round(v)".to_owned(),
+                },
+            })
         };
-        let retype = |t: &TableName| Change::AlterColumnType {
-            uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
-            column: t.column("v"),
-            from: "numeric(10,2)".parse().expect("a type"),
-            to: "numeric(10,0)".parse().expect("a type"),
-            from_nullable: true,
-            to_nullable: true,
-            through_external_partitions: false,
-            from_collation: None,
-            to_collation: None,
-            using: None,
+        let retype = |t: &TableName| {
+            Change::Column(ColumnChange::AlterColumnType {
+                uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+                column: t.column("v"),
+                from: "numeric(10,2)".parse().expect("a type"),
+                to: "numeric(10,0)".parse().expect("a type"),
+                from_nullable: true,
+                to_nullable: true,
+                through_external_partitions: false,
+                from_collation: None,
+                to_collation: None,
+                using: None,
+            })
         };
 
         let alone = probes(&set(vec![check(&table)]));
@@ -7610,26 +7663,30 @@ mod tests {
     #[test]
     fn a_check_beside_an_enum_rebuild_is_not_probed_against_the_old_label_order() {
         let table: TableName = "app.t".parse().unwrap();
-        let check = |t: &TableName| Change::AddCheck {
-            table: t.clone(),
-            name: "t_mood".into(),
-            constraint: pbps_model::CheckConstraint {
-                expression: "m <= 'ok'::app.mood".to_owned(),
-            },
+        let check = |t: &TableName| {
+            Change::Constraint(ConstraintChange::AddCheck {
+                table: t.clone(),
+                name: "t_mood".into(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "m <= 'ok'::app.mood".to_owned(),
+                },
+            })
         };
-        let rebuild = |t: &TableName, column: &str| Change::EnumRebuild {
-            uid: "y_000001".parse().unwrap(),
-            name: "app.mood".parse().unwrap(),
-            tmp: "app.tmp".parse().unwrap(),
-            step: pbps_model::EnumRebuildStep::Retype {
-                column_uid: "c_aaaaaa".parse().unwrap(),
-                column: t.column(column),
-                to: pbps_model::ColumnType::reference("app.mood".parse().unwrap()),
-                array: false,
-                values: Box::new(pbps_model::ValueChange::Relabel {
-                    removed: vec!["sad".to_owned()],
-                }),
-            },
+        let rebuild = |t: &TableName, column: &str| {
+            Change::TypeValue(TypeValueChange::EnumRebuild {
+                uid: "y_000001".parse().unwrap(),
+                name: "app.mood".parse().unwrap(),
+                tmp: "app.tmp".parse().unwrap(),
+                step: pbps_model::EnumRebuildStep::Retype {
+                    column_uid: "c_aaaaaa".parse().unwrap(),
+                    column: t.column(column),
+                    to: pbps_model::ColumnType::reference("app.mood".parse().unwrap()),
+                    array: false,
+                    values: Box::new(pbps_model::ValueChange::Relabel {
+                        removed: vec!["sad".to_owned()],
+                    }),
+                },
+            })
         };
 
         let alone = probes(&set(vec![check(&table)]));
@@ -7684,26 +7741,28 @@ mod tests {
             },
         );
         let partitions = pbps_model::Partitions::of(&stored);
-        let check = Change::AddCheck {
+        let check = Change::Constraint(ConstraintChange::AddCheck {
             table: partition.clone(),
             name: "p_1_mood".into(),
             constraint: pbps_model::CheckConstraint {
                 expression: "m <= 'ok'::app.mood".to_owned(),
             },
-        };
-        let rebuild = |t: &TableName| Change::EnumRebuild {
-            uid: "y_000001".parse().unwrap(),
-            name: "app.mood".parse().unwrap(),
-            tmp: "app.tmp".parse().unwrap(),
-            step: pbps_model::EnumRebuildStep::Retype {
-                column_uid: "c_aaaaaa".parse().unwrap(),
-                column: t.column("m"),
-                to: pbps_model::ColumnType::reference("app.mood".parse().unwrap()),
-                array: false,
-                values: Box::new(pbps_model::ValueChange::Relabel {
-                    removed: vec!["sad".to_owned()],
-                }),
-            },
+        });
+        let rebuild = |t: &TableName| {
+            Change::TypeValue(TypeValueChange::EnumRebuild {
+                uid: "y_000001".parse().unwrap(),
+                name: "app.mood".parse().unwrap(),
+                tmp: "app.tmp".parse().unwrap(),
+                step: pbps_model::EnumRebuildStep::Retype {
+                    column_uid: "c_aaaaaa".parse().unwrap(),
+                    column: t.column("m"),
+                    to: pbps_model::ColumnType::reference("app.mood".parse().unwrap()),
+                    array: false,
+                    values: Box::new(pbps_model::ValueChange::Relabel {
+                        removed: vec!["sad".to_owned()],
+                    }),
+                },
+            })
         };
         let probed =
             |report: &Preflight| report.probes.iter().any(|p| p.sql.contains("m <= ''ok''"));
@@ -7759,14 +7818,14 @@ mod tests {
             },
         );
         let partitions = pbps_model::Partitions::of(&stored);
-        let check = Change::AddCheck {
+        let check = Change::Constraint(ConstraintChange::AddCheck {
             table: partition.clone(),
             name: "p_1_rounded".into(),
             constraint: pbps_model::CheckConstraint {
                 expression: "v = round(v)".to_owned(),
             },
-        };
-        let retype = Change::AlterColumnType {
+        });
+        let retype = Change::Column(ColumnChange::AlterColumnType {
             uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
             column: parent.column("v"),
             from: "numeric(10,2)".parse().expect("a type"),
@@ -7777,7 +7836,7 @@ mod tests {
             from_collation: None,
             to_collation: None,
             using: None,
-        };
+        });
         let plan = set(vec![retype.clone(), check.clone()]);
         let told = probes_with(&plan, &partitions);
         assert!(
@@ -7797,13 +7856,13 @@ mod tests {
             probes(&plan).iter().any(|p| p.sql.contains("v = round(v)")),
             "the unrelated reading"
         );
-        let elsewhere = Change::AddCheck {
+        let elsewhere = Change::Constraint(ConstraintChange::AddCheck {
             table: "app.t".parse().expect("a table name"),
             name: "t_rounded".into(),
             constraint: pbps_model::CheckConstraint {
                 expression: "v = round(v)".to_owned(),
             },
-        };
+        });
         assert!(
             probes_with(&set(vec![retype, elsewhere]), &partitions)
                 .probes
@@ -7814,14 +7873,14 @@ mod tests {
 
         // A unique index on the partition reads its column under the name
         // the catalog has before the parent's rename runs.
-        let rename = Change::RenameColumn {
+        let rename = Change::Column(ColumnChange::RenameColumn {
             uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
             table: parent.clone(),
             table_was: None,
             from: "code".into(),
             to: "label".into(),
-        };
-        let unique = Change::AddIndex {
+        });
+        let unique = Change::Index(IndexChange::AddIndex {
             table: partition.clone(),
             name: "p_1_label".into(),
             index: Box::new(pbps_model::Index {
@@ -7834,7 +7893,7 @@ mod tests {
                 filegroup: None,
             }),
             clustered: false,
-        };
+        });
         let renamed = probes_with(&set(vec![rename, unique]), &partitions);
         assert_eq!(renamed.probes.len(), 1, "{renamed:#?}");
         let sql = &renamed.probes[0].sql;
@@ -7851,29 +7910,35 @@ mod tests {
     #[test]
     fn a_probe_never_reads_a_name_this_plan_gives_another_column() {
         let t: TableName = "app.t".parse().expect("a table name");
-        let check = Change::AddCheck {
+        let check = Change::Constraint(ConstraintChange::AddCheck {
             table: t.clone(),
             name: "t_n".into(),
             constraint: pbps_model::CheckConstraint {
                 expression: "n > 0".to_owned(),
             },
+        });
+        let drop = |c: &str| {
+            Change::Column(ColumnChange::DropColumn {
+                uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+                column: t.column(c),
+            })
         };
-        let drop = |c: &str| Change::DropColumn {
-            uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
-            column: t.column(c),
+        let rename = |table: &TableName, from: &str, to: &str| {
+            Change::Column(ColumnChange::RenameColumn {
+                uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+                table: table.clone(),
+                table_was: None,
+                from: from.into(),
+                to: to.into(),
+            })
         };
-        let rename = |table: &TableName, from: &str, to: &str| Change::RenameColumn {
-            uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
-            table: table.clone(),
-            table_was: None,
-            from: from.into(),
-            to: to.into(),
-        };
-        let add = |table: &TableName, c: &str| Change::AddColumn {
-            table: table.clone(),
-            uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
-            name: c.into(),
-            column: Box::new(pbps_model::Column::new("integer".parse().expect("a type"))),
+        let add = |table: &TableName, c: &str| {
+            Change::Column(ColumnChange::AddColumn {
+                table: table.clone(),
+                uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+                name: c.into(),
+                column: Box::new(pbps_model::Column::new("integer".parse().expect("a type"))),
+            })
         };
         let checked = |changes: Vec<Change>| {
             preflight(&set(changes))
@@ -7916,11 +7981,13 @@ mod tests {
             },
         );
         let partitions = pbps_model::Partitions::of(&stored);
-        let not_null = |c: &str| Change::SetPartitionNotNull {
-            uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
-            table: partition.clone(),
-            column: c.into(),
-            not_null: true,
+        let not_null = |c: &str| {
+            Change::Partition(PartitionChange::SetPartitionNotNull {
+                uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
+                table: partition.clone(),
+                column: c.into(),
+                not_null: true,
+            })
         };
         let readded = probes_with(
             &set(vec![
@@ -7983,18 +8050,18 @@ mod tests {
                 pbps_model::Column::new(ty.parse().expect("a type")),
             );
             set(vec![
-                Change::CreateTable {
+                Change::Table(TableChange::CreateTable {
                     uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
                     name: parent.clone(),
                     table: Box::new(table),
                     beside_default: None,
                     moves_at_most: None,
-                },
-                Change::AddForeignKey {
+                }),
+                Change::Constraint(ConstraintChange::AddForeignKey {
                     table: child.clone(),
                     name: "child_status_fkey".into(),
                     constraint: Box::new(key.clone()),
-                },
+                }),
             ])
         };
 
@@ -8057,17 +8124,17 @@ mod tests {
         };
         let plan = |column: pbps_model::Column| {
             set(vec![
-                Change::AddColumn {
+                Change::Column(ColumnChange::AddColumn {
                     uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
                     table: child.clone(),
                     name: "status".into(),
                     column: Box::new(column),
-                },
-                Change::AddForeignKey {
+                }),
+                Change::Constraint(ConstraintChange::AddForeignKey {
                     table: child.clone(),
                     name: "child_status_fkey".into(),
                     constraint: Box::new(key.clone()),
-                },
+                }),
                 deleting("app.status", "old"),
             ])
         };
@@ -8186,26 +8253,28 @@ mod tests {
             on_delete: pbps_model::ReferentialAction::NoAction,
             on_update: pbps_model::ReferentialAction::NoAction,
         };
-        let retype = |from: &str, to: &str| Change::AlterColumnType {
-            uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
-            column: child.column("status"),
-            from: from.parse().expect("a type"),
-            to: to.parse().expect("a type"),
-            from_nullable: true,
-            to_nullable: true,
-            through_external_partitions: false,
-            from_collation: None,
-            to_collation: None,
-            using: None,
+        let retype = |from: &str, to: &str| {
+            Change::Column(ColumnChange::AlterColumnType {
+                uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+                column: child.column("status"),
+                from: from.parse().expect("a type"),
+                to: to.parse().expect("a type"),
+                from_nullable: true,
+                to_nullable: true,
+                through_external_partitions: false,
+                from_collation: None,
+                to_collation: None,
+                using: None,
+            })
         };
         let plan = |retype_change: Change| {
             set(vec![
                 retype_change,
-                Change::AddForeignKey {
+                Change::Constraint(ConstraintChange::AddForeignKey {
                     table: child.clone(),
                     name: "child_status_fkey".into(),
                     constraint: Box::new(key.clone()),
-                },
+                }),
                 deleting("app.status", "old"),
             ])
         };
@@ -8338,7 +8407,7 @@ mod tests {
         // The referenced column narrows, which is the case the child-side
         // test above does not reach: the guard then lands on `p` and `q`.
         let narrowed = probes(&set(vec![
-            Change::AlterColumnType {
+            Change::Column(ColumnChange::AlterColumnType {
                 uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
                 column: parent.column("code"),
                 from: "bigint".parse().expect("a type"),
@@ -8349,12 +8418,12 @@ mod tests {
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            },
-            Change::AddForeignKey {
+            }),
+            Change::Constraint(ConstraintChange::AddForeignKey {
                 table: child.clone(),
                 name: "child_status_fkey".into(),
                 constraint: Box::new(key),
-            },
+            }),
             deleting("app.status", "old"),
         ]));
         let guard = |alias: &str| {
@@ -8406,7 +8475,7 @@ mod tests {
         // true of a probe that was never built — a negative that holds
         // whatever the barrier does.
         let widened = probes(&set(vec![
-            Change::AlterColumnType {
+            Change::Column(ColumnChange::AlterColumnType {
                 uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
                 column: parent.column("code"),
                 from: "integer".parse().expect("a type"),
@@ -8417,12 +8486,12 @@ mod tests {
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            },
-            Change::AddForeignKey {
+            }),
+            Change::Constraint(ConstraintChange::AddForeignKey {
                 table: child.clone(),
                 name: "child_status_fkey".into(),
                 constraint: Box::new(widening_key),
-            },
+            }),
             deleting("app.status", "old"),
         ]));
         let widened_own: Vec<&Probe> = widened
@@ -8494,15 +8563,15 @@ mod tests {
     #[test]
     fn a_key_this_plan_drops_first_is_left_out_of_the_probe() {
         let probes = probes(&set(vec![
-            Change::DropForeignKey {
+            Change::Constraint(ConstraintChange::DropForeignKey {
                 table: "app.child".parse().expect("a table name"),
                 name: "fk_child".into(),
-            },
-            Change::DropTable {
+            }),
+            Change::Table(TableChange::DropTable {
                 uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
                 name: "app.gone".parse().expect("a table name"),
                 detach_from: None,
-            },
+            }),
             deleting("app.status", "old"),
         ]));
         let sql = &probes[0].sql;
@@ -8522,7 +8591,7 @@ mod tests {
     #[test]
     fn a_child_row_this_plan_moves_is_left_out_of_the_count() {
         let probes = probes(&set(vec![
-            Change::UpdateRow {
+            Change::Row(RowChange::UpdateRow {
                 table: "app.child".parse().expect("a table name"),
                 key_column: "code".into(),
                 key: RowKey::from("c1"),
@@ -8539,7 +8608,7 @@ mod tests {
                 types: BTreeMap::new(),
                 after_types: BTreeMap::new(),
                 key_type: None,
-            },
+            }),
             deleting("app.status", "old"),
         ]));
         let sql = &probes[0].sql;

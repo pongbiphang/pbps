@@ -92,7 +92,10 @@ fn a_declared_package_is_created_after_its_prerequisite_pinned_gated_and_recorde
             .changes
             .iter()
             .filter_map(|p| {
-                if let pbps_model::Change::CreateExtension { name, requires, .. } = &p.change {
+                if let pbps_model::Change::Extension(
+                    pbps_model::ExtensionChange::CreateExtension { name, requires, .. },
+                ) = &p.change
+                {
                     Some((name.raw().to_owned(), requires.len(), p.risks.clone()))
                 } else {
                     None
@@ -622,12 +625,10 @@ fn an_offline_saved_plan_holding_a_create_is_refused_by_apply_and_writes_nothing
         let plan = saved(&f);
         assert_eq!(plan.origin, pbps_model::PlanOrigin::Preview);
         assert!(plan.extension_pins.is_empty());
-        assert!(
-            plan.changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, pbps_model::Change::CreateExtension { .. }))
-        );
+        assert!(plan.changes.changes.iter().any(|p| matches!(
+            p.change,
+            pbps_model::Change::Extension(pbps_model::ExtensionChange::CreateExtension { .. })
+        )));
         let before = ledger_entries(&f);
         let untouched = |f: &Fixture| {
             assert_eq!(held(f, BOTH), "");

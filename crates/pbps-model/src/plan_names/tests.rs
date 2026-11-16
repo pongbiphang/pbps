@@ -1,4 +1,9 @@
 use super::*;
+use crate::ColumnChange;
+use crate::PartitionChange;
+use crate::RoleChange;
+use crate::TableChange;
+use crate::TypeValueChange;
 use crate::{Column, Table};
 
 fn uid(kind: UidKind, name: &str) -> Uid {
@@ -17,12 +22,12 @@ fn p(change: Change) -> PlannedChange {
     PlannedChange::new(change)
 }
 fn rename(uid: &Uid, from: TableName, to: TableName) -> PlannedChange {
-    p(Change::RenameTable {
+    p(Change::Table(TableChange::RenameTable {
         uid: uid.clone(),
         from,
         to,
         defaults: vec![],
-    })
+    }))
 }
 fn ids(tables: &[(&Uid, TableName)], columns: &[(&Uid, ColumnRef)]) -> IdsFile {
     IdsFile {
@@ -38,12 +43,12 @@ fn ids(tables: &[(&Uid, TableName)], columns: &[(&Uid, ColumnRef)]) -> IdsFile {
     }
 }
 fn alter(uid: &Uid, address: ColumnRef) -> PlannedChange {
-    p(Change::AlterColumnDefault {
+    p(Change::Column(ColumnChange::AlterColumnDefault {
         uid: uid.clone(),
         column: address,
         from: None,
         to: Some("7".into()),
-    })
+    }))
 }
 
 /// A rebuild's retype is the same column in the plan's history as any other
@@ -52,7 +57,7 @@ fn alter(uid: &Uid, address: ColumnRef) -> PlannedChange {
 fn a_rebuilds_retype_is_a_step_of_its_column_and_must_agree_with_the_identities() {
     let (owner, c) = (table("a"), column("c"));
     let retype = |address: ColumnRef| {
-        p(Change::EnumRebuild {
+        p(Change::TypeValue(TypeValueChange::EnumRebuild {
             uid: uid(UidKind::Type, "e"),
             name: "app.e".parse().unwrap(),
             tmp: "app.pbps_rebuild_e".parse().unwrap(),
@@ -63,7 +68,7 @@ fn a_rebuilds_retype_is_a_step_of_its_column_and_must_agree_with_the_identities(
                 array: false,
                 values: Box::new(crate::ValueChange::Relabel { removed: vec![] }),
             },
-        })
+        }))
     };
     let known = ids(&[(&owner, t("a"))], &[(&c, t("a").column("c"))]);
     let good = [retype(t("a").column("c"))];
@@ -105,11 +110,11 @@ fn a_column_finds_its_untouched_owner_in_the_final_mapping() {
 fn a_dropped_name_and_its_next_holder_have_separate_histories() {
     let (a, b) = (table("a"), table("b"));
     let changes = vec![
-        p(Change::DropTable {
+        p(Change::Table(TableChange::DropTable {
             uid: a.clone(),
             name: t("a"),
             detach_from: None,
-        }),
+        })),
         rename(&b, t("b"), t("a")),
     ];
     let after = ids(&[(&b, t("a"))], &[]);
@@ -176,17 +181,17 @@ fn column_handoffs_follow_the_owning_identity_through_its_table_rename() {
     let (a, c, d) = (table("a"), column("c"), column("d"));
     let changes = vec![
         rename(&a, t("a"), t("b")),
-        p(Change::DropColumn {
+        p(Change::Column(ColumnChange::DropColumn {
             uid: c.clone(),
             column: t("b").column("c"),
-        }),
-        p(Change::RenameColumn {
+        })),
+        p(Change::Column(ColumnChange::RenameColumn {
             uid: d.clone(),
             table: t("b"),
             from: "d".into(),
             to: "c".into(),
             table_was: Some(t("a")),
-        }),
+        })),
     ];
     let after = ids(&[(&a, t("b"))], &[(&d, t("b").column("c"))]);
     let names = PlanNames::of(&changes, &after).unwrap();
@@ -209,16 +214,16 @@ fn column_handoffs_follow_the_owning_identity_through_its_table_rename() {
 fn roles_use_the_same_handoff_rules_in_a_separate_namespace() {
     let (a, b) = (uid(UidKind::Role, "a"), uid(UidKind::Role, "b"));
     let changes = vec![
-        p(Change::DropRole {
+        p(Change::Role(RoleChange::DropRole {
             uid: a.clone(),
             name: "a".into(),
             members: vec![],
-        }),
-        p(Change::RenameRole {
+        })),
+        p(Change::Role(RoleChange::RenameRole {
             uid: b.clone(),
             from: "b".into(),
             to: "a".into(),
-        }),
+        })),
     ];
     let after = IdsFile {
         roles: [(b.clone(), "a".into())].into(),
@@ -251,13 +256,13 @@ fn a_created_tables_inline_column_has_no_stored_address() {
     shape
         .columns
         .insert("c".into(), Column::new("int".parse().unwrap()));
-    let changes = vec![p(Change::CreateTable {
+    let changes = vec![p(Change::Table(TableChange::CreateTable {
         uid: a.clone(),
         name: t("a"),
         table: Box::new(shape),
         beside_default: None,
         moves_at_most: None,
-    })];
+    }))];
     let after = ids(&[(&a, t("a"))], &[(&c, t("a").column("c"))]);
     let names = PlanNames::of(&changes, &after).unwrap();
     assert_eq!(names.column_at(&c, At::Start), None);
@@ -274,11 +279,11 @@ fn dropping_a_table_ends_the_lifetime_of_its_known_columns() {
     let (a, c) = (table("a"), column("c"));
     let changes = vec![
         alter(&c, t("a").column("c")),
-        p(Change::DropTable {
+        p(Change::Table(TableChange::DropTable {
             uid: a.clone(),
             name: t("a"),
             detach_from: None,
-        }),
+        })),
     ];
     let after = IdsFile::default();
     let names = PlanNames::of(&changes, &after).unwrap();
@@ -391,12 +396,12 @@ fn an_invalid_position_is_not_reported_as_an_absent_object() {
 #[test]
 fn an_added_column_is_absent_until_its_own_change() {
     let (a, c) = (table("a"), column("c"));
-    let changes = vec![p(Change::AddColumn {
+    let changes = vec![p(Change::Column(ColumnChange::AddColumn {
         uid: c.clone(),
         table: t("a"),
         name: "c".into(),
         column: Box::new(Column::new("int".parse().unwrap())),
-    })];
+    }))];
     let after = ids(&[(&a, t("a"))], &[(&c, t("a").column("c"))]);
     let names = PlanNames::of(&changes, &after).unwrap();
     assert_eq!(
@@ -414,19 +419,19 @@ fn an_added_column_is_absent_until_its_own_change() {
 fn an_added_column_is_not_mistaken_for_an_inline_created_column() {
     let (a, c) = (table("a"), column("c"));
     let changes = vec![
-        p(Change::CreateTable {
+        p(Change::Table(TableChange::CreateTable {
             uid: a.clone(),
             name: t("a"),
             table: Box::new(Table::default()),
             beside_default: None,
             moves_at_most: None,
-        }),
-        p(Change::AddColumn {
+        })),
+        p(Change::Column(ColumnChange::AddColumn {
             uid: c.clone(),
             table: t("a"),
             name: "c".into(),
             column: Box::new(Column::new("int".parse().unwrap())),
-        }),
+        })),
     ];
     let after = ids(&[(&a, t("a"))], &[(&c, t("a").column("c"))]);
     let names = PlanNames::of(&changes, &after).unwrap();
@@ -440,13 +445,13 @@ fn an_added_column_is_not_mistaken_for_an_inline_created_column() {
 #[test]
 fn final_ids_do_not_invent_a_column_missing_from_the_create_shape() {
     let (a, c) = (table("a"), column("c"));
-    let changes = vec![p(Change::CreateTable {
+    let changes = vec![p(Change::Table(TableChange::CreateTable {
         uid: a.clone(),
         name: t("a"),
         table: Box::new(Table::default()),
         beside_default: None,
         moves_at_most: None,
-    })];
+    }))];
     let after = ids(&[(&a, t("a"))], &[(&c, t("a").column("c"))]);
     assert!(matches!(
         PlanNames::of(&changes, &after),
@@ -460,13 +465,13 @@ fn final_ids_do_not_invent_a_column_missing_from_the_create_shape() {
 fn an_observation_cannot_invent_a_column_missing_from_the_create_shape() {
     let (a, c) = (table("a"), column("c"));
     let changes = vec![
-        p(Change::CreateTable {
+        p(Change::Table(TableChange::CreateTable {
             uid: a.clone(),
             name: t("a"),
             table: Box::new(Table::default()),
             beside_default: None,
             moves_at_most: None,
-        }),
+        })),
         alter(&c, t("a").column("c")),
     ];
     let after = ids(&[(&a, t("a"))], &[(&c, t("a").column("c"))]);
@@ -484,15 +489,15 @@ fn an_observation_cannot_invent_a_column_missing_from_the_create_shape() {
 fn dropping_a_column_before_its_table_does_not_drop_the_column_twice() {
     let (a, c) = (table("a"), column("c"));
     let changes = vec![
-        p(Change::DropColumn {
+        p(Change::Column(ColumnChange::DropColumn {
             uid: c.clone(),
             column: t("a").column("c"),
-        }),
-        p(Change::DropTable {
+        })),
+        p(Change::Table(TableChange::DropTable {
             uid: a.clone(),
             name: t("a"),
             detach_from: None,
-        }),
+        })),
     ];
     let after = IdsFile::default();
     let names = PlanNames::of(&changes, &after).unwrap();
@@ -519,20 +524,20 @@ fn columns_cannot_trade_their_owning_table_uid() {
 fn a_column_rename_cannot_take_an_untouched_columns_name() {
     let (a, c, d) = (table("a"), column("c"), column("d"));
     let changes = vec![
-        p(Change::RenameColumn {
+        p(Change::Column(ColumnChange::RenameColumn {
             uid: c.clone(),
             table: t("a"),
             from: "c".into(),
             to: "d".into(),
             table_was: None,
-        }),
-        p(Change::RenameColumn {
+        })),
+        p(Change::Column(ColumnChange::RenameColumn {
             uid: d.clone(),
             table: t("a"),
             from: "d".into(),
             to: "e".into(),
             table_was: None,
-        }),
+        })),
     ];
     let after = ids(
         &[(&a, t("a"))],
@@ -550,11 +555,11 @@ fn a_column_rename_cannot_take_an_untouched_columns_name() {
 
 #[test]
 fn the_uid_kind_is_checked_even_for_retired_identities() {
-    let changes = vec![p(Change::DropTable {
+    let changes = vec![p(Change::Table(TableChange::DropTable {
         uid: column("wrong"),
         name: t("a"),
         detach_from: None,
-    })];
+    }))];
     assert!(matches!(
         PlanNames::of(&changes, &IdsFile::default()),
         Err(PlanNamesError::Kind {
@@ -571,13 +576,13 @@ fn a_detach_introduces_owned_column_identities_without_creating_its_table() {
     shape
         .columns
         .insert("c".into(), Column::new("int".parse().unwrap()));
-    let changes = vec![p(Change::DetachPartition {
+    let changes = vec![p(Change::Partition(PartitionChange::DetachPartition {
         uid: a.clone(),
         table: t("a"),
         parent: t("parent"),
         names: vec![],
         shape: Box::new(shape),
-    })];
+    }))];
     let after = ids(&[(&a, t("a"))], &[(&c, t("a").column("c"))]);
     let names = PlanNames::of(&changes, &after).unwrap();
     assert_eq!(names.table_at(&a, At::Start), Some(&t("a")));
@@ -593,14 +598,14 @@ fn an_attach_retires_known_column_identities_without_dropping_its_table() {
     let (a, c) = (table("a"), column("c"));
     let changes = vec![
         alter(&c, t("a").column("c")),
-        p(Change::AttachPartition {
+        p(Change::Partition(PartitionChange::AttachPartition {
             uid: a.clone(),
             table: t("a"),
             parent: t("parent"),
             bound: crate::PartitionBound::Default,
             key: Vec::new(),
             shape: Box::new(Table::default()),
-        }),
+        })),
     ];
     let after = ids(&[(&a, t("a"))], &[]);
     let names = PlanNames::of(&changes, &after).unwrap();
@@ -620,23 +625,23 @@ fn a_final_detachs_column_identity_does_not_leak_into_an_earlier_ownership_scope
         .columns
         .insert("c".into(), Column::new("int".parse().unwrap()));
     let detach = || {
-        p(Change::DetachPartition {
+        p(Change::Partition(PartitionChange::DetachPartition {
             uid: owner.clone(),
             table: t("leaf"),
             parent: t("parent"),
             names: vec![],
             shape: Box::new(shape.clone()),
-        })
+        }))
     };
     let attach = || {
-        p(Change::AttachPartition {
+        p(Change::Partition(PartitionChange::AttachPartition {
             uid: owner.clone(),
             table: t("leaf"),
             parent: t("parent"),
             bound: crate::PartitionBound::Default,
             key: Vec::new(),
             shape: Box::new(shape.clone()),
-        })
+        }))
     };
     let after = ids(&[(&owner, t("leaf"))], &[(&fresh, t("leaf").column("c"))]);
     for changes in [vec![attach(), detach()], vec![detach(), attach(), detach()]] {
@@ -661,20 +666,20 @@ fn a_first_column_address_does_not_extend_its_managed_lifetime() {
         .columns
         .insert("v".into(), Column::new("int".parse().unwrap()));
     let changes = vec![
-        p(Change::DetachPartition {
+        p(Change::Partition(PartitionChange::DetachPartition {
             uid: owner.clone(),
             table: t("leaf"),
             parent: t("parent"),
             names: vec![],
             shape: Box::new(shape),
-        }),
-        p(Change::RenameColumn {
+        })),
+        p(Change::Column(ColumnChange::RenameColumn {
             uid: fresh.clone(),
             table: t("leaf"),
             from: "v".into(),
             to: "amount".into(),
             table_was: None,
-        }),
+        })),
     ];
     let after = ids(
         &[(&owner, t("leaf"))],
@@ -734,13 +739,13 @@ fn a_refusal_shows_the_address_it_names_escaped() {
     // `Collision` prints the address two identities hold.
     let (c, d) = (column("c"), column("d"));
     let rename_column = |uid: &Uid, from: &str, to: &str| {
-        p(Change::RenameColumn {
+        p(Change::Column(ColumnChange::RenameColumn {
             uid: uid.clone(),
             table: hostile(),
             from: from.into(),
             to: to.into(),
             table_was: None,
-        })
+        }))
     };
     let collision = PlanNames::of(
         &[rename_column(&c, "c", "d"), rename_column(&d, "d", "e")],
@@ -779,19 +784,19 @@ fn pending_observations_do_not_become_early_name_transitions_or_execution_proof(
         ..Default::default()
     };
     let mut steps = vec![
-        PlannedChange::new(Change::RenameColumn {
+        PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
             uid: column.clone(),
             table: table.clone(),
             from: "n".into(),
             to: "amount".into(),
             table_was: None,
-        }),
-        PlannedChange::new(Change::AlterColumnDefault {
+        })),
+        PlannedChange::new(Change::Column(ColumnChange::AlterColumnDefault {
             uid: column.clone(),
             column: table.column("n"),
             from: Some("1".into()),
             to: None,
-        }),
+        })),
     ];
     assert!(PlanNames::of(&steps, &ids).is_err());
     let pending = [column.clone()].into();
@@ -802,7 +807,7 @@ fn pending_observations_do_not_become_early_name_transitions_or_execution_proof(
     assert!(PlanNames::of(&steps, &ids).is_err());
     steps.swap(0, 1);
     assert!(PlanNames::of(&steps, &ids).is_ok());
-    if let Change::AlterColumnDefault { uid, .. } = &mut steps[0].change {
+    if let Change::Column(ColumnChange::AlterColumnDefault { uid, .. }) = &mut steps[0].change {
         *uid = owner.clone();
     }
     assert!(PlanNames::of_templates(&steps, &ids, &[owner].into()).is_err());
@@ -819,13 +824,13 @@ fn pending_table_observations_still_require_the_correct_recorded_kind() {
         ..Default::default()
     };
     let steps = vec![
-        p(Change::RenameTable {
+        p(Change::Table(TableChange::RenameTable {
             uid: owner.clone(),
             from: old.clone(),
             to: new.clone(),
             defaults: vec![],
-        }),
-        p(Change::SetPartitionDefault {
+        })),
+        p(Change::Partition(PartitionChange::SetPartitionDefault {
             uid: owner.clone(),
             table: old,
             parent: "app.p".parse().unwrap(),
@@ -833,7 +838,7 @@ fn pending_table_observations_still_require_the_correct_recorded_kind() {
             from: Some("1".into()),
             to: None,
             fallback: None,
-        }),
+        })),
     ];
     assert!(PlanNames::of(&steps, &ids).is_err());
     let view = PlanNames::of_templates(&steps, &ids, &[owner.clone()].into()).unwrap();

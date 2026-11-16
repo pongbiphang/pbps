@@ -1,6 +1,9 @@
 //! Logical placement facts only. Templates are lowered after settlement.
 use super::*;
 use pbps_diff::order::scratch::{Auxiliary, Node, Prepared};
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::TableChange;
 
 mod consumers;
 
@@ -133,7 +136,7 @@ impl ForeignKeyPrerequisite {
         match &self.key {
             ReferencedKey::Constraint(id) => supplies_key(change, id),
             ReferencedKey::Index { unique_index } => matches!(change,
-                Change::AddIndex { table, name, .. }
+                Change::Index(IndexChange::AddIndex { table, name, .. })
                     if object(&table.schema, &table.name) == self.references && name.raw() == unique_index
             ),
         }
@@ -179,17 +182,19 @@ fn supplies_key(change: &Change, id: &ObjectIdentity) -> bool {
         )
     };
     match change {
-        Change::CreateTable { name, table, .. } => {
+        Change::Table(TableChange::CreateTable { name, table, .. }) => {
             table
                 .primary_key
                 .as_ref()
                 .is_some_and(|primary| key(name, primary.name.as_ref()))
                 || table.unique.keys().any(|n| key(name, Some(n)))
         }
-        Change::SetPrimaryKey { table, to, .. } => to
+        Change::Constraint(ConstraintChange::SetPrimaryKey { table, to, .. }) => to
             .as_ref()
             .is_some_and(|primary| key(table, primary.name.as_ref())),
-        Change::AddUnique { table, name, .. } => key(table, Some(name)),
+        Change::Constraint(ConstraintChange::AddUnique { table, name, .. }) => {
+            key(table, Some(name))
+        }
         _ => false,
     }
 }

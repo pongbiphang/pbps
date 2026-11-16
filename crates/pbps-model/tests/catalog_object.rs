@@ -2,6 +2,13 @@
 //! that the classifier and the `catalog_change!` pattern say the same thing
 //! (#2447).
 
+use pbps_model::ExtensionChange;
+use pbps_model::GrantChange;
+use pbps_model::RoleChange;
+use pbps_model::SearchChange;
+use pbps_model::TableChange;
+use pbps_model::TypeChange;
+use pbps_model::TypeValueChange;
 use pbps_model::{CatalogObject, Change, GrantTarget, ManagedType, Permission, catalog_change};
 #[path = "support/change_kinds.rs"]
 mod change_kinds_of_file;
@@ -33,30 +40,30 @@ fn catalog() -> Vec<(Change, CatalogObject)> {
     let role = |s: &str| pbps_model::RoleName::from(s);
     vec![
         (
-            Change::CreateRole {
+            Change::Role(RoleChange::CreateRole {
                 uid: "r_aaaaaa".parse().unwrap(),
                 name: role("reader"),
-            },
+            }),
             CatalogObject::Role,
         ),
         (
-            Change::DropRole {
+            Change::Role(RoleChange::DropRole {
                 uid: "r_aaaaaa".parse().unwrap(),
                 name: role("reader"),
                 members: Vec::new(),
-            },
+            }),
             CatalogObject::Role,
         ),
         (
-            Change::RenameRole {
+            Change::Role(RoleChange::RenameRole {
                 uid: "r_aaaaaa".parse().unwrap(),
                 from: role("reader"),
                 to: role("viewer"),
-            },
+            }),
             CatalogObject::Role,
         ),
         (
-            Change::CreateExtension {
+            Change::Extension(ExtensionChange::CreateExtension {
                 uid: "e_aaaaaa".parse().unwrap(),
                 name: "citext".into(),
                 definition: pbps_model::Extension {
@@ -64,11 +71,11 @@ fn catalog() -> Vec<(Change, CatalogObject)> {
                     version: "1.6".into(),
                 },
                 requires: Default::default(),
-            },
+            }),
             CatalogObject::Extension,
         ),
         (
-            Change::DropExtension {
+            Change::Extension(ExtensionChange::DropExtension {
                 uid: "e_aaaaaa".parse().unwrap(),
                 name: "citext".into(),
                 definition: pbps_model::Extension {
@@ -79,11 +86,11 @@ fn catalog() -> Vec<(Change, CatalogObject)> {
                 releases: Default::default(),
                 index_releases: Default::default(),
                 search_releases: Default::default(),
-            },
+            }),
             CatalogObject::Extension,
         ),
         (
-            Change::UpdateExtension {
+            Change::Extension(ExtensionChange::UpdateExtension {
                 uid: "e_aaaaaa".parse().unwrap(),
                 name: "citext".into(),
                 from: pbps_model::Extension {
@@ -96,11 +103,11 @@ fn catalog() -> Vec<(Change, CatalogObject)> {
                 },
                 requires: Default::default(),
                 releases: Default::default(),
-            },
+            }),
             CatalogObject::Extension,
         ),
         (
-            Change::SetExtensionSchema {
+            Change::Extension(ExtensionChange::SetExtensionSchema {
                 uid: "e_aaaaaa".parse().unwrap(),
                 name: "citext".into(),
                 from: pbps_model::Extension {
@@ -112,49 +119,49 @@ fn catalog() -> Vec<(Change, CatalogObject)> {
                     version: "1.6".into(),
                 },
                 releases: Default::default(),
-            },
+            }),
             CatalogObject::Extension,
         ),
         (
-            Change::CreateType {
+            Change::Type(TypeChange::CreateType {
                 uid: "y_aaaaaa".parse().unwrap(),
                 name: type_name(),
                 definition: enumeration(),
-            },
+            }),
             CatalogObject::Type,
         ),
         (
-            Change::DropType {
+            Change::Type(TypeChange::DropType {
                 uid: "y_aaaaaa".parse().unwrap(),
                 name: type_name(),
                 definition: enumeration(),
-            },
+            }),
             CatalogObject::Type,
         ),
         (
-            Change::RenameType {
+            Change::Type(TypeChange::RenameType {
                 uid: "y_aaaaaa".parse().unwrap(),
                 from: type_name(),
                 to: "app.feeling".parse().unwrap(),
                 definition: enumeration(),
-            },
+            }),
             CatalogObject::Type,
         ),
         (
-            Change::CreateSearch {
+            Change::Search(SearchChange::CreateSearch {
                 uid: "s_aaaaaa".parse().unwrap(),
                 name: search_name(),
                 definition: dictionary(),
                 unresolved: Vec::new(),
-            },
+            }),
             CatalogObject::Search,
         ),
         (
-            Change::DropSearch {
+            Change::Search(SearchChange::DropSearch {
                 uid: "s_aaaaaa".parse().unwrap(),
                 name: search_name(),
                 definition: dictionary(),
-            },
+            }),
             CatalogObject::Search,
         ),
     ]
@@ -165,20 +172,20 @@ fn catalog() -> Vec<(Change, CatalogObject)> {
 /// change but not a type's identity.
 fn others() -> Vec<Change> {
     vec![
-        Change::DropTable {
+        Change::Table(TableChange::DropTable {
             uid: "t_aaaaaa".parse().unwrap(),
             name: "app.t".parse().unwrap(),
             detach_from: None,
-        },
-        Change::AddEnumValue {
+        }),
+        Change::TypeValue(TypeValueChange::AddEnumValue {
             uid: "y_aaaaaa".parse().unwrap(),
             name: type_name(),
             value: "b".into(),
             placement: None,
             ordinal: 1,
             definition: enumeration(),
-        },
-        Change::RenameEnumValue {
+        }),
+        Change::TypeValue(TypeValueChange::RenameEnumValue {
             uid: "y_aaaaaa".parse().unwrap(),
             name: type_name(),
             from: "a".into(),
@@ -186,17 +193,17 @@ fn others() -> Vec<Change> {
             ordinal: 0,
             retained: Vec::new(),
             definition: enumeration(),
-        },
-        Change::Grant {
+        }),
+        Change::Permission(GrantChange::Grant {
             role: "reader".into(),
             target: GrantTarget::Schema("app".into()),
             permissions: [Permission::Usage].into(),
-        },
-        Change::Revoke {
+        }),
+        Change::Permission(GrantChange::Revoke {
             role: "reader".into(),
             target: GrantTarget::Schema("app".into()),
             permissions: [Permission::Usage].into(),
-        },
+        }),
     ]
 }
 

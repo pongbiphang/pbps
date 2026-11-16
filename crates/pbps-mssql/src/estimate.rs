@@ -15,6 +15,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::{Conn, DbError};
 pub use pbps_dialect::estimate::{Reads, Rewrite};
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::PartitionChange;
 use pbps_model::plan_names::{At, Holder, PlanNames};
 use pbps_model::{Change, ColumnType, TableName, TypeArg};
 
@@ -156,32 +161,32 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
         .enumerate()
         .filter_map(|(index, p)| {
             let (table, work, about) = match &p.change {
-                Change::RebuildPartitionedTable(_)
-                | Change::BuildPartitionedIndex(_)
-                | Change::CopyTableRows(_)
-                | Change::AnalyzeTableTree(_) => return None,
-                Change::SetPrimaryKey {
+                Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+                | Change::Index(IndexChange::BuildPartitionedIndex(_))
+                | Change::Partition(PartitionChange::CopyTableRows(_))
+                | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => return None,
+                Change::Constraint(ConstraintChange::SetPrimaryKey {
                     table,
                     to: Some(_),
                     nonclustered: false,
                     ..
-                } => (
+                }) => (
                     table,
                     Work::ClusteredBuild,
                     "building the primary key as the clustered index".to_owned(),
                 ),
-                Change::AddUnique {
+                Change::Constraint(ConstraintChange::AddUnique {
                     table,
                     name,
                     clustered: true,
                     ..
-                }
-                | Change::AddIndex {
+                })
+                | Change::Index(IndexChange::AddIndex {
                     table,
                     name,
                     clustered: true,
                     ..
-                } => (
+                }) => (
                     table,
                     Work::ClusteredBuild,
                     format!(
@@ -189,17 +194,18 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                         name = name.shown(),
                     ),
                 ),
-                Change::SetPrimaryKey {
+                Change::Constraint(ConstraintChange::SetPrimaryKey {
                     table,
                     from: Some(_),
                     to: None,
                     ..
-                } => (
+                }) => (
                     table,
                     Work::MaybeClusteredDrop(None),
                     "dropping the primary key".to_owned(),
                 ),
-                Change::DropUnique { table, name } | Change::DropIndex { table, name } => (
+                Change::Constraint(ConstraintChange::DropUnique { table, name })
+                | Change::Index(IndexChange::DropIndex { table, name }) => (
                     table,
                     Work::MaybeClusteredDrop(Some(name.clone())),
                     format!("dropping `{name}`", name = name.shown(),),
@@ -207,27 +213,27 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                 pbps_model::change_family!(tables)
                 | pbps_model::change_family!(columns)
                 | pbps_model::change_family!(table_properties)
-                | Change::SetPrimaryKey { .. }
-                | Change::SetIndexStorageParameters { .. }
+                | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+                | Change::Index(IndexChange::SetIndexStorageParameters { .. })
                 | pbps_model::change_family!(policies)
-                | Change::AddUnique { .. }
-                | Change::SetExclusion { .. }
-                | Change::AddForeignKey { .. }
-                | Change::DropForeignKey { .. }
-                | Change::AddCheck { .. }
-                | Change::DropCheck { .. }
-                | Change::AddIndex { .. }
+                | Change::Constraint(ConstraintChange::AddUnique { .. })
+                | Change::Constraint(ConstraintChange::SetExclusion { .. })
+                | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+                | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+                | Change::Constraint(ConstraintChange::AddCheck { .. })
+                | Change::Constraint(ConstraintChange::DropCheck { .. })
+                | Change::Index(IndexChange::AddIndex { .. })
                 | pbps_model::change_family!(rows)
                 | pbps_model::change_family!(modules)
                 | pbps_model::change_family!(type_values)
                 | pbps_model::catalog_change!()
-                | Change::Grant { .. }
-                | Change::Revoke { .. }
-                | Change::DetachPartition { .. }
-                | Change::AttachPartition { .. }
-                | Change::SetPartitionDefault { .. }
-                | Change::SetPartitionNotNull { .. }
-                | Change::PublicExecution { .. } => return None,
+                | Change::Permission(GrantChange::Grant { .. })
+                | Change::Permission(GrantChange::Revoke { .. })
+                | Change::Partition(PartitionChange::DetachPartition { .. })
+                | Change::Partition(PartitionChange::AttachPartition { .. })
+                | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+                | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+                | Change::Permission(GrantChange::PublicExecution { .. }) => return None,
             };
             let (rewrite, reads) = unknown("the table's clustered layout has not been read yet");
             Some((
@@ -263,11 +269,11 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
         .enumerate()
         .filter_map(|(index, p)| {
             let (uid, column, from, to, from_nullable, to_nullable) = match &p.change {
-                Change::RebuildPartitionedTable(_)
-                | Change::BuildPartitionedIndex(_)
-                | Change::CopyTableRows(_)
-                | Change::AnalyzeTableTree(_) => return None,
-                Change::AlterColumnType {
+                Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+                | Change::Index(IndexChange::BuildPartitionedIndex(_))
+                | Change::Partition(PartitionChange::CopyTableRows(_))
+                | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => return None,
+                Change::Column(ColumnChange::AlterColumnType {
                     uid,
                     column,
                     from,
@@ -278,44 +284,44 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                     from_collation,
                     to_collation,
                     using: _,
-                } => {
+                }) => {
                     recollated.insert(index, from_collation != to_collation);
                     (uid, column, from, to, *from_nullable, *to_nullable)
                 }
-                Change::AlterColumnNullability {
+                Change::Column(ColumnChange::AlterColumnNullability {
                     uid,
                     column,
                     ty,
                     to_nullable,
                     ..
-                } => (uid, column, ty, ty, !*to_nullable, *to_nullable),
+                }) => (uid, column, ty, ty, !*to_nullable, *to_nullable),
                 pbps_model::change_family!(tables)
-                | Change::AddColumn { .. }
-                | Change::DropColumn { .. }
-                | Change::RenameColumn { .. }
-                | Change::AlterColumnDefault { .. }
-                | Change::AlterColumnExpression { .. }
-                | Change::AlterColumnNumbering { .. }
-                | Change::SetColumnDeprecated { .. }
+                | Change::Column(ColumnChange::AddColumn { .. })
+                | Change::Column(ColumnChange::DropColumn { .. })
+                | Change::Column(ColumnChange::RenameColumn { .. })
+                | Change::Column(ColumnChange::AlterColumnDefault { .. })
+                | Change::Column(ColumnChange::AlterColumnExpression { .. })
+                | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+                | Change::Column(ColumnChange::SetColumnDeprecated { .. })
                 | pbps_model::change_family!(table_properties)
                 | pbps_model::change_family!(constraints)
-                | Change::SetIndexStorageParameters { .. }
+                | Change::Index(IndexChange::SetIndexStorageParameters { .. })
                 | pbps_model::change_family!(policies)
-                | Change::AddIndex { .. }
-                | Change::AddComputedColumn { .. }
-                | Change::DropComputedColumn { .. }
-                | Change::DropIndex { .. }
+                | Change::Index(IndexChange::AddIndex { .. })
+                | Change::Column(ColumnChange::AddComputedColumn { .. })
+                | Change::Column(ColumnChange::DropComputedColumn { .. })
+                | Change::Index(IndexChange::DropIndex { .. })
                 | pbps_model::change_family!(rows)
                 | pbps_model::change_family!(modules)
                 | pbps_model::change_family!(type_values)
                 | pbps_model::catalog_change!()
-                | Change::Grant { .. }
-                | Change::Revoke { .. }
-                | Change::DetachPartition { .. }
-                | Change::AttachPartition { .. }
-                | Change::SetPartitionDefault { .. }
-                | Change::SetPartitionNotNull { .. }
-                | Change::PublicExecution { .. } => return None,
+                | Change::Permission(GrantChange::Grant { .. })
+                | Change::Permission(GrantChange::Revoke { .. })
+                | Change::Partition(PartitionChange::DetachPartition { .. })
+                | Change::Partition(PartitionChange::AttachPartition { .. })
+                | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+                | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+                | Change::Permission(GrantChange::PublicExecution { .. }) => return None,
             };
             let source = match names.column_holder(column, At::Before(index)) {
                 Holder::Tracked(_) => names.stored_column(column, At::Before(index)),

@@ -10,6 +10,7 @@ fn positional_schema() -> &'static str {
 #[tokio::test]
 #[ignore = "needs live PostgreSQL"]
 async fn an_attach_cannot_borrow_a_later_detachs_empty_range() {
+    use pbps_model::PartitionChange;
     use pbps_model::{
         Change, ChangeSet, Column, IdsFile, PlannedChange, Uid, UidKind, plan_names::PlanNames,
     };
@@ -32,7 +33,7 @@ async fn an_attach_cannot_borrow_a_later_detachs_empty_range() {
         columns: [("id".into(), Column::new(ty("int")))].into(),
         ..Default::default()
     };
-    let attach = Change::AttachPartition {
+    let attach = Change::Partition(PartitionChange::AttachPartition {
         uid: child_id.clone(),
         table: child.clone(),
         parent: parent.clone(),
@@ -42,14 +43,14 @@ async fn an_attach_cannot_borrow_a_later_detachs_empty_range() {
         },
         key: Vec::new(),
         shape: Box::new(shape.clone()),
-    };
-    let detach = Change::DetachPartition {
+    });
+    let detach = Change::Partition(PartitionChange::DetachPartition {
         uid: standing_id.clone(),
         table: standing.clone(),
         parent: parent.clone(),
         names: vec![],
         shape: Box::new(shape),
-    };
+    });
     let ids = IdsFile {
         tables: [
             (Uid::derived(UidKind::Table, "parent", 0), parent),
@@ -108,6 +109,9 @@ include!(concat!(
 #[tokio::test]
 #[ignore = "needs live PostgreSQL"]
 async fn tightening_sees_an_attached_child_only_after_the_attach() {
+    use pbps_model::ColumnChange;
+    use pbps_model::PartitionChange;
+    use pbps_model::RowChange;
     use pbps_model::{
         Change, ChangeSet, Column, IdsFile, PlannedChange, Uid, UidKind, plan_names::PlanNames,
     };
@@ -126,15 +130,15 @@ async fn tightening_sees_an_attached_child_only_after_the_attach() {
     let child = TableName::new("public", "child");
     let column = Uid::derived(UidKind::Column, "parent.value", 0);
     let child_id = Uid::derived(UidKind::Table, "child", 0);
-    let tighten = Change::AlterColumnNullability {
+    let tighten = Change::Column(ColumnChange::AlterColumnNullability {
         uid: column.clone(),
         column: parent.column("value"),
         ty: ty("int"),
         to_nullable: false,
         through_external_partitions: false,
         collation: None,
-    };
-    let update = Change::UpdateRow {
+    });
+    let update = Change::Row(RowChange::UpdateRow {
         table: parent.clone(),
         key_column: "id".into(),
         key: "20".into(),
@@ -150,7 +154,7 @@ async fn tightening_sees_an_attached_child_only_after_the_attach() {
         types: [("value".into(), ty("int"))].into(),
         after_types: Default::default(),
         key_type: None,
-    };
+    });
     let shape = pbps_model::Table {
         columns: [
             ("id".into(), Column::new(ty("int"))),
@@ -159,7 +163,7 @@ async fn tightening_sees_an_attached_child_only_after_the_attach() {
         .into(),
         ..Default::default()
     };
-    let attach = Change::AttachPartition {
+    let attach = Change::Partition(PartitionChange::AttachPartition {
         uid: child_id.clone(),
         table: child.clone(),
         parent: parent.clone(),
@@ -169,7 +173,7 @@ async fn tightening_sees_an_attached_child_only_after_the_attach() {
         },
         key: Vec::new(),
         shape: Box::new(shape),
-    };
+    });
     let ids = IdsFile {
         tables: [
             (Uid::derived(UidKind::Table, "parent", 0), parent.clone()),
@@ -207,13 +211,19 @@ async fn tightening_sees_an_attached_child_only_after_the_attach() {
         for p in &plan.changes {
             for statement in dialect.fixture_emit(&p.change, p.strategy).unwrap() {
                 let result = db.conn.execute(&statement.sql).await;
-                if matches!(p.change, Change::AlterColumnNullability { .. }) {
+                if matches!(
+                    p.change,
+                    Change::Column(ColumnChange::AlterColumnNullability { .. })
+                ) {
                     target_accepted &= result.is_ok();
                 } else {
                     result.unwrap();
                 }
             }
-            if matches!(p.change, Change::AlterColumnNullability { .. }) {
+            if matches!(
+                p.change,
+                Change::Column(ColumnChange::AlterColumnNullability { .. })
+            ) {
                 break;
             }
         }
@@ -237,6 +247,8 @@ async fn tightening_sees_an_attached_child_only_after_the_attach() {
 #[tokio::test]
 #[ignore = "needs live PostgreSQL"]
 async fn a_new_key_validates_writes_before_its_own_step_and_never_after_it() {
+    use pbps_model::ConstraintChange;
+    use pbps_model::RowChange;
     use pbps_model::{
         Cell, Change, ChangeSet, ForeignKey, IdsFile, PlannedChange, ReferentialAction, Uid,
         UidKind, Value, plan_names::PlanNames,
@@ -253,7 +265,7 @@ async fn a_new_key_validates_writes_before_its_own_step_and_never_after_it() {
         .unwrap();
     let parent = TableName::new("public", "parent");
     let child = TableName::new("public", "child");
-    let delete = Change::DeleteRow {
+    let delete = Change::Row(RowChange::DeleteRow {
         table: parent.clone(),
         key_column: "id".into(),
         key: "1".into(),
@@ -263,8 +275,8 @@ async fn a_new_key_validates_writes_before_its_own_step_and_never_after_it() {
         types: Default::default(),
         after_types: Default::default(),
         key_type: None,
-    };
-    let update = Change::UpdateRow {
+    });
+    let update = Change::Row(RowChange::UpdateRow {
         table: child.clone(),
         key_column: "id".into(),
         key: "10".into(),
@@ -277,8 +289,8 @@ async fn a_new_key_validates_writes_before_its_own_step_and_never_after_it() {
         types: [("parent".into(), ty("int"))].into(),
         after_types: Default::default(),
         key_type: None,
-    };
-    let add = Change::AddForeignKey {
+    });
+    let add = Change::Constraint(ConstraintChange::AddForeignKey {
         table: child.clone(),
         name: "child_parent_fkey".into(),
         constraint: Box::new(ForeignKey {
@@ -288,7 +300,7 @@ async fn a_new_key_validates_writes_before_its_own_step_and_never_after_it() {
             on_delete: ReferentialAction::NoAction,
             on_update: ReferentialAction::NoAction,
         }),
-    };
+    });
     let ids = IdsFile {
         tables: [
             (Uid::derived(UidKind::Table, "parent", 0), parent.clone()),
@@ -312,12 +324,12 @@ async fn a_new_key_validates_writes_before_its_own_step_and_never_after_it() {
         .into(),
         ..Default::default()
     };
-    let drop_key = Change::DropForeignKey {
+    let drop_key = Change::Constraint(ConstraintChange::DropForeignKey {
         table: child.clone(),
         name: "child_parent_fkey".into(),
-    };
+    });
     let mut other_key = add.clone();
-    if let Change::AddForeignKey { name, .. } = &mut other_key {
+    if let Change::Constraint(ConstraintChange::AddForeignKey { name, .. }) = &mut other_key {
         *name = "other_parent_fkey".into();
     }
     let dialect = Postgres::new();
@@ -369,10 +381,10 @@ async fn a_new_key_validates_writes_before_its_own_step_and_never_after_it() {
             vec![
                 add,
                 other_key,
-                Change::DropForeignKey {
+                Change::Constraint(ConstraintChange::DropForeignKey {
                     table: child.clone(),
                     name: "other_parent_fkey".into(),
-                },
+                }),
                 delete,
             ],
             Some(1),
@@ -434,6 +446,8 @@ async fn a_planned_key_counts_only_references_that_survive_the_current_delete() 
 #[tokio::test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 async fn membership_null_probes_read_each_selected_stored_source_once() {
+    use pbps_model::ColumnChange;
+    use pbps_model::PartitionChange;
     use pbps_model::{
         Change, IdsFile, PlannedChange, Uid, operation::Snapshot, plan_names::PlanNames,
     };
@@ -474,7 +488,7 @@ async fn membership_null_probes_read_each_selected_stored_source_once() {
     };
     let mut after = ids.clone();
     after.columns.retain(|_, c| c.table != a);
-    let attach = Change::AttachPartition {
+    let attach = Change::Partition(PartitionChange::AttachPartition {
         uid: uid("t_bbbbbb"),
         table: a,
         parent: p.clone(),
@@ -484,15 +498,15 @@ async fn membership_null_probes_read_each_selected_stored_source_once() {
         },
         key: vec![],
         shape: Box::default(),
-    };
-    let tighten = Change::AlterColumnNullability {
+    });
+    let tighten = Change::Column(ColumnChange::AlterColumnNullability {
         uid: uid("c_bbbbbb"),
         column: p.column("d"),
         ty: ty("bigint"),
         to_nullable: false,
         through_external_partitions: false,
         collation: None,
-    };
+    });
     let pg = Postgres::new();
     let frame = pg.transaction_framing(&pbps_model::SessionZone::utc());
     for clean_standing in [false, true] {
@@ -535,13 +549,19 @@ async fn membership_null_probes_read_each_selected_stored_source_once() {
             for planned in &changes {
                 for statement in pg.fixture_emit(&planned.change, planned.strategy).unwrap() {
                     let result = db.conn.execute(&statement.sql).await;
-                    if matches!(planned.change, Change::AlterColumnNullability { .. }) {
+                    if matches!(
+                        planned.change,
+                        Change::Column(ColumnChange::AlterColumnNullability { .. })
+                    ) {
                         accepted = result.is_ok();
                     } else {
                         result.unwrap();
                     }
                 }
-                if matches!(planned.change, Change::AlterColumnNullability { .. }) {
+                if matches!(
+                    planned.change,
+                    Change::Column(ColumnChange::AlterColumnNullability { .. })
+                ) {
                     break;
                 }
             }
@@ -589,6 +609,8 @@ async fn membership_null_probes_read_each_selected_stored_source_once() {
 #[tokio::test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 async fn converted_membership_values_are_unchecked_and_engine_constraints_still_decide() {
+    use pbps_model::ColumnChange;
+    use pbps_model::PartitionChange;
     use pbps_model::{
         Change, IdsFile, PlannedChange, Uid, operation::Snapshot, plan_names::PlanNames,
     };
@@ -637,7 +659,7 @@ async fn converted_membership_values_are_unchecked_and_engine_constraints_still_
         after.columns.retain(|_, c| c.table != a);
         let mut changes = Vec::new();
         if let Some(using) = using {
-            changes.push(Change::AlterColumnType {
+            changes.push(Change::Column(ColumnChange::AlterColumnType {
                 uid: uid(if key { "c_cccccc" } else { "c_dddddd" }),
                 column: a.column(if key { "k" } else { "d" }),
                 from: ty("integer"),
@@ -648,9 +670,9 @@ async fn converted_membership_values_are_unchecked_and_engine_constraints_still_
                 to_collation: None,
                 through_external_partitions: false,
                 using: Some(using.into()),
-            });
+            }));
         }
-        changes.push(Change::AttachPartition {
+        changes.push(Change::Partition(PartitionChange::AttachPartition {
             uid: uid("t_bbbbbb"),
             table: a.clone(),
             parent: p.clone(),
@@ -660,15 +682,15 @@ async fn converted_membership_values_are_unchecked_and_engine_constraints_still_
             },
             key: vec![],
             shape: Box::default(),
-        });
-        changes.push(Change::AlterColumnNullability {
+        }));
+        changes.push(Change::Column(ColumnChange::AlterColumnNullability {
             uid: uid("c_bbbbbb"),
             column: p.column("d"),
             ty: ty("bigint"),
             to_nullable: false,
             through_external_partitions: false,
             collation: None,
-        });
+        }));
         let changes: Vec<_> = changes.into_iter().map(PlannedChange::new).collect();
         let names = PlanNames::of(&changes, &after).unwrap();
         let report = pg.preflight_with_sources(

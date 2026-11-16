@@ -1,5 +1,7 @@
 use super::*;
 use crate::{Context, Side};
+use pbps_model::ConstraintChange;
+use pbps_model::TableChange;
 use pbps_model::operation::{self, Incarnation, Origin, Source};
 use pbps_model::*;
 
@@ -124,51 +126,51 @@ fn fragment() -> (Operations, Vec<Effects>, Baseline, ChangeSet) {
     let mut bare = after.tables[&p].clone();
     bare.primary_key = None;
     let changes = vec![
-        Change::DropForeignKey {
+        Change::Constraint(ConstraintChange::DropForeignKey {
             table: r.clone(),
             name: "ref_p_fk".into(),
-        },
-        Change::SetPrimaryKey {
+        }),
+        Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: p.clone(),
             from: Some(pk.clone()),
             to: None,
             nonclustered: false,
-        },
-        Change::CreateTable {
+        }),
+        Change::Table(TableChange::CreateTable {
             uid: new_uid.clone(),
             name: tmp.clone(),
             table: Box::new(bare),
             beside_default: None,
             moves_at_most: None,
-        },
-        Change::RenameTable {
+        }),
+        Change::Table(TableChange::RenameTable {
             uid: source_uid.clone(),
             from: p.clone(),
             to: old.clone(),
             defaults: vec![],
-        },
-        Change::RenameTable {
+        }),
+        Change::Table(TableChange::RenameTable {
             uid: new_uid.clone(),
             from: tmp,
             to: p.clone(),
             defaults: vec![],
-        },
-        Change::SetPrimaryKey {
+        }),
+        Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: p,
             from: None,
             to: Some(pk),
             nonclustered: false,
-        },
-        Change::AddForeignKey {
+        }),
+        Change::Constraint(ConstraintChange::AddForeignKey {
             table: r,
             name: "ref_p_fk".into(),
             constraint: Box::new(fk),
-        },
-        Change::DropTable {
+        }),
+        Change::Table(TableChange::DropTable {
             uid: source_uid.clone(),
             name: old,
             detach_from: None,
-        },
+        }),
     ];
     let changes: Vec<_> = changes.into_iter().map(PlannedChange::new).collect();
     let names = PlanNames::of(&changes, &target).unwrap();
@@ -409,13 +411,14 @@ fn ordinary_same_name_replacement_with_a_new_uid_keeps_its_existing_order() {
     let (mut ops, _, _, _) = fragment();
     // The ordinary drop/create route uses no rebuild root or address overlay.
     let drops = ops.as_slice()[0].planned().clone();
-    let old = if let Change::DropTable { uid, .. } = ops.as_slice()[7].change() {
+    let old = if let Change::Table(TableChange::DropTable { uid, .. }) = ops.as_slice()[7].change()
+    {
         uid.clone()
     } else {
         panic!()
     };
     let mut create = ops.as_slice()[2].planned().clone();
-    let Change::CreateTable { name, table, .. } = &mut create.change else {
+    let Change::Table(TableChange::CreateTable { name, table, .. }) = &mut create.change else {
         panic!()
     };
     *name = t("p");
@@ -429,7 +432,8 @@ fn ordinary_same_name_replacement_with_a_new_uid_keeps_its_existing_order() {
     let mut before = Schema::default();
     let mut parent = table_with(&["k"]);
     parent.primary_key = table.primary_key.clone();
-    let Change::AddForeignKey { constraint, .. } = &restore.change else {
+    let Change::Constraint(ConstraintChange::AddForeignKey { constraint, .. }) = &restore.change
+    else {
         panic!()
     };
     let mut child = table_with(&["k"]);
@@ -444,7 +448,7 @@ fn ordinary_same_name_replacement_with_a_new_uid_keeps_its_existing_order() {
     before_ids.tables.insert(old.clone(), t("p"));
     let mut after_ids = before_ids.clone();
     after_ids.tables.remove(&old);
-    let Change::CreateTable { uid: new, .. } = &create.change else {
+    let Change::Table(TableChange::CreateTable { uid: new, .. }) = &create.change else {
         panic!()
     };
     after_ids.tables.insert(new.clone(), t("p"));
@@ -455,11 +459,11 @@ fn ordinary_same_name_replacement_with_a_new_uid_keeps_its_existing_order() {
     let plan = Plan {
         logical: vec![
             drops,
-            p(Change::DropTable {
+            p(Change::Table(TableChange::DropTable {
                 uid: old,
                 name: t("p"),
                 detach_from: None,
-            }),
+            })),
             create,
             restore,
         ],
@@ -511,18 +515,18 @@ fn an_inline_self_fk_binds_the_created_uid_even_when_the_old_table_has_its_name(
     after.tables.insert(t("p"), parent.clone());
     let plan = Plan {
         logical: vec![
-            p(Change::DropTable {
+            p(Change::Table(TableChange::DropTable {
                 uid: old_ids.table_uid(&t("p")).unwrap().clone(),
                 name: t("p"),
                 detach_from: None,
-            }),
-            p(Change::CreateTable {
+            })),
+            p(Change::Table(TableChange::CreateTable {
                 uid: new_uid.clone(),
                 name: t("p"),
                 table: Box::new(parent),
                 beside_default: None,
                 moves_at_most: None,
-            }),
+            })),
         ],
         before,
         after,

@@ -22,10 +22,12 @@ pub fn carry_inserts<S>(
     declared: &ModuleDeps,
 ) -> Result<Schedule, String> {
     if inserts.is_empty()
-        && !plan
-            .changes
-            .iter()
-            .any(|p| matches!(p.change, pbps_model::Change::InsertRow { .. }))
+        && !plan.changes.iter().any(|p| {
+            matches!(
+                p.change,
+                pbps_model::Change::Row(pbps_model::RowChange::InsertRow { .. })
+            )
+        })
     {
         return Ok(release);
     }
@@ -37,7 +39,7 @@ pub fn carry_inserts<S>(
         .filter_map(|edge| {
             matches!(
                 plan.changes[edge.after].change,
-                pbps_model::Change::DropColumn { .. }
+                pbps_model::Change::Column(pbps_model::ColumnChange::DropColumn { .. })
             )
             .then_some(edge.after)
         })
@@ -112,7 +114,7 @@ pub fn carry_inserts<S>(
             )
             && matches!(
                 operations.as_slice()[edge.after].change(),
-                pbps_model::Change::InsertRow { .. }
+                pbps_model::Change::Row(pbps_model::RowChange::InsertRow { .. })
             ))
         .then_some(edge.after)
     }));
@@ -163,10 +165,16 @@ pub(super) fn pending_consumers(
     let mut releases = std::collections::BTreeMap::new();
     let mut drops = std::collections::BTreeMap::new();
     for (at, operation) in operations.iter().enumerate() {
-        if let pbps_model::Change::AlterColumnExpression { column, .. } = operation.change() {
+        if let pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnExpression {
+            column,
+            ..
+        }) = operation.change()
+        {
             releases.insert(column.table.clone(), at);
         }
-        if let pbps_model::Change::DropColumn { column, .. } = operation.change() {
+        if let pbps_model::Change::Column(pbps_model::ColumnChange::DropColumn { column, .. }) =
+            operation.change()
+        {
             drops.entry(column.table.clone()).or_insert(at);
         }
     }
@@ -177,7 +185,9 @@ pub(super) fn pending_consumers(
         .iter()
         .enumerate()
         .filter_map(|(at, operation)| {
-            let pbps_model::Change::InsertRow { table, .. } = operation.change() else {
+            let pbps_model::Change::Row(pbps_model::RowChange::InsertRow { table, .. }) =
+                operation.change()
+            else {
                 return None;
             };
             (drops.get(table).is_some_and(|&drop| drop < at)
@@ -192,6 +202,9 @@ pub(super) fn pending_consumers(
 mod tests {
     use super::*;
     use crate::order::{Source, analyse, propose};
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::RowChange;
     use pbps_model::resolver::OrderReason;
     use pbps_model::{
         Change, ChangeSet, Column, ForeignKey, IdsFile, PlannedChange, PrimaryKey,
@@ -208,7 +221,7 @@ mod tests {
         Uid::derived(kind, name, 0)
     }
     fn row(name: &str, key: i64, cells: &[(&str, i64)]) -> Change {
-        Change::InsertRow {
+        Change::Row(RowChange::InsertRow {
             table: table(name),
             key_column: "id".into(),
             identity_key: false,
@@ -219,7 +232,7 @@ mod tests {
                 .collect::<Row>(),
             defaults: Default::default(),
             types: Default::default(),
-        }
+        })
     }
     fn shape(columns: &[&str]) -> Table {
         Table {
@@ -300,9 +313,9 @@ mod tests {
             .unwrap()
             .columns
             .shift_remove("a");
-        if let Change::AddUnique {
+        if let Change::Constraint(ConstraintChange::AddUnique {
             name, constraint, ..
-        } = &consumer
+        }) = &consumer
         {
             after
                 .tables
@@ -328,18 +341,18 @@ mod tests {
         ids.columns.remove(&a);
         let plan = propose(ChangeSet {
             changes: vec![
-                Change::DropColumn {
+                Change::Column(ColumnChange::DropColumn {
                     uid: a,
                     column: column("a"),
-                },
+                }),
                 row("p", 1, &[("b", 3)]),
                 consumer,
-                Change::AlterColumnExpression {
+                Change::Column(ColumnChange::AlterColumnExpression {
                     uid: uid("app.p.g", UidKind::Column),
                     column: column("g"),
                     from: "a * 2".into(),
                     to: "b * 2".into(),
-                },
+                }),
             ]
             .into_iter()
             .map(PlannedChange::new)
@@ -350,7 +363,10 @@ mod tests {
         if !defaulted {
             schedule.edge(0, 1, Source::Catalog, OrderReason::Structural);
         }
-        if matches!(&plan.changes[2].change, Change::AddUnique { .. }) {
+        if matches!(
+            &plan.changes[2].change,
+            Change::Constraint(ConstraintChange::AddUnique { .. })
+        ) {
             let operations = Operations::of_plan(&plan.changes, ModuleEdits::InPlace);
             let names = pbps_model::plan_names::PlanNames::of(&plan.changes, &ids).unwrap();
             let owners = PlanOwners::new(names, &base_ids, &ids);
@@ -470,7 +486,7 @@ mod tests {
     fn a_key_over_rows_follows_an_insert_delayed_by_its_released_input() {
         for defaulted in [false, true] {
             carried(
-                Change::AddUnique {
+                Change::Constraint(ConstraintChange::AddUnique {
                     table: table("p"),
                     name: "uq".into(),
                     constraint: pbps_model::UniqueConstraint {
@@ -479,7 +495,7 @@ mod tests {
                         filegroup: None,
                     },
                     clustered: false,
-                },
+                }),
                 defaulted,
             );
         }
@@ -502,10 +518,10 @@ mod tests {
         after_ids.columns.remove(&a);
         let plan = propose(ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::DropColumn {
+                PlannedChange::new(Change::Column(ColumnChange::DropColumn {
                     uid: a.clone(),
                     column: column("a"),
-                }),
+                })),
                 PlannedChange::new(row("p", 1, &[])),
             ],
         });

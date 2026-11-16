@@ -1,6 +1,8 @@
 //! Byte fixtures were captured before the exclusive value-source migration.
 //! A JSON-value comparison misses field ordering, which changes approved checksums.
 
+use pbps_model::ColumnChange;
+use pbps_model::TableChange;
 use pbps_model::{
     Change, ChangeSet, Collation, Column, ColumnRef, Declared, Generated, Identity, IdsFile,
     PlanBaseline, PlanOrigin, PlannedChange, SavedPlan, Schema, StateKind, StateSnapshot, Table,
@@ -63,23 +65,27 @@ fn artifacts() -> (Schema, IdsFile, SavedPlan, StateSnapshot) {
         let uid: pbps_model::Uid = format!("c_1402a{i}").parse().unwrap();
         ids.columns
             .insert(uid.clone(), ColumnRef::new(name.clone(), key));
-        adds.push(PlannedChange::new(Change::AddColumn {
-            uid,
-            table: name.clone(),
-            name: key.into(),
-            column: Box::new(column.clone()),
-        }));
+        adds.push(PlannedChange::new(Change::Column(
+            ColumnChange::AddColumn {
+                uid,
+                table: name.clone(),
+                name: key.into(),
+                column: Box::new(column.clone()),
+            },
+        )));
         table.columns.insert(key.into(), column);
     }
     let mut schema = Schema::default();
     schema.tables.insert(name.clone(), table.clone());
-    let mut changes = vec![PlannedChange::new(Change::CreateTable {
-        uid: table_uid,
-        name,
-        table: Box::new(table),
-        beside_default: None,
-        moves_at_most: None,
-    })];
+    let mut changes = vec![PlannedChange::new(Change::Table(
+        TableChange::CreateTable {
+            uid: table_uid,
+            name,
+            table: Box::new(table),
+            beside_default: None,
+            moves_at_most: None,
+        },
+    ))];
     changes.extend(adds);
     let mut plan = SavedPlan::new(
         PlanOrigin::Database,

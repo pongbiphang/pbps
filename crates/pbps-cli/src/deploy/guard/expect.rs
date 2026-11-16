@@ -2,6 +2,13 @@ use pbps_model::ColumnName;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
+use pbps_model::ColumnChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::PartitionChange;
+use pbps_model::PolicyChange;
+use pbps_model::TableChange;
+use pbps_model::TablePropertyChange;
 use pbps_model::{
     Change, ChangeSet, PartitionBound, PartitionBy, PartitionColumn, Renames, ReplicaIdentity,
     Schema, SystemTime, Table, TableName, Uid,
@@ -172,63 +179,68 @@ impl<'a> TableChanges<'a> {
         let mut own_effects: BTreeMap<_, Vec<_>> = BTreeMap::new();
         for (at, p) in plan.changes.iter().enumerate() {
             match &p.change {
-                Change::RebuildPartitionedTable(_)
-                | Change::BuildPartitionedIndex(_)
-                | Change::CopyTableRows(_)
-                | Change::AnalyzeTableTree(_) => {}
-                Change::RenameTable { uid, from, to, .. } => {
+                Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+                | Change::Index(IndexChange::BuildPartitionedIndex(_))
+                | Change::Partition(PartitionChange::CopyTableRows(_))
+                | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => {}
+                Change::Table(TableChange::RenameTable { uid, from, to, .. }) => {
                     tables.entry(uid.clone()).or_default().renamed = Some((from, to));
                 }
-                Change::SetRowSecurity { uid, table, to, .. } => {
+                Change::Policy(PolicyChange::SetRowSecurity { uid, table, to, .. }) => {
                     tables.entry(uid.clone()).or_default().row_security = Some((to, table));
                 }
-                Change::DropPolicy { table, .. } | Change::CreatePolicy { table, .. } => {
+                Change::Policy(PolicyChange::DropPolicy { table, .. })
+                | Change::Policy(PolicyChange::CreatePolicy { table, .. }) => {
                     if let pbps_model::plan_names::Holder::Tracked(uid) =
                         names.holder(table, pbps_model::plan_names::At::Before(at))
                     {
                         tables.entry(uid.clone()).or_default().policies = Some(((), table));
                     }
                 }
-                Change::SetReplicaIdentity { uid, table, to } => {
+                Change::TableProperty(TablePropertyChange::SetReplicaIdentity {
+                    uid,
+                    table,
+                    to,
+                }) => {
                     tables.entry(uid.clone()).or_default().identity = Some((to.as_ref(), table));
                 }
-                Change::SetStorageParameters {
+                Change::TableProperty(TablePropertyChange::SetStorageParameters {
                     uid,
                     table,
                     set,
                     reset,
-                } => {
+                }) => {
                     tables.entry(uid.clone()).or_default().storage = Some(((set, reset), table));
                 }
-                Change::SetTablePersistence {
+                Change::TableProperty(TablePropertyChange::SetTablePersistence {
                     uid,
                     table,
                     unlogged,
-                } => {
+                }) => {
                     tables.entry(uid.clone()).or_default().persistence = Some((*unlogged, table));
                 }
-                Change::SetComment {
+                Change::TableProperty(TablePropertyChange::SetComment {
                     target: pbps_model::CommentTarget::Table { uid, table },
                     text,
-                } => {
+                }) => {
                     tables.entry(uid.clone()).or_default().comment =
                         Some((text.as_ref().filter(|t| !t.is_empty()), table));
                 }
-                Change::RenameColumn { table, .. } => {
+                Change::Column(ColumnChange::RenameColumn { table, .. }) => {
                     parents.insert(table);
                 }
-                Change::DropColumn { column, .. } => {
+                Change::Column(ColumnChange::DropColumn { column, .. }) => {
                     parents.insert(&column.table);
                     parent_effects
                         .entry(&column.table)
                         .or_default()
                         .push((at, OwnEffect::Drop(&column.name)));
                 }
-                Change::AlterColumnNullability {
+                Change::Column(ColumnChange::AlterColumnNullability {
                     column,
                     to_nullable,
                     ..
-                } => {
+                }) => {
                     if !to_nullable {
                         parents.insert(&column.table);
                     }
@@ -237,12 +249,12 @@ impl<'a> TableChanges<'a> {
                         OwnEffect::NotNull(&column.name, (!to_nullable).then_some(false)),
                     ));
                 }
-                Change::AlterColumnType {
+                Change::Column(ColumnChange::AlterColumnType {
                     column,
                     from_nullable,
                     to_nullable,
                     ..
-                } => {
+                }) => {
                     if from_nullable != to_nullable {
                         if !to_nullable {
                             parents.insert(&column.table);
@@ -253,7 +265,7 @@ impl<'a> TableChanges<'a> {
                         ));
                     }
                 }
-                Change::AlterColumnDefault { column, .. } => {
+                Change::Column(ColumnChange::AlterColumnDefault { column, .. }) => {
                     // A parent's SET/DROP DEFAULT replaces every child's
                     // override. A later own setting restores it (#1610).
                     parent_effects
@@ -261,20 +273,23 @@ impl<'a> TableChanges<'a> {
                         .or_default()
                         .push((at, OwnEffect::Default(&column.name, false)));
                 }
-                Change::SetPartitionDefault {
-                    table, column, to, ..
-                } => {
+                Change::Partition(PartitionChange::SetPartitionDefault {
+                    table,
+                    column,
+                    to,
+                    ..
+                }) => {
                     own_effects
                         .entry(table)
                         .or_default()
                         .push((at, OwnEffect::Default(column, to.is_some())));
                 }
-                Change::SetPartitionNotNull {
+                Change::Partition(PartitionChange::SetPartitionNotNull {
                     table,
                     column,
                     not_null,
                     ..
-                } => {
+                }) => {
                     own_effects
                         .entry(table)
                         .or_default()
@@ -282,28 +297,28 @@ impl<'a> TableChanges<'a> {
                 }
                 // These families retain their legacy comparisons. Listing
                 // them makes a new change require an explicit table policy.
-                Change::CreateTable { .. }
-                | Change::DropTable { .. }
-                | Change::DetachPartition { .. }
-                | Change::AttachPartition { .. }
-                | Change::AddColumn { .. }
-                | Change::AlterColumnExpression { .. }
-                | Change::AlterColumnNumbering { .. }
-                | Change::AddComputedColumn { .. }
-                | Change::DropComputedColumn { .. }
-                | Change::SetColumnDeprecated { .. }
-                | Change::SetComment { .. }
-                | Change::SetIndexStorageParameters { .. }
+                Change::Table(TableChange::CreateTable { .. })
+                | Change::Table(TableChange::DropTable { .. })
+                | Change::Partition(PartitionChange::DetachPartition { .. })
+                | Change::Partition(PartitionChange::AttachPartition { .. })
+                | Change::Column(ColumnChange::AddColumn { .. })
+                | Change::Column(ColumnChange::AlterColumnExpression { .. })
+                | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+                | Change::Column(ColumnChange::AddComputedColumn { .. })
+                | Change::Column(ColumnChange::DropComputedColumn { .. })
+                | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+                | Change::TableProperty(TablePropertyChange::SetComment { .. })
+                | Change::Index(IndexChange::SetIndexStorageParameters { .. })
                 | pbps_model::change_family!(constraints)
-                | Change::AddIndex { .. }
-                | Change::DropIndex { .. }
+                | Change::Index(IndexChange::AddIndex { .. })
+                | Change::Index(IndexChange::DropIndex { .. })
                 | pbps_model::change_family!(rows)
                 | pbps_model::change_family!(modules)
                 | pbps_model::change_family!(type_values)
                 | pbps_model::catalog_change!()
-                | Change::Grant { .. }
-                | Change::Revoke { .. }
-                | Change::PublicExecution { .. } => {}
+                | Change::Permission(GrantChange::Grant { .. })
+                | Change::Permission(GrantChange::Revoke { .. })
+                | Change::Permission(GrantChange::PublicExecution { .. }) => {}
             }
         }
         use pbps_model::plan_names::{At, Holder};

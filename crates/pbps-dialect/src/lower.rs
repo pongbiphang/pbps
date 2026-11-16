@@ -322,6 +322,9 @@ pub fn lower_all<E: Lowering>(
 mod tests {
     use super::*;
     use crate::MinimalDialect;
+    use pbps_model::ModuleChange;
+    use pbps_model::RoleChange;
+    use pbps_model::TableChange;
     use pbps_model::operation::ModuleEdits;
     use pbps_model::{Change, PlannedChange};
 
@@ -387,7 +390,7 @@ mod tests {
             strategy: Strategy,
         ) -> Result<Vec<Statement>, DialectError> {
             Ok(match change {
-                Change::RenameTable { from, to, .. } => {
+                Change::Table(TableChange::RenameTable { from, to, .. }) => {
                     let parked = TableName::new(&to.schema, &from.name);
                     vec![
                         Statement::new("MOVE").renaming(from.clone(), parked.clone()),
@@ -396,11 +399,11 @@ mod tests {
                             .renaming(parked, to.clone()),
                     ]
                 }
-                Change::RenameRole { from, to, .. } => vec![
+                Change::Role(RoleChange::RenameRole { from, to, .. }) => vec![
                     Statement::new("PARK ROLE").renaming_role(from.clone(), "parked"),
                     Statement::new("NAME ROLE").renaming_role("parked", to.clone()),
                 ],
-                Change::DropModule { id, .. } => vec![
+                Change::Module(ModuleChange::DropModule { id, .. }) => vec![
                     Statement::new("DROP")
                         .non_transactional()
                         .releasing(Released::Module(id.clone())),
@@ -420,12 +423,12 @@ mod tests {
     #[test]
     fn a_two_step_rename_shows_the_name_it_parks_the_table_under() {
         let rename = |from: &str, to: &str| {
-            PlannedChange::new(Change::RenameTable {
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 from: t(from),
                 to: t(to),
                 defaults: vec![],
-            })
+            }))
         };
         let ops = Operations::of_plan(
             &[rename("app.a", "dst.b"), rename("app.c", "app.d")],
@@ -440,11 +443,11 @@ mod tests {
         // its own, and its first name is nobody's intermediate.
         assert_eq!(lowered[1].intermediate_tables(), [&t("app.c")]);
         let role = Operations::of_plan(
-            &[PlannedChange::new(Change::RenameRole {
+            &[PlannedChange::new(Change::Role(RoleChange::RenameRole {
                 uid: "r_aaaaaa".parse().unwrap(),
                 from: "old".into(),
                 to: "new".into(),
-            })],
+            }))],
             ModuleEdits::InPlace,
         );
         let role = frozen_lower_all(&role, &Parking).unwrap();
@@ -457,23 +460,23 @@ mod tests {
     #[test]
     fn each_statement_carries_its_operation_and_the_emitters_two_requirements() {
         let id: pbps_model::ModuleId = "app.v".parse().unwrap();
-        let mut online = PlannedChange::new(Change::CreateRole {
+        let mut online = PlannedChange::new(Change::Role(RoleChange::CreateRole {
             uid: "r_bbbbbb".parse().unwrap(),
             name: "x".into(),
-        });
+        }));
         online.strategy = Strategy { online: true };
         let ops = Operations::of_plan(
             &[
-                PlannedChange::new(Change::RenameTable {
+                PlannedChange::new(Change::Table(TableChange::RenameTable {
                     uid: "t_aaaaaa".parse().unwrap(),
                     from: t("app.a"),
                     to: t("dst.b"),
                     defaults: vec![],
-                }),
-                PlannedChange::new(Change::DropModule {
+                })),
+                PlannedChange::new(Change::Module(ModuleChange::DropModule {
                     id: id.clone(),
                     kind: pbps_model::ModuleKind::View,
-                }),
+                })),
                 online,
             ],
             ModuleEdits::InPlace,

@@ -233,9 +233,9 @@ fn preparation_keeps_typed_parts_reserved_uids_and_readonly_target_state() {
     assert!(p.slots().unowned.is_empty() && p.slots().unlowered.is_empty());
     assert!(matches!(
         part(&p, Purpose::Tree),
-        Change::CreateTable { table, .. } if table.indexes.is_empty()
+        Change::Table(TableChange::CreateTable { table, .. }) if table.indexes.is_empty()
     ));
-    let Change::CopyTableRows(copy) = part(&p, Purpose::Copy) else {
+    let Change::Partition(PartitionChange::CopyTableRows(copy)) = part(&p, Purpose::Copy) else {
         panic!("copy")
     };
     assert_eq!(copy.source.name, f.root.table);
@@ -247,7 +247,7 @@ fn preparation_keeps_typed_parts_reserved_uids_and_readonly_target_state() {
     );
     assert!(ops.iter().all(|o| o.planned().risks
         == pbps_dialect::Dialect::change_risks(&pbps_pg::Postgres::new(), o.change())));
-    let Change::BuildPartitionedIndex(recipe) = part(&p, Purpose::Own) else {
+    let Change::Index(IndexChange::BuildPartitionedIndex(recipe)) = part(&p, Purpose::Own) else {
         panic!("recipe")
     };
     assert!(
@@ -423,7 +423,7 @@ fn a_column_renamed_after_the_approval_is_copied_from_the_column_it_continues() 
     )
     .unwrap();
     let p = f.prepare().unwrap();
-    let Change::CopyTableRows(copy) = part(&p, Purpose::Copy) else {
+    let Change::Partition(PartitionChange::CopyTableRows(copy)) = part(&p, Purpose::Copy) else {
         panic!("copy")
     };
     let body = copy
@@ -456,7 +456,9 @@ fn a_rebuilt_trees_declared_comments_are_written_on_its_replacements_before_the_
             .iter()
             .filter(|x| x.purpose == Purpose::Describe)
             .map(|x| {
-                let Change::SetComment { target, text } = &x.change.change else {
+                let Change::TableProperty(TablePropertyChange::SetComment { target, text }) =
+                    &x.change.change
+                else {
                     panic!("{:?}", x.change.change);
                 };
                 (

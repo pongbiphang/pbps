@@ -6412,8 +6412,8 @@ fn a_staged_resume_rechecks_the_pinned_default_collation() {
                 database_collation: Some(pinned.to_owned()),
             },
             pbps_model::ChangeSet {
-                changes: vec![pbps_model::PlannedChange::new(
-                    pbps_model::Change::CreateModule {
+                changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Module(
+                    pbps_model::ModuleChange::CreateModule {
                         id: format!("dbo.{view}").parse().unwrap(),
                         module: Box::new(pbps_model::Module {
                             kind: pbps_model::ModuleKind::View,
@@ -6422,7 +6422,7 @@ fn a_staged_resume_rechecks_the_pinned_default_collation() {
                             options: Default::default(),
                         }),
                     },
-                )],
+                ))],
             },
             latest.snapshot.ids.clone(),
         )
@@ -8032,23 +8032,27 @@ fn apply_refuses_a_plan_that_relabels_a_rebuilt_routine_as_a_fresh_one() {
         },
         pbps_model::ChangeSet {
             changes: vec![
-                planned(pbps_model::Change::AlterModule {
-                    id: id.clone(),
-                    module: Box::new(pbps_model::Module {
-                        kind: pbps_model::ModuleKind::Function,
-                        description: None,
-                        definition: "(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$"
-                            .into(),
-                        options: Default::default(),
-                    }),
-                }),
+                planned(pbps_model::Change::Module(
+                    pbps_model::ModuleChange::AlterModule {
+                        id: id.clone(),
+                        module: Box::new(pbps_model::Module {
+                            kind: pbps_model::ModuleKind::Function,
+                            description: None,
+                            definition: "(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$"
+                                .into(),
+                            options: Default::default(),
+                        }),
+                    },
+                )),
                 // `risks: []` is consistent with what this says, which is the
                 // whole trouble: the lie is in the origin, not the risks.
-                planned(pbps_model::Change::PublicExecution {
-                    routine: "app.f(integer)".parse().unwrap(),
-                    access: pbps_model::PublicAccess::Revoked,
-                    origin: pbps_model::RoutineOrigin::Created,
-                }),
+                planned(pbps_model::Change::Permission(
+                    pbps_model::GrantChange::PublicExecution {
+                        routine: "app.f(integer)".parse().unwrap(),
+                        access: pbps_model::PublicAccess::Revoked,
+                        origin: pbps_model::RoutineOrigin::Created,
+                    },
+                )),
             ],
         },
         pbps_model::IdsFile::default(),
@@ -8102,7 +8106,7 @@ fn apply_refuses_a_plan_that_builds_a_routine_and_settles_nothing_about_public()
         pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange {
                 drop_guard: None,
-                change: pbps_model::Change::CreateModule {
+                change: pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule {
                     id: "app.f(integer)".parse().unwrap(),
                     module: Box::new(pbps_model::Module {
                         kind: pbps_model::ModuleKind::Function,
@@ -8111,7 +8115,7 @@ fn apply_refuses_a_plan_that_builds_a_routine_and_settles_nothing_about_public()
                             .into(),
                         options: Default::default(),
                     }),
-                },
+                }),
                 risks: Default::default(),
                 strategy: Default::default(),
                 findings: Default::default(),
@@ -8163,11 +8167,11 @@ fn apply_refuses_a_plan_whose_risks_were_removed() {
         pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange {
                 drop_guard: None,
-                change: pbps_model::Change::DropTable {
+                change: pbps_model::Change::Table(pbps_model::TableChange::DropTable {
                     uid: "t_aaaaaa".parse().unwrap(),
                     name: "dbo.t".parse().unwrap(),
                     detach_from: None,
-                },
+                }),
                 risks: Default::default(),
                 strategy: Default::default(),
                 findings: Default::default(),
@@ -8566,6 +8570,7 @@ fn write_plan(d: &Demo, name: &str, mode: &str) -> PathBuf {
 }
 
 fn staged_cardinality_plan(dialect: &str, count: usize, staged: bool) -> pbps_model::SavedPlan {
+    use pbps_model::TableChange;
     use pbps_model::{
         Change, ChangeSet, IdsFile, PlanBaseline, PlanOrigin, PlannedChange, SavedPlan,
     };
@@ -8581,12 +8586,12 @@ fn staged_cardinality_plan(dialect: &str, count: usize, staged: bool) -> pbps_mo
         let uid: pbps_model::Uid = uid.parse().unwrap();
         let to: pbps_model::TableName = to.parse().unwrap();
         ids.tables.insert(uid.clone(), to.clone());
-        PlannedChange::new(Change::RenameTable {
+        PlannedChange::new(Change::Table(TableChange::RenameTable {
             uid,
             from: from.parse().unwrap(),
             to,
             defaults: Vec::new(),
-        })
+        }))
     })
     .collect();
     let plan = SavedPlan::new(
@@ -15439,7 +15444,13 @@ fn roles_holding_each_other_are_dropped_parent_first_through_a_connected_plan() 
         .changes
         .iter()
         .enumerate()
-        .filter_map(|(i, p)| matches!(p.change, pbps_model::Change::DropRole { .. }).then_some(i))
+        .filter_map(|(i, p)| {
+            matches!(
+                p.change,
+                pbps_model::Change::Role(pbps_model::RoleChange::DropRole { .. })
+            )
+            .then_some(i)
+        })
         .collect();
     assert_eq!(slots.len(), 2);
     // Reconstruct this fixture's pre-membership name order, then run the
@@ -16191,11 +16202,13 @@ fn role_name_reuse_compares_the_grants_of_the_final_principal() {
         let saved: pbps_model::SavedPlan =
             serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
         let steps: Vec<_> = saved.changes.changes.iter().map(|p| &p.change).collect();
-        assert!(matches!(steps[0], pbps_model::Change::DropRole { name, .. } if name.raw() == "a"));
+        assert!(
+            matches!(steps[0], pbps_model::Change::Role(pbps_model::RoleChange::DropRole { name, .. }) if name.raw() == "a")
+        );
         assert!(steps.iter().any(|step| if replacement {
-            matches!(step, pbps_model::Change::CreateRole { name, .. } if name.raw() == "a")
+            matches!(step, pbps_model::Change::Role(pbps_model::RoleChange::CreateRole { name, .. }) if name.raw() == "a")
         } else {
-            matches!(step, pbps_model::Change::RenameRole { from, to, .. } if from.raw() == "b" && to.raw() == "a")
+            matches!(step, pbps_model::Change::Role(pbps_model::RoleChange::RenameRole { from, to, .. }) if from.raw() == "b" && to.raw() == "a")
         }));
         success(&[
             "apply",
@@ -18243,7 +18256,12 @@ fn connected_planning_keeps_dependencies_for_deleted_modules() {
         .changes
         .changes
         .iter()
-        .filter(|planned| matches!(planned.change, pbps_model::Change::AlterModule { .. }))
+        .filter(|planned| {
+            matches!(
+                planned.change,
+                pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule { .. })
+            )
+        })
         .filter_map(|planned| planned.change.module_id().map(|id| id.raw().to_string()))
         .collect();
     assert_eq!(altered, ["dbo.pbps_dep_leaf", "dbo.pbps_dep_base"]);
@@ -18265,7 +18283,12 @@ fn connected_planning_keeps_dependencies_for_deleted_modules() {
         .changes
         .changes
         .iter()
-        .filter(|planned| matches!(planned.change, pbps_model::Change::DropModule { .. }))
+        .filter(|planned| {
+            matches!(
+                planned.change,
+                pbps_model::Change::Module(pbps_model::ModuleChange::DropModule { .. })
+            )
+        })
         .filter_map(|planned| planned.change.module_id().map(|id| id.raw().to_string()))
         .collect();
     assert_eq!(dropped, ["dbo.pbps_dep_leaf", "dbo.pbps_dep_base"]);
@@ -18736,8 +18759,8 @@ fn a_failed_resume_does_not_relabel_the_interrupted_plan() {
             database_collation: None,
         },
         pbps_model::ChangeSet {
-            changes: vec![pbps_model::PlannedChange::new(
-                pbps_model::Change::CreateModule {
+            changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Module(
+                pbps_model::ModuleChange::CreateModule {
                     id: "dbo.pbps_plan_b".parse().unwrap(),
                     module: Box::new(pbps_model::Module {
                         kind: pbps_model::ModuleKind::View,
@@ -18746,7 +18769,7 @@ fn a_failed_resume_does_not_relabel_the_interrupted_plan() {
                         options: Default::default(),
                     }),
                 },
-            )],
+            ))],
         },
         checkpoint.ids.clone(),
     )
@@ -19557,7 +19580,7 @@ fn a_rename_of_a_granted_table_is_applied_rather_than_read_as_movement() {
     assert!(
         matches!(
             saved.changes.changes.as_slice(),
-            [one] if matches!(one.change, pbps_model::Change::RenameTable { .. })
+            [one] if matches!(one.change, pbps_model::Change::Table(pbps_model::TableChange::RenameTable { .. }))
         ),
         "the rename alone is the plan: {:?}",
         saved.changes
@@ -20910,7 +20933,11 @@ fn sql_server_cost_reports_row_work_without_changing_the_saved_plan_or_gate() {
             assert_eq!(c["lock"], "Sch-M");
             assert_eq!(c["blocks"], "reads and writes");
             let rewrites =
-                if let pbps_model::Change::AlterColumnType { column, .. } = &change.change {
+                if let pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType {
+                    column,
+                    ..
+                }) = &change.change
+                {
                     match column.name.raw() {
                         "i" => !compressed,
                         "w" => false,
@@ -20919,7 +20946,9 @@ fn sql_server_cost_reports_row_work_without_changing_the_saved_plan_or_gate() {
                 } else {
                     assert!(matches!(
                         change.change,
-                        pbps_model::Change::AlterColumnNullability { .. }
+                        pbps_model::Change::Column(
+                            pbps_model::ColumnChange::AlterColumnNullability { .. }
+                        )
                     ));
                     true
                 };
@@ -21481,10 +21510,10 @@ fn a_referenced_key_replacement_applies_and_the_next_plan_is_empty() {
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             assert_eq!(saved.changes.changes.len(), 4, "{:?}", saved.changes);
             assert!(
-                matches!(&saved.changes.changes[0].change, pbps_model::Change::DropForeignKey {name, ..} if name.raw() == "fk_child")
+                matches!(&saved.changes.changes[0].change, pbps_model::Change::Constraint(pbps_model::ConstraintChange::DropForeignKey {name, ..}) if name.raw() == "fk_child")
             );
             assert!(
-                matches!(&saved.changes.changes[3].change, pbps_model::Change::AddForeignKey {name, ..} if name.raw() == "fk_child")
+                matches!(&saved.changes.changes[3].change, pbps_model::Change::Constraint(pbps_model::ConstraintChange::AddForeignKey {name, ..}) if name.raw() == "fk_child")
             );
             let checksum = plan_checksum(&path);
             let mut args = vec![

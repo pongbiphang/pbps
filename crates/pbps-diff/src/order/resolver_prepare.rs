@@ -1,5 +1,12 @@
 use crate::resolver::Error;
 use pbps_dialect::Dialect;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
+use pbps_model::TablePropertyChange;
 use pbps_model::operation::{Origin, Source};
 use pbps_model::part_effects::{DefaultChange, Effect, Part as DependencyPart, PartEffect};
 use pbps_model::resolver::{Surface, SurfaceResolution};
@@ -128,7 +135,7 @@ pub(crate) fn rebuilds(
                         || ordinary.changes.iter().zip(&parts).any(|(p, facts)| {
                             invalidates(facts, input)
                                 || (rebuilds_modules && matches!((&p.change, input),
-                                    (Change::AlterModule { id, .. }, Surface::Module(m)) if id == m))
+                                    (Change::Module(ModuleChange::AlterModule { id, .. }), Surface::Module(m)) if id == m))
                         })
                 }) {
                 result.insert(forward(&o.surface, &before_names, after_ids));
@@ -240,13 +247,13 @@ pub(crate) fn changes(
             continue;
         }
         let expanded = match &planned.change {
-            Change::CreateTable {
+            Change::Table(TableChange::CreateTable {
                 uid,
                 name,
                 table,
                 beside_default,
                 moves_at_most,
-            } => {
+            }) => {
                 let mut bare = (**table).clone();
                 let checks = std::mem::take(&mut bare.checks);
                 let indexes = std::mem::take(&mut bare.indexes);
@@ -269,7 +276,7 @@ pub(crate) fn changes(
                     };
                     spec.value_source = ValueSource::None;
                     let reference = name.column(column);
-                    defaults.push(Change::AlterColumnDefault {
+                    defaults.push(Change::Column(ColumnChange::AlterColumnDefault {
                         uid: names
                             .column_uid(&reference)
                             .ok_or_else(|| Error::Definition(Surface::Default(reference.clone())))?
@@ -277,74 +284,80 @@ pub(crate) fn changes(
                         column: reference,
                         from: None,
                         to: Some(default),
-                    });
+                    }));
                 }
-                let mut parts = vec![Change::CreateTable {
+                let mut parts = vec![Change::Table(TableChange::CreateTable {
                     uid: uid.clone(),
                     name: name.clone(),
                     table: Box::new(bare),
                     beside_default: beside_default.clone(),
                     moves_at_most: *moves_at_most,
-                }];
+                })];
                 parts.extend(defaults);
-                parts.extend(
-                    checks
-                        .into_iter()
-                        .map(|(check, constraint)| Change::AddCheck {
-                            table: name.clone(),
-                            name: check,
-                            constraint,
-                        }),
-                );
-                parts.extend(indexes.into_iter().map(|(index, spec)| Change::AddIndex {
-                    table: name.clone(),
-                    clustered: table.index_is_clustered(index.raw()),
-                    name: index,
-                    index: Box::new(spec),
+                parts.extend(checks.into_iter().map(|(check, constraint)| {
+                    Change::Constraint(ConstraintChange::AddCheck {
+                        table: name.clone(),
+                        name: check,
+                        constraint,
+                    })
+                }));
+                parts.extend(indexes.into_iter().map(|(index, spec)| {
+                    Change::Index(IndexChange::AddIndex {
+                        table: name.clone(),
+                        clustered: table.index_is_clustered(index.raw()),
+                        name: index,
+                        index: Box::new(spec),
+                    })
                 }));
                 if identity.is_some() {
-                    parts.push(Change::SetReplicaIdentity {
-                        uid: uid.clone(),
-                        table: name.clone(),
-                        to: identity,
-                    });
+                    parts.push(Change::TableProperty(
+                        TablePropertyChange::SetReplicaIdentity {
+                            uid: uid.clone(),
+                            table: name.clone(),
+                            to: identity,
+                        },
+                    ));
                 }
                 parts
             }
-            Change::AlterModule { id, module } if dialect.rebuilds_modules() => vec![
-                Change::DropModule {
-                    id: id.clone(),
-                    kind: base
-                        .modules
-                        .get(id)
-                        .ok_or_else(|| Error::Definition(Surface::Module(id.clone())))?
-                        .kind,
-                },
-                Change::CreateModule {
-                    id: id.clone(),
-                    module: module.clone(),
-                },
-            ],
+            Change::Module(ModuleChange::AlterModule { id, module })
+                if dialect.rebuilds_modules() =>
+            {
+                vec![
+                    Change::Module(ModuleChange::DropModule {
+                        id: id.clone(),
+                        kind: base
+                            .modules
+                            .get(id)
+                            .ok_or_else(|| Error::Definition(Surface::Module(id.clone())))?
+                            .kind,
+                    }),
+                    Change::Module(ModuleChange::CreateModule {
+                        id: id.clone(),
+                        module: module.clone(),
+                    }),
+                ]
+            }
             // ADD COLUMN DEFAULT fills existing rows. Splitting it would
             // change data, so its default must instead wait for its inputs.
-            Change::AlterColumnDefault {
+            Change::Column(ColumnChange::AlterColumnDefault {
                 uid,
                 column,
                 from: Some(from),
                 to: Some(to),
-            } => vec![
-                Change::AlterColumnDefault {
+            }) => vec![
+                Change::Column(ColumnChange::AlterColumnDefault {
                     uid: uid.clone(),
                     column: column.clone(),
                     from: Some(from.clone()),
                     to: None,
-                },
-                Change::AlterColumnDefault {
+                }),
+                Change::Column(ColumnChange::AlterColumnDefault {
                     uid: uid.clone(),
                     column: column.clone(),
                     from: None,
                     to: Some(to.clone()),
-                },
+                }),
             ],
             _ => vec![planned.change.clone()],
         };
@@ -356,8 +369,10 @@ pub(crate) fn changes(
         };
         for change in expanded {
             let mut p = planned.clone();
-            if matches!(planned.change, Change::CreateTable { .. })
-                && matches!(change, Change::AddIndex { .. })
+            if matches!(
+                planned.change,
+                Change::Table(TableChange::CreateTable { .. })
+            ) && matches!(change, Change::Index(IndexChange::AddIndex { .. }))
             {
                 // Ordinary CREATE TABLE builds indexes on its new empty table
                 // without online/concurrent DDL. Splitting must keep that
@@ -426,12 +441,12 @@ pub(crate) fn changes(
                         .column_uid(column)
                         .ok_or_else(|| Error::Definition(surface.clone()))?
                         .clone();
-                    let rewrite = Change::AlterColumnExpression {
+                    let rewrite = Change::Column(ColumnChange::AlterColumnExpression {
                         uid,
                         column: column.clone(),
                         from: old.expression,
                         to: new.expression,
-                    };
+                    });
                     if !present(&changes, &added, &rewrite) {
                         let mut planned = PlannedChange::new(rewrite);
                         planned.risks = dialect.change_risks(&planned.change);
@@ -471,18 +486,18 @@ pub(crate) fn changes(
                     continue;
                 };
                 vec![
-                    Change::AlterColumnDefault {
+                    Change::Column(ColumnChange::AlterColumnDefault {
                         uid: uid.clone(),
                         column: before_column.clone(),
                         from: Some(old),
                         to: None,
-                    },
-                    Change::AlterColumnDefault {
+                    }),
+                    Change::Column(ColumnChange::AlterColumnDefault {
                         uid,
                         column: column.clone(),
                         from: None,
                         to: Some(new),
-                    },
+                    }),
                 ]
             }
             Surface::Check { table, name } => {
@@ -500,15 +515,15 @@ pub(crate) fn changes(
                     .ok_or_else(|| Error::Definition(surface.clone()))?
                     .clone();
                 vec![
-                    Change::DropCheck {
+                    Change::Constraint(ConstraintChange::DropCheck {
                         table: before_table.clone(),
                         name: name.clone(),
-                    },
-                    Change::AddCheck {
+                    }),
+                    Change::Constraint(ConstraintChange::AddCheck {
                         table: table.clone(),
                         name: name.clone(),
                         constraint,
-                    },
+                    }),
                 ]
             }
             Surface::Index { table, name } => {
@@ -529,16 +544,16 @@ pub(crate) fn changes(
                     .ok_or_else(|| Error::Definition(surface.clone()))?
                     .clone();
                 vec![
-                    Change::DropIndex {
+                    Change::Index(IndexChange::DropIndex {
                         table: before_table.clone(),
                         name: name.clone(),
-                    },
-                    Change::AddIndex {
+                    }),
+                    Change::Index(IndexChange::AddIndex {
                         table: table.clone(),
                         name: name.clone(),
                         index: Box::new(index),
                         clustered: definition.index_is_clustered(name.raw()),
-                    },
+                    }),
                 ]
             }
             Surface::Module(_) => continue, // Already handled with all restore obligations by diff_rebuilding.
@@ -584,11 +599,11 @@ pub(crate) fn changes(
     // review).
     let mut again = Vec::new();
     for (origin, planned) in &added {
-        let Change::AlterColumnDefault {
+        let Change::Column(ColumnChange::AlterColumnDefault {
             column,
             to: Some(fallback),
             ..
-        } = &planned.change
+        }) = &planned.change
         else {
             continue;
         };
@@ -603,7 +618,7 @@ pub(crate) fn changes(
                 continue;
             };
             let set = |c: &Change| {
-                matches!(c, Change::SetPartitionDefault { table, column: name, to: Some(_), .. }
+                matches!(c, Change::Partition(PartitionChange::SetPartitionDefault { table, column: name, to: Some(_), .. })
                     if table == partition && *name == column.name)
             };
             if changes.iter().chain(&added).any(|(_, p)| set(&p.change)) {
@@ -613,15 +628,16 @@ pub(crate) fn changes(
                 .table_uid(partition)
                 .ok_or_else(|| Error::Definition(Surface::Default(partition.column(&column.name))))?
                 .clone();
-            let mut planned = PlannedChange::new(Change::SetPartitionDefault {
-                uid,
-                table: partition.clone(),
-                parent: column.table.clone(),
-                column: column.name.clone(),
-                from: Some(own.clone()),
-                to: Some(own),
-                fallback: Some(fallback.clone()),
-            });
+            let mut planned =
+                PlannedChange::new(Change::Partition(PartitionChange::SetPartitionDefault {
+                    uid,
+                    table: partition.clone(),
+                    parent: column.table.clone(),
+                    column: column.name.clone(),
+                    from: Some(own.clone()),
+                    to: Some(own),
+                    fallback: Some(fallback.clone()),
+                }));
             planned.risks = dialect.change_risks(&planned.change);
             planned.strategy = hints.strategies.get(partition).copied().unwrap_or_default();
             // Part of the parent's restoration, after it.
@@ -750,7 +766,7 @@ fn partition_default(
         return Ok(None);
     };
     let release = match before_of {
-        Some(before_of) => Change::SetPartitionDefault {
+        Some(before_of) => Change::Partition(PartitionChange::SetPartitionDefault {
             uid: uid.clone(),
             table: before_table,
             parent: before_of.parent.clone(),
@@ -758,10 +774,10 @@ fn partition_default(
             from: Some(old),
             to: None,
             fallback: None,
-        },
+        }),
         None => {
             let before_column = before_table.column(&before_name);
-            Change::AlterColumnDefault {
+            Change::Column(ColumnChange::AlterColumnDefault {
                 uid: before_ids
                     .column_uid(&before_column)
                     .ok_or_else(definition)?
@@ -769,11 +785,11 @@ fn partition_default(
                 column: before_column,
                 from: Some(old),
                 to: None,
-            }
+            })
         }
     };
     let restore = match of {
-        Some(of) => Change::SetPartitionDefault {
+        Some(of) => Change::Partition(PartitionChange::SetPartitionDefault {
             uid,
             table: column.table.clone(),
             parent: of.parent.clone(),
@@ -785,24 +801,24 @@ fn partition_default(
                 .get(&of.parent)
                 .and_then(|parent| parent.columns.get(&column.name))
                 .and_then(default_of),
-        },
-        None => Change::AlterColumnDefault {
+        }),
+        None => Change::Column(ColumnChange::AlterColumnDefault {
             uid: ids.column_uid(column).ok_or_else(definition)?.clone(),
             column: column.clone(),
             from: None,
             to: Some(new),
-        },
+        }),
     };
     Ok(Some(vec![release, restore]))
 }
 
 fn tears_down(change: &Change, surface: &Surface) -> bool {
     matches!((change, surface),
-        (Change::AlterColumnDefault { column: a, to: None, .. }, Surface::Default(b)) if a == b)
+        (Change::Column(ColumnChange::AlterColumnDefault { column: a, to: None, .. }), Surface::Default(b)) if a == b)
         || matches!((change, surface),
-        (Change::SetPartitionDefault { table, column, to: None, fallback: None, .. }, Surface::Default(b))
+        (Change::Partition(PartitionChange::SetPartitionDefault { table, column, to: None, fallback: None, .. }), Surface::Default(b))
             if *table == b.table && *column == b.name)
         || matches!((change, surface),
-        (Change::DropCheck { table: a, name: n }, Surface::Check { table: b, name: m })
-        | (Change::DropIndex { table: a, name: n }, Surface::Index { table: b, name: m }) if a == b && n == m)
+        (Change::Constraint(ConstraintChange::DropCheck { table: a, name: n }), Surface::Check { table: b, name: m })
+        | (Change::Index(IndexChange::DropIndex { table: a, name: n }), Surface::Index { table: b, name: m }) if a == b && n == m)
 }

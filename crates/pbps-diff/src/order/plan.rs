@@ -586,7 +586,9 @@ pub(super) fn reject_pending_rebuild(changes: &ChangeSet, expanded: bool) -> Res
             && let Some((operation, table)) = planned.change.pending_rebuild()
             && !matches!(
                 planned.change,
-                pbps_model::Change::RebuildPartitionedTable(_)
+                pbps_model::Change::Partition(
+                    pbps_model::PartitionChange::RebuildPartitionedTable(_)
+                )
             )
         {
             return Err(format!(
@@ -594,7 +596,10 @@ pub(super) fn reject_pending_rebuild(changes: &ChangeSet, expanded: bool) -> Res
                 table.shown()
             ));
         }
-        if let pbps_model::Change::RebuildPartitionedTable(root) = &planned.change {
+        if let pbps_model::Change::Partition(
+            pbps_model::PartitionChange::RebuildPartitionedTable(root),
+        ) = &planned.change
+        {
             let links = root.earlier.len() + 1;
             let composed = if links > 1 {
                 format!(" composed over {links} approved links")
@@ -614,6 +619,9 @@ pub(super) fn reject_pending_rebuild(changes: &ChangeSet, expanded: bool) -> Res
 mod tests {
     use super::*;
     use crate::order::{Schedule, Source};
+    use pbps_model::GrantChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::RoleChange;
     use pbps_model::resolver::OrderReason;
     use pbps_model::{Change, PlannedChange};
 
@@ -623,10 +631,10 @@ mod tests {
             changes: ["before", "after"]
                 .into_iter()
                 .map(|name| {
-                    PlannedChange::new(Change::CreateRole {
+                    PlannedChange::new(Change::Role(RoleChange::CreateRole {
                         uid: "r_aaaaaa".parse().unwrap(),
                         name: name.into(),
-                    })
+                    }))
                 })
                 .collect(),
         };
@@ -648,10 +656,10 @@ mod tests {
     fn an_ordered_plan_can_be_renamed_in_its_roles_and_in_nothing_else() {
         let dialect = pbps_dialect::MinimalDialect;
         let create = |name: &str| {
-            PlannedChange::new(Change::CreateRole {
+            PlannedChange::new(Change::Role(RoleChange::CreateRole {
                 uid: "r_aaaaaa".parse().unwrap(),
                 name: name.into(),
-            })
+            }))
         };
         let mut schedule = Schedule::new(2);
         schedule.edge(1, 0, Source::Effect, OrderReason::Structural);
@@ -695,10 +703,10 @@ mod tests {
             changes: ["a", "b", "c"]
                 .into_iter()
                 .map(|name| {
-                    PlannedChange::new(Change::CreateRole {
+                    PlannedChange::new(Change::Role(RoleChange::CreateRole {
                         uid: pbps_model::Uid::derived(pbps_model::UidKind::Role, name, 0),
                         name: name.into(),
-                    })
+                    }))
                 })
                 .collect(),
         });
@@ -731,7 +739,7 @@ mod tests {
         let id: pbps_model::ModuleId = "app.f()".parse().unwrap();
         let mut input = propose(ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::CreateModule {
+                PlannedChange::new(Change::Module(ModuleChange::CreateModule {
                     id,
                     module: Box::new(pbps_model::Module {
                         kind: pbps_model::ModuleKind::Function,
@@ -739,16 +747,16 @@ mod tests {
                         description: None,
                         options: Default::default(),
                     }),
-                }),
-                PlannedChange::new(Change::PublicExecution {
+                })),
+                PlannedChange::new(Change::Permission(GrantChange::PublicExecution {
                     routine: "app.f()".parse().unwrap(),
                     access: pbps_model::PublicAccess::Revoked,
                     origin: pbps_model::RoutineOrigin::Created,
-                }),
-                PlannedChange::new(Change::CreateRole {
+                })),
+                PlannedChange::new(Change::Role(RoleChange::CreateRole {
                     uid: "r_aaaaaa".parse().unwrap(),
                     name: "reader".into(),
-                }),
+                })),
             ],
         });
         let decisions = crate::order::take_public_execution(&mut input);
@@ -763,7 +771,7 @@ mod tests {
         assert_eq!(input.logical(), 3);
         assert!(matches!(
             &input.changes[2].change,
-            Change::PublicExecution { .. }
+            Change::Permission(GrantChange::PublicExecution { .. })
         ));
         input.proof().validate(input.changes()).unwrap();
     }

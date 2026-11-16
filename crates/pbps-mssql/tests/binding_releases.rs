@@ -7,6 +7,9 @@ use pbps_diff::{
     Side,
     order::{self, Baseline, Violation},
 };
+use pbps_model::ConstraintChange;
+use pbps_model::ModuleChange;
+use pbps_model::RowChange;
 use pbps_model::operation::{
     Effects, ModuleEdits, ObjectKey, Operations, PlanOwners, Requirement, Snapshot,
 };
@@ -32,10 +35,10 @@ fn function(bound: bool, body: &str) -> Module {
     }
 }
 fn alter(name: &str, module: &Module) -> Change {
-    Change::AlterModule {
+    Change::Module(ModuleChange::AlterModule {
         id: id(name),
         module: Box::new(module.clone()),
-    }
+    })
 }
 fn plan(changes: Vec<Change>) -> ChangeSet {
     ChangeSet {
@@ -132,14 +135,14 @@ fn a_split_caller_releases_its_binding_at_teardown_and_rebinds_after_the_rewrite
     let (before, after) = ends(function(true, "app.f(@x) + 1"));
     let backwards = plan(vec![
         alter("f", &after.modules[&id("f")]),
-        Change::DropModule {
+        Change::Module(ModuleChange::DropModule {
             id: id("g"),
             kind: ModuleKind::Function,
-        },
-        Change::CreateModule {
+        }),
+        Change::Module(ModuleChange::CreateModule {
             id: id("g"),
             module: Box::new(after.modules[&id("g")].clone()),
-        },
+        }),
     ]);
     let (ops, fx, base) = analysed(&before, &after, &backwards);
     assert!(fx[1].requires.contains(&release()));
@@ -193,10 +196,10 @@ fn only_an_actual_old_binding_that_the_step_releases_adds_before_rewrite() {
     let (_, fx, _) = analysed(
         &before,
         &after,
-        &plan(vec![Change::CreateModule {
+        &plan(vec![Change::Module(ModuleChange::CreateModule {
             id: id("g"),
             module: Box::new(after.modules[&id("g")].clone()),
-        }]),
+        })]),
     );
     assert!(
         !fx[0].requires.contains(&release()),
@@ -253,10 +256,10 @@ fn binding_release_settle_keeps_unrelated_steps_outside_its_scope() {
     before.modules.insert(id("m"), function(true, "@x"));
     let changes = plan(vec![
         alter("f", &after.modules[&id("f")]),
-        Change::CreateModule {
+        Change::Module(ModuleChange::CreateModule {
             id: id("n"),
             module: Box::new(after.modules[&id("n")].clone()),
-        },
+        }),
         alter("m", &after.modules[&id("m")]),
         alter("g", &after.modules[&id("g")]),
     ]);
@@ -297,16 +300,16 @@ fn plans_without_before_rewrite_keep_identical_steps_sql_and_sealed_bytes() {
     // Deliberately not class order: activating a general sort on this path
     // would change an approved plan even though it releases no binding.
     let original = plan(vec![
-        Change::CreateModule {
+        Change::Module(ModuleChange::CreateModule {
             id: id("plain"),
             module: Box::new(after.modules[&id("plain")].clone()),
-        },
-        Change::AddCheck {
+        }),
+        Change::Constraint(ConstraintChange::AddCheck {
             table: table.clone(),
             name: "positive".into(),
             constraint: check,
-        },
-        Change::InsertRow {
+        }),
+        Change::Row(RowChange::InsertRow {
             table,
             key_column: "id".into(),
             identity_key: false,
@@ -314,7 +317,7 @@ fn plans_without_before_rewrite_keep_identical_steps_sql_and_sealed_bytes() {
             row: [("id".into(), Value::Int(1))].into_iter().collect(),
             defaults: Default::default(),
             types: Default::default(),
-        },
+        }),
     ]);
     let result = order::before_rewrites(
         pbps_diff::order::propose(original.clone()),
@@ -421,9 +424,11 @@ fn binding_release_dependents_follow_the_rewrite_transitively() {
     ] {
         after.modules.insert(id(name), function(true, body));
     }
-    let create = |name: &str| Change::CreateModule {
-        id: id(name),
-        module: Box::new(after.modules[&id(name)].clone()),
+    let create = |name: &str| {
+        Change::Module(ModuleChange::CreateModule {
+            id: id(name),
+            module: Box::new(after.modules[&id(name)].clone()),
+        })
     };
     let changes = plan(vec![
         alter("f", &after.modules[&id("f")]),

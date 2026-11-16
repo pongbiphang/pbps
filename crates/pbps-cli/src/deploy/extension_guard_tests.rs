@@ -14,12 +14,12 @@ fn a_manifest_is_sealed_only_for_a_create_the_rehearsal_read_and_nobody_else_own
     let uid: pbps_model::Uid = "e_aaaaaa".parse().unwrap();
     let changes = pbps_model::ChangeSet {
         changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::CreateExtension {
+            pbps_model::Change::Extension(pbps_model::ExtensionChange::CreateExtension {
                 uid: uid.clone(),
                 name: "cube".into(),
                 definition: definition.clone(),
                 requires: Default::default(),
-            },
+            }),
         )],
     };
     let ids = IdsFile {
@@ -84,7 +84,7 @@ fn a_dropped_package_stands_as_pinned_until_its_statement_and_is_gone_at_the_clo
     };
     let changes = pbps_model::ChangeSet {
         changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::DropExtension {
+            pbps_model::Change::Extension(pbps_model::ExtensionChange::DropExtension {
                 uid: "e_aaaaaa".parse().unwrap(),
                 name: "cube".into(),
                 definition: pinned.clone(),
@@ -92,7 +92,7 @@ fn a_dropped_package_stands_as_pinned_until_its_statement_and_is_gone_at_the_clo
                 releases: Default::default(),
                 index_releases: Default::default(),
                 search_releases: Default::default(),
-            },
+            }),
         )],
     };
     let mut before = Schema::default();
@@ -220,14 +220,14 @@ fn an_updated_package_stands_at_its_old_or_new_version_and_at_the_close_at_the_n
     };
     let changes = pbps_model::ChangeSet {
         changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::UpdateExtension {
+            pbps_model::Change::Extension(pbps_model::ExtensionChange::UpdateExtension {
                 uid: "e_aaaaaa".parse().unwrap(),
                 name: "cube".into(),
                 from: at("1.4"),
                 to: at("1.5"),
                 requires: Default::default(),
                 releases: Default::default(),
-            },
+            }),
         )],
     };
     let mut before = Schema::default();
@@ -298,22 +298,26 @@ fn an_updated_and_moved_package_passes_through_each_definition_and_ends_at_the_l
     let uid: pbps_model::Uid = "e_aaaaaa".parse().unwrap();
     let steps = |with_update: bool| pbps_model::ChangeSet {
         changes: with_update
-            .then(|| pbps_model::Change::UpdateExtension {
-                uid: uid.clone(),
-                name: "cube".into(),
-                from: at("ext", "1.4"),
-                to: at("ext", "1.5"),
-                requires: Default::default(),
-                releases: Default::default(),
+            .then(|| {
+                pbps_model::Change::Extension(pbps_model::ExtensionChange::UpdateExtension {
+                    uid: uid.clone(),
+                    name: "cube".into(),
+                    from: at("ext", "1.4"),
+                    to: at("ext", "1.5"),
+                    requires: Default::default(),
+                    releases: Default::default(),
+                })
             })
             .into_iter()
-            .chain([pbps_model::Change::SetExtensionSchema {
-                uid: uid.clone(),
-                name: "cube".into(),
-                from: at("ext", if with_update { "1.5" } else { "1.4" }),
-                to: at("app", if with_update { "1.5" } else { "1.4" }),
-                releases: Default::default(),
-            }])
+            .chain([pbps_model::Change::Extension(
+                pbps_model::ExtensionChange::SetExtensionSchema {
+                    uid: uid.clone(),
+                    name: "cube".into(),
+                    from: at("ext", if with_update { "1.5" } else { "1.4" }),
+                    to: at("app", if with_update { "1.5" } else { "1.4" }),
+                    releases: Default::default(),
+                },
+            )])
             .map(pbps_model::PlannedChange::new)
             .collect(),
     };
@@ -390,7 +394,7 @@ fn only_the_pinned_package_may_appear_and_the_close_requires_it() {
     };
     let changes = pbps_model::ChangeSet {
         changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::CreateExtension {
+            pbps_model::Change::Extension(pbps_model::ExtensionChange::CreateExtension {
                 uid: "e_aaaaaa".parse().unwrap(),
                 name: "cube".into(),
                 definition: pbps_model::Extension {
@@ -398,7 +402,7 @@ fn only_the_pinned_package_may_appear_and_the_close_requires_it() {
                     version: "1.5".into(),
                 },
                 requires: Default::default(),
-            },
+            }),
         )],
     };
     let mut before = Schema::default();
@@ -481,15 +485,15 @@ fn only_the_pinned_package_may_appear_and_the_close_requires_it() {
 #[test]
 fn exact_extensions_are_required_at_every_read_back() {
     let changes = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::CreateTable {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Table(
+            pbps_model::TableChange::CreateTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: "app.new".parse().unwrap(),
                 table: Box::default(),
                 beside_default: None,
                 moves_at_most: None,
             },
-        )],
+        ))],
     };
     for (schema, version) in [("ext", "1.4"), ("other", "1.6")] {
         let mut before = Schema::default();

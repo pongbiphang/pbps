@@ -14,6 +14,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::change::GrantChange;
+use crate::change::IndexChange;
+use crate::change::PartitionChange;
+use crate::change::PolicyChange;
+use crate::change::RoleChange;
 use crate::change::{Change, ChangeSet};
 use crate::schema::{PolicyRoles, RowPolicy, Schema};
 use crate::{IdsFile, RoleName};
@@ -118,44 +123,46 @@ impl RoleMapping {
     /// has to be classified here as it is for [`Change::named_roles`].
     fn change(&self, change: &mut Change) {
         match change {
-            Change::CreateRole { name, .. } => *name = self.name(name),
-            Change::DropRole { name, members, .. } => {
+            Change::Role(RoleChange::CreateRole { name, .. }) => *name = self.name(name),
+            Change::Role(RoleChange::DropRole { name, members, .. }) => {
                 *name = self.name(name);
                 for member in members {
                     *member = self.name(member);
                 }
             }
-            Change::Grant { role, .. } | Change::Revoke { role, .. } => {
+            Change::Permission(GrantChange::Grant { role, .. })
+            | Change::Permission(GrantChange::Revoke { role, .. }) => {
                 *role = self.name(role);
             }
-            Change::RenameRole { from, to, .. } => {
+            Change::Role(RoleChange::RenameRole { from, to, .. }) => {
                 *from = self.name(from);
                 *to = self.name(to);
             }
-            Change::CreatePolicy { policy, .. } | Change::DropPolicy { policy, .. } => {
+            Change::Policy(PolicyChange::CreatePolicy { policy, .. })
+            | Change::Policy(PolicyChange::DropPolicy { policy, .. }) => {
                 self.policy(policy);
             }
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_)
-            | Change::PublicExecution { .. }
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_))
+            | Change::Permission(GrantChange::PublicExecution { .. })
             | crate::change_family!(type_values)
             | crate::change_family!(types)
             | crate::change_family!(extensions)
             | crate::change_family!(search)
             | crate::change_family!(tables)
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
             | crate::change_family!(columns)
             | crate::change_family!(constraints)
-            | Change::SetIndexStorageParameters { .. }
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
             | crate::change_family!(table_properties)
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::AddIndex { .. }
-            | Change::DropIndex { .. }
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(PolicyChange::SetRowSecurity { .. })
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
             | crate::change_family!(rows)
             | crate::change_family!(modules) => {}
         }
@@ -170,12 +177,13 @@ impl Change {
     /// exhaustive match a change added later has to be classified in.
     pub fn named_roles(&self) -> BTreeSet<RoleName> {
         let mut roles: BTreeSet<_> = self.roles().cloned().collect();
-        if let Change::CreatePolicy { policy, .. } | Change::DropPolicy { policy, .. } = self
+        if let Change::Policy(PolicyChange::CreatePolicy { policy, .. })
+        | Change::Policy(PolicyChange::DropPolicy { policy, .. }) = self
             && let PolicyRoles::Roles(named) = &policy.to
         {
             roles.extend(named.iter().cloned());
         }
-        if let Change::DropRole { members, .. } = self {
+        if let Change::Role(RoleChange::DropRole { members, .. }) = self {
             roles.extend(members.iter().cloned());
         }
         roles

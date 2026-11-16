@@ -1,6 +1,9 @@
 //! Scalar validation reads the rows at the certified operation boundary,
 //! using stored physical sources (DEC-2296.10). No SQL or ordering lives here.
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
 use pbps_model::{
     Uid,
     operation::Snapshot,
@@ -29,25 +32,27 @@ pub(super) fn sources(
 ) -> Option<Result<Vec<ColumnRef>, DialectError>> {
     let change = &names.changes()[step].change;
     let column = match change {
-        Change::AlterColumnType { column, .. }
-        | Change::AlterColumnNullability {
+        Change::Column(ColumnChange::AlterColumnType { column, .. })
+        | Change::Column(ColumnChange::AlterColumnNullability {
             column,
             to_nullable: false,
             ..
-        } => column,
+        }) => column,
         _ => return None,
     };
     let parent = owner(names, &column.table, At::Before(step))?;
     let mut moving = false;
     for (at, p) in names.changes().iter().enumerate() {
         let found = match &p.change {
-            Change::AttachPartition { parent, .. } => owner(names, parent, At::Before(at)),
-            Change::DetachPartition { uid, .. }
-            | Change::DropTable {
+            Change::Partition(PartitionChange::AttachPartition { parent, .. }) => {
+                owner(names, parent, At::Before(at))
+            }
+            Change::Partition(PartitionChange::DetachPartition { uid, .. })
+            | Change::Table(TableChange::DropTable {
                 uid,
                 detach_from: Some(_),
                 ..
-            } => before
+            }) => before
                 .ids
                 .tables
                 .get(uid)
@@ -133,10 +138,10 @@ pub(super) fn unchanged(
                 | Event::UpdateRow { table, .. }
                 | Event::DeleteRow { table, .. } => table,
                 Event::CreateTable { .. } => match &names.changes()[at].change {
-                    Change::CreateTable {
+                    Change::Table(TableChange::CreateTable {
                         beside_default: Some(default),
                         ..
-                    } => default,
+                    }) => default,
                     _ => return None,
                 },
                 Event::DropTable { .. }
@@ -192,6 +197,9 @@ pub(super) fn unchanged(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::PartitionChange;
+    use pbps_model::RowChange;
     fn fixture(
         attaching: bool,
         move_first: bool,
@@ -259,7 +267,7 @@ mod tests {
                 after.columns.insert(id.parse().unwrap(), n);
             }
         }
-        let c = Change::AlterColumnType {
+        let c = Change::Column(ColumnChange::AlterColumnType {
             uid: "c_bbbbbb".parse().unwrap(),
             column: p.column("d"),
             from: "bigint".parse().unwrap(),
@@ -270,18 +278,18 @@ mod tests {
             to_collation: None,
             through_external_partitions: false,
             using: None,
-        };
+        });
         let m = if attaching {
-            Change::AttachPartition {
+            Change::Partition(PartitionChange::AttachPartition {
                 uid: "t_bbbbbb".parse().unwrap(),
                 table: a,
                 parent: p.clone(),
                 bound: PartitionBound::Default,
                 key: vec![],
                 shape: Box::new(member()),
-            }
+            })
         } else {
-            Change::DetachPartition {
+            Change::Partition(PartitionChange::DetachPartition {
                 uid: "t_bbbbbb".parse().unwrap(),
                 table: a,
                 parent: p.clone(),
@@ -291,7 +299,7 @@ mod tests {
                     t.partition_by = None;
                     t
                 }),
-            }
+            })
         };
         let steps = if move_first { vec![m, c] } else { vec![c, m] }
             .into_iter()
@@ -405,14 +413,16 @@ mod tests {
         for using in [false, true] {
             let (schema, ids, after, mut steps) = fixture(true, true);
             if using {
-                let Change::AlterColumnType { using, .. } = &mut steps[1].change else {
+                let Change::Column(ColumnChange::AlterColumnType { using, .. }) =
+                    &mut steps[1].change
+                else {
                     panic!()
                 };
                 *using = Some("d::smallint".into());
             } else {
                 steps.insert(
                     1,
-                    pbps_model::PlannedChange::new(Change::DeleteRow {
+                    pbps_model::PlannedChange::new(Change::Row(RowChange::DeleteRow {
                         table: "app.p".parse().unwrap(),
                         key_column: "k".into(),
                         key: "1".into(),
@@ -422,7 +432,7 @@ mod tests {
                         dropped: Default::default(),
                         types: Default::default(),
                         after_types: Default::default(),
-                    }),
+                    })),
                 );
             }
             let names = PlanNames::of(&steps, &after).unwrap();
@@ -455,7 +465,7 @@ mod tests {
         let (schema, ids, after, steps) = fixture(true, true);
         let a: TableName = "app.a".parse().unwrap();
         let rewrites = [
-            Change::AlterColumnType {
+            Change::Column(ColumnChange::AlterColumnType {
                 uid: "c_dddddd".parse().unwrap(),
                 column: a.column("d"),
                 from: "integer".parse().unwrap(),
@@ -466,14 +476,14 @@ mod tests {
                 to_collation: None,
                 through_external_partitions: false,
                 using: Some("coalesce(d,0)".into()),
-            },
-            Change::AlterColumnExpression {
+            }),
+            Change::Column(ColumnChange::AlterColumnExpression {
                 uid: "c_dddddd".parse().unwrap(),
                 column: a.column("d"),
                 from: "k".into(),
                 to: "k+1".into(),
-            },
-            Change::AddColumn {
+            }),
+            Change::Column(ColumnChange::AddColumn {
                 uid: "c_eeeeee".parse().unwrap(),
                 table: a.clone(),
                 name: "x".into(),
@@ -481,7 +491,7 @@ mod tests {
                     value_source: ValueSource::Default("1".into()),
                     ..pbps_model::Column::new("integer".parse().unwrap())
                 }),
-            },
+            }),
         ];
         for change in rewrites {
             for earlier in [false, true] {
@@ -521,19 +531,19 @@ mod tests {
             .insert("c_ffffff".parse().unwrap(), u.column("d"));
         for table in [u, "app.a".parse().unwrap()] {
             let change = if table.name == "unrelated" {
-                Change::AlterColumnExpression {
+                Change::Column(ColumnChange::AlterColumnExpression {
                     uid: "c_ffffff".parse().unwrap(),
                     column: table.column("d"),
                     from: "1".into(),
                     to: "2".into(),
-                }
+                })
             } else {
-                Change::AlterColumnDefault {
+                Change::Column(ColumnChange::AlterColumnDefault {
                     uid: "c_dddddd".parse().unwrap(),
                     column: table.column("d"),
                     from: None,
                     to: Some("1".into()),
-                }
+                })
             };
             steps.insert(0, pbps_model::PlannedChange::new(change));
         }
@@ -556,36 +566,38 @@ mod tests {
         let (schema, ids, _, _) = fixture(true, true);
         let p: TableName = "app.p".parse().unwrap();
         let a: TableName = "app.a".parse().unwrap();
-        let copy = Change::CopyTableRows(Box::new(pbps_model::CopyTableRows {
-            source: pbps_model::RebuildRelation {
-                uid: "t_aaaaaa".parse().unwrap(),
-                name: p.clone(),
-            },
-            target: pbps_model::RebuildRelation {
-                uid: "t_bbbbbb".parse().unwrap(),
-                name: a.clone(),
-            },
-            columns: ["k", "d"]
-                .into_iter()
-                .map(|c| pbps_model::CopyColumn {
-                    source: Some(pbps_model::CopySource {
-                        column: p.column(c),
-                        ty: "bigint".parse().unwrap(),
+        let copy = Change::Partition(PartitionChange::CopyTableRows(Box::new(
+            pbps_model::CopyTableRows {
+                source: pbps_model::RebuildRelation {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: p.clone(),
+                },
+                target: pbps_model::RebuildRelation {
+                    uid: "t_bbbbbb".parse().unwrap(),
+                    name: a.clone(),
+                },
+                columns: ["k", "d"]
+                    .into_iter()
+                    .map(|c| pbps_model::CopyColumn {
+                        source: Some(pbps_model::CopySource {
+                            column: p.column(c),
+                            ty: "bigint".parse().unwrap(),
+                            collation: None,
+                        }),
+                        target: a.column(c),
+                        cast: "bigint".parse().unwrap(),
                         collation: None,
-                    }),
-                    target: a.column(c),
-                    cast: "bigint".parse().unwrap(),
-                    collation: None,
-                    stages: vec![],
-                })
-                .collect(),
-            source_partitions: vec![pbps_model::RebuildRelation {
-                uid: "t_cccccc".parse().unwrap(),
-                name: "app.b".parse().unwrap(),
-            }],
-            target_partitions: vec![],
-            max_rows: 32,
-        }));
+                        stages: vec![],
+                    })
+                    .collect(),
+                source_partitions: vec![pbps_model::RebuildRelation {
+                    uid: "t_cccccc".parse().unwrap(),
+                    name: "app.b".parse().unwrap(),
+                }],
+                target_partitions: vec![],
+                max_rows: 32,
+            },
+        )));
         let input = [pbps_model::PlannedChange::new(copy)];
         let names = PlanNames::of(&input, &ids).unwrap();
         let before = Snapshot {

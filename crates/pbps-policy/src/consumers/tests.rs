@@ -1,4 +1,10 @@
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
+use pbps_model::TypeValueChange;
 use pbps_model::{
     Change, Column, ColumnType, Module, ModuleKind, ModuleOptions, PlannedChange, Severity, Table,
     TableName, Uid, ValueSource,
@@ -114,13 +120,13 @@ fn a_renamed_entry_still_protects_the_same_column_uid() {
         .columns
         .insert("new".into(), column);
     new.columns.insert(uid("c_aaaaaa"), name().column("new"));
-    let change = Change::RenameColumn {
+    let change = Change::Column(ColumnChange::RenameColumn {
         uid: uid("c_aaaaaa"),
         table: name(),
         from: "old".into(),
         to: "new".into(),
         table_was: None,
-    };
+    });
     for spelling in ["app.t.old", "app.t.new"] {
         let f = findings(
             &before,
@@ -194,14 +200,14 @@ fn writes_tightening_is_unproven_and_a_new_default_supplied_column_is_compatible
         .get_mut("old")
         .unwrap()
         .nullable = false;
-    let change = Change::AlterColumnNullability {
+    let change = Change::Column(ColumnChange::AlterColumnNullability {
         uid: uid("c_aaaaaa"),
         column: name().column("old"),
         ty: ColumnType::simple("integer"),
         to_nullable: false,
         collation: None,
         through_external_partitions: false,
-    };
+    });
     let f = findings(
         &before,
         &after,
@@ -234,12 +240,12 @@ fn writes_tightening_is_unproven_and_a_new_default_supplied_column_is_compatible
         .unwrap()
         .columns
         .insert("added".into(), added.clone());
-    let mut add = Change::AddColumn {
+    let mut add = Change::Column(ColumnChange::AddColumn {
         uid: uid("c_bbbbbb"),
         table: name(),
         name: "added".into(),
         column: Box::new(added),
-    };
+    });
     assert!(
         findings(
             &before,
@@ -259,7 +265,7 @@ fn writes_tightening_is_unproven_and_a_new_default_supplied_column_is_compatible
         .get_mut("added")
         .unwrap()
         .value_source = ValueSource::None;
-    if let Change::AddColumn { column, .. } = &mut add {
+    if let Change::Column(ColumnChange::AddColumn { column, .. }) = &mut add {
         column.value_source = ValueSource::None;
     }
     let f = findings(
@@ -283,10 +289,12 @@ fn suppressions_expire_at_the_configured_severity_and_never_hide_validation() {
     }; 2];
     let bound = Bindings::resolve(&consumers("app.t.old", true), &sides, &Clone::clone).unwrap();
     let cs = ChangeSet {
-        changes: vec![PlannedChange::new(Change::DropColumn {
-            uid: uid("c_aaaaaa"),
-            column: name().column("old"),
-        })],
+        changes: vec![PlannedChange::new(Change::Column(
+            ColumnChange::DropColumn {
+                uid: uid("c_aaaaaa"),
+                column: name().column("old"),
+            },
+        ))],
     };
     let mut policies = Policies::default();
     policies.rules.insert(
@@ -327,10 +335,10 @@ fn module_changes_are_unproven_but_an_identical_restoration_is_compatible() {
         options: ModuleOptions::default(),
     };
     s.modules.insert(m.clone(), module.clone());
-    let drop = Change::DropModule {
+    let drop = Change::Module(ModuleChange::DropModule {
         id: m.clone(),
         kind: ModuleKind::View,
-    };
+    });
     let mut described = s.clone();
     described.modules.get_mut(&m).unwrap().description = Some("consumer report".into());
     assert!(
@@ -342,10 +350,10 @@ fn module_changes_are_unproven_but_an_identical_restoration_is_compatible() {
             &consumers("app.v", false),
             vec![
                 drop.clone(),
-                Change::CreateModule {
+                Change::Module(ModuleChange::CreateModule {
                     id: m.clone(),
                     module: Box::new(module.clone())
-                }
+                })
             ],
             true,
         )
@@ -360,10 +368,10 @@ fn module_changes_are_unproven_but_an_identical_restoration_is_compatible() {
             &ids(),
             &ids(),
             &consumers("app.v", false),
-            vec![Change::AlterModule {
+            vec![Change::Module(ModuleChange::AlterModule {
                 id: m.clone(),
                 module: Box::new(after.modules[&m].clone())
-            }]
+            })]
         )[0]
         .1
         .id,
@@ -395,20 +403,20 @@ fn constraints_restrict_writers_but_not_readers_or_unrelated_tables() {
         filegroup: None,
     };
     let cases = vec![
-        Change::AddUnique {
+        Change::Constraint(ConstraintChange::AddUnique {
             table: name(),
             name: "uq".into(),
             constraint: key,
             clustered: false,
-        },
-        Change::AddCheck {
+        }),
+        Change::Constraint(ConstraintChange::AddCheck {
             table: name(),
             name: "ck".into(),
             constraint: pbps_model::CheckConstraint {
                 expression: "old > 0".into(),
             },
-        },
-        Change::AddForeignKey {
+        }),
+        Change::Constraint(ConstraintChange::AddForeignKey {
             table: name(),
             name: "fk".into(),
             constraint: Box::new(pbps_model::ForeignKey {
@@ -418,26 +426,26 @@ fn constraints_restrict_writers_but_not_readers_or_unrelated_tables() {
                 on_delete: Default::default(),
                 on_update: Default::default(),
             }),
-        },
+        }),
     ];
     for change in cases {
         let mut after = s.clone();
         let target = after.tables.get_mut(&name()).unwrap();
-        if let Change::AddUnique {
+        if let Change::Constraint(ConstraintChange::AddUnique {
             name, constraint, ..
-        } = &change
+        }) = &change
         {
             target.unique.insert(name.clone(), constraint.clone());
         }
-        if let Change::AddCheck {
+        if let Change::Constraint(ConstraintChange::AddCheck {
             name, constraint, ..
-        } = &change
+        }) = &change
         {
             target.checks.insert(name.clone(), constraint.clone());
         }
-        if let Change::AddForeignKey {
+        if let Change::Constraint(ConstraintChange::AddForeignKey {
             name, constraint, ..
-        } = &change
+        }) = &change
         {
             target
                 .foreign_keys
@@ -468,13 +476,13 @@ fn constraints_restrict_writers_but_not_readers_or_unrelated_tables() {
             .is_empty()
         );
     }
-    let unrelated = Change::AddCheck {
+    let unrelated = Change::Constraint(ConstraintChange::AddCheck {
         table: "app.other".parse().unwrap(),
         name: "ck".into(),
         constraint: pbps_model::CheckConstraint {
             expression: "x > 0".into(),
         },
-    };
+    });
     assert!(findings(&s, &s, &i, &i, &consumers("app.t", true), vec![unrelated]).is_empty());
 }
 
@@ -488,12 +496,12 @@ fn table_renames_preserve_bindings_and_a_reused_name_is_not_that_table() {
     after.tables.insert(renamed.clone(), shape.clone());
     new.tables.insert(uid("t_aaaaaa"), renamed.clone());
     new.columns.insert(uid("c_aaaaaa"), renamed.column("old"));
-    let rename = Change::RenameTable {
+    let rename = Change::Table(TableChange::RenameTable {
         uid: uid("t_aaaaaa"),
         from: name(),
         to: renamed.clone(),
         defaults: vec![],
-    };
+    });
     let f = findings(
         &before,
         &after,
@@ -522,20 +530,20 @@ fn table_renames_preserve_bindings_and_a_reused_name_is_not_that_table() {
     );
     let cases = vec![
         rename,
-        Change::CreateTable {
+        Change::Table(TableChange::CreateTable {
             uid: uid("t_bbbbbb"),
             name: name(),
             table: Box::new(shape),
             beside_default: None,
             moves_at_most: None,
-        },
-        Change::AddCheck {
+        }),
+        Change::Constraint(ConstraintChange::AddCheck {
             table: name(),
             name: "ck".into(),
             constraint: pbps_model::CheckConstraint {
                 expression: "old > 0".into(),
             },
-        },
+        }),
     ];
     let f = findings(
         &before,
@@ -565,13 +573,13 @@ fn unchanged_constraint_restorations_do_not_accuse_existing_writers() {
         .unwrap()
         .checks
         .insert("ck".into(), constraint.clone());
-    let restore = Change::AddCheck {
+    let restore = Change::Constraint(ConstraintChange::AddCheck {
         table: name(),
         name: "ck".into(),
         constraint: pbps_model::CheckConstraint {
             expression: "((old)>(0))".into(),
         },
-    };
+    });
     assert!(
         findings_with_restoration(
             &s,
@@ -607,10 +615,10 @@ fn inherited_column_entries_see_parent_column_changes() {
     };
     s.tables.insert(leaf.clone(), table);
     i.tables.insert(uid("t_bbbbbb"), leaf);
-    let change = Change::DropColumn {
+    let change = Change::Column(ColumnChange::DropColumn {
         uid: uid("c_aaaaaa"),
         column: name().column("old"),
-    };
+    });
     assert_eq!(
         findings(
             &s,
@@ -697,7 +705,7 @@ fn written_tables_include_sibling_columns_but_not_unrelated_tables() {
             column.nullable = false;
             let change = if folded {
                 column.ty = ColumnType::simple("bigint");
-                Change::AlterColumnType {
+                Change::Column(ColumnChange::AlterColumnType {
                     uid: column_uid.clone(),
                     column: table.column("other"),
                     from: ColumnType::simple("integer"),
@@ -708,16 +716,16 @@ fn written_tables_include_sibling_columns_but_not_unrelated_tables() {
                     to_collation: None,
                     through_external_partitions: false,
                     using: None,
-                }
+                })
             } else {
-                Change::AlterColumnNullability {
+                Change::Column(ColumnChange::AlterColumnNullability {
                     uid: column_uid.clone(),
                     column: table.column("other"),
                     ty: column.ty.clone(),
                     to_nullable: false,
                     collation: None,
                     through_external_partitions: false,
-                }
+                })
             };
             let f = findings(
                 &before,
@@ -780,11 +788,11 @@ fn written_tables_include_the_whole_partition_tree_by_uid() {
             .unwrap()
             .checks
             .insert("ck".into(), constraint.clone());
-        let change = Change::AddCheck {
+        let change = Change::Constraint(ConstraintChange::AddCheck {
             table: table.clone(),
             name: "ck".into(),
             constraint,
-        };
+        });
         for entry in ["app.leaf", "app.branch.old", "app.t"] {
             let f = findings(
                 &before,
@@ -855,11 +863,13 @@ fn unrelated_write_entries_keep_their_own_findings_and_suppressions() {
     ];
     let bound = Bindings::resolve(&consumers, &sides, &Clone::clone).unwrap();
     let cs = ChangeSet {
-        changes: vec![PlannedChange::new(Change::AddCheck {
-            table: second,
-            name: "ck".into(),
-            constraint,
-        })],
+        changes: vec![PlannedChange::new(Change::Constraint(
+            ConstraintChange::AddCheck {
+                table: second,
+                name: "ck".into(),
+                constraint,
+            },
+        ))],
     };
     let mut policies = Policies::default();
     let f = plan(&cs, &bound, &sides, &policies, &context(), &unchanged);
@@ -917,22 +927,22 @@ fn partition_column_bindings_survive_attachment_and_detachment() {
             (&attached, &detached, &inherited, &owned)
         };
         let change = if attach {
-            Change::AttachPartition {
+            Change::Partition(PartitionChange::AttachPartition {
                 uid: uid("t_bbbbbb"),
                 table: leaf.clone(),
                 parent: name(),
                 bound: pbps_model::PartitionBound::Default,
                 key: vec![],
                 shape: Box::new(attached.tables[&leaf].clone()),
-            }
+            })
         } else {
-            Change::DetachPartition {
+            Change::Partition(PartitionChange::DetachPartition {
                 uid: uid("t_bbbbbb"),
                 table: leaf.clone(),
                 parent: name(),
                 names: vec![],
                 shape: Box::new(shape.clone()),
-            }
+            })
         };
         let cs = consumers("app.leaf.old", false);
         assert!(findings(before, after, old, new, &cs, vec![change]).is_empty());
@@ -943,10 +953,10 @@ fn partition_column_bindings_survive_attachment_and_detachment() {
             old,
             new,
             &cs,
-            vec![Change::DropColumn {
+            vec![Change::Column(ColumnChange::DropColumn {
                 uid: uid("c_aaaaaa"),
                 column: name().column("old"),
-            }],
+            })],
         );
         assert_eq!(f[0].1.id, "consumer.breaking");
     }
@@ -986,13 +996,13 @@ fn partition_overrides_share_the_supplied_new_column_exception() {
                     },
                 );
             let changes = vec![
-                Change::AddColumn {
+                Change::Column(ColumnChange::AddColumn {
                     uid: uid("c_bbbbbb"),
                     table: name(),
                     name: "added".into(),
                     column: Box::new(column),
-                },
-                Change::SetPartitionDefault {
+                }),
+                Change::Partition(PartitionChange::SetPartitionDefault {
                     uid: uid("t_bbbbbb"),
                     table: leaf.clone(),
                     parent: name(),
@@ -1000,13 +1010,13 @@ fn partition_overrides_share_the_supplied_new_column_exception() {
                     from: None,
                     to: local_default.then(|| "1".into()),
                     fallback: parent_default.then(|| "0".into()),
-                },
-                Change::SetPartitionNotNull {
+                }),
+                Change::Partition(PartitionChange::SetPartitionNotNull {
                     uid: uid("t_bbbbbb"),
                     table: leaf.clone(),
                     column: "added".into(),
                     not_null: true,
-                },
+                }),
             ];
             let f = findings(
                 &before,
@@ -1039,7 +1049,7 @@ fn partition_overrides_share_the_supplied_new_column_exception() {
                 &old,
                 &new,
                 &consumers("app.leaf.old", true),
-                vec![Change::SetPartitionDefault {
+                vec![Change::Partition(PartitionChange::SetPartitionDefault {
                     uid: uid("t_bbbbbb"),
                     table: leaf.clone(),
                     parent: name(),
@@ -1047,7 +1057,7 @@ fn partition_overrides_share_the_supplied_new_column_exception() {
                     from: None,
                     to: Some("1".into()),
                     fallback: None,
-                }],
+                })],
             );
             assert_eq!(f[0].1.id, "consumer.unproven");
         }
@@ -1070,12 +1080,14 @@ fn new_written_tables_have_no_old_writers_but_existing_referenced_tables_do() {
         .unwrap()
         .foreign_keys
         .insert("fk".into(), constraint.clone());
-    let create = |t: &TableName, id: &str| Change::CreateTable {
-        uid: uid(id),
-        name: t.clone(),
-        table: Box::new(after.tables[t].clone()),
-        beside_default: None,
-        moves_at_most: None,
+    let create = |t: &TableName, id: &str| {
+        Change::Table(TableChange::CreateTable {
+            uid: uid(id),
+            name: t.clone(),
+            table: Box::new(after.tables[t].clone()),
+            beside_default: None,
+            moves_at_most: None,
+        })
     };
     for entry in ["app.t", "app.t.old", "app.leaf", "app.leaf.old"] {
         assert!(
@@ -1090,11 +1102,11 @@ fn new_written_tables_have_no_old_writers_but_existing_referenced_tables_do() {
             .is_empty()
         );
     }
-    let fk = Change::AddForeignKey {
+    let fk = Change::Constraint(ConstraintChange::AddForeignKey {
         table: leaf.clone(),
         name: "fk".into(),
         constraint: Box::new(constraint),
-    };
+    });
     assert!(
         findings(
             &schema(),
@@ -1244,13 +1256,13 @@ fn domain_deltas_follow_the_same_column_and_constraint_paths() {
             before.types.insert(changed.clone(), from.clone());
             let mut after = before.clone();
             after.types.insert(changed.clone(), to.clone());
-            let change = Change::AlterDomain {
+            let change = Change::TypeValue(TypeValueChange::AlterDomain {
                 uid: uid("y_aaaaaa"),
                 name: changed.clone(),
                 from: Box::new(from.clone()),
                 to: Box::new(to.clone()),
                 half,
-            };
+            });
             for (writes, count) in [false, true].into_iter().zip(expected) {
                 let f = findings(
                     &before,
@@ -1306,13 +1318,13 @@ fn domain_translation_keeps_overrides_supplied_columns_and_the_shared_restoratio
         before.types.insert(changed.clone(), from.clone());
         let mut after = before.clone();
         after.types.insert(changed.clone(), to.clone());
-        let change = Change::AlterDomain {
+        let change = Change::TypeValue(TypeValueChange::AlterDomain {
             uid: uid("y_aaaaaa"),
             name: changed.clone(),
             from: Box::new(from),
             to: Box::new(to),
             half,
-        };
+        });
         for writes in [false, true] {
             assert!(
                 findings(
@@ -1351,13 +1363,13 @@ fn domain_translation_keeps_overrides_supplied_columns_and_the_shared_restoratio
         before.types.insert(changed.clone(), from.clone());
         let mut after = before.clone();
         after.types.insert(changed.clone(), to.clone());
-        let change = Change::AlterDomain {
+        let change = Change::TypeValue(TypeValueChange::AlterDomain {
             uid: uid("y_aaaaaa"),
             name: changed.clone(),
             from: Box::new(from),
             to: Box::new(to),
             half,
-        };
+        });
         assert!(
             findings_with_restoration(
                 &before,
@@ -1390,19 +1402,19 @@ fn domain_translation_keeps_overrides_supplied_columns_and_the_shared_restoratio
         .insert("added".into(), spec.clone());
     new.columns.insert(uid("c_bbbbbb"), name().column("added"));
     let changes = vec![
-        Change::AddColumn {
+        Change::Column(ColumnChange::AddColumn {
             uid: uid("c_bbbbbb"),
             table: name(),
             name: "added".into(),
             column: Box::new(spec),
-        },
-        Change::AlterDomain {
+        }),
+        Change::TypeValue(TypeValueChange::AlterDomain {
             uid: uid("y_aaaaaa"),
             name: changed,
             from: Box::new(domain(false, None, None)),
             to: Box::new(domain(true, None, None)),
             half: Tighten,
-        },
+        }),
     ];
     assert!(
         findings(
@@ -1438,13 +1450,13 @@ fn domain_checks_reach_sibling_writers_and_usage_on_either_side() {
                 }),
             );
         }
-        let change = Change::AlterDomain {
+        let change = Change::TypeValue(TypeValueChange::AlterDomain {
             uid: uid("y_aaaaaa"),
             name: changed.clone(),
             from: Box::new(from.clone()),
             to: Box::new(to.clone()),
             half: pbps_model::DomainHalf::Tighten,
-        };
+        });
         assert_eq!(
             findings(
                 &sides[0],
@@ -1505,13 +1517,13 @@ fn derived_domain_overrides_keep_effective_column_attributes() {
         before.types.insert(derived.clone(), local);
         let mut after = before.clone();
         after.types.insert(root.clone(), to.clone());
-        let change = Change::AlterDomain {
+        let change = Change::TypeValue(TypeValueChange::AlterDomain {
             uid: uid("y_aaaaaa"),
             name: root.clone(),
             from: Box::new(from),
             to: Box::new(to),
             half,
-        };
+        });
         for writes in [false, true] {
             assert!(
                 findings(
@@ -1665,13 +1677,13 @@ fn domain_changes_compare_effective_attributes_over_the_whole_chain() {
         before.types.insert(changed.clone(), from.clone());
         let mut after = before.clone();
         after.types.insert(changed.clone(), to.clone());
-        let change = Change::AlterDomain {
+        let change = Change::TypeValue(TypeValueChange::AlterDomain {
             uid: uid("y_aaaaaa"),
             name: changed,
             from: Box::new(from),
             to: Box::new(to),
             half,
-        };
+        });
         for (writes, count) in [false, true].into_iter().zip(expected) {
             let found = findings(
                 &before,
@@ -1733,12 +1745,12 @@ fn new_not_null_columns_use_scalar_domain_defaults_without_crossing_arrays() {
             &ids(),
             &new,
             &consumers("app.t", true),
-            vec![Change::AddColumn {
+            vec![Change::Column(ColumnChange::AddColumn {
                 uid: uid("c_bbbbbb"),
                 table: name(),
                 name: "added".into(),
                 column: Box::new(spec),
-            }],
+            })],
         );
         assert_eq!(
             f.is_empty(),
@@ -1772,12 +1784,12 @@ fn new_not_null_columns_use_scalar_domain_defaults_without_crossing_arrays() {
             &ids(),
             &new,
             &consumers("app.t", true),
-            vec![Change::AddColumn {
+            vec![Change::Column(ColumnChange::AddColumn {
                 uid: uid("c_bbbbbb"),
                 table: name(),
                 name: "added".into(),
                 column: Box::new(spec),
-            }]
+            })]
         )
         .is_empty()
     );
@@ -1824,13 +1836,13 @@ fn element_domain_defaults_leave_array_contracts_unchanged_but_checks_still_appl
                 &ids(),
                 &ids(),
                 &consumers("app.t.old", true),
-                vec![Change::AlterDomain {
+                vec![Change::TypeValue(TypeValueChange::AlterDomain {
                     uid: uid("y_aaaaaa"),
                     name: "app.domain".parse().unwrap(),
                     from: Box::new(domain(false, Some("1"), None)),
                     to: Box::new(to),
                     half,
-                }],
+                })],
             );
             assert_eq!(f.is_empty(), compatible, "{ty}/{half:?}: {f:?}");
             assert!(f.iter().all(|(_, f)| f.id == "consumer.unproven"));

@@ -2,6 +2,7 @@
 //! The frozen pre-S7 role ordering, shared by unit and connected flow tests.
 //! Kept out of every production build (DEC-1959.1).
 
+use pbps_model::RoleChange;
 use pbps_model::{Change, ChangeSet, PlannedChange};
 use std::collections::BTreeMap;
 
@@ -10,7 +11,9 @@ fn member_depth(planned: &[PlannedChange]) -> BTreeMap<pbps_model::RoleName, usi
     let dropped: BTreeMap<&pbps_model::RoleName, &[pbps_model::RoleName]> = planned
         .iter()
         .filter_map(|p| match &p.change {
-            Change::DropRole { name, members, .. } => Some((name, members.as_slice())),
+            Change::Role(RoleChange::DropRole { name, members, .. }) => {
+                Some((name, members.as_slice()))
+            }
             _ => None,
         })
         .collect();
@@ -42,14 +45,14 @@ pub fn legacy_order(cs: &mut ChangeSet) {
         .changes
         .iter()
         .enumerate()
-        .filter(|(_, p)| matches!(p.change, Change::DropRole { .. }))
+        .filter(|(_, p)| matches!(p.change, Change::Role(RoleChange::DropRole { .. })))
         .map(|(i, _)| i)
         .collect();
     let mut drops: Vec<PlannedChange> = slots.iter().rev().map(|&i| cs.changes.remove(i)).collect();
     drops.reverse();
     // Stable: two drops at one depth keep the order the differ gave them.
     drops.sort_by_key(|p| {
-        let Change::DropRole { name, .. } = &p.change else {
+        let Change::Role(RoleChange::DropRole { name, .. }) = &p.change else {
             return 0;
         };
         depth.get(name).copied().unwrap_or(0)

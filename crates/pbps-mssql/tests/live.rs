@@ -899,6 +899,9 @@ async fn an_unassignable_signed_default_is_unknown_not_null() {
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
 async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::RowChange;
     use pbps_model::{Cell, Change, ChangeSet, PlannedChange, RowKey, Value};
     let mut db = TestDb::create("signed_fk_assignment").await;
     for (i, (kind, default, old, next)) in [
@@ -917,16 +920,18 @@ async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
         let parent = TableName::new("dbo", format!("p{i}"));
         let child = TableName::new("dbo", format!("c{i}"));
         db.conn.execute(&format!("CREATE TABLE dbo.p{i}(k {kind} PRIMARY KEY); CREATE TABLE dbo.c{i}(id int PRIMARY KEY, k {kind} DEFAULT({default}) REFERENCES dbo.p{i}(k)); INSERT dbo.p{i} VALUES('{old}'),('{next}'); INSERT dbo.c{i} VALUES(1,'{old}');")).await.unwrap();
-        let delete = |key: &str| Change::DeleteRow {
-            table: parent.clone(),
-            key_column: "k".into(),
-            key: RowKey::from(key),
-            cause: pbps_model::change::DeleteCause::Undeclared,
-            dropped: Default::default(),
-            row: Default::default(),
-            types: Default::default(),
-            after_types: Default::default(),
-            key_type: None,
+        let delete = |key: &str| {
+            Change::Row(RowChange::DeleteRow {
+                table: parent.clone(),
+                key_column: "k".into(),
+                key: RowKey::from(key),
+                cause: pbps_model::change::DeleteCause::Undeclared,
+                dropped: Default::default(),
+                row: Default::default(),
+                types: Default::default(),
+                after_types: Default::default(),
+                key_type: None,
+            })
         };
         for legacy in [true, false] {
             let types = if legacy {
@@ -934,7 +939,7 @@ async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
             } else {
                 [("k".into(), kind.parse().unwrap())].into_iter().collect()
             };
-            let update = Change::UpdateRow {
+            let update = Change::Row(RowChange::UpdateRow {
                 table: child.clone(),
                 key_column: "id".into(),
                 key: RowKey::from("1"),
@@ -951,7 +956,7 @@ async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
                 types,
                 after_types: Default::default(),
                 key_type: None,
-            };
+            });
             for (deleted, count) in [(old, 0), (next, 1)] {
                 let cs = ChangeSet {
                     changes: vec![
@@ -979,7 +984,7 @@ async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
             } else {
                 [("k".into(), kind.parse().unwrap())].into_iter().collect()
             };
-            let insert = Change::InsertRow {
+            let insert = Change::Row(RowChange::InsertRow {
                 table: child.clone(),
                 key_column: "id".into(),
                 key: RowKey::from("1"),
@@ -987,7 +992,7 @@ async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
                 row: Default::default(),
                 defaults: [("k".into(), default.to_owned())].into_iter().collect(),
                 types,
-            };
+            });
             for (deleted, count) in [(old, 0), (next, 1)] {
                 let cs = ChangeSet {
                     changes: vec![
@@ -1018,13 +1023,13 @@ async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
             column.value_source = pbps_model::ValueSource::Default(expression.into());
             let cs = ChangeSet {
                 changes: vec![
-                    PlannedChange::new(Change::AddColumn {
+                    PlannedChange::new(Change::Column(ColumnChange::AddColumn {
                         uid: "c_aaaaaa".parse().unwrap(),
                         table: TableName::new("dbo", format!("b{i}")),
                         name: "k".into(),
                         column: Box::new(column),
-                    }),
-                    PlannedChange::new(Change::AddForeignKey {
+                    })),
+                    PlannedChange::new(Change::Constraint(ConstraintChange::AddForeignKey {
                         table: TableName::new("dbo", format!("b{i}")),
                         name: format!("fk_b{i}").into(),
                         constraint: Box::new(ForeignKey {
@@ -1034,7 +1039,7 @@ async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
                             on_delete: ReferentialAction::NoAction,
                             on_update: ReferentialAction::NoAction,
                         }),
-                    }),
+                    })),
                 ],
             };
             let probes = Mssql.fixture_preflight(&cs).probes;
@@ -1715,10 +1720,10 @@ async fn applying_a_planned_migration_converges_on_the_target() {
     // `plan --db` will do it — not against the declared A.
     let migration = plan(&state_a.schema, &ids_a, &b, &ids_b);
     assert!(
-        migration
-            .changes
-            .iter()
-            .any(|p| matches!(p.change, pbps_model::Change::RenameColumn { .. })),
+        migration.changes.iter().any(|p| matches!(
+            p.change,
+            pbps_model::Change::Column(pbps_model::ColumnChange::RenameColumn { .. })
+        )),
         "the rename must plan as a rename, not a drop + add: {migration:?}"
     );
 
@@ -4442,7 +4447,7 @@ async fn a_clustered_key_meeting_an_undeclared_clustered_index_is_refused() {
     let table: TableName = "dbo.s".parse().unwrap();
     let cs = pbps_model::ChangeSet {
         changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::SetPrimaryKey {
+            pbps_model::Change::Constraint(pbps_model::ConstraintChange::SetPrimaryKey {
                 table: table.clone(),
                 from: None,
                 to: Some(PrimaryKey {
@@ -4452,7 +4457,7 @@ async fn a_clustered_key_meeting_an_undeclared_clustered_index_is_refused() {
                     filegroup: None,
                 }),
                 nonclustered: false,
-            },
+            }),
         )],
     };
     let refused = try_apply(&mut db.conn, &cs).await;
@@ -5037,7 +5042,10 @@ async fn a_bare_name_in_another_schema_is_not_an_edge() {
         .changes
         .iter()
         .filter_map(|c| {
-            if let pbps_model::Change::CreateModule { id, .. } = &c.change {
+            if let pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule {
+                id, ..
+            }) = &c.change
+            {
                 Some(id.raw().to_string())
             } else {
                 None
@@ -5089,7 +5097,10 @@ async fn a_view_named_by_a_reserved_word_is_created_after_the_view_it_selects_fr
         .changes
         .iter()
         .filter_map(|c| {
-            if let pbps_model::Change::CreateModule { id, .. } = &c.change {
+            if let pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule {
+                id, ..
+            }) = &c.change
+            {
                 Some(id.raw().to_string())
             } else {
                 None
@@ -5526,20 +5537,24 @@ async fn two_columns_whose_names_join_to_one_string_both_get_their_defaults() {
     };
     let cs = pbps_model::ChangeSet {
         changes: vec![
-            pbps_model::PlannedChange::new(pbps_model::Change::CreateTable {
-                uid: "t_ab0001".parse().unwrap(),
-                name: TableName::new("dbo", "a_b"),
-                table: Box::new(with_default("c")),
-                beside_default: None,
-                moves_at_most: None,
-            }),
-            pbps_model::PlannedChange::new(pbps_model::Change::CreateTable {
-                uid: "t_ab0002".parse().unwrap(),
-                name: TableName::new("dbo", "a"),
-                table: Box::new(with_default("b_c")),
-                beside_default: None,
-                moves_at_most: None,
-            }),
+            pbps_model::PlannedChange::new(pbps_model::Change::Table(
+                pbps_model::TableChange::CreateTable {
+                    uid: "t_ab0001".parse().unwrap(),
+                    name: TableName::new("dbo", "a_b"),
+                    table: Box::new(with_default("c")),
+                    beside_default: None,
+                    moves_at_most: None,
+                },
+            )),
+            pbps_model::PlannedChange::new(pbps_model::Change::Table(
+                pbps_model::TableChange::CreateTable {
+                    uid: "t_ab0002".parse().unwrap(),
+                    name: TableName::new("dbo", "a"),
+                    table: Box::new(with_default("b_c")),
+                    beside_default: None,
+                    moves_at_most: None,
+                },
+            )),
         ],
     };
     apply(&mut db.conn, &cs).await;
@@ -5574,6 +5589,8 @@ async fn two_columns_whose_names_join_to_one_string_both_get_their_defaults() {
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn a_renamed_tables_and_columns_generated_defaults_follow_them() {
+    use pbps_model::ColumnChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
     let mut db = TestDb::create("defaultrename975").await;
     let defaulted = |columns: &[&str]| {
@@ -5586,13 +5603,13 @@ async fn a_renamed_tables_and_columns_generated_defaults_follow_them() {
         t
     };
     let create = |uid: &str, name: &str, columns: &[&str]| {
-        PlannedChange::new(Change::CreateTable {
+        PlannedChange::new(Change::Table(TableChange::CreateTable {
             uid: uid.parse().unwrap(),
             name: name.parse().unwrap(),
             table: Box::new(defaulted(columns)),
             beside_default: None,
             moves_at_most: None,
-        })
+        }))
     };
     // A table renamed, and a new one under its old name, in one plan.
     apply(
@@ -5606,12 +5623,12 @@ async fn a_renamed_tables_and_columns_generated_defaults_follow_them() {
         &mut db.conn,
         &ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::RenameTable {
+                PlannedChange::new(Change::Table(TableChange::RenameTable {
                     uid: "t_aaa001".parse().unwrap(),
                     from: "dbo.t".parse().unwrap(),
                     to: "dbo.u".parse().unwrap(),
                     defaults: vec!["c".into()],
-                }),
+                })),
                 create("t_aaa002", "dbo.t", &["c"]),
             ],
         },
@@ -5622,13 +5639,15 @@ async fn a_renamed_tables_and_columns_generated_defaults_follow_them() {
     apply(
         &mut db.conn,
         &ChangeSet {
-            changes: vec![PlannedChange::new(Change::RenameColumn {
-                uid: "t_aaa002".parse().unwrap(),
-                table: "dbo.t".parse().unwrap(),
-                from: "c".into(),
-                to: "d".into(),
-                table_was: None,
-            })],
+            changes: vec![PlannedChange::new(Change::Column(
+                ColumnChange::RenameColumn {
+                    uid: "t_aaa002".parse().unwrap(),
+                    table: "dbo.t".parse().unwrap(),
+                    from: "c".into(),
+                    to: "d".into(),
+                    table_was: None,
+                },
+            ))],
         },
     )
     .await;
@@ -5637,12 +5656,14 @@ async fn a_renamed_tables_and_columns_generated_defaults_follow_them() {
     apply(
         &mut db.conn,
         &ChangeSet {
-            changes: vec![PlannedChange::new(Change::AddColumn {
-                uid: "t_aaa002".parse().unwrap(),
-                table: "dbo.t".parse().unwrap(),
-                name: "c".into(),
-                column: Box::new(c),
-            })],
+            changes: vec![PlannedChange::new(Change::Column(
+                ColumnChange::AddColumn {
+                    uid: "t_aaa002".parse().unwrap(),
+                    table: "dbo.t".parse().unwrap(),
+                    name: "c".into(),
+                    column: Box::new(c),
+                },
+            ))],
         },
     )
     .await;
@@ -5657,12 +5678,14 @@ async fn a_renamed_tables_and_columns_generated_defaults_follow_them() {
     apply(
         &mut db.conn,
         &ChangeSet {
-            changes: vec![PlannedChange::new(Change::RenameTable {
-                uid: "t_aaa001".parse().unwrap(),
-                from: "dbo.u".parse().unwrap(),
-                to: "dbo.w".parse().unwrap(),
-                defaults: vec!["c".into()],
-            })],
+            changes: vec![PlannedChange::new(Change::Table(
+                TableChange::RenameTable {
+                    uid: "t_aaa001".parse().unwrap(),
+                    from: "dbo.u".parse().unwrap(),
+                    to: "dbo.w".parse().unwrap(),
+                    defaults: vec!["c".into()],
+                },
+            ))],
         },
     )
     .await;
@@ -5685,19 +5708,19 @@ async fn a_renamed_tables_and_columns_generated_defaults_follow_them() {
         &mut db.conn,
         &ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::RenameTable {
+                PlannedChange::new(Change::Table(TableChange::RenameTable {
                     uid: "t_aaa004".parse().unwrap(),
                     from: "dbo.p".parse().unwrap(),
                     to: "dbo.q".parse().unwrap(),
                     defaults: vec!["a".into()],
-                }),
-                PlannedChange::new(Change::RenameColumn {
+                })),
+                PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
                     uid: "t_aaa004".parse().unwrap(),
                     table: "dbo.q".parse().unwrap(),
                     from: "a".into(),
                     to: "b".into(),
                     table_was: Some("dbo.p".parse().unwrap()),
-                }),
+                })),
                 create("t_aaa005", "dbo.p", &["a"]),
             ],
         },
@@ -5712,12 +5735,14 @@ async fn a_renamed_tables_and_columns_generated_defaults_follow_them() {
     apply(
         &mut db.conn,
         &ChangeSet {
-            changes: vec![PlannedChange::new(Change::RenameTable {
-                uid: "t_aaa003".parse().unwrap(),
-                from: "dbo.legacy".parse().unwrap(),
-                to: "dbo.adopted".parse().unwrap(),
-                defaults: vec!["c".into()],
-            })],
+            changes: vec![PlannedChange::new(Change::Table(
+                TableChange::RenameTable {
+                    uid: "t_aaa003".parse().unwrap(),
+                    from: "dbo.legacy".parse().unwrap(),
+                    to: "dbo.adopted".parse().unwrap(),
+                    defaults: vec!["c".into()],
+                },
+            ))],
         },
     )
     .await;
@@ -5772,6 +5797,8 @@ async fn a_renamed_tables_and_columns_generated_defaults_follow_them() {
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn a_default_whose_new_name_is_taken_frees_its_old_one() {
+    use pbps_model::ColumnChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
     let mut db = TestDb::create("defaultfallback981").await;
     // `t`, whose generated names are short, and `order_items`, whose
@@ -5786,13 +5813,15 @@ async fn a_default_whose_new_name_is_taken_frees_its_old_one() {
         apply(
             &mut db.conn,
             &ChangeSet {
-                changes: vec![PlannedChange::new(Change::CreateTable {
-                    uid: uid.parse().unwrap(),
-                    name: name.clone(),
-                    table: Box::new(t),
-                    beside_default: None,
-                    moves_at_most: None,
-                })],
+                changes: vec![PlannedChange::new(Change::Table(
+                    TableChange::CreateTable {
+                        uid: uid.parse().unwrap(),
+                        name: name.clone(),
+                        table: Box::new(t),
+                        beside_default: None,
+                        moves_at_most: None,
+                    },
+                ))],
             },
         )
         .await;
@@ -5810,19 +5839,19 @@ async fn a_default_whose_new_name_is_taken_frees_its_old_one() {
             &mut db.conn,
             &ChangeSet {
                 changes: vec![
-                    PlannedChange::new(Change::RenameColumn {
+                    PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
                         uid: uid.parse().unwrap(),
                         table: name.clone(),
                         from: "c".into(),
                         to: "d".into(),
                         table_was: None,
-                    }),
-                    PlannedChange::new(Change::AddColumn {
+                    })),
+                    PlannedChange::new(Change::Column(ColumnChange::AddColumn {
                         uid: uid.parse().unwrap(),
                         table: name.clone(),
                         name: "c".into(),
                         column: Box::new(c),
-                    }),
+                    })),
                 ],
             },
         )
@@ -5870,6 +5899,8 @@ async fn a_default_whose_new_name_is_taken_frees_its_old_one() {
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn a_hand_written_default_on_another_column_is_not_renamed_with_this_one() {
+    use pbps_model::ColumnChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
     let mut db = TestDb::create("defaultcolumn991").await;
     db.conn
@@ -5883,21 +5914,21 @@ async fn a_hand_written_default_on_another_column_is_not_renamed_with_this_one()
         &mut db.conn,
         &ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::RenameColumn {
+                PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
                     uid: "t_aaa991".parse().unwrap(),
                     table: "dbo.t".parse().unwrap(),
                     from: "a".into(),
                     to: "c".into(),
                     table_was: None,
-                }),
+                })),
                 // A table rename names the columns that carry a generated
                 // default; `a` is named here to put the lookup on the spot.
-                PlannedChange::new(Change::RenameTable {
+                PlannedChange::new(Change::Table(TableChange::RenameTable {
                     uid: "t_aaa992".parse().unwrap(),
                     from: "dbo.s".parse().unwrap(),
                     to: "dbo.r".parse().unwrap(),
                     defaults: vec!["a".into()],
-                }),
+                })),
             ],
         },
     )
@@ -6189,12 +6220,12 @@ async fn a_cross_schema_rename_stops_where_the_emitter_says_it_does() {
 
     let statements = Mssql
         .fixture_emit(
-            &pbps_model::Change::RenameTable {
+            &pbps_model::Change::Table(pbps_model::TableChange::RenameTable {
                 uid: "t_a9k2mq".parse().unwrap(),
                 from: "dbo.customer".parse().unwrap(),
                 to: "sales.client".parse().unwrap(),
                 defaults: Vec::new(),
-            },
+            }),
             pbps_model::Strategy::default(),
         )
         .expect("emit");
@@ -6389,6 +6420,8 @@ async fn rename_impact_finds_the_dependencies_that_block() {
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn a_column_rename_on_a_renamed_table_still_finds_its_blocker() {
+    use pbps_model::ColumnChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
     use pbps_mssql::impact::{RenameTarget, rename_impact};
 
@@ -6407,19 +6440,19 @@ async fn a_column_rename_on_a_renamed_table_still_finds_its_blocker() {
 
     let changes = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::RenameTable {
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 from: "dbo.client".parse().unwrap(),
                 to: "dbo.customer".parse().unwrap(),
                 defaults: Vec::new(),
-            }),
-            PlannedChange::new(Change::RenameColumn {
+            })),
+            PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
                 uid: "c_aaaaaa".parse().unwrap(),
                 table: "dbo.customer".parse().unwrap(),
                 from: "email".into(),
                 to: "contact_email".into(),
                 table_was: None,
-            }),
+            })),
         ],
     };
     let after = pbps_model::IdsFile {
@@ -6561,6 +6594,8 @@ async fn a_table_name_needing_quoting_still_reports_what_blocks_its_rename() {
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn preflight_probes_count_what_the_engine_would_refuse() {
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let mut db = TestDb::create("probes").await;
@@ -6590,22 +6625,22 @@ async fn preflight_probes_count_what_the_engine_would_refuse() {
 
     let cs = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::AlterColumnNullability {
+            PlannedChange::new(Change::Column(ColumnChange::AlterColumnNullability {
                 uid: "c_aaaaaa".parse().unwrap(),
                 column: "dbo.customer.email".parse().unwrap(),
                 ty: ty("nvarchar(255)"),
                 to_nullable: false,
                 through_external_partitions: false,
                 collation: None,
-            }),
-            PlannedChange::new(Change::AddCheck {
+            })),
+            PlannedChange::new(Change::Constraint(ConstraintChange::AddCheck {
                 table: TableName::new("dbo", "customer"),
                 name: "ck_customer_amount".into(),
                 constraint: pbps_model::CheckConstraint {
                     expression: "[amount] >= 0".into(),
                 },
-            }),
-            PlannedChange::new(Change::AddForeignKey {
+            })),
+            PlannedChange::new(Change::Constraint(ConstraintChange::AddForeignKey {
                 table: TableName::new("dbo", "customer"),
                 name: "fk_customer_region".into(),
                 constraint: Box::new(ForeignKey {
@@ -6615,8 +6650,8 @@ async fn preflight_probes_count_what_the_engine_would_refuse() {
                     on_delete: ReferentialAction::NoAction,
                     on_update: ReferentialAction::NoAction,
                 }),
-            }),
-            PlannedChange::new(Change::AddUnique {
+            })),
+            PlannedChange::new(Change::Constraint(ConstraintChange::AddUnique {
                 table: TableName::new("dbo", "customer"),
                 name: "uq_customer_id".into(),
                 constraint: UniqueConstraint {
@@ -6625,7 +6660,7 @@ async fn preflight_probes_count_what_the_engine_would_refuse() {
                     filegroup: None,
                 },
                 clustered: false,
-            }),
+            })),
         ],
     };
 
@@ -6671,23 +6706,26 @@ async fn preflight_probes_count_what_the_engine_would_refuse() {
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn narrowing_to_sysname_probes_the_alias_real_capacity() {
+    use pbps_model::ColumnChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let mut db = TestDb::create("sysname_probe").await;
 
     let plan = || ChangeSet {
-        changes: vec![PlannedChange::new(Change::AlterColumnType {
-            uid: "c_aaaaaa".parse().unwrap(),
-            column: "dbo.t.v".parse().unwrap(),
-            from: ty("nvarchar(200)"),
-            to: ty("sysname"),
-            from_nullable: true,
-            to_nullable: true,
-            through_external_partitions: false,
-            from_collation: None,
-            to_collation: None,
-            using: None,
-        })],
+        changes: vec![PlannedChange::new(Change::Column(
+            ColumnChange::AlterColumnType {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: "dbo.t.v".parse().unwrap(),
+                from: ty("nvarchar(200)"),
+                to: ty("sysname"),
+                from_nullable: true,
+                to_nullable: true,
+                through_external_partitions: false,
+                from_collation: None,
+                to_collation: None,
+                using: None,
+            },
+        ))],
     };
 
     let emoji = "\u{1F600}"; // one astral character: two UTF-16 code units.
@@ -6770,6 +6808,7 @@ async fn narrowing_to_sysname_probes_the_alias_real_capacity() {
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn narrowing_a_varbinary_source_to_sysname_is_not_falsely_blocked() {
+    use pbps_model::ColumnChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let mut db = TestDb::create("sysname_varbin").await;
@@ -6795,18 +6834,20 @@ async fn narrowing_a_varbinary_source_to_sysname_is_not_falsely_blocked() {
     assert_eq!((len_of_varbinary, bytes), (200, 200));
 
     let cs = ChangeSet {
-        changes: vec![PlannedChange::new(Change::AlterColumnType {
-            uid: "c_aaaaaa".parse().unwrap(),
-            column: "dbo.t.v".parse().unwrap(),
-            from: ty("varbinary(200)"),
-            to: ty("sysname"),
-            from_nullable: true,
-            to_nullable: true,
-            through_external_partitions: false,
-            from_collation: None,
-            to_collation: None,
-            using: None,
-        })],
+        changes: vec![PlannedChange::new(Change::Column(
+            ColumnChange::AlterColumnType {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: "dbo.t.v".parse().unwrap(),
+                from: ty("varbinary(200)"),
+                to: ty("sysname"),
+                from_nullable: true,
+                to_nullable: true,
+                through_external_partitions: false,
+                from_collation: None,
+                to_collation: None,
+                using: None,
+            },
+        ))],
     };
     for probe in Mssql.fixture_preflight(&cs).probes {
         let rows = db
@@ -6838,6 +6879,7 @@ async fn unicode_capacity_verdict(
     to: &str,
     value: &str,
 ) -> (i32, Result<(), String>) {
+    use pbps_model::ColumnChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
     db.conn
         .execute(&format!(
@@ -6852,18 +6894,20 @@ async fn unicode_capacity_verdict(
         .await
         .expect("insert capacity fixture");
     let changes = ChangeSet {
-        changes: vec![PlannedChange::new(Change::AlterColumnType {
-            uid: "c_aaaaaa".parse().unwrap(),
-            column: "dbo.t.v".parse().unwrap(),
-            from: ty(from),
-            to: ty(to),
-            from_nullable: true,
-            to_nullable: true,
-            through_external_partitions: false,
-            from_collation: None,
-            to_collation: None,
-            using: None,
-        })],
+        changes: vec![PlannedChange::new(Change::Column(
+            ColumnChange::AlterColumnType {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: "dbo.t.v".parse().unwrap(),
+                from: ty(from),
+                to: ty(to),
+                from_nullable: true,
+                to_nullable: true,
+                through_external_partitions: false,
+                from_collation: None,
+                to_collation: None,
+                using: None,
+            },
+        ))],
     };
     let preflight = Mssql.fixture_preflight(&changes);
     assert_eq!(preflight.probes.len(), 1, "{from} -> {to}");
@@ -7110,21 +7154,24 @@ async fn a_default_this_engine_fills_every_row_from_is_not_counted_as_missing() 
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn unicode_to_varchar_probes_character_loss() {
+    use pbps_model::ColumnChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let plan = |column: &str, from: &str, to: &str| ChangeSet {
-        changes: vec![PlannedChange::new(Change::AlterColumnType {
-            uid: "c_aaaaaa".parse().unwrap(),
-            column: column.parse().unwrap(),
-            from: ty(from),
-            to: ty(to),
-            from_nullable: true,
-            to_nullable: true,
-            through_external_partitions: false,
-            from_collation: None,
-            to_collation: None,
-            using: None,
-        })],
+        changes: vec![PlannedChange::new(Change::Column(
+            ColumnChange::AlterColumnType {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: column.parse().unwrap(),
+                from: ty(from),
+                to: ty(to),
+                from_nullable: true,
+                to_nullable: true,
+                through_external_partitions: false,
+                from_collation: None,
+                to_collation: None,
+                using: None,
+            },
+        ))],
     };
     async fn counts(conn: &mut Conn, plan: &ChangeSet) -> std::collections::BTreeMap<String, i32> {
         let mut counts = std::collections::BTreeMap::new();
@@ -7425,6 +7472,7 @@ async fn unicode_to_varchar_probes_character_loss() {
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn a_unique_index_is_probed_and_a_filtered_one_only_over_the_rows_it_keeps() {
+    use pbps_model::IndexChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let mut db = TestDb::create("uniqidx").await;
@@ -7444,24 +7492,26 @@ async fn a_unique_index_is_probed_and_a_filtered_one_only_over_the_rows_it_keeps
         .await
         .expect("create");
 
-    let index = |unique: bool, filter: Option<&str>| Change::AddIndex {
-        table: TableName::new("dbo", "customer"),
-        name: "ix_customer_email".into(),
-        index: Box::new(Index {
-            columns: vec![IndexColumn {
-                key: pbps_model::IndexKey::Column("email".into()),
-                descending: false,
-                opclass: None,
-                collation: None,
-            }],
-            include: Vec::new(),
-            unique,
-            filter: filter.map(str::to_owned),
-            method: Default::default(),
-            storage_parameters: Default::default(),
-            filegroup: None,
-        }),
-        clustered: false,
+    let index = |unique: bool, filter: Option<&str>| {
+        Change::Index(IndexChange::AddIndex {
+            table: TableName::new("dbo", "customer"),
+            name: "ix_customer_email".into(),
+            index: Box::new(Index {
+                columns: vec![IndexColumn {
+                    key: pbps_model::IndexKey::Column("email".into()),
+                    descending: false,
+                    opclass: None,
+                    collation: None,
+                }],
+                include: Vec::new(),
+                unique,
+                filter: filter.map(str::to_owned),
+                method: Default::default(),
+                storage_parameters: Default::default(),
+                filegroup: None,
+            }),
+            clustered: false,
+        })
     };
     let one = |change: Change| ChangeSet {
         changes: vec![PlannedChange::new(change)],
@@ -7533,6 +7583,8 @@ async fn a_unique_index_is_probed_and_a_filtered_one_only_over_the_rows_it_keeps
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn a_filtered_predicate_reads_a_retyped_column_through_the_type_it_has_now() {
+    use pbps_model::ColumnChange;
+    use pbps_model::IndexChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let mut db = TestDb::create("uniqidxretype").await;
@@ -7590,7 +7642,7 @@ async fn a_filtered_predicate_reads_a_retyped_column_through_the_type_it_has_now
     let probes = Mssql
         .fixture_preflight(&ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::AlterColumnType {
+                PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
                     uid: "c_bbbbbb".parse().unwrap(),
                     column: TableName::new("dbo", "customer").column("flag"),
                     from: ColumnType::simple("int"),
@@ -7601,8 +7653,8 @@ async fn a_filtered_predicate_reads_a_retyped_column_through_the_type_it_has_now
                     from_collation: None,
                     to_collation: None,
                     using: None,
-                }),
-                PlannedChange::new(Change::AddIndex {
+                })),
+                PlannedChange::new(Change::Index(IndexChange::AddIndex {
                     table: TableName::new("dbo", "customer"),
                     name: "ix_flagged".into(),
                     index: Box::new(Index {
@@ -7620,7 +7672,7 @@ async fn a_filtered_predicate_reads_a_retyped_column_through_the_type_it_has_now
                         filegroup: None,
                     }),
                     clustered: false,
-                }),
+                })),
             ],
         })
         .probes;
@@ -7644,6 +7696,8 @@ async fn a_filtered_predicate_reads_a_retyped_column_through_the_type_it_has_now
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn a_key_probe_counts_the_rows_the_plan_will_leave() {
+    use pbps_model::ConstraintChange;
+    use pbps_model::RowChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let mut db = TestDb::create("keyafter").await;
@@ -7655,7 +7709,7 @@ async fn a_key_probe_counts_the_rows_the_plan_will_leave() {
         .await
         .expect("create");
 
-    let unique = PlannedChange::new(Change::AddUnique {
+    let unique = PlannedChange::new(Change::Constraint(ConstraintChange::AddUnique {
         table: TableName::new("dbo", "customer"),
         name: "uq_email".into(),
         constraint: UniqueConstraint {
@@ -7664,8 +7718,8 @@ async fn a_key_probe_counts_the_rows_the_plan_will_leave() {
             filegroup: None,
         },
         clustered: false,
-    });
-    let delete = PlannedChange::new(Change::DeleteRow {
+    }));
+    let delete = PlannedChange::new(Change::Row(RowChange::DeleteRow {
         table: TableName::new("dbo", "customer"),
         key_column: "code".into(),
         key: pbps_model::RowKey::from("dup"),
@@ -7675,7 +7729,7 @@ async fn a_key_probe_counts_the_rows_the_plan_will_leave() {
         types: Default::default(),
         after_types: Default::default(),
         key_type: None,
-    });
+    }));
 
     let count = |changes: Vec<PlannedChange>| {
         let cs = ChangeSet { changes };
@@ -7720,6 +7774,8 @@ async fn a_key_probe_counts_the_rows_the_plan_will_leave() {
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn probes_over_a_column_this_plan_adds_run_and_count_what_the_engine_refuses() {
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
 
     let mut db = TestDb::create("addedcol").await;
@@ -7739,14 +7795,14 @@ async fn probes_over_a_column_this_plan_adds_run_and_count_what_the_engine_refus
         column.value_source = default.map_or(pbps_model::ValueSource::None, |text| {
             pbps_model::ValueSource::Default(text.into())
         });
-        PlannedChange::new(Change::AddColumn {
+        PlannedChange::new(Change::Column(ColumnChange::AddColumn {
             uid: "c_cccccc".parse().unwrap(),
             table: TableName::new("dbo", "customer"),
             name: "region_id".into(),
             column: Box::new(column),
-        })
+        }))
     };
-    let unique = PlannedChange::new(Change::AddUnique {
+    let unique = PlannedChange::new(Change::Constraint(ConstraintChange::AddUnique {
         table: TableName::new("dbo", "customer"),
         name: "uq_region".into(),
         constraint: UniqueConstraint {
@@ -7755,8 +7811,8 @@ async fn probes_over_a_column_this_plan_adds_run_and_count_what_the_engine_refus
             filegroup: None,
         },
         clustered: false,
-    });
-    let fk = PlannedChange::new(Change::AddForeignKey {
+    }));
+    let fk = PlannedChange::new(Change::Constraint(ConstraintChange::AddForeignKey {
         table: TableName::new("dbo", "customer"),
         name: "fk_customer_region".into(),
         constraint: Box::new(ForeignKey {
@@ -7766,7 +7822,7 @@ async fn probes_over_a_column_this_plan_adds_run_and_count_what_the_engine_refus
             on_delete: ReferentialAction::NoAction,
             on_update: ReferentialAction::NoAction,
         }),
-    });
+    }));
 
     let mut counts = Vec::new();
     for (label, changes) in [
@@ -9915,6 +9971,7 @@ async fn a_managed_table_under_another_spelling_is_not_asked_about_twice() {
 #[tokio::test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 async fn a_declaration_that_removes_rows_is_told_which_policy_catalog_read_its_count_needs() {
+    use pbps_model::RowChange;
     use pbps_model::{Change, ChangeSet, PlannedChange, RowKey, change::DeleteCause};
 
     let mut db = TestDb::create("doctorrls").await;
@@ -9990,7 +10047,7 @@ async fn a_declaration_that_removes_rows_is_told_which_policy_catalog_read_its_c
         .await
         .expect("see the child from this connection");
 
-    let deletion = Change::DeleteRow {
+    let deletion = Change::Row(RowChange::DeleteRow {
         table: TableName::new("app", "t"),
         key_column: "code".into(),
         key: RowKey::from("a"),
@@ -10000,7 +10057,7 @@ async fn a_declaration_that_removes_rows_is_told_which_policy_catalog_read_its_c
         types: Default::default(),
         after_types: Default::default(),
         key_type: None,
-    };
+    });
     let probe_sql = Mssql
         .fixture_preflight(&ChangeSet {
             changes: vec![PlannedChange::new(deletion.clone())],
@@ -10371,6 +10428,7 @@ async fn a_column_level_grant_is_seen_where_the_object_level_answer_is_zero() {
 #[tokio::test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB"]
 async fn referenced_column_subsets_match_the_foreign_key_and_its_probe() {
+    use pbps_model::ConstraintChange;
     use pbps_model::{Change, ChangeSet, PlannedChange};
     let mut db = TestDb::create("refsubset195").await;
     let login = format!("pbps_refsubset195_{}", std::process::id());
@@ -10394,7 +10452,7 @@ async fn referenced_column_subsets_match_the_foreign_key_and_its_probe() {
         changes: ["code", "alt"]
             .into_iter()
             .map(|column| {
-                PlannedChange::new(Change::AddForeignKey {
+                PlannedChange::new(Change::Constraint(ConstraintChange::AddForeignKey {
                     table: "app.child".parse().unwrap(),
                     name: format!("fk_{column}").into(),
                     constraint: Box::new(ForeignKey {
@@ -10404,7 +10462,7 @@ async fn referenced_column_subsets_match_the_foreign_key_and_its_probe() {
                         on_delete: ReferentialAction::NoAction,
                         on_update: ReferentialAction::NoAction,
                     }),
-                })
+                }))
             })
             .collect(),
     };
@@ -11308,8 +11366,8 @@ async fn reference_data_reaches_the_engine_in_an_order_it_accepts() {
         .await
         .expect("the edit undone");
     let ghost = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::DeleteRow {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Row(
+            pbps_model::RowChange::DeleteRow {
                 table: TableName::new("dbo", "status"),
                 key_column: "code".into(),
                 key: RowKey::from("ghost"),
@@ -11320,7 +11378,7 @@ async fn reference_data_reaches_the_engine_in_an_order_it_accepts() {
                 after_types: Default::default(),
                 key_type: None,
             },
-        )],
+        ))],
     };
     let err = try_apply(&mut db.conn, &ghost)
         .await
@@ -11601,17 +11659,18 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
             .find(|p| p.description.contains("row `old`"))
             .expect("the delete carries a probe")
     };
-    let delete = pbps_model::PlannedChange::new(pbps_model::Change::DeleteRow {
-        table: TableName::new("dbo", "status"),
-        key_column: "code".into(),
-        key: RowKey::from("old"),
-        cause: pbps_model::change::DeleteCause::Undeclared,
-        dropped: Default::default(),
-        row: std::collections::BTreeMap::new(),
-        types: std::collections::BTreeMap::new(),
-        after_types: Default::default(),
-        key_type: None,
-    });
+    let delete =
+        pbps_model::PlannedChange::new(pbps_model::Change::Row(pbps_model::RowChange::DeleteRow {
+            table: TableName::new("dbo", "status"),
+            key_column: "code".into(),
+            key: RowKey::from("old"),
+            cause: pbps_model::change::DeleteCause::Undeclared,
+            dropped: Default::default(),
+            row: std::collections::BTreeMap::new(),
+            types: std::collections::BTreeMap::new(),
+            after_types: Default::default(),
+            key_type: None,
+        }));
     let alone = pbps_model::ChangeSet {
         changes: vec![delete.clone()],
     };
@@ -11632,18 +11691,18 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     // row references nothing (DECISIONS 128).
     for (removal, why) in [
         (
-            pbps_model::Change::DropForeignKey {
+            pbps_model::Change::Constraint(pbps_model::ConstraintChange::DropForeignKey {
                 table: TableName::new("dbo", "kind"),
                 name: "fk_kind_status".into(),
-            },
+            }),
             "the constraint this plan drops first counts nothing",
         ),
         (
-            pbps_model::Change::DropTable {
+            pbps_model::Change::Table(pbps_model::TableChange::DropTable {
                 uid: "t_bbbbbb".parse().unwrap(),
                 name: TableName::new("dbo", "kind"),
                 detach_from: None,
-            },
+            }),
             "nor does a key held by a table this plan drops first",
         ),
     ] {
@@ -11665,10 +11724,12 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     // one counted: the exclusion names the table too.
     let elsewhere = pbps_model::ChangeSet {
         changes: vec![
-            pbps_model::PlannedChange::new(pbps_model::Change::DropForeignKey {
-                table: TableName::new("other", "kind"),
-                name: "fk_kind_status".into(),
-            }),
+            pbps_model::PlannedChange::new(pbps_model::Change::Constraint(
+                pbps_model::ConstraintChange::DropForeignKey {
+                    table: TableName::new("other", "kind"),
+                    name: "fk_kind_status".into(),
+                },
+            )),
             delete.clone(),
         ],
     };
@@ -11688,24 +11749,26 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
 
     let moved = pbps_model::ChangeSet {
         changes: vec![
-            pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
-                unchanged: Default::default(),
-                types: Default::default(),
-                after_types: Default::default(),
-                table: TableName::new("dbo", "kind"),
-                key_column: "id".into(),
-                key: RowKey::from("7"),
-                columns: [(
-                    "status_code".into(),
-                    (
-                        pbps_model::Cell::Value(text("old")),
-                        pbps_model::Cell::Value(text("new")),
-                    ),
-                )]
-                .into_iter()
-                .collect(),
-                key_type: None,
-            }),
+            pbps_model::PlannedChange::new(pbps_model::Change::Row(
+                pbps_model::RowChange::UpdateRow {
+                    unchanged: Default::default(),
+                    types: Default::default(),
+                    after_types: Default::default(),
+                    table: TableName::new("dbo", "kind"),
+                    key_column: "id".into(),
+                    key: RowKey::from("7"),
+                    columns: [(
+                        "status_code".into(),
+                        (
+                            pbps_model::Cell::Value(text("old")),
+                            pbps_model::Cell::Value(text("new")),
+                        ),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    key_type: None,
+                },
+            )),
             delete,
         ],
     };
@@ -11726,24 +11789,26 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     // that knows. Counted.
     let same_key = pbps_model::ChangeSet {
         changes: vec![
-            pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
-                unchanged: Default::default(),
-                types: Default::default(),
-                after_types: Default::default(),
-                table: TableName::new("dbo", "kind"),
-                key_column: "id".into(),
-                key: RowKey::from("7"),
-                columns: [(
-                    "status_code".into(),
-                    (
-                        pbps_model::Cell::Value(text("old")),
-                        pbps_model::Cell::Value(text("OLD")),
-                    ),
-                )]
-                .into_iter()
-                .collect(),
-                key_type: None,
-            }),
+            pbps_model::PlannedChange::new(pbps_model::Change::Row(
+                pbps_model::RowChange::UpdateRow {
+                    unchanged: Default::default(),
+                    types: Default::default(),
+                    after_types: Default::default(),
+                    table: TableName::new("dbo", "kind"),
+                    key_column: "id".into(),
+                    key: RowKey::from("7"),
+                    columns: [(
+                        "status_code".into(),
+                        (
+                            pbps_model::Cell::Value(text("old")),
+                            pbps_model::Cell::Value(text("OLD")),
+                        ),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    key_type: None,
+                },
+            )),
             moved.changes[1].clone(),
         ],
     };
@@ -11770,24 +11835,26 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         .expect("a column the update can set");
     let elsewhere = pbps_model::ChangeSet {
         changes: vec![
-            pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
-                unchanged: Default::default(),
-                types: Default::default(),
-                after_types: Default::default(),
-                table: TableName::new("dbo", "kind"),
-                key_column: "id".into(),
-                key: RowKey::from("7"),
-                columns: [(
-                    "note".into(),
-                    (
-                        pbps_model::Cell::Value(Value::Null),
-                        pbps_model::Cell::Value(text("x")),
-                    ),
-                )]
-                .into_iter()
-                .collect(),
-                key_type: None,
-            }),
+            pbps_model::PlannedChange::new(pbps_model::Change::Row(
+                pbps_model::RowChange::UpdateRow {
+                    unchanged: Default::default(),
+                    types: Default::default(),
+                    after_types: Default::default(),
+                    table: TableName::new("dbo", "kind"),
+                    key_column: "id".into(),
+                    key: RowKey::from("7"),
+                    columns: [(
+                        "note".into(),
+                        (
+                            pbps_model::Cell::Value(Value::Null),
+                            pbps_model::Cell::Value(text("x")),
+                        ),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    key_type: None,
+                },
+            )),
             moved.changes[1].clone(),
         ],
     };
@@ -11810,17 +11877,19 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     let insert_onto = |code: &str| pbps_model::ChangeSet {
         changes: vec![
             moved.changes[0].clone(),
-            pbps_model::PlannedChange::new(pbps_model::Change::InsertRow {
-                table: TableName::new("dbo", "kind"),
-                key_column: "id".into(),
-                identity_key: true,
-                key: RowKey::from("9"),
-                defaults: Default::default(),
-                types: Default::default(),
-                row: [("status_code".into(), text(code))]
-                    .into_iter()
-                    .collect::<Row>(),
-            }),
+            pbps_model::PlannedChange::new(pbps_model::Change::Row(
+                pbps_model::RowChange::InsertRow {
+                    table: TableName::new("dbo", "kind"),
+                    key_column: "id".into(),
+                    identity_key: true,
+                    key: RowKey::from("9"),
+                    defaults: Default::default(),
+                    types: Default::default(),
+                    row: [("status_code".into(), text(code))]
+                        .into_iter()
+                        .collect::<Row>(),
+                },
+            )),
             moved.changes[1].clone(),
         ],
     };
@@ -11830,17 +11899,19 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     let insert_defaulted = |default: &str| pbps_model::ChangeSet {
         changes: vec![
             moved.changes[0].clone(),
-            pbps_model::PlannedChange::new(pbps_model::Change::InsertRow {
-                table: TableName::new("dbo", "kind"),
-                key_column: "id".into(),
-                identity_key: true,
-                key: RowKey::from("9"),
-                defaults: [("status_code".into(), default.to_owned())]
-                    .into_iter()
-                    .collect(),
-                types: Default::default(),
-                row: Row::default(),
-            }),
+            pbps_model::PlannedChange::new(pbps_model::Change::Row(
+                pbps_model::RowChange::InsertRow {
+                    table: TableName::new("dbo", "kind"),
+                    key_column: "id".into(),
+                    identity_key: true,
+                    key: RowKey::from("9"),
+                    defaults: [("status_code".into(), default.to_owned())]
+                        .into_iter()
+                        .collect(),
+                    types: Default::default(),
+                    row: Row::default(),
+                },
+            )),
             moved.changes[1].clone(),
         ],
     };
@@ -11927,10 +11998,12 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     let mut without_the_key = unprobeable.clone();
     without_the_key.changes.insert(
         0,
-        pbps_model::PlannedChange::new(pbps_model::Change::DropForeignKey {
-            table: TableName::new("dbo", "kind"),
-            name: "fk_kind_status".into(),
-        }),
+        pbps_model::PlannedChange::new(pbps_model::Change::Constraint(
+            pbps_model::ConstraintChange::DropForeignKey {
+                table: TableName::new("dbo", "kind"),
+                name: "fk_kind_status".into(),
+            },
+        )),
     );
     let probe = refusal_for(&without_the_key).expect("the probe is still built");
     let n: i32 = db
@@ -11946,11 +12019,13 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     let mut without_the_table = unprobeable.clone();
     without_the_table.changes.insert(
         0,
-        pbps_model::PlannedChange::new(pbps_model::Change::DropTable {
-            uid: "t_cccccc".parse().unwrap(),
-            name: TableName::new("dbo", "kind"),
-            detach_from: None,
-        }),
+        pbps_model::PlannedChange::new(pbps_model::Change::Table(
+            pbps_model::TableChange::DropTable {
+                uid: "t_cccccc".parse().unwrap(),
+                name: TableName::new("dbo", "kind"),
+                detach_from: None,
+            },
+        )),
     );
     assert!(
         refusal_for(&without_the_table).is_none(),
@@ -11960,19 +12035,21 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     let elsewhere = pbps_model::ChangeSet {
         changes: vec![
             moved.changes[0].clone(),
-            pbps_model::PlannedChange::new(pbps_model::Change::InsertRow {
-                table: TableName::new("dbo", "kind"),
-                key_column: "id".into(),
-                identity_key: true,
-                key: RowKey::from("9"),
-                defaults: [("note".into(), "(CONVERT(nvarchar(10), 'x'))".to_owned())]
-                    .into_iter()
-                    .collect(),
-                types: Default::default(),
-                row: [("status_code".into(), text("new"))]
-                    .into_iter()
-                    .collect::<Row>(),
-            }),
+            pbps_model::PlannedChange::new(pbps_model::Change::Row(
+                pbps_model::RowChange::InsertRow {
+                    table: TableName::new("dbo", "kind"),
+                    key_column: "id".into(),
+                    identity_key: true,
+                    key: RowKey::from("9"),
+                    defaults: [("note".into(), "(CONVERT(nvarchar(10), 'x'))".to_owned())]
+                        .into_iter()
+                        .collect(),
+                    types: Default::default(),
+                    row: [("status_code".into(), text("new"))]
+                        .into_iter()
+                        .collect::<Row>(),
+                },
+            )),
             moved.changes[1].clone(),
         ],
     };
@@ -12005,24 +12082,26 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     let update_onto = |code: &str| pbps_model::ChangeSet {
         changes: vec![
             moved.changes[0].clone(),
-            pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
-                unchanged: Default::default(),
-                types: Default::default(),
-                after_types: Default::default(),
-                table: TableName::new("dbo", "kind"),
-                key_column: "id".into(),
-                key: RowKey::from("42"),
-                columns: [(
-                    "status_code".into(),
-                    (
-                        pbps_model::Cell::Value(text("new")),
-                        pbps_model::Cell::Value(text(code)),
-                    ),
-                )]
-                .into_iter()
-                .collect(),
-                key_type: None,
-            }),
+            pbps_model::PlannedChange::new(pbps_model::Change::Row(
+                pbps_model::RowChange::UpdateRow {
+                    unchanged: Default::default(),
+                    types: Default::default(),
+                    after_types: Default::default(),
+                    table: TableName::new("dbo", "kind"),
+                    key_column: "id".into(),
+                    key: RowKey::from("42"),
+                    columns: [(
+                        "status_code".into(),
+                        (
+                            pbps_model::Cell::Value(text("new")),
+                            pbps_model::Cell::Value(text(code)),
+                        ),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    key_type: None,
+                },
+            )),
             moved.changes[1].clone(),
         ],
     };
@@ -12131,7 +12210,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         });
     }
     let pair_update = |id: &str, cells: &[(&str, Value)]| {
-        pbps_model::PlannedChange::new(pbps_model::Change::UpdateRow {
+        pbps_model::PlannedChange::new(pbps_model::Change::Row(pbps_model::RowChange::UpdateRow {
             unchanged: Default::default(),
             types: Default::default(),
             after_types: Default::default(),
@@ -12151,10 +12230,10 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
                 })
                 .collect(),
             key_type: None,
-        })
+        }))
     };
     let pair_insert = |id: &str, cells: &[(&str, Value)]| {
-        pbps_model::PlannedChange::new(pbps_model::Change::InsertRow {
+        pbps_model::PlannedChange::new(pbps_model::Change::Row(pbps_model::RowChange::InsertRow {
             table: TableName::new("dbo", "pair_child"),
             key_column: "id".into(),
             identity_key: false,
@@ -12165,7 +12244,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
                 .iter()
                 .map(|(c, v)| ((*c).into(), v.clone()))
                 .collect::<Row>(),
-        })
+        }))
     };
     let with = |change: pbps_model::PlannedChange| pbps_model::ChangeSet {
         changes: vec![moved.changes[0].clone(), change, moved.changes[1].clone()],
@@ -12286,7 +12365,7 @@ async fn a_disabled_foreign_key_neither_cascades_nor_blocks_a_delete() {
             .unwrap_or_else(|e| panic!("{sql}\n{e}"));
     }
 
-    let delete = pbps_model::Change::DeleteRow {
+    let delete = pbps_model::Change::Row(pbps_model::RowChange::DeleteRow {
         table: TableName::new("dbo", "status"),
         key_column: "code".into(),
         key: RowKey::from("old"),
@@ -12296,7 +12375,7 @@ async fn a_disabled_foreign_key_neither_cascades_nor_blocks_a_delete() {
         types: std::collections::BTreeMap::new(),
         after_types: Default::default(),
         key_type: None,
-    };
+    });
     let cs = pbps_model::ChangeSet {
         changes: vec![pbps_model::PlannedChange::new(delete.clone())],
     };
@@ -12367,7 +12446,7 @@ async fn a_row_rewritten_after_the_plan_was_made_is_not_deleted_as_the_reviewed_
             .unwrap_or_else(|e| panic!("{sql}\n{e}"));
     }
 
-    let delete = pbps_model::Change::DeleteRow {
+    let delete = pbps_model::Change::Row(pbps_model::RowChange::DeleteRow {
         table: TableName::new("dbo", "status"),
         key_column: "code".into(),
         key: RowKey::from("old"),
@@ -12384,7 +12463,7 @@ async fn a_row_rewritten_after_the_plan_was_made_is_not_deleted_as_the_reviewed_
             .collect(),
         after_types: Default::default(),
         key_type: None,
-    };
+    });
     let sql = Mssql
         .fixture_emit(&delete, Default::default())
         .expect("emit")[0]
@@ -12472,7 +12551,7 @@ async fn a_child_row_that_arrives_after_the_probe_is_not_cascaded_away() {
             .unwrap_or_else(|e| panic!("{sql}\n{e}"));
     }
 
-    let delete = pbps_model::Change::DeleteRow {
+    let delete = pbps_model::Change::Row(pbps_model::RowChange::DeleteRow {
         table: TableName::new("dbo", "status"),
         key_column: "code".into(),
         key: RowKey::from("old"),
@@ -12482,7 +12561,7 @@ async fn a_child_row_that_arrives_after_the_probe_is_not_cascaded_away() {
         types: std::collections::BTreeMap::new(),
         after_types: Default::default(),
         key_type: None,
-    };
+    });
     let cs = pbps_model::ChangeSet {
         changes: vec![pbps_model::PlannedChange::new(delete.clone())],
     };
@@ -12709,36 +12788,40 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
     }
 
     let table = TableName::new("dbo", "status");
-    let insert = |key: &str| pbps_model::Change::InsertRow {
-        table: table.clone(),
-        key_column: "code".into(),
-        identity_key: false,
-        key: RowKey::from(key),
-        defaults: Default::default(),
-        types: Default::default(),
-        row: [("label".into(), Value::Text("New".to_owned()))]
+    let insert = |key: &str| {
+        pbps_model::Change::Row(pbps_model::RowChange::InsertRow {
+            table: table.clone(),
+            key_column: "code".into(),
+            identity_key: false,
+            key: RowKey::from(key),
+            defaults: Default::default(),
+            types: Default::default(),
+            row: [("label".into(), Value::Text("New".to_owned()))]
+                .into_iter()
+                .collect::<Row>(),
+        })
+    };
+    let update = |from: &str, to: &str| {
+        pbps_model::Change::Row(pbps_model::RowChange::UpdateRow {
+            table: table.clone(),
+            key_column: "code".into(),
+            key: RowKey::from("old"),
+            columns: [(
+                "label".into(),
+                (
+                    Cell::Value(Value::Text(from.to_owned())),
+                    Cell::Value(Value::Text(to.to_owned())),
+                ),
+            )]
             .into_iter()
-            .collect::<Row>(),
+            .collect(),
+            unchanged: Default::default(),
+            types: [("label".into(), ty("nvarchar(50)"))].into_iter().collect(),
+            after_types: Default::default(),
+            key_type: None,
+        })
     };
-    let update = |from: &str, to: &str| pbps_model::Change::UpdateRow {
-        table: table.clone(),
-        key_column: "code".into(),
-        key: RowKey::from("old"),
-        columns: [(
-            "label".into(),
-            (
-                Cell::Value(Value::Text(from.to_owned())),
-                Cell::Value(Value::Text(to.to_owned())),
-            ),
-        )]
-        .into_iter()
-        .collect(),
-        unchanged: Default::default(),
-        types: [("label".into(), ty("nvarchar(50)"))].into_iter().collect(),
-        after_types: Default::default(),
-        key_type: None,
-    };
-    let delete = pbps_model::Change::DeleteRow {
+    let delete = pbps_model::Change::Row(pbps_model::RowChange::DeleteRow {
         table: table.clone(),
         key_column: "code".into(),
         key: RowKey::from("old"),
@@ -12748,7 +12831,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         types: std::collections::BTreeMap::new(),
         after_types: Default::default(),
         key_type: None,
-    };
+    });
     let sql_of = |change: &pbps_model::Change| {
         let stmts = Mssql
             .fixture_emit(change, Default::default())
@@ -12857,7 +12940,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         )
         .await
         .expect("a trigger that rewrites a defaulted column");
-    let defaulted = pbps_model::Change::InsertRow {
+    let defaulted = pbps_model::Change::Row(pbps_model::RowChange::InsertRow {
         table: table.clone(),
         key_column: "code".into(),
         identity_key: false,
@@ -12869,7 +12952,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         row: [("label".into(), Value::Text("New".to_owned()))]
             .into_iter()
             .collect::<Row>(),
-    };
+    });
     let sql = sql_of(&defaulted);
     let err = db
         .conn
@@ -12910,7 +12993,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         )
         .await
         .expect("a trigger that fills a column left to nothing");
-    let left_null = pbps_model::Change::InsertRow {
+    let left_null = pbps_model::Change::Row(pbps_model::RowChange::InsertRow {
         table: table.clone(),
         key_column: "code".into(),
         identity_key: false,
@@ -12927,7 +13010,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         row: [("label".into(), Value::Text("New".to_owned()))]
             .into_iter()
             .collect::<Row>(),
-    };
+    });
     let sql = sql_of(&left_null);
     let err = db
         .conn
@@ -12963,7 +13046,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         collation.contains("_CI_"),
         "this case needs a case-insensitive database; got {collation}"
     );
-    let spelled = pbps_model::Change::InsertRow {
+    let spelled = pbps_model::Change::Row(pbps_model::RowChange::InsertRow {
         table: table.clone(),
         key_column: "code".into(),
         identity_key: false,
@@ -12981,7 +13064,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         row: [("label".into(), Value::Text("New".to_owned()))]
             .into_iter()
             .collect::<Row>(),
-    };
+    });
     let sql = sql_of(&spelled);
     for (trigger, why) in [
         (
@@ -13038,7 +13121,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         .execute("UPDATE dbo.status SET note = N'plain', memo = NULL WHERE code = 'old';")
         .await
         .expect("the row as the plan recorded it");
-    let whole_row = pbps_model::Change::UpdateRow {
+    let whole_row = pbps_model::Change::Row(pbps_model::RowChange::UpdateRow {
         table: table.clone(),
         key_column: "code".into(),
         key: RowKey::from("old"),
@@ -13066,7 +13149,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         .collect(),
         after_types: Default::default(),
         key_type: None,
-    };
+    });
     let sql = sql_of(&whole_row);
     db.conn
         .execute(
@@ -13127,7 +13210,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         .execute("ALTER TABLE dbo.status ADD tier nvarchar(20) NULL;")
         .await
         .expect("the column this plan adds");
-    let added = pbps_model::Change::UpdateRow {
+    let added = pbps_model::Change::Row(pbps_model::RowChange::UpdateRow {
         table: table.clone(),
         key_column: "code".into(),
         key: RowKey::from("old"),
@@ -13155,7 +13238,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         types: [("label".into(), ty("nvarchar(50)"))].into_iter().collect(),
         after_types: [("tier".into(), ty("nvarchar(20)"))].into_iter().collect(),
         key_type: None,
-    };
+    });
     let sql = sql_of(&added);
     db.conn
         .execute(
@@ -13245,11 +13328,13 @@ async fn a_grant_on_a_schema_the_database_does_not_have_is_counted_before_it_run
         .expect("one schema that is there");
 
     let grant = |schema: &str| pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Grant {
-            role: "reader".to_owned().into(),
-            target: pbps_model::GrantTarget::Schema(schema.to_owned()),
-            permissions: [pbps_model::Permission::Select].into_iter().collect(),
-        })],
+        changes: vec![pbps_model::PlannedChange::new(
+            pbps_model::Change::Permission(pbps_model::GrantChange::Grant {
+                role: "reader".to_owned().into(),
+                target: pbps_model::GrantTarget::Schema(schema.to_owned()),
+                permissions: [pbps_model::Permission::Select].into_iter().collect(),
+            }),
+        )],
     };
     for (schema, want, why) in [
         (
@@ -13291,11 +13376,13 @@ async fn a_grant_on_a_schema_the_database_does_not_have_is_counted_before_it_run
     // the same way. An object target is declared, so it exists or this plan
     // creates it: no probe, and none wanted.
     let object = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Revoke {
-            role: "reader".to_owned().into(),
-            target: pbps_model::GrantTarget::Object(TableName::new("app", "t")),
-            permissions: [pbps_model::Permission::Select].into_iter().collect(),
-        })],
+        changes: vec![pbps_model::PlannedChange::new(
+            pbps_model::Change::Permission(pbps_model::GrantChange::Revoke {
+                role: "reader".to_owned().into(),
+                target: pbps_model::GrantTarget::Object(TableName::new("app", "t")),
+                permissions: [pbps_model::Permission::Select].into_iter().collect(),
+            }),
+        )],
     };
     assert!(
         Mssql.fixture_preflight(&object).probes.is_empty(),
@@ -14148,13 +14235,13 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
         .expect("members");
     assert_eq!(found.get("reader"), Some(&vec!["pbps_member".into()]));
     let drop = pbps_model::ChangeSet {
-        changes: vec![pbps_model::PlannedChange::new(
-            pbps_model::Change::DropRole {
+        changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Role(
+            pbps_model::RoleChange::DropRole {
                 uid: renamed_ids.roles.keys().next().unwrap().clone(),
                 name: "reader".to_owned().into(),
                 members: found["reader"].clone(),
             },
-        )],
+        ))],
     };
     apply(&mut db.conn, &drop).await;
     let left = db
@@ -14832,6 +14919,10 @@ async fn a_row_write_across_a_retyped_column_still_holds_the_recorded_row() {
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::RowChange;
+    use pbps_model::TableChange;
     use pbps_model::{Cell, Change, ChangeSet, PlannedChange, RowKey, Value};
 
     let mut db = TestDb::create("fkprobe").await;
@@ -14853,7 +14944,7 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
         .await
         .expect("seed");
 
-    let fk = Change::AddForeignKey {
+    let fk = Change::Constraint(ConstraintChange::AddForeignKey {
         table: TableName::new("dbo", "customer"),
         name: "fk_customer_region".into(),
         constraint: Box::new(pbps_model::ForeignKey {
@@ -14863,13 +14954,13 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
             on_delete: ReferentialAction::NoAction,
             on_update: ReferentialAction::NoAction,
         }),
-    };
+    });
     let text = |s: &str| Cell::Value(Value::Text(s.to_owned()));
 
     // The three repairs the plan makes before the constraint is created: the
     // missing parent arrives, one orphan is pointed at it, and one goes.
     let repairs = vec![
-        PlannedChange::new(Change::InsertRow {
+        PlannedChange::new(Change::Row(RowChange::InsertRow {
             table: TableName::new("dbo", "region"),
             key_column: "code".into(),
             identity_key: false,
@@ -14877,8 +14968,8 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
             row: pbps_model::Row::default(),
             defaults: Default::default(),
             types: Default::default(),
-        }),
-        PlannedChange::new(Change::UpdateRow {
+        })),
+        PlannedChange::new(Change::Row(RowChange::UpdateRow {
             table: TableName::new("dbo", "customer"),
             key_column: "code".into(),
             key: RowKey::from("repaired"),
@@ -14889,8 +14980,8 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
             types: Default::default(),
             after_types: Default::default(),
             key_type: None,
-        }),
-        PlannedChange::new(Change::DeleteRow {
+        })),
+        PlannedChange::new(Change::Row(RowChange::DeleteRow {
             table: TableName::new("dbo", "customer"),
             key_column: "code".into(),
             key: RowKey::from("doomed"),
@@ -14900,7 +14991,7 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
             types: Default::default(),
             after_types: Default::default(),
             key_type: None,
-        }),
+        })),
     ];
 
     async fn count(conn: &mut Conn, cs: &ChangeSet) -> i32 {
@@ -14948,7 +15039,7 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
         .expect("drop the constraint");
     let orphan_arriving = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::InsertRow {
+            PlannedChange::new(Change::Row(RowChange::InsertRow {
                 table: TableName::new("dbo", "customer"),
                 key_column: "code".into(),
                 identity_key: false,
@@ -14958,7 +15049,7 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
                     .collect(),
                 defaults: Default::default(),
                 types: Default::default(),
-            }),
+            })),
             PlannedChange::new(fk),
         ],
     };
@@ -14979,14 +15070,14 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
         .insert("code".into(), Column::new(ty("varchar(10)")).not_null());
     let to_a_new_parent = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::CreateTable {
+            PlannedChange::new(Change::Table(TableChange::CreateTable {
                 uid: "t_bbbbbb".parse().unwrap(),
                 name: TableName::new("dbo", "tier"),
                 table: Box::new(lookup),
                 beside_default: None,
                 moves_at_most: None,
-            }),
-            PlannedChange::new(Change::InsertRow {
+            })),
+            PlannedChange::new(Change::Row(RowChange::InsertRow {
                 table: TableName::new("dbo", "tier"),
                 key_column: "code".into(),
                 identity_key: false,
@@ -14994,8 +15085,8 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
                 row: pbps_model::Row::default(),
                 defaults: Default::default(),
                 types: Default::default(),
-            }),
-            PlannedChange::new(Change::AddForeignKey {
+            })),
+            PlannedChange::new(Change::Constraint(ConstraintChange::AddForeignKey {
                 table: TableName::new("dbo", "customer"),
                 name: "fk_customer_tier".into(),
                 constraint: Box::new(pbps_model::ForeignKey {
@@ -15005,7 +15096,7 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
                     on_delete: ReferentialAction::NoAction,
                     on_update: ReferentialAction::NoAction,
                 }),
-            }),
+            })),
         ],
     };
     // It runs at all, which is the half only the engine can settle, and it
@@ -15034,7 +15125,7 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
         .expect("a key the two types spell differently");
     let retyping = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::AlterColumnType {
+            PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
                 uid: "c_bbbbbb".parse().unwrap(),
                 column: "dbo.customer.region_code".parse().unwrap(),
                 from: ty("int"),
@@ -15045,8 +15136,8 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            }),
-            PlannedChange::new(Change::UpdateRow {
+            })),
+            PlannedChange::new(Change::Row(RowChange::UpdateRow {
                 table: TableName::new("dbo", "customer"),
                 key_column: "code".into(),
                 key: RowKey::from("typed"),
@@ -15057,8 +15148,8 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
                 types: Default::default(),
                 after_types: Default::default(),
                 key_type: None,
-            }),
-            PlannedChange::new(Change::AddForeignKey {
+            })),
+            PlannedChange::new(Change::Constraint(ConstraintChange::AddForeignKey {
                 table: TableName::new("dbo", "customer"),
                 name: "fk_customer_region2".into(),
                 constraint: Box::new(pbps_model::ForeignKey {
@@ -15068,7 +15159,7 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
                     on_delete: ReferentialAction::NoAction,
                     on_update: ReferentialAction::NoAction,
                 }),
-            }),
+            })),
         ],
     };
     assert_eq!(
@@ -15090,14 +15181,14 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
         .insert("code".into(), Column::new(ty("varchar(10)")).not_null());
     let to_an_empty_parent = ChangeSet {
         changes: vec![
-            PlannedChange::new(Change::CreateTable {
+            PlannedChange::new(Change::Table(TableChange::CreateTable {
                 uid: "t_cccccc".parse().unwrap(),
                 name: TableName::new("dbo", "band"),
                 table: Box::new(bare),
                 beside_default: None,
                 moves_at_most: None,
-            }),
-            PlannedChange::new(Change::AddForeignKey {
+            })),
+            PlannedChange::new(Change::Constraint(ConstraintChange::AddForeignKey {
                 table: TableName::new("dbo", "customer"),
                 name: "fk_customer_band".into(),
                 constraint: Box::new(pbps_model::ForeignKey {
@@ -15107,7 +15198,7 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
                     on_delete: ReferentialAction::NoAction,
                     on_update: ReferentialAction::NoAction,
                 }),
-            }),
+            })),
         ],
     };
     // `dbo.customer` holds one row whose `region_code` is non-NULL, and no
@@ -15629,7 +15720,7 @@ async fn trailing_default_comments_preserve_insert_guards() {
         .execute("CREATE TABLE dbo.t (id int PRIMARY KEY, n int DEFAULT (1));")
         .await
         .unwrap();
-    let change = pbps_model::Change::InsertRow {
+    let change = pbps_model::Change::Row(pbps_model::RowChange::InsertRow {
         table: TableName::new("dbo", "t"),
         key_column: "id".into(),
         identity_key: false,
@@ -15637,7 +15728,7 @@ async fn trailing_default_comments_preserve_insert_guards() {
         row: Default::default(),
         defaults: [("n".into(), "1 -- why".into())].into_iter().collect(),
         types: [("n".into(), ty("int"))].into_iter().collect(),
-    };
+    });
     let sql = Mssql.fixture_emit(&change, Default::default()).unwrap();
     db.conn
         .execute(&sql[0].sql)
@@ -16859,6 +16950,9 @@ async fn constraint_name_validation_preserves_legal_index_sharing() {
 #[tokio::test]
 #[ignore = "needs a live database; run the engine's live-test script"]
 async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
+    use pbps_model::ConstraintChange;
+    use pbps_model::IndexChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, PlannedChange, TableName};
     let db = TestDb::create("key_guard177").await;
     let mut conn = connect_live(&format!(
@@ -16874,17 +16968,21 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
     conn.execute("CREATE TABLE dbo.parent (id integer NOT NULL, CONSTRAINT old_key UNIQUE(id)); CREATE TABLE dbo.child (id integer CONSTRAINT child_fk REFERENCES dbo.parent(id)); ALTER TABLE dbo.parent ADD CONSTRAINT other_key UNIQUE(id);").await.unwrap();
     let parent = TableName::new("dbo", "parent");
     let child = TableName::new("dbo", "child");
-    let drop_key = |name: &str| Change::DropUnique {
-        table: parent.clone(),
-        name: name.into(),
+    let drop_key = |name: &str| {
+        Change::Constraint(ConstraintChange::DropUnique {
+            table: parent.clone(),
+            name: name.into(),
+        })
     };
     let plan = |changes: Vec<Change>| ChangeSet {
         changes: changes.into_iter().map(PlannedChange::new).collect(),
     };
     conn.execute("CREATE TABLE dbo.indexed (id integer NOT NULL); CREATE UNIQUE INDEX standalone_key ON dbo.indexed(id); CREATE TABLE dbo.index_child (id integer CONSTRAINT index_fk REFERENCES dbo.indexed(id)); CREATE UNIQUE INDEX other_standalone ON dbo.indexed(id); CREATE INDEX ordinary_index ON dbo.indexed(id); CREATE UNIQUE INDEX filtered_index ON dbo.indexed(id) WHERE id > 0;").await.unwrap();
-    let drop_index = |name: &str| Change::DropIndex {
-        table: TableName::new("dbo", "indexed"),
-        name: name.into(),
+    let drop_index = |name: &str| {
+        Change::Index(IndexChange::DropIndex {
+            table: TableName::new("dbo", "indexed"),
+            name: name.into(),
+        })
     };
     for (name, blocked) in [
         ("standalone_key", true),
@@ -16902,10 +17000,10 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
         );
     }
     let removed = plan(vec![
-        Change::DropForeignKey {
+        Change::Constraint(ConstraintChange::DropForeignKey {
             table: TableName::new("dbo", "index_child"),
             name: "index_fk".into(),
-        },
+        }),
         drop_index("standalone_key"),
     ]);
     assert!(
@@ -16935,10 +17033,10 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
         reports[0].blocking.iter().any(|b| b.contains("child_fk")),
         "{reports:?}"
     );
-    let fk = Change::DropForeignKey {
+    let fk = Change::Constraint(ConstraintChange::DropForeignKey {
         table: child.clone(),
         name: "child_fk".into(),
-    };
+    });
     let reports =
         fixture_key_drop_blockers(&mut conn, &plan(vec![fk.clone(), drop_key("old_key")]))
             .await
@@ -16954,26 +17052,26 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
     let renamed_parent = TableName::new("dbo", "renamed_parent");
     let renamed_child = TableName::new("dbo", "renamed_child");
     let renamed = plan(vec![
-        Change::RenameTable {
+        Change::Table(TableChange::RenameTable {
             uid: "t_aaaaaa".parse().unwrap(),
             from: parent.clone(),
             to: renamed_parent.clone(),
             defaults: Vec::new(),
-        },
-        Change::RenameTable {
+        }),
+        Change::Table(TableChange::RenameTable {
             uid: "t_bbbbbb".parse().unwrap(),
             from: child.clone(),
             to: renamed_child.clone(),
             defaults: Vec::new(),
-        },
-        Change::DropForeignKey {
+        }),
+        Change::Constraint(ConstraintChange::DropForeignKey {
             table: renamed_child,
             name: "child_fk".into(),
-        },
-        Change::DropUnique {
+        }),
+        Change::Constraint(ConstraintChange::DropUnique {
             table: renamed_parent,
             name: "old_key".into(),
-        },
+        }),
     ]);
     assert!(
         fixture_key_drop_blockers(&mut conn, &renamed)
@@ -17071,6 +17169,9 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
 #[tokio::test]
 #[ignore = "needs a live database; run the engine's live-test script"]
 async fn an_undeclared_key_on_a_retyped_column_is_named_before_the_widening() {
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, PlannedChange, TableName};
     let db = TestDb::create("retype503").await;
     let mut conn = connect_live(&format!(
@@ -17107,17 +17208,19 @@ async fn an_undeclared_key_on_a_retyped_column_is_named_before_the_widening() {
     let plan = |changes: Vec<Change>| ChangeSet {
         changes: changes.into_iter().map(PlannedChange::new).collect(),
     };
-    let widen = |table: &str, column: &str, spelling: &str, wider: &str| Change::AlterColumnType {
-        uid: "c_aaaaaa".parse().unwrap(),
-        column: format!("{table}.{column}").parse().unwrap(),
-        from: ty(spelling),
-        to: ty(wider),
-        from_nullable: false,
-        to_nullable: false,
-        through_external_partitions: false,
-        from_collation: None,
-        to_collation: None,
-        using: None,
+    let widen = |table: &str, column: &str, spelling: &str, wider: &str| {
+        Change::Column(ColumnChange::AlterColumnType {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: format!("{table}.{column}").parse().unwrap(),
+            from: ty(spelling),
+            to: ty(wider),
+            from_nullable: false,
+            to_nullable: false,
+            through_external_partitions: false,
+            from_collation: None,
+            to_collation: None,
+            using: None,
+        })
     };
     for (family, spelling, wider) in [
         ("varchar", "varchar(10)", "varchar(20)"),
@@ -17205,10 +17308,10 @@ async fn an_undeclared_key_on_a_retyped_column_is_named_before_the_widening() {
         let dropped = fixture_key_drop_blockers(
             &mut conn,
             &plan(vec![
-                Change::DropForeignKey {
+                Change::Constraint(ConstraintChange::DropForeignKey {
                     table: TableName::new("ext", format!("c_{family}")),
                     name: format!("fk_{family}").into(),
-                },
+                }),
                 widen(&format!("dbo.p_{family}"), "code", spelling, wider),
             ]),
         )
@@ -17224,20 +17327,20 @@ async fn an_undeclared_key_on_a_retyped_column_is_named_before_the_widening() {
     // the retype at 9, so a plan carrying both must reverse the rename before
     // it can find the key.
     let renamed = plan(vec![
-        Change::RenameTable {
+        Change::Table(TableChange::RenameTable {
             uid: "t_aaaaaa".parse().unwrap(),
             from: TableName::new("dbo", "p_varchar"),
             to: TableName::new("dbo", "p_renamed"),
             defaults: Vec::new(),
-        },
-        Change::RenameColumn {
+        }),
+        Change::Column(ColumnChange::RenameColumn {
             uid: "c_bbbbbb".parse().unwrap(),
             table: TableName::new("dbo", "p_renamed"),
             from: "code".into(),
             to: "renamed".into(),
             table_was: None,
-        },
-        Change::AlterColumnType {
+        }),
+        Change::Column(ColumnChange::AlterColumnType {
             uid: "c_bbbbbb".parse().unwrap(),
             column: "dbo.p_renamed.renamed".parse().unwrap(),
             from: ty("varchar(10)"),
@@ -17248,7 +17351,7 @@ async fn an_undeclared_key_on_a_retyped_column_is_named_before_the_widening() {
             from_collation: None,
             to_collation: None,
             using: None,
-        },
+        }),
     ]);
     let reports = fixture_key_drop_blockers(&mut conn, &renamed)
         .await
@@ -17423,6 +17526,8 @@ async fn a_failed_retype_restores_the_default_it_temporarily_removed() {
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn retyped_keys_checks_indexes_and_foreign_keys_converge_and_still_enforce() {
     use pbps_model::Change;
+    use pbps_model::ConstraintChange;
+    use pbps_model::IndexChange;
     let mut db = TestDb::create("retype_dependents180").await;
     db.conn.execute("CREATE TABLE dbo.p (id int NOT NULL CONSTRAINT pk_p PRIMARY KEY, u int CONSTRAINT uq_p UNIQUE, x int, CONSTRAINT ck_p CHECK(id > 0), CONSTRAINT fk_self FOREIGN KEY(u) REFERENCES dbo.p(id)); CREATE INDEX ix_key ON dbo.p(u); CREATE INDEX ix_include ON dbo.p(x) INCLUDE(id); CREATE INDEX ix_filter ON dbo.p(x) WHERE id > 0; CREATE INDEX ix_unrelated ON dbo.p(x); CREATE TABLE dbo.c (n int CONSTRAINT fk_c REFERENCES dbo.p(id)); INSERT dbo.p VALUES(1,1,7); INSERT dbo.c VALUES(1);").await.unwrap();
     let before = pbps_mssql::catalog::introspect(&mut db.conn)
@@ -17442,13 +17547,16 @@ async fn retyped_keys_checks_indexes_and_foreign_keys_converge_and_still_enforce
     let ids = mint_ids(&before, &IdsFile::default(), &[]);
     let changes = plan(&before, &ids, &after, &ids);
     assert!(!changes.changes.iter().any(
-        |p| matches!(&p.change, Change::DropIndex { name, .. } if name.raw() == "ix_unrelated")
+        |p| matches!(&p.change, Change::Index(IndexChange::DropIndex { name, .. }) if name.raw() == "ix_unrelated")
     ));
     assert_eq!(
         changes
             .changes
             .iter()
-            .filter(|p| matches!(&p.change, Change::DropForeignKey { .. }))
+            .filter(|p| matches!(
+                &p.change,
+                Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            ))
             .count(),
         2
     );
@@ -17475,6 +17583,8 @@ async fn retyped_keys_checks_indexes_and_foreign_keys_converge_and_still_enforce
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn widening_a_referenced_string_keeps_its_key_but_rebuilds_the_fk_and_filter() {
     use pbps_model::Change;
+    use pbps_model::ConstraintChange;
+    use pbps_model::IndexChange;
     let mut db = TestDb::create("retype_width180").await;
     db.conn.execute("CREATE TABLE dbo.p (n varchar(10) NOT NULL CONSTRAINT pk_p PRIMARY KEY, x int, CONSTRAINT ck_p CHECK(n <> '')); CREATE INDEX ix_n ON dbo.p(n); CREATE INDEX ix_filter ON dbo.p(x) WHERE n IS NOT NULL; CREATE TABLE dbo.c (n varchar(10) CONSTRAINT fk_c REFERENCES dbo.p(n)); INSERT dbo.p VALUES('one',1); INSERT dbo.c VALUES('one');").await.unwrap();
     let before = pbps_mssql::catalog::introspect(&mut db.conn)
@@ -17499,8 +17609,8 @@ async fn widening_a_referenced_string_keeps_its_key_but_rebuilds_the_fk_and_filt
     assert_eq!(changes.changes.len(), 6, "{changes:?}");
     assert!(!changes.changes.iter().any(|p| matches!(
         &p.change,
-        Change::SetPrimaryKey { .. } | Change::DropCheck { .. }
-    ) || matches!(&p.change, Change::DropIndex { name, .. } if name.raw() == "ix_n")));
+        Change::Constraint(ConstraintChange::SetPrimaryKey { .. }) | Change::Constraint(ConstraintChange::DropCheck { .. })
+    ) || matches!(&p.change, Change::Index(IndexChange::DropIndex { name, .. }) if name.raw() == "ix_n")));
     let result = try_apply(&mut db.conn, &changes).await;
     let observed = pbps_mssql::catalog::introspect(&mut db.conn)
         .await
@@ -17519,6 +17629,7 @@ async fn widening_a_referenced_string_keeps_its_key_but_rebuilds_the_fk_and_filt
 
 #[test]
 fn retype_dependency_plans_preserve_identity_and_do_not_duplicate_explicit_changes() {
+    use pbps_model::ConstraintChange;
     use pbps_model::{Change, CheckConstraint, Hints};
     let parent_name = TableName::new("dbo", "p");
     let child_name = TableName::new("dbo", "c");
@@ -17607,22 +17718,43 @@ fn retype_dependency_plans_preserve_identity_and_do_not_duplicate_explicit_chang
         let changes = plan(&before, &ids, &wanted, &ids);
         let count =
             |test: fn(&Change) -> bool| changes.changes.iter().filter(|p| test(&p.change)).count();
-        assert_eq!(count(|c| matches!(c, Change::DropForeignKey { .. })), 1);
-        assert_eq!(count(|c| matches!(c, Change::AddForeignKey { .. })), 1);
-        assert_eq!(count(|c| matches!(c, Change::DropUnique { .. })), 1);
-        assert_eq!(count(|c| matches!(c, Change::AddUnique { .. })), 1);
-        assert_eq!(count(|c| matches!(c, Change::DropCheck { .. })), 1);
         assert_eq!(
-            count(|c| matches!(c, Change::AddCheck { .. })),
+            count(|c| matches!(
+                c,
+                Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            )),
+            1
+        );
+        assert_eq!(
+            count(|c| matches!(
+                c,
+                Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            )),
+            1
+        );
+        assert_eq!(
+            count(|c| matches!(c, Change::Constraint(ConstraintChange::DropUnique { .. }))),
+            1
+        );
+        assert_eq!(
+            count(|c| matches!(c, Change::Constraint(ConstraintChange::AddUnique { .. }))),
+            1
+        );
+        assert_eq!(
+            count(|c| matches!(c, Change::Constraint(ConstraintChange::DropCheck { .. }))),
+            1
+        );
+        assert_eq!(
+            count(|c| matches!(c, Change::Constraint(ConstraintChange::AddCheck { .. }))),
             usize::from(!explicit)
         );
         assert!(matches!(
             changes.changes[0].change,
-            Change::DropForeignKey { .. }
+            Change::Constraint(ConstraintChange::DropForeignKey { .. })
         ));
         assert!(matches!(
             changes.changes.last().unwrap().change,
-            Change::AddForeignKey { .. }
+            Change::Constraint(ConstraintChange::AddForeignKey { .. })
         ));
     }
     let new_parent = TableName::new("dbo", "renamed");
@@ -17659,10 +17791,10 @@ fn retype_dependency_plans_preserve_identity_and_do_not_duplicate_explicit_chang
     );
     let changes = plan(&before, &ids, &after, &renamed_ids);
     assert!(changes.changes.iter().any(|p| matches!(&p.change,
-        Change::SetPrimaryKey { table, from: None, to: Some(key), .. }
+        Change::Constraint(ConstraintChange::SetPrimaryKey { table, from: None, to: Some(key), .. })
         if table == &new_parent && key.columns == [pbps_model::ColumnName::from("wide")])));
     assert!(changes.changes.iter().any(|p| matches!(&p.change,
-        Change::AddForeignKey { constraint, .. } if constraint.references_table == new_parent
+        Change::Constraint(ConstraintChange::AddForeignKey { constraint, .. }) if constraint.references_table == new_parent
             && constraint.references_columns == [pbps_model::ColumnName::from("wide")])));
 }
 
@@ -17759,6 +17891,7 @@ async fn unmodelled_check_and_unique_write_behavior_is_inventoried_before_rebuil
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn retyping_an_included_column_recreates_fks_bound_to_its_unique_index() {
     use pbps_model::Change;
+    use pbps_model::ConstraintChange;
     let mut db = TestDb::create("retype_included_fk180").await;
     let mut results = Vec::new();
     for unique in [false, true] {
@@ -17789,7 +17922,12 @@ async fn retyping_an_included_column_recreates_fks_bound_to_its_unique_index() {
         let fk_drops = changes
             .changes
             .iter()
-            .filter(|p| matches!(p.change, Change::DropForeignKey { .. }))
+            .filter(|p| {
+                matches!(
+                    p.change,
+                    Change::Constraint(ConstraintChange::DropForeignKey { .. })
+                )
+            })
             .count();
         let result = try_apply(&mut db.conn, &changes).await;
         let observed = pbps_mssql::catalog::introspect(&mut db.conn)
@@ -18068,10 +18206,11 @@ async fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
             .unwrap_or_else(|| panic!("{migration:?}"))
     };
     let drop_at = at(
-        |c| matches!(c, pbps_model::Change::DropColumn { column, .. } if column.name == "note".into()),
+        |c| matches!(c, pbps_model::Change::Column(pbps_model::ColumnChange::DropColumn { column, .. }) if column.name == "note".into()),
     );
-    let rename_at =
-        at(|c| matches!(c, pbps_model::Change::RenameColumn { to, .. } if to.raw() == "note"));
+    let rename_at = at(
+        |c| matches!(c, pbps_model::Change::Column(pbps_model::ColumnChange::RenameColumn { to, .. }) if to.raw() == "note"),
+    );
     assert!(
         drop_at < rename_at,
         "the drop must free the name first: {migration:?}"
@@ -18595,6 +18734,8 @@ async fn fixture_key_drop_blockers(
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn rename_chains_report_each_identity_once_without_changing_dependency_decisions() {
+    use pbps_model::ColumnChange;
+    use pbps_model::TableChange;
     use pbps_model::{Change, IdsFile, PlannedChange, plan_names::PlanNames};
     use pbps_mssql::impact::{RenameTarget, rename_impact, rename_targets};
 
@@ -18608,21 +18749,21 @@ async fn rename_chains_report_each_identity_once_without_changing_dependency_dec
         .await
         .unwrap();
     let table = |from: &str, to: &str| {
-        PlannedChange::new(Change::RenameTable {
+        PlannedChange::new(Change::Table(TableChange::RenameTable {
             uid: "t_aaaaaa".parse().unwrap(),
             from: from.parse().unwrap(),
             to: to.parse().unwrap(),
             defaults: vec![],
-        })
+        }))
     };
     let column = |owner: &str, from: &str, to: &str| {
-        PlannedChange::new(Change::RenameColumn {
+        PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
             uid: "c_aaaaaa".parse().unwrap(),
             table: owner.parse().unwrap(),
             from: from.into(),
             to: to.into(),
             table_was: None,
-        })
+        }))
     };
     let changes = [
         table("dbo.client", "dbo.tmp"),

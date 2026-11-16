@@ -4,6 +4,10 @@
 use crate::certified_fixture::FixtureEmission as _;
 
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::TableChange;
 
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(super) fn split_new_tables(
@@ -22,7 +26,8 @@ pub(super) fn split_new_tables(
     let calls = |text: &str| calls_one_of(text, &functions);
     let mut added = generated;
     for i in (0..last).rev() {
-        let Change::CreateTable { name, table, .. } = &mut cs.changes[i].change else {
+        let Change::Table(TableChange::CreateTable { name, table, .. }) = &mut cs.changes[i].change
+        else {
             continue;
         };
         let name = name.clone();
@@ -35,11 +40,11 @@ pub(super) fn split_new_tables(
             .collect();
         for check in calling {
             if let Some(constraint) = table.checks.remove(&check) {
-                parts.push(Change::AddCheck {
+                parts.push(Change::Constraint(ConstraintChange::AddCheck {
                     table: name.clone(),
                     name: check,
                     constraint,
-                });
+                }));
             }
         }
         let filtered: Vec<pbps_model::ObjectLocalName> = table
@@ -53,12 +58,12 @@ pub(super) fn split_new_tables(
                 // Never the clustered index, which cannot be filtered; asked
                 // of the table anyway, so the split cannot say otherwise.
                 let clustered = table.index_is_clustered(index.raw());
-                parts.push(Change::AddIndex {
+                parts.push(Change::Index(IndexChange::AddIndex {
                     table: name.clone(),
                     name: index,
                     index: Box::new(spec),
                     clustered,
-                });
+                }));
             }
         }
         for (column, spec) in table.columns.iter_mut() {
@@ -73,12 +78,12 @@ pub(super) fn split_new_tables(
                 ValueSource::Default(default) if calls(default) => {
                     let to = std::mem::take(default);
                     spec.value_source = ValueSource::None;
-                    parts.push(Change::AlterColumnDefault {
+                    parts.push(Change::Column(ColumnChange::AlterColumnDefault {
                         uid: uid.clone(),
                         column: column_ref,
                         from: None,
                         to: Some(to),
-                    });
+                    }));
                 }
                 ValueSource::None
                 | ValueSource::Default(_)
@@ -311,11 +316,13 @@ fn split_parts_match_the_frozen_plan_sql_and_checksum_for_32_uid_seeds() {
                     // split obligation, even though its kind is Function.
                     2 => {
                         for p in &mut cs.changes {
-                            if let Change::CreateModule { id, module } = &p.change {
-                                p.change = Change::AlterModule {
+                            if let Change::Module(ModuleChange::CreateModule { id, module }) =
+                                &p.change
+                            {
+                                p.change = Change::Module(ModuleChange::AlterModule {
                                     id: id.clone(),
                                     module: module.clone(),
-                                };
+                                });
                             }
                         }
                     }
@@ -364,13 +371,13 @@ fn split_parts_match_the_frozen_plan_sql_and_checksum_for_32_uid_seeds() {
                     .tables
                     .into_iter()
                     .map(|(name, table)| {
-                        PlannedChange::new(Change::CreateTable {
+                        PlannedChange::new(Change::Table(TableChange::CreateTable {
                             uid: Uid::derived(UidKind::Table, &name.raw().to_string(), salt),
                             name,
                             table: Box::new(table),
                             beside_default: None,
                             moves_at_most: None,
-                        })
+                        }))
                     })
                     .collect(),
             };
@@ -438,19 +445,19 @@ fn split_parts_keep_raw_local_names_distinct_from_their_shown_lookalikes() {
         changes
             .changes
             .iter()
-            .any(|p| matches!(&p.change, Change::AddCheck { name, .. } if name.raw() == RAW))
+            .any(|p| matches!(&p.change, Change::Constraint(ConstraintChange::AddCheck { name, .. }) if name.raw() == RAW))
     );
     assert!(
         changes
             .changes
             .iter()
-            .any(|p| matches!(&p.change, Change::AddIndex { name, .. } if name.raw() == RAW))
+            .any(|p| matches!(&p.change, Change::Index(IndexChange::AddIndex { name, .. }) if name.raw() == RAW))
     );
     let bare = changes
         .changes
         .iter()
         .find_map(|p| {
-            if let Change::CreateTable { table, .. } = &p.change {
+            if let Change::Table(TableChange::CreateTable { table, .. }) = &p.change {
                 Some(table)
             } else {
                 None

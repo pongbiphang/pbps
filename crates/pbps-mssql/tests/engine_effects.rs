@@ -2,6 +2,12 @@
 
 use indexmap::IndexMap;
 use pbps_diff::order::{Baseline, Violation, analyse};
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
 use pbps_model::operation::{ModuleEdits, ObjectKey, Operations, PartKey, PlanOwners, Snapshot};
 use pbps_model::plan_names::PlanNames;
 use pbps_model::{
@@ -82,20 +88,20 @@ fn altering_a_function_while_a_computed_column_calling_it_stands_is_refused_by_n
     };
     let plan = || {
         vec![
-            Change::DropComputedColumn {
+            Change::Column(ColumnChange::DropComputedColumn {
                 table: t(),
                 name: "c".into(),
                 computed: computed(),
-            },
-            Change::AlterModule {
+            }),
+            Change::Module(ModuleChange::AlterModule {
                 id: id.clone(),
                 module: Box::new(module.clone()),
-            },
-            Change::AddComputedColumn {
+            }),
+            Change::Column(ColumnChange::AddComputedColumn {
                 table: t(),
                 name: "c".into(),
                 computed: computed(),
-            },
+            }),
         ]
     };
     // The computed column out of the way, the function altered, the column
@@ -161,7 +167,7 @@ fn rows_written_while_a_foreign_key_is_rebuilt_do_not_wait_for_it() {
         );
     }
     let insert = |id: i64, parent: Option<i64>| {
-        P::new(Change::InsertRow {
+        P::new(Change::Row(RowChange::InsertRow {
             table: t(),
             key_column: "id".into(),
             identity_key: false,
@@ -174,7 +180,7 @@ fn rows_written_while_a_foreign_key_is_rebuilt_do_not_wait_for_it() {
             .collect::<Row>(),
             defaults: Default::default(),
             types: Default::default(),
-        })
+        }))
     };
     let key = table(true).foreign_keys["fk"].clone();
     let verdict = |rebuilt: bool| {
@@ -182,16 +188,18 @@ fn rows_written_while_a_foreign_key_is_rebuilt_do_not_wait_for_it() {
         if rebuilt {
             logical.insert(
                 0,
-                P::new(Change::DropForeignKey {
+                P::new(Change::Constraint(ConstraintChange::DropForeignKey {
                     table: t(),
                     name: "fk".into(),
-                }),
+                })),
             );
-            logical.push(P::new(Change::AddForeignKey {
-                table: t(),
-                name: "fk".into(),
-                constraint: Box::new(key.clone()),
-            }));
+            logical.push(P::new(Change::Constraint(
+                ConstraintChange::AddForeignKey {
+                    table: t(),
+                    name: "fk".into(),
+                    constraint: Box::new(key.clone()),
+                },
+            )));
         }
         let ops = Operations::of_plan(&logical, ModuleEdits::InPlace);
         let names = PlanNames::of(&logical, &ids).unwrap();
@@ -229,20 +237,20 @@ fn a_computed_column_rewritten_off_a_function_does_not_hold_the_function_back() 
     };
     let plan = |new: &str| {
         vec![
-            Change::DropComputedColumn {
+            Change::Column(ColumnChange::DropComputedColumn {
                 table: t(),
                 name: "c".into(),
                 computed: computed("dbo.f(a)"),
-            },
-            Change::AddComputedColumn {
+            }),
+            Change::Column(ColumnChange::AddComputedColumn {
                 table: t(),
                 name: "c".into(),
                 computed: computed(new),
-            },
-            Change::AlterModule {
+            }),
+            Change::Module(ModuleChange::AlterModule {
                 id: id.clone(),
                 module: Box::new(module.clone()),
-            },
+            }),
         ]
     };
     let ending = |new: &str| {
@@ -452,18 +460,18 @@ fn a_storage_type_change_waits_for_every_key_and_index_over_its_column() {
     });
     let own: Vec<usize> = (0..plan.changes.len()).collect();
     assert_eq!(plan.verify(&own), []);
-    let retype = plan.at(|c| matches!(c, Change::AlterColumnType { column, .. } if column.table == t() && column.name == "a".into()));
+    let retype = plan.at(|c| matches!(c, Change::Column(ColumnChange::AlterColumnType { column, .. }) if column.table == t() && column.name == "a".into()));
     for (drop, part) in [
         (
-            plan.at(|c| matches!(c, Change::DropIndex { name, .. } if name.raw() == "ix_a")),
+            plan.at(|c| matches!(c, Change::Index(IndexChange::DropIndex { name, .. }) if name.raw() == "ix_a")),
             PartKey::Index("ix_a".into()),
         ),
         (
-            plan.at(|c| matches!(c, Change::DropUnique { name, .. } if name.raw() == "uq_a")),
+            plan.at(|c| matches!(c, Change::Constraint(ConstraintChange::DropUnique { name, .. }) if name.raw() == "uq_a")),
             PartKey::Unique("uq_a".into()),
         ),
         (
-            plan.at(|c| matches!(c, Change::DropForeignKey { name, .. } if name.raw() == "fk_x")),
+            plan.at(|c| matches!(c, Change::Constraint(ConstraintChange::DropForeignKey { name, .. }) if name.raw() == "fk_x")),
             PartKey::ForeignKey("fk_x".into()),
         ),
     ] {
@@ -482,7 +490,7 @@ fn a_varchar_widening_requires_no_check_gone_and_a_base_type_change_does() {
         let own: Vec<usize> = (0..plan.changes.len()).collect();
         assert_eq!(plan.verify(&own), [], "{to}");
         let retype = plan.at(
-            |c| matches!(c, Change::AlterColumnType { column, .. } if column.name == "b".into()),
+            |c| matches!(c, Change::Column(ColumnChange::AlterColumnType { column, .. }) if column.name == "b".into()),
         );
         plan.effects[retype].requires.iter().any(|r| {
             matches!(
@@ -514,15 +522,15 @@ fn dropping_a_computed_column_waits_for_a_check_that_names_it() {
     table.checks.clear();
     let computed = table.computed.remove("c").unwrap();
     let plan = vec![
-        Change::DropCheck {
+        Change::Constraint(ConstraintChange::DropCheck {
             table: t(),
             name: "ck_c".into(),
-        },
-        Change::DropComputedColumn {
+        }),
+        Change::Column(ColumnChange::DropComputedColumn {
             table: t(),
             name: "c".into(),
             computed,
-        },
+        }),
     ];
     let ordered = violations_from(&schema, &after, plan.clone(), &[0, 1]);
     assert_eq!(ordered, []);
@@ -557,17 +565,17 @@ fn an_index_over_a_computed_column_follows_its_addition() {
     table.computed.insert("d".into(), computed.clone());
     table.indexes.insert("ix_d".into(), index.clone());
     let plan = vec![
-        Change::AddComputedColumn {
+        Change::Column(ColumnChange::AddComputedColumn {
             table: t(),
             name: "d".into(),
             computed,
-        },
-        Change::AddIndex {
+        }),
+        Change::Index(IndexChange::AddIndex {
             table: t(),
             name: "ix_d".into(),
             index: Box::new(index),
             clustered: false,
-        },
+        }),
     ];
     assert_eq!(violations_from(&schema, &after, plan.clone(), &[0, 1]), []);
     assert!(!violations_from(&schema, &after, plan, &[1, 0]).is_empty());
@@ -667,9 +675,9 @@ fn schema_bound_callers_require_their_callees_final_definition() {
                 let (before, after, callee, caller) = module_pair(definition, alter);
                 let diffed = Diffed::new(&before, &after);
                 assert_eq!(diffed.changes.len(), 2, "{definition}");
-                let f = diffed.at(|c| matches!(c, Change::AlterModule { id, .. } if id == &callee));
+                let f = diffed.at(|c| matches!(c, Change::Module(ModuleChange::AlterModule { id, .. }) if id == &callee));
                 let g = diffed.at(|c| matches!(c,
-                    Change::CreateModule { id, .. } | Change::AlterModule { id, .. } if id == &caller));
+                    Change::Module(ModuleChange::CreateModule { id, .. }) | Change::Module(ModuleChange::AlterModule { id, .. }) if id == &caller));
                 let requirement =
                     Requirement::Is(ObjectKey::Module(callee.clone()), Incarnation::Final);
                 assert_eq!(
@@ -813,10 +821,12 @@ fn a_callers_binding_requirement_reads_its_own_payload() {
         let (before, mut after, callee, caller) = module_pair(payload, false);
         let module = after.modules[&caller].clone();
         after.modules.get_mut(&caller).unwrap().definition = ending.into();
-        let changes = vec![PlannedChange::new(Change::CreateModule {
-            id: caller,
-            module: Box::new(module),
-        })];
+        let changes = vec![PlannedChange::new(Change::Module(
+            ModuleChange::CreateModule {
+                id: caller,
+                module: Box::new(module),
+            },
+        ))];
         let ids = IdsFile::default();
         let owners = PlanOwners::new(PlanNames::of(&changes, &ids).unwrap(), &ids, &ids);
         let ops = Operations::of_plan(&changes, ModuleEdits::InPlace);
@@ -916,14 +926,16 @@ fn case_distinct_callees_do_not_invent_a_schema_bound_cycle() {
     .expect("the stable app.F is not the edited app.f");
     assert_eq!(planned.ordered.changes.changes.len(), 2);
     assert!(
-        matches!(&planned.ordered.changes.changes[0].change, Change::AlterModule { id, .. } if id == &a)
+        matches!(&planned.ordered.changes.changes[0].change, Change::Module(ModuleChange::AlterModule { id, .. }) if id == &a)
     );
     assert!(
-        matches!(&planned.ordered.changes.changes[1].change, Change::AlterModule { id, .. } if id == &lower)
+        matches!(&planned.ordered.changes.changes[1].change, Change::Module(ModuleChange::AlterModule { id, .. }) if id == &lower)
     );
     let diffed = Diffed::new(&before, &after);
-    let a_at = diffed.at(|change| matches!(change, Change::AlterModule { id, .. } if id == &a));
-    let f_at = diffed.at(|change| matches!(change, Change::AlterModule { id, .. } if id == &lower));
+    let a_at = diffed.at(
+        |change| matches!(change, Change::Module(ModuleChange::AlterModule { id, .. }) if id == &a),
+    );
+    let f_at = diffed.at(|change| matches!(change, Change::Module(ModuleChange::AlterModule { id, .. }) if id == &lower));
     assert!(diffed.effects[a_at].requires.contains(&Requirement::Is(
         ObjectKey::Module(upper),
         Incarnation::Final
@@ -965,9 +977,10 @@ fn an_unambiguous_case_insensitive_callee_still_binds() {
             after.modules.get_mut(&callee).unwrap().definition = "SELECT 2 AS n".into();
         }
         let diffed = Diffed::new(&before, &after);
-        let caller = diffed.at(|change| matches!(change, Change::CreateModule { .. }));
+        let caller =
+            diffed.at(|change| matches!(change, Change::Module(ModuleChange::CreateModule { .. })));
         let target =
-            diffed.at(|change| matches!(change, Change::AlterModule { id, .. } if id == &callee));
+            diffed.at(|change| matches!(change, Change::Module(ModuleChange::AlterModule { id, .. }) if id == &callee));
         assert!(
             diffed.effects[caller].requires.contains(&Requirement::Is(
                 ObjectKey::Module(callee),
@@ -1089,17 +1102,29 @@ fn steps(plan: &Diffed) -> Vec<String> {
     plan.changes
         .iter()
         .map(|p| match &p.change {
-            Change::DropModule { id, .. } => format!("drop {}", id.shown()),
-            Change::CreateModule { id, .. } => format!("create {}", id.shown()),
-            Change::AlterModule { id, .. } => format!("alter {}", id.shown()),
-            Change::AlterColumnType { column, .. } => format!("retype {}", column.name.shown()),
-            Change::AlterColumnNullability { column, .. } => {
+            Change::Module(ModuleChange::DropModule { id, .. }) => format!("drop {}", id.shown()),
+            Change::Module(ModuleChange::CreateModule { id, .. }) => {
+                format!("create {}", id.shown())
+            }
+            Change::Module(ModuleChange::AlterModule { id, .. }) => format!("alter {}", id.shown()),
+            Change::Column(ColumnChange::AlterColumnType { column, .. }) => {
+                format!("retype {}", column.name.shown())
+            }
+            Change::Column(ColumnChange::AlterColumnNullability { column, .. }) => {
                 format!("nullability {}", column.name.shown())
             }
-            Change::DropColumn { column, .. } => format!("drop column {}", column.name.shown()),
-            Change::AddColumn { name, .. } => format!("add column {}", name.shown()),
-            Change::DropTable { name, .. } => format!("drop table {}", name.shown()),
-            Change::RenameTable { to, .. } => format!("rename table {}", to.shown()),
+            Change::Column(ColumnChange::DropColumn { column, .. }) => {
+                format!("drop column {}", column.name.shown())
+            }
+            Change::Column(ColumnChange::AddColumn { name, .. }) => {
+                format!("add column {}", name.shown())
+            }
+            Change::Table(TableChange::DropTable { name, .. }) => {
+                format!("drop table {}", name.shown())
+            }
+            Change::Table(TableChange::RenameTable { to, .. }) => {
+                format!("rename table {}", to.shown())
+            }
             other => format!("other {}", other.subject()),
         })
         .collect()
@@ -1475,7 +1500,7 @@ fn a_views_indexes_are_compared_and_survive_a_rebuild() {
         &with_views("int", &[("v", indexed(true))]),
     );
     assert_eq!(steps(&plan), ["alter dbo.v"]);
-    let Change::AlterModule { module, .. } = &plan.changes[0].change else {
+    let Change::Module(ModuleChange::AlterModule { module, .. }) = &plan.changes[0].change else {
         panic!("{:?}", plan.changes);
     };
     assert_eq!(module.options.indexes.len(), 2);
@@ -1485,7 +1510,7 @@ fn a_views_indexes_are_compared_and_survive_a_rebuild() {
         &with_views("varchar(20)", &[("v", indexed(true))]),
     );
     assert_eq!(steps(&plan), ["drop dbo.v", "retype a", "create dbo.v"]);
-    let Change::CreateModule { module, .. } = &plan.changes[2].change else {
+    let Change::Module(ModuleChange::CreateModule { module, .. }) = &plan.changes[2].change else {
         panic!("{:?}", plan.changes);
     };
     assert_eq!(module.options.indexes.len(), 2);
@@ -1605,10 +1630,12 @@ fn connected_callee_answers_override_folding_only_for_compared_names() {
         "(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN app.F(@a) END",
         false,
     );
-    let changes = vec![PlannedChange::new(Change::CreateModule {
-        id: caller.clone(),
-        module: Box::new(after.modules[&caller].clone()),
-    })];
+    let changes = vec![PlannedChange::new(Change::Module(
+        ModuleChange::CreateModule {
+            id: caller.clone(),
+            module: Box::new(after.modules[&caller].clone()),
+        },
+    ))];
     let ids = IdsFile::default();
     let owners = PlanOwners::new(PlanNames::of(&changes, &ids).unwrap(), &ids, &ids);
     let ops = Operations::of_plan(&changes, ModuleEdits::InPlace);
@@ -1681,10 +1708,12 @@ fn connected_call_candidates_include_payloads_and_old_bindings_without_computed_
     after.modules.get_mut(&caller).unwrap().definition =
         "(@a int) RETURNS int AS BEGIN RETURN @a END".into();
     let changes = ChangeSet {
-        changes: vec![PlannedChange::new(Change::AlterModule {
-            id: caller,
-            module: Box::new(payload),
-        })],
+        changes: vec![PlannedChange::new(Change::Module(
+            ModuleChange::AlterModule {
+                id: caller,
+                module: Box::new(payload),
+            },
+        ))],
     };
     let names = pbps_mssql::schema_bound_call_names(&changes, &before, &after);
     assert!(before.tables.is_empty() && after.tables.is_empty());
@@ -1694,24 +1723,28 @@ fn connected_call_candidates_include_payloads_and_old_bindings_without_computed_
     assert!(!names.contains(&TableName::new("bogus", "call")));
     assert!(pbps_mssql::schema_bound_call_names(&ChangeSet::default(), &before, &after).is_empty());
     let plain = ChangeSet {
-        changes: vec![PlannedChange::new(Change::CreateModule {
-            id: ModuleId::Named(TableName::new("app", "plain")),
-            module: Box::new(Module {
-                kind: ModuleKind::Function,
-                definition: "(@a int) RETURNS int AS BEGIN RETURN app.F(@a) END".into(),
-                description: None,
-                options: Default::default(),
-            }),
-        })],
+        changes: vec![PlannedChange::new(Change::Module(
+            ModuleChange::CreateModule {
+                id: ModuleId::Named(TableName::new("app", "plain")),
+                module: Box::new(Module {
+                    kind: ModuleKind::Function,
+                    definition: "(@a int) RETURNS int AS BEGIN RETURN app.F(@a) END".into(),
+                    description: None,
+                    options: Default::default(),
+                }),
+            },
+        ))],
     };
     assert!(pbps_mssql::schema_bound_call_names(&plain, &before, &after).is_empty());
     // Views now carry binding in their options (DEC-2329.1); their function
     // calls need the same connected candidates as a bound function's calls.
     let view = |bound| ChangeSet {
-        changes: vec![PlannedChange::new(Change::CreateModule {
-            id: vid("caller"),
-            module: Box::new(view_of("SELECT APP.F(1) AS n", bound)),
-        })],
+        changes: vec![PlannedChange::new(Change::Module(
+            ModuleChange::CreateModule {
+                id: vid("caller"),
+                module: Box::new(view_of("SELECT APP.F(1) AS n", bound)),
+            },
+        ))],
     };
     assert!(
         pbps_mssql::schema_bound_call_names(&view(true), &before, &after)

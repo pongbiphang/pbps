@@ -15,10 +15,10 @@ fn operations() -> Operations {
     Operations::of_plan(
         &(0..3)
             .map(|i| {
-                PlannedChange::new(Change::DropModule {
+                PlannedChange::new(Change::Module(ModuleChange::DropModule {
                     id: ModuleId::Named(TableName::new("app", format!("dummy{i}"))),
                     kind: ModuleKind::View,
-                })
+                }))
             })
             .collect::<Vec<_>>(),
         ModuleEdits::InPlace,
@@ -38,16 +38,16 @@ fn object_key(kind: UidKind, seed: &str) -> ObjectKey {
     let uid = Uid::derived(kind, seed, 0);
     let name = TableName::new("app", "source");
     let change = if kind == UidKind::Column {
-        Change::DropColumn {
+        Change::Column(ColumnChange::DropColumn {
             uid,
             column: name.column("k"),
-        }
+        })
     } else {
-        Change::DropTable {
+        Change::Table(TableChange::DropTable {
             uid,
             name,
             detach_from: None,
-        }
+        })
     };
     Operations::of_plan(&[PlannedChange::new(change)], ModuleEdits::InPlace).as_slice()[0]
         .key(&owners)

@@ -11,6 +11,9 @@
 use std::collections::BTreeSet;
 
 use pbps_db::{Conn, DbError};
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::TableChange;
 use pbps_model::escape::Escaped;
 use pbps_model::{
     Change, ChangeSet, ColumnType, IndexColumn, IndexKey, ProviderKind, ProviderMember,
@@ -103,7 +106,7 @@ fn named_by(changes: &ChangeSet) -> BTreeSet<Wanted> {
     let mut out = Vec::new();
     for planned in &changes.changes {
         match &planned.change {
-            Change::AddIndex { index, .. } => {
+            Change::Index(IndexChange::AddIndex { index, .. }) => {
                 uses_in_keys(
                     &index.columns,
                     index.method.as_str(),
@@ -111,19 +114,21 @@ fn named_by(changes: &ChangeSet) -> BTreeSet<Wanted> {
                     &mut out,
                 );
             }
-            Change::CreateTable { name, table, .. } => uses_in_table(name, table, &mut out),
+            Change::Table(TableChange::CreateTable { name, table, .. }) => {
+                uses_in_table(name, table, &mut out)
+            }
             // A new exclusion constraint names the classes of its keys as an index does.
-            Change::SetExclusion {
+            Change::Constraint(ConstraintChange::SetExclusion {
                 table,
                 name,
                 to: Some(x),
                 ..
-            } => {
+            }) => {
                 let mut one = Table::default();
                 one.exclude.insert(name.clone(), (**x).clone());
                 uses_in_table(table, &one, &mut out);
             }
-            Change::BuildPartitionedIndex(build) => {
+            Change::Index(IndexChange::BuildPartitionedIndex(build)) => {
                 if let pbps_model::PartitionIndexDefinition::Index(index) = &build.definition {
                     uses_in_keys(
                         &index.columns,
@@ -380,6 +385,7 @@ pub async fn check(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::ConstraintChange;
 
     fn class(input: &str) -> Class {
         Class {
@@ -439,12 +445,14 @@ mod tests {
             timing: pbps_model::ExclusionTiming::Immediate,
         };
         let set = |from, to| ChangeSet {
-            changes: vec![pbps_model::PlannedChange::new(Change::SetExclusion {
-                table: pbps_model::TableName::new("app", "docs"),
-                name: "no_similar".into(),
-                from,
-                to,
-            })],
+            changes: vec![pbps_model::PlannedChange::new(Change::Constraint(
+                ConstraintChange::SetExclusion {
+                    table: pbps_model::TableName::new("app", "docs"),
+                    name: "no_similar".into(),
+                    from,
+                    to,
+                },
+            ))],
         };
         let added = exclusion(&[Some("ext.gist_trgm_ops"), None]);
         let wanted = named_by(&set(None, Some(Box::new(added.clone()))));

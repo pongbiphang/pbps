@@ -35,6 +35,9 @@ pub(super) async fn reports(
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; run scripts/live-tests-pg.sh"]
 async fn a_detached_column_removes_its_existing_foreign_key_before_the_referenced_table() {
+    use pbps_model::ColumnChange;
+    use pbps_model::PartitionChange;
+    use pbps_model::TableChange;
     use pbps_model::{
         Change, ChangeSet, Column, IdsFile, PlannedChange, Table, TableName,
         plan_names::{At, PlanNames},
@@ -84,22 +87,22 @@ async fn a_detached_column_removes_its_existing_foreign_key_before_the_reference
         .insert("n".into(), Column::new("integer".parse().unwrap()));
     let changes = ChangeSet {
         changes: vec![
-            Change::DetachPartition {
+            Change::Partition(PartitionChange::DetachPartition {
                 uid: "t_bbbbbb".parse().unwrap(),
                 table: child.clone(),
                 parent: parent.clone(),
                 names: vec![],
                 shape: Box::new(shape),
-            },
-            Change::DropColumn {
+            }),
+            Change::Column(ColumnChange::DropColumn {
                 uid: "c_dddddd".parse().unwrap(),
                 column: child.column("n"),
-            },
-            Change::DropTable {
+            }),
+            Change::Table(TableChange::DropTable {
                 uid: "t_cccccc".parse().unwrap(),
                 name: "public.referenced".parse().unwrap(),
                 detach_from: None,
-            },
+            }),
         ]
         .into_iter()
         .map(PlannedChange::new)
@@ -189,6 +192,8 @@ async fn a_detached_column_removes_its_existing_foreign_key_before_the_reference
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; run scripts/live-tests-pg.sh"]
 async fn column_order_and_membership_match_the_catalog_at_each_boundary() {
+    use pbps_model::ColumnChange;
+    use pbps_model::PartitionChange;
     use pbps_model::physical_sources::{Located, PhysicalSources};
     use pbps_model::plan_names::{At, PlanNames};
     use pbps_model::{Change, Column, IdsFile, PlannedChange, TableName, Uid};
@@ -236,40 +241,40 @@ async fn column_order_and_membership_match_the_catalog_at_each_boundary() {
     detached.columns.insert("e".into(), d);
     detached.columns.insert("z".into(), *column());
     let changes: Vec<_> = vec![
-        Change::AttachPartition {
+        Change::Partition(PartitionChange::AttachPartition {
             uid: uid("t_bbbbbb"),
             table: c.clone(),
             parent: p.clone(),
             bound: pbps_model::PartitionBound::Default,
             key: vec![],
             shape: Box::default(),
-        },
-        Change::RenameColumn {
+        }),
+        Change::Column(ColumnChange::RenameColumn {
             uid: uid("c_bbbbbb"),
             table: p.clone(),
             from: "d".into(),
             to: "e".into(),
             table_was: None,
-        },
-        Change::AddColumn {
+        }),
+        Change::Column(ColumnChange::AddColumn {
             uid: uid("c_eeeeee"),
             table: p.clone(),
             name: "z".into(),
             column: column(),
-        },
-        Change::DetachPartition {
+        }),
+        Change::Partition(PartitionChange::DetachPartition {
             uid: uid("t_bbbbbb"),
             table: c.clone(),
             parent: p.clone(),
             names: vec![],
             shape: Box::new(detached),
-        },
-        Change::AddColumn {
+        }),
+        Change::Column(ColumnChange::AddColumn {
             uid: uid("c_ffffff"),
             table: p.clone(),
             name: "w".into(),
             column: column(),
-        },
+        }),
     ]
     .into_iter()
     .map(PlannedChange::new)

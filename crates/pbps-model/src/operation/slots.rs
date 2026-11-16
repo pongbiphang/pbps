@@ -19,6 +19,18 @@
 //! (#1503). They reach the order only through the catalog, as occupants.
 
 use super::{ColumnKey, ObjectKey, Operation, OwnerError, Owners, PartKey, Recorded, Spelling};
+use crate::ColumnChange;
+use crate::ConstraintChange;
+use crate::ExtensionChange;
+use crate::IndexChange;
+use crate::ModuleChange;
+use crate::PartitionChange;
+use crate::PolicyChange;
+use crate::RoleChange;
+use crate::SearchChange;
+use crate::TableChange;
+use crate::TypeChange;
+use crate::TypeValueChange;
 use crate::change::DetachedKind;
 use crate::{Change, ModuleId, ModuleKind, Table, TableName};
 
@@ -283,7 +295,7 @@ pub fn names(
         },
     };
     match op.change() {
-        Change::BuildPartitionedIndex(r) => {
+        Change::Index(IndexChange::BuildPartitionedIndex(r)) => {
             r.validate().map_err(|why| OwnerError::Rebuild {
                 name: r.parent.name.shown().to_string(),
                 why,
@@ -310,46 +322,46 @@ pub fn names(
                 );
             }
         }
-        Change::RebuildPartitionedTable(_)
-        | Change::CopyTableRows(_)
-        | Change::AnalyzeTableTree(_) => {}
-        Change::CreateType { uid, name, .. } => {
+        Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+        | Change::Partition(PartitionChange::CopyTableRows(_))
+        | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => {}
+        Change::Type(TypeChange::CreateType { uid, name, .. }) => {
             nx.claim(type_address(name), ObjectKey::Type(Recorded(uid.clone())))
         }
-        Change::DropType { uid, name, .. } => {
+        Change::Type(TypeChange::DropType { uid, name, .. }) => {
             nx.release(type_address(name), ObjectKey::Type(Recorded(uid.clone())))
         }
-        Change::CreateSearch { uid, name, .. } => nx.claim(
+        Change::Search(SearchChange::CreateSearch { uid, name, .. }) => nx.claim(
             search_address(name),
             ObjectKey::Search(Recorded(uid.clone())),
         ),
-        Change::DropSearch { uid, name, .. } => nx.release(
+        Change::Search(SearchChange::DropSearch { uid, name, .. }) => nx.release(
             search_address(name),
             ObjectKey::Search(Recorded(uid.clone())),
         ),
         // The replacement holds its temporary name from its creation to the
         // swap, which hands the type back its own (DEC-1635.7).
-        Change::EnumRebuild {
+        Change::TypeValue(TypeValueChange::EnumRebuild {
             uid,
             tmp,
             step: crate::EnumRebuildStep::Create { .. },
             ..
-        } => nx.claim(type_address(tmp), ObjectKey::Type(Recorded(uid.clone()))),
-        Change::EnumRebuild {
+        }) => nx.claim(type_address(tmp), ObjectKey::Type(Recorded(uid.clone()))),
+        Change::TypeValue(TypeValueChange::EnumRebuild {
             uid,
             tmp,
             step: crate::EnumRebuildStep::Swap { .. },
             ..
-        } => nx.release(type_address(tmp), ObjectKey::Type(Recorded(uid.clone()))),
-        Change::RenameType { uid, from, to, .. } => {
+        }) => nx.release(type_address(tmp), ObjectKey::Type(Recorded(uid.clone()))),
+        Change::Type(TypeChange::RenameType { uid, from, to, .. }) => {
             let holder = ObjectKey::Type(Recorded(uid.clone()));
             nx.release(type_address(from), holder.clone());
             nx.claim(type_address(to), holder);
         }
 
-        Change::CreateTable {
+        Change::Table(TableChange::CreateTable {
             uid, name, table, ..
-        } => {
+        }) => {
             let owner = Recorded(uid.clone());
             for named in whole_table(name, &owner, table, false) {
                 nx.names.claims.push(named);
@@ -369,7 +381,7 @@ pub fn names(
                 }
             }
         }
-        Change::DropTable { uid, name, .. } => {
+        Change::Table(TableChange::DropTable { uid, name, .. }) => {
             let owner = Recorded(uid.clone());
             // The baseline's parts, under the name the drop spells: a table
             // the plan drops is the baseline's, at wherever the plan has put
@@ -397,7 +409,7 @@ pub fn names(
                 ),
             }
         }
-        Change::DetachPartition { table, names, .. } => {
+        Change::Partition(PartitionChange::DetachPartition { table, names, .. }) => {
             // The detached table's clones take the names its declaration
             // gives them. The names they had were the engine's.
             for detached in names {
@@ -416,7 +428,7 @@ pub fn names(
                 nx.part(true, table, kind, key, name.raw())?;
             }
         }
-        Change::RenameTable { uid, from, to, .. } => {
+        Change::Table(TableChange::RenameTable { uid, from, to, .. }) => {
             let owner = Recorded(uid.clone());
             let holder = ObjectKey::Table(owner.clone());
             let address = |name: &TableName| Address {
@@ -446,23 +458,23 @@ pub fn names(
                 }
             }
         }
-        Change::AddColumn {
+        Change::Column(ColumnChange::AddColumn {
             uid, table, name, ..
-        } => nx.column(true, table, uid, name.raw())?,
-        Change::DropColumn { uid, column } => {
+        }) => nx.column(true, table, uid, name.raw())?,
+        Change::Column(ColumnChange::DropColumn { uid, column }) => {
             nx.column(false, &column.table, uid, column.name.raw())?
         }
-        Change::RenameColumn {
+        Change::Column(ColumnChange::RenameColumn {
             uid,
             table,
             from,
             to,
             ..
-        } => {
+        }) => {
             nx.column(false, table, uid, from.raw())?;
             nx.column(true, table, uid, to.raw())?;
         }
-        Change::AddComputedColumn { table, name, .. } => {
+        Change::Column(ColumnChange::AddComputedColumn { table, name, .. }) => {
             nx.part(
                 true,
                 table,
@@ -471,7 +483,7 @@ pub fn names(
                 name.raw(),
             )?;
         }
-        Change::DropComputedColumn { table, name, .. } => {
+        Change::Column(ColumnChange::DropComputedColumn { table, name, .. }) => {
             nx.part(
                 false,
                 table,
@@ -480,9 +492,9 @@ pub fn names(
                 name.raw(),
             )?;
         }
-        Change::SetPrimaryKey {
+        Change::Constraint(ConstraintChange::SetPrimaryKey {
             table, from, to, ..
-        } => {
+        }) => {
             if let Some(name) = from
                 .as_ref()
                 .and_then(|pk| pk.name.as_ref().map(crate::ObjectLocalName::raw))
@@ -496,7 +508,7 @@ pub fn names(
                 nx.part(true, table, NameKind::Key, PartKey::PrimaryKey, name)?;
             }
         }
-        Change::AddUnique { table, name, .. } => {
+        Change::Constraint(ConstraintChange::AddUnique { table, name, .. }) => {
             nx.part(
                 true,
                 table,
@@ -505,7 +517,7 @@ pub fn names(
                 name.raw(),
             )?;
         }
-        Change::DropUnique { table, name } => {
+        Change::Constraint(ConstraintChange::DropUnique { table, name }) => {
             nx.part(
                 false,
                 table,
@@ -514,12 +526,12 @@ pub fn names(
                 name.raw(),
             )?;
         }
-        Change::SetExclusion {
+        Change::Constraint(ConstraintChange::SetExclusion {
             table,
             name,
             from,
             to,
-        } => {
+        }) => {
             if from.is_some() {
                 nx.part(
                     false,
@@ -539,7 +551,7 @@ pub fn names(
                 )?;
             }
         }
-        Change::AddForeignKey { table, name, .. } => {
+        Change::Constraint(ConstraintChange::AddForeignKey { table, name, .. }) => {
             nx.part(
                 true,
                 table,
@@ -548,7 +560,7 @@ pub fn names(
                 name.raw(),
             )?;
         }
-        Change::DropForeignKey { table, name } => {
+        Change::Constraint(ConstraintChange::DropForeignKey { table, name }) => {
             nx.part(
                 false,
                 table,
@@ -557,16 +569,20 @@ pub fn names(
                 name.raw(),
             )?;
         }
-        Change::CreatePolicy { table, name, .. } | Change::DropPolicy { table, name, .. } => {
+        Change::Policy(PolicyChange::CreatePolicy { table, name, .. })
+        | Change::Policy(PolicyChange::DropPolicy { table, name, .. }) => {
             nx.part(
-                matches!(op.change(), Change::CreatePolicy { .. }),
+                matches!(
+                    op.change(),
+                    Change::Policy(PolicyChange::CreatePolicy { .. })
+                ),
                 table,
                 NameKind::Policy,
                 PartKey::Policy(name.clone()),
                 name,
             )?;
         }
-        Change::AddCheck { table, name, .. } => {
+        Change::Constraint(ConstraintChange::AddCheck { table, name, .. }) => {
             nx.part(
                 true,
                 table,
@@ -575,7 +591,7 @@ pub fn names(
                 name.raw(),
             )?;
         }
-        Change::DropCheck { table, name } => {
+        Change::Constraint(ConstraintChange::DropCheck { table, name }) => {
             nx.part(
                 false,
                 table,
@@ -584,7 +600,7 @@ pub fn names(
                 name.raw(),
             )?;
         }
-        Change::AddIndex { table, name, .. } => {
+        Change::Index(IndexChange::AddIndex { table, name, .. }) => {
             nx.part(
                 true,
                 table,
@@ -593,7 +609,7 @@ pub fn names(
                 name.raw(),
             )?;
         }
-        Change::DropIndex { table, name } => {
+        Change::Index(IndexChange::DropIndex { table, name }) => {
             nx.part(
                 false,
                 table,
@@ -602,34 +618,34 @@ pub fn names(
                 name.raw(),
             )?;
         }
-        Change::CreateModule { id, module } => {
+        Change::Module(ModuleChange::CreateModule { id, module }) => {
             if let Some(address) = module_address(|t| nx.table(t).ok(), id, module.kind) {
                 nx.claim(address, ObjectKey::Module(id.clone()));
             }
         }
-        Change::DropModule { id, kind } => {
+        Change::Module(ModuleChange::DropModule { id, kind }) => {
             if let Some(address) = module_address(|t| nx.table(t).ok(), id, *kind) {
                 nx.release(address, ObjectKey::Module(id.clone()));
             }
         }
-        Change::CreateRole { uid, name } => {
+        Change::Role(RoleChange::CreateRole { uid, name }) => {
             nx.claim(role_address(name), ObjectKey::Role(Recorded(uid.clone())));
         }
-        Change::DropRole { uid, name, .. } => {
+        Change::Role(RoleChange::DropRole { uid, name, .. }) => {
             nx.release(role_address(name), ObjectKey::Role(Recorded(uid.clone())));
         }
-        Change::RenameRole { uid, from, to } => {
+        Change::Role(RoleChange::RenameRole { uid, from, to }) => {
             let holder = ObjectKey::Role(Recorded(uid.clone()));
             nx.release(role_address(from), holder.clone());
             nx.claim(role_address(to), holder);
         }
-        Change::DropExtension { uid, name, .. } => {
+        Change::Extension(ExtensionChange::DropExtension { uid, name, .. }) => {
             nx.release(
                 extension_address(name),
                 ObjectKey::Extension(Recorded(uid.clone())),
             );
         }
-        Change::CreateExtension { uid, name, .. } => {
+        Change::Extension(ExtensionChange::CreateExtension { uid, name, .. }) => {
             nx.claim(
                 extension_address(name),
                 ObjectKey::Extension(Recorded(uid.clone())),
@@ -637,21 +653,21 @@ pub fn names(
         }
         // A module rebuilt in place keeps its name; the rest take none.
         crate::change_family!(type_values)
-        | Change::AlterModule { .. }
-        | Change::UpdateExtension { .. }
-        | Change::SetExtensionSchema { .. }
-        | Change::AttachPartition { .. }
-        | Change::AlterColumnType { .. }
-        | Change::AlterColumnNullability { .. }
-        | Change::AlterColumnDefault { .. }
-        | Change::AlterColumnExpression { .. }
-        | Change::AlterColumnNumbering { .. }
-        | Change::SetColumnDeprecated { .. }
-        | Change::SetRowSecurity { .. }
+        | Change::Module(ModuleChange::AlterModule { .. })
+        | Change::Extension(ExtensionChange::UpdateExtension { .. })
+        | Change::Extension(ExtensionChange::SetExtensionSchema { .. })
+        | Change::Partition(PartitionChange::AttachPartition { .. })
+        | Change::Column(ColumnChange::AlterColumnType { .. })
+        | Change::Column(ColumnChange::AlterColumnNullability { .. })
+        | Change::Column(ColumnChange::AlterColumnDefault { .. })
+        | Change::Column(ColumnChange::AlterColumnExpression { .. })
+        | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+        | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+        | Change::Policy(PolicyChange::SetRowSecurity { .. })
         | crate::change_family!(table_properties)
-        | Change::SetPartitionDefault { .. }
-        | Change::SetPartitionNotNull { .. }
-        | Change::SetIndexStorageParameters { .. }
+        | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+        | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+        | Change::Index(IndexChange::SetIndexStorageParameters { .. })
         | crate::change_family!(rows)
         | crate::change_family!(permissions) => {}
     }
@@ -775,9 +791,9 @@ pub(super) fn read_names(op: &Operation, owners: &dyn Owners) -> Result<Vec<Name
     if !owners.address_qualified()
         && !matches!(
             change,
-            Change::CopyTableRows(_)
-                | Change::AnalyzeTableTree(_)
-                | Change::BuildPartitionedIndex(_)
+            Change::Partition(PartitionChange::CopyTableRows(_))
+                | Change::Partition(PartitionChange::AnalyzeTableTree(_))
+                | Change::Index(IndexChange::BuildPartitionedIndex(_))
         )
     {
         return Ok(Vec::new());
@@ -798,7 +814,7 @@ pub(super) fn read_names(op: &Operation, owners: &dyn Owners) -> Result<Vec<Name
             out.push(named);
         }
     };
-    if let Change::CopyTableRows(c) = change {
+    if let Change::Partition(PartitionChange::CopyTableRows(c)) = change {
         for (relations, spelling) in [
             (
                 std::iter::once(&c.source)
@@ -822,7 +838,7 @@ pub(super) fn read_names(op: &Operation, owners: &dyn Owners) -> Result<Vec<Name
                 );
             }
         }
-    } else if let Change::AnalyzeTableTree(a) = change {
+    } else if let Change::Partition(PartitionChange::AnalyzeTableTree(a)) = change {
         for relation in std::iter::once(&a.parent).chain(&a.partitions) {
             table(
                 &relation.name,
@@ -831,7 +847,7 @@ pub(super) fn read_names(op: &Operation, owners: &dyn Owners) -> Result<Vec<Name
                     .clone(),
             );
         }
-    } else if let Change::BuildPartitionedIndex(i) = change {
+    } else if let Change::Index(IndexChange::BuildPartitionedIndex(i)) = change {
         for relation in std::iter::once(&i.parent).chain(i.clones.iter().map(|c| &c.leaf)) {
             table(
                 &relation.name,
@@ -840,15 +856,16 @@ pub(super) fn read_names(op: &Operation, owners: &dyn Owners) -> Result<Vec<Name
                     .clone(),
             );
         }
-    } else if let Change::DropTable { uid, name, .. }
-    | Change::RenameTable {
+    } else if let Change::Table(TableChange::DropTable { uid, name, .. })
+    | Change::Table(TableChange::RenameTable {
         uid, from: name, ..
-    } = change
+    }) = change
     {
         table(name, uid.clone());
     } else if !matches!(
         change,
-        Change::CreateTable { .. } | Change::RebuildPartitionedTable(_)
+        Change::Table(TableChange::CreateTable { .. })
+            | Change::Partition(PartitionChange::RebuildPartitionedTable(_))
     ) && let Some(name) = change.table()
     {
         table(name, owners.table(name, op.origin().spelling())?);
@@ -857,7 +874,7 @@ pub(super) fn read_names(op: &Operation, owners: &dyn Owners) -> Result<Vec<Name
         table(name, owners.table(name, op.origin().spelling())?);
         Ok(())
     };
-    if let Change::CreateTable { table, name, .. } = change {
+    if let Change::Table(TableChange::CreateTable { table, name, .. }) = change {
         if let Some(of) = &table.partition_of {
             input(&of.parent)?;
         }
@@ -869,22 +886,22 @@ pub(super) fn read_names(op: &Operation, owners: &dyn Owners) -> Result<Vec<Name
             }
         }
     }
-    if let Change::DropTable {
+    if let Change::Table(TableChange::DropTable {
         detach_from: Some(parent),
         ..
-    }
-    | Change::AttachPartition { parent, .. }
-    | Change::DetachPartition { parent, .. } = change
+    })
+    | Change::Partition(PartitionChange::AttachPartition { parent, .. })
+    | Change::Partition(PartitionChange::DetachPartition { parent, .. }) = change
     {
         input(parent)?;
     }
-    if let Change::AddForeignKey { constraint, .. } = change {
+    if let Change::Constraint(ConstraintChange::AddForeignKey { constraint, .. }) = change {
         input(&constraint.references_table)?;
     }
     if let Some(crate::ModuleId::Trigger { on, .. }) = change.module_id() {
         input(on)?;
     }
-    if let Change::CopyTableRows(c) = change {
+    if let Change::Partition(PartitionChange::CopyTableRows(c)) = change {
         for projection in &c.columns {
             for (column, spelling) in projection
                 .source
@@ -933,6 +950,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::TableChange;
 
     #[test]
     fn a_created_table_reads_the_tables_it_references_but_not_itself() {
@@ -961,13 +979,13 @@ mod tests {
         let mut table = crate::Table::default();
         table.foreign_keys.insert("self_fk".into(), fk("t"));
         table.foreign_keys.insert("other_fk".into(), fk("other"));
-        let create = crate::PlannedChange::new(Change::CreateTable {
+        let create = crate::PlannedChange::new(Change::Table(TableChange::CreateTable {
             uid: crate::Uid::derived(crate::UidKind::Table, "t", 0),
             name: TableName::new("app", "t"),
             table: Box::new(table),
             beside_default: None,
             moves_at_most: None,
-        });
+        }));
         let ops = super::super::Operations::of_plan(&[create], super::super::ModuleEdits::InPlace);
         let read: Vec<_> = read_names(&ops.as_slice()[0], &Qualified)
             .unwrap()

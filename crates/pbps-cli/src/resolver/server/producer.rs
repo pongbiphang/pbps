@@ -509,15 +509,16 @@ pub enum ProduceError {
 #[cfg(test)]
 mod remap_tests {
     use super::{Error, remap};
+    use pbps_model::RoleChange;
     use pbps_model::resolver::{OrderEdge, OrderReason};
     use pbps_model::{Change, ChangeSet, PlannedChange, Uid, UidKind};
     use std::collections::BTreeSet;
 
     fn role(name: &str) -> PlannedChange {
-        PlannedChange::new(Change::CreateRole {
+        PlannedChange::new(Change::Role(RoleChange::CreateRole {
             uid: Uid::generate(UidKind::Role),
             name: name.into(),
-        })
+        }))
     }
 
     fn set(changes: &[&PlannedChange]) -> ChangeSet {
@@ -553,11 +554,11 @@ mod remap_tests {
     fn a_dropped_roles_members_filled_in_keep_its_edges() {
         let uid = Uid::generate(UidKind::Role);
         let drop = |name: &str, members: &[&str]| {
-            PlannedChange::new(Change::DropRole {
+            PlannedChange::new(Change::Role(RoleChange::DropRole {
                 uid: uid.clone(),
                 name: name.into(),
                 members: members.iter().map(|&m| m.into()).collect(),
-            })
+            }))
         };
         let a = role("a");
         let (resolved, filled) = (drop("old", &[]), drop("old", &["alice"]));

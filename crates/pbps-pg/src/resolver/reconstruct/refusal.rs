@@ -370,7 +370,11 @@ impl Reconstruction {
                 if i != at
                     && !self.committed.contains(&super::FillWork::Declared(i))
                     && !delta.iter().any(|(at, _)| *at == i)
-                    && let pbps_model::Change::AddColumn { table, name, .. } = &step.subject
+                    && let pbps_model::Change::Column(pbps_model::ColumnChange::AddColumn {
+                        table,
+                        name,
+                        ..
+                    }) = &step.subject
                     && column.as_ref().map_or_else(
                         || {
                             regions.iter().any(|region| {

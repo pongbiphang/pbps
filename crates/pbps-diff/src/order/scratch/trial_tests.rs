@@ -1,5 +1,6 @@
 use super::*;
 use pbps_dialect::MinimalDialect;
+use pbps_model::RoleChange;
 use pbps_model::{Uid, UidKind, resolver::OrderReason};
 fn program(
     n: usize,
@@ -9,10 +10,10 @@ fn program(
     let names = ChangeSet {
         changes: (0..n)
             .map(|at| {
-                PlannedChange::new(Change::CreateRole {
+                PlannedChange::new(Change::Role(RoleChange::CreateRole {
                     uid: Uid::derived(UidKind::Role, &at.to_string(), 0),
                     name: at.to_string().into(),
-                })
+                }))
             })
             .collect(),
     };

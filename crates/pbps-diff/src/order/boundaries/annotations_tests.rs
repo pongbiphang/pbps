@@ -1,4 +1,5 @@
 use super::*;
+use pbps_model::RoleChange;
 use pbps_model::object_ref::ObjectDeps;
 use pbps_model::{IdsFile, Schema};
 
@@ -55,12 +56,12 @@ fn annotated(
         )
         .unwrap();
     let contract = p.annotations.clone().unwrap();
-    let p = crate::order::writebacks::PlanningInput::new(vec![PlannedChange::new(
-        Change::CreateRole {
+    let p = crate::order::writebacks::PlanningInput::new(vec![PlannedChange::new(Change::Role(
+        RoleChange::CreateRole {
             uid: "r_bbbbbb".parse().unwrap(),
             name: "another".into(),
         },
-    )])
+    ))])
     .append_to(p);
     assert!(std::sync::Arc::ptr_eq(
         &contract,

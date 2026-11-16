@@ -1,4 +1,8 @@
 use super::*;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::TableChange;
 #[path = "../../../pbps-diff/tests/fixtures/forward2469.rs"]
 mod forward_fixture;
 
@@ -15,7 +19,8 @@ fn demanded_suffix_and_forward_generations_share_one_legal_recipe() {
                     .changes
                     .iter()
                     .find_map(|p| {
-                        if let Change::CreateTable { name, table, .. } = &p.change
+                        if let Change::Table(TableChange::CreateTable { name, table, .. }) =
+                            &p.change
                             && name == &"app.t".parse().unwrap()
                         {
                             Some(table)
@@ -33,7 +38,10 @@ fn demanded_suffix_and_forward_generations_share_one_legal_recipe() {
                     plan.changes()
                         .changes
                         .iter()
-                        .filter(|p| matches!(p.change, Change::AlterColumnExpression { .. }))
+                        .filter(|p| matches!(
+                            p.change,
+                            Change::Column(ColumnChange::AlterColumnExpression { .. })
+                        ))
                         .count(),
                     pairs
                 );
@@ -42,7 +50,9 @@ fn demanded_suffix_and_forward_generations_share_one_legal_recipe() {
                     .keys()
                     .map(|c| c.raw().to_owned())
                     .chain(plan.changes().changes.iter().filter_map(|p| {
-                        if let Change::AddColumn { table, name, .. } = &p.change {
+                        if let Change::Column(ColumnChange::AddColumn { table, name, .. }) =
+                            &p.change
+                        {
                             (table == &"app.t".parse().unwrap()).then(|| name.raw().to_owned())
                         } else {
                             None
@@ -52,21 +62,21 @@ fn demanded_suffix_and_forward_generations_share_one_legal_recipe() {
                 assert_eq!(physical, f.columns);
                 let steps = &plan.changes().changes;
                 for (generated, input) in [("a", "b"), ("c", "d")].into_iter().take(pairs) {
-                    let read = steps.iter().position(|p| matches!(&p.change, Change::AddColumn { name, .. } if name.raw() == input)).unwrap();
-                    let install = steps.iter().position(|p| matches!(&p.change, Change::AlterColumnExpression { column, .. } if column.name.raw() == generated)).unwrap();
+                    let read = steps.iter().position(|p| matches!(&p.change, Change::Column(ColumnChange::AddColumn { name, .. }) if name.raw() == input)).unwrap();
+                    let install = steps.iter().position(|p| matches!(&p.change, Change::Column(ColumnChange::AlterColumnExpression { column, .. }) if column.name.raw() == generated)).unwrap();
                     assert!(read < install, "{generated} must wait for {input}");
                     for (at, p) in steps.iter().enumerate() {
                         if p.change.table() == Some(&"app.t".parse().unwrap())
                             && matches!(
                                 p.change,
-                                Change::SetPrimaryKey { .. }
-                                    | Change::AddUnique { .. }
-                                    | Change::AddForeignKey { .. }
-                                    | Change::AddCheck { .. }
-                                    | Change::AddIndex { .. }
+                                Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+                                    | Change::Constraint(ConstraintChange::AddUnique { .. })
+                                    | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+                                    | Change::Constraint(ConstraintChange::AddCheck { .. })
+                                    | Change::Index(IndexChange::AddIndex { .. })
                             )
                         {
-                            let input = steps.iter().position(|p| matches!(&p.change, Change::AddColumn { name, .. } if name.raw() == "b")).unwrap();
+                            let input = steps.iter().position(|p| matches!(&p.change, Change::Column(ColumnChange::AddColumn { name, .. }) if name.raw() == "b")).unwrap();
                             assert!(input < at, "validators in this fixture read b");
                         }
                     }
@@ -78,13 +88,10 @@ fn demanded_suffix_and_forward_generations_share_one_legal_recipe() {
             assert!(error.contains("SET EXPRESSION"), "{error}");
             let m = forward_fixture::Scene::new(pairs, "mssql", validators);
             let plan = m.compile(&pbps_mssql::Mssql).unwrap();
-            assert!(
-                !plan
-                    .changes()
-                    .changes
-                    .iter()
-                    .any(|p| matches!(p.change, Change::AlterColumnExpression { .. }))
-            );
+            assert!(!plan.changes().changes.iter().any(|p| matches!(
+                p.change,
+                Change::Column(ColumnChange::AlterColumnExpression { .. })
+            )));
         }
     }
 }
@@ -118,14 +125,14 @@ fn a_final_prefix_generation_can_unlock_a_later_demanded_column() {
         .compile(&pbps_pg::Postgres::new().with_server_version(180006))
         .unwrap();
     let steps = &plan.changes().changes;
-    let generation = steps.iter().position(|p| matches!(&p.change, Change::AlterColumnExpression { column, .. } if column.name.raw() == "a")).unwrap();
+    let generation = steps.iter().position(|p| matches!(&p.change, Change::Column(ColumnChange::AlterColumnExpression { column, .. }) if column.name.raw() == "a")).unwrap();
     let later = steps
         .iter()
-        .position(|p| matches!(&p.change, Change::AddColumn { name, .. } if name.raw() == "d"))
+        .position(|p| matches!(&p.change, Change::Column(ColumnChange::AddColumn { name, .. }) if name.raw() == "d"))
         .unwrap();
     let input = steps
         .iter()
-        .position(|p| matches!(&p.change, Change::AddColumn { name, .. } if name.raw() == "b"))
+        .position(|p| matches!(&p.change, Change::Column(ColumnChange::AddColumn { name, .. }) if name.raw() == "b"))
         .unwrap();
     assert!(input < generation && generation < later);
     let mut m = forward_fixture::Scene::new(2, "mssql", true);
@@ -150,11 +157,8 @@ fn a_literal_matching_a_late_column_does_not_require_set_expression() {
     let plan = f
         .compile(&pbps_pg::Postgres::new().with_server_version(160015))
         .unwrap();
-    assert!(
-        !plan
-            .changes()
-            .changes
-            .iter()
-            .any(|p| matches!(p.change, Change::AlterColumnExpression { .. }))
-    );
+    assert!(!plan.changes().changes.iter().any(|p| matches!(
+        p.change,
+        Change::Column(ColumnChange::AlterColumnExpression { .. })
+    )));
 }

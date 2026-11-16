@@ -6,6 +6,15 @@ pub mod renames;
 use std::collections::BTreeSet;
 
 use pbps_db::{Conn, DbError};
+use pbps_model::ColumnChange;
+use pbps_model::ExtensionChange;
+use pbps_model::IndexChange;
+use pbps_model::PartitionChange;
+use pbps_model::RowChange;
+use pbps_model::SearchChange;
+use pbps_model::TableChange;
+use pbps_model::TypeChange;
+use pbps_model::TypeValueChange;
 use pbps_model::escape::Escaped;
 use pbps_model::{
     Change, ChangeSet, Column, ColumnName, ColumnType, ModuleKind, Schema, TypePin, TypeProvider,
@@ -48,7 +57,7 @@ fn reference_uses<'a>(
     }
     for planned in &changes.changes {
         match &planned.change {
-            Change::RebuildPartitionedTable(r) => {
+            Change::Partition(PartitionChange::RebuildPartitionedTable(r)) => {
                 types.extend(
                     r.before
                         .values()
@@ -60,56 +69,61 @@ fn reference_uses<'a>(
                         .flat_map(|t| t.columns.values().map(|c| (TypeSide::Desired, &c.ty))),
                 );
             }
-            Change::CopyTableRows(c) => types.extend(c.columns.iter().flat_map(|c| {
-                std::iter::once((TypeSide::Desired, &c.cast))
-                    .chain(c.source.iter().map(|s| (TypeSide::Base, &s.ty)))
-            })),
-            Change::BuildPartitionedIndex(_)
-            | Change::AnalyzeTableTree(_)
-            | Change::CreateSearch { .. }
-            | Change::DropSearch { .. }
-            | Change::CreateExtension { .. }
-            | Change::DropExtension { .. }
-            | Change::UpdateExtension { .. }
-            | Change::SetExtensionSchema { .. } => {}
-            Change::CreateTable { table, .. }
-            | Change::AttachPartition { shape: table, .. }
-            | Change::DetachPartition { shape: table, .. } => {
+            Change::Partition(PartitionChange::CopyTableRows(c)) => {
+                types.extend(c.columns.iter().flat_map(|c| {
+                    std::iter::once((TypeSide::Desired, &c.cast))
+                        .chain(c.source.iter().map(|s| (TypeSide::Base, &s.ty)))
+                }))
+            }
+            Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_))
+            | Change::Search(SearchChange::CreateSearch { .. })
+            | Change::Search(SearchChange::DropSearch { .. })
+            | Change::Extension(ExtensionChange::CreateExtension { .. })
+            | Change::Extension(ExtensionChange::DropExtension { .. })
+            | Change::Extension(ExtensionChange::UpdateExtension { .. })
+            | Change::Extension(ExtensionChange::SetExtensionSchema { .. }) => {}
+            Change::Table(TableChange::CreateTable { table, .. })
+            | Change::Partition(PartitionChange::AttachPartition { shape: table, .. })
+            | Change::Partition(PartitionChange::DetachPartition { shape: table, .. }) => {
                 types.extend(table.columns.values().map(|c| (TypeSide::Desired, &c.ty)));
             }
-            Change::AddColumn { column, .. } => types.push((TypeSide::Desired, &column.ty)),
-            Change::AlterColumnType { from, to, .. } => {
+            Change::Column(ColumnChange::AddColumn { column, .. }) => {
+                types.push((TypeSide::Desired, &column.ty))
+            }
+            Change::Column(ColumnChange::AlterColumnType { from, to, .. }) => {
                 types.extend([(TypeSide::Base, from), (TypeSide::Desired, to)])
             }
-            Change::AlterColumnNullability { ty, .. } | Change::AlterColumnNumbering { ty, .. } => {
+            Change::Column(ColumnChange::AlterColumnNullability { ty, .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { ty, .. }) => {
                 types.push((TypeSide::Desired, ty))
             }
-            Change::InsertRow { types: carried, .. } => {
+            Change::Row(RowChange::InsertRow { types: carried, .. }) => {
                 types.extend(carried.values().map(|ty| (TypeSide::Desired, ty)))
             }
-            Change::UpdateRow {
+            Change::Row(RowChange::UpdateRow {
                 types: before,
                 after_types,
                 key_type,
                 ..
-            }
-            | Change::DeleteRow {
+            })
+            | Change::Row(RowChange::DeleteRow {
                 types: before,
                 after_types,
                 key_type,
                 ..
-            } => {
+            }) => {
                 types.extend(before.values().map(|ty| (TypeSide::Base, ty)));
                 types.extend(after_types.values().map(|ty| (TypeSide::Desired, ty)));
                 // The row key is compared after structural changes; unlike
                 // recorded cells, its carried type is the declared one.
                 types.extend(key_type.iter().map(|ty| (TypeSide::Desired, ty)));
             }
-            Change::AddEnumValue { definition, .. }
-            | Change::AlterDomain { to: definition, .. }
-            | Change::RenameEnumValue { definition, .. }
-            | Change::CreateType { definition, .. }
-            | Change::RenameType { definition, .. } => {
+            Change::TypeValue(TypeValueChange::AddEnumValue { definition, .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { to: definition, .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { definition, .. })
+            | Change::Type(TypeChange::CreateType { definition, .. })
+            | Change::Type(TypeChange::RenameType { definition, .. }) => {
                 if let pbps_model::ManagedType::Domain { base, .. } = definition.as_ref()
                     && base.type_ref().is_some_and(|r| r.schema() != "pg_catalog")
                 {
@@ -117,28 +131,28 @@ fn reference_uses<'a>(
                 }
             }
             // A rebuild's replacement is an enum with no references of its own.
-            Change::EnumRebuild { .. } => {}
-            Change::DropTable { .. }
-            | Change::RenameTable { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::SetColumnDeprecated { .. }
+            Change::TypeValue(TypeValueChange::EnumRebuild { .. }) => {}
+            Change::Table(TableChange::DropTable { .. })
+            | Change::Table(TableChange::RenameTable { .. })
+            | Change::Column(ColumnChange::DropColumn { .. })
+            | Change::Column(ColumnChange::RenameColumn { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
             | pbps_model::change_family!(table_properties)
             | pbps_model::change_family!(policies)
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::SetIndexStorageParameters { .. }
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
             | pbps_model::change_family!(constraints)
-            | Change::AddIndex { .. }
-            | Change::DropIndex { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(RowChange::SetDataMode { .. })
+            | Change::Row(RowChange::SetEnsureKeys { .. })
             | pbps_model::change_family!(modules)
-            | Change::DropType { .. }
+            | Change::Type(TypeChange::DropType { .. })
             | pbps_model::change_family!(roles)
             | pbps_model::change_family!(permissions) => {}
         }
@@ -189,15 +203,15 @@ pub fn managed_names(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeR
         .collect();
     for planned in &changes.changes {
         match &planned.change {
-            Change::AddEnumValue { name, .. }
-            | Change::AlterDomain { name, .. }
-            | Change::RenameEnumValue { name, .. }
-            | Change::EnumRebuild { name, .. }
-            | Change::CreateType { name, .. }
-            | Change::DropType { name, .. } => {
+            Change::TypeValue(TypeValueChange::AddEnumValue { name, .. })
+            | Change::TypeValue(TypeValueChange::AlterDomain { name, .. })
+            | Change::TypeValue(TypeValueChange::RenameEnumValue { name, .. })
+            | Change::TypeValue(TypeValueChange::EnumRebuild { name, .. })
+            | Change::Type(TypeChange::CreateType { name, .. })
+            | Change::Type(TypeChange::DropType { name, .. }) => {
                 names.insert(name.clone());
             }
-            Change::RenameType { from, to, .. } => {
+            Change::Type(TypeChange::RenameType { from, to, .. }) => {
                 names.extend([from.clone(), to.clone()]);
             }
             _ => {}
@@ -532,9 +546,9 @@ fn refuse_retype_of_provided(
         })
     };
     for change in &changes.changes {
-        if let Change::AlterColumnType {
+        if let Change::Column(ColumnChange::AlterColumnType {
             column, from, to, ..
-        } = &change.change
+        }) = &change.change
             && (provided(from) || provided(to))
         {
             return Err(format!(
@@ -904,6 +918,9 @@ pub fn bootstrap_guard(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::RowChange;
+    use pbps_model::TableChange;
+    use pbps_model::TypeChange;
 
     fn provided(name: &str, extension: &str, version: &str) -> UserType {
         UserType::provided_for_test(name.parse().unwrap(), extension, version)
@@ -960,7 +977,7 @@ mod tests {
     fn an_update_beside_a_use_of_the_packages_type_is_refused() {
         let update = |name: &str| ChangeSet {
             changes: vec![pbps_model::PlannedChange::new(
-                pbps_model::Change::UpdateExtension {
+                pbps_model::Change::Extension(pbps_model::ExtensionChange::UpdateExtension {
                     uid: "e_aaaaaa".parse().unwrap(),
                     name: name.into(),
                     from: pbps_model::Extension {
@@ -973,7 +990,7 @@ mod tests {
                     },
                     requires: Default::default(),
                     releases: Default::default(),
-                },
+                }),
             )],
         };
         let types = [provided("ext.citext", "citext", "1.5")];
@@ -1143,19 +1160,21 @@ mod tests {
     #[test]
     fn a_pin_notes_the_move_of_its_own_package_and_no_other() {
         let move_of = |name: &str, from: &str, to: &str| {
-            pbps_model::PlannedChange::new(pbps_model::Change::SetExtensionSchema {
-                uid: "e_aaaaaa".parse().unwrap(),
-                name: name.into(),
-                from: pbps_model::Extension {
-                    schema: from.into(),
-                    version: "1.6".into(),
+            pbps_model::PlannedChange::new(pbps_model::Change::Extension(
+                pbps_model::ExtensionChange::SetExtensionSchema {
+                    uid: "e_aaaaaa".parse().unwrap(),
+                    name: name.into(),
+                    from: pbps_model::Extension {
+                        schema: from.into(),
+                        version: "1.6".into(),
+                    },
+                    to: pbps_model::Extension {
+                        schema: to.into(),
+                        version: "1.6".into(),
+                    },
+                    releases: Default::default(),
                 },
-                to: pbps_model::Extension {
-                    schema: to.into(),
-                    version: "1.6".into(),
-                },
-                releases: Default::default(),
-            })
+            ))
         };
         let changes = ChangeSet {
             changes: vec![move_of("citext", "ext", "moved")],
@@ -1208,8 +1227,8 @@ mod tests {
     fn a_retype_to_or_from_a_provided_type_is_refused_and_any_other_is_not() {
         use pbps_model::{ColumnRef, Uid};
         let retype = |from: &str, to: &str| ChangeSet {
-            changes: vec![pbps_model::PlannedChange::new(
-                pbps_model::Change::AlterColumnType {
+            changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Column(
+                pbps_model::ColumnChange::AlterColumnType {
                     uid: "c_aaaaaa".parse::<Uid>().unwrap(),
                     column: ColumnRef {
                         table: pbps_model::TableName::new("app", "t"),
@@ -1224,7 +1243,7 @@ mod tests {
                     through_external_partitions: false,
                     using: None,
                 },
-            )],
+            ))],
         };
         let planned = [planned_pin("ext", "citext", "citext")];
         let refused = refuse_retype_of_provided(&[], &planned, &retype("text", "ext.citext"));
@@ -1293,26 +1312,30 @@ mod tests {
                     values: vec!["ok".into()],
                 };
                 let mut changes = ChangeSet {
-                    changes: vec![pbps_model::PlannedChange::new(Change::CreateType {
-                        uid: "y_000001".parse().unwrap(),
-                        name: "app.mood".parse().unwrap(),
-                        definition: Box::new(enumeration),
-                    })],
+                    changes: vec![pbps_model::PlannedChange::new(Change::Type(
+                        TypeChange::CreateType {
+                            uid: "y_000001".parse().unwrap(),
+                            name: "app.mood".parse().unwrap(),
+                            definition: Box::new(enumeration),
+                        },
+                    ))],
                 };
                 if domain {
                     changes
                         .changes
-                        .push(pbps_model::PlannedChange::new(Change::CreateType {
-                            uid: "y_000002".parse().unwrap(),
-                            name: "app.choice".parse().unwrap(),
-                            definition: Box::new(pbps_model::ManagedType::Domain {
-                                base: format!("app.mood{array}").parse().unwrap(),
-                                not_null: false,
-                                default: None,
-                                checks: Default::default(),
-                                collation: None,
-                            }),
-                        }));
+                        .push(pbps_model::PlannedChange::new(Change::Type(
+                            TypeChange::CreateType {
+                                uid: "y_000002".parse().unwrap(),
+                                name: "app.choice".parse().unwrap(),
+                                definition: Box::new(pbps_model::ManagedType::Domain {
+                                    base: format!("app.mood{array}").parse().unwrap(),
+                                    not_null: false,
+                                    default: None,
+                                    checks: Default::default(),
+                                    collation: None,
+                                }),
+                            },
+                        )));
                 }
                 let ty = if domain {
                     "app.choice".to_owned()
@@ -1321,16 +1344,18 @@ mod tests {
                 };
                 changes
                     .changes
-                    .push(pbps_model::PlannedChange::new(Change::CreateTable {
-                        uid: "t_000001".parse().unwrap(),
-                        name: "app.t".parse().unwrap(),
-                        table: Box::new(pbps_model::Table {
-                            columns: [("v".into(), Column::new(ty.parse().unwrap()))].into(),
-                            ..Default::default()
-                        }),
-                        beside_default: None,
-                        moves_at_most: None,
-                    }));
+                    .push(pbps_model::PlannedChange::new(Change::Table(
+                        TableChange::CreateTable {
+                            uid: "t_000001".parse().unwrap(),
+                            name: "app.t".parse().unwrap(),
+                            table: Box::new(pbps_model::Table {
+                                columns: [("v".into(), Column::new(ty.parse().unwrap()))].into(),
+                                ..Default::default()
+                            }),
+                            beside_default: None,
+                            moves_at_most: None,
+                        },
+                    )));
                 require_references(&[], &[], &changes).unwrap();
                 let (base, desired) = declared::identities(&[], &changes);
                 assert!(base.types.is_empty());
@@ -1355,23 +1380,23 @@ mod tests {
                 values: vec!["ok".into()],
             });
             let lifecycle = if rename {
-                Change::RenameType {
+                Change::Type(TypeChange::RenameType {
                     uid: "y_000001".parse().unwrap(),
                     from: "app.old".parse().unwrap(),
                     to: "app.mood".parse().unwrap(),
                     definition,
-                }
+                })
             } else {
-                Change::CreateType {
+                Change::Type(TypeChange::CreateType {
                     uid: "y_000001".parse().unwrap(),
                     name: "app.mood".parse().unwrap(),
                     definition,
-                }
+                })
             };
             for delete in [false, true] {
                 let key_type = Some("app.mood".parse().unwrap());
                 let row = if delete {
-                    Change::DeleteRow {
+                    Change::Row(RowChange::DeleteRow {
                         table: "app.t".parse().unwrap(),
                         key_column: "v".into(),
                         key: "ok".into(),
@@ -1381,9 +1406,9 @@ mod tests {
                         types: Default::default(),
                         after_types: Default::default(),
                         key_type,
-                    }
+                    })
                 } else {
-                    Change::UpdateRow {
+                    Change::Row(RowChange::UpdateRow {
                         table: "app.t".parse().unwrap(),
                         key_column: "v".into(),
                         key: "ok".into(),
@@ -1392,7 +1417,7 @@ mod tests {
                         types: Default::default(),
                         after_types: Default::default(),
                         key_type,
-                    }
+                    })
                 };
                 let changes = ChangeSet {
                     changes: vec![
@@ -1442,18 +1467,18 @@ mod tests {
             let empty = pbps_model::IdsFile::default();
             let changes = ChangeSet {
                 changes: vec![
-                    pbps_model::PlannedChange::new(Change::DropType {
+                    pbps_model::PlannedChange::new(Change::Type(TypeChange::DropType {
                         uid: "y_000001".parse().unwrap(),
                         name: name.clone(),
                         definition: Box::new(definition.clone()),
-                    }),
-                    pbps_model::PlannedChange::new(Change::CreateTable {
+                    })),
+                    pbps_model::PlannedChange::new(Change::Table(TableChange::CreateTable {
                         uid: "t_000001".parse().unwrap(),
                         name: "app.t".parse().unwrap(),
                         table: Box::new(table),
                         beside_default: None,
                         moves_at_most: None,
-                    }),
+                    })),
                 ],
             };
             let old = Side {

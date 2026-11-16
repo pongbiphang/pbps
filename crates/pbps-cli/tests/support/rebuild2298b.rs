@@ -423,14 +423,27 @@ fn negatives(server: &str) {
                     if mutation < 2 {
                         plan.changes.changes.retain(|p| {
                             !if mutation == 0 {
-                                matches!(p.change, pbps_model::Change::CopyTableRows(_))
+                                matches!(
+                                    p.change,
+                                    pbps_model::Change::Partition(
+                                        pbps_model::PartitionChange::CopyTableRows(_)
+                                    )
+                                )
                             } else {
-                                matches!(p.change, pbps_model::Change::AnalyzeTableTree(_))
+                                matches!(
+                                    p.change,
+                                    pbps_model::Change::Partition(
+                                        pbps_model::PartitionChange::AnalyzeTableTree(_)
+                                    )
+                                )
                             }
                         });
                     } else {
                         for p in &mut plan.changes.changes {
-                            if let pbps_model::Change::CopyTableRows(c) = &mut p.change {
+                            if let pbps_model::Change::Partition(
+                                pbps_model::PartitionChange::CopyTableRows(c),
+                            ) = &mut p.change
+                            {
                                 c.max_rows += 1;
                             }
                         }

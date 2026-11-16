@@ -933,17 +933,21 @@ fn surviving_keys(
         &hints,
     )
     .ok()?;
-    let added: std::collections::BTreeSet<(&pbps_model::TableName, &str)> = changes
-        .changes
-        .iter()
-        .filter_map(|planned| {
-            if let pbps_model::Change::AddForeignKey { table, name, .. } = &planned.change {
-                Some((table, name.raw()))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let added: std::collections::BTreeSet<(&pbps_model::TableName, &str)> =
+        changes
+            .changes
+            .iter()
+            .filter_map(|planned| {
+                if let pbps_model::Change::Constraint(
+                    pbps_model::ConstraintChange::AddForeignKey { table, name, .. },
+                ) = &planned.change
+                {
+                    Some((table, name.raw()))
+                } else {
+                    None
+                }
+            })
+            .collect();
     let mut keys = pbps_db::doctor::DeclaredKeys::new();
     for (table_name, table) in &loaded.schema.tables {
         for (key_name, key) in &table.foreign_keys {
@@ -1930,7 +1934,7 @@ mod tests {
         assert!(
             changes.changes.iter().any(|c| matches!(
                 &c.change,
-                pbps_model::Change::AddForeignKey { name, .. } if name.raw() == "fk_c_p"
+                pbps_model::Change::Constraint(pbps_model::ConstraintChange::AddForeignKey { name, .. }) if name.raw() == "fk_c_p"
             )),
             "the diff as written must re-add the key for this test to mean anything"
         );

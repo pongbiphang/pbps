@@ -201,21 +201,33 @@ pub fn plan(
         .collect();
     for (at, p) in cs.changes.iter().enumerate() {
         // Follow execution addresses, so reuse of a vacated name is a new table.
-        if let pbps_model::Change::CreateTable { uid, name, .. } = &p.change {
+        if let pbps_model::Change::Table(pbps_model::TableChange::CreateTable {
+            uid, name, ..
+        }) = &p.change
+        {
             tables.insert(name.clone(), uid.clone());
-        } else if let pbps_model::Change::RenameTable { uid, from, to, .. } = &p.change {
+        } else if let pbps_model::Change::Table(pbps_model::TableChange::RenameTable {
+            uid,
+            from,
+            to,
+            ..
+        }) = &p.change
+        {
             tables.remove(from);
             tables.insert(to.clone(), uid.clone());
         }
-        let table = if let pbps_model::Change::RenameTable { uid, .. } = &p.change {
-            Some(uid)
-        } else {
-            p.change.table().and_then(|t| tables.get(t)).or_else(|| {
-                p.change
-                    .table()
-                    .and_then(|t| sides.last()?.ids.table_uid(t))
-            })
-        };
+        let table =
+            if let pbps_model::Change::Table(pbps_model::TableChange::RenameTable { uid, .. }) =
+                &p.change
+            {
+                Some(uid)
+            } else {
+                p.change.table().and_then(|t| tables.get(t)).or_else(|| {
+                    p.change
+                        .table()
+                        .and_then(|t| sides.last()?.ids.table_uid(t))
+                })
+            };
         for entry in &bound.0 {
             // A table created by this plan has no pre-existing writer contract.
             if entry.writes && entry.table().is_some_and(|uid| interfaces.created(uid)) {
@@ -252,7 +264,9 @@ pub fn plan(
             );
             out.extend(live.finding(Some(&entry.subject), message).map(|f| (at, f)));
         }
-        if let pbps_model::Change::DropTable { name, .. } = &p.change {
+        if let pbps_model::Change::Table(pbps_model::TableChange::DropTable { name, .. }) =
+            &p.change
+        {
             tables.remove(name);
         }
     }

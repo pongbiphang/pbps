@@ -82,15 +82,15 @@ fn assert_observational(shape: Shape) {
     after.modules.insert(f.clone(), function("@x + 1", true));
     after.modules.insert(g.clone(), function("@x", false));
     let mut changes = vec![
-        PlannedChange::new(Change::AlterModule {
+        PlannedChange::new(Change::Module(ModuleChange::AlterModule {
             id: f.clone(),
             module: Box::new(after.modules[&f].clone()),
-        }),
-        PlannedChange::new(Change::AlterModule {
+        })),
+        PlannedChange::new(Change::Module(ModuleChange::AlterModule {
             id: g.clone(),
             module: Box::new(after.modules[&g].clone()),
-        }),
-        PlannedChange::new(Change::AlterColumnType {
+        })),
+        PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
             uid: cid,
             column: table.column("a"),
             from: "int".parse().unwrap(),
@@ -101,14 +101,14 @@ fn assert_observational(shape: Shape) {
             to_collation: None,
             through_external_partitions: false,
             using: None,
-        }),
+        })),
     ];
     if matches!(shape, Shape::UnmanagedGrant) {
-        changes.push(PlannedChange::new(Change::Grant {
+        changes.push(PlannedChange::new(Change::Permission(GrantChange::Grant {
             role: "external_reader".into(),
             target: GrantTarget::Object("dbo.unmanaged_v".parse().unwrap()),
             permissions: [Permission::Select].into(),
-        }));
+        })));
     }
     let operations = Operations::of_plan(&changes, ModuleEdits::InPlace);
     let owners = PlanOwners::new(PlanNames::of(&changes, &ids).unwrap(), &ids, &ids);
@@ -179,7 +179,7 @@ fn assert_observational(shape: Shape) {
             .changes
             .iter()
             .position(
-                |p| matches!(&p.change, Change::AlterModule { id: changed, .. } if changed == id),
+                |p| matches!(&p.change, Change::Module(ModuleChange::AlterModule { id: changed, .. }) if changed == id),
             )
             .unwrap()
     };

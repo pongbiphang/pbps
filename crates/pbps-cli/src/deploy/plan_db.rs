@@ -12,9 +12,9 @@ pub(crate) fn type_replacement_warnings(
 ) -> Vec<crate::output::Finding> {
     let resolver = TypeResolver::new(base, desired);
     changes.changes.iter().filter_map(|step| {
-        let pbps_model::Change::DropType { uid: old, name, .. } = &step.change else { return None };
+        let pbps_model::Change::Type(pbps_model::TypeChange::DropType { uid: old, name, .. }) = &step.change else { return None };
         let TypeIdentity::Declared(new) = resolver.resolve(TypeSide::Desired, name) else { return None };
-        if old == new || !changes.changes.iter().any(|s| matches!(&s.change, pbps_model::Change::CreateType { uid, .. } if uid == new)) {
+        if old == new || !changes.changes.iter().any(|s| matches!(&s.change, pbps_model::Change::Type(pbps_model::TypeChange::CreateType { uid, .. }) if uid == new)) {
             return None;
         }
         let message = format!(
@@ -1140,7 +1140,7 @@ pub(super) async fn plan_db_selected(
         if cs
             .changes
             .iter()
-            .any(|p| matches!(p.change, pbps_model::Change::DropRole { .. }))
+            .any(|p| matches!(p.change, pbps_model::Change::Role(pbps_model::RoleChange::DropRole { .. })))
         {
             // Ownership is refused, not planned around: the engine will not
             // drop an owning role, and moving ownership is a decision about

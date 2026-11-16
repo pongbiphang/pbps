@@ -181,9 +181,12 @@ impl Drop for Role {
 
 fn recorded_changes(changes: &pbps_model::ChangeSet) -> pbps_model::ChangeSet {
     let mut recorded = changes.clone();
-    recorded
-        .changes
-        .retain(|p| !matches!(p.change, pbps_model::Change::PublicExecution { .. }));
+    recorded.changes.retain(|p| {
+        !matches!(
+            p.change,
+            pbps_model::Change::Permission(pbps_model::GrantChange::PublicExecution { .. })
+        )
+    });
     recorded
 }
 
@@ -385,13 +388,10 @@ pub fn recovery(server: &str, pg: bool) {
         reverse["data"]["changes"],
         serde_json::to_value(recorded_changes(&backward.changes)).unwrap()
     );
-    assert!(
-        backward
-            .changes
-            .changes
-            .iter()
-            .any(|p| matches!(p.change, pbps_model::Change::AlterColumnDefault { .. }))
-    );
+    assert!(backward.changes.changes.iter().any(|p| matches!(
+        p.change,
+        pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnDefault { .. })
+    )));
     apply(&d, connection, "backward.json", &backward);
     assert!(plan(&d, connection, "recovered.json").changes.is_empty());
     assert_eq!(
@@ -946,13 +946,10 @@ pub fn identities(server: &str, pg: bool) {
         compared["data"]["changes"],
         serde_json::to_value(&forward.changes).unwrap()
     );
-    assert!(
-        forward
-            .changes
-            .changes
-            .iter()
-            .any(|p| matches!(p.change, pbps_model::Change::RenameColumn { .. }))
-    );
+    assert!(forward.changes.changes.iter().any(|p| matches!(
+        p.change,
+        pbps_model::Change::Column(pbps_model::ColumnChange::RenameColumn { .. })
+    )));
     let ids = crate::idtree::snapshot(&d.dir);
     ok(d.run(&["state", "export", &first, "--db", connection, "--force"]));
     assert_eq!(crate::idtree::snapshot(&d.dir), ids);
@@ -967,16 +964,14 @@ pub fn identities(server: &str, pg: bool) {
     ok(d.run(&["rename", &format!("{schema}.product.title"), "label"]));
     d.commit();
     let backward = plan(&d, connection, "rename-back.json");
-    assert!(
-        backward
-            .changes
-            .changes
-            .iter()
-            .any(|p| matches!(p.change, pbps_model::Change::RenameColumn { .. }))
-    );
+    assert!(backward.changes.changes.iter().any(|p| matches!(
+        p.change,
+        pbps_model::Change::Column(pbps_model::ColumnChange::RenameColumn { .. })
+    )));
     assert!(!backward.changes.changes.iter().any(|p| matches!(
         p.change,
-        pbps_model::Change::DropColumn { .. } | pbps_model::Change::AddColumn { .. }
+        pbps_model::Change::Column(pbps_model::ColumnChange::DropColumn { .. })
+            | pbps_model::Change::Column(pbps_model::ColumnChange::AddColumn { .. })
     )));
     apply(&d, connection, "rename-back.json", &backward);
     assert!(plan(&d, connection, "rename-clean.json").changes.is_empty());
@@ -1124,10 +1119,10 @@ pub fn unrecorded_column_ids(server: &str, pg: bool) {
             assert_eq!(changes.changes.len(), 1, "{changes:?}");
             let change = &changes.changes[0].change;
             let expected = if add {
-                matches!(change, pbps_model::Change::AddColumn { table: actual, name, .. }
+                matches!(change, pbps_model::Change::Column(pbps_model::ColumnChange::AddColumn { table: actual, name, .. })
                     if actual == &table && name.raw() == "observed")
             } else {
-                matches!(change, pbps_model::Change::DropColumn { column, .. }
+                matches!(change, pbps_model::Change::Column(pbps_model::ColumnChange::DropColumn { column, .. })
                     if column == &table.column("observed"))
             };
             assert!(expected, "{changes:?}");
@@ -1141,7 +1136,7 @@ pub fn unrecorded_column_ids(server: &str, pg: bool) {
     assert_eq!(changes.changes.len(), 1, "{changes:?}");
     assert!(
         changes.changes.iter().any(|p| matches!(&p.change,
-            pbps_model::Change::AlterColumnDefault { column, .. }
+            pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnDefault { column, .. })
                 if column == &table.column("observed")
         )),
         "{changes:?}"
@@ -1365,7 +1360,7 @@ pub fn acquired_column_ids(server: &str, pg: bool) {
         assert_eq!(changes.changes.len(), 1, "{changes:?}");
         assert!(
             matches!(&changes.changes[0].change,
-            pbps_model::Change::AlterColumnDefault { uid: actual, column, .. }
+            pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnDefault { uid: actual, column, .. })
                 if actual == &uid && column == &table.column("observed")),
             "{changes:?}"
         );
@@ -1404,10 +1399,10 @@ pub fn public_execution_is_unknown(server: &str, pg: bool) {
     assert_eq!(
         forward.changes.changes.iter().any(|p| matches!(
             p.change,
-            pbps_model::Change::PublicExecution {
+            pbps_model::Change::Permission(pbps_model::GrantChange::PublicExecution {
                 access: pbps_model::PublicAccess::Kept,
                 ..
-            }
+            })
         )),
         pg
     );
@@ -1422,19 +1417,17 @@ pub fn public_execution_is_unknown(server: &str, pg: bool) {
         let changes: pbps_model::ChangeSet =
             serde_json::from_value(compared["data"]["changes"].clone()).unwrap();
         assert!(
-            !changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, pbps_model::Change::PublicExecution { .. })),
+            !changes.changes.iter().any(|p| matches!(
+                p.change,
+                pbps_model::Change::Permission(pbps_model::GrantChange::PublicExecution { .. })
+            )),
             "{changes:?}"
         );
         if from != to {
-            assert!(
-                changes
-                    .changes
-                    .iter()
-                    .any(|p| matches!(p.change, pbps_model::Change::AlterModule { .. }))
-            );
+            assert!(changes.changes.iter().any(|p| matches!(
+                p.change,
+                pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule { .. })
+            )));
         } else {
             assert!(changes.is_empty());
         }

@@ -2,6 +2,11 @@ use super::*;
 use crate::generated::{column_names, selects_all, without_variables};
 use crate::validate::computed_note_fold;
 use indexmap::IndexMap;
+use pbps_model::ConstraintChange;
+use pbps_model::ModuleChange;
+use pbps_model::RoleChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
 use pbps_model::{
     ChangeSet, Column, ComputedColumn, IdsFile, Module, ModuleDeps, ModuleId, Uid, UidKind,
 };
@@ -29,13 +34,13 @@ fn table_with(table: &str, spec: impl FnOnce(&mut pbps_model::Table)) -> Change 
         ..Default::default()
     };
     spec(&mut made);
-    Change::CreateTable {
+    Change::Table(TableChange::CreateTable {
         uid: Uid::derived(UidKind::Table, table, 0),
         name: name(table),
         table: Box::new(made),
         beside_default: None,
         moves_at_most: None,
-    }
+    })
 }
 
 fn table(table: &str, calls: &[(&str, &str)]) -> Change {
@@ -55,7 +60,7 @@ fn module(kind: ModuleKind, module: &str, definition: &str) -> Change {
             ModuleId::Routine(pbps_model::RoutineId::new(name(module), Vec::new()))
         }
     };
-    Change::CreateModule {
+    Change::Module(ModuleChange::CreateModule {
         id,
         module: Box::new(Module {
             kind,
@@ -63,7 +68,7 @@ fn module(kind: ModuleKind, module: &str, definition: &str) -> Change {
             description: None,
             options: Default::default(),
         }),
-    }
+    })
 }
 
 fn function(function: &str, definition: &str) -> Change {
@@ -79,7 +84,7 @@ fn build(changes: Vec<Change>) -> Result<Reconstruction, ReconstructError> {
     // split parts of a default name their column by it.
     let mut declared = pbps_model::Schema::default();
     for change in &changes {
-        if let Change::CreateTable { name, table, .. } = change {
+        if let Change::Table(TableChange::CreateTable { name, table, .. }) = change {
             declared.tables.insert(name.clone(), (**table).clone());
         }
     }
@@ -289,11 +294,11 @@ fn a_key_over_a_computed_column_follows_the_column_and_other_keys_stay_with_the_
 
 #[test]
 fn a_bootstrap_that_alters_or_drops_is_not_a_bootstrap() {
-    let refused = build(vec![Change::DropTable {
+    let refused = build(vec![Change::Table(TableChange::DropTable {
         uid: Uid::derived(UidKind::Table, "t", 0),
         name: name("t"),
         detach_from: None,
-    }])
+    })])
     .expect_err("a drop is no bootstrap step");
     assert!(
         matches!(&refused, ReconstructError::Unsupported(op) if op == "drop_table"),
@@ -304,10 +309,10 @@ fn a_bootstrap_that_alters_or_drops_is_not_a_bootstrap() {
 #[test]
 fn roles_grants_and_rows_create_no_step() {
     let reconstruction = build(vec![
-        Change::CreateRole {
+        Change::Role(RoleChange::CreateRole {
             uid: Uid::derived(UidKind::Role, "r", 0),
             name: "r".into(),
-        },
+        }),
         table("t", &[]),
     ])
     .unwrap();
@@ -583,11 +588,11 @@ fn a_foreign_key_from_or_to_a_computed_column_waits_for_every_module_and_the_key
                     changes.reverse();
                 }
                 if !inline {
-                    changes.push(Change::AddForeignKey {
+                    changes.push(Change::Constraint(ConstraintChange::AddForeignKey {
                         table: name("child"),
                         name: "fk_child".into(),
                         constraint: Box::new(fk),
-                    });
+                    }));
                 }
                 changes.push(function("f", FUNCTION));
                 let statements = sql(&build(changes).unwrap());
@@ -633,11 +638,11 @@ fn a_foreign_key_from_a_computed_column_to_a_plain_key_waits_for_the_column() {
                 changes.reverse();
             }
             if !inline {
-                changes.push(Change::AddForeignKey {
+                changes.push(Change::Constraint(ConstraintChange::AddForeignKey {
                     table: name("child"),
                     name: "fk_child".into(),
                     constraint: Box::new(fk),
-                });
+                }));
             }
             changes.push(function("f", FUNCTION));
             let statements = sql(&build(changes).unwrap());
@@ -849,7 +854,7 @@ fn a_key_over_two_computed_columns_follows_both() {
 }
 
 fn function_in(schema: &str, function_name: &str, definition: &str) -> Change {
-    Change::CreateModule {
+    Change::Module(ModuleChange::CreateModule {
         id: ModuleId::Routine(pbps_model::RoutineId::new(
             TableName::new(schema, function_name),
             Vec::new(),
@@ -860,7 +865,7 @@ fn function_in(schema: &str, function_name: &str, definition: &str) -> Change {
             description: None,
             options: Default::default(),
         }),
-    }
+    })
 }
 
 const READS_ID: &str =
@@ -1176,7 +1181,7 @@ fn a_seed_row_for_a_table_with_a_split_computed_column_makes_no_cycle() {
     // Reconstruction never runs a row, but `prepare` settles it first: the
     // seed must follow every column part, a split computed column included,
     // and no part may be ordered after it.
-    let seed = Change::InsertRow {
+    let seed = Change::Row(RowChange::InsertRow {
         table: name("t"),
         key_column: "id".into(),
         identity_key: false,
@@ -1184,7 +1189,7 @@ fn a_seed_row_for_a_table_with_a_split_computed_column_makes_no_cycle() {
         defaults: Default::default(),
         types: Default::default(),
         row: Default::default(),
-    };
+    });
     for functions_first in [false, true] {
         let table = table_with("t", |t| {
             t.columns.get_mut("id").unwrap().nullable = false;

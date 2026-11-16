@@ -591,10 +591,17 @@ pub(super) async fn recheck_extension_creates(
         // the planner's sentences.
         let (mut updates, mut moves) = (BTreeMap::new(), BTreeMap::new());
         for planned in &plan.changes.changes {
-            if let pbps_model::Change::UpdateExtension { name, from, to, .. } = &planned.change {
+            if let pbps_model::Change::Extension(pbps_model::ExtensionChange::UpdateExtension {
+                name,
+                from,
+                to,
+                ..
+            }) = &planned.change
+            {
                 updates.insert(name.raw().to_owned(), (from.clone(), to.clone()));
-            } else if let pbps_model::Change::SetExtensionSchema { name, from, to, .. } =
-                &planned.change
+            } else if let pbps_model::Change::Extension(
+                pbps_model::ExtensionChange::SetExtensionSchema { name, from, to, .. },
+            ) = &planned.change
             {
                 moves.insert(name.raw().to_owned(), (from.clone(), to.clone()));
             }

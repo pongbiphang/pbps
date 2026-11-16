@@ -3,6 +3,10 @@
 
 use super::*;
 use pbps_db::{Conn, Driver};
+use pbps_model::ConstraintChange;
+use pbps_model::GrantChange;
+use pbps_model::ModuleChange;
+use pbps_model::RowChange;
 use pbps_model::resolver::{BoundSurface, Surface, SurfaceResolution};
 use pbps_model::{Change, ChangeSet, Column, Hints, IdsFile, Module, ModuleKind, Schema, Table};
 use std::collections::BTreeMap;
@@ -351,12 +355,15 @@ async fn exercise(target_connection: String, scratch_connection: String, worker:
         .changes
         .changes
         .iter()
-        .position(|p| matches!(&p.change, Change::DropModule { id, .. } if id == &"app.f()".parse().unwrap()))
+        .position(|p| matches!(&p.change, Change::Module(ModuleChange::DropModule { id, .. }) if id == &"app.f()".parse().unwrap()))
         .unwrap();
     assert!(
         replaced.changes.changes[..dropping]
             .iter()
-            .any(|p| matches!(p.change, Change::DropCheck { .. }))
+            .any(|p| matches!(
+                p.change,
+                Change::Constraint(ConstraintChange::DropCheck { .. })
+            ))
     );
     target.execute("BEGIN").await.unwrap();
     execute(&mut target, &replaced.changes).await.unwrap();
@@ -494,13 +501,13 @@ async fn exercise(target_connection: String, scratch_connection: String, worker:
         .changes
         .changes
         .iter()
-        .position(|p| matches!(p.change, Change::InsertRow { .. }))
+        .position(|p| matches!(p.change, Change::Row(RowChange::InsertRow { .. })))
         .unwrap();
     let grant = data
         .changes
         .changes
         .iter()
-        .position(|p| matches!(p.change, Change::Grant { .. }))
+        .position(|p| matches!(p.change, Change::Permission(GrantChange::Grant { .. })))
         .unwrap();
     assert!(
         grant < insert,

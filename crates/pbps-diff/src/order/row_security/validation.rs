@@ -1,5 +1,8 @@
 //! UID-verified policy origins and the explicit created-table RLS contract.
 use super::super::AdmissionError;
+use pbps_model::PartitionChange;
+use pbps_model::PolicyChange;
+use pbps_model::TableChange;
 use pbps_model::{
     Change, ChangeSet, IdsFile, RowSecurityOrigin, TableName, Uid,
     plan_names::{At, Holder, PlanNames},
@@ -20,11 +23,13 @@ pub fn validate(
     if !changes.changes.iter().any(|step| {
         matches!(
             &step.change,
-            Change::DropPolicy { .. } | Change::CreatePolicy { .. } | Change::SetRowSecurity { .. }
-        ) || if let Change::CreateTable { table, .. } = &step.change {
+            Change::Policy(PolicyChange::DropPolicy { .. })
+                | Change::Policy(PolicyChange::CreatePolicy { .. })
+                | Change::Policy(PolicyChange::SetRowSecurity { .. })
+        ) || if let Change::Table(TableChange::CreateTable { table, .. }) = &step.change {
             table.has_row_security()
-        } else if let Change::AttachPartition { shape, .. }
-        | Change::DetachPartition { shape, .. } = &step.change
+        } else if let Change::Partition(PartitionChange::AttachPartition { shape, .. })
+        | Change::Partition(PartitionChange::DetachPartition { shape, .. }) = &step.change
         {
             shape.has_row_security()
         } else {
@@ -35,9 +40,9 @@ pub fn validate(
     }
     let mut created = BTreeMap::new();
     for (at, step) in changes.changes.iter().enumerate() {
-        if let Change::CreateTable {
+        if let Change::Table(TableChange::CreateTable {
             uid, name, table, ..
-        } = &step.change
+        }) = &step.change
         {
             if table.has_row_security() {
                 if dialect.name() != "postgres"
@@ -65,8 +70,9 @@ pub fn validate(
                     name.shown()
                 );
             }
-        } else if let Change::AttachPartition { table, shape, .. }
-        | Change::DetachPartition { table, shape, .. } = &step.change
+        } else if let Change::Partition(PartitionChange::AttachPartition { table, shape, .. })
+        | Change::Partition(PartitionChange::DetachPartition { table, shape, .. }) =
+            &step.change
             && shape.has_row_security()
         {
             bail!(
@@ -116,12 +122,12 @@ pub fn validate(
         Ok((uid, actual))
     };
     for (at, step) in changes.changes.iter().enumerate() {
-        if let Change::CreatePolicy {
+        if let Change::Policy(PolicyChange::CreatePolicy {
             table,
             name,
             policy,
             origin,
-        } = &step.change
+        }) = &step.change
         {
             let (uid, actual) = owner(table, at, Some(*origin))?;
             if actual == RowSecurityOrigin::Created
@@ -152,13 +158,13 @@ pub fn validate(
                     pbps_model::escape::Escaped(name)
                 );
             }
-        } else if let Change::SetRowSecurity {
+        } else if let Change::Policy(PolicyChange::SetRowSecurity {
             uid,
             table,
             from,
             to,
             origin,
-        } = &step.change
+        }) = &step.change
         {
             let (actual, context) = owner(table, at, Some(*origin))?;
             if actual != uid {
@@ -184,11 +190,11 @@ pub fn validate(
             if policies.get(actual).map_or(0, BTreeMap::len) != shape.row_policies.len() {
                 bail!("{}: row-security flags precede its policies", table.shown());
             }
-        } else if let Change::DropPolicy {
+        } else if let Change::Policy(PolicyChange::DropPolicy {
             table,
             name,
             policy,
-        } = &step.change
+        }) = &step.change
         {
             let (_, actual) = owner(table, at, None)?;
             if actual != RowSecurityOrigin::Standing {

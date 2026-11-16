@@ -180,9 +180,12 @@ pub(in crate::engine) async fn refuse_created_name_occupants<S: Clone>(
     let mut detach_releases = std::collections::BTreeMap::new();
     let mut detach_retained = std::collections::BTreeMap::new();
     for change in &cs.changes {
-        if let pbps_model::Change::DetachPartition {
-            uid, parent, names, ..
-        } = &change.change
+        if let pbps_model::Change::Partition(pbps_model::PartitionChange::DetachPartition {
+            uid,
+            parent,
+            names,
+            ..
+        }) = &change.change
         {
             let Some(table) = plan.base.ids.tables.get(uid) else {
                 continue;
@@ -229,15 +232,22 @@ pub(in crate::engine) async fn refuse_created_name_occupants<S: Clone>(
     at_names.extend(
         cs.changes
             .iter()
-            .filter(|p| matches!(p.change, pbps_model::Change::DetachPartition { .. }))
+            .filter(|p| {
+                matches!(
+                    p.change,
+                    pbps_model::Change::Partition(
+                        pbps_model::PartitionChange::DetachPartition { .. }
+                    )
+                )
+            })
             .flat_map(|p| crate::deploy::relation_names_created(&p.change)),
     );
     let mut type_names = asked.clone();
     type_names.extend(cs.changes.iter().flat_map(|p| match &p.change {
-        pbps_model::Change::CreateType { name, .. } => {
+        pbps_model::Change::Type(pbps_model::TypeChange::CreateType { name, .. }) => {
             vec![TableName::new(name.schema(), name.name())]
         }
-        pbps_model::Change::RenameType { from, to, .. } => vec![
+        pbps_model::Change::Type(pbps_model::TypeChange::RenameType { from, to, .. }) => vec![
             TableName::new(to.schema(), to.name()),
             TableName::new(to.schema(), from.name()),
         ],
@@ -328,11 +338,12 @@ pub(in crate::engine) async fn enum_rebuild_dependents(
     declared: Option<&Schema>,
     before: &IdsFile,
 ) -> anyhow::Result<BTreeSet<pbps_model::ModuleId>> {
-    if !changes
-        .changes
-        .iter()
-        .any(|p| matches!(p.change, pbps_model::Change::EnumRebuild { .. }))
-    {
+    if !changes.changes.iter().any(|p| {
+        matches!(
+            p.change,
+            pbps_model::Change::TypeValue(pbps_model::TypeValueChange::EnumRebuild { .. })
+        )
+    }) {
         return Ok(BTreeSet::new());
     }
     let census = pbps_pg::type_rebuild::census(conn, changes, declared, before, false)
@@ -358,7 +369,10 @@ pub(in crate::engine) async fn expand_table_rebuild<
         .changes
         .first()
         .and_then(|p| {
-            if let pbps_model::Change::RebuildPartitionedTable(r) = &p.change {
+            if let pbps_model::Change::Partition(
+                pbps_model::PartitionChange::RebuildPartitionedTable(r),
+            ) = &p.change
+            {
                 Some((r.earlier.len() + 1, r.cap()))
             } else {
                 None
@@ -622,11 +636,11 @@ pub(in crate::engine) async fn logical_slots(
         .changes
         .iter()
         .filter_map(|p| {
-            if let pbps_model::Change::CreateTable {
+            if let pbps_model::Change::Table(pbps_model::TableChange::CreateTable {
                 name,
                 beside_default: Some(default),
                 ..
-            } = &p.change
+            }) = &p.change
             {
                 Some(format!(
                     "{default} into {name}",
@@ -670,12 +684,12 @@ pub(in crate::engine) async fn numbered_column_fills(
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
     let mut fills: Vec<(TableName, pbps_model::ColumnName)> = Vec::new();
     for (i, p) in changes.changes.iter().enumerate() {
-        let pbps_model::Change::AddColumn {
+        let pbps_model::Change::Column(pbps_model::ColumnChange::AddColumn {
             table,
             name,
             column,
             ..
-        } = &p.change
+        }) = &p.change
         else {
             continue;
         };
@@ -724,6 +738,10 @@ pub(in crate::engine) async fn prepare_data_writes(
 ) -> anyhow::Result<DataWriteGuard> {
     use pbps_dialect::{RowOperation, RowWrite};
     use pbps_model::Change;
+    use pbps_model::ConstraintChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::RowChange;
+    use pbps_model::TableChange;
     let mut writes = Vec::new();
     let mut dropped = pbps_pg::data_triggers::Dropped::default();
     // Asked once per row change and updated column: indexed once,
@@ -750,18 +768,19 @@ pub(in crate::engine) async fn prepare_data_writes(
             )
     };
     for planned in &changes.changes {
-        if let Change::DropModule { id, .. } = &planned.change {
+        if let Change::Module(ModuleChange::DropModule { id, .. }) = &planned.change {
             dropped.modules.insert(id.clone());
         }
         // Both are ordered ahead of every row change, so the
         // referential action they carry cannot write when the row
         // statement runs (DECISIONS 451).
-        if let Change::DropForeignKey { table, name } = &planned.change
+        if let Change::Constraint(ConstraintChange::DropForeignKey { table, name }) =
+            &planned.change
             && let Some(old) = stored(table)
         {
             dropped.foreign_keys.insert((old, name.clone()));
         }
-        if let Change::DropTable { name, .. } = &planned.change {
+        if let Change::Table(TableChange::DropTable { name, .. }) = &planned.change {
             dropped
                 .tables
                 .insert(stored(name).unwrap_or_else(|| name.clone()));
@@ -783,12 +802,12 @@ pub(in crate::engine) async fn prepare_data_writes(
                 operation: write.operation,
             });
         }
-        let (table, mut operation) = if let Change::InsertRow {
+        let (table, mut operation) = if let Change::Row(RowChange::InsertRow {
             table,
             key_column,
             row,
             ..
-        } = &planned.change
+        }) = &planned.change
         {
             // The columns the INSERT names: the guard judges the
             // DEFAULT of no other (#2748).
@@ -800,14 +819,14 @@ pub(in crate::engine) async fn prepare_data_writes(
                         .collect(),
                 },
             )
-        } else if let Change::UpdateRow { table, columns, .. } = &planned.change {
+        } else if let Change::Row(RowChange::UpdateRow { table, columns, .. }) = &planned.change {
             (
                 table,
                 RowOperation::Update {
                     columns: columns.keys().cloned().collect(),
                 },
             )
-        } else if let Change::DeleteRow { table, .. } = &planned.change {
+        } else if let Change::Row(RowChange::DeleteRow { table, .. }) = &planned.change {
             (table, RowOperation::Delete)
         } else {
             continue;
@@ -971,11 +990,11 @@ pub(in crate::engine) async fn permission_support(
     let version = pbps_pg::roles::server_version_num(conn).await?;
     let mut roles: BTreeMap<pbps_model::RoleName, pbps_model::Role> = BTreeMap::new();
     for planned in &changes.changes {
-        if let pbps_model::Change::Grant {
+        if let pbps_model::Change::Permission(pbps_model::GrantChange::Grant {
             role,
             target,
             permissions,
-        } = &planned.change
+        }) = &planned.change
         {
             roles
                 .entry(role.clone())
@@ -1016,7 +1035,11 @@ pub(in crate::engine) async fn generation_support(
         .changes
         .iter()
         .filter_map(|p| {
-            if let pbps_model::Change::AlterColumnExpression { column, .. } = &p.change {
+            if let pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnExpression {
+                column,
+                ..
+            }) = &p.change
+            {
                 Some(column)
             } else {
                 None
@@ -1081,17 +1104,21 @@ pub(in crate::engine) fn owned_targets(
         .changes
         .iter()
         .filter_map(|planned| match &planned.change {
-            pbps_model::Change::CreateTable { name, .. } => {
+            pbps_model::Change::Table(pbps_model::TableChange::CreateTable { name, .. }) => {
                 Some(pbps_model::GrantTarget::Object(name.clone()))
             }
-            pbps_model::Change::CreateModule { id, .. } => match id {
-                pbps_model::ModuleId::Routine(r) => {
-                    Some(pbps_model::GrantTarget::Routine(r.clone()))
+            pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule { id, .. }) => {
+                match id {
+                    pbps_model::ModuleId::Routine(r) => {
+                        Some(pbps_model::GrantTarget::Routine(r.clone()))
+                    }
+                    pbps_model::ModuleId::Named(n) => {
+                        Some(pbps_model::GrantTarget::Object(n.clone()))
+                    }
+                    // A trigger is not a securable a grant can name.
+                    pbps_model::ModuleId::Trigger { .. } => None,
                 }
-                pbps_model::ModuleId::Named(n) => Some(pbps_model::GrantTarget::Object(n.clone())),
-                // A trigger is not a securable a grant can name.
-                pbps_model::ModuleId::Trigger { .. } => None,
-            },
+            }
             // Every other change either leaves the target where it was or
             // takes it away, and a grant on something this plan drops is a
             // different finding.
@@ -1111,11 +1138,11 @@ pub(in crate::engine) fn owned_targets(
 
     let mut impossible = Vec::new();
     for planned in &changes.changes {
-        let pbps_model::Change::Grant {
+        let pbps_model::Change::Permission(pbps_model::GrantChange::Grant {
             role,
             target,
             permissions,
-        } = &planned.change
+        }) = &planned.change
         else {
             continue;
         };
@@ -1125,12 +1152,19 @@ pub(in crate::engine) fn owned_targets(
         let sequence_created = if let pbps_model::GrantTarget::Sequence(c) = target {
             created.contains(&pbps_model::GrantTarget::Object(c.table.clone()))
                 || changes.changes.iter().any(|p| {
-                    if let pbps_model::Change::AddColumn { table, name, .. } = &p.change {
+                    if let pbps_model::Change::Column(pbps_model::ColumnChange::AddColumn {
+                        table,
+                        name,
+                        ..
+                    }) = &p.change
+                    {
                         return table == &c.table && name == &c.name;
                     }
-                    if let pbps_model::Change::AlterColumnNumbering {
-                        column, from, to, ..
-                    } = &p.change
+                    if let pbps_model::Change::Column(
+                        pbps_model::ColumnChange::AlterColumnNumbering {
+                            column, from, to, ..
+                        },
+                    ) = &p.change
                     {
                         return column == c
                             && !matches!(from, pbps_model::ValueSource::Sequence(_))
@@ -1208,11 +1242,11 @@ pub(in crate::engine) fn unrevocable_grants(
 
     let mut impossible = Vec::new();
     for planned in &changes.changes {
-        let pbps_model::Change::Revoke {
+        let pbps_model::Change::Permission(pbps_model::GrantChange::Revoke {
             role,
             target,
             permissions,
-        } = &planned.change
+        }) = &planned.change
         else {
             continue;
         };
@@ -1638,11 +1672,14 @@ impl PlanSession for pbps_pg::Postgres {
         role_members: Option<&RoleMembers>,
         again: &dyn Fn(&BTreeSet<pbps_model::ModuleId>) -> anyhow::Result<PlanningPlan<S>>,
     ) -> anyhow::Result<(PlanningPlan<S::Output>, ConnectedCheck)> {
-        if changes
-            .changes
-            .iter()
-            .any(|p| matches!(p.change, pbps_model::Change::RebuildPartitionedTable(_)))
-        {
+        if changes.changes.iter().any(|p| {
+            matches!(
+                p.change,
+                pbps_model::Change::Partition(
+                    pbps_model::PartitionChange::RebuildPartitionedTable(_)
+                )
+            )
+        }) {
             let (changes, check, verification) = expand_table_rebuild(
                 conn,
                 &state.admission,

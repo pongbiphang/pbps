@@ -1,4 +1,12 @@
 use super::super::{Settled, refuse_unplanned_movement};
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::PartitionChange;
+use pbps_model::PolicyChange;
+use pbps_model::TableChange;
+use pbps_model::TablePropertyChange;
+use pbps_model::TypeValueChange;
 use pbps_model::{
     Change, ChangeSet, CheckConstraint, Column, PlannedChange, ReplicaIdentity, Schema, Table,
     TableName,
@@ -39,19 +47,19 @@ fn row_security_is_exact_when_kept_and_structural_when_created() {
     let mut baseline = declared.clone();
     baseline.columns["id"].value_source = pbps_model::ValueSource::Default("7".into());
     let before = schema(baseline);
-    let kept = plan(vec![Change::AlterColumnDefault {
+    let kept = plan(vec![Change::Column(ColumnChange::AlterColumnDefault {
         uid: "c_117200".parse().unwrap(),
         column: TableName::new("app", "t").column("id"),
         from: Some("7".into()),
         to: None,
-    }]);
-    let create = plan(vec![Change::CreateTable {
+    })]);
+    let create = plan(vec![Change::Table(TableChange::CreateTable {
         uid: "t_117200".parse().unwrap(),
         name: TableName::new("app", "t"),
         table: Box::new(declared.clone()),
         beside_default: None,
         moves_at_most: None,
-    }]);
+    })]);
     for read in [Settled::SoFar, Settled::Whole, Settled::Closing] {
         for (baseline, changes) in [
             (&before, kept.clone()),
@@ -115,12 +123,14 @@ fn partition(default: Option<&str>, not_null: bool) -> Table {
 #[test]
 fn a_partition_keeps_untouched_default_text_at_every_read() {
     let name = TableName::new("app", "t");
-    let changes = plan(vec![Change::SetPartitionNotNull {
-        uid: "t_000001".parse().unwrap(),
-        table: name,
-        column: "v".into(),
-        not_null: true,
-    }]);
+    let changes = plan(vec![Change::Partition(
+        PartitionChange::SetPartitionNotNull {
+            uid: "t_000001".parse().unwrap(),
+            table: name,
+            column: "v".into(),
+            not_null: true,
+        },
+    )]);
     let before = schema(partition(Some("'kept'::text"), false));
     let kept = schema(partition(Some("'kept'::text"), true));
     let rewritten = schema(partition(Some("'changed'::text"), true));
@@ -155,13 +165,13 @@ fn a_created_partition_keeps_its_place_from_the_first_read() {
     let name = TableName::new("app", "t");
     let mut declared = partition(None, false);
     declared.partition_of.as_mut().unwrap().columns.clear();
-    let changes = plan(vec![Change::CreateTable {
+    let changes = plan(vec![Change::Table(TableChange::CreateTable {
         uid: "t_000001".parse().unwrap(),
         name,
         table: Box::new(declared.clone()),
         beside_default: None,
         moves_at_most: None,
-    }]);
+    })]);
     let before = Schema::default();
     let correct = schema(declared.clone());
     for read in [Settled::SoFar, Settled::Whole, Settled::Closing] {
@@ -230,7 +240,7 @@ fn a_partition_default_follows_the_last_parent_or_own_setting() {
         schema.tables.insert(parent.clone(), parent_table);
         schema
     };
-    let own = Change::SetPartitionDefault {
+    let own = Change::Partition(PartitionChange::SetPartitionDefault {
         uid: "t_000001".parse().unwrap(),
         table: name.clone(),
         parent: parent.clone(),
@@ -238,13 +248,13 @@ fn a_partition_default_follows_the_last_parent_or_own_setting() {
         from: Some("'kept'".into()),
         to: Some("'changed'".into()),
         fallback: None,
-    };
-    let inherited = Change::AlterColumnDefault {
+    });
+    let inherited = Change::Column(ColumnChange::AlterColumnDefault {
         uid: "c_000001".parse().unwrap(),
         column: pbps_model::ColumnRef::new(parent.clone(), "v"),
         from: Some("'parent'".into()),
         to: Some("'new parent'".into()),
-    };
+    });
     let before = reading("'parent'::text", Some("'kept'::text"));
     for own_is_last in [false, true] {
         let changes = plan(if own_is_last {
@@ -341,17 +351,17 @@ fn a_parent_drop_keeps_the_other_own_entries_across_a_table_rename() {
         };
         let mut changes = Vec::new();
         if renamed {
-            changes.push(Change::RenameTable {
+            changes.push(Change::Table(TableChange::RenameTable {
                 uid: "t_000010".parse().unwrap(),
                 from: parent.clone(),
                 to: target.clone(),
                 defaults: Vec::new(),
-            });
+            }));
         }
-        changes.push(Change::DropColumn {
+        changes.push(Change::Column(ColumnChange::DropColumn {
             uid: "c_000001".parse().unwrap(),
             column: pbps_model::ColumnRef::new(target.clone(), "v"),
-        });
+        }));
         let changes = plan(changes);
         let mut after = before.clone();
         let mut parent_table = after.tables.remove(&parent).unwrap();
@@ -421,11 +431,11 @@ fn touching_a_table_keeps_each_scalar_at_every_read() {
     let check = CheckConstraint {
         expression: "id > 0".into(),
     };
-    let changes = plan(vec![Change::AddCheck {
+    let changes = plan(vec![Change::Constraint(ConstraintChange::AddCheck {
         table: name.clone(),
         name: "ck".into(),
         constraint: check.clone(),
-    }]);
+    })]);
     let mut after = table();
     after.checks.insert("ck".into(), check);
     for field in 0..6 {
@@ -517,22 +527,22 @@ fn planned_table_scalars_keep_their_existing_checkpoint_policies() {
     let name = TableName::new("app", "t");
     let uid = "t_000000".parse::<pbps_model::Uid>().unwrap();
     let settings = [
-        Change::SetReplicaIdentity {
+        Change::TableProperty(TablePropertyChange::SetReplicaIdentity {
             uid: uid.clone(),
             table: name.clone(),
             to: Some(ReplicaIdentity::Full),
-        },
-        Change::SetStorageParameters {
+        }),
+        Change::TableProperty(TablePropertyChange::SetStorageParameters {
             uid: uid.clone(),
             table: name.clone(),
             set: [("fillfactor".into(), "80".into())].into(),
             reset: Default::default(),
-        },
-        Change::SetTablePersistence {
+        }),
+        Change::TableProperty(TablePropertyChange::SetTablePersistence {
             uid,
             table: name,
             unlogged: true,
-        },
+        }),
     ];
     for (field, change) in settings.into_iter().enumerate() {
         let mut planned = table();
@@ -586,11 +596,13 @@ fn planned_table_scalars_keep_their_existing_checkpoint_policies() {
 
 #[test]
 fn a_planned_default_replica_identity_is_not_an_absent_setting() {
-    let changes = plan(vec![Change::SetReplicaIdentity {
-        uid: "t_000000".parse().unwrap(),
-        table: TableName::new("app", "t"),
-        to: None,
-    }]);
+    let changes = plan(vec![Change::TableProperty(
+        TablePropertyChange::SetReplicaIdentity {
+            uid: "t_000000".parse().unwrap(),
+            table: TableName::new("app", "t"),
+            to: None,
+        },
+    )]);
     let mut before = table();
     before.replica_identity = Some(ReplicaIdentity::Full);
     for read in [Settled::SoFar, Settled::Whole, Settled::Closing] {
@@ -623,50 +635,50 @@ fn scalar_settings_follow_their_uid_when_a_table_name_changes_hands() {
     let ua = "t_000000".parse::<pbps_model::Uid>().unwrap();
     let ub = "t_000001".parse::<pbps_model::Uid>().unwrap();
     let changes = plan(vec![
-        Change::SetReplicaIdentity {
+        Change::TableProperty(TablePropertyChange::SetReplicaIdentity {
             uid: ua.clone(),
             table: a.clone(),
             to: Some(ReplicaIdentity::Full),
-        },
-        Change::SetReplicaIdentity {
+        }),
+        Change::TableProperty(TablePropertyChange::SetReplicaIdentity {
             uid: ub.clone(),
             table: b.clone(),
             to: Some(ReplicaIdentity::Nothing),
-        },
-        Change::RenameTable {
+        }),
+        Change::Table(TableChange::RenameTable {
             uid: ub.clone(),
             from: b.clone(),
             to: c.clone(),
             defaults: Vec::new(),
-        },
-        Change::RenameTable {
+        }),
+        Change::Table(TableChange::RenameTable {
             uid: ua.clone(),
             from: a.clone(),
             to: b.clone(),
             defaults: Vec::new(),
-        },
-        Change::SetStorageParameters {
+        }),
+        Change::TableProperty(TablePropertyChange::SetStorageParameters {
             uid: ua.clone(),
             table: b.clone(),
             set: [("fillfactor".into(), "80".into())].into(),
             reset: Default::default(),
-        },
-        Change::SetStorageParameters {
+        }),
+        Change::TableProperty(TablePropertyChange::SetStorageParameters {
             uid: ub.clone(),
             table: c.clone(),
             set: [("fillfactor".into(), "90".into())].into(),
             reset: Default::default(),
-        },
-        Change::SetTablePersistence {
+        }),
+        Change::TableProperty(TablePropertyChange::SetTablePersistence {
             uid: ua,
             table: b.clone(),
             unlogged: true,
-        },
-        Change::SetTablePersistence {
+        }),
+        Change::TableProperty(TablePropertyChange::SetTablePersistence {
             uid: ub,
             table: c.clone(),
             unlogged: false,
-        },
+        }),
     ]);
     let before = Schema {
         tables: [(a, table()), (b.clone(), table())].into(),
@@ -733,18 +745,22 @@ fn column_requirements_follow_one_uid_through_intermediate_spellings() {
     use pbps_model::{IdsFile, ValueSource};
     let name = TableName::new("app", "t");
     let uid: pbps_model::Uid = "c_000001".parse().unwrap();
-    let rename = |from: &str, to: &str| Change::RenameColumn {
-        uid: uid.clone(),
-        table: name.clone(),
-        from: from.into(),
-        to: to.into(),
-        table_was: None,
+    let rename = |from: &str, to: &str| {
+        Change::Column(ColumnChange::RenameColumn {
+            uid: uid.clone(),
+            table: name.clone(),
+            from: from.into(),
+            to: to.into(),
+            table_was: None,
+        })
     };
-    let default = |column: &str, from: Option<&str>, to: Option<&str>| Change::AlterColumnDefault {
-        uid: uid.clone(),
-        column: name.column(column),
-        from: from.map(str::to_owned),
-        to: to.map(str::to_owned),
+    let default = |column: &str, from: Option<&str>, to: Option<&str>| {
+        Change::Column(ColumnChange::AlterColumnDefault {
+            uid: uid.clone(),
+            column: name.column(column),
+            from: from.map(str::to_owned),
+            to: to.map(str::to_owned),
+        })
     };
     let changes = plan(vec![
         default("id", Some("1"), None),
@@ -835,16 +851,16 @@ fn a_column_drop_before_its_parent_rename_reaches_only_its_own_partition_entry()
         .insert("v".into(), Column::new("text".parse().unwrap()));
     before.tables.insert(parent.clone(), parent_table);
     let changes = plan(vec![
-        Change::DropColumn {
+        Change::Column(ColumnChange::DropColumn {
             uid: "c_000001".parse().unwrap(),
             column: parent.column("v"),
-        },
-        Change::RenameTable {
+        }),
+        Change::Table(TableChange::RenameTable {
             uid: "t_000001".parse().unwrap(),
             from: parent.clone(),
             to: renamed.clone(),
             defaults: Vec::new(),
-        },
+        }),
     ]);
     let ids = super::fixture_ids(&changes, &before);
     let mut after = before.clone();
@@ -975,13 +991,13 @@ fn a_rename_keeps_every_observed_column_field_across_the_move_and_at_close() {
         cases.push((field, was, now));
     }
     let name = TableName::new("app", "t");
-    let changes = plan(vec![Change::RenameColumn {
+    let changes = plan(vec![Change::Column(ColumnChange::RenameColumn {
         uid: "c_000001".parse().unwrap(),
         table: name.clone(),
         from: "id".into(),
         to: "renamed".into(),
         table_was: None,
-    }]);
+    })]);
     let mut ids = pbps_model::IdsFile::default();
     ids.tables.insert("t_000001".parse().unwrap(), name.clone());
     ids.columns
@@ -1027,11 +1043,13 @@ fn column_diagnostics_keep_the_observation_order() {
             .collect(),
         ..Default::default()
     });
-    let changes = plan(vec![Change::SetTablePersistence {
-        uid: "t_000001".parse().unwrap(),
-        table: name.clone(),
-        unlogged: true,
-    }]);
+    let changes = plan(vec![Change::TableProperty(
+        TablePropertyChange::SetTablePersistence {
+            uid: "t_000001".parse().unwrap(),
+            table: name.clone(),
+            unlogged: true,
+        },
+    )]);
     let mut after = before.clone();
     let t = after.tables.get_mut(&name).unwrap();
     t.unlogged = true;
@@ -1079,23 +1097,23 @@ fn a_retired_columns_promise_cannot_answer_for_the_next_holder_of_its_name() {
     }
     let before = schema(t);
     let changes = plan(vec![
-        Change::AlterColumnDefault {
+        Change::Column(ColumnChange::AlterColumnDefault {
             uid: "c_000001".parse().unwrap(),
             column: name.column("a"),
             from: Some("1".into()),
             to: None,
-        },
-        Change::DropColumn {
+        }),
+        Change::Column(ColumnChange::DropColumn {
             uid: "c_000001".parse().unwrap(),
             column: name.column("a"),
-        },
-        Change::RenameColumn {
+        }),
+        Change::Column(ColumnChange::RenameColumn {
             uid: "c_000002".parse().unwrap(),
             table: name.clone(),
             from: "b".into(),
             to: "a".into(),
             table_was: None,
-        },
+        }),
     ]);
     let mut ids = pbps_model::IdsFile::default();
     ids.tables.insert("t_000001".parse().unwrap(), name.clone());
@@ -1197,31 +1215,31 @@ fn retired_parent_columns_remove_their_original_own_entries() {
         let mut from = "a";
         let mut changes = Vec::new();
         for to in spellings {
-            changes.push(Change::RenameColumn {
+            changes.push(Change::Column(ColumnChange::RenameColumn {
                 uid: "c_000001".parse().unwrap(),
                 table_was: None,
                 table: parent.clone(),
                 from: from.into(),
                 to: to.into(),
-            });
+            }));
             from = to;
         }
         let final_parent = if move_parent {
             let moved = TableName::new("app", "history");
-            changes.push(Change::RenameTable {
+            changes.push(Change::Table(TableChange::RenameTable {
                 uid: "t_000002".parse().unwrap(),
                 from: parent.clone(),
                 to: moved.clone(),
                 defaults: Vec::new(),
-            });
+            }));
             moved
         } else {
             parent.clone()
         };
-        changes.push(Change::DropColumn {
+        changes.push(Change::Column(ColumnChange::DropColumn {
             uid: "c_000001".parse().unwrap(),
             column: final_parent.column(from),
-        });
+        }));
         let changes = plan(changes);
         let mut after = before.clone();
         let mut parent_table = after.tables.remove(&parent).unwrap();
@@ -1292,35 +1310,35 @@ fn retired_parent_fields_do_not_change_the_next_columns_own_entries() {
     let child = TableName::new("app", "t");
     let before = parent_with_distinct_own_columns();
     let fields = [
-        Change::AlterColumnDefault {
+        Change::Column(ColumnChange::AlterColumnDefault {
             uid: "c_000001".parse().unwrap(),
             column: parent.column("a"),
             from: Some("1".into()),
             to: None,
-        },
-        Change::AlterColumnNullability {
+        }),
+        Change::Column(ColumnChange::AlterColumnNullability {
             uid: "c_000001".parse().unwrap(),
             column: parent.column("a"),
             ty: "integer".parse().unwrap(),
             to_nullable: false,
             collation: None,
             through_external_partitions: false,
-        },
+        }),
     ];
     for field in fields {
         let changes = plan(vec![
             field,
-            Change::DropColumn {
+            Change::Column(ColumnChange::DropColumn {
                 uid: "c_000001".parse().unwrap(),
                 column: parent.column("a"),
-            },
-            Change::RenameColumn {
+            }),
+            Change::Column(ColumnChange::RenameColumn {
                 uid: "c_000002".parse().unwrap(),
                 table_was: None,
                 table: parent.clone(),
                 from: "b".into(),
                 to: "a".into(),
-            },
+            }),
         ]);
         let mut after = before.clone();
         let p = after.tables.get_mut(&parent).unwrap();
@@ -1389,19 +1407,19 @@ fn own_field_requirements_follow_the_column_through_a_name_swap() {
     let before = parent_with_distinct_own_columns();
     let fields = [
         (
-            Change::AlterColumnDefault {
+            Change::Column(ColumnChange::AlterColumnDefault {
                 uid: "c_000002".parse().unwrap(),
                 column: parent.column("b"),
                 from: Some("2".into()),
                 to: None,
-            },
+            }),
             None,
             true,
             None,
             true,
         ),
         (
-            Change::SetPartitionDefault {
+            Change::Partition(PartitionChange::SetPartitionDefault {
                 uid: "t_000001".parse().unwrap(),
                 table: child.clone(),
                 parent: parent.clone(),
@@ -1409,45 +1427,47 @@ fn own_field_requirements_follow_the_column_through_a_name_swap() {
                 from: Some("3".into()),
                 to: None,
                 fallback: Some("2".into()),
-            },
+            }),
             Some("2"),
             true,
             None,
             true,
         ),
         (
-            Change::AlterColumnNullability {
+            Change::Column(ColumnChange::AlterColumnNullability {
                 uid: "c_000002".parse().unwrap(),
                 column: parent.column("b"),
                 ty: "integer".parse().unwrap(),
                 to_nullable: false,
                 collation: None,
                 through_external_partitions: false,
-            },
+            }),
             Some("2"),
             false,
             Some("3"),
             false,
         ),
         (
-            Change::SetPartitionNotNull {
+            Change::Partition(PartitionChange::SetPartitionNotNull {
                 uid: "t_000001".parse().unwrap(),
                 table: child.clone(),
                 column: "b".into(),
                 not_null: false,
-            },
+            }),
             Some("2"),
             true,
             Some("3"),
             false,
         ),
     ];
-    let rename = |uid: &str, from: &str, to: &str| Change::RenameColumn {
-        uid: uid.parse().unwrap(),
-        table: parent.clone(),
-        from: from.into(),
-        to: to.into(),
-        table_was: None,
+    let rename = |uid: &str, from: &str, to: &str| {
+        Change::Column(ColumnChange::RenameColumn {
+            uid: uid.parse().unwrap(),
+            table: parent.clone(),
+            from: from.into(),
+            to: to.into(),
+            table_was: None,
+        })
     };
     for (field, parent_default, parent_nullable, own_default, own_not_null) in fields {
         let changes = plan(vec![
@@ -1542,25 +1562,25 @@ fn a_same_named_new_column_does_not_inherit_the_retired_definition() {
             t.columns.insert("value".into(), old.clone());
             let before = schema(t);
             let mut changes = vec![
-                Change::DropColumn {
+                Change::Column(ColumnChange::DropColumn {
                     uid: "c_000001".parse().unwrap(),
                     column: name.column("value"),
-                },
-                Change::AddColumn {
+                }),
+                Change::Column(ColumnChange::AddColumn {
                     uid: "c_000002".parse().unwrap(),
                     table: name.clone(),
                     name: "value".into(),
                     column: Box::new(replacement.clone()),
-                },
+                }),
             ];
             let final_name = if move_table {
                 let to = TableName::new("app", "moved");
-                changes.push(Change::RenameTable {
+                changes.push(Change::Table(TableChange::RenameTable {
                     uid: "t_000001".parse().unwrap(),
                     from: name.clone(),
                     to: to.clone(),
                     defaults: Vec::new(),
-                });
+                }));
                 to
             } else {
                 name.clone()
@@ -1646,21 +1666,21 @@ fn retired_part_requirements_do_not_follow_a_reused_table_name() {
         ..Default::default()
     };
     let changes = plan(vec![
-        Change::DropCheck {
+        Change::Constraint(ConstraintChange::DropCheck {
             table: a.clone(),
             name: "ck".into(),
-        },
-        Change::DropTable {
+        }),
+        Change::Table(TableChange::DropTable {
             uid: "t_000001".parse().unwrap(),
             name: a.clone(),
             detach_from: None,
-        },
-        Change::RenameTable {
+        }),
+        Change::Table(TableChange::RenameTable {
             uid: "t_000002".parse().unwrap(),
             from: b,
             to: a.clone(),
             defaults: vec![],
-        },
+        }),
     ]);
     let mut after = Schema {
         tables: [(a.clone(), t)].into(),
@@ -1718,27 +1738,31 @@ fn index_settings_fold_in_execution_order_and_follow_the_surviving_table() {
         storage_parameters: [("fillfactor".into(), fillfactor.into())].into(),
         filegroup: None,
     };
-    let setting = |name: &TableName, value: Option<&str>| Change::SetIndexStorageParameters {
-        table: name.clone(),
-        target: IndexPart::Index("ix".into()),
-        method: Default::default(),
-        set: value
-            .map(|v| [("fillfactor".into(), v.into())].into())
-            .unwrap_or_default(),
-        reset: if value.is_none() {
-            ["fillfactor".into()].into()
-        } else {
-            Default::default()
-        },
+    let setting = |name: &TableName, value: Option<&str>| {
+        Change::Index(IndexChange::SetIndexStorageParameters {
+            table: name.clone(),
+            target: IndexPart::Index("ix".into()),
+            method: Default::default(),
+            set: value
+                .map(|v| [("fillfactor".into(), v.into())].into())
+                .unwrap_or_default(),
+            reset: if value.is_none() {
+                ["fillfactor".into()].into()
+            } else {
+                Default::default()
+            },
+        })
     };
     let mut t = table();
     t.indexes.insert("ix".into(), index("70"));
     let before = schema(t.clone());
-    let renamed = || Change::RenameTable {
-        uid: "t_000001".parse().unwrap(),
-        from: from.clone(),
-        to: to.clone(),
-        defaults: vec![],
+    let renamed = || {
+        Change::Table(TableChange::RenameTable {
+            uid: "t_000001".parse().unwrap(),
+            from: from.clone(),
+            to: to.clone(),
+            defaults: vec![],
+        })
     };
     for changes in [
         plan(vec![setting(&from, Some("80")), renamed()]),
@@ -1749,29 +1773,29 @@ fn index_settings_fold_in_execution_order_and_follow_the_surviving_table() {
         ]),
         plan(vec![
             setting(&from, Some("90")),
-            Change::DropIndex {
+            Change::Index(IndexChange::DropIndex {
                 table: from.clone(),
                 name: "ix".into(),
-            },
+            }),
             renamed(),
-            Change::AddIndex {
+            Change::Index(IndexChange::AddIndex {
                 table: to.clone(),
                 name: "ix".into(),
                 index: Box::new(index("80")),
                 clustered: false,
-            },
+            }),
         ]),
         plan(vec![
-            Change::DropIndex {
+            Change::Index(IndexChange::DropIndex {
                 table: from.clone(),
                 name: "ix".into(),
-            },
-            Change::AddIndex {
+            }),
+            Change::Index(IndexChange::AddIndex {
                 table: from.clone(),
                 name: "ix".into(),
                 index: Box::new(index("90")),
                 clustered: false,
-            },
+            }),
             setting(&from, Some("80")),
             renamed(),
         ]),
@@ -1861,33 +1885,33 @@ fn a_created_tables_parts_use_the_final_definition_and_settings() {
         if carried {
             declared.indexes.insert("ix".into(), index("70", false));
         }
-        let mut steps = vec![Change::CreateTable {
+        let mut steps = vec![Change::Table(TableChange::CreateTable {
             uid: "t_000001".parse().unwrap(),
             name: name.clone(),
             table: Box::new(declared),
             beside_default: None,
             moves_at_most: None,
-        }];
+        })];
         if carried {
-            steps.push(Change::DropIndex {
+            steps.push(Change::Index(IndexChange::DropIndex {
                 table: name.clone(),
                 name: "ix".into(),
-            });
+            }));
         }
         steps.extend([
-            Change::AddIndex {
+            Change::Index(IndexChange::AddIndex {
                 table: name.clone(),
                 name: "ix".into(),
                 index: Box::new(index("80", true)),
                 clustered: false,
-            },
-            Change::SetIndexStorageParameters {
+            }),
+            Change::Index(IndexChange::SetIndexStorageParameters {
                 table: name.clone(),
                 target: IndexPart::Index("ix".into()),
                 method: Default::default(),
                 set: [("fillfactor".into(), "90".into())].into(),
                 reset: Default::default(),
-            },
+            }),
         ]);
         let changes = plan(steps);
         let mut finished = table();
@@ -1938,13 +1962,13 @@ fn a_created_heap_still_requires_exact_primary_key_presence() {
     for present in [false, true] {
         let mut declared = heap.clone();
         declared.primary_key = present.then(|| key.clone());
-        let changes = plan(vec![Change::CreateTable {
+        let changes = plan(vec![Change::Table(TableChange::CreateTable {
             uid: "t_000001".parse().unwrap(),
             name: name.clone(),
             table: Box::new(declared.clone()),
             beside_default: None,
             moves_at_most: None,
-        }]);
+        })]);
         for read in [Settled::Whole, Settled::Closing] {
             refuse_unplanned_movement(
                 &pbps_mssql::Mssql,
@@ -2021,13 +2045,13 @@ fn a_created_tables_key_unique_and_index_are_held_to_their_filegroup() {
         );
         t
     };
-    let changes = plan(vec![Change::CreateTable {
+    let changes = plan(vec![Change::Table(TableChange::CreateTable {
         uid: "t_000001".parse().unwrap(),
         name: name.clone(),
         table: Box::new(declared(Some("fgx"))),
         beside_default: None,
         moves_at_most: None,
-    }]);
+    })]);
     let check = |read: Table| {
         refuse_unplanned_movement(
             &pbps_mssql::Mssql,
@@ -2082,17 +2106,17 @@ fn a_rename_into_a_retired_name_carries_untouched_references() {
         ..Default::default()
     };
     let changes = plan(vec![
-        Change::DropTable {
+        Change::Table(TableChange::DropTable {
             uid: "t_000001".parse().unwrap(),
             name: a.clone(),
             detach_from: None,
-        },
-        Change::RenameTable {
+        }),
+        Change::Table(TableChange::RenameTable {
             uid: "t_000002".parse().unwrap(),
             from: b,
             to: a.clone(),
             defaults: vec![],
-        },
+        }),
     ]);
     referencing
         .foreign_keys
@@ -2144,18 +2168,18 @@ fn a_refilled_rename_source_keeps_the_moved_tables_incoming_reference() {
         ..Default::default()
     };
     let changes = plan(vec![
-        Change::RenameTable {
+        Change::Table(TableChange::RenameTable {
             uid: "t_000002".parse().unwrap(),
             from: b.clone(),
             to: c.clone(),
             defaults: vec![],
-        },
-        Change::RenameTable {
+        }),
+        Change::Table(TableChange::RenameTable {
             uid: "t_000001".parse().unwrap(),
             from: a,
             to: b.clone(),
             defaults: vec![],
-        },
+        }),
     ]);
     referencing
         .foreign_keys
@@ -2228,12 +2252,12 @@ fn closing_reads_keep_untouched_references_after_the_parent_has_moved() {
         tables: [(to.clone(), parent), (child.clone(), referencing)].into(),
         ..Default::default()
     };
-    let changes = plan(vec![Change::RenameTable {
+    let changes = plan(vec![Change::Table(TableChange::RenameTable {
         uid: "t_000001".parse().unwrap(),
         from,
         to,
         defaults: vec![],
-    }]);
+    })]);
     for dialect in [
         &pbps_pg::Postgres::new() as &dyn pbps_dialect::Dialect,
         &pbps_mssql::Mssql,
@@ -2278,12 +2302,14 @@ fn incoming_references_follow_column_identity_through_a_name_swap() {
         .into(),
         ..Default::default()
     };
-    let rename = |uid: &str, from: &str, to: &str| Change::RenameColumn {
-        uid: uid.parse().unwrap(),
-        table: name.clone(),
-        from: from.into(),
-        to: to.into(),
-        table_was: None,
+    let rename = |uid: &str, from: &str, to: &str| {
+        Change::Column(ColumnChange::RenameColumn {
+            uid: uid.parse().unwrap(),
+            table: name.clone(),
+            from: from.into(),
+            to: to.into(),
+            table_was: None,
+        })
     };
     let changes = plan(vec![
         rename("c_000001", "id", "temporary"),
@@ -2367,22 +2393,22 @@ fn a_new_clustered_part_cannot_leave_the_table_as_a_heap() {
     with_index.clustered = Some(Clustered::Index("ix".into()));
     for (change, expected, part) in [
         (
-            Change::AddUnique {
+            Change::Constraint(ConstraintChange::AddUnique {
                 table: name.clone(),
                 name: "uq".into(),
                 constraint: unique,
                 clustered: true,
-            },
+            }),
             with_unique,
             "unique `uq`",
         ),
         (
-            Change::AddIndex {
+            Change::Index(IndexChange::AddIndex {
                 table: name,
                 name: "ix".into(),
                 index: Box::new(index),
                 clustered: true,
-            },
+            }),
             with_index,
             "index `ix`",
         ),
@@ -2422,11 +2448,11 @@ fn computed_builds_require_persistence_and_declared_not_null() {
             persisted,
             not_null,
         };
-        let changes = plan(vec![Change::AddComputedColumn {
+        let changes = plan(vec![Change::Column(ColumnChange::AddComputedColumn {
             table: TableName::new("app", "t"),
             name: "doubled".into(),
             computed: declared.clone(),
-        }]);
+        })]);
         let mut expected = table();
         let mut observed = declared.clone();
         observed.expression = "([id]*(2))".into();
@@ -2474,11 +2500,11 @@ fn computed_builds_require_persistence_and_declared_not_null() {
 
 #[test]
 fn a_completed_drop_requires_the_table_to_be_absent() {
-    let changes = plan(vec![Change::DropTable {
+    let changes = plan(vec![Change::Table(TableChange::DropTable {
         uid: "t_000001".parse().unwrap(),
         name: TableName::new("app", "t"),
         detach_from: None,
-    }]);
+    })]);
     let before = schema(table());
     for dialect in [
         &pbps_pg::Postgres::new() as &dyn pbps_dialect::Dialect,
@@ -2513,25 +2539,25 @@ fn a_created_prefix_accepts_its_added_columns_and_rejects_unplanned_names_or_fie
         .columns
         .insert("z".into(), Column::new("integer".parse().unwrap()));
     let changes = plan(vec![
-        Change::CreateTable {
+        Change::Table(TableChange::CreateTable {
             uid: "t_015030".parse().unwrap(),
             name: name.clone(),
             table: Box::new(prefix),
             beside_default: None,
             moves_at_most: None,
-        },
-        Change::AddColumn {
+        }),
+        Change::Column(ColumnChange::AddColumn {
             uid: "c_015031".parse().unwrap(),
             table: name.clone(),
             name: "g".into(),
             column: Box::new(generated),
-        },
-        Change::AddColumn {
+        }),
+        Change::Column(ColumnChange::AddColumn {
             uid: "c_015032".parse().unwrap(),
             table: name,
             name: "z".into(),
             column: Box::new(Column::new("integer".parse().unwrap())),
-        },
+        }),
     ]);
     let check = |table: Table| {
         refuse_unplanned_movement(
@@ -2595,29 +2621,29 @@ fn row_security_standing_guard_owns_only_touched_policy_fields_and_exact_target_
         forced: true,
     };
     let changes = plan(vec![
-        Change::DropPolicy {
+        Change::Policy(PolicyChange::DropPolicy {
             table: name.clone(),
             name: "gone".into(),
             policy: old.clone(),
-        },
-        Change::DropPolicy {
+        }),
+        Change::Policy(PolicyChange::DropPolicy {
             table: name.clone(),
             name: "p".into(),
             policy: old,
-        },
-        Change::CreatePolicy {
+        }),
+        Change::Policy(PolicyChange::CreatePolicy {
             table: name.clone(),
             name: "p".into(),
             policy: target.clone(),
             origin: RowSecurityOrigin::Standing,
-        },
-        Change::SetRowSecurity {
+        }),
+        Change::Policy(PolicyChange::SetRowSecurity {
             uid: "t_117306".parse().unwrap(),
             table: name,
             from: Default::default(),
             to: flags,
             origin: RowSecurityOrigin::Standing,
-        },
+        }),
     ]);
     let before = schema(baseline.clone());
     let mut final_table = baseline.clone();
@@ -2675,7 +2701,8 @@ fn row_security_standing_guard_owns_only_touched_policy_fields_and_exact_target_
         p.using = using.then(|| "id > 1".into());
         p.with_check = with_check.then(|| "id > 2".into());
         let mut cs = changes.clone();
-        let Change::CreatePolicy { policy, .. } = &mut cs.changes[2].change else {
+        let Change::Policy(PolicyChange::CreatePolicy { policy, .. }) = &mut cs.changes[2].change
+        else {
             unreachable!()
         };
         *policy = p.clone();
@@ -2708,7 +2735,7 @@ fn a_rebuilds_moved_column_is_held_to_its_final_type_at_the_closing_read() {
             .insert(column.into(), Column::new("app.mood".parse().unwrap()));
     }
     let before = schema(t);
-    let changes = plan(vec![Change::EnumRebuild {
+    let changes = plan(vec![Change::TypeValue(TypeValueChange::EnumRebuild {
         uid: "y_000001".parse().unwrap(),
         name: "app.mood".parse().unwrap(),
         tmp: "app.pbps_rebuild_y_000001".parse().unwrap(),
@@ -2719,7 +2746,7 @@ fn a_rebuilds_moved_column_is_held_to_its_final_type_at_the_closing_read() {
             array: false,
             values: Box::new(pbps_model::ValueChange::Relabel { removed: vec![] }),
         },
-    }]);
+    })]);
     let mut ids = pbps_model::IdsFile::default();
     ids.tables.insert("t_000001".parse().unwrap(), name.clone());
     ids.columns
@@ -2765,22 +2792,22 @@ fn a_comment_is_kept_unless_the_plan_sets_it_and_then_held_to_the_text_it_sets()
     let sets = |table: Option<&str>, column: Option<&str>| {
         let mut changes = Vec::new();
         if let Some(text) = table {
-            changes.push(Change::SetComment {
+            changes.push(Change::TableProperty(TablePropertyChange::SetComment {
                 target: CommentTarget::Table {
                     uid: "t_000001".parse().unwrap(),
                     table: name.clone(),
                 },
                 text: Some(text.into()),
-            });
+            }));
         }
         if let Some(text) = column {
-            changes.push(Change::SetComment {
+            changes.push(Change::TableProperty(TablePropertyChange::SetComment {
                 target: CommentTarget::Column {
                     uid: "c_000001".parse().unwrap(),
                     column: name.column("id"),
                 },
                 text: Some(text.into()),
-            });
+            }));
         }
         plan(changes)
     };
@@ -2811,7 +2838,9 @@ fn a_comment_is_kept_unless_the_plan_sets_it_and_then_held_to_the_text_it_sets()
     );
     // Removal is held too: the plan says no comment, and one came back.
     let mut removal = both.clone();
-    if let Change::SetComment { text, .. } = &mut removal.changes[0].change {
+    if let Change::TableProperty(TablePropertyChange::SetComment { text, .. }) =
+        &mut removal.changes[0].change
+    {
         *text = None;
     }
     let mut gone = after("new table", "new column");

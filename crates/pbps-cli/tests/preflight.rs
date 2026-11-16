@@ -1,8 +1,13 @@
 use pbps_dialect::Dialect;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
+use pbps_model::RowChange;
+use pbps_model::TableChange;
 use pbps_model::{Change, ChangeSet, Index, IndexColumn, PlannedChange, Row, RowKey, TableName};
 
 fn index(unique: bool, filtered: bool) -> Change {
-    Change::AddIndex {
+    Change::Index(IndexChange::AddIndex {
         table: TableName::new("app", "items"),
         name: "ix_items".into(),
         index: Box::new(Index {
@@ -20,11 +25,11 @@ fn index(unique: bool, filtered: bool) -> Change {
             filegroup: None,
         }),
         clustered: false,
-    }
+    })
 }
 
 fn inserted() -> Change {
-    Change::InsertRow {
+    Change::Row(RowChange::InsertRow {
         table: TableName::new("app", "items"),
         key_column: "id".into(),
         identity_key: false,
@@ -32,7 +37,7 @@ fn inserted() -> Change {
         row: Row(Default::default()),
         defaults: Default::default(),
         types: Default::default(),
-    }
+    })
 }
 
 fn plan(changes: Vec<Change>) -> ChangeSet {
@@ -85,7 +90,7 @@ fn unspellable_constraint_values_and_check_predicates_are_reported() {
     use pbps_model::{CheckConstraint, ForeignKey, PrimaryKey, UniqueConstraint};
     let table = TableName::new("app", "items");
     let constraints = vec![
-        Change::AddUnique {
+        Change::Constraint(ConstraintChange::AddUnique {
             table: table.clone(),
             name: "uq".into(),
             constraint: UniqueConstraint {
@@ -94,8 +99,8 @@ fn unspellable_constraint_values_and_check_predicates_are_reported() {
                 filegroup: None,
             },
             clustered: false,
-        },
-        Change::SetPrimaryKey {
+        }),
+        Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: table.clone(),
             from: None,
             to: Some(PrimaryKey {
@@ -105,8 +110,8 @@ fn unspellable_constraint_values_and_check_predicates_are_reported() {
                 filegroup: None,
             }),
             nonclustered: false,
-        },
-        Change::AddForeignKey {
+        }),
+        Change::Constraint(ConstraintChange::AddForeignKey {
             table: table.clone(),
             name: "fk".into(),
             constraint: Box::new(ForeignKey {
@@ -116,17 +121,17 @@ fn unspellable_constraint_values_and_check_predicates_are_reported() {
                 on_delete: Default::default(),
                 on_update: Default::default(),
             }),
-        },
-        Change::AddCheck {
+        }),
+        Change::Constraint(ConstraintChange::AddCheck {
             table,
             name: "ck".into(),
             constraint: CheckConstraint {
                 expression: "value > 0".into(),
             },
-        },
+        }),
     ];
     let mut row = inserted();
-    if let Change::InsertRow { defaults, .. } = &mut row {
+    if let Change::Row(RowChange::InsertRow { defaults, .. }) = &mut row {
         defaults.insert("value".into(), "unpredictable()".into());
     }
     for (dialect, checks_collations) in [
@@ -138,7 +143,11 @@ fn unspellable_constraint_values_and_check_predicates_are_reported() {
             // Unknown row values do not hide PostgreSQL's independent
             // metadata check for a planned foreign key.
             let expected = usize::from(
-                checks_collations && matches!(constraint, Change::AddForeignKey { .. }),
+                checks_collations
+                    && matches!(
+                        constraint,
+                        Change::Constraint(ConstraintChange::AddForeignKey { .. })
+                    ),
             );
             assert_eq!(report.probes.len(), expected, "{constraint:?}: {report:?}");
             assert!(
@@ -160,13 +169,13 @@ fn an_empty_new_table_has_an_answer_and_is_not_an_unchecked_key() {
     table
         .columns
         .insert("id".into(), pbps_model::Column::new("int".parse().unwrap()));
-    let create = Change::CreateTable {
+    let create = Change::Table(TableChange::CreateTable {
         uid: "t_a1b2c3".parse().unwrap(),
         name: TableName::new("app", "items"),
         table: Box::new(table),
         beside_default: None,
         moves_at_most: None,
-    };
+    });
     for dialect in [
         &pbps_mssql::Mssql as &dyn Dialect,
         &pbps_pg::Postgres::new(),
@@ -191,32 +200,36 @@ fn probes_use_original_table_and_column_names_after_multiple_renames() {
     let table_uid: Uid = "t_aaaaaa".parse().unwrap();
     let column_uid: Uid = "c_aaaaaa".parse().unwrap();
     let table = |name| TableName::new("app", name);
-    let rename_table = |from, to| Change::RenameTable {
-        uid: table_uid.clone(),
-        from: table(from),
-        to: table(to),
-        defaults: vec![],
+    let rename_table = |from, to| {
+        Change::Table(TableChange::RenameTable {
+            uid: table_uid.clone(),
+            from: table(from),
+            to: table(to),
+            defaults: vec![],
+        })
     };
-    let rename_column = |from: &str, to: &str| Change::RenameColumn {
-        uid: column_uid.clone(),
-        table: table("final_table"),
-        from: from.into(),
-        to: to.into(),
-        table_was: Some(table("original_table")),
+    let rename_column = |from: &str, to: &str| {
+        Change::Column(ColumnChange::RenameColumn {
+            uid: column_uid.clone(),
+            table: table("final_table"),
+            from: from.into(),
+            to: to.into(),
+            table_was: Some(table("original_table")),
+        })
     };
     let changes = plan(vec![
         rename_table("original_table", "temporary_table"),
         rename_table("temporary_table", "final_table"),
         rename_column("original_column", "temporary_column"),
         rename_column("temporary_column", "final_column"),
-        Change::AlterColumnNullability {
+        Change::Column(ColumnChange::AlterColumnNullability {
             uid: column_uid.clone(),
             column: table("final_table").column("final_column"),
             ty: "int".parse().unwrap(),
             to_nullable: false,
             through_external_partitions: false,
             collation: None,
-        },
+        }),
     ]);
     let ids = IdsFile {
         tables: [(table_uid, table("final_table"))].into(),

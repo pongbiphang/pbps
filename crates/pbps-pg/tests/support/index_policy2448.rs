@@ -6,6 +6,7 @@
 use super::{sqlstate, text, truth};
 use crate::certified_fixture::FixtureEmission as _;
 use pbps_db::{Conn, Driver};
+use pbps_model::IndexChange;
 use pbps_model::storage::{IndexLock, ParameterChange};
 use pbps_model::{Change, Index, IndexColumn, IndexMethod, OpClassRef, Strategy, TableName};
 use pbps_pg::Postgres;
@@ -298,7 +299,7 @@ fn add_index(
     key: &str,
     method: IndexMethod,
 ) -> Change {
-    Change::AddIndex {
+    Change::Index(IndexChange::AddIndex {
         table: table.clone(),
         name: "ix_own".into(),
         index: Box::new(Index {
@@ -316,7 +317,7 @@ fn add_index(
             filegroup: None,
         }),
         clustered: false,
-    }
+    })
 }
 
 /// A class a schema owns is spelled with its schema and found there; a bare

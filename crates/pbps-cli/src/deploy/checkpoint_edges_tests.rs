@@ -1,4 +1,5 @@
 use super::*;
+use pbps_model::ModuleChange;
 use pbps_model::object_ref::{ObjectDeps, ObjectEdges, ObjectRef};
 use pbps_model::{
     Change, ChangeSet, Column, IdsFile, Module, ModuleKind, PlanBaseline, PlanOrigin,
@@ -74,10 +75,10 @@ fn plan(deps: ObjectEdges, dropping: &[&str]) -> SavedPlan {
             changes: dropping
                 .iter()
                 .map(|id| {
-                    PlannedChange::new(Change::DropModule {
+                    PlannedChange::new(Change::Module(ModuleChange::DropModule {
                         id: id.parse().unwrap(),
                         kind: ModuleKind::View,
-                    })
+                    }))
                 })
                 .collect(),
         },

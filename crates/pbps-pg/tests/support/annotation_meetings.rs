@@ -198,7 +198,7 @@ pub fn canonical(
         .iter()
         .position(|step| {
             matches!(
-                &step.change, pbps_model::Change::AlterColumnType { column, .. }
+                &step.change, pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType { column, .. })
                     if column == &"app.p.d".parse().unwrap()
             )
         })
@@ -209,7 +209,7 @@ pub fn canonical(
         .iter()
         .position(|step| {
             matches!(
-                &step.change, pbps_model::Change::CreateModule { id, .. }
+                &step.change, pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule { id, .. })
                     if id == &"app.v".parse().unwrap()
             )
         })
@@ -223,12 +223,10 @@ pub fn canonical(
         "{edges:?}"
     );
     assert!(provider < consumer);
-    assert!(
-        done.changes
-            .changes
-            .iter()
-            .any(|step| matches!(step.change, pbps_model::Change::AttachPartition { .. }))
-    );
+    assert!(done.changes.changes.iter().any(|step| matches!(
+        step.change,
+        pbps_model::Change::Partition(pbps_model::PartitionChange::AttachPartition { .. })
+    )));
     let ordered = done
         .changes
         .ordered(pbps_model::PlanMode::Transactional, &pg);

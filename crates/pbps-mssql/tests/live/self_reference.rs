@@ -1,4 +1,5 @@
 use super::*;
+use pbps_model::RowChange;
 use pbps_model::{Change, ChangeSet, PlannedChange, RowKey, change::DeleteCause};
 
 async fn number(conn: &mut Conn, sql: &str) -> i32 {
@@ -47,7 +48,7 @@ async fn self_reference_case(tag: &str, key: &str) {
         ))
         .await
         .unwrap();
-    let change = Change::DeleteRow {
+    let change = Change::Row(RowChange::DeleteRow {
         table: TableName::new("dbo", "node"),
         key_column: "co'de]x".into(),
         key: RowKey::from("lo'op"),
@@ -57,7 +58,7 @@ async fn self_reference_case(tag: &str, key: &str) {
         types: Default::default(),
         after_types: Default::default(),
         key_type: None,
-    };
+    });
     let cs = ChangeSet {
         changes: vec![PlannedChange::new(change.clone())],
     };

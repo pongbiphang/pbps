@@ -1,6 +1,8 @@
 //! Advisory declared-domain code vetting, independent of binding resolution.
 use super::{Entry, Refused};
 use crate::output::Finding;
+use pbps_model::TypeChange;
+use pbps_model::TypeValueChange;
 use pbps_model::{Change, ChangeSet, ManagedType};
 
 /// No scratch is acquired for enums, renames, drops or code-free domains.
@@ -8,8 +10,8 @@ use pbps_model::{Change, ChangeSet, ManagedType};
 pub fn needed(changes: &ChangeSet) -> bool {
     changes.changes.iter().any(|p| {
         let definition = match &p.change {
-            Change::CreateType { definition, .. } => definition,
-            Change::AlterDomain { to, .. } => to,
+            Change::Type(TypeChange::CreateType { definition, .. }) => definition,
+            Change::TypeValue(TypeValueChange::AlterDomain { to, .. }) => to,
             _ => return false,
         };
         matches!(definition.as_ref(), ManagedType::Domain { default, checks, .. }
@@ -85,6 +87,8 @@ pub async fn vet(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::TypeChange;
+    use pbps_model::TypeValueChange;
     use pbps_model::{DomainHalf, PlannedChange};
 
     #[test]
@@ -109,33 +113,35 @@ mod tests {
             (domain(true), true),
         ] {
             let changes = ChangeSet {
-                changes: vec![PlannedChange::new(Change::CreateType {
+                changes: vec![PlannedChange::new(Change::Type(TypeChange::CreateType {
                     uid: uid.clone(),
                     name: name.clone(),
                     definition: Box::new(definition),
-                })],
+                }))],
             };
             assert_eq!(needed(&changes), expected);
         }
         for code in [false, true] {
             let changes = ChangeSet {
-                changes: vec![PlannedChange::new(Change::AlterDomain {
-                    uid: uid.clone(),
-                    name: name.clone(),
-                    from: Box::new(domain(false)),
-                    to: Box::new(domain(code)),
-                    half: DomainHalf::Tighten,
-                })],
+                changes: vec![PlannedChange::new(Change::TypeValue(
+                    TypeValueChange::AlterDomain {
+                        uid: uid.clone(),
+                        name: name.clone(),
+                        from: Box::new(domain(false)),
+                        to: Box::new(domain(code)),
+                        half: DomainHalf::Tighten,
+                    },
+                ))],
             };
             assert_eq!(needed(&changes), code);
         }
         assert!(!needed(&ChangeSet::default()));
         assert!(!needed(&ChangeSet {
-            changes: vec![PlannedChange::new(Change::DropType {
+            changes: vec![PlannedChange::new(Change::Type(TypeChange::DropType {
                 uid,
                 name,
                 definition: Box::new(domain(true)),
-            })]
+            }))]
         }));
     }
 }

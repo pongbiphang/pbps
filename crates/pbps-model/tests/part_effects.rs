@@ -108,12 +108,12 @@ fn row_security_cases_classify_policy_parts_and_independent_flags() {
     let mut policies = 0;
     let mut flags = BTreeSet::new();
     for (name, change) in corpus::cases() {
-        if let pbps_model::Change::CreatePolicy {
+        if let pbps_model::Change::Policy(pbps_model::PolicyChange::CreatePolicy {
             table,
             name: policy_name,
             policy,
             ..
-        } = &change
+        }) = &change
         {
             policies += 1;
             assert!(
@@ -133,7 +133,12 @@ fn row_security_cases_classify_policy_parts_and_independent_flags() {
                 }],
                 "{name}"
             );
-        } else if let pbps_model::Change::SetRowSecurity { from, to, .. } = &change {
+        } else if let pbps_model::Change::Policy(pbps_model::PolicyChange::SetRowSecurity {
+            from,
+            to,
+            ..
+        }) = &change
+        {
             assert!(from.is_default(), "{name}");
             assert_ne!(from, to, "{name}");
             flags.insert((to.enabled, to.forced));
@@ -148,14 +153,15 @@ fn row_security_cases_classify_policy_parts_and_independent_flags() {
 
 #[test]
 fn dropped_policy_corpus_cases_remove_the_named_policy_and_its_declaration() {
+    use pbps_model::PolicyChange;
     use pbps_model::{Change, Declared, PartAfter};
     let mut seen = 0;
     for (case, change) in corpus::cases() {
-        if let Change::DropPolicy {
+        if let Change::Policy(PolicyChange::DropPolicy {
             table,
             name,
             policy,
-        } = &change
+        }) = &change
         {
             seen += 1;
             assert!(policy.using.is_some() || policy.with_check.is_some());
@@ -180,12 +186,14 @@ fn dropped_policy_corpus_cases_remove_the_named_policy_and_its_declaration() {
             let mut changes = pbps_model::ChangeSet::default();
             changes
                 .changes
-                .push(pbps_model::PlannedChange::new(Change::CreatePolicy {
-                    table: table.clone(),
-                    name: name.clone(),
-                    policy: policy.clone(),
-                    origin: pbps_model::RowSecurityOrigin::Standing,
-                }));
+                .push(pbps_model::PlannedChange::new(Change::Policy(
+                    PolicyChange::CreatePolicy {
+                        table: table.clone(),
+                        name: name.clone(),
+                        policy: policy.clone(),
+                        origin: pbps_model::RowSecurityOrigin::Standing,
+                    },
+                )));
             declared.advance(&changes);
             assert!(!declared.is_empty());
             changes.changes = vec![pbps_model::PlannedChange::new(change)];
@@ -200,6 +208,7 @@ fn dropped_policy_corpus_cases_remove_the_named_policy_and_its_declaration() {
 /// generated one is; it was in no inventory before (DEC-2143.2).
 #[test]
 fn a_computed_column_creates_and_removes_its_column_and_generated_parts() {
+    use pbps_model::ColumnChange;
     use pbps_model::{Change, ComputedColumn, TableName};
     let table = TableName::new("app", "t");
     let computed = ComputedColumn {
@@ -207,16 +216,16 @@ fn a_computed_column_creates_and_removes_its_column_and_generated_parts() {
         persisted: false,
         not_null: false,
     };
-    let add = Change::AddComputedColumn {
+    let add = Change::Column(ColumnChange::AddComputedColumn {
         table: table.clone(),
         name: "c".into(),
         computed: computed.clone(),
-    };
-    let drop = Change::DropComputedColumn {
+    });
+    let drop = Change::Column(ColumnChange::DropComputedColumn {
         table: table.clone(),
         name: "c".into(),
         computed,
-    };
+    });
     let column = table.column("c");
     for (change, effect) in [(add, Effect::Created), (drop, Effect::Removed)] {
         let effects = change.part_effects();

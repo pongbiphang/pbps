@@ -5,6 +5,15 @@ use super::manifest::hex;
 use super::{
     InputManifest, ManifestError, ObjectTransition, OrderError, OrderingProof, SurfaceResolution,
 };
+use crate::ColumnChange;
+use crate::ConstraintChange;
+use crate::GrantChange;
+use crate::IndexChange;
+use crate::ModuleChange;
+use crate::RoleChange;
+use crate::TableChange;
+use crate::TypeChange;
+use crate::TypeValueChange;
 use crate::{Change, ChangeSet};
 use schemars::JsonSchema;
 use std::collections::{BTreeMap, BTreeSet};
@@ -433,19 +442,19 @@ impl ResolverEvidence {
             .filter(|(_, p)| {
                 matches!(
                     &p.change,
-                    Change::Grant { .. }
-                        | Change::Revoke { .. }
-                        | Change::PublicExecution { .. }
-                        | Change::AddEnumValue { .. }
-                        | Change::AlterDomain { .. }
-                        | Change::RenameEnumValue { .. }
-                        | Change::EnumRebuild { .. }
-                        | Change::CreateType { .. }
-                        | Change::DropType { .. }
-                        | Change::RenameType { .. }
-                        | Change::CreateRole { .. }
-                        | Change::RenameRole { .. }
-                        | Change::DropRole { .. }
+                    Change::Permission(GrantChange::Grant { .. })
+                        | Change::Permission(GrantChange::Revoke { .. })
+                        | Change::Permission(GrantChange::PublicExecution { .. })
+                        | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+                        | Change::TypeValue(TypeValueChange::AlterDomain { .. })
+                        | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+                        | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
+                        | Change::Type(TypeChange::CreateType { .. })
+                        | Change::Type(TypeChange::DropType { .. })
+                        | Change::Type(TypeChange::RenameType { .. })
+                        | Change::Role(RoleChange::CreateRole { .. })
+                        | Change::Role(RoleChange::RenameRole { .. })
+                        | Change::Role(RoleChange::DropRole { .. })
                 )
             })
             .map(|(i, _)| i)
@@ -465,7 +474,7 @@ impl ResolverEvidence {
         // schema inventory; their required membership is pinned by the seal.
         for step in &changes.changes {
             let required = match &step.change {
-                Change::CreateTable { name, table, .. } => {
+                Change::Table(TableChange::CreateTable { name, table, .. }) => {
                     // Owner transitions cover catalog records, not resolution
                     // membership: every inline binding needs its own observation.
                     let mut surfaces = Vec::new();
@@ -488,21 +497,23 @@ impl ResolverEvidence {
                     }
                     surfaces
                 }
-                Change::CreateModule { id, .. }
-                | Change::AlterModule { id, .. }
-                | Change::DropModule { id, .. } => vec![super::Surface::Module(id.clone())],
+                Change::Module(ModuleChange::CreateModule { id, .. })
+                | Change::Module(ModuleChange::AlterModule { id, .. })
+                | Change::Module(ModuleChange::DropModule { id, .. }) => {
+                    vec![super::Surface::Module(id.clone())]
+                }
                 // A generation expression is the column's `pg_attrdef` row,
                 // as a default is (DEC-1168.1).
-                Change::AlterColumnDefault { column, .. }
-                | Change::AlterColumnExpression { column, .. } => {
+                Change::Column(ColumnChange::AlterColumnDefault { column, .. })
+                | Change::Column(ColumnChange::AlterColumnExpression { column, .. }) => {
                     vec![super::Surface::Default(column.clone())]
                 }
-                Change::AddColumn {
+                Change::Column(ColumnChange::AddColumn {
                     table,
                     name,
                     column,
                     ..
-                } => match column.value_source {
+                }) => match column.value_source {
                     crate::ValueSource::Default(_) | crate::ValueSource::Generated(_) => {
                         vec![super::Surface::Default(table.column(name))]
                     }
@@ -512,15 +523,16 @@ impl ResolverEvidence {
                     | crate::ValueSource::Identity(_)
                     | crate::ValueSource::Sequence(_) => Vec::new(),
                 },
-                Change::AddCheck { table, name, .. } | Change::DropCheck { table, name } => {
+                Change::Constraint(ConstraintChange::AddCheck { table, name, .. })
+                | Change::Constraint(ConstraintChange::DropCheck { table, name }) => {
                     vec![super::Surface::Check {
                         table: table.clone(),
                         name: name.clone(),
                     }]
                 }
-                Change::AddIndex {
+                Change::Index(IndexChange::AddIndex {
                     table, name, index, ..
-                } if index.holds_expression_when(filter_binds) => vec![super::Surface::Index {
+                }) if index.holds_expression_when(filter_binds) => vec![super::Surface::Index {
                     table: table.clone(),
                     name: name.clone(),
                 }],
@@ -622,6 +634,8 @@ impl ResolverEvidence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GrantChange;
+    use crate::ModuleChange;
     use crate::resolver::{
         BoundSurface, CandidateSet, Membership, ObjectIdentity, Prerequisite, ReadScope, Surface,
     };
@@ -779,15 +793,17 @@ mod tests {
 
     pub(super) fn plan() -> SavedPlan {
         let changes = ChangeSet {
-            changes: vec![PlannedChange::new(Change::CreateModule {
-                id: "app.v".parse().unwrap(),
-                module: Box::new(Module {
-                    kind: ModuleKind::View,
-                    description: None,
-                    definition: "SELECT 1 AS n".into(),
-                    options: Default::default(),
-                }),
-            })],
+            changes: vec![PlannedChange::new(Change::Module(
+                ModuleChange::CreateModule {
+                    id: "app.v".parse().unwrap(),
+                    module: Box::new(Module {
+                        kind: ModuleKind::View,
+                        description: None,
+                        definition: "SELECT 1 AS n".into(),
+                        options: Default::default(),
+                    }),
+                },
+            ))],
         };
         let surface = Surface::Module("app.v".parse().unwrap());
         let evidence = ResolverEvidence::new(
@@ -1120,11 +1136,11 @@ mod tests {
             panic!("resolved")
         };
         let changes = ChangeSet {
-            changes: vec![PlannedChange::new(Change::Grant {
+            changes: vec![PlannedChange::new(Change::Permission(GrantChange::Grant {
                 role: "reader".into(),
                 target: "app.v".parse().unwrap(),
                 permissions: BTreeSet::from([crate::Permission::Select]),
-            })],
+            }))],
         };
         // The view exists now, observed with its real fingerprint.
         let before = observed(&template, &compiled());
@@ -1368,11 +1384,15 @@ mod tests {
     fn the_opening_manifest_cannot_hold_a_placeholder() {
         let plan = plan();
         let template = resolved(&plan);
-        let Change::CreateModule { id, module } = plan.changes.changes[0].change.clone() else {
+        let Change::Module(ModuleChange::CreateModule { id, module }) =
+            plan.changes.changes[0].change.clone()
+        else {
             panic!("create")
         };
         let changes = ChangeSet {
-            changes: vec![PlannedChange::new(Change::AlterModule { id, module })],
+            changes: vec![PlannedChange::new(Change::Module(
+                ModuleChange::AlterModule { id, module },
+            ))],
         };
         let mut evidence = template.clone();
         evidence.surfaces[0].current = evidence.surfaces[0].desired.clone();

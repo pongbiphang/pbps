@@ -23,6 +23,14 @@ use std::fmt;
 
 use crate::order::catalog::Dependent;
 use pbps_dialect::Dialect;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::RoleChange;
+use pbps_model::TableChange;
+use pbps_model::TypeChange;
+use pbps_model::TypeValueChange;
 use pbps_model::{Change, ChangeSet, ModuleDeps, ModuleId, Schema};
 
 use super::{
@@ -241,14 +249,14 @@ fn discharge_deferred<S>(
     let mut transitions: BTreeMap<String, Vec<_>> = BTreeMap::new();
     for (at, p) in changes.iter().enumerate() {
         match &p.change {
-            Change::AddComputedColumn {
+            Change::Column(ColumnChange::AddComputedColumn {
                 table,
                 name,
                 computed,
-            } => {
+            }) => {
                 owners.insert(table.column(name), (at, &computed.expression));
             }
-            Change::CreateTable { name, table, .. } => {
+            Change::Table(TableChange::CreateTable { name, table, .. }) => {
                 for (column, computed) in &table.computed {
                     owners.insert(name.column(column), (at, &computed.expression));
                 }
@@ -256,10 +264,9 @@ fn discharge_deferred<S>(
             _ => {}
         }
         let (id, kind, installed) = match &p.change {
-            Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
-                (id, module.kind, true)
-            }
-            Change::DropModule { id, kind } => (id, *kind, false),
+            Change::Module(ModuleChange::CreateModule { id, module })
+            | Change::Module(ModuleChange::AlterModule { id, module }) => (id, module.kind, true),
+            Change::Module(ModuleChange::DropModule { id, kind }) => (id, *kind, false),
             _ => continue,
         };
         if kind == pbps_model::ModuleKind::Function {
@@ -401,12 +408,12 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
         let type_change = |change: &Change| {
             matches!(
                 change,
-                Change::AddEnumValue { .. }
-                    | Change::RenameEnumValue { .. }
-                    | Change::EnumRebuild { .. }
-                    | Change::CreateType { .. }
-                    | Change::DropType { .. }
-                    | Change::RenameType { .. }
+                Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+                    | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+                    | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
+                    | Change::Type(TypeChange::CreateType { .. })
+                    | Change::Type(TypeChange::DropType { .. })
+                    | Change::Type(TypeChange::RenameType { .. })
             )
         };
         if cs.changes.iter().any(|p| type_change(&p.change))
@@ -437,21 +444,24 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
                     || type_change(&cs.changes[edge.after].change)
                     || (matches!(
                         &cs.changes[edge.before].change,
-                        Change::AlterModule {
+                        Change::Module(ModuleChange::AlterModule {
                             id: ModuleId::Trigger { .. },
                             ..
-                        } | Change::DropModule {
+                        }) | Change::Module(ModuleChange::DropModule {
                             id: ModuleId::Trigger { .. },
                             ..
-                        }
+                        })
                     ) && matches!(
                         &cs.changes[edge.after].change,
-                        Change::AddCheck { .. }
-                            | Change::AddForeignKey { .. }
-                            | Change::AddUnique { .. }
-                            | Change::SetPrimaryKey { to: Some(_), .. }
-                            | Change::CreateTable { .. }
-                            | Change::AttachPartition { .. }
+                        Change::Constraint(ConstraintChange::AddCheck { .. })
+                            | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+                            | Change::Constraint(ConstraintChange::AddUnique { .. })
+                            | Change::Constraint(ConstraintChange::SetPrimaryKey {
+                                to: Some(_),
+                                ..
+                            })
+                            | Change::Table(TableChange::CreateTable { .. })
+                            | Change::Partition(PartitionChange::AttachPartition { .. })
                     ))
                 {
                     handovers.edge(edge.before, edge.after, edge.source, edge.reason);
@@ -525,7 +535,7 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
     if cs
         .changes
         .iter()
-        .any(|p| matches!(p.change, Change::DropRole { .. }))
+        .any(|p| matches!(p.change, Change::Role(RoleChange::DropRole { .. })))
     {
         match facts.role_members {
             Some(members) => {

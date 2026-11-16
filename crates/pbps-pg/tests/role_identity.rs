@@ -1,6 +1,8 @@
 //! The resolver's ordinary PostgreSQL plan cannot carry cluster identity
 //! changes while roles stay externally managed (DEC-1527.1).
 use pbps_dialect::Dialect;
+use pbps_model::GrantChange;
+use pbps_model::RoleChange;
 use pbps_model::{Change, GrantTarget, Hints, IdsFile, Permission, Role, Schema};
 use pbps_pg::Postgres;
 
@@ -49,7 +51,9 @@ fn ordinary_postgres_plans_never_manage_role_identities() {
         assert!(
             plan.changes.iter().all(|p| !matches!(
                 p.change,
-                Change::CreateRole { .. } | Change::DropRole { .. } | Change::RenameRole { .. }
+                Change::Role(RoleChange::CreateRole { .. })
+                    | Change::Role(RoleChange::DropRole { .. })
+                    | Change::Role(RoleChange::RenameRole { .. })
             )),
             "{before:?} -> {after:?}: {plan:?}"
         );
@@ -67,7 +71,7 @@ fn external_role_adoption_and_removal_still_plan_database_grants() {
     assert!(
         matches!(added.changes.as_slice(), [p] if matches!(
             &p.change,
-            Change::Grant { role, target: GrantTarget::Schema(schema), permissions }
+            Change::Permission(GrantChange::Grant { role, target: GrantTarget::Schema(schema), permissions })
             if role.raw() == "reader" && schema == "app" && permissions.contains(&Permission::Usage)
         )),
         "{added:?}"
@@ -76,7 +80,7 @@ fn external_role_adoption_and_removal_still_plan_database_grants() {
     assert!(
         matches!(removed.changes.as_slice(), [p] if matches!(
             &p.change,
-            Change::Revoke { role, target: GrantTarget::Schema(schema), permissions }
+            Change::Permission(GrantChange::Revoke { role, target: GrantTarget::Schema(schema), permissions })
             if role.raw() == "reader" && schema == "app" && permissions.contains(&Permission::Usage)
         )),
         "{removed:?}"

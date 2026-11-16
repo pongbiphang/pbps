@@ -31,13 +31,13 @@ fn external_table_sql() -> String {
     let loaded = pbps_load::load_table_str(Path::new("ext.t.yml"), EXTERNAL_TABLE).unwrap();
     pbps_mssql::Mssql
         .fixture_emit(
-            &pbps_model::Change::CreateTable {
+            &pbps_model::Change::Table(pbps_model::TableChange::CreateTable {
                 uid: "t_aaaaaa".parse().unwrap(),
                 name: loaded.name,
                 table: Box::new(loaded.table),
                 beside_default: None,
                 moves_at_most: None,
-            },
+            }),
             pbps_model::Strategy::default(),
         )
         .unwrap()

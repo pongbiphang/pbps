@@ -1,4 +1,7 @@
 use super::*;
+use crate::ColumnChange;
+use crate::PartitionChange;
+use crate::TableChange;
 use crate::{Column, PartitionBound, PartitionBy, PartitionOf, PlannedChange, Table};
 
 fn table(name: &str) -> TableName {
@@ -62,23 +65,23 @@ fn baseline(attached: bool) -> (Schema, IdsFile) {
     (schema, ids)
 }
 fn detach() -> Change {
-    Change::DetachPartition {
+    Change::Partition(PartitionChange::DetachPartition {
         uid: uid("t_bbbbbb"),
         table: table("child"),
         parent: table("parent"),
         names: vec![],
         shape: Box::new(plain()),
-    }
+    })
 }
 fn attach() -> Change {
-    Change::AttachPartition {
+    Change::Partition(PartitionChange::AttachPartition {
         uid: uid("t_bbbbbb"),
         table: table("child"),
         parent: table("parent"),
         bound: PartitionBound::Default,
         key: Vec::new(),
         shape: Box::new(plain()),
-    }
+    })
 }
 fn steps(changes: Vec<Change>) -> Vec<PlannedChange> {
     changes.into_iter().map(PlannedChange::new).collect()
@@ -91,17 +94,17 @@ fn detach_preserves_the_catalog_column_through_rename_and_ends_it_only_on_drop()
     after.columns.remove(&uid("c_dddddd"));
     let changes = steps(vec![
         detach(),
-        Change::RenameColumn {
+        Change::Column(ColumnChange::RenameColumn {
             uid: uid("c_dddddd"),
             table: table("child"),
             from: "n".into(),
             to: "amount".into(),
             table_was: None,
-        },
-        Change::DropColumn {
+        }),
+        Change::Column(ColumnChange::DropColumn {
             uid: uid("c_dddddd"),
             column: table("child").column("amount"),
-        },
+        }),
     ]);
     let names = PlanNames::of(&changes, &after).unwrap();
     let sources = PhysicalSources::of(names, &before, &old_ids).unwrap();
@@ -234,16 +237,16 @@ fn a_reused_column_name_has_a_new_source_and_cannot_receive_the_old_dependent() 
         .columns
         .insert(uid("c_eeeeee"), table("child").column("n"));
     let changes = steps(vec![
-        Change::DropColumn {
+        Change::Column(ColumnChange::DropColumn {
             uid: uid("c_dddddd"),
             column: table("child").column("n"),
-        },
-        Change::AddColumn {
+        }),
+        Change::Column(ColumnChange::AddColumn {
             uid: uid("c_eeeeee"),
             table: table("child"),
             name: "n".into(),
             column: Box::new(Column::new("integer".parse().unwrap())),
-        },
+        }),
     ]);
     let names = PlanNames::of(&changes, &after).unwrap();
     let sources = PhysicalSources::of(names, &before, &old_ids).unwrap();
@@ -273,13 +276,13 @@ fn a_parent_column_rename_reaches_only_the_children_attached_at_that_boundary() 
         .insert(uid("c_bbbbbb"), table("parent").column("amount"));
     let changes = steps(vec![
         detach(),
-        Change::RenameColumn {
+        Change::Column(ColumnChange::RenameColumn {
             uid: uid("c_bbbbbb"),
             table: table("parent"),
             from: "n".into(),
             to: "amount".into(),
             table_was: None,
-        },
+        }),
     ]);
     let names = PlanNames::of(&changes, &after).unwrap();
     let sources = PhysicalSources::of(names, &before, &old_ids).unwrap();
@@ -330,11 +333,13 @@ fn a_missing_partition_baseline_is_unavailable_not_a_new_column() {
 #[test]
 fn executable_table_handoffs_keep_sources_with_their_original_owners() {
     let (before, old_ids) = baseline(false);
-    let rename = |id: &str, from: &str, to: &str| Change::RenameTable {
-        uid: uid(id),
-        from: table(from),
-        to: table(to),
-        defaults: vec![],
+    let rename = |id: &str, from: &str, to: &str| {
+        Change::Table(TableChange::RenameTable {
+            uid: uid(id),
+            from: table(from),
+            to: table(to),
+            defaults: vec![],
+        })
     };
     for swapped in [false, true] {
         let (changes, parent_end, child_end) = if swapped {
@@ -408,17 +413,17 @@ fn a_dropped_tables_dependents_never_follow_a_new_holder_of_its_name() {
         column.table = table("parent");
     }
     let changes = steps(vec![
-        Change::DropTable {
+        Change::Table(TableChange::DropTable {
             uid: uid("t_aaaaaa"),
             name: table("parent"),
             detach_from: None,
-        },
-        Change::RenameTable {
+        }),
+        Change::Table(TableChange::RenameTable {
             uid: uid("t_bbbbbb"),
             from: table("child"),
             to: table("parent"),
             defaults: vec![],
-        },
+        }),
     ]);
     let sources =
         PhysicalSources::of(PlanNames::of(&changes, &after).unwrap(), &before, &old_ids).unwrap();
@@ -442,13 +447,13 @@ fn creating_a_partition_does_not_give_it_its_parents_stored_source() {
     before.tables.remove(&table("child"));
     old_ids.tables.remove(&uid("t_bbbbbb"));
     let (after_schema, after) = baseline(true);
-    let changes = steps(vec![Change::CreateTable {
+    let changes = steps(vec![Change::Table(TableChange::CreateTable {
         uid: uid("t_bbbbbb"),
         name: table("child"),
         table: Box::new(after_schema.tables[&table("child")].clone()),
         beside_default: None,
         moves_at_most: None,
-    }]);
+    })]);
     let sources =
         PhysicalSources::of(PlanNames::of(&changes, &after).unwrap(), &before, &old_ids).unwrap();
     assert_eq!(
@@ -504,19 +509,19 @@ fn physical_order_survives_rename_and_appends_new_member_columns() {
         .columns
         .insert(uid("c_eeeeee"), table("parent").column("z"));
     let changes = steps(vec![
-        Change::RenameColumn {
+        Change::Column(ColumnChange::RenameColumn {
             uid: uid("c_aaaaaa"),
             table: table("parent"),
             from: "n".into(),
             to: "amount".into(),
             table_was: None,
-        },
-        Change::AddColumn {
+        }),
+        Change::Column(ColumnChange::AddColumn {
             uid: uid("c_eeeeee"),
             table: table("parent"),
             name: "z".into(),
             column: Box::new(Column::new("integer".parse().unwrap())),
-        },
+        }),
     ]);
     let view =
         PhysicalSources::of(PlanNames::of(&changes, &after).unwrap(), &before, &old_ids).unwrap();
@@ -561,16 +566,16 @@ fn reusing_a_dropped_column_name_does_not_reuse_its_old_position() {
         .columns
         .insert(uid("c_ffffff"), table("parent").column("n"));
     let changes = steps(vec![
-        Change::DropColumn {
+        Change::Column(ColumnChange::DropColumn {
             uid: uid("c_bbbbbb"),
             column: table("parent").column("n"),
-        },
-        Change::AddColumn {
+        }),
+        Change::Column(ColumnChange::AddColumn {
             uid: uid("c_ffffff"),
             table: table("parent"),
             name: "n".into(),
             column: Box::new(Column::new("integer".parse().unwrap())),
-        },
+        }),
     ]);
     let view =
         PhysicalSources::of(PlanNames::of(&changes, &after).unwrap(), &before, &old_ids).unwrap();
@@ -594,13 +599,13 @@ fn excluded_families_are_unavailable_instead_of_an_empty_physical_shape() {
         .insert(uid("c_dddddd"), table("child").column("amount"));
     let changes = steps(vec![
         attach(),
-        Change::RenameColumn {
+        Change::Column(ColumnChange::RenameColumn {
             uid: uid("c_bbbbbb"),
             table: table("parent"),
             from: "n".into(),
             to: "amount".into(),
             table_was: None,
-        },
+        }),
     ]);
     let mut after = ids.clone();
     after
@@ -717,13 +722,13 @@ fn an_unread_shape_is_not_a_known_empty_column_list() {
     );
     let mut after = ids.clone();
     after.tables.insert(uid("t_cccccc"), table("empty"));
-    let changes = self::steps(vec![Change::CreateTable {
+    let changes = self::steps(vec![Change::Table(TableChange::CreateTable {
         uid: uid("t_cccccc"),
         name: table("empty"),
         table: Box::default(),
         beside_default: None,
         moves_at_most: None,
-    }]);
+    })]);
     let created =
         PhysicalSources::of(PlanNames::of(&changes, &after).unwrap(), &before, &ids).unwrap();
     assert_eq!(

@@ -335,10 +335,12 @@ async fn requirement_count_locks_every_partition_until_the_emitted_drop_commits(
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        let mut planned = PlannedChange::new(pbps_model::Change::DropColumn {
-            uid: "c_000001".parse().unwrap(),
-            column: "dbo.t.amount".parse().unwrap(),
-        });
+        let mut planned = PlannedChange::new(pbps_model::Change::Column(
+            pbps_model::ColumnChange::DropColumn {
+                uid: "c_000001".parse().unwrap(),
+                column: "dbo.t.amount".parse().unwrap(),
+            },
+        ));
         planned.drop_guard = Some(g.clone());
         let plan = pbps_diff::order::singleton(planned, PlanMode::Transactional, &Mssql);
         let statements = Mssql.prepare_emission(&plan, PlanMode::Transactional)(0).unwrap();

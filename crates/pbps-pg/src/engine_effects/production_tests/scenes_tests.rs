@@ -1,6 +1,7 @@
 //! Reference class scenes below schema_diff; canonical assertions remain PR 7's gate.
 use super::*;
 use crate::engine_effects::scenes_test::{self as scenes, KINDS, Kind, Motion};
+use pbps_model::ColumnChange;
 
 use scenes::steps;
 
@@ -171,7 +172,7 @@ fn a_missing_ordinary_uid_is_an_obligation_before_any_name_projection() {
             "c_dddddd"
         }));
         let steps = vec![
-            PlannedChange::new(Change::AlterColumnType {
+            PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
                 uid: uid("c_bbbbbb"),
                 column: name("app.p").column("d"),
                 from: "integer".parse().unwrap(),
@@ -182,7 +183,7 @@ fn a_missing_ordinary_uid_is_an_obligation_before_any_name_projection() {
                 to_collation: None,
                 through_external_partitions: false,
                 using: None,
-            }),
+            })),
             PlannedChange::new(steps(&s, Kind::Widen, Motion::Attach).remove(1)),
         ];
         let ops = Operations::of_plan(&steps, ModuleEdits::Rebuilt);

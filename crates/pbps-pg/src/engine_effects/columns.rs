@@ -1,5 +1,6 @@
 //! Measured PostgreSQL policy over portable statement transitions.
 use crate::Postgres;
+use pbps_model::ColumnChange;
 use pbps_model::change::{ColumnProperty, ColumnTransition, ColumnValue};
 use pbps_model::operation::symbolic::{Attribute, Clause, Fact, Scope, WritePolicy};
 use pbps_model::{Change, ValueSource};
@@ -54,7 +55,7 @@ pub(super) fn policy(
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(super) fn refusal(pg: &Postgres, change: &Change) -> Option<Clause> {
     match change {
-        Change::AddColumn { column, .. }
+        Change::Column(ColumnChange::AddColumn { column, .. })
             if matches!(column.value_source, ValueSource::Identity(_)) =>
         {
             Some(unsupported(
@@ -64,7 +65,7 @@ pub(super) fn refusal(pg: &Postgres, change: &Change) -> Option<Clause> {
                     .map(|_| "42P16"),
             ))
         }
-        Change::AlterColumnNumbering { from, to, .. } => {
+        Change::Column(ColumnChange::AlterColumnNumbering { from, to, .. }) => {
             if matches!(from, ValueSource::Identity(_)) || matches!(to, ValueSource::Identity(_)) {
                 Some(unsupported(
                     "identity numbering on a moving parent retains its capability/readback refusal (measured restrictions: 42P16, 55000, 42601)",

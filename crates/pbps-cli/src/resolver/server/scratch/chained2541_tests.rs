@@ -48,10 +48,12 @@ fn consumer(schema: &Schema) -> Reconstruction {
             .modules
             .iter()
             .map(|(id, module)| {
-                pbps_model::PlannedChange::new(pbps_model::Change::CreateModule {
-                    id: id.clone(),
-                    module: Box::new(module.clone()),
-                })
+                pbps_model::PlannedChange::new(pbps_model::Change::Module(
+                    pbps_model::ModuleChange::CreateModule {
+                        id: id.clone(),
+                        module: Box::new(module.clone()),
+                    },
+                ))
             })
             .collect(),
     });

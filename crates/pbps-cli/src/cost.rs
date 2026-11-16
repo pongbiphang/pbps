@@ -166,6 +166,7 @@ pub fn render(report: &CostReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::ColumnChange;
     use pbps_model::{Change, ChangeSet, PlannedChange, TableName};
 
     #[test]
@@ -179,18 +180,20 @@ mod tests {
         ] {
             let table = TableName::new("app", part);
             let changes = ChangeSet {
-                changes: vec![PlannedChange::new(Change::AlterColumnType {
-                    uid: "c_aaaaaa".parse().unwrap(),
-                    column: table.column(part),
-                    from: "int".parse().unwrap(),
-                    to: "bigint".parse().unwrap(),
-                    from_nullable: true,
-                    to_nullable: true,
-                    through_external_partitions: false,
-                    from_collation: None,
-                    to_collation: None,
-                    using: None,
-                })],
+                changes: vec![PlannedChange::new(Change::Column(
+                    ColumnChange::AlterColumnType {
+                        uid: "c_aaaaaa".parse().unwrap(),
+                        column: table.column(part),
+                        from: "int".parse().unwrap(),
+                        to: "bigint".parse().unwrap(),
+                        from_nullable: true,
+                        to_nullable: true,
+                        through_external_partitions: false,
+                        from_collation: None,
+                        to_collation: None,
+                        using: None,
+                    },
+                ))],
             };
             let ids = crate::plan_fixture::ids(&changes);
             let names = pbps_model::plan_names::PlanNames::of(&changes.changes, &ids).unwrap();

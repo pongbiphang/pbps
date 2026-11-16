@@ -1,4 +1,6 @@
 //! A binding release beside a computed-column rebuild owned by a later stage.
+use pbps_model::ColumnChange;
+use pbps_model::ModuleChange;
 use pbps_model::{
     Change, ChangeSet, Column, ComputedColumn, IdsFile, Module, ModuleId, ModuleKind,
     PlannedChange, Schema, Table, TableName, Uid, UidKind,
@@ -55,23 +57,23 @@ pub fn combined(callee: &str) -> (Schema, Schema, IdsFile, ChangeSet) {
     let mut changes: Vec<_> = ["f", "g", "z"]
         .into_iter()
         .map(|name| {
-            PlannedChange::new(Change::AlterModule {
+            PlannedChange::new(Change::Module(ModuleChange::AlterModule {
                 id: id(name),
                 module: Box::new(after.modules[&id(name)].clone()),
-            })
+            }))
         })
         .collect();
     changes.extend([
-        PlannedChange::new(Change::DropComputedColumn {
+        PlannedChange::new(Change::Column(ColumnChange::DropComputedColumn {
             table: table.clone(),
             name: "c".into(),
             computed: old,
-        }),
-        PlannedChange::new(Change::AddComputedColumn {
+        })),
+        PlannedChange::new(Change::Column(ColumnChange::AddComputedColumn {
             table,
             name: "c".into(),
             computed: new,
-        }),
+        })),
     ]);
     (before, after, ids, ChangeSet { changes })
 }

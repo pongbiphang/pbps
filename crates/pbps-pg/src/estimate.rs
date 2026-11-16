@@ -59,6 +59,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::{Conn, DbError};
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::PartitionChange;
+use pbps_model::PolicyChange;
+use pbps_model::TableChange;
+use pbps_model::TablePropertyChange;
 use pbps_model::{Change, ColumnType, Strategy, TableName};
 
 // Preserve this engine's public entry points while sharing only the questions
@@ -388,15 +396,15 @@ fn estimates_with(
             // Unlike catalog spellings, CHECK lifetime depends on the prefix
             // already executed. Carry that prefix through a table rename;
             // a new identity reusing its name starts with no removed checks.
-            if let Change::RenameTable { from, to, .. } = &p.change
+            if let Change::Table(TableChange::RenameTable { from, to, .. }) = &p.change
                 && let Some(checks) = removed_checks.remove(from)
             {
                 removed_checks.insert(to.clone(), checks);
             }
-            if let Change::CreateTable { name, .. } = &p.change {
+            if let Change::Table(TableChange::CreateTable { name, .. }) = &p.change {
                 removed_checks.remove(name);
             }
-            if let Change::DropCheck { table, name } = &p.change {
+            if let Change::Constraint(ConstraintChange::DropCheck { table, name }) = &p.change {
                 removed_checks
                     .entry(table.clone())
                     .or_default()
@@ -418,7 +426,8 @@ fn estimates_with(
             };
             // A partition created under a parent this plan creates locks
             // nothing anyone holds (#1171).
-            if matches!(p.change, Change::CreateTable { .. }) && e.source == CatalogSource::Created
+            if matches!(p.change, Change::Table(TableChange::CreateTable { .. }))
+                && e.source == CatalogSource::Created
             {
                 return None;
             }
@@ -426,9 +435,10 @@ fn estimates_with(
                 column: stored_column,
                 ..
             } = &mut e.source
-                && let Change::AlterColumnType { uid, column, .. }
-                | Change::AlterColumnNullability { uid, column, .. }
-                | Change::AlterColumnNumbering { uid, column, .. } = &p.change
+                && let Change::Column(ColumnChange::AlterColumnType { uid, column, .. })
+                | Change::Column(ColumnChange::AlterColumnNullability { uid, column, .. })
+                | Change::Column(ColumnChange::AlterColumnNumbering { uid, column, .. }) =
+                    &p.change
             {
                 // Preserve the first spelling even when ordinary ownership
                 // begins at DETACH. Managed scope starting later does not
@@ -455,18 +465,18 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         Some(Estimate::new(about, table.clone(), rewrite, reads, lock))
     };
     match change {
-        Change::RebuildPartitionedTable(_)
-        | Change::BuildPartitionedIndex(_)
-        | Change::CopyTableRows(_)
-        | Change::AnalyzeTableTree(_) => None,
-        Change::AlterColumnType {
+        Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+        | Change::Index(IndexChange::BuildPartitionedIndex(_))
+        | Change::Partition(PartitionChange::CopyTableRows(_))
+        | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => None,
+        Change::Column(ColumnChange::AlterColumnType {
             column,
             from,
             to,
             from_nullable,
             to_nullable,
             ..
-        } => {
+        }) => {
             let rewrite = rewrites(from, to);
             // The emitter folds SET NOT NULL into this ALTER TABLE. Its scan
             // remains even when widening the type alone rebuilds nothing;
@@ -495,9 +505,9 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
 
         // A rewrite of the table and its indexes under `AccessExclusiveLock`,
         // in either direction (measured on 16 and 18, #1443).
-        Change::SetTablePersistence {
+        Change::TableProperty(TablePropertyChange::SetTablePersistence {
             table, unlogged, ..
-        } => e(
+        }) => e(
             format!(
                 "switching {table} to {}",
                 if *unlogged { "unlogged" } else { "logged" },
@@ -516,13 +526,13 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         // which holds every write to the table, since each writes the index,
         // until it commits (#1442). GiST's `buffering` takes it and its
         // `fillfactor` does not (DEC-2448.2).
-        Change::SetIndexStorageParameters {
+        Change::Index(IndexChange::SetIndexStorageParameters {
             table,
             target,
             method,
             set,
             reset,
-        } => {
+        }) => {
             let of = match target {
                 pbps_model::IndexPart::PrimaryKey => "the primary key's index".to_owned(),
                 pbps_model::IndexPart::Unique(n) | pbps_model::IndexPart::Index(n) => {
@@ -553,9 +563,12 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         // parameters takes, measured on 16 and 18: `user_catalog_table`,
         // set or reset, takes `AccessExclusiveLock`, every other listed
         // parameter `ShareUpdateExclusiveLock` (#1477 review).
-        Change::SetStorageParameters {
-            table, set, reset, ..
-        } => {
+        Change::TableProperty(TablePropertyChange::SetStorageParameters {
+            table,
+            set,
+            reset,
+            ..
+        }) => {
             let catalog =
                 set.contains_key("user_catalog_table") || reset.contains("user_catalog_table");
             e(
@@ -578,7 +591,7 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         // reads no row: `USING INDEX` validates the index from the catalog.
         // Measured on 16 and 18 against a 473 MB table, each form ran in
         // about a millisecond and left `seq_scan` unchanged (#1478).
-        Change::SetReplicaIdentity { table, .. } => e(
+        Change::TableProperty(TablePropertyChange::SetReplicaIdentity { table, .. }) => e(
             format!(
                 "setting the replica identity of {table}",
                 table = table.shown()
@@ -591,11 +604,11 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
 
         // The case ADR-0012's Limits name outright: nothing is rebuilt and
         // every row is read anyway. Measured, 100,000 of them.
-        Change::AlterColumnNullability {
+        Change::Column(ColumnChange::AlterColumnNullability {
             column,
             to_nullable,
             ..
-        } => e(
+        }) => e(
             format!(
                 "making {column} {}",
                 if *to_nullable { "nullable" } else { "NOT NULL" },
@@ -612,12 +625,12 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             Lock::AccessExclusive,
         ),
 
-        Change::AddColumn {
+        Change::Column(ColumnChange::AddColumn {
             table,
             name,
             column,
             ..
-        } => {
+        }) => {
             let about = format!("adding the column {}", table.column(name).shown());
             if column.ty.type_ref().is_some() {
                 let mut estimate = Estimate::new(
@@ -682,7 +695,7 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         // reclaimed** (ADR-0012 §6). "The drop was cheap" and "the table got
         // smaller" are different claims, and an estimate that ran them together
         // would be wrong in the direction that surprises an operator.
-        Change::DropColumn { column, .. } => e(
+        Change::Column(ColumnChange::DropColumn { column, .. }) => e(
             format!(
                 "dropping {column}, which does not reclaim its space",
                 column = column.shown()
@@ -693,7 +706,7 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             Lock::AccessExclusive,
         ),
 
-        Change::AddCheck { table, name, .. } => e(
+        Change::Constraint(ConstraintChange::AddCheck { table, name, .. }) => e(
             format!("adding the check {name}", name = name.shown(),),
             table,
             Rewrite::No,
@@ -701,7 +714,7 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             Lock::AccessExclusive,
         ),
 
-        Change::AddUnique { table, name, .. } => e(
+        Change::Constraint(ConstraintChange::AddUnique { table, name, .. }) => e(
             format!("adding the unique constraint {name}", name = name.shown(),),
             table,
             Rewrite::No,
@@ -713,12 +726,12 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         // (with `ShareRowExclusive` and `Share`) on the table, so reads wait
         // too, and the build checks every row the table holds; the engine has
         // no `NOT VALID` for it (DEC-2448.3).
-        Change::SetExclusion {
+        Change::Constraint(ConstraintChange::SetExclusion {
             table,
             name,
             to: Some(_),
             ..
-        } => e(
+        }) => e(
             format!(
                 "adding the exclusion constraint {name}, which builds its index and checks \
                  every existing row while reads and writes wait",
@@ -730,9 +743,9 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             Lock::AccessExclusive,
         ),
 
-        Change::SetPrimaryKey {
+        Change::Constraint(ConstraintChange::SetPrimaryKey {
             table, to: Some(_), ..
-        } => e(
+        }) => e(
             "adding the primary key".to_owned(),
             table,
             Rewrite::No,
@@ -744,11 +757,11 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         // `ShareRowExclusiveLock` on the referenced table as well as on this
         // one — so a key nobody thought of as touching the parent blocks every
         // write to it for as long as the scan takes.
-        Change::AddForeignKey {
+        Change::Constraint(ConstraintChange::AddForeignKey {
             table,
             name,
             constraint,
-        } => {
+        }) => {
             let mut estimate = Estimate::new(
                 format!("adding the foreign key {name}", name = name.shown(),),
                 table.clone(),
@@ -764,9 +777,9 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             Some(estimate)
         }
 
-        Change::AddIndex {
+        Change::Index(IndexChange::AddIndex {
             table, name, index, ..
-        } => {
+        }) => {
             // A concurrent build is the one statement here that lets writes
             // through — measured from a second session,
             // `ShareUpdateExclusiveLock` against the plain build's `ShareLock`.
@@ -805,7 +818,7 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
 
         // Catalog-only, measured: a default is a property of the column here
         // and existing rows keep whatever they hold.
-        Change::AlterColumnDefault { column, .. } => e(
+        Change::Column(ColumnChange::AlterColumnDefault { column, .. }) => e(
             format!("changing the default of {column}", column = column.shown()),
             &column.table,
             Rewrite::No,
@@ -815,19 +828,19 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
 
         // The same two statements on a partition alone (#1581): a default
         // is catalog-only, and a NOT NULL reads the partition's rows.
-        Change::SetPartitionDefault { table, column, .. } => e(
+        Change::Partition(PartitionChange::SetPartitionDefault { table, column, .. }) => e(
             format!("changing the default of {}", table.column(column).shown()),
             table,
             Rewrite::No,
             Reads::Nothing,
             Lock::AccessExclusive,
         ),
-        Change::SetPartitionNotNull {
+        Change::Partition(PartitionChange::SetPartitionNotNull {
             table,
             column,
             not_null,
             ..
-        } => e(
+        }) => e(
             format!(
                 "making {} {}",
                 table.column(column).shown(),
@@ -846,7 +859,7 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         // Measured on 17.11 and 18.6: `SET EXPRESSION` recomputes every row
         // and rewrites the table under `ACCESS EXCLUSIVE`, rebuilding its
         // indexes (DEC-1168.1).
-        Change::AlterColumnExpression { column, .. } => e(
+        Change::Column(ColumnChange::AlterColumnExpression { column, .. }) => e(
             format!(
                 "recomputing the generated column {column}",
                 column = column.shown()
@@ -863,14 +876,14 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         // counting down) under that lock, to continue past it (DEC-1889.1):
         // one index probe where an index leads with the column, every row
         // where none does, which only the catalog can say.
-        Change::AlterColumnNumbering {
+        Change::Column(ColumnChange::AlterColumnNumbering {
             from: pbps_model::ValueSource::Sequence(_),
             to: pbps_model::ValueSource::Sequence(_),
             ..
-        } => None,
-        Change::AlterColumnNumbering {
+        }) => None,
+        Change::Column(ColumnChange::AlterColumnNumbering {
             column, from, to, ..
-        } => {
+        }) => {
             let installed = pbps_model::NumberingKind::installed(from, to);
             let mut estimate = e(
                 format!("changing how {column} is numbered", column = column.shown()),
@@ -916,14 +929,14 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             Some(estimate)
         }
 
-        Change::RenameColumn { table, from, .. } => e(
+        Change::Column(ColumnChange::RenameColumn { table, from, .. }) => e(
             format!("renaming {}", table.column(from).shown()),
             table,
             Rewrite::No,
             Reads::Nothing,
             Lock::AccessExclusive,
         ),
-        Change::RenameTable { from, .. } => e(
+        Change::Table(TableChange::RenameTable { from, .. }) => e(
             format!("renaming the table {from}", from = from.shown()),
             from,
             Rewrite::No,
@@ -941,12 +954,12 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         // range are moved out under SHARE, and the attach then holds it
         // exclusively and scans what is left, while the parent takes a lock
         // only other schema changes wait on.
-        Change::CreateTable {
+        Change::Table(TableChange::CreateTable {
             name,
             table,
             beside_default: Some(default),
             ..
-        } => table.partition_of.as_ref().and_then(|of| {
+        }) => table.partition_of.as_ref().and_then(|of| {
             e(
                 format!(
                     "creating the partition {name} of {} by moving the rows of its range out of \
@@ -961,8 +974,9 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
                 Lock::AccessExclusive,
             )
         }),
-        Change::CreateTable { name, table, .. } => table.partition_of.as_ref().and_then(|of| {
-            e(
+        Change::Table(TableChange::CreateTable { name, table, .. }) => {
+            table.partition_of.as_ref().and_then(|of| {
+                e(
                 format!(
                     "creating the partition {name} of {}",
                     of.parent.shown(),
@@ -977,8 +991,9 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
                 ),
                 Lock::AccessExclusive,
             )
-        }),
-        Change::DetachPartition { table, parent, .. } => e(
+            })
+        }
+        Change::Partition(PartitionChange::DetachPartition { table, parent, .. }) => e(
             format!(
                 "detaching the partition {table} from {parent}",
                 table = table.shown(),
@@ -996,12 +1011,12 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         // As the DEFAULT partition, the table alone is scanned, for rows
         // another partition takes, and no other partition is read or locked;
         // the parent takes the same lock (#1639, measured on 16 and 18).
-        Change::AttachPartition {
+        Change::Partition(PartitionChange::AttachPartition {
             table,
             parent,
             bound: pbps_model::PartitionBound::Default,
             ..
-        } => e(
+        }) => e(
             format!(
                 "attaching {table} to {parent} as its DEFAULT partition",
                 table = table.shown(),
@@ -1017,7 +1032,7 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         // holding it exclusively; the parent takes a lock only other schema
         // changes wait on, and its DEFAULT partition is scanned too.
         // Measured on 16 and 18 (#1545).
-        Change::AttachPartition { table, parent, .. } => e(
+        Change::Partition(PartitionChange::AttachPartition { table, parent, .. }) => e(
             format!(
                 "attaching {table} to {parent} as a partition; the parent's DEFAULT partition, if \
                  it has one, is scanned for rows inside the range as well",
@@ -1029,11 +1044,11 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             Reads::EveryRow,
             Lock::AccessExclusive,
         ),
-        Change::DropTable {
+        Change::Table(TableChange::DropTable {
             name,
             detach_from: Some(parent),
             ..
-        } => e(
+        }) => e(
             format!(
                 "detaching and dropping the partition {name} of {parent}",
                 name = name.shown(),
@@ -1050,29 +1065,29 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         ),
 
         // Not about a table's stored rows, or not about a size at all.
-        Change::DropTable {
+        Change::Table(TableChange::DropTable {
             detach_from: None, ..
-        }
-        | Change::DropPolicy { .. }
-        | Change::CreatePolicy { .. }
-        | Change::SetRowSecurity { .. }
-        | Change::SetColumnDeprecated { .. }
-        | Change::SetComment { .. }
-        | Change::SetPrimaryKey { to: None, .. }
-        | Change::SetExclusion { to: None, .. }
-        | Change::DropUnique { .. }
-        | Change::DropForeignKey { .. }
-        | Change::DropCheck { .. }
-        | Change::DropIndex { .. }
-        | Change::AddComputedColumn { .. }
-        | Change::DropComputedColumn { .. }
+        })
+        | Change::Policy(PolicyChange::DropPolicy { .. })
+        | Change::Policy(PolicyChange::CreatePolicy { .. })
+        | Change::Policy(PolicyChange::SetRowSecurity { .. })
+        | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+        | Change::TableProperty(TablePropertyChange::SetComment { .. })
+        | Change::Constraint(ConstraintChange::SetPrimaryKey { to: None, .. })
+        | Change::Constraint(ConstraintChange::SetExclusion { to: None, .. })
+        | Change::Constraint(ConstraintChange::DropUnique { .. })
+        | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+        | Change::Constraint(ConstraintChange::DropCheck { .. })
+        | Change::Index(IndexChange::DropIndex { .. })
+        | Change::Column(ColumnChange::AddComputedColumn { .. })
+        | Change::Column(ColumnChange::DropComputedColumn { .. })
         | pbps_model::change_family!(modules)
         | pbps_model::change_family!(rows)
         | pbps_model::change_family!(type_values)
         | pbps_model::catalog_change!()
-        | Change::Grant { .. }
-        | Change::Revoke { .. }
-        | Change::PublicExecution { .. } => None,
+        | Change::Permission(GrantChange::Grant { .. })
+        | Change::Permission(GrantChange::Revoke { .. })
+        | Change::Permission(GrantChange::PublicExecution { .. }) => None,
     }
 }
 
@@ -1336,6 +1351,12 @@ async fn continues_at(conn: &mut Conn, estimate: &mut Estimate) -> Result<(), Db
 mod tests {
     use super::*;
     use pbps_model::ChangeSet;
+    use pbps_model::ColumnChange;
+    use pbps_model::ConstraintChange;
+    use pbps_model::IndexChange;
+    use pbps_model::PartitionChange;
+    use pbps_model::TableChange;
+    use pbps_model::TablePropertyChange;
 
     mod fixture {
         include!(concat!(
@@ -1402,11 +1423,11 @@ mod tests {
     fn a_persistence_switch_is_a_rewrite_under_access_exclusive() {
         for unlogged in [true, false] {
             let e = estimate(
-                &Change::SetTablePersistence {
+                &Change::TableProperty(TablePropertyChange::SetTablePersistence {
                     uid: "t_000000".parse().unwrap(),
                     table: tname("app.t"),
                     unlogged,
-                },
+                }),
                 Strategy::default(),
             )
             .unwrap();
@@ -1433,13 +1454,13 @@ mod tests {
         };
         let create = |beside_default| {
             estimate(
-                &Change::CreateTable {
+                &Change::Table(TableChange::CreateTable {
                     uid: "t_000000".parse().unwrap(),
                     name: tname("app.ev_2025"),
                     table: Box::new(partition.clone()),
                     beside_default,
                     moves_at_most: None,
-                },
+                }),
                 Strategy::default(),
             )
             .unwrap()
@@ -1463,12 +1484,14 @@ mod tests {
     /// (measured on 16 and 18, #1442).
     #[test]
     fn an_index_parameter_change_takes_its_methods_lock() {
-        let change = |method| Change::SetIndexStorageParameters {
-            table: tname("app.t"),
-            target: pbps_model::IndexPart::Index("ix".into()),
-            method,
-            set: [("fillfactor".to_owned(), "70".to_owned())].into(),
-            reset: Default::default(),
+        let change = |method| {
+            Change::Index(IndexChange::SetIndexStorageParameters {
+                table: tname("app.t"),
+                target: pbps_model::IndexPart::Index("ix".into()),
+                method,
+                set: [("fillfactor".to_owned(), "70".to_owned())].into(),
+                reset: Default::default(),
+            })
         };
         let e = estimate(&change(pbps_model::IndexMethod::Btree), Strategy::default()).unwrap();
         assert!(matches!(e.rewrite, Rewrite::No) && matches!(e.reads, Reads::Nothing));
@@ -1480,7 +1503,7 @@ mod tests {
         let e = estimate(&change(pbps_model::IndexMethod::Gist), Strategy::default()).unwrap();
         assert!(matches!(e.lock, Lock::ShareUpdateExclusive));
         let mut both = change(pbps_model::IndexMethod::Gist);
-        if let Change::SetIndexStorageParameters { set, .. } = &mut both {
+        if let Change::Index(IndexChange::SetIndexStorageParameters { set, .. }) = &mut both {
             set.insert("buffering".to_owned(), "off".to_owned());
         }
         let e = estimate(&both, Strategy::default()).unwrap();
@@ -1493,14 +1516,16 @@ mod tests {
     /// review).
     #[test]
     fn a_storage_parameter_change_takes_its_strongest_parameters_lock() {
-        let change = |set: &[&str], reset: &[&str]| Change::SetStorageParameters {
-            uid: "t_000000".parse().unwrap(),
-            table: tname("app.t"),
-            set: set
-                .iter()
-                .map(|k| ((*k).to_owned(), "true".to_owned()))
-                .collect(),
-            reset: reset.iter().map(|k| (*k).to_owned()).collect(),
+        let change = |set: &[&str], reset: &[&str]| {
+            Change::TableProperty(TablePropertyChange::SetStorageParameters {
+                uid: "t_000000".parse().unwrap(),
+                table: tname("app.t"),
+                set: set
+                    .iter()
+                    .map(|k| ((*k).to_owned(), "true".to_owned()))
+                    .collect(),
+                reset: reset.iter().map(|k| (*k).to_owned()).collect(),
+            })
         };
         let lock = |c: &Change| {
             let e = estimate(c, Strategy::default()).expect("an estimate");
@@ -1535,11 +1560,11 @@ mod tests {
             Some(ReplicaIdentity::Unique("uq".into())),
             Some(ReplicaIdentity::Index("ix".into())),
         ] {
-            let change = Change::SetReplicaIdentity {
+            let change = Change::TableProperty(TablePropertyChange::SetReplicaIdentity {
                 uid: "t_000000".parse().unwrap(),
                 table: tname("app.t"),
                 to: to.clone(),
-            };
+            });
             let e = estimate(&change, Strategy::default())
                 .unwrap_or_else(|| panic!("no estimate for {to:?}"));
             assert!(matches!(e.rewrite, Rewrite::No), "{to:?}");
@@ -1552,7 +1577,7 @@ mod tests {
     fn planned_estimates_keep_change_indices_and_each_statements_strategy() {
         use pbps_model::PlannedChange;
         let index = |online| {
-            let mut p = PlannedChange::new(Change::AddIndex {
+            let mut p = PlannedChange::new(Change::Index(IndexChange::AddIndex {
                 table: tname("app.t"),
                 name: "ix".into(),
                 index: Box::new(pbps_model::Index {
@@ -1570,17 +1595,17 @@ mod tests {
                     filegroup: None,
                 }),
                 clustered: false,
-            });
+            }));
             p.strategy = Strategy { online };
             p
         };
         let cs = ChangeSet {
             changes: vec![
                 index(false),
-                PlannedChange::new(Change::DropIndex {
+                PlannedChange::new(Change::Index(IndexChange::DropIndex {
                     table: tname("app.t"),
                     name: "old".into(),
-                }),
+                })),
                 index(true),
             ],
         };
@@ -1611,13 +1636,13 @@ mod tests {
 
         let cs = ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::RenameTable {
+                PlannedChange::new(Change::Table(TableChange::RenameTable {
                     uid: "t_aaaaaa".parse().expect("a uid"),
                     from: tname("app.client"),
                     to: tname("app.customer"),
                     defaults: Vec::new(),
-                }),
-                PlannedChange::new(Change::AlterColumnType {
+                })),
+                PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
                     uid: "c_aaaaaa".parse().expect("a uid"),
                     column: cref("app.customer.v"),
                     from: ty("integer"),
@@ -1628,17 +1653,17 @@ mod tests {
                     from_collation: None,
                     to_collation: None,
                     using: None,
-                }),
-                PlannedChange::new(Change::RenameColumn {
+                })),
+                PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
                     uid: "c_aaaaaa".parse().expect("a uid"),
                     table: tname("app.customer"),
                     from: "v".into(),
                     to: "amount".into(),
                     table_was: None,
-                }),
+                })),
                 // A table this plan leaves alone, to show the translation is a
                 // lookup and not a rewrite of every name in sight.
-                PlannedChange::new(Change::AlterColumnType {
+                PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
                     uid: "c_cccccc".parse().expect("a uid"),
                     column: cref("app.invoice.v"),
                     from: ty("integer"),
@@ -1649,7 +1674,7 @@ mod tests {
                     from_collation: None,
                     to_collation: None,
                     using: None,
-                }),
+                })),
             ],
         };
         let got: Vec<(String, String)> = estimates(&cs, Strategy::default())
@@ -1682,19 +1707,21 @@ mod tests {
     fn an_early_replica_identity_is_measured_as_its_own_table() {
         use pbps_model::{ChangeSet, PlannedChange, ReplicaIdentity};
         let identity = |uid: &str, table| {
-            PlannedChange::new(Change::SetReplicaIdentity {
-                uid: uid.parse().unwrap(),
-                table: tname(table),
-                to: Some(ReplicaIdentity::Full),
-            })
+            PlannedChange::new(Change::TableProperty(
+                TablePropertyChange::SetReplicaIdentity {
+                    uid: uid.parse().unwrap(),
+                    table: tname(table),
+                    to: Some(ReplicaIdentity::Full),
+                },
+            ))
         };
         let rename = |uid: &str, from, to| {
-            PlannedChange::new(Change::RenameTable {
+            PlannedChange::new(Change::Table(TableChange::RenameTable {
                 uid: uid.parse().unwrap(),
                 from: tname(from),
                 to: tname(to),
                 defaults: Vec::new(),
-            })
+            }))
         };
         let stored = |table| CatalogSource::Stored {
             table: tname(table),
@@ -1725,13 +1752,13 @@ mod tests {
             changes: vec![
                 identity("t_bbbbbb", "app.b"),
                 rename("t_bbbbbb", "app.b", "app.c"),
-                PlannedChange::new(Change::CreateTable {
+                PlannedChange::new(Change::Table(TableChange::CreateTable {
                     uid: "t_eeeeee".parse().unwrap(),
                     name: tname("app.b"),
                     table: Box::default(),
                     beside_default: None,
                     moves_at_most: None,
-                }),
+                })),
             ],
         };
         let es = planned_estimates(&cs);
@@ -1742,7 +1769,7 @@ mod tests {
     fn renamed_columns_keep_the_catalog_spelling_and_the_plan_label() {
         use pbps_model::PlannedChange;
         let alter = |uid: &str, column| {
-            PlannedChange::new(Change::AlterColumnType {
+            PlannedChange::new(Change::Column(ColumnChange::AlterColumnType {
                 uid: uid.parse().unwrap(),
                 column: cref(column),
                 from: ty("integer"),
@@ -1753,40 +1780,40 @@ mod tests {
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            })
+            }))
         };
         let mut cs = ChangeSet {
             changes: vec![
                 alter("c_aaaaaa", "app.customer.amount"),
                 alter("c_bbbbbb", "app.other.amount"),
-                PlannedChange::new(Change::AlterColumnNullability {
+                PlannedChange::new(Change::Column(ColumnChange::AlterColumnNullability {
                     uid: "c_cccccc".parse().unwrap(),
                     column: cref("app.customer.required"),
                     ty: ty("integer"),
                     to_nullable: false,
                     through_external_partitions: false,
                     collation: None,
-                }),
-                PlannedChange::new(Change::RenameColumn {
+                })),
+                PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
                     uid: "c_aaaaaa".parse().unwrap(),
                     table: tname("app.customer"),
                     from: "v".into(),
                     to: "amount".into(),
                     table_was: None,
-                }),
-                PlannedChange::new(Change::RenameColumn {
+                })),
+                PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
                     uid: "c_cccccc".parse().unwrap(),
                     table: tname("app.customer"),
                     from: "n".into(),
                     to: "required".into(),
                     table_was: None,
-                }),
-                PlannedChange::new(Change::RenameTable {
+                })),
+                PlannedChange::new(Change::Table(TableChange::RenameTable {
                     uid: "t_aaaaaa".parse().unwrap(),
                     from: tname("app.client"),
                     to: tname("app.customer"),
                     defaults: Vec::new(),
-                }),
+                })),
             ],
         };
         // Statement spellings describe the point after their renames.
@@ -1815,7 +1842,7 @@ mod tests {
     fn reused_table_names_do_not_merge_created_and_stored_identities() {
         use pbps_model::PlannedChange;
         let index = |table| {
-            PlannedChange::new(Change::AddIndex {
+            PlannedChange::new(Change::Index(IndexChange::AddIndex {
                 table: tname(table),
                 name: "ix".into(),
                 index: Box::new(pbps_model::Index {
@@ -1833,23 +1860,23 @@ mod tests {
                     filegroup: None,
                 }),
                 clustered: false,
-            })
+            }))
         };
         let cs = ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::RenameTable {
+                PlannedChange::new(Change::Table(TableChange::RenameTable {
                     uid: "t_aaaaaa".parse().unwrap(),
                     from: tname("app.t"),
                     to: tname("app.kept"),
                     defaults: Vec::new(),
-                }),
-                PlannedChange::new(Change::CreateTable {
+                })),
+                PlannedChange::new(Change::Table(TableChange::CreateTable {
                     uid: "t_bbbbbb".parse().unwrap(),
                     name: tname("app.t"),
                     table: Box::default(),
                     beside_default: None,
                     moves_at_most: None,
-                }),
+                })),
                 index("app.t"),
                 index("app.kept"),
                 index("app.other"),
@@ -1879,14 +1906,14 @@ mod tests {
         );
         // Even a new table subsequently renamed has no stored identity.
         let mut renamed = cs;
-        renamed
-            .changes
-            .push(PlannedChange::new(Change::RenameTable {
+        renamed.changes.push(PlannedChange::new(Change::Table(
+            TableChange::RenameTable {
                 uid: "t_bbbbbb".parse().unwrap(),
                 from: tname("app.t"),
                 to: tname("app.fresh"),
                 defaults: Vec::new(),
-            }));
+            },
+        )));
         renamed.changes.push(index("app.fresh"));
         let es = planned_estimates(&renamed);
         assert_eq!(es[es.len() - 2].1.source, CatalogSource::Created);
@@ -2014,14 +2041,14 @@ mod tests {
     #[test]
     fn rewriting_nothing_is_not_the_same_as_reading_nothing() {
         let tightened = estimate(
-            &Change::AlterColumnNullability {
+            &Change::Column(ColumnChange::AlterColumnNullability {
                 uid: "c_aaaaaa".parse().expect("a uid"),
                 column: cref("app.t.v"),
                 ty: ty("integer"),
                 to_nullable: false,
                 through_external_partitions: false,
                 collation: None,
-            },
+            }),
             Strategy::default(),
         )
         .expect("an estimate");
@@ -2033,7 +2060,7 @@ mod tests {
         );
 
         let widened = estimate(
-            &Change::AlterColumnType {
+            &Change::Column(ColumnChange::AlterColumnType {
                 uid: "c_aaaaaa".parse().expect("a uid"),
                 column: cref("app.t.v"),
                 from: ty("varchar(10)"),
@@ -2044,7 +2071,7 @@ mod tests {
                 from_collation: None,
                 to_collation: None,
                 using: None,
-            },
+            }),
             Strategy::default(),
         )
         .expect("an estimate");
@@ -2059,7 +2086,7 @@ mod tests {
             [(true, false), (true, true), (false, false), (false, true)]
         {
             let e = estimate(
-                &Change::AlterColumnType {
+                &Change::Column(ColumnChange::AlterColumnType {
                     uid: "c_aaaaaa".parse().unwrap(),
                     column: cref("app.t.v"),
                     from: ty("varchar(10)"),
@@ -2070,7 +2097,7 @@ mod tests {
                     from_collation: None,
                     to_collation: None,
                     using: None,
-                },
+                }),
                 Strategy::default(),
             )
             .unwrap();
@@ -2092,36 +2119,36 @@ mod tests {
     fn nullability_check_removals_follow_only_the_executed_prefix_and_identity() {
         use pbps_model::PlannedChange;
         let tighten = |uid: &str, table| {
-            PlannedChange::new(Change::AlterColumnNullability {
+            PlannedChange::new(Change::Column(ColumnChange::AlterColumnNullability {
                 uid: uid.parse().unwrap(),
                 column: tname(table).column("v"),
                 ty: ty("integer"),
                 to_nullable: false,
                 through_external_partitions: false,
                 collation: None,
-            })
+            }))
         };
         let drop = |table, name: &str| {
-            PlannedChange::new(Change::DropCheck {
+            PlannedChange::new(Change::Constraint(ConstraintChange::DropCheck {
                 table: tname(table),
                 name: name.into(),
-            })
+            }))
         };
         let cs = ChangeSet {
             changes: vec![
                 tighten("c_aaaaaa", "app.t"),
                 drop("app.t", "gone\"check"),
                 drop("app.other", "unrelated"),
-                PlannedChange::new(Change::RenameTable {
+                PlannedChange::new(Change::Table(TableChange::RenameTable {
                     uid: "t_aaaaaa".parse().unwrap(),
                     from: tname("app.t"),
                     to: tname("app.kept"),
                     defaults: Vec::new(),
-                }),
+                })),
                 tighten("c_aaaaaa", "app.kept"),
                 drop("app.kept", "later"),
                 tighten("c_aaaaaa", "app.kept"),
-                PlannedChange::new(Change::CreateTable {
+                PlannedChange::new(Change::Table(TableChange::CreateTable {
                     uid: "t_bbbbbb".parse().unwrap(),
                     name: tname("app.t"),
                     table: Box::new(pbps_model::Table {
@@ -2130,7 +2157,7 @@ mod tests {
                     }),
                     beside_default: None,
                     moves_at_most: None,
-                }),
+                })),
                 tighten("c_bbbbbb", "app.t"),
             ],
         };
@@ -2164,12 +2191,12 @@ mod tests {
         let column = |default: &str| {
             let mut c = pbps_model::Column::new(ty("uuid"));
             c.value_source = pbps_model::ValueSource::Default(default.to_owned());
-            Change::AddColumn {
+            Change::Column(ColumnChange::AddColumn {
                 uid: "c_aaaaaa".parse().expect("a uid"),
                 table: tname("app.t"),
                 name: "v".into(),
                 column: Box::new(c),
-            }
+            })
         };
         let guessed =
             estimate(&column("gen_random_uuid()"), Strategy::default()).expect("an estimate");
@@ -2193,12 +2220,12 @@ mod tests {
             stored: true,
         });
         assert!(column.nullable);
-        let change = Change::AddColumn {
+        let change = Change::Column(ColumnChange::AddColumn {
             uid: "c_1402aa".parse().unwrap(),
             table: tname("app.t"),
             name: "g".into(),
             column: Box::new(column),
-        };
+        });
         let cost = estimate(&change, Strategy::default()).unwrap();
         assert_eq!(cost.rewrite, Rewrite::Yes);
         assert_eq!(cost.reads, Reads::EveryRow);
@@ -2209,7 +2236,7 @@ mod tests {
             pbps_model::ValueSource::Default("7".into()),
         ] {
             let mut control = change.clone();
-            let Change::AddColumn { column, .. } = &mut control else {
+            let Change::Column(ColumnChange::AddColumn { column, .. }) = &mut control else {
                 unreachable!()
             };
             column.value_source = source;
@@ -2235,12 +2262,12 @@ mod tests {
                 pbps_model::ValueSource::Identity,
             );
             column.nullable = identity.is_none();
-            let change = Change::AddColumn {
+            let change = Change::Column(ColumnChange::AddColumn {
                 uid: "c_aaaaaa".parse().expect("a uid"),
                 table: tname("app.t"),
                 name: "v".into(),
                 column: Box::new(column),
-            };
+            });
             let ours = estimate(&change, Strategy::default()).expect("an estimate");
             let (rewrite, reads) = if identity.is_some() {
                 (Rewrite::Yes, Reads::EveryRow)
@@ -2261,12 +2288,12 @@ mod tests {
         let mut column = pbps_model::Column::new(ty("integer")).not_null();
         column.value_source =
             pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence::serial());
-        let change = Change::AddColumn {
+        let change = Change::Column(ColumnChange::AddColumn {
             uid: "c_aaaaaa".parse().expect("a uid"),
             table: tname("app.t"),
             name: "v".into(),
             column: Box::new(column),
-        };
+        });
         let ours = estimate(&change, Strategy::default()).expect("an estimate");
         assert_eq!(ours.rewrite, Rewrite::Yes);
         assert_eq!(ours.reads, Reads::EveryRow);
@@ -2276,7 +2303,7 @@ mod tests {
     /// A foreign key locks the table nobody was looking at.
     #[test]
     fn a_foreign_key_names_the_referenced_table_it_also_locks() {
-        let change = Change::AddForeignKey {
+        let change = Change::Constraint(ConstraintChange::AddForeignKey {
             table: tname("app.child"),
             name: "fk_child".into(),
             constraint: Box::new(pbps_model::ForeignKey {
@@ -2286,7 +2313,7 @@ mod tests {
                 on_delete: pbps_model::ReferentialAction::NoAction,
                 on_update: pbps_model::ReferentialAction::NoAction,
             }),
-        };
+        });
         let e = estimate(&change, Strategy::default()).expect("an estimate");
         assert_eq!(e.lock, Lock::ShareRowExclusive);
         assert_eq!(e.also_locks, [tname("app.parent")]);
@@ -2294,7 +2321,9 @@ mod tests {
         // A self-reference locks one table, and naming it twice would read as
         // two.
         let mut self_referencing = change.clone();
-        if let Change::AddForeignKey { constraint, .. } = &mut self_referencing {
+        if let Change::Constraint(ConstraintChange::AddForeignKey { constraint, .. }) =
+            &mut self_referencing
+        {
             constraint.references_table = tname("app.child");
         }
         assert!(
@@ -2313,24 +2342,26 @@ mod tests {
     /// writers, reported as taking one that blocks nothing.
     #[test]
     fn the_index_lock_is_the_one_the_emitter_will_actually_take() {
-        let index = |filter: Option<&str>| Change::AddIndex {
-            table: tname("app.t"),
-            name: "ix".into(),
-            index: Box::new(pbps_model::Index {
-                columns: vec![pbps_model::IndexColumn {
-                    key: pbps_model::IndexKey::Column("v".into()),
-                    descending: false,
-                    opclass: None,
-                    collation: None,
-                }],
-                include: Vec::new(),
-                unique: false,
-                filter: filter.map(str::to_owned),
-                method: Default::default(),
-                storage_parameters: Default::default(),
-                filegroup: None,
-            }),
-            clustered: false,
+        let index = |filter: Option<&str>| {
+            Change::Index(IndexChange::AddIndex {
+                table: tname("app.t"),
+                name: "ix".into(),
+                index: Box::new(pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        key: pbps_model::IndexKey::Column("v".into()),
+                        descending: false,
+                        opclass: None,
+                        collation: None,
+                    }],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: filter.map(str::to_owned),
+                    method: Default::default(),
+                    storage_parameters: Default::default(),
+                    filegroup: None,
+                }),
+                clustered: false,
+            })
         };
         let online = Strategy { online: true };
         let lock = |change: &Change, strategy: Strategy| {
@@ -2407,28 +2438,28 @@ mod tests {
         let mut shape = Table::default();
         shape.columns.insert("v".into(), Column::new(ty("integer")));
         let changes = [
-            Change::DetachPartition {
+            Change::Partition(PartitionChange::DetachPartition {
                 uid: "t_aaaaaa".parse().unwrap(),
                 table: table.clone(),
                 parent: tname("app.parent"),
                 names: vec![],
                 shape: Box::new(shape),
-            },
-            Change::RenameColumn {
+            }),
+            Change::Column(ColumnChange::RenameColumn {
                 uid: "c_aaaaaa".parse().unwrap(),
                 table: table.clone(),
                 from: "v".into(),
                 to: "amount".into(),
                 table_was: None,
-            },
-            Change::AlterColumnNullability {
+            }),
+            Change::Column(ColumnChange::AlterColumnNullability {
                 uid: "c_aaaaaa".parse().unwrap(),
                 column: table.column("amount"),
                 ty: ty("integer"),
                 to_nullable: false,
                 through_external_partitions: false,
                 collation: None,
-            },
+            }),
         ]
         .map(PlannedChange::new);
         let ids = IdsFile {
@@ -2472,22 +2503,22 @@ mod tests {
             storage_parameters: Default::default(),
             timing: pbps_model::ExclusionTiming::Immediate,
         };
-        let add = Change::SetExclusion {
+        let add = Change::Constraint(ConstraintChange::SetExclusion {
             table: tname("app.t"),
             name: "x".into(),
             from: None,
             to: Some(Box::new(constraint.clone())),
-        };
+        });
         let e = estimate(&add, Strategy::default()).expect("an estimate");
         assert!(matches!(e.lock, Lock::AccessExclusive));
         assert!(matches!(e.reads, Reads::EveryRow), "{e:?}");
         assert!(e.about.contains("exclusion constraint x"), "{e:?}");
-        let drop = Change::SetExclusion {
+        let drop = Change::Constraint(ConstraintChange::SetExclusion {
             table: tname("app.t"),
             name: "x".into(),
             from: Some(Box::new(constraint)),
             to: None,
-        };
+        });
         assert!(estimate(&drop, Strategy::default()).is_none());
     }
 }

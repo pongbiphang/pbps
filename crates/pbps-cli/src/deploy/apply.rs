@@ -684,7 +684,10 @@ pub(super) fn pinned_managed(
     // A column a staged rebuild has already moved holds the replacement, which
     // is the declared type's own until the swap names it back (DEC-1635.7).
     for planned in &changes.changes {
-        if let pbps_model::Change::EnumRebuild { tmp, .. } = &planned.change {
+        if let pbps_model::Change::TypeValue(pbps_model::TypeValueChange::EnumRebuild {
+            tmp, ..
+        }) = &planned.change
+        {
             references.remove(tmp);
         }
     }
@@ -832,7 +835,10 @@ pub(super) fn role_drop_expectations<D: crate::emission::Engine>(
     let emit = crate::emitter(dialect, plan, mode);
     for (position, p) in cs.changes.iter().enumerate() {
         let n = emit(position)?.len();
-        if let pbps_model::Change::DropRole { name, members, .. } = &p.change {
+        if let pbps_model::Change::Role(pbps_model::RoleChange::DropRole {
+            name, members, ..
+        }) = &p.change
+        {
             let done = completed.saturating_sub(at).min(n);
             if done <= members.len() {
                 out.push((name.clone(), members[done..].to_vec()));
@@ -1229,7 +1235,9 @@ pub(super) fn dropped_modules(
         .changes
         .iter()
         .filter_map(|p| {
-            if let pbps_model::Change::DropModule { id, kind } = &p.change {
+            if let pbps_model::Change::Module(pbps_model::ModuleChange::DropModule { id, kind }) =
+                &p.change
+            {
                 Some((*kind, id.clone()))
             } else {
                 None
@@ -1242,7 +1250,12 @@ pub(super) fn dropped_referrer_names(changes: &pbps_model::ChangeSet) -> BTreeSe
     changes
         .changes
         .iter()
-        .filter(|p| matches!(p.change, pbps_model::Change::DropModule { .. }))
+        .filter(|p| {
+            matches!(
+                p.change,
+                pbps_model::Change::Module(pbps_model::ModuleChange::DropModule { .. })
+            )
+        })
         .filter_map(|p| p.change.module_id())
         .map(|id| id.object_name().raw().to_string())
         .collect()

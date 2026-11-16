@@ -10,6 +10,15 @@ use crate::ColumnName;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 
+use crate::ColumnChange;
+use crate::IndexChange;
+use crate::PartitionChange;
+use crate::PolicyChange;
+use crate::RoleChange;
+use crate::TableChange;
+use crate::TablePropertyChange;
+use crate::TypeChange;
+use crate::TypeValueChange;
 use crate::{Change, ColumnRef, IdsFile, PlannedChange, TableName, Uid, UidKind};
 
 /// A boundary in the borrowed plan. Before/After require an existing change.
@@ -258,62 +267,62 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
     use IdentityChange::{Column, Other, Role, Table, Type};
     let kept = |column: &ColumnRef| Some(column.clone());
     match change {
-        Change::RebuildPartitionedTable(_)
-        | Change::BuildPartitionedIndex(_)
-        | Change::CopyTableRows(_)
-        | Change::AnalyzeTableTree(_) => Other,
-        Change::CreateTable {
+        Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+        | Change::Index(IndexChange::BuildPartitionedIndex(_))
+        | Change::Partition(PartitionChange::CopyTableRows(_))
+        | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => Other,
+        Change::Table(TableChange::CreateTable {
             uid, name, table, ..
-        } => Table(
+        }) => Table(
             Transition::new(step, uid, None, Some(name.clone())),
             ColumnLife::Begin(table.columns.keys().cloned().collect()),
         ),
-        Change::DropTable { uid, name, .. } => Table(
+        Change::Table(TableChange::DropTable { uid, name, .. }) => Table(
             Transition::new(step, uid, Some(name.clone()), None),
             ColumnLife::End,
         ),
-        Change::RenameTable { uid, from, to, .. } => Table(
+        Change::Table(TableChange::RenameTable { uid, from, to, .. }) => Table(
             Transition::new(step, uid, Some(from.clone()), Some(to.clone())),
             ColumnLife::Keep,
         ),
-        Change::DetachPartition {
+        Change::Partition(PartitionChange::DetachPartition {
             uid, table, shape, ..
-        } => Table(
+        }) => Table(
             Transition::new(step, uid, Some(table.clone()), Some(table.clone())),
             ColumnLife::Begin(shape.columns.keys().cloned().collect()),
         ),
-        Change::AttachPartition { uid, table, .. } => Table(
+        Change::Partition(PartitionChange::AttachPartition { uid, table, .. }) => Table(
             Transition::new(step, uid, Some(table.clone()), Some(table.clone())),
             ColumnLife::End,
         ),
-        Change::SetTablePersistence { uid, table, .. }
-        | Change::SetStorageParameters { uid, table, .. }
-        | Change::SetRowSecurity { uid, table, .. }
-        | Change::SetReplicaIdentity { uid, table, .. }
-        | Change::SetPartitionDefault { uid, table, .. }
-        | Change::SetPartitionNotNull { uid, table, .. } => Table(
+        Change::TableProperty(TablePropertyChange::SetTablePersistence { uid, table, .. })
+        | Change::TableProperty(TablePropertyChange::SetStorageParameters { uid, table, .. })
+        | Change::Policy(PolicyChange::SetRowSecurity { uid, table, .. })
+        | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { uid, table, .. })
+        | Change::Partition(PartitionChange::SetPartitionDefault { uid, table, .. })
+        | Change::Partition(PartitionChange::SetPartitionNotNull { uid, table, .. }) => Table(
             Transition::new(step, uid, Some(table.clone()), Some(table.clone())),
             ColumnLife::Keep,
         ),
-        Change::AddColumn {
+        Change::Column(ColumnChange::AddColumn {
             uid, table, name, ..
-        } => Column(Transition::new(step, uid, None, Some(table.column(name)))),
-        Change::DropColumn { uid, column } => {
+        }) => Column(Transition::new(step, uid, None, Some(table.column(name)))),
+        Change::Column(ColumnChange::DropColumn { uid, column }) => {
             Column(Transition::new(step, uid, kept(column), None))
         }
-        Change::RenameColumn {
+        Change::Column(ColumnChange::RenameColumn {
             uid,
             table,
             from,
             to,
             ..
-        } => Column(Transition::new(
+        }) => Column(Transition::new(
             step,
             uid,
             Some(table.column(from)),
             Some(table.column(to)),
         )),
-        Change::EnumRebuild {
+        Change::TypeValue(TypeValueChange::EnumRebuild {
             step:
                 crate::EnumRebuildStep::Retype {
                     column_uid: uid,
@@ -321,45 +330,45 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
                     ..
                 },
             ..
-        }
-        | Change::AlterColumnType { uid, column, .. }
-        | Change::AlterColumnNullability { uid, column, .. }
-        | Change::AlterColumnDefault { uid, column, .. }
-        | Change::AlterColumnExpression { uid, column, .. }
-        | Change::AlterColumnNumbering { uid, column, .. }
-        | Change::SetColumnDeprecated { uid, column, .. } => {
+        })
+        | Change::Column(ColumnChange::AlterColumnType { uid, column, .. })
+        | Change::Column(ColumnChange::AlterColumnNullability { uid, column, .. })
+        | Change::Column(ColumnChange::AlterColumnDefault { uid, column, .. })
+        | Change::Column(ColumnChange::AlterColumnExpression { uid, column, .. })
+        | Change::Column(ColumnChange::AlterColumnNumbering { uid, column, .. })
+        | Change::Column(ColumnChange::SetColumnDeprecated { uid, column, .. }) => {
             Column(Transition::new(step, uid, kept(column), kept(column)))
         }
-        Change::SetComment {
+        Change::TableProperty(TablePropertyChange::SetComment {
             target: crate::CommentTarget::Column { uid, column },
             ..
-        } => Column(Transition::new(step, uid, kept(column), kept(column))),
-        Change::SetComment {
+        }) => Column(Transition::new(step, uid, kept(column), kept(column))),
+        Change::TableProperty(TablePropertyChange::SetComment {
             target: crate::CommentTarget::Table { uid, table },
             ..
-        } => Table(
+        }) => Table(
             Transition::new(step, uid, Some(table.clone()), Some(table.clone())),
             ColumnLife::Keep,
         ),
-        Change::CreateRole { uid, name } => {
+        Change::Role(RoleChange::CreateRole { uid, name }) => {
             Role(Transition::new(step, uid, None, Some(name.clone())))
         }
-        Change::DropRole { uid, name, .. } => {
+        Change::Role(RoleChange::DropRole { uid, name, .. }) => {
             Role(Transition::new(step, uid, Some(name.clone()), None))
         }
-        Change::RenameRole { uid, from, to } => Role(Transition::new(
+        Change::Role(RoleChange::RenameRole { uid, from, to }) => Role(Transition::new(
             step,
             uid,
             Some(from.clone()),
             Some(to.clone()),
         )),
-        Change::CreateType { uid, name, .. } => {
+        Change::Type(TypeChange::CreateType { uid, name, .. }) => {
             Type(Transition::new(step, uid, None, Some(name.clone())))
         }
-        Change::DropType { uid, name, .. } => {
+        Change::Type(TypeChange::DropType { uid, name, .. }) => {
             Type(Transition::new(step, uid, Some(name.clone()), None))
         }
-        Change::RenameType { uid, from, to, .. } => Type(Transition::new(
+        Change::Type(TypeChange::RenameType { uid, from, to, .. }) => Type(Transition::new(
             step,
             uid,
             Some(from.clone()),
@@ -368,14 +377,14 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
         crate::change_family!(type_values)
         | crate::change_family!(extensions)
         | crate::change_family!(search)
-        | Change::AddComputedColumn { .. }
-        | Change::DropComputedColumn { .. }
+        | Change::Column(ColumnChange::AddComputedColumn { .. })
+        | Change::Column(ColumnChange::DropComputedColumn { .. })
         | crate::change_family!(constraints)
-        | Change::SetIndexStorageParameters { .. }
-        | Change::DropPolicy { .. }
-        | Change::CreatePolicy { .. }
-        | Change::AddIndex { .. }
-        | Change::DropIndex { .. }
+        | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+        | Change::Policy(PolicyChange::DropPolicy { .. })
+        | Change::Policy(PolicyChange::CreatePolicy { .. })
+        | Change::Index(IndexChange::AddIndex { .. })
+        | Change::Index(IndexChange::DropIndex { .. })
         | crate::change_family!(rows)
         | crate::change_family!(modules)
         | crate::change_family!(permissions) => Other,

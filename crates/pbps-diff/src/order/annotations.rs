@@ -6,6 +6,7 @@ pub(crate) use contract::Creation;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use pbps_model::ModuleChange;
 use pbps_model::object_ref::{ObjectDeps, ObjectRef, Root, Selector};
 use pbps_model::operation::{Operation, Transition};
 use pbps_model::{Change, ModuleDeps};
@@ -153,9 +154,15 @@ pub(crate) fn legacy(operations: &[Operation], dependencies: &ModuleDeps) -> Vec
     let mut index = Index::default();
     for (at, op) in operations.iter().enumerate() {
         match op.change() {
-            Change::CreateModule { id, .. } => index.record(module(id), at, Transition::Produces),
-            Change::AlterModule { id, .. } => index.record(module(id), at, Transition::Produces),
-            Change::DropModule { id, .. } => index.record(module(id), at, Transition::Ends),
+            Change::Module(ModuleChange::CreateModule { id, .. }) => {
+                index.record(module(id), at, Transition::Produces)
+            }
+            Change::Module(ModuleChange::AlterModule { id, .. }) => {
+                index.record(module(id), at, Transition::Produces)
+            }
+            Change::Module(ModuleChange::DropModule { id, .. }) => {
+                index.record(module(id), at, Transition::Ends)
+            }
             _ => {}
         }
     }

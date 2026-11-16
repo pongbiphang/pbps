@@ -321,23 +321,31 @@ pub(super) fn refuse_pinned_movement(
     let mut expected_types = BTreeMap::new();
     for step in &changes.changes {
         match &step.change {
-            pbps_model::Change::AddEnumValue {
-                uid, definition, ..
-            }
-            | pbps_model::Change::AlterDomain {
+            pbps_model::Change::TypeValue(pbps_model::TypeValueChange::AddEnumValue {
+                uid,
+                definition,
+                ..
+            })
+            | pbps_model::Change::TypeValue(pbps_model::TypeValueChange::AlterDomain {
                 uid,
                 to: definition,
                 ..
-            }
-            | pbps_model::Change::RenameEnumValue {
-                uid, definition, ..
-            }
-            | pbps_model::Change::CreateType {
-                uid, definition, ..
-            }
-            | pbps_model::Change::RenameType {
-                uid, definition, ..
-            } => {
+            })
+            | pbps_model::Change::TypeValue(pbps_model::TypeValueChange::RenameEnumValue {
+                uid,
+                definition,
+                ..
+            })
+            | pbps_model::Change::Type(pbps_model::TypeChange::CreateType {
+                uid,
+                definition,
+                ..
+            })
+            | pbps_model::Change::Type(pbps_model::TypeChange::RenameType {
+                uid,
+                definition,
+                ..
+            }) => {
                 if let Some(name) = resolver.name(TypeSide::Desired, uid) {
                     expected_types.insert(name.clone(), Some(realized(uid, definition)));
                 }
@@ -345,7 +353,12 @@ pub(super) fn refuse_pinned_movement(
             // The replacement may stand anywhere between its creation and the
             // swap, and no longer after it; the swap leaves the final labels
             // under the type's own name (DEC-1635.7).
-            pbps_model::Change::EnumRebuild { uid, tmp, step, .. } => {
+            pbps_model::Change::TypeValue(pbps_model::TypeValueChange::EnumRebuild {
+                uid,
+                tmp,
+                step,
+                ..
+            }) => {
                 expected_types.entry(tmp.clone()).or_insert(None);
                 if let pbps_model::EnumRebuildStep::Swap { definition, .. } = step
                     && let Some(name) = resolver.name(TypeSide::Desired, uid)
@@ -360,8 +373,10 @@ pub(super) fn refuse_pinned_movement(
     // Only the final identity map decides which names must be absent.
     for step in &changes.changes {
         let old = match &step.change {
-            pbps_model::Change::DropType { name, .. } => Some(name.clone()),
-            pbps_model::Change::RenameType { from, to, .. } => {
+            pbps_model::Change::Type(pbps_model::TypeChange::DropType { name, .. }) => {
+                Some(name.clone())
+            }
+            pbps_model::Change::Type(pbps_model::TypeChange::RenameType { from, to, .. }) => {
                 if let Ok(intermediate) = pbps_model::TypeRef::new(to.schema(), from.name()) {
                     expected_types.entry(intermediate).or_insert(None);
                 }
@@ -381,9 +396,11 @@ pub(super) fn refuse_pinned_movement(
         .changes
         .iter()
         .filter_map(|p| match &p.change {
-            pbps_model::Change::CreateExtension {
-                name, definition, ..
-            } => Some((name, definition)),
+            pbps_model::Change::Extension(pbps_model::ExtensionChange::CreateExtension {
+                name,
+                definition,
+                ..
+            }) => Some((name, definition)),
             _ => None,
         })
         .collect();
@@ -393,9 +410,11 @@ pub(super) fn refuse_pinned_movement(
         .changes
         .iter()
         .filter_map(|p| match &p.change {
-            pbps_model::Change::DropExtension {
-                name, definition, ..
-            } => Some((name, definition)),
+            pbps_model::Change::Extension(pbps_model::ExtensionChange::DropExtension {
+                name,
+                definition,
+                ..
+            }) => Some((name, definition)),
             _ => None,
         })
         .collect();
@@ -407,13 +426,25 @@ pub(super) fn refuse_pinned_movement(
         (Vec<&pbps_model::Extension>, &pbps_model::Extension),
     > = BTreeMap::new();
     for p in &changes.changes {
-        if let pbps_model::Change::UpdateExtension { name, from, to, .. } = &p.change {
+        if let pbps_model::Change::Extension(pbps_model::ExtensionChange::UpdateExtension {
+            name,
+            from,
+            to,
+            ..
+        }) = &p.change
+        {
             let entry = updates.entry(name).or_insert((Vec::new(), to));
             entry.0.extend([from, to]);
         }
     }
     for p in &changes.changes {
-        if let pbps_model::Change::SetExtensionSchema { name, from, to, .. } = &p.change {
+        if let pbps_model::Change::Extension(pbps_model::ExtensionChange::SetExtensionSchema {
+            name,
+            from,
+            to,
+            ..
+        }) = &p.change
+        {
             let entry = updates.entry(name).or_insert((Vec::new(), to));
             entry.0.extend([from, to]);
             entry.1 = to;
@@ -562,7 +593,10 @@ pub(super) fn refuse_pinned_movement(
             };
             // Statements carrying the marker operate on the sequences present
             // when they run; grants follow creations, revokes precede drops.
-            let grant_tables = if matches!(p.change, pbps_model::Change::Grant { .. }) {
+            let grant_tables = if matches!(
+                p.change,
+                pbps_model::Change::Permission(pbps_model::GrantChange::Grant { .. })
+            ) {
                 &after.tables
             } else {
                 &before.tables
@@ -1088,10 +1122,16 @@ pub(super) fn refuse_pinned_movement(
                     // change uses the names at its step. Only the UID survives
                     // both renames and another column taking the vacated name.
                     !changes.changes.iter().any(|p| {
-                        if let pbps_model::Change::DropColumn { uid, .. } = &p.change {
+                        if let pbps_model::Change::Column(pbps_model::ColumnChange::DropColumn {
+                            uid,
+                            ..
+                        }) = &p.change
+                        {
                             return uid == column_uid;
                         }
-                        if let pbps_model::Change::AlterColumnNumbering { uid, to, .. } = &p.change
+                        if let pbps_model::Change::Column(
+                            pbps_model::ColumnChange::AlterColumnNumbering { uid, to, .. },
+                        ) = &p.change
                         {
                             return uid == column_uid
                                 && !matches!(to, pbps_model::ValueSource::Sequence(_));

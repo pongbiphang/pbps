@@ -8,6 +8,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::impact::{DropReport, ImpactError};
 use pbps_db::{Conn, DbError, Param, Row};
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::PartitionChange;
+use pbps_model::TableChange;
 use pbps_model::part_effects::{DefaultChange, Effect, Part as DependencyPart};
 use pbps_model::physical_sources::{PhysicalSources, Source};
 use pbps_model::plan_names::At;
@@ -194,26 +200,26 @@ pub async fn drop_blockers(
         .iter()
         .enumerate()
         .filter_map(|(index, p)| match &p.change {
-            Change::RebuildPartitionedTable(_)
-            | Change::BuildPartitionedIndex(_)
-            | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => None,
-            Change::DropTable { name, .. } => {
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => None,
+            Change::Table(TableChange::DropTable { name, .. }) => {
                 Some((index, format!("table {name}", name = name.shown())))
             }
-            Change::DropColumn { column, .. } => {
+            Change::Column(ColumnChange::DropColumn { column, .. }) => {
                 Some((index, format!("column {column}", column = column.shown())))
             }
-            Change::SetPrimaryKey {
+            Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table,
                 from: Some(_),
                 ..
-            } => Some((
+            }) => Some((
                 index,
                 format!("primary key on {table}", table = table.shown()),
             )),
-            Change::SetExclusion { .. } => None,
-            Change::DropUnique { table, name } => Some((
+            Change::Constraint(ConstraintChange::SetExclusion { .. }) => None,
+            Change::Constraint(ConstraintChange::DropUnique { table, name }) => Some((
                 index,
                 format!(
                     "unique constraint `{name}` on {table}",
@@ -221,7 +227,7 @@ pub async fn drop_blockers(
                     name = name.shown(),
                 ),
             )),
-            Change::DropIndex { table, name } => Some((
+            Change::Index(IndexChange::DropIndex { table, name }) => Some((
                 index,
                 format!(
                     "index `{name}` on {table}",
@@ -229,45 +235,45 @@ pub async fn drop_blockers(
                     name = name.shown(),
                 ),
             )),
-            Change::AlterColumnNumbering {
+            Change::Column(ColumnChange::AlterColumnNumbering {
                 column, from, to, ..
-            } if gives_up(from, to) => Some((
+            }) if gives_up(from, to) => Some((
                 index,
                 format!("numbering source of {column}", column = column.shown()),
             )),
-            Change::CreateTable { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::RenameTable { .. }
-            | Change::AddColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::AlterColumnNumbering { .. }
-            | Change::SetColumnDeprecated { .. }
+            Change::Table(TableChange::CreateTable { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Table(TableChange::RenameTable { .. })
+            | Change::Column(ColumnChange::AddColumn { .. })
+            | Change::Column(ColumnChange::RenameColumn { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
             | pbps_model::change_family!(table_properties)
-            | Change::SetPrimaryKey { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
+            | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
             | pbps_model::change_family!(policies)
-            | Change::AddUnique { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
+            | Change::Constraint(ConstraintChange::AddUnique { .. })
+            | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            | Change::Constraint(ConstraintChange::AddCheck { .. })
+            | Change::Constraint(ConstraintChange::DropCheck { .. })
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
             | pbps_model::change_family!(rows)
             | pbps_model::change_family!(modules)
             | pbps_model::change_family!(type_values)
             | pbps_model::catalog_change!()
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => None,
+            | Change::Permission(GrantChange::Grant { .. })
+            | Change::Permission(GrantChange::Revoke { .. })
+            | Change::Permission(GrantChange::PublicExecution { .. }) => None,
         })
         .collect();
     let Some(&(last, _)) = targets.last() else {
@@ -298,10 +304,10 @@ pub async fn drop_blockers(
             // referencing table, which name this partition (#1171). Measured
             // on 16 and 18: read as standing, the clone blocked every drop of
             // a partition such a key reaches, with no row referencing it.
-            if let Change::DropTable {
+            if let Change::Table(TableChange::DropTable {
                 detach_from: Some(_),
                 ..
-            } = &step.change
+            }) = &step.change
             {
                 for clone in detached_clones(conn, &classes, address).await? {
                     removals.push((index, clone));
@@ -311,24 +317,24 @@ pub async fn drop_blockers(
             // Giving up a serial drops its default first, and dropping its
             // column drops the default with it. Both recurse into every
             // partition (DEC-2219.1), including external partitions.
-            if let Change::DropColumn { column, .. }
-            | Change::AlterColumnNumbering {
+            if let Change::Column(ColumnChange::DropColumn { column, .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering {
                 column,
                 from: pbps_model::ValueSource::Sequence(_),
                 ..
-            } = &cs[index].change
+            }) = &cs[index].change
             {
                 for default in recursed_defaults(conn, &classes, sources, index, column).await? {
                     removals.push((index, default));
                 }
             }
-        } else if let Change::SetPrimaryKey {
+        } else if let Change::Constraint(ConstraintChange::SetPrimaryKey {
             table,
             from: Some(_),
             ..
-        }
-        | Change::DropUnique { table, .. }
-        | Change::DropIndex { table, .. } = &step.change
+        })
+        | Change::Constraint(ConstraintChange::DropUnique { table, .. })
+        | Change::Index(IndexChange::DropIndex { table, .. }) = &step.change
             && stored(sources, index, table, None)?.is_some()
         {
             return Err(error(format!(
@@ -348,11 +354,11 @@ pub async fn drop_blockers(
         .filter(|(i, _)| {
             matches!(
                 cs[*i].change,
-                Change::AlterColumnExpression { .. }
-                    | Change::AlterColumnNumbering {
+                Change::Column(ColumnChange::AlterColumnExpression { .. })
+                    | Change::Column(ColumnChange::AlterColumnNumbering {
                         from: pbps_model::ValueSource::Identity(_),
                         ..
-                    }
+                    })
             )
         })
         .map(|(_, a)| *a)
@@ -510,9 +516,9 @@ async fn removal(
     // sequence or an identity numbered from, which no part the model
     // projects names. An owned sequence's default goes with it, added beside
     // it in `drop_blockers`.
-    if let Change::AlterColumnNumbering {
+    if let Change::Column(ColumnChange::AlterColumnNumbering {
         column, from, to, ..
-    } = change
+    }) = change
         && gives_up(from, to)
     {
         return numbering_sequence(
@@ -853,6 +859,9 @@ async fn read_graph(conn: &mut Conn, roots: &BTreeSet<Address>) -> Result<Graph,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::PolicyChange;
+    use pbps_model::TableChange;
     use pbps_model::{ChangeSet, IdsFile, PlannedChange, Schema};
 
     fn address(object: i64) -> Address {
@@ -876,21 +885,21 @@ mod tests {
     #[test]
     fn policy_removals_enter_the_catalog_release_set_but_creations_do_not() {
         let table = TableName::new("app", "t");
-        let drop = Change::DropPolicy {
+        let drop = Change::Policy(PolicyChange::DropPolicy {
             table: table.clone(),
             name: "gate".into(),
             policy: Default::default(),
-        };
+        });
         assert_eq!(
             removal_part(&drop),
             Some(Removal::Part(&table, Part::Policy("gate")))
         );
-        let create = Change::CreatePolicy {
+        let create = Change::Policy(PolicyChange::CreatePolicy {
             table,
             name: "gate".into(),
             policy: Default::default(),
             origin: pbps_model::RowSecurityOrigin::Standing,
-        };
+        });
         assert_eq!(removal_part(&create), None);
     }
 
@@ -997,26 +1006,26 @@ mod tests {
         let u = TableName::new("app", "u");
         let cs = ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::RenameTable {
+                PlannedChange::new(Change::Table(TableChange::RenameTable {
                     uid: "t_aaaaaa".parse().unwrap(),
                     from: t.clone(),
                     to: u.clone(),
                     defaults: Vec::new(),
-                }),
-                PlannedChange::new(Change::RenameColumn {
+                })),
+                PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
                     uid: "c_aaaaaa".parse().unwrap(),
                     table: u.clone(),
                     from: "old".into(),
                     to: "new".into(),
                     table_was: None,
-                }),
-                PlannedChange::new(Change::CreateTable {
+                })),
+                PlannedChange::new(Change::Table(TableChange::CreateTable {
                     uid: "t_bbbbbb".parse().unwrap(),
                     name: t.clone(),
                     table: Box::default(),
                     beside_default: None,
                     moves_at_most: None,
-                }),
+                })),
             ],
         };
         let ids = IdsFile {

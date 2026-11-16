@@ -1,5 +1,6 @@
 //! Pin membership work and the pre-fix edge/settlement byte order.
 use super::super::*;
+use pbps_model::ModuleChange;
 use std::cell::Cell;
 use std::cmp::Ordering;
 
@@ -163,10 +164,10 @@ fn indexed_module_edges_preserve_explicit_inferred_and_same_leaf_fixture_bytes()
             .iter()
             .zip(&definitions)
             .map(|(id, module)| {
-                PlannedChange::new(Change::CreateModule {
+                PlannedChange::new(Change::Module(ModuleChange::CreateModule {
                     id: id.clone(),
                     module: Box::new(module.clone()),
-                })
+                }))
             })
             .collect(),
     };

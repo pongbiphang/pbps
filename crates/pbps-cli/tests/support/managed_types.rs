@@ -95,13 +95,10 @@ fn domain_expression_records_converge_without_masking_layout_changes_or_live_dri
         .unwrap();
         succeeds(d.run(&["plan", "--no-dev"]));
         d.commit();
-        assert!(
-            plan()
-                .changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, pbps_model::Change::RenameType { .. }))
-        );
+        assert!(plan().changes.changes.iter().any(|p| matches!(
+            p.change,
+            pbps_model::Change::Type(pbps_model::TypeChange::RenameType { .. })
+        )));
         succeeds(d.run(&[
             "apply",
             "--db",
@@ -241,7 +238,12 @@ fn declared_type_lifecycles_converge_and_vetting_is_atomic() {
             .changes
             .changes
             .iter()
-            .position(|p| matches!(p.change, pbps_model::Change::CreateTable { .. }))
+            .position(|p| {
+                matches!(
+                    p.change,
+                    pbps_model::Change::Table(pbps_model::TableChange::CreateTable { .. })
+                )
+            })
             .unwrap();
         assert!(
             first
@@ -249,7 +251,10 @@ fn declared_type_lifecycles_converge_and_vetting_is_atomic() {
                 .changes
                 .iter()
                 .take(table_at)
-                .filter(|p| matches!(p.change, pbps_model::Change::CreateType { .. }))
+                .filter(|p| matches!(
+                    p.change,
+                    pbps_model::Change::Type(pbps_model::TypeChange::CreateType { .. })
+                ))
                 .count()
                 == 3,
             "{:?}",
@@ -280,20 +285,14 @@ fn declared_type_lifecycles_converge_and_vetting_is_atomic() {
         succeeds(d.run(&["plan", "--no-dev"]));
         d.commit();
         let renamed = plan();
-        assert!(
-            renamed
-                .changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, pbps_model::Change::RenameType { .. }))
-        );
-        assert!(
-            !renamed
-                .changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, pbps_model::Change::AlterColumnType { .. }))
-        );
+        assert!(renamed.changes.changes.iter().any(|p| matches!(
+            p.change,
+            pbps_model::Change::Type(pbps_model::TypeChange::RenameType { .. })
+        )));
+        assert!(!renamed.changes.changes.iter().any(|p| matches!(
+            p.change,
+            pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType { .. })
+        )));
         succeeds(d.run(&[
             "apply",
             "--db",
@@ -1039,11 +1038,11 @@ fn a_type_move_applies_after_dropping_its_intermediate_holder_and_converges() {
         assert_eq!(saved.changes.changes.len(), 2);
         assert!(matches!(
             saved.changes.changes[0].change,
-            pbps_model::Change::DropType { .. }
+            pbps_model::Change::Type(pbps_model::TypeChange::DropType { .. })
         ));
         assert!(matches!(
             saved.changes.changes[1].change,
-            pbps_model::Change::RenameType { .. }
+            pbps_model::Change::Type(pbps_model::TypeChange::RenameType { .. })
         ));
         succeeds(d.run(&[
             "apply",
@@ -1195,13 +1194,23 @@ fn type_drops_follow_the_last_table_and_table_names_can_handoff_to_types() {
                 .changes
                 .changes
                 .iter()
-                .position(|p| matches!(p.change, pbps_model::Change::DropTable { .. }))
+                .position(|p| {
+                    matches!(
+                        p.change,
+                        pbps_model::Change::Table(pbps_model::TableChange::DropTable { .. })
+                    )
+                })
                 .unwrap();
             let type_at = saved
                 .changes
                 .changes
                 .iter()
-                .position(|p| matches!(p.change, pbps_model::Change::DropType { .. }))
+                .position(|p| {
+                    matches!(
+                        p.change,
+                        pbps_model::Change::Type(pbps_model::TypeChange::DropType { .. })
+                    )
+                })
                 .unwrap();
             assert!(table_at < type_at);
             if handoff {
@@ -1209,7 +1218,12 @@ fn type_drops_follow_the_last_table_and_table_names_can_handoff_to_types() {
                     .changes
                     .changes
                     .iter()
-                    .position(|p| matches!(p.change, pbps_model::Change::CreateType { .. }))
+                    .position(|p| {
+                        matches!(
+                            p.change,
+                            pbps_model::Change::Type(pbps_model::TypeChange::CreateType { .. })
+                        )
+                    })
                     .unwrap();
                 assert!(table_at < claim);
             }
@@ -1254,7 +1268,7 @@ fn type_drops_follow_the_last_table_and_table_names_can_handoff_to_types() {
                     serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
                 assert!(matches!(
                     returned.changes.changes[0].change,
-                    pbps_model::Change::DropType { .. }
+                    pbps_model::Change::Type(pbps_model::TypeChange::DropType { .. })
                 ));
                 succeeds(d.run(&[
                     "apply",
@@ -1330,7 +1344,7 @@ fn rename_chains_keep_distinct_type_holders_through_apply_and_resumed_checks() {
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             assert_eq!(saved.changes.changes.len(), 2);
             assert!(
-                matches!(&saved.changes.changes[0].change, pbps_model::Change::RenameType { from, to, .. } if from.name() == "b" && to.name() == "c")
+                matches!(&saved.changes.changes[0].change, pbps_model::Change::Type(pbps_model::TypeChange::RenameType { from, to, .. }) if from.name() == "b" && to.name() == "c")
             );
             if resume {
                 // Multi-change plans are transactional. Exercise the type-pin
@@ -1799,7 +1813,7 @@ fn enum_label_history_bootstraps_final_labels_connected_and_through_psql() {
         assert_eq!(rename.changes.changes.len(), 1);
         assert!(matches!(
             rename.changes.changes[0].change,
-            pbps_model::Change::RenameEnumValue { .. }
+            pbps_model::Change::TypeValue(pbps_model::TypeValueChange::RenameEnumValue { .. })
         ));
         succeeds(d.run(&[
             "apply",
@@ -2055,32 +2069,33 @@ fn type_renames_forward_bound_expressions_and_the_next_plan_is_clean() {
                 plan.changes
                     .changes
                     .iter()
-                    .filter(|p| matches!(p.change, pbps_model::Change::RenameType { .. }))
+                    .filter(|p| matches!(
+                        p.change,
+                        pbps_model::Change::Type(pbps_model::TypeChange::RenameType { .. })
+                    ))
                     .count(),
                 2
             );
             if !moved {
                 assert_eq!(plan.changes.changes.len(), 2);
             } else {
-                assert!(
-                    plan.changes
-                        .changes
-                        .iter()
-                        .any(|p| matches!(p.change, pbps_model::Change::DropModule { .. }))
-                );
-                assert!(
-                    plan.changes
-                        .changes
-                        .iter()
-                        .any(|p| matches!(p.change, pbps_model::Change::CreateModule { .. }))
-                );
+                assert!(plan.changes.changes.iter().any(|p| matches!(
+                    p.change,
+                    pbps_model::Change::Module(pbps_model::ModuleChange::DropModule { .. })
+                )));
+                assert!(plan.changes.changes.iter().any(|p| matches!(
+                    p.change,
+                    pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule { .. })
+                )));
             }
             assert!(plan.changes.changes.iter().all(|p| matches!(
                 p.change,
-                pbps_model::Change::RenameType { .. }
-                    | pbps_model::Change::DropModule { .. }
-                    | pbps_model::Change::CreateModule { .. }
-                    | pbps_model::Change::PublicExecution { .. }
+                pbps_model::Change::Type(pbps_model::TypeChange::RenameType { .. })
+                    | pbps_model::Change::Module(pbps_model::ModuleChange::DropModule { .. })
+                    | pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule { .. })
+                    | pbps_model::Change::Permission(
+                        pbps_model::GrantChange::PublicExecution { .. }
+                    )
             )));
             succeeds(d.run(&[
                 "apply",
@@ -2208,7 +2223,10 @@ fn type_renames_refuse_default_and_check_edits_inside_the_plan_window() {
                     .changes
                     .changes
                     .iter()
-                    .filter(|p| matches!(p.change, pbps_model::Change::RenameType { .. }))
+                    .filter(|p| matches!(
+                        p.change,
+                        pbps_model::Change::Type(pbps_model::TypeChange::RenameType { .. })
+                    ))
                     .count(),
                 if rename_domain { 2 } else { 1 }
             );
@@ -2494,7 +2512,7 @@ fn enum_label_additions_preserve_all_positions_through_apply_pull_and_repull() {
             assert!(!plan.changes.is_empty());
             assert!(plan.changes.changes.iter().all(|p| matches!(
                 p.change,
-                pbps_model::Change::AddEnumValue { .. }
+                pbps_model::Change::TypeValue(pbps_model::TypeValueChange::AddEnumValue { .. })
             ) && p.risks.is_empty()));
             succeeds(apply_plan(&d, db, &path, false));
             assert!(label_plan(&d, db, &path).changes.is_empty());
@@ -2547,13 +2565,10 @@ fn enum_applied_label_chains_keep_annotations_when_adding_labels_and_converge() 
         let path = d.dir.join("label-chain.plan.json");
         let chain = label_plan(&d, db, &path);
         assert_eq!(chain.changes.changes.len(), 2);
-        assert!(
-            chain
-                .changes
-                .changes
-                .iter()
-                .all(|step| matches!(step.change, pbps_model::Change::RenameEnumValue { .. }))
-        );
+        assert!(chain.changes.changes.iter().all(|step| matches!(
+            step.change,
+            pbps_model::Change::TypeValue(pbps_model::TypeValueChange::RenameEnumValue { .. })
+        )));
         succeeds(d.run(&[
             "apply",
             "--db",
@@ -2578,7 +2593,7 @@ fn enum_applied_label_chains_keep_annotations_when_adding_labels_and_converge() 
         let added = label_plan(&d, db, &path);
         assert_eq!(added.changes.changes.len(), 1);
         assert!(
-            matches!(&added.changes.changes[0].change, pbps_model::Change::AddEnumValue { value, .. } if value == "d")
+            matches!(&added.changes.changes[0].change, pbps_model::Change::TypeValue(pbps_model::TypeValueChange::AddEnumValue { value, .. }) if value == "d")
         );
         succeeds(apply_plan(&d, db, &path, false));
         assert!(label_plan(&d, db, &path).changes.is_empty());
@@ -2649,28 +2664,27 @@ fn enum_label_renames_keep_rows_and_rebuild_updated_checks_and_defaults() {
                 plan.changes
                     .changes
                     .iter()
-                    .filter(|p| matches!(p.change, pbps_model::Change::RenameEnumValue { .. }))
+                    .filter(|p| matches!(
+                        p.change,
+                        pbps_model::Change::TypeValue(
+                            pbps_model::TypeValueChange::RenameEnumValue { .. }
+                        )
+                    ))
                     .count(),
                 2
             );
-            assert!(
-                plan.changes
-                    .changes
-                    .iter()
-                    .any(|p| matches!(p.change, pbps_model::Change::DropCheck { .. }))
-            );
-            assert!(
-                plan.changes
-                    .changes
-                    .iter()
-                    .any(|p| matches!(p.change, pbps_model::Change::AddCheck { .. }))
-            );
-            assert!(
-                plan.changes
-                    .changes
-                    .iter()
-                    .any(|p| matches!(p.change, pbps_model::Change::AlterColumnDefault { .. }))
-            );
+            assert!(plan.changes.changes.iter().any(|p| matches!(
+                p.change,
+                pbps_model::Change::Constraint(pbps_model::ConstraintChange::DropCheck { .. })
+            )));
+            assert!(plan.changes.changes.iter().any(|p| matches!(
+                p.change,
+                pbps_model::Change::Constraint(pbps_model::ConstraintChange::AddCheck { .. })
+            )));
+            assert!(plan.changes.changes.iter().any(|p| matches!(
+                p.change,
+                pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnDefault { .. })
+            )));
             let denied = apply_plan(&d, db, &path, false);
             assert_ne!(code(&denied), 0);
             succeeds(d.run(&[
@@ -2811,7 +2825,7 @@ fn enum_label_renames_leave_unrelated_check_text_and_refuse_stale_bound_checks()
             assert_eq!(plan.changes.changes.len(), 1, "{:?}", plan.changes);
             assert!(matches!(
                 plan.changes.changes[0].change,
-                pbps_model::Change::RenameEnumValue { .. }
+                pbps_model::Change::TypeValue(pbps_model::TypeValueChange::RenameEnumValue { .. })
             ));
             let apply = || {
                 d.run(&[
@@ -3272,26 +3286,20 @@ fn enum_plpgsql_parameter_defaults_refuse_before_sql_and_succeed_after_a_label_o
                 d.commit();
                 let first = label_plan(&d, db, &path);
                 assert!(
-                    matches!(&first.changes.changes[..], [step] if matches!(step.change, pbps_model::Change::AddEnumValue { .. }))
+                    matches!(&first.changes.changes[..], [step] if matches!(step.change, pbps_model::Change::TypeValue(pbps_model::TypeValueChange::AddEnumValue { .. })))
                 );
                 succeeds(apply_plan(&d, db, &path, false));
                 std::fs::write(&module_file, &module).unwrap();
                 d.commit();
                 let second = label_plan(&d, db, &path);
-                assert!(
-                    second
-                        .changes
-                        .changes
-                        .iter()
-                        .any(|step| matches!(step.change, pbps_model::Change::CreateModule { .. }))
-                );
-                assert!(
-                    !second
-                        .changes
-                        .changes
-                        .iter()
-                        .any(|step| matches!(step.change, pbps_model::Change::AddEnumValue { .. }))
-                );
+                assert!(second.changes.changes.iter().any(|step| matches!(
+                    step.change,
+                    pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule { .. })
+                )));
+                assert!(!second.changes.changes.iter().any(|step| matches!(
+                    step.change,
+                    pbps_model::Change::TypeValue(pbps_model::TypeValueChange::AddEnumValue { .. })
+                )));
                 succeeds(apply_plan(&d, db, &path, false));
                 if kind == "function" {
                     assert_eq!(
@@ -3574,7 +3582,12 @@ fn rebuild_steps(plan: &pbps_model::SavedPlan) -> usize {
     plan.changes
         .changes
         .iter()
-        .filter(|p| matches!(p.change, pbps_model::Change::EnumRebuild { .. }))
+        .filter(|p| {
+            matches!(
+                p.change,
+                pbps_model::Change::TypeValue(pbps_model::TypeValueChange::EnumRebuild { .. })
+            )
+        })
         .count()
 }
 
@@ -3603,13 +3616,13 @@ fn enum_rebuild_removes_and_reorders_labels_under_the_same_uid_and_converges() {
         );
         assert!(plan.changes.changes.iter().any(|p| matches!(
             p.change,
-            pbps_model::Change::EnumRebuild {
+            pbps_model::Change::TypeValue(pbps_model::TypeValueChange::EnumRebuild {
                 step: pbps_model::EnumRebuildStep::Swap {
                     comment: Some(_),
                     ..
                 },
                 ..
-            }
+            })
         )));
 
         // Without the class: refused by name, and nothing ran.
@@ -3878,7 +3891,12 @@ fn enum_rebuild_rebuilds_views_bodies_and_triggers_over_its_columns() {
             .changes
             .changes
             .iter()
-            .filter(|p| matches!(p.change, pbps_model::Change::AlterModule { .. }))
+            .filter(|p| {
+                matches!(
+                    p.change,
+                    pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule { .. })
+                )
+            })
             .collect();
         // The views and the body that name a moved column, and the trigger,
         // are rebuilt in place; the view over a view comes down and goes back
@@ -3890,7 +3908,8 @@ fn enum_rebuild_rebuilds_views_bodies_and_triggers_over_its_columns() {
             .filter(|p| {
                 matches!(
                     p.change,
-                    pbps_model::Change::DropModule { .. } | pbps_model::Change::CreateModule { .. }
+                    pbps_model::Change::Module(pbps_model::ModuleChange::DropModule { .. })
+                        | pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule { .. })
                 )
             })
             .count();
@@ -3930,12 +3949,10 @@ fn enum_rebuild_after_a_rename_in_the_same_plan_maps_labels_by_their_final_names
         declare_mood(&d, "[ok, {name: blue, renamed_from: sad}]");
         let path = d.dir.join("rename-rebuild.plan.json");
         let plan = label_plan(&d, db, &path);
-        assert!(
-            plan.changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, pbps_model::Change::RenameEnumValue { .. }))
-        );
+        assert!(plan.changes.changes.iter().any(|p| matches!(
+            p.change,
+            pbps_model::Change::TypeValue(pbps_model::TypeValueChange::RenameEnumValue { .. })
+        )));
         assert_eq!(rebuild_steps(&plan), 4);
         succeeds(apply_rebuild(&d, db, &path, &["--allow", "rename"]));
         assert!(mood_is(db, &["ok", "blue"]));
@@ -4198,9 +4215,24 @@ fn modules_in(plan: &pbps_model::SavedPlan) -> (usize, usize, usize) {
         plan.changes.changes.iter().filter(|p| f(&p.change)).count()
     };
     (
-        count(|c| matches!(c, pbps_model::Change::DropModule { .. })),
-        count(|c| matches!(c, pbps_model::Change::CreateModule { .. })),
-        count(|c| matches!(c, pbps_model::Change::AlterModule { .. })),
+        count(|c| {
+            matches!(
+                c,
+                pbps_model::Change::Module(pbps_model::ModuleChange::DropModule { .. })
+            )
+        }),
+        count(|c| {
+            matches!(
+                c,
+                pbps_model::Change::Module(pbps_model::ModuleChange::CreateModule { .. })
+            )
+        }),
+        count(|c| {
+            matches!(
+                c,
+                pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule { .. })
+            )
+        }),
     )
 }
 
@@ -4551,10 +4583,10 @@ fn enum_rebuild_drops_a_column_and_its_parts_in_the_plan_that_removes_a_label() 
         let plan = label_plan(&d, db, &path);
         assert_eq!(rebuild_steps(&plan), 3, "{:#?}", plan.changes);
         assert!(
-            plan.changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, pbps_model::Change::DropColumn { .. })),
+            plan.changes.changes.iter().any(|p| matches!(
+                p.change,
+                pbps_model::Change::Column(pbps_model::ColumnChange::DropColumn { .. })
+            )),
             "{:#?}",
             plan.changes
         );
@@ -5371,7 +5403,10 @@ fn halves(plan: &pbps_model::SavedPlan) -> Vec<String> {
         .changes
         .iter()
         .map(|p| match &p.change {
-            pbps_model::Change::AlterDomain { half, .. } => format!("{half:?}"),
+            pbps_model::Change::TypeValue(pbps_model::TypeValueChange::AlterDomain {
+                half,
+                ..
+            }) => format!("{half:?}"),
             other => format!("{other:?}")
                 .split([' ', '{', '('])
                 .next()
@@ -7787,10 +7822,10 @@ fn a_chain_of_eleven_domains_over_a_rebuilt_enum_is_swapped_deepest_first() {
             .changes
             .iter()
             .filter_map(|p| {
-                let pbps_model::Change::EnumRebuild {
+                let pbps_model::Change::TypeValue(pbps_model::TypeValueChange::EnumRebuild {
                     step: pbps_model::EnumRebuildStep::Swap { depth, .. },
                     ..
-                } = &p.change
+                }) = &p.change
                 else {
                     return None;
                 };
@@ -8112,10 +8147,10 @@ fn an_array_held_domain_rebuilt_beside_a_label_rename_is_created_after_it() {
             .position(|p| {
                 matches!(
                     &p.change,
-                    pbps_model::Change::EnumRebuild {
+                    pbps_model::Change::TypeValue(pbps_model::TypeValueChange::EnumRebuild {
                         step: pbps_model::EnumRebuildStep::Create { .. },
                         ..
-                    }
+                    })
                 )
             })
             .expect("the replacement is created");
@@ -8123,7 +8158,14 @@ fn an_array_held_domain_rebuilt_beside_a_label_rename_is_created_after_it() {
             .changes
             .changes
             .iter()
-            .position(|p| matches!(p.change, pbps_model::Change::RenameEnumValue { .. }))
+            .position(|p| {
+                matches!(
+                    p.change,
+                    pbps_model::Change::TypeValue(
+                        pbps_model::TypeValueChange::RenameEnumValue { .. }
+                    )
+                )
+            })
             .expect("the label is renamed");
         assert!(rename < create, "{kinds:?}");
         succeeds(apply_allowing(
@@ -8432,21 +8474,28 @@ fn signature_rebuild_dependents(ty: &str) -> String {
 }
 
 fn signature_rebuild_is_ordered(plan: &pbps_model::SavedPlan, ty: &str) {
+    use pbps_model::ModuleChange;
+    use pbps_model::TypeValueChange;
     use pbps_model::{Change, EnumRebuildStep, ModuleId};
     let changes = &plan.changes.changes;
     let first_type = changes
         .iter()
-        .position(|p| matches!(p.change, Change::EnumRebuild { .. }))
+        .position(|p| {
+            matches!(
+                p.change,
+                Change::TypeValue(TypeValueChange::EnumRebuild { .. })
+            )
+        })
         .unwrap();
     let last_swap = changes
         .iter()
         .rposition(|p| {
             matches!(
                 p.change,
-                Change::EnumRebuild {
+                Change::TypeValue(TypeValueChange::EnumRebuild {
                     step: EnumRebuildStep::Swap { .. },
                     ..
-                }
+                })
             )
         })
         .unwrap();
@@ -8462,11 +8511,11 @@ fn signature_rebuild_is_ordered(plan: &pbps_model::SavedPlan, ty: &str) {
         let wanted: ModuleId = name.parse().unwrap();
         let drop = changes
             .iter()
-            .position(|p| matches!(&p.change, Change::DropModule { id, .. } if id == &wanted))
+            .position(|p| matches!(&p.change, Change::Module(ModuleChange::DropModule { id, .. }) if id == &wanted))
             .unwrap_or_else(|| panic!("missing drop of {name}: {changes:#?}"));
         let create = changes
             .iter()
-            .position(|p| matches!(&p.change, Change::CreateModule { id, .. } if id == &wanted))
+            .position(|p| matches!(&p.change, Change::Module(ModuleChange::CreateModule { id, .. }) if id == &wanted))
             .unwrap_or_else(|| panic!("missing create of {name}: {changes:#?}"));
         assert!(drop < first_type, "{name}: {changes:#?}");
         assert!(create > last_swap, "{name}: {changes:#?}");

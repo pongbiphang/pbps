@@ -6,6 +6,8 @@ use super::*;
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; run scripts/live-tests-pg.sh"]
 async fn a_renamed_dependent_keeps_its_old_target_between_address_versions() {
+    use pbps_model::ConstraintChange;
+    use pbps_model::TableChange;
     use pbps_model::operation::{
         self, AddressChain, ModuleEdits, ObjectKey, Operations, Origin, Owners, PlanOwners,
         Snapshot, Source, Spelling,
@@ -65,28 +67,28 @@ async fn a_renamed_dependent_keeps_its_old_target_between_address_versions() {
     };
     let steps = ChangeSet {
         changes: vec![
-            Change::RenameTable {
+            Change::Table(TableChange::RenameTable {
                 uid: uid("t_bbbbbb"),
                 from: table("app.u2"),
                 to: table("app.v"),
                 defaults: vec![],
-            },
-            Change::RenameTable {
+            }),
+            Change::Table(TableChange::RenameTable {
                 uid: uid("t_aaaaaa"),
                 from: table("app.u"),
                 to: table("app.mid"),
                 defaults: vec![],
-            },
-            Change::DropForeignKey {
+            }),
+            Change::Constraint(ConstraintChange::DropForeignKey {
                 table: table("app.mid"),
                 name: "fk".into(),
-            },
-            Change::RenameTable {
+            }),
+            Change::Table(TableChange::RenameTable {
                 uid: uid("t_aaaaaa"),
                 from: table("app.mid"),
                 to: table("app.u2"),
                 defaults: vec![],
-            },
+            }),
         ]
         .into_iter()
         .map(PlannedChange::new)

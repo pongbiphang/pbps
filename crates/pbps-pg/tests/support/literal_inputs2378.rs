@@ -558,6 +558,7 @@ async fn recorded_conversions_bind_probe_and_apply_on_one_empty_path_on_postgres
 async fn recorded_conversion_path(index: usize) {
     use crate::certified_fixture::FixtureEmission as _;
     use pbps_dialect::Dialect;
+    use pbps_model::ColumnChange;
     use pbps_model::{Change, PlannedChange, Uid, UidKind};
     let server = &servers()[index];
     let mut db = Scratch::create(server, "resolution2378").await;
@@ -601,7 +602,7 @@ async fn recorded_conversion_path(index: usize) {
     vet_conversion(&mut db.conn, &Admission::default(), &column, &ty, using)
         .await
         .unwrap();
-    let change = Change::AlterColumnType {
+    let change = Change::Column(ColumnChange::AlterColumnType {
         uid: Uid::generate(UidKind::Column),
         column,
         from: ty,
@@ -612,7 +613,7 @@ async fn recorded_conversion_path(index: usize) {
         from_collation: None,
         to_collation: None,
         using: Some(using.into()),
-    };
+    });
     let pg = pbps_pg::Postgres::new();
     let changes = pbps_model::ChangeSet {
         changes: vec![PlannedChange::new(change.clone())],

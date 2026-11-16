@@ -320,10 +320,12 @@ pub fn cmd_diff(
         &hints,
     );
     // This is declaration policy, not a fact retained by StateSnapshot.
-    diffed
-        .changes
-        .changes
-        .retain(|planned| !matches!(planned.change, pbps_model::Change::PublicExecution { .. }));
+    diffed.changes.changes.retain(|planned| {
+        !matches!(
+            planned.change,
+            pbps_model::Change::Permission(pbps_model::GrantChange::PublicExecution { .. })
+        )
+    });
     let data = DiffData {
         environment: target.label.clone(),
         from_id: from.id,
@@ -1229,18 +1231,14 @@ mod tests {
         )
         .changes;
         assert_eq!(changes.changes.len(), 2);
-        assert!(
-            changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, pbps_model::Change::DropColumn { .. }))
-        );
-        assert!(
-            changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, pbps_model::Change::AddColumn { .. }))
-        );
+        assert!(changes.changes.iter().any(|p| matches!(
+            p.change,
+            pbps_model::Change::Column(pbps_model::ColumnChange::DropColumn { .. })
+        )));
+        assert!(changes.changes.iter().any(|p| matches!(
+            p.change,
+            pbps_model::Change::Column(pbps_model::ColumnChange::AddColumn { .. })
+        )));
         // A UID held under another name, or retired, cannot be borrowed.
         let mut renamed = recorded.clone();
         renamed

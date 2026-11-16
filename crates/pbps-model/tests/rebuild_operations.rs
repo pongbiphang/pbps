@@ -151,7 +151,7 @@ fn rebuild_copy_and_analyze_have_step_local_effects_and_no_name_claims() {
         assert!(slots.claims.is_empty() && slots.releases.is_empty());
     }
     let mut bad = changes;
-    let Change::CopyTableRows(c) = &mut bad[1].change else {
+    let Change::Partition(PartitionChange::CopyTableRows(c)) = &mut bad[1].change else {
         panic!()
     };
     c.target.uid = c.source.uid.clone();
@@ -206,7 +206,9 @@ fn explicit_index_recipes_own_all_clones_and_refuse_ambiguous_owners() {
             1,
             [(
                 Origin::Restoration(Source::Change(0)),
-                PlannedChange::new(Change::BuildPartitionedIndex(Box::new(recipe.clone()))),
+                PlannedChange::new(Change::Index(IndexChange::BuildPartitionedIndex(Box::new(
+                    recipe.clone(),
+                )))),
             )],
             ModuleEdits::InPlace,
         );

@@ -10,6 +10,9 @@ use pbps_diff::{
         },
     },
 };
+use pbps_model::ColumnChange;
+use pbps_model::ModuleChange;
+use pbps_model::RowChange;
 use pbps_model::operation::{
     ModuleEdits, ObjectKey, Operations, PlanOwners, Requirement, Snapshot,
 };
@@ -53,10 +56,12 @@ fn fixture(
         description: None, options: Default::default() };
     before.modules.insert(root.clone(), module.clone());
     let mut after = before.clone();
-    let mut changes = vec![PlannedChange::new(Change::DropModule {
-        id: root.clone(),
-        kind: ModuleKind::Function,
-    })];
+    let mut changes = vec![PlannedChange::new(Change::Module(
+        ModuleChange::DropModule {
+            id: root.clone(),
+            kind: ModuleKind::Function,
+        },
+    ))];
     for n in 1..=if both { 2 } else { 1 } {
         let uid: pbps_model::Uid = format!("c_{n:06}").parse().unwrap();
         let column = ids.columns[&uid].clone();
@@ -71,10 +76,12 @@ fn fixture(
         let change: Change = serde_json::from_value(serde_json::json!({"op":"alter_column_type", "uid":uid, "column":column,"from":"int","to":"bigint","from_nullable":true,"to_nullable":true})).unwrap();
         changes.push(PlannedChange::new(change));
     }
-    changes.push(PlannedChange::new(Change::CreateModule {
-        id: root.clone(),
-        module: Box::new(module),
-    }));
+    changes.push(PlannedChange::new(Change::Module(
+        ModuleChange::CreateModule {
+            id: root.clone(),
+            module: Box::new(module),
+        },
+    )));
     let found = BTreeMap::from([(
         root,
         vec![Dependent {
@@ -113,10 +120,20 @@ fn sql_server_default_holders_have_catalog_proof_and_a_retype_release_gap() {
         let plan = done.changes.changes();
         let at =
             |pred: fn(&Change) -> bool| plan.changes.iter().position(|p| pred(&p.change)).unwrap();
-        let release = at(|c| matches!(c, Change::AlterColumnDefault { to: None, .. }));
-        let drop = at(|c| matches!(c, Change::DropModule { .. }));
-        let create = at(|c| matches!(c, Change::CreateModule { .. }));
-        let restore = at(|c| matches!(c, Change::AlterColumnDefault { to: Some(_), .. }));
+        let release = at(|c| {
+            matches!(
+                c,
+                Change::Column(ColumnChange::AlterColumnDefault { to: None, .. })
+            )
+        });
+        let drop = at(|c| matches!(c, Change::Module(ModuleChange::DropModule { .. })));
+        let create = at(|c| matches!(c, Change::Module(ModuleChange::CreateModule { .. })));
+        let restore = at(|c| {
+            matches!(
+                c,
+                Change::Column(ColumnChange::AlterColumnDefault { to: Some(_), .. })
+            )
+        });
         assert_eq!(done.added, 2);
         assert!(release < drop && drop < create && create < restore);
         for (before, after, reason) in [
@@ -159,7 +176,7 @@ fn sql_server_default_holders_have_catalog_proof_and_a_retype_release_gap() {
         );
         if both {
             let retype = at(
-                |c| matches!(c,Change::AlterColumnType { column,.. } if column.table.name == "t"),
+                |c| matches!(c,Change::Column(ColumnChange::AlterColumnType { column,.. }) if column.table.name == "t"),
             );
             assert!(release < retype && retype < restore);
             assert!(
@@ -223,7 +240,10 @@ fn an_existing_default_change_is_split_once_and_no_facts_add_no_release() {
             .changes()
             .changes
             .iter()
-            .filter(|p| matches!(p.change, Change::AlterColumnDefault { .. }))
+            .filter(|p| matches!(
+                p.change,
+                Change::Column(ColumnChange::AlterColumnDefault { .. })
+            ))
             .count(),
         2
     );
@@ -233,7 +253,7 @@ fn an_existing_default_change_is_split_once_and_no_facts_add_no_release() {
         before.tables[&TableName::new("app", "source")].clone(),
     );
     changes.changes.retain(
-        |p| matches!(&p.change,Change::AlterColumnType { column,.. } if column.table.name == "t"),
+        |p| matches!(&p.change,Change::Column(ColumnChange::AlterColumnType { column,.. }) if column.table.name == "t"),
     );
     let expected = changes.clone();
     let declared = Declarations {
@@ -292,7 +312,7 @@ fn default_consumer_order(update: bool) {
             .rows
             .insert(key.into(), row.clone());
         let change = if update {
-            Change::UpdateRow {
+            Change::Row(RowChange::UpdateRow {
                 table: table.clone(),
                 key_column: "id".into(),
                 key: key.into(),
@@ -312,9 +332,9 @@ fn default_consumer_order(update: bool) {
                 types: [("old".into(), "int".parse().unwrap())].into(),
                 after_types: Default::default(),
                 key_type: None,
-            }
+            })
         } else {
-            Change::InsertRow {
+            Change::Row(RowChange::InsertRow {
                 table: table.clone(),
                 key_column: "id".into(),
                 identity_key: false,
@@ -326,7 +346,7 @@ fn default_consumer_order(update: bool) {
                     Default::default()
                 },
                 types: [("old".into(), "int".parse().unwrap())].into(),
-            }
+            })
         };
         changes.changes.insert(2, PlannedChange::new(change));
         let declared = Declarations {
@@ -351,7 +371,12 @@ fn default_consumer_order(update: bool) {
         let restore = plan
             .changes
             .iter()
-            .position(|p| matches!(p.change, Change::AlterColumnDefault { to: Some(_), .. }))
+            .position(|p| {
+                matches!(
+                    p.change,
+                    Change::Column(ColumnChange::AlterColumnDefault { to: Some(_), .. })
+                )
+            })
             .unwrap();
         let write = plan
             .changes
@@ -359,7 +384,8 @@ fn default_consumer_order(update: bool) {
             .position(|p| {
                 matches!(
                     p.change,
-                    Change::InsertRow { .. } | Change::UpdateRow { .. }
+                    Change::Row(RowChange::InsertRow { .. })
+                        | Change::Row(RowChange::UpdateRow { .. })
                 )
             })
             .unwrap();
