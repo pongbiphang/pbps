@@ -333,8 +333,16 @@ class Split:
                         self.reports.append(f'{self.path}:{source.line(source.toks[arm.first].start)}: '
                                             f'{outer}: possibly unused binding {unused}; copied unchanged')
         self.families = [outer for outer in order if outer in self.by_family]
+        # A family answered by one unguarded whole-family arm (`Change::Policy(_)
+        # => refuse`) stays in the dispatch as it was: a module would hold
+        # `match policy { _ => .. }`, which clippy rejects, around one line.
+        self.inline = {outer for outer in self.families
+                       if len(self.by_family[outer]) == 1
+                       and fingerprint(self.by_family[outer][0][1]) == fingerprint('_')
+                       and not self.by_family[outer][0][0].guard.strip()}
+        self.modules = [outer for outer in self.families if outer not in self.inline]
         self.parameters = {}
-        for outer in self.families:
+        for outer in self.modules:
             used = set().union(*(identifiers(arm.guard + ' ' + arm.body)
                                  for arm, _, _ in self.by_family[outer]))
             params = []
@@ -374,6 +382,11 @@ class Split:
             raise ValueError(f'{self.path}: target match must start on its own line')
         lines = ['match change {\n']
         for outer in self.families:
+            if outer in self.inline:
+                arm, _, leading = self.by_family[outer][0]
+                lines.append(f'{indent}    {leading}Change::{outer}(_) =>{arm.body}'
+                             f'{arm.comma or ","}{arm.trailing}\n')
+                continue
             local = rust_name(outer)
             args = ', '.join(p.name for p in self.parameters[outer])
             lines.append(f'{indent}    Change::{outer}({local}) => {local}::emit({args}),\n')
@@ -382,16 +395,29 @@ class Split:
     def declarations(self):
         source, ts = self.source, self.source.toks
         mods = [(ts[i + 1].text, i) for i in source.children(0, len(ts)) if ts[i].text == 'mod']
-        added = {rust_name(outer) for outer in self.families}
+        added = {rust_name(outer) for outer in self.modules}
         if added & {name for name, _ in mods}:
             raise ValueError(f'{self.path}: family module clashes with an existing module')
-        if not mods:
-            raise ValueError(f'{self.path}: no existing module declarations to place new ones beside')
         if any(ts[i + 2].text != ';' for _, i in mods):
             # Inline test modules are irrelevant; retain only out-of-line mods.
             mods = [(name, i) for name, i in mods if ts[i + 2].text == ';']
         if not mods:
-            raise ValueError(f'{self.path}: no out-of-line module declarations')
+            # A parent with no out-of-line module yet (SQL Server's emitter)
+            # takes the new ones on the lines after its last top-level `use`,
+            # where a reader looks for a file's structure. Without such a use
+            # there is no settled place, so refuse rather than guess.
+            top = source.children(0, len(ts))
+            uses = [i for i in top if ts[i].text == 'use']
+            if not uses:
+                raise ValueError(f'{self.path}: no module declaration or top-level use to place new modules beside')
+            end = next((j for j in top if j > uses[-1] and ts[j].text == ';'), None)
+            if end is None:
+                source.refuse(uses[-1], 'cannot find the end of the last use')
+            offset = ts[end].end
+            if source.src[offset:offset + 1] != '\n':
+                source.refuse(uses[-1], 'the last use must end its line')
+            text = ''.join(f'mod {name};\n' for name in sorted(added, key=lambda value: value.removeprefix('r#')))
+            return [(offset + 1, offset + 1, text)]
         edits = defaultdict(str)
         for name in sorted(added, key=lambda value: value.removeprefix('r#')):
             later = next((i for existing, i in mods if existing.removeprefix('r#') > name.removeprefix('r#')), None)
@@ -413,7 +439,7 @@ class Split:
         edits.append((source.toks[target.match].start, source.toks[target.closing].end,
                       self.dispatch()))
         return {self.path: cfc.apply_edits(source.src, edits),
-                **{self.module_path(outer): self.module(outer) for outer in self.families}}
+                **{self.module_path(outer): self.module(outer) for outer in self.modules}}
 
     def verify(self, texts, verbatim=False):
         """Parse the result, checking multiplicity, ordering, and every boundary."""
@@ -423,6 +449,14 @@ class Split:
         if len(actual) != len(self.families):
             raise ValueError('verification: dispatch arm count differs')
         for arm, outer in zip(actual, self.families):
+            if outer in self.inline:
+                original, _, leading = self.by_family[outer][0]
+                if (fingerprint(arm.pattern) != fingerprint(f'Change::{outer}(_)')
+                        or arm.guard.strip() or fingerprint(arm.leading) != fingerprint(leading)
+                        or fingerprint(arm.trailing) != fingerprint(original.trailing)
+                        or body_fingerprint(arm.body) != body_fingerprint(original.body)):
+                    raise ValueError(f'verification: incorrect dispatch for {outer}')
+                continue
             local = rust_name(outer)
             args = ', '.join(p.name for p in self.parameters[outer])
             if (fingerprint(arm.pattern) != fingerprint(f'Change::{outer}({local})')
@@ -435,7 +469,7 @@ class Split:
                     + source.src[source.toks[fn.closing].end:])
 
         edits = []
-        for outer in self.families:
+        for outer in self.modules:
             name = rust_name(outer)
             mods = [i for i in parent.children(0, len(parent.toks))
                     if [t.text for t in parent.toks[i:i + 3]] == ['mod', name, ';']]
@@ -451,7 +485,7 @@ class Split:
         if cfc.apply_edits(parent.src, edits) != outside(self.source, self.target):
             raise ValueError('verification: parent changed outside the match and new mod lines')
 
-        for outer in self.families:
+        for outer in self.modules:
             path = self.module_path(outer)
             moved = Source(path, texts[path])
             fn = function(moved, 'emit', rust_name(outer))
@@ -495,6 +529,9 @@ class Split:
 
     def report(self, out):
         for outer in self.families:
+            if outer in self.inline:
+                print(f'{outer}: one whole-family arm, kept in the dispatch', file=out)
+                continue
             print(f'{outer}: {len(self.by_family[outer])} arms; '
                   f'parameters: {", ".join(p.name for p in self.parameters[outer])}', file=out)
         for line, families in self.shared:
@@ -513,10 +550,10 @@ def run(root, file, name, original=None, check=False, out=sys.stdout):
     split = Split(root, path.relative_to(root), name, path.read_text() if original is None else original)
     if check:
         split.verify({p: p.read_text() for p in [split.path]
-                      + [split.module_path(outer) for outer in split.families]})
+                      + [split.module_path(outer) for outer in split.modules]})
     else:
         outputs = split.outputs()
-        for outer in split.families:
+        for outer in split.modules:
             p = split.module_path(outer)
             if not p.resolve().is_relative_to(root):
                 raise ValueError(f'family output escapes the root: {p}')
