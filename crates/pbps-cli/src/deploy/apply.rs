@@ -512,7 +512,7 @@ pub(super) async fn apply_under_lock<D: crate::emission::Engine>(
             &externals_under(&externals, &plan.ids),
             target.catalog_policy(project.config.unmanaged),
             &plan.data,
-            &Schema::naming_what_a_plan_creates(&plan.changes),
+            &Schema::naming_what_identities_name(&plan.ids),
             crate::engine::Read::InsideOwnTransaction,
             CatalogWarnings::for_progress(d.progress),
         )
@@ -541,7 +541,7 @@ pub(super) async fn apply_under_lock<D: crate::emission::Engine>(
                 &externals_under(&externals, &plan.ids),
                 target.catalog_policy(project.config.unmanaged),
                 &plan.data,
-                &Schema::naming_what_a_plan_creates(&plan.changes),
+                &Schema::naming_what_identities_name(&plan.ids),
                 crate::engine::Read::InsideOwnTransaction,
                 CatalogWarnings::for_progress(d.progress),
             )
@@ -618,12 +618,13 @@ pub(super) async fn apply_under_lock<D: crate::emission::Engine>(
         }
         let mut snapshot = pbps_model::StateSnapshot::new(
             pbps_model::StateKind::Apply,
-            // No plan alters a text search object, so the record carries the previous one
-            // forward, less what the plan drops and with what it creates: what the
-            // read-back holds of any other is not this plan's result (DEC-2855.1).
+            // No plan alters a text search object: an object is recorded when its identity
+            // is held and the database holds it, and one the previous record holds keeps its
+            // recorded definition, as what the read-back holds of it is not this plan's
+            // result (DEC-2855.1).
             after
                 .schema
-                .as_recorded_after_apply(&entry.snapshot.schema, &plan.changes),
+                .as_recorded_after_apply(&entry.snapshot.schema, &plan.changes, &plan.ids),
             // The plan's mapping, not the baseline's: after a rename the two
             // disagree, and recording the old one would say the rename never
             // happened — leaving the next plan to propose it all over again.

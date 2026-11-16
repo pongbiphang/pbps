@@ -265,8 +265,9 @@ pub(super) fn staged_movement(
 /// Compares each kind the plan can change, by its own rule below. It never reads
 /// `Schema::search`, deliberately (DEC-2855.1): no plan alters a text search object, so
 /// nothing this plan promised can move one, and what the read-back holds of one is not what
-/// an apply records either (the previous record is carried forward, less what the plan drops
-/// and with what it creates, `Schema::as_recorded_after_apply`). A search object changed
+/// an apply records either (an object is recorded when its identity is held and the
+/// database holds it, and one the previous record holds keeps its recorded definition,
+/// `Schema::as_recorded_after_apply`). A search object changed
 /// during the run is therefore neither blessed by the record nor a movement of the plan's;
 /// `verify` reports it against the carried record. A kind that gains plans that alter it
 /// gains its rule here when it leaves `NameOnly`.

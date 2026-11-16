@@ -175,46 +175,66 @@ fn an_apply_carries_the_previous_record_and_not_what_the_database_holds() {
             merged(table("bigint"), (row.holding)("app.kept", 1)),
             (row.holding)("app.outside", 0),
         );
-        let recorded = read_back
-            .clone()
-            .as_recorded_after_apply(&previous, &ChangeSet::default());
+        // The recorded object still has its identity, as a declared one does.
+        let recorded = read_back.clone().as_recorded_after_apply(
+            &previous,
+            &nothing_planned(),
+            &live_of(&previous),
+        );
         assert_eq!(recorded.name_only(), previous.name_only(), "{}", row.label);
         // The plan's own result is what the read-back says of everything else.
         assert_eq!(recorded.tables, read_back.tables, "{}", row.label);
     }
 }
 
-fn planned(changes: impl IntoIterator<Item = Change>) -> ChangeSet {
+fn nothing_planned() -> ChangeSet {
+    ChangeSet::default()
+}
+
+/// A plan that creates the search objects `schema` holds, as they stand in it.
+fn creating(schema: &Schema) -> ChangeSet {
     ChangeSet {
-        changes: changes.into_iter().map(PlannedChange::new).collect(),
+        changes: schema
+            .search
+            .iter()
+            .map(|(name, object)| {
+                PlannedChange::new(Change::CreateSearch {
+                    uid: Uid::generate(UidKind::Search),
+                    name: name.clone(),
+                    definition: Box::new(object.clone()),
+                    unresolved: Vec::new(),
+                })
+            })
+            .collect(),
     }
 }
 
-fn created(name: &str) -> Change {
-    let object = text_search(name, 0).search.into_iter().next().unwrap();
-    Change::CreateSearch {
-        uid: Uid::generate(UidKind::Search),
-        name: object.0,
-        definition: Box::new(object.1),
-        unresolved: Vec::new(),
+/// The identities as the database holds them: one per name given.
+fn live(names: &[&str]) -> IdsFile {
+    let mut ids = IdsFile::default();
+    for name in names {
+        let held = text_search(name, 0).search.into_keys().next().unwrap();
+        ids.search.insert(Uid::generate(UidKind::Search), held);
     }
+    ids
 }
 
-fn dropped(name: &str) -> Change {
-    let object = text_search(name, 0).search.into_iter().next().unwrap();
-    Change::DropSearch {
-        uid: Uid::generate(UidKind::Search),
-        name: object.0,
-        definition: Box::new(object.1),
-    }
+fn held(schema: &Schema) -> Vec<String> {
+    schema
+        .search
+        .keys()
+        .map(|name| name.shown().to_string())
+        .collect()
 }
 
 #[test]
-fn an_apply_records_the_objects_it_creates_and_leaves_out_the_ones_it_drops() {
+fn an_apply_records_an_object_exactly_when_its_identity_is_held_and_the_database_holds_it() {
     let previous = merged(
         text_search("app.kept", 0),
         merged(text_search("app.retired", 0), table("int")),
     );
+    // The read-back holds the recorded object altered, one the plan made, one made
+    // outside the plan, and the dropped one is gone.
     let read_back = merged(
         text_search("app.kept", 1),
         merged(
@@ -222,15 +242,15 @@ fn an_apply_records_the_objects_it_creates_and_leaves_out_the_ones_it_drops() {
             merged(text_search("app.outside", 0), table("int")),
         ),
     );
-    let applied = planned([created("app.made"), dropped("app.retired")]);
-    let recorded = read_back
-        .clone()
-        .as_recorded_after_apply(&previous, &applied);
-    let names: Vec<_> = recorded
-        .search
-        .keys()
-        .map(|n| n.shown().to_string())
-        .collect();
+    // The identities after the plan: the one it kept and the one it made. The dropped one
+    // has none, and neither has the one made outside it.
+    let ids = live(&["app.kept", "app.made"]);
+    let recorded = read_back.clone().as_recorded_after_apply(
+        &previous,
+        &creating(&text_search("app.made", 0)),
+        &ids,
+    );
+    let names = held(&recorded);
     // The created one is in as the database holds it, the dropped one is out, the one the
     // plan left alone keeps the recorded definition, and one made outside it is not in.
     assert_eq!(names.len(), 2, "{names:?}");
@@ -238,20 +258,72 @@ fn an_apply_records_the_objects_it_creates_and_leaves_out_the_ones_it_drops() {
         recorded.search,
         merged(text_search("app.kept", 0), text_search("app.made", 0)).search
     );
-    // The read-back of an apply is kept to the objects the plan creates, so it holds the
-    // created one and neither the one made outside the plan nor a dropped one.
-    let reference = Schema::naming_what_a_plan_creates(&applied);
-    assert_eq!(reference.search.len(), 1, "{:?}", reference.search);
+    // The read-back of an apply is kept to the objects an identity names, so it holds the
+    // made one and neither the one made outside the plan nor a dropped one.
+    let reference = Schema::naming_what_identities_name(&ids);
+    assert_eq!(reference.search.len(), 2, "{:?}", reference.search);
     assert!(reference.tables.is_empty());
-    let kept = read_back.clone().as_recorded(&reference);
-    assert_eq!(kept.search.len(), 1, "{:?}", kept.search);
-    // Negative: a creation the read-back does not hold (a staged checkpoint before it ran)
-    // records nothing, and a drop of an object the record never held changes nothing.
-    let none = table("int").as_recorded_after_apply(
+    let kept = read_back.as_recorded(&reference);
+    assert_eq!(held(&kept).len(), 2, "{:?}", kept.search);
+    // Negative: an identity whose object neither the record nor the database holds records
+    // nothing (a create that has not run), and an object with no identity is not recorded
+    // however the database holds it.
+    let recorded = table("int").as_recorded_after_apply(
         &previous,
-        &planned([created("app.made"), dropped("app.never")]),
+        &nothing_planned(),
+        &live(&["app.not_run"]),
     );
-    assert_eq!(none.search.len(), 2, "{:?}", none.search);
+    assert!(recorded.search.is_empty(), "{:?}", recorded.search);
+}
+
+#[test]
+fn a_declaration_that_adopts_an_existing_object_records_it_with_its_new_identity() {
+    // The object stands on the target and the declaration matches it, so the plan makes no
+    // change for it and the previous record does not hold it: the identity is new, the
+    // object is the database's. Both kinds.
+    let previous = table("int");
+    for (name, other) in [
+        ("app.adopted", text_search("app.adopted", 0)),
+        ("app.adopted_config", config("app.adopted_config")),
+    ] {
+        let read_back = merged(other.clone(), table("int"));
+        let recorded = read_back.clone().as_recorded_after_apply(
+            &previous,
+            &nothing_planned(),
+            &live_of(&other),
+        );
+        assert_eq!(recorded.search, other.search, "{name}");
+        // Negative: the same object with no identity is the database's own, and not recorded.
+        let recorded =
+            read_back.as_recorded_after_apply(&previous, &nothing_planned(), &IdsFile::default());
+        assert!(recorded.search.is_empty(), "{name}: {:?}", recorded.search);
+    }
+}
+
+/// A configuration over the built-in dictionary.
+fn config(name: &str) -> Schema {
+    let mut schema = Schema::default();
+    schema.search.insert(
+        SearchRef::new(SearchKind::Config, name.parse().unwrap()),
+        SearchObject::Config {
+            parser: "pg_catalog.default".parse().unwrap(),
+            mappings: BTreeMap::from([(
+                "word".to_owned(),
+                vec!["pg_catalog.simple".parse().unwrap()],
+            )]),
+        },
+    );
+    schema
+}
+
+/// The identities of every search object `schema` holds.
+fn live_of(schema: &Schema) -> IdsFile {
+    let mut ids = IdsFile::default();
+    for name in schema.search.keys() {
+        ids.search
+            .insert(Uid::generate(UidKind::Search), name.clone());
+    }
+    ids
 }
 
 #[test]
@@ -390,4 +462,76 @@ fn a_sequences_type_is_spelled_like_a_columns() {
         declared.compared_with(&typed("bigint"), &long_spelling),
         typed("bigint").compared_with(&declared, &long_spelling)
     );
+}
+
+#[test]
+fn a_checkpoint_records_only_the_search_changes_that_have_run() {
+    // A plan that drops a configuration and then the dictionary it maps, stopped between
+    // the two: the configuration is gone, and the dictionary, which stands and whose
+    // identity is still live, stays recorded.
+    let previous = merged(text_search("app.docs", 0), text_search("app.words", 0));
+    let read_back = text_search("app.words", 0);
+    let recorded = read_back.clone().as_recorded_after_apply(
+        &previous,
+        &nothing_planned(),
+        &live(&["app.words"]),
+    );
+    let names = held(&recorded);
+    assert!(
+        names.len() == 1 && names[0].contains("app.words"),
+        "{names:?}"
+    );
+    // Negative: once the dictionary's drop has run too, nothing is recorded.
+    let recorded = Schema::default().as_recorded_after_apply(
+        &previous,
+        &nothing_planned(),
+        &IdsFile::default(),
+    );
+    assert!(recorded.search.is_empty(), "{:?}", recorded.search);
+    // A create that has not run is not recorded as made, even where the database holds
+    // the object (it was made outside the plan): its identity is not live yet.
+    let recorded = text_search("app.made", 0).as_recorded_after_apply(
+        &previous,
+        &nothing_planned(),
+        &IdsFile::default(),
+    );
+    assert!(
+        !held(&recorded).iter().any(|name| name.contains("app.made")),
+        "{:?}",
+        recorded.search
+    );
+}
+
+#[test]
+fn a_create_that_was_stopped_and_resumed_is_recorded_as_it_was_finished() {
+    // The previous record is the checkpoint, which holds the configuration half made; the
+    // plan creates it, and the read-back holds it finished: the finished one is recorded.
+    // An object the plan does not create keeps its recorded definition (negative).
+    let half = config_with("app.docs", &["pg_catalog.simple"]);
+    let finished = config_with("app.docs", &["pg_catalog.simple", "pg_catalog.simple"]);
+    let ids = live_of(&finished);
+    let recorded = finished
+        .clone()
+        .as_recorded_after_apply(&half, &creating(&finished), &ids);
+    assert_eq!(recorded.search, finished.search);
+    let recorded = finished
+        .clone()
+        .as_recorded_after_apply(&half, &nothing_planned(), &ids);
+    assert_eq!(recorded.search, half.search);
+}
+
+/// A configuration whose `word` token maps these dictionaries in order.
+fn config_with(name: &str, dictionaries: &[&str]) -> Schema {
+    let mut schema = Schema::default();
+    schema.search.insert(
+        SearchRef::new(SearchKind::Config, name.parse().unwrap()),
+        SearchObject::Config {
+            parser: "pg_catalog.default".parse().unwrap(),
+            mappings: BTreeMap::from([(
+                "word".to_owned(),
+                dictionaries.iter().map(|d| d.parse().unwrap()).collect(),
+            )]),
+        },
+    );
+    schema
 }

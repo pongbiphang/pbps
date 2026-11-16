@@ -904,3 +904,132 @@ fn a_configuration_over_a_package_dictionary_is_retired_with_the_package() {
         );
     }
 }
+
+/// A staged plan is one logical change, so a configuration's create is the case a stop can
+/// split: `CREATE` and then one `ADD MAPPING` per group. Stopped after the `CREATE`, the
+/// checkpoint holds the configuration as the database holds it, and `--resume` finishes the
+/// mappings without refusing the database as moved (ready round 5, DEC-2728.2).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_staged_create_stopped_after_the_configuration_exists_resumes() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        let own = OwnDatabase::new(&server, "search2728r5");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app");
+        let d = Demo::new("search2728r5");
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+        declare(&d, "app.words.textsearch-dictionary.yml", WORDS);
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        let path = d.dir.join("search.plan.json");
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        succeeds(apply_plan(&d, db, &path, false));
+        // The configuration is the one logical change of the staged plan.
+        declare(&d, "app.docs.textsearch-config.yml", DOCS);
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        succeeds(d.run(&[
+            "plan",
+            "--db",
+            db,
+            "--staged",
+            "--out",
+            path.to_str().unwrap(),
+        ]));
+        // The first `ADD MAPPING` is refused by the engine, so the run stops after the
+        // configuration's `CREATE` checkpoint and not before it.
+        on_server(
+            db,
+            "CREATE SCHEMA witness; \
+             CREATE FUNCTION witness.stop_before_the_mappings() RETURNS event_trigger \
+             LANGUAGE plpgsql AS $$ BEGIN \
+             RAISE EXCEPTION 'stop before the mapping commits'; END $$; \
+             CREATE EVENT TRIGGER stop_mapping ON ddl_command_end \
+             WHEN TAG IN ('ALTER TEXT SEARCH CONFIGURATION') \
+             EXECUTE FUNCTION witness.stop_before_the_mappings()",
+        );
+        let stopped = approved_apply(&d, db, &path, &["--staged"]);
+        assert_ne!(code(&stopped), 0, "{}", said(&stopped));
+        let checkpoint = super::latest_snapshot(db);
+        let progress = checkpoint
+            .staged
+            .as_ref()
+            .unwrap_or_else(|| panic!("no checkpoint after the stop: {}", said(&stopped)));
+        assert_eq!(progress.completed, 1, "{}", said(&stopped));
+        // The configuration, which exists, is recorded; the mappings it lacks are not claimed.
+        let held: Vec<String> = checkpoint
+            .schema
+            .search
+            .keys()
+            .map(|name| name.shown().to_string())
+            .collect();
+        assert!(
+            held.iter().any(|name| name.contains("app.docs")),
+            "{held:?}"
+        );
+        on_server(db, "DROP EVENT TRIGGER stop_mapping");
+        succeeds(approved_apply(&d, db, &path, &["--staged", "--resume"]));
+        no_changes(&succeeds(d.run(&["plan", "--db", db])));
+        succeeds(d.run(&["verify", "--db", db]));
+    }
+}
+
+/// A declaration that matches an object already on the database adopts it: identity
+/// resolution gives it a uid and the plan makes no change for it, so the record has to
+/// take the object from the read-back. Recorded without it, the apply left an identity
+/// for an object the state did not hold, and `verify` read the live object as drift
+/// (ready round 5, DEC-2728.2). An object no declaration names stays out of the record.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_declaration_that_adopts_an_existing_object_is_recorded_and_verifies() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        let own = OwnDatabase::new(&server, "search2728adopt");
+        let db = own.connection();
+        on_server(
+            db,
+            "CREATE SCHEMA app; \
+             CREATE TEXT SEARCH DICTIONARY app.words (TEMPLATE = pg_catalog.snowball, language = english); \
+             CREATE TEXT SEARCH CONFIGURATION app.docs (PARSER = pg_catalog.\"default\"); \
+             ALTER TEXT SEARCH CONFIGURATION app.docs ADD MAPPING FOR asciiword, word WITH app.words; \
+             ALTER TEXT SEARCH CONFIGURATION app.docs ADD MAPPING FOR email WITH pg_catalog.simple; \
+             CREATE TEXT SEARCH DICTIONARY app.undeclared (TEMPLATE = pg_catalog.simple)",
+        );
+        let d = Demo::new("search2728adopt");
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "objects made by hand"]));
+        declare(&d, "app.docs.textsearch-config.yml", DOCS);
+        declare(&d, "app.words.textsearch-dictionary.yml", WORDS);
+        declare(&d, "app.articles.yml", ARTICLES);
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        let path = d.dir.join("search.plan.json");
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        // The adopted objects are not in the plan: only the table is made.
+        let order = subjects(&path);
+        assert!(
+            !order
+                .iter()
+                .any(|s| s.contains("dictionary app.words") || s.contains("config app.docs")),
+            "{order:?}"
+        );
+        succeeds(apply_plan(&d, db, &path, false));
+        let record = super::latest_snapshot(db);
+        let held: Vec<String> = record
+            .schema
+            .search
+            .keys()
+            .map(|name| name.shown().to_string())
+            .collect();
+        // Recorded with their identities, and the object nobody declared is not.
+        assert!(held.iter().any(|n| n.contains("app.words")), "{held:?}");
+        assert!(held.iter().any(|n| n.contains("app.docs")), "{held:?}");
+        assert!(
+            !held.iter().any(|n| n.contains("app.undeclared")),
+            "{held:?}"
+        );
+        assert_eq!(record.ids.search.len(), 2, "{:?}", record.ids.search);
+        succeeds(d.run(&["verify", "--db", db]));
+        no_changes(&succeeds(d.run(&["plan", "--db", db])));
+    }
+}

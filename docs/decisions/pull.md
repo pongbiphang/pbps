@@ -1492,11 +1492,17 @@ reach an empty database in one plan.
 - **Held by name.** The kind stays in `NameOnly` (DEC-2855.1): no plan alters one,
   and the record, the compared form and the drift report are the ones the
   kind already has, so this change keeps no copy of them. What a plan does to one
-  joins that path in two places only. An apply's record carries the previous one
-  forward, less the objects the plan drops and with the objects it creates as the
-  database holds them (`as_recorded_after_apply` takes the plan's changes), and
-  the buildable form keeps the objects an identity names, where it left out every
-  one before (`buildable` takes the identities). The kind leaves `NameOnly` when a
+  joins that path in two places only. An apply records an object exactly when
+  its identity is held and the database holds it (`as_recorded_after_apply` takes
+  the identities as the database holds them: the plan's for a finished apply, the
+  statement loop's for a staged checkpoint), so a created object is recorded once
+  its create ran, a dropped one is gone once its drop ran, and a declaration that
+  adopts a matching object, which makes no change, records it with its new
+  identity; an object the previous record holds keeps its recorded definition,
+  except one the plan creates, which takes the read-back's (a resumed staged
+  create has the checkpoint's half-made one as its previous record). The
+  buildable form keeps the objects an identity names, where it left out every one
+  before (`buildable` takes the identities). The kind leaves `NameOnly` when a
   plan can alter one, and `refuse_pinned_movement` gains its rule then.
 - **Changes.** `CreateSearch` and `DropSearch` carry the whole definition, as
   `CreateType` does, in the `search` family of `change_family!`; they join

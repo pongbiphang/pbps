@@ -207,46 +207,77 @@ impl NameOnly {
         out
     }
 
-    /// What a plan leaves of these: the objects it creates are those the database now
-    /// holds (`read`), and the objects it drops are gone. Nothing else moves: no plan
-    /// alters one, so what the read-back holds of any other object is not the plan's
-    /// result, and a record that took it would bless a change made outside the plan.
+    /// What an apply leaves of these, by one rule: an object is recorded exactly when its
+    /// identity is held (`live`) and the database holds it. The identities are as the
+    /// database holds them now: a staged run keeps them current statement by statement,
+    /// and a finished apply holds them as the plan leaves them. So an object the plan
+    /// created is recorded once its create ran, one it dropped is gone once its drop ran,
+    /// one a declaration adopted (it stood on the target and matched, so the plan made no
+    /// change for it) is recorded with its new identity, and an object no identity names
+    /// is not the project's and is never recorded.
+    ///
+    /// Which definition: no plan alters one, so an object the previous record holds keeps
+    /// the definition it was recorded with, even where the read-back says otherwise (what
+    /// it holds of the object is not the plan's result, and a record that took it would
+    /// bless a change made outside the plan), and even where the database no longer holds
+    /// it (`verify` names it as gone). The exception is an object `applied` creates: it
+    /// is the plan's own result, and a staged create that was stopped and resumed has a
+    /// previous record (the checkpoint) holding it half made, so the read-back's definition
+    /// is the one recorded. Any other is as the read-back holds it, and is recorded only if
+    /// it does.
     #[must_use]
-    pub fn after_applying(self, read: &Self, applied: &ChangeSet) -> Self {
+    pub fn after_applying(self, read: &Self, applied: &ChangeSet, live: &IdsFile) -> Self {
         let Self {
-            mut search,
+            search: previous,
             sequences,
         } = self;
         let Self { search: read, .. } = read;
-        for planned in &applied.changes {
-            if let Change::CreateSearch { name, .. } = &planned.change
-                && let Some(made) = read.get(name)
-            {
-                search.insert(name.clone(), made.clone());
-            }
-            if let Change::DropSearch { name, .. } = &planned.change {
-                search.remove(name);
-            }
-        }
+        let made: std::collections::BTreeSet<&SearchRef> = applied
+            .changes
+            .iter()
+            .filter_map(|planned| {
+                if let Change::CreateSearch { name, .. } = &planned.change {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let search = live
+            .search
+            .values()
+            .filter_map(|name| {
+                let object = if made.contains(name) {
+                    read.get(name).or_else(|| previous.get(name))
+                } else {
+                    previous.get(name).or_else(|| read.get(name))
+                };
+                object.map(|object| (name.clone(), object.clone()))
+            })
+            .collect();
         // No plan touches a sequence, so the previous record's are carried as they were.
         Self { search, sequences }
     }
 
-    /// The objects `applied` creates, as it carries them.
+    /// The objects an identity names, by name alone: what an apply's read-back is kept to.
+    /// Only the key decides what is kept (`restricted_to`), so the definition each takes
+    /// here is a placeholder no one reads.
     #[must_use]
-    pub fn created_by(applied: &ChangeSet) -> Self {
-        let search = applied
-            .changes
-            .iter()
-            .filter_map(|planned| {
-                if let Change::CreateSearch {
-                    name, definition, ..
-                } = &planned.change
-                {
-                    Some((name.clone(), (**definition).clone()))
-                } else {
-                    None
-                }
+    pub fn named_by_identities(live: &IdsFile) -> Self {
+        let Ok(template) = "pg_catalog.simple".parse::<crate::TypeRef>() else {
+            return Self::default();
+        };
+        let search = live
+            .search
+            .values()
+            .map(|name| {
+                (
+                    name.clone(),
+                    SearchObject::Dictionary {
+                        template: template.clone(),
+                        options: BTreeMap::new(),
+                    },
+                )
             })
             .collect();
         Self {
@@ -437,32 +468,38 @@ impl Schema {
     }
 
     /// What an apply's read-back is kept to, in place of the declarations (they name
-    /// what a recording from them keeps): the name-only objects the plan creates. An
-    /// apply carries the rest of the previous record forward, and a read kept to nothing
-    /// would lose the objects the plan made.
+    /// what a recording from them keeps): the name-only objects an identity names, as
+    /// `live` holds them. A read kept to nothing would lose the objects the plan made or
+    /// adopted.
     #[must_use]
-    pub fn naming_what_a_plan_creates(applied: &ChangeSet) -> Schema {
+    pub fn naming_what_identities_name(live: &IdsFile) -> Schema {
         Classified {
             plannable: Schema::default(),
-            name_only: NameOnly::created_by(applied),
+            name_only: NameOnly::named_by_identities(live),
         }
         .into_schema()
     }
 
-    /// The recorded form after an apply: the previous record's name-only objects,
-    /// carried forward as they were, less what `applied` drops and with what it
-    /// creates as the read-back holds it. No plan alters one, so what the read-back
-    /// holds of any other is not the plan's result, and a record that took it would
-    /// bless a change made outside the plan (DEC-2728.2).
+    /// The recorded form after an apply: a name-only object is recorded exactly when its
+    /// identity is held in `live` and the database holds it, and one the previous record
+    /// holds keeps its recorded definition unless `applied` creates it (see
+    /// [`NameOnly::after_applying`]). No plan alters one, so what the read-back holds of
+    /// any other is not the plan's result, and a record that took it would bless a change
+    /// made outside the plan (DEC-2728.2).
     #[must_use]
-    pub fn as_recorded_after_apply(self, previous: &Schema, applied: &ChangeSet) -> Schema {
+    pub fn as_recorded_after_apply(
+        self,
+        previous: &Schema,
+        applied: &ChangeSet,
+        live: &IdsFile,
+    ) -> Schema {
         let Classified {
             plannable,
             name_only: read,
         } = self.classify();
         Classified {
             plannable,
-            name_only: previous.name_only().after_applying(&read, applied),
+            name_only: previous.name_only().after_applying(&read, applied, live),
         }
         .into_schema()
     }
