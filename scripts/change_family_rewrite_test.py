@@ -2,10 +2,12 @@
 """Tests for scripts/change_family_rewrite.py. Run: python3 scripts/change_family_rewrite_test.py"""
 
 import io
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import change_family_rewrite as cfr  # noqa: E402
@@ -469,6 +471,54 @@ class MoveEnum(Tree):
         with self.assertRaises(SystemExit):
             cfr.move_enum(self.root, "nothing", "N", "NChange")
 
+    def snapshot(self):
+        return {p: p.read_bytes() for p in sorted(self.root.rglob("*")) if p.is_file()}
+
+    def test_an_unrecognised_re_export_refuses_and_writes_nothing(self):
+        self.write("crates/pbps-model/src/lib.rs", "pub use change::Change;\n")
+        before = self.snapshot()
+        with self.assertRaises(SystemExit) as refused:
+            self.move()
+        self.assertIn("lib.rs re-exports change in a form this tool does not extend", str(refused.exception))
+        self.assertIn("Nothing was changed", str(refused.exception))
+        self.assertEqual(self.snapshot(), before, "change.rs and lib.rs are byte-identical")
+        # and a retry, once the re-export is in a known form, works: nothing is stranded
+        self.write("crates/pbps-model/src/lib.rs", "pub use change::{Change};\n")
+        self.assertEqual(len(self.move()), 4)
+
+    def test_a_missing_lib_rs_refuses_and_writes_nothing(self):
+        (self.root / "crates/pbps-model/src/lib.rs").unlink()
+        before = self.snapshot()
+        with self.assertRaises(SystemExit):
+            self.move()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_re_export_on_one_line_is_extended(self):
+        self.write("crates/pbps-model/src/lib.rs", "pub use change::{Change, ChangeSet};\n")
+        self.move()
+        self.assertEqual(self.read("crates/pbps-model/src/lib.rs"), "pub use change::{ ExtensionChange, Change, ChangeSet};\n")
+
+    def test_a_glob_re_export_already_has_the_inner_enum(self):
+        self.write("crates/pbps-model/src/lib.rs", "pub use change::*;\n")
+        self.move()
+        self.assertEqual(self.read("crates/pbps-model/src/lib.rs"), "pub use change::*;\n")
+        self.assertIn("pub enum ExtensionChange", self.read("crates/pbps-model/src/change.rs"))
+
+    def test_a_failure_while_writing_puts_the_first_file_back(self):
+        before = self.snapshot()
+        real = os.replace
+        calls = []
+
+        def second_replace_fails(src, dst):
+            calls.append(dst)
+            if len(calls) == 2:
+                raise OSError("disk full")
+            return real(src, dst)
+
+        with mock.patch.object(cfr.os, "replace", second_replace_fails), self.assertRaises(OSError):
+            self.move()
+        self.assertEqual(self.snapshot(), before, "no file changed and no temporary file is left")
+
     def test_the_rewrite_after_the_move_reads_the_kinds_from_the_new_enum(self):
         self.move()
         self.write("crates/pbps-cli/src/a.rs", "use pbps_model::Change;\nfn f() -> Change { Change::DropExtension { uid } }\n")
@@ -583,6 +633,66 @@ class SiteScope(Tree):
         _, out = self.run_tool()[0], None
         project = self.last_project
         return self.read(name), project, [r[2] for r in project.reports if r[0] == name]
+
+
+class AllOrNothing(Tree):
+    """A run that cannot finish writes nothing: every text is computed and every
+    guard passed before the first file is written."""
+
+    def files(self):
+        names = [f"crates/pbps-cli/src/f{i}.rs" for i in range(4)]
+        for n in names:
+            self.write(n, "use pbps_model::Change;\nfn f() -> Change { Change::DropExtension { uid } }\n")
+        return names
+
+    def snapshot(self):
+        return {p: p.read_bytes() for p in sorted(self.root.rglob("*")) if p.is_file()}
+
+    def test_a_failure_computing_a_later_file_leaves_every_file_unchanged(self):
+        self.files()
+        before = self.snapshot()
+        real = cfr.Project.site
+        seen = []
+
+        def fails_on_the_third(project, f, *args):
+            seen.append(f.path)
+            if len(seen) == 3:
+                raise RuntimeError("injected")
+            return real(project, f, *args)
+
+        with mock.patch.object(cfr.Project, "site", fails_on_the_third), self.assertRaises(RuntimeError):
+            self.run_tool()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_failure_writing_a_later_file_puts_back_the_earlier_ones(self):
+        self.files()
+        before = self.snapshot()
+        real = os.replace
+        calls = []
+
+        def third_fails(src, dst):
+            calls.append(dst)
+            if len(calls) == 3:
+                raise OSError("disk full")
+            return real(src, dst)
+
+        with mock.patch.object(cfr.os, "replace", third_fails), self.assertRaises(OSError):
+            self.run_tool()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_normal_run_rewrites_every_file_and_leaves_no_temporary_file(self):
+        names = self.files()
+        project, _ = self.run_tool()
+        for n in names:
+            self.assertIn("Change::Extension(ExtensionChange::DropExtension { uid })", self.read(n))
+        self.assertEqual([p for p in self.root.rglob("*.tmp")], [])
+        self.assertEqual(sum(project.rewrites[n] for n in names), 4)
+
+    def test_check_mode_writes_nothing_at_all(self):
+        self.files()
+        before = self.snapshot()
+        self.run_tool(write=False)
+        self.assertEqual(self.snapshot(), before)
 
 
 class Lexer(unittest.TestCase):

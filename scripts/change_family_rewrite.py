@@ -55,6 +55,7 @@ is not in the family. A second run changes nothing.
 
 import argparse
 import bisect
+import os
 import re
 import sys
 from collections import Counter
@@ -1030,7 +1031,10 @@ class Project:
         for (mpath, _), edit in self.import_edits.items():
             if edit is not None:
                 by_file.setdefault(mpath, []).append(Edit(edit[0], 2, edit[1]))
-        changed = []
+        # Two phases: every new text is computed first, and only then are the
+        # files written, together (`write_all`), so a failure in file N cannot
+        # leave files 1..N-1 rewritten.
+        changed, texts = [], {}
         for path, edits in sorted(by_file.items()):
             src = path.read_text()
             out, last = [], 0
@@ -1042,9 +1046,35 @@ class Project:
             new = "".join(out)
             if new != src:
                 changed.append(path)
-                if write:
-                    path.write_text(new)
+                texts[path] = new
+        if write:
+            write_all(texts)
         return changed
+
+
+def write_all(files):
+    """Write `{path: new text}` as one step: every file is written whole to a
+    temporary name first, then renamed over its original, and if any step fails
+    the files already replaced are put back, so no run leaves some files moved
+    and others not. The caller has computed every text and checked every guard
+    before it calls this."""
+    staged, replaced = [], []
+    try:
+        for path, new in files.items():
+            tmp = path.with_name(path.name + ".family-rewrite.tmp")
+            tmp.write_text(new)
+            staged.append((path, tmp))
+        for path, tmp in staged:
+            old = path.read_text()
+            os.replace(tmp, path)
+            replaced.append((path, old))
+    except BaseException:
+        for path, old in replaced:
+            path.write_text(old)
+        for _, tmp in staged:
+            if tmp.exists():
+                tmp.unlink()
+        raise
 
 
 def move_enum(root, family, outer, inner):
@@ -1110,12 +1140,23 @@ def move_enum(root, family, outer, inner):
     )
     cut = toks2[e2].start
     new = new[:cut] + variant + new[cut : toks2[e2].end] + "\n" + enum.rstrip("\n") + "\n" + new[toks2[e2].end :]
-    path.write_text(new)
+    # The re-export is checked before anything is written: a refusal here must
+    # leave change.rs as it was, or a retry would find the enum already moved.
     lib = root / "crates/pbps-model/src/lib.rs"
+    if not lib.is_file():
+        raise SystemExit(f"{lib} does not exist; nothing was changed")
     text = lib.read_text()
-    if "pub use change::{\n" not in text:
-        raise SystemExit("lib.rs has no `pub use change::{` list to extend; add the re-export by hand")
-    lib.write_text(text.replace("pub use change::{\n", f"pub use change::{{\n    {inner},\n", 1))
+    listed = re.search(r"pub use change::\{", text)
+    if listed:
+        after = text[listed.end() : listed.end() + 1]
+        lead = f"\n    {inner}," if after == "\n" else f" {inner}," + ("" if after.isspace() else " ")
+        text = text[: listed.end()] + lead + text[listed.end() :]
+    elif not re.search(r"pub use change::\*\s*;", text):
+        raise SystemExit(
+            "lib.rs re-exports change in a form this tool does not extend (`pub use change::{...}` or "
+            "`pub use change::*;`); add the re-export of the inner enum by hand and rerun. Nothing was changed."
+        )
+    write_all({path: new, lib: text} if listed else {path: new})
     return kinds
 
 
