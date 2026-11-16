@@ -38,14 +38,14 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
         Change::Table(TableChange::RenameTable { from, .. }) => Surface::Table(from.clone()),
         Change::Table(TableChange::CreateTable { .. })
         | Change::Partition(PartitionChange::DetachPartition { .. })
-        | crate::change_family!(extensions)
-        | crate::change_family!(search)
+        | Change::Extension(_)
+        | Change::Search(_)
         | Change::Partition(PartitionChange::AttachPartition { .. })
         | Change::Table(TableChange::DropTable { .. })
         | Change::Column(ColumnChange::AddColumn { .. })
         | Change::Column(ColumnChange::AddComputedColumn { .. })
-        | crate::change_family!(policies)
-        | crate::change_family!(table_properties)
+        | Change::Policy(_)
+        | Change::TableProperty(_)
         | Change::Partition(PartitionChange::SetPartitionDefault { .. })
         | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
         | Change::Index(IndexChange::SetIndexStorageParameters { .. })
@@ -57,15 +57,15 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
         | Change::Column(ColumnChange::AlterColumnExpression { .. })
         | Change::Column(ColumnChange::AlterColumnNumbering { .. })
         | Change::Column(ColumnChange::SetColumnDeprecated { .. })
-        | crate::change_family!(constraints)
+        | Change::Constraint(_)
         | Change::Index(IndexChange::AddIndex { .. })
         | Change::Index(IndexChange::DropIndex { .. })
-        | crate::change_family!(rows)
-        | crate::change_family!(modules)
-        | crate::change_family!(type_values)
-        | crate::change_family!(types)
-        | crate::change_family!(roles)
-        | crate::change_family!(permissions) => panic!("rename fixture"),
+        | Change::Row(_)
+        | Change::Module(_)
+        | Change::TypeValue(_)
+        | Change::Type(_)
+        | Change::Role(_)
+        | Change::Permission(_) => panic!("rename fixture"),
     };
     let rename_transition = evidence
         .transitions

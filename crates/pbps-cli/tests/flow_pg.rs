@@ -2770,29 +2770,10 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             | pbps_model::Change::Partition(pbps_model::PartitionChange::AnalyzeTableTree(_)) => {
                 panic!("cost fixture must not contain a pending rewrite")
             }
-            pbps_model::Change::TypeValue(pbps_model::TypeValueChange::AddEnumValue { .. })
-            | pbps_model::Change::TypeValue(pbps_model::TypeValueChange::AlterDomain { .. })
-            | pbps_model::Change::TypeValue(pbps_model::TypeValueChange::RenameEnumValue {
-                ..
-            })
-            | pbps_model::Change::TypeValue(pbps_model::TypeValueChange::EnumRebuild { .. })
-            | pbps_model::Change::Type(pbps_model::TypeChange::CreateType { .. })
-            | pbps_model::Change::Type(pbps_model::TypeChange::DropType { .. })
-            | pbps_model::Change::Type(pbps_model::TypeChange::RenameType { .. })
-            | pbps_model::Change::Search(pbps_model::SearchChange::CreateSearch { .. })
-            | pbps_model::Change::Search(pbps_model::SearchChange::DropSearch { .. })
-            | pbps_model::Change::Extension(pbps_model::ExtensionChange::CreateExtension {
-                ..
-            })
-            | pbps_model::Change::Extension(pbps_model::ExtensionChange::DropExtension {
-                ..
-            })
-            | pbps_model::Change::Extension(pbps_model::ExtensionChange::UpdateExtension {
-                ..
-            })
-            | pbps_model::Change::Extension(pbps_model::ExtensionChange::SetExtensionSchema {
-                ..
-            })
+            pbps_model::Change::TypeValue(_)
+            | pbps_model::Change::Type(_)
+            | pbps_model::Change::Search(_)
+            | pbps_model::Change::Extension(_)
             | pbps_model::Change::Table(pbps_model::TableChange::CreateTable { .. }) => {
                 assert_eq!(c["status"], "unavailable");
                 assert!(c["reason"].as_str().unwrap().contains("no measurement"));

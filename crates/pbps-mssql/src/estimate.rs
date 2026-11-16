@@ -17,7 +17,6 @@ use pbps_db::{Conn, DbError};
 pub use pbps_dialect::estimate::{Reads, Rewrite};
 use pbps_model::ColumnChange;
 use pbps_model::ConstraintChange;
-use pbps_model::GrantChange;
 use pbps_model::IndexChange;
 use pbps_model::PartitionChange;
 use pbps_model::plan_names::{At, Holder, PlanNames};
@@ -210,12 +209,12 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                     Work::MaybeClusteredDrop(Some(name.clone())),
                     format!("dropping `{name}`", name = name.shown(),),
                 ),
-                pbps_model::change_family!(tables)
-                | pbps_model::change_family!(columns)
-                | pbps_model::change_family!(table_properties)
+                Change::Table(_)
+                | Change::Column(_)
+                | Change::TableProperty(_)
                 | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
                 | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-                | pbps_model::change_family!(policies)
+                | Change::Policy(_)
                 | Change::Constraint(ConstraintChange::AddUnique { .. })
                 | Change::Constraint(ConstraintChange::SetExclusion { .. })
                 | Change::Constraint(ConstraintChange::AddForeignKey { .. })
@@ -223,17 +222,18 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                 | Change::Constraint(ConstraintChange::AddCheck { .. })
                 | Change::Constraint(ConstraintChange::DropCheck { .. })
                 | Change::Index(IndexChange::AddIndex { .. })
-                | pbps_model::change_family!(rows)
-                | pbps_model::change_family!(modules)
-                | pbps_model::change_family!(type_values)
-                | pbps_model::catalog_change!()
-                | Change::Permission(GrantChange::Grant { .. })
-                | Change::Permission(GrantChange::Revoke { .. })
+                | Change::Row(_)
+                | Change::Module(_)
+                | Change::TypeValue(_)
+                | Change::Role(_)
+                | Change::Type(_)
+                | Change::Search(_)
+                | Change::Extension(_)
+                | Change::Permission(_)
                 | Change::Partition(PartitionChange::DetachPartition { .. })
                 | Change::Partition(PartitionChange::AttachPartition { .. })
                 | Change::Partition(PartitionChange::SetPartitionDefault { .. })
-                | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
-                | Change::Permission(GrantChange::PublicExecution { .. }) => return None,
+                | Change::Partition(PartitionChange::SetPartitionNotNull { .. }) => return None,
             };
             let (rewrite, reads) = unknown("the table's clustered layout has not been read yet");
             Some((
@@ -295,7 +295,7 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                     to_nullable,
                     ..
                 }) => (uid, column, ty, ty, !*to_nullable, *to_nullable),
-                pbps_model::change_family!(tables)
+                Change::Table(_)
                 | Change::Column(ColumnChange::AddColumn { .. })
                 | Change::Column(ColumnChange::DropColumn { .. })
                 | Change::Column(ColumnChange::RenameColumn { .. })
@@ -303,25 +303,26 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                 | Change::Column(ColumnChange::AlterColumnExpression { .. })
                 | Change::Column(ColumnChange::AlterColumnNumbering { .. })
                 | Change::Column(ColumnChange::SetColumnDeprecated { .. })
-                | pbps_model::change_family!(table_properties)
-                | pbps_model::change_family!(constraints)
+                | Change::TableProperty(_)
+                | Change::Constraint(_)
                 | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-                | pbps_model::change_family!(policies)
+                | Change::Policy(_)
                 | Change::Index(IndexChange::AddIndex { .. })
                 | Change::Column(ColumnChange::AddComputedColumn { .. })
                 | Change::Column(ColumnChange::DropComputedColumn { .. })
                 | Change::Index(IndexChange::DropIndex { .. })
-                | pbps_model::change_family!(rows)
-                | pbps_model::change_family!(modules)
-                | pbps_model::change_family!(type_values)
-                | pbps_model::catalog_change!()
-                | Change::Permission(GrantChange::Grant { .. })
-                | Change::Permission(GrantChange::Revoke { .. })
+                | Change::Row(_)
+                | Change::Module(_)
+                | Change::TypeValue(_)
+                | Change::Role(_)
+                | Change::Type(_)
+                | Change::Search(_)
+                | Change::Extension(_)
+                | Change::Permission(_)
                 | Change::Partition(PartitionChange::DetachPartition { .. })
                 | Change::Partition(PartitionChange::AttachPartition { .. })
                 | Change::Partition(PartitionChange::SetPartitionDefault { .. })
-                | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
-                | Change::Permission(GrantChange::PublicExecution { .. }) => return None,
+                | Change::Partition(PartitionChange::SetPartitionNotNull { .. }) => return None,
             };
             let source = match names.column_holder(column, At::Before(index)) {
                 Holder::Tracked(_) => names.stored_column(column, At::Before(index)),

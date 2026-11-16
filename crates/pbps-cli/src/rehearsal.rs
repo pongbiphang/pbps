@@ -22,8 +22,6 @@ use pbps_model::ConstraintChange;
 use pbps_model::GrantChange;
 use pbps_model::IndexChange;
 use pbps_model::ModuleChange;
-use pbps_model::PolicyChange;
-use pbps_model::RoleChange;
 use pbps_model::RowChange;
 use pbps_model::role_mapping::RoleMapping;
 use pbps_model::{Change, ChangeSet, IdsFile, Schema, SessionZone};
@@ -157,14 +155,10 @@ struct Words {
 pub fn is_authorization(change: &Change) -> bool {
     matches!(
         change,
-        Change::Role(RoleChange::CreateRole { .. })
-            | Change::Role(RoleChange::DropRole { .. })
-            | Change::Role(RoleChange::RenameRole { .. })
+        Change::Role(_)
             | Change::Permission(GrantChange::Grant { .. })
             | Change::Permission(GrantChange::Revoke { .. })
-            | Change::Policy(PolicyChange::CreatePolicy { .. })
-            | Change::Policy(PolicyChange::DropPolicy { .. })
-            | Change::Policy(PolicyChange::SetRowSecurity { .. })
+            | Change::Policy(_)
     )
 }
 

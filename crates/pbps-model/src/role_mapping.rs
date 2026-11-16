@@ -15,8 +15,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::change::GrantChange;
-use crate::change::IndexChange;
-use crate::change::PartitionChange;
 use crate::change::PolicyChange;
 use crate::change::RoleChange;
 use crate::change::{Change, ChangeSet};
@@ -142,29 +140,20 @@ impl RoleMapping {
             | Change::Policy(PolicyChange::DropPolicy { policy, .. }) => {
                 self.policy(policy);
             }
-            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
-            | Change::Index(IndexChange::BuildPartitionedIndex(_))
-            | Change::Partition(PartitionChange::CopyTableRows(_))
-            | Change::Partition(PartitionChange::AnalyzeTableTree(_))
+            Change::Partition(_)
+            | Change::Index(_)
             | Change::Permission(GrantChange::PublicExecution { .. })
-            | crate::change_family!(type_values)
-            | crate::change_family!(types)
-            | crate::change_family!(extensions)
-            | crate::change_family!(search)
-            | crate::change_family!(tables)
-            | Change::Partition(PartitionChange::DetachPartition { .. })
-            | Change::Partition(PartitionChange::AttachPartition { .. })
-            | crate::change_family!(columns)
-            | crate::change_family!(constraints)
-            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-            | crate::change_family!(table_properties)
-            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
-            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::TypeValue(_)
+            | Change::Type(_)
+            | Change::Extension(_)
+            | Change::Search(_)
+            | Change::Table(_)
+            | Change::Column(_)
+            | Change::Constraint(_)
+            | Change::TableProperty(_)
             | Change::Policy(PolicyChange::SetRowSecurity { .. })
-            | Change::Index(IndexChange::AddIndex { .. })
-            | Change::Index(IndexChange::DropIndex { .. })
-            | crate::change_family!(rows)
-            | crate::change_family!(modules) => {}
+            | Change::Row(_)
+            | Change::Module(_) => {}
         }
     }
 }

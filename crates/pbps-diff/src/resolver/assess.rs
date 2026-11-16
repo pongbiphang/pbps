@@ -267,15 +267,15 @@ Change::Index(IndexChange::BuildPartitionedIndex(_)) | Change::Partition(Partiti
         | Change::Constraint(ConstraintChange::DropForeignKey { .. })
         | Change::Column(ColumnChange::AlterColumnNullability { .. })
         | Change::Column(ColumnChange::SetColumnDeprecated { .. })
-        | pbps_model::change_family!(table_properties)
-        | pbps_model::change_family!(policies)
+        | Change::TableProperty(_)
+        | Change::Policy(_)
         | Change::Index(IndexChange::SetIndexStorageParameters { .. })
         | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
-        | pbps_model::change_family!(rows)
+        | Change::Row(_)
         | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
         | Change::TypeValue(TypeValueChange::AlterDomain { .. })
         | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
-        // Roles, types and extensions (`catalog_change!`). A role or type moves
+        // Roles, types, search objects and extensions (catalog family patterns). A role or type moves
         // no existing lookup. A package create **can**: it may add an operator
         // or function that matches an argument type better than what the path
         // found before (measured on 16 and 18: intarray's `@>` on `int[]`; a
@@ -304,7 +304,7 @@ Change::Index(IndexChange::BuildPartitionedIndex(_)) | Change::Partition(Partiti
         // An **update** is the same answer for the same reason: its scratch holds
         // the version the target holds, so a plan that also needs the resolver is
         // refused by name first (DEC-2447.10).
-        | pbps_model::catalog_change!()
+        | Change::Role(_) | Change::Type(_) | Change::Search(_) | Change::Extension(_)
         | Change::Permission(GrantChange::PublicExecution { .. }) => false,
     }
 }

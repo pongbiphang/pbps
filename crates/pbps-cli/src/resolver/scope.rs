@@ -308,16 +308,10 @@ pub(crate) fn planned_schema_grants(
     use pbps_model::GrantChange;
     use pbps_model::IndexChange;
     use pbps_model::PartitionChange;
-    use pbps_model::RoleChange;
     use pbps_model::{Change, GrantTarget};
     let mut planned = Vec::new();
     for p in &changes.changes {
-        if matches!(
-            p.change,
-            Change::Role(RoleChange::CreateRole { .. })
-                | Change::Role(RoleChange::RenameRole { .. })
-                | Change::Role(RoleChange::DropRole { .. })
-        ) {
+        if matches!(p.change, Change::Role(_)) {
             return Err(
                 "persistent resolver authorization cannot project role identity changes".into(),
             );
@@ -342,25 +336,26 @@ pub(crate) fn planned_schema_grants(
                 target: GrantTarget::Schema(schema),
                 permissions,
             }) => Some((role, schema, permissions)),
-            pbps_model::change_family!(tables)
+            Change::Table(_)
             | Change::Partition(PartitionChange::DetachPartition { .. })
             | Change::Partition(PartitionChange::AttachPartition { .. })
-            | pbps_model::change_family!(columns)
-            | pbps_model::change_family!(policies)
-            | pbps_model::change_family!(table_properties)
+            | Change::Column(_)
+            | Change::Policy(_)
+            | Change::TableProperty(_)
             | Change::Index(IndexChange::SetIndexStorageParameters { .. })
             | Change::Partition(PartitionChange::SetPartitionDefault { .. })
             | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
-            | pbps_model::change_family!(constraints)
+            | Change::Constraint(_)
             | Change::Index(IndexChange::AddIndex { .. })
             | Change::Index(IndexChange::DropIndex { .. })
-            | pbps_model::change_family!(rows)
-            | pbps_model::change_family!(modules)
-            | pbps_model::change_family!(type_values)
-            | pbps_model::catalog_change!()
-            | Change::Permission(GrantChange::Grant { .. })
-            | Change::Permission(GrantChange::Revoke { .. })
-            | Change::Permission(GrantChange::PublicExecution { .. }) => None,
+            | Change::Row(_)
+            | Change::Module(_)
+            | Change::TypeValue(_)
+            | Change::Role(_)
+            | Change::Type(_)
+            | Change::Search(_)
+            | Change::Extension(_)
+            | Change::Permission(_) => None,
         };
         if let Some((role, schema, permissions)) = statement {
             let privileges = permissions
@@ -446,10 +441,6 @@ impl Authorization {
         measured: Option<&mssql_auth::Condition>,
     ) -> Result<pbps_model::resolver::AuthorizationCondition, String> {
         use pbps_model::Change;
-        use pbps_model::GrantChange;
-        use pbps_model::RoleChange;
-        use pbps_model::TypeChange;
-        use pbps_model::TypeValueChange;
         let planned = planned_schema_grants(changes)?;
         if !self.unpredictable(&planned).is_empty() {
             return Err("the adapter cannot derive the approved authorization transition".into());
@@ -484,19 +475,10 @@ impl Authorization {
                 .filter(|(_, p)| {
                     matches!(
                         p.change,
-                        Change::Permission(GrantChange::Grant { .. })
-                            | Change::Permission(GrantChange::Revoke { .. })
-                            | Change::Permission(GrantChange::PublicExecution { .. })
-                            | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
-                            | Change::TypeValue(TypeValueChange::AlterDomain { .. })
-                            | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
-                            | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
-                            | Change::Type(TypeChange::CreateType { .. })
-                            | Change::Type(TypeChange::DropType { .. })
-                            | Change::Type(TypeChange::RenameType { .. })
-                            | Change::Role(RoleChange::CreateRole { .. })
-                            | Change::Role(RoleChange::RenameRole { .. })
-                            | Change::Role(RoleChange::DropRole { .. })
+                        Change::Permission(_)
+                            | Change::TypeValue(_)
+                            | Change::Type(_)
+                            | Change::Role(_)
                     )
                 })
                 .map(|(i, _)| i)

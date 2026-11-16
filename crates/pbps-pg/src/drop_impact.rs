@@ -10,7 +10,6 @@ use pbps_db::impact::{DropReport, ImpactError};
 use pbps_db::{Conn, DbError, Param, Row};
 use pbps_model::ColumnChange;
 use pbps_model::ConstraintChange;
-use pbps_model::GrantChange;
 use pbps_model::IndexChange;
 use pbps_model::PartitionChange;
 use pbps_model::TableChange;
@@ -253,12 +252,12 @@ pub async fn drop_blockers(
             | Change::Column(ColumnChange::AlterColumnExpression { .. })
             | Change::Column(ColumnChange::AlterColumnNumbering { .. })
             | Change::Column(ColumnChange::SetColumnDeprecated { .. })
-            | pbps_model::change_family!(table_properties)
+            | Change::TableProperty(_)
             | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
             | Change::Index(IndexChange::SetIndexStorageParameters { .. })
             | Change::Partition(PartitionChange::SetPartitionDefault { .. })
             | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
-            | pbps_model::change_family!(policies)
+            | Change::Policy(_)
             | Change::Constraint(ConstraintChange::AddUnique { .. })
             | Change::Constraint(ConstraintChange::AddForeignKey { .. })
             | Change::Constraint(ConstraintChange::DropForeignKey { .. })
@@ -267,13 +266,14 @@ pub async fn drop_blockers(
             | Change::Index(IndexChange::AddIndex { .. })
             | Change::Column(ColumnChange::AddComputedColumn { .. })
             | Change::Column(ColumnChange::DropComputedColumn { .. })
-            | pbps_model::change_family!(rows)
-            | pbps_model::change_family!(modules)
-            | pbps_model::change_family!(type_values)
-            | pbps_model::catalog_change!()
-            | Change::Permission(GrantChange::Grant { .. })
-            | Change::Permission(GrantChange::Revoke { .. })
-            | Change::Permission(GrantChange::PublicExecution { .. }) => None,
+            | Change::Row(_)
+            | Change::Module(_)
+            | Change::TypeValue(_)
+            | Change::Role(_)
+            | Change::Type(_)
+            | Change::Search(_)
+            | Change::Extension(_)
+            | Change::Permission(_) => None,
         })
         .collect();
     let Some(&(last, _)) = targets.last() else {

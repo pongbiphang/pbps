@@ -368,7 +368,7 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                     .is_none_or(|id| !added.contains(&(id, name.raw())))
                     .then_some(table),
                 Change::Column(ColumnChange::AlterColumnType { .. })
-                | pbps_model::change_family!(tables)
+                | Change::Table(_)
                 | Change::Partition(PartitionChange::DetachPartition { .. })
                 | Change::Partition(PartitionChange::AttachPartition { .. })
                 | Change::Column(ColumnChange::RenameColumn { .. })
@@ -379,19 +379,20 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                 | Change::Column(ColumnChange::AlterColumnExpression { .. })
                 | Change::Column(ColumnChange::AlterColumnNumbering { .. })
                 | Change::Column(ColumnChange::SetColumnDeprecated { .. })
-                | pbps_model::change_family!(table_properties)
-                | pbps_model::change_family!(constraints)
+                | Change::TableProperty(_)
+                | Change::Constraint(_)
                 | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-                | pbps_model::change_family!(policies)
+                | Change::Policy(_)
                 | Change::Index(IndexChange::AddIndex { .. })
                 | Change::Index(IndexChange::DropIndex { .. })
-                | pbps_model::change_family!(rows)
-                | pbps_model::change_family!(modules)
-                | pbps_model::change_family!(type_values)
-                | pbps_model::catalog_change!()
-                | Change::Permission(GrantChange::Grant { .. })
-                | Change::Permission(GrantChange::Revoke { .. })
-                | Change::Permission(GrantChange::PublicExecution { .. }) => None,
+                | Change::Row(_)
+                | Change::Module(_)
+                | Change::TypeValue(_)
+                | Change::Role(_)
+                | Change::Type(_)
+                | Change::Search(_)
+                | Change::Extension(_)
+                | Change::Permission(_) => None,
             };
             if let (Some(table), Some(id)) = (contract, id) {
                 contracts.entry(id).or_insert((i, table));

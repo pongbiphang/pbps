@@ -27,7 +27,6 @@ use pbps_model::GrantChange;
 use pbps_model::IndexChange;
 use pbps_model::ModuleChange;
 use pbps_model::PartitionChange;
-use pbps_model::PolicyChange;
 use pbps_model::RoleChange;
 use pbps_model::RowChange;
 use pbps_model::SearchChange;
@@ -605,9 +604,7 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
                 ),
             })
         }
-        Change::Policy(PolicyChange::DropPolicy { .. })
-        | Change::Policy(PolicyChange::CreatePolicy { .. })
-        | Change::Policy(PolicyChange::SetRowSecurity { .. }) => Err(DialectError::Unsupported {
+        Change::Policy(_) => Err(DialectError::Unsupported {
             dialect: DIALECT,
             feature: "PostgreSQL row-security operations".into(),
         }),

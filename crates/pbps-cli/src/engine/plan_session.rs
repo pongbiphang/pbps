@@ -1308,7 +1308,7 @@ pub(crate) mod defaults {
                 && !changes
                     .changes
                     .iter()
-                    .any(|p| matches!(p.change, pbps_model::change_family!(modules))),
+                    .any(|p| matches!(p.change, pbps_model::Change::Module(_))),
             "{engine} has no step that orders the names this plan creates or moves from the catalog"
         );
         Ok(())
@@ -1502,7 +1502,7 @@ pub(crate) mod defaults {
             !any(&|c| matches!(
                 c,
                 pbps_model::Change::Permission(pbps_model::GrantChange::Grant { .. })
-                    | pbps_model::change_family!(policies)
+                    | pbps_model::Change::Policy(_)
             )) && crate::row_security::standing_owners(changes, ids)?.is_empty(),
             "{engine} has no step that checks the permissions a plan grants or the policies it writes"
         );
@@ -1627,13 +1627,13 @@ pub(crate) mod defaults {
         Ok(())
     }
 
-    /// The package changes `change_family!(extensions)` names.
+    /// The package changes `Change::Extension(_)` names.
     pub(crate) fn extension_seals(engine: &str, changes: &ChangeSet) -> anyhow::Result<()> {
         anyhow::ensure!(
             !changes
                 .changes
                 .iter()
-                .any(|p| matches!(p.change, pbps_model::change_family!(extensions))),
+                .any(|p| matches!(p.change, pbps_model::Change::Extension(_))),
             "{engine} has no step that seals the packages a plan creates, updates, moves or drops"
         );
         Ok(())

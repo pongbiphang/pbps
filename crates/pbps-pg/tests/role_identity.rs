@@ -2,7 +2,6 @@
 //! changes while roles stay externally managed (DEC-1527.1).
 use pbps_dialect::Dialect;
 use pbps_model::GrantChange;
-use pbps_model::RoleChange;
 use pbps_model::{Change, GrantTarget, Hints, IdsFile, Permission, Role, Schema};
 use pbps_pg::Postgres;
 
@@ -49,12 +48,9 @@ fn ordinary_postgres_plans_never_manage_role_identities() {
     ] {
         let plan = ordinary(&declared(before, false), &declared(after, false));
         assert!(
-            plan.changes.iter().all(|p| !matches!(
-                p.change,
-                Change::Role(RoleChange::CreateRole { .. })
-                    | Change::Role(RoleChange::DropRole { .. })
-                    | Change::Role(RoleChange::RenameRole { .. })
-            )),
+            plan.changes
+                .iter()
+                .all(|p| !matches!(p.change, Change::Role(_))),
             "{before:?} -> {after:?}: {plan:?}"
         );
         assert!(plan.changes.is_empty(), "{before:?} -> {after:?}: {plan:?}");

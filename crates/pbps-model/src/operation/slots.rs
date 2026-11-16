@@ -652,7 +652,7 @@ pub fn names(
             );
         }
         // A module rebuilt in place keeps its name; the rest take none.
-        crate::change_family!(type_values)
+        Change::TypeValue(_)
         | Change::Module(ModuleChange::AlterModule { .. })
         | Change::Extension(ExtensionChange::UpdateExtension { .. })
         | Change::Extension(ExtensionChange::SetExtensionSchema { .. })
@@ -664,12 +664,12 @@ pub fn names(
         | Change::Column(ColumnChange::AlterColumnNumbering { .. })
         | Change::Column(ColumnChange::SetColumnDeprecated { .. })
         | Change::Policy(PolicyChange::SetRowSecurity { .. })
-        | crate::change_family!(table_properties)
+        | Change::TableProperty(_)
         | Change::Partition(PartitionChange::SetPartitionDefault { .. })
         | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
         | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-        | crate::change_family!(rows)
-        | crate::change_family!(permissions) => {}
+        | Change::Row(_)
+        | Change::Permission(_) => {}
     }
     Ok(nx.names)
 }

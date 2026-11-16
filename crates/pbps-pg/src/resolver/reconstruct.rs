@@ -42,7 +42,6 @@ use pbps_model::GrantChange;
 use pbps_model::IndexChange;
 use pbps_model::ModuleChange;
 use pbps_model::PartitionChange;
-use pbps_model::PolicyChange;
 use pbps_model::RoleChange;
 use pbps_model::RowChange;
 use pbps_model::SearchChange;
@@ -448,9 +447,7 @@ impl Reconstruction {
                 // are not resolver surfaces (#595). Installing them here
                 // would also require recipient roles scratch need not hold.
                 // The typed deployment plan still emits policies and flags.
-                Change::Policy(PolicyChange::DropPolicy { .. })
-                | Change::Policy(PolicyChange::CreatePolicy { .. })
-                | Change::Policy(PolicyChange::SetRowSecurity { .. }) => {}
+                Change::Policy(_) => {}
                 // None of these changes what a name resolves to.
                 Change::Role(RoleChange::CreateRole { .. })
                 | Change::Permission(GrantChange::Grant { .. })
@@ -460,7 +457,7 @@ impl Reconstruction {
                 Change::Row(RowChange::SetEnsureKeys { .. }) => {}
                 // A bootstrap from an empty schema has no renames, drops or
                 // alterations; one that does is not a bootstrap.
-                pbps_model::change_family!(type_values)
+                Change::TypeValue(_)
                 | Change::Type(TypeChange::DropType { .. })
                 | Change::Search(SearchChange::DropSearch { .. })
                 | Change::Type(TypeChange::RenameType { .. })
@@ -475,7 +472,7 @@ impl Reconstruction {
                 | Change::Column(ColumnChange::AlterColumnDefault { .. })
                 | Change::Column(ColumnChange::AlterColumnNumbering { .. })
                 | Change::Column(ColumnChange::SetColumnDeprecated { .. })
-                | pbps_model::change_family!(table_properties)
+                | Change::TableProperty(_)
                 | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
                 | Change::Index(IndexChange::SetIndexStorageParameters { .. })
                 | Change::Partition(PartitionChange::SetPartitionDefault { .. })

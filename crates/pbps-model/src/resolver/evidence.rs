@@ -7,13 +7,9 @@ use super::{
 };
 use crate::ColumnChange;
 use crate::ConstraintChange;
-use crate::GrantChange;
 use crate::IndexChange;
 use crate::ModuleChange;
-use crate::RoleChange;
 use crate::TableChange;
-use crate::TypeChange;
-use crate::TypeValueChange;
 use crate::{Change, ChangeSet};
 use schemars::JsonSchema;
 use std::collections::{BTreeMap, BTreeSet};
@@ -442,19 +438,10 @@ impl ResolverEvidence {
             .filter(|(_, p)| {
                 matches!(
                     &p.change,
-                    Change::Permission(GrantChange::Grant { .. })
-                        | Change::Permission(GrantChange::Revoke { .. })
-                        | Change::Permission(GrantChange::PublicExecution { .. })
-                        | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
-                        | Change::TypeValue(TypeValueChange::AlterDomain { .. })
-                        | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
-                        | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
-                        | Change::Type(TypeChange::CreateType { .. })
-                        | Change::Type(TypeChange::DropType { .. })
-                        | Change::Type(TypeChange::RenameType { .. })
-                        | Change::Role(RoleChange::CreateRole { .. })
-                        | Change::Role(RoleChange::RenameRole { .. })
-                        | Change::Role(RoleChange::DropRole { .. })
+                    Change::Permission(_)
+                        | Change::TypeValue(_)
+                        | Change::Type(_)
+                        | Change::Role(_)
                 )
             })
             .map(|(i, _)| i)

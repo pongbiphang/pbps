@@ -1898,10 +1898,10 @@ fn oracle_before_its_partitions_indexes(
             Change::Index(IndexChange::AddIndex { .. })
                 | Change::Index(IndexChange::DropIndex { .. })
                 | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-                | pbps_model::change_family!(constraints)
-                | pbps_model::change_family!(policies)
+                | Change::Constraint(_)
+                | Change::Policy(_)
                 | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
-                | pbps_model::change_family!(permissions)
+                | Change::Permission(_)
         )
     };
     let mut schedule = Schedule::new(cs.changes.len());

@@ -31,7 +31,6 @@ use pbps_model::ConstraintChange;
 use pbps_model::GrantChange;
 use pbps_model::IndexChange;
 use pbps_model::ModuleChange;
-use pbps_model::PolicyChange;
 use pbps_model::RoleChange;
 use pbps_model::RowChange;
 use pbps_model::TableChange;
@@ -260,9 +259,7 @@ impl Reconstruction {
                 | Change::Row(RowChange::InsertRow { .. })
                 | Change::Row(RowChange::SetDataMode { .. })
                 | Change::Row(RowChange::SetEnsureKeys { .. })
-                | Change::Policy(PolicyChange::CreatePolicy { .. })
-                | Change::Policy(PolicyChange::DropPolicy { .. })
-                | Change::Policy(PolicyChange::SetRowSecurity { .. }) => {}
+                | Change::Policy(_) => {}
                 // A bootstrap from an empty schema has no renames, drops or
                 // alterations; one that does is not a bootstrap.
                 other => {

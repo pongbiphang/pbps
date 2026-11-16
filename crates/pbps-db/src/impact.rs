@@ -147,10 +147,10 @@ Change::Partition(PartitionChange::RebuildPartitionedTable(_)) | Change::Index(I
             // catalog lists that (#1889).
             | Change::Column(ColumnChange::AlterColumnNumbering { .. })
             | Change::Column(ColumnChange::SetColumnDeprecated { .. })
-            | pbps_model::change_family!(table_properties)
-            | pbps_model::change_family!(constraints)
+            | Change::TableProperty(_)
+            | Change::Constraint(_)
             | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-            | pbps_model::change_family!(policies)
+            | Change::Policy(_)
             | Change::Index(IndexChange::AddIndex { .. })
             | Change::Column(ColumnChange::AddComputedColumn { .. })
             | Change::Column(ColumnChange::DropComputedColumn { .. })
@@ -168,7 +168,7 @@ Change::Partition(PartitionChange::RebuildPartitionedTable(_)) | Change::Index(I
             | Change::TypeValue(TypeValueChange::AlterDomain { .. })
             | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
             | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
-             | pbps_model::catalog_change!() | Change::Permission(GrantChange::Grant { .. }) | Change::Permission(GrantChange::Revoke { .. }) | Change::Partition(PartitionChange::DetachPartition { .. }) | Change::Partition(PartitionChange::AttachPartition { .. }) | Change::Partition(PartitionChange::SetPartitionDefault { .. }) | Change::Partition(PartitionChange::SetPartitionNotNull { .. }) | Change::Permission(GrantChange::PublicExecution { .. }) => None,
+             | Change::Role(_) | Change::Type(_) | Change::Search(_) | Change::Extension(_) | Change::Permission(GrantChange::Grant { .. }) | Change::Permission(GrantChange::Revoke { .. }) | Change::Partition(PartitionChange::DetachPartition { .. }) | Change::Partition(PartitionChange::AttachPartition { .. }) | Change::Partition(PartitionChange::SetPartitionDefault { .. }) | Change::Partition(PartitionChange::SetPartitionNotNull { .. }) | Change::Permission(GrantChange::PublicExecution { .. }) => None,
         })
         .collect()
 }

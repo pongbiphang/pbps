@@ -842,15 +842,15 @@ impl Declared {
                 | Change::Column(ColumnChange::SetColumnDeprecated { .. })
                 | Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
                 | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-                | crate::change_family!(table_properties)
+                | Change::TableProperty(_)
                 | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
                 | Change::Constraint(ConstraintChange::AddUnique { .. })
                 | Change::Constraint(ConstraintChange::DropUnique { .. })
                 | Change::Constraint(ConstraintChange::AddForeignKey { .. })
                 | Change::Constraint(ConstraintChange::DropForeignKey { .. })
-                | crate::change_family!(rows)
-                | crate::change_family!(roles)
-                | crate::change_family!(permissions) => {}
+                | Change::Row(_)
+                | Change::Role(_)
+                | Change::Permission(_) => {}
             }
         }
     }

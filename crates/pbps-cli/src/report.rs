@@ -1103,26 +1103,26 @@ pub fn touched(names: &PlanNames<'_>) -> (usize, usize) {
 fn role_of(change: &Change) -> Option<&pbps_model::RoleName> {
     match change {
 Change::Partition(PartitionChange::RebuildPartitionedTable(_)) | Change::Index(IndexChange::BuildPartitionedIndex(_)) | Change::Partition(PartitionChange::CopyTableRows(_)) | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => None,
-        Change::TypeValue(TypeValueChange::AddEnumValue { .. }) | Change::TypeValue(TypeValueChange::AlterDomain { .. }) | Change::TypeValue(TypeValueChange::RenameEnumValue { .. }) | Change::TypeValue(TypeValueChange::EnumRebuild { .. }) | Change::Type(TypeChange::CreateType { .. }) | Change::Type(TypeChange::DropType { .. }) | Change::Type(TypeChange::RenameType { .. }) | Change::Search(SearchChange::CreateSearch { .. }) | Change::Search(SearchChange::DropSearch { .. }) | Change::Extension(ExtensionChange::CreateExtension { .. }) | Change::Extension(ExtensionChange::DropExtension { .. }) | Change::Extension(ExtensionChange::UpdateExtension { .. }) | Change::Extension(ExtensionChange::SetExtensionSchema { .. }) => None,
+        Change::TypeValue(_) | Change::Type(_) | Change::Search(_) | Change::Extension(_) => None,
         Change::Role(RoleChange::CreateRole { name, .. })
         | Change::Role(RoleChange::DropRole { name, .. })
         | Change::Permission(GrantChange::Grant { role: name, .. })
         | Change::Permission(GrantChange::Revoke { role: name, .. }) => Some(name),
         Change::Role(RoleChange::RenameRole { from, .. }) => Some(from),
-        pbps_model::change_family!(tables)
+        Change::Table(_)
         | Change::Partition(PartitionChange::DetachPartition { .. })
         | Change::Partition(PartitionChange::AttachPartition { .. })
-        | pbps_model::change_family!(columns)
-        | pbps_model::change_family!(table_properties)
-        | pbps_model::change_family!(constraints)
+        | Change::Column(_)
+        | Change::TableProperty(_)
+        | Change::Constraint(_)
         | Change::Index(IndexChange::SetIndexStorageParameters { .. })
         | Change::Partition(PartitionChange::SetPartitionDefault { .. })
         | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
-        | pbps_model::change_family!(policies)
+        | Change::Policy(_)
         | Change::Index(IndexChange::AddIndex { .. })
         | Change::Index(IndexChange::DropIndex { .. })
-        | pbps_model::change_family!(rows)
-        | pbps_model::change_family!(modules)
+        | Change::Row(_)
+        | Change::Module(_)
         // `PUBLIC` is not a role the summary can count: no declaration, ids
         // file or pull ever names it (ADR-0010 §5).
         | Change::Permission(GrantChange::PublicExecution { .. }) => None,

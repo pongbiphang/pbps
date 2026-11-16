@@ -311,12 +311,12 @@ Change::Partition(PartitionChange::RebuildPartitionedTable(_)) | Change::Partiti
             | Change::Column(ColumnChange::AlterColumnNumbering { .. })
             | Change::Column(ColumnChange::SetColumnDeprecated { .. })
             | Change::Policy(PolicyChange::SetRowSecurity { .. })
-            | crate::change_family!(table_properties)
+            | Change::TableProperty(_)
             | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
             | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-            | crate::change_family!(rows)
-            | crate::change_family!(type_values)
-             | crate::catalog_change!() | Change::Permission(GrantChange::Grant { .. }) | Change::Permission(GrantChange::Revoke { .. }) | Change::Permission(GrantChange::PublicExecution { .. }) => Vec::new(),
+            | Change::Row(_)
+            | Change::TypeValue(_)
+             | Change::Role(_) | Change::Type(_) | Change::Search(_) | Change::Extension(_) | Change::Permission(GrantChange::Grant { .. }) | Change::Permission(GrantChange::Revoke { .. }) | Change::Permission(GrantChange::PublicExecution { .. }) => Vec::new(),
         };
         out.extend(
             self.columns_redefined()
