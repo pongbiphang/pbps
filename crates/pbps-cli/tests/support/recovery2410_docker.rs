@@ -416,14 +416,31 @@ pub fn a_live_run_and_foreign_containers_are_left_alone(server: &str) {
     ];
     let mut leftovers = Leftovers(Vec::new());
     for (name, labels) in &foreign {
+        // The runtime removes each when its sleep ends, so a killed test leaves
+        // none for long (#2858).
         let status = Command::new("docker")
-            .args(["run", "--detach", "--pull", "never", "--name", name])
+            .args(["run", "--detach", "--rm", "--pull", "never", "--name", name])
             .args(labels)
             .args(["--entrypoint", "sleep", &image, "600"])
             .output()
             .unwrap();
         assert!(status.status.success(), "{status:?}");
         leftovers.0.push(name.clone());
+        let auto = Command::new("docker")
+            .args([
+                "container",
+                "inspect",
+                "--format",
+                "{{.HostConfig.AutoRemove}}",
+                name,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&auto.stdout).trim(),
+            "true",
+            "{name}"
+        );
     }
     let mut running = live.start();
     let pid = running.id();

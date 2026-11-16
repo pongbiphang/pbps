@@ -388,11 +388,13 @@ async fn a_container_from_another_tool_or_without_a_token_is_never_touched() {
     let mut made = Made(Vec::new());
     let (a, b, c, d) = (token(), token(), token(), token());
     // Each sleeps, so the image's server need not start: what is judged is the
-    // name and the labels. None is a run's container.
+    // name and the labels. None is a run's container. The runtime removes each
+    // when its sleep ends, so a killed test leaves none for long (#2858).
     let sleeping = |made: &mut Made, name: &str, labels: &[String]| {
         let mut args = vec![
             "run".to_owned(),
             "--detach".into(),
+            "--rm".into(),
             "--pull".into(),
             "never".into(),
         ];
@@ -404,6 +406,14 @@ async fn a_container_from_another_tool_or_without_a_token_is_never_touched() {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         docker(&args);
         made.0.push(name.to_owned());
+        let auto = docker(&[
+            "container",
+            "inspect",
+            "--format",
+            "{{.HostConfig.AutoRemove}}",
+            name,
+        ]);
+        assert_eq!(auto.trim(), "true", "{name} is removed by the runtime");
     };
     // No labels at all: another tool's, even with the name's shape.
     sleeping(&mut made, &format!("pbps-scratch-{a}"), &[]);

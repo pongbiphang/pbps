@@ -2057,3 +2057,44 @@ are `full`. Of the six scripts-only pull requests the issue names, #2771
 (`live-shards.py`) and #2836 (`live-tests-pg.sh`, `install-pg-partman.sh`) keep
 the full gate. The verdict's JSON line goes in the pull-request body, as
 `gate_scope.py`'s does, and the primary agent reruns it before enqueueing.
+
+<a id="dec-2858-1"></a>
+
+**DEC-2858.1. A live test keeps its state directory where the next live test
+finds it, and look-alike containers carry `--rm`.** Four `pbps-scratch-*`
+containers outlived the gates that made them (#2858). A live test that starts a
+real `TestScratch` kept its run records in a private `<TMPDIR>/pbps-test-scratch-<hex>`.
+When the process was killed the record and the container survived, the
+resolver's sweep left the container to its journal (DEC-2471.1), and `pbps test
+--cleanup` reconciles only the default directory, so nothing opened the private
+one again. The tests that start a look-alike container the sweep must refuse
+(no labels, a label without a token, a token that is not the name's) removed it
+only in a guard that a kill skips.
+
+`Dir::live` of the `test_scratch` live tests now makes its directory under
+`$XDG_STATE_HOME/pbps/live-test-runs/` (or `~/.local/state/pbps/live-test-runs/`),
+next to the default `test-runs`, whatever `TMPDIR` a gate uses. Before it makes
+its own, it reconciles every other directory there with the production
+`reconcile`, which proves an owner dead by pid, start tick and boot id, and
+removes the directory when no record is left. A directory is swept only when its
+maker is provably gone: each claims itself with its process identity
+(`maker.json`) before it is used, and a claim that is missing, unreadable or of
+a process still running is not judged. Without that, one live test process could
+sweep the directory of another that has rewritten a record to look dead on
+purpose (`kill` in the live tests does), and the run whose lock is held stays as
+`reconcile` already leaves it. A live test's own directory is removed when it
+ends only if no record is left in it: a failed `finish` leaves its run for the
+next live test. A cleanup that cannot be confirmed is printed and retried by the
+next run; it does not fail the test that found it. Only a path that is not
+there is an empty scan: an unreadable root, directory or claim is unknown, is
+reported, and keeps what it could not read. The product
+cleanup contract, DEC-2471.1 and the sweep's verdicts are unchanged.
+
+The two look-alike tests start their containers with `docker run --detach --rm`
+and assert `HostConfig.AutoRemove`, so the runtime removes each when its `sleep`
+ends even if the test was killed, at the latest after the sleep's 600 seconds.
+
+*What this does not cover.* A live test whose cleanup is a `Made` guard around
+containers it started itself with `docker run` still leaves them when it is
+killed, unless they are among the two look-alike tests above. This decision
+neither measured nor changed those.

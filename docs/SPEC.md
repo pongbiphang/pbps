@@ -3185,6 +3185,10 @@ DEC-1674.1).**
       cluster starts nothing.
     - The evidence records the image reference as configured. No digest is
       claimed: the content behind a tag can change, and pbps verifies none.
+    - A container an earlier version left, or one a sweep refuses to judge
+      (no run token, or another tool's name), is removed by hand:
+      `docker ps -a --filter name=pbps-scratch-` lists them, and, once nothing
+      is using one, `docker rm -f -v <name>` removes it with its volumes.
   - Before it writes anything on scratch, it establishes where scratch sits
     and what the scratch account may do (#1667, DEC-1672.1).
     - **Scratch is never the target.** The engines decide this, not the two
