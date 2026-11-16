@@ -382,53 +382,139 @@ fn tagged(value: &Value, out: &mut Vec<Value>) {
     }
 }
 
-/// Every change in the repository's plan-shaped fixtures reads and writes back in a
-/// stable form (the form pbps wrote, where the fixture is one), and every whole saved
-/// plan to the bytes it came from.
+/// Fixture objects tagged by an op this crate knows that do NOT decode as a change
+/// today, by file (relative to `crates/`) and op, and why. The list is exact: an entry
+/// that starts to decode fails the test, as does a new failure. EMPTY is the point: a
+/// refactor that breaks one kind's decoding must not turn its fixtures into
+/// "something else".
+const UNDECODED: &[(&str, &str, &str)] = &[];
+
+/// Saved plans (recognised by their shape) that do not decode or read back byte for
+/// byte today, by file and why. Exact, like `UNDECODED`.
+const SAVED_PLANS_NOT_READ_BACK: &[(&str, &str)] = &[
+    // Version 42 plans that still carry `module_deps` (now `dependencies`): kept so
+    // that a plan of that format is refused by its version and not translated
+    // (`saved_plan_version::a_plan_with_module_deps_is_refused_by_its_version_...`).
+    (
+        "pbps-cli/tests/fixtures/name-compatibility/routines/mssql/plan.json",
+        "an older format, refused by version",
+    ),
+    (
+        "pbps-cli/tests/fixtures/name-compatibility/routines/postgres/plan.json",
+        "an older format, refused by version",
+    ),
+];
+
+/// A saved plan is recognised by its shape, whatever it decodes as: an object with
+/// a `version`, a `baseline` and the `changes` of a change set. Its keys, not its
+/// success, decide that it is one.
+fn is_saved_plan(value: &Value) -> bool {
+    value.get("version").is_some_and(Value::is_number)
+        && value.get("baseline").is_some_and(Value::is_object)
+        && value
+            .get("changes")
+            .and_then(|c| c.get("changes"))
+            .is_some_and(Value::is_array)
+}
+
+/// Every object in the repository's plan fixtures that is tagged by one of the
+/// known ops IS a change, and must decode and read back stably (in the form pbps
+/// wrote, where the fixture is one); every saved plan, recognised by its shape, must
+/// decode and read back byte for byte. A failure names the file and the op. An
+/// object tagged by an op that is not in `OPS` belongs to another type and is not
+/// looked at.
 #[test]
 fn the_plan_fixtures_round_trip() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut files = Vec::new();
     json_files(&root, &mut files);
     let (mut changes, mut plans) = (0, 0);
+    let mut undecoded = Vec::new();
+    let mut plan_problems: Vec<(String, String)> = Vec::new();
     for path in files {
         let text = std::fs::read_to_string(&path).unwrap();
         if !text.contains("\"op\"") {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<Value>(&text) else {
-            continue;
-        };
+        let value = serde_json::from_str::<Value>(&text).unwrap_or_else(|error| {
+            panic!("{} mentions `op` and is not JSON: {error}", path.display())
+        });
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
         let mut found = Vec::new();
         tagged(&value, &mut found);
         for original in found {
-            // Some fixtures hold `op` objects of another type; they are not changes.
-            if let Ok(planned) = serde_json::from_value::<PlannedChange>(original.clone()) {
-                let again = serde_json::to_value(&planned).unwrap();
-                // A fixture that pbps wrote is already in the written form; a
-                // hand-written one may leave defaults out, and then only the
-                // written form has to be stable.
-                if path.to_string_lossy().contains("name-compatibility") {
-                    assert_eq!(again, original, "{}", path.display());
+            let op = original["op"].as_str().unwrap().to_owned();
+            if !OPS.contains(&op.as_str()) {
+                continue; // tagged by an op that is not a change's: another type's object
+            }
+            match serde_json::from_value::<PlannedChange>(original.clone()) {
+                Err(error) => undecoded.push((rel.clone(), op, error.to_string())),
+                Ok(planned) => {
+                    let again = serde_json::to_value(&planned).unwrap();
+                    // A fixture that pbps wrote is already in the written form; a
+                    // hand-written one may leave defaults out, and then only the
+                    // written form has to be stable.
+                    if rel.contains("name-compatibility") {
+                        assert_eq!(
+                            again, original,
+                            "{rel}: `{op}` is not written back as it was read"
+                        );
+                    }
+                    let twice: PlannedChange = serde_json::from_value(again).unwrap();
+                    assert_eq!(
+                        serde_json::to_string(&twice).unwrap(),
+                        serde_json::to_string(&planned).unwrap(),
+                        "{rel}: `{op}` is not stable"
+                    );
+                    changes += 1;
                 }
-                let twice: PlannedChange = serde_json::from_value(again.clone()).unwrap();
-                assert_eq!(
-                    serde_json::to_string(&twice).unwrap(),
-                    serde_json::to_string(&planned).unwrap()
-                );
-                changes += 1;
             }
         }
-        if let Ok(plan) = serde_json::from_str::<SavedPlan>(&text) {
-            assert_eq!(
-                serde_json::to_string(&plan).unwrap(),
-                text.trim_end(),
-                "{} is not written back byte for byte",
-                path.display()
-            );
-            plans += 1;
+        if is_saved_plan(&value) {
+            match serde_json::from_str::<SavedPlan>(&text) {
+                Err(error) => {
+                    plan_problems.push((rel.clone(), format!("does not decode: {error}")))
+                }
+                Ok(plan) if serde_json::to_string(&plan).unwrap() != text.trim_end() => {
+                    plan_problems
+                        .push((rel.clone(), "is not written back byte for byte".to_owned()));
+                }
+                Ok(_) => plans += 1,
+            }
         }
     }
+    let mut expected: Vec<(&str, &str)> =
+        UNDECODED.iter().map(|(file, op, _)| (*file, *op)).collect();
+    let mut actual: Vec<(&str, &str)> = undecoded
+        .iter()
+        .map(|(file, op, _)| (file.as_str(), op.as_str()))
+        .collect();
+    expected.sort_unstable();
+    expected.dedup();
+    actual.sort_unstable();
+    actual.dedup();
+    assert_eq!(
+        actual, expected,
+        "fixture objects of a known op that do not decode must be exactly the listed ones; errors: {undecoded:#?}"
+    );
+    let mut expected_plans: Vec<&str> = SAVED_PLANS_NOT_READ_BACK
+        .iter()
+        .map(|(file, _)| *file)
+        .collect();
+    let mut actual_plans: Vec<&str> = plan_problems
+        .iter()
+        .map(|(file, _)| file.as_str())
+        .collect();
+    expected_plans.sort_unstable();
+    actual_plans.sort_unstable();
+    assert_eq!(
+        actual_plans, expected_plans,
+        "saved plans that do not read back must be exactly the listed ones; problems: {plan_problems:#?}"
+    );
     assert!(
         changes >= 100,
         "the sweep found only {changes} changes: the fixtures moved?"

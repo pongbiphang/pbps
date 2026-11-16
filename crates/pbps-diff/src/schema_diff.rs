@@ -19524,7 +19524,7 @@ mod tests {
         for (op, words) in expected {
             let change = by_op
                 .get(op)
-                .unwrap_or_else(|| panic!("no fixture holds a `{op}`; add one"));
+                .unwrap_or_else(|| panic!("no fixture holds a `{op}` that decodes as a change: add one, or a kind stopped decoding"));
             assert_eq!(change_in_words(change), words, "{op}");
             families.insert(change.family());
         }
