@@ -397,25 +397,15 @@ pub(crate) fn declared_placement(
     ids: &IdsFile,
     paths: &DeclaredPaths,
 ) -> anyhow::Result<Placement> {
-    fn invert<K: Ord + Clone, V: Ord + Clone>(m: &BTreeMap<K, V>) -> BTreeMap<V, K> {
-        m.iter().map(|(k, v)| (v.clone(), k.clone())).collect()
-    }
-    let (tables, roles) = (invert(&ids.tables), invert(&ids.roles));
-    let (types, extensions) = (invert(&ids.types), invert(&ids.extensions));
-    let search = invert(&ids.search);
+    // Built once: a lookup per declaration over the file itself is quadratic
+    // in the schema (#1870).
+    let index = ids.index();
     let mut placement = Placement::default();
     for (source, file) in &paths.files {
-        let uid = match source {
-            Source::Table(n) => tables.get(n),
-            Source::Role(n) => roles.get(n),
-            Source::Type(n) => types.get(n),
-            Source::Extension(n) => extensions.get(n),
-            Source::Search(n) => search.get(n),
-            // Sequences take identities with the part that creates one (#2721).
-            Source::Module(_) | Source::Sequence(_) => None,
-        };
         // A declaration the old file never knew gets its identity from `plan`.
-        let Some(uid) = uid else { continue };
+        let Some(uid) = source.uid_in(&index) else {
+            continue;
+        };
         placement
             .paths
             .insert(uid.clone(), dirs.mirrored(&file.path)?);
@@ -430,7 +420,7 @@ pub(crate) fn declared_placement(
         }
     }
     for (child, parent) in &paths.children {
-        if let (Some(c), Some(p)) = (tables.get(child), tables.get(parent)) {
+        if let (Some(c), Some(p)) = (index.table_uid(child), index.table_uid(parent)) {
             placement.children.insert(c.clone(), p.clone());
         }
     }
@@ -618,18 +608,6 @@ fn renamed_from(loaded: &Loaded, kind: UidKind, name: &str) -> Option<String> {
     })
 }
 
-/// The name a declaration spells and what it declares, for the identity tree.
-fn named(source: &Source) -> Option<(UidKind, String)> {
-    match source {
-        Source::Table(n) => Some((UidKind::Table, n.raw().to_string())),
-        Source::Role(n) => Some((UidKind::Role, n.raw().to_owned())),
-        Source::Type(n) => Some((UidKind::Type, n.raw().to_string())),
-        Source::Extension(n) => Some((UidKind::Extension, n.raw().to_owned())),
-        Source::Search(n) => Some((UidKind::Search, n.raw().to_string())),
-        Source::Module(_) | Source::Sequence(_) => None,
-    }
-}
-
 /// The declarations as the validator wants them: project-relative path, kind,
 /// name, and the `renamed_from` they carry.
 pub(crate) fn declarations(
@@ -641,7 +619,7 @@ pub(crate) fn declarations(
         .files
         .iter()
         .filter_map(|(source, file)| {
-            let (kind, name) = named(source)?;
+            let (kind, name) = source.identity()?;
             Some(Declaration {
                 yaml: format!("{}/{}", dirs.schema, file.path),
                 renamed_from: renamed_from(loaded, kind, &name),
@@ -705,7 +683,7 @@ fn resolve(project: &Project) -> anyhow::Result<()> {
     let (loaded, paths) = load(project)?;
     let mut views: BTreeMap<String, YamlView> = BTreeMap::new();
     for (source, file) in &paths.files {
-        let Some((_, name)) = named(source) else {
+        let Some((_, name)) = source.identity() else {
             continue;
         };
         views.insert(

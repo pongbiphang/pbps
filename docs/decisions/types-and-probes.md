@@ -6054,3 +6054,38 @@ same nesting position with the same wrapper. Comments between alternatives are
 retained with their member patterns. An arm whose leading comment says
 "rather than a wildcard" keeps its member listings; macro substitution
 still applies there because it preserves the accepted kinds.
+
+<a id="dec-2878-3"></a>
+
+**DEC-2878.3. Of the three enums a new kind forces a variant into, only
+`Declaration` is given its answers in one place (#2878).** A census on
+`a08d62d0c` found 31 production sites that match on `LoadedFile`, `Declaration`
+or `LimitationTarget`; a new kind with a variant in each has to edit 20 of them
+in 12 files. They are not alike.
+
+`Declaration` is one-to-one with the kinds, and four of its sites asked the
+same three questions of it with a match of their own: does the kind hold an
+identity and under what name (`declared_paths`, `ids_cmd::named`), which uid
+does the identity file hold for it (`declared_placement`), and what does a
+message call it (the resolver's refusal text). Those are now
+`Declaration::identity`, `uid_in` and `described`, beside the enum, so a new
+variant stops compiling in the file that adds it and in no consumer. Methods
+on the enum and not a trait per kind with generated variants: the enum
+exists, its variants carry the key already, and a generated enum would need a
+second list in step with `schema_kinds!` to save three matches. The sites
+that stay explicit do different work per kind: the partition child of a table,
+a table's column order, a routine's argument normalisation, the annotation
+roots and their two refusals.
+
+`LoadedFile` keeps its matches. Two of its seven variants' consumers are the
+same projection written twice (`fmt`), but collecting them means generating
+variants with an associated payload per kind, across a crate boundary, for
+three sites; the loader's own matches are different logic per kind and would
+stay either way.
+
+`LimitationTarget` is not a list of kinds at all. It is a list of namespaces
+a catalog object can be unreadable in: `Relation` covers tables, named modules
+and relations no kind declares; three variants split the module family by how
+much of an identity could be read; there is none for extensions or roles.
+Deriving it from the kind list would lose exactly those distinctions, and its
+sites are namespace questions. It stays as written.

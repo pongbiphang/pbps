@@ -199,15 +199,7 @@ fn listed(names: &[String]) -> String {
     }
 }
 pub fn declaration(owner: &Declaration) -> String {
-    match owner {
-        Declaration::Table(t) => format!("table {}", t.shown()),
-        Declaration::Module(m) => format!("module {}", m.shown()),
-        Declaration::Extension(e) => format!("extension {}", e.shown()),
-        Declaration::Type(t) => format!("type {}", t.shown()),
-        Declaration::Search(s) => s.shown().to_string(),
-        Declaration::Sequence(s) => format!("sequence {}", s.shown()),
-        Declaration::Role(r) => format!("role {}", r.shown()),
-    }
+    owner.described()
 }
 
 /// P counts characters in the submitted statement. Internal p applies only to q,

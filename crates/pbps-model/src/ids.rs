@@ -749,6 +749,8 @@ pub struct IdsIndex<'a> {
     tables: BTreeMap<&'a TableName, &'a Uid>,
     columns: BTreeMap<&'a ColumnRef, &'a Uid>,
     roles: BTreeMap<&'a str, &'a Uid>,
+    extensions: BTreeMap<&'a crate::ObjectLocalName, &'a Uid>,
+    search: BTreeMap<&'a crate::SearchRef, &'a Uid>,
     columns_by_table: BTreeMap<&'a TableName, BTreeMap<&'a Uid, &'a ColumnRef>>,
 }
 
@@ -773,6 +775,14 @@ impl<'a> IdsIndex<'a> {
         for (uid, name) in &ids.roles {
             roles.entry(name.raw()).or_insert(uid);
         }
+        let mut extensions = BTreeMap::new();
+        for (uid, name) in &ids.extensions {
+            extensions.entry(name).or_insert(uid);
+        }
+        let mut search = BTreeMap::new();
+        for (uid, name) in &ids.search {
+            search.entry(name).or_insert(uid);
+        }
         Self {
             types: ids
                 .types
@@ -783,6 +793,8 @@ impl<'a> IdsIndex<'a> {
             tables,
             columns,
             roles,
+            extensions,
+            search,
             columns_by_table,
         }
     }
@@ -804,6 +816,16 @@ impl<'a> IdsIndex<'a> {
     /// [`IdsFile::role_uid`], by lookup.
     pub fn role_uid(&self, name: &crate::RoleName) -> Option<&'a Uid> {
         self.roles.get(name.raw()).copied()
+    }
+
+    /// [`IdsFile::extension_uid`], by lookup.
+    pub fn extension_uid(&self, name: &crate::ObjectLocalName) -> Option<&'a Uid> {
+        self.extensions.get(name).copied()
+    }
+
+    /// [`IdsFile::search_uid`], by lookup.
+    pub fn search_uid(&self, name: &crate::SearchRef) -> Option<&'a Uid> {
+        self.search.get(name).copied()
     }
 
     /// [`IdsFile::resolved_in`], by lookup.
@@ -1604,6 +1626,8 @@ mod tests {
         let tables = ["a.t", "a.u", "b.t", "b.v"];
         let columns = ["id", "name", "note"];
         let roles = ["app", "reader", "writer"];
+        let extensions = ["citext", "hstore", "pgcrypto"];
+        let search = ["dictionary app.d", "config app.d", "config app.e"];
         for round in 0..200 {
             let mut f = IdsFile::default();
             for i in 0..next(8) {
@@ -1618,6 +1642,14 @@ mod tests {
             for i in 0..next(5) {
                 f.roles
                     .insert(uid(&format!("r_{i:06}")), roles[next(3) as usize].into());
+            }
+            for i in 0..next(5) {
+                let name = crate::ObjectLocalName::new(extensions[next(3) as usize]);
+                f.extensions.insert(uid(&format!("e_{i:06}")), name);
+            }
+            for i in 0..next(5) {
+                let name = search[next(3) as usize].parse().unwrap();
+                f.search.insert(uid(&format!("s_{i:06}")), name);
             }
             let index = f.index();
             let other = sample();
@@ -1649,6 +1681,18 @@ mod tests {
                     f.role_uid(&crate::RoleName::from(*(r))),
                     "round {round}: {r}"
                 );
+            }
+            for e in extensions.iter().chain(&["absent"]) {
+                let e = crate::ObjectLocalName::new(*e);
+                assert_eq!(
+                    index.extension_uid(&e),
+                    f.extension_uid(&e),
+                    "round {round}"
+                );
+            }
+            for s in search.iter().chain(&["dictionary app.absent"]) {
+                let s: crate::SearchRef = s.parse().unwrap();
+                assert_eq!(index.search_uid(&s), f.search_uid(&s), "round {round}");
             }
             let absent: TableName = "z.absent".parse().unwrap();
             assert_eq!(index.table_uid(&absent), None);
