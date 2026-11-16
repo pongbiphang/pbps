@@ -6,7 +6,7 @@
 //! change only the type or only the nullability, and an omitted `NULL` /
 //! `NOT NULL` is read as `NULL` — so a type change written without the
 //! nullability silently drops a `NOT NULL`. That is why the change set carries
-//! both (see [`pbps_model::Change::AlterColumnType`]).
+//! both (see [`pbps_model::ColumnChange::AlterColumnType`]).
 //!
 //! **A default is a constraint, not a column property.** Changing or removing one
 //! means dropping a constraint whose name we may not know: a column created
@@ -2366,7 +2366,7 @@ fn rename_table(from: &TableName, to: &TableName, defaults: &[ColumnName]) -> Sq
 /// carry one.
 /// No ONLINE clause: the option is accepted on a constraint drop only when the
 /// constraint's index is clustered (3745 otherwise), and the drop half of a
-/// [`Change::SetPrimaryKey`] does not carry the layout of the key it removes —
+/// [`pbps_model::ConstraintChange::SetPrimaryKey`] does not carry the layout of the key it removes —
 /// that is the baseline's, and only the key being *added* is resolved against
 /// its table's selector (#1178). Emitting the hint on a guess would produce a
 /// statement the server rejects outright, which is worse than an offline drop

@@ -325,7 +325,7 @@ impl<S> PartialEq<PlanningPlan<S>> for ChangeSet {
 /// ```compile_fail
 /// fn partial(copy: pbps_model::CopyTableRows) {
 ///     let draft = pbps_diff::order::propose(pbps_model::ChangeSet {
-///         changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::CopyTableRows(Box::new(copy)))],
+///         changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Partition(pbps_model::PartitionChange::CopyTableRows(Box::new(copy))))],
 ///     });
 ///     draft.ordered(pbps_model::PlanMode::Transactional, &pbps_dialect::MinimalDialect);
 /// }
@@ -334,7 +334,7 @@ impl<S> PartialEq<PlanningPlan<S>> for ChangeSet {
 /// ```compile_fail
 /// fn recipe(recipe: pbps_model::BuildPartitionedIndex) {
 ///     let raw = pbps_diff::order::propose(pbps_model::ChangeSet {
-///         changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::BuildPartitionedIndex(Box::new(recipe)))],
+///         changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Index(pbps_model::IndexChange::BuildPartitionedIndex(Box::new(recipe))))],
 ///     });
 ///     let _: pbps_diff::order::OrderedPlan<pbps_dialect::MinimalDialect> = raw;
 /// }
@@ -350,7 +350,7 @@ impl<S> PartialEq<PlanningPlan<S>> for ChangeSet {
 /// fn partial<E>(analyze: pbps_model::AnalyzeTableTree, emitter: &E)
 /// where E: pbps_dialect::lower::Lowering<Input = dyn pbps_diff::order::PlanView<pbps_dialect::MinimalDialect>> {
 ///     let draft = pbps_diff::order::propose(pbps_model::ChangeSet {
-///         changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::AnalyzeTableTree(Box::new(analyze)))],
+///         changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Partition(pbps_model::PartitionChange::AnalyzeTableTree(Box::new(analyze))))],
 ///     });
 ///     pbps_dialect::lower::lower_all(&draft as &dyn pbps_diff::order::PlanView<pbps_dialect::MinimalDialect>, emitter);
 /// }

@@ -97,10 +97,7 @@ fn type_order_violations(drop: bool, order: &[usize]) -> Vec<Violation> {
     .unwrap();
     assert_eq!(proposed.changes.len(), 2);
     for (planned, expected) in proposed.changes.iter().zip(&logical) {
-        assert_eq!(
-            std::mem::discriminant(&planned.change),
-            std::mem::discriminant(expected)
-        );
+        assert!(planned.change.same_kind(expected));
     }
     let logical: Vec<_> = logical.into_iter().map(PlannedChange::new).collect();
     let owners = PlanOwners::new(

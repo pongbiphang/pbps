@@ -1,6 +1,6 @@
 use super::ColumnChange;
-use super::PartitionChange;
 use super::*;
+use crate::PartitionChange;
 use crate::{Column, OwnedSequence};
 
 #[test]

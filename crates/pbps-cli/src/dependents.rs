@@ -97,8 +97,10 @@ use pbps_model::ConstraintChange;
 use pbps_model::IndexChange;
 use pbps_model::ModuleChange;
 use pbps_model::PartitionChange;
+#[cfg(test)]
 use pbps_model::RowChange;
 use pbps_model::TableChange;
+#[cfg(test)]
 use pbps_model::TablePropertyChange;
 #[cfg(test)]
 use pbps_model::resolver::OrderReason;

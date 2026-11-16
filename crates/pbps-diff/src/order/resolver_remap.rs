@@ -186,14 +186,14 @@ pub fn remap(
 /// other field is the change's own, and a pass that rewrote one made
 /// another change.
 fn same_change(then: &pbps_model::Change, now: &pbps_model::Change) -> bool {
-    use pbps_model::Change::DropRole;
+    use pbps_model::{Change::Role, RoleChange::DropRole};
     if let (
-        DropRole { uid, name, members },
-        DropRole {
+        Role(DropRole { uid, name, members }),
+        Role(DropRole {
             uid: now_uid,
             name: now_name,
             ..
-        },
+        }),
     ) = (then, now)
     {
         return members.is_empty() && uid == now_uid && name == now_name;

@@ -1365,7 +1365,7 @@ fn is_one_dollar_quoted_literal(e: &str) -> bool {
 /// January in another.
 ///
 /// Its caller in `validate` is not a second guard, it is the *earlier* one, and
-/// it is where the whole rule is actually enforced: [`Change::AlterColumnDefault`]
+/// it is where the whole rule is actually enforced: [`pbps_model::ColumnChange::AlterColumnDefault`]
 /// carries a `ColumnRef` and two expressions and **no type**, so the emitter
 /// cannot ask this question on the one path that changes a default on a column
 /// that already exists. `validate_table` sees the declaration, types and all,

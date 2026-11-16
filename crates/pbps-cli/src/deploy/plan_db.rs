@@ -729,11 +729,11 @@ pub(super) async fn plan_db_selected(
             pbps_model::data::takeovers(&recorded_data, &declared_data, &scoped.schema)
                 .into_iter()
                 .map(|(name, mode)| {
-                    let change = pbps_model::Change::SetDataMode {
+                    let change = pbps_model::Change::Row(pbps_model::RowChange::SetDataMode {
                         table: recorded_ids.resolved_in(&name, &resolved.ids),
                         from: None,
                         to: Some(mode),
-                    };
+                    });
                     let risks = dialect.change_risks(&change);
                     let mut planned = pbps_model::PlannedChange::new(change);
                     planned.risks = risks;
@@ -1151,7 +1151,7 @@ pub(super) async fn plan_db_selected(
                 .await
                 .context("cannot read what the roles own")?;
             for p in &cs.changes {
-                if let pbps_model::Change::DropRole { name, .. } = &p.change
+                if let pbps_model::Change::Role(pbps_model::RoleChange::DropRole { name, .. }) = &p.change
                     && let Some(securables) = owned.get(name.raw())
                     && !securables.is_empty()
                 {

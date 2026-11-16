@@ -23514,32 +23514,28 @@ mod tests {
         let declared = schema_of("dbo.t", table(&[("id", Column::new(ty("int")))]));
 
         let cs = run(&base, &declared, &[]);
-        let order: Vec<_> = cs
-            .changes
-            .iter()
-            .map(|p| std::mem::discriminant(&p.change))
-            .collect();
-        assert_eq!(
-            order,
-            vec![
-                std::mem::discriminant(&Change::Constraint(ConstraintChange::SetPrimaryKey {
-                    table: "dbo.t".parse().unwrap(),
-                    from: None,
-                    to: None,
-                    nonclustered: false,
-                })),
-                std::mem::discriminant(&Change::Column(ColumnChange::AlterColumnNullability {
-                    uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
-                    column: pbps_model::ColumnRef {
-                        table: "dbo.t".parse().unwrap(),
-                        name: "id".into(),
-                    },
-                    ty: ty("int"),
-                    to_nullable: true,
-                    through_external_partitions: false,
-                    collation: None,
-                })),
-            ],
+        // The kinds are compared, not the families: both of these are one family
+        // apart from each other, but a key and a unique are one family too.
+        let order: Vec<&Change> = cs.changes.iter().map(|p| &p.change).collect();
+        let key = Change::Constraint(ConstraintChange::SetPrimaryKey {
+            table: "dbo.t".parse().unwrap(),
+            from: None,
+            to: None,
+            nonclustered: false,
+        });
+        let nullable = Change::Column(ColumnChange::AlterColumnNullability {
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+            column: pbps_model::ColumnRef {
+                table: "dbo.t".parse().unwrap(),
+                name: "id".into(),
+            },
+            ty: ty("int"),
+            to_nullable: true,
+            through_external_partitions: false,
+            collation: None,
+        });
+        assert!(
+            order.len() == 2 && order[0].same_kind(&key) && order[1].same_kind(&nullable),
             "the key has to go first: {:#?}",
             cs.changes
         );

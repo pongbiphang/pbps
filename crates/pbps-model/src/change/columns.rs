@@ -1,6 +1,6 @@
 //! Portable statement outputs, without engine recursion or normalization policy
 //! (DEC-2296.4).
-use super::Change;
+use super::{Change, ColumnChange, TableChange};
 use crate::operation::symbolic::{Attribute, Lifetime};
 use crate::{Collation, Column, ColumnName, ColumnType, TableName, Uid, ValueSource};
 
@@ -38,13 +38,13 @@ impl Change {
     #[allow(clippy::wildcard_enum_match_arm)]
     pub fn parent_column_uid(&self) -> Option<&Uid> {
         match self {
-            Self::AddColumn { uid, .. }
-            | Self::DropColumn { uid, .. }
-            | Self::RenameColumn { uid, .. }
-            | Self::AlterColumnType { uid, .. }
-            | Self::AlterColumnNullability { uid, .. }
-            | Self::AlterColumnDefault { uid, .. }
-            | Self::AlterColumnNumbering { uid, .. } => Some(uid),
+            Self::Column(ColumnChange::AddColumn { uid, .. })
+            | Self::Column(ColumnChange::DropColumn { uid, .. })
+            | Self::Column(ColumnChange::RenameColumn { uid, .. })
+            | Self::Column(ColumnChange::AlterColumnType { uid, .. })
+            | Self::Column(ColumnChange::AlterColumnNullability { uid, .. })
+            | Self::Column(ColumnChange::AlterColumnDefault { uid, .. })
+            | Self::Column(ColumnChange::AlterColumnNumbering { uid, .. }) => Some(uid),
             _ => None,
         }
     }
@@ -66,23 +66,25 @@ impl Change {
             });
         };
         match self {
-            Self::AddColumn { .. } | Self::DropColumn { .. } => {
-                let (lifetime, value) = if let Self::AddColumn { column, .. } = self {
-                    (Create, V::Definition(column))
-                } else {
-                    (Retire, V::Absent)
-                };
+            Self::Column(ColumnChange::AddColumn { .. })
+            | Self::Column(ColumnChange::DropColumn { .. }) => {
+                let (lifetime, value) =
+                    if let Self::Column(ColumnChange::AddColumn { column, .. }) = self {
+                        (Create, V::Definition(column))
+                    } else {
+                        (Retire, V::Absent)
+                    };
                 for attribute in [Presence, Name, Type, Collation, Default, NotNull] {
                     put(attribute, lifetime, value);
                 }
-                if matches!(self, Self::DropColumn { .. })
-                    || matches!(self, Self::AddColumn { column, .. } if matches!(column.value_source, ValueSource::Sequence(_) | ValueSource::Identity(_)))
+                if matches!(self, Self::Column(ColumnChange::DropColumn { .. }))
+                    || matches!(self, Self::Column(ColumnChange::AddColumn { column, .. }) if matches!(column.value_source, ValueSource::Sequence(_) | ValueSource::Identity(_)))
                 {
                     put(Numbering, lifetime, value);
                 }
             }
-            Self::RenameColumn { to, .. } => put(Name, Retain, V::Name(to)),
-            Self::AlterColumnType {
+            Self::Column(ColumnChange::RenameColumn { to, .. }) => put(Name, Retain, V::Name(to)),
+            Self::Column(ColumnChange::AlterColumnType {
                 from,
                 to,
                 from_collation,
@@ -90,7 +92,7 @@ impl Change {
                 from_nullable,
                 to_nullable,
                 ..
-            } => {
+            }) => {
                 if from != to {
                     put(Type, Retain, V::Type(to));
                 }
@@ -101,11 +103,13 @@ impl Change {
                     put(NotNull, Retain, V::Nullable(*to_nullable));
                 }
             }
-            Self::AlterColumnNullability { to_nullable, .. } => {
+            Self::Column(ColumnChange::AlterColumnNullability { to_nullable, .. }) => {
                 put(NotNull, Retain, V::Nullable(*to_nullable))
             }
-            Self::AlterColumnDefault { to, .. } => put(Default, Retain, V::Default(to.as_deref())),
-            Self::AlterColumnNumbering { from, to, .. } => {
+            Self::Column(ColumnChange::AlterColumnDefault { to, .. }) => {
+                put(Default, Retain, V::Default(to.as_deref()))
+            }
+            Self::Column(ColumnChange::AlterColumnNumbering { from, to, .. }) => {
                 let owns = |s: &ValueSource| {
                     matches!(s, ValueSource::Sequence(_) | ValueSource::Identity(_))
                 };
@@ -127,7 +131,7 @@ impl Change {
                     V::Numbering(to),
                 );
             }
-            Self::RenameTable { to, .. } => result.push(ColumnTransition {
+            Self::Table(TableChange::RenameTable { to, .. }) => result.push(ColumnTransition {
                 property: ColumnProperty::Address,
                 lifetime: Retain,
                 value: V::Address(to),

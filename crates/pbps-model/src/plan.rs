@@ -95,7 +95,7 @@ use crate::zone::SessionZone;
 /// baseline cells whose columns are dropped. Older readers deny unknown
 /// change fields; the version identifies that format boundary (DECISIONS 442).
 ///
-/// Bumped to 9 for `Change::PublicExecution`, which is a boundary in both
+/// Bumped to 9 for `GrantChange::PublicExecution`, which is a boundary in both
 /// directions (DECISIONS 517). A version 8 reader meets an unknown change
 /// variant and calls the file broken, when what it is is newer — the same
 /// shape as the field boundary above, one level up. And a version 8 plan

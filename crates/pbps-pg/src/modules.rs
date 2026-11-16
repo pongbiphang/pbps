@@ -29,7 +29,7 @@
 //! and the differ compares it. The other half landed with #248:
 //! `pbps_diff::diff_roles` restates a declared role's full permission set on
 //! a target this dialect is about to rebuild — gated by
-//! `Dialect::rebuilds_modules`, so `Change::AlterModule` sorts a `Grant` after
+//! `Dialect::rebuilds_modules`, so `pbps_model::ModuleChange::AlterModule` sorts a `Grant` after
 //! itself in the same plan, exactly where a human approving it can see what
 //! access is restored. `read_acl` below is the other side of that decision: it
 //! reads the object's ACL the same structured way `pull` does — `aclexplode`,
@@ -45,7 +45,7 @@
 //! `acldefault` would otherwise put there — used to be a refusal for good,
 //! because there was no grantee named `PUBLIC` to re-emit a revoke from and a
 //! rebuild restores the default (DECISIONS 306). Issue #318 gave the model
-//! that grantee: `Change::PublicExecution` writes down what this plan has
+//! that grantee: `pbps_model::GrantChange::PublicExecution` writes down what this plan has
 //! settled about a routine's default `EXECUTE`, and where the plan carries one
 //! for this object it is accepted here for the same reason a declared grant is
 //! — the missing default is a state somebody recorded an intent about, which
@@ -1021,7 +1021,7 @@ fn grant_target(id: &ModuleId) -> Option<GrantTarget> {
     }
 }
 
-/// The permissions this plan's own `Change::Grant` entries put on `target` —
+/// The permissions this plan's own `pbps_model::GrantChange::Grant` entries put on `target` —
 /// the **full** declared set for a target this dialect is rebuilding, not a
 /// delta, because `pbps_diff::diff_roles` treats an `AlterModule` exactly as
 /// it treats a `DropModule` once `Dialect::rebuilds_modules` answers `true`

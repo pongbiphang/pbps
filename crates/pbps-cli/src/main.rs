@@ -7466,18 +7466,22 @@ mod plan_fixture {
         let table_uid: Uid = "t_aaaaaa".parse().unwrap();
         let column_uid: Uid = "c_aaaaaa".parse().unwrap();
         let table = |name| pbps_model::TableName::new("app", name);
-        let renamed_table = |from, to| Change::RenameTable {
-            uid: table_uid.clone(),
-            from: table(from),
-            to: table(to),
-            defaults: vec![],
+        let renamed_table = |from, to| {
+            Change::Table(TableChange::RenameTable {
+                uid: table_uid.clone(),
+                from: table(from),
+                to: table(to),
+                defaults: vec![],
+            })
         };
-        let renamed_column = |from: &str, to: &str| Change::RenameColumn {
-            uid: column_uid.clone(),
-            table: table("final_table"),
-            from: from.into(),
-            to: to.into(),
-            table_was: Some(table("original_table")),
+        let renamed_column = |from: &str, to: &str| {
+            Change::Column(ColumnChange::RenameColumn {
+                uid: column_uid.clone(),
+                table: table("final_table"),
+                from: from.into(),
+                to: to.into(),
+                table_was: Some(table("original_table")),
+            })
         };
         let changes = ChangeSet {
             changes: vec![

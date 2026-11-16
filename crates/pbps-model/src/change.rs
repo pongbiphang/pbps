@@ -15,6 +15,7 @@
 //! hold a `Dialect`, and attached to [`PlannedChange`] as data.
 
 mod columns;
+mod wire;
 pub use columns::{ColumnProperty, ColumnTransition, ColumnValue};
 
 use crate::ColumnName;
@@ -260,76 +261,56 @@ pub enum DetachedKind {
     Index,
 }
 
-/// Every variant carries the UID of the object it affects, so that applying a
-/// plan never has to match on names — names are exactly what may be changing.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+/// One change of a plan: a family (DEC-2790.1) and, inside it, the kind of change.
+///
+/// Every kind carries what it needs to be applied without matching on names, which
+/// are exactly what may be changing: the UID of the object it affects, or, for the
+/// kinds that have none, the table or module it names.
+///
+/// A change is saved as one flat object tagged by `op`, printed by `Debug` as the
+/// kind alone and described by one JSON schema, as it was when every kind was a
+/// variant of this enum. The impls that keep it so are in `change/wire.rs`; the
+/// derives here are only the ones that see nothing of the layering.
+///
+/// A kind that joins a family joins every `match` that takes the family whole
+/// (`Change::Table(_)`), with no compile error: read those where a kind is added.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Change {
-    /// The kinds of the `tables` family (#2790). Serialised as the inner kind alone:
-    /// each change stays one flat object tagged by `op`.
-    #[serde(untagged)]
+    /// The kinds of the `tables` family: [`TableChange`].
     Table(TableChange),
-    /// The kinds of the `table_properties` family (#2790). Serialised as the inner kind alone:
-    /// each change stays one flat object tagged by `op`.
-    #[serde(untagged)]
+    /// The kinds of the `table_properties` family: [`TablePropertyChange`].
     TableProperty(TablePropertyChange),
-    /// The kinds of the `partitions` family (#2790). Serialised as the inner kind alone:
-    /// each change stays one flat object tagged by `op`.
-    #[serde(untagged)]
+    /// The kinds of the `partitions` family: [`PartitionChange`].
     Partition(PartitionChange),
-    /// The kinds of the `columns` family (#2790). Serialised as the inner kind alone:
-    /// each change stays one flat object tagged by `op`.
-    #[serde(untagged)]
+    /// The kinds of the `columns` family: [`ColumnChange`].
     Column(ColumnChange),
-    /// The kinds of the `constraints` family (#2790). Serialised as the inner kind alone:
-    /// each change stays one flat object tagged by `op`.
-    #[serde(untagged)]
+    /// The kinds of the `constraints` family: [`ConstraintChange`].
     Constraint(ConstraintChange),
-    /// The kinds of the `indexes` family (#2790). Serialised as the inner kind alone:
-    /// each change stays one flat object tagged by `op`.
-    #[serde(untagged)]
+    /// The kinds of the `indexes` family: [`IndexChange`].
     Index(IndexChange),
-    /// The kinds of the `policies` family (#2790). Serialised as the inner kind alone:
-    /// each change stays one flat object tagged by `op`.
-    #[serde(untagged)]
+    /// The kinds of the `policies` family: [`PolicyChange`].
     Policy(PolicyChange),
-    /// The kinds of the `rows` family (#2790). Serialised as the inner kind alone:
-    /// each change stays one flat object tagged by `op`.
-    #[serde(untagged)]
+    /// The kinds of the `rows` family: [`RowChange`].
     Row(RowChange),
-    /// The kinds of the `modules` family (#2790). Serialised as the inner kind alone:
-    /// each change stays one flat object tagged by `op`.
-    #[serde(untagged)]
+    /// The kinds of the `modules` family: [`ModuleChange`].
     Module(ModuleChange),
-    /// The kinds of the `permissions` family (#2790). Serialised as the inner kind alone:
-    /// each change stays one flat object tagged by `op`.
-    #[serde(untagged)]
+    /// The kinds of the `permissions` family: [`GrantChange`].
     Permission(GrantChange),
-    /// The kinds of the `type_values` family (#2790). Serialised as the inner kind alone:
-    /// each change stays one flat object tagged by `op`.
-    #[serde(untagged)]
+    /// The kinds of the `type_values` family: [`TypeValueChange`].
     TypeValue(TypeValueChange),
-    /// The kinds of the `roles` family (#2790). Serialised as the inner kind alone:
-    /// each change stays one flat object tagged by `op`.
-    #[serde(untagged)]
+    /// The kinds of the `roles` family: [`RoleChange`].
     Role(RoleChange),
-    /// The kinds of the `types` family (#2790). Serialised as the inner kind alone:
-    /// each change stays one flat object tagged by `op`.
-    #[serde(untagged)]
+    /// The kinds of the `types` family: [`TypeChange`].
     Type(TypeChange),
-    /// The kinds of the `extensions` family (#2790). Serialised as the inner kind alone:
-    /// each change stays one flat object tagged by `op`.
-    #[serde(untagged)]
+    /// The kinds of the `extensions` family: [`ExtensionChange`].
     Extension(ExtensionChange),
-    /// The kinds of the `search` family (#2790). Serialised as the inner kind alone:
-    /// each change stays one flat object tagged by `op`.
-    #[serde(untagged)]
+    /// The kinds of the `search` family: [`SearchChange`].
     Search(SearchChange),
 }
 
-/// The kinds of change of the `search` family (#2790): the enum `change_family!(search)`
-/// names. [`Change::Search`] holds one and serialises as it does, so a saved plan
-/// keeps its shape.
+/// The kinds of change of the `search` family (DEC-2790.1), the enum
+/// `change_family!(search)` names. [`Change::Search`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SearchChange {
@@ -357,9 +338,9 @@ pub enum SearchChange {
     },
 }
 
-/// The kinds of change of the `extensions` family (#2790): the enum `change_family!(extensions)`
-/// names. [`Change::Extension`] holds one and serialises as it does, so a saved plan
-/// keeps its shape.
+/// The kinds of change of the `extensions` family (DEC-2790.1), the enum
+/// `change_family!(extensions)` names. [`Change::Extension`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExtensionChange {
@@ -454,9 +435,9 @@ pub enum ExtensionChange {
     },
 }
 
-/// The kinds of change of the `types` family (#2790): the enum `change_family!(types)`
-/// names. [`Change::Type`] holds one and serialises as it does, so a saved plan
-/// keeps its shape.
+/// The kinds of change of the `types` family (DEC-2790.1), the enum
+/// `change_family!(types)` names. [`Change::Type`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TypeChange {
@@ -478,9 +459,9 @@ pub enum TypeChange {
     },
 }
 
-/// The kinds of change of the `roles` family (#2790): the enum `change_family!(roles)`
-/// names. [`Change::Role`] holds one and serialises as it does, so a saved plan
-/// keeps its shape.
+/// The kinds of change of the `roles` family (DEC-2790.1), the enum
+/// `change_family!(roles)` names. [`Change::Role`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RoleChange {
@@ -510,9 +491,9 @@ pub enum RoleChange {
     },
 }
 
-/// The kinds of change of the `type_values` family (#2790): the enum `change_family!(type_values)`
-/// names. [`Change::TypeValue`] holds one and serialises as it does, so a saved plan
-/// keeps its shape.
+/// The kinds of change of the `type_values` family (DEC-2790.1), the enum
+/// `change_family!(type_values)` names. [`Change::TypeValue`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TypeValueChange {
@@ -557,9 +538,9 @@ pub enum TypeValueChange {
     },
 }
 
-/// The kinds of change of the `permissions` family (#2790): the enum `change_family!(permissions)`
-/// names. [`Change::Permission`] holds one and serialises as it does, so a saved plan
-/// keeps its shape.
+/// The kinds of change of the `permissions` family (DEC-2790.1), the enum
+/// `change_family!(permissions)` names. [`Change::Permission`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GrantChange {
@@ -617,9 +598,9 @@ pub enum GrantChange {
     },
 }
 
-/// The kinds of change of the `modules` family (#2790): the enum `change_family!(modules)`
-/// names. [`Change::Module`] holds one and serialises as it does, so a saved plan
-/// keeps its shape.
+/// The kinds of change of the `modules` family (DEC-2790.1), the enum
+/// `change_family!(modules)` names. [`Change::Module`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ModuleChange {
@@ -642,9 +623,9 @@ pub enum ModuleChange {
     },
 }
 
-/// The kinds of change of the `rows` family (#2790): the enum `change_family!(rows)`
-/// names. [`Change::Row`] holds one and serialises as it does, so a saved plan
-/// keeps its shape.
+/// The kinds of change of the `rows` family (DEC-2790.1), the enum
+/// `change_family!(rows)` names. [`Change::Row`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RowChange {
@@ -848,9 +829,9 @@ pub enum RowChange {
     },
 }
 
-/// The kinds of change of the `policies` family (#2790): the enum `change_family!(policies)`
-/// names. [`Change::Policy`] holds one and serialises as it does, so a saved plan
-/// keeps its shape.
+/// The kinds of change of the `policies` family (DEC-2790.1), the enum
+/// `change_family!(policies)` names. [`Change::Policy`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PolicyChange {
@@ -877,9 +858,9 @@ pub enum PolicyChange {
     },
 }
 
-/// The kinds of change of the `indexes` family (#2790): the enum `change_family!(indexes)`
-/// names. [`Change::Index`] holds one and serialises as it does, so a saved plan
-/// keeps its shape.
+/// The kinds of change of the `indexes` family (DEC-2790.1), the enum
+/// `change_family!(indexes)` names. [`Change::Index`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum IndexChange {
@@ -910,9 +891,9 @@ pub enum IndexChange {
     },
 }
 
-/// The kinds of change of the `constraints` family (#2790): the enum `change_family!(constraints)`
-/// names. [`Change::Constraint`] holds one and serialises as it does, so a saved plan
-/// keeps its shape.
+/// The kinds of change of the `constraints` family (DEC-2790.1), the enum
+/// `change_family!(constraints)` names. [`Change::Constraint`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ConstraintChange {
@@ -946,7 +927,7 @@ pub enum ConstraintChange {
         name: ObjectLocalName,
     },
     /// Adds (`from: None`), or drops (`to: None`), an exclusion constraint
-    /// (DEC-2448.3). One variant for both, as [`Change::SetPrimaryKey`] is: a
+    /// (DEC-2448.3). One variant for both, as [`ConstraintChange::SetPrimaryKey`] is: a
     /// replacement is the drop half and the add half as two changes, each in the
     /// ordering class its direction needs. Adding takes the `constraint` risk,
     /// dropping the `destructive` one.
@@ -976,9 +957,9 @@ pub enum ConstraintChange {
     },
 }
 
-/// The kinds of change of the `columns` family (#2790): the enum `change_family!(columns)`
-/// names. [`Change::Column`] holds one and serialises as it does, so a saved plan
-/// keeps its shape.
+/// The kinds of change of the `columns` family (DEC-2790.1), the enum
+/// `change_family!(columns)` names. [`Change::Column`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ColumnChange {
@@ -1016,7 +997,7 @@ pub enum ColumnChange {
         /// reads an omitted `NULL` / `NOT NULL` as `NULL` — so a type change
         /// emitted without the nullability silently drops a `NOT NULL`. The
         /// differ therefore never emits a separate
-        /// [`Change::AlterColumnNullability`] beside a type change on the same
+        /// [`ColumnChange::AlterColumnNullability`] beside a type change on the same
         /// column, and carrying both ends keeps the `not-null` risk derivable
         /// from the change alone.
         from_nullable: bool,
@@ -1055,14 +1036,14 @@ pub enum ColumnChange {
         uid: Uid,
         column: ColumnRef,
         /// The column's type, unchanged, restated for the same reason
-        /// [`Change::AlterColumnType`] carries the nullability: `ALTER COLUMN`
+        /// [`ColumnChange::AlterColumnType`] carries the nullability: `ALTER COLUMN`
         /// takes a whole column definition, and there is no way to say "keep the
         /// type, change only this".
         ty: ColumnType,
         /// Whether the column is nullable after the change.
         to_nullable: bool,
         /// The column's explicit collation, unchanged, restated for the
-        /// reason [`Change::AlterColumnType`] carries it (#1175).
+        /// reason [`ColumnChange::AlterColumnType`] carries it (#1175).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         collation: Option<Collation>,
         /// The table is a parent whose partitions are external (#1533), and
@@ -1111,7 +1092,7 @@ pub enum ColumnChange {
     },
     /// A SQL Server computed column created (#1174, DEC-1174.1), at the end
     /// of its table. An expression or persisted change is this after a
-    /// [`Change::DropComputedColumn`]: the engine changes neither in place
+    /// [`ColumnChange::DropComputedColumn`]: the engine changes neither in place
     /// (`ALTER COLUMN … AS` is a syntax error, measured on 17.0).
     AddComputedColumn {
         table: TableName,
@@ -1134,9 +1115,9 @@ pub enum ColumnChange {
     },
 }
 
-/// The kinds of change of the `partitions` family (#2790): the enum `change_family!(partitions)`
-/// names. [`Change::Partition`] holds one and serialises as it does, so a saved plan
-/// keeps its shape.
+/// The kinds of change of the `partitions` family (DEC-2790.1), the enum
+/// `change_family!(partitions)` names. [`Change::Partition`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PartitionChange {
@@ -1203,7 +1184,7 @@ pub enum PartitionChange {
     },
     /// A partition's own NOT NULL on a column its parent leaves nullable
     /// (#1581): `ALTER TABLE <partition> ALTER COLUMN … SET NOT NULL` or
-    /// `DROP NOT NULL`, keyed as [`Change::SetPartitionDefault`] is.
+    /// `DROP NOT NULL`, keyed as [`PartitionChange::SetPartitionDefault`] is.
     SetPartitionNotNull {
         uid: Uid,
         table: TableName,
@@ -1212,9 +1193,9 @@ pub enum PartitionChange {
     },
 }
 
-/// The kinds of change of the `table_properties` family (#2790): the enum `change_family!(table_properties)`
-/// names. [`Change::TableProperty`] holds one and serialises as it does, so a saved plan
-/// keeps its shape.
+/// The kinds of change of the `table_properties` family (DEC-2790.1), the enum
+/// `change_family!(table_properties)` names. [`Change::TableProperty`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TablePropertyChange {
@@ -1257,9 +1238,9 @@ pub enum TablePropertyChange {
     },
 }
 
-/// The kinds of change of the `tables` family (#2790): the enum `change_family!(tables)`
-/// names. [`Change::Table`] holds one and serialises as it does, so a saved plan
-/// keeps its shape.
+/// The kinds of change of the `tables` family (DEC-2790.1), the enum
+/// `change_family!(tables)` names. [`Change::Table`] holds one. It is written
+/// flat, tagged by `op`, whatever holds it (`change/wire.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TableChange {
@@ -1306,7 +1287,7 @@ pub enum TableChange {
     },
 }
 
-/// What a [`Change::PublicExecution`] settles.
+/// What a [`GrantChange::PublicExecution`] settles.
 ///
 /// An enum rather than a bool for the reason [`RoutineOrigin`] is one: the two
 /// are different decisions about who may run the routine, not a flag, and a
@@ -1324,7 +1305,7 @@ pub enum PublicAccess {
     Kept,
 }
 
-/// Whether the routine a [`Change::PublicExecution`] speaks about is new in
+/// Whether the routine a [`GrantChange::PublicExecution`] speaks about is new in
 /// this plan, or one the plan rebuilds.
 ///
 /// It decides the risk class, and it is an enum rather than a bool beside the
@@ -1488,7 +1469,7 @@ pub fn drop_parameter_changes_of_rebuilt_indexes<T>(
     });
 }
 
-/// The index whose storage parameters a [`Change::SetIndexStorageParameters`]
+/// The index whose storage parameters a [`IndexChange::SetIndexStorageParameters`]
 /// sets: the primary key's, a unique constraint's (which carries the
 /// constraint's name), or a standalone index's (#1442).
 #[derive(
@@ -1737,7 +1718,7 @@ impl Dropped {
     }
 }
 
-/// Which way a [`Change::Grant`] or [`Change::Revoke`] moves a role's
+/// Which way a [`GrantChange::Grant`] or [`GrantChange::Revoke`] moves a role's
 /// permissions on one target.
 ///
 /// An enum rather than a flag beside the set: the caller adds one and
@@ -1919,11 +1900,57 @@ pub enum ChangeFamily {
 impl Change {
     /// Whether both are the same kind of change, the way a respelling is allowed
     /// to keep it (`CreateRole` and `DropRole` are not, though they share a
-    /// family). A named function so that the move of the kinds into family enums
-    /// (#2790) changes one body and not every comparison of discriminants.
+    /// family). The kinds are compared, not the families: the discriminant of
+    /// `Change` itself is the family's.
     #[must_use]
     pub fn same_kind(&self, other: &Change) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(other)
+        match self {
+            Change::Table(a) => {
+                matches!(other, Change::Table(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::TableProperty(a) => {
+                matches!(other, Change::TableProperty(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Partition(a) => {
+                matches!(other, Change::Partition(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Column(a) => {
+                matches!(other, Change::Column(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Constraint(a) => {
+                matches!(other, Change::Constraint(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Index(a) => {
+                matches!(other, Change::Index(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Policy(a) => {
+                matches!(other, Change::Policy(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Row(a) => {
+                matches!(other, Change::Row(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Module(a) => {
+                matches!(other, Change::Module(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Permission(a) => {
+                matches!(other, Change::Permission(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::TypeValue(a) => {
+                matches!(other, Change::TypeValue(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Role(a) => {
+                matches!(other, Change::Role(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Type(a) => {
+                matches!(other, Change::Type(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Extension(a) => {
+                matches!(other, Change::Extension(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+            Change::Search(a) => {
+                matches!(other, Change::Search(b) if std::mem::discriminant(a) == std::mem::discriminant(b))
+            }
+        }
     }
 }
 
@@ -1995,7 +2022,7 @@ macro_rules! catalog_change {
     };
 }
 
-/// The object a [`Change::SetComment`] comments (#2729). Each arm carries the uid the plan
+/// The object a [`TablePropertyChange::SetComment`] comments (#2729). Each arm carries the uid the plan
 /// names the object by, as the other changes on it do, and the name it has when the
 /// statement runs (the final one, after any rename).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
@@ -5134,7 +5161,7 @@ mod tests {
     }
 }
 
-/// Why a [`Change::DeleteRow`] is in the plan (ADR-0004).
+/// Why a [`RowChange::DeleteRow`] is in the plan (ADR-0004).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum DeleteCause {

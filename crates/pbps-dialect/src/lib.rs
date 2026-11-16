@@ -384,7 +384,7 @@ pub struct Statement {
     ///
     /// # Why the emitter has to say this
     ///
-    /// One [`pbps_model::Change::RenameTable`] can need two statements — SQL
+    /// One [`pbps_model::TableChange::RenameTable`] can need two statements — SQL
     /// Server's `sp_rename` cannot move a table between schemas and `ALTER
     /// SCHEMA TRANSFER` cannot rename it — and between them the table carries a
     /// name that appears in neither the baseline nor the plan. A staged apply
@@ -3627,7 +3627,7 @@ pub trait Dialect {
     /// `CREATE` commits. SQL Server grants no principal `EXECUTE` on a
     /// procedure it creates, and its `public` is an ordinary database role
     /// rather than the engine's default, so it answers `false` and
-    /// [`Change::PublicExecution`] is never built for it.
+    /// [`pbps_model::GrantChange::PublicExecution`] is never built for it.
     ///
     /// What the differ does with a `true` is take the default away as part of
     /// creating the routine, unless the declaration opts back in

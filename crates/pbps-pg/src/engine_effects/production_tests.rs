@@ -4,6 +4,7 @@ use super::*;
 use crate::Postgres;
 use pbps_diff::order::{Baseline, Checks, Schedule, analyse, graph};
 use pbps_model::ColumnChange;
+use pbps_model::ModuleChange;
 use pbps_model::PartitionChange;
 use pbps_model::TableChange;
 use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
