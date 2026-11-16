@@ -245,6 +245,47 @@ fn a_create_without_a_rehearsal_or_a_database_is_refused_by_name_and_writes_noth
             "{}",
             said(&dev)
         );
+        // A saved plan written before that refusal is named as unverified in
+        // both formats (DEC-1920.1); without `--out` nothing is named.
+        let saved = f.d.dir.join("unrehearsed.json");
+        let with_out = [
+            "plan",
+            since[0],
+            since[1],
+            "--dev",
+            "docker://unused",
+            "--out",
+            saved.to_str().unwrap(),
+        ];
+        let human = f.d.run(&with_out);
+        assert_ne!(code(&human), 0, "{}", said(&human));
+        assert!(
+            saved.exists(),
+            "the saved plan is written before the rehearsal"
+        );
+        assert_eq!(
+            said(&human)
+                .matches("did NOT pass the dev rehearsal")
+                .count(),
+            1,
+            "{}",
+            said(&human)
+        );
+        assert!(
+            said(&human).contains("unrehearsed.json"),
+            "{}",
+            said(&human)
+        );
+        let json = f.d.run(&[&with_out[..], &["--format", "json"]].concat());
+        assert_ne!(code(&json), 0, "{}", said(&json));
+        assert_eq!(
+            stdout(&json).matches("rehearsal.output-unverified").count(),
+            1,
+            "{}",
+            stdout(&json)
+        );
+        assert!(!said(&dev).contains("did NOT pass the dev rehearsal"));
+        std::fs::remove_file(&saved).unwrap();
         let preview = succeeds(f.d.run(&["plan", since[0], since[1]]));
         assert!(
             stdout(&preview).contains("create extension zzz_base"),

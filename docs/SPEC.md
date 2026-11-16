@@ -2954,6 +2954,12 @@ states that separation from production is operator-vouched. A shared entry's
 `externals` file is staged before the baseline, with no comparison to any target;
 the report states both facts. There is no target capture, compatibility verdict
 or resolver evidence. `--dev` remains refused with `--db`, `--env` and `--check`.
+`--sql` and `--out` are written before the rehearsal, so they are identical with or
+without an engine. When the rehearsal is refused or cannot run (`rehearsal.unavailable`), or
+runs and does not converge (`rehearsal.does-not-converge`), the command names each file
+written in that run as one that did **not** pass the rehearsal: a human line after the
+refusal text, and a `rehearsal.output-unverified` warning located at the file in the
+same JSON envelope (DEC-1920.1).
 Ordinary offline `plan`, `--check` and `--no-dev` acquire nothing. Nor does `apply`.
 
 The container is used three ways, all on the preview side:
