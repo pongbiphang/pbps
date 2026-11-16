@@ -54,6 +54,7 @@ class Tree(unittest.TestCase):
     def run_tool(self, write=True):
         out = io.StringIO()
         project = cfr.run(self.root, "extensions", "Extension", "ExtensionChange", write, out=out)
+        self.last_project = project
         return project, out.getvalue()
 
     def rewrite(self, body, name="crates/pbps-cli/src/a.rs", header="use pbps_model::Change;\n"):
@@ -473,6 +474,115 @@ class MoveEnum(Tree):
         self.write("crates/pbps-cli/src/a.rs", "use pbps_model::Change;\nfn f() -> Change { Change::DropExtension { uid } }\n")
         self.run_tool()
         self.assertIn("Change::Extension(ExtensionChange::DropExtension { uid })", self.read("crates/pbps-cli/src/a.rs"))
+
+
+class SiteScope(Tree):
+    """A fact is used where it is true: an alias, an import or a type alias is
+    looked up from the site outwards, and a doubt is reported, not guessed."""
+
+    def test_a_proven_crate_alias_is_followed(self):
+        text, _, reasons = self.scoped(
+            "use pbps_model as model;\nfn f(c: &model::Change) -> bool { matches!(c, model::Change::DropExtension { .. }) }\n"
+        )
+        self.assertIn("model::Change::Extension(model::ExtensionChange::DropExtension { .. })", text)
+        self.assertEqual(reasons, [])
+
+    def test_the_same_alias_for_another_crate_in_another_scope_is_reported_not_rewritten(self):
+        body = (
+            "mod mine {\n    use pbps_model as model;\n    pub fn f() -> model::Change { model::Change::DropExtension { uid } }\n}\n"
+            "mod theirs {\n    use other_crate as model;\n    pub fn g() -> model::Change { model::Change::DropExtension { uid } }\n}\n"
+        )
+        text, _, reasons = self.scoped(body)
+        self.assertIn("model::Change::Extension(model::ExtensionChange::DropExtension { uid })", text.split("mod theirs")[0])
+        self.assertIn("model::Change::DropExtension { uid } }", text.split("mod theirs")[1])
+        self.assertEqual(reasons, ["`model` is not the model crate where this is written: it names another item"])
+
+    def test_a_block_that_rebinds_the_alias_shadows_the_outer_one(self):
+        body = (
+            "use pbps_model as model;\nfn f() {\n    use other_crate as model;\n    let _ = model::Change::DropExtension { uid };\n}\n"
+        )
+        text, _, reasons = self.scoped(body)
+        self.assertNotIn("ExtensionChange", text)
+        self.assertEqual(len(reasons), 1)
+
+    def test_a_module_that_is_named_like_the_alias_is_not_the_crate(self):
+        text, _, reasons = self.scoped(
+            "use pbps_model as model;\nmod inner {\n    mod model {}\n    fn f() { let _ = model::Change::DropExtension { uid }; }\n}\n"
+        )
+        self.assertNotIn("ExtensionChange", text)
+        self.assertEqual(len(reasons), 1)
+
+    def test_an_alias_nothing_binds_is_still_an_unrecognised_qualifier(self):
+        _, _, reasons = self.scoped("fn f() { let _ = model::Change::DropExtension { uid }; }\n")
+        self.assertEqual(reasons, ["unrecognised qualifier `model` before `Change`"])
+
+    def test_an_existing_import_of_the_models_inner_enum_is_used_not_repeated(self):
+        text, _, reasons = self.scoped(
+            "use pbps_model::{Change, ExtensionChange};\nfn f() -> Change { Change::DropExtension { uid } }\n"
+        )
+        self.assertTrue(text.startswith("use pbps_model::{Change, ExtensionChange};\n"))
+        self.assertEqual(text.count("use "), 1)
+        self.assertIn("Change::Extension(ExtensionChange::DropExtension { uid })", text)
+        self.assertEqual(reasons, [])
+
+    def test_an_import_through_a_proven_alias_is_the_models_inner_enum(self):
+        text, _, reasons = self.scoped(
+            "use pbps_model as model;\nuse model::{Change, ExtensionChange};\nfn f() -> Change { Change::DropExtension { uid } }\n"
+        )
+        self.assertEqual(text.count("use "), 2)
+        self.assertIn("Change::Extension(ExtensionChange::DropExtension { uid })", text)
+        self.assertEqual(reasons, [])
+
+    def test_another_crates_enum_of_that_name_is_a_collision_and_nothing_is_rewritten(self):
+        body = "use pbps_model::Change;\nuse other::ExtensionChange;\nfn f() -> Change { Change::DropExtension { uid } }\n"
+        text, _, reasons = self.scoped(body)
+        self.assertEqual(text, body)
+        self.assertEqual(reasons, ["`ExtensionChange` is already a different item here (imported or declared); not the model's enum"])
+
+    def test_a_local_enum_of_that_name_is_a_collision(self):
+        body = "use pbps_model::Change;\nenum ExtensionChange { A }\nfn f() -> Change { Change::DropExtension { uid } }\n"
+        text, _, reasons = self.scoped(body)
+        self.assertEqual(text, body)
+        self.assertEqual(len(reasons), 1)
+
+    def test_a_collision_in_one_block_leaves_the_sites_of_another_block_alone_to_be_rewritten(self):
+        body = (
+            "use pbps_model::Change;\nfn a() { use other::ExtensionChange; let _ = Change::DropExtension { uid }; }\n"
+            "fn b() { let _ = Change::DropExtension { uid }; }\n"
+        )
+        text, _, reasons = self.scoped(body)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("fn b() { let _ = Change::Extension(ExtensionChange::DropExtension { uid }); }", text)
+        self.assertIn("fn a() { use other::ExtensionChange; let _ = Change::DropExtension { uid }; }", text)
+
+    def test_a_qualified_site_needs_no_import_so_a_foreign_one_is_no_collision(self):
+        text, _, reasons = self.scoped(
+            "use other::ExtensionChange;\nfn f() { let _ = pbps_model::Change::DropExtension { uid }; }\n"
+        )
+        self.assertIn("pbps_model::Change::Extension(pbps_model::ExtensionChange::DropExtension { uid })", text)
+        self.assertEqual(reasons, [])
+
+    def test_a_type_alias_is_the_model_change_only_where_it_is_declared_so(self):
+        body = (
+            "use pbps_model::Change;\nfn a() { type C = Change; let _ = C::DropExtension { uid }; }\n"
+            "fn b() { type C = Elsewhere; let _ = C::DropExtension { uid }; }\n"
+        )
+        text, _, reasons = self.scoped(body)
+        self.assertIn("type C = Change; let _ = C::Extension(ExtensionChange::DropExtension { uid });", text)
+        self.assertIn("type C = Elsewhere; let _ = C::DropExtension { uid };", text)
+        self.assertEqual(reasons, [])
+
+    def test_a_macro_this_file_defines_does_not_read_as_the_std_one(self):
+        body = "use pbps_model::Change;\nmacro_rules! matches { ($e:expr, $p:pat) => { false }; }\nfn f(c: &Change) -> bool { matches!(c, Change::DropExtension { .. }) }\n"
+        text, _, reasons = self.scoped(body)
+        self.assertEqual(text, body)
+        self.assertEqual(reasons, ["inside an invocation of the macro `matches!`"])
+
+    def scoped(self, body, name="crates/pbps-cli/src/a.rs"):
+        self.write(name, body)
+        _, out = self.run_tool()[0], None
+        project = self.last_project
+        return self.read(name), project, [r[2] for r in project.reports if r[0] == name]
 
 
 class Lexer(unittest.TestCase):

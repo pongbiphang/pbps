@@ -254,6 +254,7 @@ class Scope:
         self.is_mod = is_mod
         self.uses = []
         self.decls = set()  # names of enum/struct/type/trait declared here
+        self.change_aliases = set()  # of those, the `type X = ...Change;` ones
 
 
 class Facts:
@@ -267,7 +268,8 @@ class Facts:
         self.scope_of = [0] * len(toks)  # scope index per token
         self.ctx_of = [None] * len(toks)  # innermost macro context per token
         self.impl_change = [False] * len(toks)
-        self.type_alias = {}  # name -> True when `type name = ...Change;`
+        self.type_alias = {}  # name -> True when `type name = ...Change;` anywhere (a filter only)
+        self.user_macros = set()  # macros this file defines, which shadow a std one of the name
         self.uses = []
         self._walk()
 
@@ -313,6 +315,9 @@ class Facts:
                         j += 1
                     if j > i + 2 and toks[j - 1].text == "Change" and toks[j - 1].kind == "ident":
                         self.type_alias[name] = True
+                        self.scopes[cur].change_aliases.add(name)
+                elif t.text == "macro_rules" and i + 2 < len(toks) and toks[i + 1].text == "!":
+                    self.user_macros.add(toks[i + 2].text)
                 elif t.text == "use" and not (i > 0 and toks[i - 1].text in ("::", ".")):
                     self._use(i, cur)
                 elif t.text == "impl":
@@ -662,7 +667,7 @@ class Project:
                     absolute = "::".join(e.segs[:-1])
                     if e.leading:
                         absolute = "::" + absolute
-                    if s0 == MODEL_CRATE_NAME or s0 in self.crate_aliases(f) or (s0 == "crate" and in_model):
+                    if s0 == MODEL_CRATE_NAME or self.alias_status(path, s, s0) == "model" or (s0 == "crate" and in_model):
                         return ("model", (path, stmt), absolute)
                     if s0 in ("crate", "super", "self"):
                         target = self.relative_target(path, s, e.segs)
@@ -676,6 +681,8 @@ class Project:
                     if in_model:
                         return ("model", (path, stmt), absolute)  # the model crate has one `Change`
                     return ("unknown", none, none)
+            if name in sc.change_aliases:  # `type X = Change;` here: X is whatever Change is here
+                return self.resolve(path, s, "Change", depth + 1)
             if name in sc.decls:
                 if in_model and path == self.root / CHANGE_FILE and name == "Change":
                     return ("model-own", none, none)
@@ -711,13 +718,36 @@ class Project:
                 return self.resolve(decl[0], decl[1], name, depth + 1)
         return ("unknown", none, none)
 
-    def crate_aliases(self, f):
-        names = set()
-        for stmt in f.uses:
-            for e in stmt.entries:
-                if not e.glob and e.segs == (MODEL_CRATE_NAME,) and e.alias:
-                    names.add(e.alias)
-        return names
+    def alias_status(self, path, scope, name, depth=0):
+        """What `name` is where a site stands, when it is written as the first
+        segment of a path: 'model' when it is `use pbps_model as name;` in this
+        scope or the nearest one that binds it, 'foreign' when that binding or a
+        declaration is something else, 'unbound' when nothing here says."""
+        if depth > 8:
+            return "unbound"
+        f = self.facts(path)
+        if isinstance(f, LexError):
+            return "unbound"
+        s = scope
+        while True:
+            sc = f.scopes[s]
+            for stmt in sc.uses:
+                for e in stmt.entries:
+                    if not e.glob and (e.alias or e.segs[-1]) == name:
+                        return "model" if e.segs == (MODEL_CRATE_NAME,) else "foreign"
+            if name in sc.decls:
+                return "foreign"
+            for stmt in sc.uses:
+                for e in stmt.entries:
+                    if e.glob and e.segs and e.segs[0] in ("crate", "super", "self"):
+                        target = self.relative_target(path, s, e.segs, glob=True)
+                        if target is not None:
+                            found = self.alias_status(target[0], target[1], name, depth + 1)
+                            if found != "unbound":
+                                return found
+            if sc.is_mod or sc.parent is None:
+                return "unbound"
+            s = sc.parent
 
     def relative_target(self, path, scope, segs, glob=False):
         """The (file, scope index) a `super::` / `crate::` / `self::` path
@@ -865,22 +895,24 @@ class Project:
         resolved = None
         if qualified:
             _, in_model_file, _ = self.crate_info(path)
-            model_aliases = self.crate_aliases(f)
             if name_tok.text != "Change" and name_tok.text not in names:
                 return
-            if s0 == MODEL_CRATE_NAME or s0 in model_aliases:
+            alias = None if s0 in ("crate", "$crate", "super", "self", MODEL_CRATE_NAME) else self.alias_status(path, f.scope_of[i], s0)
+            if s0 == MODEL_CRATE_NAME or alias == "model":
                 pass
             elif s0 in ("crate", "$crate", "super", "self") and in_model_file:
                 pass
             elif s0 in ("crate", "$crate", "super", "self"):
                 self.skipped_other[self.rel(path)] += 1
                 return
+            elif alias == "foreign":
+                self.report(f, toks[ps].start, f"`{s0}` is not the model crate where this is written: it names another item")
+                return
             else:
                 self.report(f, toks[ps].start, f"unrecognised qualifier `{s0}` before `{name_tok.text}`")
                 return
         else:
-            lookup = "Change" if name_tok.text in f.type_alias else name_tok.text
-            kind, anchor, prefix = self.resolve(path, f.scope_of[i], lookup)
+            kind, anchor, prefix = self.resolve(path, f.scope_of[i], name_tok.text)
             resolved = (kind, anchor, prefix)
             if kind == "other":
                 self.skipped_other[self.rel(path)] += 1
@@ -894,9 +926,21 @@ class Project:
                 if not (qualified and s0 == "$crate"):
                     self.report(f, name_tok.start, f"inside the macro_rules! body of `{ctx[1]}`")
                     return
-            elif ctx[0] == "macro" and ctx[1] not in TRANSPARENT_MACROS:
+            elif ctx[0] == "macro" and (ctx[1] not in TRANSPARENT_MACROS or ctx[1] in f.user_macros):
                 self.report(f, name_tok.start, f"inside an invocation of the macro `{ctx[1]}!`")
                 return
+        # the inner enum must be what this file means by its name
+        if not qualified and resolved[0] == "model":
+            status = self.inner_status(path, f.scope_of[i], resolved[2])
+            if status == "collision":
+                self.report(
+                    f,
+                    name_tok.start,
+                    f"`{self.inner}` is already a different item here (imported or declared); not the model's enum",
+                )
+                return
+            if status == "present":
+                resolved = ("present", None, None)
         # payload group
         shape = self.shapes.get(kind_tok.text)
         after = i + 3
@@ -918,6 +962,36 @@ class Project:
         if not qualified and resolved[0] == "model":
             needs_inner.append((name_tok.start, resolved))
 
+    def inner_status(self, path, scope, prefix):
+        """Where a site stands, what the inner enum's name means: 'present' when
+        it is already imported there from the model (the path is the one a
+        mirrored import would write, or begins at the model crate), 'collision'
+        when something else holds the name, 'free' when nothing does."""
+        f = self.facts(path)
+        _, in_model, _ = self.crate_info(path)
+        s = scope
+        while True:
+            sc = f.scopes[s]
+            for stmt in sc.uses:
+                for e in stmt.entries:
+                    if e.glob or (e.alias or e.segs[-1]) != self.inner:
+                        continue
+                    ours = e.segs[-1] == self.inner and (
+                        e.alias in (None, self.inner)
+                        and (
+                            e.segs[0] == MODEL_CRATE_NAME
+                            or self.alias_status(path, s, e.segs[0]) == "model"
+                            or "::".join(e.segs[:-1]) == (prefix or "")
+                            or (in_model and e.segs[0] in ("crate", "super", "self"))
+                        )
+                    )
+                    return "present" if ours else "collision"
+            if self.inner in sc.decls:
+                return "present" if in_model and path == self.root / CHANGE_FILE else "collision"
+            if sc.is_mod or sc.parent is None:
+                return "free"
+            s = sc.parent
+
     def finish_imports(self, f, path, needs_inner):
         """The inner enum must be nameable where a bare use needs it: one
         `use <prefix>::Inner;` after the statement that brings `Change` into
@@ -934,12 +1008,6 @@ class Project:
 
     def mirror_import(self, mpath, stmt, prefix):
         mf = self.facts(mpath)
-        # already importing the inner enum there?
-        for s in mf.scopes[stmt.scope].uses:
-            for e in s.entries:
-                if not e.glob and (e.alias or e.segs[-1]) == self.inner:
-                    self.import_edits[(mpath, stmt.start)] = None
-                    return
         glob = any(e.glob for e in stmt.entries)
         attrs = mf.src[stmt.start : stmt.use_start]
         indent = mf.src[stmt.line_start : stmt.start]
