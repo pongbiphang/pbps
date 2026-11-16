@@ -892,8 +892,6 @@ name = name.shown(),
         | Change::Row(RowChange::UpdateRow { .. })
         | Change::Row(RowChange::SetDataMode { .. })
         | Change::Row(RowChange::SetEnsureKeys { .. })
-        // A permission change fails on nothing in the data; the engine refuses
-        // an impossible grant inside the transaction.
         | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
         | Change::TypeValue(TypeValueChange::AlterDomain { .. })
         | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
@@ -910,6 +908,8 @@ name = name.shown(),
             | Change::Policy(PolicyChange::SetRowSecurity { .. })
             | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. })
             | Change::Constraint(ConstraintChange::SetExclusion { .. })
+        // A permission change fails on nothing in the data; the engine refuses
+        // an impossible grant inside the transaction.
         | Change::Permission(GrantChange::PublicExecution { .. }) => Ok(Vec::new()),
 
         // Except for the one thing a permission change can fail on that is

@@ -3996,13 +3996,13 @@ name = name.shown(),
         // The pre-delete probe of ADR-0004 is built by `probes` itself, beside
         // the refusals that go with it.
         | Change::Row(RowChange::DeleteRow { .. })
-        // Roles and grants are Phase 5 step 6, and `emit` refuses every one of
-        // them by name until it lands. The securable probe the other dialect
-        // asks for a schema target belongs with that step, not ahead of it.
         | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
         | Change::TypeValue(TypeValueChange::AlterDomain { .. })
         | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
         | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
+        // Roles and grants are Phase 5 step 6, and `emit` refuses every one of
+        // them by name until it lands. The securable probe the other dialect
+        // asks for a schema target belongs with that step, not ahead of it.
          | Change::Role(_) | Change::Type(_) | Change::Search(_) | Change::Extension(_) | Change::Permission(GrantChange::Grant { .. }) | Change::Permission(GrantChange::Revoke { .. }) | Change::Index(IndexChange::SetIndexStorageParameters { .. }) | Change::TableProperty(TablePropertyChange::SetTablePersistence { .. }) | Change::Partition(PartitionChange::SetPartitionDefault { .. }) | Change::Partition(PartitionChange::SetPartitionNotNull { .. }) | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. }) | Change::Policy(PolicyChange::DropPolicy { .. }) | Change::Policy(PolicyChange::CreatePolicy { .. }) | Change::Policy(PolicyChange::SetRowSecurity { .. }) | Change::TableProperty(TablePropertyChange::SetReplicaIdentity { .. }) | Change::Partition(PartitionChange::DetachPartition { .. }) | Change::Partition(PartitionChange::AttachPartition { .. }) | Change::Permission(GrantChange::PublicExecution { .. }) => Ok(Vec::new()),
     }
 }
