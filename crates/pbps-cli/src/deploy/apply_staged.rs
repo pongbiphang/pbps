@@ -2,10 +2,29 @@
 //! written between them, and a resumed deployment re-checked.
 
 use super::*;
+use crate::engine::apply_session::Execution;
 
+/// A staged apply: one logical change, run statement by statement outside a
+/// transaction, with each completion recorded (ADR-0003 decision 2).
+///
+/// # Why the ledger is written between statements
+///
+/// Nothing here rolls back — that is the whole reason the plan is staged. So
+/// the only thing that can make a mid-way failure visible rather than
+/// mysterious is a record written as each statement completes; and once that
+/// record exists, `--resume` has somewhere honest to start from.
+///
+/// # Why resume re-checks the database
+///
+/// A checkpoint says what the database looked like when the run stopped. Half a
+/// deployment sitting in an environment is exactly when somebody reaches in by
+/// hand, so the drift discipline applies to a half-finished plan as much as to
+/// a finished one: the live state has to still equal the checkpoint, or the
+/// remaining statements are being run against something nobody planned for.
 pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
     conn: &mut Conn,
     d: &Deployment<'_, D>,
+    session: &mut D::State,
     resume: bool,
 ) -> anyhow::Result<i64> {
     let Deployment {
@@ -33,7 +52,8 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
     let original_ids = entry.snapshot.ids.clone();
     pbps_diff::drop_requirements::validate(&plan.changes, &original_ids, &plan.ids)
         .map_err(anyhow::Error::msg)?;
-    let role_renames = crate::engine::external_role_renames(conn, &original_ids, &plan.ids)
+    let role_renames = dialect
+        .external_roles(conn, &original_ids, &plan.ids)
         .await?
         .renames;
     rename_snapshot_roles(&mut entry.snapshot, &role_renames);
@@ -49,9 +69,9 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
     // [`apply_under_lock`] (DEC-1916.1).
     refuse_moved_time_zone(conn, plan, &target.label)?;
     if !resume {
-        refuse_taken_history_names(conn, &plan.changes, &target.label).await?;
-        // Nothing binds a saved plan to a server: asked again here (#1502).
-        crate::engine::refuse_unsupported_temporal(conn, &plan.changes).await?;
+        dialect
+            .history_before_intent(conn, &plan.changes, &target.label)
+            .await?;
     }
     let (start, mut previous) = if resume {
         let progress = match (&entry.snapshot.staged, entry.snapshot.kind) {
@@ -131,7 +151,7 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
         // the checkpoint's checksum cannot see move (#1247 review): a
         // statement still to run that leaves a column with no collation
         // would take the new one.
-        refuse_moved_database_collation(conn, plan, &target.label).await?;
+        refuse_moved_database_collation_with_session(dialect, conn, plan, &target.label).await?;
         // Nor can it see a permission the declarations cannot hold, for the
         // same reason: it is beside the comparison, not in it (110). A
         // resume that ran on would close the deployment with a snapshot
@@ -140,20 +160,14 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
         // And ownership, which is beside the checksum for the same reason
         // (#692), and whether this connection can revoke what is left to
         // revoke (#1057).
-        crate::engine::owned_targets(
-            conn.driver(),
-            &plan.changes,
-            &plan.ids,
-            &scoped.owners,
-            &scoped.session_role,
-        )?;
-        crate::engine::unrevocable_grants(conn.driver(), &plan.changes, &plan.ids, &unrevocable)?;
+        dialect.baseline_grants(conn.driver(), plan, &scoped, &unrevocable)?;
         // The role a `DROP ROLE` will meet is the role as the plan left it:
         // the members whose `DROP MEMBER` has not run yet, and nothing
         // owned. Membership and ownership are outside the checksum on
         // purpose, so the check above cannot see a member added while the
         // deployment was paused (DECISIONS 102).
-        check_role_drops(
+        check_role_drops_with_session(
+            dialect,
             conn,
             &role_drop_expectations(plan, dialect, plan.mode, progress.completed)?,
         )
@@ -162,7 +176,7 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
         // remaining statement needs (119).
         let (wanted, vacated) =
             role_name_expectations(plan, dialect, plan.mode, progress.completed)?;
-        refuse_taken_role_names(conn, &wanted, &vacated).await?;
+        refuse_taken_role_names_with_session(dialect, conn, &wanted, &vacated).await?;
         println!(
             "Resuming at statement {} of {} (checkpoint entry #{}).",
             progress.completed + 1,
@@ -240,25 +254,21 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
                 plan.baseline.checksum
             );
         }
-        refuse_moved_database_collation(conn, plan, &target.label).await?;
+        refuse_moved_database_collation_with_session(dialect, conn, plan, &target.label).await?;
         refuse_unexpressible(&scoped, &target.label, "apply again")?;
         // Ownership and revocability, as in the transactional apply (#692,
         // #1057).
-        crate::engine::owned_targets(
-            conn.driver(),
-            &plan.changes,
-            &plan.ids,
-            &scoped.owners,
-            &scoped.session_role,
-        )?;
-        crate::engine::unrevocable_grants(conn.driver(), &plan.changes, &plan.ids, &unrevocable)?;
+        dialect.baseline_grants(conn.driver(), plan, &scoped, &unrevocable)?;
         // Before the probes, as in the transactional apply (DEC-319.1).
-        crate::pins::check(
+        crate::pins::check_with_session(
+            dialect,
             conn,
-            project,
-            target,
-            plan,
-            &pinned_managed(&entry.snapshot, &plan.changes, &plan.ids),
+            &crate::pins::Approved {
+                project,
+                target,
+                plan,
+                managed: &pinned_managed(&entry.snapshot, &plan.changes, &plan.ids),
+            },
             crate::pins::Check::BeforeProbes,
         )
         .await?;
@@ -301,16 +311,9 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
     if start < statements.len() {
         conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
             .await?;
-        let mut seen =
-            recheck_enum_rebuilds(conn, &plan.changes, &entry.snapshot.ids, resume).await;
-        if seen.is_ok() && !resume {
-            seen = recheck_domain_alterations(conn, &plan.changes, &entry.snapshot.ids).await;
-        }
-        // Every statement starts from a target that still allows it: a resume
-        // only re-asks for the packages whose statement has not run.
-        if seen.is_ok() && !resume {
-            seen = recheck_extension_creates(conn, plan).await;
-        }
+        let seen = dialect
+            .staged_census(conn, plan, &entry.snapshot.ids, resume)
+            .await;
         let rolled = conn
             .rollback(&dialect.transaction_framing(&pin_zone(conn)))
             .await;
@@ -318,7 +321,6 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
         rolled?;
     }
 
-    let mut retained_verified = None;
     let total = statements.len();
     // Staged plans carry one logical change. A completed DROP has no catalog
     // target left; a closing-only resume must not ask for that old target.
@@ -326,8 +328,7 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
         drop_preflight(
             conn,
             dialect,
-            &plan.changes,
-            &plan.ids,
+            plan,
             &entry.snapshot.schema,
             &entry.snapshot.ids,
         )
@@ -362,26 +363,28 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
     // A resume starts from a checkpoint, whose modules include what earlier
     // steps created; the union keeps those managed too.
     let pinned_managed = pinned_managed(&entry.snapshot, &plan.changes, &plan.ids);
+    let approved = crate::pins::Approved {
+        project,
+        target,
+        plan,
+        managed: &pinned_managed,
+    };
     let written_routines = crate::engine::written_routines(&plan.changes);
     // Whether this run has a checkpoint to resume from: a resumed run starts
     // on one.
     let mut checkpointed = entry.snapshot.staged.is_some();
-    let domain_defaults = pbps_pg::type_refs::declared::capture_defaults(
-        conn,
-        &plan.declared_type_pins,
-        &plan.changes,
-        pbps_pg::pins::Within::OwnTransaction,
-    )
-    .await?;
+    // Outside any step's transaction, so read in a transaction of its own, as
+    // the check before the probes is.
+    dialect
+        .capture_physical_defaults(session, conn, plan, crate::pins::Check::BeforeProbes)
+        .await?;
     for (i, stmt) in statements.iter().enumerate().skip(start) {
         // Before each step, including the first after a resume, which skips
         // the check before the probes along with the probes.
-        crate::pins::check(
+        crate::pins::check_with_session(
+            dialect,
             conn,
-            project,
-            target,
-            plan,
-            &pinned_managed,
+            &approved,
             crate::pins::Check::BeforeStep {
                 step: i + 1,
                 total,
@@ -396,37 +399,39 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
             conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
                 .await?;
             let result = async {
-                // The plan's own admission, so a routine its review pinned is
-                // admitted here as it was at the start (DEC-2563.9).
-                let admission = crate::pins::applying(project, plan);
-                let guard = crate::engine::prepare_data_writes(
-                    conn,
-                    &admission,
-                    &plan.changes,
-                    &entry.snapshot,
-                    &plan.ids,
-                )
-                .await?;
-                crate::engine::check_data_write(conn, &admission, stmt, &guard).await?;
+                dialect
+                    .before_staged_statement(
+                        session,
+                        conn,
+                        &approved,
+                        stmt,
+                        &entry.snapshot,
+                        &previous,
+                    )
+                    .await?;
                 conn.execute(&stmt.sql).await?;
-                // A deferred trigger would otherwise run at COMMIT, after the
-                // check below, and a function replaced while an earlier one
-                // held the commit would run unchecked. The step commits right
-                // after, so settling here refuses nothing the commit would
-                // have allowed (473).
-                crate::engine::settle_data_writes(conn).await?;
+                dialect
+                    .after_statement(
+                        session,
+                        conn,
+                        &approved.admission(),
+                        stmt,
+                        Some(plan),
+                        &plan.changes,
+                        &statements[..=i],
+                        Execution::StagedRow,
+                    )
+                    .await?;
                 // Before this step commits, not after (#428). The trigger
                 // check and the row statement are two server commands, and a
                 // trigger function replaced between them has already run by
                 // now. Its pin moved, and this transaction can still take the
                 // write back with it. After the commit, the check below could
                 // only record the step and stop.
-                crate::pins::check(
+                crate::pins::check_with_session(
+                    dialect,
                     conn,
-                    project,
-                    target,
-                    plan,
-                    &pinned_managed,
+                    &approved,
                     crate::pins::Check::BeforeStepCommits {
                         step: i + 1,
                         total,
@@ -455,74 +460,35 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
             conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
                 .await?;
             let result = async {
-                let retained = crate::engine::hold_retained(
-                    conn,
-                    &plan.changes,
-                    Some(&entry.snapshot.declared.overlay(&previous)),
-                )
-                .await?;
-                if let Some(extension) = &stmt.extension {
-                    vet_before_extension(conn, extension, Some(plan)).await?;
-                }
-                if stmt.rewrites.is_some() {
-                    // The expressions the rewrite re-evaluates, held still by
-                    // the lock the guard takes, judged by the plan's own
-                    // admission (DEC-2563.9).
-                    let admission = crate::pins::applying(project, plan);
-                    let guard = crate::engine::prepare_data_writes(
+                dialect
+                    .before_staged_statement(
+                        session,
                         conn,
-                        &admission,
-                        &plan.changes,
+                        &approved,
+                        stmt,
                         &entry.snapshot,
-                        &plan.ids,
+                        &previous,
                     )
                     .await?;
-                    crate::engine::check_data_write(conn, &admission, stmt, &guard).await?;
-                }
-                if let Some(change) = &stmt.introduces {
-                    // Judged by the plan's own admission before the statement
-                    // runs, with what the earlier steps created in place.
-                    let admission = crate::pins::applying(project, plan);
-                    pbps_pg::table_expressions::vet_change(
-                        conn,
-                        &admission,
-                        pbps_pg::pins::Within::CallersTransaction,
-                        pbps_pg::table_expressions::Moment::Statement,
-                        change,
-                    )
-                    .await
-                    .and_then(pbps_pg::table_expressions::Vetted::admitted)
-                    .map_err(anyhow::Error::msg)?;
-                }
                 conn.execute(&stmt.sql).await?;
-                retained_verified =
-                    crate::engine::verify_retained(conn, retained.as_ref(), &previous).await?;
-                if let Some(type_statement) = &stmt.declared_type {
-                    pbps_pg::type_refs::declared::vet(
+                dialect
+                    .after_statement(
+                        session,
                         conn,
-                        type_statement,
-                        &crate::pins::applying(project, plan),
-                        &plan.declared_type_pins,
+                        &approved.admission(),
+                        stmt,
+                        Some(plan),
                         &plan.changes,
                         &statements[..=i],
+                        Execution::StagedGuardedDdl {
+                            previous: &previous,
+                        },
                     )
                     .await?;
-                }
-                if let Some(extension) = &stmt.extension {
-                    vet_after_extension(conn, extension, Some(plan)).await?;
-                }
-                crate::engine::refuse_unsafe_definers(
+                crate::pins::check_with_session(
+                    dialect,
                     conn,
-                    &written_routines,
-                    crate::engine::Absent::NotYetCreated,
-                )
-                .await?;
-                crate::pins::check(
-                    conn,
-                    project,
-                    target,
-                    plan,
-                    &pinned_managed,
+                    &approved,
                     crate::pins::Check::BeforeStepCommits {
                         step: i + 1,
                         total,
@@ -536,12 +502,10 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
             // The preceding ADD committed its NOT VALID CHECK. Recover it
             // after rollback, when catalog reads can run again (DEC-1638.1).
             match result {
-                Err(error) => {
-                    match crate::engine::recover_failed_staged_validation(conn, stmt).await {
-                        Some(outcome) => Err(error.context(outcome)),
-                        None => Err(error),
-                    }
-                }
+                Err(error) => match dialect.recover_failed_validation(conn, stmt).await {
+                    Some(outcome) => Err(error.context(outcome)),
+                    None => Err(error),
+                },
                 Ok(()) => Ok(()),
             }
         } else {
@@ -627,12 +591,10 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
         // statement that worked. The `VALIDATE` after it checkpoints both,
         // and takes the check out again if it fails (#1638, DEC-1638.1).
         if is_scan_check(stmt, pbps_dialect::ScanCheckStep::Add) {
-            crate::pins::check(
+            crate::pins::check_with_session(
+                dialect,
                 conn,
-                project,
-                target,
-                plan,
-                &pinned_managed,
+                &approved,
                 crate::pins::Check::AfterStep {
                     step: i + 1,
                     total,
@@ -709,12 +671,10 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
         // included. The statement has committed, so a mismatch is a
         // post-commit guard failure: the checkpoint is written first and the
         // run stops after it (DECISIONS 159).
-        let pins_after_step = crate::pins::check(
+        let pins_after_step = crate::pins::check_with_session(
+            dialect,
             conn,
-            project,
-            target,
-            plan,
-            &pinned_managed,
+            &approved,
             crate::pins::Check::AfterStep {
                 step: i + 1,
                 total,
@@ -751,8 +711,8 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
                 completed: i + 1,
                 total,
             },
-            retained_verified.as_ref(),
-            Some(&domain_defaults),
+            dialect.evidence(session).verified.as_ref(),
+            Some(&dialect.evidence(session).defaults),
         )?;
         previous = recorded;
     }
@@ -767,7 +727,7 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
     // Keep the closing guard's large future off every caller's apply future,
     // including transactional applies that never enter this staged path.
     let closing = Box::pin(async {
-        let retained = crate::engine::hold_retained(conn, &plan.changes, None).await?;
+        dialect.staged_closing(session, conn, &plan.changes).await?;
         // The closing entry is an ordinary apply with no staged marker: its absence
         // is what tells every later command this environment is no longer
         // mid-deployment.
@@ -787,19 +747,26 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
             CatalogWarnings::for_progress(d.progress),
         )
         .await?;
-        refuse_recreated_tables(conn, &plan.changes, statements, &after.unmanaged)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "{e:#}\n\n\
+        refuse_recreated_tables_with_session(
+            dialect,
+            conn,
+            &plan.changes,
+            statements,
+            &after.unmanaged,
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "{e:#}\n\n\
              All {total} statement(s) completed, but the staged deployment cannot close. \
              Nothing was rolled back; the ledger retains the last checkpoint. \
              Remove the recreated table and run `pbps apply --staged --resume`, \
              or accept the database with `pbps baseline --reason ...` and plan from there."
-                )
-            })?;
-        let verified =
-            crate::engine::verify_retained(conn, retained.as_ref(), &after.schema).await?;
+            )
+        })?;
+        dialect
+            .verify_retained(session, conn, &after.schema)
+            .await?;
         // And the last window of all: between the final checkpoint and this read.
         // Refused *before* the ordinary entry is written, because that entry is
         // what says the deployment finished — leaving the environment on its last
@@ -813,8 +780,8 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
             &target.label,
             target.environment(),
             StagedRead::Closing { total },
-            verified.as_ref(),
-            Some(&domain_defaults),
+            dialect.evidence(session).verified.as_ref(),
+            Some(&dialect.evidence(session).defaults),
         )?;
         // The same read, and the half of it no `Schema` holds. Refused here for
         // the reason the movement check above is: this is the last window, and
@@ -830,12 +797,10 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
         })?;
         // The pins once more, because a `--resume` after the last checkpoint runs
         // no step and so reaches no other check (DEC-319.1).
-        crate::pins::check(
+        crate::pins::check_with_session(
+            dialect,
             conn,
-            project,
-            target,
-            plan,
-            &pinned_managed,
+            &approved,
             if retaining {
                 crate::pins::Check::BeforeRecording {
                     executed: statements.statements(),
@@ -879,12 +844,10 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
             .advance_with_partitions(&plan.changes, &snapshot.schema);
         let id = crate::engine::record(conn, &snapshot).await?;
         if retaining {
-            crate::pins::check(
+            crate::pins::check_with_session(
+                dialect,
                 conn,
-                project,
-                target,
-                plan,
-                &pinned_managed,
+                &approved,
                 crate::pins::Check::BeforeCommit {
                     executed: statements.statements(),
                 },
@@ -935,18 +898,6 @@ pub(super) enum StagedRead {
 /// (SPEC §7.6). Use the same read's inventory without adopting unrelated
 /// unmanaged tables into the guard (SPEC §8.2); the net promise also permits
 /// a plan that deliberately reuses a name.
-pub(super) async fn refuse_recreated_tables(
-    conn: &mut Conn,
-    changes: &pbps_model::ChangeSet,
-    statements: &[pbps_dialect::Statement],
-    unmanaged: &[TableName],
-) -> anyhow::Result<()> {
-    let selected = crate::engine::apply_session::selected(conn.driver());
-    pbps_cli::with_plan_dialect!(&selected, |session| {
-        refuse_recreated_tables_with_session(session, conn, changes, statements, unmanaged).await
-    })
-}
-
 pub(super) async fn refuse_recreated_tables_with_session<D: crate::engine::ApplySession>(
     session: &D,
     conn: &mut Conn,

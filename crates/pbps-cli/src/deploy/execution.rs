@@ -313,17 +313,7 @@ pub(super) async fn execute_transaction_body(
     crate::engine::recheck_type_prerequisites(conn, type_pins, changes, trusted, true).await?;
     for position in 0..statements.len() {
         crate::engine::recheck_type_prerequisites(conn, type_pins, changes, trusted, true).await?;
-        execute_statement(
-            conn,
-            statements,
-            position,
-            &crate::engine::DataWriteGuard::default(),
-            None,
-            changes,
-            trusted,
-            None,
-        )
-        .await?;
+        execute_statement(conn, statements, position, None, changes, trusted, None).await?;
     }
     Ok(())
 }
@@ -331,7 +321,7 @@ pub(super) async fn execute_transaction_body(
 pub(super) async fn execute_statements<D: crate::engine::ApplySession>(
     conn: &mut Conn,
     dialect: &D,
-    session: &D::State,
+    session: &mut D::State,
     statements: &crate::emission::LoweredPlan,
     reviewed: &crate::pins::Approved<'_>,
     progress: Option<&services::Progress>,
@@ -342,7 +332,7 @@ pub(super) async fn execute_statements<D: crate::engine::ApplySession>(
             conn,
             statements,
             position,
-            &dialect.evidence(session).data_guard,
+            session,
             Some(reviewed),
             &reviewed.plan.changes,
             &reviewed.project.config.trusted_roles,
@@ -360,7 +350,6 @@ pub(super) async fn execute_statement(
     conn: &mut Conn,
     statements: &crate::emission::LoweredPlan,
     position: usize,
-    data_guard: &crate::engine::DataWriteGuard,
     reviewed: Option<&crate::pins::Approved<'_>>,
     changes: &pbps_model::ChangeSet,
     trusted: &BTreeSet<pbps_model::RoleName>,
@@ -368,8 +357,9 @@ pub(super) async fn execute_statement(
 ) -> anyhow::Result<()> {
     let selected = crate::engine::apply_session::selected(conn.driver());
     pbps_cli::with_plan_dialect!(&selected, |session| {
+        let mut state = Default::default();
         execute_statement_with_session(
-            session, conn, statements, position, data_guard, reviewed, changes, trusted, progress,
+            session, conn, statements, position, &mut state, reviewed, changes, trusted, progress,
         )
         .await
     })
@@ -381,7 +371,7 @@ async fn execute_statement_with_session<D: crate::engine::ApplySession>(
     conn: &mut Conn,
     statements: &crate::emission::LoweredPlan,
     position: usize,
-    data_guard: &crate::engine::DataWriteGuard,
+    state: &mut D::State,
     reviewed: Option<&crate::pins::Approved<'_>>,
     changes: &pbps_model::ChangeSet,
     trusted: &BTreeSet<pbps_model::RoleName>,
@@ -409,7 +399,7 @@ async fn execute_statement_with_session<D: crate::engine::ApplySession>(
             conn,
             &admission,
             stmt,
-            data_guard,
+            &session.evidence(state).data_guard,
             reviewed.map(|a| a.plan),
         )
         .await?;
@@ -433,6 +423,7 @@ async fn execute_statement_with_session<D: crate::engine::ApplySession>(
     }
     session
         .after_statement(
+            state,
             conn,
             &admission,
             stmt,

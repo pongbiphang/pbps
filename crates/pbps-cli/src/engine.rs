@@ -236,17 +236,6 @@ pub async fn check_drop_requirement(
     }
 }
 
-/// Recover validation after a staged step's caller has rolled its transaction back.
-pub async fn recover_failed_staged_validation(
-    conn: &mut Conn,
-    statement: &pbps_dialect::Statement,
-) -> Option<String> {
-    let selected = apply_session::selected(conn.driver());
-    pbps_cli::with_plan_dialect!(&selected, |session| {
-        session.recover_failed_validation(conn, statement).await
-    })
-}
-
 /// Catalog estimates are advisory. Failure to measure is an unavailable
 /// answer, not a reason to refuse a valid plan (ADR-0012 §3, DECISIONS 430).
 #[cfg(test)]

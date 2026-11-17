@@ -527,17 +527,6 @@ pub fn declarations_as_compared(declared: &Schema, database_collation: Option<&s
 /// column sits under it (see [`pbps_model::PlanBaseline::database_collation`]).
 /// A plan from an engine without column collations carries none and is not
 /// asked.
-pub(super) async fn refuse_moved_database_collation(
-    conn: &mut Conn,
-    plan: &pbps_model::SavedPlan,
-    label: &str,
-) -> anyhow::Result<()> {
-    let selected = crate::engine::apply_session::selected(conn.driver());
-    pbps_cli::with_plan_dialect!(&selected, |session| {
-        refuse_moved_database_collation_with_session(session, conn, plan, label).await
-    })
-}
-
 pub(super) async fn refuse_moved_database_collation_with_session<D: crate::engine::ApplySession>(
     session: &D,
     conn: &mut Conn,

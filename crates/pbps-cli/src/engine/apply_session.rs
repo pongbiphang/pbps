@@ -6,6 +6,7 @@
 //! The service selects the concrete dialect with with_plan_dialect! before
 //! opening one default state per attempt. Existing connected adapters remain
 //! available to staged apply and bootstrap until their own routes move.
+//! Staged apply now uses the positions; bootstrap and planning retain adapters.
 use super::*;
 use crate::pins::{Approved, Check};
 use anyhow::Context as _;
@@ -16,11 +17,10 @@ mod mssql;
 mod postgres;
 
 /// SQL execution has different owners; statement count cannot identify them.
-#[allow(dead_code)] // Staged hooks move in the next half of this extraction.
 #[derive(Clone, Copy)]
-pub(crate) enum Execution {
+pub(crate) enum Execution<'a> {
     Transactional,
-    StagedGuardedDdl,
+    StagedGuardedDdl { previous: &'a Schema },
     StagedRow,
 }
 
@@ -254,6 +254,29 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         self.external_roles(conn, original_ids, &plan.ids).await?;
         Ok(())
     }
+    /// The census again, where the plan runs: a dependent that appeared on an
+    /// enum after the plan was made is refused by name before the first statement
+    /// (DEC-1635.7). Inside the apply's own transaction, after the lock.
+    ///
+    /// The tightened domains again, where the plan runs: a column of an array or
+    /// a composite of the domain that appeared after the plan was made is refused
+    /// by name before the first statement (DEC-1635.8).
+    async fn staged_census(
+        &self,
+        conn: &mut Conn,
+        plan: &pbps_model::SavedPlan,
+        stored: &IdsFile,
+        resuming: bool,
+    ) -> anyhow::Result<()> {
+        recheck_enum_rebuild_census(conn, &plan.changes, stored, resuming).await?;
+        if !resuming {
+            check_domain_alterations(conn, &plan.changes, stored).await?;
+            // Every statement starts from a target that still allows it: a resume
+            // only re-asks for the packages whose statement has not run.
+            crate::deploy::recheck_extension_creates(conn, plan).await?;
+        }
+        Ok(())
+    }
     async fn declared_type_replay(
         &self,
         conn: &mut Conn,
@@ -318,18 +341,105 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         before_statement(conn, admission, stmt, guard, plan).await
     }
     #[allow(clippy::too_many_arguments)]
+    async fn before_staged_statement(
+        &self,
+        state: &mut Self::State,
+        conn: &mut Conn,
+        approved: &Approved<'_>,
+        stmt: &pbps_dialect::Statement,
+        baseline: &StateSnapshot,
+        previous: &Schema,
+    ) -> anyhow::Result<()> {
+        let plan = approved.plan;
+        if stmt.row_write.is_some() {
+            // The plan's own admission, so a routine its review pinned is
+            // admitted here as it was at the start (DEC-2563.9).
+            let admission = approved.admission();
+            let guard =
+                prepare_data_writes(conn, &admission, &plan.changes, baseline, &plan.ids).await?;
+            check_data_write(conn, &admission, stmt, &guard).await?;
+        } else {
+            self.state(state).retained = self
+                .hold_retained(
+                    conn,
+                    &plan.changes,
+                    Some(&baseline.declared.overlay(previous)),
+                )
+                .await?;
+            if let Some(extension) = &stmt.extension {
+                crate::deploy::vet_before_extension(conn, extension, Some(plan)).await?;
+            }
+            if stmt.rewrites.is_some() {
+                // The expressions the rewrite re-evaluates, held still by
+                // the lock the guard takes, judged by the plan's own
+                // admission (DEC-2563.9).
+                let admission = approved.admission();
+                let guard =
+                    prepare_data_writes(conn, &admission, &plan.changes, baseline, &plan.ids)
+                        .await?;
+                check_data_write(conn, &admission, stmt, &guard).await?;
+            }
+            if let Some(change) = &stmt.introduces {
+                // Judged by the plan's own admission before the statement
+                // runs, with what the earlier steps created in place.
+                let admission = approved.admission();
+                pbps_pg::table_expressions::vet_change(
+                    conn,
+                    &admission,
+                    pbps_pg::pins::Within::CallersTransaction,
+                    pbps_pg::table_expressions::Moment::Statement,
+                    change,
+                )
+                .await
+                .and_then(pbps_pg::table_expressions::Vetted::admitted)
+                .map_err(anyhow::Error::msg)?;
+            }
+        }
+        Ok(())
+    }
+    #[allow(clippy::too_many_arguments)]
     async fn after_statement(
         &self,
+        state: &mut Self::State,
         conn: &mut Conn,
         admission: &Admission,
         stmt: &pbps_dialect::Statement,
         plan: Option<&pbps_model::SavedPlan>,
         changes: &ChangeSet,
         executed: &[pbps_dialect::Statement],
-        execution: Execution,
+        execution: Execution<'_>,
     ) -> anyhow::Result<()> {
-        after_statement(conn, admission, stmt, plan, changes, executed, execution).await
+        match execution {
+            Execution::StagedRow => {
+                // A deferred trigger would otherwise run at COMMIT, after the
+                // check below, and a function replaced while an earlier one
+                // held the commit would run unchecked. The step commits right
+                // after, so settling here refuses nothing the commit would
+                // have allowed (473).
+                self.settle_writes(conn).await?;
+                Ok(())
+            }
+            Execution::StagedGuardedDdl { previous } => {
+                self.verify_retained(state, conn, previous).await?;
+                after_statement(conn, admission, stmt, plan, changes, executed).await?;
+                refuse_unsafe_definers(conn, &written_routines(changes), Absent::NotYetCreated)
+                    .await
+            }
+            Execution::Transactional => {
+                after_statement(conn, admission, stmt, plan, changes, executed).await
+            }
+        }
     }
+    async fn staged_closing(
+        &self,
+        state: &mut Self::State,
+        conn: &mut Conn,
+        changes: &ChangeSet,
+    ) -> anyhow::Result<()> {
+        self.state(state).retained = self.hold_retained(conn, changes, None).await?;
+        Ok(())
+    }
+    /// Recover validation after a staged step's caller has rolled its transaction back.
     async fn recover_failed_validation(
         &self,
         conn: &mut Conn,
@@ -442,9 +552,7 @@ pub(crate) async fn after_statement(
     plan: Option<&pbps_model::SavedPlan>,
     changes: &ChangeSet,
     executed: &[pbps_dialect::Statement],
-    _execution: Execution,
 ) -> anyhow::Result<()> {
-    // The staged hooks in the next half read `_execution`.
     if let Some(type_statement) = &stmt.declared_type {
         pbps_pg::type_refs::declared::vet(
             conn,
