@@ -162,7 +162,7 @@ pub(in crate::deploy) async fn apply_async(
             // have been answered about a database that is already moving.
             crate::engine::lock(&mut conn, operator).await?;
             let result = if staged {
-                apply_staged_under_lock(&mut conn, &deployment, resume)
+                apply_staged_under_lock(&mut conn, &deployment, &mut session, resume)
                     .await
                     .map(Some)
             } else {

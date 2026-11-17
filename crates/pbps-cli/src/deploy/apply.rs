@@ -707,48 +707,6 @@ pub(super) fn retain_managed_roles(schema: &mut Schema, ids: &IdsFile, dialect: 
     }
 }
 
-/// A staged apply: one logical change, run statement by statement outside a
-/// transaction, with each completion recorded (ADR-0003 decision 2).
-///
-/// # Why the ledger is written between statements
-///
-/// Nothing here rolls back — that is the whole reason the plan is staged. So
-/// the only thing that can make a mid-way failure visible rather than
-/// mysterious is a record written as each statement completes; and once that
-/// record exists, `--resume` has somewhere honest to start from.
-///
-/// # Why resume re-checks the database
-///
-/// A checkpoint says what the database looked like when the run stopped. Half a
-/// deployment sitting in an environment is exactly when somebody reaches in by
-/// hand, so the drift discipline applies to a half-finished plan as much as to
-/// a finished one: the live state has to still equal the checkpoint, or the
-/// remaining statements are being run against something nobody planned for.
-/// The census again, where the plan runs: a dependent that appeared on an
-/// enum after the plan was made is refused by name before the first statement
-/// (DEC-1635.7). Inside the apply's own transaction, after the lock.
-pub(super) async fn recheck_enum_rebuilds(
-    conn: &mut Conn,
-    changes: &pbps_model::ChangeSet,
-    stored: &IdsFile,
-    resuming: bool,
-) -> anyhow::Result<()> {
-    crate::engine::recheck_enum_rebuild_census(conn, changes, stored, resuming).await
-}
-
-/// The tightened domains again, where the plan runs: a column of an array or
-/// a composite of the domain that appeared after the plan was made is refused
-/// by name before the first statement (DEC-1635.8).
-pub(super) async fn recheck_domain_alterations(
-    conn: &mut Conn,
-    changes: &pbps_model::ChangeSet,
-    stored: &IdsFile,
-) -> anyhow::Result<()> {
-    crate::engine::check_domain_alterations(conn, changes, stored)
-        .await
-        .map(|_| ())
-}
-
 /// Refuses to act on an environment that is half-way through a staged apply.
 ///
 /// Planning or applying anything else on top of an unfinished staged plan
@@ -812,16 +770,6 @@ pub(super) fn role_drop_expectations<D: crate::emission::Engine>(
 /// otherwise commit every `DROP MEMBER` the reviewer saw and then fail on
 /// the one nobody did, leaving the reviewed users without access and the
 /// role in place (DECISIONS 92, 102).
-pub(super) async fn check_role_drops(
-    conn: &mut Conn,
-    expected: &[(pbps_model::RoleName, Vec<pbps_model::RoleName>)],
-) -> anyhow::Result<()> {
-    let selected = crate::engine::apply_session::selected(conn.driver());
-    pbps_cli::with_plan_dialect!(&selected, |session| {
-        check_role_drops_with_session(session, conn, expected).await
-    })
-}
-
 pub(super) async fn check_role_drops_with_session<D: crate::engine::ApplySession>(
     session: &D,
     conn: &mut Conn,
@@ -917,17 +865,16 @@ pub(super) async fn pin_session(
     Ok(())
 }
 
-pub(super) async fn drop_preflight(
+pub(super) async fn drop_preflight<D: crate::engine::ApplySession>(
     conn: &mut Conn,
-    dialect: &dyn pbps_dialect::Dialect,
-    changes: &pbps_model::ChangeSet,
-    ids: &IdsFile,
+    dialect: &D,
+    plan: &pbps_model::SavedPlan,
     stored: &Schema,
     stored_ids: &IdsFile,
 ) -> anyhow::Result<()> {
     conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
         .await?;
-    let result = crate::engine::check_drop_blockers(conn, changes, ids, stored, stored_ids).await;
+    let result = dialect.drop_blockers(conn, plan, stored, stored_ids).await;
     let rollback = conn
         .rollback(&dialect.transaction_framing(&pin_zone(conn)))
         .await;
