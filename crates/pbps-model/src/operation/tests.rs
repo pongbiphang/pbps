@@ -380,6 +380,7 @@ fn a_step_defines_only_what_its_own_payload_holds() {
                 descending: false,
                 opclass: None,
                 collation: None,
+                opclass_parameters: Default::default(),
             }],
             include: vec![],
             unique: false,

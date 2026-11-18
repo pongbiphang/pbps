@@ -88,14 +88,21 @@ pub(crate) fn holds_expression_key(policy: &MethodPolicy, provider: bool) -> boo
     policy.expression_keys || provider
 }
 
-/// Whether `class` is one of the engine's own that a later part of the same
-/// issue brings to `policy`'s method (BRIN's minmax-multi and Bloom, DEC-2449.1):
-/// refused by name as arriving, not as unknown.
-pub(crate) fn later_class(policy: &MethodPolicy, class: &OpClassRef) -> bool {
-    policy.method == pbps_model::IndexMethod::Brin
-        && class
-            .as_bare()
-            .is_some_and(|n| n.ends_with("_minmax_multi_ops") || n.ends_with("_bloom_ops"))
+/// [`class_problem`] for an expression key, whose type the model cannot read: a
+/// method held by key type judges the class against every key type's, and the
+/// engine against the expression's own. The type's default is spelled out as
+/// for a column, because the catalog reads it back as no class (DEC-2449.2).
+pub(crate) fn expression_class_problem(
+    policy: &MethodPolicy,
+    class: &OpClassRef,
+) -> Option<ClassProblem> {
+    let (Some(name), false) = (class.as_bare(), policy.key_types.is_empty()) else {
+        return class_problem(policy, class, None);
+    };
+    if policy.key_types.iter().any(|k| k.default_class == name) {
+        return Some(ClassProblem::DefaultSpelledOut);
+    }
+    (!policy.key_types.iter().any(|k| k.classes.contains(&name))).then_some(ClassProblem::NotHeld)
 }
 
 /// The key type of `policy` that `column` is: its normalised base type, and not
@@ -288,6 +295,7 @@ mod tests {
             descending: false,
             opclass: class.map(|c| c.parse().unwrap()),
             collation: None,
+            opclass_parameters: Default::default(),
         };
         for (declared, pulled) in [
             (Some("ext.gin_trgm_ops"), "ext.gin_trgm_ops"),

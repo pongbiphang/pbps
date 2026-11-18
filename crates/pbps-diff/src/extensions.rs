@@ -2236,6 +2236,7 @@ mod tests {
             descending: false,
             opclass: Some(class.parse::<OpClassRef>().unwrap()),
             collation: None,
+            opclass_parameters: Default::default(),
         };
         let table = |class: &str, operator: &str| {
             let mut t = Table::default();
@@ -2326,6 +2327,7 @@ mod tests {
             descending: false,
             opclass: class,
             collation: None,
+            opclass_parameters: Default::default(),
         };
         let index = |method: IndexMethod, class: Option<OpClassRef>| Index {
             columns: vec![key(class)],

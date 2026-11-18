@@ -170,7 +170,9 @@ use schemars::JsonSchema;
 /// Version 50 records the retirement of an exclusion constraint in the snapshot's identities
 /// (DEC-2448.4); every older snapshot truthfully holds none, and an older build would reject
 /// the section.
-pub const CURRENT_VERSION: u32 = 50;
+/// Version 51 records a key's `opclass_parameters` (DEC-2449.2); every older snapshot
+/// truthfully holds none, and an older build would reject the field.
+pub const CURRENT_VERSION: u32 = 51;
 
 /// The first version that records `object_deps` and no longer `module_deps`.
 ///

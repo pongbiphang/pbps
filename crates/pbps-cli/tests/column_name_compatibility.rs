@@ -496,6 +496,7 @@ fn cycling_expression_notes_show_column_identities_once_in_every_format() {
                             descending: false,
                             opclass: None,
                             collation: None,
+                            opclass_parameters: Default::default(),
                         }],
                         unique: true,
                         include: Vec::new(),

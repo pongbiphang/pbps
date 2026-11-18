@@ -32,6 +32,7 @@ fn observed(ty: &str) -> Schema {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: vec![],
                 unique: false,

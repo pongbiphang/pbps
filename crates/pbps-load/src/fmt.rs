@@ -858,6 +858,7 @@ fn render_indexes(
             let inline = |c: &pbps_model::IndexColumn| {
                 c.key.column().is_some()
                     && c.collation.is_none()
+                    && c.opclass_parameters.is_empty()
                     && c.opclass
                         .as_ref()
                         .is_none_or(|o| !o.raw().to_string().contains(char::is_whitespace))
@@ -891,6 +892,13 @@ fn render_indexes(
                             s,
                             "\n{pad}        opclass: {}",
                             scalar(&class.raw().to_string())
+                        );
+                    }
+                    if !c.opclass_parameters.is_empty() {
+                        let _ = write!(
+                            s,
+                            "\n{pad}        opclass_parameters: {}",
+                            flow(&c.opclass_parameters)
                         );
                     }
                     if let Some(collation) = &c.collation {
@@ -2152,6 +2160,26 @@ indexes:
             "{out}"
         );
         assert_eq!(out.matches("collation").count(), 1, "{out}");
+    }
+
+    /// A key's class options render under `keys:` beside its `opclass:`, in name
+    /// order and the canonical spelling, and read back as the same table; a key
+    /// with none stays in `columns:` and writes no field (#2449 PR R2, DEC-2449.2).
+    #[test]
+    fn a_keys_class_options_are_written_with_its_class_and_a_plain_key_writes_none() {
+        let yaml = "table: app.t\ncolumns:\n  a: {type: integer}\n  b: {type: integer}\nindexes:\n  ix:\n    method: brin\n    keys:\n      - {column: a, opclass: int4_bloom_ops, opclass_parameters: {false_positive_rate: 1e-2, n_distinct_per_range: -0.1}}\n      - {column: b, opclass: int4_minmax_multi_ops, opclass_parameters: {values_per_range: '040'}}\n  iy:\n    method: brin\n    columns: [a, b]\n";
+        round_trip(yaml);
+        let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        let out = render(&t.name, &t.table, &t.intents, None);
+        assert!(
+            out.contains(
+                "opclass_parameters: {false_positive_rate: 0.01, n_distinct_per_range: -0.1}\n"
+            ) && out.contains("opclass_parameters: {values_per_range: 32}\n"),
+            "{out}"
+        );
+        // Negative: the index with no class options is the one-line list.
+        assert!(out.contains("columns: [a, b]"), "{out}");
+        assert_eq!(out.matches("opclass_parameters").count(), 2, "{out}");
     }
 
     /// A generation expression reads back with its kind and renders again,

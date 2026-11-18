@@ -412,6 +412,7 @@ fn a_new_exclusion_that_calls_a_created_function_is_moved_behind_it() {
         descending: false,
         opclass: None,
         collation: None,
+        opclass_parameters: Default::default(),
     };
     assert_eq!(moved(exclusion(call.clone(), None, true)), (1, true));
     assert_eq!(

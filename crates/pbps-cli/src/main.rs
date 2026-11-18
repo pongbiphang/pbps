@@ -2762,6 +2762,7 @@ mod consumer_contract_tests {
             descending: false,
             opclass: None,
             collation: None,
+            opclass_parameters: Default::default(),
         };
         let ctx = pbps_policy::Context {
             now: 0,

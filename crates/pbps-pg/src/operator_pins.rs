@@ -247,6 +247,7 @@ mod tests {
                         descending: false,
                         opclass: None,
                         collation: None,
+                        opclass_parameters: Default::default(),
                     },
                     operator: match schema {
                         Some(s) => pbps_model::OperatorRef::in_schema(s, "%").unwrap(),

@@ -3121,6 +3121,7 @@ mod tests {
                         descending: false,
                         opclass: None,
                         collation: None,
+                        opclass_parameters: Default::default(),
                     })
                     .collect(),
                 include: vec!["note".into()],

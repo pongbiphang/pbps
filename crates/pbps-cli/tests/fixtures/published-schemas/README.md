@@ -91,3 +91,4 @@ DECISIONS 465).
 - `109/` adds the `sequence:` declaration file: a standalone sequence's type, start, increment and options (#2721 PR A); 108 was reserved and never used.
 - `112/` words the `method: gin` descriptions to name `tsvector` beside `jsonb`, with `tsvector_ops` as its default class (#1984); 110 and 111 belong to other changes.
 - `114/` carries no document change beyond its version: the retirement of an exclusion constraint lives in the identities a state embeds and `IndexPart::Exclusion` in a plan, neither of which a published schema describes (#2448 PR C2); 113 belongs to another change.
+- `116/` adds an index key's `opclass_parameters:`, the options of a BRIN minmax-multi or Bloom class (#2449 PR R2).

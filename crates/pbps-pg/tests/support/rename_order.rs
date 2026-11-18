@@ -48,6 +48,7 @@ fn fixture(case: &str) -> (Schema, Schema, Vec<Intent>) {
                         descending: false,
                         opclass: None,
                         collation: None,
+                        opclass_parameters: Default::default(),
                     }],
                     include: vec![],
                     unique: false,

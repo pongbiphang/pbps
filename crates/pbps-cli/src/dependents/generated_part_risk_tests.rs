@@ -95,6 +95,7 @@ fn fixture(kind: &str, writer: &str, late: bool) -> SavedPlan {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: vec![],
                 unique: true,

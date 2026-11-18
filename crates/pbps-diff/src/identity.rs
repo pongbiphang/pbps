@@ -2891,6 +2891,7 @@ mod drop_exclusion_tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 },
                 operator: pbps_model::OperatorRef::symbol(operator).unwrap(),
             }],

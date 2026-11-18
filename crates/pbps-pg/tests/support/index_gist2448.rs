@@ -103,6 +103,7 @@ fn key(key: IndexKey, class: Option<&str>, collation: Option<&str>) -> IndexColu
         descending: false,
         opclass: class.map(|c| c.parse::<OpClassRef>().unwrap()),
         collation: collation.map(str::to_owned),
+        opclass_parameters: Default::default(),
     }
 }
 

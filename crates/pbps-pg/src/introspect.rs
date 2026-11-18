@@ -3933,13 +3933,15 @@ fn read_index(raw: &RawIndex, parts: &Parts, table: &Table, pulled: &mut Pulled)
                 ),
             );
         }
-        let opclass = key_class(raw, parts, table, method, position, &name, pulled)?;
+        let (opclass, opclass_parameters) =
+            key_class(raw, parts, table, method, position, &key, pulled)?;
         let collation = key_collation(raw, parts, &key, position, pulled)?;
         columns.push(IndexColumn {
             key,
             descending,
             opclass,
             collation,
+            opclass_parameters,
         });
     }
 
@@ -4019,6 +4021,46 @@ fn key_collation(
     Some(Some(name.to_owned()))
 }
 
+/// A pulled key's operator class and its parameters (DEC-2449.2).
+type KeyClass = (Option<OpClassRef>, BTreeMap<String, String>);
+
+/// The `name=value` entries of a key's `attoptions`, which the catalog renders as
+/// a text array (`{values_per_range=16}`, an element with a space or a comma
+/// quoted), or `None` for text that is not one. An empty string is no options.
+fn attoption_entries(text: &str) -> Option<Vec<(String, String)>> {
+    if text.is_empty() {
+        return Some(Vec::new());
+    }
+    let inner = text.strip_prefix('{')?.strip_suffix('}')?;
+    let (mut entries, mut current) = (Vec::new(), String::new());
+    let (mut quoted, mut escaped) = (false, false);
+    for c in inner.chars() {
+        match (c, quoted, escaped) {
+            (_, true, true) => {
+                current.push(c);
+                escaped = false;
+            }
+            ('\\', true, false) => escaped = true,
+            ('"', _, false) => quoted = !quoted,
+            (',', false, false) => entries.push(std::mem::take(&mut current)),
+            _ => current.push(c),
+        }
+    }
+    if quoted || escaped {
+        return None;
+    }
+    entries.push(current);
+    let mut options = Vec::new();
+    for entry in entries {
+        let (name, value) = entry.split_once('=')?;
+        if name.is_empty() || options.iter().any(|(n, _): &(String, String)| n == name) {
+            return None;
+        }
+        options.push((name.to_owned(), value.to_owned()));
+    }
+    Some(options)
+}
+
 /// A key's operator class as the model holds it, or `None` after naming why
 /// the index is left out (DEC-1169.1).
 ///
@@ -4035,12 +4077,14 @@ fn key_class(
     table: &Table,
     method: IndexMethod,
     position: usize,
-    column: &str,
+    key: &pbps_model::IndexKey,
     pulled: &mut Pulled,
-) -> Option<Option<OpClassRef>> {
+) -> Option<KeyClass> {
     use crate::index_policy::{
-        ClassProblem, class_problem, holds_key_type, key_scope, key_type_of, offered,
+        ClassProblem, class_problem, expression_class_problem, holds_key_type, key_scope,
+        key_type_of, offered,
     };
+    let column = key.text();
     // An empty entry is the default class; a missing one is a key the query
     // did not describe, which is not the same thing.
     let Some(class) = raw.key_classes.get(position) else {
@@ -4068,20 +4112,20 @@ fn key_class(
             ),
         );
     };
-    // Operator class parameters (`gist_trgm_ops (siglen=32)`) are stored per
-    // index column and nothing read them: the key would come back as the plain
-    // class, a different index. The model holds none until a later part
-    // declares them (#2447 R2), so the index is left out and named, whatever
-    // its class (measured on 16.15 and 18.6: the class itself reads the same).
-    match raw.key_options.get(position) {
-        Some(options) if options.is_empty() => {}
-        Some(options) => {
+    // Operator class parameters (`int4_bloom_ops (false_positive_rate=0.02)`) are
+    // stored per index column, in `attoptions`, and read apart from the index's own
+    // storage options. A key whose parameters are not read would come back as the
+    // plain class, a different index, so an unreadable entry leaves the index out
+    // and named, whatever its class (DEC-2449.2).
+    let options = match raw.key_options.get(position).map(|o| attoption_entries(o)) {
+        Some(Some(entries)) => entries,
+        Some(None) => {
             left_out(
                 pulled,
                 format!(
-                    "indexes `{column}` with operator class parameters `{}`, which this model \
-                     does not hold yet (per-key opclass parameters are the next part of #2449)",
-                    pbps_model::escape::Escaped(options)
+                    "indexes `{column}` with operator class parameters `{}`, which could not \
+                     be read as `name=value` options",
+                    pbps_model::escape::Escaped(&raw.key_options[position])
                 ),
             );
             return None;
@@ -4097,13 +4141,14 @@ fn key_class(
             );
             return None;
         }
-    }
+    };
     let policy = method.policy();
     let in_table = table.columns.get(column);
     // A key type the method does not hold is named before its class: the class
     // of a key the model cannot read back is no part of the answer.
     let provided = crate::index_policy::provider_class_text(policy, class);
     if !provided
+        && key.column().is_some()
         && !policy.key_types.is_empty()
         && !in_table.is_some_and(|c| holds_key_type(policy, c))
     {
@@ -4117,8 +4162,23 @@ fn key_class(
         );
         return None;
     }
+    let unheld = |pulled: &mut Pulled, under: &str| {
+        left_out(
+            pulled,
+            format!(
+                "indexes `{column}` with operator class parameters `{}`{under}, which this \
+                 model holds only on an engine class of a family that takes them (BRIN's \
+                 minmax-multi and Bloom)",
+                pbps_model::escape::Escaped(&raw.key_options[position])
+            ),
+        );
+    };
     if class.is_empty() {
-        return Some(None);
+        if !options.is_empty() {
+            unheld(pulled, "");
+            return None;
+        }
+        return Some((None, BTreeMap::new()));
     }
     // The catalog's `schema.name` is not split: a name may hold a dot. Only
     // `pg_catalog.` is the engine's own. Any other is held when a package this
@@ -4138,18 +4198,61 @@ fn key_class(
             );
             return None;
         }
-        return provider_class(raw, parts, position, column, class, pulled, left_out);
+        if !options.is_empty() {
+            unheld(pulled, &format!(" under `{class}`"));
+            return None;
+        }
+        return provider_class(raw, parts, position, column, class, pulled, left_out)
+            .map(|class| (class, BTreeMap::new()));
     };
     let held = OpClassRef::bare(name);
     let key_type = in_table.and_then(|c| key_type_of(policy, c));
-    match class_problem(policy, &held, key_type) {
-        None => Some(Some(held)),
+    let problem = if key.column().is_some() {
+        class_problem(policy, &held, key_type)
+    } else {
+        expression_class_problem(policy, &held)
+    };
+    match problem {
+        None => {
+            let mut parameters = BTreeMap::new();
+            for (option, value) in options {
+                match policy.canonical_class_parameter(&held, &option, &value) {
+                    Ok(canonical) => {
+                        parameters.insert(option, canonical);
+                    }
+                    Err(why) => {
+                        left_out(
+                            pulled,
+                            format!(
+                                "indexes `{column}` with operator class `{class}` and an option \
+                                 this model cannot declare: {why}"
+                            ),
+                        );
+                        return None;
+                    }
+                }
+            }
+            Some((Some(held), parameters))
+        }
         Some(ClassProblem::DefaultOnly) => {
             left_out(
                 pulled,
                 format!(
                     "orders `{column}` by operator class `{class}`, and this model holds only a \
                      B-tree key's default class"
+                ),
+            );
+            None
+        }
+        // An expression's type is not the model's to read, so what it holds is every
+        // key type's classes, too many to list.
+        Some(_) if key_type.is_none() && !policy.key_types.is_empty() => {
+            left_out(
+                pulled,
+                format!(
+                    "indexes `{column}` with operator class `{class}`, which is not an engine \
+                     class of {} that this model holds",
+                    method.as_str().to_ascii_uppercase(),
                 ),
             );
             None
@@ -8754,15 +8857,16 @@ mod tests {
 
     /// A BRIN index is pulled through the policy: its options in their
     /// canonical spelling (`autosummarize=yes` reads `true`), a default class
-    /// and an `inet` key included; what this part does not hold (a minmax-multi
-    /// or Bloom class, an option the method does not have here) is left out and
-    /// named, never read back weaker (DEC-2449.1).
+    /// and an `inet` key included, and a held class with its key's options read
+    /// from `attoptions` in their canonical spelling (DEC-2449.2); an option the
+    /// method does not have here is left out and named, never read back weaker.
     #[test]
-    fn a_brin_index_is_pulled_with_its_options_and_a_later_class_is_left_out() {
-        let build = |ty: &str, class: &str, options: &[&str]| {
+    fn a_brin_index_is_pulled_with_its_options_and_its_classes_with_theirs() {
+        let build = |ty: &str, class: &str, key_options: &str, options: &[&str]| {
             let mut ix = index(50, 1, "t_ix");
             ix.method = "brin".to_owned();
             ix.key_classes = vec![class.to_owned()];
+            ix.key_options = vec![key_options.to_owned()];
             ix.reloptions = options.iter().map(|o| (*o).to_owned()).collect();
             assemble(&RawCatalog {
                 tables: vec![table(1, "t")],
@@ -8772,18 +8876,139 @@ mod tests {
             })
         };
         for ty in ["integer", "inet", "text"] {
-            let pulled = build(ty, "", &["pages_per_range=32", "autosummarize=yes"]);
+            let pulled = build(ty, "", "", &["pages_per_range=32", "autosummarize=yes"]);
             let held = only(&pulled).indexes.values().next().expect(ty);
             assert_eq!(held.method, IndexMethod::Brin, "{ty}");
             assert_eq!(held.storage_parameters["pages_per_range"], "32");
             assert_eq!(held.storage_parameters["autosummarize"], "true");
             assert!(pulled.warnings.is_empty(), "{ty}: {:?}", pulled.warnings);
         }
-        // Negative: a class this part does not hold, and an option it does not.
-        let multi = build("integer", "pg_catalog.int4_minmax_multi_ops", &[]);
-        assert!(only(&multi).indexes.is_empty());
-        assert!(!multi.warnings.is_empty());
-        let other = build("integer", "", &["fillfactor=50"]);
+        // A class's options are the key's: octal `040` is 32, a quoted element
+        // with spaces is read, an option left out is the engine's default.
+        for (ty, class, options, expected) in [
+            (
+                "integer",
+                "pg_catalog.int4_minmax_multi_ops",
+                "{values_per_range=040}",
+                vec![("values_per_range", "32")],
+            ),
+            (
+                "integer",
+                "pg_catalog.int4_minmax_multi_ops",
+                "{\"values_per_range= 16 \"}",
+                vec![("values_per_range", "16")],
+            ),
+            ("integer", "pg_catalog.int4_minmax_multi_ops", "", vec![]),
+            (
+                "integer",
+                "pg_catalog.int4_bloom_ops",
+                "{false_positive_rate=1e-2,n_distinct_per_range=3.0e1}",
+                vec![
+                    ("false_positive_rate", "0.01"),
+                    ("n_distinct_per_range", "30"),
+                ],
+            ),
+            (
+                "cidr",
+                "pg_catalog.inet_bloom_ops",
+                "{n_distinct_per_range=-1}",
+                vec![("n_distinct_per_range", "-1")],
+            ),
+        ] {
+            let pulled = build(ty, class, options, &[]);
+            let key = &only(&pulled)
+                .indexes
+                .values()
+                .next()
+                .expect(options)
+                .columns[0];
+            assert_eq!(
+                key.opclass.as_ref().map(|c| c.name()),
+                class.strip_prefix("pg_catalog."),
+                "{options}"
+            );
+            let got: Vec<(&str, &str)> = key
+                .opclass_parameters
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.as_str()))
+                .collect();
+            assert_eq!(got, expected, "{options}");
+            assert!(
+                pulled.warnings.is_empty(),
+                "{options}: {:?}",
+                pulled.warnings
+            );
+        }
+        // Negatives: each leaves the index out and names why. Options the class
+        // has none of, an option of another family, a value out of the engine's
+        // bounds, a duplicate or malformed entry, a class this model does not hold
+        // for the type, and options with no class.
+        for (ty, class, options, expected) in [
+            (
+                "integer",
+                "pg_catalog.int4_minmax_multi_ops",
+                "{false_positive_rate=0.01}",
+                "takes `values_per_range`",
+            ),
+            (
+                "integer",
+                "pg_catalog.int4_minmax_multi_ops",
+                "{values_per_range=7}",
+                "outside 8 to 256",
+            ),
+            (
+                "integer",
+                "pg_catalog.int4_bloom_ops",
+                "{false_positive_rate=0x1}",
+                "not a value",
+            ),
+            (
+                "integer",
+                "pg_catalog.int4_minmax_multi_ops",
+                "{values_per_range=16,values_per_range=17}",
+                "could not be read",
+            ),
+            (
+                "integer",
+                "pg_catalog.int4_minmax_multi_ops",
+                "values_per_range=16",
+                "could not be read",
+            ),
+            (
+                "integer",
+                "pg_catalog.int4_minmax_multi_ops",
+                "{values_per_range}",
+                "could not be read",
+            ),
+            (
+                "integer",
+                "pg_catalog.int8_bloom_ops",
+                "",
+                "this model holds BRIN over `integer` only with",
+            ),
+            (
+                "inet",
+                "pg_catalog.inet_minmax_ops",
+                "{values_per_range=16}",
+                "takes no options",
+            ),
+            (
+                "integer",
+                "",
+                "{values_per_range=16}",
+                "holds only on an engine class of a family",
+            ),
+            ("integer", "ext.int4_bloom_ops", "", "a schema owns"),
+        ] {
+            let pulled = build(ty, class, options, &[]);
+            assert!(only(&pulled).indexes.is_empty(), "{class} {options}");
+            assert!(
+                pulled.warnings.iter().any(|w| w.contains(expected)),
+                "{class} {options}: {:?}",
+                pulled.warnings
+            );
+        }
+        let other = build("integer", "", "", &["fillfactor=50"]);
         assert!(
             only(&other)
                 .indexes
@@ -8793,6 +9018,57 @@ mod tests {
             other.warnings
         );
         assert!(!other.warnings.is_empty());
+    }
+
+    /// An expression key is a BRIN key under any class of the method, read
+    /// from its own `attoptions`: the model cannot read its type, so the engine
+    /// judged the class; a column of a type BRIN is not held over is left out
+    /// whatever its class (DEC-2449.2).
+    #[test]
+    fn a_brin_expression_key_keeps_its_class_and_options_and_an_unheld_column_type_is_left_out() {
+        let build = |ty: &str, expression: bool, class: &str, options: &str| {
+            let mut ix = index(50, 1, "t_ix");
+            ix.method = "brin".to_owned();
+            if expression {
+                ix.columns = vec![0];
+                ix.has_expressions = true;
+                ix.key_texts = vec!["(a + 1)".to_owned()];
+            }
+            ix.key_classes = vec![class.to_owned()];
+            ix.key_options = vec![options.to_owned()];
+            assemble(&RawCatalog {
+                tables: vec![table(1, "t")],
+                columns: vec![col(1, 1, "a", ty)],
+                indexes: vec![ix],
+                ..RawCatalog::default()
+            })
+        };
+        let pulled = build(
+            "integer",
+            true,
+            "pg_catalog.int8_bloom_ops",
+            "{n_distinct_per_range=5}",
+        );
+        let key = &only(&pulled).indexes.values().next().expect("held").columns[0];
+        assert_eq!(key.key.expression(), Some("(a + 1)"));
+        assert_eq!(key.opclass_parameters["n_distinct_per_range"], "5");
+        // Negatives: a class no BRIN key type holds, and a column BRIN has no class for.
+        let nope = build("integer", true, "pg_catalog.range_inclusion_ops", "");
+        assert!(only(&nope).indexes.is_empty());
+        assert!(
+            nope.warnings
+                .iter()
+                .any(|w| w.contains("not an engine class of BRIN")),
+            "{:?}",
+            nope.warnings
+        );
+        let unheld = build("boolean", false, "", "");
+        assert!(only(&unheld).indexes.is_empty());
+        assert!(
+            unheld.warnings.iter().any(|w| w.contains("only over")),
+            "{:?}",
+            unheld.warnings
+        );
     }
 
     /// A class a schema owns, with nothing in the catalog that says a package

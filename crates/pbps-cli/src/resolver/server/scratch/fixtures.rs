@@ -83,6 +83,7 @@ pub(crate) fn pair_with_cross_kind_surfaces() -> (Schema, Schema) {
                 descending: false,
                 opclass: None,
                 collation: None,
+                opclass_parameters: Default::default(),
             }],
             include: Vec::new(),
             unique: false,

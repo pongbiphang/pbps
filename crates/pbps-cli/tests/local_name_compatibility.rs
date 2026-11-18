@@ -378,6 +378,12 @@ where
         .as_object_mut()
         .unwrap()
         .shift_remove("StandaloneSequenceDto");
+    // #2449 PR R2 adds a key's `opclass_parameters:` (schema set 116); the captured
+    // text predates it.
+    declaration_schema["$defs"]["IndexKeyDto"]["properties"]
+        .as_object_mut()
+        .unwrap()
+        .shift_remove("opclass_parameters");
     // #2447 PR G2 words the `opclass:` of a key for a package's class (schema set 102);
     // the captured text predates it.
     declaration_schema["$defs"]["IndexKeyDto"]["properties"]["opclass"]["description"] =
@@ -420,7 +426,7 @@ where
     );
     let changes_debug = format!("{:?}", plan.changes)
         .replace(", drop_guard: None", "")
-        .replace(", collation: None }", " }")
+        .replace(", collation: None, opclass_parameters: {} }", " }")
         .replace(" exclude: {},", "")
         // SQL Server's `filegroup` (#2813), empty on every captured object.
         .replace(", filegroup: None", "");

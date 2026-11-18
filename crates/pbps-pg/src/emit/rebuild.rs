@@ -35,6 +35,7 @@ pub(super) fn build_partitioned_index(pg: &Postgres, recipe: &BuildPartitionedIn
                         descending: false,
                         opclass: None,
                         collation: None,
+                        opclass_parameters: Default::default(),
                     })
                     .collect(),
                 include: Vec::new(),

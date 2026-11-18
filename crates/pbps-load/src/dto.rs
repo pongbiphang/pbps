@@ -1481,12 +1481,13 @@ pub struct IndexKeyDto {
     /// collation (`C`), where it is not the column's own (DEC-2448.2).
     #[serde(default)]
     pub collation: Option<String>,
-    /// An operator class's own parameters (BRIN's minmax-multi and Bloom). Read
-    /// only to be refused by name until the part of #2449 that holds them, and
-    /// left out of the published schema for the same reason (DEC-2449.1).
+    /// The operator class's own parameters (BRIN's minmax-multi `values_per_range`,
+    /// Bloom's `n_distinct_per_range` and `false_positive_rate`), by name, for a key
+    /// that names its `opclass:`. They are the key's and not the index's
+    /// `storage_parameters` (DEC-2449.2).
     #[serde(default)]
-    #[schemars(skip)]
-    pub opclass_parameters: Option<serde::de::IgnoredAny>,
+    #[schemars(with = "BTreeMap<String, StorageValueDto>")]
+    pub opclass_parameters: BTreeMap<String, Spanned<StorageValueDto>>,
     /// `asc`, the default, or `desc`.
     #[serde(default)]
     pub order: Option<IndexOrder>,

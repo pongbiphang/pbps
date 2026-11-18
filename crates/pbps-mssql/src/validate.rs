@@ -429,6 +429,12 @@ fn operator_classes(what: &str, index: &pbps_model::Index) -> Vec<DialectError> 
                 class = class.shown(),
             )));
         }
+        if !key.opclass_parameters.is_empty() {
+            found.push(invalid(format!(
+                "{what} gives `{shown}` operator class parameters, and SQL Server has no operator \
+                 classes"
+            )));
+        }
         if let Some(collation) = &key.collation {
             found.push(invalid(format!(
                 "{what} collates `{shown}` by `{}`, and a SQL Server index key takes its column's \
@@ -1914,6 +1920,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: Vec::new(),
                 unique: true,
@@ -2150,6 +2157,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: Vec::new(),
                 unique: false,
@@ -2351,6 +2359,7 @@ mod tests {
                 descending: false,
                 opclass: opclass.map(|c| c.parse().unwrap()),
                 collation: None,
+                opclass_parameters: Default::default(),
             }],
             include: Vec::new(),
             unique: false,
@@ -2387,6 +2396,23 @@ mod tests {
                 .any(|m| m.contains("`ext.int4_ops`") && m.contains("no operator classes")),
             "{qualified:?}"
         );
+        // A class's own options are PostgreSQL's too (#2449 PR R2), refused by name; a
+        // BRIN index and its class are refused with them.
+        let mut options = index(IndexMethod::Brin, Some("int4_bloom_ops"));
+        options.columns[0]
+            .opclass_parameters
+            .insert("false_positive_rate".into(), "0.01".into());
+        let options = messages(options);
+        assert!(
+            options
+                .iter()
+                .any(|m| m.contains("operator class parameters")),
+            "{options:?}"
+        );
+        assert!(
+            options.iter().any(|m| m.contains("`brin` method")),
+            "{options:?}"
+        );
         // A key collation is PostgreSQL's, refused by name; Gist likewise.
         let mut collated = index(IndexMethod::Btree, None);
         collated.columns[0].collation = Some("C".to_owned());
@@ -2421,6 +2447,7 @@ mod tests {
                 descending: false,
                 opclass: None,
                 collation: None,
+                opclass_parameters: Default::default(),
             }],
             include,
             unique: false,
@@ -2477,6 +2504,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: Vec::new(),
                 unique: false,
@@ -3204,6 +3232,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: vec!["email".into()],
                 unique: false,
@@ -3790,6 +3819,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: vec![],
                 unique: false,

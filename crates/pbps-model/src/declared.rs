@@ -1317,6 +1317,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: Vec::new(),
                 unique: false,
@@ -1334,6 +1335,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: Vec::new(),
                 unique: false,
@@ -1382,6 +1384,7 @@ mod tests {
             descending: false,
             opclass: None,
             collation: None,
+            opclass_parameters: Default::default(),
         };
         let expression_index = |text: &str| Index {
             columns: vec![
@@ -1488,6 +1491,7 @@ mod tests {
                 descending: false,
                 opclass: None,
                 collation: None,
+                opclass_parameters: Default::default(),
             }],
             include: Vec::new(),
             unique: false,
@@ -1849,6 +1853,7 @@ mod tests {
                         descending: false,
                         opclass: None,
                         collation: None,
+                        opclass_parameters: Default::default(),
                     },
                     operator: crate::OperatorRef::symbol("&&").unwrap(),
                 },

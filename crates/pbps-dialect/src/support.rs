@@ -179,14 +179,6 @@ pub const RECORDS: &[Record] = &[
             "#2448",
         )
     },
-    Record {
-        planned: Some(Planned {
-            label: "`brin` indexes",
-            today: "named",
-            tracking: "#2449",
-        }),
-        ..issue(Postgres, "`brin` indexes", Named, "#2449")
-    },
     census("Comments on extensions", &["comment on extension"], CENSUS),
     census("Publications", &["publication"], CENSUS),
     census("Subscriptions", &["subscription"], CENSUS),

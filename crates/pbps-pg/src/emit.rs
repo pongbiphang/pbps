@@ -2048,7 +2048,11 @@ fn create_index(
 /// One index key as SQL: the column or the parenthesised expression, then its
 /// collation, class and order, in the grammar's order. Shared by an index and
 /// an exclusion constraint, whose keys are the same thing.
-fn index_key_sql(c: &pbps_model::IndexColumn, ordered: bool) -> Result<String, DialectError> {
+fn index_key_sql(
+    c: &pbps_model::IndexColumn,
+    policy: &pbps_model::storage::MethodPolicy,
+) -> Result<String, DialectError> {
+    let ordered = policy.ordered;
     // An expression is written as declared, parenthesised, and ended
     // with a newline so a trailing line comment in it cannot swallow
     // the rest of the statement (DECISIONS 281, DEC-1169.2).
@@ -2077,6 +2081,18 @@ fn index_key_sql(c: &pbps_model::IndexColumn, ordered: bool) -> Result<String, D
             quote(class.schema().unwrap_or("pg_catalog"))?,
             quote(class.name())?
         );
+        // The class's own options, after the class and before the order, where
+        // the grammar puts them. A name is one of the family's closed list and a value is a literal
+        // of its canonical spelling, never text as declared (DEC-2449.2).
+        if !c.opclass_parameters.is_empty() {
+            let known = policy.class_parameters(class);
+            key = format!(
+                "{key} ({})",
+                listed(&c.opclass_parameters, &|name| known
+                    .iter()
+                    .any(|p| p.name == name))?
+            );
+        }
     }
     if ordered {
         key = format!("{key} {}", if c.descending { "DESC" } else { "ASC" });
@@ -2094,7 +2110,6 @@ fn exclusion_clause(
     name: &str,
     x: &pbps_model::ExclusionConstraint,
 ) -> Result<String, DialectError> {
-    let ordered = x.method.policy().ordered;
     let keys = x
         .keys
         .iter()
@@ -2107,7 +2122,7 @@ fn exclusion_clause(
             };
             Ok(format!(
                 "{} WITH OPERATOR({operator})",
-                index_key_sql(&k.key, ordered)?
+                index_key_sql(&k.key, x.method.policy())?
             ))
         })
         .collect::<Result<Vec<_>, DialectError>>()?
@@ -2150,11 +2165,10 @@ pub(crate) fn create_index_on(
     // A GIN key has no order: measured on 18.6, `ASC`/`DESC` on one is
     // "access method \"gin\" does not support ASC/DESC options" (DEC-1169.1).
     // The method's policy says so (DEC-2448.1).
-    let ordered = index.method.policy().ordered;
     let keys = index
         .columns
         .iter()
-        .map(|c| index_key_sql(c, ordered))
+        .map(|c| index_key_sql(c, index.method.policy()))
         .collect::<Result<Vec<_>, DialectError>>()?
         .join(", ");
 
@@ -6790,6 +6804,7 @@ mod tests {
                     descending: true,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: Vec::new(),
                 unique: false,
@@ -7399,6 +7414,7 @@ mod tests {
                 descending: false,
                 opclass: None,
                 collation: None,
+                opclass_parameters: Default::default(),
             }],
             include: vec![],
             unique: false,
@@ -7705,6 +7721,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: vec![],
                 unique: true,
@@ -7766,6 +7783,7 @@ mod tests {
                 descending: false,
                 opclass: None,
                 collation: None,
+                opclass_parameters: Default::default(),
             }],
             include: vec![],
             unique: false,
@@ -9863,6 +9881,7 @@ mod tests {
                     descending: true,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 },
                 IndexColumn::column("id"),
             ],
@@ -9946,6 +9965,7 @@ mod tests {
             descending: false,
             opclass: opclass.map(|c| c.parse().unwrap()),
             collation: None,
+            opclass_parameters: Default::default(),
         };
         let change = Change::Index(IndexChange::AddIndex {
             table: name("app", "doc"),
@@ -9987,6 +10007,7 @@ mod tests {
                         descending: false,
                         opclass: Some(class.parse().unwrap()),
                         collation: None,
+                        opclass_parameters: Default::default(),
                     }],
                     include: Vec::new(),
                     unique: false,
@@ -10013,6 +10034,68 @@ mod tests {
         assert!(sql("jsonb_path_ops").contains("\"pg_catalog\".\"jsonb_path_ops\""));
     }
 
+    /// A class's own options follow the class and precede the order and the
+    /// index's `WITH`, each name from the family's closed list and each value a
+    /// literal (DEC-2449.2); a name the class has no option of is refused rather
+    /// than spliced, and a key with none writes what it always did.
+    #[test]
+    fn a_class_option_is_written_after_the_class_and_a_foreign_name_is_refused() {
+        let add = |class: &str, parameters: &[(&str, &str)]| {
+            let change = Change::Index(IndexChange::AddIndex {
+                table: name("app", "t"),
+                name: "ix".into(),
+                index: Box::new(Index {
+                    columns: vec![
+                        IndexColumn {
+                            key: pbps_model::IndexKey::Column("n".into()),
+                            descending: false,
+                            opclass: Some(class.parse().unwrap()),
+                            collation: None,
+                            opclass_parameters: parameters
+                                .iter()
+                                .map(|(n, v)| ((*n).to_owned(), (*v).to_owned()))
+                                .collect(),
+                        },
+                        IndexColumn::column("m"),
+                    ],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                    method: pbps_model::IndexMethod::Brin,
+                    storage_parameters: [("pages_per_range".to_owned(), "8".to_owned())].into(),
+                    filegroup: None,
+                }),
+                clustered: false,
+            });
+            Postgres::new().fixture_emit(&change, Strategy::default())
+        };
+        let sql = add(
+            "int4_bloom_ops",
+            &[
+                ("false_positive_rate", "0.01"),
+                ("n_distinct_per_range", "-0.1"),
+            ],
+        )
+        .unwrap()
+        .remove(0)
+        .sql;
+        assert!(
+            sql.contains(
+                "(\"n\" \"pg_catalog\".\"int4_bloom_ops\" (false_positive_rate = '0.01', \
+                 n_distinct_per_range = '-0.1'), \"m\") WITH (pages_per_range = '8');"
+            ),
+            "{sql}"
+        );
+        // Negatives: none writes nothing extra, and a name that is not the class's
+        // option, or a class with no family, is refused before any SQL.
+        let plain = add("int4_bloom_ops", &[]).unwrap().remove(0).sql;
+        assert!(plain.contains("\"int4_bloom_ops\", \"m\")"), "{plain}");
+        assert!(add("int4_bloom_ops", &[("values_per_range", "16")]).is_err());
+        assert!(add("int4_minmax_multi_ops", &[("false_positive_rate", "0.01")]).is_err());
+        assert!(add("inet_minmax_ops", &[("values_per_range", "16")]).is_err());
+        assert!(add("int4_bloom_ops", &[("x = 1) --", "0.01")]).is_err());
+    }
+
     /// An exclusion constraint is added by `ALTER TABLE .. ADD CONSTRAINT .. EXCLUDE`
     /// in the grammar's order, with the method always spelled and each operator
     /// written `OPERATOR(pg_catalog.sym)`, never a symbol interpolated as text
@@ -10030,6 +10113,7 @@ mod tests {
                     descending: false,
                     opclass: Some("ext.gist_trgm_ops".parse().unwrap()),
                     collation: None,
+                    opclass_parameters: Default::default(),
                 },
                 operator,
             }],
@@ -10069,6 +10153,7 @@ mod tests {
                     descending: false,
                     opclass: class.map(|c| c.parse().unwrap()),
                     collation: None,
+                    opclass_parameters: Default::default(),
                 },
                 operator: pbps_model::OperatorRef::symbol(operator).unwrap(),
             }
@@ -10251,6 +10336,7 @@ mod tests {
                 descending: false,
                 opclass: class.map(|c| c.parse().unwrap()),
                 collation: collation.map(str::to_owned),
+                opclass_parameters: Default::default(),
             };
         let gist = emit(index(
             vec![
@@ -10308,6 +10394,7 @@ mod tests {
                 descending: true,
                 opclass: None,
                 collation: None,
+                opclass_parameters: Default::default(),
             }],
             include: vec!["m".into()],
             unique: true,
@@ -10437,6 +10524,7 @@ mod tests {
                         descending: false,
                         opclass: None,
                         collation: None,
+                        opclass_parameters: Default::default(),
                     }],
                     include: vec![],
                     unique: false,

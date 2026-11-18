@@ -673,6 +673,7 @@ async fn retries_roll_back_whole_groups_but_can_repeat_sequence_side_effects() {
                         descending: false,
                         opclass: Some("app.absent_ops".parse().unwrap()),
                         collation: None,
+                        opclass_parameters: Default::default(),
                     }],
                     include: vec![],
                     unique: false,

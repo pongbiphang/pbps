@@ -16,6 +16,7 @@ fn index(unique: bool, filtered: bool) -> Change {
                 descending: false,
                 opclass: None,
                 collation: None,
+                opclass_parameters: Default::default(),
             }],
             include: vec![],
             unique,
