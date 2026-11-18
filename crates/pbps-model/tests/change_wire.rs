@@ -28,6 +28,8 @@ const OPS: &[&str] = &[
     "rename_type",
     "create_search",
     "drop_search",
+    "alter_search_mapping",
+    "alter_search_dictionary",
     "create_extension",
     "drop_extension",
     "update_extension",
@@ -153,6 +155,16 @@ const ACCEPTED: &[(&str, &str, &str)] = &[
         r"drop_search",
         r#"{"op":"drop_search","uid":"s_aaaaaa","name":"dictionary app.words","definition":{"kind":"dictionary","template":"pg_catalog.simple","options":{}}}"#,
         r#"{"op":"drop_search","uid":"s_aaaaaa","name":"dictionary app.words","definition":{"kind":"dictionary","template":"pg_catalog.simple","options":{}}}"#,
+    ),
+    (
+        r"alter_search_mapping",
+        r#"{"op":"alter_search_mapping","uid":"s_aaaaaa","name":"config app.docs","before":{"kind":"config","parser":"pg_catalog.\"default\"","mappings":{"word":["app.words"]}},"after":{"kind":"config","parser":"pg_catalog.\"default\"","mappings":{"word":["pg_catalog.simple"]}}}"#,
+        r#"{"op":"alter_search_mapping","uid":"s_aaaaaa","name":"config app.docs","before":{"kind":"config","parser":"pg_catalog.default","mappings":{"word":["app.words"]}},"after":{"kind":"config","parser":"pg_catalog.default","mappings":{"word":["pg_catalog.simple"]}}}"#,
+    ),
+    (
+        r"alter_search_dictionary",
+        r#"{"op":"alter_search_dictionary","uid":"s_aaaaaa","name":"dictionary app.words","before":{"kind":"dictionary","template":"pg_catalog.simple","options":{}},"after":{"kind":"dictionary","template":"pg_catalog.simple","options":{"stopwords":"english"}}}"#,
+        r#"{"op":"alter_search_dictionary","uid":"s_aaaaaa","name":"dictionary app.words","before":{"kind":"dictionary","template":"pg_catalog.simple","options":{}},"after":{"kind":"dictionary","template":"pg_catalog.simple","options":{"stopwords":"english"}}}"#,
     ),
 ];
 

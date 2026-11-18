@@ -1569,6 +1569,15 @@ impl PlanSession for pbps_pg::Postgres {
         hints.extension_moves =
             crate::deploy::extension_move_facts(conn, base, declared, recorded_ids, resolved_ids)
                 .await?;
+        // The text search objects the plan would alter in place, and what stands on each.
+        let altered = declared
+            .search
+            .iter()
+            .filter(|(name, now)| base.search.get(*name).is_some_and(|was| was != *now))
+            .map(|(name, _)| name.clone())
+            .collect();
+        hints.search_dependents =
+            pbps_pg::search::stale_dependents(conn, &base.search, &altered).await?;
         hints.extension_drops = crate::deploy::extension_drop_facts(
             conn,
             &crate::deploy::retired_extensions(base, declared, recorded_ids, resolved_ids),

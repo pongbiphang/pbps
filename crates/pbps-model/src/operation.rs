@@ -716,6 +716,8 @@ impl Operation {
             | Change::Type(TypeChange::DropType { uid, .. })
             | Change::Type(TypeChange::RenameType { uid, .. }) => ObjectKey::Type(recorded(uid)),
             Change::Search(SearchChange::CreateSearch { uid, .. })
+            | Change::Search(SearchChange::AlterSearchMapping { uid, .. })
+            | Change::Search(SearchChange::AlterSearchDictionary { uid, .. })
             | Change::Search(SearchChange::DropSearch { uid, .. }) => {
                 ObjectKey::Search(recorded(uid))
             }
@@ -999,6 +1001,9 @@ Change::Partition(PartitionChange::RebuildPartitionedTable(_)) | Change::Partiti
             | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
             | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
             | Change::Type(TypeChange::RenameType { .. })
+            // A text search object altered in place stands before and after it.
+            | Change::Search(SearchChange::AlterSearchMapping { .. })
+            | Change::Search(SearchChange::AlterSearchDictionary { .. })
             // A package updated in place stands before and after it.
             | Change::Extension(ExtensionChange::UpdateExtension { .. })
             | Change::Extension(ExtensionChange::SetExtensionSchema { .. })

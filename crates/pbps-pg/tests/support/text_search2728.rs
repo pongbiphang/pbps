@@ -135,6 +135,19 @@ async fn measure() {
             order,
             "asciiword:simple,asciiword:d1,word:d1,word:simple,email:simple"
         );
+        // `ADD MAPPING` on a mapped token type fails, and `ALTER` or `DROP MAPPING` on an
+        // unmapped one does nothing (DEC-2728.3): each token type needs the one verb that
+        // says what it means.
+        assert_eq!(
+            db.refused("ALTER TEXT SEARCH CONFIGURATION c1 ADD MAPPING FOR email WITH d1")
+                .await,
+            "23505"
+        );
+        db.run("ALTER TEXT SEARCH CONFIGURATION c1 ALTER MAPPING FOR url WITH d1; ALTER TEXT SEARCH CONFIGURATION c1 DROP MAPPING FOR url").await;
+        assert_eq!(
+            db.one("SELECT count(*)::text FROM pg_ts_config_map WHERE mapcfg = 'app.c1'::regconfig AND maptokentype = 5").await,
+            "0"
+        );
         // A copy is its result: the catalog keeps no trace of `COPY`.
         db.run("CREATE TEXT SEARCH CONFIGURATION copied (COPY = pg_catalog.english)")
             .await;
@@ -174,6 +187,52 @@ async fn measure() {
             db.one("SELECT relfilenode::text FROM pg_class WHERE relname = 'docs_ix'")
                 .await,
             before
+        );
+        // What the census reads from `pg_depend` (DEC-2728.3): the index, a stored generated
+        // column's default and a check go stale with the configuration; a view and a plain
+        // default are evaluated on use and are not listed. A dictionary answers for the
+        // configuration that maps it, and a dictionary nothing uses for nothing.
+        db.run("CREATE VIEW v AS SELECT to_tsvector('app.c1', body) FROM docs; CREATE TABLE gen (body text, tsv tsvector GENERATED ALWAYS AS (to_tsvector('app.c1', body)) STORED, plain tsvector DEFAULT to_tsvector('app.c1', 'x'), CONSTRAINT k CHECK (to_tsvector('app.c1', body) IS NOT NULL)); CREATE MATERIALIZED VIEW mv AS SELECT to_tsvector('app.c1', body) AS x FROM docs").await;
+        let subject = |text: &str| -> std::collections::BTreeSet<SearchRef> {
+            [text.parse().unwrap()].into()
+        };
+        let census = |found: std::collections::BTreeMap<SearchRef, Vec<String>>| {
+            found.into_values().next().unwrap().join("; ")
+        };
+        let standing = Default::default();
+        let by_config = census(
+            pbps_pg::search::stale_dependents(db.conn(), &standing, &subject("config app.c1"))
+                .await
+                .unwrap(),
+        );
+        for stale in [
+            "index app.docs_ix",
+            "default value for app.gen.tsv",
+            "table constraint k on app.gen",
+            "materialized view app.mv",
+        ] {
+            assert!(by_config.contains(stale), "{stale}: {by_config}");
+        }
+        for fine in ["view app.v", "app.gen.plain"] {
+            assert!(!by_config.contains(fine), "{fine}: {by_config}");
+        }
+        let by_dictionary = census(
+            pbps_pg::search::stale_dependents(db.conn(), &standing, &subject("dictionary app.d1"))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(by_dictionary, by_config);
+        assert!(
+            census(
+                pbps_pg::search::stale_dependents(
+                    db.conn(),
+                    &standing,
+                    &subject("dictionary app.d2")
+                )
+                .await
+                .unwrap()
+            )
+            .is_empty()
         );
         db.finish().await;
     }

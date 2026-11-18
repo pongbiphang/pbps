@@ -156,12 +156,28 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
         Change::Search(SearchChange::DropSearch {
             uid: "s_aaaaaa".parse().unwrap(),
             name: "dictionary app.words".parse().unwrap(),
-            definition: Box::new(search),
+            definition: Box::new(search.clone()),
         }),
         vec![],
         vec![],
         None,
     );
+    for change in [
+        Change::Search(SearchChange::AlterSearchDictionary {
+            uid: "s_aaaaaa".parse().unwrap(),
+            name: "dictionary app.words".parse().unwrap(),
+            before: Box::new(search.clone()),
+            after: Box::new(search.clone()),
+        }),
+        Change::Search(SearchChange::AlterSearchMapping {
+            uid: "s_bbbbbb".parse().unwrap(),
+            name: "config app.docs".parse().unwrap(),
+            before: Box::new(search.clone()),
+            after: Box::new(search),
+        }),
+    ] {
+        pin(change, vec![], vec![], None);
+    }
     pin(
         Change::Type(TypeChange::RenameType {
             uid: type_uid,

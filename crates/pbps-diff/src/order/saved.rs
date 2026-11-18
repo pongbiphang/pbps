@@ -602,6 +602,65 @@ pub fn validate_saved_plan(
             {
                 return Err(AdmissionError::from_error(error));
             }
+        } else if let pbps_model::Change::Search(
+            pbps_model::SearchChange::AlterSearchMapping {
+                uid,
+                name,
+                before,
+                after,
+            }
+            | pbps_model::SearchChange::AlterSearchDictionary {
+                uid,
+                name,
+                before,
+                after,
+            },
+        ) = &step.change
+        {
+            // An alteration keeps the object's kind, parser or template and identity: no
+            // `ALTER` form changes the first two, so a payload that says it does is not one
+            // this tool made.
+            let same_kind_and_base = match (&**before, &**after) {
+                (
+                    pbps_model::SearchObject::Config { parser: a, .. },
+                    pbps_model::SearchObject::Config { parser: b, .. },
+                ) => a == b,
+                (
+                    pbps_model::SearchObject::Dictionary { template: a, .. },
+                    pbps_model::SearchObject::Dictionary { template: b, .. },
+                ) => a == b,
+                _ => false,
+            };
+            let named_by_variant = matches!(
+                (&step.change, name.kind),
+                (
+                    pbps_model::Change::Search(pbps_model::SearchChange::AlterSearchMapping { .. }),
+                    pbps_model::SearchKind::Config
+                ) | (
+                    pbps_model::Change::Search(
+                        pbps_model::SearchChange::AlterSearchDictionary { .. }
+                    ),
+                    pbps_model::SearchKind::Dictionary
+                )
+            );
+            if uid.kind() != pbps_model::UidKind::Search
+                || plan.ids.search.get(uid) != Some(name)
+                || name.kind != after.kind()
+                || !same_kind_and_base
+                || !named_by_variant
+            {
+                refuse!(
+                    "text search alteration of {} disagrees with the identity mapping",
+                    name.shown()
+                );
+            }
+            if let Some(error) = dialect
+                .validate_search(name, after, &pbps_model::Schema::default())
+                .into_iter()
+                .next()
+            {
+                return Err(AdmissionError::from_error(error));
+            }
         } else if let pbps_model::Change::Search(pbps_model::SearchChange::DropSearch {
             uid,
             name,

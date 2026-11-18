@@ -419,6 +419,7 @@ pub(super) async fn bootstrap_async(
                 extension_drops: Default::default(),
                 extension_updates: Default::default(),
                 extension_moves: Default::default(),
+                search_dependents: Default::default(),
                 target_read: false,
                 strategies: Default::default(),
                 annotations: loaded.hints.annotations.clone(),

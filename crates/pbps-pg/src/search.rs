@@ -399,28 +399,7 @@ pub(crate) fn create(
                 "CREATE TEXT SEARCH CONFIGURATION {target} (PARSER = {});",
                 qualified(parser.schema(), parser.name())?
             ))];
-            let mut groups: Vec<(&Vec<SearchName>, Vec<&String>)> = Vec::new();
-            for (alias, dictionaries) in mappings {
-                match groups.iter_mut().find(|(used, _)| *used == dictionaries) {
-                    Some((_, aliases)) => aliases.push(alias),
-                    None => groups.push((dictionaries, vec![alias])),
-                }
-            }
-            for (dictionaries, aliases) in groups {
-                let tokens = aliases
-                    .iter()
-                    .map(|alias| crate::quote(alias))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .join(", ");
-                let with = dictionaries
-                    .iter()
-                    .map(|d| qualified(d.schema(), d.name()))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .join(", ");
-                out.push(statement(format!(
-                    "ALTER TEXT SEARCH CONFIGURATION {target} ADD MAPPING FOR {tokens} WITH {with};"
-                )));
-            }
+            out.extend(mapping_statements(&target, "ADD", mappings.iter())?);
             out
         }
     };
@@ -433,6 +412,214 @@ pub(crate) fn create(
         });
     }
     Ok(statements)
+}
+
+/// One `ALTER TEXT SEARCH CONFIGURATION ... <verb> MAPPING` per group of token types that
+/// share their dictionaries, so the catalog ends with the declared rows in the engine's own
+/// order (measured: the order of the groups does not matter, the order inside one does).
+fn mapping_statements<'a>(
+    target: &str,
+    verb: &str,
+    mappings: impl Iterator<Item = (&'a String, &'a Vec<SearchName>)>,
+) -> Result<Vec<pbps_dialect::Statement>, DialectError> {
+    let mut groups: Vec<(&Vec<SearchName>, Vec<&String>)> = Vec::new();
+    for (alias, dictionaries) in mappings {
+        match groups.iter_mut().find(|(used, _)| *used == dictionaries) {
+            Some((_, aliases)) => aliases.push(alias),
+            None => groups.push((dictionaries, vec![alias])),
+        }
+    }
+    let mut out = Vec::new();
+    for (dictionaries, aliases) in groups {
+        let tokens = aliases
+            .iter()
+            .map(|alias| crate::quote(alias))
+            .collect::<Result<Vec<_>, _>>()?
+            .join(", ");
+        let with = dictionaries
+            .iter()
+            .map(|d| qualified(d.schema(), d.name()))
+            .collect::<Result<Vec<_>, _>>()?
+            .join(", ");
+        out.push(pbps_dialect::Statement::new(format!(
+            "ALTER TEXT SEARCH CONFIGURATION {target} {verb} MAPPING FOR {tokens} WITH {with};"
+        )));
+    }
+    Ok(out)
+}
+
+/// The statements that bring `before` to `after` in place, qualified throughout
+/// (DEC-2728.3). A configuration adds the token types it newly maps, replaces the dictionary
+/// list of the ones it changes and drops the ones it gives up: `ALTER MAPPING` on a token
+/// type that is not mapped does nothing and `ADD MAPPING` on one that is fails (measured on
+/// 16 and 18), so each token type gets the one verb that does what it says. A dictionary is
+/// one `ALTER` that writes each option that is new or changed and names, without a value,
+/// each one given up, which is how the engine removes one. The object keeps its identity, so
+/// no statement carries one.
+pub(crate) fn alter(
+    name: &SearchRef,
+    before: &SearchObject,
+    after: &SearchObject,
+) -> Result<Vec<pbps_dialect::Statement>, DialectError> {
+    let target = qualified(name.name.schema(), name.name.name())?;
+    match (before, after) {
+        (
+            SearchObject::Config { mappings: was, .. },
+            SearchObject::Config { mappings: now, .. },
+        ) => {
+            let changed =
+                |(alias, list): &(&String, &Vec<SearchName>)| was.get(*alias) != Some(*list);
+            let mut out = Vec::new();
+            let gone: Vec<_> = was
+                .keys()
+                .filter(|alias| !now.contains_key(*alias))
+                .collect();
+            if !gone.is_empty() {
+                let tokens = gone
+                    .iter()
+                    .map(|alias| crate::quote(alias))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(", ");
+                out.push(pbps_dialect::Statement::new(format!(
+                    "ALTER TEXT SEARCH CONFIGURATION {target} DROP MAPPING FOR {tokens};"
+                )));
+            }
+            let (standing, fresh): (Vec<_>, Vec<_>) = now
+                .iter()
+                .filter(|entry| changed(entry))
+                .partition(|(alias, _)| was.contains_key(*alias));
+            out.extend(mapping_statements(&target, "ALTER", standing.into_iter())?);
+            out.extend(mapping_statements(&target, "ADD", fresh.into_iter())?);
+            Ok(out)
+        }
+        (
+            SearchObject::Dictionary { options: was, .. },
+            SearchObject::Dictionary { options: now, .. },
+        ) => {
+            let mut items = Vec::new();
+            for (key, value) in now.iter().filter(|(k, v)| was.get(*k) != Some(*v)) {
+                items.push(format!(
+                    "{} = {}",
+                    crate::quote(key)?,
+                    crate::emit::literal(value)
+                ));
+            }
+            for key in was.keys().filter(|key| !now.contains_key(*key)) {
+                items.push(crate::quote(key)?);
+            }
+            if items.is_empty() {
+                return Ok(Vec::new());
+            }
+            Ok(vec![pbps_dialect::Statement::new(format!(
+                "ALTER TEXT SEARCH DICTIONARY {target} ({});",
+                items.join(", ")
+            ))])
+        }
+        _ => Err(invalid(format!(
+            "{} cannot be altered into another kind of object",
+            name.shown()
+        ))),
+    }
+}
+
+/// What stands on one object and keeps what the old behaviour computed: an index, a
+/// constraint (a check over the object), a stored generated column and a materialized view.
+/// A view, a plain default and a function are evaluated on use and are not here. A
+/// dictionary also answers for the configurations that map it (`pg_depend` holds that edge),
+/// whose dependents stale with it. Measured on 16 and 18 (DEC-2728.3): the catalog lists an
+/// expression index, a generated column's default, a check, a view and a materialized view
+/// over `'app.docs'::regconfig` as dependents of the configuration, and not a thesaurus's
+/// sub-dictionary, which the model reads from the options instead.
+const STALE: &str = "WITH subject(cls, oid) AS (
+        SELECT 'pg_catalog.pg_ts_config'::pg_catalog.regclass, c.oid
+          FROM pg_catalog.pg_ts_config c
+          JOIN pg_catalog.pg_namespace n ON n.oid = c.cfgnamespace
+         WHERE $1 = 'config' AND n.nspname = $2 AND c.cfgname = $3
+        UNION ALL
+        SELECT 'pg_catalog.pg_ts_dict'::pg_catalog.regclass, d.oid
+          FROM pg_catalog.pg_ts_dict d
+          JOIN pg_catalog.pg_namespace n ON n.oid = d.dictnamespace
+         WHERE $1 = 'dictionary' AND n.nspname = $2 AND d.dictname = $3
+     ), reach(cls, oid) AS (
+        SELECT cls, oid FROM subject
+        UNION
+        SELECT 'pg_catalog.pg_ts_config'::pg_catalog.regclass, x.objid
+          FROM subject s
+          JOIN pg_catalog.pg_depend x ON x.refclassid = s.cls AND x.refobjid = s.oid
+         WHERE x.classid = 'pg_catalog.pg_ts_config'::pg_catalog.regclass
+     )
+     SELECT DISTINCT CASE WHEN x.classid = 'pg_catalog.pg_rewrite'::pg_catalog.regclass
+                 THEN 'materialized view ' || (SELECT i.identity FROM pg_catalog.pg_identify_object(
+                        'pg_catalog.pg_class'::pg_catalog.regclass,
+                        (SELECT w.ev_class FROM pg_catalog.pg_rewrite w WHERE w.oid = x.objid), 0) i)
+                 ELSE (SELECT i.type || ' ' || i.identity
+                         FROM pg_catalog.pg_identify_object(x.classid, x.objid, x.objsubid) i)
+            END AS what
+       FROM reach r
+       JOIN pg_catalog.pg_depend x ON x.refclassid = r.cls AND x.refobjid = r.oid
+      WHERE (x.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+             AND EXISTS (SELECT 1 FROM pg_catalog.pg_class k
+                          WHERE k.oid = x.objid AND k.relkind IN ('i', 'I')))
+         OR x.classid = 'pg_catalog.pg_constraint'::pg_catalog.regclass
+         OR (x.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass
+             AND EXISTS (SELECT 1 FROM pg_catalog.pg_attrdef a
+                           JOIN pg_catalog.pg_attribute t
+                             ON t.attrelid = a.adrelid AND t.attnum = a.adnum
+                          WHERE a.oid = x.objid AND t.attgenerated = 's'))
+         OR (x.classid = 'pg_catalog.pg_rewrite'::pg_catalog.regclass
+             AND EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite w
+                           JOIN pg_catalog.pg_class k ON k.oid = w.ev_class
+                          WHERE w.oid = x.objid AND k.relkind = 'm'))
+      ORDER BY 1";
+
+/// For each of `subjects`, the dependents that would go stale if it changed in place, one
+/// line each, read from the target's `pg_depend` (DEC-2728.3). `standing` is what the target
+/// holds: a thesaurus names its sub-dictionary in its options and the catalog records no edge
+/// for it, so a dictionary also answers for the dictionaries that name it, transitively. Every
+/// subject has an entry, empty when nothing stands on it: an entry that is not there was not
+/// read.
+pub async fn stale_dependents(
+    conn: &mut pbps_db::Conn,
+    standing: &BTreeMap<SearchRef, SearchObject>,
+    subjects: &BTreeSet<SearchRef>,
+) -> Result<BTreeMap<SearchRef, Vec<String>>, pbps_db::DbError> {
+    let mut out = BTreeMap::new();
+    for subject in subjects {
+        let mut members = BTreeSet::from([subject.clone()]);
+        while let Some(user) = standing
+            .iter()
+            .filter(|(_, object)| matches!(object, SearchObject::Dictionary { .. }))
+            .find(|(name, object)| {
+                !members.contains(*name)
+                    && object.dictionaries().iter().any(|d| members.contains(d))
+            })
+            .map(|(name, _)| name.clone())
+        {
+            members.insert(user);
+        }
+        let mut lines = BTreeSet::new();
+        for member in &members {
+            let kind = match member.kind {
+                SearchKind::Config => "config",
+                SearchKind::Dictionary => "dictionary",
+            };
+            let rows = conn
+                .query_with(
+                    STALE,
+                    &[
+                        pbps_db::Param::Str(kind),
+                        pbps_db::Param::Str(member.name.schema()),
+                        pbps_db::Param::Str(member.name.name()),
+                    ],
+                )
+                .await?;
+            for row in &rows {
+                lines.insert(row.try_get::<&str>("what")?.unwrap_or_default().to_owned());
+            }
+        }
+        out.insert(subject.clone(), lines.into_iter().collect());
+    }
+    Ok(out)
 }
 
 /// `DROP TEXT SEARCH ... RESTRICT`: the engine refuses it while anything depends on the
@@ -919,6 +1106,106 @@ mod tests {
             },
         );
         assert_eq!(emitted(&bare).len(), 1);
+    }
+
+    fn alter_change(name: &str, before: SearchObject, after: SearchObject) -> pbps_model::Change {
+        let (uid, name) = ("s_aaaaaa".parse().unwrap(), name.parse().unwrap());
+        let (before, after) = (Box::new(before), Box::new(after));
+        pbps_model::Change::Search(if matches!(after.as_ref(), SearchObject::Config { .. }) {
+            pbps_model::SearchChange::AlterSearchMapping {
+                uid,
+                name,
+                before,
+                after,
+            }
+        } else {
+            pbps_model::SearchChange::AlterSearchDictionary {
+                uid,
+                name,
+                before,
+                after,
+            }
+        })
+    }
+
+    fn mapped(entries: &[(&str, &[&str])]) -> SearchObject {
+        SearchObject::Config {
+            parser: t("pg_catalog.\"default\""),
+            mappings: entries
+                .iter()
+                .map(|(alias, used)| ((*alias).to_owned(), used.iter().map(|d| n(d)).collect()))
+                .collect(),
+        }
+    }
+
+    /// A configuration is brought to its new mappings with the one verb each token type
+    /// needs: `ADD` for a new one, `ALTER` for a changed list (the engine's `ALTER` on an
+    /// unmapped token type does nothing, and `ADD` on a mapped one fails), `DROP` for a given
+    /// up one; token types that share a list share a statement; an unchanged one is not
+    /// mentioned. No statement carries an identity, since none is created or dropped.
+    /// Negative: two configurations that are the same emit nothing.
+    #[test]
+    fn a_configuration_alter_uses_the_verb_each_token_type_needs() {
+        let before = mapped(&[
+            ("asciiword", &["app.a", "pg_catalog.simple"]),
+            ("word", &["app.a"]),
+            ("email", &["pg_catalog.simple"]),
+            ("url", &["pg_catalog.simple"]),
+        ]);
+        let after = mapped(&[
+            ("asciiword", &["pg_catalog.simple", "app.a"]),
+            ("word", &["pg_catalog.simple", "app.a"]),
+            ("email", &["pg_catalog.simple"]),
+            ("int", &["pg_catalog.simple"]),
+            ("uint", &["pg_catalog.simple"]),
+        ]);
+        let sql = emitted(&alter_change(
+            "config app.docs",
+            before.clone(),
+            after.clone(),
+        ));
+        assert_eq!(
+            sql.iter().map(|s| s.sql.as_str()).collect::<Vec<_>>(),
+            [
+                "ALTER TEXT SEARCH CONFIGURATION \"app\".\"docs\" DROP MAPPING FOR \"url\";",
+                "ALTER TEXT SEARCH CONFIGURATION \"app\".\"docs\" ALTER MAPPING FOR \"asciiword\", \"word\" WITH \"pg_catalog\".\"simple\", \"app\".\"a\";",
+                "ALTER TEXT SEARCH CONFIGURATION \"app\".\"docs\" ADD MAPPING FOR \"int\", \"uint\" WITH \"pg_catalog\".\"simple\";",
+            ]
+        );
+        assert!(sql.iter().all(|s| s.search.is_none()));
+        assert!(emitted(&alter_change("config app.docs", after.clone(), after)).is_empty());
+    }
+
+    /// A dictionary is one `ALTER` that writes each option that is new or changed with a quoted
+    /// value and names, without one, each option given up (the engine's removal). An option
+    /// that is the same is not written. Negative: an alteration into another kind of object is
+    /// an error and not a statement.
+    #[test]
+    fn a_dictionary_alter_writes_what_changed_and_removes_what_went() {
+        let object = |options: &[(&str, &str)]| SearchObject::Dictionary {
+            template: t("pg_catalog.simple"),
+            options: options
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        };
+        let sql = emitted(&alter_change(
+            "dictionary app.words",
+            object(&[("accept", "false"), ("stopwords", "english"), ("same", "x")]),
+            object(&[("stopwords", "it's"), ("same", "x"), ("synonyms", "s")]),
+        ));
+        assert_eq!(
+            sql.iter().map(|s| s.sql.as_str()).collect::<Vec<_>>(),
+            [
+                "ALTER TEXT SEARCH DICTIONARY \"app\".\"words\" (\"stopwords\" = 'it''s', \"synonyms\" = 's', \"accept\");"
+            ]
+        );
+        let error = super::alter(
+            &"dictionary app.words".parse().unwrap(),
+            &object(&[]),
+            &mapped(&[]),
+        );
+        assert!(error.is_err());
     }
 
     /// A drop is `RESTRICT` with no `IF EXISTS`: the engine refuses it while anything names the

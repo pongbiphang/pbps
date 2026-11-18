@@ -336,6 +336,40 @@ pub enum SearchChange {
         name: crate::SearchRef,
         definition: Box<crate::SearchObject>,
     },
+    /// `ALTER TEXT SEARCH CONFIGURATION ... ADD / ALTER / DROP MAPPING` of a standing
+    /// configuration whose mappings differ and whose parser does not (DEC-2728.3). Both sides
+    /// are the whole definition, so the emit finds the token types it adds, changes or drops
+    /// from them and the plan checksum pins what was compared.
+    AlterSearchMapping {
+        uid: Uid,
+        name: crate::SearchRef,
+        before: Box<crate::SearchObject>,
+        after: Box<crate::SearchObject>,
+    },
+    /// `ALTER TEXT SEARCH DICTIONARY ... (options)` of a standing dictionary whose options
+    /// differ and whose template does not (DEC-2728.3). Shaped like
+    /// [`SearchChange::AlterSearchMapping`].
+    AlterSearchDictionary {
+        uid: Uid,
+        name: crate::SearchRef,
+        before: Box<crate::SearchObject>,
+        after: Box<crate::SearchObject>,
+    },
+}
+
+impl SearchChange {
+    /// The object the change creates or alters, as its definition now stands in the plan
+    /// (`None` for a drop).
+    #[must_use]
+    pub fn result(&self) -> Option<&crate::SearchObject> {
+        match self {
+            Self::CreateSearch { definition, .. } => Some(definition),
+            Self::AlterSearchMapping { after, .. } | Self::AlterSearchDictionary { after, .. } => {
+                Some(after)
+            }
+            Self::DropSearch { .. } => None,
+        }
+    }
 }
 
 /// The kinds of change of the `extensions` family (DEC-2790.1).
@@ -1955,6 +1989,8 @@ impl Change {
             | Change::Type(TypeChange::DropType { name, .. }) => name.raw().to_string(),
             Change::Type(TypeChange::RenameType { from, .. }) => from.raw().to_string(),
             Change::Search(SearchChange::CreateSearch { name, .. })
+            | Change::Search(SearchChange::AlterSearchMapping { name, .. })
+            | Change::Search(SearchChange::AlterSearchDictionary { name, .. })
             | Change::Search(SearchChange::DropSearch { name, .. }) => name.raw().to_string(),
             Change::Role(RoleChange::CreateRole { name, .. })
             | Change::Role(RoleChange::DropRole { name, .. })
@@ -3461,6 +3497,8 @@ Change::Partition(PartitionChange::CopyTableRows(_)) | Change::Partition(Partiti
             | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
             | Change::Type(TypeChange::CreateType { .. })
             | Change::Search(SearchChange::CreateSearch { .. })
+            | Change::Search(SearchChange::AlterSearchMapping { .. })
+            | Change::Search(SearchChange::AlterSearchDictionary { .. })
             | Change::Role(RoleChange::CreateRole { .. })
             // A replica identity changes what logical replication carries to
             // name an old row, not a row or an access: no class here gates it

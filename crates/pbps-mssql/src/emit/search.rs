@@ -5,11 +5,12 @@ use super::*;
 
 pub(super) fn emit(search: &SearchChange) -> Sql {
     match search {
-        SearchChange::CreateSearch { name, .. } | SearchChange::DropSearch { name, .. } => {
-            Err(DialectError::Unsupported {
-                dialect: crate::types::DIALECT,
-                feature: format!("{}", name.shown()),
-            })
-        }
+        SearchChange::CreateSearch { name, .. }
+        | SearchChange::AlterSearchMapping { name, .. }
+        | SearchChange::AlterSearchDictionary { name, .. }
+        | SearchChange::DropSearch { name, .. } => Err(DialectError::Unsupported {
+            dialect: crate::types::DIALECT,
+            feature: format!("{}", name.shown()),
+        }),
     }
 }

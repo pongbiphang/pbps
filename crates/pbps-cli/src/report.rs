@@ -1583,6 +1583,54 @@ fn comment_preview(text: &pbps_model::Text) -> String {
     format!("\"{}{cut}\"", Escaped(&head))
 }
 
+/// The server files a dictionary reads, as a note for its plan line, or nothing.
+fn server_files_note(definition: &pbps_model::SearchObject) -> String {
+    let files = definition.server_files();
+    if files.is_empty() {
+        return String::new();
+    }
+    format!(
+        " (reads server file {}, which pbps does not manage)",
+        files
+            .iter()
+            .map(|(option, file)| format!("`{}` for {}", Escaped(file), Escaped(option)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// What an in-place change of a text search object touches: the token types a configuration
+/// adds, changes or gives up, or the options a dictionary writes or removes.
+fn changed_parts(before: &pbps_model::SearchObject, after: &pbps_model::SearchObject) -> String {
+    use pbps_model::SearchObject::{Config, Dictionary};
+    let (word, parts): (&str, Vec<&String>) = match (before, after) {
+        (Config { mappings: was, .. }, Config { mappings: now, .. }) => (
+            "mappings",
+            was.keys()
+                .chain(now.keys())
+                .filter(|alias| was.get(*alias) != now.get(*alias))
+                .collect(),
+        ),
+        (Dictionary { options: was, .. }, Dictionary { options: now, .. }) => (
+            "options",
+            was.keys()
+                .chain(now.keys())
+                .filter(|key| was.get(*key) != now.get(*key))
+                .collect(),
+        ),
+        _ => ("object", Vec::new()),
+    };
+    let parts: std::collections::BTreeSet<_> = parts.into_iter().collect();
+    format!(
+        "{word}: {}",
+        parts
+            .iter()
+            .map(|part| Escaped(part).to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 pub fn describe(c: &Change) -> String {
     match c {
         Change::Partition(PartitionChange::RebuildPartitionedTable(_))
@@ -1748,22 +1796,7 @@ pub fn describe(c: &Change) -> String {
             unresolved,
             ..
         }) => {
-            let files = definition.server_files();
-            let mut note = String::new();
-            if !files.is_empty() {
-                note = format!(
-                    " (reads server file {}, which pbps does not manage)",
-                    files
-                        .iter()
-                        .map(|(option, file)| format!(
-                            "`{}` for {}",
-                            Escaped(file),
-                            Escaped(option)
-                        ))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
+            let mut note = server_files_note(definition);
             // An offline plan could not look for these; the plan against the database does.
             if !unresolved.is_empty() {
                 note.push_str(&format!(
@@ -1778,6 +1811,23 @@ pub fn describe(c: &Change) -> String {
             }
             format!("+ create {}{note}", name.shown())
         }
+        Change::Search(SearchChange::AlterSearchMapping {
+            name,
+            before,
+            after,
+            ..
+        })
+        | Change::Search(SearchChange::AlterSearchDictionary {
+            name,
+            before,
+            after,
+            ..
+        }) => format!(
+            "~ alter {} ({}){}",
+            name.shown(),
+            changed_parts(before, after),
+            server_files_note(after)
+        ),
         Change::Search(SearchChange::DropSearch { name, .. }) => format!("- drop {}", name.shown()),
         // A partition has no columns of its own to count; what it is, is its
         // parent and the rows it takes (#1170).
@@ -3775,6 +3825,89 @@ mod offline_base_tests {
         assert_eq!(
             offline_plan(&cs, &names, Some(("HEAD", "abcdef0123")), "unused"),
             plan(&cs, &names)
+        );
+    }
+}
+
+#[cfg(test)]
+mod search_alteration_tests {
+    use super::*;
+    use pbps_model::{SearchObject, SearchRef};
+
+    fn config(mapped: &[(&str, &str)]) -> SearchObject {
+        SearchObject::Config {
+            parser: "pg_catalog.\"default\"".parse().unwrap(),
+            mappings: mapped
+                .iter()
+                .map(|(alias, d)| ((*alias).to_owned(), vec![d.parse().unwrap()]))
+                .collect(),
+        }
+    }
+
+    fn dictionary(options: &[(&str, &str)]) -> SearchObject {
+        SearchObject::Dictionary {
+            template: "pg_catalog.simple".parse().unwrap(),
+            options: options
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        }
+    }
+
+    fn line(name: &str, before: SearchObject, after: SearchObject) -> String {
+        let name: SearchRef = name.parse().unwrap();
+        let uid = "s_aaaaaa".parse().unwrap();
+        let (before, after) = (Box::new(before), Box::new(after));
+        describe(&Change::Search(
+            if name.kind == pbps_model::SearchKind::Config {
+                SearchChange::AlterSearchMapping {
+                    uid,
+                    name,
+                    before,
+                    after,
+                }
+            } else {
+                SearchChange::AlterSearchDictionary {
+                    uid,
+                    name,
+                    before,
+                    after,
+                }
+            },
+        ))
+    }
+
+    /// The plan line of an alteration names the token types or options it touches, each once
+    /// and in order, and the server files the new options read. Negative: a token type or
+    /// option that is the same on both sides is not named.
+    #[test]
+    fn an_alteration_names_what_it_touches_and_not_what_it_leaves() {
+        let said = line(
+            "config app.docs",
+            config(&[
+                ("word", "app.a"),
+                ("email", "pg_catalog.simple"),
+                ("url", "app.a"),
+            ]),
+            config(&[
+                ("word", "app.b"),
+                ("email", "pg_catalog.simple"),
+                ("int", "app.a"),
+            ]),
+        );
+        assert_eq!(
+            said,
+            "~ alter text search configuration `app.docs` (mappings: int, url, word)"
+        );
+        let said = line(
+            "dictionary app.solo",
+            dictionary(&[("accept", "false"), ("same", "x")]),
+            dictionary(&[("same", "x"), ("stopwords", "english")]),
+        );
+        assert_eq!(
+            said,
+            "~ alter text search dictionary `app.solo` (options: accept, stopwords) \
+             (reads server file `english` for stopwords, which pbps does not manage)"
         );
     }
 }
