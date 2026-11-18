@@ -7000,6 +7000,47 @@ pub(crate) fn dropped_search<'a>(
         .collect()
 }
 
+/// The text search objects a plan frees from a package whose dictionaries live in
+/// `package_schema` (DEC-2728.2, DEC-2728.3): the ones it drops, and a configuration it keeps
+/// and alters so that it stops mapping a dictionary the project does not hold, none of which
+/// is left in that schema. The alteration (class 7) runs before the package's removal, so the
+/// engine no longer sees the dependency. A configuration that still maps a dictionary this
+/// plan cannot place elsewhere (not held, not `pg_catalog`, in the package's schema) is a
+/// "may still depend", which stays refused: a yes here is only ever too cautious.
+pub(crate) fn released_search<'a>(
+    base: Side<'a>,
+    declared: Side<'_>,
+    package_schema: &str,
+) -> std::collections::BTreeSet<&'a pbps_model::SearchRef> {
+    let held = |used: &pbps_model::SearchRef| {
+        declared.schema.search.contains_key(used) || base.schema.search.contains_key(used)
+    };
+    let package_owned = |used: &pbps_model::SearchRef| {
+        !held(used) && used.name.schema() != "pg_catalog" && used.name.schema() == package_schema
+    };
+    let mut released = dropped_search(base, declared);
+    for (uid, name) in &base.ids.search {
+        let (Some(was), Some(kept)) = (
+            base.schema.search.get(name),
+            declared
+                .ids
+                .search
+                .get(uid)
+                .and_then(|kept| declared.schema.search.get(kept)),
+        ) else {
+            continue;
+        };
+        let (was, now) = (was.dictionaries(), kept.dictionaries());
+        if name.kind == pbps_model::SearchKind::Config
+            && was.iter().any(&package_owned)
+            && !now.iter().any(&package_owned)
+        {
+            released.insert(name);
+        }
+    }
+    released
+}
+
 /// Text search configurations and dictionaries, by kind and name (DEC-2728.1, DEC-2728.2).
 /// A declared object the target lacks is created and one the declarations gave up is
 /// dropped, both by recorded identity, and a standing one whose mappings or options differ is

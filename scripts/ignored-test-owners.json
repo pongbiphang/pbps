@@ -935,6 +935,7 @@
         "text_search2728::declared_text_search_objects_are_created_in_order_and_dropped_with_a_reason",
         "text_search2728::a_missing_dictionary_is_refused_and_a_server_file_is_named_and_checked_by_the_create",
         "text_search2728::a_configuration_over_a_package_dictionary_is_retired_with_the_package",
+        "text_search2728::a_configuration_altered_away_from_a_package_dictionary_frees_the_package",
         "text_search2728::a_staged_create_stopped_after_the_configuration_exists_resumes",
         "text_search2728::a_declaration_that_adopts_an_existing_object_is_recorded_and_verifies",
         "text_search2728::a_standing_configuration_and_dictionary_are_altered_in_place_and_the_replan_is_empty",

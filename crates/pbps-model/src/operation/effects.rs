@@ -1645,9 +1645,13 @@ impl Cx<'_> {
                 for id in releases {
                     self.requires(Requirement::Absent(ObjectKey::Module(id.clone())));
                 }
-                // So is a configuration that maps a dictionary the package provides.
+                // So is a configuration that maps a dictionary the package provides, when
+                // the plan drops it. One it keeps and alters away from the package stands:
+                // its alteration is class 7 and runs before this drop (DEC-2728.3).
                 for name in search_releases {
-                    if let Some(uid) = self.before.ids.search_uid(name) {
+                    if let Some(uid) = self.before.ids.search_uid(name)
+                        && !self.after.ids.search.contains_key(uid)
+                    {
                         self.requires(Requirement::Absent(ObjectKey::Search(Recorded(
                             uid.clone(),
                         ))));

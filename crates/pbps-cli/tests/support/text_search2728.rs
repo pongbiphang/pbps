@@ -907,6 +907,119 @@ fn a_configuration_over_a_package_dictionary_is_retired_with_the_package() {
     }
 }
 
+/// A configuration the project keeps, altered to stop mapping the package's dictionary, frees
+/// the package for its removal in the same plan: the alteration (class 7) runs before the drop
+/// (class 18), so the engine's `RESTRICT` sees no dependency, and the re-plan is empty. A
+/// configuration that still maps the package's dictionary stays refused, naming it (DEC-2728.3).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_configuration_altered_away_from_a_package_dictionary_frees_the_package() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        let f = Fixture::new(
+            &server,
+            "search2728g",
+            Kind::Supplied,
+            &Options {
+                externals: Some(
+                    "CREATE SCHEMA IF NOT EXISTS ext; CREATE EXTENSION dict_int SCHEMA ext",
+                ),
+                unselected: true,
+                ..Options::default()
+            },
+        );
+        succeeds(f.d.run(&[
+            "pull",
+            "--force",
+            "--db",
+            f.target(),
+            "--extension",
+            "dict_int",
+        ]));
+        f.d.commit();
+        succeeds(f.d.run(&[
+            "baseline",
+            "--db",
+            f.target(),
+            "--reason",
+            "adopt the package",
+        ]));
+        let mapping = |dictionary: &str| {
+            format!(
+                "text_search_config: app.sdocs\nparser: pg_catalog.default\nmappings:\n  \
+                 asciiword: [{dictionary}]\n"
+            )
+        };
+        declare(
+            &f.d,
+            "app.sdocs.textsearch-config.yml",
+            &mapping("ext.intdict"),
+        );
+        succeeds(f.d.run(&["plan"]));
+        f.d.commit();
+        succeeds(f.plan(&[]));
+        succeeds(f.apply("destructive"));
+        // The package is given up while the configuration keeps mapping its dictionary: refused,
+        // naming the configuration.
+        std::fs::remove_file(f.d.dir.join("schema/extensions/dict_int.yml")).unwrap();
+        succeeds(f.d.run(&["intent", "--drop-extension", "dict_int", "retired"]));
+        f.d.commit();
+        let refused = f.plan(&[]);
+        assert_ne!(code(&refused), 0, "{}", said(&refused));
+        assert!(
+            said(&refused).contains("text search configuration app.sdocs"),
+            "{}",
+            said(&refused)
+        );
+        // Altered away from it, the same plan is valid: the alteration first, then the drop.
+        declare(
+            &f.d,
+            "app.sdocs.textsearch-config.yml",
+            &mapping("pg_catalog.simple"),
+        );
+        let planned = f.plan(&[]);
+        assert_eq!(code(&planned), 0, "{}", said(&planned));
+        let order = subjects(&f.artifact());
+        let kinds: Vec<String> = {
+            let saved: pbps_model::SavedPlan =
+                serde_json::from_slice(&std::fs::read(f.artifact()).unwrap()).unwrap();
+            saved
+                .changes
+                .changes
+                .iter()
+                .map(|p| format!("{:?}", p.change))
+                .collect()
+        };
+        let alter = kinds
+            .iter()
+            .position(|k| k.starts_with("AlterSearchMapping"))
+            .unwrap_or_else(|| panic!("no AlterSearchMapping in {order:?}"));
+        let package = kinds
+            .iter()
+            .position(|k| k.starts_with("DropExtension"))
+            .unwrap_or_else(|| panic!("no DropExtension in {order:?}"));
+        assert!(alter < package, "{order:?}");
+        succeeds(f.apply("destructive"));
+        assert_eq!(
+            scalar(
+                f.target(),
+                "SELECT count(*) FROM pg_extension WHERE extname = 'dict_int'"
+            ),
+            0
+        );
+        assert_eq!(
+            scalar(
+                f.target(),
+                "SELECT count(*) FROM pg_ts_config_map m JOIN pg_ts_config c ON c.oid = m.mapcfg \
+                 JOIN pg_ts_dict d ON d.oid = m.mapdict \
+                 WHERE c.cfgname = 'sdocs' AND d.dictname = 'simple'"
+            ),
+            1
+        );
+        f.d.commit();
+        no_changes(&succeeds(f.d.run(&["plan", "--db", f.target()])));
+    }
+}
+
 /// A staged plan is one logical change, so a configuration's create is the case a stop can
 /// split: `CREATE` and then one `ADD MAPPING` per group. Stopped after the `CREATE`, the
 /// checkpoint holds the configuration as the database holds it, and `--resume` finishes the
@@ -1383,5 +1496,59 @@ fn a_string_bodied_function_that_names_the_object_stops_an_alteration_and_one_th
             said(&out)
         );
         assert_eq!(options_of(db, "solo"), "stopwords = 'german'");
+        // A configuration the project does not hold (a custom parser) that maps the
+        // dictionary is read from the catalog, not from the held model. Negative first: one
+        // that maps another dictionary, named by a function under a materialized view, stops
+        // nothing.
+        let extra = SOLO.replace("app.solo", "app.extra");
+        declare(&d, "app.solo.textsearch-dictionary.yml", SOLO);
+        declare(&d, "app.extra.textsearch-dictionary.yml", &extra);
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        declare(
+            &d,
+            "app.solo.textsearch-dictionary.yml",
+            &SOLO.replace("english", "german"),
+        );
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        succeeds(apply_plan(&d, db, &path, false));
+        on_server(
+            db,
+            "CREATE TEXT SEARCH PARSER app.oobparser (START = prsd_start, GETTOKEN = prsd_nexttoken, END = prsd_end, LEXTYPES = prsd_lextype); \
+             CREATE TEXT SEARCH CONFIGURATION app.oob_far (PARSER = app.oobparser); \
+             ALTER TEXT SEARCH CONFIGURATION app.oob_far ADD MAPPING FOR word WITH pg_catalog.simple; \
+             CREATE FUNCTION app.f_far(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.oob_far', t) $$; \
+             CREATE MATERIALIZED VIEW app.mv_far AS SELECT app.f_far(body) AS x FROM app.loose",
+        );
+        declare(
+            &d,
+            "app.extra.textsearch-dictionary.yml",
+            &extra.replace("english", "german"),
+        );
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        succeeds(apply_plan(&d, db, &path, false));
+        // Now one that maps the dictionary: the alteration is refused, naming it.
+        on_server(
+            db,
+            "CREATE TEXT SEARCH CONFIGURATION app.oob_maps (PARSER = app.oobparser); \
+             ALTER TEXT SEARCH CONFIGURATION app.oob_maps ADD MAPPING FOR word WITH app.extra; \
+             CREATE FUNCTION app.f_maps(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.oob_maps', t) $$; \
+             CREATE MATERIALIZED VIEW app.mv_maps AS SELECT app.f_maps(body) AS x FROM app.loose",
+        );
+        declare(&d, "app.extra.textsearch-dictionary.yml", &extra);
+        let out = d.run(&["plan", "--db", db]);
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        assert!(
+            said(&out).contains(
+                "materialized view app.mv_maps (reached through function app.f_maps(pg_catalog.text), named in its body)"
+            ),
+            "{}",
+            said(&out)
+        );
+        assert!(
+            !said(&out).contains("through function app.f_far"),
+            "{}",
+            said(&out)
+        );
     }
 }

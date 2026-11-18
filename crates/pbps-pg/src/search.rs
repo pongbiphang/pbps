@@ -656,6 +656,17 @@ const BODIES: &str = "WITH RECURSIVE stored(cls, oid) AS (
         AND l.lanname NOT IN ('internal', 'c')
       ORDER BY 1, 2";
 
+/// The configurations, of any parser and whoever declared them, that map one dictionary: the
+/// names a function's text may spell to reach it (`pg_ts_config_map` holds one row per token
+/// type).
+const MAPPING_CONFIGS: &str = "SELECT DISTINCT c.cfgname AS name
+       FROM pg_catalog.pg_ts_config_map m
+       JOIN pg_catalog.pg_ts_config c ON c.oid = m.mapcfg
+       JOIN pg_catalog.pg_ts_dict d ON d.oid = m.mapdict
+       JOIN pg_catalog.pg_namespace n ON n.oid = d.dictnamespace
+      WHERE n.nspname = $1 AND d.dictname = $2
+      ORDER BY 1";
+
 /// The census lines a function's string body adds: every stored dependent that calls a
 /// function whose text names one of `names` (DEC-2728.3). `rows` are `(dependent, function,
 /// body)` from [`BODIES`]. A name counts when the body holds it as a whole identifier, or the
@@ -716,21 +727,26 @@ pub async fn stale_dependents(
         }
         let mut lines = BTreeSet::new();
         // What a function's text may spell to reach the object: its own name and, for a
-        // dictionary, the name of each configuration that maps it (a thesaurus's
+        // dictionary, the name of each configuration that maps it, read from the catalog
+        // and not from the held model: a configuration with a parser the project does not
+        // hold, or one it never declared, maps it all the same (a thesaurus's
         // sub-dictionary is a member already).
         let mut names = BTreeSet::new();
         for member in &members {
             names.insert(member.name.name().to_owned());
             if member.kind == SearchKind::Dictionary {
-                names.extend(
-                    standing
-                        .iter()
-                        .filter(|(name, object)| {
-                            name.kind == SearchKind::Config
-                                && object.dictionaries().contains(member)
-                        })
-                        .map(|(name, _)| name.name.name().to_owned()),
-                );
+                let rows = conn
+                    .query_with(
+                        MAPPING_CONFIGS,
+                        &[
+                            pbps_db::Param::Str(member.name.schema()),
+                            pbps_db::Param::Str(member.name.name()),
+                        ],
+                    )
+                    .await?;
+                for row in &rows {
+                    names.insert(row.try_get::<&str>("name")?.unwrap_or_default().to_owned());
+                }
             }
         }
         lines.extend(named_in_bodies(bodies, &names));

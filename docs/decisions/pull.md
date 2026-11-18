@@ -1689,7 +1689,9 @@ options that changed and the plan checksum pins what was compared.
   is the whole-identifier read of `generated::may_call` (DEC-1364.1): a bare name folds
   ASCII case, a quoted one is exact, the same read inside a string literal counts
   (`'app.docs'::regconfig`), and the schema is not compared, so a match is a "may". For a
-  dictionary the names are its own, a thesaurus's, and each configuration that maps it.
+  dictionary the names are its own, a thesaurus's, and each configuration that maps it, read
+  from `pg_ts_config_map` and not from the model: a configuration with a custom parser, or one
+  the project never declared, maps the dictionary all the same.
   **The limit:** a function that builds the name at run time (`EXECUTE`, `format`,
   concatenation) and never spells it is outside what the catalog can show, and the census
   does not refuse for it. Refusing every string-bodied function would block any database
@@ -1706,6 +1708,15 @@ options that changed and the plan checksum pins what was compared.
   `Is(Final)` of each dictionary it now maps. A dictionary the plan drops is dropped in class
   18 after the configuration stopped mapping it; the drop waits (`Absent`) only for the
   configurations that go away or still map it.
+- **A package's removal.** A configuration the plan keeps and alters so that it stops mapping
+  a dictionary of a package the same plan drops frees the package, as one the plan drops does
+  (`DropExtension.search_releases`). Measured on 16.15 and 18.6: `ALTER` or `DROP MAPPING` away
+  from the dictionary, then `DROP EXTENSION` without `CASCADE`, succeeds; in the other order, or
+  while any token type still maps it, the engine refuses. The alteration is class 7 and the
+  drop class 18, so the order holds, and only a configuration the plan drops is waited for
+  (`Absent`). The differ takes the dictionaries of the package to be the ones neither the
+  project nor the target model holds, outside `pg_catalog`, in the package's schema: a "may"
+  that errs toward refusing.
 - **Risk.** No new class: an alteration is listed and gated like a create, and what it could
   corrupt silently is refused instead.
 - **Recording.** The state keeps the object as the database holds it after the apply,

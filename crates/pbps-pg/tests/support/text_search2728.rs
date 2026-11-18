@@ -306,8 +306,8 @@ async fn a_stored_dependent_behind_a_view_or_a_function_is_found_and_a_read_only
 /// that names the object is listed with that function. Negatives: a body that names another
 /// object, a quoted name of another case, a body that only builds the name at run time (the
 /// limit the decision states) and a function used by no stored dependent list nothing; a
-/// dictionary answers for the name of a configuration that maps it, and one nothing maps does
-/// not.
+/// dictionary answers for the name of a configuration that maps it, read from the catalog (one
+/// of a custom parser, not held, included), and one nothing maps does not.
 #[tokio::test]
 #[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
 async fn a_stored_dependent_of_a_function_whose_body_names_the_object_is_found() {
@@ -319,7 +319,7 @@ async fn a_stored_dependent_of_a_function_whose_body_names_the_object_is_found()
             "c_sql", "c_pl", "c_wrap", "c_view", "c_none", "c_q", "c_dyn", "c_unused", "other",
         ] {
             db.run(&format!(
-                "CREATE TEXT SEARCH CONFIGURATION {config} (COPY = app.c1)"
+                "CREATE TEXT SEARCH CONFIGURATION {config} (COPY = pg_catalog.simple)"
             ))
             .await;
         }
@@ -388,7 +388,22 @@ async fn a_stored_dependent_of_a_function_whose_body_names_the_object_is_found()
         }
         // A dictionary answers for the name of the configuration that maps it.
         db.run("CREATE FUNCTION f_d(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.c1', t) $$; CREATE INDEX ix_d ON docs USING gin (f_d(body))").await;
-        for (dictionary, stored) in [("d1", vec![by("f_d", "index app.ix_d")]), ("d2", vec![])] {
+        // So does a configuration the project does not hold, a custom parser's here: the
+        // catalog says what maps the dictionary, not the held model. One that maps another
+        // dictionary does not make it answer.
+        db.run("CREATE TEXT SEARCH PARSER myparser (START = prsd_start, GETTOKEN = prsd_nexttoken, END = prsd_end, LEXTYPES = prsd_lextype); CREATE TEXT SEARCH CONFIGURATION c_custom (PARSER = myparser); ALTER TEXT SEARCH CONFIGURATION c_custom ADD MAPPING FOR word WITH d1; CREATE TEXT SEARCH CONFIGURATION c_other (PARSER = myparser); ALTER TEXT SEARCH CONFIGURATION c_other ADD MAPPING FOR word WITH d2").await;
+        db.run("CREATE FUNCTION f_custom(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.c_custom', t) $$; CREATE INDEX ix_custom ON docs USING gin (f_custom(body))").await;
+        db.run("CREATE FUNCTION f_far(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.c_other', t) $$; CREATE INDEX ix_far ON docs USING gin (f_far(body))").await;
+        for (dictionary, stored) in [
+            (
+                "d1",
+                vec![
+                    by("f_custom", "index app.ix_custom"),
+                    by("f_d", "index app.ix_d"),
+                ],
+            ),
+            ("d2", vec![by("f_far", "index app.ix_far")]),
+        ] {
             let subject: std::collections::BTreeSet<SearchRef> =
                 [format!("dictionary app.{dictionary}").parse().unwrap()].into();
             let found = census(
@@ -397,14 +412,22 @@ async fn a_stored_dependent_of_a_function_whose_body_names_the_object_is_found()
                     .unwrap(),
             );
             assert_eq!(found, stored, "{dictionary}");
+            // The held model adds nothing the catalog does not say: with none held, the same.
+            let found = census(
+                pbps_pg::search::stale_dependents(db.conn(), &Default::default(), &subject)
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(found, stored, "{dictionary}, none held");
         }
-        // Without the held configuration the name is not known to map it: the census cannot
-        // say, which is the offline plan's refusal, not an empty answer here.
+        // Negative: a dictionary nothing maps answers for no name.
+        db.run("CREATE TEXT SEARCH DICTIONARY d3 (TEMPLATE = simple)")
+            .await;
         let subject: std::collections::BTreeSet<SearchRef> =
-            ["dictionary app.d1".parse().unwrap()].into();
+            ["dictionary app.d3".parse().unwrap()].into();
         assert!(
             census(
-                pbps_pg::search::stale_dependents(db.conn(), &Default::default(), &subject)
+                pbps_pg::search::stale_dependents(db.conn(), &standing, &subject)
                     .await
                     .unwrap()
             )

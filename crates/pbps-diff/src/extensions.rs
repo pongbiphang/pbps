@@ -148,9 +148,6 @@ pub fn drops(
         })
         .flatten()
         .collect();
-    // The text search objects the plan drops (DEC-2728.2): a configuration that maps a
-    // dictionary of the package blocks its removal until it is gone.
-    let removed_search = crate::schema_diff::dropped_search(base, desired);
     let (mut changes, mut errors) = (Vec::new(), Vec::new());
     for (name, (uid, definition)) in &dropped {
         let Some(facts) = facts.get(*name) else {
@@ -163,6 +160,10 @@ pub fn drops(
             (BTreeSet::new(), BTreeSet::new(), Vec::new());
         let mut index_releases = BTreeSet::new();
         let mut search_releases = BTreeSet::new();
+        // The text search objects the plan frees from the package (DEC-2728.2, DEC-2728.3): a
+        // configuration that maps a dictionary of the package blocks its removal until it is
+        // gone, or altered away from it.
+        let removed_search = crate::schema_diff::released_search(base, desired, &definition.schema);
         for member in &facts.outside {
             match member.module(removed.iter().copied()) {
                 Some(id) => {
@@ -1538,6 +1539,78 @@ mod tests {
         let other = member("text search dictionary", &["app", "docs"]);
         let (changes, errors) = w.drops(&facts("dict_int", &[], &[other]));
         assert!(changes.is_empty() && !errors.is_empty(), "{errors:?}");
+    }
+
+    /// A configuration the plan keeps and alters so that it stops mapping the package's
+    /// dictionary frees the package, as one it drops does (DEC-2728.3). Negatives: one that
+    /// still maps a dictionary in the package's schema, and one left as it was, stay refused.
+    #[test]
+    fn a_configuration_altered_away_from_the_package_releases_it_and_one_still_mapping_it_does_not()
+    {
+        use pbps_model::{SearchObject, SearchRef, Uid, UidKind};
+        let name: SearchRef = "config app.docs".parse().unwrap();
+        let config = |mapped: &[&str]| SearchObject::Config {
+            parser: "pg_catalog.\"default\"".parse().unwrap(),
+            mappings: [(
+                "word".to_owned(),
+                mapped.iter().map(|d| d.parse().unwrap()).collect(),
+            )]
+            .into(),
+        };
+        let blocker = member("text search configuration", &["app", "docs"]);
+        let blockers = facts("dict_int", &[], std::slice::from_ref(&blocker));
+        let mut w = world(&["dict_int"], &["dict_int"], &[]);
+        let search_uid = Uid::generate(UidKind::Search);
+        w.base.search.insert(name.clone(), config(&["ext.intdict"]));
+        w.base_ids.search.insert(search_uid.clone(), name.clone());
+        w.desired_ids.search.insert(search_uid, name.clone());
+        let released = |w: &World, desired: SearchObject| {
+            let mut w = World {
+                base: w.base.clone(),
+                base_ids: w.base_ids.clone(),
+                desired: w.desired.clone(),
+                desired_ids: w.desired_ids.clone(),
+            };
+            w.desired.search.insert(name.clone(), desired);
+            w.drops(&blockers)
+        };
+        // Kept and altered to map a built-in dictionary: released, and carried by name.
+        let (changes, errors) = released(&w, config(&["pg_catalog.simple"]));
+        assert!(errors.is_empty(), "{errors:?}");
+        let [
+            pbps_model::Change::Extension(pbps_model::ExtensionChange::DropExtension {
+                search_releases,
+                ..
+            }),
+        ] = changes.as_slice()
+        else {
+            panic!("{changes:?}")
+        };
+        assert_eq!(search_releases.iter().collect::<Vec<_>>(), [&name]);
+        // A dictionary of another schema (another package's) does not hold this one.
+        let (_, errors) = released(&w, config(&["other.thesaurus"]));
+        assert!(errors.is_empty(), "{errors:?}");
+        // Negative: it still maps a dictionary of the package.
+        for still in [
+            config(&["ext.intdict"]),
+            config(&["pg_catalog.simple", "ext.otherdict"]),
+        ] {
+            let (changes, errors) = released(&w, still);
+            assert!(changes.is_empty(), "{changes:?}");
+            assert!(
+                errors[0]
+                    .to_string()
+                    .contains("text search configuration app.docs"),
+                "{errors:?}"
+            );
+        }
+        // Negative: a dictionary of that name is not the configuration the plan altered.
+        let other = member("text search dictionary", &["app", "docs"]);
+        let (changes, errors) = w.drops(&facts("dict_int", &[], &[other]));
+        assert!(
+            changes.is_empty() && !errors.is_empty(),
+            "{changes:?}{errors:?}"
+        );
     }
 
     /// An index of a table the plan keeps that it also drops, and that blocks the package's
