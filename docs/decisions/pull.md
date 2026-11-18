@@ -1671,6 +1671,12 @@ options that changed and the plan checksum pins what was compared.
 - **The census** is read from the target's `pg_depend` (`pbps_pg::search::stale_dependents`):
   an index, a constraint, a stored generated column's default and a materialized view's
   rule, over the object, and for a dictionary also over each configuration that maps it.
+  The walk is recursive through what only reads at run time (a view, a function): the
+  catalog records a materialized view over a view as an edge to the view alone, so a direct
+  read of the object's dependents missed it. A path is stale if it reaches a stored
+  dependent, a read-only chain lists nothing, and the walk stops at a stored dependent
+  (refreshing it recomputes what stands on it). A repeated node ends the walk, so a cycle
+  among views and functions ends too (measured on 16 and 18).
   A thesaurus's sub-dictionary has no catalog edge (measured), so a dictionary also answers
   for the dictionaries that name it in their options, which the model holds. The census is
   a hint of the connected plan, one entry per object the plan would alter, empty when

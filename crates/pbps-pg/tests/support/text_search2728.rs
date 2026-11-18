@@ -238,6 +238,66 @@ async fn measure() {
     }
 }
 
+/// The census follows what only reads at run time down to what stores (DEC-2728.3): a
+/// materialized view over a view over the configuration, through one view or two or a
+/// function, is as stale as one over the configuration, an index on that materialized view
+/// leaves the line on the materialized view, and a chain of views and functions that reaches
+/// no stored dependent lists nothing. The dictionary path walks the same way.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_stored_dependent_behind_a_view_or_a_function_is_found_and_a_read_only_chain_is_not() {
+    let _live = super::live_ledger().await;
+    for variable in SERVERS {
+        let mut db = Private::on(variable, "chain").await;
+        db.run("CREATE TEXT SEARCH DICTIONARY d1 (TEMPLATE = simple); CREATE TEXT SEARCH CONFIGURATION c1 (PARSER = default); ALTER TEXT SEARCH CONFIGURATION c1 ADD MAPPING FOR asciiword WITH d1; CREATE TABLE docs (body text)").await;
+        // Three configurations, one chain each, so every census line is one chain's.
+        db.run("CREATE TEXT SEARCH CONFIGURATION c_one (COPY = app.c1); CREATE TEXT SEARCH CONFIGURATION c_two (COPY = app.c1); CREATE TEXT SEARCH CONFIGURATION c_fn (COPY = app.c1); CREATE TEXT SEARCH CONFIGURATION c_read (COPY = app.c1); CREATE TEXT SEARCH CONFIGURATION c_cycle (COPY = app.c1)").await;
+        db.run("CREATE VIEW one_v AS SELECT to_tsvector('app.c_one', body) AS x FROM docs; CREATE MATERIALIZED VIEW one_mv AS SELECT x FROM one_v").await;
+        db.run("CREATE VIEW two_v1 AS SELECT to_tsvector('app.c_two', body) AS x FROM docs; CREATE VIEW two_v2 AS SELECT x FROM two_v1; CREATE MATERIALIZED VIEW two_mv AS SELECT x FROM two_v2; CREATE INDEX two_ix ON two_mv USING gin (x)").await;
+        db.run("CREATE FUNCTION fn_ts(t text) RETURNS tsvector LANGUAGE sql BEGIN ATOMIC SELECT to_tsvector('app.c_fn', t); END; CREATE VIEW fn_v AS SELECT fn_ts(body) AS x FROM docs; CREATE MATERIALIZED VIEW fn_mv AS SELECT x FROM fn_v").await;
+        db.run("CREATE VIEW read_v1 AS SELECT to_tsvector('app.c_read', body) AS x FROM docs; CREATE VIEW read_v2 AS SELECT x FROM read_v1; CREATE FUNCTION read_fn() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT count(*) FROM read_v2; END").await;
+        db.run("CREATE VIEW cyc_v AS SELECT to_tsvector('app.c_cycle', body) AS x FROM docs; CREATE FUNCTION cyc_fn() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT count(*) FROM cyc_v; END; CREATE OR REPLACE VIEW cyc_v AS SELECT to_tsvector('app.c_cycle', body) AS x FROM docs WHERE cyc_fn() >= 0").await;
+        let census = |found: std::collections::BTreeMap<SearchRef, Vec<String>>| {
+            found.into_values().next().unwrap()
+        };
+        let standing = Default::default();
+        for (config, stored) in [
+            ("c_one", vec!["materialized view app.one_mv"]),
+            ("c_two", vec!["materialized view app.two_mv"]),
+            ("c_fn", vec!["materialized view app.fn_mv"]),
+            ("c_read", vec![]),
+            ("c_cycle", vec![]),
+        ] {
+            let subject: std::collections::BTreeSet<SearchRef> =
+                [format!("config app.{config}").parse().unwrap()].into();
+            let found = census(
+                pbps_pg::search::stale_dependents(db.conn(), &standing, &subject)
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(found, stored, "{config}");
+        }
+        // The dictionary path: a view that names the dictionary, then a materialized view over it.
+        db.run("CREATE VIEW dict_v AS SELECT ts_lexize('app.d1'::regdictionary, body) AS x FROM docs; CREATE MATERIALIZED VIEW dict_mv AS SELECT x FROM dict_v").await;
+        let subject: std::collections::BTreeSet<SearchRef> =
+            ["dictionary app.d1".parse().unwrap()].into();
+        let found = census(
+            pbps_pg::search::stale_dependents(db.conn(), &standing, &subject)
+                .await
+                .unwrap(),
+        );
+        assert!(
+            found.contains(&"materialized view app.dict_mv".to_owned()),
+            "{found:?}"
+        );
+        assert!(
+            !found.iter().any(|l| l.contains("_v") && !l.contains("mv")),
+            "a view is not stale: {found:?}"
+        );
+        db.finish().await;
+    }
+}
+
 /// The pull's own query and decoder against the catalog: what a user made is read, in the
 /// engine's order and with a copy expanded; what the engine ships is not (the system-object
 /// exclusion), nor a package's member, nor anything over a parser or a template outside

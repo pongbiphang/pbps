@@ -1209,6 +1209,12 @@ fn what_would_keep_the_old_behaviour_stops_an_alteration_and_a_parser_or_templat
                 );
             }
         };
+        // A materialized view over a view over the configuration stales with it, though the
+        // catalog has no edge between the configuration and the materialized view.
+        on_server(
+            db,
+            "CREATE VIEW app.chain_v AS SELECT to_tsvector('app.docs', body) AS x FROM app.articles; CREATE MATERIALIZED VIEW app.chain_mv AS SELECT x FROM app.chain_v",
+        );
         // A mapping changed under a stored generated column.
         let docs =
             std::fs::read_to_string(d.dir.join("schema/app.docs.textsearch-config.yml")).unwrap();
@@ -1222,7 +1228,12 @@ fn what_would_keep_the_old_behaviour_stops_an_alteration_and_a_parser_or_templat
         );
         refused(
             "a mapping",
-            &["app.docs", "default value for app.articles.tsv", "new name"],
+            &[
+                "app.docs",
+                "default value for app.articles.tsv",
+                "materialized view app.chain_mv would keep the old behaviour",
+                "new name",
+            ],
         );
         // An option of a dictionary that configuration maps: the dependents are the
         // configuration's.
@@ -1232,7 +1243,15 @@ fn what_would_keep_the_old_behaviour_stops_an_alteration_and_a_parser_or_templat
             "app.words.textsearch-dictionary.yml",
             &WORDS.replace("english", "german"),
         );
-        refused("an option", &["app.words", "app.articles.tsv", "new name"]);
+        refused(
+            "an option",
+            &[
+                "app.words",
+                "app.articles.tsv",
+                "materialized view app.chain_mv would keep the old behaviour",
+                "new name",
+            ],
+        );
         // A template that differs, and a parser that is not the built-in one.
         declare(
             &d,

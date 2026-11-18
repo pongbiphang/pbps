@@ -526,11 +526,14 @@ pub(crate) fn alter(
 /// constraint (a check over the object), a stored generated column and a materialized view.
 /// A view, a plain default and a function are evaluated on use and are not here. A
 /// dictionary also answers for the configurations that map it (`pg_depend` holds that edge),
-/// whose dependents stale with it. Measured on 16 and 18 (DEC-2728.3): the catalog lists an
+/// whose dependents stale with it. The walk follows what only reads at run time (a view, a
+/// function) and stops at what stores: a materialized view over a view over the object is as
+/// stale as one over the object itself, and a path that reaches no stored dependent makes
+/// none (the `UNION` drops a repeated node, so a cycle ends). Measured on 16 and 18 (DEC-2728.3): the catalog lists an
 /// expression index, a generated column's default, a check, a view and a materialized view
 /// over `'app.docs'::regconfig` as dependents of the configuration, and not a thesaurus's
 /// sub-dictionary, which the model reads from the options instead.
-const STALE: &str = "WITH subject(cls, oid) AS (
+const STALE: &str = "WITH RECURSIVE subject(cls, oid) AS (
         SELECT 'pg_catalog.pg_ts_config'::pg_catalog.regclass, c.oid
           FROM pg_catalog.pg_ts_config c
           JOIN pg_catalog.pg_namespace n ON n.oid = c.cfgnamespace
@@ -543,10 +546,23 @@ const STALE: &str = "WITH subject(cls, oid) AS (
      ), reach(cls, oid) AS (
         SELECT cls, oid FROM subject
         UNION
-        SELECT 'pg_catalog.pg_ts_config'::pg_catalog.regclass, x.objid
-          FROM subject s
-          JOIN pg_catalog.pg_depend x ON x.refclassid = s.cls AND x.refobjid = s.oid
-         WHERE x.classid = 'pg_catalog.pg_ts_config'::pg_catalog.regclass
+        SELECT n.cls, n.oid
+          FROM reach r
+          JOIN pg_catalog.pg_depend x ON x.refclassid = r.cls AND x.refobjid = r.oid
+         CROSS JOIN LATERAL (
+              SELECT 'pg_catalog.pg_ts_config'::pg_catalog.regclass, x.objid
+               WHERE x.classid = 'pg_catalog.pg_ts_config'::pg_catalog.regclass
+                 AND r.cls = 'pg_catalog.pg_ts_dict'::pg_catalog.regclass
+              UNION ALL
+              SELECT 'pg_catalog.pg_proc'::pg_catalog.regclass, x.objid
+               WHERE x.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+              UNION ALL
+              SELECT 'pg_catalog.pg_class'::pg_catalog.regclass, w.ev_class
+                FROM pg_catalog.pg_rewrite w
+                JOIN pg_catalog.pg_class k ON k.oid = w.ev_class
+               WHERE x.classid = 'pg_catalog.pg_rewrite'::pg_catalog.regclass
+                 AND w.oid = x.objid AND k.relkind = 'v'
+         ) n(cls, oid)
      )
      SELECT DISTINCT CASE WHEN x.classid = 'pg_catalog.pg_rewrite'::pg_catalog.regclass
                  THEN 'materialized view ' || (SELECT i.identity FROM pg_catalog.pg_identify_object(
