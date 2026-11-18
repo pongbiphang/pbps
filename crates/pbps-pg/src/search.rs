@@ -588,6 +588,95 @@ const STALE: &str = "WITH RECURSIVE subject(cls, oid) AS (
                           WHERE w.oid = x.objid AND k.relkind = 'm'))
       ORDER BY 1";
 
+/// The functions with a string body that a stored dependent calls, however far down: an
+/// index, a constraint, a stored generated column and a materialized view are the roots, and
+/// the walk follows `pg_depend` to the functions they call, through a view's rule and through
+/// a function whose SQL-standard body (`BEGIN ATOMIC`) calls another. Measured on 16.15 and
+/// 18.6 (DEC-2728.3): the engine records no edge from a `LANGUAGE sql` string body or a
+/// PL/pgSQL body to a configuration it names, so [`STALE`] cannot see it, and the edge from
+/// the stored dependent to the function is there. The text is read in Rust, with the matcher
+/// the generated-column impact uses (`generated::may_call`). A function in `pg_catalog` or
+/// `information_schema`, and one written in `internal` or `c`, has no body to read.
+const BODIES: &str = "WITH RECURSIVE stored(cls, oid) AS (
+        SELECT 'pg_catalog.pg_class'::pg_catalog.regclass, c.oid
+          FROM pg_catalog.pg_class c
+          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         WHERE c.relkind IN ('i', 'I') AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+        UNION ALL
+        SELECT 'pg_catalog.pg_constraint'::pg_catalog.regclass, k.oid
+          FROM pg_catalog.pg_constraint k
+          JOIN pg_catalog.pg_namespace n ON n.oid = k.connamespace
+         WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+        UNION ALL
+        SELECT 'pg_catalog.pg_attrdef'::pg_catalog.regclass, a.oid
+          FROM pg_catalog.pg_attrdef a
+          JOIN pg_catalog.pg_attribute t ON t.attrelid = a.adrelid AND t.attnum = a.adnum
+          JOIN pg_catalog.pg_class c ON c.oid = a.adrelid
+          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         WHERE t.attgenerated = 's' AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+        UNION ALL
+        SELECT 'pg_catalog.pg_rewrite'::pg_catalog.regclass, w.oid
+          FROM pg_catalog.pg_rewrite w
+          JOIN pg_catalog.pg_class c ON c.oid = w.ev_class
+          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         WHERE c.relkind = 'm' AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+     ), walk(root_cls, root_oid, cls, oid) AS (
+        SELECT cls, oid, cls, oid FROM stored
+        UNION
+        SELECT w.root_cls, w.root_oid, n.cls, n.oid
+          FROM walk w
+          JOIN pg_catalog.pg_depend x ON x.classid = w.cls AND x.objid = w.oid
+         CROSS JOIN LATERAL (
+              SELECT 'pg_catalog.pg_proc'::pg_catalog.regclass, x.refobjid
+               WHERE x.refclassid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+              UNION ALL
+              SELECT 'pg_catalog.pg_rewrite'::pg_catalog.regclass, r.oid
+                FROM pg_catalog.pg_rewrite r
+                JOIN pg_catalog.pg_class k ON k.oid = r.ev_class
+               WHERE x.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                 AND r.ev_class = x.refobjid AND k.relkind = 'v'
+         ) n(cls, oid)
+     )
+     SELECT DISTINCT
+            CASE WHEN w.root_cls = 'pg_catalog.pg_rewrite'::pg_catalog.regclass
+                 THEN 'materialized view ' || (SELECT i.identity FROM pg_catalog.pg_identify_object(
+                        'pg_catalog.pg_class'::pg_catalog.regclass,
+                        (SELECT r.ev_class FROM pg_catalog.pg_rewrite r WHERE r.oid = w.root_oid), 0) i)
+                 ELSE (SELECT i.type || ' ' || i.identity
+                         FROM pg_catalog.pg_identify_object(w.root_cls, w.root_oid, 0) i)
+            END AS what,
+            (SELECT i.identity FROM pg_catalog.pg_identify_object(w.cls, w.oid, 0) i) AS via,
+            p.prosrc AS src
+       FROM walk w
+       JOIN pg_catalog.pg_proc p ON w.cls = 'pg_catalog.pg_proc'::pg_catalog.regclass AND p.oid = w.oid
+       JOIN pg_catalog.pg_namespace pn ON pn.oid = p.pronamespace
+       JOIN pg_catalog.pg_language l ON l.oid = p.prolang
+      WHERE p.prosqlbody IS NULL
+        AND pn.nspname NOT IN ('pg_catalog', 'information_schema')
+        AND l.lanname NOT IN ('internal', 'c')
+      ORDER BY 1, 2";
+
+/// The census lines a function's string body adds: every stored dependent that calls a
+/// function whose text names one of `names` (DEC-2728.3). `rows` are `(dependent, function,
+/// body)` from [`BODIES`]. A name counts when the body holds it as a whole identifier, or the
+/// same read inside a string literal (`'app.docs'::regconfig`): a bare name folds ASCII case
+/// as the engine does, a quoted one is exact, and the schema is not compared, so a "yes" is a
+/// "may" (`generated::may_call`). A function that builds the name at run time never spells
+/// it, and the catalog cannot show it.
+fn named_in_bodies(
+    rows: &[(String, String, String)],
+    names: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    rows.iter()
+        .filter(|(_, _, body)| {
+            names
+                .iter()
+                .any(|name| crate::generated::may_call(body, name))
+        })
+        .map(|(what, via, _)| format!("{what} (reached through function {via}, named in its body)"))
+        .collect()
+}
+
 /// For each of `subjects`, the dependents that would go stale if it changed in place, one
 /// line each, read from the target's `pg_depend` (DEC-2728.3). `standing` is what the target
 /// holds: a thesaurus names its sub-dictionary in its options and the catalog records no edge
@@ -600,6 +689,18 @@ pub async fn stale_dependents(
     subjects: &BTreeSet<SearchRef>,
 ) -> Result<BTreeMap<SearchRef, Vec<String>>, pbps_db::DbError> {
     let mut out = BTreeMap::new();
+    // One read of every string body a stored dependent calls; asked only when there is a
+    // subject, and not per subject.
+    let mut bodies = Vec::new();
+    if !subjects.is_empty() {
+        for row in &conn.query_with(BODIES, &[]).await? {
+            let text = |column: &str| -> Result<String, pbps_db::DbError> {
+                Ok(row.try_get::<&str>(column)?.unwrap_or_default().to_owned())
+            };
+            bodies.push((text("what")?, text("via")?, text("src")?));
+        }
+    }
+    let bodies = &bodies;
     for subject in subjects {
         let mut members = BTreeSet::from([subject.clone()]);
         while let Some(user) = standing
@@ -614,6 +715,25 @@ pub async fn stale_dependents(
             members.insert(user);
         }
         let mut lines = BTreeSet::new();
+        // What a function's text may spell to reach the object: its own name and, for a
+        // dictionary, the name of each configuration that maps it (a thesaurus's
+        // sub-dictionary is a member already).
+        let mut names = BTreeSet::new();
+        for member in &members {
+            names.insert(member.name.name().to_owned());
+            if member.kind == SearchKind::Dictionary {
+                names.extend(
+                    standing
+                        .iter()
+                        .filter(|(name, object)| {
+                            name.kind == SearchKind::Config
+                                && object.dictionaries().contains(member)
+                        })
+                        .map(|(name, _)| name.name.name().to_owned()),
+                );
+            }
+        }
+        lines.extend(named_in_bodies(bodies, &names));
         for member in &members {
             let kind = match member.kind {
                 SearchKind::Config => "config",
@@ -1433,5 +1553,55 @@ mod tests {
         };
         assert!(found(&config, &parser(PARSER)).is_empty());
         assert!(!found(&config, &parser("myparser")).is_empty());
+    }
+
+    /// A function's text names an object the way the engine would read it (DEC-2728.3): the
+    /// bare name case-insensitively, the same inside a literal (`'app.docs'::regconfig`), and a
+    /// quoted name exactly. Negatives: another name, a quoted name of another case, a name
+    /// inside a comment, a name that is only part of a longer identifier, and no names at all.
+    #[test]
+    fn a_function_body_names_an_object_by_whole_identifier_and_exact_quoted_case() {
+        let row = |body: &str| {
+            vec![(
+                "index app.ix".to_owned(),
+                "app.f(text)".to_owned(),
+                body.to_owned(),
+            )]
+        };
+        let names =
+            |list: &[&str]| -> BTreeSet<String> { list.iter().map(|s| (*s).to_owned()).collect() };
+        let said = "index app.ix (reached through function app.f(text), named in its body)";
+        for body in [
+            "SELECT to_tsvector('app.docs', t)",
+            "SELECT to_tsvector('docs'::regconfig, t)",
+            "SELECT to_tsvector(app.DOCS::regconfig, t)",
+            "SELECT to_tsvector(\"docs\", t)",
+            "BEGIN RETURN to_tsvector('app.docs'::regconfig, t); END",
+        ] {
+            assert_eq!(
+                named_in_bodies(&row(body), &names(&["docs"])),
+                [said.to_owned()].into(),
+                "{body}"
+            );
+        }
+        for body in [
+            "SELECT to_tsvector('app.other', t)",
+            "SELECT to_tsvector(\"DOCS\", t)",
+            "SELECT 1 -- docs",
+            "SELECT /* docs */ 1",
+            "SELECT to_tsvector('app.docs_v2', t)",
+        ] {
+            assert!(
+                named_in_bodies(&row(body), &names(&["docs"])).is_empty(),
+                "{body}"
+            );
+        }
+        // A quoted name of mixed case is matched as it was written, and a bare spelling of it
+        // is not its name.
+        assert!(named_in_bodies(&row("SELECT 'app.\"Docs\"'"), &names(&["docs"])).is_empty());
+        assert!(!named_in_bodies(&row("SELECT 'app.\"Docs\"'"), &names(&["Docs"])).is_empty());
+        assert!(named_in_bodies(&row("SELECT docs"), &names(&["Docs"])).is_empty());
+        assert!(!named_in_bodies(&row("SELECT \"Docs\""), &names(&["Docs"])).is_empty());
+        assert!(named_in_bodies(&row("SELECT docs"), &BTreeSet::new()).is_empty());
     }
 }

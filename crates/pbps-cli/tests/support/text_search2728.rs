@@ -1285,3 +1285,103 @@ fn what_would_keep_the_old_behaviour_stops_an_alteration_and_a_parser_or_templat
         no_changes(&succeeds(d.run(&["plan", "--db", db])));
     }
 }
+
+/// The catalog records no edge from a function's string body to the configuration it names,
+/// so a stored dependent that calls such a function is found by reading the body (DEC-2728.3):
+/// an index over a `LANGUAGE sql` function and a materialized view over a PL/pgSQL one stop a
+/// change of the mappings, and the refusal names the dependent and the function. Negative: a
+/// function that does not name the object lets the alteration go, and the same object is
+/// refused once a function that names it stands under a materialized view.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_string_bodied_function_that_names_the_object_stops_an_alteration_and_one_that_does_not_lets_it_go()
+ {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        let own = OwnDatabase::new(&server, "search2728e");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app");
+        let d = Demo::new("search2728e");
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+        declare(&d, "app.words.textsearch-dictionary.yml", WORDS);
+        declare(&d, "app.docs.textsearch-config.yml", DOCS);
+        declare(&d, "app.solo.textsearch-dictionary.yml", SOLO);
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        let path = d.dir.join("bodies.plan.json");
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        succeeds(apply_plan(&d, db, &path, false));
+        // Out of band, over a table the project does not declare: two functions that name the
+        // configuration in a string body, and what stores their results.
+        on_server(
+            db,
+            "CREATE TABLE app.loose (body text); \
+             CREATE FUNCTION app.f_sql(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.docs', t) $$; \
+             CREATE FUNCTION app.f_pl(t text) RETURNS tsvector LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN RETURN to_tsvector('app.docs'::regconfig, t); END $$; \
+             CREATE INDEX ix_sql ON app.loose USING gin (app.f_sql(body)); \
+             CREATE MATERIALIZED VIEW app.mv_pl AS SELECT app.f_pl(body) AS x FROM app.loose",
+        );
+        let docs =
+            std::fs::read_to_string(d.dir.join("schema/app.docs.textsearch-config.yml")).unwrap();
+        declare(
+            &d,
+            "app.docs.textsearch-config.yml",
+            &docs.replace(
+                "email: [pg_catalog.simple]",
+                "email: [app.words, pg_catalog.simple]",
+            ),
+        );
+        let out = d.run(&["plan", "--db", db]);
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        for needle in [
+            "index app.ix_sql (reached through function app.f_sql(pg_catalog.text), named in its body)",
+            "materialized view app.mv_pl (reached through function app.f_pl(pg_catalog.text), named in its body)",
+            "would keep the old behaviour",
+        ] {
+            assert!(said(&out).contains(needle), "{needle}: {}", said(&out));
+        }
+        declare(&d, "app.docs.textsearch-config.yml", &docs);
+        // Negative: a function that does not name the dictionary, under an index and a
+        // materialized view, stops nothing.
+        on_server(
+            db,
+            "CREATE FUNCTION app.f_other(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.docs', t) $$; \
+             CREATE INDEX ix_other ON app.loose USING gin (app.f_other(body)); \
+             CREATE MATERIALIZED VIEW app.mv_other AS SELECT app.f_other(body) AS x FROM app.loose",
+        );
+        declare(
+            &d,
+            "app.solo.textsearch-dictionary.yml",
+            &SOLO.replace("english", "german"),
+        );
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        succeeds(apply_plan(&d, db, &path, false));
+        assert_eq!(options_of(db, "solo"), "stopwords = 'german'");
+        // A function that names the dictionary, under a materialized view: now it is refused.
+        on_server(
+            db,
+            "CREATE FUNCTION app.f_solo(t text) RETURNS text[] LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN RETURN ts_lexize('app.solo'::regdictionary, t); END $$; \
+             CREATE MATERIALIZED VIEW app.mv_solo AS SELECT app.f_solo(body) AS x FROM app.loose",
+        );
+        declare(
+            &d,
+            "app.solo.textsearch-dictionary.yml",
+            &SOLO.replace("english", "french"),
+        );
+        let out = d.run(&["plan", "--db", db]);
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        assert!(
+            said(&out).contains(
+                "materialized view app.mv_solo (reached through function app.f_solo(pg_catalog.text), named in its body)"
+            ),
+            "{}",
+            said(&out)
+        );
+        assert!(
+            !said(&out).contains("through function app.f_other"),
+            "{}",
+            said(&out)
+        );
+        assert_eq!(options_of(db, "solo"), "stopwords = 'german'");
+    }
+}

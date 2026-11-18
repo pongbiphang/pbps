@@ -1677,6 +1677,24 @@ options that changed and the plan checksum pins what was compared.
   dependent, a read-only chain lists nothing, and the walk stops at a stored dependent
   (refreshing it recomputes what stands on it). A repeated node ends the walk, so a cycle
   among views and functions ends too (measured on 16 and 18).
+  A function with a string body (`LANGUAGE sql` text or PL/pgSQL) leaves no edge to what
+  it names (measured on 16.15 and 18.6, for an index expression, a stored generated column,
+  a constraint and a materialized view alike: the edge from the stored dependent to the
+  function is there, the edge from the function to the configuration is not). So the census
+  also follows `pg_depend` from every stored dependent to the functions it calls, through a
+  view's rule and through a `BEGIN ATOMIC` function, and reads the text of each function that
+  is not in `pg_catalog` or `information_schema`, has no SQL-standard body and is not
+  `internal` or `c`. A function whose text names the object counts as reaching it, and the
+  refusal line says "reached through function `<schema.fn>`, named in its body". "Names"
+  is the whole-identifier read of `generated::may_call` (DEC-1364.1): a bare name folds
+  ASCII case, a quoted one is exact, the same read inside a string literal counts
+  (`'app.docs'::regconfig`), and the schema is not compared, so a match is a "may". For a
+  dictionary the names are its own, a thesaurus's, and each configuration that maps it.
+  **The limit:** a function that builds the name at run time (`EXECUTE`, `format`,
+  concatenation) and never spells it is outside what the catalog can show, and the census
+  does not refuse for it. Refusing every string-bodied function would block any database
+  that uses PL/pgSQL in an index, so the tool names what it can read and says what it
+  cannot.
   A thesaurus's sub-dictionary has no catalog edge (measured), so a dictionary also answers
   for the dictionaries that name it in their options, which the model holds. The census is
   a hint of the connected plan, one entry per object the plan would alter, empty when

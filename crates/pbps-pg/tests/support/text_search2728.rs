@@ -298,6 +298,122 @@ async fn a_stored_dependent_behind_a_view_or_a_function_is_found_and_a_read_only
     }
 }
 
+/// The catalog has no edge from a function's string body to what it names (measured on 16 and
+/// 18: a `LANGUAGE sql` string body and a PL/pgSQL body, called by an index, a stored
+/// generated column and a materialized view, each leave only the edge from the stored
+/// dependent to the function), so the census reads the body (DEC-2728.3): a stored dependent
+/// that calls, directly, through a view or through a `BEGIN ATOMIC` function, a string body
+/// that names the object is listed with that function. Negatives: a body that names another
+/// object, a quoted name of another case, a body that only builds the name at run time (the
+/// limit the decision states) and a function used by no stored dependent list nothing; a
+/// dictionary answers for the name of a configuration that maps it, and one nothing maps does
+/// not.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_stored_dependent_of_a_function_whose_body_names_the_object_is_found() {
+    let _live = super::live_ledger().await;
+    for variable in SERVERS {
+        let mut db = Private::on(variable, "bodies").await;
+        db.run("CREATE TEXT SEARCH DICTIONARY d1 (TEMPLATE = simple); CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = simple); CREATE TEXT SEARCH CONFIGURATION c1 (PARSER = default); ALTER TEXT SEARCH CONFIGURATION c1 ADD MAPPING FOR asciiword WITH d1; CREATE TABLE docs (body text)").await;
+        for config in [
+            "c_sql", "c_pl", "c_wrap", "c_view", "c_none", "c_q", "c_dyn", "c_unused", "other",
+        ] {
+            db.run(&format!(
+                "CREATE TEXT SEARCH CONFIGURATION {config} (COPY = app.c1)"
+            ))
+            .await;
+        }
+        // A string body, SQL and PL/pgSQL, under an index, a generated column and a
+        // materialized view.
+        db.run("CREATE FUNCTION f_sql(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.c_sql', t) $$; CREATE INDEX ix_sql ON docs USING gin (f_sql(body))").await;
+        db.run("CREATE FUNCTION f_pl(t text) RETURNS tsvector LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN RETURN to_tsvector('app.c_pl'::regconfig, t); END $$; ALTER TABLE docs ADD COLUMN g_pl tsvector GENERATED ALWAYS AS (f_pl(body)) STORED; CREATE MATERIALIZED VIEW mv_pl AS SELECT f_pl(body) AS x FROM docs").await;
+        // A string body one hop down: a SQL-standard function calls it, a view calls it.
+        db.run("CREATE FUNCTION f_inner(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.c_wrap', t) $$; CREATE FUNCTION f_wrap(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE BEGIN ATOMIC SELECT f_inner(t); END; CREATE INDEX ix_wrap ON docs USING gin (f_wrap(body))").await;
+        db.run("CREATE FUNCTION f_v(t text) RETURNS tsvector LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN RETURN to_tsvector('APP.C_VIEW', t); END $$; CREATE VIEW v_view AS SELECT f_v(body) AS x FROM docs; CREATE MATERIALIZED VIEW mv_view AS SELECT x FROM v_view").await;
+        // Negatives: another name, a quoted name of another case, a name built at run time,
+        // and a function that no stored dependent calls.
+        db.run("CREATE FUNCTION f_none(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.other', t) $$; CREATE INDEX ix_none ON docs USING gin (f_none(body))").await;
+        db.run("CREATE FUNCTION f_q(t text) RETURNS tsvector LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN RETURN to_tsvector('app.\"C_Q\"'::regconfig, t); END $$; CREATE MATERIALIZED VIEW mv_q AS SELECT f_q(body) AS x FROM docs").await;
+        db.run("CREATE FUNCTION f_dyn(t text) RETURNS tsvector LANGUAGE plpgsql IMMUTABLE AS $$ DECLARE r tsvector; BEGIN EXECUTE format('SELECT to_tsvector(%L, $1)', 'app.c_' || 'dyn') INTO r USING t; RETURN r; END $$; CREATE MATERIALIZED VIEW mv_dyn AS SELECT f_dyn(body) AS x FROM docs").await;
+        db.run("CREATE FUNCTION f_unused(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.c_unused', t) $$; CREATE VIEW v_unused AS SELECT f_unused(body) AS x FROM docs").await;
+        // The measured premise: no edge from any of these functions to a configuration.
+        assert_eq!(
+            db.one("SELECT count(*)::text FROM pg_depend d JOIN pg_proc p ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid WHERE p.pronamespace = 'app'::regnamespace AND d.refclassid = 'pg_ts_config'::regclass").await,
+            "0"
+        );
+        assert_eq!(
+            db.one("SELECT count(*)::text FROM pg_depend d WHERE d.refclassid = 'pg_proc'::regclass AND d.refobjid = 'app.f_pl(text)'::regprocedure AND d.classid IN ('pg_attrdef'::regclass, 'pg_rewrite'::regclass)").await,
+            "2"
+        );
+        let census = |found: std::collections::BTreeMap<SearchRef, Vec<String>>| {
+            found.into_values().next().unwrap()
+        };
+        let by = |function: &str, what: &str| {
+            format!(
+                "{what} (reached through function app.{function}(pg_catalog.text), named in its body)"
+            )
+        };
+        let mut standing = std::collections::BTreeMap::new();
+        standing.insert(
+            "config app.c1".parse::<SearchRef>().unwrap(),
+            SearchObject::Config {
+                parser: "pg_catalog.default".parse().unwrap(),
+                mappings: [("asciiword".to_owned(), vec!["app.d1".parse().unwrap()])].into(),
+            },
+        );
+        for (config, stored) in [
+            ("c_sql", vec![by("f_sql", "index app.ix_sql")]),
+            (
+                "c_pl",
+                vec![
+                    by("f_pl", "default value for app.docs.g_pl"),
+                    by("f_pl", "materialized view app.mv_pl"),
+                ],
+            ),
+            ("c_wrap", vec![by("f_inner", "index app.ix_wrap")]),
+            ("c_view", vec![by("f_v", "materialized view app.mv_view")]),
+            ("c_none", vec![]),
+            ("c_q", vec![]),
+            ("c_dyn", vec![]),
+            ("c_unused", vec![]),
+        ] {
+            let subject: std::collections::BTreeSet<SearchRef> =
+                [format!("config app.{config}").parse().unwrap()].into();
+            let found = census(
+                pbps_pg::search::stale_dependents(db.conn(), &standing, &subject)
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(found, stored, "{config}");
+        }
+        // A dictionary answers for the name of the configuration that maps it.
+        db.run("CREATE FUNCTION f_d(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.c1', t) $$; CREATE INDEX ix_d ON docs USING gin (f_d(body))").await;
+        for (dictionary, stored) in [("d1", vec![by("f_d", "index app.ix_d")]), ("d2", vec![])] {
+            let subject: std::collections::BTreeSet<SearchRef> =
+                [format!("dictionary app.{dictionary}").parse().unwrap()].into();
+            let found = census(
+                pbps_pg::search::stale_dependents(db.conn(), &standing, &subject)
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(found, stored, "{dictionary}");
+        }
+        // Without the held configuration the name is not known to map it: the census cannot
+        // say, which is the offline plan's refusal, not an empty answer here.
+        let subject: std::collections::BTreeSet<SearchRef> =
+            ["dictionary app.d1".parse().unwrap()].into();
+        assert!(
+            census(
+                pbps_pg::search::stale_dependents(db.conn(), &Default::default(), &subject)
+                    .await
+                    .unwrap()
+            )
+            .is_empty()
+        );
+        db.finish().await;
+    }
+}
+
 /// The pull's own query and decoder against the catalog: what a user made is read, in the
 /// engine's order and with a copy expanded; what the engine ships is not (the system-object
 /// exclusion), nor a package's member, nor anything over a parser or a template outside
