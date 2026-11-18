@@ -9834,7 +9834,13 @@ the file and never drops a record; the tree's layout `FORMAT` is unchanged. On d
 it is a section `exclusions` of the table's own file, keyed by name (the file is the
 table), with the `_end` sentinel, placed after `rebuilds`; a dropped table's file
 holds none, and a partition, which has no file, cannot hold one (an exclusion on a
-partition is refused, DEC-2448.3). Merge is by record, so two branches retiring
+partition is refused, DEC-2448.3). It is the one section keyed by a name a human
+chose, so a name that starts with `_` is written with one more `_` (`_end` as
+`__end`): otherwise a constraint named `_end` would write an object where the
+sentinel's `true` belongs, and the reader would refuse the file the writer made. Every
+other name is written as it is, and a key with a single leading `_` is refused, as no
+writer makes one; the other sections are keyed by uids, which cannot spell the
+sentinel. Merge is by record, so two branches retiring
 different constraints both keep theirs and one retired two ways conflicts under the
 table's uid.
 
@@ -9856,7 +9862,10 @@ prompt offers the drop and asks why. In the differ it is a refusal naming the sa
 command, so a plan built without that pass (a library caller, a saved plan's
 rebuild) cannot drop one unrecorded. A rename is a drop and an add and needs the
 record, which the refusal says. The table's own drop never asks: its intent covers
-its parts.
+its parts. The differ asks it of the baseline's definition **as the baseline holds
+it**, not of the copy the plan's column renames have rewritten for the comparison:
+the record was made from the former, so a plan that renames a key or payload column
+and drops the constraint is admitted by it, and the renamed spelling is no authority.
 
 **The command** `pbps drop-exclusion TABLE NAME --reason WHY` is `Intent::DropExclusion`
 and resolves like the other drops, except that the record keeps the definition, which

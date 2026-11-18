@@ -381,6 +381,61 @@ fn a_dropped_exclusion_needs_its_recorded_reason_and_a_pull_after_it_round_trips
     });
 }
 
+/// A plan that renames the column a constraint keys on and drops the constraint
+/// is admitted by the record `drop-exclusion` wrote from the baseline: the
+/// differ compares the renamed definition but asks the original for its
+/// authority, so no rerun of the command is needed (DEC-2448.4).
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_key_column_rename_in_the_plan_that_drops_its_exclusion_is_admitted_by_the_record() {
+    let _ = server();
+    servers(|url| {
+        let own = OwnDatabase::new(url, "exclude-rename-drop");
+        let connection = own.connection();
+        on_server(connection, SETUP);
+        let d = Demo::new("exclude-rename-drop");
+        succeeds(d.run(&["pull", "--db", connection]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+        let path = d.dir.join("schema/app.booking.yml");
+        let held = std::fs::read_to_string(&path).unwrap();
+        // `room` is `one_per_room`'s plain key: renamed, with the constraint gone.
+        let declared =
+            remove_exclusion(&held, "one_per_room").replacen("\n  room:\n", "\n  room_no:\n", 1);
+        assert!(declared.contains("  room_no:"), "{held}");
+        std::fs::write(&path, &declared).unwrap();
+        succeeds(d.run(&["rename", "app.booking.room", "room_no"]));
+        succeeds(d.run(&[
+            "drop-exclusion",
+            "app.booking",
+            "one_per_room",
+            "--reason",
+            "the booking service enforces it now",
+        ]));
+        d.commit();
+        let plan = d.dir.join("plan.json");
+        let sql = d.dir.join("plan.sql");
+        let script = succeed_plan(&d, connection, &plan, &sql);
+        let drop = script
+            .find("DROP CONSTRAINT \"one_per_room\"")
+            .expect(&script);
+        let rename = script
+            .find("RENAME COLUMN \"room\" TO \"room_no\"")
+            .expect(&script);
+        assert!(drop < rename, "{script}");
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &plan,
+            &["--allow", "rename,destructive"],
+        ));
+        assert_eq!(constraints(connection, "one_per_room"), 0);
+        assert_eq!(constraints(connection, "no_overlap"), 1);
+        let next = succeeds(d.run(&["plan", "--db", connection]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    });
+}
+
 /// A changed definition at one name replaces the constraint, behind both risks
 /// and with no reason; a change of its storage parameters alone leaves the
 /// constraint and its index standing (DEC-2448.4, measured on 16.15 and 18.6).

@@ -1722,12 +1722,22 @@ pub(crate) fn diff_partial_rebuilding(
             &mut changes,
             &mut errs,
         );
+        // A retirement holds the definition as the baseline wrote it, and the
+        // table compared below has had this plan's column renames applied, so
+        // authority is asked of the original: a plan that renames a key column
+        // and drops the constraint is a valid one, and no rerun of `pbps
+        // drop-exclusion` could record the renamed text.
+        let retired = |key: &pbps_model::ObjectLocalName| {
+            base_table
+                .exclude
+                .get(key)
+                .is_some_and(|held| declared.ids.exclusion_retired(uid, key, held))
+        };
         diff_exclusions(
             declared_name,
             &renames.apply(base_table, base_name),
             declared_table,
-            declared.ids,
-            uid,
+            &retired,
             &mut changes,
             &mut errs,
         );
@@ -7046,8 +7056,7 @@ fn diff_exclusions(
     name: &TableName,
     base: &Table,
     declared: &Table,
-    retired: &pbps_model::IdsFile,
-    uid: &pbps_model::Uid,
+    retired: &dyn Fn(&pbps_model::ObjectLocalName) -> bool,
     changes: &mut Vec<Change>,
     errs: &mut Vec<DiffError>,
 ) {
@@ -7107,7 +7116,7 @@ fn diff_exclusions(
                     }
                 }
             }
-            None if retired.exclusion_retired(uid, key, was) => changes.push(drop_half(key, was)),
+            None if retired(key) => changes.push(drop_half(key, was)),
             None => errs.push(DiffError::ExclusionRefused {
                 table: name.clone(),
                 name: key.clone(),
@@ -12103,6 +12112,92 @@ mod tests {
         assert_eq!(kinds(&cs), ["SetExclusion", "SetExclusion"]);
         // Unchanged: nothing to refuse and nothing to plan.
         assert!(exclusion_plan(&held, &held, &[]).unwrap().is_empty());
+    }
+
+    /// A plan that renames a column the constraint holds (as a plain key or as
+    /// payload) and drops the constraint is a valid one: the record `pbps
+    /// drop-exclusion` wrote holds the definition as the baseline spells it, so
+    /// authority is asked of that, not of the text a rename has rewritten.
+    #[test]
+    fn a_dropped_exclusion_is_retired_by_its_baseline_definition_across_a_column_rename() {
+        let table: TableName = "app.booking".parse().unwrap();
+        let held = {
+            let mut x = exclusion("", "&&");
+            x.keys[0].key.key = pbps_model::IndexKey::Column("a".into());
+            x.include = vec!["b".into()];
+            x
+        };
+        let base = booking(&[("no_overlap", held.clone())]);
+        // `a` (the key) and `b` (the payload) are both renamed, and the
+        // constraint is gone.
+        let mut declared = booking(&[]);
+        let columns = &mut declared.tables.get_mut(&table).unwrap().columns;
+        for (from, to) in [("a", "a2"), ("b", "b2")] {
+            let column = columns.shift_remove(from).unwrap();
+            columns.insert(to.into(), column);
+        }
+        let plan = |record: Option<String>| {
+            let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let renames: Vec<Intent> = [("a", "a2"), ("b", "b2")]
+                .into_iter()
+                .map(|(from, to)| Intent::RenameColumn {
+                    table: table.clone(),
+                    from: from.into(),
+                    to: to.into(),
+                })
+                .collect();
+            let mut declared_ids = crate::resolve(&declared, &base_ids, &renames, &ctx())
+                .unwrap()
+                .ids;
+            let uid = declared_ids.table_uid(&table).unwrap().clone();
+            if let Some(was) = record {
+                declared_ids
+                    .exclusions
+                    .entry(uid)
+                    .or_default()
+                    .insert("no_overlap".into(), retirement(was));
+            }
+            diff(
+                Side {
+                    schema: &base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: &declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .map(|plan| plan.changes().clone())
+            .map_err(|errs| errs.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        // Recorded for the baseline's definition: the renames and the drop.
+        let cs = plan(Some(held.canonical_text())).unwrap();
+        assert!(
+            kinds(&cs).iter().filter(|k| **k == "SetExclusion").count() == 1
+                && kinds(&cs).iter().filter(|k| **k == "RenameColumn").count() == 2,
+            "{:?}",
+            kinds(&cs)
+        );
+        // Negative: a record of the definition as the rename spells it is a
+        // record of a different definition, and is no authority.
+        let mut spelled = held.clone();
+        spelled.keys[0].key.key = pbps_model::IndexKey::Column("a2".into());
+        spelled.include = vec!["b2".into()];
+        let said = plan(Some(spelled.canonical_text())).unwrap_err();
+        assert!(
+            said.len() == 1 && said[0].contains("pbps drop-exclusion app.booking no_overlap"),
+            "{said:?}"
+        );
+        // Negative: a record of another definition at the name.
+        let mut other = held.clone();
+        other.keys[0].operator = pbps_model::OperatorRef::symbol("-|-").unwrap();
+        assert!(plan(Some(other.canonical_text())).is_err());
+        // Negative: no record at all.
+        assert!(plan(None).is_err());
     }
 
     /// A changed definition at one name is a replacement, as a drop and an add

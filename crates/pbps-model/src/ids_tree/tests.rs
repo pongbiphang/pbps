@@ -358,6 +358,58 @@ fn an_exclusion_retirement_in_a_file_without_a_table_name_or_with_a_blank_name_i
     );
 }
 
+/// A name that spells the section's `_end` sentinel would write an object where
+/// the sentinel's `true` belongs, and the reader would refuse the file the
+/// writer made (a retirement of a constraint named `_end` could never be
+/// recorded).
+#[test]
+fn an_exclusion_named_like_the_sentinel_round_trips_and_an_ordinary_name_is_unchanged() {
+    for name in ["_end", "_", "__", "__end", "_x", "end", "a_end", "_end_"] {
+        let (mut ids, p) = sample();
+        let record = ids.exclusions[&uid("t_aaaaaa")]["no_overlap"].clone();
+        ids.exclusions
+            .get_mut(&uid("t_aaaaaa"))
+            .unwrap()
+            .insert(ObjectLocalName::new(name), record);
+        let t = split(&ids, &p).unwrap();
+        assert_eq!(assemble(&t).unwrap(), ids, "{name}");
+        let customer = &t["dbo/customer.json"];
+        // One sentinel, and the section's other keys are not it.
+        let section = customer.split("\"exclusions\"").nth(1).unwrap();
+        assert_eq!(section.matches("\"_end\": true").count(), 1, "{name}");
+        // An ordinary name is written as it is, so a tree written before this
+        // encoding existed (no name starts with `_` there) reads unchanged.
+        assert!(customer.contains("\"no_overlap\": {\"was\""), "{name}");
+    }
+    let (mut ids, p) = sample();
+    let record = ids.exclusions[&uid("t_aaaaaa")]["no_overlap"].clone();
+    ids.exclusions
+        .get_mut(&uid("t_aaaaaa"))
+        .unwrap()
+        .insert(ObjectLocalName::new("_end"), record);
+    assert!(
+        split(&ids, &p).unwrap()["dbo/customer.json"].contains("\"__end\": {\"was\""),
+        "an `_end` name is escaped"
+    );
+}
+
+#[test]
+fn an_exclusion_key_with_a_single_leading_underscore_is_refused() {
+    // No writer produces one: `_end` is the sentinel and every other name that
+    // starts with `_` is written with one more, so reading `_x` as `_x` would
+    // let two keys stand for one name.
+    let t = tree();
+    let single = edit(
+        &t["dbo/customer.json"],
+        "    \"no_overlap\": {\"was\"",
+        "    \"_x\": {\"was\"",
+    );
+    assert!(matches!(
+        refuses("dbo/customer.json", single),
+        TreeError::Malformed { .. }
+    ));
+}
+
 #[test]
 fn an_exclusion_retirement_for_a_partition_has_no_file_and_is_refused_on_split() {
     // A partition child has a uid but no file of its own, and an exclusion on one

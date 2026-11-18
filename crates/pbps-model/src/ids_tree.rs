@@ -186,6 +186,39 @@ fn section<V: Serialize>(name: &str, records: &[(Uid, V)]) -> String {
     section_keyed(name, records.iter().map(|(uid, v)| (uid.as_str(), v)))
 }
 
+/// The key a name is written under in a section keyed by a name, where the
+/// `_end` sentinel shares the object with the records. A name that starts with
+/// `_` gets one more, so no name can spell the sentinel (`_end` is written
+/// `__end`) and the two cannot be told apart wrongly. Every other name is
+/// written as it is.
+///
+/// Only the sections keyed by a name need this: every other section's keys are
+/// uids, whose kind letter and shape cannot be `_end`.
+fn name_key(name: &str) -> std::borrow::Cow<'_, str> {
+    if name.starts_with('_') {
+        std::borrow::Cow::Owned(format!("_{name}"))
+    } else {
+        std::borrow::Cow::Borrowed(name)
+    }
+}
+
+/// The name a [`name_key`] stands for. A key that starts with a single `_` is
+/// one no writer produces, so it is refused rather than guessed at: reading it
+/// as its own name would let two keys stand for one.
+fn key_name(path: &str, section: &str, key: String) -> Result<String, TreeError> {
+    match key.strip_prefix('_') {
+        None => Ok(key),
+        Some(rest) if rest.starts_with('_') => Ok(rest.to_owned()),
+        Some(_) => Err(malformed(
+            path,
+            format!(
+                "`{section}` key `{key}` starts with a single `_`, which only the \
+                 sentinel and an escaped name (`__name`) do"
+            ),
+        )),
+    }
+}
+
 fn section_keyed<'a, V: Serialize + 'a>(
     name: &str,
     records: impl Iterator<Item = (&'a str, &'a V)>,
@@ -232,9 +265,10 @@ pub fn render(file: &TreeFile) -> String {
             top.push(section("rebuilds", &t.rebuilds));
         }
         if !t.exclusions.is_empty() {
+            let keyed: Vec<_> = t.exclusions.iter().map(|(n, r)| (name_key(n), r)).collect();
             top.push(section_keyed(
                 "exclusions",
-                t.exclusions.iter().map(|(name, r)| (name.as_str(), r)),
+                keyed.iter().map(|(key, r)| (key.as_ref(), *r)),
             ));
         }
     }
@@ -437,7 +471,11 @@ fn by_name<V>(
             key,
         });
     }
-    Ok(section.records)
+    section
+        .records
+        .into_iter()
+        .map(|(key, value)| Ok((key_name(path, name, key)?, value)))
+        .collect()
 }
 
 /// What an entry of the identity tree must be, said the same way by every reader
