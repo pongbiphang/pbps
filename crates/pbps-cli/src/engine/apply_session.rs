@@ -10,7 +10,7 @@
 use super::*;
 use crate::pins::{Approved, Check};
 use anyhow::Context as _;
-use pbps_pg::admission::Admission;
+use pbps_dialect::routines::RoutineAdmission;
 
 pub(crate) mod extensions;
 mod mssql;
@@ -28,9 +28,7 @@ pub(crate) enum Execution<'a> {
 #[derive(Default)]
 pub(crate) struct Transaction {
     pub data_guard: DataWriteGuard,
-    pub retained: Option<pbps_pg::retained::Held>,
-    pub verified: Option<pbps_pg::retained::Verified>,
-    pub defaults: pbps_pg::type_refs::declared::DomainDefaults,
+    pub defaults: BTreeMap<pbps_model::Uid, pbps_model::ManagedType>,
 }
 
 pub(crate) struct Opening<'a> {
@@ -46,6 +44,10 @@ pub(crate) trait ApplySession: crate::emission::Engine {
     type State: Default;
     fn state<'s>(&self, state: &'s mut Self::State) -> &'s mut Transaction;
     fn evidence<'s>(&self, state: &'s Self::State) -> &'s Transaction;
+    fn retained_comparison<'s>(
+        &self,
+        state: &'s Self::State,
+    ) -> Option<&'s dyn pbps_dialect::RetainedComparison>;
     fn rebuild_mode(&self, changes: &ChangeSet, staged: bool) -> anyhow::Result<()>;
     fn rename_targets(&self, names: &pbps_model::plan_names::PlanNames<'_>) -> Vec<RenameTarget>;
 
@@ -176,7 +178,7 @@ pub(crate) trait ApplySession: crate::emission::Engine {
     async fn conversions(
         &self,
         conn: &mut Conn,
-        admission: &Admission,
+        admission: &RoutineAdmission,
         changes: &[pbps_model::PlannedChange],
     ) -> anyhow::Result<BTreeSet<pbps_model::ColumnRef>> {
         vet_conversions(conn, admission, changes).await
@@ -184,7 +186,7 @@ pub(crate) trait ApplySession: crate::emission::Engine {
     async fn requirement(
         &self,
         conn: &mut Conn,
-        admission: &Admission,
+        admission: &RoutineAdmission,
         table: &TableName,
         predicate: &str,
     ) -> anyhow::Result<BTreeSet<pbps_model::ColumnName>> {
@@ -193,7 +195,7 @@ pub(crate) trait ApplySession: crate::emission::Engine {
     async fn table_sites(
         &self,
         conn: &mut Conn,
-        admission: &Admission,
+        admission: &RoutineAdmission,
         changes: &[pbps_model::PlannedChange],
     ) -> bool {
         table_expressions_left_unjudged(conn, admission, changes).await
@@ -216,13 +218,13 @@ pub(crate) trait ApplySession: crate::emission::Engine {
             &plan.changes,
         )
         .await?;
-        self.state(state).retained = self
-            .hold_retained(
-                conn,
-                &plan.changes,
-                Some(&opening.baseline.declared.overlay(opening.before)),
-            )
-            .await?;
+        self.hold_retained(
+            state,
+            conn,
+            &plan.changes,
+            Some(&opening.baseline.declared.overlay(opening.before)),
+        )
+        .await?;
         self.external_roles(conn, opening.original_ids, &plan.ids)
             .await?;
         check_module_dependents(conn, plan, opening.scoped, &plan.ids, opening.recorded_ids)
@@ -296,7 +298,7 @@ pub(crate) trait ApplySession: crate::emission::Engine {
             approved.plan,
             &approved.project.config.trusted_roles,
             &approved.managed.references,
-            matches!(at.within(), pbps_pg::pins::Within::CallersTransaction),
+            matches!(at.within(), pbps_db::TransactionOwner::CallersTransaction),
         )
         .await
     }
@@ -311,7 +313,7 @@ pub(crate) trait ApplySession: crate::emission::Engine {
             &approved.plan.type_pins,
             &approved.project.config.trusted_roles,
             approved.plan.pin_type_routines,
-            matches!(at.within(), pbps_pg::pins::Within::CallersTransaction),
+            matches!(at.within(), pbps_db::TransactionOwner::CallersTransaction),
         )
         .await
     }
@@ -320,20 +322,20 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         conn: &mut Conn,
         at: Check<'_>,
         roots: &[i64],
-    ) -> Result<(pbps_pg::pins::Read, Vec<pbps_model::TypeRoutine>), DbError> {
+    ) -> Result<(pbps_dialect::routines::Read, Vec<pbps_model::TypeRoutine>), DbError> {
         pbps_pg::pins::selected(conn, at.within(), roots).await
     }
     async fn replaceable_rows(
         &self,
         conn: &mut Conn,
         at: Check<'_>,
-    ) -> Result<Option<pbps_pg::pins::Read>, DbError> {
+    ) -> Result<Option<pbps_dialect::routines::Read>, DbError> {
         read_pinned_routines(conn, at.within()).await
     }
     async fn before_transactional_statement(
         &self,
         conn: &mut Conn,
-        admission: &Admission,
+        admission: &RoutineAdmission,
         stmt: &pbps_dialect::Statement,
         guard: &DataWriteGuard,
         plan: Option<&pbps_model::SavedPlan>,
@@ -359,13 +361,13 @@ pub(crate) trait ApplySession: crate::emission::Engine {
                 prepare_data_writes(conn, &admission, &plan.changes, baseline, &plan.ids).await?;
             check_data_write(conn, &admission, stmt, &guard).await?;
         } else {
-            self.state(state).retained = self
-                .hold_retained(
-                    conn,
-                    &plan.changes,
-                    Some(&baseline.declared.overlay(previous)),
-                )
-                .await?;
+            self.hold_retained(
+                state,
+                conn,
+                &plan.changes,
+                Some(&baseline.declared.overlay(previous)),
+            )
+            .await?;
             if let Some(extension) = &stmt.extension {
                 crate::deploy::vet_before_extension(conn, extension, Some(plan)).await?;
             }
@@ -386,7 +388,7 @@ pub(crate) trait ApplySession: crate::emission::Engine {
                 pbps_pg::table_expressions::vet_change(
                     conn,
                     &admission,
-                    pbps_pg::pins::Within::CallersTransaction,
+                    pbps_db::TransactionOwner::CallersTransaction,
                     pbps_pg::table_expressions::Moment::Statement,
                     change,
                 )
@@ -402,7 +404,7 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         &self,
         state: &mut Self::State,
         conn: &mut Conn,
-        admission: &Admission,
+        admission: &RoutineAdmission,
         stmt: &pbps_dialect::Statement,
         plan: Option<&pbps_model::SavedPlan>,
         changes: &ChangeSet,
@@ -436,7 +438,7 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         conn: &mut Conn,
         changes: &ChangeSet,
     ) -> anyhow::Result<()> {
-        self.state(state).retained = self.hold_retained(conn, changes, None).await?;
+        self.hold_retained(state, conn, changes, None).await?;
         Ok(())
     }
     /// Recover validation after a staged step's caller has rolled its transaction back.
@@ -460,13 +462,13 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         state: &mut Self::State,
         conn: &mut Conn,
         plan: &pbps_model::SavedPlan,
-        at: Check<'_>,
+        owner: pbps_db::TransactionOwner,
     ) -> anyhow::Result<()> {
         self.state(state).defaults = pbps_pg::type_refs::declared::capture_defaults(
             conn,
             &plan.declared_type_pins,
             &plan.changes,
-            at.within(),
+            owner,
         )
         .await?;
         Ok(())
@@ -476,22 +478,17 @@ pub(crate) trait ApplySession: crate::emission::Engine {
     }
     async fn hold_retained(
         &self,
+        state: &mut Self::State,
         conn: &mut Conn,
         changes: &ChangeSet,
         authored: Option<&Schema>,
-    ) -> anyhow::Result<Option<pbps_pg::retained::Held>> {
-        hold_retained(conn, changes, authored).await
-    }
+    ) -> anyhow::Result<()>;
     async fn verify_retained(
         &self,
         state: &mut Self::State,
         conn: &mut Conn,
         after: &Schema,
-    ) -> anyhow::Result<()> {
-        let transaction = self.state(state);
-        transaction.verified = verify_retained(conn, transaction.retained.as_ref(), after).await?;
-        Ok(())
-    }
+    ) -> anyhow::Result<()>;
     async fn removed_name_matches(
         &self,
         conn: &mut Conn,
@@ -515,7 +512,7 @@ pub(crate) fn selected(driver: Driver) -> crate::emission::SelectedDialect {
 // These adapters preserve the statement annotations' original reachability.
 pub(crate) async fn before_statement(
     conn: &mut Conn,
-    admission: &Admission,
+    admission: &RoutineAdmission,
     stmt: &pbps_dialect::Statement,
     guard: &DataWriteGuard,
     plan: Option<&pbps_model::SavedPlan>,
@@ -528,7 +525,7 @@ pub(crate) async fn before_statement(
         pbps_pg::table_expressions::vet_change(
             conn,
             admission,
-            pbps_pg::pins::Within::CallersTransaction,
+            pbps_db::TransactionOwner::CallersTransaction,
             pbps_pg::table_expressions::Moment::Statement,
             change,
         )
@@ -547,7 +544,7 @@ pub(crate) async fn before_statement(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn after_statement(
     conn: &mut Conn,
-    admission: &Admission,
+    admission: &RoutineAdmission,
     stmt: &pbps_dialect::Statement,
     plan: Option<&pbps_model::SavedPlan>,
     changes: &ChangeSet,

@@ -206,11 +206,14 @@ pub(super) fn refuse_unplanned_movement(
     let read = match settled {
         // Final-shape fixtures use the transactional plan-scoped read.
         // Staged terminal-checkpoint policy is tested through staged_movement.
-        Settled::Whole | Settled::Closing => guard::Read::transactional(plan),
-        Settled::SoFar => guard::Staged::new(plan)?.read(StagedRead::Checkpoint {
-            completed: 1,
-            total: 2,
-        }),
+        Settled::Whole | Settled::Closing => guard::Read::fixture_transactional(plan, before),
+        Settled::SoFar => guard::Staged::new(plan)?.fixture_read(
+            StagedRead::Checkpoint {
+                completed: 1,
+                total: 2,
+            },
+            before,
+        ),
     };
     refuse_pinned_movement(dialect, read, before, after, label)
 }
@@ -258,7 +261,11 @@ pub(super) fn staged_movement(
         environment,
         read,
         None,
-        None,
+        &crate::engine::physical_domain_defaults(
+            before,
+            &pbps_diff::identity::type_refs::before_changes(&ids, changes),
+            changes,
+        ),
     )
 }
 
@@ -280,18 +287,12 @@ pub(super) fn refuse_pinned_movement(
     label: &str,
 ) -> anyhow::Result<()> {
     let verified = read.retained();
-    let defaults = read.domain_defaults();
+    let physical_types = read.domain_defaults();
     let (plan, settled) = read.parts();
     let changes = plan.changes;
     let mut named_before = sequences_named(dialect, before);
     use pbps_diff::identity::type_refs::{TypeResolver, TypeSide, after_changes, before_changes};
     let base_ids = before_changes(plan.ids, changes);
-    let physical_types = match defaults {
-        Some(defaults) => std::borrow::Cow::Borrowed(defaults),
-        None => std::borrow::Cow::Owned(pbps_pg::type_refs::declared::completed(
-            before, &base_ids, changes,
-        )),
-    };
     let realized = |uid, definition: &pbps_model::ManagedType| {
         let mut expected = definition.clone();
         if let (
@@ -314,7 +315,7 @@ pub(super) fn refuse_pinned_movement(
         pbps_pg::type_refs::renames::TypeRenames::default().schema(named_after.to_mut());
     }
     if let Some(verified) = verified {
-        verified.comparison(named_before.to_mut(), named_after.as_ref());
+        verified.rewrite(named_before.to_mut(), named_after.as_ref());
     }
     let after = named_after.as_ref();
     let before = named_before.as_ref();

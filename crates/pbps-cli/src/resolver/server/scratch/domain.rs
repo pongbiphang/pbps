@@ -205,7 +205,7 @@ pub(super) async fn run(
             {
                 pbps_pg::type_refs::vet_code(
                     session,
-                    pbps_pg::pins::Within::OwnTransaction,
+                    pbps_db::TransactionOwner::OwnTransaction,
                     std::slice::from_ref(&annotation.name),
                 )
                 .await

@@ -445,7 +445,7 @@ pub(super) async fn apply_under_lock<D: crate::engine::ApplySession>(
                 session,
                 conn,
                 plan,
-                crate::pins::Check::BeforeStatements { executed: &[] },
+                pbps_db::TransactionOwner::CallersTransaction,
             )
             .await?;
         execute_statements(conn, dialect, session, statements, &approved, progress).await?;
@@ -535,12 +535,14 @@ pub(super) async fn apply_under_lock<D: crate::engine::ApplySession>(
         let evidence = dialect.evidence(session);
         refuse_pinned_movement(
             dialect,
-            guard::Read::transactional(guard::Plan {
-                changes: &plan.changes,
-                ids: &plan.ids,
-            })
-            .with_retained(evidence.verified.as_ref())
-            .with_domain_defaults(Some(&evidence.defaults)),
+            guard::Read::transactional(
+                guard::Plan {
+                    changes: &plan.changes,
+                    ids: &plan.ids,
+                },
+                &evidence.defaults,
+            )
+            .with_retained(dialect.retained_comparison(session)),
             &before,
             &after.schema,
             &target.label,

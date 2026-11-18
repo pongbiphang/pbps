@@ -123,12 +123,15 @@ fn a_dropped_package_stands_as_pinned_until_its_statement_and_is_gone_at_the_clo
         refuse_pinned_movement(&pbps_pg::Postgres::new(), read, &before, after, "fixture")
             .map_err(|e| e.to_string())
     };
-    let closing = || guard::Read::transactional(plan);
+    let closing = || guard::Read::fixture_transactional(plan, &before);
     let midway = || {
-        staged.read(StagedRead::Checkpoint {
-            completed: 0,
-            total: 1,
-        })
+        staged.fixture_read(
+            StagedRead::Checkpoint {
+                completed: 0,
+                total: 1,
+            },
+            &before,
+        )
     };
     // Gone at the close and at a checkpoint after the statement; standing
     // as pinned at a checkpoint before it.
@@ -248,12 +251,15 @@ fn an_updated_package_stands_at_its_old_or_new_version_and_at_the_close_at_the_n
         refuse_pinned_movement(&pbps_pg::Postgres::new(), read, &before, after, "fixture")
             .map_err(|e| e.to_string())
     };
-    let closing = || guard::Read::transactional(plan);
+    let closing = || guard::Read::fixture_transactional(plan, &before);
     let midway = || {
-        staged.read(StagedRead::Checkpoint {
-            completed: 0,
-            total: 1,
-        })
+        staged.fixture_read(
+            StagedRead::Checkpoint {
+                completed: 0,
+                total: 1,
+            },
+            &before,
+        )
     };
     // At the new version, at the close and at a checkpoint; the old one
     // only while the plan runs.
@@ -344,12 +350,15 @@ fn an_updated_and_moved_package_passes_through_each_definition_and_ends_at_the_l
                 .map_err(|e| e.to_string())
         };
         let reads = || {
-            let mut reads = vec![guard::Read::transactional(plan)];
+            let mut reads = vec![guard::Read::fixture_transactional(plan, &before)];
             if let Some(staged) = &staged {
-                reads.push(staged.read(StagedRead::Checkpoint {
-                    completed: 0,
-                    total: 1,
-                }));
+                reads.push(staged.fixture_read(
+                    StagedRead::Checkpoint {
+                        completed: 0,
+                        total: 1,
+                    },
+                    &before,
+                ));
             }
             reads
         };
@@ -362,14 +371,21 @@ fn an_updated_and_moved_package_passes_through_each_definition_and_ends_at_the_l
             if !(with_update || passing.version == "1.4") {
                 continue;
             }
-            let error = check(guard::Read::transactional(plan), &held(&passing)).unwrap_err();
+            let error = check(
+                guard::Read::fixture_transactional(plan, &before),
+                &held(&passing),
+            )
+            .unwrap_err();
             assert!(error.contains("`cube`"), "{error}");
             if let Some(staged) = &staged {
                 check(
-                    staged.read(StagedRead::Checkpoint {
-                        completed: 0,
-                        total: 1,
-                    }),
+                    staged.fixture_read(
+                        StagedRead::Checkpoint {
+                            completed: 0,
+                            total: 1,
+                        },
+                        &before,
+                    ),
                     &held(&passing),
                 )
                 .unwrap();
@@ -430,12 +446,15 @@ fn only_the_pinned_package_may_appear_and_the_close_requires_it() {
         refuse_pinned_movement(&pbps_pg::Postgres::new(), read, &before, after, "fixture")
             .map_err(|e| e.to_string())
     };
-    let closing = || guard::Read::transactional(plan);
+    let closing = || guard::Read::fixture_transactional(plan, &before);
     let midway = || {
-        staged.read(StagedRead::Checkpoint {
-            completed: 0,
-            total: 1,
-        })
+        staged.fixture_read(
+            StagedRead::Checkpoint {
+                completed: 0,
+                total: 1,
+            },
+            &before,
+        )
     };
     // Installed as pinned, at the close and at a checkpoint after it.
     check(closing(), &installed(Some(pinned.clone()))).unwrap();
@@ -528,8 +547,8 @@ fn exact_extensions_are_required_at_every_read_back() {
         ] {
             let check = |after: &Schema| {
                 let read = match read {
-                    None => guard::Read::transactional(plan),
-                    Some(read) => staged.read(read),
+                    None => guard::Read::fixture_transactional(plan, &before),
+                    Some(read) => staged.fixture_read(read, &before),
                 };
                 refuse_pinned_movement(&pbps_pg::Postgres::new(), read, &before, after, "fixture")
             };

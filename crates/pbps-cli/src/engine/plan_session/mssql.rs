@@ -802,17 +802,17 @@ pub(in crate::engine) async fn unsupported_temporal(
 /// anything into. Its misspelling probe asks nothing of a type-routine review.
 #[derive(Default)]
 pub(crate) struct PlanState {
-    admission: SiteAdmission,
+    admission: RoutineAdmission,
 }
 
-impl AsRef<SiteAdmission> for PlanState {
-    fn as_ref(&self) -> &SiteAdmission {
+impl AsRef<RoutineAdmission> for PlanState {
+    fn as_ref(&self) -> &RoutineAdmission {
         &self.admission
     }
 }
 
-impl AsMut<SiteAdmission> for PlanState {
-    fn as_mut(&mut self) -> &mut SiteAdmission {
+impl AsMut<RoutineAdmission> for PlanState {
+    fn as_mut(&mut self) -> &mut RoutineAdmission {
         &mut self.admission
     }
 }

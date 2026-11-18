@@ -344,9 +344,9 @@ impl Held {
         Ok(Verified(verified))
     }
 }
-impl Verified {
+impl pbps_dialect::RetainedComparison for Verified {
     /// Only verified expressions lose byte comparison; all other fields stay pinned.
-    pub fn comparison(&self, before: &mut Schema, after: &Schema) {
+    fn rewrite(&self, before: &mut Schema, after: &Schema) {
         for (target, expected) in &self.0 {
             if let (Some(old), Some(new)) =
                 (target.expression_mut(before), target.expression(after))

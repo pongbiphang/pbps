@@ -152,7 +152,7 @@ fn a_chain_of_renames_over_a_narrow_ensure_table_moves_no_row() {
         let plan = guard::Plan { changes, ids: &ids };
         refuse_pinned_movement(
             &pbps_pg::Postgres::new(),
-            guard::Read::transactional(plan),
+            guard::Read::fixture_transactional(plan, before),
             before,
             after,
             "prod",

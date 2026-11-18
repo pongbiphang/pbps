@@ -72,6 +72,7 @@
 //! planning future that `plan_db_async` already keeps small (#2661).
 
 use super::*;
+use pbps_dialect::routines::RoutineAdmission;
 
 pub(super) mod mssql;
 pub(super) mod postgres;
@@ -87,14 +88,6 @@ pub(crate) struct StandingNotValid {
     /// The statement that validates it, for a person to run.
     pub remedy: String,
 }
-
-/// The one admission rule of every site that runs code the plan holds
-/// (DEC-2563.2), shared by the positions that vet.
-///
-/// Its type is still defined in `pbps-pg`; the alias is the single name the
-/// positions use, so that moving it is a change here and in `pins.rs`, not in
-/// every signature. SQL Server's positions ignore it.
-pub(crate) type SiteAdmission = pbps_pg::admission::Admission;
 
 /// The members of the roles a plan drops, as the schedule takes them.
 pub(crate) type RoleMembers = crate::dependents::schedule::RoleMembers;
@@ -248,18 +241,18 @@ pub(crate) trait PlanSession: crate::emission::Engine {
     /// site that runs code the plan holds, which is created empty and set by
     /// [`Self::begin_site_review`]; the bounds are how neutral code reaches it
     /// without naming an engine's type.
-    type State: Default + AsRef<SiteAdmission> + AsMut<SiteAdmission>;
+    type State: Default + AsRef<RoutineAdmission> + AsMut<RoutineAdmission>;
 
     /// The admission rule of the sites that vet while this plan is made. Neutral
     /// code that needs it (the pin seal's reviewed set) reads it from here.
-    fn site_admission<'s>(&self, state: &'s Self::State) -> &'s SiteAdmission {
+    fn site_admission<'s>(&self, state: &'s Self::State) -> &'s RoutineAdmission {
         state.as_ref()
     }
 
     /// Sets the admission rule once the plan's project is known. It is shared
     /// by the positions that vet, and admits routines as they vet them, so it
     /// lives for the whole plan.
-    fn begin_site_review(&self, state: &mut Self::State, admission: SiteAdmission) {
+    fn begin_site_review(&self, state: &mut Self::State, admission: RoutineAdmission) {
         *state.as_mut() = admission;
     }
 

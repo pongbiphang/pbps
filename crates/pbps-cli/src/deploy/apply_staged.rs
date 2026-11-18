@@ -373,10 +373,13 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
     // Whether this run has a checkpoint to resume from: a resumed run starts
     // on one.
     let mut checkpointed = entry.snapshot.staged.is_some();
-    // Outside any step's transaction, so read in a transaction of its own, as
-    // the check before the probes is.
     dialect
-        .capture_physical_defaults(session, conn, plan, crate::pins::Check::BeforeProbes)
+        .capture_physical_defaults(
+            session,
+            conn,
+            plan,
+            pbps_db::TransactionOwner::OwnTransaction,
+        )
         .await?;
     for (i, stmt) in statements.iter().enumerate().skip(start) {
         // Before each step, including the first after a resume, which skips
@@ -711,8 +714,8 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
                 completed: i + 1,
                 total,
             },
-            dialect.evidence(session).verified.as_ref(),
-            Some(&dialect.evidence(session).defaults),
+            dialect.retained_comparison(session),
+            &dialect.evidence(session).defaults,
         )?;
         previous = recorded;
     }
@@ -780,8 +783,8 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
             &target.label,
             target.environment(),
             StagedRead::Closing { total },
-            dialect.evidence(session).verified.as_ref(),
-            Some(&dialect.evidence(session).defaults),
+            dialect.retained_comparison(session),
+            &dialect.evidence(session).defaults,
         )?;
         // The same read, and the half of it no `Schema` holds. Refused here for
         // the reason the movement check above is: this is the last window, and
@@ -1019,14 +1022,12 @@ pub(super) fn staged_pinned_movement<'a>(
     label: &str,
     environment: Option<&str>,
     read: StagedRead,
-    verified: Option<&'a pbps_pg::retained::Verified>,
-    defaults: Option<&'a pbps_pg::type_refs::declared::DomainDefaults>,
+    verified: Option<&'a dyn pbps_dialect::RetainedComparison>,
+    defaults: &'a BTreeMap<pbps_model::Uid, pbps_model::ManagedType>,
 ) -> anyhow::Result<()> {
     refuse_pinned_movement(
         dialect,
-        plan.read(read)
-            .with_retained(verified)
-            .with_domain_defaults(defaults),
+        plan.read(read, defaults).with_retained(verified),
         before,
         after,
         label,

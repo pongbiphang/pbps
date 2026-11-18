@@ -13,33 +13,8 @@
 use pbps_db::{Conn, DbError, Row};
 use pbps_dialect::TransactionFraming;
 
-/// One routine in the pin set, as the catalog holds it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Routine {
-    /// `pg_proc.oid`, which keys the pin: an approved rename of a schema or of
-    /// a type in the argument list changes the spelling of the signature but
-    /// not the OID (DEC-2333.1).
-    pub oid: i64,
-    /// The schema's name when this was read, for messages only.
-    pub schema: String,
-    pub name: String,
-    /// The argument types in the spelling the pull gives a routine's identity
-    /// (`format_type` under the empty `search_path`), so that the caller can
-    /// tell a managed routine from an unmanaged one.
-    pub args: Vec<String>,
-    /// The canonical JSON this routine's pin is made over.
-    pub input: String,
-}
-
-/// What one read returned.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Read {
-    /// `server_version_num`. A plan and an apply on different releases would
-    /// render the same routine's row differently, so the caller compares this
-    /// before any digest.
-    pub server_version: String,
-    pub routines: Vec<Routine>,
-}
+pub use pbps_db::TransactionOwner as Within;
+pub use pbps_dialect::routines::{Read, Routine};
 
 /// The owners whose routines only superusers can replace: a superuser every
 /// one of whose members, by any path and with any grant options, is a
@@ -157,16 +132,6 @@ const OWN_TRANSACTION: TransactionFraming = TransactionFraming {
     commit: std::borrow::Cow::Borrowed("COMMIT;"),
     rollback: std::borrow::Cow::Borrowed("ROLLBACK;"),
 };
-
-/// Where the read runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Within {
-    /// No transaction is open; the read opens and closes its own.
-    OwnTransaction,
-    /// Inside the caller's open transaction, under a savepoint that is rolled
-    /// back afterwards so the path it sets goes with it (DECISIONS 418).
-    CallersTransaction,
-}
 
 /// Reads every routine in the pin set, managed ones included.
 pub async fn read(conn: &mut Conn, within: Within) -> Result<Read, DbError> {
