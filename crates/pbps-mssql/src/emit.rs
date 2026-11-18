@@ -1969,25 +1969,25 @@ mod tests {
             timing: pbps_model::ExclusionTiming::Immediate,
         };
         let table: pbps_model::TableName = "dbo.t".parse().unwrap();
-        let drop = Change::SetExclusion {
+        let drop = Change::Constraint(ConstraintChange::SetExclusion {
             table: table.clone(),
             name: "x".into(),
             from: Some(Box::new(held.clone())),
             to: None,
-        };
+        });
         let error = super::emit(&drop, Strategy::default())
             .unwrap_err()
             .to_string();
         assert!(error.contains("exclusion constraint x"), "{error}");
         // The option change names the table's index parameters, which are
         // PostgreSQL's whichever part they are on.
-        let tune = Change::SetIndexStorageParameters {
+        let tune = Change::Index(IndexChange::SetIndexStorageParameters {
             table,
             target: pbps_model::IndexPart::Exclusion("x".into()),
             method: pbps_model::IndexMethod::Btree,
             set: [("fillfactor".to_owned(), "70".to_owned())].into(),
             reset: Default::default(),
-        };
+        });
         let error = super::emit(&tune, Strategy::default())
             .unwrap_err()
             .to_string();

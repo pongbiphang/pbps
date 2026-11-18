@@ -337,12 +337,17 @@ pub fn resolve_with_baseline(
     // two kinds, which no resolver blocker covers, and the exclusion drops the
     // baseline holds (their retirements are recorded before it blocks), are read
     // from it.
-    let (resolved, mut blockers, partial) =
-        match resolve_with_provenance(declared, ids, intents, annotation_count, Some(baseline), ctx)
-        {
-            Ok(r) => (Some(r), Vec::new(), None),
-            Err(blocked) => (None, blocked.0, Some(blocked.1)),
-        };
+    let (resolved, mut blockers, partial) = match resolve_with_provenance(
+        declared,
+        ids,
+        intents,
+        annotation_count,
+        Some(baseline),
+        ctx,
+    ) {
+        Ok(r) => (Some(r), Vec::new(), None),
+        Err(blocked) => (None, blocked.0, Some(blocked.1)),
+    };
     let local = resolved.as_ref().map(|r| &r.ids).or(partial.as_ref());
     let local = local.expect("a resolution or a blocked one");
     let baseline_blockers = removals::inventory(baseline, local, declared, &[])

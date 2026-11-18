@@ -1511,13 +1511,13 @@ mod tests {
         // An exclusion constraint's index takes the same per-parameter lock, and
         // the estimate names the constraint, not an index of the user's (DEC-2448.4).
         let mut tuned = change(pbps_model::IndexMethod::Gist);
-        if let Change::SetIndexStorageParameters { target, .. } = &mut tuned {
+        if let Change::Index(IndexChange::SetIndexStorageParameters { target, .. }) = &mut tuned {
             *target = pbps_model::IndexPart::Exclusion("x".into());
         }
         let e = estimate(&tuned, Strategy::default()).unwrap();
         assert!(matches!(e.lock, Lock::ShareUpdateExclusive));
         assert!(e.about.contains("exclusion constraint x"), "{e:?}");
-        if let Change::SetIndexStorageParameters { set, .. } = &mut tuned {
+        if let Change::Index(IndexChange::SetIndexStorageParameters { set, .. }) = &mut tuned {
             set.insert("buffering".to_owned(), "off".to_owned());
         }
         let e = estimate(&tuned, Strategy::default()).unwrap();

@@ -10145,7 +10145,7 @@ mod tests {
         // engine (2BP01, measured on 16.15 and 18.6), so it is never emitted.
         let dropped = sql_of(
             &Postgres::new(),
-            &Change::SetExclusion {
+            &Change::Constraint(ConstraintChange::SetExclusion {
                 table: name("app", "booking"),
                 name: "no_overlap".into(),
                 from: Some(Box::new(constraint(
@@ -10153,7 +10153,7 @@ mod tests {
                     pbps_model::ExclusionTiming::Immediate,
                 ))),
                 to: None,
-            },
+            }),
         );
         assert_eq!(dropped.len(), 1, "{dropped:?}");
         assert!(
@@ -10164,13 +10164,13 @@ mod tests {
         // The backing index's options change in place, by the constraint's name.
         let tuned = sql_of(
             &Postgres::new(),
-            &Change::SetIndexStorageParameters {
+            &Change::Index(IndexChange::SetIndexStorageParameters {
                 table: name("app", "booking"),
                 target: pbps_model::IndexPart::Exclusion("no_overlap".into()),
                 method: pbps_model::IndexMethod::Gist,
                 set: [("fillfactor".to_owned(), "60".to_owned())].into(),
                 reset: ["buffering".to_owned()].into(),
-            },
+            }),
         );
         assert_eq!(tuned.len(), 1, "{tuned:?}");
         assert!(

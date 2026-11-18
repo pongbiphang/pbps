@@ -7052,20 +7052,20 @@ fn diff_exclusions(
     errs: &mut Vec<DiffError>,
 ) {
     let drop_half = |key: &pbps_model::ObjectLocalName, was: &pbps_model::ExclusionConstraint| {
-        Change::SetExclusion {
+        Change::Constraint(ConstraintChange::SetExclusion {
             table: name.clone(),
             name: key.clone(),
             from: Some(Box::new(was.clone())),
             to: None,
-        }
+        })
     };
     let add_half = |key: &pbps_model::ObjectLocalName, now: &pbps_model::ExclusionConstraint| {
-        Change::SetExclusion {
+        Change::Constraint(ConstraintChange::SetExclusion {
             table: name.clone(),
             name: key.clone(),
             from: None,
             to: Some(Box::new(now.clone())),
-        }
+        })
     };
     for (key, was) in &base.exclude {
         match declared.exclude.get(key) {
@@ -7085,13 +7085,13 @@ fn diff_exclusions(
                 });
                 match edit {
                     Some(ParameterEdit::Alter { set, reset }) => {
-                        changes.push(Change::SetIndexStorageParameters {
+                        changes.push(Change::Index(IndexChange::SetIndexStorageParameters {
                             table: name.clone(),
                             target: IndexPart::Exclusion(key.clone()),
                             method: was.method,
                             set,
                             reset,
-                        });
+                        }));
                     }
                     Some(ParameterEdit::Refuse { parameter }) => {
                         errs.push(DiffError::IndexParameterRefused {
@@ -7154,7 +7154,7 @@ fn exclusion_hazards<'a>(
     let changes: Vec<&Change> = changes.into_iter().collect();
     let released = |key: &pbps_model::ObjectLocalName| {
         changes.iter().any(|c| {
-            matches!(c, Change::SetExclusion { table, name: n, to: None, .. }
+            matches!(c, Change::Constraint(ConstraintChange::SetExclusion { table, name: n, to: None, .. })
                 if table == name && n == key)
         })
     };
@@ -12048,11 +12048,11 @@ mod tests {
         // Recorded: one drop, `destructive`, and no constraint risk.
         let cs = exclusion_plan(&held, &booking(&[]), &["no_overlap"]).unwrap();
         let [
-            Change::SetExclusion {
+            Change::Constraint(ConstraintChange::SetExclusion {
                 from: Some(_),
                 to: None,
                 ..
-            },
+            }),
         ] = cs
             .changes
             .iter()
@@ -12117,7 +12117,9 @@ mod tests {
             .changes
             .iter()
             .map(|p| match &p.change {
-                Change::SetExclusion { from, to, .. } => (from.is_some(), to.is_some()),
+                Change::Constraint(ConstraintChange::SetExclusion { from, to, .. }) => {
+                    (from.is_some(), to.is_some())
+                }
                 other => panic!("{other:?}"),
             })
             .collect();
@@ -12139,12 +12141,12 @@ mod tests {
             .insert("fillfactor".into(), "70".into());
         let cs = exclusion_plan(&held, &tuned, &[]).unwrap();
         let [
-            Change::SetIndexStorageParameters {
+            Change::Index(IndexChange::SetIndexStorageParameters {
                 target: IndexPart::Exclusion(n),
                 set,
                 reset,
                 ..
-            },
+            }),
         ] = cs
             .changes
             .iter()
@@ -12233,12 +12235,12 @@ mod tests {
             })
         };
         // The drop is released by a drop in the plan; the retype is not.
-        let released = Change::SetExclusion {
+        let released = Change::Constraint(ConstraintChange::SetExclusion {
             table: table.clone(),
             name: "no_overlap".into(),
             from: Some(Box::new(exclusion("int4range(a, b)", "&&"))),
             to: None,
-        };
+        });
         let mut errs = Vec::new();
         exclusion_hazards(
             &table,
