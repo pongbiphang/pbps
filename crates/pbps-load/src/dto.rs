@@ -1440,7 +1440,8 @@ pub struct IndexDto {
     pub filter: Option<String>,
 
     /// The access method: `btree` (the default, and what an absent key
-    /// means) or `gin` (PostgreSQL, over `jsonb` columns).
+    /// means) or `gin` (PostgreSQL, over `jsonb` columns, or `tsvector`
+    /// columns under their default class `tsvector_ops`, which is left out).
     #[serde(default)]
     pub method: pbps_model::IndexMethod,
 

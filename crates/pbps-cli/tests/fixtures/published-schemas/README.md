@@ -89,3 +89,4 @@ DECISIONS 465).
 - `105/` renames `doctor`'s `identity_file` to `identity_dir`: the identity tree's directory replaces the single identity file (#2600 PR 5a, DEC-2600.9).
 - `107/` adds a SQL Server table's, key's, unique constraint's and index's `filegroup:` to declarations (#2813); 106 belongs to another change.
 - `109/` adds the `sequence:` declaration file: a standalone sequence's type, start, increment and options (#2721 PR A); 108 was reserved and never used.
+- `112/` words the `method: gin` descriptions to name `tsvector` beside `jsonb`, with `tsvector_ops` as its default class (#1984); 110 and 111 belong to other changes.

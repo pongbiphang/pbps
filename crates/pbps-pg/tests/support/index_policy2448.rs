@@ -262,7 +262,7 @@ async fn every_parameter_verdict_and_lock_is_what_the_engine_does() {
 /// A key every method can be built over: `n` for a B-tree, `body` for GIN, and
 /// an expression for GiST, which has no default class for an integer.
 fn key_of(policy: &pbps_model::storage::MethodPolicy) -> &'static str {
-    if policy.key_type.is_some() {
+    if !policy.key_types.is_empty() {
         "body"
     } else if policy.typed_columns.is_empty() {
         "n"

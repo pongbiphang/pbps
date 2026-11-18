@@ -4038,7 +4038,9 @@ fn key_class(
     column: &str,
     pulled: &mut Pulled,
 ) -> Option<Option<OpClassRef>> {
-    use crate::index_policy::{ClassProblem, class_problem, holds_key_type, offered};
+    use crate::index_policy::{
+        ClassProblem, class_problem, holds_key_type, key_scope, key_type_of, offered,
+    };
     // An empty entry is the default class; a missing one is a key the query
     // did not describe, which is not the same thing.
     let Some(class) = raw.key_classes.get(position) else {
@@ -4102,15 +4104,15 @@ fn key_class(
     // of a key the model cannot read back is no part of the answer.
     let provided = crate::index_policy::provider_class_text(policy, class);
     if !provided
-        && policy.key_type.is_some()
+        && !policy.key_types.is_empty()
         && !in_table.is_some_and(|c| holds_key_type(policy, c))
     {
         left_out(
             pulled,
             format!(
-                "is a {0} index over `{column}`, and this model holds {0} only over `{1}`",
+                "is a {0} index over `{column}`, and this model holds {0} only over {1}",
                 method.as_str().to_ascii_uppercase(),
-                policy.key_type.unwrap_or_default(),
+                key_scope(policy),
             ),
         );
         return None;
@@ -4139,7 +4141,8 @@ fn key_class(
         return provider_class(raw, parts, position, column, class, pulled, left_out);
     };
     let held = OpClassRef::bare(name);
-    match class_problem(policy, &held) {
+    let key_type = in_table.and_then(|c| key_type_of(policy, c));
+    match class_problem(policy, &held, key_type) {
         None => Some(Some(held)),
         Some(ClassProblem::DefaultOnly) => {
             left_out(
@@ -4158,8 +4161,8 @@ fn key_class(
                     "indexes `{column}` with operator class `{class}`, and this model holds {} \
                      over `{}` only with {}",
                     method.as_str().to_ascii_uppercase(),
-                    policy.key_type.unwrap_or("its key type"),
-                    offered(policy)
+                    key_type.map_or("its key type", |k| k.base),
+                    offered(policy, key_type)
                 ),
             );
             None
@@ -7227,6 +7230,74 @@ mod tests {
             "{:?}",
             pulled.warnings
         );
+    }
+
+    /// A GIN index over a `tsvector` is read back as the default class, which
+    /// the catalog leaves empty, and held with no class at all (DEC-1984.1). What
+    /// the model holds only over other types, a class of another type's, and a
+    /// type GIN has no class for are left out by name, as before.
+    #[test]
+    fn a_gin_index_over_a_tsvector_is_read_under_its_default_class() {
+        let gin = |oid: i64, name: &str, attnum: i32, class: &str| {
+            let mut i = index(oid, 1, name);
+            i.method = "gin".to_owned();
+            i.columns = vec![attnum];
+            i.key_classes = vec![class.to_owned()];
+            i
+        };
+        let raw = |indexes: Vec<RawIndex>| RawCatalog {
+            tables: vec![table(1, "doc")],
+            columns: vec![
+                col(1, 1, "body", "text"),
+                col(1, 2, "tsv", "tsvector"),
+                col(1, 3, "d", "jsonb"),
+            ],
+            indexes,
+            ..RawCatalog::default()
+        };
+        let pulled = assemble(&raw(vec![
+            gin(10, "doc_tsv", 2, ""),
+            gin(11, "doc_d", 3, ""),
+        ]));
+        assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
+        let doc = &pulled.schema.tables[&TableName::new("app", "doc")];
+        for name in ["doc_tsv", "doc_d"] {
+            let ix = &doc.indexes[name];
+            assert_eq!(ix.method, IndexMethod::Gin, "{name}");
+            assert_eq!(
+                ix.columns[0].opclass, None,
+                "{name}: the default is no class"
+            );
+        }
+        // Negatives, each left out by name rather than read as the default.
+        for (what, ix, expected) in [
+            (
+                "a class of jsonb's over a tsvector",
+                gin(12, "doc_x", 2, "pg_catalog.jsonb_path_ops"),
+                "`tsvector` only with `tsvector_ops`",
+            ),
+            (
+                "text has no GIN class",
+                gin(13, "doc_x", 1, ""),
+                "only over `jsonb` or `tsvector` columns",
+            ),
+        ] {
+            let pulled = assemble(&raw(vec![ix]));
+            assert!(
+                pulled
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("doc_x") && w.contains(expected)),
+                "{what}: {:?}",
+                pulled.warnings
+            );
+            assert!(
+                !pulled.schema.tables[&TableName::new("app", "doc")]
+                    .indexes
+                    .contains_key("doc_x"),
+                "{what}"
+            );
+        }
     }
 
     #[test]

@@ -764,7 +764,7 @@
           "default": null
         },
         "method": {
-          "description": "The access method: `btree` (the default, and what an absent key\nmeans) or `gin` (PostgreSQL, over `jsonb` columns).",
+          "description": "The access method: `btree` (the default, and what an absent key\nmeans) or `gin` (PostgreSQL, over `jsonb` columns, or `tsvector`\ncolumns under their default class `tsvector_ops`, which is left out).",
           "$ref": "#/$defs/IndexMethod",
           "default": "btree"
         },
@@ -852,7 +852,7 @@
           "const": "btree"
         },
         {
-          "description": "PostgreSQL's generalized inverted index, over `jsonb` in this model.",
+          "description": "PostgreSQL's generalized inverted index, over `jsonb` and `tsvector`\nin this model (`tsvector_ops`, a `tsvector`'s default class, is left out).",
           "type": "string",
           "const": "gin"
         },
@@ -2177,6 +2177,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 109,
+  "x-pbps-schema-version": 112,
   "x-pbps-tool-version": "0.0.0"
 }

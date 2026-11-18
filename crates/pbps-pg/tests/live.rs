@@ -3559,13 +3559,13 @@ async fn inet_cidr_macaddr_tsvector_and_xml_columns_pull_recreate_and_repull_to_
 
 /// The converse: what DEC-1634.1 leaves out stays a reported limitation, and
 /// is never read as a type it is not. `macaddr8` is a sixth type the engine
-/// converts to and from `macaddr` and this catalogue does not hold, and a GIN
-/// index over a `tsvector` is an index method the model has nowhere to write
-/// (#1169 holds `gin` over plain `jsonb` only). Each earns a limitation on its
-/// own table, and a sibling table of the five types beside them is untouched.
+/// converts to and from `macaddr` and this catalogue does not hold, so it earns
+/// a limitation on its own table. A GIN index over a `tsvector` was the other
+/// one until DEC-1984.1 held it under its default class, so its table is now
+/// read whole, and a sibling table of the five types beside them is untouched.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
-async fn macaddr8_and_a_gin_over_a_tsvector_stay_reported_limitations() {
+async fn macaddr8_stays_a_reported_limitation_and_a_gin_over_a_tsvector_is_held() {
     let s = emit_schema("net1634l");
     let mut db = TestDb::create("net1634_lim").await;
     fresh(&mut db, &s).await;
@@ -3589,10 +3589,23 @@ async fn macaddr8_and_a_gin_over_a_tsvector_stay_reported_limitations() {
         "a macaddr8 column is a limitation: {named:?}"
     );
     assert!(
-        named
+        !named
             .iter()
             .any(|n| n.starts_with(&format!("{s}.searched"))),
-        "a GIN over a tsvector is a limitation: {named:?}"
+        "a GIN over a tsvector is held, not a limitation: {named:?}"
+    );
+    let searched = read
+        .schema
+        .tables
+        .get(&TableName::new(&s, "searched"))
+        .expect("the table with a GIN over a tsvector is read");
+    assert!(
+        searched
+            .indexes
+            .values()
+            .any(|ix| ix.method == pbps_model::IndexMethod::Gin),
+        "its GIN index is read with it: {:?}",
+        searched.indexes
     );
     assert!(
         !named.iter().any(|n| n.contains(".plain")),
