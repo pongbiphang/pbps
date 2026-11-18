@@ -9865,7 +9865,14 @@ record, which the refusal says. The table's own drop never asks: its intent cove
 its parts. The differ asks it of the baseline's definition **as the baseline holds
 it**, not of the copy the plan's column renames have rewritten for the comparison:
 the record was made from the former, so a plan that renames a key or payload column
-and drops the constraint is admitted by it, and the renamed spelling is no authority.
+and drops the constraint is admitted by it, and the renamed spelling is no authority. Both asks use **one baseline**, the one
+the differ compares: the snapshot's declared texts laid over what the engine read
+(`Declared::overlay`), not the raw read-back. The engine respells an expression or a
+predicate it stores (`'[)'` reads back as `'[)'::text`, `note = 'x'` as `note =
+'x'::text`, `BETWEEN` as two comparisons, measured on 16.15 and 18.6), and the
+record keeps the declaration's spelling, so asking the raw read-back refused a
+correctly recorded retirement of a constraint pbps had created. A Git baseline
+records nothing and the overlay leaves it as it is.
 
 **The command** `pbps drop-exclusion TABLE NAME --reason WHY` is `Intent::DropExclusion`
 and resolves like the other drops, except that the record keeps the definition, which

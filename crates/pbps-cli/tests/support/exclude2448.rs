@@ -6,7 +6,7 @@
 //! engines.
 use super::{
     Demo, OwnDatabase, approved_apply, code, on_server, scalar, server, stderr, stdout, succeeds,
-    try_on_server,
+    text_of, try_on_server,
 };
 
 fn servers(mut check: impl FnMut(&str)) {
@@ -433,6 +433,121 @@ fn a_key_column_rename_in_the_plan_that_drops_its_exclusion_is_admitted_by_the_r
         assert_eq!(constraints(connection, "no_overlap"), 1);
         let next = succeeds(d.run(&["plan", "--db", connection]));
         assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    });
+}
+
+/// A constraint pbps created is stored by the engine under its own spelling
+/// (`'[)'` reads back as `'[)'::text`, `note = 'x'` as `note = 'x'::text`), and
+/// the retirement `drop-exclusion` records is the declaration's. The record is
+/// judged against the baseline the differ compares, what was declared, so a
+/// correct record is admitted and the next plan is empty; a record of another
+/// definition, or none, is refused (DEC-2448.4, measured on 16.15 and 18.6).
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_retirement_of_a_constraint_pbps_created_is_judged_by_its_declared_spelling() {
+    let _ = server();
+    servers(|url| {
+        let own = OwnDatabase::new(url, "exclude-respelled");
+        let connection = own.connection();
+        on_server(
+            connection,
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.booking (id integer PRIMARY KEY, room integer NOT NULL, \
+               starts integer NOT NULL, ends integer NOT NULL, note text, \
+               active boolean NOT NULL DEFAULT true)",
+        );
+        let d = Demo::new("exclude-respelled");
+        succeeds(d.run(&["pull", "--db", connection]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+        let path = d.dir.join("schema/app.booking.yml");
+        let held = std::fs::read_to_string(&path).unwrap();
+        let declare = |filter: &str| {
+            format!(
+                "{held}exclude:\n  stay_apart:\n    method: gist\n    keys:\n      \
+                 - {{expression: \"int4range(starts, ends, '[)')\", operator: \"&&\"}}\n    \
+                 where: \"{filter}\"\n"
+            )
+        };
+        let plan = d.dir.join("plan.json");
+        let sql = d.dir.join("plan.sql");
+
+        // Created by pbps, under the spelling the declaration gives it.
+        std::fs::write(&path, declare("active AND note = 'x'")).unwrap();
+        d.commit();
+        succeed_plan(&d, connection, &plan, &sql);
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &plan,
+            &["--allow", "constraint"],
+        ));
+        let stored = text_of(
+            connection,
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'stay_apart'",
+        );
+        assert!(
+            stored.contains("'[)'::text") && stored.contains("'x'::text"),
+            "the engine respells what was declared: {stored}"
+        );
+        let next = succeeds(d.run(&["plan", "--db", connection]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+        // A later declaration of another definition, then the removal.
+        std::fs::write(&path, declare("active AND note = 'y'")).unwrap();
+        d.commit();
+        std::fs::write(&path, &held).unwrap();
+        d.commit();
+        let refused = |what: &str| {
+            let out = d.run(&["plan", "--db", connection]);
+            assert_ne!(code(&out), 0, "{what}: {}", said(&out));
+            assert!(
+                said(&out).contains("pbps drop-exclusion app.booking stay_apart --reason"),
+                "{what}: {}",
+                said(&out)
+            );
+            assert_eq!(constraints(connection, "stay_apart"), 1);
+        };
+        // No record.
+        refused("no record");
+        // A record of what the declaration said later is not this definition.
+        succeeds(d.run(&[
+            "drop-exclusion",
+            "app.booking",
+            "stay_apart",
+            "--reason",
+            "x",
+            "--since",
+            "HEAD~1",
+        ]));
+        d.commit();
+        refused("another definition");
+        // The record of the definition the database holds, spelled as declared.
+        succeeds(d.run(&[
+            "drop-exclusion",
+            "app.booking",
+            "stay_apart",
+            "--reason",
+            "the booking service enforces it now",
+            "--since",
+            "HEAD~3",
+        ]));
+        d.commit();
+        let script = succeed_plan(&d, connection, &plan, &sql);
+        assert!(
+            script.contains("DROP CONSTRAINT \"stay_apart\""),
+            "{script}"
+        );
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &plan,
+            &["--allow", "destructive"],
+        ));
+        assert_eq!(constraints(connection, "stay_apart"), 0);
+        let next = succeeds(d.run(&["plan", "--db", connection]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+        succeeds(d.run(&["verify", "--db", connection]));
     });
 }
 

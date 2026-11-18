@@ -939,6 +939,7 @@
         "exclude2448::a_replaced_exclusion_is_rebuilt_and_an_option_only_change_keeps_it_standing",
         "exclude2448::a_key_column_drop_under_an_exclusion_is_refused_alone_and_planned_with_its_drop",
         "exclude2448::a_key_column_rename_in_the_plan_that_drops_its_exclusion_is_admitted_by_the_record",
+        "exclude2448::a_retirement_of_a_constraint_pbps_created_is_judged_by_its_declared_spelling",
         "partition_trigger1811::a_trigger_on_the_default_partition_added_with_a_new_partition_applies_and_reads_back",
         "partition_trigger1811::parent_and_member_triggers_apply_with_a_new_partition_and_read_back",
         "partition_trigger1811::a_clone_in_another_enabled_mode_leaves_the_tree_out_by_name",

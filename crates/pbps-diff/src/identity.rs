@@ -2943,6 +2943,64 @@ mod drop_exclusion_tests {
         )
     }
 
+    /// The record keeps the declaration's spelling, and the engine stores another
+    /// (`'[)'` reads back as `'[)'::text`): judged against the read-back the
+    /// right record is refused, judged against the baseline the differ compares
+    /// (the declared text laid over the read-back) it is admitted, and another
+    /// definition is refused either way.
+    #[test]
+    fn a_retirement_recorded_in_the_declared_spelling_is_judged_against_the_declared_baseline() {
+        let table: TableName = "app.booking".parse().unwrap();
+        let spelled = |key: &str, filter: &str| {
+            let mut schema = world("app.booking", &[("no_overlap", "&&")]);
+            let held = schema.tables.get_mut(&table).unwrap();
+            let x = held.exclude.get_mut("no_overlap").unwrap();
+            x.keys[0].key.key = pbps_model::IndexKey::Expression(key.into());
+            x.filter = Some(filter.into());
+            schema
+        };
+        let declared_base = spelled("int4range(a, b, '[)')", "a > 0 AND b = 'x'");
+        let read_back = spelled(
+            "int4range(a, b, '[)'::text)",
+            "((a > 0) AND (b = 'x'::text))",
+        );
+        assert_ne!(declared_base, read_back);
+        let overlaid = pbps_model::Declared::from_schema(&declared_base).overlay(&read_back);
+        assert_eq!(overlaid, declared_base);
+        let declared = world("app.booking", &[]);
+        let ids = resolve(&read_back, &IdsFile::default(), &[], &context())
+            .unwrap()
+            .ids;
+        // `drop-exclusion` reads the Git declarations, which are spelled as declared.
+        let intent = [drop_intent("app.booking", "no_overlap")];
+        let retired = resolved(&declared_base, &ids, &declared, &ids, &intent)
+            .unwrap()
+            .ids;
+        let needs = vec![Blocker::DropExclusionNeedsReason {
+            table: table.clone(),
+            name: "no_overlap".into(),
+        }];
+        assert_eq!(
+            resolved(&read_back, &ids, &declared, &retired, &[]).unwrap_err(),
+            needs
+        );
+        assert!(resolved(&overlaid, &ids, &declared, &retired, &[]).is_ok());
+        // Negative: a record of another definition is no authority under either.
+        let other_text = spelled("int4range(a, b, '(]')", "a > 0 AND b = 'x'");
+        let other = resolved(&other_text, &ids, &declared, &ids, &intent)
+            .unwrap()
+            .ids;
+        assert_eq!(
+            resolved(&overlaid, &ids, &declared, &other, &[]).unwrap_err(),
+            needs
+        );
+        // Negative: no record.
+        assert_eq!(
+            resolved(&overlaid, &ids, &declared, &ids, &[]).unwrap_err(),
+            needs
+        );
+    }
+
     #[test]
     fn a_dropped_exclusion_is_a_blocker_until_its_definition_is_retired_and_then_converges() {
         let base = world("app.booking", &[("no_overlap", "&&")]);

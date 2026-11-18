@@ -5302,12 +5302,16 @@ fn cmd_plan(
             baseline::load(project, source, dialect.as_ref()),
         )?;
 
+        // The differ's baseline below overlays what was declared on the read-back
+        // (ADR-0013 §4); an exclusion's recorded retirement is judged against the
+        // same text, not the engine's respelling (DEC-2448.4).
+        let identity_base = base.declared.overlay(&base.schema);
         let res = match resolve_with_intent(
             project,
             &loaded,
             &ids,
             pbps_diff::Side {
-                schema: &base.schema,
+                schema: &identity_base,
                 ids: &base.ids,
             },
             may_prompt,
