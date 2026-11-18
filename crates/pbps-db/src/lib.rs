@@ -55,6 +55,16 @@ pub use ledger::{
 };
 pub use mssql::LocalDbSelector;
 
+/// Where the read runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionOwner {
+    /// No transaction is open; the read opens and closes its own.
+    OwnTransaction,
+    /// Inside the caller's open transaction, under a savepoint that is rolled
+    /// back afterwards so the path it sets goes with it (DECISIONS 418).
+    CallersTransaction,
+}
+
 /// The application name every connection this process opens carries, unless
 /// its connection string names one: `pbps/<pid>/<nonce>` (#1188).
 ///

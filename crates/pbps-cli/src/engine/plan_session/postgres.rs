@@ -29,17 +29,17 @@ pub(crate) struct PlanState {
     /// The one admission rule of every site that runs code the plan holds
     /// (DEC-2563.2): the routines the sites vet are admitted into it, and the
     /// plan shows and pins them when it seals.
-    admission: SiteAdmission,
+    admission: RoutineAdmission,
 }
 
-impl AsRef<SiteAdmission> for PlanState {
-    fn as_ref(&self) -> &SiteAdmission {
+impl AsRef<RoutineAdmission> for PlanState {
+    fn as_ref(&self) -> &RoutineAdmission {
         &self.admission
     }
 }
 
-impl AsMut<SiteAdmission> for PlanState {
-    fn as_mut(&mut self) -> &mut SiteAdmission {
+impl AsMut<RoutineAdmission> for PlanState {
+    fn as_mut(&mut self) -> &mut RoutineAdmission {
         &mut self.admission
     }
 }
@@ -86,15 +86,16 @@ pub(in crate::engine) async fn type_input_routines(
     inside: bool,
 ) -> anyhow::Result<BTreeSet<i64>> {
     let within = if inside {
-        pbps_pg::pins::Within::CallersTransaction
+        pbps_db::TransactionOwner::CallersTransaction
     } else {
-        pbps_pg::pins::Within::OwnTransaction
+        pbps_db::TransactionOwner::OwnTransaction
     };
     // Where each type is now: a placeholder names a type the plan itself
     // brings and is not read, and a type its package's move carried is
     // found under the name the move gave it (DEC-2447.12).
     let references = pbps_pg::type_refs::current_references(conn, within, pins).await?;
-    let admission = pbps_pg::admission::Admission::new(trusted.iter().cloned(), pin_routines);
+    let admission =
+        pbps_dialect::routines::RoutineAdmission::new(trusted.iter().cloned(), pin_routines);
     Ok(pbps_pg::type_refs::input_routines(conn, within, &references, &admission).await?)
 }
 
@@ -358,7 +359,7 @@ pub(in crate::engine) async fn expand_table_rebuild<
     D: crate::emission::Engine,
 >(
     conn: &mut Conn,
-    admission: &pbps_pg::admission::Admission,
+    admission: &pbps_dialect::routines::RoutineAdmission,
     changes: PlanningPlan<S>,
     before: pbps_diff::Side<'_>,
     desired: pbps_diff::Side<'_>,
@@ -731,7 +732,7 @@ pub(in crate::engine) async fn numbered_column_fills(
 /// The PostgreSQL body of `engine::prepare_data_writes`, which apply also calls.
 pub(in crate::engine) async fn prepare_data_writes(
     conn: &mut Conn,
-    admission: &pbps_pg::admission::Admission,
+    admission: &pbps_dialect::routines::RoutineAdmission,
     changes: &ChangeSet,
     baseline: &StateSnapshot,
     planned_ids: &pbps_model::IdsFile,
@@ -1329,7 +1330,7 @@ pub(in crate::engine) async fn check_domain_alterations(
 /// bind table expressions this way.
 pub(in crate::engine) async fn table_expression_notes(
     conn: &mut Conn,
-    admission: &pbps_pg::admission::Admission,
+    admission: &pbps_dialect::routines::RoutineAdmission,
     changes: &[pbps_model::PlannedChange],
     mut on_note: impl FnMut(String),
 ) {
@@ -1337,7 +1338,7 @@ pub(in crate::engine) async fn table_expression_notes(
         let Ok(pbps_pg::table_expressions::Vetted::Unjudged(notes)) = vet_table_expressions(
             conn,
             admission,
-            pbps_pg::pins::Within::OwnTransaction,
+            pbps_db::TransactionOwner::OwnTransaction,
             pbps_pg::table_expressions::Moment::Early,
             &planned.change,
         )

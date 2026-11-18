@@ -131,7 +131,7 @@ pub async fn execute_staged_statement(
 /// DEC-2331.1). Nothing to vet on an engine that records none.
 pub async fn vet_conversions(
     conn: &mut Conn,
-    admission: &pbps_pg::admission::Admission,
+    admission: &pbps_dialect::routines::RoutineAdmission,
     changes: &[pbps_model::PlannedChange],
 ) -> anyhow::Result<std::collections::BTreeSet<pbps_model::ColumnRef>> {
     let mut immutable = std::collections::BTreeSet::new();
@@ -162,8 +162,8 @@ pub async fn vet_conversions(
 /// Judges the table expressions a change introduces (DEC-2563.4).
 pub async fn vet_table_expressions(
     conn: &mut Conn,
-    admission: &pbps_pg::admission::Admission,
-    within: pbps_pg::pins::Within,
+    admission: &pbps_dialect::routines::RoutineAdmission,
+    within: pbps_db::TransactionOwner,
     moment: pbps_pg::table_expressions::Moment,
     change: &pbps_model::Change,
 ) -> Result<pbps_pg::table_expressions::Vetted, String> {
@@ -172,7 +172,7 @@ pub async fn vet_table_expressions(
 
 pub async fn vet_drop_requirements(
     conn: &mut Conn,
-    admission: &pbps_pg::admission::Admission,
+    admission: &pbps_dialect::routines::RoutineAdmission,
     names: &pbps_model::plan_names::PlanNames<'_>,
 ) -> anyhow::Result<()> {
     for (index, step) in names.changes().iter().enumerate() {
@@ -198,7 +198,7 @@ pub async fn vet_drop_requirements(
 
 pub async fn vet_drop_requirement(
     conn: &mut Conn,
-    admission: &pbps_pg::admission::Admission,
+    admission: &pbps_dialect::routines::RoutineAdmission,
     table: &TableName,
     predicate: &str,
 ) -> anyhow::Result<BTreeSet<pbps_model::ColumnName>> {
@@ -206,7 +206,7 @@ pub async fn vet_drop_requirement(
         Driver::Postgres => pbps_pg::input_path::vet_requirement(
             conn,
             admission,
-            pbps_pg::pins::Within::OwnTransaction,
+            pbps_db::TransactionOwner::OwnTransaction,
             table,
             predicate,
         )
@@ -220,7 +220,7 @@ pub async fn vet_drop_requirement(
 
 pub async fn check_drop_requirement(
     conn: &mut Conn,
-    admission: &pbps_pg::admission::Admission,
+    admission: &pbps_dialect::routines::RoutineAdmission,
     statement: &pbps_dialect::Statement,
 ) -> Result<(), DbError> {
     let Some(guard) = &statement.drop_guard else {
@@ -2878,7 +2878,7 @@ pub struct DataWriteGuard {
 
 pub async fn prepare_data_writes(
     conn: &mut Conn,
-    admission: &pbps_pg::admission::Admission,
+    admission: &pbps_dialect::routines::RoutineAdmission,
     changes: &ChangeSet,
     baseline: &StateSnapshot,
     planned_ids: &pbps_model::IdsFile,
@@ -2912,7 +2912,7 @@ pub async fn settle_data_writes(conn: &mut Conn) -> anyhow::Result<bool> {
 
 pub async fn check_data_write(
     conn: &mut Conn,
-    admission: &pbps_pg::admission::Admission,
+    admission: &pbps_dialect::routines::RoutineAdmission,
     statement: &pbps_dialect::Statement,
     guard: &DataWriteGuard,
 ) -> anyhow::Result<()> {
@@ -5113,9 +5113,9 @@ pub async fn check_type_pins(
     match conn.driver() {
         Driver::Postgres => {
             let within = if within_transaction {
-                pbps_pg::pins::Within::CallersTransaction
+                pbps_db::TransactionOwner::CallersTransaction
             } else {
-                pbps_pg::pins::Within::OwnTransaction
+                pbps_db::TransactionOwner::OwnTransaction
             };
             pbps_pg::type_refs::trusted_roles(conn, trusted).await?;
             pbps_pg::type_refs::check(
@@ -5166,9 +5166,9 @@ pub async fn recheck_type_prerequisites(
     match conn.driver() {
         Driver::Postgres => {
             let within = if inside {
-                pbps_pg::pins::Within::CallersTransaction
+                pbps_db::TransactionOwner::CallersTransaction
             } else {
-                pbps_pg::pins::Within::OwnTransaction
+                pbps_db::TransactionOwner::OwnTransaction
             };
             pbps_pg::type_refs::check(conn, within, &expected.types, &[], changes).await?;
             pbps_pg::class_pins::check(conn, within, &expected.providers, changes).await?;
@@ -5238,7 +5238,7 @@ pub async fn installation_ids(conn: &mut Conn, ids: &IdsFile) -> anyhow::Result<
 
 pub async fn rebuild_window(
     conn: &mut Conn,
-    admission: &pbps_pg::admission::Admission,
+    admission: &pbps_dialect::routines::RoutineAdmission,
     before: pbps_diff::Side<'_>,
     changes: &ChangeSet,
 ) -> anyhow::Result<()> {
@@ -5250,35 +5250,13 @@ pub async fn rebuild_window(
 
 pub type RebuildVerification = pbps_pg::rebuild::Verification;
 
-/// Retention is a connected engine guard, never a second plan emitter.
-pub async fn hold_retained(
-    conn: &mut Conn,
-    changes: &pbps_model::ChangeSet,
-    authored: Option<&pbps_model::Schema>,
-) -> anyhow::Result<Option<pbps_pg::retained::Held>> {
-    if pbps_model::retained::expressions(changes).next().is_none() {
-        return Ok(None);
-    }
-    anyhow::ensure!(
-        conn.driver() == pbps_db::Driver::Postgres,
-        "retained expressions require PostgreSQL"
-    );
-    pbps_pg::retained::hold(conn, changes, authored)
-        .await
-        .map(Some)
-        .map_err(anyhow::Error::msg)
-}
-pub async fn verify_retained(
-    conn: &mut Conn,
-    held: Option<&pbps_pg::retained::Held>,
-    after: &pbps_model::Schema,
-) -> anyhow::Result<Option<pbps_pg::retained::Verified>> {
-    match held {
-        Some(held) => held
-            .verify(conn, &pbps_pg::Postgres::new(), after)
-            .await
-            .map(Some)
-            .map_err(anyhow::Error::msg),
-        None => Ok(None),
-    }
+/// Fixture reads have no apply session, so retain their baseline replay behind
+/// the engine seam rather than omitting physical defaults (#2798).
+#[cfg(test)]
+pub(crate) fn physical_domain_defaults(
+    before: &Schema,
+    ids: &IdsFile,
+    changes: &ChangeSet,
+) -> BTreeMap<pbps_model::Uid, pbps_model::ManagedType> {
+    pbps_pg::type_refs::declared::completed(before, ids, changes)
 }

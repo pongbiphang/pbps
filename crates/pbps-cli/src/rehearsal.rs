@@ -659,7 +659,7 @@ async fn run_statements(
     }
     // A scratch holds no declared role and reviews nothing: what runs there is
     // judged as the target's apply will judge it.
-    let admission = pbps_pg::admission::Admission::default();
+    let admission = pbps_dialect::routines::RoutineAdmission::default();
     for (i, statement) in statements.iter().enumerate() {
         let executed =
             match crate::engine::check_drop_requirement(conn, &admission, statement).await {

@@ -47,9 +47,15 @@ pub mod estimate;
 pub mod lower;
 pub mod plan_rows;
 pub mod predicate;
+pub mod routines;
 pub mod slots;
 pub mod support;
 pub mod types;
+
+/// Engine-owned evidence determines which retained expressions compare equal (#2798).
+pub trait RetainedComparison {
+    fn rewrite(&self, before: &mut Schema, after: &Schema);
+}
 
 #[cfg(test)]
 use pbps_model::ChangeSet;

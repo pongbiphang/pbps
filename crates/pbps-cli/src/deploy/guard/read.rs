@@ -1,7 +1,9 @@
 use pbps_model::TableChange;
 use pbps_model::TypeChange;
 use pbps_model::{Change, ChangeSet, IdsFile};
-use pbps_pg::type_refs::declared::DomainDefaults;
+use pbps_model::{ManagedType, Uid};
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 use super::{super::Settled, super::StagedRead, Plan};
 
@@ -17,57 +19,68 @@ enum Mode {
 pub(in crate::deploy) struct Read<'a> {
     plan: Plan<'a>,
     mode: Mode,
-    retained: Option<&'a pbps_pg::retained::Verified>,
-    defaults: Option<&'a DomainDefaults>,
+    retained: Option<&'a dyn pbps_dialect::RetainedComparison>,
+    defaults: Cow<'a, BTreeMap<Uid, ManagedType>>,
 }
 
 impl<'a> Read<'a> {
-    pub(in crate::deploy) fn transactional(plan: Plan<'a>) -> Self {
+    pub(in crate::deploy) fn transactional(
+        plan: Plan<'a>,
+        defaults: &'a BTreeMap<Uid, ManagedType>,
+    ) -> Self {
+        Self::new(plan, Mode::Transactional, Cow::Borrowed(defaults))
+    }
+
+    fn new(plan: Plan<'a>, mode: Mode, defaults: Cow<'a, BTreeMap<Uid, ManagedType>>) -> Self {
         Self {
             plan,
-            mode: Mode::Transactional,
+            mode,
             retained: None,
-            defaults: None,
+            defaults,
         }
     }
 
-    fn staged(plan: Plan<'a>, read: StagedRead) -> Self {
+    fn staged(
+        plan: Plan<'a>,
+        read: StagedRead,
+        defaults: Cow<'a, BTreeMap<Uid, ManagedType>>,
+    ) -> Self {
         let mode = match read {
             StagedRead::Checkpoint { completed, total } if completed < total => Mode::StagedMid,
             StagedRead::Checkpoint { .. } => Mode::StagedWhole,
             StagedRead::Closing { .. } => Mode::StagedClosing,
         };
-        Self {
+        Self::new(plan, mode, defaults)
+    }
+
+    #[cfg(test)]
+    pub(in crate::deploy) fn fixture_transactional(
+        plan: Plan<'a>,
+        before: &pbps_model::Schema,
+    ) -> Self {
+        Self::new(
             plan,
-            mode,
-            retained: None,
-            defaults: None,
-        }
+            Mode::Transactional,
+            Cow::Owned(fixture_defaults(plan, before)),
+        )
     }
 
     pub(in crate::deploy) fn with_retained(
         mut self,
-        retained: Option<&'a pbps_pg::retained::Verified>,
+        retained: Option<&'a dyn pbps_dialect::RetainedComparison>,
     ) -> Self {
         self.retained = retained;
         self
     }
-    pub(in crate::deploy) fn retained(&self) -> Option<&'a pbps_pg::retained::Verified> {
+    pub(in crate::deploy) fn retained(&self) -> Option<&'a dyn pbps_dialect::RetainedComparison> {
         self.retained
     }
 
-    pub(in crate::deploy) fn with_domain_defaults(
-        mut self,
-        defaults: Option<&'a DomainDefaults>,
-    ) -> Self {
-        self.defaults = defaults;
-        self
-    }
-    pub(in crate::deploy) fn domain_defaults(&self) -> Option<&'a DomainDefaults> {
-        self.defaults
+    pub(in crate::deploy) fn domain_defaults(&self) -> &BTreeMap<Uid, ManagedType> {
+        &self.defaults
     }
 
-    pub(in crate::deploy) fn parts(self) -> (Plan<'a>, Settled) {
+    pub(in crate::deploy) fn parts(&self) -> (Plan<'a>, Settled) {
         // A transactional read, like the staged closing read, is scoped by
         // the plan alone. Its omitted default cells therefore mean something
         // a checkpoint's omissions cannot (DECISIONS 191).
@@ -94,8 +107,21 @@ impl<'a> Staged<'a> {
         Ok(Self(plan))
     }
 
-    pub(in crate::deploy) fn read(&self, read: StagedRead) -> Read<'a> {
-        Read::staged(self.0, read)
+    pub(in crate::deploy) fn read(
+        &self,
+        read: StagedRead,
+        defaults: &'a BTreeMap<Uid, ManagedType>,
+    ) -> Read<'a> {
+        Read::staged(self.0, read, Cow::Borrowed(defaults))
+    }
+
+    #[cfg(test)]
+    pub(in crate::deploy) fn fixture_read(
+        &self,
+        read: StagedRead,
+        before: &pbps_model::Schema,
+    ) -> Read<'a> {
+        Read::staged(self.0, read, Cow::Owned(fixture_defaults(self.0, before)))
     }
 
     pub(in crate::deploy) fn statement(
@@ -148,6 +174,13 @@ impl StatementPlan {
             ids: &self.ids,
         })
     }
+}
+
+#[cfg(test)]
+fn fixture_defaults(plan: Plan<'_>, before: &pbps_model::Schema) -> BTreeMap<Uid, ManagedType> {
+    // Fixtures have no apply session; preserve its baseline replay through the engine seam (#2798).
+    let base = pbps_diff::identity::type_refs::before_changes(plan.ids, plan.changes);
+    crate::engine::physical_domain_defaults(before, &base, plan.changes)
 }
 
 #[cfg(test)]
@@ -324,13 +357,25 @@ mod tests {
         let bare = schema(&name, table());
         let complete = schema(&name, declared.clone());
         let dialect = pbps_pg::Postgres::new();
-        refuse_pinned_movement(&dialect, staged.read(checkpoint), &empty, &bare, "test")
-            .expect("the index is emitted after CREATE in the same logical change");
-        refuse_pinned_movement(&dialect, staged.read(checkpoint), &bare, &complete, "test")
-            .expect("the pending index can appear at a later checkpoint");
         refuse_pinned_movement(
             &dialect,
-            staged.read(StagedRead::Closing { total: 2 }),
+            staged.fixture_read(checkpoint, &empty),
+            &empty,
+            &bare,
+            "test",
+        )
+        .expect("the index is emitted after CREATE in the same logical change");
+        refuse_pinned_movement(
+            &dialect,
+            staged.fixture_read(checkpoint, &bare),
+            &bare,
+            &complete,
+            "test",
+        )
+        .expect("the pending index can appear at a later checkpoint");
+        refuse_pinned_movement(
+            &dialect,
+            staged.fixture_read(StagedRead::Closing { total: 2 }, &complete),
             &complete,
             &complete,
             "test",
@@ -338,7 +383,7 @@ mod tests {
         .expect("the promised parts are present at the close");
         let error = refuse_pinned_movement(
             &dialect,
-            staged.read(StagedRead::Closing { total: 2 }),
+            staged.fixture_read(StagedRead::Closing { total: 2 }, &bare),
             &bare,
             &bare,
             "test",
@@ -356,7 +401,7 @@ mod tests {
             let before = if already_observed { &complete } else { &bare };
             let error = refuse_pinned_movement(
                 &dialect,
-                staged.read(checkpoint),
+                staged.fixture_read(checkpoint, before),
                 before,
                 &schema(&name, wrong),
                 "test",
@@ -417,7 +462,7 @@ mod tests {
             };
             refuse_pinned_movement(
                 &pg,
-                at_statement.staged().read(read),
+                at_statement.staged().fixture_read(read, &before),
                 &before,
                 &after,
                 "test",
@@ -428,7 +473,7 @@ mod tests {
             assert!(
                 refuse_pinned_movement(
                     &pg,
-                    at_statement.staged().read(read),
+                    at_statement.staged().fixture_read(read, &before),
                     &before,
                     &drift,
                     "test"
@@ -477,7 +522,7 @@ mod tests {
                 };
                 refuse_pinned_movement(
                     dialect,
-                    at_statement.staged().read(read),
+                    at_statement.staged().fixture_read(read, &before),
                     &before,
                     &observed,
                     "test",
@@ -487,7 +532,7 @@ mod tests {
                 wrong.columns.get_mut("id").unwrap().nullable = false;
                 let error = refuse_pinned_movement(
                     dialect,
-                    at_statement.staged().read(read),
+                    at_statement.staged().fixture_read(read, &before),
                     &before,
                     &schema(address, wrong),
                     "test",
@@ -498,7 +543,7 @@ mod tests {
             }
             refuse_pinned_movement(
                 dialect,
-                staged.read(StagedRead::Closing { total: 2 }),
+                staged.fixture_read(StagedRead::Closing { total: 2 }, &before),
                 &before,
                 &schema(&to, table()),
                 "test",

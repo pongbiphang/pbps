@@ -126,7 +126,7 @@ async fn guarded_drop(session: &Session<'_>, input: &Assembled) -> anyhow::Resul
     conn.execute("BEGIN").await?;
     let result = crate::engine::check_drop_requirement(
         &mut conn,
-        &pbps_pg::admission::Admission::default(),
+        &pbps_dialect::routines::RoutineAdmission::default(),
         &statement,
     )
     .await;

@@ -70,7 +70,7 @@ fn ids(roles: &[(&str, &str)]) -> IdsFile {
 fn compare(cs: &ChangeSet, ids: &IdsFile, before: &Schema, after: &Schema) -> Result<(), String> {
     refuse_pinned_movement(
         &pbps_mssql::Mssql,
-        Read::transactional(Plan { changes: cs, ids }),
+        Read::fixture_transactional(Plan { changes: cs, ids }, before),
         before,
         after,
         "test",
@@ -201,7 +201,7 @@ fn staged_role_reads_keep_grants_at_the_observed_boundary() {
         ] {
             let result = refuse_pinned_movement(
                 &pbps_mssql::Mssql,
-                staged.read(StagedRead::Closing { total: 1 }),
+                staged.fixture_read(StagedRead::Closing { total: 1 }, baseline),
                 baseline,
                 &schema(&[("b", held)]),
                 "test",
@@ -229,10 +229,13 @@ fn staged_role_reads_keep_grants_at_the_observed_boundary() {
     ] {
         let result = refuse_pinned_movement(
             &pbps_mssql::Mssql,
-            staged.read(StagedRead::Checkpoint {
-                completed: 1,
-                total: 2,
-            }),
+            staged.fixture_read(
+                StagedRead::Checkpoint {
+                    completed: 1,
+                    total: 2,
+                },
+                &before,
+            ),
             &before,
             &schema(&[("a", held)]),
             "test",
@@ -594,10 +597,13 @@ fn serial_sequence_grants_disappear_with_the_column_uid_across_renames() {
                 let check = |after: &Schema| {
                     refuse_pinned_movement(
                         &pg,
-                        Read::transactional(Plan {
-                            changes: &cs,
-                            ids: &after_ids,
-                        }),
+                        Read::fixture_transactional(
+                            Plan {
+                                changes: &cs,
+                                ids: &after_ids,
+                            },
+                            &before,
+                        ),
                         &before,
                         after,
                         "test",

@@ -26,7 +26,7 @@ pub(super) async fn run_probes(
 ) -> anyhow::Result<()> {
     run_probes_observed(
         conn,
-        &pbps_pg::admission::Admission::default(),
+        &pbps_dialect::routines::RoutineAdmission::default(),
         dialect,
         names,
         partitions,
@@ -40,7 +40,7 @@ pub(super) async fn run_probes(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_probes_observed(
     conn: &mut Conn,
-    admission: &pbps_pg::admission::Admission,
+    admission: &pbps_dialect::routines::RoutineAdmission,
     dialect: &dyn pbps_dialect::Dialect,
     names: &pbps_model::plan_names::PlanNames<'_>,
     partitions: &pbps_model::Partitions,
@@ -391,7 +391,7 @@ async fn execute_statement_with_session<D: crate::engine::ApplySession>(
         .context("Nothing has been applied — the transaction was rolled back.")?;
     }
     let admission = reviewed.map_or_else(
-        || pbps_pg::admission::Admission::without_review(trusted.iter().cloned()),
+        || pbps_dialect::routines::RoutineAdmission::without_review(trusted.iter().cloned()),
         crate::pins::Approved::admission,
     );
     session

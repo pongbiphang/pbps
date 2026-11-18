@@ -14,9 +14,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, bail};
 use pbps_db::Conn;
 use pbps_db::fingerprint::FingerprintKey;
+use pbps_dialect::routines::RoutineAdmission;
 use pbps_model::escape::Escaped;
 use pbps_model::{ModuleId, RoutineArg, RoutineId, RoutinePin, RoutinePins, TableName};
-use pbps_pg::admission::Admission;
 
 use crate::db::Target;
 use pbps_config::Project;
@@ -69,16 +69,16 @@ pub enum Check<'a> {
 }
 
 impl<'a> Check<'a> {
-    pub(crate) fn within(self) -> pbps_pg::pins::Within {
+    pub(crate) fn within(self) -> pbps_db::TransactionOwner {
         match self {
             Check::BeforeStatements { .. }
             | Check::BeforeRecording { .. }
             | Check::BeforeCommit { .. }
-            | Check::BeforeStepCommits { .. } => pbps_pg::pins::Within::CallersTransaction,
+            | Check::BeforeStepCommits { .. } => pbps_db::TransactionOwner::CallersTransaction,
             Check::BeforeProbes
             | Check::BeforeStep { .. }
             | Check::AfterStep { .. }
-            | Check::BeforeClosing { .. } => pbps_pg::pins::Within::OwnTransaction,
+            | Check::BeforeClosing { .. } => pbps_db::TransactionOwner::OwnTransaction,
         }
     }
 
@@ -186,15 +186,15 @@ impl Approved<'_> {
     /// admits only the routines the plan showed and pinned (DEC-2563.2), and
     /// each site refuses any other where it vets, before it evaluates.
     #[must_use]
-    pub fn admission(&self) -> Admission {
+    pub fn admission(&self) -> RoutineAdmission {
         applying(self.project, self.plan)
     }
 }
 
 /// Apply's admission for `plan`: the routines it showed and pinned, and no others.
 #[must_use]
-pub fn applying(project: &Project, plan: &pbps_model::SavedPlan) -> Admission {
-    Admission::new(
+pub fn applying(project: &Project, plan: &pbps_model::SavedPlan) -> RoutineAdmission {
+    RoutineAdmission::new(
         project.config.trusted_roles.iter().cloned(),
         plan.pin_type_routines,
     )
@@ -203,8 +203,8 @@ pub fn applying(project: &Project, plan: &pbps_model::SavedPlan) -> Admission {
 
 /// The admission rule of a command that is about to plan.
 #[must_use]
-pub fn admission(project: &Project) -> Admission {
-    Admission::new(
+pub fn admission(project: &Project) -> RoutineAdmission {
+    RoutineAdmission::new(
         project.config.trusted_roles.iter().cloned(),
         project.config.pin_type_routines,
     )
@@ -224,7 +224,7 @@ pub async fn seal(
     managed: &BTreeSet<ModuleId>,
 ) -> anyhow::Result<Option<RoutinePins>> {
     let Some(read) =
-        crate::engine::read_pinned_routines(conn, pbps_pg::pins::Within::OwnTransaction)
+        crate::engine::read_pinned_routines(conn, pbps_db::TransactionOwner::OwnTransaction)
             .await
             .context("could not read the routines this plan pins (DEC-319.1)")?
     else {
@@ -369,7 +369,7 @@ pub async fn seal_selected(
     project: &Project,
     target: &Target,
     types: &[pbps_model::TypePin],
-    sites: &Admission,
+    sites: &RoutineAdmission,
 ) -> anyhow::Result<(Vec<pbps_model::TypeRoutine>, Option<RoutinePins>)> {
     // The referenced types' routines, and those the plan's expressions reached
     // (`sites`: conversions, requirements and copy conversions, vetted by now).
@@ -387,7 +387,7 @@ pub async fn seal_selected(
     }
     let (read, sources) = pbps_pg::pins::selected(
         conn,
-        pbps_pg::pins::Within::OwnTransaction,
+        pbps_db::TransactionOwner::OwnTransaction,
         &roots.into_iter().collect::<Vec<_>>(),
     )
     .await?;
@@ -484,7 +484,7 @@ struct Unmanaged {
 
 /// The routines that the plan does not manage, keyed by `pg_proc.oid`.
 fn unmanaged(
-    routines: Vec<pbps_pg::pins::Routine>,
+    routines: Vec<pbps_dialect::routines::Routine>,
     managed: &BTreeSet<ModuleId>,
 ) -> BTreeMap<i64, Unmanaged> {
     routines
@@ -506,7 +506,7 @@ fn unmanaged(
 /// The routine's identity as the model spells it, so that overloads differ and
 /// a name is escaped once, where it is shown. An argument list the model's
 /// identity cannot hold still gets a signature, joined as the catalog gave it.
-fn signature(routine: &pbps_pg::pins::Routine) -> String {
+fn signature(routine: &pbps_dialect::routines::Routine) -> String {
     match routine_id(routine) {
         Some(id) => id.raw().to_string(),
         None => format!(
@@ -518,7 +518,7 @@ fn signature(routine: &pbps_pg::pins::Routine) -> String {
     }
 }
 
-fn routine_id(routine: &pbps_pg::pins::Routine) -> Option<RoutineId> {
+fn routine_id(routine: &pbps_dialect::routines::Routine) -> Option<RoutineId> {
     let args = routine
         .args
         .iter()
@@ -536,7 +536,7 @@ fn routine_id(routine: &pbps_pg::pins::Routine) -> Option<RoutineId> {
 /// An argument list that does not parse as the model's routine identity cannot
 /// be a managed routine's, so it is pinned: a failure to match errs towards
 /// pinning, never towards leaving out.
-fn is_managed(routine: &pbps_pg::pins::Routine, managed: &BTreeSet<ModuleId>) -> bool {
+fn is_managed(routine: &pbps_dialect::routines::Routine, managed: &BTreeSet<ModuleId>) -> bool {
     routine_id(routine).is_some_and(|id| managed.contains(&ModuleId::Routine(id)))
 }
 
@@ -663,8 +663,8 @@ mod tests {
         name: &str,
         args: &[&str],
         input: &str,
-    ) -> pbps_pg::pins::Routine {
-        pbps_pg::pins::Routine {
+    ) -> pbps_dialect::routines::Routine {
+        pbps_dialect::routines::Routine {
             oid,
             schema: schema.to_owned(),
             name: name.to_owned(),
@@ -684,7 +684,7 @@ mod tests {
 
     fn pins(
         key: &FingerprintKey,
-        routines: Vec<pbps_pg::pins::Routine>,
+        routines: Vec<pbps_dialect::routines::Routine>,
     ) -> BTreeMap<i64, RoutinePin> {
         digests(key, &unmanaged(routines, &BTreeSet::new()))
     }

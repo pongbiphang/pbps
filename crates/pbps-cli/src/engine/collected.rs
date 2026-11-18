@@ -15,8 +15,8 @@ use super::*;
 /// answers `None`, which a caller reads as "nothing to seal or check".
 pub(crate) async fn read_pinned_routines(
     conn: &mut Conn,
-    within: pbps_pg::pins::Within,
-) -> Result<Option<pbps_pg::pins::Read>, DbError> {
+    within: pbps_db::TransactionOwner,
+) -> Result<Option<pbps_dialect::routines::Read>, DbError> {
     match conn.driver() {
         Driver::Postgres => pbps_pg::pins::read(conn, within).await.map(Some),
         Driver::Mssql => Ok(None),
@@ -163,7 +163,7 @@ pub(crate) async fn history_name_occupants(
 /// SQL Server leaves none unjudged.
 pub(crate) async fn table_expressions_left_unjudged(
     conn: &mut Conn,
-    admission: &pbps_pg::admission::Admission,
+    admission: &pbps_dialect::routines::RoutineAdmission,
     changes: &[pbps_model::PlannedChange],
 ) -> bool {
     match conn.driver() {
@@ -173,7 +173,7 @@ pub(crate) async fn table_expressions_left_unjudged(
                 match vet_table_expressions(
                     conn,
                     admission,
-                    pbps_pg::pins::Within::OwnTransaction,
+                    pbps_db::TransactionOwner::OwnTransaction,
                     pbps_pg::table_expressions::Moment::Early,
                     &planned.change,
                 )

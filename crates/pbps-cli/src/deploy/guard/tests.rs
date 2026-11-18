@@ -788,10 +788,13 @@ fn column_requirements_follow_one_uid_through_intermediate_spellings() {
     let check = |after: &Schema| {
         super::super::refuse_pinned_movement(
             &pbps_pg::Postgres::new(),
-            super::Read::transactional(super::Plan {
-                changes: &changes,
-                ids: &ids,
-            }),
+            super::Read::fixture_transactional(
+                super::Plan {
+                    changes: &changes,
+                    ids: &ids,
+                },
+                &before,
+            ),
             &before,
             after,
             "test",
@@ -879,10 +882,13 @@ fn a_column_drop_before_its_parent_rename_reaches_only_its_own_partition_entry()
     let check = |after: &Schema| {
         super::super::refuse_pinned_movement(
             &pbps_pg::Postgres::new(),
-            super::Read::transactional(super::Plan {
-                changes: &changes,
-                ids: &ids,
-            }),
+            super::Read::fixture_transactional(
+                super::Plan {
+                    changes: &changes,
+                    ids: &ids,
+                },
+                &before,
+            ),
             &before,
             after,
             "test",
@@ -1014,10 +1020,13 @@ fn a_rename_keeps_every_observed_column_field_across_the_move_and_at_close() {
             let check = |column| {
                 super::super::refuse_pinned_movement(
                     &pbps_pg::Postgres::new(),
-                    super::Read::transactional(super::Plan {
-                        changes: &changes,
-                        ids: &ids,
-                    }),
+                    super::Read::fixture_transactional(
+                        super::Plan {
+                            changes: &changes,
+                            ids: &ids,
+                        },
+                        &before,
+                    ),
                     &before,
                     &observed("renamed", column),
                     "test",
@@ -1127,10 +1136,13 @@ fn a_retired_columns_promise_cannot_answer_for_the_next_holder_of_its_name() {
     let check = |after: &Schema| {
         super::super::refuse_pinned_movement(
             &pbps_pg::Postgres::new(),
-            super::Read::transactional(super::Plan {
-                changes: &changes,
-                ids: &ids,
-            }),
+            super::Read::fixture_transactional(
+                super::Plan {
+                    changes: &changes,
+                    ids: &ids,
+                },
+                &before,
+            ),
             &before,
             after,
             "test",
@@ -1600,10 +1612,13 @@ fn a_same_named_new_column_does_not_inherit_the_retired_definition() {
             let check = |after: &Schema| {
                 super::super::refuse_pinned_movement(
                     &pbps_pg::Postgres::new(),
-                    super::Read::transactional(super::Plan {
-                        changes: &changes,
-                        ids: &ids,
-                    }),
+                    super::Read::fixture_transactional(
+                        super::Plan {
+                            changes: &changes,
+                            ids: &ids,
+                        },
+                        &before,
+                    ),
                     &before,
                     after,
                     "test",
@@ -2758,10 +2773,13 @@ fn a_rebuilds_moved_column_is_held_to_its_final_type_at_the_closing_read() {
         t.columns.get_mut("other").unwrap().ty = other.parse().unwrap();
         super::super::refuse_pinned_movement(
             &pbps_pg::Postgres::new(),
-            super::Read::transactional(super::Plan {
-                changes: &changes,
-                ids: &ids,
-            }),
+            super::Read::fixture_transactional(
+                super::Plan {
+                    changes: &changes,
+                    ids: &ids,
+                },
+                &before,
+            ),
             &before,
             &after,
             "test",
