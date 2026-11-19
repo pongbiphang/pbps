@@ -355,6 +355,60 @@ fn an_exclusion_is_torn_down_and_restored_around_a_retype_of_a_column_it_holds()
     });
 }
 
+/// A column an exclusion holds is retyped while the exclusion's storage parameters change:
+/// the restoring add carries the declared `fillfactor`, so the plan holds no `ALTER INDEX`
+/// on an index that is not there between the teardown and the restoration. The apply
+/// verifies and the declarations plan nothing after it.
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_parameter_change_beside_a_retype_rides_on_the_restored_exclusion() {
+    let _ = server();
+    servers(|url, _| {
+        let own = OwnDatabase::new(url, "exclude-retype-params");
+        let connection = own.connection();
+        on_server(
+            connection,
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.q (id integer PRIMARY KEY, a integer NOT NULL, b integer NOT NULL); \
+             INSERT INTO app.q VALUES (1, 1, 5), (2, 6, 9); \
+             ALTER TABLE app.q ADD CONSTRAINT x EXCLUDE USING btree ((a + b) WITH =) \
+               WITH (fillfactor = 90)",
+        );
+        let d = adopt("exclude-retype-params", connection);
+        let path = d.dir.join("schema/app.q.yml");
+        let held = std::fs::read_to_string(&path).unwrap();
+        let text = held
+            .replacen("a:\n    type: integer", "a:\n    type: bigint", 1)
+            .replacen("fillfactor: 90", "fillfactor: 70", 1);
+        assert!(
+            text.contains("fillfactor: 70") && text.contains("type: bigint"),
+            "{held}"
+        );
+        std::fs::write(&path, text).unwrap();
+        d.commit();
+        let (plan, script) = plan_sql(&d, connection);
+        let teardown = position(&script, "DROP CONSTRAINT \"x\"");
+        let altered = position(&script, "TYPE");
+        let restored = position(&script, "ADD CONSTRAINT \"x\" EXCLUDE USING btree");
+        assert!(
+            teardown < altered && altered < restored && !script.contains("ALTER INDEX"),
+            "{script}"
+        );
+        assert!(script.contains("fillfactor"), "{script}");
+        succeeds(approved_apply(&d, connection, &plan, BOTH));
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_class c JOIN pg_constraint k ON k.conindid = c.oid \
+                 WHERE k.conname = 'x' AND c.reloptions @> ARRAY['fillfactor=70']"
+            ),
+            1
+        );
+        let was = definition(connection, "x");
+        settled(&d, connection, "x", &was);
+    });
+}
+
 /// A replacement the rows refuse leaves the old constraint, its definition and the rows
 /// standing and records nothing; the same declarations then plan again.
 #[test]

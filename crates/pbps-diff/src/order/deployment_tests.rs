@@ -523,3 +523,60 @@ fn an_exclusion_dependent_is_dropped_as_a_constraint_and_put_back_from_the_decla
     assert!(!d.managed(&indexed));
     assert!(dependent(Part::Index("x".into())).managed(&indexed));
 }
+
+/// The weave and the type rebuild restore an exclusion through the same `SetExclusion` add
+/// the differ states, so the one normalization drops an `ALTER INDEX` on its backing index
+/// wherever the restoration stands, and only then: a drop half, or an add of another
+/// exclusion, leaves the parameter edit alone (DEC-2448.5).
+#[test]
+fn a_restored_exclusion_subsumes_the_parameter_edit_of_its_backing_index() {
+    use pbps_model::{
+        ExclusionConstraint, ExclusionKey, ExclusionTiming, IndexColumn, IndexMethod, IndexPart,
+    };
+    let table: TableName = "app.t".parse().unwrap();
+    let exclusion = Box::new(ExclusionConstraint {
+        method: IndexMethod::Gist,
+        keys: vec![ExclusionKey {
+            key: IndexColumn::column("a"),
+            operator: pbps_model::OperatorRef::symbol("&&").unwrap(),
+        }],
+        include: Vec::new(),
+        filter: None,
+        storage_parameters: Default::default(),
+        timing: ExclusionTiming::Immediate,
+    });
+    let edit = |name: &str| {
+        Change::Index(IndexChange::SetIndexStorageParameters {
+            table: table.clone(),
+            target: IndexPart::Exclusion(name.into()),
+            method: IndexMethod::Gist,
+            set: [("fillfactor".to_owned(), "70".to_owned())].into(),
+            reset: Default::default(),
+        })
+    };
+    let set = |name: &str, from: bool, to: bool| {
+        Change::Constraint(ConstraintChange::SetExclusion {
+            table: table.clone(),
+            name: name.into(),
+            from: from.then(|| exclusion.clone()),
+            to: to.then(|| exclusion.clone()),
+        })
+    };
+    let kept = |changes: Vec<Change>| {
+        let mut changes = changes;
+        crate::order::drop_parameter_changes_of_rebuilt_indexes(&mut changes, |c| c);
+        changes.len()
+    };
+    assert_eq!(
+        kept(vec![
+            set("x", true, false),
+            edit("x"),
+            set("x", false, true)
+        ]),
+        2
+    );
+    // Negative: a drop half restores nothing.
+    assert_eq!(kept(vec![set("x", true, false), edit("x")]), 2);
+    // Negative: another exclusion's restoration is not this one's.
+    assert_eq!(kept(vec![edit("x"), set("y", false, true)]), 2);
+}

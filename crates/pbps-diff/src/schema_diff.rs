@@ -12587,6 +12587,56 @@ mod tests {
         assert!(exclusion_plan(&held, &gone, &[]).is_err());
     }
 
+    /// A retype under an exclusion whose storage parameters also change is one rebuild: the
+    /// restoring add carries the declared parameters, so no `ALTER INDEX` is left between the
+    /// teardown and the restoration to name an index that is not there. The same parameter
+    /// change with no rebuild keeps its `ALTER INDEX` (DEC-2448.5).
+    #[test]
+    fn a_parameter_edit_beside_an_exclusions_rebuild_is_subsumed_by_its_restoration() {
+        let held = booking(&[("no_overlap", exclusion("int4range(a, b)", "&&"))]);
+        let table: TableName = "app.booking".parse().unwrap();
+        let mut tuned = held.clone();
+        tuned
+            .tables
+            .get_mut(&table)
+            .unwrap()
+            .exclude
+            .get_mut("no_overlap")
+            .unwrap()
+            .storage_parameters
+            .insert("fillfactor".into(), "70".into());
+        // Negative: with no rebuild the parameter edit stands alone.
+        let cs = exclusion_plan(&held, &tuned, &[]).unwrap();
+        assert_eq!(
+            kinds(&cs),
+            ["SetIndexStorageParameters"],
+            "{:?}",
+            kinds(&cs)
+        );
+        // The retype rebuilds the constraint; the parameters ride on its add.
+        let mut retyped = tuned.clone();
+        retyped
+            .tables
+            .get_mut(&table)
+            .unwrap()
+            .columns
+            .get_mut("a")
+            .unwrap()
+            .ty = ty("bigint");
+        let cs = exclusion_plan(&held, &retyped, &[]).unwrap();
+        assert_eq!(
+            kinds(&cs),
+            ["SetExclusion", "AlterColumnType", "SetExclusion"],
+            "{:?}",
+            kinds(&cs)
+        );
+        let carried = cs.changes.iter().any(|p| {
+            matches!(&p.change, Change::Constraint(ConstraintChange::SetExclusion { to: Some(x), .. })
+                if x.storage_parameters.get("fillfactor").map(String::as_str) == Some("70"))
+        });
+        assert!(carried, "{:?}", kinds(&cs));
+    }
+
     fn parameters_of(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
             .iter()

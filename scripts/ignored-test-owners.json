@@ -949,6 +949,7 @@
         "exclude2448_rebuild::an_exclusion_is_torn_down_and_restored_around_a_function_it_calls",
         "exclude2448_rebuild::an_exclusion_is_torn_down_and_restored_around_a_type_rebuild",
         "exclude2448_rebuild::an_exclusion_is_torn_down_and_restored_around_a_retype_of_a_column_it_holds",
+        "exclude2448_rebuild::a_parameter_change_beside_a_retype_rides_on_the_restored_exclusion",
         "exclude2448_rebuild::a_replacement_exclusion_the_rows_refuse_leaves_the_old_one_standing",
         "exclude2448_rebuild::an_exclusion_is_torn_down_and_restored_around_a_generated_expression_change",
         "partition_trigger1811::a_trigger_on_the_default_partition_added_with_a_new_partition_applies_and_reads_back",

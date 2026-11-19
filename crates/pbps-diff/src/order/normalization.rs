@@ -28,6 +28,14 @@ pub fn drop_parameter_changes_of_rebuilt_indexes<T>(
             Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table, to: Some(_), ..
             }) => Some((table.clone(), IndexPart::PrimaryKey)),
+            // An exclusion's restoration carries the declared storage parameters in its
+            // `ADD ... EXCLUDE ... WITH (...)`, as a unique constraint's add does (#2448 PR D).
+            Change::Constraint(ConstraintChange::SetExclusion {
+                table,
+                name,
+                to: Some(_),
+                ..
+            }) => Some((table.clone(), IndexPart::Exclusion(name.clone()))),
             _ => None,
         })
         .collect();

@@ -10032,6 +10032,13 @@ name is free again after the drop, which the existing slot settlement already se
   recipe; D adds nothing there, and `Part::Exclusion` stays unmapped in the partition
   closure's reader so that nothing restores one unseen.
 
+**Parameters ride on the restoration.** Whichever path restores an exclusion (the differ's
+own pair, the weave, a plan that drops and adds it), the add carries the declared storage
+parameters, so the one normalization that drops a parameter edit of a rebuilt index
+(`drop_parameter_changes_of_rebuilt_indexes`) reads an adding `SetExclusion` as it reads an
+`AddUnique`. Left in, the `ALTER INDEX` would name the backing index between the teardown
+and the restoration, where it does not exist. With no restoration beside it, the edit stays.
+
 **A failed replacement rolls back** with the apply: the old constraint, its definition and
 the rows stand, the ledger holds a `failed` entry and no state (measured on both engines: a
 conflicting add after the drop in one transaction leaves the dropped constraint back).
