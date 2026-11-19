@@ -309,6 +309,34 @@ pub fn first_word(text: &str) -> Option<String> {
     None
 }
 
+/// Whether the code of `text` may name `name`: as a bare word, or as a quoted
+/// name (`"…"`, `` `…` `` or `[…]`, quotes undoubled), never in a comment or a
+/// `'…'` string. `same` says when two spellings are one name. An
+/// over-approximation on purpose, as every dependency scan is: a double-quoted
+/// word SQLite falls back to reading as a string counts as a name, and a column
+/// of another table with the same name counts too. A false yes costs a view
+/// torn down and built again; a false no costs an apply the engine refuses.
+#[must_use]
+pub fn names(text: &str, name: &str, same: impl Fn(&str, &str) -> bool) -> bool {
+    pieces(text).iter().any(|piece| match piece {
+        Piece::Code(code) => code
+            .split(|c| !crate::ident::identifier_continues(c))
+            .any(|word| !word.is_empty() && same(word, name)),
+        Piece::Quoted(run) => match run.chars().next() {
+            Some(q @ ('"' | '`')) => {
+                let inner = run[1..].strip_suffix(q).unwrap_or(&run[1..]);
+                same(
+                    &inner.replace(&[q, q].iter().collect::<String>(), &q.to_string()),
+                    name,
+                )
+            }
+            Some('[') => same(run[1..].strip_suffix(']').unwrap_or(&run[1..]), name),
+            _ => false,
+        },
+        Piece::Comment(_) => false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

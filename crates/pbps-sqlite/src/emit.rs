@@ -5,17 +5,16 @@
 //! over the changes names every variant, so a new kind of change is a compile
 //! error here and not a silent gap:
 //!
-//! - **In place**: its statements. `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE
-//!   .. RENAME`, `ADD COLUMN`, `RENAME COLUMN`, `CREATE` and `DROP INDEX`, `CREATE`
-//!   and `DROP VIEW`.
+//! - **In place**: its statements. `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE`
+//!   (`RENAME`, `ADD`, `RENAME` and `DROP COLUMN`, `ALTER COLUMN .. SET` and
+//!   `DROP NOT NULL`, `ADD` and `DROP CONSTRAINT`), `CREATE` and `DROP INDEX`,
+//!   `CREATE` and `DROP VIEW`.
 //! - **Needs the table rebuilt**: `NotBuilt`, by name. SQLite cannot change a
 //!   column's type or default, or add a key, in place. Never an empty success and
 //!   never a statement the library would refuse at apply.
 //! - **Cannot occur**: validation refuses the declaration (`Unsupported` or
 //!   `NotBuilt`, as it does). The emitter still answers, because a saved plan can
 //!   carry any change.
-//! - **Not yet**: the parts of this item that come later answer `NotBuilt` and
-//!   say so.
 //!
 //! # Names
 //!
@@ -43,6 +42,7 @@ use crate::validate::{SCHEMA, not_built, unsupported};
 use crate::{Version, ident, lexis};
 
 mod column;
+mod constraint;
 mod index;
 mod module;
 mod refused;
@@ -56,10 +56,6 @@ pub(crate) type Sql = Result<Vec<Statement>, DialectError>;
 /// The in-place `ALTER` forms whose arrival version is kept, with the version
 /// that brought each. Whether the floor gates them is [`GATE`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "the forms after the first are written by the next part of the item; their arrival stays beside the one that is, so the table and its test are whole"
-)]
 pub(crate) enum Form {
     RenameColumn,
     DropColumn,
@@ -71,7 +67,7 @@ pub(crate) enum Form {
 }
 
 impl Form {
-    #[allow(dead_code, reason = "read by the arrival table's test")]
+    #[cfg(test)]
     pub(crate) const ALL: [Form; 7] = [
         Form::RenameColumn,
         Form::DropColumn,
@@ -224,7 +220,7 @@ fn lowered(gate: Gate, dialect: &Sqlite, change: &Change) -> Sql {
         Change::TableProperty(change) => refused::table_property(change),
         Change::Partition(change) => refused::partition(change),
         Change::Column(change) => column::emit(dialect, gate, change),
-        Change::Constraint(change) => refused::constraint(change),
+        Change::Constraint(change) => constraint::emit(dialect, gate, change),
         Change::Index(change) => index::emit(change),
         Change::Policy(change) => refused::policy(change),
         Change::Row(change) => refused::row(change),
@@ -243,9 +239,23 @@ pub(crate) fn rebuild(what: &str) -> DialectError {
     not_built(format!("the table rebuild (item 8 of #2950): {what}"))
 }
 
-/// The answer for what this item builds in a later part.
-pub(crate) fn later(what: &str) -> DialectError {
-    not_built(format!("the next part of item 3 of #2950: {what}"))
+/// Whether the gate in force lets the project's floor have `form`. What it does
+/// not is the rebuild's, said by name and never a statement the library would
+/// take or refuse by luck.
+pub(crate) fn allowed(
+    dialect: &Sqlite,
+    gate: Gate,
+    form: Form,
+    what: &str,
+) -> Result<(), DialectError> {
+    if allows_under(gate, dialect.floor(), form) {
+        return Ok(());
+    }
+    Err(rebuild(&format!(
+        "{what} needs SQLite {}, and this project's floor is {}",
+        form.arrival(),
+        dialect.floor()
+    )))
 }
 
 /// `main."name"`: a table, index or view in the one schema this engine holds.

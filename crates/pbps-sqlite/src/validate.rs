@@ -253,6 +253,56 @@ pub(crate) fn column_errors(
     }
 }
 
+/// Constraint names of one table that differ only in ASCII case. The shared
+/// rule (`Table::constraint_name_conflicts`, called in `table`) compares names
+/// exactly and reports the pairs that are letter for letter alike; SQLite folds
+/// ASCII case, which is what this adds. SQLite takes a `CREATE TABLE` that
+/// gives two constraints the same name, and then `DROP CONSTRAINT` drops the
+/// first of them whatever its kind and `ADD CONSTRAINT` refuses the name
+/// (measured), so a declaration that does it could never be changed in place.
+fn constraint_names_by_case(shown: &str, table: &Table, found: &mut Vec<DialectError>) {
+    let named = table
+        .primary_key
+        .iter()
+        .filter_map(|key| key.name.as_ref())
+        .map(|name| (name, "primary key"))
+        .chain(table.unique.keys().map(|name| (name, "unique constraint")))
+        .chain(table.foreign_keys.keys().map(|name| (name, "foreign key")))
+        .chain(table.checks.keys().map(|name| (name, "check constraint")));
+    let mut seen: Vec<(&ObjectLocalName, &str)> = Vec::new();
+    for (name, kind) in named {
+        if let Some((_, was)) = seen
+            .iter()
+            .find(|(other, _)| other.raw() != name.raw() && ident::same(other.raw(), name.raw()))
+        {
+            found.push(invalid(format!(
+                "the {was} and the {kind} of `{shown}` are named alike in another ASCII case (`{}`); \
+                 SQLite folds the case, so it drops whichever comes first and refuses to add a second",
+                name.shown()
+            )));
+        }
+        seen.push((name, kind));
+    }
+}
+
+/// What is wrong with one declared check: a name SQLite cannot be given, or an
+/// expression it would not read whole.
+pub(crate) fn check_errors(
+    shown: &str,
+    constraint: &ObjectLocalName,
+    check: &pbps_model::CheckConstraint,
+    found: &mut Vec<DialectError>,
+) {
+    local_name("check constraint", constraint.raw(), found);
+    if !expression(&check.expression) {
+        found.push(invalid(format!(
+            "check constraint `{}` of `{shown}` is not one expression SQLite reads whole (empty, \
+             unbalanced parentheses, or a `;`)",
+            constraint.shown()
+        )));
+    }
+}
+
 /// What is wrong with one declared index. The columns are held to the table's
 /// only when the table is at hand: an emitter given just the index cannot.
 pub(crate) fn index_errors(
@@ -426,15 +476,10 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
         }
     }
     for (constraint, check) in &table.checks {
-        local_name("check constraint", constraint.raw(), &mut found);
-        if !expression(&check.expression) {
-            found.push(invalid(format!(
-                "check constraint `{}` of `{shown}` is not one expression SQLite reads whole (empty, \
-                 unbalanced parentheses, or a `;`)",
-                constraint.shown()
-            )));
-        }
+        check_errors(&shown, constraint, check, &mut found);
     }
+    found.extend(table.constraint_name_conflicts().into_iter().map(invalid));
+    constraint_names_by_case(&shown, table, &mut found);
     for (index, def) in &table.indexes {
         index_errors(&shown, index, def, Some(table), &mut found);
     }

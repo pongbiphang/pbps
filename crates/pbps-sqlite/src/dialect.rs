@@ -16,8 +16,8 @@ use pbps_model::{
     Change, ColumnType, Module, ModuleId, ModuleKind, Role, SessionZone, Strategy, Table, TableName,
 };
 
-use crate::emit;
 use crate::{DEFAULT_VERSION_FLOOR, TRANSACTION, Version, ident, lexis, types, validate};
+use crate::{emit, ordering};
 
 /// The SQLite dialect. Holds the version floor as a value: the
 /// oldest SQLite the project targets, which later items gate what they write
@@ -60,6 +60,50 @@ impl Dialect for Sqlite {
 
     fn lexicon(&self) -> Lexicon {
         ident::LEXICON
+    }
+
+    /// A name in code, read with SQLite's own lexis: the shared scanner nests
+    /// block comments, so it could miss a name SQLite reads as code.
+    fn may_name(&self, text: &str, name: &str) -> bool {
+        ordering::may_name(text, name)
+    }
+
+    /// SQLite has the one schema, `main`: a name qualified with it is the name.
+    fn may_name_qualified(&self, text: &str, schema: &str, name: &str) -> bool {
+        schema == validate::SCHEMA && ordering::may_name(text, name)
+    }
+
+    fn may_name_qualified_exact(&self, text: &str, schema: &str, name: &str) -> bool {
+        schema == validate::SCHEMA && lexis::names(text, name, |a, b| a == b)
+    }
+
+    /// SQLite has no module that is called by a two-part name (no functions or
+    /// procedures), so nothing in a definition is one.
+    fn qualified_calls(&self, _text: &str) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    /// The views a change leaves invalid, which SQLite then refuses to rename
+    /// or drop a column beside (see `ordering`).
+    fn schema_bound_teardown(
+        &self,
+        base: &pbps_model::Schema,
+        declared: &pbps_model::Schema,
+        changes: &[Change],
+    ) -> std::collections::BTreeSet<ModuleId> {
+        ordering::teardown(base, declared, changes)
+    }
+
+    fn engine_effects(
+        &self,
+        op: &pbps_model::operation::Operation,
+        owners: &dyn pbps_model::operation::Owners,
+        before: pbps_model::operation::Snapshot<'_>,
+        after: pbps_model::operation::Snapshot<'_>,
+        _catalog: Option<&pbps_dialect::slots::CatalogFacts>,
+        _captured: &pbps_model::operation::Captured,
+    ) -> Result<pbps_model::operation::Effects, pbps_model::operation::OwnerError> {
+        ordering::effects(self, op, owners, before, after)
     }
 
     /// The code of a definition, read with SQLite's own lexis: the shared
@@ -316,9 +360,9 @@ mod tests {
             d.intermediate_tables(&drop, Strategy::default()),
             Ok(Vec::new())
         );
-        let unbuilt = Change::Column(pbps_model::ColumnChange::DropColumn {
-            uid: "c_aaaaaa".parse().expect("uid"),
-            column: TableName::new("main", "t").column("c"),
+        let unbuilt = Change::Constraint(pbps_model::ConstraintChange::DropUnique {
+            table: TableName::new("main", "t"),
+            name: "u".into(),
         });
         for result in [
             d.intermediate_tables(&unbuilt, Strategy::default())
@@ -334,7 +378,7 @@ mod tests {
                 Err(DialectError::NotBuilt {
                     dialect: "sqlite",
                     part,
-                }) => assert!(part.contains("next part"), "{part}"),
+                }) => assert!(part.contains("table rebuild"), "{part}"),
                 other => panic!("expected NotBuilt, got {other:?}"),
             }
         }
@@ -614,5 +658,21 @@ mod tests {
                 .is_empty()
         );
         assert!(d.validate_table(&name, &child("a")).is_empty());
+    }
+
+    /// The name scans the shared checks use are read with SQLite's own lexis, so
+    /// a name after a block comment the shared scanner would nest is still found.
+    #[test]
+    fn the_name_scans_follow_sqlite_s_lexis() {
+        let d = Sqlite::default();
+        assert!(d.may_name("a /* /* */ b", "b"));
+        assert!(d.may_name("A", "a") && d.may_name("\"a\"", "a") && d.may_name("[a]", "a"));
+        assert!(!d.may_name("a /* b */", "b") && !d.may_name("'b'", "b") && !d.may_name("bb", "b"));
+        assert!(d.may_name_qualified("main.t", "main", "t"));
+        assert!(d.may_name_qualified("T", "main", "t"));
+        assert!(!d.may_name_qualified("T", "other", "t"));
+        assert!(d.may_name_qualified_exact("t", "main", "t"));
+        assert!(!d.may_name_qualified_exact("T", "main", "t"));
+        assert!(d.qualified_calls("main.f(x)").is_empty());
     }
 }
