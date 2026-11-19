@@ -46,10 +46,10 @@ pub struct Baseline {
     pub ids: ValidIds,
     /// The annotations that travelled beside that revision's declarations.
     ///
-    /// Only `depends_on:` of every kind of file survives usefully — it is an
-    /// ordering edge the identifier scan cannot find, so rebuilding the baseline without it can
-    /// fail on declarations that were always valid. A baseline read from a state
-    /// file has none: a snapshot records the database, and hints are not in it.
+    /// `depends_on:` supplies ordering edges the identifier scan cannot find,
+    /// so rebuilding the baseline without them can fail on valid declarations.
+    /// Git baselines read them from historical files. State-file baselines read
+    /// the snapshot's recorded edges. Both carry the historical declaration side.
     pub hints: pbps_model::Hints,
     /// What the baseline's objects were declared as when last written, where
     /// the baseline is a recorded state (ADR-0009 §2.2, ADR-0013 §4). A git
@@ -93,10 +93,14 @@ pub fn load(
                         path.display()
                     )
                 })?;
+            let mut hints = pbps_model::Hints::default();
+            // Match a Git baseline: offline planning records this historical
+            // declaration side, and rehearsal rebuilds the baseline under it.
+            hints.annotations.declare(snap.object_deps.to_deps());
             Ok(Baseline {
                 schema: snap.schema,
                 ids,
-                hints: pbps_model::Hints::default(),
+                hints,
                 declared: snap.declared,
                 description: format!("baseline file {}", path.display()),
                 git_sha: snap.git_sha,
