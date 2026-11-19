@@ -146,7 +146,7 @@ impl std::fmt::Display for ForeignBuild {
 }
 
 /// A released format's number and fingerprint, frozen at the release.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Frozen {
     pub version: u32,
@@ -154,7 +154,7 @@ pub struct Frozen {
 }
 
 /// What the last release froze. Written only by the release step.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Released {
     pub tag: String,
@@ -163,24 +163,30 @@ pub struct Released {
     pub schema_set: Frozen,
 }
 
-/// The last release's frozen formats, or `None` while no release exists.
+/// Reads the record file's text: `{"released": null}`, or `{"released": {...}}`.
 ///
-/// The data file sits beside this module so that the crate that reads it owns
-/// it, and the schema-set rule of a later change reads it through here too.
-pub fn released() -> Option<&'static Released> {
+/// One parser for the loader below and for the release step's own check of what
+/// it wrote, so the two cannot come to accept different files.
+pub fn parse_record(text: &str) -> Result<Option<Released>, serde_json::Error> {
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Record {
         released: Option<Released>,
     }
+    serde_json::from_str::<Record>(text).map(|record| record.released)
+}
+
+/// The last release's frozen formats, or `None` while no release exists.
+///
+/// The data file sits beside this module so that the crate that reads it owns
+/// it, and the schema-set rule of a later change reads it through here too.
+pub fn released() -> Option<&'static Released> {
     static RECORD: OnceLock<Option<Released>> = OnceLock::new();
     RECORD
         .get_or_init(|| {
-            serde_json::from_str::<Record>(include_str!("released_formats.json"))
-                .expect(
-                    "released_formats.json is read by a test and edited only by the release step",
-                )
-                .released
+            parse_record(include_str!("released_formats.json")).expect(
+                "released_formats.json is read by a test and edited only by the release step",
+            )
         })
         .as_ref()
 }
@@ -314,14 +320,8 @@ mod tests {
         );
         assert_eq!(PLAN.check_raw(&same), Ok(()));
         // Negative: text with no readable envelope is the callers' to refuse.
-        for text in [
-            "",
-            "{",
-            "null",
-            "[]",
-            r#"{"version":"x"}"#,
-            r#"{"version":83,"version":84}"#,
-        ] {
+        let duplicate = format!(r#"{{"version":{number},"version":{}}}"#, number + 1);
+        for text in ["", "{", "null", "[]", r#"{"version":"x"}"#, &duplicate] {
             assert_eq!(PLAN.check_raw(text), Ok(()), "{text}");
         }
         assert_eq!(
@@ -367,7 +367,7 @@ mod tests {
 
     #[test]
     fn nothing_is_asserted_about_the_number_while_nothing_is_released() {
-        for number in [0, 1, 83, u32::MAX] {
+        for number in [0, 1, PLAN.current, u32::MAX] {
             assert_eq!(
                 check_increment("plan", number, &another_build(), None),
                 Ok(())

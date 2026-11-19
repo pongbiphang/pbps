@@ -15,6 +15,11 @@ use schemars::JsonSchema;
 
 /// The current state-snapshot format version.
 ///
+/// The number is a release label, and what tells two builds apart is the fingerprint
+/// recorded beside it (DEC-2412.2, DEC-2412.3). The history below is kept as written and
+/// takes no new line: history lives in DEC entries, and a change adds neither a line nor a
+/// number here until a release has frozen one.
+///
 /// Bumped to 2 when `Schema` grew `modules`: what a state records is what a
 /// drift check compares, so an older client would deserialize a new snapshot,
 /// silently ignore the modules in it, introspect only tables, and report a

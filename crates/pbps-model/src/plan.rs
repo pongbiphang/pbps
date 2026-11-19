@@ -37,6 +37,11 @@ use crate::zone::SessionZone;
 
 /// The current plan-file format version.
 ///
+/// The number is a release label, and what tells two builds apart is the fingerprint
+/// recorded beside it (DEC-2412.2, DEC-2412.3). The history below is kept as written and
+/// takes no new line: history lives in DEC entries, and a change adds neither a line nor a
+/// number here until a release has frozen one.
+///
 /// Bumped to 2 when `mode` and `strategy` arrived. Both change what *executing*
 /// the plan does, and serde would let an older `apply` read the file, ignore the
 /// unknown fields, and run a staged plan inside a transaction with the reviewed
