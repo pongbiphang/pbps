@@ -8,18 +8,19 @@
 //! it (`CURRENT_VERSION - 1`), or a historical fixture's own number, which
 //! stays what it was.
 //!
-//! The scan reads every Rust source of the workspace and looks at two shapes of
-//! comparison (`assert_eq!`, `assert_ne!`, `==`, `!=`):
+//! The scan reads every Rust source of the workspace and looks for one shape
+//! of comparison (`assert_eq!`, `assert_ne!`, `==`, `!=`): a format constant
+//! (`FORMAT_CONSTANTS`: the three current numbers and two
+//! historical boundaries) against a digit literal, whatever the number. Its few legitimate hits
+//! are listed below with their reasons, and an entry that no longer matches a
+//! line fails the test, so the list cannot outlive what it excuses.
 //!
-//! - a format constant against a digit literal, whatever the number;
-//! - a `version` field against a digit literal that is *now* the current number
-//!   of the plan, the state or the schema set, which is how a hand-written
-//!   `assert_eq!(plan.version, 83)` reads once the constant is not named.
-//!
-//! A comparison with an older number is a historical fixture and is not
-//! flagged by the second shape. The first shape's few legitimate hits are
-//! listed below with their reasons, and an entry that no longer matches a line
-//! fails the test, so the list cannot outlive what it excuses.
+//! The limit, in plain words: a `version` field against a literal, as in
+//! `assert_eq!(plan.version, 83)`, is not found. The text does not name which
+//! format the field belongs to, and a guess flags other formats' numbers (the
+//! UI's, the resolver manifest's, a hook's), which would fail a release for
+//! nothing once the three numbers are reset to 1 (#1159). Such a test fails by
+//! itself when the number moves, and its author takes the constant then.
 
 use std::path::Path;
 
@@ -73,27 +74,8 @@ fn is_literal(operand: &str) -> bool {
     !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit() || b == b'_')
 }
 
-fn literal(operand: &str) -> Option<u32> {
-    is_literal(operand)
-        .then(|| {
-            operand
-                .strip_suffix("u32")
-                .unwrap_or(operand)
-                .replace('_', "")
-        })
-        .and_then(|digits| digits.parse().ok())
-}
-
 fn names_a_format_constant(operand: &str) -> bool {
     FORMAT_CONSTANTS.contains(&operand.rsplit("::").next().unwrap_or(operand))
-}
-
-fn names_a_version(operand: &str) -> bool {
-    // `plan.version`, `value["version"]` and `schema["x-pbps-schema-version"]`.
-    operand
-        .to_ascii_lowercase()
-        .trim_end_matches(['"', ']'])
-        .ends_with("version")
 }
 
 /// The two operands an `assert_eq!`/`assert_ne!` compares, from the text after
@@ -145,14 +127,10 @@ fn operator_operands(piece: &str) -> Vec<(String, String)> {
 }
 
 /// Every comparison in `text` that breaks the rule, as its statement.
-fn offences(text: &str, current: &[u32]) -> Vec<String> {
+fn offences(text: &str) -> Vec<String> {
     let breaks = |a: &str, b: &str| {
-        let against_a_constant = (names_a_format_constant(a) && is_literal(b))
-            || (names_a_format_constant(b) && is_literal(a));
-        let current_number = |version: &str, number: &str| {
-            names_a_version(version) && literal(number).is_some_and(|n| current.contains(&n))
-        };
-        against_a_constant || current_number(a, b) || current_number(b, a)
+        (names_a_format_constant(a) && is_literal(b))
+            || (names_a_format_constant(b) && is_literal(a))
     };
     let mut found = Vec::new();
     for piece in pieces(text) {
@@ -169,24 +147,9 @@ fn offences(text: &str, current: &[u32]) -> Vec<String> {
     found
 }
 
-fn current_numbers(crates: &Path) -> Vec<u32> {
-    let cli = std::fs::read_to_string(crates.join("pbps-cli/src/integration.rs")).unwrap();
-    let schema_set = cli
-        .lines()
-        .find_map(|line| line.strip_prefix("pub const SCHEMA_VERSION: u32 = "))
-        .and_then(|rest| rest.trim_end_matches(';').parse().ok())
-        .expect("integration.rs declares SCHEMA_VERSION on one line");
-    vec![
-        pbps_model::plan::CURRENT_VERSION,
-        pbps_model::state::CURRENT_VERSION,
-        schema_set,
-    ]
-}
-
 #[test]
 fn no_test_compares_a_format_number_with_a_literal() {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    let current = current_numbers(crates);
     let mut files = Vec::new();
     sources(crates, &mut files);
     let mut found = Vec::new();
@@ -199,7 +162,7 @@ fn no_test_compares_a_format_number_with_a_literal() {
             continue;
         }
         let text = std::fs::read_to_string(file).unwrap();
-        for statement in offences(&text, &current) {
+        for statement in offences(&text) {
             found.push((relative(crates, file), statement));
         }
     }
@@ -225,8 +188,7 @@ fn every_allowed_comparison_says_why() {
 }
 
 #[test]
-fn the_scan_finds_a_constant_or_a_current_number_against_a_literal() {
-    let current = [83, 52, 117];
+fn the_scan_finds_a_format_constant_against_a_literal() {
     for line in [
         "assert_eq!(CURRENT_VERSION, 51);",
         "assert_eq!(pbps_model::state::CURRENT_VERSION, 52u32);",
@@ -235,35 +197,35 @@ fn the_scan_finds_a_constant_or_a_current_number_against_a_literal() {
         "assert_eq!(OLDEST_READABLE_VERSION,\n    6\n);",
         "assert!(CURRENT_VERSION == 83);",
         "if state::CURRENT_VERSION != 7 {",
-        "assert_eq!(plan.version, 83);",
-        "assert_eq!(value[\"version\"], 52, \"{value}\");",
-        "assert_eq!(117, schema[\"x-pbps-schema-version\"]);",
-        "assert_eq!(1_17, a.schema_version);",
+        "assert_eq!(value[\"x\"], 1_000); assert_eq!(SCHEMA_VERSION, 1_17);",
     ] {
-        assert!(!offences(line, &current).is_empty(), "{line}");
+        assert!(!offences(line).is_empty(), "{line}");
     }
 }
 
 #[test]
-fn the_scan_leaves_symbols_older_numbers_and_comments_alone() {
-    let current = [83, 52, 117];
+fn the_scan_leaves_symbols_other_fields_and_comments_alone() {
     for line in [
         // The constant against another symbol or arithmetic on itself.
         "assert_eq!(plan.version, CURRENT_VERSION);",
         "assert_eq!(read.version, OBJECT_DEPS_VERSION - 1);",
         "assert!(OBJECT_DEPS_VERSION <= CURRENT_VERSION);",
         "snapshot.version = CURRENT_VERSION + 1;",
-        // A historical fixture's own number, and fields of other formats.
+        // The limit: a `version` field against a literal names no format, so it
+        // is not found, whether the number is current or an old fixture's.
+        "assert_eq!(plan.version, 83);",
+        "assert_eq!(value[\"version\"], 52, \"{value}\");",
+        "assert_eq!(117, schema[\"x-pbps-schema-version\"]);",
         "assert_eq!(before.version, 33);",
-        "assert_eq!(fixture[\"version\"], 11);",
         "assert_eq!(value[\"schema_version\"], 1);",
-        // A literal with no version beside it.
+        "assert!(self.version != 1);",
+        // A literal with no format beside it.
         "assert_eq!(rows.len(), 83);",
         "assert_eq!(count, 52);",
         // A comment is not a test.
         "// assert_eq!(CURRENT_VERSION, 51);",
         "/// assert_eq!(plan.version, 83);",
     ] {
-        assert!(offences(line, &current).is_empty(), "{line}");
+        assert!(offences(line).is_empty(), "{line}");
     }
 }
