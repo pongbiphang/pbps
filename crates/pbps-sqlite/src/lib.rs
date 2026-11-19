@@ -18,7 +18,9 @@
 //!
 //! | Module | Item | Holds |
 //! |---|---|---|
-//! | [`dialect`] | 2 | names, quoting, what is refused by name |
+//! | [`dialect`] | 2 | `Sqlite`, the `Dialect` implementation, and the version floor as a value |
+//! | [`ident`], [`lexis`], [`names`] | 2 | quoting and case, SQLite's own lexis, the case-collision check |
+//! | [`validate`] | 2 | what is refused by name, and what is not built yet |
 //! | [`types`] | 2 | the type table, affinity, STRICT's types, what a type change costs |
 //! | [`keywords`] | 2 | the words SQLite cannot take as a bare name |
 //! | [`emit`] | 3 | the SQL for the changes SQLite can make in place |
@@ -37,18 +39,23 @@ use pbps_dialect::TransactionFraming;
 pub mod catalog;
 pub mod dialect;
 pub mod emit;
+pub mod ident;
 pub mod keywords;
+pub mod lexis;
+pub mod names;
 pub mod preflight;
 pub mod state;
 #[cfg(test)]
 mod tests;
 pub mod types;
+pub mod validate;
 
 pub use pbps_db::sqlite::Version;
 
 /// The oldest SQLite a project targets unless it says otherwise: the first
 /// release with `ALTER TABLE ... DROP COLUMN`. The library pbps links is at or
-/// above it; the project field that raises it is item 2's.
+/// above it. The dialect takes the floor as a value (`dialect::Sqlite`); the
+/// project field that sets it belongs to the wiring (item 7).
 pub const DEFAULT_VERSION_FLOOR: Version = Version::new(3, 35, 0);
 
 /// How an apply frames its transaction.

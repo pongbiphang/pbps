@@ -151,3 +151,18 @@ fn the_bundled_library_is_at_or_above_the_default_floor() {
     // Negative control: the comparison does refuse an older library.
     assert!(Version::new(3, 34, 1) < DEFAULT_VERSION_FLOOR);
 }
+
+/// Whether the engine runs `sql` (a fresh in-memory database each time).
+pub(crate) fn accepts(sql: &str) -> bool {
+    Fresh::memory().connection().execute_batch(sql).is_ok()
+}
+
+/// The engine's own words for refusing `sql`, empty if it ran.
+pub(crate) fn refusal(sql: &str) -> String {
+    Fresh::memory()
+        .connection()
+        .execute_batch(sql)
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default()
+}
