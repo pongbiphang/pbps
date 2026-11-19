@@ -431,3 +431,152 @@ fn a_new_exclusion_that_calls_a_created_function_is_moved_behind_it() {
     // Negative: a drop is not an addition and calls nothing.
     assert_eq!(moved(exclusion(call, None, false)), (0, false));
 }
+
+/// An exclusion constraint a rebuild finds standing is its own part: it is dropped as a
+/// constraint (never as an index), put back from the declaration, and judged unmanaged
+/// where the declarations hold no such constraint, whatever index they hold by that name
+/// (DEC-2448.5).
+#[test]
+fn an_exclusion_dependent_is_dropped_as_a_constraint_and_put_back_from_the_declaration() {
+    use pbps_model::{
+        ExclusionConstraint, ExclusionKey, ExclusionTiming, IndexColumn, IndexMethod, Table,
+    };
+    let exclusion = ExclusionConstraint {
+        method: IndexMethod::Gist,
+        keys: vec![ExclusionKey {
+            key: IndexColumn::column("a"),
+            operator: pbps_model::OperatorRef::symbol("&&").unwrap(),
+        }],
+        include: Vec::new(),
+        filter: Some("app.live(a)".into()),
+        storage_parameters: Default::default(),
+        timing: ExclusionTiming::Immediate,
+    };
+    let table: TableName = "app.t".parse().unwrap();
+    let mut declared = Schema::default();
+    let mut held = Table::default();
+    held.exclude.insert("x".into(), exclusion.clone());
+    declared.tables.insert(table.clone(), held);
+    let dependent = |part: Part| Dependent {
+        described: "constraint x on table app.t".into(),
+        holds: Holds::TablePart {
+            table: table.clone(),
+            part,
+        },
+    };
+    let d = dependent(Part::Exclusion("x".into()));
+    assert!(d.managed(&declared));
+    let removal = removal_of(&d, &declared, None).unwrap();
+    assert!(
+        matches!(&removal, Change::Constraint(ConstraintChange::SetExclusion {
+            name, from: Some(from), to: None, ..
+        }) if name.raw() == "x" && **from == exclusion),
+        "{removal:?}"
+    );
+    assert!(removes(
+        &removal.part_effects(),
+        &d.holds,
+        &Partitions::default()
+    ));
+    let restoration = restoration_of(&d, &declared, None).unwrap();
+    assert!(
+        matches!(&restoration, Change::Constraint(ConstraintChange::SetExclusion {
+            from: None, to: Some(to), ..
+        }) if **to == exclusion),
+        "{restoration:?}"
+    );
+    assert!(restores(
+        &restoration.part_effects(),
+        &d.holds,
+        &Partitions::default()
+    ));
+    // Negative: the drop of an index of that name is not the constraint's removal.
+    let index_drop = Change::Index(IndexChange::DropIndex {
+        table: table.clone(),
+        name: "x".into(),
+    });
+    assert!(!removes(
+        &index_drop.part_effects(),
+        &d.holds,
+        &Partitions::default()
+    ));
+    // Negative: where the declarations do not hold it, it is unmanaged and cannot be
+    // taken down or put back, and an index of that name does not stand for it.
+    let mut empty = declared.clone();
+    empty.tables.get_mut(&table).unwrap().exclude.clear();
+    assert!(!d.managed(&empty));
+    assert!(removal_of(&d, &empty, None).is_err());
+    assert!(restoration_of(&d, &empty, None).is_err());
+    let mut indexed = empty.clone();
+    indexed.tables.get_mut(&table).unwrap().indexes.insert(
+        "x".into(),
+        pbps_model::Index {
+            columns: vec![IndexColumn::column("a")],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: IndexMethod::Btree,
+            storage_parameters: Default::default(),
+            filegroup: None,
+        },
+    );
+    assert!(!d.managed(&indexed));
+    assert!(dependent(Part::Index("x".into())).managed(&indexed));
+}
+
+/// The weave and the type rebuild restore an exclusion through the same `SetExclusion` add
+/// the differ states, so the one normalization drops an `ALTER INDEX` on its backing index
+/// wherever the restoration stands, and only then: a drop half, or an add of another
+/// exclusion, leaves the parameter edit alone (DEC-2448.5).
+#[test]
+fn a_restored_exclusion_subsumes_the_parameter_edit_of_its_backing_index() {
+    use pbps_model::{
+        ExclusionConstraint, ExclusionKey, ExclusionTiming, IndexColumn, IndexMethod, IndexPart,
+    };
+    let table: TableName = "app.t".parse().unwrap();
+    let exclusion = Box::new(ExclusionConstraint {
+        method: IndexMethod::Gist,
+        keys: vec![ExclusionKey {
+            key: IndexColumn::column("a"),
+            operator: pbps_model::OperatorRef::symbol("&&").unwrap(),
+        }],
+        include: Vec::new(),
+        filter: None,
+        storage_parameters: Default::default(),
+        timing: ExclusionTiming::Immediate,
+    });
+    let edit = |name: &str| {
+        Change::Index(IndexChange::SetIndexStorageParameters {
+            table: table.clone(),
+            target: IndexPart::Exclusion(name.into()),
+            method: IndexMethod::Gist,
+            set: [("fillfactor".to_owned(), "70".to_owned())].into(),
+            reset: Default::default(),
+        })
+    };
+    let set = |name: &str, from: bool, to: bool| {
+        Change::Constraint(ConstraintChange::SetExclusion {
+            table: table.clone(),
+            name: name.into(),
+            from: from.then(|| exclusion.clone()),
+            to: to.then(|| exclusion.clone()),
+        })
+    };
+    let kept = |changes: Vec<Change>| {
+        let mut changes = changes;
+        crate::order::drop_parameter_changes_of_rebuilt_indexes(&mut changes, |c| c);
+        changes.len()
+    };
+    assert_eq!(
+        kept(vec![
+            set("x", true, false),
+            edit("x"),
+            set("x", false, true)
+        ]),
+        2
+    );
+    // Negative: a drop half restores nothing.
+    assert_eq!(kept(vec![set("x", true, false), edit("x")]), 2);
+    // Negative: another exclusion's restoration is not this one's.
+    assert_eq!(kept(vec![edit("x"), set("y", false, true)]), 2);
+}

@@ -546,6 +546,15 @@ fn drops(changes: &ChangeSet, table: &TableName, part: &Part) -> bool {
             *t == target && name == n
         }
         (
+            Change::Constraint(ConstraintChange::SetExclusion {
+                table: t,
+                name,
+                to: None,
+                ..
+            }),
+            Part::Exclusion(n),
+        ) => *t == target && name == n,
+        (
             Change::Column(ColumnChange::AlterColumnDefault {
                 column, to: None, ..
             }),
@@ -607,7 +616,7 @@ fn verdict(
             // Dropped and restored from the declaration, which the engine
             // would refuse to retype beside: constants typed as the old enum.
             // On a column, they only name it, and the engine rebuilds them.
-            Part::Check(_) | Part::Index(_) | Part::Default(_) => {
+            Part::Check(_) | Part::Index(_) | Part::Exclusion(_) | Part::Default(_) => {
                 // A partition's default is its parent's, copied: the plan
                 // drops it where the declaration holds it, at the root.
                 let mut owner = table.clone();
@@ -621,7 +630,7 @@ fn verdict(
                 }
                 if level == Level::Column || drops(changes, &owner, part) {
                     Verdict::Fine
-                } else if matches!(part, Part::Index(_) | Part::Check(_)) {
+                } else if matches!(part, Part::Index(_) | Part::Check(_) | Part::Exclusion(_)) {
                     Verdict::Refuse(
                         "the plan does not drop and restore it, which its constants of the old type require"
                             .into(),
@@ -1026,6 +1035,54 @@ mod tests {
             // Without the rename the drop names another table.
             assert!(matches!(judge(at(&target).to_vec()), Verdict::Refuse(_)));
         }
+    }
+
+    /// An exclusion with a constant of the type in its predicate is judged as a check and an
+    /// index are: the plan drops it as a constraint and restores it, or the rebuild is
+    /// refused; one that only holds the column is the engine's to rebuild (DEC-2448.5).
+    #[test]
+    fn an_exclusion_is_dropped_and_restored_by_the_plan_or_the_rebuild_is_refused() {
+        let table = TableName::new("app", "t");
+        let held = Holds::TablePart {
+            table: table.clone(),
+            part: Part::Exclusion("x".into()),
+        };
+        let drop_exclusion = |name: &str| {
+            Change::Constraint(ConstraintChange::SetExclusion {
+                table: table.clone(),
+                name: name.into(),
+                from: None,
+                to: None,
+            })
+        };
+        let judge = |level: Level, changes: Vec<Change>| {
+            verdict(
+                level,
+                &dependent(held.clone()),
+                &plan(changes),
+                Some(&Schema::default()),
+                &Default::default(),
+            )
+        };
+        assert!(matches!(
+            judge(Level::Type, vec![drop_exclusion("x")]),
+            Verdict::Fine
+        ));
+        assert!(matches!(judge(Level::Column, vec![]), Verdict::Fine));
+        // Negative: nothing drops it, a drop of another name, or of an index of its name.
+        assert!(matches!(judge(Level::Type, vec![]), Verdict::Refuse(_)));
+        assert!(matches!(
+            judge(Level::Type, vec![drop_exclusion("y")]),
+            Verdict::Refuse(_)
+        ));
+        let index = Change::Index(IndexChange::DropIndex {
+            table: table.clone(),
+            name: "x".into(),
+        });
+        assert!(matches!(
+            judge(Level::Type, vec![index]),
+            Verdict::Refuse(_)
+        ));
     }
 
     fn drop_column(table: &str, column: &str) -> Change {

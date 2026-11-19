@@ -1980,13 +1980,15 @@ pub(crate) fn diff_partial_rebuilding(
     // Every change is in: whichever pass produced a retype or a drop of a held
     // column is seen, not only the table loop's.
     for (table, held) in &standing {
-        exclusion_hazards(
+        let stated = exclusion_hazards(
             table,
             held,
+            declared.schema.tables.get(table),
             changes.iter().filter(|c| c.table() == Some(table)),
             dialect,
             &mut errs,
         );
+        changes.extend(stated);
     }
     // Descriptions are comments only where the engine holds them; elsewhere they stay the
     // free text they were (#2729).
@@ -7147,32 +7149,50 @@ fn diff_exclusions(
     }
 }
 
-/// A column change under a standing exclusion constraint, refused by name
-/// (DEC-2448.3, DEC-2448.4). The engine drops an exclusion silently when a plain
-/// key column is dropped, and silently rebuilds it, under an exclusive lock,
-/// when one is retyped (measured on 16.15 and 18.6): a guarantee given up, or a
-/// rebuild, that no plan states. A drop is allowed where the same plan drops the
-/// constraint, which is the statement the engine would otherwise have made
-/// unseen (a pure drop has passed the retirement gate, a replacement states the
-/// drop and the validation); a retype needs the teardown and restoration of PR
-/// D, so it is refused whatever else the plan says. A key that is an
-/// expression, or a predicate, names its columns in text this model does not
-/// parse, so a column its text mentions counts as one it holds.
+/// A column change under a standing exclusion constraint (DEC-2448.3, DEC-2448.4,
+/// DEC-2448.5). The engine drops an exclusion silently when a plain key column is
+/// dropped, and silently rebuilds it, under an exclusive lock, when one is
+/// retyped or a generated one has its expression set (measured on 16.15 and
+/// 18.6): a guarantee given up, or a rebuild, that no plan states.
+///
+/// - A **drop** is allowed where the same plan drops the constraint, which is
+///   the statement the engine would otherwise have made unseen (a pure drop has
+///   passed the retirement gate, a replacement states the drop and the
+///   validation). Alone it is refused by name.
+/// - A **retype** or an **expression** change where the plan does not already
+///   drop or replace the constraint is stated: the constraint's drop and its add
+///   of the declared definition are two changes beside it, as a replacement's
+///   are, in the classes that put the drop before the column change and the add
+///   after it. A conflicting rebuild then fails as one transaction with the old
+///   constraint standing, and the plan shows the `destructive` and `constraint`
+///   risks the engine would have taken unseen. The definition is declared,
+///   because a differing one is a replacement already.
+///
+/// A key that is an expression, or a predicate, names its columns in text this
+/// model does not parse, so a column its text mentions counts as one it holds.
 #[allow(clippy::wildcard_enum_match_arm)]
 fn exclusion_hazards<'a>(
     name: &TableName,
     base: &Table,
+    declared: Option<&Table>,
     changes: impl IntoIterator<Item = &'a Change>,
     dialect: &(impl Dialect + ?Sized),
     errs: &mut Vec<DiffError>,
-) {
+) -> Vec<Change> {
+    let mut stated = Vec::new();
     if base.exclude.is_empty() {
-        return;
+        return stated;
     }
     let changes: Vec<&Change> = changes.into_iter().collect();
     let released = |key: &pbps_model::ObjectLocalName| {
         changes.iter().any(|c| {
             matches!(c, Change::Constraint(ConstraintChange::SetExclusion { table, name: n, to: None, .. })
+                if table == name && n == key)
+        })
+    };
+    let handled = |key: &pbps_model::ObjectLocalName| {
+        changes.iter().any(|c| {
+            matches!(c, Change::Constraint(ConstraintChange::SetExclusion { table, name: n, .. })
                 if table == name && n == key)
         })
     };
@@ -7190,25 +7210,53 @@ fn exclusion_hazards<'a>(
             _ => continue,
         };
         for (key, x) in &base.exclude {
-            if exclusion_names(x, &column.name, dialect) && !(what == "dropped" && released(key)) {
-                let fix = if what == "dropped" {
-                    "drop the constraint in the same plan (`pbps drop-exclusion`), or the \
-                     engine would drop it without a plan saying so"
-                } else {
-                    "that arrives with the rebuild of a later PR, and the engine would \
-                     otherwise rebuild the constraint without a plan saying so"
-                };
-                errs.push(DiffError::ExclusionRefused {
-                    table: name.clone(),
-                    name: key.clone(),
-                    reason: format!(
-                        "column `{}` is {what} while the constraint holds it; {fix}",
-                        column.name.shown()
-                    ),
-                });
+            if !exclusion_names(x, &column.name, dialect) {
+                continue;
+            }
+            if what == "dropped" {
+                if !released(key) {
+                    errs.push(DiffError::ExclusionRefused {
+                        table: name.clone(),
+                        name: key.clone(),
+                        reason: format!(
+                            "column `{}` is dropped while the constraint holds it; drop the \
+                             constraint in the same plan (`pbps drop-exclusion`), or the \
+                             engine would drop it without a plan saying so",
+                            column.name.shown()
+                        ),
+                    });
+                }
+            } else if !handled(key) && !stated.iter().any(|s| exclusion_change_of(s, name, key)) {
+                // Gone from the declarations is the retirement gate's refusal, not
+                // this one's; a definition that differs is a replacement, and
+                // `handled` has seen it.
+                if let Some(now) = declared.and_then(|t| t.exclude.get(key)) {
+                    stated.push(Change::Constraint(ConstraintChange::SetExclusion {
+                        table: name.clone(),
+                        name: key.clone(),
+                        from: Some(Box::new(x.clone())),
+                        to: None,
+                    }));
+                    stated.push(Change::Constraint(ConstraintChange::SetExclusion {
+                        table: name.clone(),
+                        name: key.clone(),
+                        from: None,
+                        to: Some(Box::new(now.clone())),
+                    }));
+                }
             }
         }
     }
+    stated
+}
+
+fn exclusion_change_of(
+    change: &Change,
+    table: &TableName,
+    key: &pbps_model::ObjectLocalName,
+) -> bool {
+    matches!(change, Change::Constraint(ConstraintChange::SetExclusion { table: t, name: n, .. })
+        if t == table && n == key)
 }
 
 /// Whether an exclusion constraint's keys, payload or predicate hold `column`.
@@ -11905,14 +11953,24 @@ mod tests {
 
     /// A retype an enum or a domain rebuild pushes before the table loop runs is
     /// seen by the hazard check as much as the loop's own: the check is asked of
-    /// the whole change list, so no pass can hide one (DEC-2448.3).
+    /// the whole change list, so no pass can hide one, and each states the
+    /// constraint's drop and add (DEC-2448.3, DEC-2448.5).
     #[test]
-    fn a_rebuild_that_retypes_a_held_column_is_refused_and_one_that_does_not_still_plans() {
-        let refused = |base: &Schema, declared: &Schema| -> Vec<String> {
-            match alter_domain(base, declared, &[]) {
-                Ok(_) => Vec::new(),
-                Err(errors) => errors.iter().map(ToString::to_string).collect(),
-            }
+    fn a_rebuild_that_retypes_a_held_column_states_the_constraints_pair() {
+        // How many changes of the constraint `x` the plan holds: its drop and its add
+        // where a rebuilt type retypes a column it holds, none where it does not.
+        let stated = |base: &Schema, declared: &Schema| -> usize {
+            alter_domain(base, declared, &[])
+                .unwrap_or_else(|errors| panic!("{errors:?}"))
+                .changes
+                .iter()
+                .filter(|p| {
+                    matches!(
+                        p.change,
+                        Change::Constraint(ConstraintChange::SetExclusion { .. })
+                    )
+                })
+                .count()
         };
         let hold = |mut world: Schema, key: &str| {
             let t: TableName = "app.t".parse().unwrap();
@@ -11931,23 +11989,23 @@ mod tests {
         }
         let before = domain_world(code(false, None, &[], "text"), false, false);
         let after = domain_world(collated, false, false);
-        let said = refused(
-            &hold(before.clone(), "int4range(v::int, 1)"),
-            &hold(after.clone(), "int4range(v::int, 1)"),
-        );
-        assert!(
-            said.iter()
-                .any(|m| m.contains("`v`") && m.contains("while the constraint holds it")),
-            "{said:?}"
+        assert_eq!(
+            stated(
+                &hold(before.clone(), "int4range(v::int, 1)"),
+                &hold(after.clone(), "int4range(v::int, 1)"),
+            ),
+            2
         );
         // Negative: the same rebuild beside an exclusion that holds `id` only.
-        let said = refused(
-            &hold(before.clone(), "int4range(id, 1)"),
-            &hold(after.clone(), "int4range(id, 1)"),
+        assert_eq!(
+            stated(
+                &hold(before.clone(), "int4range(id, 1)"),
+                &hold(after.clone(), "int4range(id, 1)"),
+            ),
+            0
         );
-        assert!(said.is_empty(), "{said:?}");
         // Negative: a rebuild with no exclusion at all.
-        assert!(refused(&before, &after).is_empty());
+        assert_eq!(stated(&before, &after), 0);
         // Enum: removing a label rebuilds the type and retypes `m`.
         let moods = |labels: &[&str], key: &str| {
             let mut t = table(&[
@@ -11964,23 +12022,19 @@ mod tests {
             );
             s
         };
-        let said = refused(
-            &moods(&["a", "b", "c"], "int4range(m::int, 1)"),
-            &moods(&["a", "c"], "int4range(m::int, 1)"),
+        assert_eq!(
+            stated(
+                &moods(&["a", "b", "c"], "int4range(m::int, 1)"),
+                &moods(&["a", "c"], "int4range(m::int, 1)"),
+            ),
+            2
         );
-        assert!(
-            said.iter()
-                .any(|m| m.contains("`m`") && m.contains("while the constraint holds it")),
-            "{said:?}"
-        );
-        let said = refused(
-            &moods(&["a", "b", "c"], "int4range(id, 1)"),
-            &moods(&["a", "c"], "int4range(id, 1)"),
-        );
-        assert!(
-            said.iter()
-                .all(|m| !m.contains("while the constraint holds it")),
-            "{said:?}"
+        assert_eq!(
+            stated(
+                &moods(&["a", "b", "c"], "int4range(id, 1)"),
+                &moods(&["a", "c"], "int4range(id, 1)"),
+            ),
+            0
         );
     }
 
@@ -12284,9 +12338,10 @@ mod tests {
 
     /// The engine's silent loss of a guarantee under a column change is refused
     /// by name: a drop of a key column is allowed only where the same plan drops
-    /// the constraint, and a retype never is (DEC-2448.3, DEC-2448.4).
+    /// the constraint; a retype is allowed and states the constraint's drop and
+    /// add beside it (DEC-2448.3, DEC-2448.4, DEC-2448.5).
     #[test]
-    fn a_column_change_under_an_exclusion_is_refused_unless_the_plan_drops_it() {
+    fn a_column_drop_under_an_exclusion_is_refused_and_a_retype_states_its_rebuild() {
         let held = booking(&[("no_overlap", exclusion("int4range(a, b)", "&&"))]);
         let table: TableName = "app.booking".parse().unwrap();
         let mut gone = booking(&[]);
@@ -12343,79 +12398,243 @@ mod tests {
                 using: None,
             })
         };
-        // The drop is released by a drop in the plan; the retype is not.
+        // A drop is released by a drop in the plan, and a retype needs none: it is stated.
         let released = Change::Constraint(ConstraintChange::SetExclusion {
             table: table.clone(),
             name: "no_overlap".into(),
             from: Some(Box::new(exclusion("int4range(a, b)", "&&"))),
             to: None,
         });
+        let declared = Some(&held.tables[&table]);
         let mut errs = Vec::new();
-        exclusion_hazards(
+        let stated = exclusion_hazards(
             &table,
             &held.tables[&table],
+            declared,
             &[drop("a"), released.clone()],
             &MinimalDialect,
             &mut errs,
         );
-        assert!(errs.is_empty(), "{errs:?}");
-        exclusion_hazards(
+        assert!(errs.is_empty() && stated.is_empty(), "{errs:?}");
+        // The drop of the constraint beside the retype is the plan's own statement of it.
+        let stated = exclusion_hazards(
             &table,
             &held.tables[&table],
+            declared,
             &[retype("a"), released],
             &MinimalDialect,
             &mut errs,
         );
-        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs.is_empty() && stated.is_empty(), "{errs:?} {stated:?}");
+        // A retype alone is stated as the constraint's drop and add, in that order.
+        let stated = exclusion_hazards(
+            &table,
+            &held.tables[&table],
+            declared,
+            &[retype("a")],
+            &MinimalDialect,
+            &mut errs,
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(
+            matches!(
+                stated.as_slice(),
+                [
+                    Change::Constraint(ConstraintChange::SetExclusion {
+                        from: Some(_),
+                        to: None,
+                        ..
+                    }),
+                    Change::Constraint(ConstraintChange::SetExclusion {
+                        from: None,
+                        to: Some(_),
+                        ..
+                    }),
+                ]
+            ),
+            "{stated:?}"
+        );
+        // Negative: a constraint the declarations no longer hold is the retirement gate's
+        // to refuse, not restated here.
+        let stated = exclusion_hazards(
+            &table,
+            &held.tables[&table],
+            Some(&Table::default()),
+            &[retype("a")],
+            &MinimalDialect,
+            &mut errs,
+        );
+        assert!(errs.is_empty() && stated.is_empty());
+        // Negative: a column the constraint does not hold states nothing.
+        let stated = exclusion_hazards(
+            &table,
+            &held.tables[&table],
+            declared,
+            &[retype("id")],
+            &MinimalDialect,
+            &mut errs,
+        );
+        assert!(errs.is_empty() && stated.is_empty());
         let mut with_filter = held.tables[&table].clone();
         with_filter.exclude.get_mut("no_overlap").unwrap().filter = Some("c > 0".into());
-        type Edit<'a> = &'a dyn Fn(&str) -> Change;
-        let changes: [(Edit<'_>, &str, &str); 2] = [(&drop, "a", "id"), (&retype, "b", "id")];
-        for (change, held_column, free_column) in changes {
-            let mut errs = Vec::new();
-            exclusion_hazards(
-                &table,
-                &with_filter,
-                &[change(held_column)],
-                &MinimalDialect,
-                &mut errs,
-            );
+        // A key, the payload and the predicate each hold a column: a drop of it is refused,
+        // a retype of it is stated, and one the constraint does not name is neither.
+        for (held_column, free_column) in [("a", "id"), ("b", "id"), ("c", "id")] {
+            let ask = |change: Change| {
+                let mut errs = Vec::new();
+                let stated = exclusion_hazards(
+                    &table,
+                    &with_filter,
+                    Some(&with_filter),
+                    &[change],
+                    &MinimalDialect,
+                    &mut errs,
+                );
+                (errs, stated)
+            };
+            let (errs, stated) = ask(drop(held_column));
             assert_eq!(errs.len(), 1, "{held_column}: {errs:?}");
+            assert!(stated.is_empty());
             assert!(
                 errs[0]
                     .to_string()
                     .contains("while the constraint holds it"),
                 "{errs:?}"
             );
-            let mut errs = Vec::new();
-            exclusion_hazards(
-                &table,
-                &with_filter,
-                &[change("c")],
-                &MinimalDialect,
-                &mut errs,
-            );
-            assert_eq!(errs.len(), 1, "the predicate holds `c`: {errs:?}");
-            let mut errs = Vec::new();
-            exclusion_hazards(
-                &table,
-                &with_filter,
-                &[change(free_column)],
-                &MinimalDialect,
-                &mut errs,
-            );
-            assert!(errs.is_empty(), "{free_column}: {errs:?}");
+            let (errs, stated) = ask(retype(held_column));
+            assert!(errs.is_empty(), "{held_column}: {errs:?}");
+            assert_eq!(stated.len(), 2, "{held_column}: {stated:?}");
+            for free in [drop(free_column), retype(free_column)] {
+                let (errs, stated) = ask(free);
+                assert!(
+                    errs.is_empty() && stated.is_empty(),
+                    "{free_column}: {errs:?}"
+                );
+            }
         }
         // And a table with no exclusion has no hazard at all.
         let mut errs = Vec::new();
-        exclusion_hazards(
+        let stated = exclusion_hazards(
             &table,
             &Table::default(),
+            None,
             &[drop("a")],
             &MinimalDialect,
             &mut errs,
         );
-        assert!(errs.is_empty());
+        assert!(errs.is_empty() && stated.is_empty());
+    }
+
+    /// A retype of a column a standing exclusion holds is one plan: the constraint's drop,
+    /// the retype, the constraint's add, in that order. A retype of a column the
+    /// constraint does not hold, and a retype beside a replacement the plan already states,
+    /// add no pair (DEC-2448.5).
+    #[test]
+    fn a_retype_under_an_exclusion_plans_its_drop_before_and_its_add_after() {
+        let held = booking(&[("no_overlap", exclusion("int4range(a, b)", "&&"))]);
+        let table: TableName = "app.booking".parse().unwrap();
+        let retyped = |column: &str| {
+            let mut declared = held.clone();
+            declared
+                .tables
+                .get_mut(&table)
+                .unwrap()
+                .columns
+                .get_mut(column)
+                .unwrap()
+                .ty = ty("bigint");
+            declared
+        };
+        let cs = exclusion_plan(&held, &retyped("a"), &[]).unwrap();
+        assert_eq!(
+            kinds(&cs),
+            ["SetExclusion", "AlterColumnType", "SetExclusion"],
+            "{:?}",
+            kinds(&cs)
+        );
+        let directions: Vec<(bool, bool)> = cs
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::Constraint(ConstraintChange::SetExclusion { from, to, .. }) => {
+                    Some((from.is_some(), to.is_some()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(directions, [(true, false), (false, true)]);
+        // Negative: a column the constraint does not hold plans no pair.
+        let cs = exclusion_plan(&held, &retyped("id"), &[]).unwrap();
+        assert_eq!(kinds(&cs), ["AlterColumnType"], "{:?}", kinds(&cs));
+        // Negative: beside a replacement the plan states, the pair is that replacement's.
+        let mut replaced = retyped("a");
+        replaced
+            .tables
+            .get_mut(&table)
+            .unwrap()
+            .exclude
+            .insert("no_overlap".into(), exclusion("int4range(a, b)", "-|-"));
+        let cs = exclusion_plan(&held, &replaced, &[]).unwrap();
+        assert_eq!(
+            kinds(&cs).iter().filter(|k| *k == "SetExclusion").count(),
+            2,
+            "{:?}",
+            kinds(&cs)
+        );
+        // Negative: the constraint gone from the declarations needs its record, retype or not.
+        let mut gone = retyped("a");
+        gone.tables.get_mut(&table).unwrap().exclude.clear();
+        assert!(exclusion_plan(&held, &gone, &[]).is_err());
+    }
+
+    /// A retype under an exclusion whose storage parameters also change is one rebuild: the
+    /// restoring add carries the declared parameters, so no `ALTER INDEX` is left between the
+    /// teardown and the restoration to name an index that is not there. The same parameter
+    /// change with no rebuild keeps its `ALTER INDEX` (DEC-2448.5).
+    #[test]
+    fn a_parameter_edit_beside_an_exclusions_rebuild_is_subsumed_by_its_restoration() {
+        let held = booking(&[("no_overlap", exclusion("int4range(a, b)", "&&"))]);
+        let table: TableName = "app.booking".parse().unwrap();
+        let mut tuned = held.clone();
+        tuned
+            .tables
+            .get_mut(&table)
+            .unwrap()
+            .exclude
+            .get_mut("no_overlap")
+            .unwrap()
+            .storage_parameters
+            .insert("fillfactor".into(), "70".into());
+        // Negative: with no rebuild the parameter edit stands alone.
+        let cs = exclusion_plan(&held, &tuned, &[]).unwrap();
+        assert_eq!(
+            kinds(&cs),
+            ["SetIndexStorageParameters"],
+            "{:?}",
+            kinds(&cs)
+        );
+        // The retype rebuilds the constraint; the parameters ride on its add.
+        let mut retyped = tuned.clone();
+        retyped
+            .tables
+            .get_mut(&table)
+            .unwrap()
+            .columns
+            .get_mut("a")
+            .unwrap()
+            .ty = ty("bigint");
+        let cs = exclusion_plan(&held, &retyped, &[]).unwrap();
+        assert_eq!(
+            kinds(&cs),
+            ["SetExclusion", "AlterColumnType", "SetExclusion"],
+            "{:?}",
+            kinds(&cs)
+        );
+        let carried = cs.changes.iter().any(|p| {
+            matches!(&p.change, Change::Constraint(ConstraintChange::SetExclusion { to: Some(x), .. })
+                if x.storage_parameters.get("fillfactor").map(String::as_str) == Some("70"))
+        });
+        assert!(carried, "{:?}", kinds(&cs));
     }
 
     fn parameters_of(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {

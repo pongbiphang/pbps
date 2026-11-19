@@ -37,6 +37,10 @@ pub enum Part {
     Check(pbps_model::ObjectLocalName),
     Default(pbps_model::ColumnName),
     Index(pbps_model::ObjectLocalName),
+    /// An exclusion constraint, which owns its backing index (DEC-2448.5). It is not an
+    /// `Index`: the engine refuses `DROP INDEX` of it (`2BP01`) and a declaration holds it
+    /// under `exclude`, not `indexes`.
+    Exclusion(pbps_model::ObjectLocalName),
     /// A generated column's expression. Never restorable: no statement takes
     /// the expression off and puts it back. A plan that changes the
     /// expression releases the dependency instead, when that change runs
@@ -70,6 +74,7 @@ impl Dependent {
                     Part::ForeignKey(name) => t.foreign_keys.contains_key(name),
                     Part::Check(name) => t.checks.contains_key(name),
                     Part::Index(name) => t.indexes.contains_key(name),
+                    Part::Exclusion(name) => t.exclude.contains_key(name),
                     // A default is the column's, and the column is what the
                     // declaration names. A partition's is its own where it
                     // declares one, and otherwise the copy of its parent's

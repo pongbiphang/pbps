@@ -2030,38 +2030,6 @@ impl Dialect for Postgres {
         }
         found.extend(validate::table_exclusions(table));
         found.extend(validate::provider_classes(name, table, schema));
-        // An exclusion constraint's expression or predicate that may call a
-        // function this project declares is refused for now: the plan's
-        // ordering of such a constraint against the function it calls is the
-        // index machinery's (DEC-1169.2), which an exclusion is not on yet
-        // (DEC-2448.3). The engine would refuse the constraint where the
-        // function does not exist yet, so this says so before any plan.
-        for (exclusion, x) in &table.exclude {
-            let texts = x
-                .filter
-                .iter()
-                .map(String::as_str)
-                .chain(x.keys.iter().filter_map(|k| k.key.key.expression()));
-            for text in texts {
-                for id in schema.modules.keys() {
-                    if matches!(id, pbps_model::ModuleId::Routine(_))
-                        && generated::may_call(text, id.name())
-                    {
-                        found.push(DialectError::Invalid {
-                            dialect: types::DIALECT,
-                            message: format!(
-                                "exclusion constraint `{}` on `{}` may call the routine `{}` of \
-                                 this project in an expression or predicate; that is not held yet \
-                                 (an exclusion over built-in functions and operators is)",
-                                exclusion.shown(),
-                                name.shown(),
-                                pbps_model::escape::Escaped(id.name()),
-                            ),
-                        });
-                    }
-                }
-            }
-        }
         if table.has_row_security() {
             let invalid = |message| DialectError::Invalid {
                 dialect: types::DIALECT,
@@ -8677,12 +8645,12 @@ mod enum_partition_key_tests {
             .collect()
     }
 
-    /// A retype or drop of a column a standing exclusion holds is refused by name
-    /// whatever the column is called: the guard reads an expression and a
+    /// A retype of a column a standing exclusion holds states the constraint's drop
+    /// and add, whatever the column is called: the guard reads an expression and a
     /// predicate with the engine's identifier scan, so a quoted name with a
     /// hyphen, a space, a doubled quote or a mixed case is found, a bare
     /// lowercase one still is, and the name inside a string literal or a comment
-    /// is not a reference (DEC-2448.3).
+    /// is not a reference (DEC-2448.3, DEC-2448.5).
     #[test]
     fn a_column_an_exclusion_holds_is_found_by_its_quoted_name_and_not_in_a_literal() {
         let columns = ["start-time", "my col", "a\"b", "MixedCase", "plain", "free"];
@@ -8724,9 +8692,10 @@ mod enum_partition_key_tests {
             operator: "test".into(),
             today: "2026-11-06".into(),
         };
-        // The refusals of retyping `column` to bigint, where `base` is the
-        // declared schema with the exclusion and `declared` retypes it.
-        let refusals = |schema: &Schema, column: &str| -> Vec<String> {
+        // How many changes of the constraint the plan holds when `column` is retyped to
+        // bigint: its drop and add where the scan finds the column in the constraint's
+        // text, none where it does not. `schema` is the declared schema with the exclusion.
+        let stated = |schema: &Schema, column: &str| -> usize {
             let mut declared = schema.clone();
             declared
                 .tables
@@ -8744,7 +8713,7 @@ mod enum_partition_key_tests {
             let ids = pbps_diff::resolve(&declared, &base_ids, &[], &context)
                 .unwrap()
                 .ids;
-            let outcome = pbps_diff::diff(
+            let plan = pbps_diff::diff(
                 pbps_diff::Side {
                     schema,
                     ids: &base_ids,
@@ -8755,11 +8724,20 @@ mod enum_partition_key_tests {
                 },
                 &super::Postgres::new(),
                 &pbps_model::Hints::default(),
-            );
-            match outcome {
-                Ok(_) => Vec::new(),
-                Err(errors) => errors.iter().map(ToString::to_string).collect(),
-            }
+            )
+            .unwrap_or_else(|errors| panic!("{errors:?}"));
+            plan.changes()
+                .changes
+                .iter()
+                .filter(|p| {
+                    matches!(
+                        p.change,
+                        pbps_model::Change::Constraint(
+                            pbps_model::ConstraintChange::SetExclusion { .. }
+                        )
+                    )
+                })
+                .count()
         };
         let held = base(
             "int4range(\"start-time\", \"my col\") || int4range(\"a\"\"b\", \"MixedCase\") \
@@ -8767,17 +8745,9 @@ mod enum_partition_key_tests {
             Some("\"start-time\" > 0"),
         );
         for column in columns {
-            let said = refusals(&held, column);
-            if column == "free" {
-                // Negative: a column nothing mentions retypes freely.
-                assert!(said.is_empty(), "{said:?}");
-            } else {
-                assert!(
-                    said.iter()
-                        .any(|m| m.contains("while the constraint holds it")),
-                    "{column}: {said:?}"
-                );
-            }
+            // Negative: a column nothing mentions retypes alone.
+            let expected = if column == "free" { 0 } else { 2 };
+            assert_eq!(stated(&held, column), expected, "{column}");
         }
         // Negative: the name in a string literal or a comment is no reference, and
         // an unquoted `StartTime` folds to `starttime`, which is another column.
@@ -8785,20 +8755,19 @@ mod enum_partition_key_tests {
             "int4range(1, 2) /* \"start-time\" */ || int4range(plain, plain)",
             Some("'start-time' = 'my col'"),
         );
-        assert!(refusals(&literal, "start-time").is_empty());
-        assert!(refusals(&literal, "my col").is_empty());
-        assert!(!refusals(&literal, "plain").is_empty());
+        assert_eq!(stated(&literal, "start-time"), 0);
+        assert_eq!(stated(&literal, "my col"), 0);
+        assert_eq!(stated(&literal, "plain"), 2);
         let folded = base("int4range(MixedCase, 1)", None);
-        assert!(refusals(&folded, "MixedCase").is_empty());
+        assert_eq!(stated(&folded, "MixedCase"), 0);
     }
 
-    /// An exclusion constraint whose expression or predicate may call a routine
-    /// this project declares is refused by name, since the plan's order against
-    /// that routine is the index machinery's and an exclusion is not on it yet;
-    /// one over built-in functions, or over a routine only by a lookalike
-    /// word, is held (DEC-2448.3).
+    /// An exclusion constraint whose expression or predicate calls a routine this
+    /// project declares is held, as an index's is: the plan orders it against the
+    /// routine and tears it down and restores it around the routine's rebuild
+    /// (DEC-2448.5). Only a declaration the exclusion rules refuse is still refused.
     #[test]
-    fn an_exclusion_that_may_call_a_projects_routine_is_refused_by_name() {
+    fn an_exclusion_that_calls_a_projects_routine_is_held() {
         let exclusion = |expression: &str, filter: Option<&str>| {
             let mut table = Table::default();
             table.columns.insert(
@@ -8839,17 +8808,19 @@ mod enum_partition_key_tests {
                 options: Default::default(),
             },
         );
-        let said = problems(&exclusion("app.span(a)", None), &schema).join("\n");
-        assert!(said.contains("may call the routine `span`"), "{said}");
-        let said = problems(
-            &exclusion("int4range(a, a)", Some("app.span(a) IS NOT NULL")),
-            &schema,
-        )
-        .join("\n");
-        assert!(said.contains("may call the routine `span`"), "{said}");
-        // Held: built-ins only, and the same table in a project with no routine.
-        assert!(problems(&exclusion("int4range(a, a)", Some("a > 0")), &schema).is_empty());
-        assert!(problems(&exclusion("app.span(a)", None), &Schema::default()).is_empty());
+        for (expression, filter) in [
+            ("app.span(a)", None),
+            ("int4range(a, a)", Some("app.span(a) IS NOT NULL")),
+            ("int4range(a, a)", Some("a > 0")),
+        ] {
+            let found = problems(&exclusion(expression, filter), &schema);
+            assert!(found.is_empty(), "{expression} {filter:?}: {found:?}");
+        }
+        // Negative: the exclusion rules still apply to such a declaration (an
+        // empty key list names nothing for the constraint to exclude).
+        let mut empty = exclusion("app.span(a)", None);
+        empty.exclude.get_mut("x").unwrap().keys.clear();
+        assert!(!problems(&empty, &schema).is_empty());
     }
 
     /// DEC-2346.1: a scalar reference to a declared enum keys a LIST or RANGE

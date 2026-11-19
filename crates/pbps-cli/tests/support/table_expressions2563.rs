@@ -13,16 +13,21 @@ enum Kind {
     Create,
     IndexKey,
     IndexFilter,
+    /// An exclusion constraint's key and predicate are judged as an index's are (#2448 PR D).
+    ExclusionKey,
+    ExclusionFilter,
     Policy,
     Domain,
 }
-const KINDS: [Kind; 8] = [
+const KINDS: [Kind; 10] = [
     Kind::Check,
     Kind::Default,
     Kind::Generated,
     Kind::Create,
     Kind::IndexKey,
     Kind::IndexFilter,
+    Kind::ExclusionKey,
+    Kind::ExclusionFilter,
     Kind::Policy,
     Kind::Domain,
 ];
@@ -45,6 +50,12 @@ impl Kind {
             )),
             Kind::IndexFilter => d.table(&format!(
                 "{BASE}indexes:\n  ix:\n    columns: [id]\n    where: 'app.ok(email)'\n"
+            )),
+            Kind::ExclusionKey => d.table(&format!(
+                "{BASE}exclude:\n  ix:\n    method: btree\n    keys:\n      - {{expression: 'app.ok(email)', operator: \"=\"}}\n"
+            )),
+            Kind::ExclusionFilter => d.table(&format!(
+                "{BASE}exclude:\n  ix:\n    method: btree\n    keys:\n      - {{column: id, operator: \"=\"}}\n    where: 'app.ok(email)'\n"
             )),
             Kind::Policy => d.table(&format!(
                 "{BASE}row_policies:\n  p: {{using: 'app.ok(email)', with_check: 'app.ok(email)'}}\n"
@@ -77,7 +88,8 @@ impl Kind {
                     "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'app' AND table_name = 't' AND column_name = 'g'"
                 }
                 Kind::Create => "SELECT count(*) FROM pg_class WHERE oid = to_regclass('app.u')",
-                Kind::IndexKey | Kind::IndexFilter => {
+                // The backing index of an exclusion constraint has the constraint's name.
+                Kind::IndexKey | Kind::IndexFilter | Kind::ExclusionKey | Kind::ExclusionFilter => {
                     "SELECT count(*) FROM pg_class WHERE oid = to_regclass('app.ix')"
                 }
                 Kind::Policy => {
@@ -97,6 +109,8 @@ impl Kind {
             | Kind::Create
             | Kind::IndexKey
             | Kind::IndexFilter
+            | Kind::ExclusionKey
+            | Kind::ExclusionFilter
             | Kind::Policy
             | Kind::Domain => "app.ok(pg_catalog.text)",
         }
@@ -112,7 +126,12 @@ impl Kind {
     fn evaluates_over_a_row(self) -> bool {
         matches!(
             self,
-            Kind::Check | Kind::Generated | Kind::IndexKey | Kind::IndexFilter
+            Kind::Check
+                | Kind::Generated
+                | Kind::IndexKey
+                | Kind::IndexFilter
+                | Kind::ExclusionKey
+                | Kind::ExclusionFilter
         )
     }
 
@@ -132,6 +151,8 @@ impl Kind {
             | Kind::Create
             | Kind::IndexKey
             | Kind::IndexFilter
+            | Kind::ExclusionKey
+            | Kind::ExclusionFilter
             | Kind::Policy
             | Kind::Domain => format!(
                 "function: app.ok(text)\ndefinition: '(text) RETURNS boolean LANGUAGE plpgsql IMMUTABLE {set}AS $$BEGIN RETURN true; END$$'\n"
@@ -626,9 +647,11 @@ fn a_check_that_cannot_be_bound_is_not_evaluated_by_the_preflight_probe() {
     }
 }
 
-const NEW_SITES: [Kind; 4] = [
+const NEW_SITES: [Kind; 6] = [
     Kind::IndexKey,
     Kind::IndexFilter,
+    Kind::ExclusionKey,
+    Kind::ExclusionFilter,
     Kind::Policy,
     Kind::Domain,
 ];
@@ -779,6 +802,8 @@ fn an_expression_that_closes_its_clause_is_refused_as_more_than_declared() {
                 | Kind::Create
                 | Kind::IndexKey
                 | Kind::IndexFilter
+                | Kind::ExclusionKey
+                | Kind::ExclusionFilter
                 | Kind::Policy => c.d.dir.join("schema/app.t.yml"),
             };
             let current = std::fs::read_to_string(&file).unwrap();

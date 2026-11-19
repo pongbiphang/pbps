@@ -91,10 +91,54 @@ struct Spec {
     /// Name in the temporary table, the name to show, the type, the value.
     columns: Vec<Column>,
     checks: Vec<(String, String)>,
-    /// An index whose expressions are bound, by name.
-    index: Option<(String, Box<pbps_model::Index>)>,
+    /// An index or an exclusion constraint whose expressions are bound.
+    keyed: Option<Keyed>,
     /// A policy created on the binding table, by name.
     policy: Option<(String, Box<pbps_model::RowPolicy>)>,
+}
+
+/// The keys and the filter of an index or of an exclusion constraint, which are bound
+/// alike: an exclusion's `ADD ... EXCLUDE` evaluates its keys and its predicate over the
+/// stored rows as the deployment role, as an index build does (#2448 PR D review).
+struct Keyed {
+    /// What a refusal calls it: `index` or `exclusion constraint`.
+    noun: &'static str,
+    name: String,
+    keys: Vec<pbps_model::IndexColumn>,
+    filter: Option<String>,
+}
+
+impl Keyed {
+    fn of_index(name: &pbps_model::ObjectLocalName, index: &pbps_model::Index) -> Self {
+        Self {
+            noun: "index",
+            name: name.shown().to_string(),
+            keys: index.columns.clone(),
+            filter: index.filter.clone(),
+        }
+    }
+
+    fn of_exclusion(
+        name: &pbps_model::ObjectLocalName,
+        exclusion: &pbps_model::ExclusionConstraint,
+    ) -> Self {
+        Self {
+            noun: "exclusion constraint",
+            name: name.shown().to_string(),
+            keys: exclusion.keys.iter().map(|k| k.key.clone()).collect(),
+            filter: exclusion.filter.clone(),
+        }
+    }
+}
+
+/// Whether an exclusion constraint holds a key expression or a predicate, the only
+/// parts that can call a routine. One that is only columns carries nothing.
+fn exclusion_holds_expression(exclusion: &pbps_model::ExclusionConstraint) -> bool {
+    exclusion.filter.is_some()
+        || exclusion
+            .keys
+            .iter()
+            .any(|k| k.key.key.expression().is_some())
 }
 
 /// One CHECK of the binding table and what its tree is called in a refusal.
@@ -177,22 +221,28 @@ impl Spec {
                 });
             }
         }
-        if let Some((name, index)) = &self.index {
-            for (i, column) in index.columns.iter().enumerate() {
+        if let Some(Keyed {
+            noun,
+            name,
+            keys,
+            filter,
+        }) = &self.keyed
+        {
+            for (i, column) in keys.iter().enumerate() {
                 if let pbps_model::IndexKey::Expression(text) = &column.key {
                     out.push(Constraint {
                         name: fresh("pbps_key"),
                         expression: format!("({text}\n) IS NOT NULL"),
-                        label: format!("key {} of index `{name}` on {}", i + 1, self.table),
+                        label: format!("key {} of {noun} `{name}` on {}", i + 1, self.table),
                         boolean: false,
                     });
                 }
             }
-            if let Some(filter) = &index.filter {
+            if let Some(filter) = filter {
                 out.push(Constraint {
                     name: fresh("pbps_filter"),
                     expression: filter.clone(),
-                    label: format!("the filter of index `{name}` on {}", self.table),
+                    label: format!("the filter of {noun} `{name}` on {}", self.table),
                     boolean: true,
                 });
             }
@@ -245,6 +295,7 @@ fn binds_on_table(change: &Change) -> bool {
     match change {
         Change::Constraint(ConstraintChange::AddCheck { .. })
         | Change::Index(IndexChange::AddIndex { .. })
+        | Change::Constraint(ConstraintChange::SetExclusion { to: Some(_), .. })
         | Change::Policy(PolicyChange::CreatePolicy { .. })
         | Change::Column(ColumnChange::AlterColumnExpression { .. }) => true,
         Change::Column(ColumnChange::AddColumn { column, .. }) => {
@@ -265,6 +316,9 @@ fn bound_table(change: &Change) -> Option<&str> {
         Change::Column(ColumnChange::AddColumn { table, .. })
         | Change::Constraint(ConstraintChange::AddCheck { table, .. })
         | Change::Index(IndexChange::AddIndex { table, .. })
+        | Change::Constraint(ConstraintChange::SetExclusion {
+            table, to: Some(_), ..
+        })
         | Change::Policy(PolicyChange::CreatePolicy { table, .. }) => Some(&table.name),
         Change::Column(ColumnChange::AlterColumnDefault { column, .. })
         | Change::Column(ColumnChange::AlterColumnExpression { column, .. }) => {
@@ -297,6 +351,11 @@ pub fn carries(change: &Change) -> bool {
         // A key that is only a column, and no filter, calls nothing; such an
         // index is also the one built concurrently, outside any transaction.
         Change::Index(IndexChange::AddIndex { index, .. }) => index.holds_expression(),
+        // The same shape as an index: the add evaluates the keys and the predicate over the
+        // rows, whether the plan adds the constraint or restores it after a rebuild.
+        Change::Constraint(ConstraintChange::SetExclusion { to: Some(x), .. }) => {
+            exclusion_holds_expression(x)
+        }
         Change::Policy(PolicyChange::CreatePolicy { policy, .. }) => {
             policy.using.is_some() || policy.with_check.is_some()
         }
@@ -307,7 +366,8 @@ pub fn carries(change: &Change) -> bool {
 /// Whether a pre-flight probe can evaluate the expressions `change` carries over
 /// stored rows, so that leaving them unjudged must leave the probe unrun. The
 /// only probe that evaluates an index is the duplicate count of a unique index
-/// under a filter; no probe evaluates a policy or a domain.
+/// under a filter; no probe evaluates a policy, a domain or an exclusion
+/// constraint, whose own add is the one evaluation.
 #[must_use]
 #[allow(
     clippy::wildcard_enum_match_arm,
@@ -318,7 +378,8 @@ pub fn probed(change: &Change) -> bool {
         Change::Index(IndexChange::AddIndex { index, .. }) => {
             index.unique && index.filter.is_some()
         }
-        Change::Policy(PolicyChange::CreatePolicy { .. }) => false,
+        Change::Policy(PolicyChange::CreatePolicy { .. })
+        | Change::Constraint(ConstraintChange::SetExclusion { .. }) => false,
         _ => domain_code(change).is_none(),
     }
 }
@@ -901,6 +962,18 @@ fn describe(change: &Change) -> String {
                 table.shown()
             )
         }
+        Change::Constraint(ConstraintChange::SetExclusion {
+            table,
+            name,
+            to: Some(_),
+            ..
+        }) => {
+            format!(
+                "the expressions of exclusion constraint `{}` on {}",
+                name.shown(),
+                table.shown()
+            )
+        }
         Change::Policy(PolicyChange::CreatePolicy { table, name, .. }) => {
             format!(
                 "the expressions of row policy `{name}` on {}",
@@ -1058,7 +1131,7 @@ async fn spec(conn: &mut Conn, change: &Change) -> Result<Option<Spec>, String> 
                 .iter()
                 .map(|(n, c)| (n.raw().to_owned(), c.expression.clone()))
                 .collect(),
-            index: None,
+            keyed: None,
             policy: None,
         },
         Change::Column(ColumnChange::AddColumn {
@@ -1080,7 +1153,7 @@ async fn spec(conn: &mut Conn, change: &Change) -> Result<Option<Spec>, String> 
                 value: value(&column.value_source),
             }],
             checks: Vec::new(),
-            index: None,
+            keyed: None,
             policy: None,
         },
         Change::Constraint(ConstraintChange::AddCheck {
@@ -1096,17 +1169,18 @@ async fn spec(conn: &mut Conn, change: &Change) -> Result<Option<Spec>, String> 
             like: Some(table.clone()),
             columns: Vec::new(),
             checks: vec![(name.raw().to_owned(), constraint.expression.clone())],
-            index: None,
+            keyed: None,
             policy: None,
         },
         Change::Index(IndexChange::AddIndex {
             table, name, index, ..
-        }) => on_table(
-            change,
+        }) => on_table(change, table, Some(Keyed::of_index(name, index)), None),
+        Change::Constraint(ConstraintChange::SetExclusion {
             table,
-            Some((name.shown().to_string(), index.clone())),
-            None,
-        ),
+            name,
+            to: Some(x),
+            ..
+        }) => on_table(change, table, Some(Keyed::of_exclusion(name, x)), None),
         Change::Policy(PolicyChange::CreatePolicy {
             table,
             name,
@@ -1154,7 +1228,7 @@ async fn existing(
             value: Some(value),
         }],
         checks: Vec::new(),
-        index: None,
+        keyed: None,
         policy: None,
     })
 }
@@ -1163,7 +1237,7 @@ async fn existing(
 fn on_table(
     change: &Change,
     table: &TableName,
-    index: Option<(String, Box<pbps_model::Index>)>,
+    keyed: Option<Keyed>,
     policy: Option<(String, Box<pbps_model::RowPolicy>)>,
 ) -> Spec {
     Spec {
@@ -1175,10 +1249,13 @@ fn on_table(
         like: Some(table.clone()),
         columns: Vec::new(),
         checks: Vec::new(),
-        index,
+        keyed,
         policy,
     }
 }
 
 #[cfg(test)]
 mod view_tests;
+
+#[cfg(test)]
+mod exclusion_tests;

@@ -229,6 +229,7 @@ pub fn with_catalog_parts(
             Part::ForeignKey(n) => PartKey::ForeignKey(n.clone()),
             Part::Check(n) => PartKey::Check(n.clone()),
             Part::Index(n) => PartKey::Index(n.clone()),
+            Part::Exclusion(n) => PartKey::Exclusion(n.clone()),
             Part::Default(_) | Part::Generated(_) | Part::Policy(_) => return Err(bad()),
         };
         let holder = base_table_named(owners, before, table)

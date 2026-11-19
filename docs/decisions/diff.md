@@ -9990,3 +9990,70 @@ older snapshot truthfully holds no class options, and an older build rejects the
 field), published schema set 116 (`opclass_parameters` in the declaration schema).
 A key with no options writes the bytes it did, and a btree, GIN, GiST or BRIN index
 without them is unchanged.
+
+<a id="dec-2448-5"></a>
+
+**DEC-2448.5. EXCLUDE constraints across the rebuilds that tear parts down (#2448 PR D).**
+An exclusion constraint is one more part on the list every teardown and restoration
+reads (`order::catalog::Part::Exclusion`), not a branch beside it: the catalog readers,
+`Dependent::managed`, the weave's match, removal and restoration, the name slots and the
+enum and domain rebuild's verdict each gain the one arm. The catalog names a function, an
+enum or a domain's dependent through the constraint's **backing index** (measured on 16.15
+and 18.6: `pg_depend` has a `pg_class` row for it, once per edge, and none for the
+constraint), so the reader asks whether that index is `conindid` of a `contype = 'x'`
+constraint and reports the constraint, in the engine's own words (`constraint x on table
+t`), instead of an index nobody declares. Removal is `ALTER TABLE .. DROP CONSTRAINT`
+(`DROP INDEX` of it is `2BP01`), restoration is the atomic native clause with the declared
+definition and **no `USING INDEX` attach**: the index comes back owned by the constraint,
+under the one name both share (`CREATE INDEX x` beside a constraint `x` is `42P07`, and the
+name is free again after the drop, which the existing slot settlement already sees).
+
+**Where each path ends.**
+- *A function or module an expression or predicate calls* (measured: `DROP FUNCTION` is
+  `2BP01 constraint x on table t depends on function`): the validate refusal of DEC-2448.3 is
+  lifted, since the plan now holds it; the weave drops the constraint before the module's
+  drop and adds it after the module's create; the ordering pass that moves an addition behind
+  the function it calls already read a `SetExclusion`.
+- *An enum or domain rebuild*: a constant of the old type in an expression or predicate is
+  refused by the engine at the retype (`42883`), so, like a check and an index, the plan must
+  drop and restore it or the rebuild is refused by name; an exclusion that only holds the
+  column is not a dependent of the type.
+- *A retype, an enum's retype step or a generated expression change of a column a standing
+  exclusion holds*: measured, the engine rebuilds the constraint and its index in place
+  (new oids, an exclusive lock), and a rebuild the rows refuse fails the statement whole
+  (`could not create exclusion constraint`), with the old one standing. DEC-2448.4 refused
+  it as a rebuild no plan states; the differ now states it, as the drop and the add of the
+  declared definition beside the column change (`destructive` and `constraint` risks, the
+  classes that put the drop before the column change and the add after it), unless the plan
+  already drops or replaces that constraint. A column drop keeps its rule. On 16
+  `SET EXPRESSION` does not exist, so the existing pre-17 refusal stands.
+- *A physical table copy*: the only one is the partitioned rebuild, and an exclusion on a
+  partitioned table or a partition is refused until PR E, which also owns the rebuild's
+  recipe; D adds nothing there, and `Part::Exclusion` stays unmapped in the partition
+  closure's reader so that nothing restores one unseen.
+
+**Parameters ride on the restoration.** Whichever path restores an exclusion (the differ's
+own pair, the weave, a plan that drops and adds it), the add carries the declared storage
+parameters, so the one normalization that drops a parameter edit of a rebuilt index
+(`drop_parameter_changes_of_rebuilt_indexes`) reads an adding `SetExclusion` as it reads an
+`AddUnique`. Left in, the `ALTER INDEX` would name the backing index between the teardown
+and the restoration, where it does not exist. With no restoration beside it, the edit stays.
+
+**Judged like an index.** `ADD ... EXCLUDE` evaluates the constraint's key expressions and its
+predicate over the stored rows as the deployment role, as an index build does, so lifting the
+validate refusal made the routine they call a deployment-role execution. An exclusion add (the
+declared one and the restoration) is therefore a table expression of the same kind as an index
+(DEC-2563.4): `table_expressions::carries` reads an adding `SetExclusion` that holds an expression
+key or a predicate, emission sets `Statement.introduces`, and the one binder judges it with the
+owner-trust, fixed-search-path and pin checks of the index path, its keys and predicate labelled
+as the index's are. A key of plain columns with no predicate carries nothing. No pre-flight probe
+evaluates an exclusion (its own add is the one evaluation), so `probed` is false. Before this,
+master's validate refused only a routine the project declares; an exclusion calling a routine the
+project does not declare was admitted with no judgement, which the same arm closes.
+
+**A failed replacement rolls back** with the apply: the old constraint, its definition and
+the rows stand, the ledger holds a `failed` entry and no state (measured on both engines: a
+conflicting add after the drop in one transaction leaves the dropped constraint back).
+
+Formats: none. `SetExclusion` is plan 73's kind, no snapshot, identity or published document
+names the list, and the published schema set is unchanged.
