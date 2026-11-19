@@ -333,7 +333,11 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
         if def.columns.is_empty() {
             found.push(invalid(format!("{what} names no column")));
         }
-        columns_of(&what, &keys, table, &mut found);
+        // Only the keys that are columns are held to the table's columns. An
+        // index of expressions alone names none and is not empty for that.
+        if !keys.is_empty() {
+            columns_of(&what, &keys, table, &mut found);
+        }
         if !def.include.is_empty() {
             found.push(unsupported(format!("included columns ({what})")));
         }
@@ -857,7 +861,9 @@ mod tests {
             make(&mut table);
             let found = errors(&table);
             assert!(
-                found.iter().any(is_not_built) && !found.iter().any(is_unsupported),
+                // Valid SQLite that is not built is said once, as that: it
+                // is neither absent from SQLite nor a mistake.
+                found.iter().all(is_not_built) && !found.is_empty(),
                 "{sql}: {}",
                 said(&found)
             );
@@ -1185,6 +1191,13 @@ mod tests {
         ("DELETE FROM t", false, false),
         ("PRAGMA user_version", false, false),
         ("EXPLAIN SELECT 1", false, false),
+        // The first word is a whole name, by SQLite's own rule for one.
+        ("SELECT$foo 1", false, false),
+        ("SELECT\u{e9} 1", false, false),
+        ("SELECT1", false, false),
+        ("WITH_x AS (SELECT 1) SELECT 1", false, false),
+        ("SELECT\"a\" FROM (SELECT 1 AS a)", true, true),
+        ("SELECT(1)", true, true),
         ("", false, false),
         ("   ", false, false),
         // Valid SQLite that is two statements: refused, a view is one.

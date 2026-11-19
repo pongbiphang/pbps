@@ -192,9 +192,11 @@ pub fn first_word(text: &str) -> Option<String> {
                 if trimmed.is_empty() {
                     continue;
                 }
+                // The whole name, by SQLite's rule for one: `SELECT$x` and
+                // `SELECTé` are one word each, and neither is `SELECT`.
                 let word: String = trimmed
                     .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .take_while(|c| crate::ident::identifier_continues(*c))
                     .collect();
                 return Some(word.to_ascii_lowercase());
             }
