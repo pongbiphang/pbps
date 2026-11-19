@@ -6123,3 +6123,20 @@ hold for any target: the match must be the function's tail expression, since a
 moved `return` or `?` would otherwise run what follows it; generic parameters go
 to a family function whose parameters name them; and a comment between the
 alternatives of a shared arm moves with the alternative after it.
+
+<a id="dec-2798-17"></a>
+
+**DEC-2798.17. The three change-family tools are removed once the last branch
+that predates the move has crossed it (#2798).** `scripts/change_family_rewrite.py`,
+`scripts/change_family_collapse.py` and `scripts/change_family_split.py` did the
+mechanical moves of #2790 and carried older branches across them (DEC-2790.2,
+DEC-2790.3). DEC-2790.2 kept the rewrite tool until the freeze was over. The
+last open branch cut before the move, #2911, has merged, so no input the tools
+accept is left: the macros they rewrote are gone and the functions they split
+are already split. They are deleted with their tests and the three steps of the
+`lint` job that ran those tests.
+
+The entries above still name the tools, as the record of how the moves were
+made; the scripts themselves are in the history at the merge of #2911. A later
+mechanical move of the same shape starts from that history instead of from a
+tool kept green against code it can no longer read.
