@@ -5,15 +5,16 @@
 
 use super::{Binding, Closing, Naming, Prepared, Scratch};
 use crate::resolver::contract::{
-    ApplyRecheck, BindingView, ClosingInputs, ClusterDomain, FactsError, GrantRecheck, Phase,
-    Planning, PreparedView, Rehearsal, RehearsalRequest, Replay, ResolverEngine, Sealable, Step,
-    Support, TargetRead, sealed::Sealed,
+    ApplyRecheck, BindingView, ClosingInputs, ClusterDomain, FactsError, GrantRecheck, Never,
+    Phase, Planning, PreparedView, Rehearsal, RehearsalRequest, Replay, ResolverEngine, Sealable,
+    Step, Support, TargetReadStep, sealed::Sealed,
 };
 use crate::resolver::scope;
 use crate::resolver::server::scratch::rehearse::Roles;
 use crate::resolver::server::scratch::{Provenance, Provisioning, Tokens};
 use crate::resolver::server::{BindingRequest, Error, PlanningDialect, ProduceError, ScopeRequest};
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
+use pbps_db::resolver::Observation;
 use pbps_db::resolver::capture::{Assessment, CaptureDifference, CaptureError};
 use pbps_db::resolver::environment::{CatalogFacts, DatabaseRecipe, ScopeReport};
 use pbps_db::{Conn, DbError, Driver};
@@ -27,6 +28,7 @@ use pbps_model::resolver::{
 };
 use pbps_model::role_mapping::RoleMapping;
 use pbps_model::{ChangeSet, Hints, IdsFile, ModuleDeps, ModuleId, RoleName, Schema, SessionZone};
+use pbps_pg::resolver::authorization as pg_auth;
 use pbps_pg::resolver::capture::{BindingRecord, SealError};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -68,6 +70,10 @@ impl ResolverEngine for PgResolver {
     type CompiledCapture = Box<Closing>;
     type CapturedInputs = pbps_pg::resolver::capture::CapturedInputs;
     type History = pbps_pg::resolver::scope_witness::Witness;
+    type Authorization = pg_auth::AuthorizationContext;
+    /// PostgreSQL measures no authorization condition: its after-state is the
+    /// planned grants projected onto the context it read.
+    type Condition = Never;
 
     fn binding_classes(surface: &Surface) -> Option<&'static [&'static str]> {
         pbps_pg::resolver::binding_classes(surface)
@@ -187,7 +193,7 @@ impl ResolverEngine for PgResolver {
         provisioning: Provisioning,
         admin: &'a mut Conn,
         target: &'a CatalogFacts,
-        authorization: &'a scope::Authorization,
+        authorization: &'a Self::Authorization,
         schemas: &'a [String],
     ) -> Step<'a, Result<Prepared, Error>> {
         Box::pin(async move {
@@ -210,7 +216,7 @@ impl ResolverEngine for PgResolver {
         admin: &'a mut Conn,
         target_connection: &'a mut Conn,
         target: &'a CatalogFacts,
-        authorization: &'a scope::Authorization,
+        authorization: &'a Self::Authorization,
         schemas: &'a [String],
         binding: &'a BindingRequest<'a>,
         extras: &'a [String],
@@ -393,7 +399,7 @@ impl ResolverEngine for PgResolver {
         extras: &'a [String],
         authorization_schemas: &'a [String],
         _: &'a [scope::PlannedGrant],
-    ) -> Step<'a, Result<(CatalogFacts, scope::Authorization), DbError>> {
+    ) -> Step<'a, Result<(CatalogFacts, Self::Authorization), DbError>> {
         Box::pin(async move {
             let scope = pbps_pg::resolver::environment::Scope {
                 schemas,
@@ -401,7 +407,7 @@ impl ResolverEngine for PgResolver {
             };
             let (catalog, authorization) =
                 pbps_pg::resolver::scope_facts(connection, &scope, authorization_schemas).await?;
-            Ok((catalog, scope::Authorization::Postgres(authorization)))
+            Ok((catalog, authorization))
         })
     }
 
@@ -411,7 +417,7 @@ impl ResolverEngine for PgResolver {
         extras: &'a [String],
         authorization_schemas: &'a [String],
         _: &'a [scope::PlannedGrant],
-    ) -> Step<'a, Result<TargetRead<Self::History>, DbError>> {
+    ) -> TargetReadStep<'a, Self::Authorization, Self::History> {
         Box::pin(async move {
             let scope = pbps_pg::resolver::environment::Scope {
                 schemas,
@@ -420,11 +426,7 @@ impl ResolverEngine for PgResolver {
             let (catalog, authorization, witness) =
                 pbps_pg::resolver::witnessed_scope_facts(connection, &scope, authorization_schemas)
                     .await?;
-            Ok((
-                catalog,
-                scope::Authorization::Postgres(authorization),
-                witness,
-            ))
+            Ok((catalog, authorization, witness))
         })
     }
 
@@ -450,6 +452,73 @@ impl ResolverEngine for PgResolver {
         after: &Self::History,
     ) -> Result<Vec<String>, DbError> {
         before.differences(after)
+    }
+
+    fn same_context(a: &Self::Authorization, b: &Self::Authorization) -> bool {
+        a.canonical() == b.canonical()
+    }
+
+    fn canonical(authorization: &Self::Authorization) -> Vec<u8> {
+        authorization.canonical()
+    }
+
+    fn authorization_rule() -> Result<&'static str, String> {
+        Ok(pg_auth::RULE)
+    }
+
+    fn transition(
+        authorization: &Self::Authorization,
+        planned: &[scope::PlannedGrant],
+        _: Option<&Self::Condition>,
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        Ok((
+            authorization.canonical(),
+            pg_auth::with_planned(authorization.clone(), &scope::pg_planned(planned)).canonical(),
+        ))
+    }
+
+    fn unpredictable(
+        authorization: &Self::Authorization,
+        planned: &[scope::PlannedGrant],
+    ) -> Vec<String> {
+        pg_auth::ambiguous_grantors(authorization, &scope::pg_planned(planned))
+    }
+
+    fn unusable_schemas(
+        authorization: &Self::Authorization,
+        planned: &[scope::PlannedGrant],
+    ) -> Vec<String> {
+        pg_auth::with_planned(authorization.clone(), &scope::pg_planned(planned))
+            .schemas
+            .into_iter()
+            .filter(|(_, schema)| schema.privileges.get("USAGE") != Some(&true))
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    fn project_visibility(
+        authorization: &Self::Authorization,
+        planned: &[scope::PlannedGrant],
+        schemas: &[String],
+        extras: &[String],
+        catalog: &mut CatalogFacts,
+    ) {
+        let expected = pg_auth::with_planned(authorization.clone(), &scope::pg_planned(planned));
+        catalog.visibility = expected_visibility(&expected, schemas, extras);
+    }
+
+    fn authorization_condition<'a>(
+        _: &'a mut Self::Prepared,
+        _: &'a mut Conn,
+    ) -> Step<'a, Result<Option<Self::Condition>, Error>> {
+        Box::pin(async move { Ok(None) })
+    }
+
+    fn recheck_condition<'a>(
+        condition: &'a Self::Condition,
+        _: &'a mut Conn,
+    ) -> Step<'a, Result<bool, DbError>> {
+        match *condition {}
     }
 
     fn through_shape_view(staged: &Self::Staged, error: Error) -> Error {
@@ -564,13 +633,6 @@ impl BindingView for Box<Binding> {
 }
 
 impl PreparedView for Prepared {
-    fn authorization_condition<'a>(
-        &'a mut self,
-        _: &'a mut Conn,
-    ) -> Step<'a, Result<Option<Box<pbps_mssql::resolver::authorization::Condition>>, Error>> {
-        Box::pin(async move { Ok(None) })
-    }
-
     fn dependency_placements(&self) -> BTreeMap<DependencyName, DependencyPlacement> {
         Default::default()
     }
@@ -679,7 +741,7 @@ impl ApplyRecheck for PgResolver {
         &'a self,
         conn: &'a mut Conn,
         r: Replay<'a>,
-    ) -> Step<'a, Result<(CatalogFacts, scope::Authorization), FactsError>> {
+    ) -> Step<'a, Result<(CatalogFacts, Vec<u8>), FactsError>> {
         Box::pin(async move {
             let target = &r.evidence.qualification().target_scope;
             let scope = pbps_pg::resolver::environment::Scope {
@@ -688,9 +750,7 @@ impl ApplyRecheck for PgResolver {
             };
             pbps_pg::resolver::scope_facts_in_transaction(conn, &scope, r.scope_schemas)
                 .await
-                .map(|(catalog, authorization)| {
-                    (catalog, scope::Authorization::Postgres(authorization))
-                })
+                .map(|(catalog, authorization)| (catalog, authorization.canonical()))
                 .map_err(|error| FactsError::Unread(error.to_string()))
         })
     }
@@ -742,4 +802,120 @@ fn routines(evidence: &ResolverEvidence) -> BTreeMap<ModuleId, ObjectIdentity> {
         }
     }
     routines
+}
+
+/// The effective schema order a PostgreSQL deployer would see on each
+/// in-scope path, derived from the (post-plan) authorization: `pg_catalog`
+/// first, then each of the path's schemas the deployer has USAGE on, in
+/// order. This is what `current_schemas(true)` returns once the temporary
+/// namespaces are stripped, so a reproduction that grants the same USAGE
+/// matches it, and a planned USAGE change is compared against its intended
+/// effect.
+fn expected_visibility(
+    auth: &pg_auth::AuthorizationContext,
+    paths: &[String],
+    extras: &[String],
+) -> BTreeMap<String, Observation> {
+    paths
+        .iter()
+        .map(|start| {
+            let mut visible = vec!["pg_catalog".to_owned()];
+            for schema in std::iter::once(start).chain(extras.iter()) {
+                let usable = auth
+                    .schemas
+                    .get(schema)
+                    .and_then(|s| s.privileges.get("USAGE"))
+                    .copied()
+                    .unwrap_or(false);
+                // `current_schemas` lists each namespace once, at its first
+                // occurrence, so a schema repeated on the path (or an extra
+                // equal to the start) is not duplicated here (finding on #688).
+                if usable && !visible.contains(schema) {
+                    visible.push(schema.clone());
+                }
+            }
+            let rendered = pbps_db::resolver::environment::render_visibility(&visible);
+            (start.clone(), Observation::reported(Some(&rendered)))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expected_visibility_is_pg_catalog_then_the_usable_path_schemas_in_order() {
+        use pbps_pg::resolver::authorization::{AuthorizationContext, SchemaAuthorization};
+        let schema = |usage: bool| SchemaAuthorization {
+            owner: "o".into(),
+            privileges: [("USAGE".to_owned(), usage), ("CREATE".to_owned(), false)]
+                .into_iter()
+                .collect(),
+            acl: pbps_pg::resolver::authorization::SchemaAcl::Default,
+        };
+        let context = AuthorizationContext {
+            principal: pbps_db::resolver::environment::DeploymentPrincipal {
+                login: "d".into(),
+                effective: "d".into(),
+                superuser: false,
+            },
+            schemas: [
+                ("app".to_owned(), schema(true)),
+                ("secret".to_owned(), schema(false)),
+                ("ext".to_owned(), schema(true)),
+            ]
+            .into_iter()
+            .collect(),
+            roles: BTreeMap::new(),
+            settings: BTreeMap::new(),
+        };
+        let extras = vec!["ext".to_owned()];
+        let visibility =
+            expected_visibility(&context, &["app".to_owned(), "secret".to_owned()], &extras);
+        // app is usable and ext (an extra) is usable, in path order after pg_catalog.
+        assert_eq!(
+            visibility["app"],
+            Observation::reported(Some(r#"["pg_catalog","app","ext"]"#))
+        );
+        // secret is not usable, so only pg_catalog and the usable extra remain.
+        assert_eq!(
+            visibility["secret"],
+            Observation::reported(Some(r#"["pg_catalog","ext"]"#))
+        );
+    }
+
+    #[test]
+    fn a_planned_revoke_makes_the_schema_one_the_supplied_login_gives_up() {
+        let context = pg_auth::AuthorizationContext {
+            principal: pbps_db::resolver::environment::DeploymentPrincipal {
+                login: "d".into(),
+                effective: "d".into(),
+                superuser: false,
+            },
+            schemas: [(
+                "app".to_owned(),
+                // The deployer owns it, so its revoke from itself is one it
+                // has the authority to make.
+                pg_auth::SchemaAuthorization {
+                    owner: "d".into(),
+                    privileges: BTreeMap::from([("USAGE".into(), true), ("CREATE".into(), true)]),
+                    acl: pbps_pg::resolver::authorization::SchemaAcl::Default,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            roles: BTreeMap::new(),
+            settings: BTreeMap::new(),
+        };
+        // Negative: with nothing planned the deployer keeps its usage.
+        assert!(PgResolver::unusable_schemas(&context, &[]).is_empty());
+        let revoke = [scope::PlannedGrant {
+            principal: "d".into(),
+            schema: "app".into(),
+            privilege: "USAGE".into(),
+            revoke: true,
+        }];
+        assert_eq!(PgResolver::unusable_schemas(&context, &revoke), ["app"]);
+    }
 }

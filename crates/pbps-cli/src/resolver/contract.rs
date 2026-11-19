@@ -91,7 +91,10 @@ pub struct Preview;
 
 /// What a read of the target answers beside its catalog: the deployer's
 /// authorization and the run-local history of the read.
-pub type TargetRead<H> = (CatalogFacts, scope::Authorization, H);
+pub type TargetRead<A, H> = (CatalogFacts, A, H);
+
+/// A boxed read of the target with its authorization and history.
+pub type TargetReadStep<'a, A, H> = Step<'a, Result<TargetRead<A, H>, DbError>>;
 
 /// What one engine supports. Written out in full per engine: there is no
 /// default, so a new operation cannot silently read as unsupported or
@@ -159,6 +162,13 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
     /// fingerprinted, but it decides the recheck's verdict: a missing
     /// difference is a weaker recheck.
     type History: Send + Sync;
+    /// The deployment authorization context of the target: what the deployer
+    /// may do there, read once and compared again at the recheck and at apply.
+    /// Never erased: a context of one engine is not another's.
+    type Authorization: Send + Sync;
+    /// What the engine measured of the authorization after the plan's grants
+    /// ran on the reproduction, where it measures any (SQL Server).
+    type Condition: Send + Sync;
 
     /// The catalog classes a surface's creation-time record may have in this
     /// engine, or `None` where the engine has no mapping for it.
@@ -239,7 +249,7 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
         provisioning: Provisioning,
         admin: &'a mut Conn,
         target: &'a CatalogFacts,
-        authorization: &'a scope::Authorization,
+        authorization: &'a Self::Authorization,
         schemas: &'a [String],
     ) -> Step<'a, Result<Self::Prepared, Error>>;
     #[allow(clippy::too_many_arguments)]
@@ -249,7 +259,7 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
         admin: &'a mut Conn,
         target_connection: &'a mut Conn,
         target: &'a CatalogFacts,
-        authorization: &'a scope::Authorization,
+        authorization: &'a Self::Authorization,
         schemas: &'a [String],
         binding: &'a BindingRequest<'a>,
         extras: &'a [String],
@@ -362,7 +372,7 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
         extras: &'a [String],
         authorization_schemas: &'a [String],
         planned: &'a [scope::PlannedGrant],
-    ) -> Step<'a, Result<(CatalogFacts, scope::Authorization), DbError>>;
+    ) -> Step<'a, Result<(CatalogFacts, Self::Authorization), DbError>>;
     /// The producer's opening/recheck route, with a complete PostgreSQL
     /// sidecar. Ordinary reads and apply retain `read_target`'s existing
     /// endpoint-value contract.
@@ -372,7 +382,7 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
         extras: &'a [String],
         authorization_schemas: &'a [String],
         planned: &'a [scope::PlannedGrant],
-    ) -> Step<'a, Result<TargetRead<Self::History>, DbError>>;
+    ) -> TargetReadStep<'a, Self::Authorization, Self::History>;
     /// How the scratch database must be created to stand in for the target's.
     /// `Err` is why it cannot be, and says so.
     fn recipe(catalog: &CatalogFacts) -> Result<DatabaseRecipe, String>;
@@ -389,6 +399,63 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
         before: &Self::History,
         after: &Self::History,
     ) -> Result<Vec<String>, DbError>;
+    /// The publication recheck compares the engine's complete context, before
+    /// any grant projection, rather than only its persisted digest.
+    fn same_context(a: &Self::Authorization, b: &Self::Authorization) -> bool;
+    /// The context's canonical bytes, which the shared digest framing keys.
+    fn canonical(authorization: &Self::Authorization) -> Vec<u8>;
+    /// The name of the versioned authorization rule the context was read
+    /// under.
+    fn authorization_rule() -> Result<&'static str, String>;
+    /// What the context becomes under the plan's schema grants, as the
+    /// canonical bytes before and after. PostgreSQL projects the planned
+    /// grants onto it; SQL Server takes what the verified reproduction
+    /// measured, and refuses without it.
+    fn transition(
+        authorization: &Self::Authorization,
+        planned: &[scope::PlannedGrant],
+        measured: Option<&Self::Condition>,
+    ) -> Result<(Vec<u8>, Vec<u8>), String>;
+    /// Planned grants whose outcome the adapter cannot stand behind, named.
+    /// PostgreSQL's is a grantor the engine would pick among several
+    /// inherited option holders; SQL Server runs the grants through the
+    /// engine and has nothing to predict.
+    fn unpredictable(
+        authorization: &Self::Authorization,
+        planned: &[scope::PlannedGrant],
+    ) -> Vec<String>;
+    /// The in-scope schemas the deployer cannot use once the plan's grants
+    /// and revokes have run. A supplied scratch login owns every schema it
+    /// compiles in and so uses all of them; these it must give up, or the
+    /// comparison sees a schema the target's deployer will not, and a valid
+    /// plan is refused (#1678 review). SQL Server has no supplied layout.
+    fn unusable_schemas(
+        authorization: &Self::Authorization,
+        planned: &[scope::PlannedGrant],
+    ) -> Vec<String>;
+    /// Rewrites the target's visibility facts to what the deployer is meant
+    /// to see once the plan's grants have run. On PostgreSQL a planned USAGE
+    /// grant changes the effective search order, so it is derived from the
+    /// projected context; on SQL Server a grant changes no binding order, so
+    /// the facts stand as read.
+    fn project_visibility(
+        authorization: &Self::Authorization,
+        planned: &[scope::PlannedGrant],
+        schemas: &[String],
+        extras: &[String],
+        catalog: &mut CatalogFacts,
+    );
+    /// What the engine measured of the authorization after the run's work,
+    /// where it measures any.
+    fn authorization_condition<'a>(
+        prepared: &'a mut Self::Prepared,
+        target: &'a mut Conn,
+    ) -> Step<'a, Result<Option<Self::Condition>, Error>>;
+    /// Whether the measured condition still holds on the target.
+    fn recheck_condition<'a>(
+        condition: &'a Self::Condition,
+        target: &'a mut Conn,
+    ) -> Step<'a, Result<bool, DbError>>;
     /// The externals the base and the plan read are the target's, as for
     /// the resolver: a file that stages something else would rehearse a
     /// plan on a state the target does not hold. The comparison needs the
@@ -427,12 +494,6 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
 /// type, so a prepared scratch of one engine is never read as another's and the
 /// run's generic code calls these as methods.
 pub trait PreparedView: Sized + Send {
-    /// What the authorization looked like after the run's work, where the
-    /// engine measures it (SQL Server's `Condition`).
-    fn authorization_condition<'a>(
-        &'a mut self,
-        target: &'a mut Conn,
-    ) -> Step<'a, Result<Option<Box<pbps_mssql::resolver::authorization::Condition>>, Error>>;
     fn dependency_placements(&self) -> BTreeMap<DependencyName, DependencyPlacement>;
     fn catalog(&self) -> &CatalogFacts;
     #[cfg(test)]
@@ -509,6 +570,8 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
     type CompiledCapture = Never;
     type CapturedInputs = Never;
     type History = Never;
+    type Authorization = Never;
+    type Condition = Never;
 
     fn binding_classes(_: &Surface) -> Option<&'static [&'static str]> {
         None
@@ -581,7 +644,7 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
         _: Provisioning,
         _: &'a mut Conn,
         _: &'a CatalogFacts,
-        _: &'a scope::Authorization,
+        _: &'a Never,
         _: &'a [String],
     ) -> Step<'a, Result<Never, Error>> {
         match *scratch {}
@@ -592,7 +655,7 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
         _: &'a mut Conn,
         _: &'a mut Conn,
         _: &'a CatalogFacts,
-        _: &'a scope::Authorization,
+        _: &'a Never,
         _: &'a [String],
         _: &'a BindingRequest<'a>,
         _: &'a [String],
@@ -703,7 +766,7 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
         _: &'a [String],
         _: &'a [String],
         _: &'a [scope::PlannedGrant],
-    ) -> Step<'a, Result<(CatalogFacts, scope::Authorization), DbError>> {
+    ) -> Step<'a, Result<(CatalogFacts, Never), DbError>> {
         Box::pin(std::future::ready(Err(DbError::Refused(
             refusal::<D>().to_string(),
         ))))
@@ -714,7 +777,7 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
         _: &'a [String],
         _: &'a [String],
         _: &'a [scope::PlannedGrant],
-    ) -> Step<'a, Result<TargetRead<Never>, DbError>> {
+    ) -> TargetReadStep<'a, Never, Never> {
         Box::pin(std::future::ready(Err(DbError::Refused(
             refusal::<D>().to_string(),
         ))))
@@ -730,6 +793,49 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
     }
     fn history_differences(before: &Never, _: &Never) -> Result<Vec<String>, DbError> {
         match *before {}
+    }
+    fn same_context(a: &Never, _: &Never) -> bool {
+        match *a {}
+    }
+    fn canonical(authorization: &Never) -> Vec<u8> {
+        match *authorization {}
+    }
+    fn authorization_rule() -> Result<&'static str, String> {
+        Err(refusal::<D>().to_string())
+    }
+    fn transition(
+        authorization: &Never,
+        _: &[scope::PlannedGrant],
+        _: Option<&Never>,
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        match *authorization {}
+    }
+    fn unpredictable(authorization: &Never, _: &[scope::PlannedGrant]) -> Vec<String> {
+        match *authorization {}
+    }
+    fn unusable_schemas(authorization: &Never, _: &[scope::PlannedGrant]) -> Vec<String> {
+        match *authorization {}
+    }
+    fn project_visibility(
+        authorization: &Never,
+        _: &[scope::PlannedGrant],
+        _: &[String],
+        _: &[String],
+        _: &mut CatalogFacts,
+    ) {
+        match *authorization {}
+    }
+    fn authorization_condition<'a>(
+        prepared: &'a mut Never,
+        _: &'a mut Conn,
+    ) -> Step<'a, Result<Option<Never>, Error>> {
+        match *prepared {}
+    }
+    fn recheck_condition<'a>(
+        condition: &'a Never,
+        _: &'a mut Conn,
+    ) -> Step<'a, Result<bool, DbError>> {
+        match *condition {}
     }
     fn rehearsal_base<'a>(
         scratch: &'a Never,
@@ -774,12 +880,6 @@ impl BindingView for Never {
 }
 
 impl PreparedView for Never {
-    fn authorization_condition<'a>(
-        &'a mut self,
-        _: &'a mut Conn,
-    ) -> Step<'a, Result<Option<Box<pbps_mssql::resolver::authorization::Condition>>, Error>> {
-        match *self {}
-    }
     fn dependency_placements(&self) -> BTreeMap<DependencyName, DependencyPlacement> {
         match *self {}
     }
@@ -978,12 +1078,15 @@ pub trait ApplyRecheck: Send + Sync {
         closing: ClosingInputs<'a>,
     ) -> Step<'a, Result<InputManifest, String>>;
     /// The target's reported facts and its deployer's authorization, read
-    /// together as the engine's own promise of coherence allows.
+    /// together as the engine's own promise of coherence allows. The
+    /// authorization is answered as its canonical bytes, which the guard
+    /// digests with the shared framing; the context itself stays the
+    /// engine's.
     fn scope_facts<'a>(
         &'a self,
         conn: &'a mut Conn,
         replay: Replay<'a>,
-    ) -> Step<'a, Result<(CatalogFacts, crate::resolver::scope::Authorization), FactsError>>;
+    ) -> Step<'a, Result<(CatalogFacts, Vec<u8>), FactsError>>;
     /// The separate object-grant postconditions: their fingerprints and the
     /// changes found. An engine that holds none refuses a claim of any.
     fn object_grants<'a>(

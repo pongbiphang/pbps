@@ -175,6 +175,38 @@ impl AuthorizationContext {
     }
 }
 
+/// A fixed context for tests of code that digests one, which cannot be made
+/// outside this crate (its fields are private and a real one is read from a
+/// server). Built only with the `test-fixtures` feature, which the CLI's tests
+/// enable; no release build holds it.
+#[cfg(feature = "test-fixtures")]
+pub fn fixture_context() -> AuthorizationContext {
+    AuthorizationContext {
+        staged: Box::default(),
+        principal: DeploymentPrincipal {
+            login: "deploy_login".into(),
+            effective: "dep".into(),
+            superuser: false,
+        },
+        default_schema: "app".into(),
+        binding_default_schema: Some("app".into()),
+        schema_domain: schema_domain::Domain::default(),
+        language: "us_english".into(),
+        database_permissions: ["CONNECT", "CREATE TABLE"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        database_grants: Vec::new(),
+        schemas: BTreeMap::new(),
+        roles: [("readers".into(), false)].into_iter().collect(),
+        impersonation: BTreeSet::new(),
+        principal_grants: Vec::new(),
+        principal_owners: BTreeMap::new(),
+        principals: [("dep".into(), PrincipalKind::User)].into_iter().collect(),
+        spellings: BTreeMap::new(),
+    }
+}
+
 /// Resolves each principal the plan's grants name to the catalog's spelling
 /// of it, as the deployer reading `context`, and records every answer in
 /// `context.spellings` (#726) — a name the catalog does not know as `None`,

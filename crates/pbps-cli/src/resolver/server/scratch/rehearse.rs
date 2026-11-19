@@ -108,7 +108,8 @@ pub async fn with_session<D: PlanningDialect, T, E>(
         )
         .await
         .map_err(db("the target's analysis scope"))?;
-        let ambiguous = authorization.unpredictable(&request.planned);
+        let ambiguous =
+            <D::Resolver as ResolverEngine>::unpredictable(&authorization, &request.planned);
         if !ambiguous.is_empty() {
             return Err(Error::Scope(format!(
                 "the grantor of a planned grant cannot be predicted on the target: {}",

@@ -579,11 +579,7 @@ async fn mssql_the_planned_authorization_inventory_is_what_planning_sealed_befor
             else {
                 panic!("the run should complete");
             };
-            let crate::resolver::scope::Authorization::Mssql(read) =
-                &unsealed.sealing.authorization
-            else {
-                panic!("a SQL Server run reads SQL Server's context");
-            };
+            let read = &unsealed.sealing.authorization;
             assert_eq!(read.canonical().len(), 3221, "the scope read");
             let condition = unsealed
                 .sealing

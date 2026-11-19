@@ -28,6 +28,10 @@ tiberius.workspace = true
 tokio = { workspace = true, features = ["io-util", "process", "time"] }
 unicode-normalization.workspace = true
 
+[features]
+# A fixed authorization context, for the CLI's tests (see `fixture_context`).
+test-fixtures = []
+
 [dev-dependencies]
 pbps-diff = { workspace = true, features = ["test-fixtures"] }
 # The commutation suite (#1965) declares its scenarios in YAML and loads them

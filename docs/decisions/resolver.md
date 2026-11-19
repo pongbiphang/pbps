@@ -6917,3 +6917,57 @@ Pinned by the `compile_fail` doctest beside a compiling one on `History<D>`,
 the stand-in engine's refusals, the engines' own authorization-scope test and
 the live recheck tests of both engines. Formats: none. No sealed bytes, plan,
 state or evidence change.
+
+<a id="dec-2798-14"></a>
+
+**DEC-2798.14. The authorization context and the measured condition are typed
+by the engine; apply digests the canonical bytes the engine answers with
+(#2798, route step 3).** DEC-2798.13 left the deployer's authorization as the
+two-engine union its reads returned. It is the evidence that decides what a
+deployer may do, so it is an associated type of `ResolverEngine` and never
+erased: PostgreSQL's context, SQL Server's boxed context, and an uninhabited
+type for an engine without a resolver. The same holds for the measured
+condition: SQL Server's, and uninhabited for PostgreSQL, whose after-state is
+the planned grants projected onto the context it read, so it holds none.
+
+**What moved.** The union's methods are engine functions, each arm moved with
+its predicate and text unchanged: whether two reads are the same context (the
+engine's own canonical bytes compared), the rule it was read under, what it
+becomes under the plan's schema grants (`transition`), which planned grants are
+unpredictable, which schemas a supplied login must give up, and what the
+deployer is meant to see once the grants have run (`project_visibility`, with
+`expected_visibility`, which is PostgreSQL's alone). `persisted_after` keeps its
+shell in `scope.rs`: the planned grants, the unpredictability refusal, the
+digest framing and the changed indices are the same for every engine, and only
+the middle step, the context's before and after bytes, is the engine's. SQL
+Server still refuses it when the verified reproduction measured no condition,
+in the same words; PostgreSQL still projects the planned grants.
+The condition is read from the prepared scratch and rechecked on the target
+through the engine, so the run holds no SQL Server type.
+
+**The pair that answered "differs".** A comparison of a PostgreSQL context with
+a SQL Server one answered `false`, a refusal-direction answer. The pair cannot
+be written now, so no path can read it any other way. The adapters' own
+let-else arms on the union, and the one `unreachable!` in SQL Server's apply
+recheck, are gone for the same reason: the adapter is handed its engine's
+context.
+
+**Apply.** The apply recheck is object-safe and cannot carry an associated
+context, so `scope_facts` answers the context's canonical bytes with the facts,
+and the guard digests them with the shared framing (`authorization_digest`),
+which is what the union's `digest` did on the same bytes: a test fixes a
+context of each engine and a key and pins the digest of both with and without
+object-grant fingerprints, recorded from the union's method before it was
+deleted. What apply reads, on which connection, in which order, what it compares
+and what it refuses are unchanged.
+
+**What stays.** The run-local principals and their reproduction (`prepare`,
+`settle`, the deployer's name) keep their union until the next change, and take
+the PostgreSQL context directly now; the arms they had for SQL Server's context
+had no caller, because SQL Server's adapter reproduces through its own crate.
+
+Pinned by the digest test, the per-engine tests of the context comparison, the
+visibility projection and the refusal without a measurement, a `compile_fail`
+doctest beside a compiling one on each of `Authorization<D>` and `Condition<D>`,
+and the live recheck and apply tests of both engines. Formats: none. No sealed
+bytes, plan, state or evidence change.

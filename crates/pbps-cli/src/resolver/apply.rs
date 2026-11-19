@@ -17,7 +17,7 @@
 
 use crate::resolver::contract::{ApplyRecheck, ClosingInputs, FactsError, Phase, Replay};
 use crate::resolver::server::PlanningDialect;
-use crate::resolver::{contract, sealing};
+use crate::resolver::{contract, scope, sealing};
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
 use pbps_model::dependency::Dependencies;
 use pbps_model::resolver::ResolverEvidence;
@@ -223,7 +223,7 @@ impl Guard<'_> {
         sealed: &str,
         phase: Phase,
     ) -> anyhow::Result<Vec<String>> {
-        let (catalog, authorization) = match self.resolver.scope_facts(conn, self.replay()).await {
+        let (catalog, canonical) = match self.resolver.scope_facts(conn, self.replay()).await {
             Ok(read) => read,
             // Refused before any read, in words of its own.
             Err(FactsError::Refused(why)) => return Err(anyhow::anyhow!("{why}")),
@@ -256,7 +256,7 @@ impl Guard<'_> {
                 .await
                 .map_err(|why| self.unreadable("the object grant postconditions", why))?
         };
-        if authorization.digest(self.key, &fingerprints).as_ref() != Some(expected)
+        if &scope::authorization_digest(self.key, &canonical, &fingerprints) != expected
             && grant_changes.is_empty()
         {
             changed.push("the target deployer's authorization".to_owned());
