@@ -295,6 +295,17 @@ fn exact_dependent(part: &DependencyPart<'_>, holds: &Holds) -> bool {
                 table: target,
                 part: Part::Index(target_name),
             },
+        )
+        | (
+            DependencyPart::Named {
+                table,
+                kind: pbps_model::Part::Exclusion,
+                name,
+            },
+            Holds::TablePart {
+                table: target,
+                part: Part::Exclusion(target_name),
+            },
         ) => *table == target && *name == target_name.raw(),
         (
             DependencyPart::Named {
@@ -556,6 +567,7 @@ fn named_at(
                 | Part::ForeignKey(_)
                 | Part::Check(_)
                 | Part::Index(_)
+                | Part::Exclusion(_)
                 | Part::Policy(_) => unreachable!(),
             };
             (here.address.table, part)
@@ -565,6 +577,7 @@ fn named_at(
         | Part::ForeignKey(_)
         | Part::Check(_)
         | Part::Index(_)
+        | Part::Exclusion(_)
         | Part::Policy(_) => {
             let Located::Present(table) = sources.table_template(table, at, intent) else {
                 return None;
@@ -591,7 +604,8 @@ fn respell(p: &mut PlannedChange, holds: &Holds, dialect: &dyn Dialect) {
         | Change::Constraint(ConstraintChange::DropCheck { table: t, .. })
         | Change::Constraint(ConstraintChange::AddCheck { table: t, .. })
         | Change::Index(IndexChange::DropIndex { table: t, .. })
-        | Change::Index(IndexChange::AddIndex { table: t, .. }) => *t = table.clone(),
+        | Change::Index(IndexChange::AddIndex { table: t, .. })
+        | Change::Constraint(ConstraintChange::SetExclusion { table: t, .. }) => *t = table.clone(),
         _ => return,
     }
     p.risks = dialect.change_risks(&p.change);
@@ -858,6 +872,28 @@ pub(super) fn removal_of(
                 table: table.clone(),
                 name: name.clone(),
             }),
+            // `ALTER TABLE .. DROP CONSTRAINT`: the backing index goes with it, and
+            // `DROP INDEX` of it is refused (DEC-2448.5). The declaration is the
+            // definition the plan restores, and equals the one standing, because a
+            // differing one is already a replacement the plan states itself.
+            Part::Exclusion(name) => {
+                let held = declared
+                    .tables
+                    .get(table)
+                    .and_then(|t| t.exclude.get(name))
+                    .ok_or_else(|| {
+                        format!(
+                            "{}: the declarations do not hold it, so a rebuild could not put it back",
+                            pbps_model::escape::Escaped(&d.described)
+                        )
+                    })?;
+                Change::Constraint(ConstraintChange::SetExclusion {
+                    table: table.clone(),
+                    name: name.clone(),
+                    from: Some(Box::new(held.clone())),
+                    to: None,
+                })
+            }
             Part::Default(column) => {
                 let from = if let Some(of) = partition_of(declared, table) {
                     of.columns.get(column).and_then(|own| own.default.clone())
@@ -948,6 +984,14 @@ pub(super) fn restoration_of(
                     name: name.clone(),
                     index: Box::new(t.indexes.get(name).ok_or_else(unsupported)?.clone()),
                     clustered: false,
+                }),
+                Part::Exclusion(name) => Change::Constraint(ConstraintChange::SetExclusion {
+                    table: table.clone(),
+                    name: name.clone(),
+                    from: None,
+                    to: Some(Box::new(
+                        t.exclude.get(name).ok_or_else(unsupported)?.clone(),
+                    )),
                 }),
                 Part::Policy(_) | Part::Generated(_) => return Err(unsupported()),
                 Part::Default(column) => {

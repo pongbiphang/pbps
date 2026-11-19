@@ -556,6 +556,7 @@ fn named_at(sources: &PhysicalSources<'_>, at: At, holds: &Holds) -> Option<Hold
                 | Part::ForeignKey(_)
                 | Part::Check(_)
                 | Part::Index(_)
+                | Part::Exclusion(_)
                 | Part::Policy(_) => unreachable!(),
             };
             (here.address.table, part)
@@ -565,6 +566,7 @@ fn named_at(sources: &PhysicalSources<'_>, at: At, holds: &Holds) -> Option<Hold
         | Part::ForeignKey(_)
         | Part::Check(_)
         | Part::Index(_)
+        | Part::Exclusion(_)
         | Part::Policy(_) => {
             let Located::Present(table) = sources.locate_table(table, at) else {
                 return None;
@@ -793,7 +795,7 @@ fn removal_of(
             }))
         }
         Holds::TablePart { table, part } => Ok(match part {
-            Part::PrimaryKey(_) | Part::Unique(_) | Part::ForeignKey(_) => {
+            Part::PrimaryKey(_) | Part::Unique(_) | Part::ForeignKey(_) | Part::Exclusion(_) => {
                 unreachable!("outside the frozen module oracle")
             }
             Part::Check(name) => Change::Constraint(ConstraintChange::DropCheck {
@@ -882,6 +884,7 @@ fn restoration_of(
                 Part::PrimaryKey(_)
                 | Part::Unique(_)
                 | Part::ForeignKey(_)
+                | Part::Exclusion(_)
                 | Part::Policy(_)
                 | Part::Generated(_) => return Err(unsupported()),
                 Part::Default(column) => {

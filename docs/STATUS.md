@@ -529,7 +529,7 @@ How each kind is handled today:
 | Kind | Today | Tracking |
 |---|---|---|
 | Extensions, as declared and versioned objects | named by census | #2447; census [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
-| `gist` indexes (held, DEC-2448.2) and `EXCLUDE` constraints (read, declare, add, drop, replace and retire held, DEC-2448.3, DEC-2448.4; rebuild and partitions next) | partly held | #2448 |
+| `gist` indexes (held, DEC-2448.2) and `EXCLUDE` constraints (read, declare, add, drop, replace and retire held, DEC-2448.3, DEC-2448.4; teardown and restoration across rebuilds held, DEC-2448.5; partitions next) | partly held | #2448 |
 | Standalone sequences (read, declared and pulled, DEC-2721.1; their current value is never schema; create, drop, alter and rename next) | partly held | #2721 |
 | Text search configurations and dictionaries (a user's, over the built-in parser and templates, are held and pulled, DEC-2728.1; create and drop planned, DEC-2728.2; alter and rename next) | partly held | #2728 |
 <!-- /generated:postgres-planned -->

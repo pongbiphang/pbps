@@ -1937,6 +1937,10 @@ async fn read_dependents(
                     table: TableName::new(&dep_schema, &dep_name),
                     part: Part::Index(part.clone().into()),
                 },
+                "exclusion" => Holds::TablePart {
+                    table: TableName::new(&dep_schema, &dep_name),
+                    part: Part::Exclusion(part.clone().into()),
+                },
                 // `other` is the fallback arm, which already carries its own
                 // sentence in `unrepresentable` and never reaches here; a
                 // `what` this match has not heard of is a query and a reader
@@ -2109,8 +2113,13 @@ fn dependents_query(edge: &str) -> String {
            JOIN pg_catalog.pg_namespace n2 ON n2.oid = c2.relnamespace
           WHERE {edge} AND d.classid = 'pg_catalog.pg_attrdef'::regclass
           UNION ALL
-         SELECT 'index',
-                COALESCE(pg_catalog.pg_describe_object('pg_catalog.pg_class'::regclass, pic.oid, 0),
+         SELECT CASE WHEN xc.oid IS NULL THEN 'index' ELSE 'exclusion' END,
+                -- An exclusion constraint's backing index is named as the constraint, as
+                -- the engine's own `DETAIL` names it (`constraint x on table t`); it is
+                -- dropped by `DROP CONSTRAINT`, and `DROP INDEX` of it is `2BP01`
+                -- (DEC-2448.5).
+                COALESCE(pg_catalog.pg_describe_object('pg_catalog.pg_constraint'::regclass, xc.oid, 0),
+                         pg_catalog.pg_describe_object('pg_catalog.pg_class'::regclass, pic.oid, 0),
                          pg_catalog.pg_describe_object(d.classid, d.objid, d.objsubid)),
                 COALESCE(pn.nspname, n2.nspname), COALESCE(pc.relname, c2.relname),
                 COALESCE(pic.relname, ic.relname), 0::int8,
@@ -2122,6 +2131,7 @@ fn dependents_query(edge: &str) -> String {
            FROM pg_catalog.pg_depend d
            JOIN pg_catalog.pg_class ic ON ic.oid = d.objid
            LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = ic.oid
+           LEFT JOIN pg_catalog.pg_constraint xc ON xc.conindid = ic.oid AND xc.contype = 'x'
            LEFT JOIN pg_catalog.pg_class c2 ON c2.oid = i.indrelid
            LEFT JOIN pg_catalog.pg_namespace n2 ON n2.oid = c2.relnamespace
            -- A partition's clone of its parent's index is the parent's, as
