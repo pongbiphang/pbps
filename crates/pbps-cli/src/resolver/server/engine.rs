@@ -47,7 +47,14 @@ fn unsupported() -> Error {
 /// Concrete planning type retained from the engine adapter through publication.
 /// Configuration comes from the qualified capture, never a cross-engine cast.
 pub trait PlanningDialect: pbps_dialect::Dialect + Clone + Send + Sync + 'static {
+    /// The engine's resolver, chosen here once. An engine without one writes
+    /// `NoResolver<Self>`, and every resolver operation it lacks is refused by
+    /// name (DEC-2798.5).
+    type Resolver: crate::resolver::contract::ResolverEngine<Dialect = Self>;
     const DRIVER: Driver;
+    /// How an engine is named in a refusal. Duplicates `Engine::name` in the
+    /// binary, which the library cannot reach; a binary test pins the two equal.
+    const NAME: &'static str;
     /// Whether an index filter binds at creation; see
     /// `Dialect::filter_binds_expression`.
     const FILTER_BINDS: bool;
@@ -59,7 +66,9 @@ pub trait PlanningDialect: pbps_dialect::Dialect + Clone + Send + Sync + 'static
     ) -> Option<pbps_model::resolver::ObjectIdentity>;
 }
 impl PlanningDialect for pbps_pg::Postgres {
+    type Resolver = postgres::PgResolver;
     const DRIVER: Driver = Driver::Postgres;
+    const NAME: &'static str = "PostgreSQL";
     const FILTER_BINDS: bool = true;
     fn configured(extras: &[String], version: Option<i64>) -> Self {
         let dialect = Self::with_write_path_extras(extras.to_vec());
@@ -76,7 +85,9 @@ impl PlanningDialect for pbps_pg::Postgres {
     }
 }
 impl PlanningDialect for pbps_mssql::Mssql {
+    type Resolver = mssql::MssqlResolver;
     const DRIVER: Driver = Driver::Mssql;
+    const NAME: &'static str = "SQL Server";
     const FILTER_BINDS: bool = false;
     fn configured(_: &[String], _: Option<i64>) -> Self {
         Self

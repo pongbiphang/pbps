@@ -107,9 +107,14 @@ fn check(server: &str) {
         .schema;
     let key = pbps_db::fingerprint::EnvironmentFingerprintKey::from_file(&sealed.d.dir.join("key"))
         .unwrap();
-    let keyed = pbps_cli::resolver::apply::Keyed::check(&plan, Ok(key), "grant closing")
-        .unwrap()
-        .unwrap();
+    let keyed = pbps_cli::resolver::apply::Keyed::check(
+        &plan,
+        Ok(key),
+        "grant closing",
+        &pbps_pg::Postgres::new(),
+    )
+    .unwrap()
+    .unwrap();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

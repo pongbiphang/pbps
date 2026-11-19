@@ -14,7 +14,10 @@ use pbps_mssql::resolver::{
 use sql::recovery as record;
 
 mod chained;
+mod contract;
 mod recovery;
+
+pub(super) use contract::MssqlResolver;
 use std::collections::{BTreeMap, BTreeSet};
 
 enum Created {

@@ -5167,3 +5167,26 @@ pub(crate) fn physical_domain_defaults(
 ) -> BTreeMap<pbps_model::Uid, pbps_model::ManagedType> {
     pbps_pg::type_refs::declared::completed(before, ids, changes)
 }
+
+#[cfg(test)]
+mod resolver_name_tests {
+    use pbps_cli::resolver::server::PlanningDialect;
+
+    /// The library spells an engine in its refusals from a constant, because
+    /// `engine::of` is the binary's. The two must not drift.
+    fn named<D: PlanningDialect>() -> (&'static str, &'static str) {
+        (D::NAME, super::of(D::DRIVER).name())
+    }
+
+    #[test]
+    fn a_refusal_names_the_engine_as_the_engine_names_itself() {
+        for (refusal, engine) in [named::<pbps_pg::Postgres>(), named::<pbps_mssql::Mssql>()] {
+            assert_eq!(refusal, engine);
+        }
+        assert_ne!(
+            named::<pbps_pg::Postgres>().0,
+            named::<pbps_mssql::Mssql>().0,
+            "two engines must not share a name"
+        );
+    }
+}

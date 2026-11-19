@@ -154,6 +154,13 @@ fn sql_server_evidence_reads_back_and_is_applyable_with_the_ordinary_approval() 
 
 /// The first step of `apply`, before it reads a key or opens a connection.
 fn admitted(plan: &SavedPlan) -> anyhow::Result<bool> {
+    admitted_by(plan, &pbps_mssql::Mssql)
+}
+
+fn admitted_by<D: pbps_cli::resolver::server::PlanningDialect>(
+    plan: &SavedPlan,
+    dialect: &D,
+) -> anyhow::Result<bool> {
     let config =
         pbps_config::Config::parse("dialect: mssql\n", std::path::Path::new("pbps.yml")).unwrap();
     let project = pbps_config::Project {
@@ -163,7 +170,8 @@ fn admitted(plan: &SavedPlan) -> anyhow::Result<bool> {
     // A bare target has no environment, hence no key: whatever refuses first
     // is the check under test.
     let key = pbps_cli::resolver::sealing::environment_key(&project, None);
-    pbps_cli::resolver::apply::Keyed::check(plan, key, "target").map(|keyed| keyed.is_some())
+    pbps_cli::resolver::apply::Keyed::check(plan, key, "target", dialect)
+        .map(|keyed| keyed.is_some())
 }
 
 #[test]
@@ -185,7 +193,9 @@ fn the_key_check_leaves_other_plans_to_their_own_checks() {
         18,
         SameInstance::NotApplicable,
     );
-    let error = admitted(&postgres).unwrap_err().to_string();
+    let error = admitted_by(&postgres, &pbps_pg::Postgres::new())
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("fingerprint key"), "{error}");
     // An ordinary SQL Server plan has no evidence to key.
     let mut ordinary = resolved();

@@ -5930,6 +5930,7 @@ async fn resolver_generated_table_parts_seal_and_close_plain_exception_and_row_s
                     &saved,
                     crate::resolver::sealing::environment_key(&key.project, Some(ENVIRONMENT)),
                     "issue-1503",
+                    &pbps_pg::Postgres::new(),
                 )?
                 .unwrap();
                 let mut conn = Conn::connect(Driver::Postgres, &fixture.on(&target_db)).await?;

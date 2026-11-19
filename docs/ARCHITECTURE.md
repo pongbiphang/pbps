@@ -68,6 +68,10 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
   DEC-2798.3, DEC-2798.4). The resolver, the rehearsal and the role-name gates
   are neutral, and apply, bootstrap and baseline still call routed `engine`
   functions until they move onto an apply-side trait.
+- An engine states what its resolver supports once, in `PlanningDialect::Resolver`
+  (`type Resolver = NoResolver<Self>` when it has none); resolver code reads
+  those facts from that type and adds no `Driver` comparison for them
+  (DEC-2798.5).
 - `spikes/` is workspace-`exclude`d: evaluation crates, not product code.
 - Pure module and RLS policy dependency facts live in `pbps-diff::order::catalog`.
   PostgreSQL owns their reads and re-exports the shared value types. The

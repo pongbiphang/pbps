@@ -861,6 +861,9 @@ pub(super) async fn plan_db_selected(
                 selection,
                 assessment,
             } => {
+                // An engine without a resolver is refused by name before
+                // anything else is asked of the plan.
+                pbps_cli::resolver::planning(&dialect)?;
                 if needs_review {
                     bail!("resolver execution would run unreviewed type routines; use a separate reviewed plan before resolver execution (DEC-2181.2)");
                 }

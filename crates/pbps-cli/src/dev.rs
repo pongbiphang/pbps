@@ -107,7 +107,7 @@ fn parse(raw: &str) -> Spec {
 
 /// Builds the baseline, applies the plan, and compares against the declarations.
 #[allow(clippy::too_many_arguments)]
-pub fn rehearse<D: crate::emission::Engine>(
+pub fn rehearse<D: crate::emission::Engine + pbps_cli::resolver::server::PlanningDialect>(
     spec: &Spec,
     baseline: &Schema,
     baseline_ids: &IdsFile,
@@ -118,17 +118,17 @@ pub fn rehearse<D: crate::emission::Engine>(
     selected: &D,
     hints: &pbps_model::Hints,
 ) -> anyhow::Result<crate::rehearsal::Findings> {
-    let dialect = selected.as_ref();
     // The scratch-database lifecycle and container setup below are SQL
     // Server-specific (SPEC §9.3). Dispatching catalog reads by connection
-    // cannot make that lifecycle safe for another dialect.
-    if dialect.name() != "mssql" {
+    // cannot make that lifecycle safe for another dialect, so an engine says
+    // whether it has one, and the answer is asked before anything else.
+    if let Err(unsupported) = pbps_cli::resolver::preview(selected) {
         bail!(
-            "dev rehearsal is not supported for dialect `{}`; it currently requires SQL Server. \
-             Remove --dev and the dev block in pbps.yml to generate an offline preview.",
-            dialect.name()
+            "{unsupported}. Remove --dev and the dev block in pbps.yml to generate an offline \
+             preview."
         );
     }
+    let dialect = selected.as_ref();
     let (build, _) =
         crate::rehearsal::lower_from_empty(selected, baseline, baseline_ids, baseline_hints)?;
 
