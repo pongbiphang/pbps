@@ -1,3 +1,4 @@
+use crate::engine::owned_test_of;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -1263,7 +1264,7 @@ mod live {
     }
 
     async fn start_on<'d>(d: &'d Dir, driver: Driver, image: &str) -> TestScratch<'d> {
-        TestScratch::start(&d.dir, driver, image, PullPolicy::Never)
+        TestScratch::start(&d.dir, owned_test_of(driver), image, PullPolicy::Never)
             .await
             .unwrap()
     }
@@ -1514,7 +1515,7 @@ mod live {
         let foreign_dir = StateDir::open(d.base.join("foreign-runs")).unwrap();
         let foreign = Box::pin(TestScratch::start(
             &foreign_dir,
-            driver,
+            owned_test_of(driver),
             image,
             PullPolicy::Never,
         ))

@@ -3,6 +3,7 @@
 use super::*;
 use crate::deploy::test_run::whole::{bootstrap, plan};
 use crate::deploy::test_run::{Progress, apply};
+use crate::engine::owned_test_of;
 use crate::plan_test::{
     Revision,
     execution::Control,
@@ -472,7 +473,11 @@ async fn lifecycle(image: &str, case: Case) -> anyhow::Result<()> {
         run_ms: 600_000.try_into()?,
         cleanup_ms: 30_000.try_into()?,
     };
-    let mut control = Control::new(timeouts, std::future::pending()).with_driver(Driver::Mssql);
+    let mut control = Control::new(
+        timeouts,
+        std::future::pending(),
+        owned_test_of(Driver::Mssql),
+    );
     let mut data = TestData::new(false);
     data.phases.push(Phase::new("input", "none"));
     data.phases

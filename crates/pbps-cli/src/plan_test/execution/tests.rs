@@ -1,5 +1,7 @@
 use super::*;
+use crate::engine::owned_test_of;
 use crate::plan_test::report::{Phase, Status, TestData};
+use pbps_db::Driver;
 
 fn timeouts() -> Timeouts {
     Timeouts {
@@ -15,10 +17,14 @@ fn timeouts() -> Timeouts {
 #[tokio::test]
 async fn d2b1_1165_one_cancellation_observation_is_sticky_across_completed_phases() {
     let (send, receive) = tokio::sync::oneshot::channel::<()>();
-    let mut control = Control::new(timeouts(), async {
-        receive.await.unwrap();
-        Ok(())
-    });
+    let mut control = Control::new(
+        timeouts(),
+        async {
+            receive.await.unwrap();
+            Ok(())
+        },
+        owned_test_of(Driver::Postgres),
+    );
     assert_eq!(
         control
             .bounded(Duration::from_secs(1), async { Ok(7) })
@@ -43,7 +49,11 @@ async fn d2b1_1165_one_cancellation_observation_is_sticky_across_completed_phase
 async fn d2b1_1165_each_step_gets_a_new_budget_and_the_run_deadline_still_caps_it() {
     let mut limits = timeouts();
     limits.step_ms = 2000.try_into().unwrap();
-    let mut control = Control::new(limits, std::future::pending());
+    let mut control = Control::new(
+        limits,
+        std::future::pending(),
+        owned_test_of(Driver::Postgres),
+    );
     control
         .bounded(ms(limits.step_ms), async { Ok(()) })
         .await
@@ -183,7 +193,11 @@ async fn d2b1_1165_cancellation_before_acquisition_creates_no_run_record() {
         let dir = test_scratch::StateDir::open(stage.path().join("runs")).unwrap();
         let mut limits = timeouts();
         limits.startup_ms = 1000.try_into().unwrap();
-        let mut control = Control::new(limits, std::future::ready(Ok(())));
+        let mut control = Control::new(
+            limits,
+            std::future::ready(Ok(())),
+            owned_test_of(Driver::Postgres),
+        );
         let mut data = TestData::new(false);
         data.phases.push(Phase::new("provision", "owned"));
         assert!(
@@ -209,10 +223,14 @@ async fn d2b1_1165_cancelled_work_retains_borrowed_progress_and_collection_is_id
     use crate::deploy::test_run::{Progress, collect_progress};
     let progress = Progress::default();
     let (send, receive) = tokio::sync::oneshot::channel::<()>();
-    let mut control = Control::new(timeouts(), async {
-        receive.await.unwrap();
-        Ok(())
-    });
+    let mut control = Control::new(
+        timeouts(),
+        async {
+            receive.await.unwrap();
+            Ok(())
+        },
+        owned_test_of(Driver::Postgres),
+    );
     let work = async {
         progress.accepted.set(true);
         progress.started.set(true);
@@ -282,7 +300,11 @@ fn d2b1_1165_owned_execution_future_frames_are_bounded() {
 async fn cleanup_of_35_seconds(cleanup_ms: std::num::NonZeroU32) -> TestData {
     let mut limits = timeouts();
     limits.cleanup_ms = cleanup_ms;
-    let control = Control::new(limits, std::future::pending());
+    let control = Control::new(
+        limits,
+        std::future::pending(),
+        owned_test_of(Driver::Postgres),
+    );
     let mut data = TestData::default();
     control
         .finish_within(

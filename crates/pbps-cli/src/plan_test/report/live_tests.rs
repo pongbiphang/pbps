@@ -1,5 +1,6 @@
 use super::*;
 use crate::deploy::test_run::boxed_future;
+use crate::engine::owned_test_of;
 use crate::plan_test::{
     Revision, execution::Control, revision::Assembled, session::HopContext, session::Session,
 };
@@ -146,14 +147,18 @@ async fn exercise(
 ) -> anyhow::Result<()> {
     let session = control.provision(scratch, data, 0).await?;
     let input = input()?;
-    let mut bootstrap = Phase::on(Driver::Postgres, "bootstrap", "base");
+    let mut bootstrap = Phase::on(owned_test_of(Driver::Postgres), "bootstrap", "base");
     boxed_future(|| control.bootstrap(&session, &input, &mut bootstrap)).await?;
     ensure!(bootstrap.entry.is_some());
     data.phases.push(bootstrap);
 
     let started = Instant::now();
     let error = guarded_drop(&session, &input).await?;
-    let mut phase = Phase::on(Driver::Postgres, "candidate_apply", "guarded drop");
+    let mut phase = Phase::on(
+        owned_test_of(Driver::Postgres),
+        "candidate_apply",
+        "guarded drop",
+    );
     phase.record(started, "test.apply", &Err::<(), _>(error));
     ensure!(matches!(phase.outcome, Status::Failed));
     data.phases.push(phase);
@@ -162,7 +167,7 @@ async fn exercise(
         let started = Instant::now();
         let error = ledger_seam(&session, lock).await?;
         let mut phase = Phase::on(
-            Driver::Postgres,
+            owned_test_of(Driver::Postgres),
             if lock {
                 "candidate_apply"
             } else {
@@ -193,7 +198,7 @@ async fn exercise(
         .execute("BEGIN; LOCK TABLE app.orders IN ACCESS EXCLUSIVE MODE")
         .await?;
     let mut phase = Phase::on(
-        Driver::Postgres,
+        owned_test_of(Driver::Postgres),
         "candidate_plan",
         "terminated planning backend",
     );
@@ -240,10 +245,17 @@ async fn lifecycle(variable: &str) -> anyhow::Result<()> {
         run_ms: 180000.try_into()?,
         cleanup_ms: 30000.try_into()?,
     };
-    let mut control = Control::new(limits, std::future::pending());
+    let mut control = Control::new(
+        limits,
+        std::future::pending(),
+        owned_test_of(Driver::Postgres),
+    );
     let mut data = TestData::new(false);
-    data.phases
-        .push(Phase::on(Driver::Postgres, "provision", "owned"));
+    data.phases.push(Phase::on(
+        owned_test_of(Driver::Postgres),
+        "provision",
+        "owned",
+    ));
     let scratch = control
         .start(&registry, &image, &mut data, 0)
         .await

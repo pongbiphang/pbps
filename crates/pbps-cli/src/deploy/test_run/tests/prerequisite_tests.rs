@@ -5,6 +5,7 @@
 //! keeping its oid, never by its new name merely existing.
 use super::*;
 use crate::deploy::test_run::whole::plan_after;
+use crate::engine::owned_test_of;
 use crate::plan_test::session::{HopContext, prerequisites::complete_renames};
 use pbps_db::Param;
 use pbps_model::{PolicyRoles, RoleName, RowPolicy};
@@ -409,7 +410,7 @@ async fn run(variable: &str, scenario: Scenario) -> anyhow::Result<()> {
     let scratch = boxed_future(|| {
         crate::test_scratch::TestScratch::start(
             &registry,
-            Driver::Postgres,
+            owned_test_of(Driver::Postgres),
             &image,
             pbps_config::resolver::PullPolicy::Never,
         )
