@@ -895,6 +895,7 @@
         "index_brin2449_classes::a_class_option_the_engine_would_refuse_is_refused_by_name_and_the_endpoints_are_held",
         "index_brin2449_classes::a_bloom_filter_that_does_not_fit_fails_the_apply_and_keeps_the_old_index",
         "index_brin2449_classes::a_brin_shape_this_model_does_not_hold_is_left_out_of_the_pull_by_name",
+        "index_brin2449_classes::an_own_brin_index_under_other_class_options_than_its_parents_survives_the_attach",
         "index_gist2448::a_gist_index_and_a_key_collation_round_trip_change_and_replace_through_the_tool",
         "index_gist2448::a_declaration_the_engine_would_refuse_is_refused_by_name_before_it_reaches_it",
         "extensions2447_classes::a_provider_class_is_read_when_its_package_is_managed_and_left_out_by_name_when_not",

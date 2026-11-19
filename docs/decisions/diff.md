@@ -9974,7 +9974,11 @@ include the options). A difference that also touches an in-place option, or
 `ALTER` beside it. A leaf index a partition declares for itself is adopted by its
 parent's index whatever its class options, as it is whatever its storage
 parameters (measured: a leaf at `values_per_range=32` is attached to a parent at
-16 and keeps 32), so `adopts` does not compare them.
+16 and keeps 32), so `adopts` does not compare them, and neither does the match an
+ordinary table's attach plans against its parent's indexes (`attached`): an own index
+declared over such a match is dropped before the attach and built after it, as any
+adopted one is, and not left to become the parent's clone with the declared one
+absent (#2923 review).
 
 **Not here.** SQL Server refuses a key's class and so its options, before any
 statement. A package's class for BRIN remains outside (no package provides one).

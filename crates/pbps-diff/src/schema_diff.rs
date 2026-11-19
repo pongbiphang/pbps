@@ -5020,9 +5020,15 @@ fn attached(
                 })
                 .collect()
         };
-    // An index as the engine matches it to adopt it: storage parameters
-    // and sort order aside, measured on 16 and 18 (`DESC` and `NULLS FIRST`
-    // adopted, another collation, operator class, `INCLUDE` or method not).
+    // An index as the engine matches it to adopt it: storage parameters,
+    // a key's class options and sort order aside, measured on 16 and 18
+    // (`DESC` and `NULLS FIRST` adopted, another collation, operator class,
+    // `INCLUDE` or method not). A BRIN key's `values_per_range` of 32 under
+    // a parent's 16 is adopted all the same, and the clone keeps its 32
+    // (DEC-2449.2), so the options are not part of the match: left in, an
+    // own index declared over such a match would not be seen as adopted, and
+    // the attach would turn it into the parent's clone and leave the declared
+    // one absent.
     let index = |t: &Table| -> BTreeMap<pbps_model::ObjectLocalName, Index> {
         t.indexes
             .iter()
@@ -5031,6 +5037,7 @@ fn attached(
                 i.storage_parameters.clear();
                 for c in &mut i.columns {
                     c.descending = false;
+                    c.opclass_parameters.clear();
                 }
                 (n.clone(), i)
             })
@@ -5942,7 +5949,8 @@ fn refuse_parent_index(
 /// Whether a new parent index can take a partition's own index as its
 /// clone. Measured on 16.15 and 18.6: the method, the keys in order with
 /// their classes, uniqueness, the predicate and the `INCLUDE` columns must
-/// match; a key's direction and the storage parameters need not (#1688).
+/// match; a key's direction, its class options (`opclass_parameters`) and
+/// the storage parameters need not (#1688, DEC-2449.2).
 ///
 /// An expression key or a predicate is a match whatever its text, as the
 /// attach path takes it (DEC-1545.1): the engine compares what each parses
@@ -16179,6 +16187,80 @@ mod tests {
                 reclaimed.changes
             );
         }
+        // A BRIN index under class options the parent's differ in is adopted
+        // all the same, measured on 16 and 18 (DEC-2449.2), and the clone
+        // keeps its own. So an own index declared as that one is displaced
+        // before the attach and added after it, as any adopted one is; left
+        // in place it would become the parent's clone and the declared index
+        // would be absent. With no such index on the parent nothing is
+        // adopted, and the own index stays.
+        let brin = |values_per_range: &str| Index {
+            columns: vec![pbps_model::IndexColumn {
+                opclass: Some("int4_minmax_multi_ops".parse().unwrap()),
+                opclass_parameters: [("values_per_range".to_owned(), values_per_range.to_owned())]
+                    .into(),
+                ..pbps_model::IndexColumn::column("n")
+            }],
+            method: pbps_model::IndexMethod::Brin,
+            ..index_on("n")
+        };
+        let steps = |base: &Schema, declared: &Schema| -> Vec<String> {
+            outcome(base, declared, &[])
+                .2
+                .expect("planned")
+                .changes
+                .iter()
+                .map(|p| match &p.change {
+                    Change::Index(IndexChange::DropIndex { name, .. }) => {
+                        format!("drop {}", name.shown())
+                    }
+                    Change::Index(IndexChange::AddIndex { name, .. }) => {
+                        format!("add {}", name.shown())
+                    }
+                    other => format!("{other:?}").split(' ').next().unwrap().to_owned(),
+                })
+                .collect()
+        };
+        let ev: TableName = "app.ev".parse().unwrap();
+        let t: TableName = "app.t".parse().unwrap();
+        let with_brins = |parents: Option<&str>, own: &str| {
+            let mut base = ordinary(&|t| {
+                t.indexes.insert("t_n".into(), brin(own));
+            });
+            let mut declared = declared.clone();
+            declared
+                .tables
+                .get_mut(&t)
+                .unwrap()
+                .indexes
+                .insert("t_n".into(), brin(own));
+            for schema in [&mut base, &mut declared] {
+                let parent = schema.tables.get_mut(&ev).unwrap();
+                parent.indexes.remove("ev_n");
+                if let Some(p) = parents {
+                    parent.indexes.insert("ev_n".into(), brin(p));
+                }
+            }
+            (base, declared)
+        };
+        let (base_brin, declared_brin) = with_brins(Some("16"), "32");
+        assert_eq!(
+            steps(&base_brin, &declared_brin),
+            [
+                "drop t_id",
+                "drop t_n",
+                "AttachPartition",
+                "SetPartitionDefault",
+                "add t_n"
+            ],
+            "options the parent's differ in are still an adoption"
+        );
+        let (base_none, declared_none) = with_brins(None, "32");
+        assert_eq!(
+            steps(&base_none, &declared_none),
+            ["drop t_id", "AttachPartition", "SetPartitionDefault"],
+            "no index of the parent's, nothing adopted"
+        );
         // The attach validates the parent's foreign key over the rows it
         // brings, so it waits for the rows the plan writes into the table that
         // key references, and goes before the rows of a table referencing

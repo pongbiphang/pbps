@@ -464,3 +464,92 @@ fn a_brin_shape_this_model_does_not_hold_is_left_out_of_the_pull_by_name() {
         }
     });
 }
+
+/// An ordinary table attached under a parent that holds the same BRIN index at
+/// other class options is adopted by it all the same (measured on 16 and 18,
+/// DEC-2449.2), and the clone keeps the table's own options. So an index the
+/// partition declares of its own as that one is dropped before the attach and
+/// built again after it, and stands as its own, not as the parent's clone.
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn an_own_brin_index_under_other_class_options_than_its_parents_survives_the_attach() {
+    let _ = server();
+    servers(|url| {
+        let own = OwnDatabase::new(url, "brin-classes-attach");
+        let connection = own.connection();
+        on_server(
+            connection,
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.ev (id integer, ts date NOT NULL, n integer) PARTITION BY RANGE (ts); \
+             CREATE INDEX ev_n ON app.ev USING brin (n int4_minmax_multi_ops (values_per_range = 16)); \
+             CREATE TABLE app.t (id integer, ts date NOT NULL, n integer); \
+             CREATE INDEX t_n ON app.t USING brin (n int4_minmax_multi_ops (values_per_range = 32))",
+        );
+        let d = Demo::new("brin-classes-attach");
+        succeeds(d.run(&["pull", "--db", connection]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+        let tree = d.dir.join("schema/app.ev.yml");
+        let key = |value: u32, indent: usize| {
+            let pad = " ".repeat(indent);
+            format!(
+                "{pad}keys:\n{pad}  - column: n\n{pad}    opclass: int4_minmax_multi_ops\n\
+                 {pad}    opclass_parameters: {{values_per_range: {value}}}\n"
+            )
+        };
+        let parent = format!(
+            "table: app.ev\ncolumns:\n  id: {{type: integer}}\n  ts: {{type: date, nullable: false}}\n  \
+             n: {{type: integer}}\npartition_by: [ts]\nindexes:\n  ev_n:\n    method: brin\n{}",
+            key(16, 4)
+        );
+        // Declared as a partition, with an index of its own that the parent's
+        // would adopt, at options the parent's does not have.
+        let attached = format!(
+            "{parent}partitions:\n  t:\n    from: [\"2026-01-01\"]\n    to: [\"2027-01-01\"]\n    \
+             indexes:\n      t_n:\n        method: brin\n{}",
+            key(32, 8)
+        );
+        std::fs::remove_file(d.dir.join("schema/app.t.yml")).unwrap();
+        std::fs::write(&tree, &attached).unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let script = plan_sql(&d, connection);
+        let (drop, attach, create) = (
+            script.find("DROP INDEX"),
+            script.find("ATTACH PARTITION"),
+            script.rfind("CREATE INDEX"),
+        );
+        assert!(
+            matches!((drop, attach, create), (Some(a), Some(b), Some(c)) if a < b && b < c),
+            "the own index is dropped before the attach and built after it:\n{script}"
+        );
+        let plan = d.dir.join("plan.json");
+        succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &plan,
+            &["--allow", "constraint", "--allow", "destructive"],
+        ));
+        // The declared index stands as the partition's own, at its own options,
+        // beside the parent's clone at the parent's.
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_class WHERE oid = 'app.t_n'::regclass AND NOT relispartition"
+            ),
+            1
+        );
+        assert!(has_option(connection, "t_n", 1, "values_per_range=32"));
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+                 WHERE i.indrelid = 'app.t'::regclass AND c.relispartition"
+            ),
+            1
+        );
+        succeeds(d.run(&["verify", "--db", connection]));
+        empty_plan(&d, connection);
+    });
+}
