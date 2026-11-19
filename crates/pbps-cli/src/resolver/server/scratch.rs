@@ -445,8 +445,7 @@ impl<D: super::PlanningDialect> Run<'_, D> {
         let records = compiled
             .planning_records()
             .map_err(|error| Error::Binding(error.to_string()))?;
-        let surfaces = engine::surfaces::<D>(
-            driver,
+        let surfaces = resolution::from_sides::<D>(
             base,
             desired,
             &resolution::records(&opening),
@@ -469,8 +468,11 @@ impl<D: super::PlanningDialect> Run<'_, D> {
             &captured,
         )?;
         let identity = Identity {
-            rule: engine::reported_rule(driver)?,
-            resolver_build: engine::reported_build(driver, self.key, prepared.catalog())?,
+            rule: <D::Resolver as ResolverEngine>::reported_rule()?,
+            resolver_build: <D::Resolver as ResolverEngine>::reported_build(
+                self.key,
+                prepared.catalog(),
+            )?,
             channels: format!("scratch|{}|{}", self.tokens.target, self.tokens.scratch),
             runtime: ResolverRuntime::Scratch {
                 entry: self.provenance.entry.as_str().into(),
@@ -488,7 +490,10 @@ impl<D: super::PlanningDialect> Run<'_, D> {
         };
         let producer = super::ProducerOutcome::<D> {
             compiled,
-            opening_build: engine::reported_build(driver, self.key, &opening_catalog)?,
+            opening_build: <D::Resolver as ResolverEngine>::reported_build(
+                self.key,
+                &opening_catalog,
+            )?,
             surfaces,
             captured,
         };

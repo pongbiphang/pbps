@@ -6840,3 +6840,41 @@ Pinned by a `compile_fail` doctest beside a compiling one on each capture's type
 alias, the publication tests of the earlier changes, and the live recheck and
 seal tests of both engines. Formats: none. No sealed bytes, plan, state or
 evidence change.
+
+<a id="dec-2798-12"></a>
+
+**DEC-2798.12. The dialect names its resolver and nothing else of the engine's
+facts; the seal reads what the evidence is keyed under from the engine
+(#2798, route step 3).** DEC-2798.11 typed the captures. What the producer still
+decided by the driver were values: the rules the evidence is keyed under, what
+it claims of the reproduced authorization, which object-grant reader runs. They
+are the engine's facts, so each is stated once by the engine and read where it
+was compared.
+
+**What moved.** `PlanningDialect` keeps `Resolver`, `DRIVER`, `NAME` and
+`configured`. `FILTER_BINDS`, `binding_classes`, `dependent_object`,
+`reported_rule` and `reported_build` are `ResolverEngine` items, so an engine
+without a resolver answers them by refusing or answering no mapping, and no
+caller reads the dialect for them. The `driver` guard of the surface
+resolution is gone: the run is the dialect's, so it compared a value with
+itself. The seal reads `Planning`: the channels rule, the cluster domain
+(already the one apply recomputes) and the authorization-reproduction claim
+(`for_postgres_layout` for PostgreSQL, always `Reproduced` for SQL Server), each
+byte for byte the string or function the match held. The recheck's object-grant
+snapshot and the seal of the grant questions are `retain_grants` and
+`seal_grants`: PostgreSQL reads the snapshot on the target after a clean
+recheck, on the recheck's own connection, and seals from it at the same place;
+SQL Server holds none and seals none. The seal's choice used to follow the
+authorization union (`Mssql`); it now follows the engine, which is the same
+engine by construction.
+
+**What stays.** `producer.rs` still names the driver where it hands a value to
+the scope reads (`Opening.driver`) and the authorization state the scope group
+owns (`Authorization`, `History`, the measured `Condition`); those go with that
+group. `resolution.rs` and `transitions.rs` name no engine, and a scan of their
+production code says so.
+
+Pinned by `each_engine_states_the_facts_its_evidence_is_sealed_under`, the scans
+of `resolution.rs` and `transitions.rs` with their planted-token cases, the
+publication tests of the earlier changes, and the live recheck and seal tests of
+both engines. Formats: none. No sealed bytes, plan, state or evidence change.

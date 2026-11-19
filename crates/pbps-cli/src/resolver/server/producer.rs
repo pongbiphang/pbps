@@ -170,10 +170,8 @@ pub(super) fn seal<D: super::PlanningDialect, S>(
         crate::resolver::sealing::target_catalog_fingerprint(key, facts)
             .map_err(|reason| Error::Scope(reason.into()))
     };
-    let (channels_rule, cluster_rule, cluster_component) = match D::DRIVER {
-        pbps_db::Driver::Postgres => ("pbps/pg-channels/v1", CLUSTER_RULE, "system-identifier"),
-        pbps_db::Driver::Mssql => ("pbps/mssql-channels/v1", MSSQL_CLUSTER_RULE, "family-guid"),
-    };
+    let planning = crate::resolver::contract::planning_of::<D>()
+        .map_err(|unsupported| Error::Binding(unsupported.to_string()))?;
     let qualification = Qualification {
         rule: identity.rule.into(),
         target_environment: catalog(&opening_catalog)?,
@@ -183,26 +181,19 @@ pub(super) fn seal<D: super::PlanningDialect, S>(
         resolver_build: identity.resolver_build,
         channels: fingerprint(
             key,
-            channels_rule,
+            planning.channels_rule,
             "qualified-connections",
             identity.channels.as_bytes(),
         ),
         authorization: {
             let ResolverRuntime::Scratch { layout, .. } = &identity.runtime;
-            match D::DRIVER {
-                pbps_db::Driver::Postgres => {
-                    pbps_model::resolver::AuthorizationReproduction::for_postgres_layout(*layout)
-                }
-                pbps_db::Driver::Mssql => {
-                    pbps_model::resolver::AuthorizationReproduction::Reproduced
-                }
-            }
+            (planning.reproduction)(*layout)
         },
         runtime: identity.runtime,
         target_cluster: fingerprint(
             key,
-            cluster_rule,
-            cluster_component,
+            planning.cluster.rule,
+            planning.cluster.component,
             identity.target_cluster.as_bytes(),
         ),
         limitations: identity
@@ -286,21 +277,14 @@ impl<D: super::PlanningDialect> Unsealed<D> {
                 // The caller can still add grant steps in its final passes.
                 // Retain one private canonical snapshot, then seal only the
                 // final plan's selected questions; none enters binding inputs.
-                let grants = match self.opening.driver {
-                    pbps_db::Driver::Postgres => {
-                        match scope::object_grants::capture(target).await {
-                            Ok(read) => Some(Box::new(read)),
-                            Err(error) => {
-                                return Err(Box::new(Refused {
-                                    error: Error::Read(format!(
-                                        "the recheck's object grants: {error}"
-                                    )),
-                                    unsealed: self,
-                                }));
-                            }
-                        }
+                let grants = match <D::Resolver as ResolverEngine>::retain_grants(target).await {
+                    Ok(grants) => grants,
+                    Err(error) => {
+                        return Err(Box::new(Refused {
+                            error,
+                            unsealed: self,
+                        }));
                     }
-                    pbps_db::Driver::Mssql => None,
                 };
                 Ok(Rechecked(self, grants))
             }
@@ -435,15 +419,13 @@ impl<D: super::PlanningDialect> Rechecked<D> {
             pbps_diff::order::resolver_remap::finish(&run.ordered.changes, changes, describe)
                 .map_err(Error::Binding)?;
         let proof = changes.proof().clone();
-        let object_grants = if matches!(run.sealing.authorization, scope::Authorization::Mssql(_)) {
-            // SQL Server's object permissions are part of the engine-read
-            // authorization context (DEC-2143.1); no PostgreSQL grant reader
-            // runs on that engine.
-            Vec::new()
-        } else {
-            scope::object_grants::seal(&run.key, &changes, desired.ids, grants.as_deref())
-                .map_err(Error::Scope)?
-        };
+        let object_grants = <D::Resolver as ResolverEngine>::seal_grants(
+            &run.key,
+            &changes,
+            desired.ids,
+            grants.as_deref(),
+        )
+        .map_err(Error::Scope)?;
         seal::<D, _>(
             &run.key,
             run.sealing,

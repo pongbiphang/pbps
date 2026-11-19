@@ -24,10 +24,19 @@ use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, DbError, Driver};
 use pbps_model::dependency::DependencyName;
 use pbps_model::operation::Captured;
-use pbps_model::resolver::{DependencyPlacement, InputManifest, ManifestError, OutsideWrites};
-use pbps_model::{Hints, IdsFile, ModuleDeps, RoleName, Schema, SessionZone};
+use pbps_model::resolver::{
+    AuthorizationGrant, AuthorizationReproduction, DependencyPlacement, InputManifest,
+    ManifestError, ObjectIdentity, OutsideWrites, ScratchLayout, Surface,
+};
+use pbps_model::{ChangeSet, Hints, IdsFile, ModuleDeps, RoleName, Schema, SessionZone};
 use pbps_pg::resolver::capture::{BindingRecord, SealError};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// SQL Server reproduces the deployer's authorization whichever layout the
+/// run used: its scratch enters the sandbox as the reproduced deployer.
+fn reproduced(_: ScratchLayout) -> AuthorizationReproduction {
+    AuthorizationReproduction::Reproduced
+}
 
 /// SQL Server's resolver: planning, both rehearsals and the apply recheck.
 pub struct MssqlResolver;
@@ -43,7 +52,11 @@ const CLUSTER: ClusterDomain = ClusterDomain {
 impl ResolverEngine for MssqlResolver {
     type Dialect = pbps_mssql::Mssql;
     const SUPPORT: Support = Support {
-        planning: Some(&Planning { cluster: CLUSTER }),
+        planning: Some(&Planning {
+            cluster: CLUSTER,
+            channels_rule: "pbps/mssql-channels/v1",
+            reproduction: reproduced,
+        }),
         rehearsal: Some(&Rehearsal {
             request: RehearsalRequest::AsItStands,
             run_key: true,
@@ -55,11 +68,52 @@ impl ResolverEngine for MssqlResolver {
     /// SQL Server's scratch has no standard to put it into.
     type Standard = ();
     type Scratch<'a> = Box<Scratch<'a>>;
+    const FILTER_BINDS: bool = false;
     type Prepared = Prepared;
     type Binding = Box<Binding>;
     type Staged = pbps_mssql::resolver::capture::Staged;
     type CompiledCapture = Box<Closing>;
     type CapturedInputs = pbps_mssql::resolver::capture::CapturedInputs;
+
+    fn binding_classes(surface: &Surface) -> Option<&'static [&'static str]> {
+        pbps_mssql::resolver::binding_classes(surface)
+    }
+
+    fn dependent_object(
+        record: &BindingRecord,
+        reached: &BTreeSet<ObjectIdentity>,
+    ) -> Option<ObjectIdentity> {
+        pbps_mssql::resolver::dependent_object(&record.object, &record.bindings, reached)
+    }
+
+    fn retain_grants(
+        _: &mut Conn,
+    ) -> Step<'_, Result<Option<Box<pbps_db::catalog::Pulled>>, Error>> {
+        // SQL Server's object permissions are part of the engine-read
+        // authorization context (DEC-2143.1); no PostgreSQL grant reader runs
+        // on that engine.
+        Box::pin(std::future::ready(Ok(None)))
+    }
+
+    fn seal_grants(
+        _: &EnvironmentFingerprintKey,
+        _: &ChangeSet,
+        _: &IdsFile,
+        _: Option<&pbps_db::catalog::Pulled>,
+    ) -> Result<Vec<AuthorizationGrant>, String> {
+        Ok(Vec::new())
+    }
+
+    fn reported_rule() -> Result<&'static str, Error> {
+        Ok(pbps_mssql::resolver::compatibility::REPORTED_RULE)
+    }
+
+    fn reported_build(
+        key: &EnvironmentFingerprintKey,
+        catalog: &CatalogFacts,
+    ) -> Result<String, Error> {
+        super::reported_build(key, catalog)
+    }
 
     fn standard(
         declared: Option<&pbps_config::resolver::ScratchStandard>,

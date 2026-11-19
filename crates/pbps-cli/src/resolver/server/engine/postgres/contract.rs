@@ -19,12 +19,14 @@ use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, DbError, Driver};
 use pbps_model::dependency::DependencyName;
 use pbps_model::operation::Captured;
-use pbps_model::resolver::{DependencyPlacement, OutsideWrites};
+use pbps_model::resolver::{
+    AuthorizationGrant, AuthorizationReproduction, DependencyPlacement, OutsideWrites,
+};
 use pbps_model::resolver::{
     InputManifest, ManifestError, ObjectIdentity, ObjectOwnership, ResolverEvidence, Surface,
 };
 use pbps_model::role_mapping::RoleMapping;
-use pbps_model::{Hints, IdsFile, ModuleDeps, ModuleId, RoleName, Schema, SessionZone};
+use pbps_model::{ChangeSet, Hints, IdsFile, ModuleDeps, ModuleId, RoleName, Schema, SessionZone};
 use pbps_pg::resolver::capture::{BindingRecord, SealError};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -44,7 +46,11 @@ const CLUSTER: ClusterDomain = ClusterDomain {
 impl ResolverEngine for PgResolver {
     type Dialect = pbps_pg::Postgres;
     const SUPPORT: Support = Support {
-        planning: Some(&Planning { cluster: CLUSTER }),
+        planning: Some(&Planning {
+            cluster: CLUSTER,
+            channels_rule: "pbps/pg-channels/v1",
+            reproduction: AuthorizationReproduction::for_postgres_layout,
+        }),
         rehearsal: Some(&Rehearsal {
             request: RehearsalRequest::Projected,
             run_key: false,
@@ -55,11 +61,54 @@ impl ResolverEngine for PgResolver {
 
     type Standard = pbps_pg::resolver::standard::Standard;
     type Scratch<'a> = Box<Scratch<'a>>;
+    const FILTER_BINDS: bool = true;
     type Prepared = Prepared;
     type Binding = Box<Binding>;
     type Staged = pbps_pg::resolver::capture::Staged;
     type CompiledCapture = Box<Closing>;
     type CapturedInputs = pbps_pg::resolver::capture::CapturedInputs;
+
+    fn binding_classes(surface: &Surface) -> Option<&'static [&'static str]> {
+        pbps_pg::resolver::binding_classes(surface)
+    }
+
+    fn dependent_object(
+        record: &BindingRecord,
+        reached: &BTreeSet<ObjectIdentity>,
+    ) -> Option<ObjectIdentity> {
+        pbps_pg::resolver::dependent_object(&record.object, &record.bindings, reached)
+    }
+
+    fn retain_grants(
+        target: &mut Conn,
+    ) -> Step<'_, Result<Option<Box<pbps_db::catalog::Pulled>>, Error>> {
+        Box::pin(async move {
+            match scope::object_grants::capture(target).await {
+                Ok(read) => Ok(Some(Box::new(read))),
+                Err(error) => Err(Error::Read(format!("the recheck's object grants: {error}"))),
+            }
+        })
+    }
+
+    fn seal_grants(
+        key: &EnvironmentFingerprintKey,
+        changes: &ChangeSet,
+        ids: &IdsFile,
+        held: Option<&pbps_db::catalog::Pulled>,
+    ) -> Result<Vec<AuthorizationGrant>, String> {
+        scope::object_grants::seal(key, changes, ids, held)
+    }
+
+    fn reported_rule() -> Result<&'static str, Error> {
+        Ok(pbps_pg::resolver::compatibility::REPORTED_RULE)
+    }
+
+    fn reported_build(
+        key: &EnvironmentFingerprintKey,
+        catalog: &CatalogFacts,
+    ) -> Result<String, Error> {
+        super::reported_build(key, catalog)
+    }
 
     fn standard(
         declared: Option<&pbps_config::resolver::ScratchStandard>,

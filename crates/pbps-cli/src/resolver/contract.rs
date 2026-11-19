@@ -23,7 +23,10 @@ use pbps_db::{Conn, DbError};
 use pbps_model::dependency::Dependencies;
 use pbps_model::dependency::DependencyName;
 use pbps_model::operation::Captured;
-use pbps_model::resolver::ManifestError;
+use pbps_model::resolver::{
+    AuthorizationGrant, AuthorizationReproduction, ManifestError, ObjectIdentity, ScratchLayout,
+    Surface,
+};
 use pbps_model::resolver::{DependencyPlacement, OutsideWrites};
 use pbps_model::resolver::{InputManifest, ResolverEvidence};
 use pbps_model::{ChangeSet, Hints, IdsFile, ModuleDeps, RoleName, Schema, SessionZone};
@@ -51,10 +54,14 @@ pub struct ClusterDomain {
     pub component: &'static str,
 }
 
-/// Facts the sealed evidence names. The producer still holds its own copy of
-/// the other facts until it moves; only the cluster is read from here.
+/// Facts the sealed evidence names, each written once per engine and read by
+/// the seal: the domain the cluster identity is keyed under, the rule the
+/// qualified connections are keyed under, and what the evidence claims of the
+/// reproduced authorization for the layout the run used.
 pub struct Planning {
     pub cluster: ClusterDomain,
+    pub channels_rule: &'static str,
+    pub reproduction: fn(ScratchLayout) -> AuthorizationReproduction,
 }
 
 /// Connected rehearsal: the same scratch, nothing sealed. What an engine
@@ -120,6 +127,10 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
     type Dialect: PlanningDialect<Resolver = Self>;
     const SUPPORT: Support;
 
+    /// Whether an index filter binds at creation; see
+    /// `Dialect::filter_binds_expression`.
+    const FILTER_BINDS: bool;
+
     /// The state the scratch is put into, as the entry declares it.
     type Standard: Clone + Send + Sync + 'static;
     /// What a run acquired and must release; borrows the run's request.
@@ -140,6 +151,37 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
     type CompiledCapture: Sealable + Send + Sync;
     /// The opening capture the publication recheck captures again.
     type CapturedInputs: Send + Sync;
+
+    /// The catalog classes a surface's creation-time record may have in this
+    /// engine, or `None` where the engine has no mapping for it.
+    fn binding_classes(surface: &Surface) -> Option<&'static [&'static str]>;
+    /// An object this engine's catalog ties to one already reached (a
+    /// foreign key's triggers, for instance).
+    fn dependent_object(
+        record: &BindingRecord,
+        reached: &BTreeSet<ObjectIdentity>,
+    ) -> Option<ObjectIdentity>;
+    /// The rule the reported facts of the target and the scratch are compared
+    /// under, as the evidence names it. An engine without a resolver has none.
+    fn reported_rule() -> Result<&'static str, Error>;
+    /// The object-grant snapshot the publication recheck retains, read on the
+    /// target after a clean recheck. An engine that seals none holds none.
+    fn retain_grants(
+        target: &mut Conn,
+    ) -> Step<'_, Result<Option<Box<pbps_db::catalog::Pulled>>, Error>>;
+    /// The object-grant questions the final plan's grant writes seal, from the
+    /// snapshot `retain_grants` held.
+    fn seal_grants(
+        key: &EnvironmentFingerprintKey,
+        changes: &ChangeSet,
+        ids: &IdsFile,
+        held: Option<&pbps_db::catalog::Pulled>,
+    ) -> Result<Vec<AuthorizationGrant>, String>;
+    /// A keyed fingerprint of what the engine reports about its build.
+    fn reported_build(
+        key: &EnvironmentFingerprintKey,
+        catalog: &CatalogFacts,
+    ) -> Result<String, Error>;
 
     /// The standard an entry declares, or the refusal of one this engine
     /// cannot hold.
@@ -403,12 +445,40 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
     /// that would follow is uninhabited.
     type Standard = ();
     type Scratch<'a> = Never;
+    const FILTER_BINDS: bool = false;
     type Prepared = Never;
     type Binding = Never;
     type Staged = Never;
     type CompiledCapture = Never;
     type CapturedInputs = Never;
 
+    fn binding_classes(_: &Surface) -> Option<&'static [&'static str]> {
+        None
+    }
+    fn dependent_object(_: &BindingRecord, _: &BTreeSet<ObjectIdentity>) -> Option<ObjectIdentity> {
+        None
+    }
+    fn retain_grants(
+        _: &mut Conn,
+    ) -> Step<'_, Result<Option<Box<pbps_db::catalog::Pulled>>, Error>> {
+        Box::pin(std::future::ready(Err(Error::Unusable(
+            refusal::<D>().to_string(),
+        ))))
+    }
+    fn seal_grants(
+        _: &EnvironmentFingerprintKey,
+        _: &ChangeSet,
+        _: &IdsFile,
+        _: Option<&pbps_db::catalog::Pulled>,
+    ) -> Result<Vec<AuthorizationGrant>, String> {
+        Err(refusal::<D>().to_string())
+    }
+    fn reported_rule() -> Result<&'static str, Error> {
+        Err(Error::Unusable(refusal::<D>().to_string()))
+    }
+    fn reported_build(_: &EnvironmentFingerprintKey, _: &CatalogFacts) -> Result<String, Error> {
+        Err(Error::Unusable(refusal::<D>().to_string()))
+    }
     fn standard(_: Option<&pbps_config::resolver::ScratchStandard>) -> Result<(), Error> {
         Err(Error::Unusable(refusal::<D>().to_string()))
     }

@@ -3,6 +3,7 @@
 
 use super::Error;
 use super::engine::BindingRecord;
+use crate::resolver::contract::ResolverEngine;
 use pbps_db::resolver::capture::{Assessment, Verdict};
 use pbps_model::Schema;
 use pbps_model::resolver::{
@@ -26,7 +27,7 @@ fn required<D: super::PlanningDialect>(schema: &Schema) -> BTreeSet<Surface> {
             });
         }
         for (name, index) in &definition.indexes {
-            if index.holds_expression_when(D::FILTER_BINDS) {
+            if index.holds_expression_when(<D::Resolver as ResolverEngine>::FILTER_BINDS) {
                 surfaces.insert(Surface::Index {
                     table: table.clone(),
                     name: name.clone(),
@@ -54,7 +55,7 @@ fn bound<D: super::PlanningDialect>(
     records: &[BindingRecord],
     surface: &Surface,
 ) -> Result<BoundSurface, Error> {
-    let classes = D::binding_classes(surface).ok_or_else(|| {
+    let classes = <D::Resolver as ResolverEngine>::binding_classes(surface).ok_or_else(|| {
         Error::Binding(format!(
             "the engine has no creation-time catalog mapping for {surface:?}"
         ))

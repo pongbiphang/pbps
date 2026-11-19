@@ -163,4 +163,7 @@ pub(crate) fn names_for_reference(token: &str) -> Result<ScratchNames, Error> {
 mod tests;
 
 #[cfg(test)]
+mod structure_tests;
+
+#[cfg(test)]
 mod transitions_tests;
