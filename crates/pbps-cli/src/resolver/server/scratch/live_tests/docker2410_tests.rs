@@ -14,7 +14,7 @@ use super::super::removal_race2807_tests::{
     accept_kept, confirmed_absent, confirmed_absent_within,
 };
 use super::setting;
-use crate::resolver::server::engine;
+use crate::resolver::server::engine::{self, container::owned};
 use pbps_db::resolver::Kept;
 use pbps_db::{Conn, Driver};
 use std::process::Command;
@@ -163,7 +163,7 @@ async fn a_container_whose_keeper_connected_and_is_gone_is_removed_at_once() {
     // The run's session, and then its death: the server shows it gone, and
     // knows it was there.
     drop(
-        Keeper::open(Driver::Postgres, &connection, &dead)
+        Keeper::open(owned(Driver::Postgres), &connection, &dead)
             .await
             .unwrap(),
     );
@@ -190,10 +190,10 @@ async fn a_keeper_that_connects_between_the_two_reads_is_alive_and_not_yet_kept(
     let (between, go) = engine::pause_between_reads(&run);
     let reader = token();
     let (seen, keeper) = tokio::join!(
-        engine::keeper_seen(Driver::Postgres, &connection, &reader, &run),
+        engine::keeper_seen(owned(Driver::Postgres), &connection, &reader, &run),
         async {
             between.await.unwrap();
-            let keeper = Keeper::open(Driver::Postgres, &connection, &run)
+            let keeper = Keeper::open(owned(Driver::Postgres), &connection, &run)
                 .await
                 .unwrap();
             go.send(()).unwrap();
@@ -238,7 +238,7 @@ async fn a_live_runs_container_is_never_touched_even_past_the_grace() {
     let mut made = Made(Vec::new());
     let live = token();
     let (name, connection) = start(&mut made, &live).await;
-    let keeper = Keeper::open(Driver::Postgres, &connection, &live)
+    let keeper = Keeper::open(owned(Driver::Postgres), &connection, &live)
         .await
         .unwrap();
     tokio::time::sleep(GRACE + Duration::from_millis(1500)).await;
@@ -803,7 +803,7 @@ async fn recovery_keeps_unconfirmed_volumes_named_after_the_container_is_gone() 
     ]);
     made.0.push(holder);
     drop(
-        Keeper::open(Driver::Postgres, &connection, &dead)
+        Keeper::open(owned(Driver::Postgres), &connection, &dead)
             .await
             .unwrap(),
     );

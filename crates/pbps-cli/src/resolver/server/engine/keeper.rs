@@ -2,28 +2,21 @@
 //! run holds in its own server, the persistent mark that it connected, and the
 //! reads that tell whether it is still there. The SQL is the engine crates'.
 
+use super::container::ContainerSupport;
 use pbps_db::resolver::Kept;
-use pbps_db::{Conn, DbError, Driver};
+use pbps_db::{Conn, DbError};
 
 /// The keeper's session in its own server, named by the run's token, and the
 /// mark that it connected. The mark is written once the session exists. The
 /// caller holds the session as long as the container lives.
 pub(in crate::resolver::server) async fn keep_and_mark(
-    driver: Driver,
+    support: &ContainerSupport,
     connection: &str,
     token: &str,
 ) -> Result<Conn, DbError> {
-    let mut conn = Conn::connect_named(driver, connection, &format!("pbps-{token}")).await?;
-    match driver {
-        Driver::Postgres => {
-            pbps_pg::resolver::scratch::keep(&mut conn).await?;
-            pbps_pg::resolver::recovery::mark_kept(&mut conn).await?;
-        }
-        Driver::Mssql => {
-            pbps_mssql::resolver::scratch::mark(&mut conn, token).await?;
-            pbps_mssql::resolver::scratch::mark_kept(&mut conn, token).await?;
-        }
-    }
+    let mut conn =
+        Conn::connect_named(support.driver, connection, &format!("pbps-{token}")).await?;
+    (support.hold_keeper)(&mut conn, token).await?;
     Ok(conn)
 }
 
@@ -31,40 +24,15 @@ pub(in crate::resolver::server) async fn keep_and_mark(
 /// session of its own named for `own`; `None` when that session cannot see
 /// itself, which proves nothing about the keeper. Each read takes the mark
 /// first and the session second: a keeper that appears between them is then
-/// alive and not yet kept, never gone and kept.
+/// alive and not yet kept, never gone and kept. The order is the engine's own
+/// read, written beside its SQL in [`ContainerSupport`].
 pub(in crate::resolver::server) async fn keeper_seen(
-    driver: Driver,
+    support: &ContainerSupport,
     connection: &str,
     own: &str,
     token: &str,
 ) -> Result<Option<Kept>, DbError> {
-    match driver {
-        Driver::Postgres => {
-            let mut conn = Conn::connect_named(driver, connection, &format!("pbps-{own}")).await?;
-            let ever = pbps_pg::resolver::recovery::kept(&mut conn).await?;
-            between_reads(token).await;
-            let alive =
-                pbps_pg::resolver::recovery::alive(&mut conn, own, &[token.to_owned()]).await?;
-            Ok(alive.map(|alive| Kept {
-                alive: alive.contains(token),
-                ever,
-            }))
-        }
-        Driver::Mssql => {
-            use pbps_mssql::resolver::scratch as sql;
-            let mut conn = Conn::connect(driver, connection).await?;
-            sql::mark(&mut conn, own).await?;
-            if !sql::marker_present(&mut conn, own).await? {
-                return Ok(None);
-            }
-            let ever = sql::kept(&mut conn).await?;
-            between_reads(token).await;
-            Ok(Some(Kept {
-                alive: sql::marker_present(&mut conn, token).await?,
-                ever,
-            }))
-        }
-    }
+    (support.read_keeper)(connection, own, token).await
 }
 
 /// A reader of `token`'s keeper held between its two reads, for the test that
@@ -95,7 +63,7 @@ pub(in crate::resolver::server) fn pause_between_reads(
 }
 
 #[cfg(test)]
-async fn between_reads(token: &str) {
+pub(super) async fn between_reads(token: &str) {
     let armed = {
         let mut pause = PAUSE.lock().unwrap();
         pause.take_if(|(armed, ..)| armed == token)
@@ -107,4 +75,4 @@ async fn between_reads(token: &str) {
 }
 
 #[cfg(not(test))]
-async fn between_reads(_: &str) {}
+pub(super) async fn between_reads(_: &str) {}

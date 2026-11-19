@@ -9,6 +9,8 @@
 //! It talks to whatever `docker` the runner has: Docker, rootless Docker, or
 //! Podman through its compatible command or socket (`DOCKER_HOST`).
 
+use super::super::engine::container::{self as support_of, Readiness};
+pub use super::super::engine::container::{ContainerSupport, support};
 use super::super::{Error, ProduceError, engine};
 
 pub mod journal;
@@ -43,6 +45,8 @@ pub async fn with_container<T>(
     pull: PullPolicy,
     run: impl AsyncFnOnce(&str) -> Result<T, ProduceError>,
 ) -> Result<T, ProduceError> {
+    // Refused for want of support before the target is even connected.
+    require(driver)?;
     bind_target(driver, target_connection, planned_identity).await?;
     with_started(driver, image, pull, run).await
 }
@@ -54,20 +58,23 @@ pub async fn with_started<T>(
     pull: PullPolicy,
     run: impl AsyncFnOnce(&str) -> Result<T, ProduceError>,
 ) -> Result<T, ProduceError> {
+    // Before the runtime is asked anything: an engine with no support is
+    // refused by name, not discovered to fail at the first `docker run`.
+    let support = require(driver)?;
     acquire(image, pull).await?;
     // The run's token names its container and its session in the server, so a
     // later run can tell from them that the owner is gone (#2410).
     let token = format!("{:032x}", rand::random::<u128>());
     recovery::sweep(&token).await;
     let (container, ready) = Box::pin(Container::start_ready(
-        driver,
+        support,
         image,
         &token,
         &mut Anonymous(token.clone()),
     ))
     .await?;
     let (outcome, keeper) = match ready {
-        Ok(()) => match recovery::Keeper::open(driver, &container.connection, &token).await {
+        Ok(()) => match recovery::Keeper::open(support, &container.connection, &token).await {
             Ok(keeper) => (run(&container.connection).await, Some(keeper)),
             Err(error) => (Err(error), None),
         },
@@ -100,7 +107,7 @@ impl Held {
         image: &str,
         pull: PullPolicy,
     ) -> Result<Self, ProduceError> {
-        Self::start_owned(driver, image, pull, &mut Anonymous::new()).await
+        Self::start_owned(require(driver)?, image, pull, &mut Anonymous::new()).await
     }
 
     /// [`Held::start`] for a caller that must know of the container before it
@@ -108,7 +115,7 @@ impl Held {
     /// is told before the create and given the container's id before anything
     /// connects to it (`pbps test`, ADR-0019 section 3).
     pub async fn start_owned(
-        driver: Driver,
+        support: &'static ContainerSupport,
         image: &str,
         pull: PullPolicy,
         owner: &mut impl Owner,
@@ -119,9 +126,9 @@ impl Held {
         let token = owner.token();
         recovery::sweep(&token).await;
         let (container, ready) =
-            Box::pin(Container::start_ready(driver, image, &token, owner)).await?;
+            Box::pin(Container::start_ready(support, image, &token, owner)).await?;
         let kept = match ready {
-            Ok(()) => recovery::Keeper::open(driver, &container.connection, &token).await,
+            Ok(()) => recovery::Keeper::open(support, &container.connection, &token).await,
             Err(error) => Err(error),
         };
         match kept {
@@ -211,6 +218,12 @@ impl Owner for Anonymous {
     }
 }
 
+/// The support of the engine `driver` names, or the refusal that names it,
+/// as a start that has no support in hand needs it.
+fn require(driver: Driver) -> Result<&'static ContainerSupport, ProduceError> {
+    support_of::select(driver).map_err(|refusal| ProduceError::Acquire(refusal.to_string()))
+}
+
 /// The planning read's cluster, read again on a fresh target connection.
 pub async fn bind_target(
     driver: Driver,
@@ -273,15 +286,17 @@ struct Container {
     /// The runtime's id, known once `docker run` returned it; empty before.
     immutable: String,
     connection: String,
-    engine: engine::Docker,
+    support: &'static ContainerSupport,
     /// Set once `remove` confirmed it gone, so the drop guard stands down.
     removed: bool,
+    /// The password the server was started with, as the support derived it: the
+    /// one the connection carries and a diagnostic redacts.
     password: String,
 }
 
 /// One run's container start, as [`startup::started_ready`] drives it.
 struct Starting<'a, O: Owner> {
-    driver: Driver,
+    support: &'static ContainerSupport,
     image: &'a str,
     token: &'a str,
     owner: &'a mut O,
@@ -297,7 +312,7 @@ impl<O: Owner> startup::Launch for Starting<'_, O> {
             })?;
         }
         Box::pin(Container::start(
-            self.driver,
+            self.support,
             self.image,
             self.token,
             &mut *self.owner,
@@ -306,7 +321,7 @@ impl<O: Owner> startup::Launch for Starting<'_, O> {
     }
 
     async fn wait(&mut self, container: Container) -> (Container, Result<(), startup::NotReady>) {
-        let waited = Box::pin(container.wait_ready(self.driver)).await;
+        let waited = Box::pin(container.wait_ready()).await;
         (container, waited)
     }
 
@@ -314,7 +329,8 @@ impl<O: Owner> startup::Launch for Starting<'_, O> {
         // Reported before the container and its log are removed, as DEC-958.1
         // does for the fixture: the retry must not hide that the engine crashed.
         eprintln!(
-            "note: SQL Server crashed while starting; starting it once more (DEC-2762.1). The first start:\n{report}"
+            "note: {} crashed while starting; starting it once more (DEC-2762.1). The first start:\n{report}",
+            self.support.name
         );
     }
 
@@ -325,13 +341,14 @@ impl<O: Owner> startup::Launch for Starting<'_, O> {
 
 impl Container {
     async fn start(
-        driver: Driver,
+        support: &'static ContainerSupport,
         image: &str,
         token: &str,
         owner: &mut impl Owner,
     ) -> Result<Self, ProduceError> {
-        let password = format!("{:032x}", rand::random::<u128>());
-        let engine = engine::docker(driver, &password)?;
+        // Derived once: the launch, the connection and the redaction of a
+        // diagnostic all take this one secret.
+        let launch = support.launch(&format!("{:032x}", rand::random::<u128>()));
         // Named by the run before it is asked for, so a `docker run` that
         // created the container and then failed, timed out or was cancelled
         // leaves one this run can still name and remove.
@@ -339,12 +356,9 @@ impl Container {
             id: format!("pbps-scratch-{token}"),
             immutable: String::new(),
             connection: String::new(),
-            engine,
+            support,
             removed: false,
-            password: match driver {
-                Driver::Mssql => pbps_mssql::resolver::scratch::password(&password),
-                Driver::Postgres => password.clone(),
-            },
+            password: launch.secret,
         };
         owner
             .before_create()
@@ -354,7 +368,8 @@ impl Container {
         let args = run_args(
             &container.id,
             token,
-            &container.engine,
+            support,
+            &launch.environment,
             image,
             &owner.labels(),
         );
@@ -395,16 +410,12 @@ impl Container {
             container.removed = false;
         }
         let port = match started {
-            Ok(_) => docker(&[
-                "port",
-                &container.id,
-                &format!("{}/tcp", container.engine.port),
-            ])
-            .await
-            .map_err(|why| ProduceError::Acquire(format!("its published port: {why}")))
-            .and_then(|text| {
-                published_port(&text, container.engine.port).map_err(ProduceError::Acquire)
-            }),
+            Ok(_) => docker(&["port", &container.id, &format!("{}/tcp", support.port)])
+                .await
+                .map_err(|why| ProduceError::Acquire(format!("its published port: {why}")))
+                .and_then(|text| {
+                    published_port(&text, support.port).map_err(ProduceError::Acquire)
+                }),
             Err(error) => Err(error),
         };
         let port = match port {
@@ -417,23 +428,24 @@ impl Container {
                 };
             }
         };
-        container.connection = container.engine.connection(port, &password)?;
+        container.connection = (support.loopback)(port, &container.password);
         Ok(container)
     }
 
-    /// The container started and its server answering. A SQL Server that
-    /// crashed while starting is started once more, and only then
-    /// (DEC-2762.1); PostgreSQL and every other failure are reported as they
-    /// are. The container returned is the one the caller must still remove,
-    /// with how it became ready.
+    /// The container started and its server answering. A server whose
+    /// readiness strategy diagnoses a crash (SQL Server) that crashed while
+    /// starting is started once more, and only then (DEC-2762.1); every other
+    /// engine and every other failure are reported as they are. The container
+    /// returned is the one the caller must still remove, with how it became
+    /// ready.
     async fn start_ready(
-        driver: Driver,
+        support: &'static ContainerSupport,
         image: &str,
         token: &str,
         owner: &mut impl Owner,
     ) -> Result<(Self, Result<(), ProduceError>), ProduceError> {
         let started = Box::pin(startup::started_ready(&mut Starting {
-            driver,
+            support,
             image,
             token,
             owner,
@@ -442,11 +454,17 @@ impl Container {
         Ok((started.container, started.ready))
     }
 
-    async fn wait_ready(&self, driver: Driver) -> Result<(), startup::NotReady> {
-        if driver == Driver::Mssql {
-            return startup::ready(&self.connection, &self.id, &self.password).await;
+    async fn wait_ready(&self) -> Result<(), startup::NotReady> {
+        if self.support.readiness == Readiness::ExitDiagnosed {
+            return startup::ready(
+                self.support.driver,
+                &self.connection,
+                &self.id,
+                &self.password,
+            )
+            .await;
         }
-        self.ready(driver, READY).await.map_err(|error| {
+        self.ready(READY).await.map_err(|error| {
             startup::NotReady::Failed(match error {
                 ProduceError::Acquire(why) => why,
                 other @ (ProduceError::Run(_) | ProduceError::Cleanup(_)) => other.to_string(),
@@ -458,19 +476,27 @@ impl Container {
     /// server listens on TCP.
     /// The deadline bounds each attempt too: a server that accepts TCP and
     /// then stalls in its handshake would otherwise hold the run past it.
-    async fn ready(&self, driver: Driver, within: Duration) -> Result<(), ProduceError> {
-        if driver == Driver::Mssql {
-            return startup::ready(&self.connection, &self.id, &self.password)
+    async fn ready(&self, within: Duration) -> Result<(), ProduceError> {
+        let query = match self.support.readiness {
+            Readiness::ExitDiagnosed => {
+                return startup::ready(
+                    self.support.driver,
+                    &self.connection,
+                    &self.id,
+                    &self.password,
+                )
                 .await
                 .map_err(|e| ProduceError::Acquire(e.into_report()));
-        }
+            }
+            Readiness::Polled { query } => query,
+        };
         let deadline = tokio::time::Instant::now() + within;
         loop {
             let attempt = async {
-                let mut conn = Conn::connect(driver, &self.connection)
+                let mut conn = Conn::connect(self.support.driver, &self.connection)
                     .await
                     .map_err(|error| error.to_string())?;
-                conn.query(self.engine.readiness_query)
+                conn.query(query)
                     .await
                     .map(|_| ())
                     .map_err(|error| error.to_string())
@@ -705,7 +731,8 @@ pub(super) fn process_label() -> String {
 fn run_args(
     name: &str,
     token: &str,
-    engine: &engine::Docker,
+    support: &ContainerSupport,
+    environment: &[String],
     image: &str,
     extra: &[String],
 ) -> Vec<String> {
@@ -730,14 +757,7 @@ fn run_args(
         "--label",
         &format!("{}={token}", recovery::TOKEN),
         "--label",
-        &format!(
-            "{}={}",
-            recovery::ENGINE,
-            match engine.driver {
-                Driver::Postgres => "postgres",
-                Driver::Mssql => "mssql",
-            }
-        ),
+        &format!("{}={}", recovery::ENGINE, support.label),
     ]
     .into_iter()
     .map(str::to_owned)
@@ -746,7 +766,7 @@ fn run_args(
         args.push("--label".into());
         args.push(label.clone());
     }
-    for variable in &engine.environment {
+    for variable in environment {
         args.push("--env".into());
         args.push(variable.clone());
     }
@@ -754,7 +774,7 @@ fn run_args(
     // loopback only, so nothing off this host can reach the server.
     args.extend([
         "--publish".into(),
-        format!("127.0.0.1::{}", engine.port),
+        format!("127.0.0.1::{}", support.port),
         image.into(),
     ]);
     args
@@ -915,7 +935,7 @@ mod tests {
             id: "pbps-scratch-t".into(),
             immutable: String::new(),
             connection: String::new(),
-            engine: super::engine::docker(Driver::Postgres, "x").unwrap(),
+            support: owned(Driver::Postgres),
             removed: true,
             password: String::new(),
         };
@@ -947,9 +967,17 @@ mod tests {
     /// be fetched, not only at the inspection before it.
     #[test]
     fn the_launch_never_pulls_and_publishes_on_loopback_only() {
-        let engine = super::engine::docker(Driver::Postgres, "secret").unwrap();
+        let postgres = owned(Driver::Postgres);
+        let launch = postgres.launch("secret");
         let token = "0123456789abcdef0123456789abcdef";
-        let args = run_args("pbps-scratch-0", token, &engine, "postgres:18", &[]);
+        let args = run_args(
+            "pbps-scratch-0",
+            token,
+            postgres,
+            &launch.environment,
+            "postgres:18",
+            &[],
+        );
         let after = |flag: &str| {
             let at = args
                 .iter()
@@ -959,32 +987,35 @@ mod tests {
         };
         assert_eq!(after("--pull"), "never");
         assert_eq!(after("--env"), "POSTGRES_PASSWORD=secret");
-        assert_eq!(engine.readiness_query, "SELECT 1 AS ok");
         assert_eq!(
-            engine.connection(41417, "secret").unwrap(),
+            (postgres.loopback)(41417, &launch.secret),
             "host=127.0.0.1 port=41417 user=postgres password=secret dbname=postgres sslmode=disable"
         );
-        let mssql =
-            super::engine::docker(Driver::Mssql, "0123456789abcdef0123456789abcdef").unwrap();
+        let mssql = owned(Driver::Mssql);
+        let mssql_launch = mssql.launch("0123456789abcdef0123456789abcdef");
         let password = pbps_mssql::resolver::scratch::password("0123456789abcdef0123456789abcdef");
         assert_eq!(
-            mssql.environment,
+            mssql_launch.environment,
             [
                 "ACCEPT_EULA=Y".to_owned(),
                 format!("MSSQL_SA_PASSWORD={password}")
             ]
         );
-        assert_eq!(mssql.readiness_query, "SELECT 1 AS ok");
         assert_eq!(
-            mssql
-                .connection(41417, "0123456789abcdef0123456789abcdef")
-                .unwrap(),
+            (mssql.loopback)(41417, &mssql_launch.secret),
             format!(
                 "Server=127.0.0.1,41417;Database=master;User \
                  Id=sa;Password={password};TrustServerCertificate=true"
             )
         );
-        let mssql_args = run_args("pbps-scratch-1", token, &mssql, "sql-server-image", &[]);
+        let mssql_args = run_args(
+            "pbps-scratch-1",
+            token,
+            mssql,
+            &mssql_launch.environment,
+            "sql-server-image",
+            &[],
+        );
         assert!(
             mssql_args
                 .windows(2)
@@ -1045,6 +1076,7 @@ mod tests {
             assert!(!no_such_image(unknown), "{unknown}");
         }
     }
+    use crate::resolver::server::engine::container::owned;
     use pbps_db::Driver;
     use std::time::Duration;
 
@@ -1068,7 +1100,7 @@ mod tests {
             connection: format!(
                 "host=127.0.0.1 port={port} user=postgres password=x dbname=postgres sslmode=disable"
             ),
-            engine: super::engine::docker(Driver::Postgres, "x").unwrap(),
+            support: owned(Driver::Postgres),
             // Nothing was started: the drop guard has nothing to remove.
             removed: true,
             password: String::new(),
@@ -1076,7 +1108,7 @@ mod tests {
         let started = std::time::Instant::now();
         let outcome = tokio::time::timeout(
             Duration::from_secs(30),
-            container.ready(Driver::Postgres, Duration::from_secs(2)),
+            container.ready(Duration::from_secs(2)),
         )
         .await;
         held.abort();

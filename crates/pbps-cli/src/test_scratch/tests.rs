@@ -1601,7 +1601,12 @@ mod live {
         ]);
         for (token, recoverable) in [(&recorded, true), (&anonymous, false)] {
             let (image, mut owner) = (image(), Stuck(token.clone(), recoverable));
-            let start = Held::start_owned(Driver::Postgres, &image, PullPolicy::Never, &mut owner);
+            let start = Held::start_owned(
+                owned_test_of(Driver::Postgres).container,
+                &image,
+                PullPolicy::Never,
+                &mut owner,
+            );
             assert!(
                 tokio::time::timeout(Duration::from_secs(20), start)
                     .await
@@ -1704,8 +1709,13 @@ mod live {
         ]);
         for (token, recoverable) in [(&recorded, true), (&anonymous, false)] {
             let mut owner = Refusing(token.clone(), recoverable);
-            let started =
-                Held::start_owned(Driver::Postgres, &image(), PullPolicy::Never, &mut owner).await;
+            let started = Held::start_owned(
+                owned_test_of(Driver::Postgres).container,
+                &image(),
+                PullPolicy::Never,
+                &mut owner,
+            )
+            .await;
             assert!(started.is_err());
         }
         let listed = |token: &String| {

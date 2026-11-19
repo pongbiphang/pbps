@@ -200,11 +200,16 @@ fn after_exit(observed: &Observed, log: Result<&str, &str>, password: &str) -> N
     }
 }
 
-pub(super) async fn ready(connection: &str, id: &str, password: &str) -> Result<(), NotReady> {
+pub(super) async fn ready(
+    driver: pbps_db::Driver,
+    connection: &str,
+    id: &str,
+    password: &str,
+) -> Result<(), NotReady> {
     let started = std::time::Instant::now();
     loop {
         let answer = readiness_probe(started, async {
-            let mut c = Conn::connect(pbps_db::Driver::Mssql, connection).await?;
+            let mut c = Conn::connect(driver, connection).await?;
             c.query("SELECT 1 AS ok;").await?;
             Ok(())
         })
