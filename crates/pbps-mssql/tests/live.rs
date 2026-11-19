@@ -16595,6 +16595,42 @@ async fn timeline_answers_a_never_migrated_ledger_without_ever_calling_ensure_ta
     db.drop().await;
 }
 
+/// A row another development build recorded at this build's number is refused
+/// by the reader of the latest row, with the remedy, and is still listed by the
+/// timeline, which has only the projected number (DEC-2412.2).
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_row_from_another_development_build_is_refused_by_latest_and_still_listed() {
+    let mut db = TestDb::create("foreignbuild2412").await;
+    let schema = normalized(&rich_schema());
+    let ids = mint_ids(&schema, &IdsFile::default(), &[]);
+
+    let ok = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    pbps_mssql::state::record(&mut db.conn, &ok)
+        .await
+        .expect("record this build's row");
+    let mut foreign = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    foreign.format_fingerprint = Some("ab".repeat(32));
+    pbps_mssql::state::record(&mut db.conn, &foreign)
+        .await
+        .expect("writing never checks the fingerprint");
+
+    match pbps_mssql::state::latest(&mut db.conn).await {
+        Err(pbps_db::LedgerError::BadEntry { message, .. }) => {
+            assert!(message.contains("different development build"), "{message}");
+            assert!(message.contains("pbps baseline --reason ..."), "{message}");
+        }
+        other => panic!("the newest row is another build's and must be refused: {other:?}"),
+    }
+    let rows = pbps_mssql::state::timeline(&mut db.conn, 10)
+        .await
+        .expect("timeline");
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.state.is_ok()), "{rows:?}");
+
+    db.drop().await;
+}
+
 /// Finding 2 from #353's round-1 review: a row a newer pbps wrote populates
 /// the projected columns like any other row, and the projected path must
 /// refuse it exactly as [`pbps_model::StateSnapshot::read_json`]'s JSON

@@ -2098,3 +2098,65 @@ ends even if the test was killed, at the latest after the sleep's 600 seconds.
 containers it started itself with `docker run` still leaves them when it is
 killed, unless they are among the two look-alike tests above. This decision
 neither measured nor changed those.
+
+<a id="dec-2412-2"></a>
+
+**DEC-2412.2. A saved plan and a ledger snapshot record the build that wrote them next
+to their number, and a reader refuses another build's.** DEC-2412.1 made the
+fingerprint; this entry records it and reads it back, for the two formats that are
+files and rows: the saved plan and the ledger snapshot (the state file of `plan --base`
+is the same snapshot). The published schema set follows in #2412's next pull request.
+
+- **Where.** `format_fingerprint: Option<String>` (64 lowercase hex, absent when
+  `None`) directly after `version`, in `SavedPlan` and in `StateSnapshot`. A plan's is
+  inside its checksum like every field, so the approver's checksum names the build.
+  One `stamp()` per type sets the number and the value together, and `new()`,
+  `recording_data_work` and the re-stamp of a failed attempt call it. A test reads
+  every Rust source and fails any other line that writes `CURRENT_VERSION` to a
+  `version` field.
+- **What is recorded.** One function per artifact returns it, and the writer, the
+  reader and the rule test call nothing else. A snapshot records the fingerprint of its
+  shape. A plan records one value folding the shape with `state_checksum` of a fixed
+  sample table, so an algorithm that changes while the shape stays (the case
+  DEC-2412.1 could not see, and the one the old literal pin guarded) is also another
+  build. The literal is gone from the tests. A snapshot folds nothing in: it stores no
+  checksum of its own contents, and `plan_checksum` is the applied plan's, only compared
+  for equality.
+- **What a reader does.** The check is `pbps_model::format::Format::check`, asked on the
+  raw envelope before the strict parse (a file from another build usually holds a field
+  this build lacks, and would be refused for that field instead of its cause). The same
+  number is three results: equal is accepted, different is refused, and **absent is
+  refused** with "no fingerprint recorded", since otherwise deleting the field would skip
+  the check. An older or a newer number keeps today's diagnostic byte for byte, and the
+  value is not generated for it. Remedies reuse the sentences each artifact already
+  had: a plan is recomputed with `pbps plan --db ... --out ...` on this build and
+  reviewed again, a row is re-recorded with `pbps baseline --reason ...`, a state file
+  is taken again from a database this build recorded. Messages show the first 12 digits.
+- **The ledger.** A mismatching row is `Unreadable::UnsupportedVersion { detail }`, so
+  nothing in the published envelope changes. The timeline's projected path has only the
+  number and stays number-only: a row from another build is still listed, its counts
+  being what its writer computed, and no ledger column or migration is added.
+- **Numbers.** Plan 82 to 83 and state 51 to 52, once, because the field is an addition
+  an older build would reject as an unknown field instead of a newer plan. They are the
+  last numbers moved by a change. A later change to either format moves the fingerprint
+  and writes no number, no history line and no archive. The set stays 117.
+- **The rule, with no release.** The number is a label and nothing is asserted about it;
+  builds are told apart by the fingerprint. A record of what the last release froze
+  (`crates/pbps-model/src/released_formats.json`, `{"released": null}` today, written
+  only by the release step and read with one `include_str!`) gives the rule its meaning
+  afterwards: a pure function of the current number, the current recorded value and the
+  frozen record. An unchanged value keeps the frozen number and a changed one makes it
+  frozen plus one, both ways, so a bump that changes nothing fails as well as a change
+  that forgot its bump. #1159 owns the reset of the numbers to 1 and the public contract.
+- **Cost.** The shape fingerprint is generated once per process on first use, which a
+  plan writer and a reader at this number pay. Measured on `f39a56a05`: about 150 ms for
+  the plan and 17 ms for the snapshot in the dev profile (the tests'), 109 ms and
+  13 ms with `schemars`, `serde_json`, `indexmap`, `hashbrown` and `serde` at
+  `opt-level = 3`, and about 47 ms and 4 ms in the release profile. The dev profile was
+  not tuned: the generic code is instantiated in `pbps-model`, whose profile is not
+  named in `Cargo.toml`, so the override did not reach 50 ms.
+- **What it costs a developer.** Before the first release, a ledger row, plan or state
+  file written by a build with another format is refused until it is re-recorded or
+  recomputed, where the old additive range kept an older row readable. The first release
+  promises no compatibility (STATUS) and the refusal says what to run. Rows written
+  before this change are at an older number and stay readable.

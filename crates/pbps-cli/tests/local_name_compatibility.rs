@@ -292,8 +292,8 @@ where
     assert!(explain.status.success(), "{explain:?}");
     // Compare captured envelopes after explain has exercised the current
     // applicable version, following the column/role compatibility suites.
-    plan.version = 44;
-    state.version = 27;
+    plan = plan.as_written_at(44);
+    state = state.as_written_at(27);
     state.plan_checksum = Some(plan.wire_fingerprint());
     // Strip the type branches from set 54 (extended in sets 56 and 59) and the
     // dependency branch from set 58. Captured legacy branches must still

@@ -8550,10 +8550,11 @@ fn staged_needs_a_target() {
 /// A staged fixture reaching content validation must supply one separately.
 fn write_plan(d: &Demo, name: &str, mode: &str) -> PathBuf {
     let path = d.dir.join(name);
-    let version = pbps_model::plan::CURRENT_VERSION;
+    // The number alone would be another development build's plan.
+    let stamp = pbps_model::format::PLAN.stamp_members();
     let plan = format!(
         r#"{{
-  "version": {version},
+  {stamp},
   "origin": "database",
   "analysis": {{ "kind": "ordinary" }},
   "mode": "{mode}",

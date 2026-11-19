@@ -613,4 +613,31 @@ mod tests {
         assert_eq!(state.modules, 1);
         assert_eq!(state.staged, None);
     }
+
+    /// A stored row is read through `StateSnapshot::read_json`, so a row another
+    /// development build recorded at this number is refused with the remedy
+    /// (DEC-2412.2), and this build's own row is read.
+    #[test]
+    fn a_stored_row_from_another_build_is_refused_and_this_builds_is_read() {
+        use pbps_model::{IdsFile, Schema, StateKind, StateSnapshot, Unreadable};
+        let row = |snapshot: &StateSnapshot| StoredEntry {
+            id: 1,
+            applied_at: "2026-11-19".into(),
+            state_json: serde_json::to_string(snapshot).unwrap(),
+        };
+        let mut snapshot = StateSnapshot::new(
+            StateKind::Apply,
+            Schema::default(),
+            IdsFile::default(),
+            "leon",
+        );
+        assert_eq!(row(&snapshot).read().unwrap().snapshot, snapshot);
+        snapshot.format_fingerprint = Some("ab".repeat(32));
+        let Err(Unreadable::UnsupportedVersion(why)) = row(&snapshot).read() else {
+            panic!("another build's row is unsupported");
+        };
+        assert!(why.contains("pbps baseline --reason ..."), "{why}");
+        snapshot.format_fingerprint = None;
+        assert!(row(&snapshot).read().is_err());
+    }
 }

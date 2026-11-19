@@ -108,8 +108,8 @@ fn hostile_names_keep_master_artifact_bytes_checksums_and_sql() {
     let (schema, ids, mut plan, mut state) = artifacts(NAME);
     // These fixtures pin historical bytes, independently of a new envelope's
     // deliberately advanced version (#1172).
-    plan.version = 42;
-    state.version = 25;
+    plan = plan.as_written_at(42);
+    state = state.as_written_at(25);
     state.plan_checksum = Some(plan.wire_fingerprint());
     let outputs = [
         ("schema.json", serde_json::to_string(&schema).unwrap()),
@@ -185,7 +185,7 @@ fn explain_shows_hostile_names_exactly_once_and_keeps_master_json() {
     let root =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/name-compatibility");
     let mut historical = plan.clone();
-    historical.version = 42;
+    historical = historical.as_written_at(42);
     // Explain must exercise the current applicable format. Only the checksum
     // changes when its version advances; all names and JSON stay pinned.
     let expected = std::fs::read_to_string(root.join("explain.json"))

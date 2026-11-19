@@ -176,8 +176,8 @@ fn routine_and_module_artifacts_keep_master_bytes_and_filename_components() {
             .join("tests/fixtures/name-compatibility/routines")
             .join(dialect.name());
         let historical_checksum = std::fs::read_to_string(root.join("plan.sha256")).unwrap();
-        plan.version = 42;
-        state.version = 25;
+        plan = plan.as_written_at(42);
+        state = state.as_written_at(25);
         state.plan_checksum = Some(historical_checksum.clone());
         let outputs = [
             ("schema.json", serde_json::to_string(&schema).unwrap()),

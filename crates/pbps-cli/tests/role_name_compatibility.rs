@@ -169,8 +169,8 @@ where
     assert!(explain.status.success(), "{explain:?}");
     // Compare archived envelopes after explain has exercised the current
     // applicable version, with the checksum that version produces.
-    plan.version = 44;
-    state.version = 27;
+    plan = plan.as_written_at(44);
+    state = state.as_written_at(27);
     state.plan_checksum = Some(plan.wire_fingerprint());
     let outputs = [
         ("schema.json", serde_json::to_string(&schema).unwrap()),

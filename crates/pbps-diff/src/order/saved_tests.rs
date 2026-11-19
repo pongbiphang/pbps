@@ -119,6 +119,55 @@ fn admission_refuses_an_old_version_before_checksum_checks() {
     );
 }
 
+/// The same number is three results, and a different or an absent fingerprint
+/// is refused before the checksum is looked at (DEC-2412.2).
+#[test]
+fn admission_refuses_a_plan_another_build_wrote_before_checksum_checks() {
+    let current = pbps_model::format::PLAN.identity();
+    let mut plan = wire();
+    plan.format_fingerprint = Some("ab".repeat(32));
+    assert_eq!(
+        refusal(plan.clone(), "unapproved"),
+        format!(
+            "`plan.json` was written by a different development build of pbps (plan format {}, \
+             fingerprint abababababab; this build's fingerprint is {}).\n\
+             Recompute it with `pbps plan --db ... --out ...` on this build and review the new \
+             artifact for approval.",
+            pbps_model::plan::CURRENT_VERSION,
+            &current[..12]
+        )
+    );
+    plan.format_fingerprint = None;
+    let error = refusal(plan, "unapproved");
+    assert!(error.contains("no fingerprint recorded"), "{error}");
+    // Negative: this build's own plan reaches the checksum check.
+    let error = refusal(wire(), "unapproved");
+    assert!(error.contains("approved checksum: unapproved"), "{error}");
+}
+
+#[test]
+fn the_saved_plan_validation_refuses_a_plan_another_build_wrote() {
+    let mut plan = wire();
+    plan.format_fingerprint = Some("ab".repeat(32));
+    let error = super::validate_saved_plan(&plan, &MinimalDialect)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.starts_with("this saved plan was written by a different development build"),
+        "{error}"
+    );
+    assert!(
+        error.contains("Recompute it with `pbps plan --db ... --out ...` on this build"),
+        "{error}"
+    );
+    plan.format_fingerprint = None;
+    let error = super::validate_saved_plan(&plan, &MinimalDialect)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no fingerprint recorded"), "{error}");
+    assert!(super::validate_saved_plan(&wire(), &MinimalDialect).is_ok());
+}
+
 #[test]
 fn admission_still_refuses_invalid_payloads_after_the_outer_checks_pass() {
     let mut plan = wire().staged();

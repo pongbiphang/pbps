@@ -12670,6 +12670,45 @@ async fn a_reason_at_the_columns_width_is_stored_whole_and_one_more_is_refused()
     db.drop().await;
 }
 
+/// A row another development build recorded at this build's number is refused
+/// by the reader of the latest row, with the remedy, and is still listed by the
+/// timeline, which has only the projected number (DEC-2412.2). Reading the
+/// state is what is refused; the history is not erased.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_row_from_another_development_build_is_refused_by_latest_and_still_listed() {
+    let mut db = TestDb::create("foreignbuild2412").await;
+    state::ensure_tables(&mut db.conn).await.expect("create");
+
+    state::record(&mut db.conn, &snapshot(StateKind::Apply))
+        .await
+        .expect("record this build's row");
+    let mut foreign = snapshot(StateKind::Apply);
+    foreign.format_fingerprint = Some("ab".repeat(32));
+    state::record(&mut db.conn, &foreign)
+        .await
+        .expect("writing never checks the fingerprint");
+
+    match state::latest(&mut db.conn).await {
+        Err(LedgerError::BadEntry { message, .. }) => {
+            assert!(message.contains("different development build"), "{message}");
+            assert!(message.contains("pbps baseline --reason ..."), "{message}");
+        }
+        other => panic!("the newest row is another build's and must be refused: {other:?}"),
+    }
+    let rows = state::timeline(&mut db.conn, 10).await.expect("timeline");
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.state.is_ok()), "{rows:?}");
+
+    // The row above it is this build's again: the history is not poisoned.
+    state::record(&mut db.conn, &snapshot(StateKind::Apply))
+        .await
+        .expect("record");
+    assert!(state::latest(&mut db.conn).await.expect("latest").is_some());
+
+    db.drop().await;
+}
+
 /// An entry this build cannot read is refused **by its version**, and it does
 /// not erase the history above it (DECISIONS 218, 222). The reader is
 /// `StateSnapshot::from_json`, and there is no second path to it.

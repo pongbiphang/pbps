@@ -119,6 +119,9 @@ pub fn admit<D: Dialect + ?Sized>(
             pbps_model::plan::CURRENT_VERSION
         );
     }
+    if let Err(foreign) = plan.check_build() {
+        refuse!("`{}` {foreign}.\n{}", plan_path.display(), foreign.remedy());
+    }
     let plan_checksum = plan.wire_fingerprint();
     if plan_checksum != approved_checksum {
         refuse!(
@@ -436,6 +439,9 @@ pub fn validate_saved_plan(
 ) -> Result<(), AdmissionError> {
     if plan.version != pbps_model::plan::CURRENT_VERSION {
         refuse!("unsupported saved-plan version {}", plan.version);
+    }
+    if let Err(foreign) = plan.check_build() {
+        refuse!("this saved plan {foreign}. {}", foreign.remedy());
     }
     pbps_model::retained::validate(plan).map_err(AdmissionError::message)?;
     // A lineage record stays in the identity file after its rewrite, so one is

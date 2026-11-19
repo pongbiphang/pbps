@@ -61,6 +61,7 @@ pub mod escape;
 pub mod extension_provider;
 pub mod finding;
 pub mod fingerprint;
+pub mod format;
 pub mod ids;
 pub mod ids_check;
 pub mod ids_merge;
