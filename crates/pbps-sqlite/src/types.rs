@@ -281,7 +281,7 @@ fn is_word(word: &str) -> bool {
 /// accepted here: the model splits arguments at every comma, so it cannot
 /// carry a comment that holds one, and nothing writes such a type (see the
 /// catalog reader's gap list in DEC-2950.2).
-fn signed_number(text: &str) -> bool {
+pub(crate) fn signed_number(text: &str) -> bool {
     let rest = text.strip_prefix(['+', '-']).map_or(text, |after| {
         after.trim_start_matches([' ', '\t', '\n', '\r', '\x0c'])
     });
