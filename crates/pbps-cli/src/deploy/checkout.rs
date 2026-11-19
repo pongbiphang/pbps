@@ -450,7 +450,17 @@ mod tests {
         let mut schema = Schema::default();
         for n in 0..200 {
             let role: pbps_model::RoleName = format!("r{n:03}\n\x1b\u{202e}").into();
-            ids.roles.insert(Uid::generate(UidKind::Role), role.clone());
+            // Draw until the uid is new: 200 draws from about 1.07e9 values
+            // collide roughly once in 20,000 runs, and a reused uid would
+            // overwrite an earlier role and leave 199 (#2900). `Uid::generate`
+            // leaves the collision check to its caller.
+            let uid = loop {
+                let uid = Uid::generate(UidKind::Role);
+                if !ids.contains_uid(&uid) {
+                    break uid;
+                }
+            };
+            ids.roles.insert(uid, role.clone());
             schema.roles.insert(role, Role::default());
         }
         let removed = removals(&ids, &schema, &IdsFile::default(), &Schema::default(), &[]);
