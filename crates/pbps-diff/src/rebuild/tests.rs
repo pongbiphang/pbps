@@ -2452,3 +2452,49 @@ fn copy_stages_bind_a_renamed_input_by_lineage_and_pin_changed_conversions() {
         .contains("re-approve")
     );
 }
+
+/// The recipes build a parent's index and its clones by name and hold no exclusion's, so a
+/// tree whose parent holds one is not rebuilt, whichever side holds it (DEC-2448.6, #2448).
+/// Negative: the same approval of the tree without one qualifies.
+#[test]
+fn a_tree_whose_parent_holds_an_exclusion_is_not_rebuilt() {
+    let exclusion = || pbps_model::ExclusionConstraint {
+        method: pbps_model::IndexMethod::Btree,
+        keys: vec![pbps_model::ExclusionKey {
+            key: pbps_model::IndexColumn::column("k"),
+            operator: pbps_model::OperatorRef::symbol("=").unwrap(),
+        }],
+        include: Vec::new(),
+        filter: None,
+        storage_parameters: Default::default(),
+        timing: pbps_model::ExclusionTiming::Immediate,
+    };
+    let (base, ids, desired) = fixture();
+    let approval = recorded(&base, &ids, &desired);
+    qualify(side(&base, &ids), side(&desired, &approval), &table()).unwrap();
+    for (held_by_base, held_by_desired) in [(true, false), (false, true), (true, true)] {
+        let (mut base, ids, mut desired) = fixture();
+        if held_by_base {
+            base.tables
+                .get_mut(&table())
+                .unwrap()
+                .exclude
+                .insert("x".into(), exclusion());
+        }
+        if held_by_desired {
+            desired
+                .tables
+                .get_mut(&table())
+                .unwrap()
+                .exclude
+                .insert("x".into(), exclusion());
+        }
+        let approval = recorded(&base, &ids, &desired);
+        let error = qualify(side(&base, &ids), side(&desired, &approval), &table()).unwrap_err();
+        assert!(
+            error.why.contains("holds an exclusion constraint") && error.why.contains("#2448"),
+            "{}",
+            error.why
+        );
+    }
+}

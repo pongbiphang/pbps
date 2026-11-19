@@ -10057,3 +10057,61 @@ conflicting add after the drop in one transaction leaves the dropped constraint 
 
 Formats: none. `SetExclusion` is plan 73's kind, no snapshot, identity or published document
 names the list, and the published schema set is unchanged.
+
+<a id="dec-2448-6"></a>
+
+**DEC-2448.6. A partitioned parent's EXCLUDE on PostgreSQL 18, and the seam that carries the rest (#2448 PR E1).**
+Measured on 16.15 and 18.6 (`~/gate2448e/m`, the probes of this entry):
+
+| Rule | Engine |
+|---|---|
+| A parent's exclusion | 16 refuses every form, `0A000 exclusion constraints are not supported on partitioned tables` (`ALTER TABLE ADD`, `CREATE TABLE (EXCLUDE ..)`, a B-tree one alike). 18 takes it. |
+| Key coverage | Every partition-key column must be a **plain key** column excluded with an equality: missing, in `INCLUDE`, under a cast or expression, or with `<>` is `0A000 unique constraint on partitioned table must include all partitioning columns` or `cannot match partition key to index .. using non-equal operator`. A partition key with an expression is refused whatever the exclusion says. The same for RANGE, LIST and HASH, and for each column of a composite key. A column that is not a partition key takes any exclusion operator. |
+| Catalog | The parent holds a `relkind 'I'` index and a `conparentid 0` constraint; each partition, a DEFAULT one and one created later included, holds a clone (`conislocal f`, `coninhcount 1`, `conparentid` the parent's, its index attached through `pg_inherits`) under the engine's name `<leaf>_<keys>_excl`. Parameters, predicate and timing are copied to it. A clone cannot be dropped alone (`42P16`, `2BP01`), and the parent's drop takes every clone. |
+| `ONLY` | `ALTER TABLE ONLY parent ADD .. EXCLUDE` is accepted and leaves the parent's index **invalid** with no clone; the reader already leaves an invalid index out by name (`indisvalid = false`). `NO INHERIT` is `0A000`. |
+| Options | `ALTER INDEX parent SET` is `42809`; on a clone it is accepted. An option edit of a parent's exclusion is therefore a replacement whose add carries the final options, the rule DEC-2449.1 states for an index. |
+| Adoption | A partition's own exclusion is taken as the parent's clone on `ATTACH` and on a parent's `ADD` over a standing partition, and not by `CREATE TABLE .. PARTITION OF (CONSTRAINT ..)` nor when it is added to an already cloned partition. What decides is the method, the keys in order with their operators, the `INCLUDE` columns and the predicate; **not** the timing, the storage parameters or the name. The adopted one keeps its own name and reads as a clone, and the parent's drop removes it. |
+| Detach | The clone becomes the partition's own, under the engine's name. |
+| Rows | A cross-partition `UPDATE` and an insert through the DEFAULT partition are checked by the clone of the landing partition (`23P01`); a parent's `ADD` over rows that collide in one partition fails whole (`23P01`). |
+| Names | The parent's constraint name is a schema relation name: an own constraint of that name is `42P07`. A clone takes a free name by itself when its name is held; an own constraint added **after** under a clone's name is `42P07`. |
+
+**What is held (E1).** `exclude:` of a table with `partition_by` is validated (`validate`) against the
+coverage rule offline, as the engine's, and otherwise as an ordinary table's exclusion: the same change
+(`SetExclusion`), risks (`constraint` on an add, `destructive` on a drop), ordering classes and
+retirement, which is keyed by the **parent's** uid as any table's. The differ takes it on a standing
+partitioned parent in the list of changes a parent takes (DEC-1688.1, DEC-1689.1), refusing by name an
+add that lacks the key (`holds_key_with_equality`, one predicate with validation) or that a
+partition's own exclusion could be taken for (`adopts_exclusion`, the engine's rule above, the one
+predicate the differ, the attach path and validation are to share), and plans an option edit as a
+replacement. `before_its_partitions_indexes` orders a parent's added exclusion ahead of an own one it
+could adopt, as it does an index. PostgreSQL 16 is refused by name before any statement:
+`generation_support`, the connected check that asks the server what a plan needs of it and that apply
+also runs, reads `server_version_num` (`partitioned_exclusion`, as `roles::unsupported_permissions`
+does for `maintain`), so a saved plan is checksummed as any other and applying it to a 16 server
+fails there and not halfway.
+
+**Refused by name, and why each stands.**
+- **A partition's own exclusion** (`partition_of`): `validate` refuses it as before, and the pull still
+  leaves its tree out. The declaration cannot say it yet (a partition entry has no `exclude:`, which
+  needs the published schema set), and `validate_partition` has no parent to check an own one against
+  the parent's: the adoption above would make the declared guarantee vanish with the parent's.
+- **A detach of a partition of a parent that holds an exclusion**: the clone becomes an own constraint
+  under the engine's name, which `DetachedKind` cannot name, and the plan wire has no kind for it.
+- **A `RebuildPartitionedTable` of a tree that holds one**: the recipe builds a parent's index and its
+  clones by name (`PartitionIndexDefinition`), and holds none for an exclusion. Both refusals name
+  #2448, the PR that carries them; neither is a deferral.
+- **An attach** of an ordinary table to a parent that holds one is the engine's: it builds the clone
+  over the rows and refuses a conflict whole. An ordinary table's own exclusion is not declared on a
+  partition, so none is adopted from it.
+- **Nested partitioning** stays outside the model (STATUS); the key rule above is the root's, and the
+  engine's per-level measurement (each level needs its own partition key) is the reason a later PR must
+  ask it of every level.
+
+**Seam.** E1 is this entry. E2 is the partition's own exclusion (reader, declaration, `validate_partition`
+against its parent's, the attach shape, the own part of a rebuild, a record for its drop in the parent's
+ids file) and the detach and rebuild of a parent's. It needs the published schema set and the ids
+section, and no plan or state number: #2412 PR 2 takes the next plan and state numbers and after it no
+PR writes either before the first release.
+
+Formats: none. `SetExclusion` is plan 73's kind, the snapshot already holds `exclude` for any table,
+the published documents name no part of this, and the ids file is the parent's own.

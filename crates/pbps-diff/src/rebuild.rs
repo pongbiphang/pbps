@@ -745,6 +745,19 @@ pub fn qualify(
             stale()
         });
     }
+    // A parent's exclusion cannot be rebuilt around: the recipes build a parent's index
+    // and its clones by name, and no recipe holds an exclusion's (DEC-2448.6, #2448).
+    if tree(base.schema, table)
+        .into_iter()
+        .chain(tree(desired.schema, table))
+        .any(|(_, t)| !t.exclude.is_empty())
+    {
+        return Err(refused(
+            table,
+            "the tree holds an exclusion constraint, and rebuilding one is not supported yet \
+             (DEC-2448.6, #2448)",
+        ));
+    }
     shape(base.schema, desired.schema, table, used.len() == 1)?;
     if intent.conversions
         != intent

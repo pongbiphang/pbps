@@ -87,6 +87,7 @@ pub mod operator_read;
 pub mod partition_index;
 mod partition_runway;
 mod partition_series;
+pub mod partitioned_exclusion;
 pub mod partman;
 pub mod pins;
 mod preflight;
