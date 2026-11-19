@@ -6971,3 +6971,39 @@ visibility projection and the refusal without a measurement, a `compile_fail`
 doctest beside a compiling one on each of `Authorization<D>` and `Condition<D>`,
 and the live recheck and apply tests of both engines. Formats: none. No sealed
 bytes, plan, state or evidence change.
+
+<a id="dec-2798-15"></a>
+
+**DEC-2798.15. The run-local principals are each adapter's own type, and the
+authorization shell names no engine (#2798, route step 3).** DEC-2798.14 typed
+the deployer's authorization and left the principals that stand in for it on
+scratch as a two-engine union whose functions took the PostgreSQL context
+directly. The principals never leave an adapter (only an adapter holds, builds
+or consumes them), so they are not an associated type of the contract: each
+adapter's prepared scratch holds its own engine's map, `Prepared.map` is
+PostgreSQL's role map or SQL Server's principal map, and the union and its
+mixed arms are gone by typing.
+
+**What moved.** PostgreSQL's `generate`, `supplied`, `deployer`, `prepare`,
+`enter` and `settle` are functions of its adapter (`postgres/principals.rs`),
+with their statements, their order, their connection and their error texts
+unchanged; `enter` still issues exactly `SET ROLE "<name>"` with embedded quotes
+doubled, and nothing for a session that is already the deployer. SQL Server's
+reproduction already ran through its own crate, so the arms `scope.rs` had for
+it had no caller and are removed. The reason the engines reproduce a plan's
+grants differently (PostgreSQL projects them and verifies against the
+projection; SQL Server verifies against the target as read, then runs them as
+the reproduced deployer) stays with each engine, on the adapter that does it. The
+two cluster rule constants are the engines' own (`CLUSTER` in each contract),
+and the last driver value left the rehearsal: the connection takes it from the
+dialect where it is opened.
+
+**Acceptance of the group.** `scope.rs`, `producer.rs`, `scratch.rs`,
+`scratch/rehearse.rs`, `resolution.rs`, `transitions.rs` and `apply.rs` name no
+engine in production code, and a scan of each says so, with planted-token cases.
+The one carve-out is the default type parameter of the three public run types
+in `producer.rs`.
+
+Pinned by those scans, the cluster-domain test (now against the strings), the
+authorization tests of DEC-2798.14, and the live scratch and apply tests of both
+engines. Formats: none. No sealed bytes, plan, state or evidence change.

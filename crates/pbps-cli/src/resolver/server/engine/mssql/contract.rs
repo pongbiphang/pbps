@@ -44,9 +44,11 @@ pub struct MssqlResolver;
 
 impl Sealed for MssqlResolver {}
 
-/// The domain the planning seals the cluster under; apply recomputes it.
+/// The domain the planning seals the cluster under; apply recomputes it. SQL
+/// Server's instance identity (`family_guid`) is keyed under its own label so
+/// that no PostgreSQL digest equals a SQL Server one (#2144, DEC-1685.1).
 const CLUSTER: ClusterDomain = ClusterDomain {
-    rule: crate::resolver::server::MSSQL_CLUSTER_RULE,
+    rule: "pbps/mssql-instance-identity/v1",
     component: "family-guid",
 };
 

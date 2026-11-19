@@ -1,32 +1,23 @@
-//! Engine routing for analysis-scope qualification (ADR-0016 cases 5, 14, 16,
-//! 21, 23; SPEC §9.3.3).
+//! What a plan's schema grants do to the deployer's authorization, the part of
+//! qualifying an analysis scope that is the same for every engine (ADR-0016
+//! cases 5, 14, 16, 21, 23; SPEC §9.3.3).
 //!
 //! The resolver lifecycle — which session is opened when, what is sealed,
 //! what a later check re-reads — is the CLI's and is the same for every
 //! engine. What a scope *is* belongs to the engine crates: the facts they
 //! read, the versioned rule that compares them, the deployment authorization
-//! context and how it is reproduced on scratch. This module is the one place
-//! that names an engine for that work, so the lifecycle in `server` and the
-//! target binding in `native` name none, and adding an engine is a compile
-//! error in every function here rather than a branch someone forgot
-//! (docs/ARCHITECTURE.md; #714).
+//! context and how it is reproduced on scratch. Each engine states those
+//! through `ResolverEngine` (`resolver/contract.rs`), so this module names no
+//! engine and adding one is a compile error in its own impl rather than a
+//! branch someone forgot (docs/ARCHITECTURE.md; #714). What is left here is
+//! the planned schema grants, the digest framing apply and the producer share,
+//! and the shell of the persisted authorization condition.
 //!
-//! The two engines do not reproduce a plan's preceding grants the same way,
-//! and the difference is kept behind [`prepare`] and [`settle`]. PostgreSQL
-//! records a grant under a grantor the engine chooses, so its adapter
-//! projects the grants onto the target's context and verifies the
-//! reproduction against that projection. SQL Server refuses a grant the
-//! deployer cannot make outright, so its adapter verifies the reproduction
-//! against the target as read and only then lets the engine run the grants
-//! as the reproduced deployer — no projection to keep in step with it
-//! (DECISIONS 520, 521).
+//! The way each engine reproduces a plan's preceding grants differs, and its
+//! reason is kept with that engine: PostgreSQL's in `postgres/principals.rs`,
+//! SQL Server's beside its `apply_planned` in `mssql.rs`.
 
 pub(crate) mod object_grants;
-
-use pbps_db::transport::{ExecuteConnection, QueryConnection};
-use pbps_db::{DbError, Driver};
-use pbps_mssql::resolver::authorization as mssql_auth;
-use pbps_pg::resolver::authorization as pg_auth;
 
 /// A schema grant or revoke the plan performs before its DDL. A GRANT keeps
 /// the emitter's whole comma-separated privilege mask in one entry; REVOKE
@@ -38,45 +29,6 @@ pub struct PlannedGrant {
     pub schema: String,
     pub privilege: String,
     pub revoke: bool,
-}
-
-pub(in crate::resolver) fn pg_planned(planned: &[PlannedGrant]) -> Vec<pg_auth::PlannedGrant> {
-    planned
-        .iter()
-        .map(|grant| pg_auth::PlannedGrant {
-            role: grant.principal.raw().to_owned(),
-            schema: grant.schema.clone(),
-            privilege: grant.privilege.clone(),
-            revoke: grant.revoke,
-        })
-        .collect()
-}
-
-pub(in crate::resolver) fn mssql_planned(
-    planned: &[PlannedGrant],
-) -> Vec<mssql_auth::PlannedGrant> {
-    // SQL Server's reproduction retains its original per-permission shape.
-    planned
-        .iter()
-        .flat_map(|grant| {
-            grant
-                .privilege
-                .split(", ")
-                .map(|permission| mssql_auth::PlannedGrant {
-                    principal: grant.principal.clone(),
-                    schema: grant.schema.clone(),
-                    permission: permission.to_owned(),
-                    revoke: grant.revoke,
-                })
-        })
-        .collect()
-}
-
-/// The run-local principals that stand in for the target's on scratch.
-#[derive(Debug, Clone)]
-pub enum Principals {
-    Postgres(pg_auth::RoleMap),
-    Mssql(mssql_auth::PrincipalMap),
 }
 
 /// The label authorization digests are keyed under; distinct from the capture
@@ -247,119 +199,12 @@ pub(crate) fn persisted_after<E: crate::resolver::contract::ResolverEngine>(
     })
 }
 
-impl Principals {
-    /// `login` is the scratch run login and `token` the run's unique suffix.
-    pub(crate) fn generate(
-        context: &pg_auth::AuthorizationContext,
-        planned: &[PlannedGrant],
-        login: &str,
-        token: &str,
-    ) -> Self {
-        Self::Postgres(pg_auth::RoleMap::generate(
-            context,
-            &pg_planned(planned),
-            login,
-            token,
-        ))
-    }
-
-    /// The map of a supplied scratch login that reproduces no role: it
-    /// stands for the deployer (#1672).
-    pub(crate) fn supplied(context: &pg_auth::AuthorizationContext, login: &str) -> Self {
-        Self::Postgres(pg_auth::RoleMap::supplied(context, login))
-    }
-
-    /// The server-wide principals this run creates and must drop. SQL
-    /// Server's are database-scoped and go with the scratch database.
-    pub(crate) fn server_wide_names(&self) -> Vec<pbps_model::RoleName> {
-        match self {
-            Self::Postgres(map) => map.run_local_names(),
-            Self::Mssql(_) => Vec::new(),
-        }
-    }
-
-    /// The principal the compilation session switches to.
-    pub(crate) fn deployer(
-        &self,
-        context: &pg_auth::AuthorizationContext,
-    ) -> Result<Option<pbps_model::RoleName>, &'static str> {
-        match self {
-            Self::Postgres(map) => map
-                .deployer(context)
-                .map(Some)
-                .ok_or("no run-local deployer role was mapped"),
-            Self::Mssql(_) => Err("the principal map belongs to another engine"),
-        }
-    }
-}
-
-const MIXED: &str = "the authorization context and the principal map belong to different engines";
-
-/// Builds the reproduction through an administrative connection in the
-/// scratch database: principals, memberships, schemas, grants and login
-/// defaults, and runs the plan's grants here, as the mapped deployer.
-pub(crate) async fn prepare(
-    admin: &mut impl ExecuteConnection,
-    principals: &Principals,
-    context: &pg_auth::AuthorizationContext,
-    planned: &[PlannedGrant],
-    database: &str,
-) -> Result<(), DbError> {
-    match principals {
-        Principals::Postgres(map) => {
-            pg_auth::reconstruct(admin, map, context, database).await?;
-            let deployer = map
-                .deployer(context)
-                .ok_or_else(|| DbError::BadRow("no run-local deployer role was mapped".into()))?;
-            pg_auth::apply_planned(admin, map, &deployer, &pg_planned(planned)).await
-        }
-        Principals::Mssql(_) => Err(DbError::BadRow(MIXED.into())),
-    }
-}
-
-/// Switches the scratch session to the reproduced deployer. Idempotent, so a
-/// later check may call it again on the same session.
-pub(crate) async fn enter(
-    session: &mut impl QueryConnection,
-    driver: Driver,
-    deployer: Option<&pbps_model::RoleName>,
-) -> Result<(), DbError> {
-    match (driver, deployer) {
-        (_, None) => Ok(()),
-        (Driver::Postgres, Some(deployer)) => session
-            .query(&format!(
-                "SET ROLE \"{}\"",
-                deployer.raw().replace('"', "\"\"")
-            ))
-            .await
-            .map(|_| ()),
-        (Driver::Mssql, Some(deployer)) => mssql_auth::enter(session, Some(deployer)).await,
-    }
-}
-
-/// Verifies the reproduction as the reproduced deployer, which the session
-/// has [`enter`]ed, and names every key that does not reproduce the target.
-/// An empty result is a faithful reproduction with the plan's grants run.
-pub(crate) async fn settle(
-    session: &mut impl QueryConnection,
-    principals: &Principals,
-    context: &pg_auth::AuthorizationContext,
-    planned: &[PlannedGrant],
-    schemas: &[String],
-) -> Result<Vec<String>, DbError> {
-    match principals {
-        Principals::Postgres(map) => {
-            let expected = pg_auth::with_planned(context.clone(), &pg_planned(planned));
-            pg_auth::verify(session, map, &expected, schemas).await
-        }
-        Principals::Mssql(_) => Err(DbError::BadRow(MIXED.into())),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::resolver::server::PlanningDialect;
+    use pbps_mssql::resolver::authorization as mssql_auth;
+    use pbps_pg::resolver::authorization as pg_auth;
     use std::collections::BTreeMap;
 
     type Pg = <pbps_pg::Postgres as PlanningDialect>::Resolver;

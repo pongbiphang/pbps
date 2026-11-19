@@ -5332,7 +5332,7 @@ async fn resolver_recheck_binds_the_target_by_engine_identity() {
             plan.evidence.qualification().target_cluster,
             super::super::producer::fingerprint(
                 &environment,
-                super::super::producer::CLUSTER_RULE,
+                "pbps/pg-cluster-identity/v1",
                 "system-identifier",
                 identity.as_bytes(),
             ),

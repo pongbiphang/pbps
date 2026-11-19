@@ -498,7 +498,7 @@ class TheAllowlist(unittest.TestCase):
             'crates/pbps-cli/src/plan_test/session.rs',
             'crates/pbps-cli/src/plan_test/session/prerequisites.rs',
             'crates/pbps-cli/src/report.rs',
-            'crates/pbps-cli/src/resolver/scope.rs',
+            'crates/pbps-cli/src/resolver/server/engine/postgres/principals.rs',
             'crates/pbps-cli/src/status.rs',
             'crates/pbps-cli/tests/flow.rs',
             'crates/pbps-cli/tests/flow_pg.rs',

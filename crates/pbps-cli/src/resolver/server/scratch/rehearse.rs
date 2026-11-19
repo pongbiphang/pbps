@@ -55,7 +55,6 @@ pub async fn with_session<D: PlanningDialect, T, E>(
     // request is built (DEC-2798.5).
     let rehearsal = contract::rehearsal_of::<D>()
         .map_err(|unsupported| ProduceError::Acquire(unsupported.to_string()))?;
-    let driver = D::DRIVER;
     // The write path's extras are the dialect's, and the CLI's PostgreSQL
     // dialect configures none, as for the resolver.
     let request = match rehearsal.request {
@@ -67,7 +66,7 @@ pub async fn with_session<D: PlanningDialect, T, E>(
     // Every connection of the run opens the one endpoint found here
     // (DEC-2271.2), as for the resolver.
     let scratch = &<D::Resolver as ResolverEngine>::endpoint(scratch).await?;
-    let mut target = Conn::connect(driver, target_connection)
+    let mut target = Conn::connect(D::DRIVER, target_connection)
         .await
         .map_err(|error| {
             ProduceError::Run(Error::Unusable(format!(

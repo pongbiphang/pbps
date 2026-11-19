@@ -71,7 +71,8 @@ pub struct Prepared {
     /// compile here and nowhere else. It cannot leave its context, so a read
     /// that needs more than the deployer may see opens [`Reach::open`].
     pub(in crate::resolver::server) compile: Conn,
-    pub(in crate::resolver::server) map: scope::Principals,
+    /// The run-local principals that stand in for the target's on scratch.
+    pub(in crate::resolver::server) map: auth::PrincipalMap,
     pub(in crate::resolver::server) inventory: externals::Inventory,
     pub(in crate::resolver::server) staged: capture::Staged,
     pub(super) scratch_catalog: CatalogFacts,
@@ -113,12 +114,7 @@ impl Prepared {
         &mut self,
         target: &mut Conn,
     ) -> Result<Box<auth::Condition>, Error> {
-        let scope::Principals::Mssql(map) = &self.map else {
-            return Err(Error::Scope(
-                "the SQL Server principal map belongs to another engine".into(),
-            ));
-        };
-        auth::capture_condition(target, &mut self.compile, map, &self.chaining.context)
+        auth::capture_condition(target, &mut self.compile, &self.map, &self.chaining.context)
             .await
             .map(Box::new)
             .map_err(read)
@@ -727,7 +723,7 @@ impl Scratch<'_> {
             auth::InventoryError::Owners(why) => Error::Externals(vec![why]),
         })?;
         let token = self.token.clone();
-        let planned = scope::mssql_planned(&self.request.planned);
+        let planned = mssql_planned(&self.request.planned);
         let mut map = auth::PrincipalMap::generate(&context, &planned, &token);
         let mut setup_context = context.clone();
         let initially_held = &authorization.schemas;
@@ -884,6 +880,12 @@ impl Scratch<'_> {
         if !differences.is_empty() {
             return Err(Error::Externals(differences));
         }
+        // SQL Server refuses a grant the deployer cannot make outright, so the
+        // reproduction is verified against the target as read (above) and only
+        // then does the engine run the planned grants as the reproduced
+        // deployer: there is no projection to keep in step with it
+        // (DECISIONS 520, 521). PostgreSQL's reproduction projects the grants
+        // instead (`postgres/principals.rs`).
         auth::apply_planned(&mut compile, &map, &planned)
             .await
             .map_err(read)?;
@@ -905,7 +907,7 @@ impl Scratch<'_> {
         Ok(Prepared {
             dependencies: dependency_inputs.rehearsals(),
             compile,
-            map: scope::Principals::Mssql(map),
+            map,
             inventory: after,
             staged,
             scratch_catalog,
@@ -1404,6 +1406,24 @@ impl Binding {
         .await
         .map_err(super::catalog_read_failed)
     }
+}
+
+/// SQL Server's reproduction retains its original per-permission shape.
+fn mssql_planned(planned: &[scope::PlannedGrant]) -> Vec<auth::PlannedGrant> {
+    planned
+        .iter()
+        .flat_map(|grant| {
+            grant
+                .privilege
+                .split(", ")
+                .map(|permission| auth::PlannedGrant {
+                    principal: grant.principal.clone(),
+                    schema: grant.schema.clone(),
+                    permission: permission.to_owned(),
+                    revoke: grant.revoke,
+                })
+        })
+        .collect()
 }
 
 #[cfg(test)]
