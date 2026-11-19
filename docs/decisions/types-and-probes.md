@@ -6189,7 +6189,13 @@ answers the questions apart.
   collapsed to one space.
 - **The policy is one function, `types::standing`, and is provisional.** A word
   that is a reserved keyword is refused, because SQLite reads `int not null` as
-  a column with a constraint. A word on the promise list is refused wherever it
+  a column with a constraint. So are eight keywords that stand bare as a name
+  and are a syntax error inside a type (`cross`, `full`, `indexed`, `inner`,
+  `left`, `natural`, `outer`, `right`): the list of words refused as a bare
+  name is not the rule for a type, so every keyword is run on the engine in
+  type position. A type of 16 bytes or more that ends in `always` is refused
+  too: SQLite cuts that word, and a `generated` before it, from the text it
+  stores, so the column would not read back as declared. A word on the promise list is refused wherever it
   stands, because SQLite accepts `int auto_increment` and `int identity(1,1)` as
   a type whose text contains the word, and numbers nothing. A name goes on that
   list when the engine it comes from creates or restricts values as part of the

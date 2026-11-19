@@ -225,9 +225,10 @@ pub enum Standing {
 #[must_use]
 pub fn standing(base: &str) -> Standing {
     for word in base.split_ascii_whitespace() {
-        if keywords::is_reserved(word) {
+        if keywords::ends_type(word) {
             return Standing::Refused(
-                "it is a keyword, which ends the type name and starts a constraint",
+                "it holds a keyword SQLite does not take inside a type name: the word ends the \
+                 type and starts a constraint, or is a syntax error there",
             );
         }
         if let Some(&(_, why)) = PROMISES
@@ -376,6 +377,20 @@ pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
     if let Standing::Refused(why) = standing(&base) {
         return Err(invalid(format!(
             "`{}` cannot be a column type here: {why}",
+            ty.shown()
+        )));
+    }
+    // SQLite cuts a trailing `always`, and a `generated` before it, from the
+    // type it stores, once the text is 16 bytes or longer and has no
+    // arguments (measured; it compares the last six bytes, not a word). Such
+    // a type would not read back as declared.
+    if ty.args.is_empty()
+        && base.len() >= 16
+        && base.as_bytes()[base.len() - 6..].eq_ignore_ascii_case(b"always")
+    {
+        return Err(invalid(format!(
+            "`{}` ends in `always`, which SQLite drops from a type this long (with a `generated` \
+             before it), so the column would not read back as declared",
             ty.shown()
         )));
     }
