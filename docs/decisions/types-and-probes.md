@@ -6140,3 +6140,68 @@ The entries above still name the tools, as the record of how the moves were
 made; the scripts themselves are in the history at the merge of #2911. A later
 mechanical move of the same shape starts from that history instead of from a
 tool kept green against code it can no longer read.
+
+<a id="dec-2950-2"></a>
+
+**DEC-2950.2. A SQLite type is a run of words whose letters decide its
+affinity; pbps writes any name the policy allows, with the affinity the rules
+give it (#2950).** The other two engines have a catalogue of type names. SQLite
+has none: it takes any run of words as a column's type, keeps the text as
+written, and uses the letters inside it for one purpose, the column's affinity.
+`point` is an integer column, `charm` is a text column, `uuid` is numeric, and
+`serial` is accepted and numbers nothing. `crates/pbps-sqlite/src/types.rs`
+answers the questions apart.
+
+- **Affinity is the engine's five rules, and nothing else.** In order, the text
+  contains `int` (integer), `char`, `clob` or `text` (text), `blob` or is empty
+  (no conversion), `real`, `floa` or `doub` (real), else numeric. The function
+  is tested against the engine over a corpus by two probes that tell all five
+  apart (`CAST('1.5' AS t)` and `CAST('12' AS t)`), not against the
+  documentation. Integer and numeric store every value alike; they differ in a
+  cast and in one more place, the rowid.
+- **Only `integer`, with no arguments, can be the rowid.** `int`, `bigint` and
+  `integer(5)` as a single-column primary key are ordinary columns that accept
+  NULL. So `int` and `integer` are two types, and a change between them is
+  `Narrowing`: a rebuild would turn stored NULLs into numbers.
+- **Lengths and precisions are compared as declared.** SQLite enforces none, so
+  `varchar(10)` to `varchar(20)` moves no value and is `Safe`, but it is still a
+  change of declaration and is planned as one. Two names of one affinity are
+  also two types (`varchar` and `text`), and a change between them is `Safe`.
+- **One alias table, for spellings that cannot differ in effect:** `double
+  precision` is `double`, `character varying` and `varying character` are
+  `varchar`, `native character` is `nchar`. Each pair has one affinity, is
+  outside STRICT's six and has no rowid alias. Whitespace inside a name is
+  collapsed to one space.
+- **The policy is one function, `types::standing`, and is provisional.** A word
+  that is a reserved keyword is refused, because SQLite reads `int not null` as
+  a column with a constraint. A word on the promise list is refused wherever it
+  stands, because SQLite accepts `int auto_increment` and `int identity(1,1)` as
+  a type whose text contains the word, and numbers nothing. A name goes on that
+  list when the engine it comes from creates or restricts values as part of the
+  type and SQLite does neither: numbering (`serial` and its sized forms,
+  `identity`, `auto_increment`, `autoincrement`), a version that changes by
+  itself (`rowversion`), a set of allowed values (`enum`). The list is about
+  promised behaviour, not affinity. A documented name is documented; every other
+  name is unlisted: written with the affinity the rules give it and marked, so a
+  later layer can say what that affinity does (`uuid` is numeric, and digit-only
+  text is stored as a number).
+- **STRICT keeps its closed set:** `int`, `integer`, `real`, `text`, `blob`,
+  `any`, no arguments. The model has no table flag for it yet, so this is the
+  rule a declaration will be checked against and nothing can ask for it.
+- **Arguments** are at most two non-negative whole numbers, as SQLite takes and
+  ignores them; `max`, a name, a negative number, three, a trailing word after
+  the parentheses and any argument position inside the name are refused.
+
+Rejected:
+- **A closed catalogue of the documented names (option A).** It refuses most
+  existing databases at `pull`, because applications declare `uuid`, `json`,
+  `timestamp` and `boolean` freely. It stays one line away: `standing` returns
+  `Refused` instead of `Unlisted` in its last branch, and the policy table
+  test (`unlisted_names_are_written_with_their_rule_affinity`) changes in step.
+  The maintainer's answer is still to come.
+- **Equal when the affinity is equal.** It would hide the rowid difference and
+  STRICT's set, and a declaration would stop meaning what it says.
+
+Pinned by the affinity oracle test, the policy table, the catalog round trip
+(a normalized type written, read back and normalized is unchanged), and the
+STRICT and rowid tests against the real engine.
