@@ -105,3 +105,106 @@ fn the_counts_the_scheduler_asks_for_are_the_statements_written() {
         );
     }
 }
+
+fn child(parent: &str) -> Table {
+    let mut t = table(&[("id", col("integer")), ("owner", col("integer"))]);
+    t.foreign_keys.insert(
+        pbps_model::ObjectLocalName::new("f_owner"),
+        pbps_model::ForeignKey {
+            columns: vec!["owner".into()],
+            references_table: tn(parent),
+            references_columns: vec!["id".into()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        },
+    );
+    t
+}
+
+fn parent() -> Table {
+    let mut t = table(&[("id", col("integer"))]);
+    t.primary_key = Some(pbps_model::PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+        filegroup: None,
+    });
+    t
+}
+
+/// Plans `base` to `declared` on the differ's route, runs it on `base_sql` and
+/// compares with `declared_sql` built directly.
+fn reaches(base: &Schema, base_sql: &str, declared: &Schema, declared_sql: &str) -> Vec<String> {
+    let d = Sqlite::default();
+    let out = plan((base, &ids(base, &[])), (declared, &ids(declared, &[])), &d).expect("plans");
+    let mut db = built(base_sql);
+    run(db.connection(), &out).unwrap_or_else(|e| panic!("{e}\nplan: {:#?}", sql_text(&out)));
+    assert_same(
+        &catalog_of(&mut db),
+        &catalog_of(&mut built(declared_sql)),
+        "the plan reaches the declared schema",
+    );
+    sql_text(&out).into_iter().map(str::to_owned).collect()
+}
+
+const PARENT: &str = "CREATE TABLE p(id integer, PRIMARY KEY (id))";
+const CHILD: &str = "CREATE TABLE c(id integer, owner integer, \
+                     CONSTRAINT f_owner FOREIGN KEY (owner) REFERENCES p (id))";
+
+/// The differ plans a new table's foreign key as its own change. SQLite cannot
+/// add one, so it is written in the table's `CREATE`, through the real route.
+#[test]
+fn a_new_tables_foreign_key_is_written_in_its_create_on_the_planning_route() {
+    let base = schema(&[("p", parent())], &[]);
+    let declared = schema(&[("p", parent()), ("c", child("p"))], &[]);
+    let out = reaches(&base, PARENT, &declared, &[PARENT, CHILD].join(";"));
+    assert_eq!(out.len(), 1, "{out:#?}");
+    assert!(out[0].contains("FOREIGN KEY"), "{out:#?}");
+    // Both new at once: a `CREATE` may reference a table that is not there
+    // yet, so the order of the two does not matter (measured below).
+    let out = reaches(
+        &Schema::default(),
+        "",
+        &declared,
+        &[PARENT, CHILD].join(";"),
+    );
+    assert_eq!(out.len(), 2, "{out:#?}");
+    // The key is never counted as a statement of its own.
+    let key = Change::Constraint(pbps_model::ConstraintChange::AddForeignKey {
+        table: tn("c"),
+        name: pbps_model::ObjectLocalName::new("f_owner"),
+        constraint: Box::new(child("p").foreign_keys.into_values().next().expect("one")),
+    });
+    assert_eq!(
+        pbps_dialect::Dialect::statement_count(
+            &Sqlite::default(),
+            &key,
+            Default::default(),
+            pbps_model::PlanMode::Transactional
+        ),
+        Ok(0)
+    );
+    let mut db = built(&["CREATE TABLE c(owner integer REFERENCES p (id))", PARENT].join(";"));
+    db.connection()
+        .execute_batch(
+            "PRAGMA foreign_keys = ON; INSERT INTO p VALUES (1); INSERT INTO c VALUES (1)",
+        )
+        .expect("the child was created before its parent and the key holds");
+}
+
+/// Negative: a key added to a table the plan does not create is the rebuild's,
+/// and never an empty success.
+#[test]
+fn a_foreign_key_added_to_a_standing_table_is_still_refused() {
+    let plain = table(&[("id", col("integer")), ("owner", col("integer"))]);
+    let base = schema(&[("p", parent()), ("c", plain)], &[]);
+    let declared = schema(&[("p", parent()), ("c", child("p"))], &[]);
+    let d = Sqlite::default();
+    let error = plan(
+        (&base, &ids(&base, &[])),
+        (&declared, &ids(&declared, &[])),
+        &d,
+    )
+    .expect_err("refused");
+    assert!(error.contains("rebuild"), "{error}");
+}

@@ -102,15 +102,14 @@ fn add(table: &TableName, name: &ColumnName, column: &Column) -> Sql {
         )));
     }
     let default = declared_default(column)?;
-    if let Some(text) = &default
-        && !validate::default_is_constant(text)
-    {
+    let constant = default.as_deref().map(validate::default_constant);
+    if let (Some(text), Some(None)) = (&default, constant) {
         return Err(rebuild(&format!(
             "adding the column `{shown}` with the default `{text}`: ADD COLUMN refuses CURRENT_TIME, CURRENT_DATE, CURRENT_TIMESTAMP and every expression as a default"
         )));
     }
-    let valued = default
-        .as_deref()
+    let valued = constant
+        .flatten()
         .is_some_and(|text| !text.eq_ignore_ascii_case("null"));
     if !column.nullable && !valued {
         return Err(not_built(format!(

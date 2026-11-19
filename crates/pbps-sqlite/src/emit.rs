@@ -36,7 +36,7 @@
 //! newer token. [`allows_under`] is the one place that decision lives (DEC-2950.4).
 
 use pbps_dialect::{DialectError, Statement};
-use pbps_model::{Change, TableName};
+use pbps_model::{Change, ConstraintChange, PlannedChange, TableChange, TableName};
 
 use crate::dialect::Sqlite;
 use crate::validate::{SCHEMA, not_built, unsupported};
@@ -133,6 +133,56 @@ pub(crate) fn allows_under(gate: Gate, floor: Version, form: Form) -> bool {
 /// Emits one change for a project on `dialect`'s floor.
 pub(crate) fn emit(dialect: &Sqlite, change: &Change) -> Sql {
     emit_under(GATE, dialect, change)
+}
+
+/// Emits the change at `position` of a plan.
+///
+/// The differ takes a new table's foreign keys out of its `CreateTable` and
+/// plans each as an `AddForeignKey`, because other engines add them once every
+/// table exists. SQLite has no statement that adds one, and needs none: a
+/// `CREATE TABLE` may reference a table that is not there yet (measured). So
+/// the keys the plan adds to a table it creates are written inside that
+/// table's `CREATE`, and each such `AddForeignKey` writes nothing of its own.
+/// One on a table the plan does not create is still the rebuild's.
+pub(crate) fn emit_at(dialect: &Sqlite, changes: &[PlannedChange], position: usize) -> Sql {
+    let change = &changes[position].change;
+    if let Change::Constraint(ConstraintChange::AddForeignKey { table, .. }) = change
+        && changes.iter().any(|planned| {
+            matches!(&planned.change,
+                Change::Table(TableChange::CreateTable { name, .. }) if name == table)
+        })
+    {
+        return Ok(Vec::new());
+    }
+    if let Change::Table(TableChange::CreateTable { name, .. }) = change
+        && added(changes, name).next().is_some()
+    {
+        let mut whole = change.clone();
+        if let Change::Table(TableChange::CreateTable { table, .. }) = &mut whole {
+            table.foreign_keys.extend(added(changes, name));
+        }
+        return emit(dialect, &whole);
+    }
+    emit(dialect, change)
+}
+
+/// The foreign keys a plan adds to the table `to`.
+fn added<'a>(
+    changes: &'a [PlannedChange],
+    to: &'a TableName,
+) -> impl Iterator<Item = (pbps_model::ObjectLocalName, pbps_model::ForeignKey)> + 'a {
+    changes.iter().filter_map(move |planned| {
+        if let Change::Constraint(ConstraintChange::AddForeignKey {
+            table,
+            name,
+            constraint,
+        }) = &planned.change
+            && table == to
+        {
+            return Some((name.clone(), (**constraint).clone()));
+        }
+        None
+    })
 }
 
 /// [`emit`] under a stated gate, so each form's test runs under both.

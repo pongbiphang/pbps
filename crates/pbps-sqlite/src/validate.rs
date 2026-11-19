@@ -137,12 +137,32 @@ fn expression(text: &str) -> bool {
 #[must_use]
 pub fn default_value(text: &str) -> bool {
     let text = text.trim_matches(lexis::is_space);
+    if literal(text)
+        || matches!(
+            text.to_ascii_lowercase().as_str(),
+            "current_time" | "current_date" | "current_timestamp"
+        )
+    {
+        return true;
+    }
+    match text
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        Some(inner) => expression(inner),
+        None => false,
+    }
+}
+
+/// A signed number, a complete string, a blob literal, `NULL`, `TRUE` or
+/// `FALSE`, and nothing else.
+fn literal(text: &str) -> bool {
     if types::signed_number(text) {
         return true;
     }
     if matches!(
         text.to_ascii_lowercase().as_str(),
-        "null" | "true" | "false" | "current_time" | "current_date" | "current_timestamp"
+        "null" | "true" | "false"
     ) {
         return true;
     }
@@ -158,23 +178,26 @@ pub fn default_value(text: &str) -> bool {
         let hex = inside.len() % 2 == 0 && inside.chars().all(|c| c.is_ascii_hexdigit());
         return lexis::is_one_string(literal) && (!blob || hex);
     }
-    match text
+    false
+}
+
+/// The constant a default that [`default_value`] accepts is, if it is one: a number, a
+/// string, a blob, `NULL`, `TRUE` or `FALSE`. `ALTER TABLE .. ADD COLUMN`
+/// refuses the rest (`CURRENT_TIME`, `CURRENT_DATE`, `CURRENT_TIMESTAMP` and
+/// every computed expression, even `(1+2)`), measured on 3.54.1. Parentheses
+/// around a constant, nested or not, leave it a constant (`(1)`, `((-1))`,
+/// `('a')`), measured too. The engine also folds a sign outside the
+/// parentheses (`(-(1))`); that one stays the rebuild's.
+#[must_use]
+pub(crate) fn default_constant(text: &str) -> Option<&str> {
+    let mut text = text.trim_matches(lexis::is_space);
+    while let Some(inner) = text
         .strip_prefix('(')
         .and_then(|rest| rest.strip_suffix(')'))
     {
-        Some(inner) => expression(inner),
-        None => false,
+        text = inner.trim_matches(lexis::is_space);
     }
-}
-
-/// Whether a default that [`default_value`] accepts is a constant: a number, a
-/// string, a blob, `NULL`, `TRUE` or `FALSE`. `ALTER TABLE .. ADD COLUMN`
-/// refuses the rest (`CURRENT_TIME`, `CURRENT_DATE`, `CURRENT_TIMESTAMP` and
-/// every expression in parentheses, even `(1+2)`), measured on 3.54.1.
-#[must_use]
-pub(crate) fn default_is_constant(text: &str) -> bool {
-    let text = text.trim_matches(lexis::is_space);
-    !(text.starts_with('(') || text.to_ascii_lowercase().starts_with("current_"))
+    literal(text).then_some(text)
 }
 
 /// What is wrong with one column's type, default, value source and

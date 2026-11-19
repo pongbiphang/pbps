@@ -178,6 +178,14 @@ impl Dialect for Sqlite {
         _strategy: Strategy,
         _mode: pbps_model::PlanMode,
     ) -> Result<usize, DialectError> {
+        // A foreign key is never a statement of its own here: in a plan it is
+        // written inside its table's `CREATE`, or the plan is not emitted.
+        if matches!(
+            change,
+            Change::Constraint(pbps_model::ConstraintChange::AddForeignKey { .. })
+        ) {
+            return Ok(0);
+        }
         emit::emit(self, change).map(|statements| statements.len())
     }
 }
@@ -208,12 +216,13 @@ impl Sqlite {
         position: usize,
         mode: pbps_model::PlanMode,
     ) -> Result<Vec<Statement>, DialectError> {
-        let planned = &pbps_dialect::PlanPayload::changes(plan).changes[position];
+        let changes = &pbps_dialect::PlanPayload::changes(plan).changes;
+        let planned = &changes[position];
         pbps_dialect::drop_requirements::emit(
             planned.drop_guard.as_ref(),
             mode,
             types::DIALECT,
-            || emit::emit(self, &planned.change),
+            || emit::emit_at(self, changes, position),
         )
     }
 }
