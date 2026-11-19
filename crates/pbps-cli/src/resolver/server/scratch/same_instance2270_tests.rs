@@ -148,7 +148,7 @@ async fn automatic_externals(default: &'static str) {
         let (catalog, authorization) = crate::resolver::scope::read_target(
             &mut target, Driver::Mssql, &request.schemas, &[], &request.schemas, &[],
         ).await.unwrap();
-        let prepared = state.prepare(provisioning, &mut admin, &mut target, &catalog, &authorization, &request.schemas, &binding, &[], Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key())).await;
+        let prepared = MssqlEngine::prepare(&mut state, provisioning, &mut admin, &mut target, &catalog, &authorization, &request.schemas, &binding, &[], Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key())).await;
         let checked = async {
             let super::super::engine::Prepared::Mssql(mut prepared) = prepared? else { panic!("wrong engine"); };
             assert!(prepared.staged.compared().contains(&capture::object("dbo", "external2270")));
@@ -160,7 +160,7 @@ async fn automatic_externals(default: &'static str) {
             assert!(prepared.compile.execute("REVERT;").await.is_err());
             Ok::<(), Error>(())
         }.await;
-        state.release(&mut admin).await.unwrap();
+        MssqlEngine::release(&mut state, &mut admin).await.unwrap();
         checked.unwrap();
         assert!(sql::inventory::read(&mut connection(&scratch_url).await, None).await.unwrap().is_empty());
     }).await;

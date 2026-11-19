@@ -27,7 +27,7 @@
 
 use super::producer::{Identity, Opening, Sealing, Unsealed, request};
 use super::{BindingRequest, Error, ProduceError, ResolvedPlan, engine, resolution};
-use crate::resolver::contract;
+use crate::resolver::contract::{self, ResolverEngine};
 use crate::resolver::scope;
 use pbps_db::resolver::environment::Verdict;
 use pbps_db::{Conn, Driver};
@@ -208,7 +208,7 @@ pub enum Provisioning {
     Supplied,
 }
 
-struct Run<'a> {
+struct Run<'a, D: super::PlanningDialect> {
     driver: Driver,
     planned_identity: &'a str,
     key: &'a pbps_db::fingerprint::EnvironmentFingerprintKey,
@@ -216,12 +216,12 @@ struct Run<'a> {
     tokens: &'a Tokens,
     externals: Option<&'a str>,
     provenance: &'a Provenance,
-    state: engine::Scratch<'a>,
+    state: engine::Scratch<'a, D>,
 }
 
-impl Run<'_> {
+impl<D: super::PlanningDialect> Run<'_, D> {
     #[allow(clippy::too_many_arguments)]
-    async fn resolve<D: super::PlanningDialect>(
+    async fn resolve(
         &mut self,
         provisioning: Provisioning,
         target: &mut Conn,
@@ -267,20 +267,19 @@ impl Run<'_> {
         let opening_catalog = target_catalog.clone();
         // What the externals file lacks is filled from the target (#1778,
         // DEC-1778.2); which of it the file holds is known once it has run.
-        let mut prepared = self
-            .state
-            .prepare(
-                provisioning,
-                admin,
-                target,
-                &target_catalog,
-                &authorization,
-                &scope_schemas,
-                binding,
-                &request.write_path_extras,
-                Some(self.key),
-            )
-            .await?;
+        let mut prepared = <D::Resolver as ResolverEngine>::prepare(
+            &mut self.state,
+            provisioning,
+            admin,
+            target,
+            &target_catalog,
+            &authorization,
+            &scope_schemas,
+            binding,
+            &request.write_path_extras,
+            Some(self.key),
+        )
+        .await?;
         // The expected visibility is the deployer's after the plan's own
         // grants.
         authorization.project_visibility(
@@ -322,21 +321,26 @@ impl Run<'_> {
             }
         }
         let extras = &request.write_path_extras;
-        let mut reconstruction = self
-            .state
-            .reconstruction(
-                target,
-                binding,
-                desired.ids,
-                &hints.annotations.modules(desired.schema),
-                &mut prepared,
-            )
-            .await?;
+        let mut reconstruction = <D::Resolver as ResolverEngine>::reconstruction(
+            &self.state,
+            target,
+            binding,
+            desired.ids,
+            &hints.annotations.modules(desired.schema),
+            &mut prepared,
+        )
+        .await?;
         let chains = reconstruction.chains(&prepared);
         let mut staged = if self.externals.is_some() || prepared.has_filled() {
-            self.state
-                .compare_externals(provisioning, &mut prepared, admin, target, &reconstruction)
-                .await?
+            <D::Resolver as ResolverEngine>::compare_externals(
+                &self.state,
+                provisioning,
+                &mut prepared,
+                admin,
+                target,
+                &reconstruction,
+            )
+            .await?
         } else {
             engine::staged(driver, &prepared)?
         };

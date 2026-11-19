@@ -457,7 +457,7 @@ pub struct Scratch<'a> {
 /// (#2432). One strategy for each placement, so no rehearsal creates, or leaves
 /// on a cluster other runs use, a role it should not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::resolver::server) enum Naming {
+pub enum Naming {
     /// The scratch is on the target's own cluster: the roles are the target's
     /// real ones and are there. Nothing is created, recorded or asked of the
     /// account, and the scratch database's own cleanup takes every grant and
@@ -494,7 +494,7 @@ impl Naming {
 
 /// The scratch side, provisioned and qualified: the session the declarations
 /// compile in, the session that captures what they bound, and the scope.
-pub(in crate::resolver::server) struct Prepared {
+pub struct Prepared {
     sessions: Sessions,
     pub(super) scratch_catalog: CatalogFacts,
     pub(super) map: scope::Principals,
@@ -1857,7 +1857,7 @@ impl Scratch<'_> {
 }
 
 /// The private reconstruction and the target links it is compared against.
-pub(in crate::resolver::server) struct Binding {
+pub struct Binding {
     base_managed: Managed,
     desired_managed: Managed,
     links: Vec<externals::Link>,

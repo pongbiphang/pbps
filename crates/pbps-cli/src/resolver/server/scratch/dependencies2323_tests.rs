@@ -221,7 +221,8 @@ async fn prepare_probe(
     )
     .await
     .unwrap();
-    let prepared = Box::pin(state.prepare(
+    let prepared = Box::pin(MssqlEngine::prepare(
+        &mut state,
         provisioning,
         &mut admin,
         &mut target,
@@ -265,7 +266,7 @@ async fn prepare_probe(
         let companion_views=observer.query("SELECT name FROM sys.views WHERE is_ms_shipped=0 ORDER BY name;").await.unwrap().iter().map(|r|r.try_get::<&str>("name").unwrap().unwrap().to_owned()).collect();
         Ok(Observation { rehearsals: prepared.dependencies, columns, kind, nonnullable, private_tables, write_error, view_indexes, companion_views })
     }).await;
-    state.release(&mut admin).await.unwrap();
+    MssqlEngine::release(&mut state, &mut admin).await.unwrap();
     verified.unwrap()
 }
 

@@ -6660,3 +6660,38 @@ of a disagreeing binding and a missing key), the `compile_fail` doctest on
 `Standard<D>`, `every_engine_validates_binding_sides_and_key_before_connections`,
 and the live scratch tests of both engines. Formats: none. No sealed bytes,
 plan, state or evidence change.
+
+<a id="dec-2798-7"></a>
+
+**DEC-2798.7. The scratch state is typed by the engine: a generic associated
+`Scratch<'a>` with boxed steps compiles through the supervisor's spawn, so
+nothing is erased (#2798, route step 3).** DEC-2798.6 typed the standard and
+the acquisition and left the scratch a two-engine union. The remaining doubt
+was whether a lifetime-generic associated `Scratch<'a>` with a boxed `release`,
+implemented for both engines, still gives a `Send` future where the supervisor
+spawns the run. It does, with no `unsafe`, no erasure and no fallback. The
+adapters' `Prepared` and `Binding` are widened to `pub` inside their private
+modules for the same reason their `Scratch` was: the trait's signatures name
+them. Fields stay private and no constructor is added.
+
+**What moved.** `ResolverEngine` now carries `Scratch<'a>` and the steps that
+take one: `release`, `prepare_code`, `prepare`, `reconstruction`,
+`compare_externals`, `naming` and `rehearsal_roles`, each engine's arm moved
+unchanged from the union's methods into its own `contract.rs`. `acquire`
+returns the engine's own scratch, and the run is `Run<'a, D>`. The union is
+gone, so a scratch of one engine cannot be handed to another engine's step.
+`NoResolver<D>`'s scratch is uninhabited: every step after acquisition is
+unreachable by type, where DEC-2798.6 could only refuse at acquisition.
+
+**What stays aliased.** `Prepared`, `Binding` and `Staged` are still the
+two-engine unions, named in the trait's signatures rather than as associated
+types: an associated type that merely aliased them would be opaque to the run's
+generic code, which reads them through the unions' methods. They become
+associated types when their own group moves, and until then the mixed pairs of
+`reconstruction` and `compare_externals` stay explicit named errors in each
+engine's impl. A question only one engine can answer (a code vet, a cluster
+role name) stays an explicit named error in the other engine's impl.
+
+Pinned by the tests of DEC-2798.6, which this change leaves as they are, and by
+the live scratch tests of both engines. Formats: none. No sealed bytes, plan,
+state or evidence change.

@@ -136,28 +136,28 @@ pub(super) async fn observe(
     .await
     .map_err(|e| Error::Binding(e.to_string()))?;
     let result = Box::pin(async {
-        let mut prepared = state
-            .prepare(
-                provisioning,
-                &mut admin,
-                &mut source,
-                &catalog,
-                &authorization,
-                &request.schemas,
-                &binding,
-                &[],
-                Some(&key),
-            )
-            .await?;
-        let mut reconstruction = state
-            .reconstruction(
-                &mut source,
-                &binding,
-                &ids,
-                &Default::default(),
-                &mut prepared,
-            )
-            .await?;
+        let mut prepared = MssqlEngine::prepare(
+            &mut state,
+            provisioning,
+            &mut admin,
+            &mut source,
+            &catalog,
+            &authorization,
+            &request.schemas,
+            &binding,
+            &[],
+            Some(&key),
+        )
+        .await?;
+        let mut reconstruction = MssqlEngine::reconstruction(
+            &state,
+            &mut source,
+            &binding,
+            &ids,
+            &Default::default(),
+            &mut prepared,
+        )
+        .await?;
         let mut staged = super::super::engine::staged(Driver::Mssql, &prepared)?;
         reconstruction
             .compile(
@@ -184,8 +184,7 @@ pub(super) async fn observe(
         Ok((roots, placements))
     })
     .await;
-    state
-        .release(&mut admin)
+    MssqlEngine::release(&mut state, &mut admin)
         .await
         .map_err(|e| Error::Binding(format!("cleanup {e:?}")))?;
     result

@@ -239,19 +239,19 @@ async fn on_scratch(target: &str, scratch: &str) -> String {
     )
     .await
     .unwrap();
-    let prepared = state
-        .prepare(
-            provisioning,
-            &mut admin,
-            &mut target_conn,
-            &catalog,
-            &authorization,
-            &schemas,
-            &binding,
-            &[],
-            Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key()),
-        )
-        .await;
+    let prepared = MssqlEngine::prepare(
+        &mut state,
+        provisioning,
+        &mut admin,
+        &mut target_conn,
+        &catalog,
+        &authorization,
+        &schemas,
+        &binding,
+        &[],
+        Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key()),
+    )
+    .await;
     let landed = async {
         let super::super::engine::Prepared::Mssql(mut prepared) = prepared? else {
             panic!("wrong engine");
@@ -259,7 +259,7 @@ async fn on_scratch(target: &str, scratch: &str) -> String {
         Ok::<String, Error>(schema_of_probe(&mut prepared.compile).await)
     }
     .await;
-    state.release(&mut admin).await.unwrap();
+    MssqlEngine::release(&mut state, &mut admin).await.unwrap();
     landed.unwrap()
 }
 
