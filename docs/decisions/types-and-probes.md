@@ -6161,8 +6161,17 @@ answers the questions apart.
   cast and in one more place, the rowid.
 - **Only `integer`, with no arguments, can be the rowid.** `int`, `bigint` and
   `integer(5)` as a single-column primary key are ordinary columns that accept
-  NULL. So `int` and `integer` are two types, and a change between them is
-  `Narrowing`: a rebuild would turn stored NULLs into numbers.
+  NULL. So `int` and `integer` are two types. The cost of changing between them
+  depends on the direction, measured by rebuilding by hand: **into** the alias
+  (`int`, `bigint`, `numeric` or `integer(5)` to `integer`) is `Narrowing`,
+  because an `int` key may hold NULLs and the rebuild turns each into a number
+  (two NULLs became 1 and 2); **out of** it keeps every stored value and class
+  for a key column and for one that is not a key, so it follows the ordinary
+  storage rule (`Safe` between names of one storage behaviour). The function
+  sees types and not keys, so into-alias is `Narrowing` for any column, the
+  conservative side. What does change out of the alias is a later insert that
+  omits the key, which then stores NULL; that moves no stored value and is a
+  matter for a plan note, not this gate.
 - **Lengths and precisions are compared as declared.** SQLite enforces none, so
   `varchar(10)` to `varchar(20)` moves no value and is `Safe`, but it is still a
   change of declaration and is planned as one. Two names of one affinity are
@@ -6188,9 +6197,26 @@ answers the questions apart.
 - **STRICT keeps its closed set:** `int`, `integer`, `real`, `text`, `blob`,
   `any`, no arguments. The model has no table flag for it yet, so this is the
   rule a declaration will be checked against and nothing can ask for it.
-- **Arguments** are at most two non-negative whole numbers, as SQLite takes and
-  ignores them; `max`, a name, a negative number, three, a trailing word after
-  the parentheses and any argument position inside the name are refused.
+- **Arguments** are what SQLite takes, measured: one or two signed numbers,
+  which it ignores. A sign, a space after it, decimals (`1.5`, `.5`, `5.`),
+  exponents, hex, any length are all valid, and the model carries every one (a
+  whole number as `Int`, anything else as text), so all are accepted and
+  compared as declared. `max`, a name, a string, `NULL`, `1_000`, a second
+  sign, `1e`, `0x`, a third argument, a trailing word after the parentheses and
+  any argument position inside the name are refused, as SQLite refuses them.
+- **Type words** follow the engine, not the model's parser: letters, digits,
+  `_`, `$` and non-ASCII characters, not starting with a digit or `$`, so a type
+  built outside the parser (a saved plan, the catalog reader) is not refused
+  for a spelling SQLite takes.
+- **Known gaps for the catalog reader (item 4),** each valid SQLite that
+  `normalize` refuses and each pinned by a test that names it: a column with no
+  declared type (the model has no empty type: its parser refuses it and a saved
+  plan would not read back); a comment inside the parentheses (the model splits
+  arguments at every comma); an array spelling such as `text[]`, a word on the
+  promise list such as `int auto_increment`, and a quoted type word that is a
+  keyword such as `"not null"`, which are refused on purpose because writing
+  them unquoted would say something else. The reader reports each by name and
+  does not guess.
 
 Rejected:
 - **A closed catalogue of the documented names (option A).** It refuses most
@@ -6203,5 +6229,7 @@ Rejected:
   STRICT's set, and a declaration would stop meaning what it says.
 
 Pinned by the affinity oracle test, the policy table, the catalog round trip
-(a normalized type written, read back and normalized is unchanged), and the
-STRICT and rowid tests against the real engine.
+(a normalized type written, read back and normalized is unchanged), the
+argument and type-word tests that run every form against the real engine in
+both directions, the hand rebuild of both rowid directions, and the STRICT and
+rowid tests.

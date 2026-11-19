@@ -84,7 +84,7 @@ pub fn affinity_of(ty: &ColumnType) -> Affinity {
 /// Whether a column of this type can be the table's rowid: the declared type
 /// is exactly `integer`, no arguments, and (elsewhere) the only primary key
 /// column. `int`, `bigint` and `integer(5)` are ordinary columns that accept
-/// NULL (measured).
+/// NULL (measured). A column that is not a key is no alias under either name.
 #[must_use]
 pub fn rowid_alias(ty: &ColumnType) -> bool {
     ty.base == "integer" && ty.args.is_empty()
@@ -221,7 +221,7 @@ pub enum Standing {
 /// that then changes.
 #[must_use]
 pub fn standing(base: &str) -> Standing {
-    for word in base.split_whitespace() {
+    for word in base.split_ascii_whitespace() {
         if keywords::is_reserved(word) {
             return Standing::Refused(
                 "it is a keyword, which ends the type name and starts a constraint",
@@ -251,15 +251,66 @@ fn invalid(message: String) -> DialectError {
     }
 }
 
-/// A word SQLite reads as a plain name: a letter or `_`, then letters, digits
-/// and `_`. The model's parser already refuses anything else; a type built
-/// another way (a saved plan, a state snapshot) is held to it here.
+/// A word SQLite reads as one plain name, measured on 3.54.1: it starts with a
+/// letter, `_` or any non-ASCII character, and goes on with letters, digits,
+/// `_`, `$` and non-ASCII characters (`a$b`, `naïve` and `日本語` are accepted,
+/// `$a`, `1a`, `a-b`, `a#b` are not). The model's parser is narrower (ASCII
+/// letters, digits and `_`), but a type built another way, a saved plan or a
+/// state snapshot, is held to the engine's rule and not the parser's.
 fn is_word(word: &str) -> bool {
     let mut chars = word.chars();
     chars
         .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || !c.is_ascii())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii())
+}
+
+/// Whether `text` is a signed number as SQLite's grammar reads one inside the
+/// parentheses of a type, measured on 3.54.1: an optional `+` or `-`, then
+/// optional white space (`- 1` is accepted), then decimal digits, a decimal
+/// with a point (`1.5`, `.5`, `5.`), either with an exponent (`1e3`, `1E+3`,
+/// `1.5e-2`), or `0x` and hex digits. Any length. Refused by the engine and
+/// here: a second sign (`+-1`), `1e`, `0x`, `1.2.3`, `1_000`, a bare sign or
+/// point, and digits that are not ASCII.
+///
+/// A comment between the sign and the digits is also valid SQLite. It is not
+/// accepted here: the model splits arguments at every comma, so it cannot
+/// carry a comment that holds one, and nothing writes such a type (see the
+/// catalog reader's gap list in DEC-2950.2).
+fn signed_number(text: &str) -> bool {
+    let rest = text.strip_prefix(['+', '-']).map_or(text, |after| {
+        after.trim_start_matches([' ', '\t', '\n', '\r', '\x0c'])
+    });
+    if let Some(hex) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+        return !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    let digits = |part: &str| part.chars().all(|c| c.is_ascii_digit());
+    let (mantissa, exponent) = match rest.find(['e', 'E']) {
+        Some(at) => (&rest[..at], Some(&rest[at + 1..])),
+        None => (rest, None),
+    };
+    let mantissa_ok = match mantissa.split_once('.') {
+        Some((whole, fraction)) => {
+            digits(whole) && digits(fraction) && !(whole.is_empty() && fraction.is_empty())
+        }
+        None => !mantissa.is_empty() && digits(mantissa),
+    };
+    let exponent_ok = exponent.is_none_or(|e| {
+        let e = e.strip_prefix(['+', '-']).unwrap_or(e);
+        !e.is_empty() && digits(e)
+    });
+    mantissa_ok && exponent_ok
+}
+
+/// Whether SQLite takes this argument: a whole number, or a number the model
+/// holds as text (decimals, exponents, hex, a number too large for 64 bits,
+/// a space after the sign). `max` and names are syntax errors.
+fn takes_argument(arg: &TypeArg) -> bool {
+    match arg {
+        TypeArg::Int(_) => true,
+        TypeArg::Ident(text) => signed_number(text),
+        TypeArg::Max => false,
+    }
 }
 
 /// The canonical form of a declared type: words separated by one space, the
@@ -269,6 +320,12 @@ fn is_word(word: &str) -> bool {
 /// The result is idempotent, and it is the form the catalog read-back parses
 /// to: the model lower-cases a type's base, SQLite returns the text as
 /// written, and the two meet in this function.
+///
+/// Known gaps, valid SQLite this refuses, for the catalog reader to report by
+/// name (DEC-2950.2): a column with no declared type; a comment inside the
+/// parentheses; and, on purpose, an array spelling, a promise-list word and a
+/// quoted keyword, which would say something else once written unquoted. Each
+/// is pinned by a test that names it.
 pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
     if ty.type_ref().is_some() {
         return Err(invalid(format!(
@@ -289,10 +346,22 @@ pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
             ty.shown()
         )));
     }
-    let words: Vec<&str> = ty.base.split_whitespace().collect();
-    if words.is_empty() || !words.iter().all(|w| is_word(w)) {
+    let words: Vec<&str> = ty.base.split_ascii_whitespace().collect();
+    if words.is_empty() {
+        // Known gap: SQLite takes a column with no declared type (BLOB
+        // affinity, no conversion) and a catalog read finds many of them, but
+        // the model has no spelling for it: a type must not be empty, and the
+        // empty string does not survive the saved plan's own round trip.
         return Err(invalid(format!(
-            "`{}` is not a type name SQLite reads as one: words of letters, digits and `_`",
+            "`{}` is an empty type. SQLite accepts a column with no declared type (it keeps \
+             every value as given), but a declaration cannot say so; declare `blob`",
+            ty.shown()
+        )));
+    }
+    if !words.iter().all(|w| is_word(w)) {
+        return Err(invalid(format!(
+            "`{}` is not a type name SQLite reads as one: words of letters, digits, `_`, `$` \
+             and non-ASCII characters, not starting with a digit or `$`",
             ty.shown()
         )));
     }
@@ -307,15 +376,11 @@ pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
             ty.shown()
         )));
     }
-    // SQLite takes up to two numbers and ignores them. A name, `max` or a
-    // negative number is a syntax error or meaningless.
-    let numbers = ty
-        .args
-        .iter()
-        .all(|arg| matches!(arg, TypeArg::Int(n) if *n >= 0));
-    if ty.args.len() > 2 || !numbers {
+    // SQLite takes one or two signed numbers and ignores them; a name, `max`,
+    // a string or a third argument is a syntax error (measured).
+    if ty.args.len() > 2 || !ty.args.iter().all(takes_argument) {
         return Err(invalid(format!(
-            "`{}` has arguments SQLite does not take: at most two non-negative whole numbers",
+            "`{}` has arguments SQLite does not take: at most two signed numbers",
             ty.shown()
         )));
     }
@@ -342,8 +407,18 @@ pub fn strict_allows(ty: &ColumnType) -> bool {
 ///
 /// - Equal: `Safe`. A different length or precision with the same name:
 ///   `Safe`, since SQLite enforces none.
-/// - Whether the column could be the rowid changes (`int` to `integer`): the
-///   rebuild would turn stored NULLs into numbers, so `Narrowing`.
+/// - **Into** the rowid alias (`int` to `integer`, `integer(5)` to `integer`,
+///   `numeric` to `integer`): `Narrowing`. An `int` primary key may hold NULLs
+///   and a rebuild as `integer primary key` turns each into a number (measured:
+///   two NULLs became 1 and 2). The function sees types and not keys, so this
+///   holds for a column that is not a key too, where no value moves; that is
+///   the conservative side.
+/// - **Out of** the alias (`integer` to `int`, `numeric` or `integer(5)`): the
+///   ordinary storage rule below. An `integer primary key` holds no NULL and
+///   keeps every value under any other name (measured, rebuilt by hand into
+///   each). What does change is a later insert that omits the key: it stores
+///   NULL, no longer a number. That is not a stored value and is for a plan
+///   note, not this gate.
 /// - Same storage behaviour (`Integer` and `Numeric` store alike; any two
 ///   names of one other affinity): `Safe`.
 /// - Any other change of affinity rewrites stored values (a number becomes
@@ -356,7 +431,7 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
     if from == to {
         return TypeChangeRisk::Safe;
     }
-    if rowid_alias(&from) != rowid_alias(&to) {
+    if !rowid_alias(&from) && rowid_alias(&to) {
         return TypeChangeRisk::Narrowing;
     }
     // Which affinities store a value the same way.
@@ -744,8 +819,13 @@ mod tests {
             "app.mood",
             "varchar(max)",
             "varchar(a)",
-            "varchar(-1)",
             "varchar(1,2,3)",
+            "varchar('5')",
+            "varchar(1e)",
+            "varchar(0x)",
+            "varchar(+-1)",
+            "varchar(1.2.3)",
+            "varchar(1_000)",
             "timestamp(3) with time zone",
         ] {
             let parsed: Result<ColumnType, _> = declared.parse();
@@ -772,7 +852,7 @@ mod tests {
             assert!(error.contains(word), "{declared}: {error}");
         }
         // Types a saved plan could carry that the parser would not make.
-        for base in ["1abc", "a-b", "a;b", "", "a.b"] {
+        for base in ["1abc", "a-b", "a;b", "", "a.b", "$a", "a#b"] {
             let built = ColumnType::new(base, Vec::new());
             assert!(normalize(&built).is_err(), "{base:?}");
         }
@@ -892,6 +972,225 @@ mod tests {
         }
     }
 
+    /// Forms for the parentheses of a type, with what SQLite 3.54.1 did with
+    /// each (measured). `true` means `CREATE TABLE t(a varchar(<form>))` works.
+    const ARGUMENT_FORMS: [(&str, bool); 47] = [
+        ("10", true),
+        ("0", true),
+        ("-0", true),
+        ("-1", true),
+        ("+5", true),
+        (" 5 ", true),
+        ("1,2", true),
+        ("-1,-2", true),
+        ("1.5", true),
+        ("-1.5", true),
+        (".5", true),
+        ("5.", true),
+        ("5.e3", true),
+        ("1e3", true),
+        ("1E3", true),
+        ("1E+3", true),
+        ("1e-2", true),
+        ("+1.5e+2", true),
+        (".5e1", true),
+        ("0x10", true),
+        ("0X10", true),
+        ("-0x10", true),
+        ("00012", true),
+        ("1e0003", true),
+        ("99999999999999999999", true),
+        ("-9223372036854775809", true),
+        ("1.5,-2.5", true),
+        ("- 1", true),
+        ("+ 5", true),
+        ("-  1.5", true),
+        ("- 0x10", true),
+        ("1,2,3", false),
+        ("a", false),
+        ("max", false),
+        ("'5'", false),
+        ("NULL", false),
+        ("1_000", false),
+        ("1 2", false),
+        ("--1", false),
+        ("+-1", false),
+        ("0x", false),
+        ("1e", false),
+        ("1.2.3", false),
+        ("1e+", false),
+        (".", false),
+        ("+", false),
+        ("-", false),
+    ];
+
+    /// Type arguments, against the engine in both directions: a form SQLite
+    /// accepts is accepted here and one it refuses is refused. The model
+    /// carries every accepted form (a whole number as `Int`, anything else as
+    /// text), so nothing the engine takes is left out, and what each form
+    /// reads back as parses to the type that was written.
+    #[test]
+    fn arguments_are_accepted_exactly_when_the_engine_accepts_them() {
+        for (form, engine_accepts) in ARGUMENT_FORMS {
+            let declared = ["varchar(", form, ")"].concat();
+            let engine = mem()
+                .connection()
+                .execute_batch(&["CREATE TABLE t(a ", &declared, ")"].concat())
+                .is_ok();
+            assert_eq!(engine, engine_accepts, "the engine on {declared}");
+            let parsed: ColumnType = declared.parse().expect("the model carries the form");
+            assert_eq!(
+                normalize(&parsed).is_ok(),
+                engine,
+                "normalize on {declared}"
+            );
+            if engine {
+                // Written back in the model's own spelling, read back, parsed.
+                let normalized = normalize(&parsed).expect("accepted");
+                let mut fresh = mem();
+                let c = fresh.connection();
+                c.execute_batch(
+                    &["CREATE TABLE t(a ", &normalized.raw().to_string(), ")"].concat(),
+                )
+                .expect("the model's spelling is valid SQL");
+                let rows = c
+                    .query("SELECT type FROM pragma_table_xinfo('t')", &[])
+                    .expect("read back");
+                let read: ColumnType = rows[0].text(0).expect("type").parse().expect("parse");
+                assert_eq!(
+                    normalize(&read).expect("normalizes"),
+                    normalized,
+                    "{declared}"
+                );
+            }
+        }
+        // Negative: a third argument and `max` are refused by both, and `Int`
+        // with a sign is a whole number the model carries.
+        assert!(normalize(&ty("varchar(-1)")).is_ok());
+        assert!(normalize(&ty("decimal(10,-2)")).is_ok());
+        assert!(normalize(&ty("varchar(1,2,3)")).is_err());
+        assert!(normalize(&ty("varchar(max)")).is_err());
+    }
+
+    /// A comment inside the parentheses is valid SQLite and is refused here:
+    /// the model splits arguments at every comma, so it cannot carry one that
+    /// holds a comma, and nothing writes such a type. Known gap for the
+    /// catalog reader (item 4), which reports such a column by name.
+    #[test]
+    fn a_comment_inside_the_parentheses_is_a_known_gap() {
+        for form in ["1/**/", "-/**/1"] {
+            let declared = ["varchar(", form, ")"].concat();
+            assert!(
+                mem()
+                    .connection()
+                    .execute_batch(&["CREATE TABLE t(a ", &declared, ")"].concat())
+                    .is_ok(),
+                "the engine accepts {declared}"
+            );
+            assert!(normalize(&ty(&declared)).is_err(), "{declared}");
+        }
+    }
+
+    /// Valid SQLite that is refused on purpose, because written unquoted it
+    /// would say something else: an array spelling, a promise-list word and a
+    /// quoted keyword. The engine takes all three and an existing database can
+    /// carry them, so they are named here as gaps for the catalog reader to
+    /// report, not left to look like oversights.
+    #[test]
+    fn valid_sqlite_that_is_refused_on_purpose_is_named() {
+        for (declared, read_back) in [
+            ("text[]", "text[]"),
+            ("int auto_increment", "int auto_increment"),
+            ("\"not null\"", "not null"),
+        ] {
+            let mut fresh = mem();
+            let c = fresh.connection();
+            c.execute_batch(&["CREATE TABLE t(a ", declared, ")"].concat())
+                .expect("the engine accepts it");
+            let rows = c
+                .query("SELECT type FROM pragma_table_xinfo('t')", &[])
+                .expect("type");
+            assert_eq!(rows[0].text(0).expect("type"), read_back);
+            let parsed: ColumnType = read_back.parse().expect("the model parses the read-back");
+            assert!(normalize(&parsed).is_err(), "{declared}");
+        }
+    }
+
+    /// Type words, against the engine: SQLite takes letters, digits, `_`, `$`
+    /// and every non-ASCII character in a word, and not a leading digit or
+    /// `$`. A type built outside the parser (a saved plan, the catalog
+    /// reader) is held to that, not to the parser's narrower rule.
+    #[test]
+    fn type_words_are_accepted_exactly_when_the_engine_accepts_them() {
+        for word in [
+            "a$",
+            "a$b$",
+            "é1",
+            "a\u{a0}b",
+            "_1",
+            "日本",
+            "Ωmega",
+            "a\u{2003}b",
+            "x\u{200b}y",
+            "tYpe_1",
+            "$a",
+            "9",
+            "1a",
+            "a#b",
+            "a@b",
+            "a:b",
+            "a?b",
+            "a-b",
+            "a;b",
+            "a.b",
+        ] {
+            let engine = mem()
+                .connection()
+                .execute_batch(&["CREATE TABLE t(a ", word, ")"].concat())
+                .is_ok();
+            let built = ColumnType::new(word, Vec::new());
+            assert_eq!(normalize(&built).is_ok(), engine, "{word:?}");
+        }
+        // The same words with a space between them are two words, and a
+        // non-ASCII space is part of one word, as the engine reads it.
+        assert!(normalize(&ColumnType::new("a$b c1", Vec::new())).is_ok());
+        assert_eq!(
+            normalize(&ColumnType::new("a\u{a0}b", Vec::new()))
+                .expect("one word")
+                .base,
+            "a\u{a0}b"
+        );
+    }
+
+    /// A column with no declared type is valid SQLite and common in existing
+    /// databases (BLOB affinity). The model cannot hold the empty type: its
+    /// parser refuses it and a saved plan's own round trip would fail. Known
+    /// gap for the catalog reader, which reports such a column by name;
+    /// `normalize` says so instead of calling it a bad name.
+    #[test]
+    fn a_column_with_no_declared_type_is_a_known_gap() {
+        let mut fresh = mem();
+        let c = fresh.connection();
+        c.execute_batch("CREATE TABLE t(a, b int)")
+            .expect("a typeless column");
+        let rows = c
+            .query("SELECT type FROM pragma_table_xinfo('t') ORDER BY cid", &[])
+            .expect("types");
+        assert_eq!(rows[0].text(0).expect("empty text"), "");
+        assert_eq!(affinity(""), Affinity::Blob);
+        assert!("".parse::<ColumnType>().is_err(), "the parser refuses it");
+        let built = ColumnType::new("", Vec::new());
+        assert!(
+            ColumnType::try_from(String::from(built.clone())).is_err(),
+            "and a serialized one could not be read back"
+        );
+        let error = normalize(&built).expect_err("empty").to_string();
+        assert!(
+            error.contains("empty type") && error.contains("no declared type"),
+            "{error}"
+        );
+    }
+
     /// What a change of declared type costs, with the engine's facts behind
     /// each class.
     #[test]
@@ -916,17 +1215,32 @@ mod tests {
             Safe,
             "INTEGER and NUMERIC store alike"
         );
+        // Into the rowid alias: stored NULLs would become numbers.
+        for from in ["int", "bigint", "numeric", "integer(5)"] {
+            assert_eq!(
+                risk(from, "integer"),
+                Narrowing,
+                "{from} into the rowid alias"
+            );
+        }
+        // Out of it: no value moves, so the ordinary storage rule applies.
+        for to in ["int", "bigint", "numeric", "integer(5)"] {
+            assert_eq!(
+                risk("integer", to),
+                Safe,
+                "integer out of the rowid alias to {to}"
+            );
+        }
         assert_eq!(
-            risk("int", "integer"),
+            risk("integer", "text"),
             Narrowing,
-            "the column could become the rowid"
+            "out of the alias, but a number becomes text"
         );
         assert_eq!(
-            risk("integer", "integer(5)"),
+            risk("integer", "real"),
             Narrowing,
-            "the rowid is lost"
+            "out of the alias, but a number becomes real"
         );
-        assert_eq!(risk("integer", "numeric"), Narrowing, "the rowid is lost");
         assert_eq!(risk("int", "text"), Narrowing, "a number becomes text");
         assert_eq!(risk("text", "int"), Narrowing, "`0012` becomes 12");
         assert_eq!(risk("real", "numeric"), Narrowing);
@@ -941,5 +1255,106 @@ mod tests {
             "equal is not enough"
         );
         assert_eq!(risk("varchar(10)", "text[]"), Incompatible);
+    }
+
+    /// The rowid claim, rebuilt by hand on the engine in both directions, for a
+    /// key column and a column that is not a key: create the new table, copy,
+    /// compare values, storage classes and NULL counts.
+    #[test]
+    fn a_rebuild_into_the_rowid_changes_values_and_out_of_it_does_not() {
+        fn count(c: &pbps_db::sqlite::Connection, sql: &str) -> i64 {
+            c.query(sql, &[]).expect("count")[0].integer(0).expect("n")
+        }
+        let identical = |c: &pbps_db::sqlite::Connection| {
+            count(
+                c,
+                "SELECT count(*) FROM (SELECT a, typeof(a), b FROM old EXCEPT SELECT a, typeof(a), b FROM new)",
+            ) == 0
+                && count(
+                    c,
+                    "SELECT count(*) FROM (SELECT a, typeof(a), b FROM new EXCEPT SELECT a, typeof(a), b FROM old)",
+                ) == 0
+        };
+        // Into the alias: an `int` key holding NULLs.
+        let mut fresh = mem();
+        let c = fresh.connection();
+        c.execute_batch(
+            "CREATE TABLE old(a int PRIMARY KEY, b); \
+             INSERT INTO old VALUES (NULL,'n1'),(NULL,'n2'),(7,'k7'); \
+             CREATE TABLE new(a integer PRIMARY KEY, b); INSERT INTO new SELECT a, b FROM old;",
+        )
+        .expect("rebuild into the alias");
+        assert_eq!(count(c, "SELECT count(*) FROM old WHERE a IS NULL"), 2);
+        assert_eq!(
+            count(c, "SELECT count(*) FROM new WHERE a IS NULL"),
+            0,
+            "the NULLs became numbers"
+        );
+        assert!(!identical(c));
+        // Out of the alias, key column: no NULL to lose, every value and class kept.
+        for target in ["int", "numeric", "integer(5)", "bigint"] {
+            let mut fresh = mem();
+            let c = fresh.connection();
+            c.execute_batch(
+                &[
+                    "CREATE TABLE old(a integer PRIMARY KEY, b); \
+                     INSERT INTO old VALUES (1,'x'),(5,'y'),(NULL,'z'); \
+                     CREATE TABLE new(a ",
+                    target,
+                    " PRIMARY KEY, b); INSERT INTO new SELECT a, b FROM old;",
+                ]
+                .concat(),
+            )
+            .expect("rebuild out of the alias");
+            assert!(identical(c), "integer key to {target} key");
+            assert_eq!(
+                count(c, "SELECT count(*) FROM new WHERE a IS NULL"),
+                0,
+                "{target}"
+            );
+        }
+        // Non-key columns, either direction: NULLs, numbers and text all kept.
+        for (from, to) in [
+            ("integer", "int"),
+            ("int", "integer"),
+            ("integer", "numeric"),
+            ("numeric", "integer"),
+        ] {
+            let mut fresh = mem();
+            let c = fresh.connection();
+            c.execute_batch(
+                &[
+                    "CREATE TABLE old(a ",
+                    from,
+                    ", b); INSERT INTO old VALUES (NULL,'n'),(3,'t'),('x','s'),(2.5,'f'); CREATE TABLE new(a ",
+                    to,
+                    ", b); INSERT INTO new SELECT a, b FROM old;",
+                ]
+                .concat(),
+            )
+            .expect("rebuild a non-key column");
+            assert!(identical(c), "non-key {from} to {to}");
+            assert_eq!(
+                count(c, "SELECT count(*) FROM new WHERE a IS NULL"),
+                1,
+                "{from} to {to}"
+            );
+        }
+        // The one thing that does change out of the alias: an insert that omits the key.
+        let omitted = |declared: &str| {
+            let mut fresh = mem();
+            let c = fresh.connection();
+            c.execute_batch(
+                &[
+                    "CREATE TABLE t(a ",
+                    declared,
+                    " PRIMARY KEY, b); INSERT INTO t(b) VALUES ('x');",
+                ]
+                .concat(),
+            )
+            .expect("insert");
+            count(c, "SELECT count(a) FROM t")
+        };
+        assert_eq!((omitted("integer"), omitted("int")), (1, 0));
     }
 }
