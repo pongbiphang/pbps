@@ -33,6 +33,15 @@ fn invalid(message: String) -> DialectError {
     }
 }
 
+/// The refusal of a ledger name. Tables, views and indexes share one
+/// namespace, so the ledger's two tables take their names from all three.
+fn ledger_name(what: &str) -> DialectError {
+    invalid(format!(
+        "{what} has the name of a ledger table this tool owns (SPEC §8.1), and SQLite keeps \
+         tables, views and indexes in one namespace; choose another name"
+    ))
+}
+
 fn unsupported(feature: impl Into<String>) -> DialectError {
     DialectError::Unsupported {
         dialect: DIALECT,
@@ -47,16 +56,9 @@ fn not_built(part: impl Into<String>) -> DialectError {
     }
 }
 
-/// A table or view name: in `main`, writable, not SQLite's own, and (for a
-/// table) not the ledger's.
-fn object(
-    kind: &str,
-    schema: &str,
-    local: &str,
-    shown: &str,
-    ledger: bool,
-    found: &mut Vec<DialectError>,
-) {
+/// A table or view name: in `main`, writable, not SQLite's own, and not one
+/// of the ledger's, which are taken in the namespace both share.
+fn object(kind: &str, schema: &str, local: &str, shown: &str, found: &mut Vec<DialectError>) {
     if schema != SCHEMA {
         found.push(unsupported(format!(
             "a schema other than `{SCHEMA}` (the {kind} `{shown}` is in `{}`); declare it as `{SCHEMA}.<name>`",
@@ -71,10 +73,8 @@ fn object(
             "the {kind} `{shown}` starts with `sqlite_`, which SQLite keeps for its own objects"
         )));
     }
-    if ledger && names::is_ledger(local) {
-        found.push(invalid(format!(
-            "the table `{shown}` is one of the ledger tables this tool owns (SPEC §8.1); name another table"
-        )));
+    if names::is_ledger(local) {
+        found.push(ledger_name(&format!("the {kind} `{shown}`")));
     }
 }
 
@@ -162,7 +162,7 @@ pub fn default_value(text: &str) -> bool {
 pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
     let mut found = Vec::new();
     let shown = name.shown().to_string();
-    object("table", &name.schema, &name.name, &shown, true, &mut found);
+    object("table", &name.schema, &name.name, &shown, &mut found);
 
     if table.columns.is_empty() {
         found.push(invalid(format!(
@@ -315,6 +315,9 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
                 "{what} starts with `sqlite_`, which SQLite keeps for its own objects"
             )));
         }
+        if names::is_ledger(index.raw()) {
+            found.push(ledger_name(&what));
+        }
         let mut keys = Vec::new();
         for key in &def.columns {
             match &key.key {
@@ -376,7 +379,7 @@ pub fn module(id: &ModuleId, module: &Module) -> Vec<DialectError> {
         ModuleKind::Trigger => vec![not_built(format!("triggers (`{shown}`)"))],
         ModuleKind::View => {
             let mut found = Vec::new();
-            object("view", &name.schema, &name.name, &shown, false, &mut found);
+            object("view", &name.schema, &name.name, &shown, &mut found);
             if id.args().is_some() {
                 found.push(invalid(format!("the view `{shown}` is declared with an argument list; SQLite identifies a view by name")));
             }
@@ -1282,6 +1285,50 @@ mod tests {
                 .any(is_invalid)
         );
         assert!(refusal("CREATE VIEW sqlite_v AS SELECT 1").contains("reserved"));
+    }
+
+    /// The ledger's two names are taken in the one namespace tables, views
+    /// and indexes share, so none of the three may carry one, in any case.
+    #[test]
+    fn a_view_or_an_index_named_like_a_ledger_table_is_refused() {
+        // The engine's side: with the ledger in place, each is refused.
+        for sql in [
+            "CREATE VIEW __pbps_state AS SELECT 1",
+            "CREATE VIEW __PBPS_LOCK AS SELECT 1",
+            "CREATE TABLE t(c); CREATE INDEX __pbps_lock ON t(c)",
+            "CREATE TABLE t(c); CREATE INDEX __Pbps_State ON t(c)",
+        ] {
+            let ledger = "CREATE TABLE __pbps_state(a); CREATE TABLE __pbps_lock(a); ";
+            assert!(!accepts(&[ledger, sql].concat()), "{sql}");
+            assert!(accepts(sql), "without the ledger the engine takes {sql}");
+        }
+        for name in ["__pbps_state", "__PBPS_LOCK"] {
+            let mut named = view("SELECT 1");
+            named.0 = ModuleId::Named(pbps_model::ObjectName::new("main", name));
+            let found = super::module(&named.0, &named.1);
+            assert!(
+                found.iter().any(is_invalid),
+                "view {name}: {}",
+                said(&found)
+            );
+        }
+        for name in ["__pbps_lock", "__Pbps_State"] {
+            let mut table = base();
+            table.indexes.insert(name.into(), index(&["c"]));
+            let found = errors(&table);
+            assert!(
+                found.iter().any(is_invalid),
+                "index {name}: {}",
+                said(&found)
+            );
+        }
+        // Negative: a name that only starts like one is free.
+        let mut near = view("SELECT 1");
+        near.0 = ModuleId::Named(pbps_model::ObjectName::new("main", "__pbps_states"));
+        assert!(super::module(&near.0, &near.1).is_empty());
+        let mut table = base();
+        table.indexes.insert("__pbps_locks".into(), index(&["c"]));
+        assert!(errors(&table).is_empty(), "{}", said(&errors(&table)));
     }
 
     /// What SQLite has no object for, and the trigger it has and this does not build.
