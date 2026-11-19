@@ -2662,6 +2662,59 @@ mod tests {
         assert!(error.downcast_ref::<crate::Found>().is_some(), "{error}");
     }
 
+    /// An engine that gave no answer to a question `doctor` requires is
+    /// unknown, not ready: the trait's default is an `Err`, and each `Err`
+    /// lands on a finding that stops the readiness claim. A third engine
+    /// cannot reach "ready" through a question it never answered.
+    #[test]
+    fn a_required_question_an_engine_never_answered_is_unknown_and_not_ready() {
+        use pbps_db::engine::not_answered;
+        let mut d = EnvDiagnosis::unknown("prod".to_owned(), Some("prod".to_owned()), "ready");
+        d.ledger = LedgerCheck::of(Err(not_answered("the ledger diagnostics", "Stub")));
+        append_cause(
+            &mut d.server_capabilities_unknown,
+            not_answered("the server version", "Stub").to_string(),
+        );
+        let findings = env_findings(
+            &d,
+            false,
+            &pbps_pg::Postgres::new(),
+            pbps_db::Driver::Postgres,
+        );
+        for id in ["ledger.unknown", "server.capabilities-unknown"] {
+            let found = findings.iter().find(|f| f.id == id);
+            let found = found.unwrap_or_else(|| panic!("{id} missing: {findings:?}"));
+            assert_eq!(found.severity, output::Severity::Error, "{id}");
+            assert!(found.message.contains("is not answered for Stub"), "{id}");
+        }
+        let report = output::Report::<Diagnosis>::new("doctor", findings, None);
+        // Two unknowns, each an unanswerable finding: the command could not
+        // answer, which is never the established difference of a `Found`.
+        assert_eq!(unanswerable(&report), 2);
+        let error = outcome(&report).unwrap_err();
+        assert!(error.downcast_ref::<crate::Found>().is_none(), "{error}");
+    }
+
+    /// The advisory partition question is the other direction: an engine
+    /// without it gets a warning that says so, which neither fails the
+    /// environment nor reads as a clean runway.
+    #[test]
+    fn a_partition_runway_not_available_is_a_warning_and_not_a_clean_bill() {
+        let mut d = EnvDiagnosis::unknown("prod".to_owned(), Some("prod".to_owned()), "ready");
+        d.partitions = PartitionCheck::Unreadable(
+            pbps_db::engine::partition_runway_not_available("Stub").to_string(),
+        );
+        let findings = partition_findings(&d);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].severity, output::Severity::Warning);
+        assert!(
+            findings[0]
+                .message
+                .contains("partition runway is not available for Stub: ")
+        );
+        assert!(findings[0].message.contains("undetermined, not fine"));
+    }
+
     /// The first cause is not decorated: a diagnosis with one thing to say
     /// says it plainly.
     #[test]

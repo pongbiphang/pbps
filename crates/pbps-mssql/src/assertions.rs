@@ -42,6 +42,20 @@ impl Target {
     }
 }
 
+/// Lets the engine seam hand the target to `plan --assert` without the command
+/// naming this type; the identity stays private and every check is
+/// [`run_target`]'s.
+impl pbps_db::engine::AssertionTarget for Target {
+    fn run<'a>(
+        &'a self,
+        connection: &'a str,
+        sql: &'a str,
+        timeout: Duration,
+    ) -> pbps_db::engine::EngineFuture<'a, Result<AssertionResult, DbError>> {
+        Box::pin(run_target(connection, self, sql, timeout))
+    }
+}
+
 /// The checked connection is consumed by bounded execution, including on error.
 /// Procedure EXECUTE is write-capable even without EXECUTE AS: ownership
 /// chaining can write where the caller's direct table permissions cannot.

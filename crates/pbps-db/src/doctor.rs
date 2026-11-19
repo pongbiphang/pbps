@@ -321,6 +321,51 @@ pub enum LockReadGap {
 }
 
 // ---------------------------------------------------------------------------
+// What the server is and what the account holds
+// ---------------------------------------------------------------------------
+//
+// Plain data the engines fill in their own words. They live here, not in the
+// CLI, so that `pbps_db::engine::Engine` can return them and a third engine
+// answers `doctor` in one place (#2798); nothing about them is serialized.
+
+/// What the connected server can do, as far as a plan's statements care.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Capabilities {
+    /// The edition this server runs, named as the operator would recognise
+    /// it, where the engine *has* editions. `None` is "this engine has one
+    /// edition" — a fact about the engine, not an edition that could not be
+    /// read; a read that fails is the `Err` of the engine's `capabilities`.
+    pub edition: Option<String>,
+    /// Whether `strategy: online` is accepted at all (ADR-0003).
+    pub supports_online: bool,
+    /// Whether the statements the emitter writes for a module are accepted:
+    /// `CREATE OR ALTER` arrived in SQL Server 2016 SP1, and an older server
+    /// rejects every module statement in a plan. `None` where the version
+    /// that decides it was not read.
+    pub supports_create_or_alter: Option<bool>,
+}
+
+/// A permission the deployment needs and the connected account does not hold,
+/// with the securable already spelled the way this engine's `GRANT` names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionGap {
+    pub permission: &'static str,
+    pub securable: String,
+    pub why: String,
+}
+
+/// What `doctor` learns about the connected account.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Permissions {
+    pub gaps: Vec<PermissionGap>,
+    /// What the account lacks that only some plans need, each with what it
+    /// would allow: advice, never a gap (#1644).
+    pub advised: Vec<PermissionGap>,
+    /// The managed schemas the database does not have yet.
+    pub absent_schemas: BTreeSet<String>,
+}
+
+// ---------------------------------------------------------------------------
 // The runway of a RANGE-partitioned table (#1789, DEC-1789.2)
 // ---------------------------------------------------------------------------
 

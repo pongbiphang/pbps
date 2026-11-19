@@ -36,6 +36,20 @@ impl Target {
     }
 }
 
+/// Lets the engine seam hand the target to `plan --assert` without the command
+/// naming this type; the identity stays private and every check is
+/// [`run_target`]'s.
+impl pbps_db::engine::AssertionTarget for Target {
+    fn run<'a>(
+        &'a self,
+        connection: &'a str,
+        sql: &'a str,
+        timeout: Duration,
+    ) -> pbps_db::engine::EngineFuture<'a, Result<AssertionResult, DbError>> {
+        Box::pin(run_target(connection, self, sql, timeout))
+    }
+}
+
 /// Checks and SQL share one fresh connection; no checked session is substituted.
 /// A failed admission is separate from the assertion's execution outcome.
 pub async fn run_target(
