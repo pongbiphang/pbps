@@ -845,7 +845,8 @@ async fn reference_held() {
     )
     .await
     .unwrap();
-    let prepared = Box::pin(state.prepare(
+    let prepared = Box::pin(MssqlEngine::prepare(
+        &mut state,
         provisioning,
         &mut admin,
         &mut target,
@@ -857,7 +858,7 @@ async fn reference_held() {
         Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key()),
     ))
     .await;
-    let released = Box::pin(state.release(&mut admin)).await;
+    let released = Box::pin(MssqlEngine::release(&mut state, &mut admin)).await;
     let left = inventory(&scratch).await;
     let kept = (
         left.0.contains(&reference),
@@ -979,7 +980,8 @@ async fn prepared(
     )
     .await
     .unwrap();
-    let prepared = Box::pin(state.prepare(
+    let prepared = Box::pin(MssqlEngine::prepare(
+        &mut state,
         provisioning,
         &mut admin,
         &mut target,
@@ -1016,7 +1018,7 @@ async fn prepared(
         ))
         .await
         .unwrap();
-        let released = state.release(&mut admin).await;
+        let released = MssqlEngine::release(&mut state, &mut admin).await;
         return (token, recorded, marked, Some(released));
     }
     // Killed: nothing is released, and the sessions close with their owners.

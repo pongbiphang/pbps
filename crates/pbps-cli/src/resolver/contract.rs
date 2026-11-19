@@ -12,15 +12,16 @@
 //! scratch lifecycle carries engine-branded state and will be typed through
 //! `PlanningDialect::Resolver` instead.
 
-use crate::resolver::server::engine::Scratch;
+use crate::resolver::scope;
+use crate::resolver::server::engine::{Binding, Naming, Prepared, Staged};
 use crate::resolver::server::scratch::{Provenance, Provisioning, Tokens};
-use crate::resolver::server::{Error, PlanningDialect, ProduceError, ScopeRequest};
+use crate::resolver::server::{BindingRequest, Error, PlanningDialect, ProduceError, ScopeRequest};
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
 use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, DbError};
 use pbps_model::dependency::Dependencies;
 use pbps_model::resolver::{InputManifest, ResolverEvidence};
-use pbps_model::{ChangeSet, IdsFile, Schema};
+use pbps_model::{ChangeSet, IdsFile, ModuleDeps, RoleName, Schema};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
@@ -99,11 +100,11 @@ impl Support {
 /// The engine half of the resolver. Sealed: nothing outside this crate names
 /// it, so no other crate can add an engine's resolver by implementing it.
 ///
-/// Selection is typed by the engine: its standard cannot be another engine's,
-/// and the engine's own acquisition makes the scratch of its own variant. The
-/// scratch and the states that follow it are still the two-engine unions of
-/// `server::engine`, named in the signatures until their own group moves: an
-/// associated type that merely aliased them would be opaque to the run's
+/// Acquisition is typed by the engine: its standard and its scratch cannot be
+/// another engine's, and a cleanup obligation is held in the engine's own
+/// type. The states that follow the scratch are still the two-engine unions
+/// of `server::engine`, named in the signatures until their own group moves:
+/// an associated type that merely aliased them would be opaque to the run's
 /// generic code, which reads them through the unions' methods.
 pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
     /// The dialect this resolver belongs to, one to one: brand and state are
@@ -113,6 +114,10 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
 
     /// The state the scratch is put into, as the entry declares it.
     type Standard: Clone + Send + Sync + 'static;
+    /// What a run acquired and must release; borrows the run's request.
+    type Scratch<'a>: Send
+    where
+        Self: 'a;
 
     /// The standard an entry declares, or the refusal of one this engine
     /// cannot hold.
@@ -147,10 +152,72 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
         standard: &'a Self::Standard,
         externals: Option<&'a str>,
         provenance: &'a Provenance,
-    ) -> Step<'b, Result<(Provisioning, Scratch<'a>), ProduceError>>
+    ) -> Step<'b, Result<(Provisioning, Self::Scratch<'a>), ProduceError>>
     where
         'a: 'b;
+    /// Drops what the run created. `Err` names exactly what may remain.
+    fn release<'a>(
+        scratch: &'a mut Self::Scratch<'_>,
+        admin: &'a mut Conn,
+    ) -> Step<'a, Result<(), Vec<String>>>;
+    /// A code vet stages only the operator's externals file. Automatic fill
+    /// could install an extension whose absence must be named by CREATE.
+    fn prepare_code<'a>(
+        scratch: &'a mut Self::Scratch<'_>,
+        provisioning: Provisioning,
+        admin: &'a mut Conn,
+        target: &'a CatalogFacts,
+        authorization: &'a scope::Authorization,
+        schemas: &'a [String],
+    ) -> Step<'a, Result<Prepared, Error>>;
+    #[allow(clippy::too_many_arguments)]
+    fn prepare<'a>(
+        scratch: &'a mut Self::Scratch<'_>,
+        provisioning: Provisioning,
+        admin: &'a mut Conn,
+        target_connection: &'a mut Conn,
+        target: &'a CatalogFacts,
+        authorization: &'a scope::Authorization,
+        schemas: &'a [String],
+        binding: &'a BindingRequest<'a>,
+        extras: &'a [String],
+        key: Option<&'a EnvironmentFingerprintKey>,
+    ) -> Step<'a, Result<Prepared, Error>>;
+    fn reconstruction<'a>(
+        scratch: &'a Self::Scratch<'_>,
+        target: &'a mut Conn,
+        binding: &'a BindingRequest<'a>,
+        ids: &'a IdsFile,
+        dependencies: &'a ModuleDeps,
+        prepared: &'a mut Prepared,
+    ) -> Step<'a, Result<Binding, Error>>;
+    fn compare_externals<'a>(
+        scratch: &'a Self::Scratch<'_>,
+        provisioning: Provisioning,
+        prepared: &'a mut Prepared,
+        admin: &'a mut Conn,
+        target: &'a mut Conn,
+        binding: &'a Binding,
+    ) -> Step<'a, Result<Staged, Error>>;
+    /// How a rehearsal names the roles a plan names on this scratch (see
+    /// `Naming`). SQL Server has no cluster role to name: its roles are the
+    /// scratch database's own and a rehearsal asks
+    /// `scratch::rehearse::principals` instead (DEC-2379.3).
+    fn naming(scratch: &Self::Scratch<'_>) -> Result<Naming, Error>;
+    /// Makes the roles a rehearsal names, by `naming`. `Err` inside is why the
+    /// scratch cannot hold them, and says so.
+    fn rehearsal_roles<'a>(
+        scratch: &'a mut Self::Scratch<'_>,
+        admin: &'a mut Conn,
+        roles: &'a [RoleName],
+        naming: Naming,
+    ) -> Step<'a, Result<Result<(), String>, Error>>;
 }
+
+/// The state of a resolver that does not exist: no value can be made, so
+/// every method that would consume one is unreachable by type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Never {}
 
 /// The resolver of an engine that has none.
 pub struct NoResolver<D>(PhantomData<fn() -> D>);
@@ -172,8 +239,10 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
     const SUPPORT: Support = Support::NONE;
     /// Configuration, not a state: it holds nothing to release and carries no
     /// brand, so a caller can name one. What it cannot do is go further:
-    /// every operation that starts a run refuses by name.
+    /// every operation that starts a run refuses by name, and the scratch
+    /// that would follow is uninhabited.
     type Standard = ();
+    type Scratch<'a> = Never;
 
     fn standard(_: Option<&pbps_config::resolver::ScratchStandard>) -> Result<(), Error> {
         Err(Error::Unusable(refusal::<D>().to_string()))
@@ -203,13 +272,71 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
         _: &'a (),
         _: Option<&'a str>,
         _: &'a Provenance,
-    ) -> Step<'b, Result<(Provisioning, Scratch<'a>), ProduceError>>
+    ) -> Step<'b, Result<(Provisioning, Never), ProduceError>>
     where
         'a: 'b,
     {
         Box::pin(std::future::ready(Err(ProduceError::Acquire(
             refusal::<D>().to_string(),
         ))))
+    }
+    fn release<'a>(scratch: &'a mut Never, _: &'a mut Conn) -> Step<'a, Result<(), Vec<String>>> {
+        match *scratch {}
+    }
+    fn prepare_code<'a>(
+        scratch: &'a mut Never,
+        _: Provisioning,
+        _: &'a mut Conn,
+        _: &'a CatalogFacts,
+        _: &'a scope::Authorization,
+        _: &'a [String],
+    ) -> Step<'a, Result<Prepared, Error>> {
+        match *scratch {}
+    }
+    fn prepare<'a>(
+        scratch: &'a mut Never,
+        _: Provisioning,
+        _: &'a mut Conn,
+        _: &'a mut Conn,
+        _: &'a CatalogFacts,
+        _: &'a scope::Authorization,
+        _: &'a [String],
+        _: &'a BindingRequest<'a>,
+        _: &'a [String],
+        _: Option<&'a EnvironmentFingerprintKey>,
+    ) -> Step<'a, Result<Prepared, Error>> {
+        match *scratch {}
+    }
+    fn reconstruction<'a>(
+        scratch: &'a Never,
+        _: &'a mut Conn,
+        _: &'a BindingRequest<'a>,
+        _: &'a IdsFile,
+        _: &'a ModuleDeps,
+        _: &'a mut Prepared,
+    ) -> Step<'a, Result<Binding, Error>> {
+        match *scratch {}
+    }
+    fn compare_externals<'a>(
+        scratch: &'a Never,
+        _: Provisioning,
+        _: &'a mut Prepared,
+        _: &'a mut Conn,
+        _: &'a mut Conn,
+        _: &'a Binding,
+    ) -> Step<'a, Result<Staged, Error>> {
+        match *scratch {}
+    }
+    fn naming(scratch: &Never) -> Result<Naming, Error> {
+        match *scratch {}
+    }
+    fn rehearsal_roles<'a>(
+        scratch: &'a mut Never,
+        _: &'a mut Conn,
+        _: &'a [RoleName],
+        _: Naming,
+    ) -> Step<'a, Result<Result<(), String>, Error>> {
+        match *scratch {}
     }
 }
 

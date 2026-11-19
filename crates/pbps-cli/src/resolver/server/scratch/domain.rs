@@ -144,10 +144,16 @@ pub(super) async fn run(
         )
         .await
         .map_err(read)?;
-        let mut prepared = state
-            .prepare_code(provisioning, &mut admin, &catalog, &authorization, &schemas)
-            .await
-            .map_err(run)?;
+        let mut prepared = Postgres::prepare_code(
+            &mut state,
+            provisioning,
+            &mut admin,
+            &catalog,
+            &authorization,
+            &schemas,
+        )
+        .await
+        .map_err(run)?;
         let report = scope::compare_reported(Driver::Postgres, &catalog, prepared.catalog())
             .map_err(|why| run(Error::Scope(why)))?;
         // A different engine version cannot give a verdict about these trees.
@@ -226,7 +232,7 @@ pub(super) async fn run(
         }
     }
     .await;
-    let released = state.release(&mut admin).await;
+    let released = Postgres::release(&mut state, &mut admin).await;
     match released {
         Err(names) => Err(Refused::Unavailable(ProduceError::Cleanup(names))),
         Ok(()) => result,

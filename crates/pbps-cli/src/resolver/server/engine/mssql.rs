@@ -63,7 +63,7 @@ pub struct Scratch<'a> {
     reported: std::sync::Mutex<Option<CatalogFacts>>,
 }
 
-pub(in crate::resolver::server) struct Prepared {
+pub struct Prepared {
     pub(in crate::resolver::server) dependencies: dependencies::Rehearsals,
     /// The reproduced deployer, entered from the sandbox: the declarations
     /// compile here and nowhere else. It cannot leave its context, so a read
@@ -1151,7 +1151,7 @@ pub(super) fn compile_failed(error: ReconstructError) -> Error {
 }
 
 /// The private reconstruction, and what the two captures of its run read.
-pub(in crate::resolver::server) struct Binding {
+pub struct Binding {
     reconstruction: Reconstruction,
     /// The roots both sides' declarations name.
     managed: capture::CaptureScope,

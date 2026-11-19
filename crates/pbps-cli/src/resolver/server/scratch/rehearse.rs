@@ -121,19 +121,19 @@ pub async fn with_session<D: PlanningDialect, T, E>(
         let key = rehearsal
             .run_key
             .then(pbps_db::fingerprint::EnvironmentFingerprintKey::for_one_run);
-        let mut prepared = state
-            .prepare(
-                provisioning,
-                &mut admin,
-                &mut target,
-                &target_catalog,
-                &authorization,
-                &scope_schemas,
-                binding,
-                &request.write_path_extras,
-                key.as_ref(),
-            )
-            .await?;
+        let mut prepared = <D::Resolver as ResolverEngine>::prepare(
+            &mut state,
+            provisioning,
+            &mut admin,
+            &mut target,
+            &target_catalog,
+            &authorization,
+            &scope_schemas,
+            binding,
+            &request.write_path_extras,
+            key.as_ref(),
+        )
+        .await?;
         // The externals the base and the plan read are the target's, as for
         // the resolver: a file that stages something else would rehearse a
         // plan on a state the target does not hold. The comparison needs the
@@ -146,15 +146,15 @@ pub async fn with_session<D: PlanningDialect, T, E>(
             // a function the base also holds has no order the plain bootstrap
             // can write (DEC-2379.3). Its externals were staged and compared
             // with the target by `prepare`.
-            let mut built = state
-                .reconstruction(
-                    &mut target,
-                    binding,
-                    base.ids,
-                    &hints.annotations.modules(desired.schema),
-                    &mut prepared,
-                )
-                .await?;
+            let mut built = <D::Resolver as ResolverEngine>::reconstruction(
+                &state,
+                &mut target,
+                binding,
+                base.ids,
+                &hints.annotations.modules(desired.schema),
+                &mut prepared,
+            )
+            .await?;
             let mut staged = prepared.completed_staged().ok_or_else(|| {
                 Error::Scope("the prepared scratch holds no staged inventory".into())
             })?;
@@ -170,15 +170,15 @@ pub async fn with_session<D: PlanningDialect, T, E>(
                 )
                 .await?;
         } else if externals.is_some() || prepared.has_filled() {
-            let mut reconstruction = state
-                .reconstruction(
-                    &mut target,
-                    binding,
-                    desired.ids,
-                    &hints.annotations.modules(desired.schema),
-                    &mut prepared,
-                )
-                .await?;
+            let mut reconstruction = <D::Resolver as ResolverEngine>::reconstruction(
+                &state,
+                &mut target,
+                binding,
+                desired.ids,
+                &hints.annotations.modules(desired.schema),
+                &mut prepared,
+            )
+            .await?;
             if reconstruction.has_fill() {
                 return Err(Error::Externals(vec![
                     "the externals fill reads managed relations, which a rehearsal cannot \
@@ -188,21 +188,21 @@ pub async fn with_session<D: PlanningDialect, T, E>(
                 ]));
             }
             reconstruction.chains(&prepared);
-            state
-                .compare_externals(
-                    provisioning,
-                    &mut prepared,
-                    &mut admin,
-                    &mut target,
-                    &reconstruction,
-                )
-                .await?;
+            <D::Resolver as ResolverEngine>::compare_externals(
+                &state,
+                provisioning,
+                &mut prepared,
+                &mut admin,
+                &mut target,
+                &reconstruction,
+            )
+            .await?;
         }
         let reader = prepared.reader().await?;
         let roles = if driver == Driver::Mssql {
             principals(named, base.schema, desired.schema)
         } else {
-            roles(&mut state, &mut admin, named, &tokens).await?
+            roles::<D>(&mut state, &mut admin, named, &tokens).await?
         };
         // PostgreSQL's prepared scratch knows it holds a supplied database;
         // SQL Server's layout is the provisioning the acquisition chose, as for
@@ -216,7 +216,7 @@ pub async fn with_session<D: PlanningDialect, T, E>(
         Ok((layout, run(session, reader, roles).await))
     }
     .await;
-    let released = state.release(&mut admin).await;
+    let released = <D::Resolver as ResolverEngine>::release(&mut state, &mut admin).await;
     drop(target);
     match (opened, released) {
         (_, Err(names)) => Err(ProduceError::Cleanup(names)),
@@ -228,15 +228,15 @@ pub async fn with_session<D: PlanningDialect, T, E>(
 /// The roles of the run, by the naming its placement decides. Here and in the
 /// one place the plan is lowered again (`OrderedPlan::under_role_names`) is all
 /// the code that tells the three apart.
-async fn roles(
-    state: &mut engine::Scratch<'_>,
+async fn roles<D: PlanningDialect>(
+    state: &mut engine::Scratch<'_, D>,
     admin: &mut Conn,
     named: &BTreeSet<RoleName>,
     tokens: &Tokens,
 ) -> Result<Roles, Error> {
     // The engine's own roles keep their names: they are the scratch's too.
     let own = |role: &RoleName| role.raw().starts_with("pg_");
-    let naming = state.naming()?;
+    let naming = <D::Resolver as ResolverEngine>::naming(state)?;
     let mapping = match naming {
         engine::Naming::Existing => RoleMapping::default(),
         engine::Naming::Created => {
@@ -247,9 +247,13 @@ async fn roles(
         }
     };
     Ok(
-        match state
-            .rehearsal_roles(admin, mapping.created(), naming)
-            .await?
+        match <D::Resolver as ResolverEngine>::rehearsal_roles(
+            state,
+            admin,
+            mapping.created(),
+            naming,
+        )
+        .await?
         {
             Ok(()) => Ok(mapping),
             Err(why) => Err(why),

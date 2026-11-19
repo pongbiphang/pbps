@@ -6,17 +6,21 @@
 //! compared at both ends, and a change made and restored in between leaves
 //! nothing to find (DEC-2144.1).
 
-use super::super::Scratch as EngineScratch;
+use super::super::{Binding, Prepared, Staged, unsupported};
+use super::Scratch;
 use crate::resolver::contract::{
     ApplyRecheck, ClosingInputs, ClusterDomain, FactsError, GrantRecheck, Phase, Planning, Preview,
     Rehearsal, RehearsalRequest, Replay, ResolverEngine, Step, Support, sealed::Sealed,
 };
 use crate::resolver::scope;
+use crate::resolver::server::engine::Naming;
 use crate::resolver::server::scratch::{Provenance, Provisioning, Tokens};
-use crate::resolver::server::{Error, ProduceError, ScopeRequest};
+use crate::resolver::server::{BindingRequest, Error, ProduceError, ScopeRequest};
+use pbps_db::fingerprint::EnvironmentFingerprintKey;
 use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, DbError, Driver};
 use pbps_model::resolver::InputManifest;
+use pbps_model::{IdsFile, ModuleDeps, RoleName};
 
 /// SQL Server's resolver: planning, both rehearsals and the apply recheck.
 pub struct MssqlResolver;
@@ -43,6 +47,7 @@ impl ResolverEngine for MssqlResolver {
 
     /// SQL Server's scratch has no standard to put it into.
     type Standard = ();
+    type Scratch<'a> = Box<Scratch<'a>>;
 
     fn standard(
         declared: Option<&pbps_config::resolver::ScratchStandard>,
@@ -85,7 +90,7 @@ impl ResolverEngine for MssqlResolver {
         _: &'a Self::Standard,
         externals: Option<&'a str>,
         provenance: &'a Provenance,
-    ) -> Step<'b, Result<(Provisioning, EngineScratch<'a>), ProduceError>>
+    ) -> Step<'b, Result<(Provisioning, Self::Scratch<'a>), ProduceError>>
     where
         'a: 'b,
     {
@@ -101,8 +106,108 @@ impl ResolverEngine for MssqlResolver {
                 provenance,
             )
             .await?;
-            Ok((provisioning, EngineScratch::Mssql(Box::new(scratch))))
+            Ok((provisioning, Box::new(scratch)))
         })
+    }
+
+    fn release<'a>(
+        scratch: &'a mut Self::Scratch<'_>,
+        admin: &'a mut Conn,
+    ) -> Step<'a, Result<(), Vec<String>>> {
+        Box::pin(async move { scratch.release(admin).await })
+    }
+
+    /// A code vet is a PostgreSQL operation: the question is refused by name.
+    fn prepare_code<'a>(
+        _: &'a mut Self::Scratch<'_>,
+        _: Provisioning,
+        _: &'a mut Conn,
+        _: &'a CatalogFacts,
+        _: &'a scope::Authorization,
+        _: &'a [String],
+    ) -> Step<'a, Result<Prepared, Error>> {
+        Box::pin(async move { Err(unsupported()) })
+    }
+
+    fn prepare<'a>(
+        scratch: &'a mut Self::Scratch<'_>,
+        provisioning: Provisioning,
+        admin: &'a mut Conn,
+        target_connection: &'a mut Conn,
+        target: &'a CatalogFacts,
+        authorization: &'a scope::Authorization,
+        schemas: &'a [String],
+        binding: &'a BindingRequest<'a>,
+        _: &'a [String],
+        key: Option<&'a EnvironmentFingerprintKey>,
+    ) -> Step<'a, Result<Prepared, Error>> {
+        Box::pin(async move {
+            scratch
+                .prepare(
+                    provisioning,
+                    admin,
+                    target,
+                    target_connection,
+                    authorization,
+                    schemas,
+                    binding,
+                    key.ok_or_else(|| {
+                        Error::Binding(
+                        "SQL Server capture requires the configured environment fingerprint key"
+                            .into(),
+                    )
+                    })?,
+                )
+                .await
+                .map(Prepared::Mssql)
+        })
+    }
+
+    fn reconstruction<'a>(
+        scratch: &'a Self::Scratch<'_>,
+        _: &'a mut Conn,
+        binding: &'a BindingRequest<'a>,
+        ids: &'a IdsFile,
+        dependencies: &'a ModuleDeps,
+        _: &'a mut Prepared,
+    ) -> Step<'a, Result<Binding, Error>> {
+        Box::pin(async move {
+            scratch
+                .reconstruction(binding, ids, dependencies)
+                .map(|binding| Binding::Mssql(Box::new(binding)))
+        })
+    }
+
+    fn compare_externals<'a>(
+        _: &'a Self::Scratch<'_>,
+        _: Provisioning,
+        prepared: &'a mut Prepared,
+        _: &'a mut Conn,
+        _: &'a mut Conn,
+        _: &'a Binding,
+    ) -> Step<'a, Result<Staged, Error>> {
+        Box::pin(async move {
+            match prepared {
+                Prepared::Mssql(prepared) => Ok(Staged::Mssql(prepared.staged.clone())),
+                Prepared::Postgres(_) => Err(unsupported()),
+            }
+        })
+    }
+
+    /// SQL Server has no cluster role to name: its roles are the scratch
+    /// database's own and a rehearsal asks `scratch::rehearse::principals`
+    /// instead (DEC-2379.3).
+    fn naming(_: &Self::Scratch<'_>) -> Result<Naming, Error> {
+        Err(unsupported())
+    }
+
+    fn rehearsal_roles<'a>(
+        _: &'a mut Self::Scratch<'_>,
+        _: &'a mut Conn,
+        _: &'a [RoleName],
+        _: Naming,
+    ) -> Step<'a, Result<Result<(), String>, Error>> {
+        Box::pin(async move { Err(unsupported()) })
     }
 }
 

@@ -132,7 +132,7 @@ impl<D: PlanningDialect> Request<D> {
         // through acquisition. Complete resolution before releasing on the
         // same checked connection, even when nobody awaits the result.
         let result = run
-            .resolve::<D>(
+            .resolve(
                 provisioning,
                 &mut target,
                 &mut admin,
@@ -143,7 +143,7 @@ impl<D: PlanningDialect> Request<D> {
             )
             .await;
         // Neither in-flight SQL nor release is raced against caller cancellation.
-        let cleanup = run.state.release(&mut admin).await;
+        let cleanup = <D::Resolver as ResolverEngine>::release(&mut run.state, &mut admin).await;
         drop(run);
         match (result, cleanup) {
             (_, Err(names)) => Err(ProduceError::Cleanup(names)),

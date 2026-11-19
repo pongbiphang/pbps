@@ -3,20 +3,22 @@
 //! ones `resolver::apply` made before it named no engine, moved with their
 //! comments; they run on the apply's own connection, inside its transaction.
 
-use super::super::Scratch as EngineScratch;
+use super::super::{Binding, Prepared, Staged, unsupported};
+use super::{Naming, Scratch};
 use crate::resolver::contract::{
     ApplyRecheck, ClosingInputs, ClusterDomain, FactsError, GrantRecheck, Phase, Planning,
     Rehearsal, RehearsalRequest, Replay, ResolverEngine, Step, Support, sealed::Sealed,
 };
 use crate::resolver::scope;
 use crate::resolver::server::scratch::{Provenance, Provisioning, Tokens};
-use crate::resolver::server::{Error, ProduceError, ScopeRequest};
+use crate::resolver::server::{BindingRequest, Error, ProduceError, ScopeRequest};
+use pbps_db::fingerprint::EnvironmentFingerprintKey;
 use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, DbError, Driver};
-use pbps_model::ModuleId;
 use pbps_model::resolver::{
     InputManifest, ObjectIdentity, ObjectOwnership, ResolverEvidence, Surface,
 };
+use pbps_model::{IdsFile, ModuleDeps, ModuleId, RoleName};
 use std::collections::BTreeMap;
 
 /// PostgreSQL's resolver: planning, connected rehearsal and the apply recheck.
@@ -45,6 +47,7 @@ impl ResolverEngine for PgResolver {
     };
 
     type Standard = pbps_pg::resolver::standard::Standard;
+    type Scratch<'a> = Box<Scratch<'a>>;
 
     fn standard(
         declared: Option<&pbps_config::resolver::ScratchStandard>,
@@ -88,7 +91,7 @@ impl ResolverEngine for PgResolver {
         standard: &'a Self::Standard,
         externals: Option<&'a str>,
         provenance: &'a Provenance,
-    ) -> Step<'b, Result<(Provisioning, EngineScratch<'a>), ProduceError>>
+    ) -> Step<'b, Result<(Provisioning, Self::Scratch<'a>), ProduceError>>
     where
         'a: 'b,
     {
@@ -106,8 +109,123 @@ impl ResolverEngine for PgResolver {
                 provenance,
             )
             .await?;
-            Ok((provisioning, EngineScratch::Postgres(Box::new(scratch))))
+            Ok((provisioning, Box::new(scratch)))
         })
+    }
+
+    fn release<'a>(
+        scratch: &'a mut Self::Scratch<'_>,
+        admin: &'a mut Conn,
+    ) -> Step<'a, Result<(), Vec<String>>> {
+        Box::pin(async move { scratch.release(admin).await })
+    }
+
+    fn prepare_code<'a>(
+        scratch: &'a mut Self::Scratch<'_>,
+        provisioning: Provisioning,
+        admin: &'a mut Conn,
+        target: &'a CatalogFacts,
+        authorization: &'a scope::Authorization,
+        schemas: &'a [String],
+    ) -> Step<'a, Result<Prepared, Error>> {
+        Box::pin(async move {
+            scratch
+                .prepare(
+                    provisioning,
+                    admin,
+                    target,
+                    authorization,
+                    schemas,
+                    &Default::default(),
+                )
+                .await
+                .map(Prepared::Postgres)
+        })
+    }
+
+    fn prepare<'a>(
+        scratch: &'a mut Self::Scratch<'_>,
+        provisioning: Provisioning,
+        admin: &'a mut Conn,
+        target_connection: &'a mut Conn,
+        target: &'a CatalogFacts,
+        authorization: &'a scope::Authorization,
+        schemas: &'a [String],
+        binding: &'a BindingRequest<'a>,
+        extras: &'a [String],
+        _: Option<&'a EnvironmentFingerprintKey>,
+    ) -> Step<'a, Result<Prepared, Error>> {
+        Box::pin(async move {
+            let fill = super::fill(target_connection, binding, extras).await?;
+            let mut prepared = scratch
+                .prepare(provisioning, admin, target, authorization, schemas, &fill)
+                .await?;
+            let problems = pbps_pg::resolver::scratch::extension_prerequisites(
+                prepared.session(admin),
+                &binding.base.extensions,
+            )
+            .await
+            .map_err(|error| Error::Read(format!("scratch extension prerequisites: {error}")))?;
+            if !problems.is_empty() {
+                return Err(Error::Binding(problems.join("; ")));
+            }
+            Ok(Prepared::Postgres(prepared))
+        })
+    }
+
+    fn reconstruction<'a>(
+        scratch: &'a Self::Scratch<'_>,
+        target: &'a mut Conn,
+        binding: &'a BindingRequest<'a>,
+        ids: &'a IdsFile,
+        dependencies: &'a ModuleDeps,
+        prepared: &'a mut Prepared,
+    ) -> Step<'a, Result<Binding, Error>> {
+        Box::pin(async move {
+            let Prepared::Postgres(prepared) = prepared else {
+                return Err(unsupported());
+            };
+            scratch
+                .reconstruction(target, binding, ids, dependencies, prepared)
+                .await
+                .map(|binding| Binding::Postgres(Box::new(binding)))
+        })
+    }
+
+    fn compare_externals<'a>(
+        scratch: &'a Self::Scratch<'_>,
+        provisioning: Provisioning,
+        prepared: &'a mut Prepared,
+        admin: &'a mut Conn,
+        target: &'a mut Conn,
+        binding: &'a Binding,
+    ) -> Step<'a, Result<Staged, Error>> {
+        Box::pin(async move {
+            match (prepared, binding) {
+                (Prepared::Postgres(prepared), Binding::Postgres(binding)) => scratch
+                    .compare_externals(provisioning, prepared, admin, target, binding)
+                    .await
+                    .map(Staged::Postgres),
+                (Prepared::Mssql(_), _) | (Prepared::Postgres(_), Binding::Mssql(_)) => {
+                    Err(unsupported())
+                }
+            }
+        })
+    }
+
+    /// See `Scratch::naming`.
+    fn naming(scratch: &Self::Scratch<'_>) -> Result<Naming, Error> {
+        Ok(scratch.naming())
+    }
+
+    /// See `Scratch::rehearsal_roles`.
+    fn rehearsal_roles<'a>(
+        scratch: &'a mut Self::Scratch<'_>,
+        admin: &'a mut Conn,
+        roles: &'a [RoleName],
+        naming: Naming,
+    ) -> Step<'a, Result<Result<(), String>, Error>> {
+        Box::pin(async move { scratch.rehearsal_roles(admin, roles, naming).await })
     }
 }
 

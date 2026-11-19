@@ -761,25 +761,25 @@ async fn mssql_supplied_cleanup_names_the_retained_sandbox_after_failure() {
             let (catalog, authorization) =
                 crate::resolver::scope::read_target(&mut target, Driver::Mssql, &[], &[], &[], &[])
                     .await?;
-            let prepared = state
-                .prepare(
-                    provisioning,
-                    &mut admin,
-                    &mut target,
-                    &catalog,
-                    &authorization,
-                    &[],
-                    &BindingRequest {
-                        dependencies: &Default::default(),
-                        bootstrap: &bootstrap,
-                        base: &schema,
-                        desired: &schema,
-                    },
-                    &[],
-                    Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key()),
-                )
-                .await
-                .err();
+            let prepared = MssqlEngine::prepare(
+                &mut state,
+                provisioning,
+                &mut admin,
+                &mut target,
+                &catalog,
+                &authorization,
+                &[],
+                &BindingRequest {
+                    dependencies: &Default::default(),
+                    bootstrap: &bootstrap,
+                    base: &schema,
+                    desired: &schema,
+                },
+                &[],
+                Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key()),
+            )
+            .await
+            .err();
             let rows = admin
                 .query(
                     "SELECT name FROM sys.database_principals \
@@ -809,7 +809,7 @@ async fn mssql_supplied_cleanup_names_the_retained_sandbox_after_failure() {
                     )
                     .await?;
             }
-            let cleanup = state.release(&mut admin).await;
+            let cleanup = MssqlEngine::release(&mut state, &mut admin).await;
             let retained = admin
                 .query(&format!(
                     "SELECT IS_ROLEMEMBER(N'db_owner',name) AS membership \
@@ -1380,7 +1380,7 @@ async fn mssql_prepare_renders_missing_external_and_returns_entered_compile_conn
         let mut admin=connection(&scratch_server).await;
         let (provisioning,mut state)=MssqlEngine::acquire(&mut target,&mut admin,&tokens,&identity,&scratch_server,&request,&(),file,&provenance).await.unwrap();
         let (catalog,authorization)=crate::resolver::scope::read_target(&mut target,Driver::Mssql,&request.schemas,&[],&request.schemas,&[]).await.unwrap();
-        let prepared=state.prepare(provisioning,&mut admin,&mut target,&catalog,&authorization,&request.schemas,&binding,&[], Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key())).await;
+        let prepared=MssqlEngine::prepare(&mut state, provisioning,&mut admin,&mut target,&catalog,&authorization,&request.schemas,&binding,&[], Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key())).await;
         let verification=tokio::spawn(async move { match prepared {
             Ok(super::engine::Prepared::Mssql(mut prepared)) => {
                 assert!(matches!(prepared.map,crate::resolver::scope::Principals::Mssql(_)));
@@ -1395,7 +1395,7 @@ async fn mssql_prepare_renders_missing_external_and_returns_entered_compile_conn
             Ok(super::engine::Prepared::Postgres(_)) => panic!("wrong engine"),
             Err(error) => Err(error),
         }}).await;
-        let cleanup=state.release(&mut admin).await;
+        let cleanup=MssqlEngine::release(&mut state, &mut admin).await;
         cleanup.unwrap();
         verification.map_err(|error| Error::Read(error.to_string()))??;
         }
@@ -1444,7 +1444,7 @@ async fn mssql_supplied_type_permissions_release_to_empty_inventory() {
         let (catalog, authorization) = crate::resolver::scope::read_target(
             &mut target, Driver::Mssql, &request.schemas, &[], &request.schemas, &[],
         ).await.unwrap();
-        let prepared = state.prepare(
+        let prepared = MssqlEngine::prepare(&mut state,
             provisioning, &mut admin, &mut target, &catalog, &authorization,
             &request.schemas, &binding, &[], Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key()),
         ).await.unwrap();
@@ -1457,7 +1457,7 @@ async fn mssql_supplied_type_permissions_release_to_empty_inventory() {
         // Drop compile sessions before releasing the supplied database through
         // the real fresh-session sandbox cleanup path.
         drop(prepared);
-        state.release(&mut admin).await.unwrap();
+        MssqlEngine::release(&mut state, &mut admin).await.unwrap();
         assert!(sql::inventory::read(&mut admin, None).await.unwrap().is_empty());
     }).await;
     // Even a regression panic must release both owned fixtures and their users.
@@ -1537,20 +1537,20 @@ async fn mssql_a_reconnect_to_a_differing_backend_refuses_and_an_equal_one_does_
         )
         .await
         .unwrap();
-        let prepared = state
-            .prepare(
-                provisioning,
-                &mut admin,
-                &mut target,
-                &catalog,
-                &authorization,
-                &request.schemas,
-                &binding,
-                &[],
-                Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key()),
-            )
-            .await
-            .unwrap();
+        let prepared = MssqlEngine::prepare(
+            &mut state,
+            provisioning,
+            &mut admin,
+            &mut target,
+            &catalog,
+            &authorization,
+            &request.schemas,
+            &binding,
+            &[],
+            Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key()),
+        )
+        .await
+        .unwrap();
         let super::engine::Prepared::Mssql(prepared) = prepared else {
             panic!("wrong engine");
         };
@@ -1579,7 +1579,7 @@ async fn mssql_a_reconnect_to_a_differing_backend_refuses_and_an_equal_one_does_
             .map(|_| ())
             .map_err(|error| error.to_string());
         drop(prepared);
-        state.release(&mut admin).await.unwrap();
+        MssqlEngine::release(&mut state, &mut admin).await.unwrap();
         assert!(equal.is_ok(), "{equal:?}");
         let refusal = differing.expect_err("a differing backend must refuse");
         assert!(refusal.contains("database_ansi_padding"), "{refusal}");

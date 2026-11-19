@@ -6,10 +6,8 @@
 //! answers. The binding calls below hand the PostgreSQL adapter the managed
 //! declarations and return its comparison; nothing here seals evidence.
 
-use super::scratch::Provisioning;
-use super::{BindingRequest, Error, ProduceError};
+use super::{Error, ProduceError};
 use crate::resolver::contract::ResolverEngine;
-use crate::resolver::scope;
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
 use pbps_db::resolver::capture::{Assessment, CaptureDifference, CaptureError};
 use pbps_db::resolver::environment::CatalogFacts;
@@ -24,7 +22,7 @@ mod postgres;
 #[cfg(test)]
 pub(super) use keeper::pause_between_reads;
 pub(super) use keeper::{keep_and_mark, keeper_seen};
-pub(super) use postgres::Naming;
+pub use postgres::Naming;
 #[cfg(test)]
 pub(super) use postgres::{
     for_tests::{
@@ -41,7 +39,7 @@ pub(super) use pbps_pg::resolver::capture::BindingRecord;
 const NO_BINDING_ADAPTER: &str =
     "SQL Server has no binding adapter yet; its design and implementation are #619 and #620";
 
-fn unsupported() -> Error {
+pub(super) fn unsupported() -> Error {
     Error::Binding("the resolver is implemented for PostgreSQL only".into())
 }
 
@@ -123,19 +121,26 @@ impl PlanningDialect for pbps_mssql::Mssql {
 /// ```
 pub type Standard<D> = <<D as PlanningDialect>::Resolver as ResolverEngine>::Standard;
 
-pub enum Scratch<'a> {
-    Postgres(Box<postgres::Scratch<'a>>),
-    Mssql(Box<mssql::Scratch<'a>>),
+/// What the run acquired and must release, for the engine the dialect names.
+pub(super) type Scratch<'a, D> = <<D as PlanningDialect>::Resolver as ResolverEngine>::Scratch<'a>;
+
+/// The standard an entry declares, or the refusal of one the engine cannot
+/// hold.
+pub fn declared_standard<D: PlanningDialect>(
+    declared: Option<&pbps_config::resolver::ScratchStandard>,
+) -> Result<Standard<D>, Error> {
+    <D::Resolver as ResolverEngine>::standard(declared)
 }
-pub(super) enum Prepared {
+
+pub enum Prepared {
     Postgres(postgres::Prepared),
     Mssql(mssql::Prepared),
 }
-pub(super) enum Binding {
+pub enum Binding {
     Postgres(Box<postgres::Binding>),
     Mssql(Box<mssql::Binding>),
 }
-pub(super) enum Staged {
+pub enum Staged {
     Postgres(pbps_pg::resolver::capture::Staged),
     Mssql(pbps_mssql::resolver::capture::Staged),
 }
@@ -146,173 +151,6 @@ pub(super) enum CompiledCapture {
 pub(super) enum CapturedInputs {
     Postgres(pbps_pg::resolver::capture::CapturedInputs),
     Mssql(pbps_mssql::resolver::capture::CapturedInputs),
-}
-
-/// The standard an entry declares, or the refusal of one the engine cannot
-/// hold.
-pub fn declared_standard<D: PlanningDialect>(
-    declared: Option<&pbps_config::resolver::ScratchStandard>,
-) -> Result<Standard<D>, Error> {
-    <D::Resolver as ResolverEngine>::standard(declared)
-}
-
-impl Scratch<'_> {
-    /// A code vet stages only the operator's externals file. Automatic fill
-    /// could install an extension whose absence must be named by CREATE.
-    pub(super) async fn prepare_code(
-        &mut self,
-        provisioning: Provisioning,
-        admin: &mut Conn,
-        target: &CatalogFacts,
-        authorization: &scope::Authorization,
-        schemas: &[String],
-    ) -> Result<Prepared, Error> {
-        match self {
-            Self::Postgres(scratch) => scratch
-                .prepare(
-                    provisioning,
-                    admin,
-                    target,
-                    authorization,
-                    schemas,
-                    &Default::default(),
-                )
-                .await
-                .map(Prepared::Postgres),
-            Self::Mssql(_) => Err(unsupported()),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn prepare(
-        &mut self,
-        provisioning: Provisioning,
-        admin: &mut Conn,
-        target_connection: &mut Conn,
-        target: &CatalogFacts,
-        authorization: &scope::Authorization,
-        schemas: &[String],
-        binding: &BindingRequest<'_>,
-        extras: &[String],
-        key: Option<&EnvironmentFingerprintKey>,
-    ) -> Result<Prepared, Error> {
-        match self {
-            Self::Postgres(scratch) => {
-                let fill = postgres::fill(target_connection, binding, extras).await?;
-                let mut prepared = scratch
-                    .prepare(provisioning, admin, target, authorization, schemas, &fill)
-                    .await?;
-                let problems = pbps_pg::resolver::scratch::extension_prerequisites(
-                    prepared.session(admin),
-                    &binding.base.extensions,
-                )
-                .await
-                .map_err(|error| {
-                    Error::Read(format!("scratch extension prerequisites: {error}"))
-                })?;
-                if !problems.is_empty() {
-                    return Err(Error::Binding(problems.join("; ")));
-                }
-                Ok(Prepared::Postgres(prepared))
-            }
-            Self::Mssql(scratch) => scratch
-                .prepare(
-                    provisioning,
-                    admin,
-                    target,
-                    target_connection,
-                    authorization,
-                    schemas,
-                    binding,
-                    key.ok_or_else(|| {
-                        Error::Binding(
-                        "SQL Server capture requires the configured environment fingerprint key"
-                            .into(),
-                    )
-                    })?,
-                )
-                .await
-                .map(Prepared::Mssql),
-        }
-    }
-
-    pub(super) async fn reconstruction(
-        &self,
-        target: &mut Conn,
-        binding: &BindingRequest<'_>,
-        ids: &pbps_model::IdsFile,
-        dependencies: &pbps_model::ModuleDeps,
-        prepared: &mut Prepared,
-    ) -> Result<Binding, Error> {
-        match self {
-            Self::Mssql(scratch) => scratch
-                .reconstruction(binding, ids, dependencies)
-                .map(|binding| Binding::Mssql(Box::new(binding))),
-            Self::Postgres(scratch) => {
-                let Prepared::Postgres(prepared) = prepared else {
-                    return Err(unsupported());
-                };
-                scratch
-                    .reconstruction(target, binding, ids, dependencies, prepared)
-                    .await
-                    .map(|binding| Binding::Postgres(Box::new(binding)))
-            }
-        }
-    }
-
-    pub(super) async fn compare_externals(
-        &self,
-        provisioning: Provisioning,
-        prepared: &mut Prepared,
-        admin: &mut Conn,
-        target: &mut Conn,
-        binding: &Binding,
-    ) -> Result<Staged, Error> {
-        match (self, prepared, binding) {
-            (Self::Mssql(_), Prepared::Mssql(prepared), _) => {
-                Ok(Staged::Mssql(prepared.staged.clone()))
-            }
-            (Self::Mssql(_), Prepared::Postgres(_), _)
-            | (Self::Postgres(_), Prepared::Mssql(_), _) => Err(unsupported()),
-            (Self::Postgres(scratch), Prepared::Postgres(prepared), Binding::Postgres(binding)) => {
-                scratch
-                    .compare_externals(provisioning, prepared, admin, target, binding)
-                    .await
-                    .map(Staged::Postgres)
-            }
-            (Self::Postgres(_), Prepared::Postgres(_), Binding::Mssql(_)) => Err(unsupported()),
-        }
-    }
-
-    /// See `postgres::Scratch::naming`. SQL Server has no cluster role to
-    /// name: its roles are the scratch database's own and a rehearsal asks
-    /// `scratch::rehearse::principals` instead (DEC-2379.3).
-    pub(super) fn naming(&self) -> Result<Naming, Error> {
-        match self {
-            Self::Postgres(scratch) => Ok(scratch.naming()),
-            Self::Mssql(_) => Err(unsupported()),
-        }
-    }
-
-    /// See `postgres::Scratch::rehearsal_roles`.
-    pub(super) async fn rehearsal_roles(
-        &mut self,
-        admin: &mut Conn,
-        roles: &[pbps_model::RoleName],
-        naming: Naming,
-    ) -> Result<Result<(), String>, Error> {
-        match self {
-            Self::Postgres(scratch) => scratch.rehearsal_roles(admin, roles, naming).await,
-            Self::Mssql(_) => Err(unsupported()),
-        }
-    }
-
-    pub(super) async fn release(&mut self, admin: &mut Conn) -> Result<(), Vec<String>> {
-        match self {
-            Self::Postgres(scratch) => scratch.release(admin).await,
-            Self::Mssql(scratch) => scratch.release(admin).await,
-        }
-    }
 }
 
 impl Prepared {
