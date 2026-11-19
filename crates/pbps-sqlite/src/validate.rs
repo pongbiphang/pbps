@@ -186,18 +186,27 @@ fn literal(text: &str) -> bool {
 /// refuses the rest (`CURRENT_TIME`, `CURRENT_DATE`, `CURRENT_TIMESTAMP` and
 /// every computed expression, even `(1+2)`), measured on 3.54.1. Parentheses
 /// around a constant, nested or not, leave it a constant (`(1)`, `((-1))`,
-/// `('a')`), measured too. The engine also folds a sign outside the
-/// parentheses (`(-(1))`); that one stays the rebuild's.
+/// `('a')`), measured too, and so does a comment beside it (`(1 /* unit */)`):
+/// the constant is read from the code, so a comment counts as the white space
+/// it is and a string is never read into. The engine also folds a sign outside
+/// the parentheses (`(-(1))`); that one stays the rebuild's.
 #[must_use]
-pub(crate) fn default_constant(text: &str) -> Option<&str> {
-    let mut text = text.trim_matches(lexis::is_space);
+pub(crate) fn default_constant(text: &str) -> Option<String> {
+    let code: String = lexis::pieces(text)
+        .into_iter()
+        .map(|piece| match piece {
+            lexis::Piece::Code(run) | lexis::Piece::Quoted(run) => run,
+            lexis::Piece::Comment(_) => " ",
+        })
+        .collect();
+    let mut text = code.trim_matches(lexis::is_space);
     while let Some(inner) = text
         .strip_prefix('(')
         .and_then(|rest| rest.strip_suffix(')'))
     {
         text = inner.trim_matches(lexis::is_space);
     }
-    literal(text).then_some(text)
+    literal(text).then(|| text.to_owned())
 }
 
 /// What is wrong with one column's type, default, value source and
