@@ -715,6 +715,7 @@ pub(crate) fn write_declarations_with_deps(
     public_execute: &pbps_model::PublicExecute,
     deps: &pbps_model::object_ref::ObjectDeps,
 ) -> anyhow::Result<BTreeSet<PathBuf>> {
+    use pbps_load::SpelledDeps;
     use pbps_model::diagnostic::Declaration;
     use pbps_model::object_ref::{ObjectDeps, Registry};
     let registry = Registry::new(schema);
@@ -730,7 +731,11 @@ pub(crate) fn write_declarations_with_deps(
             .push((owner.clone(), targets.clone()));
     }
     let none = ObjectDeps::default();
-    let of = |declaration: &Declaration| owned.get(declaration).unwrap_or(&none);
+    // Spelled against this schema, which is the whole project being written:
+    // what loads back from these files must be the reference that was written.
+    let of = |declaration: &Declaration| {
+        SpelledDeps::new(&registry, owned.get(declaration).unwrap_or(&none))
+    };
     // Before the first file: two declarations whose names differ only in case
     // encode to filenames that differ only in case, and a filesystem that
     // ignores case would keep one of each — the second silently written over
@@ -755,7 +760,7 @@ pub(crate) fn write_declarations_with_deps(
                 definition,
                 &[],
                 &BTreeMap::new(),
-                of(&Declaration::Type(name.clone())),
+                &of(&Declaration::Type(name.clone())),
             ),
         )
         .with_context(|| format!("cannot write `{}`", path.display()))?;
@@ -785,11 +790,16 @@ pub(crate) fn write_declarations_with_deps(
             .collect();
         let path = declaration_file::path(dir, name, None)?;
         // The parent's file also holds the edges its partitions own (#1170).
-        let mut own = of(&Declaration::Table(name.clone())).clone();
+        let mut own = owned
+            .get(&Declaration::Table(name.clone()))
+            .unwrap_or(&none)
+            .clone();
         for (child, _) in &partitions {
+            let child = Declaration::Table((*child).clone());
             own.0
-                .extend(of(&Declaration::Table((*child).clone())).0.iter().cloned());
+                .extend(owned.get(&child).unwrap_or(&none).0.iter().cloned());
         }
+        let own = SpelledDeps::new(&registry, &own);
         std::fs::write(
             &path,
             pbps_load::render_partitioned(name, table, &partitions, &[], None, &own),
@@ -807,7 +817,7 @@ pub(crate) fn write_declarations_with_deps(
             pbps_load::render_module(
                 id,
                 module,
-                of(&Declaration::Module(id.clone())),
+                &of(&Declaration::Module(id.clone())),
                 public_execute.contains(id),
             ),
         )
@@ -824,7 +834,7 @@ pub(crate) fn write_declarations_with_deps(
         }
         std::fs::write(
             &path,
-            pbps_load::render_role(name, role, &[], of(&Declaration::Role(name.clone()))),
+            pbps_load::render_role(name, role, &[], &of(&Declaration::Role(name.clone()))),
         )
         .with_context(|| format!("cannot write `{}`", path.display()))?;
         written.insert(path);

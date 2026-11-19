@@ -4322,8 +4322,14 @@ pub struct IdentityCounts {
 }
 
 /// The names `fmt` judges a `renamed_from` against: every table, role and type
-/// any readable file of the project declares. An unreadable or unparseable file
-/// contributes nothing here.
+/// any readable file of the project declares, and every module, which no intent
+/// reads. An unreadable or unparseable file contributes nothing here.
+///
+/// It is not the merged project: a partition is not in `tables`, because
+/// `RenameSource::of` would then judge more `renamed_from` annotations
+/// redeclared. The modules are what the spelling of a `depends_on:` reference
+/// needs: `Registry::parse` asks the schema only whether a module of that name
+/// is declared (DEC-2469.8).
 fn fmt_declared(files: &[PathBuf]) -> Schema {
     let mut declared = Schema::default();
     for path in files {
@@ -4349,8 +4355,10 @@ fn fmt_declared(files: &[PathBuf]) -> Schema {
             Ok(pbps_load::LoadedFile::Sequence(s)) => {
                 declared.sequences.insert(s.name, s.definition);
             }
-            Ok(pbps_load::LoadedFile::Module(_) | pbps_load::LoadedFile::Dependency(_))
-            | Err(_) => {}
+            Ok(pbps_load::LoadedFile::Module(m)) => {
+                declared.modules.insert(m.id, m.module);
+            }
+            Ok(pbps_load::LoadedFile::Dependency(_)) | Err(_) => {}
         }
     }
     declared
@@ -4366,6 +4374,7 @@ fn canonical_table(
     t: &pbps_load::LoadedTable,
     ids: &IdsFile,
     declared: &Schema,
+    registry: &pbps_model::object_ref::Registry<'_>,
 ) -> (String, Vec<Intent>) {
     // Judged against the declared names, because a `renamed_from`
     // whose source is declared again records a rename that
@@ -4387,7 +4396,7 @@ fn canonical_table(
             &partitions,
             &pending,
             t.strategy.as_ref(),
-            &t.depends_on.deps,
+            &pbps_load::SpelledDeps::new(registry, &t.depends_on.deps),
         ),
         absorbed,
     )
@@ -4551,9 +4560,16 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
                     .sequences
                     .insert(s.name.clone(), s.definition.clone());
             }
-            pbps_load::LoadedFile::Module(_) | pbps_load::LoadedFile::Dependency(_) => {}
+            pbps_load::LoadedFile::Module(m) => {
+                declared.modules.insert(m.id.clone(), m.module.clone());
+            }
+            pbps_load::LoadedFile::Dependency(_) => {}
         }
     }
+    // Spells every `depends_on:` reference, so a shorthand is written only where
+    // the project's own reader reads it back. That needs the modules `declared`
+    // now holds, not the partitions it lacks (see `fmt_declared`).
+    let registry = pbps_model::object_ref::Registry::new(&declared);
 
     let mut changed: Vec<(PathBuf, Vec<Intent>)> = Vec::new();
     for FmtInput {
@@ -4589,7 +4605,7 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
                         &t.definition,
                         &pending,
                         &t.value_renames,
-                        &t.depends_on.deps,
+                        &pbps_load::SpelledDeps::new(&registry, &t.depends_on.deps),
                     ),
                     absorbed,
                 )
@@ -4606,17 +4622,27 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
             pbps_load::LoadedFile::Module(m) => (
                 // A module has no one-shot annotations to absorb: it carries no
                 // identity, so there is no rename intent to record (ADR-0002).
-                pbps_load::render_module(&m.id, &m.module, &m.depends_on.deps, m.public_execute),
+                pbps_load::render_module(
+                    &m.id,
+                    &m.module,
+                    &pbps_load::SpelledDeps::new(&registry, &m.depends_on.deps),
+                    m.public_execute,
+                ),
                 Vec::new(),
             ),
-            pbps_load::LoadedFile::Table(t) => canonical_table(&t, &ids, &declared),
+            pbps_load::LoadedFile::Table(t) => canonical_table(&t, &ids, &declared, &registry),
             pbps_load::LoadedFile::Role(r) => {
                 let (pending, absorbed): (Vec<Intent>, Vec<Intent>) =
                     r.intents.iter().cloned().partition(|i| {
                         !pbps_diff::intent_is_absorbed(i, &ids, RenameSource::of(i, &declared))
                     });
                 (
-                    pbps_load::render_role(&r.name, &r.role, &pending, &r.depends_on.deps),
+                    pbps_load::render_role(
+                        &r.name,
+                        &r.role,
+                        &pending,
+                        &pbps_load::SpelledDeps::new(&registry, &r.depends_on.deps),
+                    ),
                     absorbed,
                 )
             }

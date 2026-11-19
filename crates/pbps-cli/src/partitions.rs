@@ -92,7 +92,8 @@ pub fn cmd_extend(
     let files = pbps_load::schema_files(&project.schema_dir())
         .with_context(|| format!("cannot list `{}`", project.schema_dir().display()))?;
     let declared = crate::fmt_declared(&files);
-    let (canonical, _) = crate::canonical_table(&file, &ids, &declared);
+    let registry = pbps_model::object_ref::Registry::new(&declared);
+    let (canonical, _) = crate::canonical_table(&file, &ids, &declared, &registry);
     if canonical != original {
         bail!(
             "`{}` is not in canonical form, and rewriting it would change more than the new \
@@ -118,7 +119,7 @@ pub fn cmd_extend(
             },
         ));
     }
-    let (text, _) = crate::canonical_table(&extended, &ids, &declared);
+    let (text, _) = crate::canonical_table(&extended, &ids, &declared, &registry);
 
     // Read back what is about to be written, as every command will: the file
     // must hold the parent as it was and each new partition as generated, and
@@ -137,7 +138,7 @@ pub fn cmd_extend(
     got.sort_by(|a, b| a.0.cmp(&b.0));
     if reloaded.table != file.table
         || got != expected
-        || crate::canonical_table(&reloaded, &ids, &declared).0 != text
+        || crate::canonical_table(&reloaded, &ids, &declared, &registry).0 != text
     {
         bail!(
             "the rewritten `{}` does not read back as generated; nothing was written",

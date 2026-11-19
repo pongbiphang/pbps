@@ -481,15 +481,34 @@ impl<'a> Registry<'a> {
 
     pub fn render(&self, reference: &ObjectRef) -> Result<String, Problem> {
         self.entry(reference)?;
-        let short = reference.raw();
-        if self.parse(&short, &Default::default()).as_ref() == Ok(reference) {
-            Ok(short)
-        } else {
-            Ok(format!(
-                "object::{}",
-                serde_json::to_string(reference).expect("reference serializes")
-            ))
-        }
+        Ok(self.spell(reference))
+    }
+
+    /// The one rule for writing a reference into a file: the shortest spelling
+    /// that [`Registry::parse`] reads back as this same reference, else the
+    /// structured escape.
+    ///
+    /// A whole module is tried bare first, so a list written before the typed
+    /// prefixes existed keeps its bytes. Reparsing here, with this project's
+    /// declarations, is what a shorthand's meaning depends on: `table::app.t`
+    /// is the table until a view named `t` in a schema `table::app` is
+    /// declared, and then the loader refuses it. A writer that spelled it
+    /// without asking would write a file its own reader refuses. It does not
+    /// ask whether the schema declares the reference: an undeclared target is
+    /// validation's to name, and a file that holds one must still be written.
+    pub fn spell(&self, reference: &ObjectRef) -> String {
+        let none = Default::default();
+        reference
+            .legacy_spelling()
+            .into_iter()
+            .chain(std::iter::once(reference.raw()))
+            .find(|short| self.parse(short, &none).as_ref() == Ok(reference))
+            .unwrap_or_else(|| {
+                format!(
+                    "object::{}",
+                    serde_json::to_string(reference).expect("reference serializes")
+                )
+            })
     }
 
     pub fn declaration(&self, reference: &ObjectRef) -> Result<&Declaration, Problem> {

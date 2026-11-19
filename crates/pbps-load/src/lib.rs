@@ -28,7 +28,7 @@ use pbps_model::{Hints, Schema, TableName};
 pub use convert::{LoadedModule, LoadedRole, LoadedTable, Written};
 pub use dependencies::{LoadedDependency, load_dependency_str, render_dependency};
 pub use error::{LoadError, Semantic, SourceFile};
-pub use fmt::{render, render_module, render_partitioned, render_role};
+pub use fmt::{SpelledDeps, render, render_module, render_partitioned, render_role};
 pub use managed_types::{
     LoadedType, load_type_str, render_type, render_type_with_intents,
     render_type_with_value_renames,

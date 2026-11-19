@@ -1,7 +1,7 @@
 //! `depends_on:` on every declaration root that has an address (DEC-2469.8).
 
 use super::*;
-use pbps_model::object_ref::{ObjectDeps, ObjectRef};
+use pbps_model::object_ref::{ObjectDeps, ObjectRef, Registry};
 
 const FILES: [(&str, &str); 5] = [
     ("table", "table: app.t\n{dep}columns:\n  x: {type: int}\n"),
@@ -184,27 +184,36 @@ fn a_depends_on_error_points_at_the_item() {
     assert_eq!(errors[0].line(), Some(4), "{errors:?}");
 }
 
-#[test]
-fn fmt_keeps_depends_on_on_every_root_kind_and_is_idempotent() {
-    let render = |file: &LoadedFile| match file {
+/// `pbps fmt` of one file against a project's registry: every declaration kind
+/// that has an address, spelled the way the project's own reader reads back.
+fn format_file(registry: &Registry<'_>, file: &LoadedFile) -> String {
+    match file {
         LoadedFile::Table(t) => fmt::render_partitioned(
             &t.name,
             &t.table,
             &[],
             &[],
             t.strategy.as_ref(),
-            &t.depends_on.deps,
+            &SpelledDeps::new(registry, &t.depends_on.deps),
         ),
-        LoadedFile::Module(m) => {
-            render_module(&m.id, &m.module, &m.depends_on.deps, m.public_execute)
-        }
-        LoadedFile::Role(r) => render_role(&r.name, &r.role, &[], &r.depends_on.deps),
+        LoadedFile::Module(m) => render_module(
+            &m.id,
+            &m.module,
+            &SpelledDeps::new(registry, &m.depends_on.deps),
+            m.public_execute,
+        ),
+        LoadedFile::Role(r) => render_role(
+            &r.name,
+            &r.role,
+            &[],
+            &SpelledDeps::new(registry, &r.depends_on.deps),
+        ),
         LoadedFile::Type(t) => render_type_with_value_renames(
             &t.name,
             &t.definition,
             &[],
             &t.value_renames,
-            &t.depends_on.deps,
+            &SpelledDeps::new(registry, &t.depends_on.deps),
         ),
         LoadedFile::Extension(_)
         | LoadedFile::Dependency(_)
@@ -212,7 +221,15 @@ fn fmt_keeps_depends_on_on_every_root_kind_and_is_idempotent() {
         | LoadedFile::Sequence(_) => {
             unreachable!("these roots take no depends_on")
         }
-    };
+    }
+}
+
+#[test]
+fn fmt_keeps_depends_on_on_every_root_kind_and_is_idempotent() {
+    // One file alone: a project that declares nothing, so no spelling is ambiguous.
+    let empty = pbps_model::Schema::default();
+    let registry = Registry::new(&empty);
+    let render = |file: &LoadedFile| format_file(&registry, file);
     let lists = "depends_on: [table::app.u, app.z(), app.f()]\n";
     let mapped = "depends_on:\n  \"role::reader\": [app.f()]\n  \"table::app.t\": [app.g()]\n";
     for (kind, _) in FILES {
@@ -252,4 +269,92 @@ fn fmt_keeps_depends_on_on_every_root_kind_and_is_idempotent() {
             [reference("table::app.u")].into()
         )])
     );
+}
+
+/// Every file of `files` rewritten by `fmt` against the project the files make,
+/// as `(name, text)`. The rewritten project must load with the edges it had, and
+/// rewriting it again must change nothing.
+fn formatted(files: &[(&str, String)]) -> Vec<(String, String)> {
+    let before = project(files).unwrap_or_else(|e| panic!("{}", problems(&e)));
+    let registry = Registry::new(&before.schema);
+    let once: Vec<(String, String)> = files
+        .iter()
+        .map(|(name, text)| {
+            let file = load_file_str(Path::new(name), text).unwrap();
+            ((*name).to_owned(), format_file(&registry, &file))
+        })
+        .collect();
+    let named: Vec<_> = once.iter().map(|(n, t)| (n.as_str(), t.clone())).collect();
+    let after = project(&named)
+        .unwrap_or_else(|e| panic!("the rewritten project does not load: {}", problems(&e)));
+    assert_eq!(
+        after.hints.annotations.declared, before.hints.annotations.declared,
+        "{once:?}"
+    );
+    let registry = Registry::new(&after.schema);
+    for (name, text) in &once {
+        let file = load_file_str(Path::new(name), text).unwrap();
+        assert_eq!(
+            &format_file(&registry, &file),
+            text,
+            "{name}: not idempotent"
+        );
+    }
+    once
+}
+
+/// A shorthand is only spelled where the project reads it back as the same
+/// reference. `table::app.t` is the table until a view `t` in a schema
+/// `table::app` exists, and then the loader refuses it (DEC-2469.8). `fmt` once
+/// rewrote the structured escape to the shorthand, as a target and as the
+/// table's own owner key, and left a project that did not load.
+#[test]
+fn fmt_spells_a_reference_the_way_the_project_reads_it_back() {
+    let escape = |text: &str| {
+        format!(
+            "object::{}",
+            serde_json::to_string(&reference(text)).unwrap()
+        )
+    };
+    let files = |with_view: bool| {
+        // The table's file names two owners, itself and a column, so its own
+        // owner key is written in the map form, where it is spelled too.
+        let mut files = vec![
+            (
+                "t.yml",
+                format!(
+                    "table: app.t\ndepends_on:\n  '{}': [app.f()]\n  'column::app.t.x': [app.f()]\n\
+                     columns:\n  x: {{type: int}}\n",
+                    escape("table::app.t"),
+                ),
+            ),
+            (
+                "v.yml",
+                format!(
+                    "view: app.v\ndepends_on: ['{}']\ndefinition: SELECT 1\n",
+                    escape("table::app.t")
+                ),
+            ),
+        ];
+        if with_view {
+            files.push(("m.yml", "view: table::app.t\ndefinition: SELECT 1\n".into()));
+        }
+        files
+    };
+    // The shorthand reads as the view here, so each spelling stays the escape:
+    // the owner key and the target of the table's file, and the view's target.
+    let ambiguous = formatted(&files(true));
+    for name in ["t.yml", "v.yml"] {
+        let text = &ambiguous.iter().find(|(n, _)| n == name).unwrap().1;
+        assert_eq!(text.matches("object::").count(), 1, "{name}\n{text}");
+        assert!(!text.contains("table::app.t"), "{name}\n{text}");
+    }
+    // Negative: with no such view, the same annotations are written as the
+    // shorthand, which is shorter and says the same.
+    for (name, text) in formatted(&files(false)) {
+        if name != "m.yml" {
+            assert!(!text.contains("object::"), "{name}\n{text}");
+            assert!(text.contains("table::app.t"), "{name}\n{text}");
+        }
+    }
 }

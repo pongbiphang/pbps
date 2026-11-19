@@ -4,13 +4,13 @@ use std::{
     path::Path,
 };
 
-use pbps_model::object_ref::{ObjectDeps, Root};
+use pbps_model::object_ref::Root;
 use pbps_model::{ColumnType, ManagedType, TypeRef};
 
 use crate::{
     LoadError, SourceFile, Written,
     dto::{DependsOnDto, DomainTypeDto, EnumTypeDto, KindProbe},
-    fmt::{render_depends_on, scalar},
+    fmt::{SpelledDeps, render_depends_on, scalar},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,7 +152,7 @@ pub fn render_type_with_intents(
         definition,
         pending,
         &BTreeMap::new(),
-        &ObjectDeps::default(),
+        &SpelledDeps::default(),
     )
 }
 
@@ -161,7 +161,7 @@ pub fn render_type_with_value_renames(
     definition: &ManagedType,
     pending: &[pbps_model::Intent],
     value_renames: &BTreeMap<String, String>,
-    depends_on: &ObjectDeps,
+    depends_on: &SpelledDeps,
 ) -> String {
     let mut out = format!(
         "{}: {}\n",

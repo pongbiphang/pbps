@@ -875,6 +875,56 @@ mod tests {
         assert!(!project.schema_dir().exists());
     }
 
+    /// A view `product` in the schema `table::dbo` makes the shorthand
+    /// `table::dbo.product` read as that view. The export must write the
+    /// structured escape, or the tree it stages is refused by its own loader.
+    #[test]
+    fn state_history_export_spells_an_edge_the_way_the_loader_reads_it_back() {
+        let view = |definition: &str| pbps_model::Module {
+            kind: pbps_model::ModuleKind::View,
+            definition: definition.into(),
+            description: None,
+            options: Default::default(),
+        };
+        let written = pbps_model::object_ref::ObjectDeps(vec![(
+            "module::dbo.a".parse().unwrap(),
+            ["table::dbo.product".parse().unwrap()].into(),
+        )]);
+        let exported = |label: &str, shadow: bool| {
+            let (_stage, project, mut entry) = fixture(label);
+            let dialect = crate::dialect(&project).unwrap();
+            let schema = &mut entry.snapshot.schema;
+            schema.modules.insert(
+                "dbo.a".parse().unwrap(),
+                view("SELECT code FROM dbo.product"),
+            );
+            if shadow {
+                schema
+                    .modules
+                    .insert("table::dbo.product".parse().unwrap(), view("SELECT 1"));
+            }
+            entry.snapshot.object_deps =
+                pbps_model::object_ref::ObjectEdges::from_deps(&written).unwrap();
+            export(&project, &entry, true, dialect.as_ref())
+                .unwrap_or_else(|e| panic!("{label}: {}", e.message));
+            let text: String = std::fs::read_dir(project.schema_dir())
+                .unwrap()
+                .map(|file| std::fs::read_to_string(file.unwrap().path()).unwrap())
+                .collect();
+            let loaded = pbps_load::load_schema_dir(&project.schema_dir()).unwrap();
+            assert_eq!(
+                loaded.hints.annotations.declared, written,
+                "{label}\n{text}"
+            );
+            text
+        };
+        let escaped = exported("history-spelling-ambiguous", true);
+        assert!(escaped.contains("object::"), "{escaped}");
+        // Negative: with no such view the same edge is the shorthand.
+        let plain = exported("history-spelling-plain", false);
+        assert!(plain.contains("table::dbo.product") && !plain.contains("object::"));
+    }
+
     #[test]
     fn state_history_export_reads_the_identity_file_as_absent_unreadable_or_clean() {
         let dialect_of = |p: &crate::Project| crate::dialect(p).unwrap();

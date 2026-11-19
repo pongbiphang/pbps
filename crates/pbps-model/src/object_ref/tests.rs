@@ -455,6 +455,37 @@ fn typed_collisions_and_external_assumptions_never_become_guessed_local_targets(
     );
 }
 
+/// One rule writes a reference, and `render` only adds the declaration check:
+/// a writer must still be able to write a target the schema does not declare,
+/// which validation names.
+#[test]
+fn spell_is_what_parse_reads_back_and_render_adds_only_the_declaration_check() {
+    let mut schema = fixture();
+    let ambiguous = reference("table::app.t");
+    let plain = reference("app.v");
+    let registry = Registry::new(&schema);
+    // No view named `t` in the schema `table::app`: the shorthand reads back.
+    assert_eq!(registry.spell(&ambiguous), "table::app.t");
+    // A whole module keeps its bare spelling, so an older list keeps its bytes.
+    assert_eq!(registry.spell(&plain), "app.v");
+    schema
+        .modules
+        .insert("table::app.t".parse().unwrap(), module(ModuleKind::View));
+    let registry = Registry::new(&schema);
+    let spelled = registry.spell(&ambiguous);
+    assert!(spelled.starts_with("object::"), "{spelled}");
+    assert_eq!(registry.parse(&spelled, &Default::default()), Ok(ambiguous));
+    // The view itself is not spelled bare: the bare name is the table's spelling.
+    assert_eq!(
+        registry.spell(&reference("module::table::app.t")),
+        "module::table::app.t"
+    );
+    // Negative: `render` refuses what the schema does not declare, `spell` does not.
+    let gone = reference("table::app.gone");
+    assert!(registry.render(&gone).is_err());
+    assert_eq!(registry.spell(&gone), "table::app.gone");
+}
+
 #[test]
 fn every_legacy_module_identity_family_round_trips_without_wire_changes() {
     let mut names = vec![

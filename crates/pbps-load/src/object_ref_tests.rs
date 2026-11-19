@@ -21,7 +21,7 @@ fn legacy_module_targets_keep_their_loader_formatter_and_json_bytes() {
         let rendered = render_module(
             &owner.id,
             &owner.module,
-            &owner.depends_on.deps,
+            &SpelledDeps::alone(&owner.depends_on.deps),
             owner.public_execute,
         );
         let again = load_module_str(Path::new("v.yaml"), &rendered).unwrap();
@@ -30,7 +30,7 @@ fn legacy_module_targets_keep_their_loader_formatter_and_json_bytes() {
             render_module(
                 &again.id,
                 &again.module,
-                &again.depends_on.deps,
+                &SpelledDeps::alone(&again.depends_on.deps),
                 again.public_execute
             ),
             rendered
@@ -58,7 +58,7 @@ fn a_prefix_names_the_kind_and_a_spelling_with_an_unknown_prefix_is_refused() {
     let rendered = render_module(
         &escaped.id,
         &escaped.module,
-        &escaped.depends_on.deps,
+        &SpelledDeps::alone(&escaped.depends_on.deps),
         false,
     );
     assert!(

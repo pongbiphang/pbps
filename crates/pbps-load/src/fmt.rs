@@ -14,7 +14,7 @@
 
 use std::fmt::Write as _;
 
-use pbps_model::object_ref::{ObjectDeps, ObjectRef, Root};
+use pbps_model::object_ref::{ObjectDeps, ObjectRef, Registry, Root};
 use pbps_model::{
     Clustered, Intent, Module, ModuleId, ObjectName, PrimaryKey, ReplicaIdentity, Strategy, Table,
     TableName,
@@ -45,7 +45,7 @@ pub fn render(
     intents: &[Intent],
     strategy: Option<&Strategy>,
 ) -> String {
-    render_partitioned(name, table, &[], intents, strategy, &ObjectDeps::default())
+    render_partitioned(name, table, &[], intents, strategy, &SpelledDeps::default())
 }
 
 /// [`render`], for a partitioned parent with its partitions, which are
@@ -57,7 +57,7 @@ pub fn render_partitioned(
     partitions: &[(&TableName, &Table)],
     intents: &[Intent],
     strategy: Option<&Strategy>,
-    depends_on: &ObjectDeps,
+    depends_on: &SpelledDeps,
 ) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "table: {}", scalar(&name.raw().to_string()));
@@ -513,7 +513,7 @@ fn value(v: &pbps_model::Value) -> String {
 pub fn render_module(
     id: &ModuleId,
     module: &Module,
-    depends_on: &ObjectDeps,
+    depends_on: &SpelledDeps,
     public_execute: bool,
 ) -> String {
     let mut s = String::new();
@@ -595,7 +595,7 @@ pub fn render_role(
     name: &pbps_model::RoleName,
     role: &pbps_model::Role,
     pending: &[Intent],
-    depends_on: &ObjectDeps,
+    depends_on: &SpelledDeps,
 ) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "role: {}", scalar(name.raw()));
@@ -626,42 +626,69 @@ pub fn render_role(
     s
 }
 
+/// A file's `depends_on:` edges with every reference already spelled, the way
+/// the project's own reader will read it back (DEC-2469.8).
+///
+/// The spelling is decided here, once, by [`Registry::spell`], and not by the
+/// renderers: a shorthand's meaning depends on what the whole project declares,
+/// and a renderer sees one file. Taking the spelled value as the renderers'
+/// argument also adds no parameter to the ones that carry no edges, which pass
+/// `&Default::default()`.
+#[derive(Debug, Clone, Default)]
+pub struct SpelledDeps(Vec<(ObjectRef, String, Vec<String>)>);
+
+impl SpelledDeps {
+    /// `deps` spelled for `registry`, which must hold every module the project
+    /// declares: that is all `Registry::parse` asks of the schema for a
+    /// reference with no external assumptions, so a shorthand is judged
+    /// ambiguous exactly when the project declares a module of that name. Owners and targets are in the order
+    /// of the reference type, which is also the order of the saved plan, and
+    /// an owner with no targets is dropped.
+    pub fn new(registry: &Registry<'_>, deps: &ObjectDeps) -> Self {
+        let mut entries: Vec<_> = deps
+            .0
+            .iter()
+            .filter(|(_, targets)| !targets.is_empty())
+            .map(|(owner, targets)| {
+                (
+                    owner.clone(),
+                    registry.spell(owner),
+                    targets.iter().map(|t| registry.spell(t)).collect(),
+                )
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        Self(entries)
+    }
+
+    /// [`SpelledDeps::new`] for a file alone: a project that declares nothing,
+    /// so no shorthand is ambiguous. For tests of one file's round trip; a
+    /// writer always has the project.
+    #[cfg(test)]
+    pub(crate) fn alone(deps: &ObjectDeps) -> Self {
+        Self::new(&Registry::new(&pbps_model::Schema::default()), deps)
+    }
+}
+
 /// Writes a file's `depends_on:` (DEC-2469.8), for every kind of root.
 ///
 /// Only the root's own edges are the list form. Any other owner makes the
 /// whole key a map, the root's own edges then under its own reference, so a
-/// file reads back to exactly the entries it was written from. References and
-/// owners are in the order of the reference type, which is also the order of
-/// the saved plan. A file with no edges gets no key.
-pub(crate) fn render_depends_on(s: &mut String, root: &Root, deps: &ObjectDeps) {
+/// file reads back to exactly the entries it was written from. A file with no
+/// edges gets no key.
+pub(crate) fn render_depends_on(s: &mut String, root: &Root, deps: &SpelledDeps) {
     let own = ObjectRef::whole(root.clone());
-    let spell = |targets: &std::collections::BTreeSet<ObjectRef>| {
-        seq(&targets.iter().map(written).collect::<Vec<_>>())
-    };
-    let mut entries: Vec<_> = deps.0.iter().filter(|(_, t)| !t.is_empty()).collect();
-    entries.sort();
-    match entries.as_slice() {
+    match deps.0.as_slice() {
         [] => {}
-        [(owner, targets)] if *owner == own => {
-            let _ = writeln!(s, "depends_on: {}", spell(targets));
+        [(owner, _, targets)] if *owner == own => {
+            let _ = writeln!(s, "depends_on: {}", seq(targets));
         }
-        _ => {
+        entries => {
             s.push_str("depends_on:\n");
-            for (owner, targets) in entries {
-                let _ = writeln!(s, "  {}: {}", scalar(&written(owner)), spell(targets));
+            for (_, owner, targets) in entries {
+                let _ = writeln!(s, "  {}: {}", scalar(owner), seq(targets));
             }
         }
-    }
-}
-
-/// One reference as a file writes it. A whole module keeps its bare spelling
-/// where that still reads back as the same reference, so a module list written
-/// before the typed prefixes existed keeps its bytes; every other reference is
-/// its prefixed shorthand, or the structured escape when shorthand cannot say it.
-fn written(reference: &ObjectRef) -> String {
-    match reference.legacy_spelling() {
-        Some(bare) if bare.parse::<ObjectRef>().as_ref() == Ok(reference) => bare,
-        _ => reference.raw(),
     }
 }
 
@@ -1529,7 +1556,7 @@ mod tests {
                 render_module(
                     &back.id,
                     &back.module,
-                    &back.depends_on.deps,
+                    &SpelledDeps::alone(&back.depends_on.deps),
                     back.public_execute
                 ),
                 out
@@ -1612,7 +1639,12 @@ mod tests {
     fn module_round_trip(yaml: &str) -> String {
         let a = crate::load_module_str(Path::new("m.yml"), yaml)
             .unwrap_or_else(|e| panic!("the original file failed to load: {e:?}"));
-        let out = render_module(&a.id, &a.module, &a.depends_on.deps, a.public_execute);
+        let out = render_module(
+            &a.id,
+            &a.module,
+            &SpelledDeps::alone(&a.depends_on.deps),
+            a.public_execute,
+        );
         let b = crate::load_module_str(Path::new("m.yml"), &out).unwrap_or_else(|e| {
             panic!("the rewritten file does not read back: {e:?}\noutput:\n{out}")
         });
@@ -1621,7 +1653,12 @@ mod tests {
         assert_eq!(a.depends_on, b.depends_on, "output:\n{out}");
         assert_eq!(a.public_execute, b.public_execute, "output:\n{out}");
         assert_eq!(
-            render_module(&b.id, &b.module, &b.depends_on.deps, b.public_execute),
+            render_module(
+                &b.id,
+                &b.module,
+                &SpelledDeps::alone(&b.depends_on.deps),
+                b.public_execute
+            ),
             out,
             "fmt is not idempotent"
         );
