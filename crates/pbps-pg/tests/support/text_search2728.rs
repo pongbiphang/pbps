@@ -521,6 +521,83 @@ async fn a_stored_dependent_behind_wrappers_of_string_bodies_is_found_through_th
     }
 }
 
+/// A string body records no edge to a view it reads either (measured on 16 and 18: a PL/pgSQL
+/// and a `LANGUAGE sql` string reader record none to the view, a `BEGIN ATOMIC` reader one), so
+/// a view is a node of the same walk as a function (DEC-2728.3): a materialized view over a
+/// PL/pgSQL function that reads a view over `to_tsvector('app.c_v', ...)`, an index over a
+/// SQL function that reads a view over a view naming the configuration, and a function that
+/// reads a materialized view that names it each list the dependent with the view the body
+/// names. Negatives: a function that reads a view over another configuration lists nothing
+/// for this one, and a view the body does not name (a longer identifier) lists nothing.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_stored_dependent_behind_a_function_that_reads_a_view_is_found_through_the_name_it_reads()
+{
+    let _live = super::live_ledger().await;
+    for variable in SERVERS {
+        let mut db = Private::on(variable, "views").await;
+        for config in ["c_v", "c_vv", "c_m", "c_other"] {
+            db.run(&format!(
+                "CREATE TEXT SEARCH CONFIGURATION {config} (COPY = pg_catalog.simple)"
+            ))
+            .await;
+        }
+        db.run("CREATE TABLE docs (body text)").await;
+        // A view over the configuration, read by a PL/pgSQL function under a matview.
+        db.run("CREATE VIEW vw_a AS SELECT to_tsvector('app.c_v', body) AS x FROM docs; CREATE FUNCTION rd_pl(t text) RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN RETURN (SELECT count(*) FROM app.vw_a); END $$; CREATE MATERIALIZED VIEW mv_pl AS SELECT rd_pl(body) AS x FROM docs").await;
+        // A view over a view over the configuration, read by a SQL function under an index.
+        db.run("CREATE VIEW vw_b AS SELECT to_tsvector('app.c_vv', body) AS x FROM docs; CREATE VIEW vw_bb AS SELECT x FROM vw_b; CREATE FUNCTION rd_sql(t text) RETURNS bigint LANGUAGE sql IMMUTABLE AS $$ SELECT count(*) FROM app.vw_bb $$; CREATE INDEX ix_v ON docs (rd_sql(body))").await;
+        // A materialized view over the configuration, read by a function under an index.
+        db.run("CREATE MATERIALIZED VIEW mv_in AS SELECT to_tsvector('app.c_m', body) AS x FROM docs; CREATE FUNCTION rd_mv(t text) RETURNS bigint LANGUAGE sql IMMUTABLE AS $$ SELECT count(*) FROM app.mv_in $$; CREATE INDEX ix_m ON docs (rd_mv(body))").await;
+        // Negatives: a view over another configuration, and a view whose name is only the
+        // start of the longer identifier the body reads.
+        db.run("CREATE VIEW vw_o AS SELECT to_tsvector('app.c_other', body) AS x FROM docs; CREATE FUNCTION rd_o(t text) RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN RETURN (SELECT count(*) FROM app.vw_o); END $$; CREATE MATERIALIZED VIEW mv_o AS SELECT rd_o(body) AS x FROM docs").await;
+        db.run("CREATE VIEW vw_c AS SELECT to_tsvector('app.c_vv', body) AS x FROM docs; CREATE VIEW vw_c2 AS SELECT 1 AS x; CREATE FUNCTION rd_long(t text) RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN RETURN (SELECT count(*) FROM app.vw_c2); END $$; CREATE MATERIALIZED VIEW mv_long AS SELECT rd_long(body) AS x FROM docs").await;
+        // The measured premise: no edge from either string reader to its view, one from the
+        // `BEGIN ATOMIC` reader.
+        db.run("CREATE FUNCTION rd_atomic(t text) RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT count(*) FROM app.vw_a; END").await;
+        for (reader, edges) in [("rd_pl", "0"), ("rd_sql", "0"), ("rd_atomic", "1")] {
+            assert_eq!(
+                db.one(&format!("SELECT count(*)::text FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass AND d.refclassid = 'pg_class'::regclass AND d.objid = 'app.{reader}(text)'::regprocedure")).await,
+                edges,
+                "{reader}"
+            );
+        }
+        let by = |view: &str, kind: &str, what: &str| {
+            format!("{what} (reached through {kind} app.{view}, which a body names)")
+        };
+        for (config, stored) in [
+            (
+                "c_v",
+                vec![by("vw_a", "view", "materialized view app.mv_pl")],
+            ),
+            ("c_vv", vec![by("vw_bb", "view", "index app.ix_v")]),
+            (
+                "c_m",
+                vec![
+                    by("mv_in", "materialized view", "index app.ix_m"),
+                    "materialized view app.mv_in".to_owned(),
+                ],
+            ),
+            (
+                "c_other",
+                vec![by("vw_o", "view", "materialized view app.mv_o")],
+            ),
+        ] {
+            let subject: std::collections::BTreeSet<SearchRef> =
+                [format!("config app.{config}").parse().unwrap()].into();
+            let found = pbps_pg::search::stale_dependents(db.conn(), &Default::default(), &subject)
+                .await
+                .unwrap()
+                .into_values()
+                .next()
+                .unwrap();
+            assert_eq!(found, stored, "{config}");
+        }
+        db.finish().await;
+    }
+}
+
 /// The pull's own query and decoder against the catalog: what a user made is read, in the
 /// engine's order and with a copy expanded; what the engine ships is not (the system-object
 /// exclusion), nor a package's member, nor anything over a parser or a template outside

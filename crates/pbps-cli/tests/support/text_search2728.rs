@@ -1404,7 +1404,8 @@ fn what_would_keep_the_old_behaviour_stops_an_alteration_and_a_parser_or_templat
 /// an index over a `LANGUAGE sql` function and a materialized view over a PL/pgSQL one stop a
 /// change of the mappings, and the refusal names the dependent and the function. Negative: a
 /// function that does not name the object lets the alteration go, and the same object is
-/// refused once a function that names it stands under a materialized view.
+/// refused once a function that names it stands under a materialized view. A materialized
+/// view over a PL/pgSQL function that reads a view over the configuration is refused too.
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn a_string_bodied_function_that_names_the_object_stops_an_alteration_and_one_that_does_not_lets_it_go()
@@ -1435,7 +1436,10 @@ fn a_string_bodied_function_that_names_the_object_stops_an_alteration_and_one_th
              CREATE MATERIALIZED VIEW app.mv_pl AS SELECT app.f_pl(body) AS x FROM app.loose; \
              CREATE FUNCTION app.w_in(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.docs', t) $$; \
              CREATE FUNCTION app.w_pl(t text) RETURNS tsvector LANGUAGE plpgsql AS $$ BEGIN RETURN app.w_in(t); END $$; \
-             CREATE MATERIALIZED VIEW app.mv_w AS SELECT app.w_pl(body) AS x FROM app.loose",
+             CREATE MATERIALIZED VIEW app.mv_w AS SELECT app.w_pl(body) AS x FROM app.loose; \
+             CREATE VIEW app.vw_docs AS SELECT to_tsvector('app.docs', body) AS x FROM app.loose; \
+             CREATE FUNCTION app.rd_view(t text) RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN RETURN (SELECT count(*) FROM app.vw_docs); END $$; \
+             CREATE MATERIALIZED VIEW app.mv_rd AS SELECT app.rd_view(body) AS x FROM app.loose",
         );
         let docs =
             std::fs::read_to_string(d.dir.join("schema/app.docs.textsearch-config.yml")).unwrap();
@@ -1453,6 +1457,7 @@ fn a_string_bodied_function_that_names_the_object_stops_an_alteration_and_one_th
             "index app.ix_sql (reached through function app.f_sql(pg_catalog.text), named in its body)",
             "materialized view app.mv_pl (reached through function app.f_pl(pg_catalog.text), named in its body)",
             "materialized view app.mv_w (reached through function app.w_in(pg_catalog.text), named in its body)",
+            "materialized view app.mv_rd (reached through view app.vw_docs, which a body names)",
             "would keep the old behaviour",
         ] {
             assert!(said(&out).contains(needle), "{needle}: {}", said(&out));
