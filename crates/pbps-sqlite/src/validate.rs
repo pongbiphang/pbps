@@ -393,8 +393,11 @@ pub fn foreign_key_parents(name: &TableName, table: &Table, schema: &Schema) -> 
             continue;
         };
         let wanted: BTreeSet<&ColumnName> = fk.references_columns.iter().collect();
+        // A parent column named twice matches no key, however many columns
+        // the key has: the sets alone would take it.
+        let distinct = wanted.len() == fk.references_columns.len();
         let is = |columns: &mut dyn Iterator<Item = &ColumnName>| {
-            columns.collect::<BTreeSet<_>>() == wanted
+            distinct && columns.collect::<BTreeSet<_>>() == wanted
         };
         let primary = parent
             .primary_key
@@ -1427,6 +1430,7 @@ mod tests {
         let rows: Vec<(&str, &str, Make, &[&str])> = vec![
             ("the primary key", "", |_| {}, &["id"]),
             ("a column that is no key", "", |_| {}, &["a"]),
+            ("the primary key named twice", "", |_| {}, &["id", "id"]),
             (
                 "a unique index",
                 "CREATE UNIQUE INDEX u ON p(a)",
