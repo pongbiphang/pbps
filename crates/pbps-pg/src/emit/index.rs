@@ -24,10 +24,11 @@ pub(super) fn emit(pg: &Postgres, change: &Change, index: &IndexChange, strategy
                 ))
             };
             match target {
-                // A unique constraint's index carries the constraint's name.
-                pbps_model::IndexPart::Unique(n) | pbps_model::IndexPart::Index(n) => {
-                    one(pg, table, alter(n.raw())?)
-                }
+                // A unique or exclusion constraint's index carries the
+                // constraint's name (measured on 16.15 and 18.6).
+                pbps_model::IndexPart::Unique(n)
+                | pbps_model::IndexPart::Index(n)
+                | pbps_model::IndexPart::Exclusion(n) => one(pg, table, alter(n.raw())?),
                 // The key's index is found when the statement runs, as an
                 // unnamed key's drop is: a pulled key carries its name, but a
                 // declared one need not (#1442).

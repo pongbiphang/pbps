@@ -42,6 +42,7 @@ impl<'a> Slot<'a> {
             IndexPart::PrimaryKey => Self::PrimaryKey,
             IndexPart::Unique(name) => Self::Unique(name.raw()),
             IndexPart::Index(name) => Self::Index(name.raw()),
+            IndexPart::Exclusion(name) => Self::Exclusion(name.raw()),
         }
     }
 

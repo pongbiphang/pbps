@@ -228,17 +228,25 @@ pub(super) async fn plan_db_selected(
         // missing checkout UID supplies no drop reason (DEC-2414.1).
         let context = crate::context(project.root())?;
         let resolution = match checked_target.as_ref() {
-            Ok((_, entry)) => pbps_diff::identity::resolve_with_baseline(
-                &loaded.schema,
-                &ids,
-                &loaded.intents,
-                loaded.intents.len(),
-                pbps_diff::Side {
-                    schema: &entry.snapshot.schema,
-                    ids: &entry.snapshot.ids,
-                },
-                &context,
-            ),
+            Ok((_, entry)) => {
+                // The retirement of an exclusion constraint is recorded as its
+                // declared definition, and the engine respells the stored one, so
+                // the record is judged against the baseline the differ compares:
+                // what was declared where the snapshot recorded it, the read-back
+                // elsewhere (DEC-2448.4).
+                let base = entry.snapshot.declared.overlay(&entry.snapshot.schema);
+                pbps_diff::identity::resolve_with_baseline(
+                    &loaded.schema,
+                    &ids,
+                    &loaded.intents,
+                    loaded.intents.len(),
+                    pbps_diff::Side {
+                        schema: &base,
+                        ids: &entry.snapshot.ids,
+                    },
+                    &context,
+                )
+            }
             // The target read's saved error still prevents a plan below.
             Err(_) => pbps_diff::resolve_with_annotations(
                 &loaded.schema,

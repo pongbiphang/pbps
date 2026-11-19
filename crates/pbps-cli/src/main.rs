@@ -451,6 +451,23 @@ enum Command {
         reason: pbps_model::Reason,
     },
 
+    /// Record an exclusion constraint drop: the guarantee it enforced is given
+    /// up, and the retirement is what lets a plan drop it (DEC-2448.4)
+    DropExclusion {
+        /// The table that holds it, e.g. app.booking
+        table: String,
+        /// The constraint's name
+        name: String,
+        /// Why it is being dropped; required for audit
+        #[arg(long)]
+        reason: pbps_model::Reason,
+        /// The git revision whose declarations still hold the constraint: the
+        /// record keeps the definition it retires. After the declarations that
+        /// dropped it were committed, name the revision before them
+        #[arg(long, default_value = "HEAD")]
+        since: String,
+    },
+
     /// Allow a new range partition to take its rows from the DEFAULT partition
     /// beside it (#1788)
     MoveRows {
@@ -701,6 +718,7 @@ impl Command {
             | Command::DropRole { .. }
             | Command::DropExtension { .. }
             | Command::DropSearch { .. }
+            | Command::DropExclusion { .. }
             | Command::MoveRows { .. }
             | Command::Convert { .. }
             | Command::RebuildTable { .. }
@@ -1026,6 +1044,7 @@ fn run() -> anyhow::Result<()> {
     | Command::DropRole { reason, .. }
     | Command::DropExtension { reason, .. }
     | Command::DropSearch { reason, .. }
+    | Command::DropExclusion { reason, .. }
     | Command::MoveRows { reason, .. }
     | Command::RebuildTable {
         reason: Some(reason),
@@ -1058,6 +1077,7 @@ fn run() -> anyhow::Result<()> {
         | Command::DropRole { .. }
         | Command::DropExtension { .. }
         | Command::DropSearch { .. }
+        | Command::DropExclusion { .. }
         | Command::MoveRows { .. }
         | Command::Convert { .. }
         | Command::RebuildTable { .. }
@@ -1666,6 +1686,20 @@ fn run() -> anyhow::Result<()> {
                 reason,
             }
             .into(),
+        ),
+        Command::DropExclusion {
+            table,
+            name,
+            reason,
+            since,
+        } => cmd_drop_exclusion(
+            &project,
+            Intent::DropExclusion {
+                table: table.parse::<TableName>()?,
+                name: name.into(),
+                reason,
+            },
+            since,
         ),
         Command::MoveRows {
             table,
@@ -4771,6 +4805,53 @@ fn cmd_convert(
     Ok(())
 }
 
+/// Records one exclusion constraint's retirement. The record keeps the
+/// definition it retires, which only the baseline still holds once the
+/// declarations have dropped it, so this resolves against the checked-in
+/// baseline as `convert` and `rebuild-table` do, at the revision `--since` names
+/// (DEC-2448.4).
+fn cmd_drop_exclusion(project: &Project, intent: Intent, since: String) -> anyhow::Result<()> {
+    let dialect = dialect(project)?;
+    let loaded = load(project, dialect.as_ref())?;
+    if !loaded.intents.is_empty() {
+        bail!("resolve declaration identity annotations before recording an exclusion drop");
+    }
+    let ids = read_ids(project)?;
+    let baseline = baseline::load(
+        project,
+        &baseline::Source::Git { rev: since },
+        dialect.as_ref(),
+    )?;
+    match pbps_diff::resolve_with_annotations_against(
+        &loaded.schema,
+        &ids,
+        std::slice::from_ref(&intent),
+        0,
+        Side {
+            schema: &baseline.schema,
+            ids: &baseline.ids,
+        },
+        &context(project.root())?,
+    ) {
+        Ok(res) if res.ids == ids => {
+            println!("The identity file is unchanged; this retirement is already recorded.");
+            Ok(())
+        }
+        Ok(res) => {
+            write_ids(project, &res.ids)?;
+            println!("updated {}", project.ids_dir().display());
+            Ok(())
+        }
+        Err(blockers) => {
+            eprintln!(
+                "{}",
+                report::blockers_with_intents(&blockers, std::slice::from_ref(&intent))
+            );
+            Err(Found::new("identity could not be resolved").into())
+        }
+    }
+}
+
 /// Resolves every supplied decision together; only a complete answer is written.
 fn cmd_intent(project: &Project, batch: IntentBatch) -> anyhow::Result<()> {
     cmd_intent_with(project, batch, |_| Ok(()))
@@ -5221,12 +5302,16 @@ fn cmd_plan(
             baseline::load(project, source, dialect.as_ref()),
         )?;
 
+        // The differ's baseline below overlays what was declared on the read-back
+        // (ADR-0013 §4); an exclusion's recorded retirement is judged against the
+        // same text, not the engine's respelling (DEC-2448.4).
+        let identity_base = base.declared.overlay(&base.schema);
         let res = match resolve_with_intent(
             project,
             &loaded,
             &ids,
             pbps_diff::Side {
-                schema: &base.schema,
+                schema: &identity_base,
                 ids: &base.ids,
             },
             may_prompt,

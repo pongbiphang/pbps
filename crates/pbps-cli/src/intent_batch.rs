@@ -4,7 +4,7 @@ use anyhow::{Context as _, ensure};
 use clap::{ArgAction, Args};
 use pbps_model::{ColumnRef, Intent, Reason};
 
-pub const SINGLE_REASON_HELP: &str = "pbps intent refuses hyphen-leading values; a single '-' as one drop reason reads that reason from stdin, and the single commands pbps drop, drop-table, drop-role, drop-extension, drop-search, move-rows or rebuild-table accept --reason - too.";
+pub const SINGLE_REASON_HELP: &str = "pbps intent refuses hyphen-leading values; a single '-' as one drop reason reads that reason from stdin, and the single commands pbps drop, drop-table, drop-role, drop-extension, drop-search, drop-exclusion, move-rows or rebuild-table accept --reason - too.";
 
 /// The reason options. Only their second value is audit text, so only there
 /// can `-` stand for stdin.
@@ -449,10 +449,27 @@ mod tests {
             .get_arguments()
             .any(|a| a.get_long() == Some(DROP_EXTENSION_FLAG.trim_start_matches("--")));
         assert!(batch_flag, "`pbps intent` takes {DROP_EXTENSION_FLAG}");
-        // The remedy a blocker prints runs as written.
+        // The exclusion command has a name everywhere too, and no batch spelling:
+        // a table and a name do not fit a pair (DEC-2448.4).
+        assert!(
+            command
+                .find_subcommand(crate::report::DROP_EXCLUSION)
+                .is_some(),
+            "the single command is `{}`",
+            crate::report::DROP_EXCLUSION
+        );
+        assert!(
+            !command
+                .find_subcommand("intent")
+                .unwrap()
+                .get_arguments()
+                .any(|a| a.get_long() == Some(crate::report::DROP_EXCLUSION)),
+            "`pbps intent` does not take it"
+        );
         let said = crate::report::blockers(&[pbps_diff::Blocker::DropExtensionNeedsReason {
             name: "citext".into(),
         }]);
+        // The remedy a blocker prints runs as written.
         assert!(
             said.contains(&format!(
                 "pbps {} citext --reason",

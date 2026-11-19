@@ -56,6 +56,7 @@ pub enum ChoiceKind {
     DropRole(pbps_model::RoleName),
     DropExtension(pbps_model::ObjectLocalName),
     DropSearch(pbps_model::SearchRef),
+    DropExclusion(TableName, pbps_model::ObjectLocalName),
     DropType(pbps_model::TypeRef),
 }
 
@@ -244,6 +245,14 @@ pub fn choices(b: &Blocker) -> Vec<Choice> {
             label: format!("{} was dropped (you will be asked why)", name.shown()),
             kind: ChoiceKind::DropSearch(name.clone()),
         }),
+        Blocker::DropExclusionNeedsReason { table, name } => out.push(Choice {
+            label: format!(
+                "exclusion constraint {} on {} was dropped (you will be asked why)",
+                name.shown(),
+                table.shown()
+            ),
+            kind: ChoiceKind::DropExclusion(table.clone(), name.clone()),
+        }),
         // A stale or misspelled annotation. There is nothing to choose: the
         // remedy is to edit the file, and offering an option here would invite
         // the user to confirm a typo into the identity file.
@@ -369,6 +378,14 @@ pub fn ask_from<R: std::io::BufRead>(blockers: &[Blocker], reader: R) -> Option<
             ChoiceKind::DropSearch(name) => Intent::DropSearch {
                 name: name.clone(),
                 reason: reason(&mut lines, &name.shown().to_string())?,
+            },
+            ChoiceKind::DropExclusion(table, name) => Intent::DropExclusion {
+                table: table.clone(),
+                name: name.clone(),
+                reason: reason(
+                    &mut lines,
+                    &format!("exclusion constraint {} on {}", name.shown(), table.shown()),
+                )?,
             },
         });
     }
@@ -524,6 +541,13 @@ fn question(b: &Blocker) -> String {
                 .map(|t| format!("{t}: ", t = t.shown()))
                 .unwrap_or_default();
             format!("{prefix}{what} `{part}` contains a `.`")
+        }
+        Blocker::DropExclusionNeedsReason { table, name } => {
+            format!(
+                "exclusion constraint {} disappeared from {}",
+                name.shown(),
+                table.shown()
+            )
         }
         Blocker::MoveNotBesideDefault { table } => {
             format!(
@@ -997,6 +1021,35 @@ mod tests {
             got,
             vec![Intent::DropExtension {
                 name: "citext".into(),
+                reason: "retired for good".parse().unwrap(),
+            }]
+        );
+        // Negative: a blank reason, or no answer, records nothing.
+        assert_eq!(ask_from(std::slice::from_ref(&b), answers("1\n\n")), None);
+        assert_eq!(ask_from(std::slice::from_ref(&b), answers("")), None);
+    }
+
+    /// An exclusion constraint that vanished from a declared table offers one
+    /// choice, a drop, asks why, and records nothing on a blank answer
+    /// (DEC-2448.4).
+    #[test]
+    fn a_vanished_exclusion_offers_a_drop_and_asks_why() {
+        let b = Blocker::DropExclusionNeedsReason {
+            table: "app.booking".parse().unwrap(),
+            name: "no_overlap".into(),
+        };
+        let offered = choices(&b);
+        assert_eq!(offered.len(), 1);
+        assert!(matches!(
+            &offered[0].kind,
+            ChoiceKind::DropExclusion(t, n) if t.raw().to_string() == "app.booking" && n.raw() == "no_overlap"
+        ));
+        let got = ask_from(std::slice::from_ref(&b), answers("1\nretired for good\n")).unwrap();
+        assert_eq!(
+            got,
+            vec![Intent::DropExclusion {
+                table: "app.booking".parse().unwrap(),
+                name: "no_overlap".into(),
                 reason: "retired for good".parse().unwrap(),
             }]
         );

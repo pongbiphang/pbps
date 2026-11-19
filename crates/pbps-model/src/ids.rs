@@ -46,6 +46,7 @@ macro_rules! each_name_map {
             moves: _,
             rebuilds: _,
             conversions: _,
+            exclusions: _,
         } = $ids;
         each_name_map!(@each $kind, $map, $body;
             Table => tables, Column => columns, Role => roles, Type => types,
@@ -65,6 +66,7 @@ macro_rules! each_name_map {
             moves: _,
             rebuilds: _,
             conversions: _,
+            exclusions: _,
         } = $ids;
         let IdsFile {
             version: _,
@@ -78,6 +80,7 @@ macro_rules! each_name_map {
             moves: _,
             rebuilds: _,
             conversions: _,
+            exclusions: _,
         } = $other;
         each_name_map!(@each $map, $theirs, $body;
             own_tables => tables, own_columns => columns, own_roles => roles,
@@ -141,6 +144,15 @@ pub enum IdsError {
 
     #[error("a conversion is recorded for {uid}, but no live column entry has that uid")]
     OrphanConversion { uid: Uid },
+
+    #[error("an exclusion retirement is recorded for {uid}, but no live table entry has that uid")]
+    OrphanExclusion { uid: Uid },
+
+    #[error(
+        "the exclusion retirement recorded for {uid} `{}` has a blank definition, reason, operator or date",
+        crate::escape::Escaped(.name)
+    )]
+    InvalidExclusion { uid: Uid, name: String },
 
     #[error(
         "the conversion recorded for {uid} is blank, or its `from` and `to` are not two different types"
@@ -221,6 +233,17 @@ pub struct IdsFile {
     /// section records none, and every such change keeps its refusal.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub conversions: BTreeMap<Uid, Conversion>,
+
+    /// The exclusion constraints a human retired (`pbps drop-exclusion`,
+    /// DEC-2448.4), by the owning table's uid and then the constraint's name.
+    /// An exclusion has no uid of its own (a rename is a retirement and an
+    /// addition), so the table's uid is what keeps a record through a table
+    /// rename or move and keeps a new table of the same spelling from
+    /// inheriting it. A compatible evolution under version 1, like the
+    /// sections above: the struct refuses unknown fields, so a reader that
+    /// does not know the section refuses the file and never drops a record.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub exclusions: BTreeMap<Uid, BTreeMap<crate::ObjectLocalName, ExclusionRetirement>>,
 }
 
 impl Default for IdsFile {
@@ -237,8 +260,29 @@ impl Default for IdsFile {
             moves: BTreeMap::new(),
             rebuilds: BTreeMap::new(),
             conversions: BTreeMap::new(),
+            exclusions: BTreeMap::new(),
         }
     }
+}
+
+/// The retirement of one exclusion constraint, written by `pbps drop-exclusion`
+/// (DEC-2448.4).
+///
+/// Dropping an exclusion gives up a guarantee the engine enforced, so the plan
+/// that does it needs the reason an auditor asks for, and it needs it for
+/// *this* definition: `was` is the canonical text of the definition the human
+/// retired ([`crate::ExclusionConstraint::canonical_text`]), so a same-named
+/// constraint of another definition finds no authority. A record stays in git
+/// after the drop, as a tombstone does, because an environment that still holds
+/// the constraint is retired by it later.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExclusionRetirement {
+    pub was: String,
+    pub reason: String,
+    pub operator: String,
+    /// `YYYY-MM-DD`
+    pub dropped_at: String,
 }
 
 /// A move of a DEFAULT partition's rows into a new range partition, allowed by
@@ -429,6 +473,7 @@ impl IdsFile {
             .retain(|_, column| !tables.contains(&column.table));
         let live = kept.tables.clone();
         kept.moves.retain(|uid, _| live.contains_key(uid));
+        kept.exclusions.retain(|uid, _| live.contains_key(uid));
         let (columns, tombstones) = (&kept.columns, &kept.tombstones);
         kept.conversions.retain(|uid, _| columns.contains_key(uid));
         // A lineage whose replacement parts were removed is no longer whole;
@@ -479,6 +524,22 @@ impl IdsFile {
 
     pub fn role_uid(&self, name: &crate::RoleName) -> Option<&Uid> {
         self.roles.iter().find(|(_, n)| *n == name).map(|(u, _)| u)
+    }
+
+    /// Whether a human retired exactly this exclusion constraint of this table:
+    /// the record is the table's uid, the name and the definition's canonical
+    /// text. The same name with another definition, or another table's record
+    /// of it, is no authority (DEC-2448.4).
+    pub fn exclusion_retired(
+        &self,
+        table: &Uid,
+        name: &crate::ObjectLocalName,
+        was: &crate::ExclusionConstraint,
+    ) -> bool {
+        self.exclusions
+            .get(table)
+            .and_then(|named| named.get(name))
+            .is_some_and(|record| record.was == was.canonical_text())
     }
 
     pub fn extension_uid(&self, name: &crate::ObjectLocalName) -> Option<&Uid> {
@@ -664,6 +725,25 @@ impl IdsFile {
         for uid in self.moves.keys() {
             if !self.tables.contains_key(uid) {
                 return Err(IdsError::OrphanMove { uid: uid.clone() });
+            }
+        }
+        // The same for a retirement: a table drop takes its records with it.
+        for (uid, named) in &self.exclusions {
+            if !self.tables.contains_key(uid) {
+                return Err(IdsError::OrphanExclusion { uid: uid.clone() });
+            }
+            for (name, record) in named {
+                let blank = |t: &str| t.trim().is_empty();
+                if blank(&record.was)
+                    || blank(&record.reason)
+                    || blank(&record.operator)
+                    || blank(&record.dropped_at)
+                {
+                    return Err(IdsError::InvalidExclusion {
+                        uid: uid.clone(),
+                        name: name.raw().to_owned(),
+                    });
+                }
             }
         }
         // A conversion belongs to a live column, and says what it converts
@@ -1494,6 +1574,100 @@ mod tests {
             f.validated().unwrap_err(),
             IdsError::OrphanMove { .. }
         ));
+    }
+
+    /// DEC-2448.4: an exclusion's retirement joins the file as a move does, under
+    /// the same version. An older file reads with none and an empty section is
+    /// not written; a reader that does not know the section refuses the file
+    /// (the struct denies unknown fields) rather than dropping a record; and a
+    /// record without its live table, or a blank one, is refused.
+    #[test]
+    fn exclusion_retirements_join_the_file_and_belong_to_a_live_table() {
+        let retired = || ExclusionRetirement {
+            was: "{\"method\":\"gist\"}".into(),
+            reason: "the service enforces it".into(),
+            operator: "leon".into(),
+            dropped_at: "2026-11-15".into(),
+        };
+        let mut f = sample();
+        f.exclusions
+            .insert(uid("t_a9k2mq"), [("no_overlap".into(), retired())].into());
+        f.validate().unwrap();
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(
+            json.contains("\"exclusions\":{\"t_a9k2mq\":{\"no_overlap\":"),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<IdsFile>(&json).unwrap(), f);
+        // Legacy bytes: no section is written when there is no record.
+        let old = serde_json::to_string(&sample()).unwrap();
+        assert!(!old.contains("exclusions"), "{old}");
+        assert!(
+            serde_json::from_str::<IdsFile>(&old)
+                .unwrap()
+                .exclusions
+                .is_empty()
+        );
+        // A reader without the section refuses what it does not know: pinned
+        // by the same strictness on a field no build knows.
+        let unknown = json.replacen("\"exclusions\"", "\"exclusions_of_a_later_build\"", 1);
+        assert!(serde_json::from_str::<IdsFile>(&unknown).is_err());
+        // A state for a database without the table keeps no record of it.
+        assert!(
+            f.without(&["dbo.customer".parse().unwrap()])
+                .exclusions
+                .is_empty()
+        );
+        // The match is on this definition, at this name, under this table.
+        let held = crate::ExclusionConstraint {
+            method: crate::IndexMethod::Gist,
+            keys: Vec::new(),
+            include: Vec::new(),
+            filter: None,
+            storage_parameters: Default::default(),
+            timing: crate::ExclusionTiming::Immediate,
+        };
+        f.exclusions
+            .get_mut(&uid("t_a9k2mq"))
+            .unwrap()
+            .get_mut("no_overlap")
+            .unwrap()
+            .was = held.canonical_text();
+        let name = crate::ObjectLocalName::from("no_overlap");
+        assert!(f.exclusion_retired(&uid("t_a9k2mq"), &name, &held));
+        let mut other = held.clone();
+        other.filter = Some("active".into());
+        assert!(!f.exclusion_retired(&uid("t_a9k2mq"), &name, &other));
+        assert!(!f.exclusion_retired(&uid("t_a9k2mq"), &"renamed".into(), &held));
+        assert!(!f.exclusion_retired(&uid("t_bbbbbb"), &name, &held));
+        // Negative: a record whose table has no live entry, and a blank one.
+        let mut orphan = f.clone();
+        orphan
+            .exclusions
+            .insert(uid("t_bbbbbb"), [("x".into(), retired())].into());
+        assert!(matches!(
+            orphan.validated().unwrap_err(),
+            IdsError::OrphanExclusion { .. }
+        ));
+        for blank in 0..4 {
+            let mut f = f.clone();
+            let r = f
+                .exclusions
+                .get_mut(&uid("t_a9k2mq"))
+                .unwrap()
+                .get_mut("no_overlap")
+                .unwrap();
+            match blank {
+                0 => r.was = " ".into(),
+                1 => r.reason = "\t".into(),
+                2 => r.operator = String::new(),
+                _ => r.dropped_at = "\n".into(),
+            }
+            assert!(matches!(
+                f.validated().unwrap_err(),
+                IdsError::InvalidExclusion { .. }
+            ));
+        }
     }
 
     #[test]

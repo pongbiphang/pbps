@@ -297,6 +297,7 @@ impl From<&IndexPart> for PartKey {
             IndexPart::PrimaryKey => PartKey::PrimaryKey,
             IndexPart::Unique(name) => PartKey::Unique(name.clone()),
             IndexPart::Index(name) => PartKey::Index(name.clone()),
+            IndexPart::Exclusion(name) => PartKey::Exclusion(name.clone()),
         }
     }
 }

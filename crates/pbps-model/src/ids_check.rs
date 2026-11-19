@@ -604,6 +604,8 @@ fn invalid_uid(e: &IdsError) -> Option<&Uid> {
         | IdsError::InvalidRebuild { uid }
         | IdsError::OrphanConversion { uid }
         | IdsError::InvalidConversion { uid }
+        | IdsError::OrphanExclusion { uid }
+        | IdsError::InvalidExclusion { uid, .. }
         | IdsError::InvalidDropRequirement { uid }
         | IdsError::NotHeld { uid, .. } => Some(uid),
         IdsError::UnsupportedVersion { .. } | IdsError::DuplicateName { .. } => None,

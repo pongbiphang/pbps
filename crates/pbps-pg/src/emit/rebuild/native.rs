@@ -441,7 +441,8 @@ async fn exercise(
                     }
                     Definition::Index(_) | Definition::Unique(_) => match &part {
                         IndexPart::Index(name) | IndexPart::Unique(name) => name.clone(),
-                        IndexPart::PrimaryKey => unreachable!(),
+                        // Refused on a partitioned table, so never a part of one.
+                        IndexPart::PrimaryKey | IndexPart::Exclusion(_) => unreachable!(),
                     },
                 };
                 Ok(BuildPartitionedIndex {

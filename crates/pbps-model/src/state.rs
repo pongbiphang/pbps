@@ -167,7 +167,10 @@ use schemars::JsonSchema;
 /// used; 46 belongs to another change.
 /// Version 49 records standalone sequences (DEC-2721.1); every older snapshot truthfully
 /// holds none. 48 was reserved and never used.
-pub const CURRENT_VERSION: u32 = 49;
+/// Version 50 records the retirement of an exclusion constraint in the snapshot's identities
+/// (DEC-2448.4); every older snapshot truthfully holds none, and an older build would reject
+/// the section.
+pub const CURRENT_VERSION: u32 = 50;
 
 /// The first version that records `object_deps` and no longer `module_deps`.
 ///

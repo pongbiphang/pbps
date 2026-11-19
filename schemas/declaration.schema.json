@@ -2177,6 +2177,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 112,
+  "x-pbps-schema-version": 114,
   "x-pbps-tool-version": "0.0.0"
 }

@@ -312,7 +312,10 @@ use crate::zone::SessionZone;
 // 79 adds `CreateSearch` and `DropSearch`, a text search configuration or dictionary created
 // or dropped by recorded identity (DEC-2728.2): an older build would refuse them as unknown
 // changes; 74 and 77 are unused, and 75, 76 and 78 belong to other changes.
-pub const CURRENT_VERSION: u32 = 79;
+// 80 adds `SetExclusion`'s drop half and `IndexPart::Exclusion` (DEC-2448.4): an older build
+// would not know the part, and would refuse a plan that drops a constraint only by chance of
+// reading `from` without `to`; 79 is the text search objects'.
+pub const CURRENT_VERSION: u32 = 80;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -1678,7 +1681,7 @@ mod tests {
             Default::default(),
             Default::default(),
         );
-        assert_eq!(plan.version, 79);
+        assert_eq!(plan.version, 80);
         let bare = serde_json::to_value(&plan).unwrap();
         assert!(bare.get("extension_drops").is_none(), "{bare}");
         assert!(bare.get("extension_changes").is_none(), "{bare}");

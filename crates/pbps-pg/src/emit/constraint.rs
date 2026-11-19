@@ -92,12 +92,29 @@ pub(super) fn emit(pg: &Postgres, change: &Change, constraint: &ConstraintChange
                 exclusion_clause(name.raw(), x)?
             ),
         ),
-        // Dropping or replacing one needs the retirement record and arrives with
-        // it (DEC-2448.3); a replacement is a drop and an add as two changes,
-        // each in its own ordering class, never one change carrying both.
+        // `DROP CONSTRAINT`, never `DROP INDEX`: the backing index is owned by
+        // the constraint and the engine refuses to drop it alone (2BP01,
+        // measured on 16.15 and 18.6). Both go together.
+        ConstraintChange::SetExclusion {
+            table,
+            name,
+            from: Some(_),
+            to: None,
+        } => one(
+            pg,
+            table,
+            format!(
+                "ALTER TABLE {} DROP CONSTRAINT {};",
+                qualified(table)?,
+                quote(name.raw())?
+            ),
+        ),
+        // A replacement is a drop and an add as two changes, each in its own
+        // ordering class, never one change carrying both (DEC-2448.3); and a
+        // change holding neither has nothing to emit.
         ConstraintChange::SetExclusion { name, .. } => Err(invalid(format!(
-            "exclusion constraint `{}` cannot be dropped or replaced yet: that arrives with \
-             the retirement record (DEC-2448.3)",
+            "exclusion constraint `{}` is changed by a drop and an add as two changes, \
+             never by one carrying both (DEC-2448.3)",
             name.shown()
         ))),
         ConstraintChange::DropUnique { table, name }
