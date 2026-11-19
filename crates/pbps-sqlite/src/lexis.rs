@@ -270,6 +270,19 @@ pub fn has_second_statement(text: &str) -> bool {
     false
 }
 
+/// Whether the code of `text` holds `word` as a bare word of its own, ASCII
+/// case ignored: not inside a string, a quoted name or a comment, and not as
+/// part of a longer name.
+#[must_use]
+pub fn has_bare_word(text: &str, word: &str) -> bool {
+    pieces(text).iter().any(|piece| match piece {
+        Piece::Code(code) => code
+            .split(|c| !crate::ident::identifier_continues(c))
+            .any(|found| found.eq_ignore_ascii_case(word)),
+        Piece::Quoted(_) | Piece::Comment(_) => false,
+    })
+}
+
 /// The first word of the code, lower-cased, skipping layout and comments: what
 /// a statement starts with.
 #[must_use]
@@ -442,6 +455,28 @@ mod tests {
         // The blob prefix goes with its string, but a name ending in `x` stays.
         assert!(!blanked.contains("x'") && blanked.contains("ex"));
         assert_eq!(code_only("é 'ü'").len(), "é 'ü'".len());
+    }
+
+    #[test]
+    fn a_bare_word_is_found_only_as_code_and_only_whole() {
+        for text in ["a IN (SELECT 1)", "select", "(sElEcT\t1)", "x,select,y"] {
+            assert!(has_bare_word(text, "select"), "{text:?}");
+        }
+        for text in [
+            "'select'",
+            "\"select\"",
+            "`select`",
+            "[select]",
+            "-- select\n1",
+            "/* select */ 1",
+            "selected",
+            "preselect",
+            "select$",
+            "sélect",
+            "",
+        ] {
+            assert!(!has_bare_word(text, "select"), "{text:?}");
+        }
     }
 
     #[test]

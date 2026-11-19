@@ -111,9 +111,19 @@ fn local_name(what: &str, name: &str, found: &mut Vec<DialectError>) {
 }
 
 /// Whether `text` is one expression SQLite reads whole: something there, its
-/// parentheses closed, no `;`. Read with SQLite's own lexis (`lexis`).
+/// parentheses closed, no `;`, and no subquery, which SQLite has in none of
+/// the places this is asked about (a check, an index filter, a default).
+/// `SELECT` is reserved, so the bare word is always one. Read with SQLite's
+/// own lexis (`lexis`).
+///
+/// This reads structure and nothing here parses SQL. What an expression may
+/// mean (a default that names a column, a filter that calls a function that
+/// is not deterministic, a name that does not exist) is the engine's to
+/// refuse, at apply and inside the plan's transaction.
 fn expression(text: &str) -> bool {
-    lexis::has_token(text) && lexis::is_one_expression(text)
+    lexis::has_token(text)
+        && lexis::is_one_expression(text)
+        && !lexis::has_bare_word(text, "select")
 }
 
 /// Whether `text` is exactly one default SQLite reads as a value, and nothing
@@ -1358,6 +1368,13 @@ mod tests {
         ("c > 0 -- why\n", true, true),
         ("c <> ')'", true, true),
         ("\"c\" > 0", true, true),
+        // A subquery: SQLite has none in a check, a default or an index filter.
+        ("c IN (SELECT 1)", false, false),
+        ("c > (select max(1))", false, false),
+        ("EXISTS (SELECT 1)", false, false),
+        ("c <> \"select\"", true, true),
+        ("c <> 'select'", true, true),
+        ("c > 0 /* select */", true, true),
         // An empty group is no expression.
         ("()", false, false),
         ("(())", false, false),
@@ -1553,6 +1570,56 @@ mod tests {
             refused += usize::from(!engine);
         }
         assert!(kept >= 3 && refused >= 3, "{kept} kept, {refused} refused");
+    }
+
+    /// A subquery is refused in the two other places an expression stands, as
+    /// the engine refuses it there.
+    #[test]
+    fn a_subquery_is_refused_in_a_default_and_in_an_index_filter() {
+        assert!(!accepts("CREATE TABLE t(c DEFAULT ((SELECT 1)))"));
+        assert!(!accepts(
+            "CREATE TABLE t(c); CREATE INDEX i ON t(c) WHERE c IN (SELECT 1)"
+        ));
+        assert!(!default_value("((SELECT 1))"));
+        assert!(!default_value("(1 + (select 2))"));
+        assert!(!expression("c IN (SELECT 1)"));
+        // Negative: the same shapes without one.
+        assert!(accepts("CREATE TABLE t(c DEFAULT ((1)))") && default_value("((1))"));
+        assert!(accepts(
+            "CREATE TABLE t(c); CREATE INDEX i ON t(c) WHERE c IN (1)"
+        ));
+    }
+
+    /// Where the check stops, pinned: it reads structure, and nothing here
+    /// parses SQL. What an expression may mean is the engine's to refuse, at
+    /// apply and inside the plan's transaction. Each row is taken here and
+    /// refused by the engine.
+    #[test]
+    fn what_an_expression_means_is_left_to_the_engine() {
+        for (sql, text, is_default) in [
+            // A default may not name a column.
+            ("CREATE TABLE t(c, d DEFAULT (c))", "(c)", true),
+            // A partial index's filter may not call a function that is not deterministic.
+            (
+                "CREATE TABLE t(c); CREATE INDEX i ON t(c) WHERE random() > 0",
+                "random() > 0",
+                false,
+            ),
+            // A check may not name a column the table does not have.
+            (
+                "CREATE TABLE t(c, CHECK (missing > 0))",
+                "missing > 0",
+                false,
+            ),
+        ] {
+            assert!(!accepts(sql), "the engine refuses {sql}");
+            let taken = if is_default {
+                default_value(text)
+            } else {
+                expression(text)
+            };
+            assert!(taken, "{text} is structure this check takes");
+        }
     }
 
     /// The ledger's two names are taken in the one namespace tables, views

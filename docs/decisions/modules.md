@@ -2236,6 +2236,15 @@ This adds no persisted field, format number, published schema or YAML route. C3 
 - **A view is one statement starting `SELECT`, `WITH` or `VALUES`,** in `main`, with no options. A `;` followed by more code is refused, since SQLite runs it. Nothing parses SQL: a body that starts right but is not a whole query is left to the engine, which refuses it when the plan runs in its transaction.
 - **A table is `main.<name>` and nothing else**: any other schema is refused as unsupported, and no model change was made. The model has no table flag for STRICT, WITHOUT ROWID or AUTOINCREMENT, so they cannot be declared.
 - **Three words for a refusal.** `Unsupported`: SQLite has no such thing (roles and grants, identity and sequence columns, partitions, row security, filegroups, clustered keys, storage parameters, included columns, index methods, operator classes, system versioning, exclusion constraints, procedures, functions, a schema other than `main`), each shown to be refused by the engine. `NotBuilt`: valid SQLite that version 0 does not build (generated and computed columns, column and index collation, expression indexes, triggers, declared rows). `Invalid`: the declaration uses a feature wrongly (a missing column, a name starting `sqlite_`, a ledger name in any case, an unequal foreign key, a bad expression).
+- **An expression is checked for structure, not meaning.** A check, an index
+  filter and a default in parentheses must be one expression: closed, with no
+  `;`, no empty group and no subquery (SQLite has none in these places, and
+  `SELECT` is reserved, so the bare word is always one). Nothing here parses
+  SQL, so what an expression means is the engine's to refuse at apply, inside
+  the plan's transaction: a default that names a column, a filter that calls a
+  function that is not deterministic, a name that does not exist. The other
+  engines' dialects stop at the same line. A test pins three such rows as
+  taken here and refused by the engine.
 - **A foreign key must reference a key of its parent.** SQLite creates a child
   whose parent columns are neither the parent's primary key nor held unique
   together, and then refuses every write to it (`foreign key mismatch`), so
