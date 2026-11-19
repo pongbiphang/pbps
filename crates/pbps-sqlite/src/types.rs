@@ -439,9 +439,14 @@ pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
 
 /// The type of a column as the catalog reports it, which is the text the engine
 /// stored: the declared type as written, a column with no type reported as
-/// empty. Empty (only ASCII white space) is [`UNTYPED`]; anything else
-/// parses and normalizes as a declared type does, so a read type and a
-/// declared one meet in the same form.
+/// empty. Empty is [`UNTYPED`]; anything else parses and normalizes as a
+/// declared type does, so a read type and a declared one meet in the same form.
+///
+/// Empty is not proof of no type: a column declared with a quoted empty name
+/// (`a ""`) is reported empty too and has NUMERIC affinity (measured), so the
+/// caller must also see in the stored text that the column has no type words.
+/// A quoted name of only white space (`a " "`) is reported as that white space
+/// and is NUMERIC as well; it is refused here, never read as no type.
 ///
 /// A column really declared `untyped` is refused, by name: read as the
 /// reserved word it would be written back with no type, and the column would
@@ -449,8 +454,15 @@ pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
 /// gives), converting what it stores. Only the bare word collides; `untyped
 /// int` and `untyped(5)` are ordinary types.
 pub fn read_back(declared: &str) -> Result<ColumnType, DialectError> {
-    if declared.chars().all(|c| c.is_ascii_whitespace()) {
+    if declared.is_empty() {
         return Ok(ColumnType::new(UNTYPED, Vec::new()));
+    }
+    if declared.chars().all(|c| c.is_ascii_whitespace()) {
+        return Err(invalid(
+            "a column is declared with a quoted type name of only white space: it has NUMERIC \
+             affinity, and this tool cannot write that name back"
+                .to_owned(),
+        ));
     }
     let parsed: ColumnType = declared.parse().map_err(|_| {
         invalid(format!(

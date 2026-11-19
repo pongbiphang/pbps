@@ -251,13 +251,35 @@ fn a_type_read_from_the_catalog_is_the_declared_one_and_no_type_is_the_word() {
         ColumnType::new("untyped", Vec::new())
     );
     assert_eq!(read_back(stored[1]).expect("int"), ty("int"));
-    // A type that is only white space has no type's text either, and the same
-    // affinity (measured by the rules' own test).
-    assert_eq!(affinity(stored[2]), Affinity::Blob);
-    assert_eq!(
-        read_back(stored[2]).expect("blank"),
-        ColumnType::new("untyped", Vec::new())
-    );
+    // A quoted name of only white space is a declared type: the pragma
+    // reports the white space, and the column is not a typeless one.
+    assert_eq!(stored[2], " ");
+    assert!(read_back(stored[2]).is_err());
+}
+
+/// The engine, observed: a quoted blank and a quoted empty type name are
+/// NUMERIC columns, and the pragma reports the empty one exactly as it reports
+/// no type. That is why empty alone is not proof, and why blank is refused.
+#[test]
+fn a_quoted_blank_or_empty_type_name_is_a_numeric_column_the_pragma_cannot_tell_from_none() {
+    let mut fresh = Fresh::memory();
+    let c = fresh.connection();
+    c.execute_batch("CREATE TABLE t(a, b \" \", c \"\"); INSERT INTO t VALUES ('1', '1', '1')")
+        .expect("creates");
+    let rows = c
+        .query("SELECT typeof(a), typeof(b), typeof(c) FROM t", &[])
+        .expect("types");
+    let kinds: Vec<&str> = (0..3).map(|i| rows[0].text(i).expect("kind")).collect();
+    assert_eq!(kinds, ["text", "integer", "integer"]);
+    let rows = c
+        .query("SELECT type FROM pragma_table_xinfo('t') ORDER BY cid", &[])
+        .expect("declared");
+    let stored: Vec<&str> = rows.iter().map(|r| r.text(0).expect("type")).collect();
+    assert_eq!(stored, ["", " ", ""]);
+    assert!(read_back(" ").is_err());
+    assert!(read_back("\t\n").is_err());
+    // Negative: empty is still the word.
+    assert!(read_back("").is_ok());
 }
 
 #[test]
