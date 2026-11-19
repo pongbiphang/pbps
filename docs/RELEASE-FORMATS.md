@@ -60,10 +60,14 @@ produces something the checks refuse fails at once.
    rebuilds with the new one. The `check` mode, `the_released_record_matches_its_archive_and_this_build`,
    now holds the build to the record: the archive exists and hashes to the frozen
    fingerprint, and no format sits at a frozen number with another fingerprint.
-2. Read the diff. It holds the record and three new files under `released/<n>/`,
+2. Expect the envelope corpus to read the new `released/<n>/envelope.schema.json`
+   (`envelope_archives.rs`, DEC-2412.3): every emitted envelope must keep
+   validating against the released set's envelope schema while the wire version is
+   unchanged. A released directory with no readable envelope fails that test.
+3. Read the diff. It holds the record and three new files under `released/<n>/`,
    plus whatever the reset changed. No file under an older numbered archive
    directory changes.
-3. Commit the record and the archive with the code that produced them, and tag
+4. Commit the record and the archive with the code that produced them, and tag
    that commit.
 
 ## The next cycle

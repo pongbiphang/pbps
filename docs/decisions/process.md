@@ -2199,8 +2199,12 @@ moves once per merged change and that every number has an archive.
   still validates the new envelope, or adds one `envelope.schema.json` under
   `published-schemas/wire/<n>/`, `n` being a number no other directory uses. The floor
   moved twice (89 and 103), so the case is rare, and the first change that takes the
-  second way also teaches `envelope_archives.rs` to read that directory. This
-  replaces that sentence of DEC-1734.1 and nothing else in it.
+  second way also teaches `envelope_archives.rs` to read that directory. A released
+  set's envelope joins the corpus with no floor: `envelope_archives.rs` reads every
+  `published-schemas/released/<n>/envelope.schema.json`, so every emitted envelope
+  must keep validating against it while the wire version is unchanged, and a
+  released directory with no readable envelope fails the test. This replaces that
+  sentence of DEC-1734.1 and nothing else in it.
 - **Choice 4: the release step is a procedure and one test target.** No new `pbps`
   command, because a command widens the surface for something done once per release,
   and no script, because the three fingerprints come out of this binary's types and a
@@ -2229,10 +2233,13 @@ moves once per merged change and that every number has an archive.
   request of a cycle writes `released + 1` once, and the rule test says so if it does
   not. A second concurrent pull request writes the same line, which merges without a
   conflict while nobody puts a comment beside it. Tests assert no literal format
-  number: a source test fails a comparison of a format constant, or of a `version`
-  field, with a literal, except a historical boundary listed with its reason (the
-  oldest readable state number and the number at which `object_deps` began). The
-  history comments stay as written and take no new line.
+  number: a source test fails a comparison of a format constant with a literal,
+  except a historical boundary listed with its reason (the oldest readable state
+  number and the number at which `object_deps` began). It does not find a `version`
+  field against a literal, because the text does not say which format the field
+  belongs to and a guess would flag other formats' numbers once #1159 resets the
+  three to 1; such a test fails by itself when the number moves. The history
+  comments stay as written and take no new line.
 - **Later hardening, not done here (O12).** After a release, a ledger row or plan at
   the number the release froze but with another fingerprint was written by a build
   from before the release. The reader checks only the current number, so it reads

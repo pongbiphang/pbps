@@ -17,7 +17,8 @@ released number plus one, once. A release archives the complete set under
 `released/<n>/` (`<n>` is the released number), with the one procedure in
 [docs/RELEASE-FORMATS.md](../../../../../docs/RELEASE-FORMATS.md). That directory
 is kept apart from the numbered ones because after the reset to 1 the old
-numbers 2 to 9 would name two different sets. A breaking envelope change that
+numbers 2 to 9 would name two different sets. The envelope corpus reads every
+`released/<n>/envelope.schema.json` with no floor. A breaking envelope change that
 cannot raise the corpus floor to an existing archive adds one
 `envelope.schema.json` under `wire/<n>/`.
 
