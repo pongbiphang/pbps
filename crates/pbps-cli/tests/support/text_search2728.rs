@@ -1432,7 +1432,10 @@ fn a_string_bodied_function_that_names_the_object_stops_an_alteration_and_one_th
              CREATE FUNCTION app.f_sql(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.docs', t) $$; \
              CREATE FUNCTION app.f_pl(t text) RETURNS tsvector LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN RETURN to_tsvector('app.docs'::regconfig, t); END $$; \
              CREATE INDEX ix_sql ON app.loose USING gin (app.f_sql(body)); \
-             CREATE MATERIALIZED VIEW app.mv_pl AS SELECT app.f_pl(body) AS x FROM app.loose",
+             CREATE MATERIALIZED VIEW app.mv_pl AS SELECT app.f_pl(body) AS x FROM app.loose; \
+             CREATE FUNCTION app.w_in(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.docs', t) $$; \
+             CREATE FUNCTION app.w_pl(t text) RETURNS tsvector LANGUAGE plpgsql AS $$ BEGIN RETURN app.w_in(t); END $$; \
+             CREATE MATERIALIZED VIEW app.mv_w AS SELECT app.w_pl(body) AS x FROM app.loose",
         );
         let docs =
             std::fs::read_to_string(d.dir.join("schema/app.docs.textsearch-config.yml")).unwrap();
@@ -1449,6 +1452,7 @@ fn a_string_bodied_function_that_names_the_object_stops_an_alteration_and_one_th
         for needle in [
             "index app.ix_sql (reached through function app.f_sql(pg_catalog.text), named in its body)",
             "materialized view app.mv_pl (reached through function app.f_pl(pg_catalog.text), named in its body)",
+            "materialized view app.mv_w (reached through function app.w_in(pg_catalog.text), named in its body)",
             "would keep the old behaviour",
         ] {
             assert!(said(&out).contains(needle), "{needle}: {}", said(&out));

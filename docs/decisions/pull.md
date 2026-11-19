@@ -1680,11 +1680,19 @@ options that changed and the plan checksum pins what was compared.
   A function with a string body (`LANGUAGE sql` text or PL/pgSQL) leaves no edge to what
   it names (measured on 16.15 and 18.6, for an index expression, a stored generated column,
   a constraint and a materialized view alike: the edge from the stored dependent to the
-  function is there, the edge from the function to the configuration is not). So the census
-  also follows `pg_depend` from every stored dependent to the functions it calls, through a
-  view's rule and through a `BEGIN ATOMIC` function, and reads the text of each function that
-  is not in `pg_catalog` or `information_schema`, has no SQL-standard body and is not
-  `internal` or `c`. A function whose text names the object counts as reaching it, and the
+  function is there, the edge from the function to the configuration is not), and the same
+  holds between two string-bodied functions: a PL/pgSQL or `LANGUAGE sql` wrapper records no
+  edge to the function it calls, a `BEGIN ATOMIC` one does (measured on 16.15 and 18.6). So
+  the functions a stored dependent reaches are the fixpoint of two steps: the catalog's edges
+  (from a stored dependent, through a view's rule and through a `BEGIN ATOMIC` function, to
+  functions), and the **lexical call**: the text of a reached function that names another user
+  function, of any schema ("may" errs toward refusing), reaches it, and the catalog's edges
+  lead on from there. A visited set ends the walk, so mutually recursive functions end it. The
+  text of every reached function that is not in `pg_catalog` or `information_schema`, has no
+  SQL-standard body and is not `internal` or `c` is then read for the object's names. It is
+  done in Rust over one read of every user function and its catalog edges, not in a recursive
+  query, because the whole-identifier matcher is Rust's and a second one in SQL would read
+  names differently. A function whose text names the object counts as reaching it, and the
   refusal line says "reached through function `<schema.fn>`, named in its body". "Names"
   is the whole-identifier read of `generated::may_call` (DEC-1364.1): a bare name folds
   ASCII case, a quoted one is exact, the same read inside a string literal counts
@@ -1692,8 +1700,8 @@ options that changed and the plan checksum pins what was compared.
   dictionary the names are its own, a thesaurus's, and each configuration that maps it, read
   from `pg_ts_config_map` and not from the model: a configuration with a custom parser, or one
   the project never declared, maps the dictionary all the same.
-  **The limit:** a function that builds the name at run time (`EXECUTE`, `format`,
-  concatenation) and never spells it is outside what the catalog can show, and the census
+  **The limit:** a name or a function that is built at run time (`EXECUTE`, `format`,
+  concatenation) and never spelled is outside what the catalog can show, and the census
   does not refuse for it. Refusing every string-bodied function would block any database
   that uses PL/pgSQL in an index, so the tool names what it can read and says what it
   cannot.

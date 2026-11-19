@@ -2802,6 +2802,7 @@
         "text_search2728::measure",
         "text_search2728::a_stored_dependent_behind_a_view_or_a_function_is_found_and_a_read_only_chain_is_not",
         "text_search2728::a_stored_dependent_of_a_function_whose_body_names_the_object_is_found",
+        "text_search2728::a_stored_dependent_behind_wrappers_of_string_bodies_is_found_through_the_names_they_call",
         "text_search2728::the_pull_reads_what_a_user_made_and_nothing_else",
         "sequences2721::measure",
         "sequences2721::the_pull_reads_standalone_sequences_and_nothing_else",

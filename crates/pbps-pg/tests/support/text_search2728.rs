@@ -437,6 +437,90 @@ async fn a_stored_dependent_of_a_function_whose_body_names_the_object_is_found()
     }
 }
 
+/// The catalog has no edge from a string body to a function it calls either (measured on 16 and
+/// 18: a PL/pgSQL wrapper and a `LANGUAGE sql` string wrapper record none to their callee, a
+/// `BEGIN ATOMIC` wrapper does), so the functions a stored dependent reaches are the fixpoint
+/// of the catalog's edges and of the user functions a body names (DEC-2728.3): a materialized
+/// view over a PL/pgSQL wrapper of a string function that names the object, an index over a
+/// wrapper of a wrapper, and a materialized view over a mutually recursive pair (which must
+/// end) list the dependent with the function whose text names the object. Negatives: a
+/// wrapper whose callee names another configuration, and a wrapper that builds its callee's
+/// name at run time (the limit the decision states) list nothing for this one.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_stored_dependent_behind_wrappers_of_string_bodies_is_found_through_the_names_they_call()
+{
+    let _live = super::live_ledger().await;
+    for variable in SERVERS {
+        let mut db = Private::on(variable, "wrappers").await;
+        for config in ["c_a", "c_b", "c_cyc", "c_other"] {
+            db.run(&format!(
+                "CREATE TEXT SEARCH CONFIGURATION {config} (COPY = pg_catalog.simple)"
+            ))
+            .await;
+        }
+        db.run("CREATE TABLE docs (body text)").await;
+        // leaf_a names c_a; a PL/pgSQL wrapper calls it, a matview stands over the wrapper.
+        db.run("CREATE FUNCTION leaf_a(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.c_a', t) $$; CREATE FUNCTION w_pl(t text) RETURNS tsvector LANGUAGE plpgsql AS $$ BEGIN RETURN app.leaf_a(t); END $$; CREATE MATERIALIZED VIEW mv_w AS SELECT w_pl(body) AS x FROM docs").await;
+        // A `BEGIN ATOMIC` wrapper of the same function, under an index (the catalog edge).
+        db.run("CREATE FUNCTION w_atomic(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE BEGIN ATOMIC SELECT app.leaf_a(t); END; CREATE INDEX ix_at ON docs USING gin (w_atomic(body))").await;
+        // Two SQL string wrappers deep, under an index.
+        db.run("CREATE FUNCTION leaf_b(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.c_b', t) $$; CREATE FUNCTION s2(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT app.leaf_b(t) $$; CREATE FUNCTION s1(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT app.s2(t) $$; CREATE INDEX ix_c ON docs USING gin (s1(body))").await;
+        // Two PL/pgSQL functions that call each other; one names the configuration.
+        db.run("CREATE FUNCTION ca(t text) RETURNS tsvector LANGUAGE plpgsql AS $$ BEGIN RETURN app.cb(t); END $$; CREATE FUNCTION cb(t text) RETURNS tsvector LANGUAGE plpgsql AS $$ BEGIN IF t = '' THEN RETURN to_tsvector('app.c_cyc', t); END IF; RETURN app.ca(t); END $$; CREATE MATERIALIZED VIEW mv_cyc AS SELECT ca(body) AS x FROM docs").await;
+        // Negatives: a wrapper whose callee names another configuration, and a wrapper that
+        // builds its callee's name at run time.
+        db.run("CREATE FUNCTION leaf_o(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.c_other', t) $$; CREATE FUNCTION w_neg(t text) RETURNS tsvector LANGUAGE plpgsql AS $$ BEGIN RETURN app.leaf_o(t); END $$; CREATE MATERIALIZED VIEW mv_neg AS SELECT w_neg(body) AS x FROM docs").await;
+        db.run("CREATE FUNCTION w_dyn(t text) RETURNS tsvector LANGUAGE plpgsql AS $$ DECLARE r tsvector; BEGIN EXECUTE format('SELECT app.%I($1)', 'leaf_' || 'a') INTO r USING t; RETURN r; END $$; CREATE MATERIALIZED VIEW mv_dyn AS SELECT w_dyn(body) AS x FROM docs").await;
+        // The measured premise: edges to the callee from the PL/pgSQL, SQL-string and
+        // PL/pgSQL-recursive wrappers: none; from the `BEGIN ATOMIC` wrapper: one.
+        for (caller, edges) in [
+            ("w_pl", "0"),
+            ("s1", "0"),
+            ("s2", "0"),
+            ("ca", "0"),
+            ("w_atomic", "1"),
+        ] {
+            assert_eq!(
+                db.one(&format!("SELECT count(*)::text FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass AND d.refclassid = 'pg_proc'::regclass AND d.objid = 'app.{caller}(text)'::regprocedure")).await,
+                edges,
+                "{caller}"
+            );
+        }
+        let by = |function: &str, what: &str| {
+            format!(
+                "{what} (reached through function app.{function}(pg_catalog.text), named in its body)"
+            )
+        };
+        for (config, stored) in [
+            (
+                "c_a",
+                vec![
+                    by("leaf_a", "index app.ix_at"),
+                    by("leaf_a", "materialized view app.mv_w"),
+                ],
+            ),
+            ("c_b", vec![by("leaf_b", "index app.ix_c")]),
+            ("c_cyc", vec![by("cb", "materialized view app.mv_cyc")]),
+            (
+                "c_other",
+                vec![by("leaf_o", "materialized view app.mv_neg")],
+            ),
+        ] {
+            let subject: std::collections::BTreeSet<SearchRef> =
+                [format!("config app.{config}").parse().unwrap()].into();
+            let found = pbps_pg::search::stale_dependents(db.conn(), &Default::default(), &subject)
+                .await
+                .unwrap()
+                .into_values()
+                .next()
+                .unwrap();
+            assert_eq!(found, stored, "{config}");
+        }
+        db.finish().await;
+    }
+}
+
 /// The pull's own query and decoder against the catalog: what a user made is read, in the
 /// engine's order and with a copy expanded; what the engine ships is not (the system-object
 /// exclusion), nor a package's member, nor anything over a parser or a template outside
