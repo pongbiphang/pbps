@@ -16,8 +16,13 @@ pbps-db.workspace = true
 pbps-dialect.workspace = true
 # `ColumnType`, which the type table reads and writes.
 pbps-model.workspace = true
+# The sealed plan type `PlanDialect::Plan` names: an emitter takes a plan only
+# through `pbps_diff::order::PlanView`.
+pbps-diff.workspace = true
 
 [dev-dependencies]
+# A one-operation plan and the differ's own route, for the emitter's tests.
+pbps-diff = { workspace = true, features = ["test-fixtures"] }
 # The harness names each test's directory with a random suffix, as the CLI's
 # own tests do.
 rand.workspace = true

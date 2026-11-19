@@ -14,8 +14,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use pbps_dialect::DialectError;
 use pbps_model::escape::Escaped;
 use pbps_model::{
-    ColumnName, IndexKey, IndexMethod, Module, ModuleId, ModuleKind, ModuleOptions, Role, Schema,
-    Table, TableName, ValueSource,
+    ColumnName, IndexKey, IndexMethod, Module, ModuleId, ModuleKind, ModuleOptions,
+    ObjectLocalName, Role, Schema, Table, TableName, ValueSource,
 };
 
 use crate::types::DIALECT;
@@ -26,7 +26,7 @@ use crate::{ident, lexis, names, types};
 /// syntax error in `REFERENCES` anyway.
 pub const SCHEMA: &str = "main";
 
-fn invalid(message: String) -> DialectError {
+pub(crate) fn invalid(message: String) -> DialectError {
     DialectError::Invalid {
         dialect: DIALECT,
         message,
@@ -42,14 +42,14 @@ fn ledger_name(what: &str) -> DialectError {
     ))
 }
 
-fn unsupported(feature: impl Into<String>) -> DialectError {
+pub(crate) fn unsupported(feature: impl Into<String>) -> DialectError {
     DialectError::Unsupported {
         dialect: DIALECT,
         feature: feature.into(),
     }
 }
 
-fn not_built(part: impl Into<String>) -> DialectError {
+pub(crate) fn not_built(part: impl Into<String>) -> DialectError {
     DialectError::NotBuilt {
         dialect: DIALECT,
         part: part.into(),
@@ -167,6 +167,125 @@ pub fn default_value(text: &str) -> bool {
     }
 }
 
+/// Whether a default that [`default_value`] accepts is a constant: a number, a
+/// string, a blob, `NULL`, `TRUE` or `FALSE`. `ALTER TABLE .. ADD COLUMN`
+/// refuses the rest (`CURRENT_TIME`, `CURRENT_DATE`, `CURRENT_TIMESTAMP` and
+/// every expression in parentheses, even `(1+2)`), measured on 3.54.1.
+#[must_use]
+pub(crate) fn default_is_constant(text: &str) -> bool {
+    let text = text.trim_matches(lexis::is_space);
+    !(text.starts_with('(') || text.to_ascii_lowercase().starts_with("current_"))
+}
+
+/// What is wrong with one column's type, default, value source and
+/// collation: shared by a table's validation and by the emitter's `ADD COLUMN`.
+pub(crate) fn column_errors(
+    shown: &str,
+    column: &ColumnName,
+    def: &pbps_model::Column,
+    found: &mut Vec<DialectError>,
+) {
+    if let Err(error) = types::normalize(&def.ty) {
+        found.push(error);
+    }
+    match &def.value_source {
+        ValueSource::None => {}
+        ValueSource::Default(text) => {
+            if !default_value(text) {
+                found.push(invalid(format!(
+                    "the default of `{shown}.{}` is not one value SQLite reads whole: a number, a string, \
+                     `NULL`, `TRUE`, `FALSE`, `CURRENT_TIME`, `CURRENT_DATE`, `CURRENT_TIMESTAMP`, or an \
+                     expression in parentheses",
+                    column.shown()
+                )));
+            }
+        }
+        ValueSource::Identity(_) => found.push(unsupported(format!(
+            "identity columns (`{shown}.{}`); declare an `integer` primary key, which numbers itself",
+            column.shown()
+        ))),
+        ValueSource::Sequence(_) => found.push(unsupported(format!(
+            "a column owning a sequence (`{shown}.{}`)",
+            column.shown()
+        ))),
+        ValueSource::Generated(_) => found.push(not_built(format!(
+            "generated columns (`{shown}.{}`)",
+            column.shown()
+        ))),
+    }
+    if def.collation.is_some() {
+        found.push(not_built(format!(
+            "column collation (`{shown}.{}`)",
+            column.shown()
+        )));
+    }
+}
+
+/// What is wrong with one declared index. The columns are held to the table's
+/// only when the table is at hand: an emitter given just the index cannot.
+pub(crate) fn index_errors(
+    shown: &str,
+    index: &ObjectLocalName,
+    def: &pbps_model::Index,
+    table: Option<&Table>,
+    found: &mut Vec<DialectError>,
+) {
+    let what = format!("index `{}` of `{shown}`", index.shown());
+    local_name("index", index.raw(), found);
+    if ident::has_reserved_prefix(index.raw()) {
+        found.push(invalid(format!(
+            "{what} starts with `sqlite_`, which SQLite keeps for its own objects"
+        )));
+    }
+    if names::is_ledger(index.raw()) {
+        found.push(ledger_name(&what));
+    }
+    let mut keys = Vec::new();
+    for key in &def.columns {
+        match &key.key {
+            IndexKey::Column(column) => keys.push(column.clone()),
+            IndexKey::Expression(_) => {
+                found.push(not_built(format!("expression indexes ({what})")))
+            }
+        }
+        if key.opclass.is_some() || !key.opclass_parameters.is_empty() {
+            found.push(unsupported(format!("operator classes ({what})")));
+        }
+        if key.collation.is_some() {
+            found.push(not_built(format!("collation in an index ({what})")));
+        }
+    }
+    if def.columns.is_empty() {
+        found.push(invalid(format!("{what} names no column")));
+    }
+    // Only the keys that are columns are held to the table's columns. An
+    // index of expressions alone names none and is not empty for that.
+    if !keys.is_empty()
+        && let Some(table) = table
+    {
+        columns_of(&what, &keys, table, found);
+    }
+    if !def.include.is_empty() {
+        found.push(unsupported(format!("included columns ({what})")));
+    }
+    if def.method != IndexMethod::Btree {
+        found.push(unsupported(format!(
+            "an index method other than the default ({what})"
+        )));
+    }
+    if !def.storage_parameters.is_empty() || def.filegroup.is_some() {
+        found.push(unsupported(format!("storage options on {what}")));
+    }
+    if let Some(filter) = &def.filter
+        && !expression(filter)
+    {
+        found.push(invalid(format!(
+            "the filter of {what} is not one expression SQLite reads whole (empty, unbalanced \
+             parentheses, or a `;`)"
+        )));
+    }
+}
+
 /// Everything wrong with a declared table.
 #[must_use]
 pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
@@ -196,40 +315,7 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
                 column.shown()
             )));
         }
-        if let Err(error) = types::normalize(&def.ty) {
-            found.push(error);
-        }
-        match &def.value_source {
-            ValueSource::None => {}
-            ValueSource::Default(text) => {
-                if !default_value(text) {
-                    found.push(invalid(format!(
-                        "the default of `{shown}.{}` is not one value SQLite reads whole: a number, a string, \
-                         `NULL`, `TRUE`, `FALSE`, `CURRENT_TIME`, `CURRENT_DATE`, `CURRENT_TIMESTAMP`, or an \
-                         expression in parentheses",
-                        column.shown()
-                    )));
-                }
-            }
-            ValueSource::Identity(_) => found.push(unsupported(format!(
-                "identity columns (`{shown}.{}`); declare an `integer` primary key, which numbers itself",
-                column.shown()
-            ))),
-            ValueSource::Sequence(_) => found.push(unsupported(format!(
-                "a column owning a sequence (`{shown}.{}`)",
-                column.shown()
-            ))),
-            ValueSource::Generated(_) => found.push(not_built(format!(
-                "generated columns (`{shown}.{}`)",
-                column.shown()
-            ))),
-        }
-        if def.collation.is_some() {
-            found.push(not_built(format!(
-                "column collation (`{shown}.{}`)",
-                column.shown()
-            )));
-        }
+        column_errors(&shown, column, def, &mut found);
     }
     if !table.computed.is_empty() {
         found.push(not_built(format!("computed columns (table `{shown}`)")));
@@ -318,58 +404,7 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
         }
     }
     for (index, def) in &table.indexes {
-        let what = format!("index `{}` of `{shown}`", index.shown());
-        local_name("index", index.raw(), &mut found);
-        if ident::has_reserved_prefix(index.raw()) {
-            found.push(invalid(format!(
-                "{what} starts with `sqlite_`, which SQLite keeps for its own objects"
-            )));
-        }
-        if names::is_ledger(index.raw()) {
-            found.push(ledger_name(&what));
-        }
-        let mut keys = Vec::new();
-        for key in &def.columns {
-            match &key.key {
-                IndexKey::Column(column) => keys.push(column.clone()),
-                IndexKey::Expression(_) => {
-                    found.push(not_built(format!("expression indexes ({what})")))
-                }
-            }
-            if key.opclass.is_some() || !key.opclass_parameters.is_empty() {
-                found.push(unsupported(format!("operator classes ({what})")));
-            }
-            if key.collation.is_some() {
-                found.push(not_built(format!("collation in an index ({what})")));
-            }
-        }
-        if def.columns.is_empty() {
-            found.push(invalid(format!("{what} names no column")));
-        }
-        // Only the keys that are columns are held to the table's columns. An
-        // index of expressions alone names none and is not empty for that.
-        if !keys.is_empty() {
-            columns_of(&what, &keys, table, &mut found);
-        }
-        if !def.include.is_empty() {
-            found.push(unsupported(format!("included columns ({what})")));
-        }
-        if def.method != IndexMethod::Btree {
-            found.push(unsupported(format!(
-                "an index method other than the default ({what})"
-            )));
-        }
-        if !def.storage_parameters.is_empty() || def.filegroup.is_some() {
-            found.push(unsupported(format!("storage options on {what}")));
-        }
-        if let Some(filter) = &def.filter
-            && !expression(filter)
-        {
-            found.push(invalid(format!(
-                "the filter of {what} is not one expression SQLite reads whole (empty, unbalanced \
-                 parentheses, or a `;`)"
-            )));
-        }
+        index_errors(&shown, index, def, Some(table), &mut found);
     }
     found
 }
