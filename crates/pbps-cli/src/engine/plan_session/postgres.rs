@@ -1073,14 +1073,36 @@ pub(in crate::engine) async fn generation_support(
         })
         .collect();
     if !adding.is_empty() && version < pbps_pg::partitioned_exclusion::ARRIVED_IN {
-        let mut partitioned =
-            pbps_pg::partitioned_exclusion::standing_partitioned(conn, &adding).await?;
-        partitioned.extend(changes.changes.iter().filter_map(|p| match &p.change {
-            pbps_model::Change::Table(pbps_model::TableChange::CreateTable {
-                name, table, ..
-            }) if table.partition_by.is_some() => Some(name.clone()),
-            _ => None,
-        }));
+        // The catalog holds a renamed table under its old name, and a replaced one
+        // as the table the plan drops, so the names are resolved first.
+        let renames: Vec<(pbps_model::TableName, pbps_model::TableName)> = changes
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                pbps_model::Change::Table(pbps_model::TableChange::RenameTable {
+                    from,
+                    to,
+                    ..
+                }) => Some((from.clone(), to.clone())),
+                _ => None,
+            })
+            .collect();
+        let created: BTreeMap<pbps_model::TableName, bool> = changes
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                pbps_model::Change::Table(pbps_model::TableChange::CreateTable {
+                    name,
+                    table,
+                    ..
+                }) => Some((name.clone(), table.partition_by.is_some())),
+                _ => None,
+            })
+            .collect();
+        let asked = pbps_pg::partitioned_exclusion::asked(&adding, &renames, &created);
+        let standing = pbps_pg::partitioned_exclusion::standing_partitioned(conn, &asked).await?;
+        let partitioned =
+            pbps_pg::partitioned_exclusion::partitioned(&standing, &renames, &created);
         problems.extend(pbps_pg::partitioned_exclusion::unsupported(
             version,
             &adding,

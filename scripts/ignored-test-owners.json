@@ -954,6 +954,7 @@
         "exclude2448_rebuild::an_exclusion_is_torn_down_and_restored_around_a_generated_expression_change",
         "exclude2448_partitions::a_gist_partition_tree_reads_plans_and_keeps_a_partitions_own_index_its_own",
         "exclude2448_partitions::a_parents_exclusion_is_refused_by_name_on_16_and_planned_on_18",
+        "exclude2448_partitions::a_renamed_parents_exclusion_is_refused_by_its_old_name_on_16_and_planned_on_18",
         "exclude2448_partitions::a_parents_exclusion_is_added_enforced_replaced_and_dropped_on_18",
         "exclude2448_partitions::a_parents_exclusion_is_held_to_the_engines_rules_and_a_failed_add_changes_nothing",
         "partition_trigger1811::a_trigger_on_the_default_partition_added_with_a_new_partition_applies_and_reads_back",

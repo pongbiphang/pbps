@@ -283,6 +283,69 @@ fn a_parents_exclusion_is_refused_by_name_on_16_and_planned_on_18() {
     });
 }
 
+/// The gate asks the catalog about the tables as it holds them now: a plan that renames a
+/// standing partitioned parent and adds an exclusion to it names a table the catalog does not
+/// hold yet, and 16 must still refuse it by name before any statement, not with `0A000`
+/// mid-apply. 18 plans the same declaration.
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_renamed_parents_exclusion_is_refused_by_its_old_name_on_16_and_planned_on_18() {
+    let _ = server();
+    servers(|url, current| {
+        let own = OwnDatabase::new(url, "exclude-renamed-parent");
+        let connection = own.connection();
+        on_server(connection, TREE);
+        let d = adopt("exclude-renamed-parent", connection);
+        let old = d.dir.join("schema/app.ev.yml");
+        let held = std::fs::read_to_string(&old).unwrap();
+        let renamed = held.replacen("ev", "ev2", 1);
+        assert_ne!(renamed, held, "{held}");
+        std::fs::remove_file(&old).unwrap();
+        std::fs::write(d.dir.join("schema/app.ev2.yml"), format!("{renamed}{SLOT}")).unwrap();
+        succeeds(d.run(&["rename-table", "app.ev", "app.ev2"]));
+        d.commit();
+        succeeds(d.run(&["validate"]));
+        let before = recorded(&d, connection);
+        if current {
+            let (_, script) = plan_sql(&d, connection);
+            assert!(
+                script.contains("RENAME TO \"ev2\"")
+                    && script.contains("ADD CONSTRAINT \"one_per_slot\" EXCLUDE USING btree"),
+                "{script}"
+            );
+            return;
+        }
+        let refused = d.run(&["plan", "--db", connection]);
+        assert_ne!(code(&refused), 0, "{}", said(&refused));
+        let text = said(&refused);
+        assert!(
+            text.contains(
+                "app.ev2: an exclusion constraint on a partitioned table needs PostgreSQL 18"
+            ),
+            "{text}"
+        );
+        // Nothing ran: the parent keeps its old name, and the engine's own answer is the
+        // backstop for the statement the gate stood in front of.
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_class WHERE relname = 'ev' AND relkind = 'p'"
+            ),
+            1
+        );
+        let raw = try_on_server(
+            connection,
+            "ALTER TABLE app.ev ADD CONSTRAINT x EXCLUDE USING btree (k WITH =)",
+        )
+        .unwrap_err();
+        assert!(
+            raw.contains("exclusion constraints are not supported on partitioned tables"),
+            "{raw}"
+        );
+        assert_eq!(recorded(&d, connection), before);
+    });
+}
+
 /// On 18 a parent's exclusion is added behind the `constraint` risk with a clone on every
 /// partition, a partition created later and the DEFAULT one, it enforces, an option edit is a
 /// replacement (a partitioned index takes no `ALTER INDEX SET`), and a drop needs its record
