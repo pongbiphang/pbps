@@ -137,8 +137,8 @@ pub async fn target_identity<D: PlanningDialect>(
     <D::Resolver as crate::resolver::contract::ResolverEngine>::target_identity(target).await
 }
 
-struct ProducerOutcome {
-    compiled: engine::CompiledCapture,
+struct ProducerOutcome<D: PlanningDialect> {
+    compiled: <D::Resolver as crate::resolver::contract::ResolverEngine>::CompiledCapture,
     opening_build: String,
     surfaces: Vec<pbps_model::resolver::SurfaceResolution>,
     /// What the run bound at creation, which ordered the plan and must order

@@ -27,14 +27,16 @@
 
 use super::producer::{Identity, Opening, Sealing, Unsealed, request};
 use super::{BindingRequest, Error, ProduceError, ResolvedPlan, engine, resolution};
-use crate::resolver::contract::{self, PreparedView, ResolverEngine};
+use crate::resolver::contract::{self, PreparedView, ResolverEngine, Sealable};
 use crate::resolver::scope;
 use pbps_db::resolver::environment::Verdict;
 use pbps_db::{Conn, Driver};
 use pbps_model::Hints;
 use pbps_model::resolver::{OutsideWrites, ResolverRuntime, ScratchLayout, ScratchSource};
 
-pub use super::engine::{Binding, Prepared, Staged, Standard, declared_standard};
+pub use super::engine::{
+    Binding, CapturedInputs, CompiledCapture, Prepared, Staged, Standard, declared_standard,
+};
 
 pub mod domain;
 pub mod preview;
@@ -233,8 +235,8 @@ impl<D: super::PlanningDialect> Run<'_, D> {
     ) -> Result<
         (
             pbps_diff::resolver::Ordered<pbps_diff::order::Canonical<D>>,
-            Sealing,
-            Opening,
+            Sealing<D>,
+            Opening<D>,
         ),
         Error,
     > {
@@ -419,7 +421,7 @@ impl<D: super::PlanningDialect> Run<'_, D> {
         .await?;
         // The shapes the externals file was compared with must be the ones this
         // capture seals: a target written between the two reads refuses.
-        let changed = <D::Resolver as ResolverEngine>::changed_since(&staged, &current)?;
+        let changed = <D::Resolver as ResolverEngine>::changed_since(&staged, &current);
         if !changed.is_empty() {
             return Err(Error::Read(format!(
                 "the target changed while the run read it, after the externals file was compared \
@@ -451,7 +453,12 @@ impl<D: super::PlanningDialect> Run<'_, D> {
             &records,
             &assessment,
         )?;
-        let captured = engine::captured_bindings(&compiled, &current, base.schema, desired.schema);
+        let captured = <D::Resolver as ResolverEngine>::captured_bindings(
+            &compiled,
+            &current,
+            base.schema,
+            desired.schema,
+        );
         let ordered = engine::plan::<D>(
             &reconstruction,
             base,
@@ -479,7 +486,7 @@ impl<D: super::PlanningDialect> Run<'_, D> {
             target_cluster: self.planned_identity.to_owned(),
             limitations,
         };
-        let producer = super::ProducerOutcome {
+        let producer = super::ProducerOutcome::<D> {
             compiled,
             opening_build: engine::reported_build(driver, self.key, &opening_catalog)?,
             surfaces,
