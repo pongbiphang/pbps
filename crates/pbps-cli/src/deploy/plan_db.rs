@@ -878,7 +878,7 @@ pub(super) async fn plan_db_selected(
                 // The cluster this plan was read from: the resolver checks its
                 // own target connection against it (#1685).
                 let identity =
-                    match crate::resolution::planning_identity(&mut conn, selection).await {
+                    match crate::resolution::planning_identity(&dialect, &mut conn, selection).await {
                         Ok(identity) => identity,
                         Err(crate::resolution::Refused::Finding(finding)) => {
                             return Ok(Connected::Refused { finding, findings });

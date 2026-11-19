@@ -1,14 +1,14 @@
 //! Sealing a run's answer into the plan's evidence, and the run's errors.
 
 use super::{Error, ResolvedPlan, ScopeRequest, engine, transitions};
+use crate::resolver::contract::ResolverEngine;
 use crate::resolver::scope;
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
 use pbps_model::Hints;
 use pbps_model::resolver::{Qualification, ResolverEvidence, ResolverRuntime};
 use std::collections::BTreeSet;
 
-pub(super) fn request(
-    driver: pbps_db::Driver,
+pub(super) fn request<D: super::PlanningDialect>(
     base: pbps_diff::Side<'_>,
     desired: pbps_diff::Side<'_>,
     hints: &Hints,
@@ -17,7 +17,7 @@ pub(super) fn request(
     // The same plan `pbps_diff::resolver::plan` starts from: without
     // ADR-0013's candidate rebuilds, or the scope qualified here and the
     // grants sealed at the end could describe two different plans.
-    let ordinary = engine::ordinary(driver, base, desired, hints, extras)?;
+    let ordinary = engine::ordinary::<D>(base, desired, hints, extras)?;
     let planned = scope::planned_schema_grants(&ordinary).map_err(Error::Scope)?;
     Ok(scope_of(base, desired, planned, extras))
 }
@@ -320,7 +320,7 @@ impl<D: super::PlanningDialect> Unsealed<D> {
         let read = |what: &'static str| {
             move |error: pbps_db::DbError| Error::Read(format!("the recheck's {what}: {error}"))
         };
-        let identity = engine::target_identity(self.opening.driver, target)
+        let identity = <D::Resolver as ResolverEngine>::target_identity(target)
             .await
             .map_err(read("cluster identity"))?;
         if identity != self.opening.planned_identity {

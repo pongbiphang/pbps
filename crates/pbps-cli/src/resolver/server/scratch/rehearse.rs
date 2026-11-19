@@ -10,8 +10,9 @@
 //! another build proves syntax and convergence, never the build's behaviour.
 
 use super::super::producer::{request, request_as_it_stands};
-use super::super::{BindingRequest, Error, ProduceError, engine};
-use super::{Provenance, Tokens};
+use super::super::{BindingRequest, Error, PlanningDialect, ProduceError, engine};
+use super::{Provenance, Standard, Tokens};
+use crate::resolver::contract::{self, RehearsalRequest, ResolverEngine};
 use crate::resolver::scope;
 use pbps_db::{Conn, Driver};
 use pbps_model::resolver::OutsideWrites;
@@ -38,8 +39,7 @@ pub type Roles = Result<RoleMapping, String>;
 /// is recorded before it is made and removed with the scratch, and `run` is told
 /// which names the roles have; or, when it cannot rehearse them, why not.
 #[allow(clippy::too_many_arguments)]
-pub async fn with_session<T, E>(
-    driver: Driver,
+pub async fn with_session<D: PlanningDialect, T, E>(
     scratch: &str,
     target_connection: &str,
     planned_identity: &str,
@@ -47,24 +47,28 @@ pub async fn with_session<T, E>(
     base: pbps_diff::Side<'_>,
     desired: pbps_diff::Side<'_>,
     hints: &Hints,
-    standard: impl Into<engine::Standard>,
+    standard: &Standard<D>,
     externals: Option<&str>,
     provenance: &Provenance,
     named: &BTreeSet<RoleName>,
     run: impl AsyncFnOnce(&mut Conn, Option<Conn>, Roles) -> Result<T, E>,
 ) -> Result<(ScratchLayout, Result<T, E>), ProduceError> {
+    // An engine without a connected rehearsal is refused by name before the
+    // request is built (DEC-2798.5).
+    let rehearsal = contract::rehearsal_of::<D>()
+        .map_err(|unsupported| ProduceError::Acquire(unsupported.to_string()))?;
+    let driver = D::DRIVER;
     // The write path's extras are the dialect's, and the CLI's PostgreSQL
     // dialect configures none, as for the resolver.
-    let request = match driver {
-        Driver::Postgres => {
-            request(driver, base, desired, hints, &[]).map_err(ProduceError::Run)?
+    let request = match rehearsal.request {
+        RehearsalRequest::Projected => {
+            request::<D>(base, desired, hints, &[]).map_err(ProduceError::Run)?
         }
-        Driver::Mssql => request_as_it_stands(base, desired, &[]),
+        RehearsalRequest::AsItStands => request_as_it_stands(base, desired, &[]),
     };
-    let standard = standard.into();
     // Every connection of the run opens the one endpoint found here
     // (DEC-2271.2), as for the resolver.
-    let scratch = &engine::endpoint(driver, scratch).await?;
+    let scratch = &<D::Resolver as ResolverEngine>::endpoint(scratch).await?;
     let mut target = Conn::connect(driver, target_connection)
         .await
         .map_err(|error| {
@@ -75,16 +79,15 @@ pub async fn with_session<T, E>(
     // The token first: the scratch session carries it from its first packet,
     // and a killed rehearsal is recovered by it (#2410).
     let tokens = Tokens::generate();
-    let mut admin = engine::connect_scratch(driver, scratch, &tokens).await?;
-    let (provisioning, mut state) = engine::scratch(
-        driver,
+    let mut admin = <D::Resolver as ResolverEngine>::connect_scratch(scratch, &tokens).await?;
+    let (provisioning, mut state) = <D::Resolver as ResolverEngine>::acquire(
         &mut target,
         &mut admin,
         &tokens,
         planned_identity,
         scratch,
         &request,
-        &standard,
+        standard,
         externals,
         provenance,
     )
@@ -115,7 +118,8 @@ pub async fn with_session<T, E>(
         }
         // SQL Server's captures fingerprint what they read, and a rehearsal
         // compares in memory and seals nothing: the key is the run's own.
-        let key = (driver == Driver::Mssql)
+        let key = rehearsal
+            .run_key
             .then(pbps_db::fingerprint::EnvironmentFingerprintKey::for_one_run);
         let mut prepared = state
             .prepare(

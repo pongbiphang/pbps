@@ -25,9 +25,10 @@ fn inputs(base: &str) -> Inputs {
 
 async fn vet(scratch: &str, target: &str, inputs: &Inputs) -> Result<(), domain::Refused> {
     let mut target_session = Conn::connect(Driver::Postgres, target).await.unwrap();
-    let identity = crate::resolver::server::target_identity(&mut target_session)
-        .await
-        .unwrap();
+    let identity =
+        crate::resolver::server::target_identity(&pbps_pg::Postgres::new(), &mut target_session)
+            .await
+            .unwrap();
     domain::vet(
         scratch,
         target,

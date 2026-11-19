@@ -122,7 +122,7 @@ pub async fn compare(
     live: &Schema,
     hints: &Hints,
     requests: &[RetainedExpression],
-    standard: impl Into<Standard>,
+    standard: &Standard<pbps_pg::Postgres>,
     externals: Option<&str>,
     provenance: &Provenance,
 ) -> Result<Vec<RetainedExpression>, domain::Refused> {

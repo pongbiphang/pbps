@@ -5,6 +5,7 @@
 //! both captures passed; each negative names what refused.
 
 use super::*;
+use crate::resolver::server::scratch::engines::{MssqlEngine, ResolverEngine};
 use indexmap::IndexMap;
 use pbps_model::{Column, Module, ModuleKind, Table};
 use std::pin::Pin;
@@ -215,15 +216,14 @@ async fn on_scratch(target: &str, scratch: &str) -> String {
     let policy = provenance();
     let identity = sql::cluster_identity(&mut target_conn).await.unwrap();
     let mut admin = connection(scratch).await;
-    let (provisioning, mut state) = super::super::engine::scratch(
-        Driver::Mssql,
+    let (provisioning, mut state) = MssqlEngine::acquire(
         &mut target_conn,
         &mut admin,
         &tokens,
         &identity,
         scratch,
         &request,
-        &Standard::Mssql,
+        &(),
         None,
         &policy,
     )

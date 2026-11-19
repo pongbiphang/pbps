@@ -296,8 +296,7 @@ async fn resolver_replacement_backend_invalidates_the_registered_session() {
         let identity = identity_of(&target).await;
         let image = setting(image_var);
         let containers = scratch_containers();
-        let docker = super::super::container::with_container(
-            Driver::Postgres,
+        let docker = super::super::container::with_container::<pbps_pg::Postgres, _>(
             &target,
             &identity,
             &image,

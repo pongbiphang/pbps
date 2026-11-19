@@ -27,6 +27,7 @@
 
 use super::producer::{Identity, Opening, Sealing, Unsealed, request};
 use super::{BindingRequest, Error, ProduceError, ResolvedPlan, engine, resolution};
+use crate::resolver::contract;
 use crate::resolver::scope;
 use pbps_db::resolver::environment::Verdict;
 use pbps_db::{Conn, Driver};
@@ -48,7 +49,6 @@ mod supervised;
 /// could not confirm names exactly what may remain.
 #[allow(clippy::too_many_arguments)]
 pub async fn produce<D: super::PlanningDialect>(
-    driver: Driver,
     scratch: &str,
     target_connection: &str,
     planned_identity: &str,
@@ -59,12 +59,11 @@ pub async fn produce<D: super::PlanningDialect>(
     write_path_extras: &[String],
     project: &pbps_config::Project,
     environment: Option<&str>,
-    standard: impl Into<Standard>,
+    standard: &Standard<D>,
     externals: Option<&str>,
     provenance: &Provenance,
 ) -> Result<ResolvedPlan<pbps_diff::order::Canonical<D>>, ProduceError> {
     let unsealed = produce_unsealed::<D>(
-        driver,
         scratch,
         target_connection,
         planned_identity,
@@ -82,7 +81,7 @@ pub async fn produce<D: super::PlanningDialect>(
     .await?;
     // Rechecked as `plan` rechecks it, so every answer this returns has
     // passed the recheck too.
-    let mut session = Conn::connect(driver, target_connection)
+    let mut session = Conn::connect(D::DRIVER, target_connection)
         .await
         .map_err(|error| {
             ProduceError::Run(Error::Read(format!("the recheck's session: {error}")))
@@ -101,7 +100,6 @@ pub async fn produce<D: super::PlanningDialect>(
 /// publishing caller runs its ordinary passes and the recheck first (#1516).
 #[allow(clippy::too_many_arguments)]
 pub async fn produce_unsealed<D: super::PlanningDialect>(
-    driver: Driver,
     scratch: &str,
     target_connection: &str,
     planned_identity: &str,
@@ -112,15 +110,14 @@ pub async fn produce_unsealed<D: super::PlanningDialect>(
     write_path_extras: &[String],
     project: &pbps_config::Project,
     environment: Option<&str>,
-    standard: impl Into<Standard>,
+    standard: &Standard<D>,
     externals: Option<&str>,
     provenance: &Provenance,
 ) -> Result<Unsealed<D>, ProduceError> {
-    if driver != D::DRIVER {
-        return Err(ProduceError::Run(Error::Binding(
-            "the resolver planning dialect and selected driver belong to different engines".into(),
-        )));
-    }
+    // An engine without a resolver is refused by name before the request is
+    // built; no state of its own exists to go further with (DEC-2798.5).
+    contract::planning_of::<D>()
+        .map_err(|unsupported| ProduceError::Acquire(unsupported.to_string()))?;
     // Compared as the model compares sides (DEC-2855.1): a kind held by name only that one
     // side does not name is no disagreement about what the resolver builds.
     if !binding.base.equal_as_compared(base.schema)
@@ -133,9 +130,8 @@ pub async fn produce_unsealed<D: super::PlanningDialect>(
     let key = crate::resolver::sealing::environment_key(project, environment)
         .map_err(|error| ProduceError::Run(Error::Binding(error.to_string())))?;
     let request =
-        request(driver, base, desired, hints, write_path_extras).map_err(ProduceError::Run)?;
-    supervised::Request {
-        driver,
+        request::<D>(base, desired, hints, write_path_extras).map_err(ProduceError::Run)?;
+    supervised::Request::<D> {
         scratch: scratch.to_owned(),
         target: target_connection.to_owned(),
         planned_identity: planned_identity.to_owned(),
@@ -148,11 +144,11 @@ pub async fn produce_unsealed<D: super::PlanningDialect>(
         hints: hints.clone(),
         key,
         scope: request,
-        standard: standard.into(),
+        standard: standard.clone(),
         externals: externals.map(str::to_owned),
         provenance: provenance.clone(),
     }
-    .start::<D>()
+    .start()
     .await
 }
 
@@ -188,7 +184,7 @@ fn unusable(reason: impl Into<String>) -> ProduceError {
 ///
 /// `scratch` is also the run's token (#2410): its keeper session and every
 /// resource it creates carry it.
-pub(super) struct Tokens {
+pub struct Tokens {
     pub(super) target: String,
     pub(super) scratch: String,
 }
@@ -205,7 +201,7 @@ impl Tokens {
 
 /// How the run provisions its scratch database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Provisioning {
+pub enum Provisioning {
     /// A run-owned login and database, created and dropped by the run.
     RunOwned,
     /// The database the connection names, owned by the scratch account.
@@ -526,6 +522,16 @@ tokio::task_local! {
 
 pub mod container;
 
+/// The engines' resolvers, named for the tests that drive one directly.
+#[cfg(test)]
+mod engines {
+    pub(super) use crate::resolver::contract::ResolverEngine;
+    pub(super) type MssqlEngine =
+        <pbps_mssql::Mssql as crate::resolver::server::PlanningDialect>::Resolver;
+    pub(super) type PgEngine =
+        <pbps_pg::Postgres as crate::resolver::server::PlanningDialect>::Resolver;
+}
+
 #[cfg(test)]
 pub(super) mod fixtures;
 
@@ -548,7 +554,7 @@ use super::engine::release_supplied;
 
 #[cfg(test)]
 mod tests {
-    use super::{BindingRequest, Driver, Error, ProduceError, Provenance, produce_unsealed};
+    use super::{BindingRequest, Error, ProduceError, Provenance, produce_unsealed};
     use pbps_model::{Hints, IdsFile, Schema};
 
     /// Both engines validate the binding sides and key before connecting.
@@ -610,9 +616,8 @@ mod tests {
             };
             // One run per engine: the planning dialect is part of the call's type.
             macro_rules! run {
-                ($dialect:ty, $driver:expr) => {
+                ($dialect:ty, $standard:expr) => {
                     match produce_unsealed::<$dialect>(
-                        $driver,
                         "invalid scratch connection",
                         "invalid target connection",
                         "",
@@ -623,7 +628,7 @@ mod tests {
                         &[],
                         &project,
                         None,
-                        &standard,
+                        $standard,
                         None,
                         &provenance,
                     )
@@ -635,8 +640,8 @@ mod tests {
                     }
                 };
             }
-            let postgres = run!(pbps_pg::Postgres, Driver::Postgres);
-            assert_eq!(run!(pbps_mssql::Mssql, Driver::Mssql), postgres);
+            let postgres = run!(pbps_pg::Postgres, &standard);
+            assert_eq!(run!(pbps_mssql::Mssql, &()), postgres);
             if disagrees {
                 assert_eq!(
                     postgres,
@@ -676,7 +681,6 @@ mod tests {
             pbps_diff::resolver::ordinary(side, side, &pbps_mssql::Mssql, &Hints::default())
                 .unwrap();
         let outcome = produce_unsealed::<pbps_mssql::Mssql>(
-            Driver::Mssql,
             r"Server=(localdb)\x;Integrated Security=SSPI",
             "Server=127.0.0.1,1;User Id=sa;Password=never-tried",
             "",
@@ -692,7 +696,7 @@ mod tests {
             &[],
             &key.project,
             Some(ENVIRONMENT),
-            super::Standard::Mssql,
+            &(),
             None,
             &Provenance::server(),
         )

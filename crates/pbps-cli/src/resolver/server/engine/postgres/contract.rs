@@ -3,13 +3,16 @@
 //! ones `resolver::apply` made before it named no engine, moved with their
 //! comments; they run on the apply's own connection, inside its transaction.
 
+use super::super::Scratch as EngineScratch;
 use crate::resolver::contract::{
     ApplyRecheck, ClosingInputs, ClusterDomain, FactsError, GrantRecheck, Phase, Planning,
-    Rehearsal, Replay, ResolverEngine, Step, Support, sealed::Sealed,
+    Rehearsal, RehearsalRequest, Replay, ResolverEngine, Step, Support, sealed::Sealed,
 };
 use crate::resolver::scope;
+use crate::resolver::server::scratch::{Provenance, Provisioning, Tokens};
+use crate::resolver::server::{Error, ProduceError, ScopeRequest};
 use pbps_db::resolver::environment::CatalogFacts;
-use pbps_db::{Conn, Driver};
+use pbps_db::{Conn, DbError, Driver};
 use pbps_model::ModuleId;
 use pbps_model::resolver::{
     InputManifest, ObjectIdentity, ObjectOwnership, ResolverEvidence, Surface,
@@ -33,10 +36,79 @@ impl ResolverEngine for PgResolver {
     type Dialect = pbps_pg::Postgres;
     const SUPPORT: Support = Support {
         planning: Some(&Planning { cluster: CLUSTER }),
-        rehearsal: Some(&Rehearsal),
+        rehearsal: Some(&Rehearsal {
+            request: RehearsalRequest::Projected,
+            run_key: false,
+        }),
         preview: None,
         apply: Some(&PgResolver),
     };
+
+    type Standard = pbps_pg::resolver::standard::Standard;
+
+    fn standard(
+        declared: Option<&pbps_config::resolver::ScratchStandard>,
+    ) -> Result<Self::Standard, Error> {
+        Ok(super::declared_standard(declared))
+    }
+
+    fn endpoint(connection: &str) -> Step<'_, Result<String, ProduceError>> {
+        Box::pin(async move { Ok(connection.to_owned()) })
+    }
+
+    fn connect_scratch<'a>(
+        scratch: &'a str,
+        tokens: &'a Tokens,
+    ) -> Step<'a, Result<Conn, ProduceError>> {
+        Box::pin(async move {
+            let mut admin = Conn::connect_named(
+                Driver::Postgres,
+                scratch,
+                &format!("pbps-{}", tokens.scratch),
+            )
+            .await
+            .map_err(|error| ProduceError::Acquire(format!("the scratch server: {error}")))?;
+            super::reset_role(&mut admin).await?;
+            super::keep(&mut admin).await?;
+            Ok(admin)
+        })
+    }
+
+    fn target_identity(target: &mut Conn) -> Step<'_, Result<String, DbError>> {
+        Box::pin(super::target_identity(target))
+    }
+
+    fn acquire<'a, 'b>(
+        target: &'b mut Conn,
+        admin: &'b mut Conn,
+        tokens: &'b Tokens,
+        planned_identity: &'b str,
+        scratch: &'a str,
+        request: &'a ScopeRequest,
+        standard: &'a Self::Standard,
+        externals: Option<&'a str>,
+        provenance: &'a Provenance,
+    ) -> Step<'b, Result<(Provisioning, EngineScratch<'a>), ProduceError>>
+    where
+        'a: 'b,
+    {
+        Box::pin(async move {
+            let (provisioning, scratch) = super::scratch(
+                Driver::Postgres,
+                target,
+                admin,
+                tokens,
+                planned_identity,
+                scratch,
+                request,
+                standard,
+                externals,
+                provenance,
+            )
+            .await?;
+            Ok((provisioning, EngineScratch::Postgres(Box::new(scratch))))
+        })
+    }
 }
 
 impl ApplyRecheck for PgResolver {

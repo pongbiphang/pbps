@@ -145,10 +145,7 @@ pub fn rehearse<D: crate::emission::Engine + pbps_cli::resolver::server::Plannin
                 ResolverProfile::Server {
                     url_env, standard, ..
                 } => {
-                    pbps_cli::resolver::server::scratch::declared_standard(
-                        pbps_db::Driver::Mssql,
-                        standard.as_ref(),
-                    )?;
+                    pbps_cli::resolver::server::scratch::declared_standard::<D>(standard.as_ref())?;
                     Source::Server(std::env::var(url_env).map_err(|error| {
                         let reason = match error {
                             std::env::VarError::NotPresent => "not set",

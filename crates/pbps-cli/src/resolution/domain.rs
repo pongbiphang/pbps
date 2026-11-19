@@ -36,16 +36,17 @@ pub async fn vet(
 ) -> Verdict {
     use pbps_cli::resolver::server::scratch::domain;
     let result = async {
-        let identity = pbps_cli::resolver::server::target_identity(conn)
+        let identity = pbps_cli::resolver::server::target_identity(&pbps_pg::Postgres::new(), conn)
             .await
             .map_err(|error| error.to_string())?;
-        let open = entry
-            .open(conn.driver(), &identity)
-            .await
-            .map_err(|refused| match refused {
-                Refused::Finding(finding) => finding.message,
-                Refused::Unanswerable(error) => error.to_string(),
-            })?;
+        let open =
+            entry
+                .open::<pbps_pg::Postgres>(&identity)
+                .await
+                .map_err(|refused| match refused {
+                    Refused::Finding(finding) => finding.message,
+                    Refused::Unanswerable(error) => error.to_string(),
+                })?;
         Ok(domain::vet(
             &open.connection,
             target.connection(),

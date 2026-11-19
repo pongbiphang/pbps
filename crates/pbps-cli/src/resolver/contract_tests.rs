@@ -221,3 +221,149 @@ fn apply_and_producer_seal_under_one_cluster_domain() {
     assert_eq!(planned, ms);
     assert_ne!(pg, ms, "the engines must not share a cluster domain");
 }
+
+/// What a run asked of an engine that has none must show nothing but the
+/// engine's own refusal: the binding sides disagree and no key is configured,
+/// so either would answer first if the engine were asked later, and the
+/// request counter shows that no connection was tried.
+fn unservable() -> (
+    pbps_model::Schema,
+    pbps_model::Schema,
+    pbps_config::Project,
+    pbps_diff::order::DiffPlan,
+) {
+    let schema = pbps_model::Schema::default();
+    let mut different = pbps_model::Schema::default();
+    different
+        .tables
+        .insert("app.other".parse().unwrap(), Default::default());
+    let project = pbps_config::Project {
+        root: std::env::temp_dir(),
+        config: pbps_config::Config::parse("dialect: postgres\n", std::path::Path::new("pbps.yml"))
+            .unwrap(),
+    };
+    let ids = IdsFile::default();
+    let side = pbps_diff::Side {
+        schema: &schema,
+        ids: &ids,
+    };
+    let bootstrap =
+        pbps_diff::diff(side, side, &MinimalDialect, &pbps_model::Hints::default()).unwrap();
+    (schema, different, project, bootstrap)
+}
+
+#[tokio::test]
+async fn an_engine_without_planning_support_is_refused_before_a_connection_opens() {
+    use super::server::scratch::{Provenance, produce_unsealed};
+    use super::server::{BindingRequest, ProduceError};
+    let (schema, different, project, bootstrap) = unservable();
+    let ids = IdsFile::default();
+    let side = pbps_diff::Side {
+        schema: &schema,
+        ids: &ids,
+    };
+    let (outcome, requests) = pbps_db::request_count::scope(produce_unsealed::<MinimalDialect>(
+        "invalid scratch connection",
+        "invalid target connection",
+        "",
+        &BindingRequest {
+            dependencies: &Default::default(),
+            bootstrap: &bootstrap,
+            base: &different,
+            desired: &schema,
+        },
+        side,
+        side,
+        &pbps_model::Hints::default(),
+        &[],
+        &project,
+        None,
+        &(),
+        None,
+        &Provenance::server(),
+    ))
+    .await;
+    match outcome {
+        Err(ProduceError::Acquire(why)) => {
+            assert_eq!(why, "Stand-in does not support resolver-backed planning");
+        }
+        Err(other) => panic!("not the engine's refusal: {other}"),
+        Ok(_) => panic!("an engine without a resolver planned"),
+    }
+    assert_eq!(requests, 0, "the refusal must precede every connection");
+}
+
+#[tokio::test]
+async fn an_engine_without_rehearsal_support_is_refused_before_a_connection_opens() {
+    use super::server::scratch::{Provenance, rehearse::with_session};
+    use super::server::{BindingRequest, ProduceError};
+    let (schema, different, _, bootstrap) = unservable();
+    let ids = IdsFile::default();
+    let side = pbps_diff::Side {
+        schema: &schema,
+        ids: &ids,
+    };
+    let (outcome, requests) =
+        pbps_db::request_count::scope(with_session::<MinimalDialect, (), ()>(
+            "invalid scratch connection",
+            "invalid target connection",
+            "",
+            &BindingRequest {
+                dependencies: &Default::default(),
+                bootstrap: &bootstrap,
+                base: &different,
+                desired: &schema,
+            },
+            side,
+            side,
+            &pbps_model::Hints::default(),
+            &(),
+            None,
+            &Provenance::server(),
+            &BTreeSet::new(),
+            async |_, _, _| Ok(()),
+        ))
+        .await;
+    match outcome {
+        Err(ProduceError::Acquire(why)) => {
+            assert_eq!(why, "Stand-in does not support connected rehearsal");
+        }
+        Err(other) => panic!("not the engine's refusal: {other}"),
+        Ok(_) => panic!("an engine without a resolver rehearsed"),
+    }
+    assert_eq!(requests, 0, "the refusal must precede every connection");
+}
+
+/// What a resolver the engine does not have can still be asked, and answers
+/// by name: nothing it could produce exists to hold.
+#[tokio::test]
+async fn a_resolver_that_does_not_exist_acquires_nothing_and_names_the_engine() {
+    use super::contract::ResolverEngine;
+    type Missing = <MinimalDialect as PlanningDialect>::Resolver;
+    let refused = Missing::standard(None).err().unwrap().to_string();
+    assert!(
+        refused.contains("Stand-in does not support resolver-backed planning"),
+        "{refused}"
+    );
+    let endpoint = Missing::endpoint("Server=db").await.unwrap_err();
+    assert!(
+        matches!(&endpoint, super::server::ProduceError::Acquire(why)
+            if why == "Stand-in does not support resolver-backed planning"),
+        "{endpoint}"
+    );
+}
+
+#[test]
+fn a_rehearsal_states_its_scope_request_and_key_policy_per_engine() {
+    use super::contract::RehearsalRequest;
+    let pg = contract::rehearsal(&pbps_pg::Postgres::new()).unwrap();
+    assert_eq!(
+        (pg.request, pg.run_key),
+        (RehearsalRequest::Projected, false)
+    );
+    let ms = contract::rehearsal(&pbps_mssql::Mssql).unwrap();
+    assert_eq!(
+        (ms.request, ms.run_key),
+        (RehearsalRequest::AsItStands, true)
+    );
+}

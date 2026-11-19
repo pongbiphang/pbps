@@ -130,8 +130,11 @@ pub struct ResolvedPlan<S = pbps_diff::order::Canonical<pbps_pg::Postgres>> {
 
 /// The selected resolver binds its target before acquiring scratch. The
 /// engine adapter supplies the lineage read; this acquires no resource.
-pub async fn target_identity(target: &mut pbps_db::Conn) -> Result<String, pbps_db::DbError> {
-    engine::target_identity(target.driver(), target).await
+pub async fn target_identity<D: PlanningDialect>(
+    _: &D,
+    target: &mut pbps_db::Conn,
+) -> Result<String, pbps_db::DbError> {
+    <D::Resolver as crate::resolver::contract::ResolverEngine>::target_identity(target).await
 }
 
 struct ProducerOutcome {

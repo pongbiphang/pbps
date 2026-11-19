@@ -7,6 +7,7 @@
 //! `tests/flow_pg.rs`). A live run is a session carrying its token on a
 //! connection the test holds open.
 
+use crate::resolver::server::scratch::engines::{PgEngine, ResolverEngine};
 use std::collections::BTreeSet;
 
 use super::super::recovery;
@@ -440,7 +441,7 @@ async fn the_keeper_is_named_by_its_token_and_keeps_its_settings() {
     for server in SERVERS {
         let fixture = Fixture::new(server);
         let tokens = super::super::Tokens::generate();
-        let mut keeper = engine::connect_scratch(Driver::Postgres, &fixture.server, &tokens)
+        let mut keeper = PgEngine::connect_scratch(&fixture.server, &tokens)
             .await
             .unwrap();
         let show = async |conn: &mut Conn, setting: &str| {
@@ -940,7 +941,7 @@ async fn the_keepers_settings_survive_the_two_places_that_reset_a_session() {
     for server in SERVERS {
         let fixture = Fixture::new(server);
         let tokens = super::super::Tokens::generate();
-        let mut keeper = engine::connect_scratch(Driver::Postgres, &fixture.server, &tokens)
+        let mut keeper = PgEngine::connect_scratch(&fixture.server, &tokens)
             .await
             .unwrap();
         let idle = async |conn: &mut Conn| {
@@ -1067,7 +1068,6 @@ async fn a_run_killed_after_its_externals_changed_the_logins_defaults_is_recover
                     let mut planning = Conn::connect(Driver::Postgres, &target).await.unwrap();
                     let identity = sql::cluster_identity(&mut planning).await.unwrap();
                     super::super::produce::<pbps_pg::Postgres>(
-                        Driver::Postgres,
                         &scratch,
                         &target,
                         &identity,

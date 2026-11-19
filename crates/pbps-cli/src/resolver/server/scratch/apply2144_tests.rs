@@ -65,7 +65,6 @@ async fn sealed_with(
     let run = begin(target, declared).await;
     let (base, desired) = run.sides(declared);
     let plan = super::super::produce::<pbps_mssql::Mssql>(
-        Driver::Mssql,
         scratch,
         target,
         &run.identity,
@@ -76,7 +75,7 @@ async fn sealed_with(
         &[],
         &run.key.project,
         Some(ENVIRONMENT),
-        Standard::Mssql,
+        &(),
         externals,
         &provenance(),
     )

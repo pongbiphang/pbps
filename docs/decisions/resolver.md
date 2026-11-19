@@ -6616,3 +6616,47 @@ Pinned by `resolver::contract_tests` (the engine named in each refusal, the
 refusal ahead of the key, the ordinary plan untouched, one cluster domain for
 planning and apply), the offline explain and flow tests, and the live apply
 tests of both engines. Formats: none.
+
+<a id="dec-2798-6"></a>
+
+**DEC-2798.6. The dialect selects the standard and the acquisition, and the
+admission is made by type (#2798, route step 3).** The scratch state itself
+follows in the next change. DEC-2798.5 left the doubt whether boxed steps
+implemented for both engines still give a `Send` future where the supervisor
+spawns the run. For `endpoint`, `connect_scratch` and `acquire` they do, with no
+`unsafe`, no erasure and no fallback: the only compiler complaint was a private
+state type in a public interface, answered by widening the two adapters'
+`Scratch` to `pub` inside their private modules, fields private and no
+constructor added. The shape that makes it compile is two lifetimes on
+`acquire`: what the call borrows (`'b`) ends with the call, what the scratch
+keeps (`'a`) lives as long as it does.
+
+**What moved.** `ResolverEngine` now carries `Standard`, `standard`,
+`endpoint`, `connect_scratch`, `target_identity` and `acquire`, each engine's
+arm moved unchanged into its own `contract.rs`; `acquire` makes the engine's
+own variant of the scratch. A standard for another engine is a type error, not
+a runtime refusal. The supervisor's request is `Request<D>`, and `produce`,
+`produce_unsealed`, `with_session`, `Entry::open` and `request` lose their
+`driver` parameter, because the dialect type says it. The ordinary plan needs
+no engine arm: both were `D::configured(extras, None)`. A rehearsal's scope
+request and run-key policy are `Rehearsal` facts (`Projected` or `AsItStands`;
+`run_key`), stated once per engine instead of compared.
+
+**Admission by type.** `produce_unsealed` and `with_session` are `pub`, so each
+asks the engine first by type (`planning_of`, `rehearsal_of`) and answers
+`{engine} does not support …` as an acquire failure before the binding sides,
+the key or any connection. `NoResolver<D>`'s `Standard` is plain configuration,
+which is why a caller can name one and reach the refusal; every operation that
+would start a run refuses by name.
+
+**What stays a union.** The scratch and the states that follow it (`Prepared`,
+`Binding`, `Staged`) are still the two-engine unions, read through their
+methods. They become associated types when their own group moves. Until then
+the union's own methods still match on a mixed pair, as before.
+
+Pinned by `an_engine_without_planning_support_is_refused_before_a_connection_opens`
+and its rehearsal twin (the stand-in engine, zero requests, the refusal ahead
+of a disagreeing binding and a missing key), the `compile_fail` doctest on
+`Standard<D>`, `every_engine_validates_binding_sides_and_key_before_connections`,
+and the live scratch tests of both engines. Formats: none. No sealed bytes,
+plan, state or evidence change.

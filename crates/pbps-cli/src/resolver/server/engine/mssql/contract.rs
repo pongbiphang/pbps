@@ -6,11 +6,14 @@
 //! compared at both ends, and a change made and restored in between leaves
 //! nothing to find (DEC-2144.1).
 
+use super::super::Scratch as EngineScratch;
 use crate::resolver::contract::{
     ApplyRecheck, ClosingInputs, ClusterDomain, FactsError, GrantRecheck, Phase, Planning, Preview,
-    Rehearsal, Replay, ResolverEngine, Step, Support, sealed::Sealed,
+    Rehearsal, RehearsalRequest, Replay, ResolverEngine, Step, Support, sealed::Sealed,
 };
 use crate::resolver::scope;
+use crate::resolver::server::scratch::{Provenance, Provisioning, Tokens};
+use crate::resolver::server::{Error, ProduceError, ScopeRequest};
 use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, DbError, Driver};
 use pbps_model::resolver::InputManifest;
@@ -30,10 +33,77 @@ impl ResolverEngine for MssqlResolver {
     type Dialect = pbps_mssql::Mssql;
     const SUPPORT: Support = Support {
         planning: Some(&Planning { cluster: CLUSTER }),
-        rehearsal: Some(&Rehearsal),
+        rehearsal: Some(&Rehearsal {
+            request: RehearsalRequest::AsItStands,
+            run_key: true,
+        }),
         preview: Some(&Preview),
         apply: Some(&MssqlResolver),
     };
+
+    /// SQL Server's scratch has no standard to put it into.
+    type Standard = ();
+
+    fn standard(
+        declared: Option<&pbps_config::resolver::ScratchStandard>,
+    ) -> Result<Self::Standard, Error> {
+        if declared.is_none() {
+            Ok(())
+        } else {
+            Err(Error::Unusable(
+                "SQL Server scratch does not accept a PostgreSQL standard declaration".into(),
+            ))
+        }
+    }
+
+    fn endpoint(connection: &str) -> Step<'_, Result<String, ProduceError>> {
+        Box::pin(super::endpoint(connection))
+    }
+
+    fn connect_scratch<'a>(
+        scratch: &'a str,
+        tokens: &'a Tokens,
+    ) -> Step<'a, Result<Conn, ProduceError>> {
+        Box::pin(async move {
+            Conn::connect_named(Driver::Mssql, scratch, &format!("pbps-{}", tokens.scratch))
+                .await
+                .map_err(|error| ProduceError::Acquire(format!("the scratch server: {error}")))
+        })
+    }
+
+    fn target_identity(target: &mut Conn) -> Step<'_, Result<String, DbError>> {
+        Box::pin(pbps_mssql::resolver::scratch::cluster_identity(target))
+    }
+
+    fn acquire<'a, 'b>(
+        target: &'b mut Conn,
+        admin: &'b mut Conn,
+        tokens: &'b Tokens,
+        planned_identity: &'b str,
+        scratch: &'a str,
+        request: &'a ScopeRequest,
+        _: &'a Self::Standard,
+        externals: Option<&'a str>,
+        provenance: &'a Provenance,
+    ) -> Step<'b, Result<(Provisioning, EngineScratch<'a>), ProduceError>>
+    where
+        'a: 'b,
+    {
+        Box::pin(async move {
+            let (provisioning, scratch) = super::scratch(
+                target,
+                admin,
+                tokens,
+                planned_identity,
+                scratch,
+                externals,
+                request,
+                provenance,
+            )
+            .await?;
+            Ok((provisioning, EngineScratch::Mssql(Box::new(scratch))))
+        })
+    }
 }
 
 impl ApplyRecheck for MssqlResolver {

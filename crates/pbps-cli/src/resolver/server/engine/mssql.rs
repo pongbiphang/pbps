@@ -32,7 +32,7 @@ enum Created {
     },
 }
 
-pub(in crate::resolver::server) struct Scratch<'a> {
+pub struct Scratch<'a> {
     connection: &'a str,
     mark: sql::SessionMark,
     backend: sql::Backend,

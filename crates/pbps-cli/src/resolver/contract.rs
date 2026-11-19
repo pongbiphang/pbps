@@ -12,10 +12,12 @@
 //! scratch lifecycle carries engine-branded state and will be typed through
 //! `PlanningDialect::Resolver` instead.
 
-use crate::resolver::server::PlanningDialect;
-use pbps_db::Conn;
+use crate::resolver::server::engine::Scratch;
+use crate::resolver::server::scratch::{Provenance, Provisioning, Tokens};
+use crate::resolver::server::{Error, PlanningDialect, ProduceError, ScopeRequest};
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
 use pbps_db::resolver::environment::CatalogFacts;
+use pbps_db::{Conn, DbError};
 use pbps_model::dependency::Dependencies;
 use pbps_model::resolver::{InputManifest, ResolverEvidence};
 use pbps_model::{ChangeSet, IdsFile, Schema};
@@ -48,9 +50,27 @@ pub struct Planning {
     pub cluster: ClusterDomain,
 }
 
-/// Connected rehearsal: the same scratch, nothing sealed. The policy it holds
-/// today as engine comparisons moves here with the rehearsal.
-pub struct Rehearsal;
+/// Connected rehearsal: the same scratch, nothing sealed. What an engine
+/// decides about it is stated here once, where the rehearsal used to compare
+/// the driver.
+pub struct Rehearsal {
+    /// How the scope the rehearsal qualifies is asked of the plan.
+    pub request: RehearsalRequest,
+    /// Whether the rehearsal's captures need a fingerprint key. They compare
+    /// in memory and seal nothing, so the key is the run's own.
+    pub run_key: bool,
+}
+
+/// The scope a rehearsal qualifies, by what the scratch stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RehearsalRequest {
+    /// The plan's grants are projected onto the scope and replayed into the
+    /// scratch before the rehearsal runs.
+    Projected,
+    /// The scratch stands for the target as it is now and the plan's own
+    /// statements make every change, grants included (DEC-2379.3).
+    AsItStands,
+}
 
 /// Target-less dev rehearsal. The operation itself moves in a later change.
 pub struct Preview;
@@ -78,11 +98,58 @@ impl Support {
 
 /// The engine half of the resolver. Sealed: nothing outside this crate names
 /// it, so no other crate can add an engine's resolver by implementing it.
+///
+/// Selection is typed by the engine: its standard cannot be another engine's,
+/// and the engine's own acquisition makes the scratch of its own variant. The
+/// scratch and the states that follow it are still the two-engine unions of
+/// `server::engine`, named in the signatures until their own group moves: an
+/// associated type that merely aliased them would be opaque to the run's
+/// generic code, which reads them through the unions' methods.
 pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
     /// The dialect this resolver belongs to, one to one: brand and state are
     /// the same engine by construction, not by a runtime comparison.
     type Dialect: PlanningDialect<Resolver = Self>;
     const SUPPORT: Support;
+
+    /// The state the scratch is put into, as the entry declares it.
+    type Standard: Clone + Send + Sync + 'static;
+
+    /// The standard an entry declares, or the refusal of one this engine
+    /// cannot hold.
+    fn standard(
+        declared: Option<&pbps_config::resolver::ScratchStandard>,
+    ) -> Result<Self::Standard, Error>;
+    /// The string the scratch server is reached by for this run. An ordinary
+    /// string is itself; a SQL Server `(localdb)` selector is resolved to the
+    /// pipe its instance listens on now, once, so that every connection of the
+    /// run opens the same endpoint and a pipe that has gone is a failure rather
+    /// than a reason to look again (DEC-2271.2).
+    fn endpoint(connection: &str) -> Step<'_, Result<String, ProduceError>>;
+    /// The scratch session that stays open for the whole run: named by the
+    /// run's token from its first packet, acting as itself, and told to let the
+    /// server notice if its client vanishes (#2410).
+    fn connect_scratch<'a>(
+        scratch: &'a str,
+        tokens: &'a Tokens,
+    ) -> Step<'a, Result<Conn, ProduceError>>;
+    /// The engine lineage identity the target reports.
+    fn target_identity(target: &mut Conn) -> Step<'_, Result<String, DbError>>;
+    /// The checked acquisition. The call's own borrows (`'b`) end with the
+    /// call; what the scratch keeps (`'a`) lives as long as it does.
+    #[allow(clippy::too_many_arguments)]
+    fn acquire<'a, 'b>(
+        target: &'b mut Conn,
+        admin: &'b mut Conn,
+        tokens: &'b Tokens,
+        planned_identity: &'b str,
+        scratch: &'a str,
+        request: &'a ScopeRequest,
+        standard: &'a Self::Standard,
+        externals: Option<&'a str>,
+        provenance: &'a Provenance,
+    ) -> Step<'b, Result<(Provisioning, Scratch<'a>), ProduceError>>
+    where
+        'a: 'b;
 }
 
 /// The resolver of an engine that has none.
@@ -90,9 +157,60 @@ pub struct NoResolver<D>(PhantomData<fn() -> D>);
 
 impl<D> sealed::Sealed for NoResolver<D> {}
 
+/// What every operation that would start a run says. The admission functions
+/// refuse before any of these is asked; this keeps a caller that skipped them
+/// from going further, because no state can be made.
+fn refusal<D: PlanningDialect>() -> Unsupported {
+    Unsupported {
+        engine: D::NAME,
+        operation: Operation::Planning,
+    }
+}
+
 impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
     type Dialect = D;
     const SUPPORT: Support = Support::NONE;
+    /// Configuration, not a state: it holds nothing to release and carries no
+    /// brand, so a caller can name one. What it cannot do is go further:
+    /// every operation that starts a run refuses by name.
+    type Standard = ();
+
+    fn standard(_: Option<&pbps_config::resolver::ScratchStandard>) -> Result<(), Error> {
+        Err(Error::Unusable(refusal::<D>().to_string()))
+    }
+    fn endpoint(_: &str) -> Step<'_, Result<String, ProduceError>> {
+        Box::pin(std::future::ready(Err(ProduceError::Acquire(
+            refusal::<D>().to_string(),
+        ))))
+    }
+    fn connect_scratch<'a>(_: &'a str, _: &'a Tokens) -> Step<'a, Result<Conn, ProduceError>> {
+        Box::pin(std::future::ready(Err(ProduceError::Acquire(
+            refusal::<D>().to_string(),
+        ))))
+    }
+    fn target_identity(_: &mut Conn) -> Step<'_, Result<String, DbError>> {
+        Box::pin(std::future::ready(Err(DbError::Refused(
+            refusal::<D>().to_string(),
+        ))))
+    }
+    fn acquire<'a, 'b>(
+        _: &'b mut Conn,
+        _: &'b mut Conn,
+        _: &'b Tokens,
+        _: &'b str,
+        _: &'a str,
+        _: &'a ScopeRequest,
+        _: &'a (),
+        _: Option<&'a str>,
+        _: &'a Provenance,
+    ) -> Step<'b, Result<(Provisioning, Scratch<'a>), ProduceError>>
+    where
+        'a: 'b,
+    {
+        Box::pin(std::future::ready(Err(ProduceError::Acquire(
+            refusal::<D>().to_string(),
+        ))))
+    }
 }
 
 /// An operation an engine can lack.
@@ -148,10 +266,10 @@ impl fmt::Display for CannotRecheck {
 impl std::error::Error for CannotRecheck {}
 
 // The admission functions take the dialect as a witness: every caller sits in
-// a `with_plan_dialect!` arm, where the engine has no name to write.
+// a `with_plan_dialect!` arm, where the engine has no name to write. The
+// library's own entry points are generic in the dialect and ask by type.
 
 fn admit<D: PlanningDialect, T>(
-    _: &D,
     fact: impl FnOnce(&Support) -> Option<&'static T>,
     operation: Operation,
 ) -> Result<&'static T, Unsupported> {
@@ -161,16 +279,24 @@ fn admit<D: PlanningDialect, T>(
     })
 }
 
-pub fn planning<D: PlanningDialect>(dialect: &D) -> Result<&'static Planning, Unsupported> {
-    admit(dialect, |support| support.planning, Operation::Planning)
+pub(crate) fn planning_of<D: PlanningDialect>() -> Result<&'static Planning, Unsupported> {
+    admit::<D, _>(|support| support.planning, Operation::Planning)
 }
 
-pub fn rehearsal<D: PlanningDialect>(dialect: &D) -> Result<&'static Rehearsal, Unsupported> {
-    admit(dialect, |support| support.rehearsal, Operation::Rehearsal)
+pub(crate) fn rehearsal_of<D: PlanningDialect>() -> Result<&'static Rehearsal, Unsupported> {
+    admit::<D, _>(|support| support.rehearsal, Operation::Rehearsal)
 }
 
-pub fn preview<D: PlanningDialect>(dialect: &D) -> Result<&'static Preview, Unsupported> {
-    admit(dialect, |support| support.preview, Operation::Preview)
+pub fn planning<D: PlanningDialect>(_: &D) -> Result<&'static Planning, Unsupported> {
+    planning_of::<D>()
+}
+
+pub fn rehearsal<D: PlanningDialect>(_: &D) -> Result<&'static Rehearsal, Unsupported> {
+    rehearsal_of::<D>()
+}
+
+pub fn preview<D: PlanningDialect>(_: &D) -> Result<&'static Preview, Unsupported> {
+    admit::<D, _>(|support| support.preview, Operation::Preview)
 }
 
 /// The recheck of this engine's resolver evidence. A resolved plan on an

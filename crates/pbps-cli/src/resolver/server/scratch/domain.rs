@@ -1,11 +1,15 @@
 //! An unsealed, code-only goal of the scratch run (DEC-2309.1).
-use super::super::{Error, ProduceError, engine, producer::request};
+use super::super::{Error, PlanningDialect, ProduceError, producer::request};
 use super::{Provenance, Standard, Tokens};
+use crate::resolver::contract::ResolverEngine;
 use crate::resolver::scope;
 use pbps_db::resolver::environment::Verdict;
 use pbps_db::{Conn, Driver};
 use pbps_dialect::Dialect;
 use pbps_model::{Hints, IdsFile, PlanMode, Schema};
+
+/// The code vet is a PostgreSQL operation by design.
+type Postgres = <pbps_pg::Postgres as PlanningDialect>::Resolver;
 
 /// An answered refusal is distinct from a scratch that could not answer.
 #[derive(Debug)]
@@ -22,7 +26,7 @@ pub async fn vet(
     target_connection: &str,
     identity: &str,
     desired: pbps_diff::Side<'_>,
-    standard: impl Into<Standard>,
+    standard: &Standard<pbps_pg::Postgres>,
     externals: Option<&str>,
     provenance: &Provenance,
 ) -> Result<(), Refused> {
@@ -46,7 +50,7 @@ pub(super) async fn run(
     target_connection: &str,
     identity: &str,
     desired: pbps_diff::Side<'_>,
-    standard: impl Into<Standard>,
+    standard: &Standard<pbps_pg::Postgres>,
     externals: Option<&str>,
     provenance: &Provenance,
     comparison: Option<&super::retained::Comparison<'_>>,
@@ -97,33 +101,27 @@ pub(super) async fn run(
     )
     .map_err(|error| unavailable(error.to_string()))?;
     let request = match comparison {
-        Some(comparison) => request(
-            Driver::Postgres,
-            comparison.before,
-            comparison.after,
-            comparison.hints,
-            &[],
-        ),
-        None => request(Driver::Postgres, base, desired_types, &hints, &[]),
+        Some(comparison) => {
+            request::<pbps_pg::Postgres>(comparison.before, comparison.after, comparison.hints, &[])
+        }
+        None => request::<pbps_pg::Postgres>(base, desired_types, &hints, &[]),
     }
     .map_err(|error| Refused::Unavailable(ProduceError::Run(error)))?;
-    let standard = standard.into();
     let mut target = Conn::connect(Driver::Postgres, target_connection)
         .await
         .map_err(|error| unavailable(format!("the vet's target session: {error}")))?;
     let tokens = Tokens::generate();
-    let mut admin = engine::connect_scratch(Driver::Postgres, scratch, &tokens)
+    let mut admin = Postgres::connect_scratch(scratch, &tokens)
         .await
         .map_err(Refused::Unavailable)?;
-    let (provisioning, mut state) = engine::scratch(
-        Driver::Postgres,
+    let (provisioning, mut state) = Postgres::acquire(
         &mut target,
         &mut admin,
         &tokens,
         identity,
         scratch,
         &request,
-        &standard,
+        standard,
         externals,
         provenance,
     )

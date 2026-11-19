@@ -430,7 +430,7 @@ enum Created {
     },
 }
 
-pub(in crate::resolver::server) struct Scratch<'a> {
+pub struct Scratch<'a> {
     driver: Driver,
     scratch: &'a str,
     request: &'a ScopeRequest,
@@ -2216,18 +2216,6 @@ pub(super) async fn fill(
                 Error::Read(format!("the externals to fill: {error}"))
             }
         })
-}
-
-pub(super) fn ordinary(
-    base: pbps_diff::Side<'_>,
-    desired: pbps_diff::Side<'_>,
-    hints: &pbps_model::Hints,
-    extras: &[String],
-) -> Result<pbps_diff::order::DiffPlan, Error> {
-    let dialect = pbps_pg::Postgres::with_write_path_extras(extras.to_vec());
-    pbps_diff::resolver::ordinary(base, desired, &dialect, hints).map_err(|errors| {
-        Error::Binding(format!("ordinary typed plan cannot be formed: {errors:?}"))
-    })
 }
 
 impl Binding {

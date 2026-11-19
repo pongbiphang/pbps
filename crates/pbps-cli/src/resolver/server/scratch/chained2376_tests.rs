@@ -1,5 +1,6 @@
 //! Native chained staging, on warm server scratch (#2376).
 use super::*;
+use crate::resolver::server::scratch::engines::{MssqlEngine, ResolverEngine};
 use pbps_model::{Column, ForeignKey, PrimaryKey, ReferentialAction, Table, TableName};
 use pbps_mssql::resolver::capture;
 use std::collections::{BTreeMap, BTreeSet};
@@ -121,15 +122,14 @@ pub(super) async fn observe(
     let mut admin = connection(scratch).await;
     let tokens = super::super::Tokens::generate();
     let provenance = provenance();
-    let (provisioning, mut state) = super::super::engine::scratch(
-        Driver::Mssql,
+    let (provisioning, mut state) = MssqlEngine::acquire(
         &mut source,
         &mut admin,
         &tokens,
         &identity,
         scratch,
         &request,
-        &Standard::Mssql,
+        &(),
         file,
         &provenance,
     )
