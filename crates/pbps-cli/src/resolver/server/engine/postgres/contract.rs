@@ -3,11 +3,12 @@
 //! ones `resolver::apply` made before it named no engine, moved with their
 //! comments; they run on the apply's own connection, inside its transaction.
 
-use super::super::{Binding, Prepared, Staged, unsupported};
-use super::{Naming, Scratch};
+use super::super::{Binding, CompiledCapture, Staged, unsupported};
+use super::{Naming, Prepared, Scratch};
 use crate::resolver::contract::{
     ApplyRecheck, ClosingInputs, ClusterDomain, FactsError, GrantRecheck, Phase, Planning,
-    Rehearsal, RehearsalRequest, Replay, ResolverEngine, Step, Support, sealed::Sealed,
+    PreparedView, Rehearsal, RehearsalRequest, Replay, ResolverEngine, Step, Support,
+    sealed::Sealed,
 };
 use crate::resolver::scope;
 use crate::resolver::server::scratch::{Provenance, Provisioning, Tokens};
@@ -15,10 +16,12 @@ use crate::resolver::server::{BindingRequest, Error, ProduceError, ScopeRequest}
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
 use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, DbError, Driver};
+use pbps_model::dependency::DependencyName;
+use pbps_model::resolver::{DependencyPlacement, OutsideWrites};
 use pbps_model::resolver::{
     InputManifest, ObjectIdentity, ObjectOwnership, ResolverEvidence, Surface,
 };
-use pbps_model::{IdsFile, ModuleDeps, ModuleId, RoleName};
+use pbps_model::{IdsFile, ModuleDeps, ModuleId, RoleName, SessionZone};
 use std::collections::BTreeMap;
 
 /// PostgreSQL's resolver: planning, connected rehearsal and the apply recheck.
@@ -48,6 +51,7 @@ impl ResolverEngine for PgResolver {
 
     type Standard = pbps_pg::resolver::standard::Standard;
     type Scratch<'a> = Box<Scratch<'a>>;
+    type Prepared = Prepared;
 
     fn standard(
         declared: Option<&pbps_config::resolver::ScratchStandard>,
@@ -139,7 +143,6 @@ impl ResolverEngine for PgResolver {
                     &Default::default(),
                 )
                 .await
-                .map(Prepared::Postgres)
         })
     }
 
@@ -169,7 +172,7 @@ impl ResolverEngine for PgResolver {
             if !problems.is_empty() {
                 return Err(Error::Binding(problems.join("; ")));
             }
-            Ok(Prepared::Postgres(prepared))
+            Ok(prepared)
         })
     }
 
@@ -182,9 +185,6 @@ impl ResolverEngine for PgResolver {
         prepared: &'a mut Prepared,
     ) -> Step<'a, Result<Binding, Error>> {
         Box::pin(async move {
-            let Prepared::Postgres(prepared) = prepared else {
-                return Err(unsupported());
-            };
             scratch
                 .reconstruction(target, binding, ids, dependencies, prepared)
                 .await
@@ -201,14 +201,82 @@ impl ResolverEngine for PgResolver {
         binding: &'a Binding,
     ) -> Step<'a, Result<Staged, Error>> {
         Box::pin(async move {
-            match (prepared, binding) {
-                (Prepared::Postgres(prepared), Binding::Postgres(binding)) => scratch
+            match binding {
+                Binding::Postgres(binding) => scratch
                     .compare_externals(provisioning, prepared, admin, target, binding)
                     .await
                     .map(Staged::Postgres),
-                (Prepared::Mssql(_), _) | (Prepared::Postgres(_), Binding::Mssql(_)) => {
-                    Err(unsupported())
+                Binding::Mssql(_) => Err(unsupported()),
+            }
+        })
+    }
+
+    fn staged(_: &Self::Prepared) -> Staged {
+        Staged::Postgres(Default::default())
+    }
+
+    fn completed_staged(_: &Self::Prepared) -> Option<Staged> {
+        None
+    }
+
+    fn chains(binding: &mut Binding, prepared: &Self::Prepared) -> Result<Vec<String>, Error> {
+        match binding {
+            Binding::Postgres(binding) => Ok(binding.chains(prepared)),
+            Binding::Mssql(_) => Err(unsupported()),
+        }
+    }
+
+    fn compile<'a>(
+        binding: &'a mut Binding,
+        prepared: &'a mut Self::Prepared,
+        admin: &'a mut Conn,
+        target: &'a mut Conn,
+        extras: &'a [String],
+        zone: Option<&'a SessionZone>,
+        outside_writes: OutsideWrites,
+        staged: &'a mut Staged,
+    ) -> Step<'a, Result<(), Error>> {
+        Box::pin(async move {
+            match (binding, staged) {
+                (Binding::Postgres(binding), Staged::Postgres(staged)) => {
+                    binding
+                        .compile(
+                            prepared,
+                            admin,
+                            target,
+                            extras,
+                            zone,
+                            outside_writes,
+                            staged,
+                        )
+                        .await
                 }
+                _ => Err(unsupported()),
+            }
+        })
+    }
+
+    fn capture_desired<'a>(
+        binding: &'a Binding,
+        prepared: &'a mut Self::Prepared,
+        admin: &'a mut Conn,
+        _: &'a mut Conn,
+        extras: &'a [String],
+        visibility: &'a BTreeMap<String, pbps_db::resolver::Observation>,
+        schemas: &'a [String],
+        key: &'a EnvironmentFingerprintKey,
+        desired: pbps_diff::Side<'a>,
+        staged: &'a Staged,
+    ) -> Step<'a, Result<CompiledCapture, Error>> {
+        Box::pin(async move {
+            match (binding, staged) {
+                (Binding::Postgres(binding), Staged::Postgres(staged)) => binding
+                    .capture_desired(
+                        prepared, admin, extras, visibility, schemas, key, desired, staged,
+                    )
+                    .await
+                    .map(|closing| CompiledCapture::Postgres(Box::new(closing))),
+                _ => Err(unsupported()),
             }
         })
     }
@@ -226,6 +294,60 @@ impl ResolverEngine for PgResolver {
         naming: Naming,
     ) -> Step<'a, Result<Result<(), String>, Error>> {
         Box::pin(async move { scratch.rehearsal_roles(admin, roles, naming).await })
+    }
+}
+
+impl PreparedView for Prepared {
+    fn authorization_condition<'a>(
+        &'a mut self,
+        _: &'a mut Conn,
+    ) -> Step<'a, Result<Option<Box<pbps_mssql::resolver::authorization::Condition>>, Error>> {
+        Box::pin(async move { Ok(None) })
+    }
+
+    fn dependency_placements(&self) -> BTreeMap<DependencyName, DependencyPlacement> {
+        Default::default()
+    }
+
+    fn catalog(&self) -> &CatalogFacts {
+        &self.scratch_catalog
+    }
+
+    #[cfg(test)]
+    fn catalog_mut(&mut self) -> &mut CatalogFacts {
+        &mut self.scratch_catalog
+    }
+
+    fn into_catalog(self) -> CatalogFacts {
+        self.scratch_catalog
+    }
+
+    fn session<'a>(&'a mut self, admin: &'a mut Conn) -> &'a mut Conn {
+        Prepared::session(self, admin)
+    }
+
+    fn deployer<'a>(&'a mut self, admin: &'a mut Conn) -> &'a mut Conn {
+        Prepared::session(self, admin)
+    }
+
+    fn reader(&self) -> Step<'_, Result<Option<Conn>, Error>> {
+        Box::pin(async move { Ok(None) })
+    }
+
+    fn differences(&self) -> &[String] {
+        &self.differences
+    }
+
+    fn supplied(&self) -> bool {
+        Prepared::supplied(self)
+    }
+
+    fn has_filled(&self) -> bool {
+        Prepared::has_filled(self)
+    }
+
+    fn unfillable(&self) -> Vec<String> {
+        Prepared::unfillable(self)
     }
 }
 

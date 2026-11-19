@@ -1382,7 +1382,7 @@ async fn mssql_prepare_renders_missing_external_and_returns_entered_compile_conn
         let (catalog,authorization)=crate::resolver::scope::read_target(&mut target,Driver::Mssql,&request.schemas,&[],&request.schemas,&[]).await.unwrap();
         let prepared=MssqlEngine::prepare(&mut state, provisioning,&mut admin,&mut target,&catalog,&authorization,&request.schemas,&binding,&[], Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key())).await;
         let verification=tokio::spawn(async move { match prepared {
-            Ok(super::engine::Prepared::Mssql(mut prepared)) => {
+            Ok(mut prepared) => {
                 assert!(matches!(prepared.map,crate::resolver::scope::Principals::Mssql(_)));
                 assert!(format!("{:?}",prepared.inventory).contains("ext2269"));
                 assert!(prepared.staged.compared().contains(&capture::object("dbo","ext2269")));
@@ -1392,7 +1392,6 @@ async fn mssql_prepare_renders_missing_external_and_returns_entered_compile_conn
                 assert!(prepared.compile.execute("REVERT;").await.is_err());
                 Ok(())
             },
-            Ok(super::engine::Prepared::Postgres(_)) => panic!("wrong engine"),
             Err(error) => Err(error),
         }}).await;
         let cleanup=MssqlEngine::release(&mut state, &mut admin).await;
@@ -1444,11 +1443,10 @@ async fn mssql_supplied_type_permissions_release_to_empty_inventory() {
         let (catalog, authorization) = crate::resolver::scope::read_target(
             &mut target, Driver::Mssql, &request.schemas, &[], &request.schemas, &[],
         ).await.unwrap();
-        let prepared = MssqlEngine::prepare(&mut state,
+        let mut prepared = MssqlEngine::prepare(&mut state,
             provisioning, &mut admin, &mut target, &catalog, &authorization,
             &request.schemas, &binding, &[], Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key()),
         ).await.unwrap();
-        let super::engine::Prepared::Mssql(mut prepared) = prepared else { panic!("wrong engine"); };
         let rows = prepared.compile.query("SELECT p.state_desc,USER_NAME(p.grantee_principal_id) AS grantee,USER_NAME(p.grantor_principal_id) AS grantor,USER_NAME(t.principal_id) AS owner FROM sys.database_permissions p JOIN sys.types t ON p.class=6 AND t.user_type_id=p.major_id;").await.unwrap();
         assert_eq!(rows.len(), 3);
         assert!(rows.iter().any(|r| r.try_get::<&str>("state_desc").unwrap()==Some("GRANT")));
@@ -1551,9 +1549,6 @@ async fn mssql_a_reconnect_to_a_differing_backend_refuses_and_an_equal_one_does_
         )
         .await
         .unwrap();
-        let super::engine::Prepared::Mssql(prepared) = prepared else {
-            panic!("wrong engine");
-        };
         let reach = prepared.reach();
         let option = |on: bool| {
             format!(

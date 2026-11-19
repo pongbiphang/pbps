@@ -237,7 +237,7 @@ async fn prepare_probe(
     let database = case.other_name.clone();
     let observer_url = format!("{scratch};Database={database}");
     let verified = tokio::spawn(async move {
-        let super::super::engine::Prepared::Mssql(mut prepared) = prepared? else { panic!("wrong engine"); };
+        let mut prepared = prepared?;
         // This connection is the companion's managed scratch, never target.
         let write_error = if let Some(sql) = write_probe {
             prepared.compile.execute(&sql).await.err().map(|e| e.server_error_code().unwrap_or_else(|| e.to_string()))

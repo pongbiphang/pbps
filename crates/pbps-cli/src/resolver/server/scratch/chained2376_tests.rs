@@ -1,6 +1,6 @@
 //! Native chained staging, on warm server scratch (#2376).
 use super::*;
-use crate::resolver::server::scratch::engines::{MssqlEngine, ResolverEngine};
+use crate::resolver::server::scratch::engines::{MssqlEngine, PreparedView, ResolverEngine};
 use pbps_model::{Column, ForeignKey, PrimaryKey, ReferentialAction, Table, TableName};
 use pbps_mssql::resolver::capture;
 use std::collections::{BTreeMap, BTreeSet};
@@ -158,22 +158,19 @@ pub(super) async fn observe(
             &mut prepared,
         )
         .await?;
-        let mut staged = super::super::engine::staged(Driver::Mssql, &prepared)?;
-        reconstruction
-            .compile(
-                &mut prepared,
-                &mut admin,
-                &mut source,
-                &[],
-                None,
-                provenance.outside_writes,
-                &mut staged,
-            )
-            .await?;
+        let mut staged = MssqlEngine::staged(&prepared);
+        MssqlEngine::compile(
+            &mut reconstruction,
+            &mut prepared,
+            &mut admin,
+            &mut source,
+            &[],
+            None,
+            provenance.outside_writes,
+            &mut staged,
+        )
+        .await?;
         let placements = prepared.dependency_placements();
-        let super::super::engine::Prepared::Mssql(prepared) = prepared else {
-            unreachable!()
-        };
         let current =
             capture::capture_declared(&mut source, prepared.staged.scope(), dependencies, &key)
                 .await

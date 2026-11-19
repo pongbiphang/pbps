@@ -27,14 +27,14 @@
 
 use super::producer::{Identity, Opening, Sealing, Unsealed, request};
 use super::{BindingRequest, Error, ProduceError, ResolvedPlan, engine, resolution};
-use crate::resolver::contract::{self, ResolverEngine};
+use crate::resolver::contract::{self, PreparedView, ResolverEngine};
 use crate::resolver::scope;
 use pbps_db::resolver::environment::Verdict;
 use pbps_db::{Conn, Driver};
 use pbps_model::Hints;
 use pbps_model::resolver::{OutsideWrites, ResolverRuntime, ScratchLayout, ScratchSource};
 
-pub use super::engine::{Standard, declared_standard};
+pub use super::engine::{Prepared, Standard, declared_standard};
 
 pub mod domain;
 pub mod preview;
@@ -330,7 +330,7 @@ impl<D: super::PlanningDialect> Run<'_, D> {
             &mut prepared,
         )
         .await?;
-        let chains = reconstruction.chains(&prepared);
+        let chains = <D::Resolver as ResolverEngine>::chains(&mut reconstruction, &prepared)?;
         let mut staged = if self.externals.is_some() || prepared.has_filled() {
             <D::Resolver as ResolverEngine>::compare_externals(
                 &self.state,
@@ -342,7 +342,7 @@ impl<D: super::PlanningDialect> Run<'_, D> {
             )
             .await?
         } else {
-            engine::staged(driver, &prepared)?
+            <D::Resolver as ResolverEngine>::staged(&prepared)
         };
         #[cfg(test)]
         if let Ok(Some(sql)) = AFTER_STAGING.try_with(Clone::clone) {
@@ -381,34 +381,34 @@ impl<D: super::PlanningDialect> Run<'_, D> {
             }
             error
         };
-        reconstruction
-            .compile(
-                &mut prepared,
-                admin,
-                target,
-                extras,
-                zone.as_ref(),
-                outside_writes,
-                &mut staged,
-            )
-            .await
-            .map_err(|error| failed(error, &staged))?;
-        if let Some(completed) = prepared.completed_staged() {
+        <D::Resolver as ResolverEngine>::compile(
+            &mut reconstruction,
+            &mut prepared,
+            admin,
+            target,
+            extras,
+            zone.as_ref(),
+            outside_writes,
+            &mut staged,
+        )
+        .await
+        .map_err(|error| failed(error, &staged))?;
+        if let Some(completed) = <D::Resolver as ResolverEngine>::completed_staged(&prepared) {
             staged = completed;
         }
-        let compiled = reconstruction
-            .capture_desired(
-                &mut prepared,
-                admin,
-                target,
-                extras,
-                &target_catalog.visibility,
-                &request.schemas,
-                self.key,
-                desired,
-                &staged,
-            )
-            .await?;
+        let compiled = <D::Resolver as ResolverEngine>::capture_desired(
+            &reconstruction,
+            &mut prepared,
+            admin,
+            target,
+            extras,
+            &target_catalog.visibility,
+            &request.schemas,
+            self.key,
+            desired,
+            &staged,
+        )
+        .await?;
         let (current, opening) = reconstruction
             .capture_opening(target, &compiled, self.key, base)
             .await?;
@@ -529,7 +529,7 @@ pub mod container;
 /// The engines' resolvers, named for the tests that drive one directly.
 #[cfg(test)]
 mod engines {
-    pub(super) use crate::resolver::contract::ResolverEngine;
+    pub(super) use crate::resolver::contract::{PreparedView, ResolverEngine};
     pub(super) type MssqlEngine =
         <pbps_mssql::Mssql as crate::resolver::server::PlanningDialect>::Resolver;
     pub(super) type PgEngine =

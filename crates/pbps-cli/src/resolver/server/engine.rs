@@ -13,7 +13,7 @@ use pbps_db::resolver::capture::{Assessment, CaptureDifference, CaptureError};
 use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, Driver};
 use pbps_model::Hints;
-use pbps_model::resolver::{InputManifest, OutsideWrites, SurfaceResolution};
+use pbps_model::resolver::{InputManifest, SurfaceResolution};
 
 pub(crate) mod container;
 mod keeper;
@@ -121,6 +121,31 @@ impl PlanningDialect for pbps_mssql::Mssql {
 /// ```
 pub type Standard<D> = <<D as PlanningDialect>::Resolver as ResolverEngine>::Standard;
 
+/// What the run prepared on its scratch, for the engine the dialect names. A
+/// scratch prepared by one engine cannot be handed to another's step: it is a
+/// type error, not an arm that refuses at run time.
+///
+/// ```compile_fail
+/// use pbps_cli::resolver::server::scratch::Prepared;
+/// fn for_sql_server(_: Prepared<pbps_mssql::Mssql>) {}
+/// fn prepared_by_postgres(prepared: Prepared<pbps_pg::Postgres>) {
+///     for_sql_server(prepared);
+/// }
+/// ```
+///
+/// Each engine's own prepared scratch is the type its adapter holds:
+///
+/// ```
+/// use pbps_cli::resolver::server::scratch::Prepared;
+/// fn for_postgres(prepared: Prepared<pbps_pg::Postgres>) -> Prepared<pbps_pg::Postgres> {
+///     prepared
+/// }
+/// fn for_sql_server(prepared: Prepared<pbps_mssql::Mssql>) -> Prepared<pbps_mssql::Mssql> {
+///     prepared
+/// }
+/// ```
+pub type Prepared<D> = <<D as PlanningDialect>::Resolver as ResolverEngine>::Prepared;
+
 /// What the run acquired and must release, for the engine the dialect names.
 pub(super) type Scratch<'a, D> = <<D as PlanningDialect>::Resolver as ResolverEngine>::Scratch<'a>;
 
@@ -132,10 +157,6 @@ pub fn declared_standard<D: PlanningDialect>(
     <D::Resolver as ResolverEngine>::standard(declared)
 }
 
-pub enum Prepared {
-    Postgres(postgres::Prepared),
-    Mssql(mssql::Prepared),
-}
 pub enum Binding {
     Postgres(Box<postgres::Binding>),
     Mssql(Box<mssql::Binding>),
@@ -144,7 +165,7 @@ pub enum Staged {
     Postgres(pbps_pg::resolver::capture::Staged),
     Mssql(pbps_mssql::resolver::capture::Staged),
 }
-pub(super) enum CompiledCapture {
+pub enum CompiledCapture {
     Postgres(Box<postgres::Closing>),
     Mssql(Box<mssql::Closing>),
 }
@@ -153,176 +174,11 @@ pub(super) enum CapturedInputs {
     Mssql(pbps_mssql::resolver::capture::CapturedInputs),
 }
 
-impl Prepared {
-    pub(super) async fn authorization_condition(
-        &mut self,
-        target: &mut Conn,
-    ) -> Result<Option<Box<pbps_mssql::resolver::authorization::Condition>>, Error> {
-        match self {
-            Self::Postgres(_) => Ok(None),
-            Self::Mssql(prepared) => prepared.authorization_condition(target).await.map(Some),
-        }
-    }
-    pub(super) fn completed_staged(&self) -> Option<Staged> {
-        match self {
-            Self::Mssql(prepared) => Some(Staged::Mssql(prepared.staged.clone())),
-            Self::Postgres(_) => None,
-        }
-    }
-
-    pub(super) fn dependency_placements(
-        &self,
-    ) -> std::collections::BTreeMap<
-        pbps_model::dependency::DependencyName,
-        pbps_model::resolver::DependencyPlacement,
-    > {
-        match self {
-            Self::Postgres(_) => Default::default(),
-            Self::Mssql(prepared) => prepared.dependency_placements(),
-        }
-    }
-
-    pub(super) fn catalog(&self) -> &CatalogFacts {
-        match self {
-            Self::Postgres(prepared) => &prepared.scratch_catalog,
-            Self::Mssql(prepared) => &prepared.scratch_catalog,
-        }
-    }
-    #[cfg(test)]
-    pub(super) fn catalog_mut(&mut self) -> &mut CatalogFacts {
-        match self {
-            Self::Postgres(prepared) => &mut prepared.scratch_catalog,
-            Self::Mssql(prepared) => &mut prepared.scratch_catalog,
-        }
-    }
-    pub(super) fn into_catalog(self) -> CatalogFacts {
-        match self {
-            Self::Postgres(prepared) => prepared.scratch_catalog,
-            Self::Mssql(prepared) => prepared.scratch_catalog,
-        }
-    }
-    /// The session the scratch's statements run on: the reproduced
-    /// deployer's where the run made its own login, the checked connection
-    /// where the scratch account compiles as itself.
-    pub(super) fn session<'a>(&'a mut self, admin: &'a mut Conn) -> &'a mut Conn {
-        match self {
-            Self::Postgres(prepared) => prepared.session(admin),
-            Self::Mssql(_) => admin,
-        }
-    }
-
-    /// The session a rehearsal's statements run in: the reproduced deployer's,
-    /// as an apply's are, where the scratch has one (SQL Server), and the
-    /// checked connection otherwise.
-    pub(super) fn deployer<'a>(&'a mut self, admin: &'a mut Conn) -> &'a mut Conn {
-        match self {
-            Self::Postgres(prepared) => prepared.session(admin),
-            Self::Mssql(prepared) => &mut prepared.compile,
-        }
-    }
-
-    /// A connection that reads the scratch database as a whole, for the
-    /// comparison after the plan ran: the deployer's cannot leave its context
-    /// and may lack `VIEW DEFINITION`. `None` where the session reads it itself.
-    pub(super) async fn reader(&self) -> Result<Option<Conn>, Error> {
-        match self {
-            Self::Postgres(_) => Ok(None),
-            Self::Mssql(prepared) => prepared.reach().open().await.map(Some),
-        }
-    }
-    pub(super) fn differences(&self) -> &[String] {
-        match self {
-            Self::Postgres(prepared) => &prepared.differences,
-            Self::Mssql(prepared) => &prepared.differences,
-        }
-    }
-    pub(super) fn supplied(&self) -> bool {
-        match self {
-            Self::Postgres(prepared) => prepared.supplied(),
-            Self::Mssql(_) => false,
-        }
-    }
-    pub(super) fn has_filled(&self) -> bool {
-        match self {
-            Self::Postgres(prepared) => prepared.has_filled(),
-            Self::Mssql(prepared) => !prepared.staged.compared().is_empty(),
-        }
-    }
-    pub(super) fn unfillable(&self) -> Vec<String> {
-        match self {
-            Self::Postgres(prepared) => prepared.unfillable(),
-            Self::Mssql(_) => Vec::new(),
-        }
-    }
-}
-
 impl Binding {
     pub(super) fn has_fill(&self) -> bool {
         match self {
             Self::Postgres(binding) => binding.has_fill(),
             Self::Mssql(_) => false,
-        }
-    }
-    pub(super) fn chains(&mut self, prepared: &Prepared) -> Vec<String> {
-        match (self, prepared) {
-            (Self::Postgres(binding), Prepared::Postgres(prepared)) => binding.chains(prepared),
-            (Self::Mssql(_), Prepared::Mssql(_)) => Vec::new(),
-            (Self::Postgres(_), Prepared::Mssql(_)) | (Self::Mssql(_), Prepared::Postgres(_)) => {
-                unreachable!("a binding and its preparation come from one engine")
-            }
-        }
-    }
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn compile(
-        &mut self,
-        prepared: &mut Prepared,
-        admin: &mut Conn,
-        target: &mut Conn,
-        extras: &[String],
-        zone: Option<&pbps_model::SessionZone>,
-        outside: OutsideWrites,
-        staged: &mut Staged,
-    ) -> Result<(), Error> {
-        match (self, prepared, staged) {
-            (Self::Postgres(binding), Prepared::Postgres(prepared), Staged::Postgres(staged)) => {
-                binding
-                    .compile(prepared, admin, target, extras, zone, outside, staged)
-                    .await
-            }
-            (Self::Mssql(binding), Prepared::Mssql(prepared), Staged::Mssql(_)) => {
-                let len = binding.len();
-                binding.compile(prepared, target, 0..len).await
-            }
-            _ => Err(unsupported()),
-        }
-    }
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn capture_desired(
-        &self,
-        prepared: &mut Prepared,
-        admin: &mut Conn,
-        target: &mut Conn,
-        extras: &[String],
-        visibility: &std::collections::BTreeMap<String, pbps_db::resolver::Observation>,
-        schemas: &[String],
-        key: &EnvironmentFingerprintKey,
-        desired: pbps_diff::Side<'_>,
-        staged: &Staged,
-    ) -> Result<CompiledCapture, Error> {
-        match (self, prepared, staged) {
-            (Self::Postgres(binding), Prepared::Postgres(prepared), Staged::Postgres(staged)) => {
-                binding
-                    .capture_desired(
-                        prepared, admin, extras, visibility, schemas, key, desired, staged,
-                    )
-                    .await
-                    .map(|closing| CompiledCapture::Postgres(Box::new(closing)))
-            }
-            (Self::Mssql(binding), Prepared::Mssql(prepared), Staged::Mssql(staged)) => binding
-                .capture_desired(prepared.reach(), target, schemas, key, desired, staged)
-                .await
-                .map(|closing| CompiledCapture::Mssql(Box::new(closing))),
-            (Self::Postgres(_), ..) | (Self::Mssql(_), ..) => Err(unsupported()),
         }
     }
     pub(super) async fn capture_opening(
@@ -390,15 +246,6 @@ impl Staged {
             Self::Postgres(staged) => postgres::through_shape_view(error, staged),
             Self::Mssql(_) => error,
         }
-    }
-}
-
-pub(super) fn staged(driver: Driver, prepared: &Prepared) -> Result<Staged, Error> {
-    match (driver, prepared) {
-        (Driver::Postgres, _) => Ok(Staged::Postgres(Default::default())),
-        // Preparation always compares the externals, an empty set included.
-        (Driver::Mssql, Prepared::Mssql(prepared)) => Ok(Staged::Mssql(prepared.staged.clone())),
-        (Driver::Mssql, Prepared::Postgres(_)) => Err(unsupported()),
     }
 }
 

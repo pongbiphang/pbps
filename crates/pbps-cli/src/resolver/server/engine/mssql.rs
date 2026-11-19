@@ -1183,7 +1183,7 @@ impl Closing {
 }
 
 /// The compiled scratch capture and the exact scope its opening read uses.
-pub(in crate::resolver::server) struct Closing {
+pub struct Closing {
     captured: capture::CompiledCapture,
     /// The target's own roots and the candidates both sides settled on.
     target_scope: capture::CaptureScope,

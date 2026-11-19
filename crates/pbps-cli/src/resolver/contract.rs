@@ -13,16 +13,18 @@
 //! `PlanningDialect::Resolver` instead.
 
 use crate::resolver::scope;
-use crate::resolver::server::engine::{Binding, Naming, Prepared, Staged};
+use crate::resolver::server::engine::{Binding, CompiledCapture, Naming, Staged};
 use crate::resolver::server::scratch::{Provenance, Provisioning, Tokens};
 use crate::resolver::server::{BindingRequest, Error, PlanningDialect, ProduceError, ScopeRequest};
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
 use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, DbError};
 use pbps_model::dependency::Dependencies;
+use pbps_model::dependency::DependencyName;
+use pbps_model::resolver::{DependencyPlacement, OutsideWrites};
 use pbps_model::resolver::{InputManifest, ResolverEvidence};
-use pbps_model::{ChangeSet, IdsFile, ModuleDeps, RoleName, Schema};
-use std::collections::BTreeSet;
+use pbps_model::{ChangeSet, IdsFile, ModuleDeps, RoleName, Schema, SessionZone};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -102,9 +104,11 @@ impl Support {
 ///
 /// Acquisition is typed by the engine: its standard and its scratch cannot be
 /// another engine's, and a cleanup obligation is held in the engine's own
-/// type. The states that follow the scratch are still the two-engine unions
-/// of `server::engine`, named in the signatures until their own group moves:
-/// an associated type that merely aliased them would be opaque to the run's
+/// type. The prepared scratch is typed the same way and read through
+/// `PreparedView`, so the run's generic code keeps its accessors. The binding
+/// and the staged set that follow it are still the two-engine unions of
+/// `server::engine`, named in the signatures until their own group moves: an
+/// associated type that merely aliased them would be opaque to the run's
 /// generic code, which reads them through the unions' methods.
 pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
     /// The dialect this resolver belongs to, one to one: brand and state are
@@ -118,6 +122,9 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
     type Scratch<'a>: Send
     where
         Self: 'a;
+    /// The scratch once provisioned and qualified: the sessions the
+    /// declarations compile in and what the reproduction found.
+    type Prepared: PreparedView + Send;
 
     /// The standard an entry declares, or the refusal of one this engine
     /// cannot hold.
@@ -169,7 +176,7 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
         target: &'a CatalogFacts,
         authorization: &'a scope::Authorization,
         schemas: &'a [String],
-    ) -> Step<'a, Result<Prepared, Error>>;
+    ) -> Step<'a, Result<Self::Prepared, Error>>;
     #[allow(clippy::too_many_arguments)]
     fn prepare<'a>(
         scratch: &'a mut Self::Scratch<'_>,
@@ -182,23 +189,54 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
         binding: &'a BindingRequest<'a>,
         extras: &'a [String],
         key: Option<&'a EnvironmentFingerprintKey>,
-    ) -> Step<'a, Result<Prepared, Error>>;
+    ) -> Step<'a, Result<Self::Prepared, Error>>;
     fn reconstruction<'a>(
         scratch: &'a Self::Scratch<'_>,
         target: &'a mut Conn,
         binding: &'a BindingRequest<'a>,
         ids: &'a IdsFile,
         dependencies: &'a ModuleDeps,
-        prepared: &'a mut Prepared,
+        prepared: &'a mut Self::Prepared,
     ) -> Step<'a, Result<Binding, Error>>;
     fn compare_externals<'a>(
         scratch: &'a Self::Scratch<'_>,
         provisioning: Provisioning,
-        prepared: &'a mut Prepared,
+        prepared: &'a mut Self::Prepared,
         admin: &'a mut Conn,
         target: &'a mut Conn,
         binding: &'a Binding,
     ) -> Step<'a, Result<Staged, Error>>;
+    /// The staged inventory a run starts from when no externals file was
+    /// compared. Preparation always compares the externals, an empty set
+    /// included, where the engine has them.
+    fn staged(prepared: &Self::Prepared) -> Staged;
+    /// The staged inventory preparation completed, where it did.
+    fn completed_staged(prepared: &Self::Prepared) -> Option<Staged>;
+    fn chains(binding: &mut Binding, prepared: &Self::Prepared) -> Result<Vec<String>, Error>;
+    #[allow(clippy::too_many_arguments)]
+    fn compile<'a>(
+        binding: &'a mut Binding,
+        prepared: &'a mut Self::Prepared,
+        admin: &'a mut Conn,
+        target: &'a mut Conn,
+        extras: &'a [String],
+        zone: Option<&'a SessionZone>,
+        outside_writes: OutsideWrites,
+        staged: &'a mut Staged,
+    ) -> Step<'a, Result<(), Error>>;
+    #[allow(clippy::too_many_arguments)]
+    fn capture_desired<'a>(
+        binding: &'a Binding,
+        prepared: &'a mut Self::Prepared,
+        admin: &'a mut Conn,
+        target: &'a mut Conn,
+        extras: &'a [String],
+        visibility: &'a BTreeMap<String, pbps_db::resolver::Observation>,
+        schemas: &'a [String],
+        key: &'a EnvironmentFingerprintKey,
+        desired: pbps_diff::Side<'a>,
+        staged: &'a Staged,
+    ) -> Step<'a, Result<CompiledCapture, Error>>;
     /// How a rehearsal names the roles a plan names on this scratch (see
     /// `Naming`). SQL Server has no cluster role to name: its roles are the
     /// scratch database's own and a rehearsal asks
@@ -212,6 +250,39 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
         roles: &'a [RoleName],
         naming: Naming,
     ) -> Step<'a, Result<Result<(), String>, Error>>;
+}
+
+/// What the run reads of an engine's prepared scratch. Held on the state's own
+/// type, so a prepared scratch of one engine is never read as another's and the
+/// run's generic code calls these as methods.
+pub trait PreparedView: Sized + Send {
+    /// What the authorization looked like after the run's work, where the
+    /// engine measures it (SQL Server's `Condition`).
+    fn authorization_condition<'a>(
+        &'a mut self,
+        target: &'a mut Conn,
+    ) -> Step<'a, Result<Option<Box<pbps_mssql::resolver::authorization::Condition>>, Error>>;
+    fn dependency_placements(&self) -> BTreeMap<DependencyName, DependencyPlacement>;
+    fn catalog(&self) -> &CatalogFacts;
+    #[cfg(test)]
+    fn catalog_mut(&mut self) -> &mut CatalogFacts;
+    fn into_catalog(self) -> CatalogFacts;
+    /// The session the scratch's statements run on: the reproduced
+    /// deployer's where the run made its own login, the checked connection
+    /// where the scratch account compiles as itself.
+    fn session<'a>(&'a mut self, admin: &'a mut Conn) -> &'a mut Conn;
+    /// The session a rehearsal's statements run in: the reproduced deployer's,
+    /// as an apply's are, where the scratch has one (SQL Server), and the
+    /// checked connection otherwise.
+    fn deployer<'a>(&'a mut self, admin: &'a mut Conn) -> &'a mut Conn;
+    /// A connection that reads the scratch database as a whole, for the
+    /// comparison after the plan ran: the deployer's cannot leave its context
+    /// and may lack `VIEW DEFINITION`. `None` where the session reads it itself.
+    fn reader(&self) -> Step<'_, Result<Option<Conn>, Error>>;
+    fn differences(&self) -> &[String];
+    fn supplied(&self) -> bool;
+    fn has_filled(&self) -> bool;
+    fn unfillable(&self) -> Vec<String>;
 }
 
 /// The state of a resolver that does not exist: no value can be made, so
@@ -243,6 +314,7 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
     /// that would follow is uninhabited.
     type Standard = ();
     type Scratch<'a> = Never;
+    type Prepared = Never;
 
     fn standard(_: Option<&pbps_config::resolver::ScratchStandard>) -> Result<(), Error> {
         Err(Error::Unusable(refusal::<D>().to_string()))
@@ -290,7 +362,7 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
         _: &'a CatalogFacts,
         _: &'a scope::Authorization,
         _: &'a [String],
-    ) -> Step<'a, Result<Prepared, Error>> {
+    ) -> Step<'a, Result<Never, Error>> {
         match *scratch {}
     }
     fn prepare<'a>(
@@ -304,7 +376,7 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
         _: &'a BindingRequest<'a>,
         _: &'a [String],
         _: Option<&'a EnvironmentFingerprintKey>,
-    ) -> Step<'a, Result<Prepared, Error>> {
+    ) -> Step<'a, Result<Never, Error>> {
         match *scratch {}
     }
     fn reconstruction<'a>(
@@ -313,19 +385,54 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
         _: &'a BindingRequest<'a>,
         _: &'a IdsFile,
         _: &'a ModuleDeps,
-        _: &'a mut Prepared,
+        _: &'a mut Never,
     ) -> Step<'a, Result<Binding, Error>> {
         match *scratch {}
     }
     fn compare_externals<'a>(
         scratch: &'a Never,
         _: Provisioning,
-        _: &'a mut Prepared,
+        _: &'a mut Never,
         _: &'a mut Conn,
         _: &'a mut Conn,
         _: &'a Binding,
     ) -> Step<'a, Result<Staged, Error>> {
         match *scratch {}
+    }
+    fn staged(prepared: &Never) -> Staged {
+        match *prepared {}
+    }
+    fn completed_staged(prepared: &Never) -> Option<Staged> {
+        match *prepared {}
+    }
+    fn chains(_: &mut Binding, prepared: &Never) -> Result<Vec<String>, Error> {
+        match *prepared {}
+    }
+    fn compile<'a>(
+        _: &'a mut Binding,
+        prepared: &'a mut Never,
+        _: &'a mut Conn,
+        _: &'a mut Conn,
+        _: &'a [String],
+        _: Option<&'a SessionZone>,
+        _: OutsideWrites,
+        _: &'a mut Staged,
+    ) -> Step<'a, Result<(), Error>> {
+        match *prepared {}
+    }
+    fn capture_desired<'a>(
+        _: &'a Binding,
+        prepared: &'a mut Never,
+        _: &'a mut Conn,
+        _: &'a mut Conn,
+        _: &'a [String],
+        _: &'a BTreeMap<String, pbps_db::resolver::Observation>,
+        _: &'a [String],
+        _: &'a EnvironmentFingerprintKey,
+        _: pbps_diff::Side<'a>,
+        _: &'a Staged,
+    ) -> Step<'a, Result<CompiledCapture, Error>> {
+        match *prepared {}
     }
     fn naming(scratch: &Never) -> Result<Naming, Error> {
         match *scratch {}
@@ -337,6 +444,49 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
         _: Naming,
     ) -> Step<'a, Result<Result<(), String>, Error>> {
         match *scratch {}
+    }
+}
+
+impl PreparedView for Never {
+    fn authorization_condition<'a>(
+        &'a mut self,
+        _: &'a mut Conn,
+    ) -> Step<'a, Result<Option<Box<pbps_mssql::resolver::authorization::Condition>>, Error>> {
+        match *self {}
+    }
+    fn dependency_placements(&self) -> BTreeMap<DependencyName, DependencyPlacement> {
+        match *self {}
+    }
+    fn catalog(&self) -> &CatalogFacts {
+        match *self {}
+    }
+    #[cfg(test)]
+    fn catalog_mut(&mut self) -> &mut CatalogFacts {
+        match *self {}
+    }
+    fn into_catalog(self) -> CatalogFacts {
+        match self {}
+    }
+    fn session<'a>(&'a mut self, _: &'a mut Conn) -> &'a mut Conn {
+        match *self {}
+    }
+    fn deployer<'a>(&'a mut self, _: &'a mut Conn) -> &'a mut Conn {
+        match *self {}
+    }
+    fn reader(&self) -> Step<'_, Result<Option<Conn>, Error>> {
+        match *self {}
+    }
+    fn differences(&self) -> &[String] {
+        match *self {}
+    }
+    fn supplied(&self) -> bool {
+        match *self {}
+    }
+    fn has_filled(&self) -> bool {
+        match *self {}
+    }
+    fn unfillable(&self) -> Vec<String> {
+        match *self {}
     }
 }
 

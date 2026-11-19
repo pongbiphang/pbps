@@ -6,11 +6,12 @@
 //! compared at both ends, and a change made and restored in between leaves
 //! nothing to find (DEC-2144.1).
 
-use super::super::{Binding, Prepared, Staged, unsupported};
-use super::Scratch;
+use super::super::{Binding, CompiledCapture, Staged, unsupported};
+use super::{Prepared, Scratch};
 use crate::resolver::contract::{
-    ApplyRecheck, ClosingInputs, ClusterDomain, FactsError, GrantRecheck, Phase, Planning, Preview,
-    Rehearsal, RehearsalRequest, Replay, ResolverEngine, Step, Support, sealed::Sealed,
+    ApplyRecheck, ClosingInputs, ClusterDomain, FactsError, GrantRecheck, Phase, Planning,
+    PreparedView, Preview, Rehearsal, RehearsalRequest, Replay, ResolverEngine, Step, Support,
+    sealed::Sealed,
 };
 use crate::resolver::scope;
 use crate::resolver::server::engine::Naming;
@@ -19,8 +20,10 @@ use crate::resolver::server::{BindingRequest, Error, ProduceError, ScopeRequest}
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
 use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, DbError, Driver};
-use pbps_model::resolver::InputManifest;
-use pbps_model::{IdsFile, ModuleDeps, RoleName};
+use pbps_model::dependency::DependencyName;
+use pbps_model::resolver::{DependencyPlacement, InputManifest, OutsideWrites};
+use pbps_model::{IdsFile, ModuleDeps, RoleName, SessionZone};
+use std::collections::BTreeMap;
 
 /// SQL Server's resolver: planning, both rehearsals and the apply recheck.
 pub struct MssqlResolver;
@@ -48,6 +51,7 @@ impl ResolverEngine for MssqlResolver {
     /// SQL Server's scratch has no standard to put it into.
     type Standard = ();
     type Scratch<'a> = Box<Scratch<'a>>;
+    type Prepared = Prepared;
 
     fn standard(
         declared: Option<&pbps_config::resolver::ScratchStandard>,
@@ -159,7 +163,6 @@ impl ResolverEngine for MssqlResolver {
                     })?,
                 )
                 .await
-                .map(Prepared::Mssql)
         })
     }
 
@@ -169,7 +172,7 @@ impl ResolverEngine for MssqlResolver {
         binding: &'a BindingRequest<'a>,
         ids: &'a IdsFile,
         dependencies: &'a ModuleDeps,
-        _: &'a mut Prepared,
+        _: &'a mut Self::Prepared,
     ) -> Step<'a, Result<Binding, Error>> {
         Box::pin(async move {
             scratch
@@ -186,10 +189,65 @@ impl ResolverEngine for MssqlResolver {
         _: &'a mut Conn,
         _: &'a Binding,
     ) -> Step<'a, Result<Staged, Error>> {
+        Box::pin(async move { Ok(Staged::Mssql(prepared.staged.clone())) })
+    }
+
+    fn staged(prepared: &Self::Prepared) -> Staged {
+        // Preparation always compares the externals, an empty set included.
+        Staged::Mssql(prepared.staged.clone())
+    }
+
+    fn completed_staged(prepared: &Self::Prepared) -> Option<Staged> {
+        Some(Staged::Mssql(prepared.staged.clone()))
+    }
+
+    fn chains(binding: &mut Binding, _: &Self::Prepared) -> Result<Vec<String>, Error> {
+        match binding {
+            Binding::Mssql(_) => Ok(Vec::new()),
+            Binding::Postgres(_) => Err(unsupported()),
+        }
+    }
+
+    fn compile<'a>(
+        binding: &'a mut Binding,
+        prepared: &'a mut Self::Prepared,
+        _: &'a mut Conn,
+        target: &'a mut Conn,
+        _: &'a [String],
+        _: Option<&'a SessionZone>,
+        _: OutsideWrites,
+        staged: &'a mut Staged,
+    ) -> Step<'a, Result<(), Error>> {
         Box::pin(async move {
-            match prepared {
-                Prepared::Mssql(prepared) => Ok(Staged::Mssql(prepared.staged.clone())),
-                Prepared::Postgres(_) => Err(unsupported()),
+            match (binding, staged) {
+                (Binding::Mssql(binding), Staged::Mssql(_)) => {
+                    let len = binding.len();
+                    binding.compile(prepared, target, 0..len).await
+                }
+                _ => Err(unsupported()),
+            }
+        })
+    }
+
+    fn capture_desired<'a>(
+        binding: &'a Binding,
+        prepared: &'a mut Self::Prepared,
+        _: &'a mut Conn,
+        target: &'a mut Conn,
+        _: &'a [String],
+        _: &'a BTreeMap<String, pbps_db::resolver::Observation>,
+        schemas: &'a [String],
+        key: &'a EnvironmentFingerprintKey,
+        desired: pbps_diff::Side<'a>,
+        staged: &'a Staged,
+    ) -> Step<'a, Result<CompiledCapture, Error>> {
+        Box::pin(async move {
+            match (binding, staged) {
+                (Binding::Mssql(binding), Staged::Mssql(staged)) => binding
+                    .capture_desired(prepared.reach(), target, schemas, key, desired, staged)
+                    .await
+                    .map(|closing| CompiledCapture::Mssql(Box::new(closing))),
+                _ => Err(unsupported()),
             }
         })
     }
@@ -208,6 +266,67 @@ impl ResolverEngine for MssqlResolver {
         _: Naming,
     ) -> Step<'a, Result<Result<(), String>, Error>> {
         Box::pin(async move { Err(unsupported()) })
+    }
+}
+
+impl PreparedView for Prepared {
+    fn authorization_condition<'a>(
+        &'a mut self,
+        target: &'a mut Conn,
+    ) -> Step<'a, Result<Option<Box<pbps_mssql::resolver::authorization::Condition>>, Error>> {
+        Box::pin(async move {
+            Prepared::authorization_condition(self, target)
+                .await
+                .map(Some)
+        })
+    }
+
+    fn dependency_placements(&self) -> BTreeMap<DependencyName, DependencyPlacement> {
+        Prepared::dependency_placements(self)
+    }
+
+    fn catalog(&self) -> &CatalogFacts {
+        &self.scratch_catalog
+    }
+
+    #[cfg(test)]
+    fn catalog_mut(&mut self) -> &mut CatalogFacts {
+        &mut self.scratch_catalog
+    }
+
+    fn into_catalog(self) -> CatalogFacts {
+        self.scratch_catalog
+    }
+
+    fn session<'a>(&'a mut self, admin: &'a mut Conn) -> &'a mut Conn {
+        admin
+    }
+
+    fn deployer<'a>(&'a mut self, _: &'a mut Conn) -> &'a mut Conn {
+        &mut self.compile
+    }
+
+    fn reader(&self) -> Step<'_, Result<Option<Conn>, Error>> {
+        // `Prepared` holds the deployer's connection and is not `Sync`, so the
+        // reach is taken now and only it is held across the open.
+        let reach = self.reach();
+        Box::pin(async move { reach.open().await.map(Some) })
+    }
+
+    fn differences(&self) -> &[String] {
+        &self.differences
+    }
+
+    fn supplied(&self) -> bool {
+        false
+    }
+
+    fn has_filled(&self) -> bool {
+        !self.staged.compared().is_empty()
+    }
+
+    fn unfillable(&self) -> Vec<String> {
+        Vec::new()
     }
 }
 
