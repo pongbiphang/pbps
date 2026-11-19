@@ -1,10 +1,46 @@
-//! The SQL Server half of [`Session`]. It holds connections and builds
-//! connection strings; the SQL is `pbps_mssql::test_scratch`'s.
-use super::{Conn, Driver, Session, TestScratch};
+//! The SQL Server half of [`Session`]: its [`TestEngine`], and the protocol
+//! `session.rs` still branches to. It holds connections and builds connection
+//! strings; the SQL is `pbps_mssql::test_scratch`'s.
+use super::{
+    Conn, Driver, HopContext, Provisioned, Session, SessionFuture, TestEngine, TestScratch,
+};
+use crate::plan_test::snapshot::{Allocator, Rows, Snapshot, insert};
 use anyhow::{Context as _, ensure};
 use pbps_db::query::AssertionResult;
 use pbps_model::Schema;
-use pbps_mssql::test_scratch as sql;
+use pbps_mssql::test_scratch::{self as sql, snapshot as snapshot_sql};
+use std::collections::BTreeMap;
+
+/// SQL Server's owned-test session, one per engine record.
+pub(crate) struct MssqlTest;
+
+impl TestEngine for MssqlTest {
+    fn open<'a>(&self, scratch: &'a TestScratch<'a>) -> SessionFuture<'a, Provisioned> {
+        Box::pin(open(scratch))
+    }
+    fn admin<'a>(&self, scratch: &'a TestScratch<'_>) -> SessionFuture<'a, Conn> {
+        Box::pin(admin(scratch))
+    }
+    fn prepare<'a>(&self, session: &'a Session<'_>, hop: HopContext<'a>) -> SessionFuture<'a, ()> {
+        // SQL Server has no cluster roles to create first, so the incoming hop
+        // needs its namespaces alone.
+        Box::pin(namespaces(session, &hop.incoming.loaded.schema))
+    }
+    fn namespaces<'a>(
+        &self,
+        session: &'a Session<'_>,
+        schema: &'a Schema,
+    ) -> SessionFuture<'a, ()> {
+        Box::pin(namespaces(session, schema))
+    }
+    fn snapshot<'a>(
+        &self,
+        session: &'a Session<'_>,
+        schema: &'a Schema,
+    ) -> SessionFuture<'a, Snapshot> {
+        Box::pin(snapshot(session, schema))
+    }
+}
 
 /// The owned server's `Server=host,port` part, from the administrator's string.
 fn server(admin: &str) -> anyhow::Result<&str> {
@@ -33,7 +69,7 @@ pub(super) fn admin_database(admin: &str) -> anyhow::Result<String> {
     Ok(moved)
 }
 
-pub(super) async fn admin(scratch: &TestScratch<'_>) -> anyhow::Result<Conn> {
+async fn admin(scratch: &TestScratch<'_>) -> anyhow::Result<Conn> {
     Ok(Conn::connect(Driver::Mssql, &admin_database(scratch.connection())?).await?)
 }
 
@@ -46,7 +82,7 @@ fn identities(session: &Session<'_>) -> sql::Identities {
     }
 }
 
-pub(super) async fn new<'a>(scratch: &'a TestScratch<'a>) -> anyhow::Result<Session<'a>> {
+async fn open(scratch: &TestScratch<'_>) -> anyhow::Result<Provisioned> {
     let admin = scratch.connection();
     let ids = sql::Identities::for_run(scratch.run_id());
     let passwords = [(); 3].map(|()| {
@@ -64,9 +100,7 @@ pub(super) async fn new<'a>(scratch: &'a TestScratch<'a>) -> anyhow::Result<Sess
     let mut conn = self::admin(scratch).await?;
     sql::create_users(&mut conn, &ids).await?;
     drop(conn);
-    let key = scratch.fingerprint_key()?;
-    Ok(Session {
-        scratch,
+    Ok(Provisioned {
         // The apply login is dbo of the owned database; no managed identity is
         // a role on SQL Server, so nothing is excluded from the catalog read.
         target: crate::db::Target::test_owned_with_driver(
@@ -77,14 +111,12 @@ pub(super) async fn new<'a>(scratch: &'a TestScratch<'a>) -> anyhow::Result<Sess
         fixture: as_login(admin, &ids.fixture, &passwords[1])?,
         assertion: as_login(admin, &ids.assertion, &passwords[2])?,
         roles: [ids.apply, ids.fixture, ids.assertion],
-        key,
-        driver: Driver::Mssql,
     })
 }
 
 /// Namespaces for every schema the declarations name; also a `prepare`, since
 /// SQL Server has no cluster roles to create first.
-pub(super) async fn namespaces(session: &Session<'_>, schema: &Schema) -> anyhow::Result<()> {
+async fn namespaces(session: &Session<'_>, schema: &Schema) -> anyhow::Result<()> {
     let mut conn = session.admin().await?;
     sql::namespaces(
         &mut conn,
@@ -130,4 +162,35 @@ pub(super) async fn assertion(
     sql::run_assertion(&session.assertion, text, timeout)
         .await
         .unwrap_or_else(AssertionResult::Unanswerable)
+}
+
+/// The same read as PostgreSQL's, as the apply login (see
+/// `pbps_mssql::test_scratch::snapshot`). Every table's rows come before any
+/// allocator probe: a probe runs the table's triggers, which are user code, and
+/// consumes values.
+async fn snapshot(session: &Session<'_>, schema: &Schema) -> anyhow::Result<Snapshot> {
+    let mut conn = Conn::connect(Driver::Mssql, session.target().connection()).await?;
+    let mut tables = BTreeMap::new();
+    for name in schema.tables.keys() {
+        let read = snapshot_sql::read_table(&mut conn, &name.schema, &name.name).await?;
+        tables.insert(
+            name.raw().to_string(),
+            Rows {
+                columns: read.columns,
+                rows: read.rows,
+            },
+        );
+    }
+    let mut allocators = BTreeMap::new();
+    for read in snapshot_sql::read_allocators(&mut conn).await? {
+        insert(
+            &mut allocators,
+            Allocator {
+                name: read.name,
+                used_by: read.used_by,
+                next: read.next,
+            },
+        );
+    }
+    Ok(Snapshot { tables, allocators })
 }

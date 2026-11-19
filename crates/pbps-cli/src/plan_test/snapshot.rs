@@ -4,13 +4,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::Context as _;
-use pbps_db::{Conn, Driver};
 use pbps_model::Schema;
-use pbps_mssql::test_scratch::snapshot as sql;
 
 use super::report::{AllocatorComparison, Cell, RowDifference, TableComparison};
-use super::session::{Session, quoted, table};
+use super::session::Session;
 
 /// Differences shown per table; this limit never decides equality.
 const SHOWN: usize = 20;
@@ -20,174 +17,39 @@ const VALUE: usize = 200;
 /// One table's rows as a multiset. Columns are sorted by name: a column added
 /// by a later hop sits last in a replayed table and in declared order in a
 /// bootstrapped one, and neither order is a difference in the data.
-pub(super) struct Rows {
-    columns: Vec<String>,
-    rows: BTreeMap<Vec<Option<String>>, u64>,
+pub(crate) struct Rows {
+    pub(super) columns: Vec<String>,
+    pub(super) rows: BTreeMap<Vec<Option<String>>, u64>,
 }
 
 /// An allocator is compared under the column that owns it, else under its name:
 /// a renamed table keeps its sequence's old generated name, while a bootstrap
 /// of the new revision generates a new one, and neither is a difference.
-pub(super) struct Allocator {
-    name: String,
-    used_by: Option<String>,
-    next: String,
+pub(crate) struct Allocator {
+    pub(super) name: String,
+    pub(super) used_by: Option<String>,
+    pub(super) next: String,
 }
 
-pub(super) struct Snapshot {
-    tables: BTreeMap<String, Rows>,
-    allocators: BTreeMap<String, Allocator>,
+pub(crate) struct Snapshot {
+    pub(super) tables: BTreeMap<String, Rows>,
+    pub(super) allocators: BTreeMap<String, Allocator>,
 }
 
-/// Reads rows first, then probes the allocators: a probe consumes a value, and
-/// this database is discarded afterwards. `nextval` is the engine's own answer
-/// for increments, caches and exhaustion; `last_value + 1` is a guess.
+/// The comparison database's rows and allocators, read by the run's engine
+/// (see [`super::session::TestEngine::snapshot`]).
 pub(super) async fn read(session: &Session<'_>, schema: &Schema) -> anyhow::Result<Snapshot> {
-    if session.driver() == Driver::Mssql {
-        // Boxed so the larger arm does not grow the frame of the other.
-        return Box::pin(read_mssql(session, schema)).await;
-    }
-    let mut conn = session.admin().await?;
-    let mut tables = BTreeMap::new();
-    for name in schema.tables.keys() {
-        let relation = table(name)?;
-        let literal = relation.replace('\'', "''");
-        let sql = format!(
-            "SELECT a.attname::text AS name FROM pg_catalog.pg_attribute a \
-             WHERE a.attrelid = '{literal}'::pg_catalog.regclass AND a.attnum > 0 \
-             AND NOT a.attisdropped ORDER BY a.attname COLLATE \"C\""
-        );
-        let mut columns = Vec::new();
-        for row in conn.query(&sql).await? {
-            columns.push(
-                row.try_get::<&str>("name")?
-                    .context("a column has no name")?
-                    .to_owned(),
-            );
-        }
-        let cells = columns
-            .iter()
-            .map(|c| quoted(c).map(|c| format!("{c}::pg_catalog.text")))
-            .collect::<anyhow::Result<Vec<_>>>()?
-            .join(", ");
-        // jsonb text keeps NULL apart from '' and every value as its own text.
-        let sql = format!(
-            "SELECT pg_catalog.to_jsonb(ARRAY[{cells}]::pg_catalog.text[])::pg_catalog.text AS row, \
-             pg_catalog.count(*)::pg_catalog.text AS n FROM {relation} GROUP BY 1"
-        );
-        let mut rows = BTreeMap::new();
-        for row in conn.query(&sql).await? {
-            let cells: Vec<Option<String>> =
-                serde_json::from_str(row.try_get::<&str>("row")?.context("a row has no text")?)?;
-            let count = row.try_get::<&str>("n")?.context("a row has no count")?;
-            rows.insert(cells, count.parse::<u64>()?);
-        }
-        tables.insert(name.raw().to_string(), Rows { columns, rows });
-    }
-    // The ledger's own tables are not managed: their allocator differs between
-    // a replay and a bootstrap by construction. Every other user sequence is
-    // compared, so an allocator reached only through a function default is
-    // never omitted.
-    let sql = "SELECT n.nspname::text AS schema, c.relname::text AS name, \
-        tn.nspname::text AS owner_schema, t.relname::text AS owner_table, \
-        a.attname::text AS owner_column \
-        FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-        LEFT JOIN pg_catalog.pg_depend d ON d.objid = c.oid \
-          AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass \
-          AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass \
-          AND d.deptype IN ('a', 'i') \
-        LEFT JOIN pg_catalog.pg_class t ON t.oid = d.refobjid \
-        LEFT JOIN pg_catalog.pg_namespace tn ON tn.oid = t.relnamespace \
-        LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = t.oid AND a.attnum = d.refobjsubid \
-        WHERE c.relkind = 'S' AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' \
-        ORDER BY 1, 2";
-    let mut allocators = BTreeMap::new();
-    for row in conn.query(sql).await? {
-        let text = |column: &str| -> anyhow::Result<Option<String>> {
-            Ok(row.try_get::<&str>(column)?.map(str::to_owned))
-        };
-        let (owner_schema, owner_table) = (text("owner_schema")?, text("owner_table")?);
-        if owner_schema.as_deref() == Some(pbps_pg::state::LEDGER_SCHEMA)
-            && [
-                pbps_db::ledger::STATE_TABLE_NAME,
-                pbps_db::ledger::LOCK_TABLE_NAME,
-            ]
-            .contains(&owner_table.as_deref().unwrap_or_default())
-        {
-            continue;
-        }
-        let name = pbps_model::TableName::new(
-            text("schema")?.context("a sequence has no schema")?,
-            text("name")?.context("a sequence has no name")?,
-        );
-        let shown = name.shown().to_string();
-        let used_by = match (owner_schema, owner_table, text("owner_column")?) {
-            (Some(schema), Some(table), Some(column)) => Some(format!("{schema}.{table}.{column}")),
-            _ => None,
-        };
-        let literal = table(&name)?.replace('\'', "''");
-        let next = conn
-            .query(&format!(
-                "SELECT pg_catalog.nextval('{literal}'::pg_catalog.regclass)::pg_catalog.text AS next"
-            ))
-            .await
-            .with_context(|| format!("the next value of sequence {shown} cannot be established"))?;
-        let next = next
-            .first()
-            .and_then(|r| r.try_get::<&str>("next").transpose())
-            .transpose()?
-            .with_context(|| format!("sequence {shown} gave no next value"))?
-            .to_owned();
-        insert(
-            &mut allocators,
-            Allocator {
-                name: name.raw().to_string(),
-                used_by,
-                next,
-            },
-        );
-    }
-    Ok(Snapshot { tables, allocators })
+    session.snapshot(schema).await
 }
 
 /// Two allocators owned by one column are told apart by name.
-fn insert(allocators: &mut BTreeMap<String, Allocator>, allocator: Allocator) {
+pub(super) fn insert(allocators: &mut BTreeMap<String, Allocator>, allocator: Allocator) {
     let key = allocator
         .used_by
         .clone()
         .filter(|owner| !allocators.contains_key(owner))
         .unwrap_or_else(|| allocator.name.clone());
     allocators.insert(key, allocator);
-}
-
-/// The same read on SQL Server, as the apply login (see `pbps_mssql::test_scratch::snapshot`).
-/// Every table's rows come before any allocator probe: a probe runs the table's
-/// triggers, which are user code, and consumes values.
-async fn read_mssql(session: &Session<'_>, schema: &Schema) -> anyhow::Result<Snapshot> {
-    let mut conn = Conn::connect(Driver::Mssql, session.target().connection()).await?;
-    let mut tables = BTreeMap::new();
-    for name in schema.tables.keys() {
-        let read = sql::read_table(&mut conn, &name.schema, &name.name).await?;
-        tables.insert(
-            name.raw().to_string(),
-            Rows {
-                columns: read.columns,
-                rows: read.rows,
-            },
-        );
-    }
-    let mut allocators = BTreeMap::new();
-    for read in sql::read_allocators(&mut conn).await? {
-        insert(
-            &mut allocators,
-            Allocator {
-                name: read.name,
-                used_by: read.used_by,
-                next: read.next,
-            },
-        );
-    }
-    Ok(Snapshot { tables, allocators })
 }
 
 fn cell(value: &Option<String>) -> Cell {

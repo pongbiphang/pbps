@@ -2,7 +2,11 @@ use super::*;
 use crate::engine::owned_test_of;
 use crate::plan_test::execution::{Control, ms};
 use crate::plan_test::report::{ManifestWrite, Phase, Repin, Status, TestData};
+// Only the Linux lifecycle test below attaches context to an error.
+#[cfg(target_os = "linux")]
+use anyhow::Context as _;
 use pbps_config::test_manifest::CommitId;
+use pbps_db::Driver;
 
 async fn compared(original: &Snapshot, proposed: &Snapshot, control: &mut Control) -> TestData {
     let mut data = TestData::for_repin();

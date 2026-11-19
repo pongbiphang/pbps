@@ -1,29 +1,88 @@
 //! Credentials and targets can only be derived from this run's owned handle.
 //!
-//! One `Session` serves both engines: the PostgreSQL code below is the original,
-//! and each method hands a SQL Server run to [`mssql`], whose SQL lives in
-//! `pbps_mssql::test_scratch`. Callers name no engine (DEC-1165.14).
+//! One `Session` serves every engine that owns a test scratch. What differs is
+//! the engine's [`TestEngine`], carried by the run's [`OwnedTest`] and
+//! selected once with it (#2798). PostgreSQL's is [`postgres`]; SQL Server's is
+//! [`mssql`], whose SQL lives in `pbps_mssql::test_scratch`. Callers name no
+//! engine (DEC-1165.14). The grants, fixture and assertion protocol is still
+//! branched on the driver below, until it moves behind the same contract.
 mod mssql;
+mod postgres;
 pub(crate) mod prerequisites;
+pub(crate) use mssql::MssqlTest;
+pub(crate) use postgres::PostgresTest;
 pub(crate) use prerequisites::HopContext;
 
-use super::revision::Assembled;
-use crate::{db::Target, test_scratch::TestScratch};
+use super::{revision::Assembled, snapshot::Snapshot};
+use crate::{db::Target, engine::OwnedTest, test_scratch::TestScratch};
 use anyhow::{Context as _, ensure};
 use pbps_db::{Conn, Driver, query::AssertionResult};
 use pbps_dialect::Dialect as _;
 use pbps_model::{Schema, TableName};
-use std::time::Duration;
+use std::{future::Future, pin::Pin, time::Duration};
+
+/// A connected step of an engine's session. Boxed so that the contract is
+/// object safe and neither engine's larger future grows the other's frame; the
+/// outputs are common types, so nothing certified is erased by the box.
+pub(crate) type SessionFuture<'a, T> = Pin<Box<dyn Future<Output = anyhow::Result<T>> + 'a>>;
+
+/// What an engine provisioned for one owned run, before the handle that owns
+/// the run adds its own fields. The engine cannot name another engine's support
+/// record or the run's key, so a session cannot be assembled from mixed parts.
+pub(crate) struct Provisioned {
+    /// Where the apply identity connects. It excludes infrastructure identities
+    /// from the catalog read, wherever the engine has them.
+    pub target: Target,
+    /// The fixture identity's connection string.
+    pub fixture: String,
+    /// The assertion identity's connection string.
+    pub assertion: String,
+    /// Apply, fixture and assertion identities, in that order.
+    pub roles: [String; 3],
+}
+
+/// What `pbps test` needs of an engine's owned scratch once the server runs:
+/// the isolation of one run and the reads that follow from it.
+///
+/// An engine that advertises owned-test support owes every method, with no
+/// default, because a missing one would read as a step that needed nothing. An
+/// engine that cannot do one refuses it, by name, from that method. A snapshot
+/// in particular is never absent and equal: a re-pin that could not read one
+/// has not compared anything.
+///
+/// `Any` lets a test ask which implementation a record carries; a trait object
+/// has no other identity.
+pub(crate) trait TestEngine: std::any::Any + Sync {
+    /// Provisions this run's identities and database on the owned server, and
+    /// the apply target, in the engine's own order.
+    fn open<'a>(&self, scratch: &'a TestScratch<'a>) -> SessionFuture<'a, Provisioned>;
+    /// The administrator's connection to the owned database.
+    fn admin<'a>(&self, scratch: &'a TestScratch<'_>) -> SessionFuture<'a, Conn>;
+    /// Prepares only the incoming hop, before its capture/plan, from the pair of
+    /// hops: preparing a future union would make those future roles unmanaged in
+    /// an earlier hop, and a name alone cannot say a role is new (#2552).
+    fn prepare<'a>(&self, session: &'a Session<'_>, hop: HopContext<'a>) -> SessionFuture<'a, ()>;
+    /// The namespaces the declarations name, as provisioning prerequisites.
+    fn namespaces<'a>(&self, session: &'a Session<'_>, schema: &'a Schema)
+    -> SessionFuture<'a, ()>;
+    /// The comparison database's rows and allocators for a re-pin.
+    fn snapshot<'a>(
+        &self,
+        session: &'a Session<'_>,
+        schema: &'a Schema,
+    ) -> SessionFuture<'a, Snapshot>;
+}
 
 pub(crate) struct Session<'a> {
     scratch: &'a TestScratch<'a>,
+    /// The record that admitted the run: its [`TestEngine`] and its driver.
+    owned: &'static OwnedTest,
     target: Target,
     fixture: String,
     assertion: String,
     /// Apply, fixture and assertion identities, in that order, on either engine.
     roles: [String; 3],
     key: std::path::PathBuf,
-    driver: Driver,
 }
 pub(super) fn quoted(name: &str) -> anyhow::Result<String> {
     Ok(pbps_pg::Postgres::new().quote_ident(name)?)
@@ -33,91 +92,31 @@ pub(super) fn table(name: &TableName) -> anyhow::Result<String> {
 }
 impl<'a> Session<'a> {
     pub async fn new(scratch: &'a TestScratch<'a>) -> anyhow::Result<Self> {
-        // Boxed so the larger arm does not grow the frame of the other.
-        if scratch.driver() == Driver::Mssql {
-            return Box::pin(mssql::new(scratch)).await;
-        }
-        let admin = scratch.connection();
-        ensure!(
-            !admin.contains("://"),
-            "the owned adapter must return a keyword connection"
-        );
-        let mut conn = Conn::connect(Driver::Postgres, admin).await?;
-        let rows = conn.query("SELECT current_user::text AS role").await?;
-        let provision_role: pbps_model::RoleName = rows
-            .first()
-            .context("missing owned provision role result")?
-            .try_get::<&str>("role")?
-            .context("NULL owned provision role")?
-            .into();
-        // The frozen declarations must never capture an infrastructure identity.
-        let roles = ["apply", "fixture", "assertion"]
-            .map(|kind| format!("pbps_test_{kind}_{}", scratch.run_id()));
-        let mut passwords = Vec::new();
-        for role in &roles {
-            let password = format!("{:032x}", rand::random::<u128>());
-            let sql = format!(
-                concat!(
-                    "CREATE ROLE {role} LOGIN NOSUPERUSER NOCREATEDB ",
-                    "NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '{password}'"
-                ),
-                role = role,
-                password = password
-            );
-            conn.execute(&sql).await?;
-            passwords.push(password);
-        }
-        let [apply, fixture, assertion] = &roles;
-        conn.execute(&format!("CREATE DATABASE pbps_test OWNER {apply}"))
-            .await?;
-        let permissions = format!(
-            concat!(
-                "REVOKE ALL ON DATABASE pbps_test FROM PUBLIC; ",
-                "GRANT CONNECT ON DATABASE pbps_test TO {apply}, {fixture}, {assertion}; ",
-                "GRANT TEMP ON DATABASE pbps_test TO {fixture}"
-            ),
-            apply = apply,
-            fixture = fixture,
-            assertion = assertion
-        );
-        conn.execute(&permissions).await?;
-        drop(conn);
-        let db = format!("{admin} dbname=pbps_test");
-        let mut conn = Conn::connect(Driver::Postgres, &db).await?;
-        conn.execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
-            .await?;
-        drop(conn);
-        let connection =
-            |role: &str, password: &str| format!("{db} user={role} password={password}");
+        let owned = scratch.owned();
+        let Provisioned {
+            target,
+            fixture,
+            assertion,
+            roles,
+        } = owned.session.open(scratch).await?;
         let key = scratch.fingerprint_key()?;
         Ok(Self {
             scratch,
-            target: Target::test_owned(
-                connection(apply, &passwords[0]),
-                roles
-                    .iter()
-                    .map(|r| r.as_str().into())
-                    .chain([provision_role])
-                    .collect(),
-            ),
-            fixture: connection(fixture, &passwords[1]),
-            assertion: connection(assertion, &passwords[2]),
+            owned,
+            target,
+            fixture,
+            assertion,
             roles,
             key,
-            driver: Driver::Postgres,
         })
     }
     pub(super) async fn admin(&self) -> anyhow::Result<Conn> {
-        if self.driver == Driver::Mssql {
-            return mssql::admin(self.scratch).await;
-        }
-        let db = format!("{} dbname=pbps_test", self.scratch.connection());
-        Ok(Conn::connect(Driver::Postgres, &db).await?)
+        self.owned.session.admin(self.scratch).await
     }
     pub async fn revoke_fixture_routines(&self) -> anyhow::Result<()> {
         // A SQL Server fixture is granted tables only (ADR-0019 §6), so there is
         // no routine grant to take back before a plan reads the catalog.
-        if self.driver == Driver::Mssql {
+        if self.driver() == Driver::Mssql {
             return Ok(());
         }
         let mut conn = self.admin().await?;
@@ -146,42 +145,19 @@ impl<'a> Session<'a> {
         }
         Ok(())
     }
-    // Prepare only the incoming hop, before its capture/plan, from the pair of
-    // hops: preparing a future union would make those future roles unmanaged in
-    // an earlier hop, and a name alone cannot say a role is new (#2552).
+    /// Prepares only the incoming hop; see [`TestEngine::prepare`].
     pub async fn prepare(&self, hop: HopContext<'_>) -> anyhow::Result<()> {
-        let schema = &hop.incoming.loaded.schema;
-        if self.driver == Driver::Mssql {
-            return mssql::namespaces(self, schema).await;
-        }
-        let mut conn = self.admin().await?;
-        // Ordinary bootstrap requires cluster roles to exist (ADR-0010 §3).
-        // Only this owned cluster's administrator supplies those prerequisites;
-        // roles keep their ordinary scope and existing image roles stay untouched.
-        let roles = prerequisites::roles(hop);
-        prerequisites::complete_renames(&mut conn, &roles.renames).await?;
-        prerequisites::create_missing(&mut conn, &roles.introduced).await?;
-        self.namespaces(schema).await
+        self.owned.session.prepare(self, hop).await
     }
     pub async fn namespaces(&self, schema: &Schema) -> anyhow::Result<()> {
-        if self.driver == Driver::Mssql {
-            return mssql::namespaces(self, schema).await;
-        }
-        let mut conn = self.admin().await?;
-        let apply = &self.roles[0];
-        // Namespaces are provisioning prerequisites of ordinary bootstrap,
-        // not managed changes. Reuse its inventory in this fresh owned database.
-        for namespace in crate::deploy::schemas_declared(schema).into_keys() {
-            conn.execute(&format!(
-                "CREATE SCHEMA IF NOT EXISTS {} AUTHORIZATION {apply}",
-                quoted(&namespace)?
-            ))
-            .await?;
-        }
-        Ok(())
+        self.owned.session.namespaces(self, schema).await
+    }
+    /// The comparison database's snapshot; see [`TestEngine::snapshot`].
+    pub(super) async fn snapshot(&self, schema: &Schema) -> anyhow::Result<Snapshot> {
+        self.owned.session.snapshot(self, schema).await
     }
     pub(super) fn driver(&self) -> Driver {
-        self.driver
+        self.owned.container.driver
     }
     pub fn target(&self) -> &Target {
         &self.target
@@ -196,14 +172,14 @@ impl<'a> Session<'a> {
     /// PostgreSQL's is a READ ONLY transaction each assertion opens for itself,
     /// so it has nothing to do here; SQL Server's is the database mode.
     pub async fn seal(&self) -> anyhow::Result<()> {
-        match self.driver {
+        match self.driver() {
             Driver::Postgres => Ok(()),
             Driver::Mssql => Box::pin(mssql::seal(self)).await,
         }
     }
     /// Runs one assertion file on its own connection as the assertion login.
     pub async fn run_assertion(&self, sql: &str, timeout: Duration) -> AssertionResult {
-        match self.driver {
+        match self.driver() {
             Driver::Postgres => pbps_pg::assertions::run(&self.assertion, sql, timeout).await,
             Driver::Mssql => Box::pin(mssql::assertion(self, sql, timeout)).await,
         }
@@ -251,7 +227,7 @@ impl<'a> Session<'a> {
         }
     }
     pub async fn grants(&self, schema: &Schema) -> anyhow::Result<()> {
-        if self.driver == Driver::Mssql {
+        if self.driver() == Driver::Mssql {
             return Box::pin(mssql::grants(self, schema)).await;
         }
         let mut conn = self.admin().await?;
@@ -391,7 +367,7 @@ impl<'a> Session<'a> {
         Ok(())
     }
     pub async fn fixtures(&self) -> anyhow::Result<Conn> {
-        Ok(Conn::connect(self.driver, &self.fixture).await?)
+        Ok(Conn::connect(self.driver(), &self.fixture).await?)
     }
     /// Runs one fixture file on `fixtures()`'s connection. PostgreSQL bounds it
     /// by the server's own `statement_timeout`; SQL Server has none, so its
@@ -402,7 +378,7 @@ impl<'a> Session<'a> {
         sql: &str,
         timeout_ms: u128,
     ) -> anyhow::Result<()> {
-        match self.driver {
+        match self.driver() {
             Driver::Postgres => {
                 // PostgreSQL uses i32 milliseconds; zero would disable the limit.
                 conn.execute(&format!("SET statement_timeout = '{timeout_ms}ms'"))

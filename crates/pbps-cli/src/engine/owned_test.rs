@@ -13,9 +13,11 @@
 //! Only the facts that need no per-run state are here, and the container the
 //! scratch runs in is not one of them: it is the resolver's shared
 //! [`ContainerSupport`], which this record carries and does not copy. The
-//! session that provisions identities and runs fixtures stays where it is until
-//! it moves behind its own record.
+//! session that provisions identities is the engine's [`TestEngine`], carried
+//! the same way. Its grants, fixture and assertion steps still branch on the
+//! driver in `plan_test::session` until they move behind it.
 
+use crate::plan_test::session::{MssqlTest, PostgresTest, TestEngine};
 use anyhow::Context as _;
 use pbps_cli::resolver::server::scratch::container::{ContainerSupport, support};
 use pbps_db::{Conn, Driver};
@@ -34,6 +36,11 @@ pub(crate) struct OwnedTest {
     /// that a caller cannot pair one engine's support with another engine's
     /// container or driver.
     pub container: &'static ContainerSupport,
+    /// The run's session on the owned server: its identities, administrator
+    /// connection, incoming-hop preparation and comparison snapshot. It is
+    /// chosen with the container so that a run cannot provision one engine's
+    /// identities on another engine's server.
+    pub session: &'static dyn TestEngine,
     /// What a `provision` phase calls the scratch.
     pub scratch_label: &'static str,
     /// The engine string of the durable run record. It is read back by later
@@ -61,6 +68,7 @@ const fn container_of(driver: Driver) -> &'static ContainerSupport {
 
 pub(super) static POSTGRES: OwnedTest = OwnedTest {
     container: container_of(Driver::Postgres),
+    session: &PostgresTest,
     scratch_label: "owned PostgreSQL scratch",
     record_engine: "postgres",
     is_fault_code: postgres_fault_code,
@@ -69,6 +77,7 @@ pub(super) static POSTGRES: OwnedTest = OwnedTest {
 
 pub(super) static MSSQL: OwnedTest = OwnedTest {
     container: container_of(Driver::Mssql),
+    session: &MssqlTest,
     scratch_label: "owned SQL Server scratch",
     record_engine: "mssql",
     is_fault_code: pbps_mssql::test_scratch::infrastructure_fault,
@@ -160,6 +169,30 @@ mod tests {
                 profile(driver).owned_test.expect("the profile carries it")
             ));
         }
+    }
+
+    #[test]
+    fn each_engine_record_carries_its_own_session_implementation() {
+        use std::any::Any;
+        let session = |record: &OwnedTest| -> &dyn Any { record.session };
+        assert!(session(&POSTGRES).is::<PostgresTest>());
+        assert!(session(&MSSQL).is::<MssqlTest>());
+        // Negative: neither record answers with the other engine's session, so
+        // one engine's identities are never provisioned on the other's server.
+        assert!(!session(&POSTGRES).is::<MssqlTest>());
+        assert!(!session(&MSSQL).is::<PostgresTest>());
+    }
+
+    #[test]
+    fn the_profile_selects_the_session_of_the_engine_it_names() {
+        use std::any::Any;
+        let selected = |driver| -> &'static dyn Any {
+            crate::engine::require_owned_test(driver).unwrap().session
+        };
+        assert!(selected(Driver::Postgres).is::<PostgresTest>());
+        assert!(selected(Driver::Mssql).is::<MssqlTest>());
+        assert!(!selected(Driver::Postgres).is::<MssqlTest>());
+        assert!(!selected(Driver::Mssql).is::<PostgresTest>());
     }
 
     #[test]
