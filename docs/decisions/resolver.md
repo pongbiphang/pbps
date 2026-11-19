@@ -6770,3 +6770,36 @@ one.
 Pinned by a `compile_fail` doctest beside a compiling one on `Binding<D>` and on
 `Staged<D>`, the tests of DEC-2798.6 to DEC-2798.8, and the live scratch tests
 of both engines. Formats: none. No sealed bytes, plan, state or evidence change.
+
+<a id="dec-2798-10"></a>
+
+**DEC-2798.10. The connected rehearsal asks the engine for its base and its
+roles, and names no engine itself (#2798, route step 3).** With the states typed
+(DEC-2798.8, DEC-2798.9), what was left in `scratch::rehearse` was two decisions
+made by comparing the driver: how the base is built on the scratch, and which
+roles the plan may name. Both are now engine functions, so the rehearsal is the
+same code for every engine and a third engine adds its own two.
+
+**What moved.** `rehearsal_base` takes the prepared scratch to the state the
+plan's statements run from: SQL Server compiles the base through the
+reconstruction's creation trials (DEC-2379.3); PostgreSQL builds the
+reconstruction only when the externals file or the fill staged something to
+compare, and refuses a fill that reads managed relations. `rehearsal_roles`
+answers the roles the run can have: PostgreSQL by the placement of the scratch
+(its own names, the names the cluster lacks, or names of the run's own), SQL
+Server by checking that every principal the plan names is declared or built into
+every database, and making nothing. Each body moved with its statements, its
+connection and its messages unchanged, and the order the rehearsal calls them in
+(base, reader, roles) is the order it had.
+
+**What went by typing.** `ResolverEngine::naming` is gone: only PostgreSQL
+tells its three placements apart, so `Naming` is the adapter's own again and
+SQL Server no longer answers a question it was asked only to refuse. The
+principal checks and their tests moved to the SQL Server adapter.
+
+Pinned by a scan of the rehearsal's production source for any driver branch or
+engine path, with a planted token it must catch (`structure_tests`), the
+principal tests at their new home, and the live rehearsal flows of both engines.
+The rehearsal still hands `D::DRIVER` to the connection and to the scope
+reads: a value, not a decision, which moves with the scope group. Formats: none.
+No sealed bytes, plan, state or evidence change.

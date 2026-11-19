@@ -22,7 +22,6 @@ mod postgres;
 #[cfg(test)]
 pub(super) use keeper::pause_between_reads;
 pub(super) use keeper::{keep_and_mark, keeper_seen};
-pub use postgres::Naming;
 #[cfg(test)]
 pub(super) use postgres::{
     for_tests::{
