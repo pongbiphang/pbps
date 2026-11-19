@@ -1285,6 +1285,165 @@ fn a_standing_configuration_and_dictionary_are_altered_in_place_and_the_replan_i
     }
 }
 
+/// A plan pins the object it alters to the definition it was approved over (SPEC §7.6).
+/// Another session that changes a token type or an option the plan does not touch, between the
+/// plan and the apply, moves the database off the plan's baseline and the apply refuses before
+/// statement one. One that changes it while the statements run (an event trigger stands for
+/// the other session: it writes in the transaction, which is what the read-back would see) is
+/// not the plan's result: the close, or a staged run's checkpoint, refuses it and records
+/// nothing, instead of taking the read-back as the alteration's result and keeping the change
+/// beside the plan's own. Ordinary and staged, a mapping and an option. Negative: with no
+/// intervening change the same declaration applies, and the next plan is empty and verifies.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn an_alteration_is_refused_when_another_session_changed_the_object_after_the_plan() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        let own = OwnDatabase::new(&server, "search2728d");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app");
+        let d = Demo::new("search2728d");
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+        declare(&d, "app.words.textsearch-dictionary.yml", WORDS);
+        declare(&d, "app.docs.textsearch-config.yml", DOCS);
+        declare(&d, "app.solo.textsearch-dictionary.yml", SOLO);
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        let path = d.dir.join("moved.plan.json");
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        succeeds(apply_plan(&d, db, &path, false));
+        let held = |db: &str| format!("{} / {}", mappings_of(db, "docs"), options_of(db, "solo"));
+        let mut round = 0;
+        for (mapping, staged, during) in [
+            (true, false, false),
+            (true, false, true),
+            (true, true, true),
+            (false, false, false),
+            (false, false, true),
+            (false, true, true),
+        ] {
+            round += 1;
+            let flip = round % 2 == 1;
+            // The plan changes `word` (or `accept`); the other session changes `email` (or
+            // `stopwords`), which the plan does not.
+            let (other, tag) = if mapping {
+                let word = if flip {
+                    "pg_catalog.simple"
+                } else {
+                    "app.words"
+                };
+                declare(
+                    &d,
+                    "app.docs.textsearch-config.yml",
+                    &format!(
+                        "text_search_config: app.docs\nparser: pg_catalog.default\nmappings:\n  \
+                         asciiword: [app.words]\n  email: [pg_catalog.simple]\n  word: [{word}]\n"
+                    ),
+                );
+                (
+                    "ALTER TEXT SEARCH CONFIGURATION app.docs ALTER MAPPING FOR email WITH app.words",
+                    "ALTER TEXT SEARCH CONFIGURATION",
+                )
+            } else {
+                let accept = if flip { "false" } else { "true" };
+                declare(
+                    &d,
+                    "app.solo.textsearch-dictionary.yml",
+                    &format!(
+                        "text_search_dictionary: app.solo\ntemplate: pg_catalog.simple\n\
+                         options:\n  accept: \"{accept}\"\n  stopwords: english\n"
+                    ),
+                );
+                (
+                    "ALTER TEXT SEARCH DICTIONARY app.solo (stopwords = 'russian')",
+                    "ALTER TEXT SEARCH DICTIONARY",
+                )
+            };
+            let mut plan = vec!["plan", "--db", db, "--out", path.to_str().unwrap()];
+            if staged {
+                plan.push("--staged");
+            }
+            succeeds(d.run(&plan));
+            let unmoved = held(db);
+            if during {
+                // Once per statement of the plan: written only while the other session's
+                // change is not yet there, so the nested statement ends it.
+                let done = if mapping {
+                    "EXISTS (SELECT 1 FROM pg_ts_config_map m JOIN pg_ts_config c ON c.oid = m.mapcfg \
+                     JOIN pg_ts_dict d ON d.oid = m.mapdict WHERE c.cfgname = 'docs' \
+                     AND m.maptokentype = 4 AND d.dictname = 'words')"
+                } else {
+                    "EXISTS (SELECT 1 FROM pg_ts_dict WHERE dictname = 'solo' \
+                     AND dictinitoption LIKE '%russian%')"
+                };
+                on_server(
+                    db,
+                    &format!(
+                        "CREATE SCHEMA witness; \
+                         CREATE FUNCTION witness.the_other_session() RETURNS event_trigger \
+                         LANGUAGE plpgsql AS $$ BEGIN IF NOT {done} THEN {other}; END IF; END $$; \
+                         CREATE EVENT TRIGGER other_session ON ddl_command_end \
+                         WHEN TAG IN ('{tag}') EXECUTE FUNCTION witness.the_other_session()"
+                    ),
+                );
+            } else {
+                on_server(db, other);
+            }
+            let moved = held(db);
+            let refused = apply_plan(&d, db, &path, staged);
+            assert_ne!(code(&refused), 0, "{round}: {}", said(&refused));
+            let text = said(&refused);
+            assert!(
+                text.contains(if during {
+                    "does not match what its plan promised"
+                } else {
+                    "no longer the database this plan was computed against"
+                }),
+                "{round}: {text}"
+            );
+            if during {
+                on_server(
+                    db,
+                    "DROP EVENT TRIGGER other_session; DROP SCHEMA witness CASCADE",
+                );
+            }
+            if !staged {
+                // Rolled back: the database is as it was before the apply, and the record, which
+                // holds what was approved, still agrees with it unless the other session wrote.
+                assert_eq!(
+                    held(db),
+                    if during { unmoved.clone() } else { moved },
+                    "{round}"
+                );
+                if during {
+                    succeeds(d.run(&["verify", "--db", db]));
+                }
+            }
+            if !during || staged {
+                // A staged run stops on a checkpoint, and an apply the plan baseline refused leaves
+                // the other session's change as drift against the record: either way it is
+                // taken as it stands before anything is planned over it.
+                if !during {
+                    assert_ne!(code(&d.run(&["verify", "--db", db])), 0, "{round}");
+                }
+                succeeds(d.run(&[
+                    "baseline",
+                    "--db",
+                    db,
+                    "--reason",
+                    "the other session's change",
+                ]));
+            }
+            // The same declaration planned again sees the object as it now stands: it applies,
+            // closes and leaves nothing to plan.
+            succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+            succeeds(apply_plan(&d, db, &path, false));
+            no_changes(&succeeds(d.run(&["plan", "--db", db])));
+            succeeds(d.run(&["verify", "--db", db]));
+        }
+    }
+}
+
 /// What would keep the old behaviour stops the change, by name, before any statement: a stored
 /// generated column over a configuration stops a change of its mappings and, through the
 /// configuration that maps it, a change of a dictionary's options; a parser or a template that

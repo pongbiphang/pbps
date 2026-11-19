@@ -2490,6 +2490,11 @@ two halves:
    through and at the close at the last, and each one the plan drops stands as pinned
    until its statement and is absent from the close on; installed packages
    outside the declarations are not compared.
+   A text search configuration or dictionary the plan alters in place (DEC-2728.3)
+   stands at the definition the plan was approved over or at the one it writes, before
+   its statement and at every checkpoint, and at the close at the one it writes
+   (mappings per token type in order, options as the plan canonicalised them); one
+   the plan does not alter is not compared (DEC-2855.1).
    A closing mismatch refuses success recording and rolls the transaction back;
    a failed-attempt entry retains the previously recorded schema and identities.
 

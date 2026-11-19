@@ -939,6 +939,7 @@
         "text_search2728::a_staged_create_stopped_after_the_configuration_exists_resumes",
         "text_search2728::a_declaration_that_adopts_an_existing_object_is_recorded_and_verifies",
         "text_search2728::a_standing_configuration_and_dictionary_are_altered_in_place_and_the_replan_is_empty",
+        "text_search2728::an_alteration_is_refused_when_another_session_changed_the_object_after_the_plan",
         "text_search2728::what_would_keep_the_old_behaviour_stops_an_alteration_and_a_parser_or_template_change_is_refused",
         "text_search2728::a_string_bodied_function_that_names_the_object_stops_an_alteration_and_one_that_does_not_lets_it_go",
         "exclude2448::an_exclusion_constraint_round_trips_is_added_behind_its_risk_and_enforces",

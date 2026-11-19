@@ -1736,6 +1736,14 @@ options that changed and the plan checksum pins what was compared.
   corrupt silently is refused instead.
 - **Recording.** The state keeps the object as the database holds it after the apply,
   as it does for a create; a previous record is not carried over a plan's own alteration.
+  What is recorded is therefore held to the plan first (SPEC §7.6): the guard pins the
+  object as a package an update changes is pinned, at the definition the plan was approved
+  over or at the one it writes before the close and at a checkpoint, and at the one it writes
+  at the close. A change another session makes to the object while the statements run, to a
+  token type or an option the plan does not touch as much as to one it does, is neither, so
+  the close refuses and rolls back (a staged run stops on the checkpoint), and the read-back
+  is never taken as the alteration's result unchecked. A change between the plan and the
+  apply is the baseline checksum's, which holds the objects an identity names.
 - **Saved plans** are admitted only if the uid is recorded under the name, the object keeps its
   kind and its parser or template, and the new definition passes the dialect's checks.
 - **SQL Server** refuses both at emit, as the create.
