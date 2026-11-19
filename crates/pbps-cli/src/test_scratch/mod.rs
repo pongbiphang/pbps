@@ -277,7 +277,10 @@ impl ContainerOwner for RunOwner<'_, '_> {
 pub(crate) struct TestScratch<'d> {
     held: Held,
     journal: Journal<'d>,
-    driver: Driver,
+    /// The support record that admitted this run. The session that provisions
+    /// identities is read from it, so a handle cannot be paired with another
+    /// engine's session (#2798).
+    owned: &'static OwnedTest,
 }
 
 impl<'d> TestScratch<'d> {
@@ -350,7 +353,6 @@ impl<'d> TestScratch<'d> {
         // admitted the run starts its container (#2798).
         let engine = owned.record_engine;
         let container = owned.container;
-        let driver = container.driver;
         // What `ours` checks of the container later; the resolver's own
         // labels (token, engine, process) are set by its start.
         let labels = [
@@ -396,7 +398,7 @@ impl<'d> TestScratch<'d> {
             Ok(held) => Ok(TestScratch {
                 held,
                 journal,
-                driver,
+                owned,
             }),
             Err(error) => {
                 // A start that failed leaves a record; it is deleted only once
@@ -428,7 +430,12 @@ impl<'d> TestScratch<'d> {
 
     /// Which engine the owned server runs; the caller chose it at `start`.
     pub(crate) fn driver(&self) -> Driver {
-        self.driver
+        self.owned.container.driver
+    }
+
+    /// The owned-test support this run was admitted by.
+    pub(crate) fn owned(&self) -> &'static OwnedTest {
+        self.owned
     }
 
     /// The superuser connection to the owned server.
