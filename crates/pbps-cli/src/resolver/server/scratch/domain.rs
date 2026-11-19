@@ -1,7 +1,7 @@
 //! An unsealed, code-only goal of the scratch run (DEC-2309.1).
 use super::super::{Error, PlanningDialect, ProduceError, producer::request};
 use super::{Provenance, Standard, Tokens};
-use crate::resolver::contract::ResolverEngine;
+use crate::resolver::contract::{PreparedView, ResolverEngine};
 use crate::resolver::scope;
 use pbps_db::resolver::environment::Verdict;
 use pbps_db::{Conn, Driver};

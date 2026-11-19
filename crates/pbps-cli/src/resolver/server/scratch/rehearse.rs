@@ -12,7 +12,7 @@
 use super::super::producer::{request, request_as_it_stands};
 use super::super::{BindingRequest, Error, PlanningDialect, ProduceError, engine};
 use super::{Provenance, Standard, Tokens};
-use crate::resolver::contract::{self, RehearsalRequest, ResolverEngine};
+use crate::resolver::contract::{self, PreparedView, RehearsalRequest, ResolverEngine};
 use crate::resolver::scope;
 use pbps_db::{Conn, Driver};
 use pbps_model::resolver::OutsideWrites;
@@ -155,20 +155,21 @@ pub async fn with_session<D: PlanningDialect, T, E>(
                 &mut prepared,
             )
             .await?;
-            let mut staged = prepared.completed_staged().ok_or_else(|| {
-                Error::Scope("the prepared scratch holds no staged inventory".into())
-            })?;
-            built
-                .compile(
-                    &mut prepared,
-                    &mut admin,
-                    &mut target,
-                    &[],
-                    None,
-                    OutsideWrites::Refused,
-                    &mut staged,
-                )
-                .await?;
+            let mut staged = <D::Resolver as ResolverEngine>::completed_staged(&prepared)
+                .ok_or_else(|| {
+                    Error::Scope("the prepared scratch holds no staged inventory".into())
+                })?;
+            <D::Resolver as ResolverEngine>::compile(
+                &mut built,
+                &mut prepared,
+                &mut admin,
+                &mut target,
+                &[],
+                None,
+                OutsideWrites::Refused,
+                &mut staged,
+            )
+            .await?;
         } else if externals.is_some() || prepared.has_filled() {
             let mut reconstruction = <D::Resolver as ResolverEngine>::reconstruction(
                 &state,
@@ -187,7 +188,7 @@ pub async fn with_session<D: PlanningDialect, T, E>(
                         .into(),
                 ]));
             }
-            reconstruction.chains(&prepared);
+            <D::Resolver as ResolverEngine>::chains(&mut reconstruction, &prepared)?;
             <D::Resolver as ResolverEngine>::compare_externals(
                 &state,
                 provisioning,

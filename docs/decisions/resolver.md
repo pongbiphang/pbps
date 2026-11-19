@@ -6695,3 +6695,45 @@ role name) stays an explicit named error in the other engine's impl.
 Pinned by the tests of DEC-2798.6, which this change leaves as they are, and by
 the live scratch tests of both engines. Formats: none. No sealed bytes, plan,
 state or evidence change.
+
+<a id="dec-2798-8"></a>
+
+**DEC-2798.8. The prepared scratch is typed by the engine and read through an
+accessor trait on its own type; the steps that link it to the states still
+unions are engine functions with a named refusal for the mixed pair (#2798,
+route step 3).** DEC-2798.7 left `Prepared`, `Binding` and `Staged` two-engine
+unions and said each becomes an associated type when its group moves. They
+cannot move one at a time without a bridge: a step that takes a typed state and
+a union state cannot stay a method of the union, which does not know the
+engine. This change types `Prepared` and keeps the bridge as small as the code
+allows.
+
+**What moved.** `ResolverEngine::Prepared` carries the engine's own prepared
+scratch. The run reads it through `PreparedView`, a trait on the state type with
+the accessors the union used to match (catalog, differences, sessions, reader,
+placements, authorization condition and the three fill questions), so a prepared
+scratch of one engine cannot be read as another's and the run's generic code
+still writes `prepared.catalog()`. The steps that make or link a staged set or
+a binding with it (`staged`, `completed_staged`, `chains`, `compile`,
+`capture_desired`) are engine functions that take `Self::Prepared` and still name
+the union `Binding`/`Staged`; each impl keeps the arm for the other engine's
+binding or staged set as an explicit named error, as `reconstruction` and
+`compare_externals` already did. The staged set the run starts from can no longer
+be a mixed pair, so `staged` is infallible.
+
+**One interim signature.** `chains` was the only step whose mixed pair was an
+`unreachable!`, and a trait function must not keep one, so it returns a result
+for now; it is infallible again when the binding is typed in the next change. The
+reader of a SQL Server scratch takes its reach before the future starts, because
+the prepared scratch holds the deployer's connection and is not `Sync`; the open
+itself is unchanged.
+
+**Visibility.** `CompiledCapture` and the adapters' `Closing` are `pub` inside
+their private modules because the trait's `capture_desired` returns them. Fields
+stay private and no constructor is added; the sealed capture is still made only
+by the engine's `capture_desired` and consumed only by `seal_for_plan`.
+
+Pinned by the `compile_fail` doctest beside a compiling one on `Prepared<D>`,
+the tests of DEC-2798.6 and DEC-2798.7, and the live scratch tests of both
+engines, which no longer destructure a union. Formats: none. No sealed bytes,
+plan, state or evidence change.

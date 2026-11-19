@@ -1868,7 +1868,7 @@ pub struct Binding {
 }
 
 /// The fixed-key closing capture and the exact scope its opening read uses.
-pub(in crate::resolver::server) struct Closing {
+pub struct Closing {
     captured: CompiledCapture,
     scope: CaptureScope,
     paths: Paths,

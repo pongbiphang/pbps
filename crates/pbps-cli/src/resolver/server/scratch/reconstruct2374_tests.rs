@@ -253,9 +253,7 @@ async fn on_scratch(target: &str, scratch: &str) -> String {
     )
     .await;
     let landed = async {
-        let super::super::engine::Prepared::Mssql(mut prepared) = prepared? else {
-            panic!("wrong engine");
-        };
+        let mut prepared = prepared?;
         Ok::<String, Error>(schema_of_probe(&mut prepared.compile).await)
     }
     .await;

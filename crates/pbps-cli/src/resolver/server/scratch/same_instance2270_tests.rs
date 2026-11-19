@@ -150,7 +150,7 @@ async fn automatic_externals(default: &'static str) {
         ).await.unwrap();
         let prepared = MssqlEngine::prepare(&mut state, provisioning, &mut admin, &mut target, &catalog, &authorization, &request.schemas, &binding, &[], Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key())).await;
         let checked = async {
-            let super::super::engine::Prepared::Mssql(mut prepared) = prepared? else { panic!("wrong engine"); };
+            let mut prepared = prepared?;
             assert!(prepared.staged.compared().contains(&capture::object("dbo", "external2270")));
             // The target's authored default is deliberately absent: the renderer
             // sends catalog structure, rather than replaying source-bearing DDL.
