@@ -33,8 +33,10 @@ pbps-sqlite    SQLite, the third engine (#2950): the same responsibilities as
                pbps-pg, filled item by item (dialect, emitter, catalog reader,
                state SQL, preflight). It is built before it is wired
                (DEC-2950.1), over the connection in `pbps_db::sqlite`, and names
-               no driver type. Its functions are synchronous. Nothing depends on
-               it yet, and `pbps-cli` does not name it
+               no driver type. Its functions are synchronous. Depends on
+               pbps-diff for sealed plan emission inputs, as pbps-pg does
+               (DEC-1959.5). Nothing depends on it yet, and `pbps-cli` does
+               not name it
 pbps-db        Connections plus transaction framing. Owns "there is a network";
                the shapes a connected command consumes — ledger types and
                prune policy, what a pull found (`catalog`), what a rename
@@ -79,8 +81,9 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
   (`type Resolver = NoResolver<Self>` when it has none); resolver code reads
   those facts from that type and adds no `Driver` comparison for them
   (DEC-2798.5).
-- `pbps-sqlite` depends on `pbps-db` and `pbps-dialect` and on nothing else
-  in the workspace so far, and no crate depends on it until the engine is wired
+- `pbps-sqlite` depends on `pbps-db`, `pbps-dialect` and `pbps-diff` (the
+  sealed plan its emitter reads, as `pbps-pg` does) and on nothing else in the
+  workspace so far, and no crate depends on it until the engine is wired
   (the last of the plan in #2950). Wiring adds a `Driver` and a `Conn` variant
   and the arms every exhaustive `match` then needs, which is why it waits for
   route steps 4 to 6 of #2798. The crate calls `pbps_db::sqlite::Connection`

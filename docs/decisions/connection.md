@@ -1507,3 +1507,53 @@ Rejected:
 Pinned by `pbps_db::sqlite::tests` (each guarantee above with its negative case,
 and a mutation of each fails one) and by `pbps-sqlite`'s own tests on in-memory
 and file databases.
+
+<a id="dec-2950-4"></a>
+
+**DEC-2950.4. The SQLite version floor gates the text written into the file, not the statements only the bundled library runs (#2950).** The epic says "the
+version floor gates what the emitter may write". This entry refines that
+sentence, and does not repeal it: the floor is the oldest SQLite an
+application opens the file with, so it gates what stays in the file, and an
+`ALTER TABLE` form is a statement that pbps's own bundled library executes and
+that leaves old syntax behind. Written as one function, `emit::allows_under`,
+so the other reading is a one-line change.
+
+- **What the floor gates.** Text the emitter writes verbatim and the file keeps:
+  `DEFAULT TRUE` and `DEFAULT FALSE` need 3.23 (before it they are names, so the
+  default would mean the text `TRUE`), and the later items' `STRICT` and
+  generated columns. Below the floor such a column is answered `NotBuilt`, by
+  name, and never written.
+- **What it does not gate.** The in-place `ALTER` forms. Their arrival is kept in
+  a table (`RENAME TO` 3.1.2, `ADD COLUMN` 3.2, `RENAME COLUMN` 3.25,
+  `DROP COLUMN` 3.35, and `SET` and `DROP NOT NULL`, `ADD` and `DROP CONSTRAINT
+  CHECK` and `DROP CONSTRAINT` of a foreign key 3.53.0, from SQLite's release
+  notes read on 2026-11-20) and a test pins it, but nothing reads it while the
+  gate is `Text`.
+- **The measurement.** A file altered by the bundled 3.54.1 with each form was
+  opened by 3.46.1, which reported `integrity_check` ok and enforced its
+  constraints. For each form the stored `sqlite_schema.sql` after the `ALTER`
+  was compared with what a rebuild by hand stores: it is the same text up to
+  quotes, case and white space, and no token newer than 3.35 appears, `ADD
+  CONSTRAINT .. CHECK` and the `NOT NULL` forms included. So no form leaves text
+  an older release cannot parse, which is the case for not gating it.
+- **What brings the gate back.** Executing the statements on a library other
+  than the bundled one (a system library, or an application's own), because the
+  statement itself is then run by a release that may not know the form. The
+  change is `emit::GATE` set to `EveryForm`, the arrival table already in place;
+  each form's test runs under both settings.
+- **Within a plan, order is not a gate.** A rename rewrites the views, indexes
+  and foreign keys that name the old name, and fails while any view is invalid;
+  the shared scheduler already puts renames before the drops that leave a view
+  dangling and a view's drop and create last, so a plain rename needs no input
+  of its own. Pinned by plans run through the differ's own route.
+
+Rejected:
+- **Gating every form by its arrival (option A).** It refuses valid plans on a
+  floor below 3.35 for statements the tool's own library runs and whose result
+  every release since 3.35 reads. It stays one line away.
+- **Gating nothing.** `DEFAULT TRUE` written for a file an older application
+  opens would silently mean the text `TRUE`.
+
+Pinned by the arrival table's test, `allows_under` under both gates, each form
+that is built under both, the boolean default below and at its release, the
+text of each form against a rebuild by hand, and the plan-order scenarios.

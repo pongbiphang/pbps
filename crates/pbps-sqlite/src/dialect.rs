@@ -4,18 +4,19 @@
 //! [`Sqlite`] implements [`Dialect`]. Everything a declaration, a differ or a
 //! scan asks of the engine without a connection is answered here or in
 //! `ident`, `types`, `validate`, `lexis` and `names`; the SQL a change becomes
-//! is the emitter's (item 3), and `PlanDialect`, which needs the differ's
-//! sealed plan type, waits for it. Until then `intermediate_tables` answers
-//! `NotBuilt`, which the trait documents for a dialect arriving in steps, and
-//! never an empty answer.
+//! is the emitter's (`emit`), reached through `PlanDialect`, whose plan type is
+//! the differ's sealed one.
 
 use std::borrow::Cow;
 
-use pbps_dialect::{Dialect, DialectError, Lexicon, TransactionFraming, TypeChangeRisk};
+use pbps_dialect::{
+    Dialect, DialectError, Lexicon, PlanDialect, Statement, TransactionFraming, TypeChangeRisk,
+};
 use pbps_model::{
     Change, ColumnType, Module, ModuleId, ModuleKind, Role, SessionZone, Strategy, Table, TableName,
 };
 
+use crate::emit;
 use crate::{DEFAULT_VERSION_FLOOR, TRANSACTION, Version, ident, lexis, types, validate};
 
 /// The SQLite dialect. Holds the version floor as a value: the
@@ -159,16 +160,70 @@ impl Dialect for Sqlite {
         None
     }
 
-    /// Not built: SQL generation is item 3. Said, never answered empty.
+    /// The tables a change's statements hold under a name neither the baseline
+    /// nor the plan has, read from the statements the emitter writes.
     fn intermediate_tables(
         &self,
-        _change: &Change,
+        change: &Change,
         _strategy: Strategy,
     ) -> Result<Vec<TableName>, DialectError> {
-        Err(DialectError::NotBuilt {
-            dialect: types::DIALECT,
-            part: "SQL generation (item 3 of #2950)".to_owned(),
-        })
+        Ok(pbps_dialect::lower::intermediate_tables(&emit::emit(
+            self, change,
+        )?))
+    }
+
+    fn statement_count(
+        &self,
+        change: &Change,
+        _strategy: Strategy,
+        _mode: pbps_model::PlanMode,
+    ) -> Result<usize, DialectError> {
+        // A foreign key is never a statement of its own here: in a plan it is
+        // written inside its table's `CREATE`, or the plan is not emitted.
+        if matches!(
+            change,
+            Change::Constraint(pbps_model::ConstraintChange::AddForeignKey { .. })
+        ) {
+            return Ok(0);
+        }
+        emit::emit(self, change).map(|statements| statements.len())
+    }
+}
+
+/// The emitter, behind the differ's sealed plan: a plan reaches `emit` only as a
+/// `PlanView`, never as a draft or a view a caller made up. The `Strategy` of a
+/// change (`ONLINE`, which is SQL Server's) means nothing here and is ignored.
+impl PlanDialect for Sqlite {
+    type Plan = dyn pbps_diff::order::PlanView<Self>;
+
+    fn emit(&self, plan: &Self::Plan, position: usize) -> Result<Vec<Statement>, DialectError> {
+        self.emit_in(plan, position, pbps_model::PlanMode::Transactional)
+    }
+
+    fn emit_staged(
+        &self,
+        plan: &Self::Plan,
+        position: usize,
+    ) -> Result<Vec<Statement>, DialectError> {
+        self.emit_in(plan, position, pbps_model::PlanMode::Staged)
+    }
+}
+
+impl Sqlite {
+    fn emit_in(
+        &self,
+        plan: &<Self as PlanDialect>::Plan,
+        position: usize,
+        mode: pbps_model::PlanMode,
+    ) -> Result<Vec<Statement>, DialectError> {
+        let changes = &pbps_dialect::PlanPayload::changes(plan).changes;
+        let planned = &changes[position];
+        pbps_dialect::drop_requirements::emit(
+            planned.drop_guard.as_ref(),
+            mode,
+            types::DIALECT,
+            || emit::emit_at(self, changes, position),
+        )
     }
 }
 
@@ -239,21 +294,49 @@ mod tests {
         assert!(!d.filter_binds_expression());
     }
 
-    /// Nothing the engine builds yet is answered with an empty success: SQL
-    /// generation is said to be unbuilt, by name.
+    /// What the emitter does not build yet is said to be unbuilt, by name, and a
+    /// change that is built reports its statements.
     #[test]
-    fn sql_generation_is_said_to_be_unbuilt_and_never_answered_empty() {
-        let change = Change::Table(pbps_model::TableChange::DropTable {
+    fn a_change_the_emitter_builds_reports_its_statements_and_one_it_does_not_says_so() {
+        let d = Sqlite::default();
+        let drop = Change::Table(pbps_model::TableChange::DropTable {
             uid: "t_aaaaaa".parse().expect("uid"),
             name: TableName::new("main", "t"),
             detach_from: None,
         });
-        match Sqlite::default().intermediate_tables(&change, Strategy::default()) {
-            Err(DialectError::NotBuilt {
-                dialect: "sqlite",
-                part,
-            }) => assert!(part.contains("item 3"), "{part}"),
-            other => panic!("expected NotBuilt, got {other:?}"),
+        assert_eq!(
+            d.statement_count(
+                &drop,
+                Strategy::default(),
+                pbps_model::PlanMode::Transactional
+            ),
+            Ok(1)
+        );
+        assert_eq!(
+            d.intermediate_tables(&drop, Strategy::default()),
+            Ok(Vec::new())
+        );
+        let unbuilt = Change::Column(pbps_model::ColumnChange::DropColumn {
+            uid: "c_aaaaaa".parse().expect("uid"),
+            column: TableName::new("main", "t").column("c"),
+        });
+        for result in [
+            d.intermediate_tables(&unbuilt, Strategy::default())
+                .map(|_| ()),
+            d.statement_count(
+                &unbuilt,
+                Strategy::default(),
+                pbps_model::PlanMode::Transactional,
+            )
+            .map(|_| ()),
+        ] {
+            match result {
+                Err(DialectError::NotBuilt {
+                    dialect: "sqlite",
+                    part,
+                }) => assert!(part.contains("next part"), "{part}"),
+                other => panic!("expected NotBuilt, got {other:?}"),
+            }
         }
     }
 
