@@ -117,8 +117,9 @@ pub(crate) enum Gate {
 pub(crate) const GATE: Gate = Gate::Text;
 
 /// The first release that reads `TRUE` and `FALSE` as constants. Before it they
-/// are names, so a default written `TRUE` would mean the text `'TRUE'`.
-pub(crate) const BOOLEAN_DEFAULT: Version = Version::new(3, 23, 0);
+/// are names, so a default written `TRUE` would mean the text `'TRUE'`, and a
+/// check or a view that says `TRUE` would name a column that is not there.
+pub(crate) const BOOLEAN_WORDS: Version = Version::new(3, 23, 0);
 
 /// Whether a project that targets `floor` may have `form` written in place.
 #[must_use]
@@ -136,8 +137,40 @@ pub(crate) fn emit(dialect: &Sqlite, change: &Change) -> Sql {
 
 /// [`emit`] under a stated gate, so each form's test runs under both.
 pub(crate) fn emit_under(gate: Gate, dialect: &Sqlite, change: &Change) -> Sql {
+    let statements = lowered(gate, dialect, change)?;
+    kept_text(dialect, &statements)?;
+    Ok(statements)
+}
+
+/// What a statement writes into the file must mean to the floor's SQLite what
+/// it means to the one that runs it. `TRUE` and `FALSE` do not: before
+/// [`BOOLEAN_WORDS`] they are names. Every statement is read here, after it is
+/// written, so a default, a check, an index's filter and a view's body are held
+/// alike and a new statement cannot forget to ask. The read is of code only:
+/// a string, a quoted name and a comment are not the words.
+fn kept_text(dialect: &Sqlite, statements: &[Statement]) -> Result<(), DialectError> {
+    if dialect.at_least(BOOLEAN_WORDS) {
+        return Ok(());
+    }
+    for word in ["TRUE", "FALSE"] {
+        if statements
+            .iter()
+            .any(|statement| lexis::has_bare_word(&statement.sql, word))
+        {
+            return Err(not_built(format!(
+                "`{word}` in text kept in the file, for a project whose floor is {}: SQLite reads \
+                 TRUE and FALSE as constants from {BOOLEAN_WORDS}, and as names before it (write 1 \
+                 or 0, or quote a column of that name)",
+                dialect.floor()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn lowered(gate: Gate, dialect: &Sqlite, change: &Change) -> Sql {
     match change {
-        Change::Table(change) => table::emit(dialect, change),
+        Change::Table(change) => table::emit(change),
         Change::TableProperty(change) => refused::table_property(change),
         Change::Partition(change) => refused::partition(change),
         Change::Column(change) => column::emit(dialect, gate, change),

@@ -10,7 +10,7 @@ use pbps_model::ColumnChange;
 use super::golden::{WithDefault, add_column, uid};
 use super::*;
 use crate::Version;
-use crate::emit::{BOOLEAN_DEFAULT, Form, GATE, Gate, allows_under, emit_under};
+use crate::emit::{BOOLEAN_WORDS, Form, GATE, Gate, allows_under, emit_under};
 
 #[test]
 fn the_arrival_table_is_the_releases_that_brought_each_form() {
@@ -87,7 +87,7 @@ fn boolean_default() -> Change {
 #[test]
 fn a_boolean_default_is_text_kept_in_the_file_so_the_floor_gates_it_under_either_gate() {
     let before = Sqlite::with_floor(Version::new(3, 22, 0));
-    let at = Sqlite::with_floor(BOOLEAN_DEFAULT);
+    let at = Sqlite::with_floor(BOOLEAN_WORDS);
     for gate in [Gate::Text, Gate::EveryForm] {
         assert!(
             emit_under(gate, &at, &boolean_default()).is_ok(),
@@ -119,6 +119,70 @@ fn a_boolean_default_is_text_kept_in_the_file_so_the_floor_gates_it_under_either
     );
 }
 
+/// The words are gated wherever a statement leaves them in the file, and only
+/// where they are code.
+#[test]
+fn the_boolean_words_are_gated_in_every_text_a_statement_keeps() {
+    let before = Sqlite::with_floor(Version::new(3, 22, 0));
+    let at = Sqlite::with_floor(BOOLEAN_WORDS);
+    let with_check = |expression: &str| {
+        let mut t = table(&[("a", col("integer"))]);
+        t.checks.insert(
+            "k".into(),
+            pbps_model::CheckConstraint {
+                expression: expression.into(),
+            },
+        );
+        super::golden::create_table_change("t", &t)
+    };
+    let with_filter = |filter: &str| {
+        Change::Index(pbps_model::IndexChange::AddIndex {
+            table: tn("t"),
+            name: pbps_model::ObjectLocalName::new("i"),
+            index: Box::new(super::golden::index(&["a"], false, Some(filter))),
+            clustered: false,
+        })
+    };
+    let with_view = |body: &str| {
+        let (id, module) = view("v", body);
+        Change::Module(pbps_model::ModuleChange::CreateModule {
+            id,
+            module: Box::new(module),
+        })
+    };
+    // In a new table: an expression default is not one `ADD COLUMN` takes.
+    let with_default = |text: &str| {
+        let t = table(&[("x", col("integer").with_default(text))]);
+        super::golden::create_table_change("t", &t)
+    };
+    let kept: Vec<(&str, Change)> = vec![
+        ("a default in parentheses", with_default("(TRUE)")),
+        ("a default inside an expression", with_default("(1 + true)")),
+        ("a check", with_check("a = FALSE")),
+        ("an index filter", with_filter("a IS NOT TRUE")),
+        ("a view body", with_view("SELECT false AS f")),
+    ];
+    for (what, change) in &kept {
+        assert!(emit_under(Gate::Text, &at, change).is_ok(), "{what}");
+        match emit_under(Gate::Text, &before, change) {
+            Err(DialectError::NotBuilt { part, .. }) => assert!(part.contains("3.23.0"), "{part}"),
+            other => panic!("{what}: {other:?}"),
+        }
+    }
+    // Negative: the letters in a string, a quoted name, a comment or a longer
+    // word are not the words.
+    let free: Vec<(&str, Change)> = vec![
+        ("a string", with_default("'TRUE'")),
+        ("a string in an expression", with_check("a <> 'false'")),
+        ("a quoted name", with_check("\"true\" > 0")),
+        ("a comment", with_view("SELECT 1 /* true */ AS f")),
+        ("a longer word", with_filter("truely > 0 AND a > falsey")),
+    ];
+    for (what, change) in &free {
+        assert!(emit_under(Gate::Text, &before, change).is_ok(), "{what}");
+    }
+}
+
 #[test]
 fn the_boolean_default_means_a_constant_only_from_its_release() {
     // The engine measured on the bundled release: `TRUE` is a constant. On a
@@ -132,5 +196,5 @@ fn the_boolean_default_means_a_constant_only_from_its_release() {
         .query("SELECT b FROM t", &[])
         .expect("reads");
     assert_eq!(rows[0].integer(0).expect("an integer, not text"), 1);
-    assert_eq!(BOOLEAN_DEFAULT, Version::new(3, 23, 0));
+    assert_eq!(BOOLEAN_WORDS, Version::new(3, 23, 0));
 }

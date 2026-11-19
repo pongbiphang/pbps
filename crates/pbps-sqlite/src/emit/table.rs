@@ -7,11 +7,10 @@ use pbps_model::{
 };
 
 use super::{Sql, closed, column, index, later, local, qualified, statement};
-use crate::dialect::Sqlite;
 use crate::validate::{self, SCHEMA, unsupported};
 use crate::{ident, names};
 
-pub(super) fn emit(dialect: &Sqlite, change: &TableChange) -> Sql {
+pub(super) fn emit(change: &TableChange) -> Sql {
     match change {
         TableChange::CreateTable {
             name,
@@ -24,7 +23,7 @@ pub(super) fn emit(dialect: &Sqlite, change: &TableChange) -> Sql {
             if beside_default.is_some() {
                 return Err(unsupported("partitions"));
             }
-            create(dialect, name, table)
+            create(name, table)
         }
         TableChange::DropTable {
             name, detach_from, ..
@@ -45,7 +44,7 @@ pub(super) fn emit(dialect: &Sqlite, change: &TableChange) -> Sql {
 /// constraints are part of the statement that makes the table, written as named
 /// table constraints: a constraint's name exists only in the stored text, and a
 /// table-level clause is what `DROP CONSTRAINT` can find later.
-fn create(dialect: &Sqlite, name: &TableName, table: &Table) -> Sql {
+fn create(name: &TableName, table: &Table) -> Sql {
     // The declaration's own refusals, repeated: a saved plan can carry a table
     // validation never saw.
     if let Some(error) = validate::table(name, table).into_iter().next() {
@@ -53,7 +52,7 @@ fn create(dialect: &Sqlite, name: &TableName, table: &Table) -> Sql {
     }
     let mut parts = Vec::new();
     for (column_name, def) in &table.columns {
-        parts.push(column::definition(dialect, column_name, def)?);
+        parts.push(column::definition(column_name, def)?);
     }
     if let Some(key) = &table.primary_key {
         parts.push(primary_key(key)?);

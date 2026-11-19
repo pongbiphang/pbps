@@ -4,8 +4,8 @@ use pbps_dialect::Created;
 use pbps_model::{Column, ColumnChange, ColumnName, TableName, ValueSource};
 
 use super::{
-    BOOLEAN_DEFAULT, Form, Gate, Sql, allows_under, closed, is_rowid_name, later, local, qualified,
-    rebuild, statement,
+    Form, Gate, Sql, allows_under, closed, is_rowid_name, later, local, qualified, rebuild,
+    statement,
 };
 use crate::dialect::Sqlite;
 use crate::types;
@@ -18,7 +18,7 @@ pub(super) fn emit(dialect: &Sqlite, gate: Gate, change: &ColumnChange) -> Sql {
             name,
             column,
             ..
-        } => add(dialect, table, name, column),
+        } => add(table, name, column),
         ColumnChange::RenameColumn {
             table, from, to, ..
         } => rename(dialect, gate, table, from, to),
@@ -48,7 +48,6 @@ pub(super) fn emit(dialect: &Sqlite, gate: Gate, change: &ColumnChange) -> Sql {
 /// form [`validate::default_value`] admits; `TRUE` and `FALSE` are text that
 /// stays in the file, so they need the floor to read them as constants.
 pub(super) fn definition(
-    dialect: &Sqlite,
     name: &ColumnName,
     column: &Column,
 ) -> Result<String, pbps_dialect::DialectError> {
@@ -62,13 +61,6 @@ pub(super) fn definition(
             return Err(validate::invalid(format!(
                 "the default of `{}` is not one value SQLite reads whole",
                 name.shown()
-            )));
-        }
-        let boolean = text.eq_ignore_ascii_case("true") || text.eq_ignore_ascii_case("false");
-        if boolean && !dialect.at_least(BOOLEAN_DEFAULT) {
-            return Err(not_built(format!(
-                "a default of `{text}` for a project whose floor is {}: SQLite reads TRUE and FALSE as constants from {BOOLEAN_DEFAULT}",
-                dialect.floor()
             )));
         }
         sql.push_str(" DEFAULT ");
@@ -96,7 +88,7 @@ fn declared_default(column: &Column) -> Result<Option<String>, pbps_dialect::Dia
 /// one only on an empty table, which a plan cannot know), a default that is
 /// `CURRENT_TIMESTAMP` or any expression, and the names `rowid` and `oid`. Those
 /// are the rebuild's, so no statement reaches apply to be refused there.
-fn add(dialect: &Sqlite, table: &TableName, name: &ColumnName, column: &Column) -> Sql {
+fn add(table: &TableName, name: &ColumnName, column: &Column) -> Sql {
     let at = qualified(table)?;
     let mut found = Vec::new();
     validate::column_errors(&table.shown().to_string(), name, column, &mut found);
@@ -129,7 +121,7 @@ fn add(dialect: &Sqlite, table: &TableName, name: &ColumnName, column: &Column) 
         "ALTER TABLE ",
         &at,
         " ADD COLUMN ",
-        &definition(dialect, name, column)?,
+        &definition(name, column)?,
     ]
     .concat();
     Ok(vec![
