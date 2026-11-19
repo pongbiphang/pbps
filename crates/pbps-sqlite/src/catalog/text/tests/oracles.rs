@@ -12,9 +12,9 @@
 
 use pbps_db::sqlite::{Connection, Value};
 
-use super::super::{Kind, Marker, Place, TableText, table};
+use super::super::{Kind, Marker, Place, TableText, index, table, view};
 use super::corpus::{self, Case};
-use super::facts::{agree, facts, rebuilt, stored};
+use super::facts::{agree, agree_index, agree_view, facts, rebuilt, stored};
 use crate::ident;
 use crate::tests::Fresh;
 
@@ -140,6 +140,53 @@ fn o1_a_disagreement_is_seen_in_each_direction() {
         place: Place::Table,
     });
     assert!(agree(&bad, &found).unwrap_err().contains("no index"));
+}
+
+#[test]
+fn o1_every_index_and_view_of_the_corpus_reads_and_agrees() {
+    for case in corpus::accepted(corpus::indexes()) {
+        let mut fresh = Fresh::memory();
+        fresh.connection().execute_batch(case.setup).expect("setup");
+        fresh.connection().execute_batch(&case.sql).expect("index");
+        let (name, sql) = stored(fresh.connection(), "index").remove(0);
+        let text = index(&name, &sql).unwrap_or_else(|e| panic!("{}: {sql}: {e}", case.sql));
+        let found = facts(fresh.connection(), "t");
+        let row = found
+            .indexes
+            .iter()
+            .find(|i| i.name == name)
+            .expect("listed");
+        agree_index(&text, row, "t").unwrap_or_else(|e| panic!("{}: {sql}: {e}", case.sql));
+    }
+    for case in corpus::accepted(corpus::views()) {
+        let mut fresh = Fresh::memory();
+        fresh.connection().execute_batch(case.setup).expect("setup");
+        fresh.connection().execute_batch(&case.sql).expect("view");
+        let (name, sql) = stored(fresh.connection(), "view").remove(0);
+        let text = view(&name, &sql).unwrap_or_else(|e| panic!("{}: {sql}: {e}", case.sql));
+        agree_view(&text, fresh.connection())
+            .unwrap_or_else(|e| panic!("{}: {sql}: {e}", case.sql));
+        // The view rebuilt from its body is the view the engine made.
+        let again = ["CREATE VIEW \"w\" AS ", &text.body].concat();
+        fresh
+            .connection()
+            .execute_batch(&again)
+            .unwrap_or_else(|e| panic!("{again}: {e}"));
+        let c = fresh.connection();
+        let columns = |view: &str| -> Vec<String> {
+            c.query(
+                "SELECT name FROM pragma_table_xinfo(?1) ORDER BY cid",
+                &[Value::Text(view.to_owned())],
+            )
+            .expect("columns")
+            .iter()
+            .map(|r| r.text(0).expect("name").to_owned())
+            .collect()
+        };
+        if text.column_list.is_none() {
+            assert_eq!(columns(&name), columns("w"), "{}", case.sql);
+        }
+    }
 }
 
 #[test]

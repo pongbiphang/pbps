@@ -2,8 +2,11 @@
 //! the subset and compares the whole result, so a field that moves is seen.
 
 use super::super::{
-    Conflict, Constraint, Deferral, Kind, Marked, Marker, Place, Reaction, TableText, Target, table,
+    Conflict, Constraint, Deferral, Kind, Marked, Marker, Place, Reaction, TableText, Target,
+    index, table, view,
 };
+use super::facts::stored;
+use crate::tests::Fresh;
 
 fn t(sql: &str) -> TableText {
     table("t", sql).unwrap_or_else(|e| panic!("{sql}: {e}"))
@@ -435,6 +438,40 @@ fn what_the_engine_rewrites_is_in_the_subset() {
 }
 
 #[test]
+fn an_index_is_its_name_table_entries_and_predicate() {
+    let read = index("i", "CREATE UNIQUE INDEX \"i\" ON \"t\" (\"owner\", \"qty\" DESC, lower(c), (a + b)) WHERE qty IS NOT NULL AND (c <> ')' OR a /* ) */ < 3)").expect("reads");
+    assert_eq!(read.name, "i");
+    assert_eq!(read.table, "t");
+    assert!(read.unique);
+    assert_eq!(read.entries, 4);
+    assert_eq!(
+        read.filter.as_deref(),
+        Some("qty IS NOT NULL AND (c <> ')' OR a /* ) */ < 3)")
+    );
+    let plain = index("i", "CREATE INDEX i ON t(a)").expect("reads");
+    assert!(!plain.unique && plain.filter.is_none() && plain.entries == 1);
+}
+
+#[test]
+fn a_view_is_its_name_column_list_and_body_verbatim() {
+    let read = view(
+        "v",
+        "CREATE VIEW \"v\" AS SELECT a /* ; */ FROM t -- AS\n WHERE b > 0\n",
+    )
+    .expect("reads");
+    assert_eq!(read.name, "v");
+    assert_eq!(read.column_list, None);
+    assert_eq!(read.body, "SELECT a /* ; */ FROM t -- AS\n WHERE b > 0");
+    let listed = view(
+        "v",
+        "CREATE VIEW v (\"x y\", [z]) AS WITH x AS (SELECT 1) SELECT * FROM x",
+    )
+    .expect("reads");
+    assert_eq!(listed.column_list, Some(names(&["x y", "z"])));
+    assert_eq!(listed.body, "WITH x AS (SELECT 1) SELECT * FROM x");
+}
+
+#[test]
 fn generated_and_always_without_an_as_are_words_of_a_type_and_not_a_generated_column() {
     // Neither is reserved, so `generated always` ends a type until an `AS`
     // follows; the engine cuts them from the declared type, and no marker is
@@ -448,5 +485,171 @@ fn generated_and_always_without_an_as_are_words_of_a_type_and_not_a_generated_co
             Marker::Generated { stored: None },
             Target::Column(2)
         )]
+    );
+}
+
+#[test]
+fn an_index_counts_its_entries_by_the_commas_at_its_own_level() {
+    let read = index(
+        "i",
+        "CREATE INDEX i ON t(max(a, b), (c, d) > (1, 2), coalesce(e, 'x,y'))",
+    )
+    .expect("reads");
+    assert_eq!(read.entries, 3);
+}
+
+/// What the engine keeps after the `AS` of a view and the `WHERE` of an index,
+/// as the text stands when it is stored.
+const TAILS: &[(&str, &str)] = &[
+    // (the statement given to the engine, the text expected after the token)
+    ("SELECT a FROM t -- note", "SELECT a FROM t -- note"),
+    ("SELECT a FROM t /* why */", "SELECT a FROM t /* why */"),
+    ("SELECT a FROM t\n-- note\n", "SELECT a FROM t\n-- note"),
+    ("SELECT a FROM t;", "SELECT a FROM t"),
+    ("SELECT a FROM t; -- note", "SELECT a FROM t"),
+    (
+        "SELECT a FROM t /* a */ -- b\n /* c */",
+        "SELECT a FROM t /* a */ -- b\n /* c */",
+    ),
+    ("/* c */ SELECT a FROM t", "/* c */ SELECT a FROM t"),
+    ("-- c\n SELECT a FROM t", "-- c\n SELECT a FROM t"),
+    ("\n\n  SELECT a FROM t   \n\n", "SELECT a FROM t"),
+    ("SELECT a FROM t -- note\n;", "SELECT a FROM t -- note"),
+];
+
+#[test]
+fn a_views_body_runs_from_the_as_to_the_end_of_the_stored_text_comments_included() {
+    for (given, expected) in TAILS {
+        let mut fresh = Fresh::memory();
+        let c = fresh.connection();
+        c.execute_batch("CREATE TABLE t(a int, b int)")
+            .expect("table");
+        c.execute_batch(&["CREATE VIEW v AS ", given].concat())
+            .expect("the engine takes it");
+        let (_, sql) = stored(c, "view").remove(0);
+        let read = view("v", &sql).unwrap_or_else(|e| panic!("{given:?}: {sql:?}: {e}"));
+        assert_eq!(read.body, *expected, "{given:?} stored as {sql:?}");
+        // The stored text ends with what was read, so nothing the engine kept
+        // was cut, and a body begins at the token after `AS`.
+        assert!(
+            sql.ends_with(&read.body),
+            "{sql:?} does not end with {:?}",
+            read.body
+        );
+        // Written back as the emitter writes a body, the engine stores the
+        // same text and the same body comes out: a fixed point.
+        let tail = if read
+            .body
+            .rsplit('\n')
+            .next()
+            .is_some_and(|l| l.contains("--"))
+            && !read.body.ends_with("*/")
+        {
+            "\n"
+        } else {
+            ""
+        };
+        c.execute_batch(&["CREATE VIEW w AS ", &read.body, tail].concat())
+            .expect("rebuilt");
+        let again = stored(c, "view")
+            .into_iter()
+            .find(|(n, _)| n == "w")
+            .expect("w")
+            .1;
+        assert_eq!(
+            view("w", &again).expect("reads").body,
+            read.body,
+            "{given:?}"
+        );
+    }
+}
+
+#[test]
+fn an_indexs_predicate_runs_from_the_where_to_the_end_of_the_stored_text_comments_included() {
+    for (given, expected) in [
+        ("b > 0 -- note", "b > 0 -- note"),
+        ("b > 0 /* why */", "b > 0 /* why */"),
+        ("b > 0\n-- note\n", "b > 0\n-- note"),
+        ("b > 0;", "b > 0"),
+        ("/* c */ b > 0", "/* c */ b > 0"),
+        ("-- c\n b > 0", "-- c\n b > 0"),
+        ("  b > 0   \n", "b > 0"),
+        ("/* d */ b > 0 /* e */ -- f\n", "/* d */ b > 0 /* e */ -- f"),
+        ("b > 0 -- note\n;", "b > 0 -- note"),
+    ] {
+        let mut fresh = Fresh::memory();
+        let c = fresh.connection();
+        c.execute_batch("CREATE TABLE t(a int, b int)")
+            .expect("table");
+        c.execute_batch(&["CREATE INDEX i ON t(a) WHERE ", given].concat())
+            .expect("the engine takes it");
+        let (_, sql) = stored(c, "index").remove(0);
+        let read = index("i", &sql).unwrap_or_else(|e| panic!("{given:?}: {sql:?}: {e}"));
+        assert_eq!(
+            read.filter.as_deref(),
+            Some(expected),
+            "{given:?} stored as {sql:?}"
+        );
+        assert!(
+            sql.trim_end_matches(crate::lexis::is_space)
+                .ends_with(expected),
+            "{sql:?}"
+        );
+        let tail = if expected
+            .rsplit('\n')
+            .next()
+            .is_some_and(|l| l.contains("--"))
+            && !expected.ends_with("*/")
+        {
+            "\n"
+        } else {
+            ""
+        };
+        c.execute_batch(&["CREATE INDEX j ON t(a) WHERE ", expected, tail].concat())
+            .expect("rebuilt");
+        let again = stored(c, "index")
+            .into_iter()
+            .find(|(n, _)| n == "j")
+            .expect("j")
+            .1;
+        assert_eq!(
+            index("j", &again).expect("reads").filter.as_deref(),
+            Some(expected),
+            "{given:?}"
+        );
+    }
+}
+
+#[test]
+fn a_predicate_or_a_body_with_nothing_but_comments_after_the_token_is_refused() {
+    for sql in [
+        "CREATE INDEX i ON t(a) WHERE -- nothing\n",
+        "CREATE INDEX i ON t(a) WHERE /* nothing */",
+    ] {
+        assert!(
+            index("i", sql).unwrap_err().what().contains("no predicate"),
+            "{sql}"
+        );
+    }
+    for sql in [
+        "CREATE VIEW v AS -- nothing\n",
+        "CREATE VIEW v AS /* nothing */",
+    ] {
+        assert!(
+            view("v", sql).unwrap_err().what().contains("no body"),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn a_temporary_view_is_refused_as_one_and_not_as_a_missing_word() {
+    let refused = view("v", "CREATE TEMP VIEW v AS SELECT 1").expect_err("refused");
+    assert!(refused.what().contains("temporary view"), "{refused}");
+    assert!(
+        view("v", "CREATE TEMPORARY VIEW v AS SELECT 1")
+            .unwrap_err()
+            .what()
+            .contains("temporary view")
     );
 }

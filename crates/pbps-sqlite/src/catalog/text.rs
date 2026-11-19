@@ -1,9 +1,10 @@
 //! The tokenizer for what only the stored `CREATE` text holds (#2950, item 4).
 //!
 //! `sqlite_schema.sql` is the one place SQLite keeps constraint names, CHECK
-//! expressions, a default as it was written, and the markers of everything the
-//! model cannot hold in a table. This module reads exactly that, from the text
-//! of a table, and nothing else: structure that a pragma reports (a column's type and
+//! expressions, the predicate of a partial index, a default as it was written,
+//! a view's body, and the markers of everything the model cannot hold. This
+//! module reads exactly that, from the text of a table, an index or a view,
+//! and nothing else: structure that a pragma reports (a column's type and
 //! position, a key's columns, an index's keys, a foreign key's rows) is the
 //! pragmas', and the reader that uses this module checks the two against each
 //! other and refuses a table on which they disagree.
@@ -47,7 +48,15 @@
 //! default    := ["+"|"-"] number | string | blob | NULL | TRUE | FALSE | CURRENT_TIME
 //!               | CURRENT_DATE | CURRENT_TIMESTAMP | "(" expr ")"
 //! option     := WITHOUT ROWID | STRICT
+//! index      := CREATE [UNIQUE] INDEX name ON name "(" entry ("," entry)* ")" [WHERE expr]
+//! view       := CREATE VIEW name ["(" name ("," name)* ")"] AS body
 //! ```
+//!
+//! An index's predicate and a view's body are not found by counting
+//! parentheses: each is everything the engine stored after the `WHERE` or the
+//! `AS`, to the end of the stored text, comments before the first token and after
+//! the last included (measured: the engine keeps them), with only the white
+//! space at the two ends removed.
 //!
 //! A name is a bare word or one of the four quoted forms (`"a"`, `` `a` ``,
 //! `[a]`, `'a'`), and is returned unquoted. A column's type is **skipped, not
@@ -228,6 +237,28 @@ pub(crate) struct TableText {
     pub columns: Vec<String>,
     pub constraints: Vec<Constraint>,
     pub markers: Vec<Marked>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexText {
+    pub name: String,
+    pub table: String,
+    pub unique: bool,
+    /// How many entries the key list holds. What each is, is the pragma's.
+    pub entries: usize,
+    /// Everything stored after `WHERE`, to the end of the stored text (comments
+    /// included), white space trimmed at the two ends only.
+    pub filter: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ViewText {
+    pub name: String,
+    /// The names of a column list, which the model has nowhere to put.
+    pub column_list: Option<Vec<String>>,
+    /// Everything stored after the `AS`, to the end of the stored text
+    /// (comments included), white space trimmed at the two ends only.
+    pub body: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1059,6 +1090,105 @@ fn key_constraint(
         mark_key(out, key, marker);
     }
     Ok(key)
+}
+
+/// The tokenizer's result for the text of an index.
+pub(crate) fn index(object: &str, sql: &str) -> Result<IndexText, Unread> {
+    let mut p = Parser::new(object, sql)?;
+    p.expect_word("create")?;
+    let unique = p.eat_word("unique");
+    p.expect_word("index")?;
+    let name = p.name("the index's name")?;
+    p.expect_word("on")?;
+    let table = p.name("the indexed table's name")?;
+    p.expect_punct('(')?;
+    // Entries are counted, not read: an entry is a column, an expression, a
+    // collation and a direction, and the pragma says which.
+    let mut entries = 0usize;
+    let mut depth = 1usize;
+    let mut filled = false;
+    loop {
+        let Some(tok) = p.peek() else {
+            return Err(p.fail("an index key list that is never closed"));
+        };
+        p.at += 1;
+        if Parser::punct_is(Some(tok), '(') {
+            depth += 1;
+            filled = true;
+        } else if Parser::punct_is(Some(tok), ')') {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                if !filled {
+                    return Err(p.fail("an empty index entry"));
+                }
+                entries += 1;
+                break;
+            }
+            filled = true;
+        } else if depth == 1 && Parser::punct_is(Some(tok), ',') {
+            if !filled {
+                return Err(p.fail("an empty index entry"));
+            }
+            entries += 1;
+            filled = false;
+        } else {
+            filled = true;
+        }
+    }
+    // The predicate is everything the engine stored after the `WHERE`, to the
+    // end of the stored text: comments before the first token and after the
+    // last are kept (measured: the engine keeps them), and only the white
+    // space at the two ends is removed.
+    let filter = if p.eat_word("where") {
+        let from = p.toks.get(p.at - 1).map_or(0, |t| t.end);
+        let text = p.trimmed(from, sql.len());
+        if !lexis::has_token(text) {
+            return Err(p.fail("a `WHERE` with no predicate"));
+        }
+        p.at = p.toks.len();
+        Some(text.to_owned())
+    } else {
+        None
+    };
+    p.done()?;
+    Ok(IndexText {
+        name,
+        table,
+        unique,
+        entries,
+        filter,
+    })
+}
+
+/// The tokenizer's result for the text of a view.
+pub(crate) fn view(object: &str, sql: &str) -> Result<ViewText, Unread> {
+    let mut p = Parser::new(object, sql)?;
+    p.expect_word("create")?;
+    if p.at_word("temp") || p.at_word("temporary") {
+        return Err(p.fail("a temporary view, which is not in the file"));
+    }
+    p.expect_word("view")?;
+    let name = p.name("the view's name")?;
+    let column_list = if p.at_punct('(') {
+        Some(p.name_list("a view column's name")?)
+    } else {
+        None
+    };
+    p.expect_word("as")?;
+    // Everything the engine stored after the `AS`, to the end of the stored
+    // text, comments included (measured), with only the white space at the two
+    // ends removed.
+    let from = p.toks.get(p.at - 1).map_or(0, |t| t.end);
+    let body = p.trimmed(from, sql.len()).to_owned();
+    if !lexis::has_token(&body) {
+        return Err(p.fail("a view with no body"));
+    }
+    p.at = p.toks.len();
+    Ok(ViewText {
+        name,
+        column_list,
+        body,
+    })
 }
 
 #[cfg(test)]

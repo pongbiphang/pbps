@@ -1,4 +1,4 @@
-//! What the engine's pragmas say about a table, and the
+//! What the engine's pragmas say about a table, an index or a view, and the
 //! comparison with what the tokenizer read from the stored text.
 //!
 //! `agree` is the O1 oracle: both directions, on everything both sources can
@@ -9,7 +9,9 @@
 
 use pbps_db::sqlite::{Connection, Record, Value};
 
-use super::super::{Constraint, Kind, Marked, Marker, Place, Reaction, TableText};
+use super::super::{
+    Constraint, IndexText, Kind, Marked, Marker, Place, Reaction, TableText, ViewText,
+};
 use crate::ident;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -380,6 +382,59 @@ pub(in super::super) fn agree(text: &TableText, facts: &Facts) -> Result<(), Str
         }
     }
     Ok(())
+}
+
+/// The same for an index's text and the engine's rows for it.
+pub(in super::super) fn agree_index(
+    text: &IndexText,
+    row: &IndexRow,
+    table: &str,
+) -> Result<(), String> {
+    if text.name != row.name {
+        return Err(format!(
+            "the index is `{}` in the text and `{}` in the engine",
+            text.name, row.name
+        ));
+    }
+    if !ident::same(&text.table, table) {
+        return Err(format!(
+            "the index is on `{}` in the text and `{table}` in the engine",
+            text.table
+        ));
+    }
+    if text.unique != row.unique
+        || text.filter.is_some() != row.partial
+        || text.entries != row.keys.len()
+    {
+        return Err(format!(
+            "the index flags or entry count differ: {text:?} against {row:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// The same for a view: a column list agrees with the columns the engine finds.
+pub(in super::super) fn agree_view(text: &ViewText, c: &Connection) -> Result<(), String> {
+    // A view that names what is not there has no columns to count: the engine
+    // creates it all the same, and there is nothing to compare.
+    let Some(list) = &text.column_list else {
+        return Ok(());
+    };
+    let Ok(columns) = c.query(
+        "SELECT count(*) FROM pragma_table_xinfo(?1)",
+        &[Value::Text(text.name.clone())],
+    ) else {
+        return Ok(());
+    };
+    let found = int(&columns[0], 0);
+    if list.len() as i64 == found {
+        Ok(())
+    } else {
+        Err(format!(
+            "a view column list of {} names, {found} columns in the engine",
+            list.len()
+        ))
+    }
 }
 
 /// A name written back as one quoted name.
