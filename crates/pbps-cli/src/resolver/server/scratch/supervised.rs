@@ -119,7 +119,6 @@ impl<D: PlanningDialect> Request<D> {
         )
         .await?;
         let mut run = Run {
-            driver: D::DRIVER,
             planned_identity: &planned_identity,
             key: &key,
             request: &scope,

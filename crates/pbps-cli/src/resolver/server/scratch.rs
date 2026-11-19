@@ -28,14 +28,14 @@
 use super::producer::{Identity, Opening, Sealing, Unsealed, request};
 use super::{BindingRequest, Error, ProduceError, ResolvedPlan, engine, resolution};
 use crate::resolver::contract::{self, PreparedView, ResolverEngine, Sealable};
-use crate::resolver::scope;
+use pbps_db::Conn;
 use pbps_db::resolver::environment::Verdict;
-use pbps_db::{Conn, Driver};
 use pbps_model::Hints;
 use pbps_model::resolver::{OutsideWrites, ResolverRuntime, ScratchLayout, ScratchSource};
 
 pub use super::engine::{
-    Binding, CapturedInputs, CompiledCapture, Prepared, Staged, Standard, declared_standard,
+    Binding, CapturedInputs, CompiledCapture, History, Prepared, Staged, Standard,
+    declared_standard,
 };
 
 pub mod domain;
@@ -211,7 +211,6 @@ pub enum Provisioning {
 }
 
 struct Run<'a, D: super::PlanningDialect> {
-    driver: Driver,
     planned_identity: &'a str,
     key: &'a pbps_db::fingerprint::EnvironmentFingerprintKey,
     request: &'a super::ScopeRequest,
@@ -240,25 +239,26 @@ impl<D: super::PlanningDialect> Run<'_, D> {
         ),
         Error,
     > {
-        let driver = self.driver;
         let request = self.request;
         let db = |what: &'static str| {
             move |error: pbps_db::DbError| Error::Read(format!("{what}: {error}"))
         };
-        let scope_schemas =
-            scope::scope_schemas(driver, &request.schemas, &request.write_path_extras)
-                .map_err(Error::Scope)?;
-        // The target as its own deployer sees it, in one snapshot.
-        let (mut target_catalog, authorization, history) = scope::read_target_with_history(
-            target,
-            driver,
+        let scope_schemas = <D::Resolver as ResolverEngine>::scope_schemas(
             &request.schemas,
             &request.write_path_extras,
-            &scope_schemas,
-            &request.planned,
         )
-        .await
-        .map_err(db("the target's analysis scope"))?;
+        .map_err(Error::Scope)?;
+        // The target as its own deployer sees it, in one snapshot.
+        let (mut target_catalog, authorization, history) =
+            <D::Resolver as ResolverEngine>::read_target_with_history(
+                target,
+                &request.schemas,
+                &request.write_path_extras,
+                &scope_schemas,
+                &request.planned,
+            )
+            .await
+            .map_err(db("the target's analysis scope"))?;
         let ambiguous = authorization.unpredictable(&request.planned);
         if !ambiguous.is_empty() {
             return Err(Error::Scope(format!(
@@ -297,8 +297,9 @@ impl<D: super::PlanningDialect> Run<'_, D> {
                 pbps_db::resolver::Observation::Observed { value: build },
             );
         }
-        let mut report = scope::compare_reported(driver, &target_catalog, prepared.catalog())
-            .map_err(Error::Scope)?;
+        let mut report =
+            <D::Resolver as ResolverEngine>::compare_reported(&target_catalog, prepared.catalog())
+                .map_err(Error::Scope)?;
         for key in prepared.differences() {
             report.facts.insert(
                 format!("authorization:{key}"),
@@ -309,7 +310,7 @@ impl<D: super::PlanningDialect> Run<'_, D> {
             );
         }
         let mut limitations = report.limitations.clone();
-        if let Some((name, reason)) = history.limitation() {
+        if let Some((name, reason)) = <D::Resolver as ResolverEngine>::limitation(&history) {
             limitations.insert(name.into(), reason.into());
         }
         match report.verdict() {
@@ -513,7 +514,6 @@ impl<D: super::PlanningDialect> Run<'_, D> {
         };
         let recheck = Opening {
             history,
-            driver,
             request: request.clone(),
             scope_schemas,
             current,

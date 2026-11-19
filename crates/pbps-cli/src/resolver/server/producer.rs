@@ -234,8 +234,7 @@ pub struct Unsealed<D: super::PlanningDialect = pbps_pg::Postgres> {
 
 /// What the run read on the target, for the publication recheck.
 pub(super) struct Opening<D: super::PlanningDialect> {
-    pub history: scope::History,
-    pub driver: pbps_db::Driver,
+    pub history: <D::Resolver as ResolverEngine>::History,
     pub request: ScopeRequest,
     pub scope_schemas: Vec<String>,
     /// The opening capture: its scope, which holds the externals file's staged
@@ -313,16 +312,16 @@ impl<D: super::PlanningDialect> Unsealed<D> {
             ]);
         }
         let request = &self.opening.request;
-        let (catalog, authorization, history) = scope::read_target_with_history(
-            target,
-            self.opening.driver,
-            &request.schemas,
-            &request.write_path_extras,
-            &self.opening.scope_schemas,
-            &request.planned,
-        )
-        .await
-        .map_err(read("analysis scope"))?;
+        let (catalog, authorization, history) =
+            <D::Resolver as ResolverEngine>::read_target_with_history(
+                target,
+                &request.schemas,
+                &request.write_path_extras,
+                &self.opening.scope_schemas,
+                &request.planned,
+            )
+            .await
+            .map_err(read("analysis scope"))?;
         #[cfg(test)]
         let catalog = {
             let mut catalog = catalog;
@@ -350,9 +349,7 @@ impl<D: super::PlanningDialect> Unsealed<D> {
             changed.push("the target's staged authorization condition".into());
         }
         changed.extend(
-            self.opening
-                .history
-                .differences(&history)
+            <D::Resolver as ResolverEngine>::history_differences(&self.opening.history, &history)
                 .map_err(read("catalog history"))?,
         );
         let differences = <D::Resolver as ResolverEngine>::recapture(target, &self.opening.current)

@@ -3,6 +3,7 @@
 
 use super::super::scratch::{Provenance, Provisioning, Tokens};
 use super::super::{BindingRequest, Error, ProduceError, ScopeRequest};
+use crate::resolver::contract::ResolverEngine;
 use crate::resolver::scope;
 use pbps_db::resolver::ScratchNames;
 use pbps_db::resolver::environment::CatalogFacts;
@@ -682,8 +683,7 @@ impl Scratch<'_> {
             dependencies::read(target_connection, binding.dependencies, real)
                 .await
                 .map_err(read)?;
-        let recipe = scope::recipe(Driver::Mssql, target)
-            .map_err(|error| Error::Scope(error.to_string()))?;
+        let recipe = <MssqlResolver as ResolverEngine>::recipe(target).map_err(Error::Scope)?;
         let Acquired {
             mut owner,
             database,
@@ -895,9 +895,10 @@ impl Scratch<'_> {
         auth::apply_planned(&mut compile, &map, &planned)
             .await
             .map_err(read)?;
-        let scratch_catalog = scope::read_catalog(&mut compile, Driver::Mssql, schemas, &[])
-            .await
-            .map_err(read)?;
+        let scratch_catalog =
+            <MssqlResolver as ResolverEngine>::read_catalog(&mut compile, schemas, &[])
+                .await
+                .map_err(read)?;
         let managed_ids = required.managed().clone();
         self.chained = Some(required);
         let chaining = chained::Chaining {
@@ -1514,7 +1515,7 @@ mod tests {
             ("product_version", Some("17.0.4075.5")),
             ("engine_edition", Some("5")),
         ]);
-        let report = scope::compare_reported(Driver::Mssql, &boxed, &hosted).unwrap();
+        let report = <MssqlResolver as ResolverEngine>::compare_reported(&boxed, &hosted).unwrap();
         assert_eq!(report.rule.as_str(), resolver::compatibility::REPORTED_RULE);
         let Verdict::Unknown(unknown) = report.verdict() else {
             panic!(
@@ -1535,7 +1536,8 @@ mod tests {
             ("engine_edition", Some("3")),
             ("edition", Some("Enterprise Developer Edition (64-bit)")),
         ]);
-        let report = scope::compare_reported(Driver::Mssql, &developer, &express).unwrap();
+        let report =
+            <MssqlResolver as ResolverEngine>::compare_reported(&developer, &express).unwrap();
         assert!(
             report.limitations["edition"].contains("Express Edition"),
             "{:?}",

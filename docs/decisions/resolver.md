@@ -6878,3 +6878,42 @@ Pinned by `each_engine_states_the_facts_its_evidence_is_sealed_under`, the scans
 of `resolution.rs` and `transitions.rs` with their planted-token cases, the
 publication tests of the earlier changes, and the live recheck and seal tests of
 both engines. Formats: none. No sealed bytes, plan, state or evidence change.
+
+<a id="dec-2798-13"></a>
+
+**DEC-2798.13. The target observation is the engine's, and the run-local history
+is typed by it (#2798, route step 3).** DEC-2798.12 left the scope group as the
+last place the resolver compared a driver to decide what a deployer sees of the
+target. The group moves in parts; the first moves what the run reads of the
+target and its history, and keeps the authorization the reads return as the
+two-engine union until the part that types it.
+
+**What moved.** `scope_schemas`, `read_catalog`, `read_target`,
+`read_target_with_history`, `recipe` and `compare_reported` are
+`ResolverEngine` functions; each engine's arm moved from `scope.rs` with its
+predicate, its connection and its message unchanged (SQL Server still refuses
+write-path extras, still resolves the planned principals to the catalog's
+spelling within each bracketed read, still reads no history). The reads return
+the engine's own `Authorization` variant exactly where the old `match` built it,
+so no new path hands out an authorization. The recipe's refusal is the engine's
+own text as a string (the caller wrapped the same text in `Error::Scope`).
+`History` is an associated type: PostgreSQL's witness, SQL Server's unit (it
+keeps none), and uninhabited for an engine without a resolver. Comparing two
+histories of one engine is infallible and the old refusal "the target catalog
+history changed engine" is not representable, so a path that compared a
+PostgreSQL witness with SQL Server's can no longer answer by a catch-all.
+
+**What went with them.** The driver value the run and its recheck carried only
+to hand to these reads (`Run.driver`, `Opening.driver`) is deleted, and
+`scratch.rs` joins the files whose production code a scan keeps engine-free. An
+engine without a resolver answers every read by refusing by name, and its
+recipe and comparison likewise.
+
+**What does not move yet.** The `Authorization` union and its methods, the
+measured condition, the principals and their reproduction stay in `scope.rs`
+and the adapters until the parts that type them.
+
+Pinned by the `compile_fail` doctest beside a compiling one on `History<D>`,
+the stand-in engine's refusals, the engines' own authorization-scope test and
+the live recheck tests of both engines. Formats: none. No sealed bytes, plan,
+state or evidence change.

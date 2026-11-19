@@ -212,6 +212,24 @@ fn apply_and_producer_seal_under_one_cluster_domain() {
     assert_ne!(pg, ms, "the engines must not share a cluster domain");
 }
 
+/// SQL Server has no write path; PostgreSQL's carries its extras into the
+/// authorization scope without the `pg_temp` alias or a duplicate.
+#[test]
+fn the_authorization_scope_is_the_engines_own() {
+    use super::contract::ResolverEngine;
+    type Pg = <pbps_pg::Postgres as PlanningDialect>::Resolver;
+    type Ms = <pbps_mssql::Mssql as PlanningDialect>::Resolver;
+    let schemas = ["app".to_owned()];
+    let extras = ["ext".to_owned(), "pg_temp".to_owned(), "app".to_owned()];
+    assert_eq!(
+        Pg::scope_schemas(&schemas, &extras).unwrap(),
+        ["app", "ext"]
+    );
+    assert_eq!(Ms::scope_schemas(&schemas, &[]).unwrap(), ["app"]);
+    let refused = Ms::scope_schemas(&schemas, &extras).unwrap_err();
+    assert!(refused.contains("no write path"), "{refused}");
+}
+
 /// The seal reads these where it once matched the driver: a string that moved
 /// to the wrong engine would key one engine's evidence under the other's rule.
 #[test]
@@ -371,6 +389,44 @@ async fn a_resolver_that_does_not_exist_acquires_nothing_and_names_the_engine() 
         matches!(&endpoint, super::server::ProduceError::Acquire(why)
             if why == "Stand-in does not support resolver-backed planning"),
         "{endpoint}"
+    );
+}
+
+/// The reads a run makes of the target are refused by name for an engine that
+/// has no resolver, whichever of them is asked first, and refuse as the
+/// engine's own answer rather than reading as an empty scope.
+#[tokio::test]
+async fn a_resolver_that_does_not_exist_reads_no_scope_and_names_the_engine() {
+    use super::contract::ResolverEngine;
+    type Missing = <MinimalDialect as PlanningDialect>::Resolver;
+    let named = "Stand-in does not support resolver-backed planning";
+    assert_eq!(Missing::scope_schemas(&[], &[]).unwrap_err(), named);
+    let facts = pbps_db::resolver::environment::CatalogFacts {
+        observations: Default::default(),
+        extensions: Vec::new(),
+        available_extensions: Default::default(),
+        collations: Vec::new(),
+        settings: Default::default(),
+        visibility: Default::default(),
+    };
+    assert_eq!(Missing::recipe(&facts).err().unwrap(), named);
+    assert_eq!(
+        Missing::compare_reported(&facts, &facts).err().unwrap(),
+        named
+    );
+}
+
+/// SQL Server keeps no run-local history, so a recheck of its target has no
+/// history difference to find and no limitation to name; that is its answer,
+/// not a gap, and it is stated by the engine.
+#[test]
+fn sql_server_has_no_history_and_says_so() {
+    use super::contract::ResolverEngine;
+    type Ms = <pbps_mssql::Mssql as PlanningDialect>::Resolver;
+    assert_eq!(Ms::limitation(&()), None);
+    assert_eq!(
+        Ms::history_differences(&(), &()).unwrap(),
+        Vec::<String>::new()
     );
 }
 

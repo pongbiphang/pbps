@@ -39,10 +39,7 @@ impl Case {
     ) {
         let schemas = vec![cases::SCHEMA.to_owned()];
         let mut reader = Conn::connect(Driver::Postgres, &self.target).await.unwrap();
-        crate::resolver::scope::read_target(
-            &mut reader,
-            Driver::Postgres,
-            &schemas,
+        <crate::resolver::server::scratch::engines::PgEngine as crate::resolver::contract::ResolverEngine>::read_target(&mut reader, &schemas,
             &[],
             &schemas,
             &[],

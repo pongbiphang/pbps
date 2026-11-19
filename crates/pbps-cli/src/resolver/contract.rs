@@ -18,7 +18,7 @@ use crate::resolver::server::scratch::{Provenance, Provisioning, Tokens};
 use crate::resolver::server::{BindingRequest, Error, PlanningDialect, ProduceError, ScopeRequest};
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
 use pbps_db::resolver::capture::{Assessment, CaptureDifference, CaptureError};
-use pbps_db::resolver::environment::CatalogFacts;
+use pbps_db::resolver::environment::{CatalogFacts, DatabaseRecipe, ScopeReport};
 use pbps_db::{Conn, DbError};
 use pbps_model::dependency::Dependencies;
 use pbps_model::dependency::DependencyName;
@@ -89,6 +89,10 @@ pub enum RehearsalRequest {
 /// Target-less dev rehearsal. The operation itself moves in a later change.
 pub struct Preview;
 
+/// What a read of the target answers beside its catalog: the deployer's
+/// authorization and the run-local history of the read.
+pub type TargetRead<H> = (CatalogFacts, scope::Authorization, H);
+
 /// What one engine supports. Written out in full per engine: there is no
 /// default, so a new operation cannot silently read as unsupported or
 /// supported.
@@ -151,6 +155,10 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
     type CompiledCapture: Sealable + Send + Sync;
     /// The opening capture the publication recheck captures again.
     type CapturedInputs: Send + Sync;
+    /// Run-local history beside the reported scope; never saved or
+    /// fingerprinted, but it decides the recheck's verdict: a missing
+    /// difference is a weaker recheck.
+    type History: Send + Sync;
 
     /// The catalog classes a surface's creation-time record may have in this
     /// engine, or `None` where the engine has no mapping for it.
@@ -332,6 +340,55 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
     /// The planning dialect the binding was generated under, from the same
     /// measured capability reconstruction used.
     fn dialect(binding: &Self::Binding, extras: &[String]) -> Self::Dialect;
+    /// Static authorization seeds for a request. PostgreSQL adds write-path
+    /// extras without the nonpersistent `pg_temp` alias. SQL Server's connected
+    /// reader adds and qualifies dbo/default fallback questions (DEC-717.1),
+    /// including known absence; its static seeds are not the frozen domain.
+    /// SQL Server write-path extras still describe no supported path and refuse.
+    fn scope_schemas(schemas: &[String], extras: &[String]) -> Result<Vec<String>, String>;
+    /// The catalog facts of one side, as the connection's current principal.
+    fn read_catalog<'a>(
+        connection: &'a mut Conn,
+        schemas: &'a [String],
+        extras: &'a [String],
+    ) -> Step<'a, Result<CatalogFacts, DbError>>;
+    /// The target's catalog facts and its deployer's authorization context,
+    /// read together so the sealed scope never holds half of a change: one
+    /// catalog snapshot on PostgreSQL, a bracketed double read on SQL Server,
+    /// whose catalog views no transaction makes a snapshot.
+    fn read_target<'a>(
+        connection: &'a mut Conn,
+        schemas: &'a [String],
+        extras: &'a [String],
+        authorization_schemas: &'a [String],
+        planned: &'a [scope::PlannedGrant],
+    ) -> Step<'a, Result<(CatalogFacts, scope::Authorization), DbError>>;
+    /// The producer's opening/recheck route, with a complete PostgreSQL
+    /// sidecar. Ordinary reads and apply retain `read_target`'s existing
+    /// endpoint-value contract.
+    fn read_target_with_history<'a>(
+        connection: &'a mut Conn,
+        schemas: &'a [String],
+        extras: &'a [String],
+        authorization_schemas: &'a [String],
+        planned: &'a [scope::PlannedGrant],
+    ) -> Step<'a, Result<TargetRead<Self::History>, DbError>>;
+    /// How the scratch database must be created to stand in for the target's.
+    /// `Err` is why it cannot be, and says so.
+    fn recipe(catalog: &CatalogFacts) -> Result<DatabaseRecipe, String>;
+    /// The resolver's rule over what both sides report, which observes no
+    /// process (#1672).
+    fn compare_reported(
+        target: &CatalogFacts,
+        resolver: &CatalogFacts,
+    ) -> Result<ScopeReport, String>;
+    /// What the run-local history says the compared rule cannot, by name.
+    fn limitation(history: &Self::History) -> Option<(&'static str, &'static str)>;
+    /// What the target's history shows changed between two reads of it.
+    fn history_differences(
+        before: &Self::History,
+        after: &Self::History,
+    ) -> Result<Vec<String>, DbError>;
     /// The externals the base and the plan read are the target's, as for
     /// the resolver: a file that stages something else would rehearse a
     /// plan on a state the target does not hold. The comparison needs the
@@ -451,6 +508,7 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
     type Staged = Never;
     type CompiledCapture = Never;
     type CapturedInputs = Never;
+    type History = Never;
 
     fn binding_classes(_: &Surface) -> Option<&'static [&'static str]> {
         None
@@ -626,6 +684,52 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
     }
     fn dialect(binding: &Never, _: &[String]) -> D {
         match *binding {}
+    }
+    fn scope_schemas(_: &[String], _: &[String]) -> Result<Vec<String>, String> {
+        Err(refusal::<D>().to_string())
+    }
+    fn read_catalog<'a>(
+        _: &'a mut Conn,
+        _: &'a [String],
+        _: &'a [String],
+    ) -> Step<'a, Result<CatalogFacts, DbError>> {
+        Box::pin(std::future::ready(Err(DbError::Refused(
+            refusal::<D>().to_string(),
+        ))))
+    }
+    fn read_target<'a>(
+        _: &'a mut Conn,
+        _: &'a [String],
+        _: &'a [String],
+        _: &'a [String],
+        _: &'a [scope::PlannedGrant],
+    ) -> Step<'a, Result<(CatalogFacts, scope::Authorization), DbError>> {
+        Box::pin(std::future::ready(Err(DbError::Refused(
+            refusal::<D>().to_string(),
+        ))))
+    }
+    fn read_target_with_history<'a>(
+        _: &'a mut Conn,
+        _: &'a [String],
+        _: &'a [String],
+        _: &'a [String],
+        _: &'a [scope::PlannedGrant],
+    ) -> Step<'a, Result<TargetRead<Never>, DbError>> {
+        Box::pin(std::future::ready(Err(DbError::Refused(
+            refusal::<D>().to_string(),
+        ))))
+    }
+    fn recipe(_: &CatalogFacts) -> Result<DatabaseRecipe, String> {
+        Err(refusal::<D>().to_string())
+    }
+    fn compare_reported(_: &CatalogFacts, _: &CatalogFacts) -> Result<ScopeReport, String> {
+        Err(refusal::<D>().to_string())
+    }
+    fn limitation(history: &Never) -> Option<(&'static str, &'static str)> {
+        match *history {}
+    }
+    fn history_differences(before: &Never, _: &Never) -> Result<Vec<String>, DbError> {
+        match *before {}
     }
     fn rehearsal_base<'a>(
         scratch: &'a Never,

@@ -229,10 +229,7 @@ async fn on_scratch(target: &str, scratch: &str) -> String {
     )
     .await
     .unwrap();
-    let (catalog, authorization) = crate::resolver::scope::read_target(
-        &mut target_conn,
-        Driver::Mssql,
-        &schemas,
+    let (catalog, authorization) = <crate::resolver::server::scratch::engines::MssqlEngine as crate::resolver::contract::ResolverEngine>::read_target(&mut target_conn, &schemas,
         &[],
         &schemas,
         &[],

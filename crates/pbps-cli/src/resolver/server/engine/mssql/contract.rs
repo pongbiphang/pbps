@@ -12,7 +12,7 @@ use super::{Binding, Closing, Prepared, Scratch};
 use crate::resolver::contract::{
     ApplyRecheck, BindingView, ClosingInputs, ClusterDomain, FactsError, GrantRecheck, Phase,
     Planning, PreparedView, Preview, Rehearsal, RehearsalRequest, Replay, ResolverEngine, Sealable,
-    Step, Support, sealed::Sealed,
+    Step, Support, TargetRead, sealed::Sealed,
 };
 use crate::resolver::scope;
 use crate::resolver::server::scratch::rehearse::Roles;
@@ -20,7 +20,7 @@ use crate::resolver::server::scratch::{Provenance, Provisioning, Tokens};
 use crate::resolver::server::{BindingRequest, Error, PlanningDialect, ProduceError, ScopeRequest};
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
 use pbps_db::resolver::capture::{Assessment, CaptureDifference, CaptureError};
-use pbps_db::resolver::environment::CatalogFacts;
+use pbps_db::resolver::environment::{CatalogFacts, DatabaseRecipe, ScopeReport};
 use pbps_db::{Conn, DbError, Driver};
 use pbps_model::dependency::DependencyName;
 use pbps_model::operation::Captured;
@@ -74,6 +74,7 @@ impl ResolverEngine for MssqlResolver {
     type Staged = pbps_mssql::resolver::capture::Staged;
     type CompiledCapture = Box<Closing>;
     type CapturedInputs = pbps_mssql::resolver::capture::CapturedInputs;
+    type History = ();
 
     fn binding_classes(surface: &Surface) -> Option<&'static [&'static str]> {
         pbps_mssql::resolver::binding_classes(surface)
@@ -349,6 +350,91 @@ impl ResolverEngine for MssqlResolver {
         }
     }
 
+    fn scope_schemas(schemas: &[String], extras: &[String]) -> Result<Vec<String>, String> {
+        if extras.is_empty() {
+            Ok(schemas.to_vec())
+        } else {
+            Err(format!(
+                "SQL Server has no write path, so a scope cannot carry write-path extras: {}",
+                extras.join(", ")
+            ))
+        }
+    }
+
+    fn read_catalog<'a>(
+        connection: &'a mut Conn,
+        schemas: &'a [String],
+        _: &'a [String],
+    ) -> Step<'a, Result<CatalogFacts, DbError>> {
+        Box::pin(async move {
+            let scope = pbps_mssql::resolver::environment::Scope { schemas };
+            pbps_mssql::resolver::environment::read(connection, &scope).await
+        })
+    }
+
+    fn read_target<'a>(
+        connection: &'a mut Conn,
+        schemas: &'a [String],
+        _: &'a [String],
+        authorization_schemas: &'a [String],
+        planned: &'a [scope::PlannedGrant],
+    ) -> Step<'a, Result<(CatalogFacts, scope::Authorization), DbError>> {
+        Box::pin(async move {
+            let scope = pbps_mssql::resolver::environment::Scope { schemas };
+            // The planned grants' principals are resolved to the catalog's
+            // spelling within each bracketed read (#726).
+            let names: Vec<pbps_model::RoleName> =
+                planned.iter().map(|g| g.principal.clone()).collect();
+            let (catalog, authorization) = pbps_mssql::resolver::scope_facts(
+                connection,
+                &scope,
+                authorization_schemas,
+                &names,
+            )
+            .await?;
+            Ok((
+                catalog,
+                scope::Authorization::Mssql(Box::new(authorization)),
+            ))
+        })
+    }
+
+    fn read_target_with_history<'a>(
+        connection: &'a mut Conn,
+        schemas: &'a [String],
+        extras: &'a [String],
+        authorization_schemas: &'a [String],
+        planned: &'a [scope::PlannedGrant],
+    ) -> Step<'a, Result<TargetRead<Self::History>, DbError>> {
+        Box::pin(async move {
+            let (catalog, authorization) =
+                Self::read_target(connection, schemas, extras, authorization_schemas, planned)
+                    .await?;
+            Ok((catalog, authorization, ()))
+        })
+    }
+
+    fn recipe(catalog: &CatalogFacts) -> Result<DatabaseRecipe, String> {
+        DatabaseRecipe::from_sql_server_catalog(catalog).map_err(|error| error.to_string())
+    }
+
+    fn compare_reported(
+        target: &CatalogFacts,
+        resolver: &CatalogFacts,
+    ) -> Result<ScopeReport, String> {
+        Ok(pbps_mssql::resolver::compatibility::compare_reported(
+            target, resolver,
+        ))
+    }
+
+    fn limitation(_: &Self::History) -> Option<(&'static str, &'static str)> {
+        None
+    }
+
+    fn history_differences(_: &Self::History, _: &Self::History) -> Result<Vec<String>, DbError> {
+        Ok(Vec::new())
+    }
+
     fn through_shape_view(_: &Self::Staged, error: Error) -> Error {
         error
     }
@@ -517,7 +603,7 @@ impl ApplyRecheck for MssqlResolver {
     }
 
     fn scope_schemas(&self, schemas: &[String], extras: &[String]) -> Result<Vec<String>, String> {
-        scope::scope_schemas(Driver::Mssql, schemas, extras)
+        <Self as ResolverEngine>::scope_schemas(schemas, extras)
     }
 
     fn recheck_opening<'a>(
@@ -575,9 +661,8 @@ impl ApplyRecheck for MssqlResolver {
             let planned = scope::planned_schema_grants(r.changes)
                 .map_err(|why| FactsError::Refused(format!("the plan's own grants: {why}")))?;
             async {
-                let (catalog, read) = scope::read_target(
+                let (catalog, read) = <Self as ResolverEngine>::read_target(
                     conn,
-                    Driver::Mssql,
                     &target.schemas,
                     &target.write_path_extras,
                     r.scope_schemas,

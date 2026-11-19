@@ -835,10 +835,7 @@ async fn reference_held() {
     ))
     .await
     .unwrap();
-    let (catalog, authorization) = crate::resolver::scope::read_target(
-        &mut target,
-        Driver::Mssql,
-        &request.schemas,
+    let (catalog, authorization) = <crate::resolver::server::scratch::engines::MssqlEngine as crate::resolver::contract::ResolverEngine>::read_target(&mut target, &request.schemas,
         &[],
         &request.schemas,
         &[],
@@ -970,10 +967,7 @@ async fn prepared(
     )
     .await
     .unwrap();
-    let (catalog, authorization) = crate::resolver::scope::read_target(
-        &mut target,
-        Driver::Mssql,
-        &request.schemas,
+    let (catalog, authorization) = <crate::resolver::server::scratch::engines::MssqlEngine as crate::resolver::contract::ResolverEngine>::read_target(&mut target, &request.schemas,
         &[],
         &request.schemas,
         &[],

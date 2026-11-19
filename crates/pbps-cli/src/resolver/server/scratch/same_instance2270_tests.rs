@@ -145,8 +145,7 @@ async fn automatic_externals(default: &'static str) {
             &request, &(), None, &p,
         ).await.unwrap();
         assert_eq!(provisioning, super::super::Provisioning::Supplied);
-        let (catalog, authorization) = crate::resolver::scope::read_target(
-            &mut target, Driver::Mssql, &request.schemas, &[], &request.schemas, &[],
+        let (catalog, authorization) = <crate::resolver::server::scratch::engines::MssqlEngine as crate::resolver::contract::ResolverEngine>::read_target(&mut target, &request.schemas, &[], &request.schemas, &[],
         ).await.unwrap();
         let prepared = MssqlEngine::prepare(&mut state, provisioning, &mut admin, &mut target, &catalog, &authorization, &request.schemas, &binding, &[], Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key())).await;
         let checked = async {
