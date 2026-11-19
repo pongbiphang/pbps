@@ -7,6 +7,11 @@
 
 pub mod apply;
 
+mod contract;
+pub use contract::{
+    CannotRecheck, NoResolver, Operation, Unsupported, planning, preview, rehearsal,
+};
+
 pub mod scope;
 
 pub mod server;
@@ -15,3 +20,6 @@ pub mod sealing;
 
 #[cfg(test)]
 pub(crate) mod generated_fixtures;
+
+#[cfg(test)]
+mod contract_tests;

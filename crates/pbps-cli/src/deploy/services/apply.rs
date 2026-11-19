@@ -130,6 +130,7 @@ pub(in crate::deploy) async fn apply_async(
             plan,
             pbps_cli::resolver::sealing::environment_key(project, target.environment()),
             &target.label,
+            dialect,
         )?;
         let mut session = Default::default();
         let deployment = Deployment {

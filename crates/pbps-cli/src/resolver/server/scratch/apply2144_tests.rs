@@ -107,6 +107,7 @@ fn keyed<'a>(saved: &'a pbps_model::SavedPlan, run: &Begun) -> Keyed<'a> {
         saved,
         crate::resolver::sealing::environment_key(&run.key.project, Some(ENVIRONMENT)),
         "issue-2144",
+        &pbps_mssql::Mssql,
     )
     .unwrap()
     .expect("a resolved plan")
@@ -461,6 +462,7 @@ async fn mssql_another_key_or_another_instance_refuses_before_anything_is_read()
                 &saved,
                 crate::resolver::sealing::environment_key(&other.project, Some(ENVIRONMENT)),
                 "issue-2144",
+                &pbps_mssql::Mssql,
             )
             .err()
             .expect("another key must refuse")

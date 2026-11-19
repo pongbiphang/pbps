@@ -6555,3 +6555,64 @@ Pinned by the offline refusal tests (both files, one file, neither flag, a run
 that skips the rehearsal) and the live SQL Server tests (a non-converging
 computed column, with and without `--sql`; a converging run). Formats: none.
 No sealed bytes, plan, state or evidence change.
+
+<a id="dec-2798-5"></a>
+
+**DEC-2798.5. An engine states what its resolver supports once, at its
+dialect; the resolved-apply recheck is an object-safe trait, and an engine
+without one is refused by name (#2798, route step 3).** The resolver asked
+"which engine?" in about thirty places by comparing a `Driver`, and a third
+engine would have added an arm to each. `PlanningDialect` now names
+`type Resolver: ResolverEngine<Dialect = Self>` and `const NAME`, chosen in the
+engine's own `impl`. Every caller already holds the concrete dialect (the
+command code is expanded once per engine by `with_plan_dialect!`), so no
+driver-keyed table is added: a second selection would need a test that the two
+agree, and none is needed when there is one.
+
+**The contract.** `resolver::contract` holds `Support`, one value per engine:
+`planning`, `rehearsal`, `preview` and `apply`, each an `Option<&'static …>`.
+Absence is the answer, not a flag beside a placeholder, and the facts are handed
+out only by the admission function that can refuse (`planning`, `rehearsal`,
+`preview`, `apply`), so nothing holds a fact it did not admit. An engine with no
+resolver writes `type Resolver = NoResolver<Self>`; `Support` has no default, so
+a new operation is a compile error in every engine rather than a silent "no".
+The refusals are `{engine} does not support resolver-backed planning`,
+`… connected rehearsal`, `… target-less dev rehearsal`, and `{engine} cannot
+recheck this plan's resolver evidence`. The first three are unanswerable (the
+rehearsal one names `rehearse: false` and `--no-rehearse` as the way out; it is
+refused, never skipped, because an unsupported rehearsal is not a passed one).
+
+**Why the recheck is a trait object and the lifecycle will not be.**
+`ApplyRecheck` takes the serialized evidence and returns strings and manifests
+that the neutral guard compares with the sealed ones; it holds no brand and no
+sealed state, and its callers are generic over `ApplySession`, a different
+trait, so a typed contract would force a `PlanningDialect` bound onto about ten
+apply functions. The scratch lifecycle is the opposite: its states are
+engine-branded, adjacent steps hand them to each other, and the sealed capture
+is consumed exactly once, so they are typed through `PlanningDialect::Resolver`
+as associated types, where a mixed pair does not compile instead of reaching a
+runtime arm. Evidence-bearing state is never erased behind `dyn Any`.
+
+**Why apply goes first.** `resolver::apply` needs only the engine crates' calls
+and the scope reads, has the smallest surface and is the most security-sensitive
+file, so it moves before the scope and authorization state, which would
+otherwise need a bridge enum. The bodies moved from it are unchanged: the same
+calls in the same order on the apply's own connection, and every engine error
+still becomes `Guard::unreadable`, because an unreadable input is not an
+unchanged one.
+
+**Absence is a named refusal.** A resolved plan on an engine with no recheck is
+refused by `Keyed::check`, after the plan is known to be resolved and before the
+key is read or anything connects. It never falls through to an ordinary apply,
+which would drop the check the evidence exists for; an ordinary plan returns
+`None` before the engine is consulted.
+
+**Changed text.** The target-less dev refusal now reads `{engine} does not
+support target-less dev rehearsal`, with the remedy sentence after it and the
+finding id `rehearsal.unavailable` unchanged. Nothing serialized changes: no
+rule string, domain, evidence field or format number.
+
+Pinned by `resolver::contract_tests` (the engine named in each refusal, the
+refusal ahead of the key, the ordinary plan untouched, one cluster domain for
+planning and apply), the offline explain and flow tests, and the live apply
+tests of both engines. Formats: none.

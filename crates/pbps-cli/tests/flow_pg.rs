@@ -10978,7 +10978,7 @@ fn postgres_rehearsals_refuse_before_connecting_or_starting_a_container() {
         let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
         assert_eq!(v["findings"][0]["id"], "rehearsal.unavailable", "{v}");
         assert!(
-            stdout(&o).contains("dev rehearsal is not supported for dialect `postgres`"),
+            stdout(&o).contains("PostgreSQL does not support target-less dev rehearsal"),
             "{v}"
         );
     }
@@ -10994,7 +10994,7 @@ fn postgres_rehearsals_refuse_before_connecting_or_starting_a_container() {
     );
     assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
     assert!(
-        stderr(&o).contains("dev rehearsal is not supported for dialect `postgres`"),
+        stderr(&o).contains("PostgreSQL does not support target-less dev rehearsal"),
         "{}",
         stderr(&o)
     );

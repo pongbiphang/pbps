@@ -117,12 +117,21 @@ async fn refuse_absent_roles(
 
 /// Runs the rehearsal on the entry's scratch, which is released before this
 /// returns.
-pub async fn run<D: crate::emission::Engine>(
+pub async fn run<D: crate::emission::Engine + pbps_cli::resolver::server::PlanningDialect>(
     entry: &mut Entry<'_>,
     conn: &mut Conn,
     target: &crate::db::Target,
     plan: &Plan<'_, D>,
 ) -> anyhow::Result<Verdict> {
+    // An engine with no connected rehearsal is refused, never skipped: an
+    // unsupported rehearsal is not a passed one. The question is asked before
+    // the cluster is identified or a scratch is started, and the way out is
+    // the switch that turns the rehearsal off.
+    if let Err(unsupported) = pbps_cli::resolver::rehearsal(plan.dialect) {
+        anyhow::bail!(
+            "{unsupported}. Turn the rehearsal off with `rehearse: false` or `--no-rehearse`."
+        );
+    }
     let driver = conn.driver();
     let identity = match crate::resolution::planning_identity(conn, entry.selection()).await {
         Ok(Some(identity)) => identity,

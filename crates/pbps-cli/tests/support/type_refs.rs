@@ -3040,7 +3040,7 @@ fn bootstrap_refuses_before_partition_default_parsing_can_advance_a_sequence() {
         let rehearsal = d.run(&["plan", "--dev", db]);
         assert_ne!(code(&rehearsal), 0);
         assert!(
-            stderr(&rehearsal).contains("dev rehearsal is not supported"),
+            stderr(&rehearsal).contains("does not support target-less dev rehearsal"),
             "{}",
             stderr(&rehearsal)
         );

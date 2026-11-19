@@ -19,8 +19,11 @@ use pbps_pg::resolver::standard::{self, Standard};
 use pbps_pg::resolver::{draft, externals};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod contract;
 mod recovery;
 mod release;
+
+pub(super) use contract::PgResolver;
 
 use pbps_pg::resolver::session::{Reset, SessionState};
 
