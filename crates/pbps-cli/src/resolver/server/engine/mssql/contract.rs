@@ -6,18 +6,19 @@
 //! compared at both ends, and a change made and restored in between leaves
 //! nothing to find (DEC-2144.1).
 
-use super::super::{Binding, CompiledCapture, Staged, unsupported};
-use super::{Prepared, Scratch};
+use super::super::{CapturedInputs, CompiledCapture, unsupported};
+use super::{Binding, Prepared, Scratch};
 use crate::resolver::contract::{
-    ApplyRecheck, ClosingInputs, ClusterDomain, FactsError, GrantRecheck, Phase, Planning,
-    PreparedView, Preview, Rehearsal, RehearsalRequest, Replay, ResolverEngine, Step, Support,
-    sealed::Sealed,
+    ApplyRecheck, BindingView, ClosingInputs, ClusterDomain, FactsError, GrantRecheck, Phase,
+    Planning, PreparedView, Preview, Rehearsal, RehearsalRequest, Replay, ResolverEngine, Step,
+    Support, sealed::Sealed,
 };
 use crate::resolver::scope;
 use crate::resolver::server::engine::Naming;
 use crate::resolver::server::scratch::{Provenance, Provisioning, Tokens};
-use crate::resolver::server::{BindingRequest, Error, ProduceError, ScopeRequest};
+use crate::resolver::server::{BindingRequest, Error, PlanningDialect, ProduceError, ScopeRequest};
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
+use pbps_db::resolver::capture::Assessment;
 use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, DbError, Driver};
 use pbps_model::dependency::DependencyName;
@@ -52,6 +53,8 @@ impl ResolverEngine for MssqlResolver {
     type Standard = ();
     type Scratch<'a> = Box<Scratch<'a>>;
     type Prepared = Prepared;
+    type Binding = Box<Binding>;
+    type Staged = pbps_mssql::resolver::capture::Staged;
 
     fn standard(
         declared: Option<&pbps_config::resolver::ScratchStandard>,
@@ -173,11 +176,11 @@ impl ResolverEngine for MssqlResolver {
         ids: &'a IdsFile,
         dependencies: &'a ModuleDeps,
         _: &'a mut Self::Prepared,
-    ) -> Step<'a, Result<Binding, Error>> {
+    ) -> Step<'a, Result<Self::Binding, Error>> {
         Box::pin(async move {
             scratch
                 .reconstruction(binding, ids, dependencies)
-                .map(|binding| Binding::Mssql(Box::new(binding)))
+                .map(Box::new)
         })
     }
 
@@ -187,50 +190,42 @@ impl ResolverEngine for MssqlResolver {
         prepared: &'a mut Prepared,
         _: &'a mut Conn,
         _: &'a mut Conn,
-        _: &'a Binding,
-    ) -> Step<'a, Result<Staged, Error>> {
-        Box::pin(async move { Ok(Staged::Mssql(prepared.staged.clone())) })
+        _: &'a Self::Binding,
+    ) -> Step<'a, Result<Self::Staged, Error>> {
+        Box::pin(async move { Ok(prepared.staged.clone()) })
     }
 
-    fn staged(prepared: &Self::Prepared) -> Staged {
+    fn staged(prepared: &Self::Prepared) -> Self::Staged {
         // Preparation always compares the externals, an empty set included.
-        Staged::Mssql(prepared.staged.clone())
+        prepared.staged.clone()
     }
 
-    fn completed_staged(prepared: &Self::Prepared) -> Option<Staged> {
-        Some(Staged::Mssql(prepared.staged.clone()))
+    fn completed_staged(prepared: &Self::Prepared) -> Option<Self::Staged> {
+        Some(prepared.staged.clone())
     }
 
-    fn chains(binding: &mut Binding, _: &Self::Prepared) -> Result<Vec<String>, Error> {
-        match binding {
-            Binding::Mssql(_) => Ok(Vec::new()),
-            Binding::Postgres(_) => Err(unsupported()),
-        }
+    fn chains(_: &mut Self::Binding, _: &Self::Prepared) -> Vec<String> {
+        Vec::new()
     }
 
     fn compile<'a>(
-        binding: &'a mut Binding,
+        binding: &'a mut Self::Binding,
         prepared: &'a mut Self::Prepared,
         _: &'a mut Conn,
         target: &'a mut Conn,
         _: &'a [String],
         _: Option<&'a SessionZone>,
         _: OutsideWrites,
-        staged: &'a mut Staged,
+        _: &'a mut Self::Staged,
     ) -> Step<'a, Result<(), Error>> {
         Box::pin(async move {
-            match (binding, staged) {
-                (Binding::Mssql(binding), Staged::Mssql(_)) => {
-                    let len = binding.len();
-                    binding.compile(prepared, target, 0..len).await
-                }
-                _ => Err(unsupported()),
-            }
+            let len = binding.len();
+            binding.compile(prepared, target, 0..len).await
         })
     }
 
     fn capture_desired<'a>(
-        binding: &'a Binding,
+        binding: &'a Self::Binding,
         prepared: &'a mut Self::Prepared,
         _: &'a mut Conn,
         target: &'a mut Conn,
@@ -239,17 +234,65 @@ impl ResolverEngine for MssqlResolver {
         schemas: &'a [String],
         key: &'a EnvironmentFingerprintKey,
         desired: pbps_diff::Side<'a>,
-        staged: &'a Staged,
+        staged: &'a Self::Staged,
     ) -> Step<'a, Result<CompiledCapture, Error>> {
         Box::pin(async move {
-            match (binding, staged) {
-                (Binding::Mssql(binding), Staged::Mssql(staged)) => binding
-                    .capture_desired(prepared.reach(), target, schemas, key, desired, staged)
-                    .await
-                    .map(|closing| CompiledCapture::Mssql(Box::new(closing))),
-                _ => Err(unsupported()),
+            binding
+                .capture_desired(prepared.reach(), target, schemas, key, desired, staged)
+                .await
+                .map(|closing| CompiledCapture::Mssql(Box::new(closing)))
+        })
+    }
+
+    fn capture_opening<'a>(
+        binding: &'a Self::Binding,
+        target: &'a mut Conn,
+        closing: &'a CompiledCapture,
+        key: &'a EnvironmentFingerprintKey,
+        base: pbps_diff::Side<'a>,
+    ) -> Step<'a, Result<(CapturedInputs, InputManifest), Error>> {
+        Box::pin(async move {
+            match closing {
+                CompiledCapture::Mssql(closing) => {
+                    let (current, opening) =
+                        binding.capture_opening(target, closing, key, base).await?;
+                    Ok((CapturedInputs::Mssql(current), opening))
+                }
+                CompiledCapture::Postgres(_) => Err(unsupported()),
             }
         })
+    }
+
+    fn assess(
+        binding: &mut Self::Binding,
+        closing: &CompiledCapture,
+        current: &CapturedInputs,
+        staged: &Self::Staged,
+    ) -> Result<Assessment, Error> {
+        match (closing, current) {
+            (CompiledCapture::Mssql(closing), CapturedInputs::Mssql(current)) => {
+                Ok(binding.assess(closing, current, staged))
+            }
+            _ => Err(unsupported()),
+        }
+    }
+
+    fn changed_since(
+        staged: &Self::Staged,
+        current: &CapturedInputs,
+    ) -> Result<Vec<String>, Error> {
+        match current {
+            CapturedInputs::Mssql(current) => Ok(staged.changed_since(current)),
+            CapturedInputs::Postgres(_) => Err(unsupported()),
+        }
+    }
+
+    fn through_shape_view(_: &Self::Staged, error: Error) -> Error {
+        error
+    }
+
+    fn dialect(_: &Self::Binding, extras: &[String]) -> Self::Dialect {
+        <pbps_mssql::Mssql as PlanningDialect>::configured(extras, None)
     }
 
     /// SQL Server has no cluster role to name: its roles are the scratch
@@ -266,6 +309,12 @@ impl ResolverEngine for MssqlResolver {
         _: Naming,
     ) -> Step<'a, Result<Result<(), String>, Error>> {
         Box::pin(async move { Err(unsupported()) })
+    }
+}
+
+impl BindingView for Box<Binding> {
+    fn has_fill(&self) -> bool {
+        false
     }
 }
 

@@ -6737,3 +6737,36 @@ Pinned by the `compile_fail` doctest beside a compiling one on `Prepared<D>`,
 the tests of DEC-2798.6 and DEC-2798.7, and the live scratch tests of both
 engines, which no longer destructure a union. Formats: none. No sealed bytes,
 plan, state or evidence change.
+
+<a id="dec-2798-9"></a>
+
+**DEC-2798.9. The binding and the staged set are typed by the engine; only the
+captures they meet are still unions (#2798, route step 3).** DEC-2798.8 typed the
+prepared scratch and kept the binding and the staged set as unions, with the
+steps that link them as engine functions that refused the other engine's pair by
+name. This change types both, so those mixed pairs are type errors and their
+arms are gone.
+
+**What moved.** `ResolverEngine::Binding` and `::Staged` are the engines' own
+states (the adapter's binding, boxed as before, and its staged inventory). The
+binding is read through `BindingView` on its own type. `dialect` replaces the
+guard of the old `Binding::plan`: it builds the planning dialect from the
+binding and the extras (PostgreSQL from the generation version the binding
+measured, SQL Server from nothing), and the plan is the neutral
+`plan_captured` over it, so "the dialect and the capture belong to different
+engines" is a type error. `chains` is infallible again, as DEC-2798.8 said it
+would be. `capture_opening`, `assess`, `changed_since` and `through_shape_view`
+are engine functions.
+
+**What stays a union.** `CompiledCapture` and `CapturedInputs` are evidence the
+engine seals and rechecks, and move with their own group. Until then the
+engine functions that take one keep an explicit named error for the other
+engine's capture, including the pair `changed_since` used to guard with an
+`unreachable!`: a staged set met a capture of the other engine as a panic, and
+now as `unsupported()`. Both unions are `pub` inside their private module so the
+trait can name them; fields stay private and nothing new constructs or erases
+one.
+
+Pinned by a `compile_fail` doctest beside a compiling one on `Binding<D>` and on
+`Staged<D>`, the tests of DEC-2798.6 to DEC-2798.8, and the live scratch tests
+of both engines. Formats: none. No sealed bytes, plan, state or evidence change.

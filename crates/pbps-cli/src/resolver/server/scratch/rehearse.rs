@@ -12,7 +12,9 @@
 use super::super::producer::{request, request_as_it_stands};
 use super::super::{BindingRequest, Error, PlanningDialect, ProduceError, engine};
 use super::{Provenance, Standard, Tokens};
-use crate::resolver::contract::{self, PreparedView, RehearsalRequest, ResolverEngine};
+use crate::resolver::contract::{
+    self, BindingView, PreparedView, RehearsalRequest, ResolverEngine,
+};
 use crate::resolver::scope;
 use pbps_db::{Conn, Driver};
 use pbps_model::resolver::OutsideWrites;
@@ -188,7 +190,7 @@ pub async fn with_session<D: PlanningDialect, T, E>(
                         .into(),
                 ]));
             }
-            <D::Resolver as ResolverEngine>::chains(&mut reconstruction, &prepared)?;
+            <D::Resolver as ResolverEngine>::chains(&mut reconstruction, &prepared);
             <D::Resolver as ResolverEngine>::compare_externals(
                 &state,
                 provisioning,
