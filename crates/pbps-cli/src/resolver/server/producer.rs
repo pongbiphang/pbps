@@ -1,7 +1,7 @@
 //! Sealing a run's answer into the plan's evidence, and the run's errors.
 
 use super::{Error, ResolvedPlan, ScopeRequest, engine, transitions};
-use crate::resolver::contract::ResolverEngine;
+use crate::resolver::contract::{ResolverEngine, Sealable};
 use crate::resolver::scope;
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
 use pbps_model::Hints;
@@ -77,7 +77,7 @@ pub(super) fn fingerprint(
 /// qualified it, and what the run observed. Held by value: the seal waits
 /// until the caller's ordinary passes have run on the plan, after the
 /// scratch is released (#1516).
-pub(super) struct Sealing {
+pub(super) struct Sealing<D: super::PlanningDialect> {
     pub planned: Vec<super::PlannedGrant>,
     /// Unprojected opening target facts.
     pub opening_catalog: pbps_db::resolver::environment::CatalogFacts,
@@ -89,7 +89,7 @@ pub(super) struct Sealing {
     pub schemas: Vec<String>,
     pub write_path_extras: Vec<String>,
     pub identity: Identity,
-    pub producer: super::ProducerOutcome,
+    pub producer: super::ProducerOutcome<D>,
     pub opening: pbps_model::resolver::InputManifest,
 }
 
@@ -112,7 +112,7 @@ pub(super) struct Identity {
 /// order.
 pub(super) fn seal<D: super::PlanningDialect, S>(
     key: &EnvironmentFingerprintKey,
-    sealed: Sealing,
+    sealed: Sealing<D>,
     changes: pbps_diff::order::PlanningPlan<S>,
     proof: pbps_model::resolver::OrderingProof,
     base: pbps_diff::Side<'_>,
@@ -234,22 +234,22 @@ pub(super) fn seal<D: super::PlanningDialect, S>(
 /// [`Unsealed::changes`], [rechecks](Unsealed::recheck) the target, then
 /// [seals](Rechecked::seal) the plan in its final order, so the sealed order
 /// already holds whatever those passes added or moved (DEC-1516.1).
-pub struct Unsealed<D = pbps_pg::Postgres> {
+pub struct Unsealed<D: super::PlanningDialect = pbps_pg::Postgres> {
     pub(super) key: EnvironmentFingerprintKey,
     pub(super) ordered: pbps_diff::resolver::Ordered<pbps_diff::order::Canonical<D>>,
-    pub(super) sealing: Sealing,
-    pub(super) opening: Opening,
+    pub(super) sealing: Sealing<D>,
+    pub(super) opening: Opening<D>,
 }
 
 /// What the run read on the target, for the publication recheck.
-pub(super) struct Opening {
+pub(super) struct Opening<D: super::PlanningDialect> {
     pub history: scope::History,
     pub driver: pbps_db::Driver,
     pub request: ScopeRequest,
     pub scope_schemas: Vec<String>,
     /// The opening capture: its scope, which holds the externals file's staged
     /// objects, and its dropped signatures are captured again.
-    pub current: engine::CapturedInputs,
+    pub current: <D::Resolver as ResolverEngine>::CapturedInputs,
     /// The `system_identifier` the planning read recorded (DEC-1685.1).
     pub planned_identity: String,
 }
@@ -371,7 +371,7 @@ impl<D: super::PlanningDialect> Unsealed<D> {
                 .differences(&history)
                 .map_err(read("catalog history"))?,
         );
-        let differences = engine::recapture(target, &self.opening.current)
+        let differences = <D::Resolver as ResolverEngine>::recapture(target, &self.opening.current)
             .await
             .map_err(|error| Error::Read(format!("the recheck's capture: {error}")))?;
         changed.extend(differences.iter().map(|difference| {
@@ -414,7 +414,10 @@ impl<D: super::PlanningDialect> Unsealed<D> {
 ///     Rechecked(other)
 /// }
 /// ```
-pub struct Rechecked<D = pbps_pg::Postgres>(Unsealed<D>, Option<Box<pbps_db::catalog::Pulled>>);
+pub struct Rechecked<D: super::PlanningDialect = pbps_pg::Postgres>(
+    Unsealed<D>,
+    Option<Box<pbps_db::catalog::Pulled>>,
+);
 
 impl<D: super::PlanningDialect> Rechecked<D> {
     /// Seals `changes`, the resolver's plan after the caller's passes. Every
@@ -459,7 +462,7 @@ impl<D: super::PlanningDialect> Rechecked<D> {
 }
 
 /// A recheck that did not pass: why, and the run it leaves unsealed.
-pub struct Refused<D = pbps_pg::Postgres> {
+pub struct Refused<D: super::PlanningDialect = pbps_pg::Postgres> {
     pub error: Error,
     pub unsealed: Unsealed<D>,
 }

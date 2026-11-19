@@ -13,19 +13,21 @@
 //! `PlanningDialect::Resolver` instead.
 
 use crate::resolver::scope;
-use crate::resolver::server::engine::{CapturedInputs, CompiledCapture};
 use crate::resolver::server::scratch::rehearse::Roles;
 use crate::resolver::server::scratch::{Provenance, Provisioning, Tokens};
 use crate::resolver::server::{BindingRequest, Error, PlanningDialect, ProduceError, ScopeRequest};
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
-use pbps_db::resolver::capture::Assessment;
+use pbps_db::resolver::capture::{Assessment, CaptureDifference, CaptureError};
 use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, DbError};
 use pbps_model::dependency::Dependencies;
 use pbps_model::dependency::DependencyName;
+use pbps_model::operation::Captured;
+use pbps_model::resolver::ManifestError;
 use pbps_model::resolver::{DependencyPlacement, OutsideWrites};
 use pbps_model::resolver::{InputManifest, ResolverEvidence};
 use pbps_model::{ChangeSet, Hints, IdsFile, ModuleDeps, RoleName, Schema, SessionZone};
+use pbps_pg::resolver::capture::{BindingRecord, SealError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
@@ -132,6 +134,12 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
     type Binding: BindingView + Send + Sync;
     /// The inventory of the shapes the externals file was compared with.
     type Staged: Send + Sync;
+    /// What the scratch's compile left to seal: private to the engine, read
+    /// for its planning records and consumed exactly once by `seal_for_plan`.
+    /// Never erased: a capture of one engine cannot be sealed by another.
+    type CompiledCapture: Sealable + Send + Sync;
+    /// The opening capture the publication recheck captures again.
+    type CapturedInputs: Send + Sync;
 
     /// The standard an entry declares, or the refusal of one this engine
     /// cannot hold.
@@ -243,27 +251,40 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
         key: &'a EnvironmentFingerprintKey,
         desired: pbps_diff::Side<'a>,
         staged: &'a Self::Staged,
-    ) -> Step<'a, Result<CompiledCapture, Error>>;
-    /// The opening capture of the target, as the binding reads it. The
-    /// capture states are still the two-engine unions, so a capture of the
-    /// other engine is a named error until they are typed.
+    ) -> Step<'a, Result<Self::CompiledCapture, Error>>;
+    /// The opening capture of the target, as the binding reads it.
     fn capture_opening<'a>(
         binding: &'a Self::Binding,
         target: &'a mut Conn,
-        closing: &'a CompiledCapture,
+        closing: &'a Self::CompiledCapture,
         key: &'a EnvironmentFingerprintKey,
         base: pbps_diff::Side<'a>,
-    ) -> Step<'a, Result<(CapturedInputs, InputManifest), Error>>;
+    ) -> Step<'a, Result<(Self::CapturedInputs, InputManifest), Error>>;
     fn assess(
         binding: &mut Self::Binding,
-        closing: &CompiledCapture,
-        current: &CapturedInputs,
+        closing: &Self::CompiledCapture,
+        current: &Self::CapturedInputs,
         staged: &Self::Staged,
     ) -> Result<Assessment, Error>;
     /// The shapes the externals file was compared with that the opening
     /// capture finds changed.
-    fn changed_since(staged: &Self::Staged, current: &CapturedInputs)
-    -> Result<Vec<String>, Error>;
+    fn changed_since(staged: &Self::Staged, current: &Self::CapturedInputs) -> Vec<String>;
+    /// What the target now holds that the opening capture's scope held then:
+    /// the publication recheck's capture, taken afresh on the target.
+    fn recapture<'a>(
+        target: &'a mut Conn,
+        current: &'a Self::CapturedInputs,
+    ) -> Step<'a, Result<Vec<CaptureDifference>, CaptureError>>;
+    /// What the run bound at creation, for ordering: the schema-bound callees
+    /// of each module the capture read whole, on the target now and on the
+    /// scratch database the declarations compiled on (DEC-2143.8). PostgreSQL
+    /// has no such lexical guess to replace, so it brings none.
+    fn captured_bindings(
+        compiled: &Self::CompiledCapture,
+        current: &Self::CapturedInputs,
+        base: &Schema,
+        desired: &Schema,
+    ) -> Captured;
     /// A failure of the scratch compile, as the staged shapes explain it.
     fn through_shape_view(staged: &Self::Staged, error: Error) -> Error;
     /// The planning dialect the binding was generated under, from the same
@@ -336,6 +357,16 @@ pub trait PreparedView: Sized + Send {
     fn unfillable(&self) -> Vec<String>;
 }
 
+/// What the run reads of a compiled capture, and the one door it is sealed
+/// through. On the capture's own type, like `PreparedView`: `seal_for_plan`
+/// consumes it, so a capture is sealed at most once.
+pub trait Sealable: Sized {
+    /// The logical ownership records of what the compile left, safe to use
+    /// before the capture itself is sealed.
+    fn planning_records(&self) -> Result<Vec<BindingRecord>, ManifestError>;
+    fn seal_for_plan(self) -> Result<InputManifest, SealError>;
+}
+
 /// What the run reads of an engine's binding. On the state's own type, like
 /// `PreparedView`, so a binding of one engine is never read as another's.
 pub trait BindingView: Sized + Send {
@@ -375,6 +406,8 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
     type Prepared = Never;
     type Binding = Never;
     type Staged = Never;
+    type CompiledCapture = Never;
+    type CapturedInputs = Never;
 
     fn standard(_: Option<&pbps_config::resolver::ScratchStandard>) -> Result<(), Error> {
         Err(Error::Unusable(refusal::<D>().to_string()))
@@ -491,28 +524,32 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
         _: &'a EnvironmentFingerprintKey,
         _: pbps_diff::Side<'a>,
         _: &'a Never,
-    ) -> Step<'a, Result<CompiledCapture, Error>> {
+    ) -> Step<'a, Result<Never, Error>> {
         match *prepared {}
     }
     fn capture_opening<'a>(
         binding: &'a Never,
         _: &'a mut Conn,
-        _: &'a CompiledCapture,
+        _: &'a Never,
         _: &'a EnvironmentFingerprintKey,
         _: pbps_diff::Side<'a>,
-    ) -> Step<'a, Result<(CapturedInputs, InputManifest), Error>> {
+    ) -> Step<'a, Result<(Never, InputManifest), Error>> {
         match *binding {}
     }
-    fn assess(
-        binding: &mut Never,
-        _: &CompiledCapture,
-        _: &CapturedInputs,
-        _: &Never,
-    ) -> Result<Assessment, Error> {
+    fn assess(binding: &mut Never, _: &Never, _: &Never, _: &Never) -> Result<Assessment, Error> {
         match *binding {}
     }
-    fn changed_since(staged: &Never, _: &CapturedInputs) -> Result<Vec<String>, Error> {
+    fn changed_since(staged: &Never, _: &Never) -> Vec<String> {
         match *staged {}
+    }
+    fn recapture<'a>(
+        _: &'a mut Conn,
+        current: &'a Never,
+    ) -> Step<'a, Result<Vec<CaptureDifference>, CaptureError>> {
+        match *current {}
+    }
+    fn captured_bindings(compiled: &Never, _: &Never, _: &Schema, _: &Schema) -> Captured {
+        match *compiled {}
     }
     fn through_shape_view(staged: &Never, _: Error) -> Error {
         match *staged {}
@@ -544,6 +581,15 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
         _: &'a Tokens,
     ) -> Step<'a, Result<Roles, Error>> {
         match *scratch {}
+    }
+}
+
+impl Sealable for Never {
+    fn planning_records(&self) -> Result<Vec<BindingRecord>, ManifestError> {
+        match *self {}
+    }
+    fn seal_for_plan(self) -> Result<InputManifest, SealError> {
+        match self {}
     }
 }
 

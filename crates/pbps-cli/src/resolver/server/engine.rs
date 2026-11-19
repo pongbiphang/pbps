@@ -8,12 +8,12 @@
 
 use super::{Error, ProduceError};
 use crate::resolver::contract::ResolverEngine;
+use pbps_db::Driver;
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
-use pbps_db::resolver::capture::{Assessment, CaptureDifference, CaptureError};
+use pbps_db::resolver::capture::Assessment;
 use pbps_db::resolver::environment::CatalogFacts;
-use pbps_db::{Conn, Driver};
 use pbps_model::Hints;
-use pbps_model::resolver::{InputManifest, SurfaceResolution};
+use pbps_model::resolver::SurfaceResolution;
 
 pub(crate) mod container;
 mod keeper;
@@ -192,6 +192,53 @@ pub type Binding<D> = <<D as PlanningDialect>::Resolver as ResolverEngine>::Bind
 pub type Staged<D> = <<D as PlanningDialect>::Resolver as ResolverEngine>::Staged;
 
 /// What the run acquired and must release, for the engine the dialect names.
+/// What the scratch's compile left to seal, for the engine the dialect names.
+/// It is the type alone: nothing outside this crate can make, read or seal one,
+/// and the capture of one engine cannot be handed to another's step:
+///
+/// ```compile_fail
+/// use pbps_cli::resolver::server::scratch::CompiledCapture;
+/// fn for_sql_server(_: CompiledCapture<pbps_mssql::Mssql>) {}
+/// fn compiled_by_postgres(compiled: CompiledCapture<pbps_pg::Postgres>) {
+///     for_sql_server(compiled);
+/// }
+/// ```
+///
+/// Each engine's own capture is the type its adapter holds:
+///
+/// ```
+/// use pbps_cli::resolver::server::scratch::CompiledCapture;
+/// fn for_postgres(compiled: CompiledCapture<pbps_pg::Postgres>) -> CompiledCapture<pbps_pg::Postgres> {
+///     compiled
+/// }
+/// fn for_sql_server(compiled: CompiledCapture<pbps_mssql::Mssql>) -> CompiledCapture<pbps_mssql::Mssql> {
+///     compiled
+/// }
+/// ```
+pub type CompiledCapture<D> = <<D as PlanningDialect>::Resolver as ResolverEngine>::CompiledCapture;
+
+/// The opening capture the recheck captures again, for the engine the dialect
+/// names. The opening capture of one engine cannot be rechecked by another:
+///
+/// ```compile_fail
+/// use pbps_cli::resolver::server::scratch::CapturedInputs;
+/// fn for_sql_server(_: CapturedInputs<pbps_mssql::Mssql>) {}
+/// fn captured_by_postgres(current: CapturedInputs<pbps_pg::Postgres>) {
+///     for_sql_server(current);
+/// }
+/// ```
+///
+/// ```
+/// use pbps_cli::resolver::server::scratch::CapturedInputs;
+/// fn for_postgres(current: CapturedInputs<pbps_pg::Postgres>) -> CapturedInputs<pbps_pg::Postgres> {
+///     current
+/// }
+/// fn for_sql_server(current: CapturedInputs<pbps_mssql::Mssql>) -> CapturedInputs<pbps_mssql::Mssql> {
+///     current
+/// }
+/// ```
+pub type CapturedInputs<D> = <<D as PlanningDialect>::Resolver as ResolverEngine>::CapturedInputs;
+
 pub(super) type Scratch<'a, D> = <<D as PlanningDialect>::Resolver as ResolverEngine>::Scratch<'a>;
 
 /// The standard an entry declares, or the refusal of one the engine cannot
@@ -200,54 +247,6 @@ pub fn declared_standard<D: PlanningDialect>(
     declared: Option<&pbps_config::resolver::ScratchStandard>,
 ) -> Result<Standard<D>, Error> {
     <D::Resolver as ResolverEngine>::standard(declared)
-}
-
-pub enum CompiledCapture {
-    Postgres(Box<postgres::Closing>),
-    Mssql(Box<mssql::Closing>),
-}
-pub enum CapturedInputs {
-    Postgres(pbps_pg::resolver::capture::CapturedInputs),
-    Mssql(pbps_mssql::resolver::capture::CapturedInputs),
-}
-
-impl CompiledCapture {
-    pub(super) fn planning_records(
-        &self,
-    ) -> Result<Vec<BindingRecord>, pbps_model::resolver::ManifestError> {
-        match self {
-            Self::Postgres(closing) => closing.planning_records(),
-            Self::Mssql(closing) => Ok(closing
-                .planning_records()?
-                .into_iter()
-                .map(|record| BindingRecord {
-                    object: record.object,
-                    ownership: record.ownership,
-                    bindings: record.bindings,
-                })
-                .collect()),
-        }
-    }
-    pub(super) fn seal_for_plan(
-        self,
-    ) -> Result<InputManifest, pbps_pg::resolver::capture::SealError> {
-        match self {
-            Self::Postgres(closing) => closing.seal_for_plan(),
-            Self::Mssql(closing) => closing.seal_for_plan().map_err(Into::into),
-        }
-    }
-}
-
-pub(super) async fn recapture(
-    target: &mut Conn,
-    current: &CapturedInputs,
-) -> Result<Vec<CaptureDifference>, CaptureError> {
-    match current {
-        CapturedInputs::Postgres(current) => postgres::recapture(target, current).await,
-        CapturedInputs::Mssql(current) => pbps_mssql::resolver::capture::recapture(target, current)
-            .await
-            .map(|(_, differences)| differences),
-    }
 }
 
 pub(super) fn ordinary<D: PlanningDialect>(
@@ -274,27 +273,6 @@ pub(super) fn plan<D: PlanningDialect>(
     let dialect = <D::Resolver as ResolverEngine>::dialect(binding, extras);
     pbps_diff::resolver::plan_captured(base, desired, hints, surfaces, &dialect, captured)
         .map_err(|error| Error::Binding(error.to_string()))
-}
-
-/// What the run bound at creation, for ordering: the schema-bound callees of
-/// each module the capture read whole, on the target now and on the scratch
-/// database the declarations compiled on (DEC-2143.8). PostgreSQL has no
-/// such lexical guess to replace, so it brings none.
-pub(super) fn captured_bindings(
-    compiled: &CompiledCapture,
-    current: &CapturedInputs,
-    base: &pbps_model::Schema,
-    desired: &pbps_model::Schema,
-) -> pbps_model::operation::Captured {
-    match (compiled, current) {
-        (CompiledCapture::Mssql(compiled), CapturedInputs::Mssql(current)) => {
-            pbps_model::operation::Captured {
-                before: current.schema_bound_callees(base),
-                after: compiled.schema_bound_callees(desired),
-            }
-        }
-        _ => Default::default(),
-    }
 }
 
 pub(super) fn surfaces<D: PlanningDialect>(

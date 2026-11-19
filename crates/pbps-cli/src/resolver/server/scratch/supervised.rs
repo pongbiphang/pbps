@@ -28,15 +28,15 @@ pub(super) struct Request<D: PlanningDialect> {
 
 // Even a result already sent into the channel needs an owner. A receiver
 // dropped before observing it must not silently lose a cleanup failure.
-struct Reply<D = pbps_pg::Postgres>(Option<Result<Unsealed<D>, ProduceError>>);
+struct Reply<D: PlanningDialect = pbps_pg::Postgres>(Option<Result<Unsealed<D>, ProduceError>>);
 
-impl<D> Reply<D> {
+impl<D: PlanningDialect> Reply<D> {
     fn receive(mut self) -> Result<Unsealed<D>, ProduceError> {
         self.0.take().expect("a supervisor reply is received once")
     }
 }
 
-impl<D> Drop for Reply<D> {
+impl<D: PlanningDialect> Drop for Reply<D> {
     fn drop(&mut self) {
         if let Some(Err(ProduceError::Cleanup(names))) = self.0.take() {
             super::recovery::cancelled_cleanup(names);

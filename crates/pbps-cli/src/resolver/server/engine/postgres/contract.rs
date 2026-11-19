@@ -3,28 +3,29 @@
 //! ones `resolver::apply` made before it named no engine, moved with their
 //! comments; they run on the apply's own connection, inside its transaction.
 
-use super::super::{CapturedInputs, CompiledCapture, unsupported};
-use super::{Binding, Naming, Prepared, Scratch};
+use super::{Binding, Closing, Naming, Prepared, Scratch};
 use crate::resolver::contract::{
     ApplyRecheck, BindingView, ClosingInputs, ClusterDomain, FactsError, GrantRecheck, Phase,
-    Planning, PreparedView, Rehearsal, RehearsalRequest, Replay, ResolverEngine, Step, Support,
-    sealed::Sealed,
+    Planning, PreparedView, Rehearsal, RehearsalRequest, Replay, ResolverEngine, Sealable, Step,
+    Support, sealed::Sealed,
 };
 use crate::resolver::scope;
 use crate::resolver::server::scratch::rehearse::Roles;
 use crate::resolver::server::scratch::{Provenance, Provisioning, Tokens};
 use crate::resolver::server::{BindingRequest, Error, PlanningDialect, ProduceError, ScopeRequest};
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
-use pbps_db::resolver::capture::Assessment;
+use pbps_db::resolver::capture::{Assessment, CaptureDifference, CaptureError};
 use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, DbError, Driver};
 use pbps_model::dependency::DependencyName;
+use pbps_model::operation::Captured;
 use pbps_model::resolver::{DependencyPlacement, OutsideWrites};
 use pbps_model::resolver::{
-    InputManifest, ObjectIdentity, ObjectOwnership, ResolverEvidence, Surface,
+    InputManifest, ManifestError, ObjectIdentity, ObjectOwnership, ResolverEvidence, Surface,
 };
 use pbps_model::role_mapping::RoleMapping;
 use pbps_model::{Hints, IdsFile, ModuleDeps, ModuleId, RoleName, Schema, SessionZone};
+use pbps_pg::resolver::capture::{BindingRecord, SealError};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// PostgreSQL's resolver: planning, connected rehearsal and the apply recheck.
@@ -57,6 +58,8 @@ impl ResolverEngine for PgResolver {
     type Prepared = Prepared;
     type Binding = Box<Binding>;
     type Staged = pbps_pg::resolver::capture::Staged;
+    type CompiledCapture = Box<Closing>;
+    type CapturedInputs = pbps_pg::resolver::capture::CapturedInputs;
 
     fn standard(
         declared: Option<&pbps_config::resolver::ScratchStandard>,
@@ -260,58 +263,54 @@ impl ResolverEngine for PgResolver {
         key: &'a EnvironmentFingerprintKey,
         desired: pbps_diff::Side<'a>,
         staged: &'a Self::Staged,
-    ) -> Step<'a, Result<CompiledCapture, Error>> {
+    ) -> Step<'a, Result<Self::CompiledCapture, Error>> {
         Box::pin(async move {
             binding
                 .capture_desired(
                     prepared, admin, extras, visibility, schemas, key, desired, staged,
                 )
                 .await
-                .map(|closing| CompiledCapture::Postgres(Box::new(closing)))
+                .map(Box::new)
         })
     }
 
     fn capture_opening<'a>(
         binding: &'a Self::Binding,
         target: &'a mut Conn,
-        closing: &'a CompiledCapture,
+        closing: &'a Self::CompiledCapture,
         key: &'a EnvironmentFingerprintKey,
         base: pbps_diff::Side<'a>,
-    ) -> Step<'a, Result<(CapturedInputs, InputManifest), Error>> {
-        Box::pin(async move {
-            match closing {
-                CompiledCapture::Postgres(closing) => {
-                    let (current, opening) =
-                        binding.capture_opening(target, closing, key, base).await?;
-                    Ok((CapturedInputs::Postgres(current), opening))
-                }
-                CompiledCapture::Mssql(_) => Err(unsupported()),
-            }
-        })
+    ) -> Step<'a, Result<(Self::CapturedInputs, InputManifest), Error>> {
+        Box::pin(async move { binding.capture_opening(target, closing, key, base).await })
     }
 
     fn assess(
         binding: &mut Self::Binding,
-        closing: &CompiledCapture,
-        current: &CapturedInputs,
+        closing: &Self::CompiledCapture,
+        current: &Self::CapturedInputs,
         staged: &Self::Staged,
     ) -> Result<Assessment, Error> {
-        match (closing, current) {
-            (CompiledCapture::Postgres(closing), CapturedInputs::Postgres(current)) => {
-                Ok(binding.assess(closing, current, staged))
-            }
-            _ => Err(unsupported()),
-        }
+        Ok(binding.assess(closing, current, staged))
     }
 
-    fn changed_since(
-        staged: &Self::Staged,
-        current: &CapturedInputs,
-    ) -> Result<Vec<String>, Error> {
-        match current {
-            CapturedInputs::Postgres(current) => Ok(staged.changed_since(current)),
-            CapturedInputs::Mssql(_) => Err(unsupported()),
-        }
+    fn changed_since(staged: &Self::Staged, current: &Self::CapturedInputs) -> Vec<String> {
+        staged.changed_since(current)
+    }
+
+    fn recapture<'a>(
+        target: &'a mut Conn,
+        current: &'a Self::CapturedInputs,
+    ) -> Step<'a, Result<Vec<CaptureDifference>, CaptureError>> {
+        Box::pin(super::recapture(target, current))
+    }
+
+    fn captured_bindings(
+        _: &Self::CompiledCapture,
+        _: &Self::CapturedInputs,
+        _: &Schema,
+        _: &Schema,
+    ) -> Captured {
+        Default::default()
     }
 
     fn through_shape_view(staged: &Self::Staged, error: Error) -> Error {
@@ -406,6 +405,16 @@ impl ResolverEngine for PgResolver {
                 },
             )
         })
+    }
+}
+
+impl Sealable for Box<Closing> {
+    fn planning_records(&self) -> Result<Vec<BindingRecord>, ManifestError> {
+        Closing::planning_records(self)
+    }
+
+    fn seal_for_plan(self) -> Result<InputManifest, SealError> {
+        Closing::seal_for_plan(*self)
     }
 }
 

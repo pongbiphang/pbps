@@ -6,25 +6,27 @@
 //! compared at both ends, and a change made and restored in between leaves
 //! nothing to find (DEC-2144.1).
 
-use super::super::{CapturedInputs, CompiledCapture, unsupported};
+use super::super::unsupported;
 use super::principals::principals;
-use super::{Binding, Prepared, Scratch};
+use super::{Binding, Closing, Prepared, Scratch};
 use crate::resolver::contract::{
     ApplyRecheck, BindingView, ClosingInputs, ClusterDomain, FactsError, GrantRecheck, Phase,
-    Planning, PreparedView, Preview, Rehearsal, RehearsalRequest, Replay, ResolverEngine, Step,
-    Support, sealed::Sealed,
+    Planning, PreparedView, Preview, Rehearsal, RehearsalRequest, Replay, ResolverEngine, Sealable,
+    Step, Support, sealed::Sealed,
 };
 use crate::resolver::scope;
 use crate::resolver::server::scratch::rehearse::Roles;
 use crate::resolver::server::scratch::{Provenance, Provisioning, Tokens};
 use crate::resolver::server::{BindingRequest, Error, PlanningDialect, ProduceError, ScopeRequest};
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
-use pbps_db::resolver::capture::Assessment;
+use pbps_db::resolver::capture::{Assessment, CaptureDifference, CaptureError};
 use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, DbError, Driver};
 use pbps_model::dependency::DependencyName;
-use pbps_model::resolver::{DependencyPlacement, InputManifest, OutsideWrites};
+use pbps_model::operation::Captured;
+use pbps_model::resolver::{DependencyPlacement, InputManifest, ManifestError, OutsideWrites};
 use pbps_model::{Hints, IdsFile, ModuleDeps, RoleName, Schema, SessionZone};
+use pbps_pg::resolver::capture::{BindingRecord, SealError};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// SQL Server's resolver: planning, both rehearsals and the apply recheck.
@@ -56,6 +58,8 @@ impl ResolverEngine for MssqlResolver {
     type Prepared = Prepared;
     type Binding = Box<Binding>;
     type Staged = pbps_mssql::resolver::capture::Staged;
+    type CompiledCapture = Box<Closing>;
+    type CapturedInputs = pbps_mssql::resolver::capture::CapturedInputs;
 
     fn standard(
         declared: Option<&pbps_config::resolver::ScratchStandard>,
@@ -236,55 +240,58 @@ impl ResolverEngine for MssqlResolver {
         key: &'a EnvironmentFingerprintKey,
         desired: pbps_diff::Side<'a>,
         staged: &'a Self::Staged,
-    ) -> Step<'a, Result<CompiledCapture, Error>> {
+    ) -> Step<'a, Result<Self::CompiledCapture, Error>> {
         Box::pin(async move {
             binding
                 .capture_desired(prepared.reach(), target, schemas, key, desired, staged)
                 .await
-                .map(|closing| CompiledCapture::Mssql(Box::new(closing)))
+                .map(Box::new)
         })
     }
 
     fn capture_opening<'a>(
         binding: &'a Self::Binding,
         target: &'a mut Conn,
-        closing: &'a CompiledCapture,
+        closing: &'a Self::CompiledCapture,
         key: &'a EnvironmentFingerprintKey,
         base: pbps_diff::Side<'a>,
-    ) -> Step<'a, Result<(CapturedInputs, InputManifest), Error>> {
-        Box::pin(async move {
-            match closing {
-                CompiledCapture::Mssql(closing) => {
-                    let (current, opening) =
-                        binding.capture_opening(target, closing, key, base).await?;
-                    Ok((CapturedInputs::Mssql(current), opening))
-                }
-                CompiledCapture::Postgres(_) => Err(unsupported()),
-            }
-        })
+    ) -> Step<'a, Result<(Self::CapturedInputs, InputManifest), Error>> {
+        Box::pin(async move { binding.capture_opening(target, closing, key, base).await })
     }
 
     fn assess(
         binding: &mut Self::Binding,
-        closing: &CompiledCapture,
-        current: &CapturedInputs,
+        closing: &Self::CompiledCapture,
+        current: &Self::CapturedInputs,
         staged: &Self::Staged,
     ) -> Result<Assessment, Error> {
-        match (closing, current) {
-            (CompiledCapture::Mssql(closing), CapturedInputs::Mssql(current)) => {
-                Ok(binding.assess(closing, current, staged))
-            }
-            _ => Err(unsupported()),
-        }
+        Ok(binding.assess(closing, current, staged))
     }
 
-    fn changed_since(
-        staged: &Self::Staged,
-        current: &CapturedInputs,
-    ) -> Result<Vec<String>, Error> {
-        match current {
-            CapturedInputs::Mssql(current) => Ok(staged.changed_since(current)),
-            CapturedInputs::Postgres(_) => Err(unsupported()),
+    fn changed_since(staged: &Self::Staged, current: &Self::CapturedInputs) -> Vec<String> {
+        staged.changed_since(current)
+    }
+
+    fn recapture<'a>(
+        target: &'a mut Conn,
+        current: &'a Self::CapturedInputs,
+    ) -> Step<'a, Result<Vec<CaptureDifference>, CaptureError>> {
+        Box::pin(async move {
+            pbps_mssql::resolver::capture::recapture(target, current)
+                .await
+                .map(|(_, differences)| differences)
+        })
+    }
+
+    fn captured_bindings(
+        compiled: &Self::CompiledCapture,
+        current: &Self::CapturedInputs,
+        base: &Schema,
+        desired: &Schema,
+    ) -> Captured {
+        Captured {
+            before: current.schema_bound_callees(base),
+            after: compiled.schema_bound_callees(desired),
         }
     }
 
@@ -355,6 +362,23 @@ impl ResolverEngine for MssqlResolver {
         _: &'a Tokens,
     ) -> Step<'a, Result<Roles, Error>> {
         Box::pin(async move { Ok(principals(named, base, desired)) })
+    }
+}
+
+impl Sealable for Box<Closing> {
+    fn planning_records(&self) -> Result<Vec<BindingRecord>, ManifestError> {
+        Ok(Closing::planning_records(self)?
+            .into_iter()
+            .map(|record| BindingRecord {
+                object: record.object,
+                ownership: record.ownership,
+                bindings: record.bindings,
+            })
+            .collect())
+    }
+
+    fn seal_for_plan(self) -> Result<InputManifest, SealError> {
+        Closing::seal_for_plan(*self).map_err(Into::into)
     }
 }
 

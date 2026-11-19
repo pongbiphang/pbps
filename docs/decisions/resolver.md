@@ -6803,3 +6803,40 @@ principal tests at their new home, and the live rehearsal flows of both engines.
 The rehearsal still hands `D::DRIVER` to the connection and to the scope
 reads: a value, not a decision, which moves with the scope group. Formats: none.
 No sealed bytes, plan, state or evidence change.
+
+<a id="dec-2798-11"></a>
+
+**DEC-2798.11. The two captures are typed by the engine and sealed through a
+trait on the capture's own type; nothing is erased (#2798, route step 3).**
+DEC-2798.9 left `CompiledCapture` and `CapturedInputs` as two-engine unions with
+a named error for the other engine's capture. They are evidence: the first is
+the private raw capture the plan's evidence is sealed from, consumed exactly
+once; the second is the opening capture the publication recheck captures again.
+Erasing either (`dyn Any`, a boxed object, a serialized detour) would put the
+mixed-engine runtime error back, so each is an associated type of
+`ResolverEngine`: PostgreSQL's `Box<Closing>` and its `CapturedInputs`, SQL
+Server's own, and an uninhabited type for an engine without a resolver.
+
+**What moved.** `capture_desired`, `capture_opening`, `assess`, `changed_since`
+and the recheck's `recapture` are engine functions over those types, so the
+mixed arms of the previous change are gone and `changed_since` is infallible
+again, as DEC-2798.9 said it would be. `captured_bindings`, which decides
+whether an engine brings schema-bound callees to order the plan by (SQL Server
+does, PostgreSQL has no such guess to replace), is an engine function too.
+`planning_records` and `seal_for_plan` are `Sealable`, implemented on each
+engine's own capture: `seal_for_plan` still takes the capture by value, so it is
+sealed at most once, and SQL Server's records and error are converted where the
+union converted them. The run's outcome and the recheck's state (`Sealing`,
+`Opening`, `ProducerOutcome`, and the public `Unsealed`, `Rechecked` and
+`Refused`) carry the dialect, so a recheck still cannot seal another run's
+evidence, now also because the captures are of one engine by type.
+
+**What does not move.** The authorization condition stays the SQL Server type
+the scope code names: it is consumed by `Authorization::persisted_after`, which
+is the scope group's. Sealing order, the key, the connection of every read and
+every serialized byte are untouched.
+
+Pinned by a `compile_fail` doctest beside a compiling one on each capture's type
+alias, the publication tests of the earlier changes, and the live recheck and
+seal tests of both engines. Formats: none. No sealed bytes, plan, state or
+evidence change.
