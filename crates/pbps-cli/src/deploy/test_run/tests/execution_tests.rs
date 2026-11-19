@@ -1,4 +1,5 @@
 use super::*;
+use crate::engine::owned_test_of;
 use crate::plan_test::{
     execution::Control,
     report::{Assertion, TestData},
@@ -42,7 +43,11 @@ fn limits() -> pbps_config::test_manifest::Timeouts {
 /// with, where the product default of 30 s is not (see the plan_test tests).
 #[tokio::test(start_paused = true)]
 async fn d2b1_1165_cleanup_allowance_outlasts_a_35_second_removal() {
-    let control = Control::new(limits(), std::future::pending());
+    let control = Control::new(
+        limits(),
+        std::future::pending(),
+        owned_test_of(Driver::Postgres),
+    );
     let mut data = TestData::default();
     control
         .finish_within(
@@ -306,7 +311,7 @@ async fn cancelled_before_any_warning(
     input: &Assembled,
     plan: bool,
 ) -> anyhow::Result<()> {
-    let mut control = Control::new(limits(), async { Ok(()) });
+    let mut control = Control::new(limits(), async { Ok(()) }, owned_test_of(Driver::Postgres));
     let mut phase = Phase::new("early", "cancelled");
     let error = if plan {
         control
@@ -590,9 +595,11 @@ async fn lifecycle(variable: &str, case: Case) -> anyhow::Result<()> {
     if matches!(case, Case::Budgets) {
         limits.step_ms = 30000.try_into().unwrap();
     }
-    let mut control = Control::new(limits, async {
-        receive.await.map_err(std::io::Error::other)
-    });
+    let mut control = Control::new(
+        limits,
+        async { receive.await.map_err(std::io::Error::other) },
+        owned_test_of(Driver::Postgres),
+    );
     let mut data = TestData::new(false);
     data.phases
         .push(Phase::new("provision", "owned PostgreSQL"));

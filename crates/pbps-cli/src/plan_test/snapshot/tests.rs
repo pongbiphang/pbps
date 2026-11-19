@@ -1,4 +1,5 @@
 use super::*;
+use crate::engine::owned_test_of;
 use crate::plan_test::execution::{Control, ms};
 use crate::plan_test::report::{ManifestWrite, Phase, Repin, Status, TestData};
 use pbps_config::test_manifest::CommitId;
@@ -181,7 +182,11 @@ async fn a_renamed_owner_keeps_its_allocator_but_an_unowned_name_does_not_move()
 
 #[tokio::test]
 async fn comparison_reports_keep_raw_names_and_escape_each_message_once() {
-    let mut control = Control::new(Default::default(), std::future::pending());
+    let mut control = Control::new(
+        Default::default(),
+        std::future::pending(),
+        owned_test_of(Driver::Postgres),
+    );
     for (table, sequence, shown_table, shown_sequence) in [
         ("app.t", "app.s", "app.t", "app.s"),
         ("app.t\\\n", "app.s\\\t", r"app.t\\\n", r"app.s\\\t"),
@@ -288,7 +293,11 @@ async fn an_expired_comparison_is_unanswerable_even_for_matching_or_empty_snapsh
             run_ms: 1.try_into().unwrap(),
             ..Default::default()
         };
-        let mut control = Control::new(limits, std::future::pending());
+        let mut control = Control::new(
+            limits,
+            std::future::pending(),
+            owned_test_of(Driver::Postgres),
+        );
         tokio::time::advance(std::time::Duration::from_millis(2)).await;
         let mut a = snapshot(rows(&["id"], &[(&[Some("1")], 1)]), &[("app.s", "3")]);
         if empty {
@@ -319,6 +328,7 @@ async fn an_interrupt_between_tables_or_allocators_is_unanswerable() {
                     Poll::Ready(Ok(()))
                 }
             }),
+            owned_test_of(Driver::Postgres),
         );
         let mut a = snapshot(rows(&["id"], &[(&[Some("1")], 1)]), &[]);
         a.tables.insert("app.u".into(), rows(&["id"], &[]));
@@ -335,7 +345,11 @@ async fn an_interrupt_between_tables_or_allocators_is_unanswerable() {
 
 #[tokio::test]
 async fn an_interrupt_before_an_empty_comparison_is_unanswerable() {
-    let mut control = Control::new(Default::default(), std::future::ready(Ok(())));
+    let mut control = Control::new(
+        Default::default(),
+        std::future::ready(Ok(())),
+        owned_test_of(Driver::Postgres),
+    );
     let a = Snapshot {
         tables: BTreeMap::new(),
         allocators: BTreeMap::new(),
@@ -417,10 +431,17 @@ async fn pg18_snapshot_serializes_raw_table_and_sequence_names() -> anyhow::Resu
     let dir = crate::adopt::Stage::new("snapshot2648")?;
     let registry = crate::test_scratch::StateDir::open(dir.path().join("runs"))?;
     let image = std::env::var("PBPS_TEST_PG_SCRATCH_IMAGE")?;
-    let mut control = Control::new(Default::default(), std::future::pending());
+    let mut control = Control::new(
+        Default::default(),
+        std::future::pending(),
+        owned_test_of(Driver::Postgres),
+    );
     let mut data = TestData::for_repin();
-    data.phases
-        .push(Phase::on(Driver::Postgres, "provision", "raw names"));
+    data.phases.push(Phase::on(
+        owned_test_of(Driver::Postgres),
+        "provision",
+        "raw names",
+    ));
     let scratch = boxed_future(|| control.start(&registry, &image, &mut data, 0))
         .await
         .with_context(|| {

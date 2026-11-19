@@ -5,7 +5,7 @@ use super::{
     report::{Assertion, Phase, Status, TestData},
     session::{HopContext, Session},
 };
-use crate::{deploy::test_run, test_scratch};
+use crate::{deploy::test_run, engine::OwnedTest, test_scratch};
 use pbps_config::test_manifest::{CommitId, Timeouts};
 use std::{
     collections::BTreeMap,
@@ -18,7 +18,7 @@ use std::{
 /// the same way, twice, to the new revision (ADR-0019 §4, §5).
 pub(super) struct Replay<'a> {
     /// The engine of the run, which its phases read their error numbers by.
-    pub driver: pbps_db::Driver,
+    pub owned: &'static OwnedTest,
     pub chain: &'a ReplayChain,
     pub revisions: &'a BTreeMap<CommitId, Assembled>,
     /// Name, SQL and path by manifest index; an entry the chain does not name is unused.
@@ -28,9 +28,9 @@ pub(super) struct Replay<'a> {
 }
 
 impl Inputs {
-    fn replay(&self) -> Replay<'_> {
+    fn replay(&self, owned: &'static OwnedTest) -> Replay<'_> {
         Replay {
-            driver: crate::db::driver_for(self.identity.dialect),
+            owned,
             chain: &self.chain,
             revisions: &self.revisions,
             fixtures: self
@@ -49,11 +49,11 @@ pub(super) fn replay_phases(r: &Replay<'_>, phases: &mut Vec<Phase>) {
     let first = phases.len();
     for (index, group) in r.chain.groups.iter().enumerate() {
         if index == 0 {
-            phases.push(Phase::on(r.driver, "bootstrap", group.commit.to_string()));
+            phases.push(Phase::on(r.owned, "bootstrap", group.commit.to_string()));
         } else {
             let hop = &r.chain.hops[index - 1];
             for phase in ["replay_plan", "replay_apply"] {
-                let mut p = Phase::on(r.driver, phase, group.commit.to_string());
+                let mut p = Phase::on(r.owned, phase, group.commit.to_string());
                 p.from = Some(hop.from.to_string());
                 p.to = Some(hop.to.to_string());
                 p.distance = Some(hop.distance);
@@ -61,7 +61,7 @@ pub(super) fn replay_phases(r: &Replay<'_>, phases: &mut Vec<Phase>) {
             }
         }
         for f in &group.fixtures {
-            phases.push(Phase::on(r.driver, "fixture", r.fixtures[*f].0));
+            phases.push(Phase::on(r.owned, "fixture", r.fixtures[*f].0));
         }
     }
     for p in &mut phases[first..] {
@@ -69,30 +69,39 @@ pub(super) fn replay_phases(r: &Replay<'_>, phases: &mut Vec<Phase>) {
     }
 }
 
-pub(super) fn scratch_label(driver: pbps_db::Driver) -> &'static str {
-    match driver {
-        pbps_db::Driver::Postgres => "owned PostgreSQL scratch",
-        pbps_db::Driver::Mssql => "owned SQL Server scratch",
+/// The owned-test support of the run's engine, or `None` after recording the
+/// refusal. Asked before records are reconciled, a runtime is discovered or a
+/// record is written, so an engine without support is refused by name and no
+/// run is reported as passed or skipped (#2798).
+pub(super) fn admit(
+    data: &mut TestData,
+    dialect: pbps_config::DialectName,
+) -> Option<&'static OwnedTest> {
+    match crate::engine::require_owned_test(crate::db::driver_for(dialect)) {
+        Ok(owned) => Some(owned),
+        Err(refusal) => {
+            data.failure(0, "test.input", refusal.to_string(), false);
+            None
+        }
     }
 }
 
-fn prepare(data: &mut TestData, inputs: &Inputs) {
-    let driver = crate::db::driver_for(inputs.identity.dialect);
+fn prepare(data: &mut TestData, inputs: &Inputs, owned: &'static OwnedTest) {
     data.phases
-        .push(Phase::on(driver, "provision", scratch_label(driver)));
-    replay_phases(&inputs.replay(), &mut data.phases);
+        .push(Phase::on(owned, "provision", owned.scratch_label));
+    replay_phases(&inputs.replay(owned), &mut data.phases);
     data.phases.push(Phase::on(
-        driver,
+        owned,
         "candidate_plan",
         inputs.candidate.revision.to_string(),
     ));
     data.phases.push(Phase::on(
-        driver,
+        owned,
         "candidate_apply",
         inputs.candidate.revision.to_string(),
     ));
     for a in &inputs.frozen.assertions {
-        data.phases.push(Phase::on(driver, "assertion", &a.name));
+        data.phases.push(Phase::on(owned, "assertion", &a.name));
         data.assertions.push(Assertion {
             name: a.name.clone(),
             path: a.file.path.clone(),
@@ -200,8 +209,8 @@ pub(super) async fn run_replay(
 }
 async fn work(inputs: &Inputs, session: &Session<'_>, data: &mut TestData, control: &mut Control) {
     let timeouts = inputs.frozen.manifest.timeouts;
-    let driver = crate::db::driver_for(inputs.identity.dialect);
-    let replay = inputs.replay();
+    let owned = control.owned();
+    let replay = inputs.replay(owned);
     let Some(mut phase) =
         test_run::boxed_future(|| run_replay(&replay, session, data, control, 2)).await
     else {
@@ -252,7 +261,7 @@ async fn work(inputs: &Inputs, session: &Session<'_>, data: &mut TestData, contr
             Ok(result) => result,
             Err(error) => A::Unanswerable(pbps_db::DbError::BadRow(error.to_string())),
         };
-        let (outcome, finding, evidence) = judge(driver, result);
+        let (outcome, finding, evidence) = judge(owned, result);
         let a = &mut data.assertions[index];
         a.outcome = outcome.into();
         if let Some(e) = evidence {
@@ -282,7 +291,7 @@ type Judged = (
 
 /// What one assertion's result means for the run: its outcome name, the finding
 /// it raises (id, message, whether the run could not look), and its evidence.
-fn judge(driver: pbps_db::Driver, result: pbps_db::query::AssertionResult) -> Judged {
+fn judge(owned: &OwnedTest, result: pbps_db::query::AssertionResult) -> Judged {
     use pbps_db::query::AssertionResult as A;
     match result {
         A::Pass(e) => ("pass", None, Some(e)),
@@ -303,7 +312,7 @@ fn judge(driver: pbps_db::Driver, result: pbps_db::query::AssertionResult) -> Ju
         // A coded engine fault (resources, storage, a session the server ended)
         // says the run could not look, not what the SQL did: the same reading
         // `Phase::record` gives a step's error.
-        A::SqlError(e) if super::report::engine_fault(driver, &e) => (
+        A::SqlError(e) if super::report::engine_fault(owned, &e) => (
             "unanswerable",
             Some(("test.assertion.unanswerable", e.to_string(), true)),
             None,
@@ -433,8 +442,11 @@ pub(crate) fn command(
         match checked {
             Ok(inputs) => {
                 data.input = Some(inputs.identity.clone());
-                prepare(&mut data, &inputs);
-                Some(inputs)
+                let Some(owned) = admit(&mut data, inputs.identity.dialect) else {
+                    return publish(data.finish(), json);
+                };
+                prepare(&mut data, &inputs, owned);
+                Some((inputs, owned))
             }
             Err(refusals) => {
                 for r in refusals {
@@ -452,28 +464,34 @@ pub(crate) fn command(
     data.phases[0].outcome = Status::Passed;
     data.phases[0].elapsed_ms = elapsed(started);
     match crate::db::runtime() {
-        Ok(runtime) => runtime.block_on(execute(inputs.as_ref(), &mut data)),
+        Ok(runtime) => runtime.block_on(execute(
+            inputs.as_ref().map(|(inputs, owned)| (inputs, *owned)),
+            &mut data,
+        )),
         Err(error) => data.failure(0, "test.infrastructure", error.to_string(), true),
     }
-    if let Some(inputs) = &inputs {
+    if let Some((inputs, _)) = &inputs {
         data.reverify(inputs);
     }
     publish(data.finish(), json)
 }
 
-async fn execute(inputs: Option<&Inputs>, data: &mut TestData) {
-    let allowance = inputs.map_or(Duration::from_secs(30), |i| {
+async fn execute(inputs: Option<(&Inputs, &'static OwnedTest)>, data: &mut TestData) {
+    let allowance = inputs.map_or(Duration::from_secs(30), |(i, _)| {
         ms(i.frozen.manifest.timeouts.cleanup_ms)
     });
     let Some(dir) = reconcile(data, allowance).await else {
         return;
     };
-    let Some(inputs) = inputs else {
+    let Some((inputs, owned)) = inputs else {
         data.cleanup_confirmed = true;
         return;
     };
-    let mut control = Control::new(inputs.frozen.manifest.timeouts, tokio::signal::ctrl_c())
-        .with_driver(crate::db::driver_for(inputs.identity.dialect));
+    let mut control = Control::new(
+        inputs.frozen.manifest.timeouts,
+        tokio::signal::ctrl_c(),
+        owned,
+    );
     let Some(scratch) =
         test_run::boxed_future(|| control.start(&dir, &inputs.identity.image, data, 1)).await
     else {

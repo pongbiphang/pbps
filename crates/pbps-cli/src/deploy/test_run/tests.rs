@@ -1,5 +1,6 @@
 use super::whole::{bootstrap, plan};
 use super::*;
+use crate::engine::owned_test_of;
 use crate::plan_test::{Revision, report::Status};
 use anyhow::{Context as _, ensure};
 use pbps_db::{Conn, Driver};
@@ -397,7 +398,7 @@ async fn lifecycle(variable: &str) -> anyhow::Result<()> {
     let scratch = boxed_future(|| {
         crate::test_scratch::TestScratch::start(
             &registry,
-            Driver::Postgres,
+            owned_test_of(Driver::Postgres),
             &image,
             pbps_config::resolver::PullPolicy::Never,
         )
@@ -421,7 +422,7 @@ async fn lifecycle(variable: &str) -> anyhow::Result<()> {
     let refused = boxed_future(|| {
         crate::test_scratch::TestScratch::start_bounded(
             &registry,
-            Driver::Postgres,
+            owned_test_of(Driver::Postgres),
             &image,
             pbps_config::resolver::PullPolicy::Never,
             Some(end),
@@ -1127,7 +1128,7 @@ async fn admission_case(variable: &str, case: Admission) -> anyhow::Result<()> {
     let scratch = boxed_future(|| {
         crate::test_scratch::TestScratch::start(
             &registry,
-            Driver::Postgres,
+            owned_test_of(Driver::Postgres),
             &image,
             pbps_config::resolver::PullPolicy::Never,
         )

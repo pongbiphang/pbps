@@ -66,6 +66,9 @@ pub(crate) struct Profile {
     pub capabilities_unknown_message: fn(cause: &str) -> String,
     /// Read by [`impact_notes`].
     pub impact_notes: fn(&ImpactReport) -> Vec<String>,
+    /// What `pbps test` needs of an engine that owns its scratch server, or
+    /// `None` where this engine has none (read by [`require_owned_test`]).
+    pub owned_test: Option<&'static OwnedTest>,
 }
 
 /// The profile of the engine `driver` names.
@@ -103,6 +106,7 @@ static MSSQL: Profile = Profile {
     online_depends_on_the_edition: true,
     capabilities_unknown_message: mssql_capabilities_unknown_message,
     impact_notes: mssql_impact_notes,
+    owned_test: Some(&owned_test::MSSQL),
 };
 
 static POSTGRES: Profile = Profile {
@@ -123,6 +127,7 @@ static POSTGRES: Profile = Profile {
     online_depends_on_the_edition: false,
     capabilities_unknown_message: postgres_capabilities_unknown_message,
     impact_notes: pbps_pg::impact::notes,
+    owned_test: Some(&owned_test::POSTGRES),
 };
 
 fn mssql_identity_unread(error: DbError) -> crate::resolution::Refused {

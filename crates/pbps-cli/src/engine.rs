@@ -60,6 +60,23 @@ pub(crate) fn of(driver: Driver) -> &'static dyn pbps_db::engine::Engine {
     }
 }
 
+/// The owned-test support of the engine `driver` names, or the refusal that
+/// names the engine where it has none.
+///
+/// The one selection for `pbps test`: a command asks once, before it
+/// reconciles records, discovers a runtime or writes a record, and carries the
+/// answer through its phases (#2798).
+pub(crate) fn require_owned_test(driver: Driver) -> anyhow::Result<&'static OwnedTest> {
+    owned_test::require(of(driver).name(), profile::profile(driver).owned_test)
+}
+
+/// The support record of an engine that has one, for a test that has no
+/// manifest to admit it from.
+#[cfg(test)]
+pub(crate) fn owned_test_of(driver: Driver) -> &'static OwnedTest {
+    require_owned_test(driver).expect("both engines own a test scratch")
+}
+
 #[cfg(test)]
 mod of_tests {
     use super::*;
@@ -89,6 +106,10 @@ pub(crate) use collected::*;
 // one `Profile` per engine, read by the functions below that need no connection
 // (#2798).
 mod profile;
+// What `pbps test` needs of an engine that owns its scratch server, where the
+// answer is a value; selected by `require_owned_test` (#2798).
+mod owned_test;
+pub(crate) use owned_test::OwnedTest;
 // The engine's steps of a connected plan, reached at named positions (#2798).
 pub(crate) mod apply_session;
 pub(crate) use apply_session::ApplySession;

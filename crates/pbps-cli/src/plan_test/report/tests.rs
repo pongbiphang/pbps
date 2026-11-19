@@ -1,4 +1,5 @@
 use super::*;
+use crate::engine::owned_test_of;
 use pbps_db::{DbError, Driver, LedgerError, catalog::RowsError};
 use pbps_model::TableName;
 use std::time::Instant;
@@ -46,7 +47,7 @@ fn coded(code: Option<&str>) -> DbError {
 
 fn assert_report(driver: Driver, error: anyhow::Error, unknown: bool) {
     let cause = format!("{error:#}");
-    let mut phase = Phase::on(driver, "candidate_plan", "candidate");
+    let mut phase = Phase::on(owned_test_of(driver), "candidate_plan", "candidate");
     phase.record(Instant::now(), "test.plan", &Err::<(), _>(error));
     assert_eq!(matches!(phase.outcome, Status::Unanswerable), unknown);
     assert!(matches!(phase.outcome, Status::Failed) || unknown);
@@ -80,12 +81,15 @@ fn postgres_infrastructure_codes_have_the_same_verdict_through_every_wrapper() {
         "08006", "53300", "58030", "XX000", "57000", "57014", "57P01", "57P02", "57P03", "57P04",
         "57P05", "25P03", "25P04",
     ] {
-        assert!(engine_fault(Driver::Postgres, &coded(Some(code))), "{code}");
+        assert!(
+            engine_fault(owned_test_of(Driver::Postgres), &coded(Some(code))),
+            "{code}"
+        );
         for wrapper in WRAPPERS {
             for context in [false, true] {
                 let error = wrap(coded(Some(code)), wrapper, context);
                 assert!(
-                    unanswerable(Some(Driver::Postgres), &error),
+                    unanswerable(Some(owned_test_of(Driver::Postgres)), &error),
                     "{code}, {wrapper:?}, context={context}: {error:#}"
                 );
                 assert_report(Driver::Postgres, error, true);
@@ -97,7 +101,7 @@ fn postgres_infrastructure_codes_have_the_same_verdict_through_every_wrapper() {
         "25001", "25006", "25P02", "42P01", "42501", "23505", "55P03",
     ] {
         assert!(
-            !engine_fault(Driver::Postgres, &coded(Some(code))),
+            !engine_fault(owned_test_of(Driver::Postgres), &coded(Some(code))),
             "{code}"
         );
         for wrapper in WRAPPERS {

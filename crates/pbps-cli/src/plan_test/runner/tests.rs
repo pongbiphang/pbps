@@ -1,4 +1,5 @@
 use super::*;
+use crate::engine::owned_test_of;
 
 #[test]
 fn d2b2_1165_empty_cleanup_has_no_project_or_plan_identity() {
@@ -120,7 +121,7 @@ fn coded(code: &str) -> anyhow::Error {
 }
 
 fn outcome_on(engine: pbps_db::Driver, error: anyhow::Error) -> Status {
-    let mut phase = Phase::on(engine, "assertion", "a");
+    let mut phase = Phase::on(owned_test_of(engine), "assertion", "a");
     phase.record(Instant::now(), "test.assertion", &Err::<(), _>(error));
     phase.outcome
 }
@@ -203,7 +204,7 @@ fn an_engine_fault_an_assertion_returns_is_unanswerable_and_the_users_own_error_
         (Postgres, "08006"),
     ];
     for (driver, code) in faults {
-        let (outcome, finding, _) = judge(driver, sql_error(code));
+        let (outcome, finding, _) = judge(owned_test_of(driver), sql_error(code));
         assert_eq!(outcome, "unanswerable", "{code}");
         let (id, _, unknown) = finding.unwrap();
         assert_eq!(
@@ -222,7 +223,7 @@ fn an_engine_fault_an_assertion_returns_is_unanswerable_and_the_users_own_error_
         (Postgres, "42P01"),
     ];
     for (driver, code) in findings {
-        let (outcome, finding, _) = judge(driver, sql_error(code));
+        let (outcome, finding, _) = judge(owned_test_of(driver), sql_error(code));
         assert_eq!(outcome, "sql_error", "{code}");
         let (id, _, unknown) = finding.unwrap();
         assert_eq!((id, unknown), ("test.assertion.sql", false), "{code}");
@@ -233,8 +234,10 @@ fn an_engine_fault_an_assertion_returns_is_unanswerable_and_the_users_own_error_
         rows: vec![],
         truncated: true,
     };
-    let (outcome, finding, evidence) =
-        judge(Mssql, pbps_db::query::AssertionResult::Violation(rows));
+    let (outcome, finding, evidence) = judge(
+        owned_test_of(Mssql),
+        pbps_db::query::AssertionResult::Violation(rows),
+    );
     assert_eq!(outcome, "violation");
     assert!(!finding.unwrap().2 && evidence.is_some());
 }

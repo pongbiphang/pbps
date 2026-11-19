@@ -16,6 +16,7 @@ mod record;
 mod removal;
 mod runtime;
 
+use crate::engine::OwnedTest;
 use pbps_config::resolver::PullPolicy;
 use pbps_db::Driver;
 
@@ -284,13 +285,13 @@ impl<'d> TestScratch<'d> {
     /// handle. On failure it confirms nothing is left or says what is.
     pub(crate) async fn start(
         dir: &'d StateDir,
-        driver: Driver,
+        owned: &'static OwnedTest,
         image: &str,
         pull: PullPolicy,
     ) -> Result<TestScratch<'d>, Error> {
         Self::start_bounded(
             dir,
-            driver,
+            owned,
             image,
             pull,
             None,
@@ -301,7 +302,7 @@ impl<'d> TestScratch<'d> {
 
     pub(crate) async fn start_bounded(
         dir: &'d StateDir,
-        driver: Driver,
+        owned: &'static OwnedTest,
         image: &str,
         pull: PullPolicy,
         deadline: Option<tokio::time::Instant>,
@@ -309,7 +310,7 @@ impl<'d> TestScratch<'d> {
     ) -> Result<TestScratch<'d>, Error> {
         Self::start_cancelled(
             dir,
-            driver,
+            owned,
             image,
             pull,
             deadline,
@@ -322,7 +323,7 @@ impl<'d> TestScratch<'d> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn start_cancelled(
         dir: &'d StateDir,
-        driver: Driver,
+        owned: &'static OwnedTest,
         image: &str,
         pull: PullPolicy,
         deadline: Option<tokio::time::Instant>,
@@ -344,10 +345,11 @@ impl<'d> TestScratch<'d> {
                 }
             } => result?,
         };
-        let engine = match driver {
-            Driver::Postgres => "postgres",
-            Driver::Mssql => "mssql",
-        };
+        // Written to the record, which a later run's recovery reads back, so
+        // it is the engine's stored string and the same support record that
+        // admitted the run starts its container (#2798).
+        let engine = owned.record_engine;
+        let driver = owned.driver;
         // What `ours` checks of the container later; the resolver's own
         // labels (token, engine, process) are set by its start.
         let labels = [

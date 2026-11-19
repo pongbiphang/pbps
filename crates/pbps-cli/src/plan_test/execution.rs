@@ -6,7 +6,7 @@ use super::{
     revision::Assembled,
     session::{HopContext, Session},
 };
-use crate::{deploy::test_run, test_scratch};
+use crate::{deploy::test_run, engine::OwnedTest, test_scratch};
 use anyhow::Context as _;
 use pbps_config::test_manifest::Timeouts;
 use std::{
@@ -27,20 +27,22 @@ pub(crate) struct Control {
     end: Deadline,
     timeouts: Timeouts,
     cancel: Pin<Box<dyn Future<Output = std::io::Result<()>>>>,
-    /// The engine of the manifest's dialect; PostgreSQL until a caller says so.
-    driver: pbps_db::Driver,
+    /// The manifest's engine's owned-test support. Required at construction:
+    /// a default would run one engine's answers against another engine.
+    owned: &'static OwnedTest,
 }
 impl Control {
     pub(crate) fn new(
         timeouts: Timeouts,
         signal: impl Future<Output = std::io::Result<()>> + 'static,
+        owned: &'static OwnedTest,
     ) -> Self {
         let mut signal = Box::pin(signal);
         let mut observed = false;
         Self {
             end: Deadline::now() + ms(timeouts.run_ms),
             timeouts,
-            driver: pbps_db::Driver::Postgres,
+            owned,
             cancel: Box::pin(poll_fn(move |cx| {
                 if observed {
                     return std::task::Poll::Ready(Ok(()));
@@ -51,9 +53,9 @@ impl Control {
             })),
         }
     }
-    pub(crate) fn with_driver(mut self, driver: pbps_db::Driver) -> Self {
-        self.driver = driver;
-        self
+    /// The support this run's phases read their facts from.
+    pub(super) fn owned(&self) -> &'static OwnedTest {
+        self.owned
     }
     pub(super) fn deadline(&self, allowance: Duration) -> Deadline {
         self.end.min(Deadline::now() + allowance)
@@ -87,7 +89,7 @@ impl Control {
         let started = Instant::now();
         let result = test_scratch::TestScratch::start_cancelled(
             dir,
-            self.driver,
+            self.owned,
             image,
             pbps_config::resolver::PullPolicy::IfMissing,
             Some(self.deadline(ms(self.timeouts.startup_ms))),
@@ -114,6 +116,8 @@ impl Control {
         phase: usize,
     ) -> anyhow::Result<Session<'s>> {
         let started = Instant::now();
+        // Copied out so the bounded future does not borrow `self` twice.
+        let owned = self.owned;
         let result = self
             .bounded(
                 ms(self.timeouts.startup_ms),
@@ -121,19 +125,7 @@ impl Control {
                     data.acquired_image = Some(scratch.acquired_image().await?);
                     let mut conn =
                         pbps_db::Conn::connect(scratch.driver(), scratch.connection()).await?;
-                    data.engine_build = Some(match scratch.driver() {
-                        pbps_db::Driver::Postgres => {
-                            let rows = conn.query("SELECT version() AS version").await?;
-                            rows.first()
-                                .context("engine build is unreadable")?
-                                .try_get::<&str>("version")?
-                                .context("missing engine build")?
-                                .into()
-                        }
-                        pbps_db::Driver::Mssql => {
-                            pbps_mssql::test_scratch::engine_build(&mut conn).await?
-                        }
-                    });
+                    data.engine_build = Some((owned.read_engine_build)(&mut conn).await?);
                     drop(conn);
                     Session::new(scratch).await
                 }),

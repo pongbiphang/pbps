@@ -1,4 +1,5 @@
 //! Test evidence is a report; no executable artifact is a field (ADR-0019 §9).
+use crate::engine::OwnedTest;
 use crate::output::{Finding, Report};
 use pbps_config::test_manifest::CommitId;
 use schemars::JsonSchema;
@@ -39,14 +40,14 @@ pub(crate) struct Phase {
     /// The engine whose error numbers `record` reads. Not part of the report.
     #[serde(skip)]
     #[schemars(skip)]
-    engine: Option<pbps_db::Driver>,
+    engine: Option<&'static OwnedTest>,
 }
 impl Phase {
     /// A phase that works against `engine`'s database. The engine is required
     /// because a server error code means different things on each: a SQLSTATE
     /// prefix on PostgreSQL, a plain number on SQL Server (`unanswerable`).
     /// Nothing defaults to an engine, so a caller that has none does not compile.
-    pub fn on(engine: pbps_db::Driver, phase: &str, identity: impl Into<String>) -> Self {
+    pub fn on(engine: &'static OwnedTest, phase: &str, identity: impl Into<String>) -> Self {
         Self {
             engine: Some(engine),
             ..Self::offline(phase, identity)
@@ -96,7 +97,7 @@ impl Phase {
 /// A tool-authored refusal answered; an uncoded transport or deadline failure
 /// did not. With a code, the engine decides. A phase with no database never
 /// reads a coded error as a fault by its number (ADR-0019 §9).
-pub(super) fn unanswerable(engine: Option<pbps_db::Driver>, error: &anyhow::Error) -> bool {
+pub(super) fn unanswerable(engine: Option<&OwnedTest>, error: &anyhow::Error) -> bool {
     use pbps_db::{DbError, LedgerError};
     // A transparent ledger error skips the DbError in source(); a rows-read
     // source downcasts to Box<DbError>. Recover both shapes, as ledger_safe_reason
@@ -117,7 +118,7 @@ pub(super) fn unanswerable(engine: Option<pbps_db::Driver>, error: &anyhow::Erro
         }
         return !matches!(db, DbError::Refused(_))
             && db.server_error_code().is_none_or(|c| match engine {
-                Some(driver) => fault_code(driver, &c),
+                Some(owned) => (owned.is_fault_code)(&c),
                 None => false,
             });
     }
@@ -125,24 +126,13 @@ pub(super) fn unanswerable(engine: Option<pbps_db::Driver>, error: &anyhow::Erro
         .chain()
         .any(|e| e.is::<tokio::time::error::Elapsed>() || e.is::<std::io::Error>())
 }
-/// Whether a server-coded error is the engine or its host failing, by the
-/// engine's own numbering.
-fn fault_code(driver: pbps_db::Driver, code: &str) -> bool {
-    match driver {
-        pbps_db::Driver::Postgres => {
-            ["08", "53", "57", "58", "XX"]
-                .iter()
-                .any(|p| code.starts_with(p))
-                || matches!(code, "25P03" | "25P04")
-        }
-        pbps_db::Driver::Mssql => pbps_mssql::test_scratch::infrastructure_fault(code),
-    }
-}
-/// [`fault_code`] for a database error an assertion returned.
-pub(super) fn engine_fault(driver: pbps_db::Driver, error: &pbps_db::DbError) -> bool {
+/// Whether a database error an assertion returned is the engine or its host
+/// failing, by the engine's own numbering
+/// ([`OwnedTest::is_fault_code`](crate::engine::OwnedTest)).
+pub(super) fn engine_fault(owned: &OwnedTest, error: &pbps_db::DbError) -> bool {
     error
         .server_error_code()
-        .is_some_and(|code| fault_code(driver, &code))
+        .is_some_and(|code| (owned.is_fault_code)(&code))
 }
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct Column {

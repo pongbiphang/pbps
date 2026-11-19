@@ -17,12 +17,12 @@ use sha2::{Digest as _, Sha256};
 
 use super::execution::{Control, elapsed, ms};
 use super::report::{ManifestWrite, Phase, Repin, Side, Status, TestData};
-use super::runner::{Replay, locate, publish, reconcile, replay_phases, run_replay};
+use super::runner::{Replay, admit, locate, publish, reconcile, replay_phases, run_replay};
 use super::{
     ChainProblem, ConsumedFile, GitProblem, Inputs, Outcome, Refusal, ReplayChain, Revision, Role,
     chain, git, revision, snapshot,
 };
-use crate::{deploy::test_run, test_scratch};
+use crate::{deploy::test_run, engine::OwnedTest, test_scratch};
 
 /// A validated re-pin: everything known without a database.
 struct Plan {
@@ -386,9 +386,12 @@ pub(crate) fn command(
         }
     };
     data.input = Some(plan.inputs.identity.clone());
+    let Some(owned) = admit(&mut data, plan.inputs.identity.dialect) else {
+        return publish(data.finish(), json);
+    };
     data.phases[0].outcome = Status::Passed;
     match crate::db::runtime() {
-        Ok(runtime) => runtime.block_on(execute(&plan, &mut data)),
+        Ok(runtime) => runtime.block_on(execute(&plan, owned, &mut data)),
         Err(error) => data.failure(0, "test.infrastructure", error.to_string(), true),
     }
     publish(data.finish(), json)
@@ -421,9 +424,9 @@ async fn side(
             (f.name.as_str(), text, f.file.path.as_str())
         })
         .collect();
-    let driver = crate::db::driver_for(plan.inputs.identity.dialect);
+    let owned = control.owned();
     let replay = Replay {
-        driver,
+        owned,
         chain: if original {
             &plan.original
         } else {
@@ -435,13 +438,13 @@ async fn side(
         timeouts,
     };
     let provision = data.phases.len();
-    let mut p = Phase::on(driver, "provision", super::runner::scratch_label(driver));
+    let mut p = Phase::on(owned, "provision", owned.scratch_label);
     p.side = Some(label.to_owned());
     data.phases.push(p);
     let first = data.phases.len();
     replay_phases(&replay, &mut data.phases);
     let read = data.phases.len();
-    let mut p = Phase::on(driver, "snapshot", "rows and allocators");
+    let mut p = Phase::on(owned, "snapshot", "rows and allocators");
     p.side = Some(label.to_owned());
     data.phases.push(p);
     if !run {
@@ -535,13 +538,12 @@ fn runs(second: bool, completed: usize, cleanup_confirmed: bool) -> bool {
     completed == usize::from(second) && (!second || cleanup_confirmed)
 }
 
-async fn execute(plan: &Plan, data: &mut TestData) {
+async fn execute(plan: &Plan, owned: &'static OwnedTest, data: &mut TestData) {
     let timeouts = plan.inputs.frozen.manifest.timeouts;
     let Some(dir) = reconcile(data, ms(timeouts.cleanup_ms)).await else {
         return;
     };
-    let mut control = Control::new(timeouts, tokio::signal::ctrl_c())
-        .with_driver(crate::db::driver_for(plan.inputs.identity.dialect));
+    let mut control = Control::new(timeouts, tokio::signal::ctrl_c(), owned);
     let mut snapshots = Vec::new();
     // Stop at the first side that does not complete; the other is listed as skipped.
     for label in ["original", "proposed"] {
