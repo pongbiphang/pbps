@@ -810,7 +810,9 @@ mod tests {
             let normalized = normalize(&ty(declared)).expect(declared);
             let mut fresh = mem();
             let c = fresh.connection();
-            c.execute_batch(&format!("CREATE TABLE t(a {})", normalized.raw()))
+            // Concatenated, not formatted: this is the SQL the engine is
+            // asked to run, and the type goes in exactly as it is written.
+            c.execute_batch(&["CREATE TABLE t(a ", &normalized.raw().to_string(), ")"].concat())
                 .expect(declared);
             let rows = c
                 .query("SELECT type FROM pragma_table_xinfo('t')", &[])
@@ -851,7 +853,9 @@ mod tests {
             let parsed = ty(declared);
             let engine = mem()
                 .connection()
-                .execute_batch(&format!("CREATE TABLE t(c {}) STRICT", parsed.raw()))
+                .execute_batch(
+                    &["CREATE TABLE t(c ", &parsed.raw().to_string(), ") STRICT"].concat(),
+                )
                 .is_ok();
             assert_eq!(strict_allows(&parsed), engine, "{declared}");
         }
