@@ -378,8 +378,8 @@ fn exclusion(
 /// has no default GIN class at all.
 fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
     use crate::index_policy::{
-        ClassProblem, class_problem, holds_expression_key, holds_key_type, key_scope, key_type_of,
-        later_class, offered, provider_key,
+        ClassProblem, class_problem, expression_class_problem, holds_expression_key,
+        holds_key_type, key_scope, key_type_of, offered, provider_key,
     };
     let policy = index.method.policy();
     let method = index.method.as_str().to_ascii_uppercase();
@@ -427,8 +427,15 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
             {
                 found.push(invalid(format!(
                     "{what} is a {method} index over `{column}`, and this model holds {method} \
-                     only over {}",
+                     only over {}{}",
                     key_scope(policy),
+                    // BRIN has an operator class for what a cast reaches, so an
+                    // expression is the way to index a column of any other type.
+                    if policy.method == pbps_model::IndexMethod::Brin {
+                        "; index an expression over it, such as `(flag::integer)`"
+                    } else {
+                        ""
+                    },
                     column = column.shown(),
                 )));
             }
@@ -440,7 +447,10 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
             spoke = typed.is_some();
             found.extend(typed);
         }
-        let Some(class) = &key.opclass else { continue };
+        let Some(class) = &key.opclass else {
+            found.extend(key_parameters(what, policy, key));
+            continue;
+        };
         // The type a class is read against: the key column's entry of the
         // method's key types (DEC-1984.1).
         let key_type = column
@@ -448,26 +458,20 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
             .and_then(|c| key_type_of(policy, c));
         let at = format!("`{shown}`");
         let named = class.shown();
-        if later_class(policy, class) {
-            // Said instead of the type's own message: the class is the engine's,
-            // and the part that holds it is the next one.
-            if spoke {
-                found.pop();
-            }
-            found.push(invalid(format!(
-                "{what} indexes {at} with operator class `{named}`, which a {method} index \
-                 takes in the next part of #2449 (minmax-multi and Bloom); until then leave \
-                 the class out for the type's default"
-            )));
-            continue;
-        }
         // The type's message already named the class; a method with no class of
         // its own to offer has nothing to add to it.
         if spoke && policy.classes.is_empty() {
             continue;
         }
-        found.push(invalid(match class_problem(policy, class, key_type) {
-            None => continue,
+        let problem = match column {
+            Some(_) => class_problem(policy, class, key_type),
+            None => expression_class_problem(policy, class),
+        };
+        let said = match problem {
+            None => {
+                found.extend(key_parameters(what, policy, key));
+                continue;
+            }
             // The B-tree's own wording: its direction words are the likelier slip.
             Some(ClassProblem::DefaultOnly) if method == "BTREE" => format!(
                 "{what} indexes {at} with operator class `{named}`; a B-tree index here \
@@ -483,6 +487,16 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
                  `{}`; leave the class out",
                 key_type.map_or("its key type", |k| k.base)
             ),
+            // An expression's type is the engine's to bind: the class is judged
+            // against every type the method holds, and the engine against this one.
+            Some(ClassProblem::NotHeld) if key_type.is_none() && !policy.key_types.is_empty() => {
+                format!(
+                    "{what} indexes {at} with operator class `{named}`, which is not an \
+                     engine class of {method} that this model holds; leave the class out for \
+                     the type's default, or name the minmax-multi or Bloom class of the \
+                     expression's type (`int4_minmax_multi_ops`, `int4_bloom_ops`)"
+                )
+            }
             // A type with no class beside its default has nothing to offer but it.
             Some(ClassProblem::NotHeld) if key_type.is_some_and(|k| k.classes.is_empty()) => {
                 let key = key_type.expect("checked");
@@ -497,7 +511,9 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
                  over `{}` here takes `{}` or, by leaving it out, the \
                  default `{}`",
                 key_type.map_or("its key type", |k| k.base),
-                key_type.map_or(policy.classes, |k| k.classes).join("` or `"),
+                key_type
+                    .map_or(policy.classes, |k| k.classes)
+                    .join("` or `"),
                 key_type.map_or("its default", |k| k.default_class),
             ),
             Some(ClassProblem::Outside) => format!(
@@ -510,9 +526,47 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
                     offered(policy, key_type)
                 }
             ),
-        }));
+        };
+        found.push(invalid(said));
     }
     found
+}
+
+/// A key's operator class parameters (DEC-2449.2): each is an option of the key's
+/// class, in the one canonical spelling the loader and the pull both write, and
+/// there are none without a class to hold them.
+fn key_parameters(
+    what: &str,
+    policy: &MethodPolicy,
+    key: &pbps_model::IndexColumn,
+) -> Vec<DialectError> {
+    let shown = pbps_model::escape::Escaped(key.key.text());
+    let Some(class) = &key.opclass else {
+        return (!key.opclass_parameters.is_empty())
+            .then(|| {
+                invalid(format!(
+                    "{what} gives `{shown}` operator class parameters and no operator class"
+                ))
+            })
+            .into_iter()
+            .collect();
+    };
+    key.opclass_parameters
+        .iter()
+        .filter_map(|(name, value)| {
+            let why = match policy.canonical_class_parameter(class, name, value) {
+                Ok(canonical) if canonical == *value => return None,
+                Ok(canonical) => {
+                    format!("`{value}` is not in its canonical spelling `{canonical}`")
+                }
+                Err(why) => why,
+            };
+            Some(invalid(format!(
+                "{what} sets operator class parameter `{}` on `{shown}`: {why}",
+                pbps_model::escape::Escaped(name),
+            )))
+        })
+        .collect()
 }
 
 /// What a key's collation may be (DEC-2448.2): held for a column key of a
@@ -1295,6 +1349,7 @@ mod tests {
                         descending: *descending,
                         opclass: class.map(|c| c.parse().unwrap()),
                         collation: None,
+                        opclass_parameters: Default::default(),
                     })
                     .collect(),
                 include: Vec::new(),
@@ -1360,6 +1415,7 @@ mod tests {
                         descending: false,
                         opclass: class.map(|c| c.parse().unwrap()),
                         collation: collation.map(str::to_owned),
+                        opclass_parameters: Default::default(),
                     })
                     .collect(),
                 include: Vec::new(),
@@ -1455,6 +1511,94 @@ mod tests {
         assert!(structure(&filtered).is_empty());
     }
 
+    /// BRIN holds the engine's minmax-multi and Bloom class of each key's own
+    /// input type, over a column or an expression, with that family's options in
+    /// their canonical spelling, and nothing else takes options (DEC-2449.2).
+    #[test]
+    fn a_brin_key_holds_its_types_multi_and_bloom_classes_with_their_options() {
+        use IndexMethod::Brin;
+        for (column, class) in [
+            ("n", "int4_minmax_multi_ops"),
+            ("n", "pg_catalog.int4_bloom_ops"),
+            ("body", "text_bloom_ops"),
+            ("ip", "inet_minmax_ops"),
+            ("ip", "inet_minmax_multi_ops"),
+            ("net", "inet_bloom_ops"),
+            // An expression's type is the engine's: any held class is let through.
+            ("n + 1", "int8_minmax_multi_ops"),
+        ] {
+            let keys = [(column, Some(class), None)];
+            assert!(
+                structure(&gist_table(Brin, &keys)).is_empty(),
+                "{column} {class}"
+            );
+        }
+        let with = |class: &str, parameters: &[(&str, &str)]| {
+            let mut t = gist_table(Brin, &[("n", Some(class), None)]);
+            t.indexes.get_mut("ix").unwrap().columns[0].opclass_parameters = parameters
+                .iter()
+                .map(|(n, v)| ((*n).to_owned(), (*v).to_owned()))
+                .collect();
+            structure(&t).join("\n")
+        };
+        assert_eq!(
+            with("int4_minmax_multi_ops", &[("values_per_range", "16")]),
+            ""
+        );
+        assert_eq!(
+            with(
+                "int4_bloom_ops",
+                &[
+                    ("false_positive_rate", "0.01"),
+                    ("n_distinct_per_range", "-0.1")
+                ]
+            ),
+            ""
+        );
+        // Negatives: each is refused by the option's or the class's name.
+        for (class, parameters, expected) in [
+            (
+                "int4_minmax_multi_ops",
+                vec![("values_per_range", "040")],
+                "canonical spelling `32`",
+            ),
+            (
+                "int4_minmax_multi_ops",
+                vec![("values_per_range", "7")],
+                "outside 8 to 256",
+            ),
+            (
+                "int4_minmax_multi_ops",
+                vec![("false_positive_rate", "0.01")],
+                "takes `values_per_range`",
+            ),
+            (
+                "int4_bloom_ops",
+                vec![("values_per_range", "16")],
+                "takes `n_distinct_per_range`",
+            ),
+            (
+                "int8_bloom_ops",
+                vec![("false_positive_rate", "0.01")],
+                "over `integer` here takes",
+            ),
+        ] {
+            let found = with(class, &parameters);
+            assert!(found.contains(expected), "{class} {parameters:?}: {found}");
+        }
+        let mut orphan = gist_table(Brin, &[("n", None, None)]);
+        orphan.indexes.get_mut("ix").unwrap().columns[0]
+            .opclass_parameters
+            .insert("values_per_range".into(), "16".into());
+        assert!(structure(&orphan).join("\n").contains("no operator class"));
+        // B-tree has no family: an option on its (spelled-out) class is refused.
+        let mut btree = gist_table(IndexMethod::Btree, &[("n", Some("int4_bloom_ops"), None)]);
+        btree.indexes.get_mut("ix").unwrap().columns[0]
+            .opclass_parameters
+            .insert("false_positive_rate".into(), "0.01".into());
+        assert!(!structure(&btree).is_empty());
+    }
+
     /// Negative: BRIN is never unique, ordered or `INCLUDE`d; a column the
     /// engine has no class for (`tsvector`, an array, a user type) is refused with
     /// the advice to index an expression; the type's own default class is
@@ -1485,21 +1629,29 @@ mod tests {
             spelled.contains("leave the class out") && !spelled.contains("B-tree"),
             "{spelled}"
         );
+        // The engine's class of another type, and of none: named, with the type's own.
         for class in [
-            "int4_minmax_multi_ops",
-            "int4_bloom_ops",
-            "pg_catalog.int4_bloom_ops",
+            "int8_bloom_ops",
+            "text_bloom_ops",
+            "range_inclusion_ops",
+            "nope_ops",
         ] {
-            let later = said(&[("n", Some(class), None)]);
+            let wrong = said(&[("n", Some(class), None)]);
             assert!(
-                later.contains("next part of #2449")
-                    && later.matches("operator class").count() == 1,
-                "{class}: {later}"
+                wrong.contains("over `integer` here takes `int4_minmax_multi_ops`"),
+                "{class}: {wrong}"
             );
         }
+        // An expression's type is the engine's to bind, so a class that is no
+        // BRIN class of this model is named, and the default is "leave it out".
         let expression = said(&[("int4range(n, n)", Some("range_inclusion_ops"), None)]);
         assert!(
-            expression.contains("only its type's default class"),
+            expression.contains("not an engine class of BRIN that this model holds"),
+            "{expression}"
+        );
+        let expression = said(&[("n + 1", Some("int4_minmax_ops"), None)]);
+        assert!(
+            expression.contains("is BRIN's default") && expression.contains("leave the class out"),
             "{expression}"
         );
         let outside = said(&[("n", Some("ext.int4_minmax_ops"), None)]);
@@ -1662,6 +1814,7 @@ mod tests {
                 descending: false,
                 opclass: class.map(|c| c.parse().unwrap()),
                 collation: None,
+                opclass_parameters: Default::default(),
             }];
             structure(&table)
         };
@@ -1904,6 +2057,7 @@ mod tests {
                         descending: false,
                         opclass: None,
                         collation: None,
+                        opclass_parameters: Default::default(),
                     },
                     operator: "ext.%".parse().unwrap(),
                 }],
@@ -2406,6 +2560,7 @@ mod tests {
                             descending: false,
                             opclass: (!class.is_empty()).then(|| class.parse().unwrap()),
                             collation: None,
+                            opclass_parameters: Default::default(),
                         },
                         operator: pbps_model::OperatorRef::symbol("&&").unwrap(),
                     })

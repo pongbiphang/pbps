@@ -134,10 +134,30 @@ pub struct KeyType {
     pub classes: &'static [&'static str],
 }
 
+/// One option of an operator class's own (`pg_attribute.attoptions` of the index
+/// key, not the index's `reloptions`), as the engine parses it (DEC-2449.2).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClassParameter {
+    pub name: &'static str,
+    pub kind: Kind,
+    /// The inclusive bounds the engine states for a real option, which
+    /// [`Kind::Real`] alone does not carry (an integer's are in its kind).
+    pub bounds: Option<(f64, f64)>,
+}
+
+/// The options of every class whose name ends in `suffix`: BRIN's families are
+/// told by it, once the class is one the method holds, so a class of that name
+/// outside the held list takes none (DEC-2449.2).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClassFamily {
+    pub suffix: &'static str,
+    pub parameters: &'static [ClassParameter],
+}
+
 /// What this model holds of one index access method: the capabilities the
 /// engine reports for it, the key types and operator classes it is held over,
 /// and its storage parameters with their change verdicts (DEC-2448.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MethodPolicy {
     pub method: IndexMethod,
     /// `pg_indexam_has_property(…, 'can_unique')`.
@@ -172,6 +192,9 @@ pub struct MethodPolicy {
     /// class, so none is written). Empty where the method is not held by type
     /// (DEC-2448.2).
     pub typed_columns: &'static [(&'static str, Option<&'static str>)],
+    /// The families of held classes that take options of their own, empty where
+    /// none does (DEC-2449.2).
+    pub class_families: &'static [ClassFamily],
     /// The lock an in-place change of one of its parameters takes.
     pub lock: IndexLock,
     pub parameters: &'static [IndexParameter],
@@ -195,6 +218,74 @@ impl MethodPolicy {
             })
             .max()
             .unwrap_or(self.lock)
+    }
+
+    /// The options the held class `class` takes: those of its family, and none
+    /// for a class this method does not hold (a schema's, or an unknown name).
+    pub fn class_parameters(&self, class: &crate::OpClassRef) -> &'static [ClassParameter] {
+        let Some(name) = class.as_bare() else {
+            return &[];
+        };
+        let held = self.classes.contains(&name)
+            || self.key_types.iter().any(|k| k.classes.contains(&name));
+        if !held {
+            return &[];
+        }
+        self.class_families
+            .iter()
+            .find(|f| name.ends_with(f.suffix))
+            .map_or(&[], |f| f.parameters)
+    }
+
+    /// `value` of option `name` of the held class `class`, in its one canonical
+    /// spelling by the engine's own rules, or why it is not one.
+    pub fn canonical_class_parameter(
+        &self,
+        class: &crate::OpClassRef,
+        name: &str,
+        value: &str,
+    ) -> Result<String, String> {
+        let known = self.class_parameters(class);
+        let shown = crate::escape::Escaped(name);
+        let Some(parameter) = known.iter().find(|p| p.name == name) else {
+            let takes = if known.is_empty() {
+                "takes no options".to_owned()
+            } else {
+                format!(
+                    "takes {}",
+                    known
+                        .iter()
+                        .map(|p| format!("`{}`", p.name))
+                        .collect::<Vec<_>>()
+                        .join(" and ")
+                )
+            };
+            return Err(format!(
+                "`{shown}` is not an option of operator class `{}`, which {takes}",
+                class.shown()
+            ));
+        };
+        // An integer's bounds are its kind's, but the engine's message names them
+        // as it does a real's, so both are read the same way.
+        let (kind, bounds) = if let Kind::IntBetween(lo, hi) = parameter.kind {
+            (Kind::Int, Some((lo as f64, hi as f64)))
+        } else {
+            (parameter.kind, parameter.bounds)
+        };
+        let text = spelled(kind, name, value)?;
+        let in_range = |bounds: (f64, f64)| {
+            text.parse::<f64>()
+                .is_ok_and(|r| (bounds.0..=bounds.1).contains(&r))
+        };
+        match bounds {
+            Some(bounds) if !in_range(bounds) => Err(format!(
+                "`{}` is outside {} to {}, the range of `{shown}`",
+                crate::escape::Escaped(value),
+                bounds.0,
+                bounds.1
+            )),
+            _ => Ok(text),
+        }
     }
 
     /// The most severe verdict among `names` and the first name that has it.
@@ -267,6 +358,7 @@ static BTREE: MethodPolicy = MethodPolicy {
     exclusion: true,
     provider_classes: true,
     typed_columns: &[],
+    class_families: &[],
     lock: IndexLock::ShareUpdateExclusive,
     parameters: &[
         param("deduplicate_items", Kind::Bool),
@@ -299,6 +391,7 @@ static GIN: MethodPolicy = MethodPolicy {
     exclusion: false,
     provider_classes: true,
     typed_columns: &[],
+    class_families: &[],
     lock: IndexLock::AccessExclusive,
     parameters: &[
         param("fastupdate", Kind::Bool),
@@ -333,6 +426,7 @@ static GIST: MethodPolicy = MethodPolicy {
         ("inet", Some("inet_ops")),
         ("cidr", Some("inet_ops")),
     ],
+    class_families: &[],
     lock: IndexLock::ShareUpdateExclusive,
     parameters: &[
         param_locked("buffering", Kind::Buffering, IndexLock::AccessExclusive),
@@ -340,11 +434,14 @@ static GIST: MethodPolicy = MethodPolicy {
     ],
 };
 
-/// BRIN (DEC-2449.1), measured on 16.15 and 18.6. No unique, no `INCLUDE`, no
-/// order. Held over a column of a type the model declares and the engine gives a
-/// default class (the minmax ones and `inet`/`cidr`'s inclusion), or over an
-/// expression; the default class is the only one held (the multi and Bloom
-/// classes are the next part). `pages_per_range` is `Rebuild`: `ALTER … SET`
+/// BRIN (DEC-2449.1, DEC-2449.2), measured on 16.15 and 18.6. No unique, no
+/// `INCLUDE`, no order. Held over a column of a type the model declares and the
+/// engine gives a default class (the minmax ones, and `inet`/`cidr`'s inclusion),
+/// or over an expression. Beside the default, each type holds the engine's own
+/// minmax-multi and Bloom classes of its input type (`inet`/`cidr` also the plain
+/// `inet_minmax_ops`), which take options of their own: `values_per_range` for
+/// the first, `n_distinct_per_range` and `false_positive_rate` for the second,
+/// with the bounds the engine states. `pages_per_range` is `Rebuild`: `ALTER … SET`
 /// records the value and leaves the metapage at the old granularity until a
 /// `REINDEX`, and `RESET` keeps the physical one, so only a rebuild makes the
 /// declared value the one in use. `autosummarize` is a runtime flag and changes
@@ -357,30 +454,119 @@ static BRIN: MethodPolicy = MethodPolicy {
     expression_keys: true,
     exclusion: false,
     provider_classes: false,
-    key_types: &[],
+    key_types: &[
+        key(
+            "smallint",
+            "int2_minmax_ops",
+            &["int2_minmax_multi_ops", "int2_bloom_ops"],
+        ),
+        key(
+            "integer",
+            "int4_minmax_ops",
+            &["int4_minmax_multi_ops", "int4_bloom_ops"],
+        ),
+        key(
+            "bigint",
+            "int8_minmax_ops",
+            &["int8_minmax_multi_ops", "int8_bloom_ops"],
+        ),
+        key(
+            "numeric",
+            "numeric_minmax_ops",
+            &["numeric_minmax_multi_ops", "numeric_bloom_ops"],
+        ),
+        key(
+            "real",
+            "float4_minmax_ops",
+            &["float4_minmax_multi_ops", "float4_bloom_ops"],
+        ),
+        key(
+            "double precision",
+            "float8_minmax_ops",
+            &["float8_minmax_multi_ops", "float8_bloom_ops"],
+        ),
+        key("character", "bpchar_minmax_ops", &["bpchar_bloom_ops"]),
+        key("character varying", "text_minmax_ops", &["text_bloom_ops"]),
+        key("text", "text_minmax_ops", &["text_bloom_ops"]),
+        key("bytea", "bytea_minmax_ops", &["bytea_bloom_ops"]),
+        key(
+            "date",
+            "date_minmax_ops",
+            &["date_minmax_multi_ops", "date_bloom_ops"],
+        ),
+        key(
+            "time without time zone",
+            "time_minmax_ops",
+            &["time_minmax_multi_ops", "time_bloom_ops"],
+        ),
+        key(
+            "time with time zone",
+            "timetz_minmax_ops",
+            &["timetz_minmax_multi_ops", "timetz_bloom_ops"],
+        ),
+        key(
+            "timestamp without time zone",
+            "timestamp_minmax_ops",
+            &["timestamp_minmax_multi_ops", "timestamp_bloom_ops"],
+        ),
+        key(
+            "timestamp with time zone",
+            "timestamptz_minmax_ops",
+            &["timestamptz_minmax_multi_ops", "timestamptz_bloom_ops"],
+        ),
+        key(
+            "interval",
+            "interval_minmax_ops",
+            &["interval_minmax_multi_ops", "interval_bloom_ops"],
+        ),
+        key(
+            "uuid",
+            "uuid_minmax_ops",
+            &["uuid_minmax_multi_ops", "uuid_bloom_ops"],
+        ),
+        key(
+            "macaddr",
+            "macaddr_minmax_ops",
+            &["macaddr_minmax_multi_ops", "macaddr_bloom_ops"],
+        ),
+        key(
+            "inet",
+            "inet_inclusion_ops",
+            &["inet_minmax_ops", "inet_minmax_multi_ops", "inet_bloom_ops"],
+        ),
+        key(
+            "cidr",
+            "inet_inclusion_ops",
+            &["inet_minmax_ops", "inet_minmax_multi_ops", "inet_bloom_ops"],
+        ),
+    ],
     classes: &[],
     collation: false,
-    typed_columns: &[
-        ("smallint", None),
-        ("integer", None),
-        ("bigint", None),
-        ("numeric", None),
-        ("real", None),
-        ("double precision", None),
-        ("character", None),
-        ("character varying", None),
-        ("text", None),
-        ("bytea", None),
-        ("date", None),
-        ("time without time zone", None),
-        ("time with time zone", None),
-        ("timestamp without time zone", None),
-        ("timestamp with time zone", None),
-        ("interval", None),
-        ("uuid", None),
-        ("macaddr", None),
-        ("inet", None),
-        ("cidr", None),
+    typed_columns: &[],
+    class_families: &[
+        ClassFamily {
+            suffix: "_minmax_multi_ops",
+            parameters: &[ClassParameter {
+                name: "values_per_range",
+                kind: Kind::IntBetween(8, 256),
+                bounds: None,
+            }],
+        },
+        ClassFamily {
+            suffix: "_bloom_ops",
+            parameters: &[
+                ClassParameter {
+                    name: "n_distinct_per_range",
+                    kind: Kind::Real,
+                    bounds: Some((-1.0, 2_147_483_647.0)),
+                },
+                ClassParameter {
+                    name: "false_positive_rate",
+                    kind: Kind::Real,
+                    bounds: Some((0.0001, 0.25)),
+                },
+            ],
+        },
     ],
     lock: IndexLock::AccessExclusive,
     parameters: &[
@@ -393,6 +579,20 @@ static BRIN: MethodPolicy = MethodPolicy {
         param_locked("autosummarize", Kind::Bool, IndexLock::AccessExclusive),
     ],
 };
+
+/// One key type of BRIN: its default class, and the engine's other classes of
+/// the same input type that the model holds.
+const fn key(
+    base: &'static str,
+    default_class: &'static str,
+    classes: &'static [&'static str],
+) -> KeyType {
+    KeyType {
+        base,
+        default_class,
+        classes,
+    }
+}
 
 pub(crate) fn policy_of(method: IndexMethod) -> &'static MethodPolicy {
     match method {
@@ -653,7 +853,7 @@ mod tests {
         let b = IndexMethod::Brin.policy();
         assert_eq!(b.method, IndexMethod::Brin);
         assert!(!b.unique && !b.include && !b.ordered && b.expression_keys && !b.collation);
-        assert_eq!((b.classes, b.key_types), (&[][..], &[][..]));
+        assert!(b.classes.is_empty() && b.typed_columns.is_empty());
         assert_eq!(b.lock, IndexLock::AccessExclusive);
         assert_eq!(
             b.change_of(["pages_per_range"]),
@@ -669,24 +869,150 @@ mod tests {
             b.lock_of(["autosummarize", "pages_per_range"]),
             IndexLock::AccessExclusive
         );
-        let typed: Vec<_> = b.typed_columns.iter().map(|(t, _)| *t).collect();
+        let typed: Vec<_> = b.key_types.iter().map(|k| k.base).collect();
         // The measured defaults: `inet` and `cidr` through inclusion, the rest
         // minmax; no class is ever required of a column.
-        for held in [
-            "integer",
-            "text",
-            "timestamp with time zone",
-            "inet",
-            "cidr",
-            "uuid",
+        for (held, default) in [
+            ("integer", "int4_minmax_ops"),
+            ("text", "text_minmax_ops"),
+            ("character varying", "text_minmax_ops"),
+            ("timestamp with time zone", "timestamptz_minmax_ops"),
+            ("inet", "inet_inclusion_ops"),
+            ("cidr", "inet_inclusion_ops"),
+            ("uuid", "uuid_minmax_ops"),
         ] {
-            assert!(typed.contains(&held), "{held}");
+            let key = b.key_types.iter().find(|k| k.base == held).expect(held);
+            assert_eq!(key.default_class, default, "{held}");
+            assert!(!key.classes.contains(&default), "{held}");
         }
-        assert!(b.typed_columns.iter().all(|(_, class)| class.is_none()));
+        assert_eq!(typed.len(), 20);
         // Negative: the types the engine gives no BRIN class are not held.
         for none in ["boolean", "json", "jsonb", "tsvector", "xml"] {
             assert!(!typed.contains(&none), "{none}");
         }
+    }
+
+    /// Every class a BRIN key type holds is of its own input type and of one of the
+    /// two families that take options (or `inet`'s plain minmax), and a minmax
+    /// class is never held beside the default that already is one (measured on
+    /// 16.15 and 18.6, DEC-2449.2): `character` has only Bloom, a `text` or
+    /// `bytea` has no minmax-multi, and a default is never in its own list.
+    #[test]
+    fn each_brin_key_type_holds_the_classes_of_its_own_input_type() {
+        let brin = IndexMethod::Brin.policy();
+        let has = |ty: &str, class: &str| {
+            brin.key_types
+                .iter()
+                .find(|k| k.base == ty)
+                .is_some_and(|k| k.classes.contains(&class))
+        };
+        assert!(has("integer", "int4_minmax_multi_ops") && has("integer", "int4_bloom_ops"));
+        assert!(
+            has("character", "bpchar_bloom_ops") && !has("character", "bpchar_minmax_multi_ops")
+        );
+        assert!(has("character varying", "text_bloom_ops") && has("text", "text_bloom_ops"));
+        assert!(!has("text", "text_minmax_multi_ops") && !has("bytea", "bytea_minmax_multi_ops"));
+        assert!(has("cidr", "inet_bloom_ops") && has("inet", "inet_minmax_ops"));
+        // Negatives: another type's class, and a default spelled as a class.
+        assert!(!has("integer", "int8_bloom_ops") && !has("integer", "int4_minmax_ops"));
+        assert!(!has("inet", "inet_inclusion_ops") && !has("date", "date_minmax_ops"));
+        for key in brin.key_types {
+            for class in key.classes {
+                assert!(
+                    class.ends_with("_minmax_multi_ops")
+                        || class.ends_with("_bloom_ops")
+                        || *class == "inet_minmax_ops",
+                    "{} {class}",
+                    key.base
+                );
+            }
+        }
+    }
+
+    /// The options of a held class are its family's, with the engine's bounds
+    /// and in one canonical spelling (DEC-2449.2, measured on 16.15 and 18.6:
+    /// `values_per_range` 8 to 256, `n_distinct_per_range` -1 to 2147483647,
+    /// `false_positive_rate` 0.0001 to 0.25, C's number spellings).
+    #[test]
+    fn a_class_option_is_its_familys_in_one_spelling_within_the_engines_bounds() {
+        let brin = IndexMethod::Brin.policy();
+        let value = |class: &str, name: &str, value: &str| {
+            brin.canonical_class_parameter(&class.parse().unwrap(), name, value)
+        };
+        let multi = "int4_minmax_multi_ops";
+        let bloom = "pg_catalog.int4_bloom_ops";
+        for (given, canonical) in [
+            ("8", "8"),
+            ("256", "256"),
+            ("040", "32"),
+            ("0x20", "32"),
+            (" 16 ", "16"),
+            ("7e1", "70"),
+        ] {
+            assert_eq!(
+                value(multi, "values_per_range", given).as_deref(),
+                Ok(canonical),
+                "{given}"
+            );
+        }
+        for given in ["7", "257", "0", "-8", "x", ""] {
+            assert!(
+                value(multi, "values_per_range", given).is_err(),
+                "{given:?}"
+            );
+        }
+        for (given, canonical) in [
+            ("-1", "-1"),
+            ("0", "0"),
+            ("-0.1", "-0.1"),
+            ("32.0", "32"),
+            ("3.0e1", "30"),
+            ("2147483647", "2147483647"),
+        ] {
+            assert_eq!(
+                value(bloom, "n_distinct_per_range", given).as_deref(),
+                Ok(canonical),
+                "{given}"
+            );
+        }
+        for given in ["-1.0001", "2147483648", "nan", "inf", "0x10"] {
+            assert!(
+                value(bloom, "n_distinct_per_range", given).is_err(),
+                "{given}"
+            );
+        }
+        for (given, canonical) in [
+            ("0.0001", "0.0001"),
+            ("0.25", "0.25"),
+            ("1e-2", "0.01"),
+            ("0.010", "0.01"),
+        ] {
+            assert_eq!(
+                value(bloom, "false_positive_rate", given).as_deref(),
+                Ok(canonical),
+                "{given}"
+            );
+        }
+        for given in ["0.00009", "0.2501", "0", "-0.01", "1e-400"] {
+            assert!(
+                value(bloom, "false_positive_rate", given).is_err(),
+                "{given}"
+            );
+        }
+        // Negatives: another family's option, no option at all, and a class the
+        // method does not hold takes none, whatever its name ends in.
+        assert!(value(multi, "false_positive_rate", "0.01").is_err());
+        assert!(value(bloom, "values_per_range", "16").is_err());
+        assert!(value("int4_minmax_ops", "values_per_range", "16").is_err());
+        assert!(value("inet_minmax_ops", "values_per_range", "16").is_err());
+        assert!(value("ext.int4_bloom_ops", "false_positive_rate", "0.01").is_err());
+        assert!(value("range_bloom_ops", "false_positive_rate", "0.01").is_err());
+        assert!(
+            IndexMethod::Btree
+                .policy()
+                .class_parameters(&"int4_bloom_ops".parse().unwrap())
+                .is_empty()
+        );
     }
 
     /// `pages_per_range` is a whole number from 1 to 131072 (the engine's

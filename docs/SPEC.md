@@ -569,8 +569,13 @@ indexes:
   numeric, string, date and time types, `uuid`, `macaddr`, `inet`, `cidr`) or an
   expression, with `pages_per_range` (a change rebuilds the index) and
   `autosummarize` (altered in place); an option change on a partitioned parent's
-  index rebuilds it for every method (DEC-2449.1). BRIN's minmax-multi and Bloom
-  classes and `exclude:` are refused by name until their own parts.
+  index rebuilds it for every method (DEC-2449.1). A BRIN key may name the engine's
+  minmax-multi or Bloom class of its input type (`int4_minmax_multi_ops`,
+  `int4_bloom_ops`), with that family's options in `opclass_parameters:` beside
+  `opclass:` (`values_per_range`; `n_distinct_per_range` and `false_positive_rate`),
+  in the engine's bounds and one canonical spelling; a change to a class or an option
+  rebuilds the index, and a filter that fits no page fails the apply, which leaves
+  the old index (DEC-2449.2).
 - **A PostgreSQL exclusion constraint is an `exclude:` entry** with a required
   `method:` (`btree` or `gist`), `keys:` that each name a column or an expression and
   the `operator:` (a `pg_catalog` symbol such as `&&` or `=`) it is excluded with,

@@ -603,6 +603,7 @@ async fn mssql_chained_views_wait_only_for_the_foreign_keys_actual_key() {
                         descending: false,
                         opclass: None,
                         collation: None,
+                        opclass_parameters: Default::default(),
                     }],
                     include: vec![],
                     unique,

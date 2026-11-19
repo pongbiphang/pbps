@@ -449,6 +449,7 @@ async fn mssql_a_filtered_index_is_no_resolver_surface() {
                                 descending: false,
                                 opclass: None,
                                 collation: None,
+                                opclass_parameters: Default::default(),
                             }],
                             include: vec![],
                             unique: false,

@@ -315,7 +315,10 @@ use crate::zone::SessionZone;
 // 80 adds `SetExclusion`'s drop half and `IndexPart::Exclusion` (DEC-2448.4): an older build
 // would not know the part, and would refuse a plan that drops a constraint only by chance of
 // reading `from` without `to`; 79 is the text search objects'.
-pub const CURRENT_VERSION: u32 = 80;
+// 82 adds a key's `opclass_parameters`, the options of BRIN's minmax-multi and Bloom classes
+// (DEC-2449.2): an older build would reject the field as unknown instead of as a newer plan;
+// 81 belongs to another change.
+pub const CURRENT_VERSION: u32 = 82;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -1681,7 +1684,7 @@ mod tests {
             Default::default(),
             Default::default(),
         );
-        assert_eq!(plan.version, 80);
+        assert_eq!(plan.version, 82);
         let bare = serde_json::to_value(&plan).unwrap();
         assert!(bare.get("extension_drops").is_none(), "{bare}");
         assert!(bare.get("extension_changes").is_none(), "{bare}");

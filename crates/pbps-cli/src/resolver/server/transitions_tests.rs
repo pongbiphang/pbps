@@ -167,6 +167,7 @@ fn a_child_dropped_after_its_tables_rename_keeps_its_opening_inventory() {
                 descending: false,
                 opclass: None,
                 collation: None,
+                opclass_parameters: Default::default(),
             }],
             include: Vec::new(),
             unique: false,

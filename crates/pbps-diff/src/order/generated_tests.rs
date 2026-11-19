@@ -1268,6 +1268,7 @@ fn a_new_exclusion_reads_its_key_expressions_and_predicate_and_a_drop_reads_none
         descending: false,
         opclass: None,
         collation: None,
+        opclass_parameters: Default::default(),
     };
     assert_eq!(
         super::gather(

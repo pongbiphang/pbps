@@ -1857,6 +1857,12 @@ pub struct IndexColumn {
     /// column key has one: an expression carries its own, which the catalog
     /// does not tell apart.
     pub collation: Option<String>,
+    /// The operator class's own parameters (BRIN's minmax-multi `values_per_range`,
+    /// Bloom's `n_distinct_per_range` and `false_positive_rate`), each value in
+    /// its canonical spelling (DEC-2449.2). Empty is the engine's defaults, and an
+    /// explicit default is a pin that stays one. They are the key's, never the
+    /// index's `storage_parameters`: the catalog keeps them in `attoptions`.
+    pub opclass_parameters: std::collections::BTreeMap<String, String>,
 }
 
 /// What an index key orders by: a column of the table, or an expression over
@@ -1907,6 +1913,7 @@ impl IndexColumn {
             descending: false,
             opclass: None,
             collation: None,
+            opclass_parameters: Default::default(),
         }
     }
 }
@@ -1928,6 +1935,8 @@ struct RawIndexColumn {
     opclass: Option<crate::OpClassRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     collation: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    opclass_parameters: std::collections::BTreeMap<String, String>,
 }
 
 impl TryFrom<RawIndexColumn> for IndexColumn {
@@ -1949,6 +1958,7 @@ impl TryFrom<RawIndexColumn> for IndexColumn {
             descending: raw.descending,
             opclass: raw.opclass,
             collation: raw.collation,
+            opclass_parameters: raw.opclass_parameters,
         })
     }
 }
@@ -1965,6 +1975,7 @@ impl From<IndexColumn> for RawIndexColumn {
             descending: c.descending,
             opclass: c.opclass,
             collation: c.collation,
+            opclass_parameters: c.opclass_parameters,
         }
     }
 }
@@ -1998,6 +2009,33 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&own).unwrap(),
             r#"{"name":"c","descending":false,"opclass":"ext.gist_ops"}"#
+        );
+    }
+
+    /// A key's class parameters are written only when it has some, so every key
+    /// from before them reads and writes the same bytes; held ones round-trip in
+    /// name order, and an unknown field is still refused (DEC-2449.2).
+    #[test]
+    fn an_index_key_class_parameters_are_written_only_when_held() {
+        let plain = r#"{"name":"n","descending":false,"opclass":"int4_bloom_ops"}"#;
+        let key: IndexColumn = serde_json::from_str(plain).unwrap();
+        assert!(key.opclass_parameters.is_empty());
+        assert_eq!(serde_json::to_string(&key).unwrap(), plain);
+        let held = r#"{"name":"n","descending":false,"opclass":"int4_bloom_ops","opclass_parameters":{"false_positive_rate":"0.01","n_distinct_per_range":"32"}}"#;
+        let key: IndexColumn = serde_json::from_str(held).unwrap();
+        assert_eq!(key.opclass_parameters["n_distinct_per_range"], "32");
+        assert_eq!(serde_json::to_string(&key).unwrap(), held);
+        // Negative: the parameters are the key's, not its class's identity.
+        let other = IndexColumn {
+            opclass_parameters: Default::default(),
+            ..key.clone()
+        };
+        assert_ne!(other, key);
+        assert!(
+            serde_json::from_str::<IndexColumn>(
+                r#"{"name":"n","descending":false,"opclass_parameter":{}}"#
+            )
+            .is_err()
         );
     }
 
@@ -2273,6 +2311,7 @@ mod tests {
                 descending: false,
                 opclass: None,
                 collation: None,
+                opclass_parameters: Default::default(),
             }],
             include: Vec::new(),
             unique,
@@ -2390,6 +2429,7 @@ mod tests {
                 descending: false,
                 opclass: None,
                 collation: None,
+                opclass_parameters: Default::default(),
             }],
             include: Vec::new(),
             unique: false,
@@ -2728,6 +2768,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 },
                 operator: crate::OperatorRef::symbol("&&").unwrap(),
             }],

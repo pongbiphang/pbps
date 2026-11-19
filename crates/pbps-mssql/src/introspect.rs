@@ -658,6 +658,7 @@ fn indexed_view(
                 descending: i.is_descending,
                 opclass: None,
                 collation: None,
+                opclass_parameters: Default::default(),
             });
         }
     }
@@ -2160,6 +2161,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 descending: i.is_descending,
                 opclass: None,
                 collation: None,
+                opclass_parameters: Default::default(),
             });
         }
     }

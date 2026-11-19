@@ -822,6 +822,13 @@
           ],
           "default": null
         },
+        "opclass_parameters": {
+          "description": "The operator class's own parameters (BRIN's minmax-multi `values_per_range`,\nBloom's `n_distinct_per_range` and `false_positive_rate`), by name, for a key\nthat names its `opclass:`. They are the key's and not the index's\n`storage_parameters` (DEC-2449.2).",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/StorageValueDto"
+          }
+        },
         "order": {
           "description": "`asc`, the default, or `desc`.",
           "anyOf": [
@@ -2177,6 +2184,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 114,
+  "x-pbps-schema-version": 116,
   "x-pbps-tool-version": "0.0.0"
 }

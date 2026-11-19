@@ -5020,9 +5020,15 @@ fn attached(
                 })
                 .collect()
         };
-    // An index as the engine matches it to adopt it: storage parameters
-    // and sort order aside, measured on 16 and 18 (`DESC` and `NULLS FIRST`
-    // adopted, another collation, operator class, `INCLUDE` or method not).
+    // An index as the engine matches it to adopt it: storage parameters,
+    // a key's class options and sort order aside, measured on 16 and 18
+    // (`DESC` and `NULLS FIRST` adopted, another collation, operator class,
+    // `INCLUDE` or method not). A BRIN key's `values_per_range` of 32 under
+    // a parent's 16 is adopted all the same, and the clone keeps its 32
+    // (DEC-2449.2), so the options are not part of the match: left in, an
+    // own index declared over such a match would not be seen as adopted, and
+    // the attach would turn it into the parent's clone and leave the declared
+    // one absent.
     let index = |t: &Table| -> BTreeMap<pbps_model::ObjectLocalName, Index> {
         t.indexes
             .iter()
@@ -5031,6 +5037,7 @@ fn attached(
                 i.storage_parameters.clear();
                 for c in &mut i.columns {
                     c.descending = false;
+                    c.opclass_parameters.clear();
                 }
                 (n.clone(), i)
             })
@@ -5130,6 +5137,7 @@ fn attached(
                 descending: false,
                 opclass: None,
                 collation: None,
+                opclass_parameters: Default::default(),
             })
             .collect(),
         include: Vec::new(),
@@ -5941,7 +5949,8 @@ fn refuse_parent_index(
 /// Whether a new parent index can take a partition's own index as its
 /// clone. Measured on 16.15 and 18.6: the method, the keys in order with
 /// their classes, uniqueness, the predicate and the `INCLUDE` columns must
-/// match; a key's direction and the storage parameters need not (#1688).
+/// match; a key's direction, its class options (`opclass_parameters`) and
+/// the storage parameters need not (#1688, DEC-2449.2).
 ///
 /// An expression key or a predicate is a match whatever its text, as the
 /// attach path takes it (DEC-1545.1): the engine compares what each parses
@@ -10648,6 +10657,7 @@ mod tests {
                         descending: false,
                         opclass: Some(class),
                         collation: None,
+                        opclass_parameters: Default::default(),
                     }],
                     include: Vec::new(),
                     unique: false,
@@ -11215,6 +11225,7 @@ mod tests {
                         descending: false,
                         opclass: None,
                         collation: None,
+                        opclass_parameters: Default::default(),
                     }],
                     include: Vec::new(),
                     unique: false,
@@ -11527,6 +11538,7 @@ mod tests {
                 descending: false,
                 opclass: None,
                 collation: None,
+                opclass_parameters: Default::default(),
             }],
             include: Vec::new(),
             unique: false,
@@ -11742,6 +11754,7 @@ mod tests {
             exclusion: true,
             provider_classes: true,
             typed_columns: &[],
+            class_families: &[],
             lock: IndexLock::AccessExclusive,
             parameters: &[
                 p("altered", ParameterChange::Alter),
@@ -11760,6 +11773,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 },
                 operator: pbps_model::OperatorRef::symbol(operator).unwrap(),
             }],
@@ -12544,6 +12558,80 @@ mod tests {
         ));
     }
 
+    /// A key's class or its class's options changing replaces the index, through
+    /// the ordinary drop and add and never an `ALTER INDEX`: the engine has no
+    /// in-place change of a key's options (measured, `42601`). A difference that
+    /// also touches an in-place option is still one replacement carrying every
+    /// final option (DEC-2449.2).
+    #[test]
+    fn a_class_or_a_class_option_change_is_one_replacement_carrying_every_final_option() {
+        let table_with = |class: &str, key: &[(&str, &str)], parameters: &[(&str, &str)]| {
+            let mut t = Table::default();
+            t.columns
+                .insert("n".into(), Column::new("integer".parse().unwrap()));
+            t.indexes.insert(
+                "ix".into(),
+                Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        opclass: Some(class.parse().unwrap()),
+                        opclass_parameters: parameters_of(key),
+                        ..pbps_model::IndexColumn::column("n")
+                    }],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                    method: IndexMethod::Brin,
+                    storage_parameters: parameters_of(parameters),
+                    filegroup: None,
+                },
+            );
+            t
+        };
+        let run = |was: &Table, now: &Table| {
+            let mut changes = Vec::new();
+            let mut errs = Vec::new();
+            diff_constraints(&"dbo.t".parse().unwrap(), was, now, &mut changes, &mut errs);
+            assert!(errs.is_empty(), "{errs:?}");
+            changes
+        };
+        let base = table_with("int4_minmax_multi_ops", &[("values_per_range", "16")], &[]);
+        assert!(run(&base, &base).is_empty());
+        let option = table_with("int4_minmax_multi_ops", &[("values_per_range", "32")], &[]);
+        let class = table_with("int4_bloom_ops", &[], &[]);
+        let pin = table_with("int4_minmax_multi_ops", &[], &[]);
+        for now in [&option, &class, &pin] {
+            assert!(
+                matches!(
+                    run(&base, now).as_slice(),
+                    [Change::Index(IndexChange::DropIndex { .. }), Change::Index(IndexChange::AddIndex { index, .. })]
+                        if index.columns == now.indexes["ix"].columns
+                ),
+                "{now:?}"
+            );
+        }
+        // An in-place option beside it adds no `ALTER`: one replacement has it all.
+        let both = table_with(
+            "int4_minmax_multi_ops",
+            &[("values_per_range", "32")],
+            &[("autosummarize", "true")],
+        );
+        assert!(matches!(
+            run(&base, &both).as_slice(),
+            [Change::Index(IndexChange::DropIndex { .. }), Change::Index(IndexChange::AddIndex { index, .. })]
+                if index.storage_parameters.get("autosummarize").map(String::as_str) == Some("true")
+        ));
+        // Negative: the in-place option alone is still the `ALTER`.
+        let only = table_with(
+            "int4_minmax_multi_ops",
+            &[("values_per_range", "16")],
+            &[("autosummarize", "true")],
+        );
+        assert!(matches!(
+            run(&base, &only).as_slice(),
+            [Change::Index(IndexChange::SetIndexStorageParameters { .. })]
+        ));
+    }
+
     /// Through the differ itself, under a policy that holds one parameter of
     /// each verdict: `Alter` is the `ALTER INDEX` change, `Rebuild` replaces
     /// the index (its drop and its add, carrying the final parameters), and
@@ -12766,6 +12854,7 @@ mod tests {
                         descending,
                         opclass: None,
                         collation: None,
+                        opclass_parameters: Default::default(),
                     }],
                     include: Vec::new(),
                     unique: false,
@@ -14740,6 +14829,7 @@ mod tests {
                             descending: false,
                             opclass: None,
                             collation: None,
+                            opclass_parameters: Default::default(),
                         }],
                         include: Vec::new(),
                         unique: false,
@@ -15776,6 +15866,7 @@ mod tests {
                 descending: false,
                 opclass: None,
                 collation: None,
+                opclass_parameters: Default::default(),
             }],
             include: Vec::new(),
             unique: false,
@@ -16096,6 +16187,80 @@ mod tests {
                 reclaimed.changes
             );
         }
+        // A BRIN index under class options the parent's differ in is adopted
+        // all the same, measured on 16 and 18 (DEC-2449.2), and the clone
+        // keeps its own. So an own index declared as that one is displaced
+        // before the attach and added after it, as any adopted one is; left
+        // in place it would become the parent's clone and the declared index
+        // would be absent. With no such index on the parent nothing is
+        // adopted, and the own index stays.
+        let brin = |values_per_range: &str| Index {
+            columns: vec![pbps_model::IndexColumn {
+                opclass: Some("int4_minmax_multi_ops".parse().unwrap()),
+                opclass_parameters: [("values_per_range".to_owned(), values_per_range.to_owned())]
+                    .into(),
+                ..pbps_model::IndexColumn::column("n")
+            }],
+            method: pbps_model::IndexMethod::Brin,
+            ..index_on("n")
+        };
+        let steps = |base: &Schema, declared: &Schema| -> Vec<String> {
+            outcome(base, declared, &[])
+                .2
+                .expect("planned")
+                .changes
+                .iter()
+                .map(|p| match &p.change {
+                    Change::Index(IndexChange::DropIndex { name, .. }) => {
+                        format!("drop {}", name.shown())
+                    }
+                    Change::Index(IndexChange::AddIndex { name, .. }) => {
+                        format!("add {}", name.shown())
+                    }
+                    other => format!("{other:?}").split(' ').next().unwrap().to_owned(),
+                })
+                .collect()
+        };
+        let ev: TableName = "app.ev".parse().unwrap();
+        let t: TableName = "app.t".parse().unwrap();
+        let with_brins = |parents: Option<&str>, own: &str| {
+            let mut base = ordinary(&|t| {
+                t.indexes.insert("t_n".into(), brin(own));
+            });
+            let mut declared = declared.clone();
+            declared
+                .tables
+                .get_mut(&t)
+                .unwrap()
+                .indexes
+                .insert("t_n".into(), brin(own));
+            for schema in [&mut base, &mut declared] {
+                let parent = schema.tables.get_mut(&ev).unwrap();
+                parent.indexes.remove("ev_n");
+                if let Some(p) = parents {
+                    parent.indexes.insert("ev_n".into(), brin(p));
+                }
+            }
+            (base, declared)
+        };
+        let (base_brin, declared_brin) = with_brins(Some("16"), "32");
+        assert_eq!(
+            steps(&base_brin, &declared_brin),
+            [
+                "drop t_id",
+                "drop t_n",
+                "AttachPartition",
+                "SetPartitionDefault",
+                "add t_n"
+            ],
+            "options the parent's differ in are still an adoption"
+        );
+        let (base_none, declared_none) = with_brins(None, "32");
+        assert_eq!(
+            steps(&base_none, &declared_none),
+            ["drop t_id", "AttachPartition", "SetPartitionDefault"],
+            "no index of the parent's, nothing adopted"
+        );
         // The attach validates the parent's foreign key over the rows it
         // brings, so it waits for the rows the plan writes into the table that
         // key references, and goes before the rows of a table referencing
@@ -16198,6 +16363,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 })
                 .collect(),
             unique: true,
@@ -16903,6 +17069,7 @@ mod tests {
                         descending: false,
                         opclass: None,
                         collation: None,
+                        opclass_parameters: Default::default(),
                     }],
                     ..index_on("n")
                 },
@@ -16972,6 +17139,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: Vec::new(),
                 unique: false,
@@ -17924,6 +18092,7 @@ mod tests {
                 descending: false,
                 opclass: None,
                 collation: None,
+                opclass_parameters: Default::default(),
             }],
             include: Vec::new(),
             unique: false,
@@ -19077,6 +19246,7 @@ mod tests {
                 descending: false,
                 opclass: None,
                 collation: None,
+                opclass_parameters: Default::default(),
             }],
             include: Vec::new(),
             unique: true,
@@ -19222,6 +19392,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: Vec::new(),
                 unique: false,
@@ -19861,6 +20032,7 @@ mod tests {
                         descending: false,
                         opclass: None,
                         collation: None,
+                        opclass_parameters: Default::default(),
                     }],
                     include: Vec::new(),
                     unique: false,
@@ -20425,6 +20597,7 @@ mod tests {
                         descending: false,
                         opclass: None,
                         collation: None,
+                        opclass_parameters: Default::default(),
                     }],
                     include: Vec::new(),
                     unique: false,
@@ -24202,6 +24375,7 @@ mod tests {
                 descending: false,
                 opclass: None,
                 collation: None,
+                opclass_parameters: Default::default(),
             }],
             include: vec![],
             unique: false,
@@ -24279,6 +24453,7 @@ mod tests {
                             descending: false,
                             opclass: None,
                             collation: None,
+                            opclass_parameters: Default::default(),
                         }],
                         include: vec![],
                         unique: true,
@@ -24391,6 +24566,7 @@ mod tests {
                         descending: false,
                         opclass: None,
                         collation: None,
+                        opclass_parameters: Default::default(),
                     }],
                     include: vec![],
                     unique,
@@ -24621,6 +24797,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: vec![],
                 unique: true,
@@ -24774,6 +24951,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: vec!["note".into()],
                 unique: false,
@@ -24798,6 +24976,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: vec!["note".into()],
                 unique: false,
@@ -24986,6 +25165,7 @@ mod tests {
                 descending: false,
                 opclass: None,
                 collation: None,
+                opclass_parameters: Default::default(),
             }],
             include: vec![],
             unique: false,
@@ -25250,6 +25430,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: vec![],
                 unique: false,
@@ -25352,6 +25533,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: vec![],
                 unique: false,
@@ -25768,6 +25950,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: vec![],
                 unique: false,
@@ -25820,6 +26003,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: vec![],
                 unique: false,
@@ -25866,6 +26050,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: vec![],
                 unique: false,
@@ -26092,6 +26277,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: vec![],
                 unique: false,
@@ -29408,6 +29594,7 @@ mod tests {
             descending: false,
             opclass: None,
             collation: None,
+            opclass_parameters: Default::default(),
         };
         for kind in [
             Part::Computed,

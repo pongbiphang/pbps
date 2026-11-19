@@ -226,6 +226,7 @@ fn schema() -> Schema {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: Vec::new(),
                 unique: false,

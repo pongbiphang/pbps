@@ -3,7 +3,8 @@
 //! options, the round trip ends in an empty plan, `autosummarize` alters in
 //! place, `pages_per_range` replaces the index (a native `ALTER` leaves the
 //! metapage at the old granularity), a drop needs `--allow destructive` and
-//! nothing else, and a declaration this part does not hold is refused by name.
+//! nothing else, and a declaration this part does not hold is refused by name (its classes with options are
+//! `index_brin2449_classes`).
 //! Each case runs on both pinned engines.
 use super::{
     Demo, OwnDatabase, approved_apply, code, on_server, scalar, server, stderr, stdout, succeeds,
@@ -219,16 +220,12 @@ fn a_brin_declaration_the_engine_or_this_part_does_not_hold_is_refused_by_name()
             "leave the class out",
         ),
         (
-            "  ix:\n    method: brin\n    keys:\n      - {column: n, opclass: int4_bloom_ops}\n",
-            "next part of #2449",
-        ),
-        (
-            "  ix:\n    method: brin\n    keys:\n      - {column: n, opclass: int4_minmax_multi_ops}\n",
-            "next part of #2449",
+            "  ix:\n    method: brin\n    keys:\n      - {column: n, opclass: int8_bloom_ops}\n",
+            "over `integer` here takes",
         ),
         (
             "  ix:\n    method: brin\n    keys:\n      - column: n\n        opclass_parameters: {values_per_range: 8}\n",
-            "opclass_parameters",
+            "names its `opclass:`",
         ),
         (
             "  ix:\n    method: brin\n    keys:\n      - {column: label, collation: C}\n",

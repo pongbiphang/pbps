@@ -480,6 +480,7 @@ async fn a_clustered_index_change_is_a_rewrite_only_where_the_catalog_says_so() 
             descending: false,
             opclass: None,
             collation: None,
+            opclass_parameters: Default::default(),
         }],
         include: Vec::new(),
         unique: false,

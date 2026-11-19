@@ -1049,6 +1049,7 @@ fn convert_indexes(
 ) -> std::collections::BTreeMap<pbps_model::ObjectLocalName, Index> {
     let mut indexes = std::collections::BTreeMap::new();
     for (k, ix) in dtos {
+        let method = ix.method;
         let mut cols = Vec::with_capacity(ix.columns.len() + ix.keys.len());
         let mut ok = true;
         // One list or the other (DEC-1169.2): two would leave the order of
@@ -1075,7 +1076,7 @@ fn convert_indexes(
             }
         }
         for c in &ix.keys {
-            match parse_index_key(src, c) {
+            match parse_index_key(src, c, method) {
                 Ok(v) => cols.push(v),
                 Err(e) => {
                     errs.push(e);
@@ -1083,7 +1084,6 @@ fn convert_indexes(
                 }
             }
         }
-        let method = ix.method;
         let storage_parameters = storage_parameters_of(
             src,
             &ix.storage_parameters,
@@ -1144,14 +1144,14 @@ fn convert_exclusions(
                 collation: e.collation.clone(),
                 order: e.order,
                 // An exclusion key has no class parameters to declare.
-                opclass_parameters: None,
+                opclass_parameters: Default::default(),
             };
             let spanned = Spanned {
                 value: as_index,
                 defined: key.defined,
                 referenced: key.referenced,
             };
-            let column = parse_index_key(src, &spanned);
+            let column = parse_index_key(src, &spanned, x.method);
             let operator = e.operator.parse::<pbps_model::OperatorRef>();
             match (column, operator) {
                 (Ok(key), Ok(operator)) => keys.push(pbps_model::ExclusionKey { key, operator }),
@@ -1256,6 +1256,7 @@ fn parse_index_column(src: &SourceFile, v: &Spanned<String>) -> Result<IndexColu
         descending,
         opclass,
         collation: None,
+        opclass_parameters: Default::default(),
     };
 
     match parts.as_slice() {
@@ -1349,6 +1350,7 @@ fn storage_parameters_of(
 fn parse_index_key(
     src: &SourceFile,
     v: &Spanned<crate::dto::IndexKeyDto>,
+    method: pbps_model::IndexMethod,
 ) -> Result<IndexColumn, LoadError> {
     let bad = |msg: &str| {
         LoadError::semantic(
@@ -1359,7 +1361,7 @@ fn parse_index_key(
         )
         .with_help(
             "the format is `{column: <name>}` or `{expression: \"...\"}`, with optional \
-             `opclass:`, `collation:` and `order: asc|desc`",
+             `opclass:`, `opclass_parameters:`, `collation:` and `order: asc|desc`",
         )
     };
     let e = &v.value;
@@ -1372,12 +1374,6 @@ fn parse_index_key(
         (Some(_), Some(_)) => return Err(bad("a key names a column or an expression, not both")),
         (None, None) => return Err(bad("a key names a column or an expression")),
     };
-    if e.opclass_parameters.is_some() {
-        return Err(bad(
-            "`opclass_parameters:` arrives with BRIN's minmax-multi and Bloom classes, the next \
-             part of #2449",
-        ));
-    }
     let opclass = e
         .opclass
         .as_deref()
@@ -1390,11 +1386,36 @@ fn parse_index_key(
         .map(key_collation)
         .transpose()
         .map_err(|why: String| bad(&why))?;
+    // A parameter belongs to a class: which ones exist, and their bounds, are the
+    // class's family's (DEC-2449.2), so a key with parameters and no class has no
+    // family to read them against.
+    let mut problems = Vec::new();
+    let opclass_parameters = match &opclass {
+        Some(class) => storage_parameters_of(
+            src,
+            &e.opclass_parameters,
+            &|n, v| method.policy().canonical_class_parameter(class, n, v),
+            "a minmax-multi class takes `values_per_range`, a Bloom class \
+             `n_distinct_per_range` and `false_positive_rate`",
+            &mut problems,
+        ),
+        None if e.opclass_parameters.is_empty() => Default::default(),
+        None => {
+            return Err(bad(
+                "`opclass_parameters:` belong to an operator class, so the key names its \
+                 `opclass:`",
+            ));
+        }
+    };
+    if let Some(first) = problems.into_iter().next() {
+        return Err(first);
+    }
     Ok(IndexColumn {
         key,
         descending: e.order == Some(crate::dto::IndexOrder::Desc),
         opclass,
         collation,
+        opclass_parameters,
     })
 }
 

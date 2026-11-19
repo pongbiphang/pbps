@@ -1202,11 +1202,12 @@ indexes:
     }
 
     /// BRIN loads as a method with its two options in their canonical spelling,
-    /// and a key's `opclass_parameters:` (the next part of #2449) is refused by
-    /// name; an option the method does not have, and one out of the engine's
-    /// bounds, are refused at load.
+    /// and a key's `opclass_parameters:` in the canonical spelling of its class's
+    /// family (DEC-2449.2); an option the method or the class does not have, one
+    /// out of the engine's bounds, and parameters with no class are refused at
+    /// load.
     #[test]
-    fn brin_loads_with_its_options_and_a_key_s_class_parameters_are_refused_by_name() {
+    fn brin_loads_with_its_options_and_a_key_s_class_parameters() {
         let t = load(
             "table: app.t\ncolumns:\n  a: {type: integer}\nindexes:\n  ix:\n    method: brin\n    \
              columns: [a]\n    storage_parameters: {pages_per_range: 32, autosummarize: yes}\n",
@@ -1215,12 +1216,102 @@ indexes:
         assert_eq!(ix.method, pbps_model::IndexMethod::Brin);
         assert_eq!(ix.storage_parameters["pages_per_range"], "32");
         assert_eq!(ix.storage_parameters["autosummarize"], "true");
+        // A value is read by the engine's rules: octal `040` is 32, `3.0e1` is 30.
+        let t = load(
+            "table: app.t\ncolumns:\n  a: {type: integer}\n  b: {type: integer}\nindexes:\n  ix:\n    \
+             method: brin\n    keys:\n      - {column: a, opclass: int4_minmax_multi_ops, \
+             opclass_parameters: {values_per_range: '040'}}\n      - {column: b, opclass: \
+             pg_catalog.int4_bloom_ops, opclass_parameters: {n_distinct_per_range: 3.0e1, \
+             false_positive_rate: 1e-2}}\n",
+        );
+        let keys = &t.table.indexes["ix"].columns;
+        assert_eq!(keys[0].opclass_parameters["values_per_range"], "32");
+        assert_eq!(keys[1].opclass_parameters["n_distinct_per_range"], "30");
+        assert_eq!(keys[1].opclass_parameters["false_positive_rate"], "0.01");
+        for (class, parameters, expected) in [
+            (
+                "int4_minmax_multi_ops",
+                "values_per_range: 7",
+                "outside 8 to 256",
+            ),
+            (
+                "int4_minmax_multi_ops",
+                "values_per_range: 257",
+                "outside 8 to 256",
+            ),
+            (
+                "int4_minmax_multi_ops",
+                "values_per_range: 8.5.1",
+                "not a value",
+            ),
+            (
+                "int4_minmax_multi_ops",
+                "n_distinct_per_range: 4",
+                "takes `values_per_range`",
+            ),
+            (
+                "int4_bloom_ops",
+                "values_per_range: 16",
+                "takes `n_distinct_per_range`",
+            ),
+            (
+                "int4_bloom_ops",
+                "n_distinct_per_range: -1.5",
+                "outside -1 to",
+            ),
+            (
+                "int4_bloom_ops",
+                "n_distinct_per_range: 2147483648",
+                "outside -1 to",
+            ),
+            (
+                "int4_bloom_ops",
+                "false_positive_rate: 0.00009",
+                "outside 0.0001 to 0.25",
+            ),
+            (
+                "int4_bloom_ops",
+                "false_positive_rate: 0.2501",
+                "outside 0.0001 to 0.25",
+            ),
+            (
+                "int4_bloom_ops",
+                "false_positive_rate: 'nan'",
+                "not a value",
+            ),
+            (
+                "int4_bloom_ops",
+                "false_positive_rate: 'inf'",
+                "not a value",
+            ),
+            // A class that is no family's, or a schema's, takes none.
+            (
+                "int4_minmax_ops",
+                "values_per_range: 16",
+                "takes no options",
+            ),
+            (
+                "ext.int4_bloom_ops",
+                "false_positive_rate: 0.01",
+                "takes no options",
+            ),
+        ] {
+            let e = errors(&format!(
+                "table: app.t\ncolumns:\n  a: {{type: integer}}\nindexes:\n  ix:\n    method: brin\n    \
+                 keys:\n      - {{column: a, opclass: {class}, opclass_parameters: {{{parameters}}}}}\n"
+            ));
+            assert!(
+                render(&e).contains(expected),
+                "{class} {parameters}: {}",
+                render(&e)
+            );
+        }
         let e = errors(
             "table: app.t\ncolumns:\n  a: {type: integer}\nindexes:\n  ix:\n    method: brin\n    \
              keys:\n      - {column: a, opclass_parameters: {values_per_range: 8}}\n",
         );
         assert!(
-            render(&e).contains("opclass_parameters") && render(&e).contains("#2449"),
+            render(&e).contains("names its `opclass:`"),
             "{}",
             render(&e)
         );

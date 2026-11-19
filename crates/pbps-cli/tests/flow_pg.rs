@@ -250,6 +250,8 @@ mod extensions2447_types;
 mod extensions2447_update;
 #[path = "support/index_brin2449.rs"]
 mod index_brin2449;
+#[path = "support/index_brin2449_classes.rs"]
+mod index_brin2449_classes;
 #[path = "support/index_gist2448.rs"]
 mod index_gist2448;
 #[path = "support/partition_trigger1811.rs"]

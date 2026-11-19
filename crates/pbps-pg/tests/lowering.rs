@@ -60,6 +60,7 @@ fn index(key: IndexKey, filter: Option<&str>) -> Change {
                 descending: false,
                 opclass: None,
                 collation: None,
+                opclass_parameters: Default::default(),
             }],
             include: vec![],
             unique: false,

@@ -9907,3 +9907,86 @@ in its version: no published document names a plan part or an identity record. I
 version 1 and the tree's layout version are unchanged; a file with no retirement
 serialises exactly as before. SQL Server has no such constraint and refuses every
 form by name.
+
+<a id="dec-2449-2"></a>
+
+**DEC-2449.2. BRIN's minmax-multi and Bloom classes, and the options a class takes (#2449 PR R2).**
+`opclass_parameters:` is a mapping beside a key's `opclass:`, by option name, and the
+model's `IndexColumn.opclass_parameters` (default empty, written only when set). It
+is the key's, never the index's `storage_parameters`: the catalog keeps a class
+option in the index relation's `pg_attribute.attoptions` of that key, aligned with
+the key's position, and `pg_class.reloptions` holds none of it (measured on 16.15
+and 18.6; the full `pg_get_indexdef` prints it as `int4_bloom_ops (k='v')`, and
+the per-key `pg_get_indexdef(index, n, true)` does not). The pull reads
+`attoptions` per key, as it already did to refuse it, and now holds it for the
+classes below. A pull of any other class with options (a package's
+`gist_trgm_ops (siglen=32)`, #2447) still leaves the index out and names it.
+
+**The classes.** BRIN is held by key type now: `key_types` carries, for each of
+the twenty column types R1 held, the default class (never written) and the engine's
+other classes of its input type: the type's `*_minmax_multi_ops` and `*_bloom_ops`,
+and `inet_minmax_ops` beside them for `inet` and `cidr`. `character` has only
+Bloom, `text`, `character varying` and `bytea` only Bloom, and no minmax-multi
+class exists for them. A column of another type stays refused with the advice to
+index an expression. An expression key's type is the engine's to bind, so a class
+on one is judged against every key type's (`expression_class_problem`): a held
+class is let through, the type's default spelled out is refused as it is for a
+column (the catalog reads it back as no class), and the engine refuses a class
+that does not fit the type at apply. The class's family is told by its name's
+suffix **only after** the class is one the policy holds, never for a name that
+merely ends in it: a schema's `ext.int4_bloom_ops`, an unknown name and a
+`range_inclusion_ops` take no options. The suffix stands for the engine's own
+identity, which a live test reads: of the 72 built-in classes, exactly those with
+`brin_bloom_options` as support function 5 end in `_bloom_ops`, exactly those with
+`brin_minmax_multi_options` in `_minmax_multi_ops`, and each key type's classes are
+exactly the engine's of its input type.
+
+**The options**, with the bounds the engine states, each a value in one spelling by
+the engine's own rules, so `040` (octal 32), `0x20` and `32` are one value and
+`3.0e1` and `30` are one: `values_per_range` 8 to 256 for a minmax-multi class;
+`n_distinct_per_range` -1 to 2147483647 and `false_positive_rate` 0.0001 to 0.25
+for a Bloom class. Zero is a value of the first (measured). A value outside is
+`22023` on the engine and a named load error here; `nan`, `inf`, a hexadecimal
+real and an underflow are refused as shapes this model does not claim (the engine
+takes `0x10` for a real, so such an index is left out of a pull and named, not read
+as another value). An omitted option is the engine's default and an explicit
+default is a pin that stays one, in the file, the plan, the state and the pull:
+removing a pin is a change and a rebuild. No value is clamped, and no class is
+replaced to make one fit. A YAML number is read from its text in the file
+(`1e-2`, `32.0`), never through a float.
+
+**Bounds do not prove a build.** A Bloom filter that does not fit fails the build
+(`XX000`, "the bloom filter is too large") over rows, whatever the values: on an
+empty table the same index builds. `n_distinct_per_range: -1` at the default
+`pages_per_range`, and `false_positive_rate: 0.0001` at the default estimate,
+fail over 2,000 rows and build with `pages_per_range: 1` or an estimate of 100.
+The replacement is one transaction, so the failed apply keeps the old index and
+its rows and records nothing. The model does not try to size a filter: the engine
+is the only place the page size, the estimate and the rows meet, and the failure
+is its own words.
+
+**Changing one.** The engine has no in-place change of a key's options (`ALTER
+INDEX .. ALTER COLUMN .. SET (..)` is `42601`), so a class, an option, or a pin
+changing is the ordinary drop and add, which the differ already does for any key
+that differs (the index is compared without its storage parameters, and the keys
+include the options). A difference that also touches an in-place option, or
+`pages_per_range`, is still one replacement carrying every final option, never an
+`ALTER` beside it. A leaf index a partition declares for itself is adopted by its
+parent's index whatever its class options, as it is whatever its storage
+parameters (measured: a leaf at `values_per_range=32` is attached to a parent at
+16 and keeps 32), so `adopts` does not compare them, and neither does the match an
+ordinary table's attach plans against its parent's indexes (`attached`): an own index
+declared over such a match is dropped before the attach and built after it, as any
+adopted one is, and not left to become the parent's clone with the declared one
+absent (#2923 review).
+
+**Not here.** SQL Server refuses a key's class and so its options, before any
+statement. A package's class for BRIN remains outside (no package provides one).
+Imported physical geometry is not certified: an index changed natively without a
+`REINDEX` reads as its catalog value (DEC-2449.1).
+
+Formats: plan 82 (an older build rejects the key's field as unknown), state 51 (an
+older snapshot truthfully holds no class options, and an older build rejects the
+field), published schema set 116 (`opclass_parameters` in the declaration schema).
+A key with no options writes the bytes it did, and a btree, GIN, GiST or BRIN index
+without them is unchanged.

@@ -200,8 +200,12 @@ fn a_hand_edited_status_table_is_a_difference() {
     let edited = text.replacen("| Publications |", "| Publications, by hand |", 1);
     assert_ne!(edited, text, "the census table has a publications row");
     assert_eq!(regenerated(&edited), text);
-    let row = "| `brin` indexes | named | #2449 |\n";
-    let removed = text.replacen(row, "", 1);
+    // A row of the planned table, which holds a kind until its last part lands.
+    let row = text
+        .lines()
+        .find(|l| l.starts_with("| Standalone sequences"))
+        .expect("the planned table has a sequences row");
+    let removed = text.replacen(&format!("{row}\n"), "", 1);
     assert_ne!(removed, text);
     assert_eq!(regenerated(&removed), text);
 }

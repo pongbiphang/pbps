@@ -5117,6 +5117,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: Vec::new(),
                 unique: filter.is_none(),
@@ -5422,6 +5423,7 @@ mod tests {
                         descending: false,
                         opclass: None,
                         collation: None,
+                        opclass_parameters: Default::default(),
                     }],
                     include: Vec::new(),
                     unique: filter.is_none(),
@@ -5833,6 +5835,7 @@ mod tests {
             descending: false,
             opclass: None,
             collation: None,
+            opclass_parameters: Default::default(),
         };
         assert_eq!(moved(exclusion(call.clone(), None, true)), Ok(1));
         assert_eq!(
@@ -6365,6 +6368,7 @@ mod tests {
                             descending: false,
                             opclass: None,
                             collation: None,
+                            opclass_parameters: Default::default(),
                         }],
                         include: Vec::new(),
                         unique: false,
@@ -6559,6 +6563,7 @@ mod tests {
                 descending: false,
                 opclass: None,
                 collation: None,
+                opclass_parameters: Default::default(),
             }],
             include: Vec::new(),
             unique: false,
@@ -7363,6 +7368,7 @@ mod tests {
                     descending: false,
                     opclass: None,
                     collation: None,
+                    opclass_parameters: Default::default(),
                 }],
                 include: Vec::new(),
                 unique: false,

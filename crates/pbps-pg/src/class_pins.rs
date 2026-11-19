@@ -433,6 +433,7 @@ mod tests {
                 descending: false,
                 opclass: class.map(|c| c.parse().unwrap()),
                 collation: None,
+                opclass_parameters: Default::default(),
             },
             operator: pbps_model::OperatorRef::symbol("=").unwrap(),
         };

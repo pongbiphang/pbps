@@ -138,6 +138,7 @@ mod effects_of_each_kind {
                 descending: false,
                 opclass: None,
                 collation: None,
+                opclass_parameters: Default::default(),
             }],
             include: vec![],
             unique: false,

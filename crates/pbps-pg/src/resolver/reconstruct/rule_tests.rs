@@ -37,6 +37,7 @@ fn keyed(column: &str, unique: bool, filter: Option<&str>) -> Index {
             descending: false,
             opclass: None,
             collation: None,
+            opclass_parameters: Default::default(),
         }],
         include: Vec::new(),
         unique,
