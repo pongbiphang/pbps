@@ -104,7 +104,7 @@ def is_builder(path):
 # nature, a number for a known hole, which has to equal what the file holds -
 # a new one fails, and so does one fixed without lowering it.
 ALLOWED = {
-    "crates/pbps-cli/src/plan_test/session.rs": (
+    "crates/pbps-cli/src/plan_test/session/postgres.rs": (
         1,
         "builds a GRANT signature from normalized routine arguments in the owned session (#1165)",
     ),
