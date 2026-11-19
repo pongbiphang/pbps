@@ -65,7 +65,10 @@ pub fn affinity(declared: &str) -> Affinity {
         Affinity::Integer
     } else if has("char") || has("clob") || has("text") {
         Affinity::Text
-    } else if has("blob") || text.trim().is_empty() {
+    } else if has("blob") || text.bytes().all(|b| b.is_ascii_whitespace()) {
+        // Empty means no declared type. Only ASCII white space is white space
+        // to SQLite; a no-break space is a name character, so a type made of
+        // one is a name and falls through to numeric.
         Affinity::Blob
     } else if has("real") || has("floa") || has("doub") {
         Affinity::Real
@@ -605,6 +608,10 @@ mod tests {
             "timestamp with time zone",
             "double(53)",
             "real(8)",
+            // A no-break space is a name character to SQLite, not white
+            // space: a type made only of it is a name, and numeric.
+            "\u{a0}",
+            "\u{a0}\u{2003}",
         ] {
             corpus.push(extra.to_owned());
         }
