@@ -1,0 +1,24 @@
+[package]
+name = "pbps-sqlite"
+description = "PongBiphang Schema - the SQLite dialect"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The connection is `pbps_db::sqlite`: the library stays behind the transport
+# crate, and this crate names no driver type (ARCHITECTURE constraint 9).
+pbps-db.workspace = true
+# `TransactionFraming`: the text of begin, commit and rollback is the
+# dialect's (ADR-0014 section 2).
+pbps-dialect.workspace = true
+
+[dev-dependencies]
+# The harness names each test's directory with a random suffix, as the CLI's
+# own tests do.
+rand.workspace = true
+
+[lints]
+workspace = true

@@ -29,12 +29,19 @@ pbps-mssql     SQL Server: type catalogue, validation, the T-SQL emitter (the
                for sealed plan emission inputs, as pbps-pg does (DEC-1959.5)
 pbps-pg        PostgreSQL: the same responsibilities as pbps-mssql, as far as
                Phase 5 has built them. Everything unbuilt refuses by name
+pbps-sqlite    SQLite, the third engine (#2950): the same responsibilities as
+               pbps-pg, filled item by item (dialect, emitter, catalog reader,
+               state SQL, preflight). It is built before it is wired
+               (DEC-2950.1), over the connection in `pbps_db::sqlite`, and names
+               no driver type. Its functions are synchronous. Nothing depends on
+               it yet, and `pbps-cli` does not name it
 pbps-db        Connections plus transaction framing. Owns "there is a network";
                the shapes a connected command consumes — ledger types and
                prune policy, what a pull found (`catalog`), what a rename
                touches (`impact`), what `doctor` asks (`doctor`) — and no
                engine's SQL. One module per driver, and nothing outside them
-               names one. Driver isolation: see constraint 9
+               names one. Driver isolation: see constraint 9. The SQLite module
+               is public, because `Conn` has no `Sqlite` variant yet
 pbps-docs      Markdown / self-contained HTML / Mermaid ERD from the model.
                Pure: no dialect, no connection, no configuration
 pbps-ui        Loopback UI over fixed CLI subprocess commands; currently read
@@ -72,6 +79,13 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
   (`type Resolver = NoResolver<Self>` when it has none); resolver code reads
   those facts from that type and adds no `Driver` comparison for them
   (DEC-2798.5).
+- `pbps-sqlite` depends on `pbps-db` and `pbps-dialect` and on nothing else
+  in the workspace so far, and no crate depends on it until the engine is wired
+  (the last of the plan in #2950). Wiring adds a `Driver` and a `Conn` variant
+  and the arms every exhaustive `match` then needs, which is why it waits for
+  route steps 4 to 6 of #2798. The crate calls `pbps_db::sqlite::Connection`
+  directly, a synchronous type; the wiring runs those calls on a blocking
+  thread behind the async `Conn`.
 - `spikes/` is workspace-`exclude`d: evaluation crates, not product code.
 - Pure module and RLS policy dependency facts live in `pbps-diff::order::catalog`.
   PostgreSQL owns their reads and re-exports the shared value types. The
@@ -321,6 +335,9 @@ has a home, the entry links there instead of repeating its content.
    `tiberius`, `pbps-db::postgres` names `tokio_postgres`, and nothing else in
    the workspace names either — `pbps-db::Conn` dispatches between them and
    holds no driver type ([decision 225](decisions/connection.md#decision-225)).
+   `pbps-db::sqlite` is the third file and names `rusqlite` (DEC-2950.1); it is
+   public until `Conn` has a `Sqlite` variant, and no `rusqlite` type appears in
+   one of its signatures.
 
 Typed portable creation demands stay in planning state (DEC-2469.4).
 `pbps-dialect::creation` selects facets and refines engine-provided recipes using

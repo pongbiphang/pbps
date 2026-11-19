@@ -8,6 +8,7 @@ members = [
     "crates/pbps-dialect",
     "crates/pbps-mssql",
     "crates/pbps-pg",
+    "crates/pbps-sqlite",
     "crates/pbps-docs",
     "crates/pbps-db",
     "crates/pbps-policy",
@@ -99,6 +100,15 @@ rustls-native-certs = "0.8"
 # than a new one (DECISIONS 434).
 socket2    = { version = "0.6", features = ["all"] }
 rand       = "0.10"
+
+# SQLite (#2950): the C library applications run, compiled from the bundled
+# amalgamation so the single static binary of SPEC 11.4 needs no system
+# `libsqlite3`. Pinned exactly, like `tiberius`, because the bundled SQLite
+# version is part of the behaviour the design was measured against (3.46 and
+# 3.54 differ in 15 of 662 steps). `default-features = false` drops `cache`
+# (`hashlink`, unused) and `ffi-sqlite-wasm-rs`, a wasm-only package that
+# would still enter the lock file. Named in one file only, `pbps-db::sqlite`.
+rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled"] }
 
 serde_json = { version = "1", features = ["preserve_order"] }
 
