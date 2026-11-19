@@ -1,12 +1,12 @@
-//! The SQL Server half of [`Session`]: its [`TestEngine`], and the protocol
-//! `session.rs` still branches to. It holds connections and builds connection
-//! strings; the SQL is `pbps_mssql::test_scratch`'s.
+//! The SQL Server half of [`Session`]: its [`TestEngine`], with the grant,
+//! fixture, seal and assertion protocol behind it. It holds connections and
+//! builds connection strings; the SQL is `pbps_mssql::test_scratch`'s.
 use super::{
-    Conn, Driver, HopContext, Provisioned, Session, SessionFuture, TestEngine, TestScratch,
+    AssertionFuture, Conn, HopContext, Provisioned, Session, SessionFuture, TestEngine, TestScratch,
 };
 use crate::plan_test::snapshot::{Allocator, Rows, Snapshot, insert};
 use anyhow::{Context as _, ensure};
-use pbps_db::query::AssertionResult;
+use pbps_db::{Driver, query::AssertionResult};
 use pbps_model::Schema;
 use pbps_mssql::test_scratch::{self as sql, snapshot as snapshot_sql};
 use std::collections::BTreeMap;
@@ -39,6 +39,38 @@ impl TestEngine for MssqlTest {
         schema: &'a Schema,
     ) -> SessionFuture<'a, Snapshot> {
         Box::pin(snapshot(session, schema))
+    }
+    fn revoke_fixture_routines<'a>(&self, _session: &'a Session<'_>) -> SessionFuture<'a, ()> {
+        // A SQL Server fixture is granted tables only (ADR-0019 §6), so there is
+        // no routine grant to take back before a plan reads the catalog.
+        Box::pin(std::future::ready(Ok(())))
+    }
+    fn grants<'a>(&self, session: &'a Session<'_>, schema: &'a Schema) -> SessionFuture<'a, ()> {
+        Box::pin(grants(session, schema))
+    }
+    fn fixtures<'a>(&self, session: &'a Session<'_>) -> SessionFuture<'a, Conn> {
+        Box::pin(async move { Ok(Conn::connect(Driver::Mssql, &session.fixture).await?) })
+    }
+    fn run_fixture<'a>(
+        &self,
+        conn: &'a mut Conn,
+        sql: &'a str,
+        _timeout_ms: u128,
+    ) -> SessionFuture<'a, ()> {
+        // SQL Server has no statement timeout to set: the caller's deadline
+        // dropping the connection is the bound.
+        Box::pin(fixture(conn, sql))
+    }
+    fn seal<'a>(&self, session: &'a Session<'_>) -> SessionFuture<'a, ()> {
+        Box::pin(seal(session))
+    }
+    fn run_assertion<'a>(
+        &self,
+        session: &'a Session<'_>,
+        sql: &'a str,
+        timeout: std::time::Duration,
+    ) -> AssertionFuture<'a> {
+        Box::pin(assertion(session, sql, timeout))
     }
 }
 
@@ -126,7 +158,7 @@ async fn namespaces(session: &Session<'_>, schema: &Schema) -> anyhow::Result<()
     Ok(())
 }
 
-pub(super) async fn grants(session: &Session<'_>, schema: &Schema) -> anyhow::Result<()> {
+async fn grants(session: &Session<'_>, schema: &Schema) -> anyhow::Result<()> {
     let mut conn = session.admin().await?;
     sql::grants(&mut conn, &identities(session), schema).await?;
     Ok(())
@@ -134,7 +166,7 @@ pub(super) async fn grants(session: &Session<'_>, schema: &Schema) -> anyhow::Re
 
 /// A refusal of the fixture's text or a transaction it left open is the user's
 /// to fix; only a database error keeps its code, so that the report classifies it.
-pub(super) async fn fixture(conn: &mut Conn, text: &str) -> anyhow::Result<()> {
+async fn fixture(conn: &mut Conn, text: &str) -> anyhow::Result<()> {
     sql::run_fixture(conn, text)
         .await
         .map_err(|error| match error {
@@ -147,14 +179,14 @@ pub(super) async fn fixture(conn: &mut Conn, text: &str) -> anyhow::Result<()> {
 
 /// Switches the owned database read-only from the administrator's connection to
 /// `master`; the caller's deadline bounds it (the statement itself has none).
-pub(super) async fn seal(session: &Session<'_>) -> anyhow::Result<()> {
+async fn seal(session: &Session<'_>) -> anyhow::Result<()> {
     let mut conn = Conn::connect(Driver::Mssql, session.scratch.connection()).await?;
     sql::seal(&mut conn).await?;
     Ok(())
 }
 
 /// A failed setup read is not an assertion result: it is unanswerable.
-pub(super) async fn assertion(
+async fn assertion(
     session: &Session<'_>,
     text: &str,
     timeout: std::time::Duration,

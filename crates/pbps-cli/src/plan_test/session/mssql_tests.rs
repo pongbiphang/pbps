@@ -9,6 +9,8 @@ use crate::plan_test::{
     execution::Control,
     report::{Phase, TestData},
 };
+use anyhow::{Context as _, ensure};
+use pbps_db::Driver;
 use pbps_db::query::AssertionResult;
 use pbps_model::{IdsFile, Intent, TableName};
 use std::time::Duration;

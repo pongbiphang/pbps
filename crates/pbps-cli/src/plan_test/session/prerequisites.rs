@@ -5,7 +5,7 @@
 //! spells differently from the previous one may be the same principal under a
 //! recorded rename. So this asks the identity mappings first and the catalog
 //! second, and creates only what no recorded identity accounts for.
-use super::{Assembled, quoted};
+use super::{Assembled, postgres::quoted};
 use pbps_db::Conn;
 use pbps_model::{IdsFile, RoleName, Schema};
 use std::collections::BTreeSet;
