@@ -7,7 +7,7 @@ use super::super::container::{Keeper, seen, swept};
 use super::super::recovery::{self, Report};
 use super::super::removal_race2807_tests::accept_kept;
 use super::*;
-use crate::resolver::server::engine;
+use crate::resolver::server::engine::{self, container::owned};
 use pbps_db::resolver::Kept;
 use std::process::Command;
 use std::time::Duration;
@@ -140,11 +140,11 @@ async fn retry_unreadable_cleanup<F: std::future::Future<Output = Report>>(
 async fn a_sql_server_container_is_alive_while_its_keeper_is_and_removed_at_once_when_it_is_gone() {
     let (made, name, token, connection) = start().await;
     let token_of_run = format!("{:032x}", rand::random::<u128>());
-    let keeper = retry_tls_eof(|| Keeper::open(Driver::Mssql, &connection, &token))
+    let keeper = retry_tls_eof(|| Keeper::open(owned(Driver::Mssql), &connection, &token))
         .await
         .unwrap();
     // While the session is there, and the server has the mark of it.
-    let held = retry_tls_eof(|| seen(Driver::Mssql, &connection, &token_of_run, &token))
+    let held = retry_tls_eof(|| seen(owned(Driver::Mssql), &connection, &token_of_run, &token))
         .await
         .unwrap();
     let live = swept(&token_of_run).await;
@@ -170,7 +170,7 @@ async fn a_sql_server_container_is_alive_while_its_keeper_is_and_removed_at_once
     }
     // Gone, and the mark that it was there stays: that, not the age, is what
     // makes the container the dead run's however young it is.
-    let after = retry_tls_eof(|| seen(Driver::Mssql, &connection, &token_of_run, &token))
+    let after = retry_tls_eof(|| seen(owned(Driver::Mssql), &connection, &token_of_run, &token))
         .await
         .unwrap();
     let dead = retry_unreadable_cleanup(&name, || swept(&token_of_run)).await;
@@ -208,7 +208,7 @@ async fn a_sql_server_container_is_alive_while_its_keeper_is_and_removed_at_once
 #[ignore = "needs the owned SQL Server resolver fixtures and a container runtime"]
 async fn a_sql_server_container_stopped_after_a_running_observation_is_removed_at_once() {
     let (made, name, token, connection) = start().await;
-    let keeper = retry_tls_eof(|| Keeper::open(Driver::Mssql, &connection, &token))
+    let keeper = retry_tls_eof(|| Keeper::open(owned(Driver::Mssql), &connection, &token))
         .await
         .unwrap();
     let own = format!("{:032x}", rand::random::<u128>());
@@ -250,10 +250,10 @@ async fn a_sql_server_keeper_that_connects_between_the_two_reads_is_alive_and_no
     let (between, go) = engine::pause_between_reads(&run);
     let reader = format!("{:032x}", rand::random::<u128>());
     let (seen, keeper) = tokio::join!(
-        engine::keeper_seen(Driver::Mssql, &connection, &reader, &run),
+        engine::keeper_seen(owned(Driver::Mssql), &connection, &reader, &run),
         async {
             between.await.unwrap();
-            let keeper = retry_tls_eof(|| Keeper::open(Driver::Mssql, &connection, &run))
+            let keeper = retry_tls_eof(|| Keeper::open(owned(Driver::Mssql), &connection, &run))
                 .await
                 .unwrap();
             go.send(()).unwrap();

@@ -10,12 +10,14 @@
 //! owned scratch is refused by name at that one place and cannot reach a
 //! path that would borrow another engine's answers.
 //!
-//! Only the facts that need no per-run state are here. The session that
-//! provisions identities and runs fixtures, and the container facts the
-//! resolver shares, stay where they are until they move behind their own
-//! records.
+//! Only the facts that need no per-run state are here, and the container the
+//! scratch runs in is not one of them: it is the resolver's shared
+//! [`ContainerSupport`], which this record carries and does not copy. The
+//! session that provisions identities and runs fixtures stays where it is until
+//! it moves behind its own record.
 
 use anyhow::Context as _;
+use pbps_cli::resolver::server::scratch::container::{ContainerSupport, support};
 use pbps_db::{Conn, Driver};
 use std::{future::Future, pin::Pin};
 
@@ -27,10 +29,11 @@ pub(crate) type BuildRead<'c> = Pin<Box<dyn Future<Output = anyhow::Result<Strin
 /// Written out in full for each engine, with no default, so a new engine that
 /// claims support owes an answer for every field.
 pub(crate) struct OwnedTest {
-    /// The driver the scratch server is reached through. It travels with the
-    /// record so that a caller cannot pair one engine's support with another
-    /// engine's driver; the shared container seam still takes the driver.
-    pub driver: Driver,
+    /// The container support the scratch server starts from, and through it
+    /// the driver the server is reached through. It travels with the record so
+    /// that a caller cannot pair one engine's support with another engine's
+    /// container or driver.
+    pub container: &'static ContainerSupport,
     /// What a `provision` phase calls the scratch.
     pub scratch_label: &'static str,
     /// The engine string of the durable run record. It is read back by later
@@ -45,8 +48,19 @@ pub(crate) struct OwnedTest {
     pub read_engine_build: for<'c> fn(&'c mut Conn) -> BuildRead<'c>,
 }
 
+/// The container support of an engine whose owned test needs one.
+///
+/// Evaluated at compile time, so that an engine that claims an owned test
+/// without container support does not build.
+const fn container_of(driver: Driver) -> &'static ContainerSupport {
+    match support(driver) {
+        Some(container) => container,
+        None => panic!("an owned test scratch needs the engine's container support"),
+    }
+}
+
 pub(super) static POSTGRES: OwnedTest = OwnedTest {
-    driver: Driver::Postgres,
+    container: container_of(Driver::Postgres),
     scratch_label: "owned PostgreSQL scratch",
     record_engine: "postgres",
     is_fault_code: postgres_fault_code,
@@ -54,7 +68,7 @@ pub(super) static POSTGRES: OwnedTest = OwnedTest {
 };
 
 pub(super) static MSSQL: OwnedTest = OwnedTest {
-    driver: Driver::Mssql,
+    container: container_of(Driver::Mssql),
     scratch_label: "owned SQL Server scratch",
     record_engine: "mssql",
     is_fault_code: pbps_mssql::test_scratch::infrastructure_fault,
@@ -132,11 +146,15 @@ mod tests {
     }
 
     #[test]
-    fn both_engines_are_supported_and_each_record_names_its_own_driver() {
+    fn both_engines_are_supported_and_each_record_carries_its_own_container() {
         for driver in DRIVERS {
             let support =
                 crate::engine::require_owned_test(driver).expect("both engines own a test scratch");
-            assert_eq!(support.driver, driver);
+            assert_eq!(support.container.driver, driver);
+            assert!(std::ptr::eq(
+                support.container,
+                pbps_cli::resolver::server::scratch::container::support(driver).unwrap()
+            ));
             assert!(std::ptr::eq(
                 support,
                 profile(driver).owned_test.expect("the profile carries it")

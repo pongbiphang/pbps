@@ -150,8 +150,13 @@ pub(super) async fn exercise() {
         token: token.clone(),
         completed: None,
     };
-    let started =
-        Held::start_owned(Driver::Postgres, &image(), PullPolicy::Never, &mut owner).await;
+    let started = Held::start_owned(
+        crate::engine::owned_test_of(Driver::Postgres).container,
+        &image(),
+        PullPolicy::Never,
+        &mut owner,
+    )
+    .await;
     let failure = started.as_ref().err().map(ToString::to_string);
     let swapped = owner
         .completed

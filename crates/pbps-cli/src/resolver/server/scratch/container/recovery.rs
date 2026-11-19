@@ -30,10 +30,10 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use pbps_db::Conn;
 use pbps_db::resolver::Kept;
-use pbps_db::{Conn, Driver};
 
-use super::super::super::engine;
+use super::super::super::engine::{self, container::ContainerSupport};
 use super::super::recovery::{self, Adapter, Failed, Liveness, Resource};
 use super::READY;
 use super::{docker, journal, remove_with_volumes, wait_removed, wait_until};
@@ -69,11 +69,11 @@ pub(in crate::resolver::server::scratch) struct Keeper {
 
 impl Keeper {
     pub(in crate::resolver::server::scratch) async fn open(
-        driver: Driver,
+        support: &ContainerSupport,
         connection: &str,
         token: &str,
     ) -> Result<Self, super::ProduceError> {
-        let conn = engine::keep_and_mark(driver, connection, token)
+        let conn = engine::keep_and_mark(support, connection, token)
             .await
             .map_err(|e| {
                 super::ProduceError::Acquire(format!("the scratch container's keeper session: {e}"))
@@ -86,12 +86,12 @@ impl Keeper {
 /// (`own`). `None` when the reader cannot see its own session, which proves
 /// nothing.
 async fn look(
-    driver: Driver,
+    support: &ContainerSupport,
     connection: &str,
     own: &str,
     token: &str,
 ) -> Result<Option<Kept>, String> {
-    tokio::time::timeout(PROBE, engine::keeper_seen(driver, connection, own, token))
+    tokio::time::timeout(PROBE, engine::keeper_seen(support, connection, own, token))
         .await
         .map_err(|_| "the server did not answer in time".to_owned())?
         .map_err(|e| e.to_string())
@@ -136,7 +136,10 @@ struct State {
     status: String,
     started: String,
     created: String,
-    driver: Option<Driver>,
+    /// The support of the engine the container is labelled with, or `None` for
+    /// a label no compiled engine writes: that container's keeper cannot be
+    /// read, which is unprovable and never dead.
+    support: Option<&'static ContainerSupport>,
     journal: Option<String>,
 }
 
@@ -241,12 +244,22 @@ fn state_from_json(text: &str, token: &str) -> Result<State, String> {
         status: text(&value["State"]["Status"])?,
         started: text(&value["State"]["StartedAt"])?,
         created: text(&value["Created"])?,
-        driver: match labels[ENGINE].as_str() {
-            Some("postgres") => Some(Driver::Postgres),
-            Some("mssql") => Some(Driver::Mssql),
-            _ => None,
-        },
+        support: labels[ENGINE]
+            .as_str()
+            .and_then(engine::container::by_label),
     })
+}
+
+/// The support to read a candidate's keeper through, or why it cannot be read.
+///
+/// A label no compiled engine writes is not a verdict on the container: its
+/// keeper cannot be read, so the candidate is unprovable and kept, and the
+/// manual remedy is shown. It is never taken for dead, and no driver is guessed
+/// for it.
+fn keeper_support(state: &State) -> Result<&'static ContainerSupport, String> {
+    state
+        .support
+        .ok_or_else(|| "its engine is not labelled".to_owned())
 }
 
 /// What a container the runtime was stopping became.
@@ -370,12 +383,12 @@ impl<'a> Containers<'a> {
             Ok(state) => state,
             Err(verdict) => return verdict,
         };
-        let seen = match (state.status.as_str(), state.driver) {
-            ("running", Some(driver)) => Some(match self.connection(&listed.id, driver).await {
-                Ok(connection) => look(driver, &connection, self.own, token).await,
+        let seen = match (state.status.as_str(), keeper_support(&state)) {
+            ("running", Ok(support)) => Some(match self.connection(&listed.id, support).await {
+                Ok(connection) => look(support, &connection, self.own, token).await,
                 Err(why) => Err(why),
             }),
-            ("running", None) => Some(Err("its engine is not labelled".into())),
+            ("running", Err(why)) => Some(Err(why)),
             _ => None,
         };
         let needs_age = state.status == "created"
@@ -414,7 +427,7 @@ impl<'a> Containers<'a> {
 
     /// The connection to a candidate's server, from what the runtime holds of
     /// it: the published loopback port and the password its run generated.
-    async fn connection(&self, name: &str, driver: Driver) -> Result<String, String> {
+    async fn connection(&self, name: &str, support: &ContainerSupport) -> Result<String, String> {
         let env = docker(&[
             "container",
             "inspect",
@@ -423,30 +436,16 @@ impl<'a> Containers<'a> {
             name,
         ])
         .await?;
-        let variable = match driver {
-            Driver::Postgres => "POSTGRES_PASSWORD=",
-            Driver::Mssql => "MSSQL_SA_PASSWORD=",
-        };
+        let variable = support.password_line_prefix();
         let password = env
             .lines()
-            .find_map(|line| line.strip_prefix(variable))
+            .find_map(|line| line.strip_prefix(variable.as_str()))
             .ok_or("its password is not in its environment")?;
-        let port = match driver {
-            Driver::Postgres => 5432,
-            Driver::Mssql => 1433,
-        };
-        let published = docker(&["port", name, &format!("{port}/tcp")]).await?;
-        let port = super::published_port(&published, port)?;
-        Ok(match driver {
-            Driver::Postgres => format!(
-                "host=127.0.0.1 port={port} user=postgres password={password} dbname=postgres \
-                 sslmode=disable"
-            ),
-            Driver::Mssql => format!(
-                "Server=127.0.0.1,{port};Database=master;User Id=sa;Password={password};\
-                 TrustServerCertificate=true"
-            ),
-        })
+        let published = docker(&["port", name, &format!("{}/tcp", support.port)]).await?;
+        let port = super::published_port(&published, support.port)?;
+        // The password is the secret the run stored, already derived: it is
+        // spelled into the connection as it is and never derived again.
+        Ok((support.loopback)(port, password))
     }
 
     /// How old a candidate is: the daemon's clock for a container that was
@@ -559,13 +558,13 @@ pub(super) async fn sweep(own: &str) {
 /// once)`, for the tests that read each engine's marks.
 #[cfg(test)]
 pub(in crate::resolver::server::scratch) async fn seen(
-    driver: Driver,
+    support: &ContainerSupport,
     connection: &str,
     own: &str,
     token: &str,
 ) -> Result<Option<(bool, bool)>, String> {
     // Let the caller bound retries for its engine's transient transport error.
-    look(driver, connection, own, token)
+    look(support, connection, own, token)
         .await
         .map(|kept| kept.map(|kept| (kept.alive, kept.ever)))
 }
@@ -765,6 +764,90 @@ mod tests {
         assert!(state_from_json(&test.to_string(), T).is_err());
     }
 
+    /// The stored label picks the support the container was started with, and
+    /// a label no compiled engine writes picks none. Such a container is read
+    /// as unprovable below and never as dead.
+    #[test]
+    fn a_stored_engine_label_selects_its_own_support_and_an_unknown_one_none() {
+        let with = |label: serde_json::Value| {
+            let mut valid = serde_json::json!({"Id":"a".repeat(64),"Name":format!("/pbps-scratch-{T}"),"Config":{"Labels":{"pbps.resolver":"scratch",TOKEN:T}},"State":{"Status":"running","StartedAt":"2026-10-29T00:00:00Z"},"Created":"2026-10-29T00:00:00Z","Mounts":[]});
+            valid["Config"]["Labels"][ENGINE] = label;
+            state_from_json(&valid.to_string(), T).unwrap()
+        };
+        for driver in [pbps_db::Driver::Postgres, pbps_db::Driver::Mssql] {
+            let expected = engine::container::owned(driver);
+            let state = with(expected.label.into());
+            assert!(std::ptr::eq(state.support.unwrap(), expected));
+        }
+        for label in [
+            serde_json::json!("oracle"),
+            serde_json::json!("Postgres"),
+            serde_json::json!(""),
+            serde_json::json!(7),
+            serde_json::Value::Null,
+        ] {
+            assert!(with(label.clone()).support.is_none(), "{label}");
+        }
+        // A container with no engine label at all is the same: not guessed.
+        let mut unlabelled = serde_json::json!({"Id":"a".repeat(64),"Name":format!("/pbps-scratch-{T}"),"Config":{"Labels":{"pbps.resolver":"scratch",TOKEN:T}},"State":{"Status":"running","StartedAt":"2026-10-29T00:00:00Z"},"Created":"2026-10-29T00:00:00Z","Mounts":[]});
+        assert!(
+            state_from_json(&unlabelled.to_string(), T)
+                .unwrap()
+                .support
+                .is_none()
+        );
+        unlabelled["Config"]["Labels"][ENGINE] = "mssql".into();
+        assert!(
+            state_from_json(&unlabelled.to_string(), T)
+                .unwrap()
+                .support
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_running_container_whose_keeper_could_not_be_read_is_unprovable_never_dead() {
+        let mut unknown = state("running");
+        unknown.support = None;
+        assert_eq!(
+            keeper_support(&unknown).err().as_deref(),
+            Some("its engine is not labelled")
+        );
+        assert!(keeper_support(&state("running")).is_ok());
+        // What `classify` reads of a label with no support, and of a server
+        // that cannot be read or cannot see itself: none of them is a verdict
+        // on the owner, so none lets the container be removed.
+        for seen in [
+            Err("its engine is not labelled".to_owned()),
+            Err("the server did not answer in time".to_owned()),
+        ] {
+            assert!(
+                matches!(
+                    verdict(&unknown, Some(seen), Some(10_000), GRACE),
+                    Liveness::Unprovable(_)
+                ),
+                "an old container is not dead for what could not be read"
+            );
+        }
+        assert!(matches!(
+            verdict(&unknown, Some(Ok(None)), Some(10_000), GRACE),
+            Liveness::Unprovable(_)
+        ));
+        // Negative: a keeper that was seen and is gone is the one dead answer.
+        assert_eq!(
+            verdict(
+                &unknown,
+                Some(Ok(Some(Kept {
+                    alive: false,
+                    ever: true
+                }))),
+                None,
+                GRACE
+            ),
+            Liveness::Dead
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_test_journal_defers_even_an_exited_or_already_removed_container() {
@@ -877,7 +960,7 @@ mod tests {
             status: status.into(),
             started: String::new(),
             created: String::new(),
-            driver: Some(Driver::Postgres),
+            support: Some(engine::container::owned(pbps_db::Driver::Postgres)),
             journal: None,
         }
     }

@@ -16,6 +16,7 @@ use pbps_db::{Conn, DbError, Driver};
 use pbps_model::Hints;
 use pbps_model::resolver::{InputManifest, OutsideWrites, SurfaceResolution};
 
+pub(crate) mod container;
 mod keeper;
 pub(super) mod mssql;
 mod postgres;
@@ -809,54 +810,6 @@ use postgres::compile_failed;
 pub(super) use postgres::reconstruction;
 #[cfg(test)]
 pub(super) use postgres::{generation_version, release_supplied};
-
-/// Values the runner needs to start and reach one engine's Docker image.
-/// Acquisition, deadlines and confirmed removal remain the runner's work.
-pub(super) struct Docker {
-    pub driver: Driver,
-    pub environment: Vec<String>,
-    pub port: u16,
-    pub readiness_query: &'static str,
-}
-
-pub(super) fn docker(driver: Driver, password: &str) -> Result<Docker, ProduceError> {
-    match driver {
-        Driver::Postgres => Ok(Docker {
-            driver,
-            environment: vec![format!("POSTGRES_PASSWORD={password}")],
-            port: 5432,
-            readiness_query: "SELECT 1 AS ok",
-        }),
-        Driver::Mssql => Ok(Docker {
-            driver,
-            environment: vec![
-                "ACCEPT_EULA=Y".into(),
-                format!(
-                    "MSSQL_SA_PASSWORD={}",
-                    pbps_mssql::resolver::scratch::password(password)
-                ),
-            ],
-            port: 1433,
-            readiness_query: "SELECT 1 AS ok",
-        }),
-    }
-}
-
-impl Docker {
-    pub(super) fn connection(&self, port: u16, password: &str) -> Result<String, ProduceError> {
-        match self.driver {
-            Driver::Postgres => Ok(format!(
-                "host=127.0.0.1 port={port} user=postgres password={password} dbname=postgres \
-                 sslmode=disable"
-            )),
-            Driver::Mssql => Ok(format!(
-                "Server=127.0.0.1,{port};Database=master;User \
-                 Id=sa;Password={};TrustServerCertificate=true",
-                pbps_mssql::resolver::scratch::password(password)
-            )),
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

@@ -349,7 +349,8 @@ impl<'d> TestScratch<'d> {
         // it is the engine's stored string and the same support record that
         // admitted the run starts its container (#2798).
         let engine = owned.record_engine;
-        let driver = owned.driver;
+        let container = owned.container;
+        let driver = container.driver;
         // What `ours` checks of the container later; the resolver's own
         // labels (token, engine, process) are set by its start.
         let labels = [
@@ -386,7 +387,7 @@ impl<'d> TestScratch<'d> {
             location: journal::location(dir.path()).map_err(Error::State)?,
             journal: &mut journal,
         };
-        let start = Held::start_owned(driver, image, pull, &mut owner);
+        let start = Held::start_owned(container, image, pull, &mut owner);
         let started = match deadline {
             Some(end) => bounded_start(start, end, &mut cancelled, &resource).await,
             None => start.await,
