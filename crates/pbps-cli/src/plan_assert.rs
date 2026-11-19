@@ -164,30 +164,14 @@ impl Selection {
                 .assertion_ms
                 .get(),
         ));
-        let expected = crate::engine::read_assertion_target(planning).await?;
+        // The engine reads and keeps the target's identity; nothing here
+        // names an engine, so one that implements assertions needs no edit in
+        // this file, and one that does not is refused before any file runs.
+        let target = crate::engine::read_assertion_target(planning).await?;
         let mut passed = Vec::new();
         for assertion in &self.assertions {
             let path = assertion.record.path.raw();
-            let result = match &expected {
-                Expected::Postgres(target) => {
-                    pbps_pg::assertions::run_target(
-                        &self.connection,
-                        target,
-                        &assertion.text,
-                        timeout,
-                    )
-                    .await
-                }
-                Expected::Mssql(target) => {
-                    pbps_mssql::assertions::run_target(
-                        &self.connection,
-                        target,
-                        &assertion.text,
-                        timeout,
-                    )
-                    .await
-                }
-            };
+            let result = target.run(&self.connection, &assertion.text, timeout).await;
             classify(path, result)?;
             passed.push(assertion.record.clone());
         }
@@ -195,9 +179,14 @@ impl Selection {
     }
 }
 
-pub(crate) enum Expected {
-    Postgres(pbps_pg::assertions::Target),
-    Mssql(pbps_mssql::assertions::Target),
+/// `--assert` reached an engine that has no plan target assertions. A refusal
+/// the user can act on by dropping the flag, not by fixing the login, so it
+/// carries no assertion-login remedy.
+pub(crate) fn unsupported(engine: &str) -> Stop {
+    Stop::Refused(Finding::error(
+        "plan.assertion.refused",
+        pbps_db::engine::assertions_unsupported(engine),
+    ))
 }
 
 fn connection_problem(message: String) -> Finding {

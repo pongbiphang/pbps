@@ -40,6 +40,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::catalog::{CatalogNames, Pulled, RowsError, Spellings};
 use pbps_db::doctor::Ask;
+pub use pbps_db::doctor::{Capabilities, Permissions};
 use pbps_db::impact::{ImpactError, ImpactReport, RenameTarget};
 use pbps_db::{Conn, DbError, Driver, LedgerEntry, LedgerError, LockInfo, TimelineEntry};
 use pbps_model::{ChangeSet, IdsFile, ObservedRows, RowScope, Schema, StateSnapshot, TableName};
@@ -49,7 +50,10 @@ use pbps_model::{ChangeSet, IdsFile, ObservedRows, RowScope, Schema, StateSnapsh
 ///
 /// The one `match` for those operations; the functions below delegate through
 /// it, so a third engine is a compile error here and nowhere else for them
-/// (#2798). Operations only some engines have still match on the driver
+/// (#2798). The provided methods (`doctor`'s questions and plan target
+/// assertions) have a stated default there, so a third engine answers each in
+/// its own `impl` and is not named by `doctor.rs` or `plan_assert.rs`.
+/// Operations only some other engines have still match on the driver
 /// themselves, until they move behind the trait too.
 pub(crate) fn of(driver: Driver) -> &'static dyn pbps_db::engine::Engine {
     static MSSQL: pbps_mssql::engine::MssqlEngine = pbps_mssql::engine::MssqlEngine;
@@ -1245,35 +1249,12 @@ pub async fn role_owned_securables(
 
 /// Advisory target observations; never acquires or contacts a resolver.
 pub async fn resolver_discovery(conn: &mut Conn) -> Result<pbps_db::resolver::Discovery, DbError> {
-    match conn.driver() {
-        Driver::Mssql => pbps_mssql::resolver::discover(conn).await,
-        Driver::Postgres => pbps_pg::resolver::discover(conn).await,
-    }
+    of(conn.driver()).resolver_discovery(conn).await
 }
 
 /// The server's version, as text an operator recognises.
 pub async fn server_version(conn: &mut Conn) -> Result<String, DbError> {
-    match conn.driver() {
-        Driver::Mssql => pbps_mssql::doctor::server_version(conn).await,
-        Driver::Postgres => Ok(pbps_pg::doctor::server_version(conn).await?.text),
-    }
-}
-
-/// What the connected server can do, as far as a plan's statements care.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Capabilities {
-    /// The edition this server runs, named as the operator would recognise
-    /// it, where the engine *has* editions. `None` is "this engine has one
-    /// edition" — a fact about the engine, not an edition that could not be
-    /// read; a read that fails is the `Err` of [`capabilities`].
-    pub edition: Option<String>,
-    /// Whether `strategy: online` is accepted at all (ADR-0003).
-    pub supports_online: bool,
-    /// Whether the statements the emitter writes for a module are accepted:
-    /// `CREATE OR ALTER` arrived in SQL Server 2016 SP1, and an older server
-    /// rejects every module statement in a plan. `None` where the version
-    /// that decides it was not read.
-    pub supports_create_or_alter: Option<bool>,
+    of(conn.driver()).server_version(conn).await
 }
 
 /// Reads the server's capabilities. `version` is what [`server_version`]
@@ -1282,34 +1263,7 @@ pub struct Capabilities {
 /// supports the syntax regardless), and a version that could not be read
 /// leaves that one `None` rather than guessed.
 pub async fn capabilities(conn: &mut Conn, version: Option<&str>) -> Result<Capabilities, DbError> {
-    match conn.driver() {
-        Driver::Mssql => {
-            use pbps_mssql::edition::Edition;
-            let edition = pbps_mssql::edition::edition(conn).await?;
-            Ok(Capabilities {
-                edition: Some(match &edition {
-                    // Named as unrecognised rather than passed through: the
-                    // tool is about to treat it as limited, and an operator
-                    // reading their own edition string back without comment
-                    // would not know that.
-                    Edition::Unknown(raw) => format!("{raw} (unrecognised; treated as limited)"),
-                    known @ (Edition::Full(_) | Edition::Limited(_)) => known.name().to_owned(),
-                }),
-                supports_online: edition.supports_online(),
-                supports_create_or_alter: version
-                    .map(|v| pbps_mssql::doctor::supports_create_or_alter(v, edition.name())),
-            })
-        }
-        // One edition, and every release this tool speaks to builds an index
-        // `CONCURRENTLY` and replaces a routine with `CREATE OR REPLACE`; the
-        // emitter writes both. Nothing is read because there is nothing that
-        // could answer differently.
-        Driver::Postgres => Ok(Capabilities {
-            edition: None,
-            supports_online: true,
-            supports_create_or_alter: Some(true),
-        }),
-    }
+    of(conn.driver()).capabilities(conn, version).await
 }
 
 /// What the connected server says about the plan's `strategy: online` hints
@@ -2237,32 +2191,10 @@ pub async fn permission_support(
 /// there, a role with `CREATE` on `public` can make the ledger tables first
 /// and attach code the deployment account would run. SQL Server's ledger
 /// lives in `dbo`, and whether it needs the same check is not this issue's
-/// question, so it reports none.
+/// question, so it reports none. An engine that answers nothing is an `Err`,
+/// which `doctor` reports as unknown, never as a clean ledger.
 pub async fn ledger_problems(conn: &mut Conn) -> Result<Vec<String>, DbError> {
-    match conn.driver() {
-        Driver::Mssql => Ok(Vec::new()),
-        Driver::Postgres => pbps_pg::state::ledger_problems(conn).await,
-    }
-}
-
-/// A permission the deployment needs and the connected account does not hold,
-/// with the securable already spelled the way this engine's `GRANT` names it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PermissionGap {
-    pub permission: &'static str,
-    pub securable: String,
-    pub why: String,
-}
-
-/// What `doctor` learns about the connected account.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Permissions {
-    pub gaps: Vec<PermissionGap>,
-    /// What the account lacks that only some plans need, each with what it
-    /// would allow: advice, never a gap (#1644).
-    pub advised: Vec<PermissionGap>,
-    /// The managed schemas the database does not have yet.
-    pub absent_schemas: BTreeSet<String>,
+    of(conn.driver()).ledger_problems(conn).await
 }
 
 /// Reads what the connected account holds and reports what it lacks.
@@ -2279,52 +2211,7 @@ pub async fn permissions(
     project_ids: &IdsFile,
     ask: &Ask<'_>,
 ) -> Result<Permissions, DbError> {
-    match conn.driver() {
-        Driver::Mssql => {
-            let held = pbps_mssql::doctor::permissions(
-                conn,
-                ask.managed_tables,
-                ask.managed_schemas,
-                ask.referenced_columns,
-                ask.granted,
-                ask.data,
-                ask.declared_keys,
-                project_ids,
-            )
-            .await?;
-            let render = |gaps: Vec<pbps_mssql::doctor::Gap>| -> Vec<PermissionGap> {
-                gaps.into_iter()
-                    .map(|g| PermissionGap {
-                        permission: g.permission,
-                        securable: g.securable(),
-                        why: g.why.into(),
-                    })
-                    .collect()
-            };
-            Ok(Permissions {
-                gaps: render(pbps_mssql::doctor::missing(&held)),
-                advised: render(pbps_mssql::doctor::advised(&held)),
-                absent_schemas: held.absent_schemas,
-            })
-        }
-        Driver::Postgres => {
-            let held = pbps_pg::doctor::permissions(conn, ask, project_ids).await?;
-            Ok(Permissions {
-                gaps: pbps_pg::doctor::missing(&held)
-                    .into_iter()
-                    .map(|g| PermissionGap {
-                        permission: g.permission,
-                        securable: g.securable(),
-                        why: g.why,
-                    })
-                    .collect(),
-                // PostgreSQL's dependency reads need nothing the required
-                // list does not ask.
-                advised: Vec::new(),
-                absent_schemas: held.absent_schemas,
-            })
-        }
-    }
+    of(conn.driver()).permissions(conn, project_ids, ask).await
 }
 
 /// Whether each partitioned parent's partitions reach far enough past its
@@ -2332,16 +2219,16 @@ pub async fn permissions(
 /// (#1789, DEC-1789.2). Reads existence, never a value, and writes nothing.
 ///
 /// SQL Server has no RANGE partitions to run out of, so the question does not
-/// apply and the report is empty.
+/// apply and the report is empty; an engine that answers nothing is an `Err`
+/// that `doctor` shows as a warning, never as an empty (clean) report.
 pub async fn partition_runway(
     conn: &mut Conn,
     ask: &pbps_db::doctor::RunwayAsk<'_>,
     project_ids: &IdsFile,
 ) -> Result<pbps_db::doctor::RunwayReport, DbError> {
-    match conn.driver() {
-        Driver::Mssql => Ok(pbps_db::doctor::RunwayReport::default()),
-        Driver::Postgres => pbps_pg::doctor::partition_runway(conn, ask, project_ids).await,
-    }
+    of(conn.driver())
+        .partition_runway(conn, ask, project_ids)
+        .await
 }
 
 /// What `doctor` tells the operator when its lock read was refused, in this
@@ -2380,11 +2267,10 @@ pub async fn lock_read_gap(driver: Driver, connection: &str) -> pbps_db::doctor:
     let Ok(mut conn) = Conn::connect(driver, connection).await else {
         return LockReadGap::Unexplained;
     };
-    let answer = match driver {
-        Driver::Mssql => pbps_mssql::doctor::lock_read_gap(&mut conn).await,
-        Driver::Postgres => pbps_pg::doctor::lock_read_gap(&mut conn).await,
-    };
-    answer.unwrap_or(LockReadGap::Unexplained)
+    of(driver)
+        .lock_read_gap(&mut conn)
+        .await
+        .unwrap_or(LockReadGap::Unexplained)
 }
 
 /// The remedy for a lock read that failed, from what [`lock_read_gap`] saw.

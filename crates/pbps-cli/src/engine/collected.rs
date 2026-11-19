@@ -285,21 +285,20 @@ pub(crate) fn same_instance_consent(
 /// Reads what the target assertions are held against: the planning target's
 /// own identity, which an assertion login must match.
 ///
-/// An engine's error stops planning with the same finding for either engine.
+/// An engine's error stops planning with the same finding for every engine,
+/// and an engine without assertions is refused by name (#2798).
 pub(crate) async fn read_assertion_target(
     planning: &mut Conn,
-) -> Result<crate::plan_assert::Expected, crate::plan_assert::Stop> {
+) -> Result<Box<dyn pbps_db::engine::AssertionTarget>, crate::plan_assert::Stop> {
     use crate::plan_assert::stop;
-    match planning.driver() {
-        Driver::Postgres => Ok(crate::plan_assert::Expected::Postgres(
-            pbps_pg::assertions::Target::read(planning)
-                .await
-                .map_err(|e| stop("the planning target", e))?,
-        )),
-        Driver::Mssql => Ok(crate::plan_assert::Expected::Mssql(
-            pbps_mssql::assertions::Target::read(planning)
-                .await
-                .map_err(|e| stop("the planning target", e))?,
-        )),
+    use pbps_db::engine::TargetAssertions;
+    let engine = of(planning.driver());
+    match engine
+        .read_assertion_target(planning)
+        .await
+        .map_err(|e| stop("the planning target", e))?
+    {
+        TargetAssertions::Supported(target) => Ok(target),
+        TargetAssertions::Unsupported => Err(crate::plan_assert::unsupported(engine.name())),
     }
 }

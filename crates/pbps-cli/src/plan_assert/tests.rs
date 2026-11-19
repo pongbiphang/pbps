@@ -318,3 +318,16 @@ fn an_unanswerable_assertion_keeps_its_own_finding_through_the_envelope() {
         ["plan.failed"]
     );
 }
+
+#[test]
+fn an_engine_without_assertions_is_refused_by_name_without_a_login_remedy() {
+    let finding = refused(unsupported("Stub"));
+    assert_eq!(finding.id, "plan.assertion.refused");
+    assert_eq!(
+        finding.message,
+        "Stub does not support plan target assertions"
+    );
+    // Pointing at a different login would send the user to fix what is not
+    // broken: only dropping `--assert` helps.
+    assert!(finding.remedy.is_none(), "{:?}", finding.remedy);
+}

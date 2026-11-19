@@ -13,12 +13,20 @@
 //!
 //! # What is, and is not, in the trait
 //!
-//! Only the operations any engine needs in order to plan and apply: the ledger
-//! and the lock, the catalog read, and executing one staged statement. Every
-//! method is required: there is no default body, because a default would let a
-//! new engine compile while silently lacking part of the ledger. Capabilities
-//! only some engines have (extensions, partitions, temporal tables, ...) arrive
-//! in later steps as methods with refusing defaults (#2798).
+//! The operations any engine needs in order to plan and apply: the ledger and
+//! the lock, the catalog read, and executing one staged statement. Those are
+//! required: there is no default body, because a default would let a new
+//! engine compile while silently lacking part of the ledger.
+//!
+//! Capabilities only some engines have arrive as methods with a stated default
+//! (#2798): the questions `doctor` asks, and plan target assertions. A default
+//! never reads as success. Advisory data an engine may lack answers "not
+//! available" in words that name the engine ([`not_available`]); knowledge
+//! `doctor` requires stays unanswered ([`not_answered`]), which `doctor` reports
+//! as unknown and which still withholds its readiness claim. An engine that
+//! knows a feature does not apply says so itself (SQL Server's empty partition
+//! report): a default is for an engine that gave no answer, and an unreadable
+//! query is never read as an absent feature.
 //!
 //! # How async is expressed
 //!
@@ -32,11 +40,16 @@
 
 use std::collections::BTreeMap;
 
+use std::time::Duration;
+
 use pbps_dialect::Statement;
-use pbps_model::{ObservedRows, RowScope, Schema, StateSnapshot, TableName};
+use pbps_model::{IdsFile, ObservedRows, RowScope, Schema, StateSnapshot, TableName};
 
 use crate::catalog::{Pulled, RowsError};
+use crate::doctor::{Ask, Capabilities, LockReadGap, Permissions, RunwayAsk, RunwayReport};
 use crate::ledger::{StateRevision, StoredEntry};
+use crate::query::AssertionResult;
+use crate::resolver::{Candidate, Discovery};
 use crate::{Conn, DbError, Driver, LedgerEntry, LedgerError, LockInfo, TimelineEntry};
 
 /// What an [`Engine`] method returns: a boxed, `Send` future borrowing the
@@ -67,10 +80,85 @@ pub enum Read {
     InsideOwnTransaction,
 }
 
+/// The words of an advisory question an engine does not answer: not a failure
+/// and not a positive result (#2798).
+pub fn not_available(operation: &str, engine: &str, reason: &str) -> String {
+    format!("{operation} is not available for {engine}: {reason}")
+}
+
+/// The refusal of a question `doctor` requires and an engine did not answer.
+/// An error, never an empty or true answer, so the caller reports unknown.
+pub fn not_answered(operation: &str, engine: &str) -> DbError {
+    DbError::Refused(format!(
+        "{operation} is not answered for {engine}: this engine has not implemented the question"
+    ))
+}
+
+/// What an engine with no resolver discovery reports: a candidate that says
+/// why it is unavailable and nothing else, so a missing advisory is visible
+/// and cannot be read as a clean environment.
+pub fn discovery_not_available(engine: &str) -> Discovery {
+    Discovery::unverified(
+        Default::default(),
+        None,
+        Candidate::Unavailable {
+            reason: not_available(
+                "resolver discovery",
+                engine,
+                "this engine has no discovery queries",
+            ),
+        },
+    )
+}
+
+/// What an engine with no partition-runway question refuses with; `doctor`
+/// shows it as a warning that the runway is undetermined (#1789).
+pub fn partition_runway_not_available(engine: &str) -> DbError {
+    DbError::Refused(not_available(
+        "partition runway",
+        engine,
+        "this engine has not declared whether it has RANGE partitions to run out",
+    ))
+}
+
+/// The words a plan reports when `--assert` reaches an engine without target
+/// assertions (#2401). It names the engine; no assertion login can fix it.
+pub fn assertions_unsupported(engine: &str) -> String {
+    format!("{engine} does not support plan target assertions")
+}
+
+/// What the planning target is held to by `--assert`: the identity read from
+/// the planning connection, kept private to the engine that read it.
+///
+/// Boxed rather than an associated type because it returns an
+/// [`AssertionResult`], not certified evidence, so no command needs to name the
+/// engine's type; a neutral associated target can replace it later without a
+/// caller edit.
+pub trait AssertionTarget: Send + Sync {
+    /// Runs one assertion on a fresh connection from `connection`, after the
+    /// engine has checked that it is the planning database, a separate login
+    /// and effectively read-only. Every check the engine makes precedes the SQL.
+    fn run<'a>(
+        &'a self,
+        connection: &'a str,
+        sql: &'a str,
+        timeout: Duration,
+    ) -> EngineFuture<'a, Result<AssertionResult, DbError>>;
+}
+
+/// An engine's answer to "what do assertions run against?". Two outcomes, so an
+/// engine without assertions is a named answer and not an error to be mistaken
+/// for an unreadable target.
+pub enum TargetAssertions {
+    Unsupported,
+    Supported(Box<dyn AssertionTarget>),
+}
+
 /// The connected operations every engine provides.
 ///
-/// Every method is required and none has a default body; optional capabilities
-/// arrive later with refusing defaults (#2798). Methods take `&self` so an
+/// The ledger, catalog and execution methods are required; the `doctor` and
+/// assertion questions below them have stated defaults (see the module
+/// header). Methods take `&self` so an
 /// engine is a shareable, usually zero-sized, value, and `&mut Conn` because
 /// the connection is the one thing they mutate. Each returns the same result
 /// type the CLI's per-operation function returns, so callers match on
@@ -188,6 +276,92 @@ pub trait Engine: Send + Sync {
         conn: &'a mut Conn,
         statement: &'a Statement,
     ) -> EngineFuture<'a, Result<(), DbError>>;
+
+    // -- What `doctor` asks (provided; see the module header) --------------
+
+    /// Advisory target observations; never acquires or contacts a resolver.
+    /// Default: a discovery that says it is not available.
+    fn resolver_discovery<'a>(
+        &'a self,
+        _conn: &'a mut Conn,
+    ) -> EngineFuture<'a, Result<Discovery, DbError>> {
+        Box::pin(async move { Ok(discovery_not_available(self.name())) })
+    }
+
+    /// The server's version, as text an operator recognises. Required
+    /// knowledge; default: not answered.
+    fn server_version<'a>(
+        &'a self,
+        _conn: &'a mut Conn,
+    ) -> EngineFuture<'a, Result<String, DbError>> {
+        Box::pin(async move { Err(not_answered("the server version", self.name())) })
+    }
+
+    /// What the connected server can do. `version` is what
+    /// [`Engine::server_version`] answered, where it answered. Required
+    /// knowledge; default: not answered, never another engine's true values.
+    fn capabilities<'a>(
+        &'a self,
+        _conn: &'a mut Conn,
+        _version: Option<&'a str>,
+    ) -> EngineFuture<'a, Result<Capabilities, DbError>> {
+        Box::pin(async move { Err(not_answered("the server capabilities", self.name())) })
+    }
+
+    /// How the ledger's tables differ from the recipe they are created from,
+    /// one line each; empty when they match or are not there yet. Required
+    /// knowledge; default: not answered, never an empty list that reads clean.
+    fn ledger_problems<'a>(
+        &'a self,
+        _conn: &'a mut Conn,
+    ) -> EngineFuture<'a, Result<Vec<String>, DbError>> {
+        Box::pin(async move { Err(not_answered("the ledger diagnostics", self.name())) })
+    }
+
+    /// What the connected account holds, with each gap's securable spelled the
+    /// way this engine's `GRANT` names it. Required knowledge; default: not
+    /// answered, never `Permissions::default()`.
+    fn permissions<'a>(
+        &'a self,
+        _conn: &'a mut Conn,
+        _project_ids: &'a IdsFile,
+        _ask: &'a Ask<'a>,
+    ) -> EngineFuture<'a, Result<Permissions, DbError>> {
+        Box::pin(async move { Err(not_answered("the account's permissions", self.name())) })
+    }
+
+    /// Whether each partitioned parent's partitions reach far enough past its
+    /// rows (#1789). Advisory; default: not available.
+    fn partition_runway<'a>(
+        &'a self,
+        _conn: &'a mut Conn,
+        _ask: &'a RunwayAsk<'a>,
+        _project_ids: &'a IdsFile,
+    ) -> EngineFuture<'a, Result<RunwayReport, DbError>> {
+        Box::pin(async move { Err(partition_runway_not_available(self.name())) })
+    }
+
+    /// Why a fresh session of the same identity could not read the lock, to
+    /// choose the remedy (#822). Default: unexplained, the observation that
+    /// never invents a grant.
+    fn lock_read_gap<'a>(
+        &'a self,
+        _conn: &'a mut Conn,
+    ) -> EngineFuture<'a, Result<LockReadGap, DbError>> {
+        Box::pin(async { Ok(LockReadGap::Unexplained) })
+    }
+
+    // -- Plan target assertions (provided) ---------------------------------
+
+    /// Reads what `plan --assert` holds the assertion login to, from the
+    /// planning connection. Default: [`TargetAssertions::Unsupported`], so
+    /// an engine that has not implemented assertions is refused by name.
+    fn read_assertion_target<'a>(
+        &'a self,
+        _conn: &'a mut Conn,
+    ) -> EngineFuture<'a, Result<TargetAssertions, DbError>> {
+        Box::pin(async { Ok(TargetAssertions::Unsupported) })
+    }
 }
 
 #[cfg(test)]
@@ -326,6 +500,69 @@ mod tests {
         let engine: &'static dyn Engine = &Stub;
         assert_eq!(engine.driver(), Driver::Postgres);
         assert_eq!(engine.name(), "Stub");
+    }
+
+    /// The `Stub` above implements none of the provided methods and still
+    /// compiles, so the doctor and assertion questions are optional. What their
+    /// defaults say is pinned below at the function level, because the methods
+    /// need a connection and no offline `Conn` exists.
+    #[test]
+    fn an_advisory_question_an_engine_lacks_is_worded_as_not_available_for_it() {
+        assert_eq!(
+            not_available("partition runway", "Stub", "no RANGE partitions declared"),
+            "partition runway is not available for Stub: no RANGE partitions declared"
+        );
+        let DbError::Refused(text) = partition_runway_not_available("Stub") else {
+            panic!("a missing partition runway must be a refusal, not an empty report");
+        };
+        assert!(
+            text.starts_with("partition runway is not available for Stub: "),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_missing_resolver_discovery_is_an_unavailable_candidate_not_a_clean_environment() {
+        let discovery = discovery_not_available("Stub");
+        assert!(discovery.observations.is_empty());
+        assert!(discovery.extensions.is_none());
+        let Candidate::Unavailable { reason } = &discovery.candidate else {
+            panic!("an engine without discovery must not suggest a candidate");
+        };
+        assert!(
+            reason.starts_with("resolver discovery is not available for Stub: "),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn an_unanswered_required_question_is_a_refusal_naming_the_engine_never_a_value() {
+        // Each of these is an `Err` in the trait defaults: an `Ok` with an
+        // empty or true value would let `doctor` claim readiness it never
+        // established.
+        for operation in [
+            "the server version",
+            "the server capabilities",
+            "the ledger diagnostics",
+            "the account's permissions",
+        ] {
+            let DbError::Refused(text) = not_answered(operation, "Stub") else {
+                panic!("{operation} must be refused when unanswered");
+            };
+            assert!(
+                text.starts_with(&format!("{operation} is not answered for Stub")),
+                "{text}"
+            );
+            assert!(!text.contains("not available"), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_assertion_refusal_names_the_engine() {
+        assert_eq!(
+            assertions_unsupported("Stub"),
+            "Stub does not support plan target assertions"
+        );
     }
 
     #[test]
