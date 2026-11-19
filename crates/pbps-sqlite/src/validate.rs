@@ -1287,6 +1287,61 @@ mod tests {
         assert!(refusal("CREATE VIEW sqlite_v AS SELECT 1").contains("reserved"));
     }
 
+    /// Expressions of a check, as `(text, the engine takes it inside
+    /// `CHECK (…)`, this takes it)`. Nothing is taken here that the engine
+    /// refuses; where the engine takes more, the row says why it is refused.
+    const EXPRESSIONS: &[(&str, bool, bool)] = &[
+        ("c > 0", true, true),
+        ("(c > 0)", true, true),
+        ("c > 0 AND (c < 9 OR c IS NULL)", true, true),
+        ("random() > 0", true, true),
+        ("abs ( c ) > (0)", true, true),
+        ("c IN ()", true, true),
+        ("c > 0 /* why */", true, true),
+        ("c > 0 -- why\n", true, true),
+        ("c <> ')'", true, true),
+        ("\"c\" > 0", true, true),
+        // An empty group is no expression.
+        ("()", false, false),
+        ("(())", false, false),
+        ("c > ()", false, false),
+        ("c > 0 AND ( /* nothing */ )", false, false),
+        ("c > 0 OR ()", false, false),
+        ("NOT ()", false, false),
+        ("c IN /* none */ ()", true, true),
+        ("abs /* of */ (c) > 0", true, true),
+        ("0 AND()", false, false),
+        ("", false, false),
+        // A run that never closes swallows the parenthesis that ends the check.
+        ("c > 0 /*", false, false),
+        ("c > 0 /* *", false, false),
+        ("c > 0 -- why", false, false),
+        ("c > 'a", false, false),
+        ("c > \"a", false, false),
+        ("c > `a", false, false),
+        ("c > [a", false, false),
+        ("c > 0)", false, false),
+        ("(c > 0", false, false),
+        ("c > 0; SELECT 1", false, false),
+    ];
+
+    #[test]
+    fn a_check_expression_is_never_taken_where_the_engine_refuses_it() {
+        let (mut taken, mut refused) = (0, 0);
+        for &(text, engine, here) in EXPRESSIONS {
+            let ddl = ["CREATE TABLE t(c, CHECK (", text, "))"].concat();
+            assert_eq!(accepts(&ddl), engine, "the engine on {text:?}");
+            assert_eq!(expression(text), here, "the check on {text:?}");
+            assert!(
+                engine || !here,
+                "{text:?} is taken and the engine refuses it"
+            );
+            taken += usize::from(here);
+            refused += usize::from(!here);
+        }
+        assert!(taken > 5 && refused > 5);
+    }
+
     /// The ledger's two names are taken in the one namespace tables, views
     /// and indexes share, so none of the three may carry one, in any case.
     #[test]

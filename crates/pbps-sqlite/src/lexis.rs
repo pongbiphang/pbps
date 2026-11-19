@@ -135,27 +135,116 @@ pub fn has_token(text: &str) -> bool {
     })
 }
 
-/// Whether the code of `text` closes every parenthesis it opens and never
-/// closes one it did not, so it cannot end a wrapper placed around it, and
-/// holds no `;`.
+/// Whether a quoted run or a comment ends where SQLite ends it. One that does
+/// not runs to the end of the text, and takes with it whatever is written
+/// after the text: a `--` comment with no line end, a `/*` with no `*/`, a
+/// string or a quoted name with no closer.
+fn closes(piece: Piece<'_>) -> bool {
+    match piece {
+        Piece::Code(_) => true,
+        Piece::Comment(run) if run.starts_with("--") => false,
+        Piece::Comment(run) => run.len() >= 4 && run.ends_with("*/"),
+        Piece::Quoted(run) if run.starts_with('[') => run.ends_with(']'),
+        Piece::Quoted(run) => run
+            .chars()
+            .next()
+            .is_some_and(|quote| quoted_len(run, quote) == (run.len(), true)),
+    }
+}
+
+/// Whether `text` can stand inside a pair of parentheses as one expression:
+/// its code closes every parenthesis it opens and never closes one it did
+/// not, so it cannot end a wrapper placed around it; it holds no `;`; no
+/// group is empty unless a name or `IN` comes before it (`random()`, `c IN
+/// ()`), and no other keyword does (`AND ()`);
+/// and no comment or quoted run is left open at the end, where it would
+/// swallow the wrapper's own closing parenthesis. A `--` comment is closed
+/// only by a line end that follows it.
 #[must_use]
 pub fn is_one_expression(text: &str) -> bool {
-    let mut depth = 0usize;
-    for piece in pieces(text) {
-        let Piece::Code(code) = piece else { continue };
-        for c in code.chars() {
-            match c {
-                '(' => depth += 1,
-                ')' => match depth.checked_sub(1) {
-                    Some(d) => depth = d,
-                    None => return false,
-                },
-                ';' => return false,
-                _ => {}
+    // One entry per open group: whether a name came before it, and whether
+    // anything has been written inside it.
+    let mut groups: Vec<(bool, bool)> = Vec::new();
+    // The bare word just read, if the last thing read was one.
+    let mut word = String::new();
+    // Whether layout or a comment has ended that word: the next name
+    // character starts another.
+    let mut separated = false;
+    let mut after_quoted = false;
+    let all = pieces(text);
+    for (at, piece) in all.iter().enumerate() {
+        match *piece {
+            Piece::Comment(run) => {
+                let line = run.starts_with("--");
+                let ended = if line {
+                    all.get(at + 1).is_some()
+                } else {
+                    closes(*piece)
+                };
+                if !ended {
+                    return false;
+                }
+                // A comment separates two words as layout does.
+                separated = true;
+            }
+            Piece::Quoted(_) => {
+                if !closes(*piece) {
+                    return false;
+                }
+                if let Some(group) = groups.last_mut() {
+                    group.1 = true;
+                }
+                // A quoted name may be called; a string may not, and the
+                // engine says so.
+                word.clear();
+                after_quoted = true;
+            }
+            Piece::Code(code) => {
+                for c in code.chars() {
+                    match c {
+                        ';' => return false,
+                        '(' => {
+                            let named = after_quoted
+                                || (!word.is_empty()
+                                    && (!crate::keywords::is_reserved(&word)
+                                        || word.eq_ignore_ascii_case("in")));
+                            groups.push((named, false));
+                            word.clear();
+                            after_quoted = false;
+                        }
+                        ')' => {
+                            let Some((named, filled)) = groups.pop() else {
+                                return false;
+                            };
+                            if !named && !filled {
+                                return false;
+                            }
+                            if let Some(group) = groups.last_mut() {
+                                group.1 = true;
+                            }
+                            word.clear();
+                            after_quoted = false;
+                        }
+                        c if is_space(c) => separated = true,
+                        c => {
+                            if let Some(group) = groups.last_mut() {
+                                group.1 = true;
+                            }
+                            if !crate::ident::identifier_continues(c) || after_quoted || separated {
+                                word.clear();
+                            }
+                            separated = false;
+                            if crate::ident::identifier_continues(c) {
+                                word.push(c);
+                            }
+                            after_quoted = false;
+                        }
+                    }
+                }
             }
         }
     }
-    depth == 0
+    groups.is_empty()
 }
 
 /// Whether anything but `;` and layout follows the first `;` in code, which
