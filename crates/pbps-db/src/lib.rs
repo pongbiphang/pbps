@@ -47,6 +47,9 @@ pub mod query;
 #[doc(hidden)]
 pub mod request_count;
 pub mod resolver;
+// The third driver module (#2950). Public because `Conn` has no `Sqlite`
+// variant yet; see the module's own documentation for why.
+pub mod sqlite;
 pub mod transport;
 
 pub use ledger::{

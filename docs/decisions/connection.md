@@ -1444,3 +1444,66 @@ Rejected:
 Pinned by `plan_session::tests` (each default with its negative case, and a
 mutation of each selector fails one) and by the existing connected-plan tests,
 which exercise the positions of both engines unchanged.
+
+<a id="dec-2950-1"></a>
+
+**DEC-2950.1. SQLite is linked through `rusqlite` with its bundled source,
+behind `pbps-db`, and its crate is built before it is wired (#2950).** The
+maintainer decided on 2026-11-19 that SQLite is a supported third engine and not
+a stub for #2798. This entry records the library, where the connection lives and
+the order of work; the first item of the plan is the code that follows it.
+
+- **The library.** The C SQLite that applications run, through `rusqlite` with
+  the `bundled` feature (SQLite 3.54.1 at the pinned `=0.43.0`), with default
+  features off. The pin follows `tiberius`: the bundled SQLite version is part of
+  the behaviour the design was measured against, and the study found 15 of 662
+  steps differ between 3.46 and 3.54. Turning off the defaults drops a statement
+  cache that is not used and a package for the browser target that would still
+  enter the lock file. The C source is built by `cc`, which the release builds
+  already run for the TLS provider.
+- **The connection is `pbps_db::sqlite`.** It is the third driver module, the
+  only file that names `rusqlite` (ARCHITECTURE constraint 9), and its types are
+  its own: `Connection`, `Value`, `Record`, `Version`, with `DbError` for every
+  failure. It is public and `Conn` is unchanged, so no existing `match` moves.
+  The extended result code is the error's code, as decimal text.
+- **It is synchronous.** The library's connection is `Send` and not `Sync`, and
+  SQLite runs in the calling thread. The async `Conn` will move the connection
+  into `spawn_blocking` and back, which needs only `Send`, and a transaction
+  lives in the connection so it spans those calls. Nothing async is built now.
+- **What a connection guarantees.** Foreign keys are set and read back at open
+  and again before every transaction, because the pragma is per connection, off
+  in a distribution build, on in the bundled one, and silently ignored inside a
+  transaction. A path is a path: `""`, `":memory:"` and a name that starts with
+  `file:` are refused, the last because the bundled build reads such a name as
+  a URI whatever the open flags say. The schema is read once at open, so a file that is not a
+  database is refused there, and a write-protected file is refused because the
+  library would silently open it read-only. The busy timeout is 0, so a second
+  deployer is refused at once and waiting for the apply lock stays a decision of
+  the state layer.
+- **The crate comes before the wiring.** A `Driver` variant today breaks about
+  70 exhaustive matches in about 17 files that route steps 4 to 6 are rewriting;
+  arms written now would be thrown away. `pbps-sqlite` has no such conflict, is
+  tested on a real SQLite, and gives those steps the questions only this engine
+  asks (no schema namespace, constraints without names, a rebuild as the ordinary
+  path, type affinity, a per-connection `foreign_keys`) while they are cheap. The
+  wiring is the acceptance of #2798.
+- **Tests are ordinary tests.** SQLite is a library in the test process, so
+  there is nothing for an `#[ignore]` fixture to start and no owner to register.
+  They run in the `quick` and Windows jobs with the rest of the workspace.
+
+Rejected:
+- **`rusqlite` inside `pbps-sqlite`.** It breaks constraint 9 and puts the
+  driver behind the engine crate instead of the transport crate, so the wiring
+  would have to move it.
+- **A Rust reimplementation of SQLite.** It is not at 1.0, reports an older
+  SQLite, rewrites the stored `CREATE` text and the declared types, lacks
+  `foreign_key_check`, and refuses files with generated columns by default.
+  Revisit at its 1.0, behind the same boundary.
+- **A system library.** Its version and its `foreign_keys` default differ per
+  host, so no measurement would hold for another machine.
+- **Keeping the library's 5 second busy default.** That is a policy about
+  another deployer's lock, and it belongs to the state layer.
+
+Pinned by `pbps_db::sqlite::tests` (each guarantee above with its negative case,
+and a mutation of each fails one) and by `pbps-sqlite`'s own tests on in-memory
+and file databases.

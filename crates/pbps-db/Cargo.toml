@@ -27,6 +27,8 @@ futures-util.workspace = true
 tiberius.workspace = true
 tokio-util.workspace = true
 tokio-postgres.workspace = true
+# The third driver module (#2950), named nowhere outside `sqlite`.
+rusqlite.workspace = true
 # TLS for the PostgreSQL driver, chosen here because `tokio-postgres` leaves it
 # to the caller — the property ADR-0014's Limits name `tiberius 0.12` as
 # lacking. The same `rustls` the other driver already resolves.
