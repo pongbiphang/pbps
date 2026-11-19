@@ -3,17 +3,18 @@
 //! ones `resolver::apply` made before it named no engine, moved with their
 //! comments; they run on the apply's own connection, inside its transaction.
 
-use super::super::{Binding, CompiledCapture, Staged, unsupported};
-use super::{Naming, Prepared, Scratch};
+use super::super::{CapturedInputs, CompiledCapture, unsupported};
+use super::{Binding, Naming, Prepared, Scratch};
 use crate::resolver::contract::{
-    ApplyRecheck, ClosingInputs, ClusterDomain, FactsError, GrantRecheck, Phase, Planning,
-    PreparedView, Rehearsal, RehearsalRequest, Replay, ResolverEngine, Step, Support,
+    ApplyRecheck, BindingView, ClosingInputs, ClusterDomain, FactsError, GrantRecheck, Phase,
+    Planning, PreparedView, Rehearsal, RehearsalRequest, Replay, ResolverEngine, Step, Support,
     sealed::Sealed,
 };
 use crate::resolver::scope;
 use crate::resolver::server::scratch::{Provenance, Provisioning, Tokens};
-use crate::resolver::server::{BindingRequest, Error, ProduceError, ScopeRequest};
+use crate::resolver::server::{BindingRequest, Error, PlanningDialect, ProduceError, ScopeRequest};
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
+use pbps_db::resolver::capture::Assessment;
 use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, DbError, Driver};
 use pbps_model::dependency::DependencyName;
@@ -52,6 +53,8 @@ impl ResolverEngine for PgResolver {
     type Standard = pbps_pg::resolver::standard::Standard;
     type Scratch<'a> = Box<Scratch<'a>>;
     type Prepared = Prepared;
+    type Binding = Box<Binding>;
+    type Staged = pbps_pg::resolver::capture::Staged;
 
     fn standard(
         declared: Option<&pbps_config::resolver::ScratchStandard>,
@@ -183,12 +186,12 @@ impl ResolverEngine for PgResolver {
         ids: &'a IdsFile,
         dependencies: &'a ModuleDeps,
         prepared: &'a mut Prepared,
-    ) -> Step<'a, Result<Binding, Error>> {
+    ) -> Step<'a, Result<Self::Binding, Error>> {
         Box::pin(async move {
             scratch
                 .reconstruction(target, binding, ids, dependencies, prepared)
                 .await
-                .map(|binding| Binding::Postgres(Box::new(binding)))
+                .map(Box::new)
         })
     }
 
@@ -198,66 +201,54 @@ impl ResolverEngine for PgResolver {
         prepared: &'a mut Prepared,
         admin: &'a mut Conn,
         target: &'a mut Conn,
-        binding: &'a Binding,
-    ) -> Step<'a, Result<Staged, Error>> {
+        binding: &'a Self::Binding,
+    ) -> Step<'a, Result<Self::Staged, Error>> {
         Box::pin(async move {
-            match binding {
-                Binding::Postgres(binding) => scratch
-                    .compare_externals(provisioning, prepared, admin, target, binding)
-                    .await
-                    .map(Staged::Postgres),
-                Binding::Mssql(_) => Err(unsupported()),
-            }
+            scratch
+                .compare_externals(provisioning, prepared, admin, target, binding)
+                .await
         })
     }
 
-    fn staged(_: &Self::Prepared) -> Staged {
-        Staged::Postgres(Default::default())
+    fn staged(_: &Self::Prepared) -> Self::Staged {
+        Default::default()
     }
 
-    fn completed_staged(_: &Self::Prepared) -> Option<Staged> {
+    fn completed_staged(_: &Self::Prepared) -> Option<Self::Staged> {
         None
     }
 
-    fn chains(binding: &mut Binding, prepared: &Self::Prepared) -> Result<Vec<String>, Error> {
-        match binding {
-            Binding::Postgres(binding) => Ok(binding.chains(prepared)),
-            Binding::Mssql(_) => Err(unsupported()),
-        }
+    fn chains(binding: &mut Self::Binding, prepared: &Self::Prepared) -> Vec<String> {
+        binding.chains(prepared)
     }
 
     fn compile<'a>(
-        binding: &'a mut Binding,
+        binding: &'a mut Self::Binding,
         prepared: &'a mut Self::Prepared,
         admin: &'a mut Conn,
         target: &'a mut Conn,
         extras: &'a [String],
         zone: Option<&'a SessionZone>,
         outside_writes: OutsideWrites,
-        staged: &'a mut Staged,
+        staged: &'a mut Self::Staged,
     ) -> Step<'a, Result<(), Error>> {
         Box::pin(async move {
-            match (binding, staged) {
-                (Binding::Postgres(binding), Staged::Postgres(staged)) => {
-                    binding
-                        .compile(
-                            prepared,
-                            admin,
-                            target,
-                            extras,
-                            zone,
-                            outside_writes,
-                            staged,
-                        )
-                        .await
-                }
-                _ => Err(unsupported()),
-            }
+            binding
+                .compile(
+                    prepared,
+                    admin,
+                    target,
+                    extras,
+                    zone,
+                    outside_writes,
+                    staged,
+                )
+                .await
         })
     }
 
     fn capture_desired<'a>(
-        binding: &'a Binding,
+        binding: &'a Self::Binding,
         prepared: &'a mut Self::Prepared,
         admin: &'a mut Conn,
         _: &'a mut Conn,
@@ -266,19 +257,70 @@ impl ResolverEngine for PgResolver {
         schemas: &'a [String],
         key: &'a EnvironmentFingerprintKey,
         desired: pbps_diff::Side<'a>,
-        staged: &'a Staged,
+        staged: &'a Self::Staged,
     ) -> Step<'a, Result<CompiledCapture, Error>> {
         Box::pin(async move {
-            match (binding, staged) {
-                (Binding::Postgres(binding), Staged::Postgres(staged)) => binding
-                    .capture_desired(
-                        prepared, admin, extras, visibility, schemas, key, desired, staged,
-                    )
-                    .await
-                    .map(|closing| CompiledCapture::Postgres(Box::new(closing))),
-                _ => Err(unsupported()),
+            binding
+                .capture_desired(
+                    prepared, admin, extras, visibility, schemas, key, desired, staged,
+                )
+                .await
+                .map(|closing| CompiledCapture::Postgres(Box::new(closing)))
+        })
+    }
+
+    fn capture_opening<'a>(
+        binding: &'a Self::Binding,
+        target: &'a mut Conn,
+        closing: &'a CompiledCapture,
+        key: &'a EnvironmentFingerprintKey,
+        base: pbps_diff::Side<'a>,
+    ) -> Step<'a, Result<(CapturedInputs, InputManifest), Error>> {
+        Box::pin(async move {
+            match closing {
+                CompiledCapture::Postgres(closing) => {
+                    let (current, opening) =
+                        binding.capture_opening(target, closing, key, base).await?;
+                    Ok((CapturedInputs::Postgres(current), opening))
+                }
+                CompiledCapture::Mssql(_) => Err(unsupported()),
             }
         })
+    }
+
+    fn assess(
+        binding: &mut Self::Binding,
+        closing: &CompiledCapture,
+        current: &CapturedInputs,
+        staged: &Self::Staged,
+    ) -> Result<Assessment, Error> {
+        match (closing, current) {
+            (CompiledCapture::Postgres(closing), CapturedInputs::Postgres(current)) => {
+                Ok(binding.assess(closing, current, staged))
+            }
+            _ => Err(unsupported()),
+        }
+    }
+
+    fn changed_since(
+        staged: &Self::Staged,
+        current: &CapturedInputs,
+    ) -> Result<Vec<String>, Error> {
+        match current {
+            CapturedInputs::Postgres(current) => Ok(staged.changed_since(current)),
+            CapturedInputs::Mssql(_) => Err(unsupported()),
+        }
+    }
+
+    fn through_shape_view(staged: &Self::Staged, error: Error) -> Error {
+        super::through_shape_view(error, staged)
+    }
+
+    fn dialect(binding: &Self::Binding, extras: &[String]) -> Self::Dialect {
+        <pbps_pg::Postgres as PlanningDialect>::configured(
+            extras,
+            Some(binding.generation_version()),
+        )
     }
 
     /// See `Scratch::naming`.
@@ -294,6 +336,12 @@ impl ResolverEngine for PgResolver {
         naming: Naming,
     ) -> Step<'a, Result<Result<(), String>, Error>> {
         Box::pin(async move { scratch.rehearsal_roles(admin, roles, naming).await })
+    }
+}
+
+impl BindingView for Box<Binding> {
+    fn has_fill(&self) -> bool {
+        Binding::has_fill(self)
     }
 }
 

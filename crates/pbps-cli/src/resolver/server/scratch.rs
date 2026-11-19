@@ -34,7 +34,7 @@ use pbps_db::{Conn, Driver};
 use pbps_model::Hints;
 use pbps_model::resolver::{OutsideWrites, ResolverRuntime, ScratchLayout, ScratchSource};
 
-pub use super::engine::{Prepared, Standard, declared_standard};
+pub use super::engine::{Binding, Prepared, Staged, Standard, declared_standard};
 
 pub mod domain;
 pub mod preview;
@@ -330,7 +330,7 @@ impl<D: super::PlanningDialect> Run<'_, D> {
             &mut prepared,
         )
         .await?;
-        let chains = <D::Resolver as ResolverEngine>::chains(&mut reconstruction, &prepared)?;
+        let chains = <D::Resolver as ResolverEngine>::chains(&mut reconstruction, &prepared);
         let mut staged = if self.externals.is_some() || prepared.has_filled() {
             <D::Resolver as ResolverEngine>::compare_externals(
                 &self.state,
@@ -355,8 +355,8 @@ impl<D: super::PlanningDialect> Run<'_, D> {
         let zone = target.session_zone().cloned();
         let outside_writes = self.provenance.outside_writes;
         let unfillable = prepared.unfillable();
-        let failed = |error: Error, staged: &engine::Staged| {
-            let error = staged.through_shape_view(error);
+        let failed = |error: Error, staged: &<D::Resolver as ResolverEngine>::Staged| {
+            let error = <D::Resolver as ResolverEngine>::through_shape_view(staged, error);
             if let Error::Creation(mut failure) = error {
                 if !(chains.is_empty() && unfillable.is_empty()) {
                     let context = std::sync::Arc::make_mut(&mut failure);
@@ -409,12 +409,17 @@ impl<D: super::PlanningDialect> Run<'_, D> {
             &staged,
         )
         .await?;
-        let (current, opening) = reconstruction
-            .capture_opening(target, &compiled, self.key, base)
-            .await?;
+        let (current, opening) = <D::Resolver as ResolverEngine>::capture_opening(
+            &reconstruction,
+            target,
+            &compiled,
+            self.key,
+            base,
+        )
+        .await?;
         // The shapes the externals file was compared with must be the ones this
         // capture seals: a target written between the two reads refuses.
-        let changed = staged.changed_since(&current);
+        let changed = <D::Resolver as ResolverEngine>::changed_since(&staged, &current)?;
         if !changed.is_empty() {
             return Err(Error::Read(format!(
                 "the target changed while the run read it, after the externals file was compared \
@@ -422,7 +427,12 @@ impl<D: super::PlanningDialect> Run<'_, D> {
                 changed.join("; ")
             )));
         }
-        let assessment = reconstruction.assess(&compiled, &current, &staged)?;
+        let assessment = <D::Resolver as ResolverEngine>::assess(
+            &mut reconstruction,
+            &compiled,
+            &current,
+            &staged,
+        )?;
         // A runtime-bound module is not rebuilt for an object the plan creates
         // that its names will resolve to, so the change is reported where the
         // plan's accepted limitations are: named, described, sealed (DEC-2143.7).
@@ -442,8 +452,15 @@ impl<D: super::PlanningDialect> Run<'_, D> {
             &assessment,
         )?;
         let captured = engine::captured_bindings(&compiled, &current, base.schema, desired.schema);
-        let ordered =
-            reconstruction.plan::<D>(base, desired, hints, extras, &surfaces, &captured)?;
+        let ordered = engine::plan::<D>(
+            &reconstruction,
+            base,
+            desired,
+            hints,
+            extras,
+            &surfaces,
+            &captured,
+        )?;
         let identity = Identity {
             rule: engine::reported_rule(driver)?,
             resolver_build: engine::reported_build(driver, self.key, prepared.catalog())?,

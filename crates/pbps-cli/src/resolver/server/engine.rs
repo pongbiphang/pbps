@@ -146,6 +146,52 @@ pub type Standard<D> = <<D as PlanningDialect>::Resolver as ResolverEngine>::Sta
 /// ```
 pub type Prepared<D> = <<D as PlanningDialect>::Resolver as ResolverEngine>::Prepared;
 
+/// What the run reconstructed the declarations as, for the engine the dialect
+/// names. A binding of one engine cannot be handed to another's step:
+///
+/// ```compile_fail
+/// use pbps_cli::resolver::server::scratch::Binding;
+/// fn for_sql_server(_: Binding<pbps_mssql::Mssql>) {}
+/// fn bound_by_postgres(binding: Binding<pbps_pg::Postgres>) {
+///     for_sql_server(binding);
+/// }
+/// ```
+///
+/// Each engine's own binding is the type its adapter holds:
+///
+/// ```
+/// use pbps_cli::resolver::server::scratch::Binding;
+/// fn for_postgres(binding: Binding<pbps_pg::Postgres>) -> Binding<pbps_pg::Postgres> {
+///     binding
+/// }
+/// fn for_sql_server(binding: Binding<pbps_mssql::Mssql>) -> Binding<pbps_mssql::Mssql> {
+///     binding
+/// }
+/// ```
+pub type Binding<D> = <<D as PlanningDialect>::Resolver as ResolverEngine>::Binding;
+
+/// The shapes the externals file was compared with, for the engine the
+/// dialect names. A staged set of another engine is a type error too:
+///
+/// ```compile_fail
+/// use pbps_cli::resolver::server::scratch::Staged;
+/// fn for_sql_server(_: Staged<pbps_mssql::Mssql>) {}
+/// fn staged_by_postgres(staged: Staged<pbps_pg::Postgres>) {
+///     for_sql_server(staged);
+/// }
+/// ```
+///
+/// ```
+/// use pbps_cli::resolver::server::scratch::Staged;
+/// fn for_postgres(staged: Staged<pbps_pg::Postgres>) -> Staged<pbps_pg::Postgres> {
+///     staged
+/// }
+/// fn for_sql_server(staged: Staged<pbps_mssql::Mssql>) -> Staged<pbps_mssql::Mssql> {
+///     staged
+/// }
+/// ```
+pub type Staged<D> = <<D as PlanningDialect>::Resolver as ResolverEngine>::Staged;
+
 /// What the run acquired and must release, for the engine the dialect names.
 pub(super) type Scratch<'a, D> = <<D as PlanningDialect>::Resolver as ResolverEngine>::Scratch<'a>;
 
@@ -157,96 +203,13 @@ pub fn declared_standard<D: PlanningDialect>(
     <D::Resolver as ResolverEngine>::standard(declared)
 }
 
-pub enum Binding {
-    Postgres(Box<postgres::Binding>),
-    Mssql(Box<mssql::Binding>),
-}
-pub enum Staged {
-    Postgres(pbps_pg::resolver::capture::Staged),
-    Mssql(pbps_mssql::resolver::capture::Staged),
-}
 pub enum CompiledCapture {
     Postgres(Box<postgres::Closing>),
     Mssql(Box<mssql::Closing>),
 }
-pub(super) enum CapturedInputs {
+pub enum CapturedInputs {
     Postgres(pbps_pg::resolver::capture::CapturedInputs),
     Mssql(pbps_mssql::resolver::capture::CapturedInputs),
-}
-
-impl Binding {
-    pub(super) fn has_fill(&self) -> bool {
-        match self {
-            Self::Postgres(binding) => binding.has_fill(),
-            Self::Mssql(_) => false,
-        }
-    }
-    pub(super) async fn capture_opening(
-        &self,
-        target: &mut Conn,
-        closing: &CompiledCapture,
-        key: &EnvironmentFingerprintKey,
-        base: pbps_diff::Side<'_>,
-    ) -> Result<(CapturedInputs, InputManifest), Error> {
-        match (self, closing) {
-            (Self::Postgres(binding), CompiledCapture::Postgres(closing)) => {
-                let (current, opening) =
-                    binding.capture_opening(target, closing, key, base).await?;
-                Ok((CapturedInputs::Postgres(current), opening))
-            }
-            (Self::Mssql(binding), CompiledCapture::Mssql(closing)) => {
-                let (current, opening) =
-                    binding.capture_opening(target, closing, key, base).await?;
-                Ok((CapturedInputs::Mssql(current), opening))
-            }
-            (Self::Postgres(_), CompiledCapture::Mssql(_))
-            | (Self::Mssql(_), CompiledCapture::Postgres(_)) => Err(unsupported()),
-        }
-    }
-    pub(super) fn assess(
-        &mut self,
-        closing: &CompiledCapture,
-        current: &CapturedInputs,
-        staged: &Staged,
-    ) -> Result<Assessment, Error> {
-        match (self, closing, current, staged) {
-            (
-                Self::Postgres(binding),
-                CompiledCapture::Postgres(closing),
-                CapturedInputs::Postgres(current),
-                Staged::Postgres(staged),
-            ) => Ok(binding.assess(closing, current, staged)),
-            (
-                Self::Mssql(binding),
-                CompiledCapture::Mssql(closing),
-                CapturedInputs::Mssql(current),
-                Staged::Mssql(staged),
-            ) => Ok(binding.assess(closing, current, staged)),
-            (Self::Mssql(_), ..) => Err(unsupported()),
-            (Self::Postgres(_), ..) => Err(unsupported()),
-        }
-    }
-}
-
-impl Staged {
-    pub(super) fn changed_since(&self, current: &CapturedInputs) -> Vec<String> {
-        match (self, current) {
-            (Self::Postgres(staged), CapturedInputs::Postgres(current)) => {
-                staged.changed_since(current)
-            }
-            (Self::Mssql(staged), CapturedInputs::Mssql(current)) => staged.changed_since(current),
-            (Self::Postgres(_), CapturedInputs::Mssql(_))
-            | (Self::Mssql(_), CapturedInputs::Postgres(_)) => {
-                unreachable!("a staged set and its capture come from one engine")
-            }
-        }
-    }
-    pub(super) fn through_shape_view(&self, error: Error) -> Error {
-        match self {
-            Self::Postgres(staged) => postgres::through_shape_view(error, staged),
-            Self::Mssql(_) => error,
-        }
-    }
 }
 
 impl CompiledCapture {
@@ -299,31 +262,19 @@ pub(super) fn ordinary<D: PlanningDialect>(
     )
 }
 
-impl Binding {
-    pub(super) fn plan<D: PlanningDialect>(
-        &self,
-        base: pbps_diff::Side<'_>,
-        desired: pbps_diff::Side<'_>,
-        hints: &Hints,
-        extras: &[String],
-        surfaces: &[SurfaceResolution],
-        captured: &pbps_model::operation::Captured,
-    ) -> Result<pbps_diff::resolver::Ordered<pbps_diff::order::Canonical<D>>, Error> {
-        let version = match self {
-            Self::Postgres(binding) if D::DRIVER == Driver::Postgres => {
-                Some(binding.generation_version())
-            }
-            Self::Mssql(_) if D::DRIVER == Driver::Mssql => None,
-            Self::Postgres(_) | Self::Mssql(_) => {
-                return Err(Error::Binding(
-                    "the planning dialect and qualified capture belong to different engines".into(),
-                ));
-            }
-        };
-        let dialect = D::configured(extras, version);
-        pbps_diff::resolver::plan_captured(base, desired, hints, surfaces, &dialect, captured)
-            .map_err(|error| Error::Binding(error.to_string()))
-    }
+/// The ordered plan under the dialect the binding was generated under.
+pub(super) fn plan<D: PlanningDialect>(
+    binding: &<D::Resolver as ResolverEngine>::Binding,
+    base: pbps_diff::Side<'_>,
+    desired: pbps_diff::Side<'_>,
+    hints: &Hints,
+    extras: &[String],
+    surfaces: &[SurfaceResolution],
+    captured: &pbps_model::operation::Captured,
+) -> Result<pbps_diff::resolver::Ordered<pbps_diff::order::Canonical<D>>, Error> {
+    let dialect = <D::Resolver as ResolverEngine>::dialect(binding, extras);
+    pbps_diff::resolver::plan_captured(base, desired, hints, surfaces, &dialect, captured)
+        .map_err(|error| Error::Binding(error.to_string()))
 }
 
 /// What the run bound at creation, for ordering: the schema-bound callees of

@@ -13,10 +13,11 @@
 //! `PlanningDialect::Resolver` instead.
 
 use crate::resolver::scope;
-use crate::resolver::server::engine::{Binding, CompiledCapture, Naming, Staged};
+use crate::resolver::server::engine::{CapturedInputs, CompiledCapture, Naming};
 use crate::resolver::server::scratch::{Provenance, Provisioning, Tokens};
 use crate::resolver::server::{BindingRequest, Error, PlanningDialect, ProduceError, ScopeRequest};
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
+use pbps_db::resolver::capture::Assessment;
 use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, DbError};
 use pbps_model::dependency::Dependencies;
@@ -106,10 +107,10 @@ impl Support {
 /// another engine's, and a cleanup obligation is held in the engine's own
 /// type. The prepared scratch is typed the same way and read through
 /// `PreparedView`, so the run's generic code keeps its accessors. The binding
-/// and the staged set that follow it are still the two-engine unions of
-/// `server::engine`, named in the signatures until their own group moves: an
-/// associated type that merely aliased them would be opaque to the run's
-/// generic code, which reads them through the unions' methods.
+/// and the staged set are typed the same way. Only the captures they are
+/// compared with are still the two-engine unions of `server::engine`, named in
+/// the signatures until their own group moves: a capture of the other engine is
+/// a named error in the engine's step.
 pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
     /// The dialect this resolver belongs to, one to one: brand and state are
     /// the same engine by construction, not by a runtime comparison.
@@ -125,6 +126,11 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
     /// The scratch once provisioned and qualified: the sessions the
     /// declarations compile in and what the reproduction found.
     type Prepared: PreparedView + Send;
+    /// The reconstruction of the declarations on the scratch, and the target
+    /// links it is compared against.
+    type Binding: BindingView + Send + Sync;
+    /// The inventory of the shapes the externals file was compared with.
+    type Staged: Send + Sync;
 
     /// The standard an entry declares, or the refusal of one this engine
     /// cannot hold.
@@ -197,36 +203,36 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
         ids: &'a IdsFile,
         dependencies: &'a ModuleDeps,
         prepared: &'a mut Self::Prepared,
-    ) -> Step<'a, Result<Binding, Error>>;
+    ) -> Step<'a, Result<Self::Binding, Error>>;
     fn compare_externals<'a>(
         scratch: &'a Self::Scratch<'_>,
         provisioning: Provisioning,
         prepared: &'a mut Self::Prepared,
         admin: &'a mut Conn,
         target: &'a mut Conn,
-        binding: &'a Binding,
-    ) -> Step<'a, Result<Staged, Error>>;
+        binding: &'a Self::Binding,
+    ) -> Step<'a, Result<Self::Staged, Error>>;
     /// The staged inventory a run starts from when no externals file was
     /// compared. Preparation always compares the externals, an empty set
     /// included, where the engine has them.
-    fn staged(prepared: &Self::Prepared) -> Staged;
+    fn staged(prepared: &Self::Prepared) -> Self::Staged;
     /// The staged inventory preparation completed, where it did.
-    fn completed_staged(prepared: &Self::Prepared) -> Option<Staged>;
-    fn chains(binding: &mut Binding, prepared: &Self::Prepared) -> Result<Vec<String>, Error>;
+    fn completed_staged(prepared: &Self::Prepared) -> Option<Self::Staged>;
+    fn chains(binding: &mut Self::Binding, prepared: &Self::Prepared) -> Vec<String>;
     #[allow(clippy::too_many_arguments)]
     fn compile<'a>(
-        binding: &'a mut Binding,
+        binding: &'a mut Self::Binding,
         prepared: &'a mut Self::Prepared,
         admin: &'a mut Conn,
         target: &'a mut Conn,
         extras: &'a [String],
         zone: Option<&'a SessionZone>,
         outside_writes: OutsideWrites,
-        staged: &'a mut Staged,
+        staged: &'a mut Self::Staged,
     ) -> Step<'a, Result<(), Error>>;
     #[allow(clippy::too_many_arguments)]
     fn capture_desired<'a>(
-        binding: &'a Binding,
+        binding: &'a Self::Binding,
         prepared: &'a mut Self::Prepared,
         admin: &'a mut Conn,
         target: &'a mut Conn,
@@ -235,8 +241,33 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
         schemas: &'a [String],
         key: &'a EnvironmentFingerprintKey,
         desired: pbps_diff::Side<'a>,
-        staged: &'a Staged,
+        staged: &'a Self::Staged,
     ) -> Step<'a, Result<CompiledCapture, Error>>;
+    /// The opening capture of the target, as the binding reads it. The
+    /// capture states are still the two-engine unions, so a capture of the
+    /// other engine is a named error until they are typed.
+    fn capture_opening<'a>(
+        binding: &'a Self::Binding,
+        target: &'a mut Conn,
+        closing: &'a CompiledCapture,
+        key: &'a EnvironmentFingerprintKey,
+        base: pbps_diff::Side<'a>,
+    ) -> Step<'a, Result<(CapturedInputs, InputManifest), Error>>;
+    fn assess(
+        binding: &mut Self::Binding,
+        closing: &CompiledCapture,
+        current: &CapturedInputs,
+        staged: &Self::Staged,
+    ) -> Result<Assessment, Error>;
+    /// The shapes the externals file was compared with that the opening
+    /// capture finds changed.
+    fn changed_since(staged: &Self::Staged, current: &CapturedInputs)
+    -> Result<Vec<String>, Error>;
+    /// A failure of the scratch compile, as the staged shapes explain it.
+    fn through_shape_view(staged: &Self::Staged, error: Error) -> Error;
+    /// The planning dialect the binding was generated under, from the same
+    /// measured capability reconstruction used.
+    fn dialect(binding: &Self::Binding, extras: &[String]) -> Self::Dialect;
     /// How a rehearsal names the roles a plan names on this scratch (see
     /// `Naming`). SQL Server has no cluster role to name: its roles are the
     /// scratch database's own and a rehearsal asks
@@ -285,6 +316,13 @@ pub trait PreparedView: Sized + Send {
     fn unfillable(&self) -> Vec<String>;
 }
 
+/// What the run reads of an engine's binding. On the state's own type, like
+/// `PreparedView`, so a binding of one engine is never read as another's.
+pub trait BindingView: Sized + Send {
+    /// Whether the externals fill reads managed relations.
+    fn has_fill(&self) -> bool;
+}
+
 /// The state of a resolver that does not exist: no value can be made, so
 /// every method that would consume one is unreachable by type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,6 +353,8 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
     type Standard = ();
     type Scratch<'a> = Never;
     type Prepared = Never;
+    type Binding = Never;
+    type Staged = Never;
 
     fn standard(_: Option<&pbps_config::resolver::ScratchStandard>) -> Result<(), Error> {
         Err(Error::Unusable(refusal::<D>().to_string()))
@@ -386,7 +426,7 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
         _: &'a IdsFile,
         _: &'a ModuleDeps,
         _: &'a mut Never,
-    ) -> Step<'a, Result<Binding, Error>> {
+    ) -> Step<'a, Result<Never, Error>> {
         match *scratch {}
     }
     fn compare_externals<'a>(
@@ -395,33 +435,33 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
         _: &'a mut Never,
         _: &'a mut Conn,
         _: &'a mut Conn,
-        _: &'a Binding,
-    ) -> Step<'a, Result<Staged, Error>> {
+        _: &'a Never,
+    ) -> Step<'a, Result<Never, Error>> {
         match *scratch {}
     }
-    fn staged(prepared: &Never) -> Staged {
+    fn staged(prepared: &Never) -> Never {
         match *prepared {}
     }
-    fn completed_staged(prepared: &Never) -> Option<Staged> {
+    fn completed_staged(prepared: &Never) -> Option<Never> {
         match *prepared {}
     }
-    fn chains(_: &mut Binding, prepared: &Never) -> Result<Vec<String>, Error> {
+    fn chains(_: &mut Never, prepared: &Never) -> Vec<String> {
         match *prepared {}
     }
     fn compile<'a>(
-        _: &'a mut Binding,
+        _: &'a mut Never,
         prepared: &'a mut Never,
         _: &'a mut Conn,
         _: &'a mut Conn,
         _: &'a [String],
         _: Option<&'a SessionZone>,
         _: OutsideWrites,
-        _: &'a mut Staged,
+        _: &'a mut Never,
     ) -> Step<'a, Result<(), Error>> {
         match *prepared {}
     }
     fn capture_desired<'a>(
-        _: &'a Binding,
+        _: &'a Never,
         prepared: &'a mut Never,
         _: &'a mut Conn,
         _: &'a mut Conn,
@@ -430,9 +470,35 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
         _: &'a [String],
         _: &'a EnvironmentFingerprintKey,
         _: pbps_diff::Side<'a>,
-        _: &'a Staged,
+        _: &'a Never,
     ) -> Step<'a, Result<CompiledCapture, Error>> {
         match *prepared {}
+    }
+    fn capture_opening<'a>(
+        binding: &'a Never,
+        _: &'a mut Conn,
+        _: &'a CompiledCapture,
+        _: &'a EnvironmentFingerprintKey,
+        _: pbps_diff::Side<'a>,
+    ) -> Step<'a, Result<(CapturedInputs, InputManifest), Error>> {
+        match *binding {}
+    }
+    fn assess(
+        binding: &mut Never,
+        _: &CompiledCapture,
+        _: &CapturedInputs,
+        _: &Never,
+    ) -> Result<Assessment, Error> {
+        match *binding {}
+    }
+    fn changed_since(staged: &Never, _: &CapturedInputs) -> Result<Vec<String>, Error> {
+        match *staged {}
+    }
+    fn through_shape_view(staged: &Never, _: Error) -> Error {
+        match *staged {}
+    }
+    fn dialect(binding: &Never, _: &[String]) -> D {
+        match *binding {}
     }
     fn naming(scratch: &Never) -> Result<Naming, Error> {
         match *scratch {}
@@ -444,6 +510,12 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
         _: Naming,
     ) -> Step<'a, Result<Result<(), String>, Error>> {
         match *scratch {}
+    }
+}
+
+impl BindingView for Never {
+    fn has_fill(&self) -> bool {
+        match *self {}
     }
 }
 
