@@ -467,8 +467,11 @@ the upgrade path leads from versions no deployment ever wrote. **At the first
 tagged release, reset `plan::CURRENT_VERSION`, `state::CURRENT_VERSION` and
 `integration::SCHEMA_VERSION` to 1 and drop `state::OLDEST_READABLE_VERSION`'s
 back-compatibility with the pre-release numbering** (DECISIONS 145). Until
-then, bump freely: a plan file lives for the length of one deployment window,
-and there is nothing in the field to invalidate.
+then no change moves a number: each format records a fingerprint of its own
+shape beside it, a reader refuses another development build's artifact, and a
+change adds no number, no archive and no history comment (DEC-2412.2,
+DEC-2412.3). The reset and the first freeze follow
+[docs/RELEASE-FORMATS.md](RELEASE-FORMATS.md).
 
 ### No universal connection layer
 
