@@ -21,7 +21,11 @@
 //! listed below with their reasons, and an entry that no longer matches a line
 //! fails the test, so the list cannot outlive what it excuses.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+#[path = "support/source_scan.rs"]
+mod source_scan;
+use source_scan::{relative, sources};
 
 /// The constants that name a format's number or a boundary in its history.
 const FORMAT_CONSTANTS: [&str; 4] = [
@@ -47,22 +51,6 @@ const ALLOWED: [(&str, &str, &str); 2] = [
          later bump of the current number must not move it, which is what the test pins",
     ),
 ];
-
-fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            if path
-                .file_name()
-                .is_some_and(|n| n != "target" && n != "fixtures")
-            {
-                sources(&path, out);
-            }
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
-}
 
 /// Code with whitespace removed, one statement-ish piece at a time. Comment
 /// lines are dropped; strings are not parsed, so a brace inside one splits a
@@ -212,13 +200,7 @@ fn no_test_compares_a_format_number_with_a_literal() {
         }
         let text = std::fs::read_to_string(file).unwrap();
         for statement in offences(&text, &current) {
-            found.push((
-                file.strip_prefix(crates)
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned(),
-                statement,
-            ));
+            found.push((relative(crates, file), statement));
         }
     }
     found.sort();

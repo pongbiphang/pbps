@@ -6,29 +6,11 @@
 //! build's. The scan reads every Rust source of the workspace, so a new writer in
 //! any crate is found.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            if path
-                .file_name()
-                .is_some_and(|n| n != "target" && n != "fixtures")
-            {
-                sources(&path, out);
-            }
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
-}
-
-/// A relative path as the list below spells it. Windows separates with `\`, and
-/// the expected names are written once, with `/`.
-fn slashed(shown: &str) -> String {
-    shown.replace('\\', "/")
-}
+#[path = "support/source_scan.rs"]
+mod source_scan;
+use source_scan::{relative, slashed, sources};
 
 /// Lines (path, text) that write the bare constant to a field called `version`.
 fn writers_of_the_number(text: &str) -> Vec<String> {
@@ -65,10 +47,7 @@ fn no_writer_sets_the_number_outside_stamp() {
         }
         let text = std::fs::read_to_string(file).unwrap();
         for line in writers_of_the_number(&text) {
-            found.push(format!(
-                "{}: {line}",
-                slashed(&file.strip_prefix(crates).unwrap().to_string_lossy())
-            ));
+            found.push(format!("{}: {line}", relative(crates, file)));
         }
     }
     found.sort();
@@ -111,4 +90,13 @@ fn a_found_line_is_named_alike_on_every_platform() {
     // A name that has no separator, or already has `/`, is not changed.
     assert_eq!(slashed("plan.rs"), "plan.rs");
     assert_eq!(slashed("pbps-model/src/plan.rs"), "pbps-model/src/plan.rs");
+    // `relative` strips the root and then spells the rest alike; on Windows the
+    // separators are `\`, and here a `\` in a file name stands in for them.
+    assert_eq!(
+        relative(
+            Path::new("crates"),
+            &Path::new("crates").join("pbps-model\\src\\plan.rs")
+        ),
+        "pbps-model/src/plan.rs"
+    );
 }
