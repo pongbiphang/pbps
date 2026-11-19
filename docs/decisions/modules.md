@@ -2236,6 +2236,13 @@ This adds no persisted field, format number, published schema or YAML route. C3 
 - **A view is one statement starting `SELECT`, `WITH` or `VALUES`,** in `main`, with no options. A `;` followed by more code is refused, since SQLite runs it. Nothing parses SQL: a body that starts right but is not a whole query is left to the engine, which refuses it when the plan runs in its transaction.
 - **A table is `main.<name>` and nothing else**: any other schema is refused as unsupported, and no model change was made. The model has no table flag for STRICT, WITHOUT ROWID or AUTOINCREMENT, so they cannot be declared.
 - **Three words for a refusal.** `Unsupported`: SQLite has no such thing (roles and grants, identity and sequence columns, partitions, row security, filegroups, clustered keys, storage parameters, included columns, index methods, operator classes, system versioning, exclusion constraints, procedures, functions, a schema other than `main`), each shown to be refused by the engine. `NotBuilt`: valid SQLite that version 0 does not build (generated and computed columns, column and index collation, expression indexes, triggers, declared rows). `Invalid`: the declaration uses a feature wrongly (a missing column, a name starting `sqlite_`, a ledger name in any case, an unequal foreign key, a bad expression).
+- **A foreign key must reference a key of its parent.** SQLite creates a child
+  whose parent columns are neither the parent's primary key nor held unique
+  together, and then refuses every write to it (`foreign key mismatch`), so
+  neither `CREATE` nor apply says anything. The schema-aware hook
+  (`validate_table_in_schema`) refuses the declaration. The columns' order is
+  free, and a unique index over part of the rows does not count, both as the
+  engine has it.
 - **Valid SQLite refused on purpose, each pinned:** the empty name; a key, constraint or index naming a column twice or in another case; the empty type and a comment in a type's parentheses (DEC-2950.2); the forms of a default listed above; a second statement in a view; `MAIN` for `main`.
 - **The version floor is a value** on `Sqlite`: `Sqlite::with_floor`, `floor` and `at_least`. The project field belongs to the wiring, because adding a field to `pbps.yml` or a dialect name to its schema changes a versioned format and the selection in `pbps-cli`.
 - **`manages_roles` is overridden to `false`:** its trait default is `true`, which would claim SQLite's nonexistent roles are the tool's.

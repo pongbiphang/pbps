@@ -87,6 +87,20 @@ impl Dialect for Sqlite {
         validate::table(name, table)
     }
 
+    /// With the schema at hand, a foreign key is also held to its parent's
+    /// keys: SQLite would create the child and refuse every write to it.
+    fn validate_table_in_schema(
+        &self,
+        name: &TableName,
+        table: &Table,
+        sources: pbps_model::diagnostic::ColumnSources<'_>,
+        schema: &pbps_model::Schema,
+    ) -> Vec<DialectError> {
+        let mut found = self.validate_table_sources(name, table, sources);
+        found.extend(validate::foreign_key_parents(name, table, schema));
+        found
+    }
+
     fn validate_module(&self, id: &ModuleId, module: &Module) -> Vec<DialectError> {
         validate::module(id, module)
     }
@@ -473,5 +487,49 @@ mod tests {
             !d.validate_table(&TableName::new("s", "t"), &table_with(&["c"]))
                 .is_empty()
         );
+    }
+
+    /// The schema-aware hook is the one the command line calls, so the parent
+    /// key rule has to be reachable through it and not only as a function.
+    #[test]
+    fn the_schema_aware_validation_holds_a_foreign_key_to_its_parent_s_keys() {
+        let column = || Column::new("int".parse().expect("type"));
+        let mut parent = Table::default();
+        parent.columns.insert("id".into(), column());
+        parent.columns.insert("a".into(), column());
+        parent.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        });
+        let child = |references: &str| {
+            let mut child = Table::default();
+            child.columns.insert("x".into(), column());
+            child.foreign_keys.insert(
+                "f".into(),
+                pbps_model::ForeignKey {
+                    columns: vec!["x".into()],
+                    references_table: TableName::new("main", "p"),
+                    references_columns: vec![references.into()],
+                    on_delete: pbps_model::ReferentialAction::NoAction,
+                    on_update: pbps_model::ReferentialAction::NoAction,
+                },
+            );
+            child
+        };
+        let mut schema = Schema::default();
+        schema.tables.insert(TableName::new("main", "p"), parent);
+        let name = TableName::new("main", "c");
+        let d = Sqlite::default();
+        let found = d.validate_table_in_schema(&name, &child("a"), Default::default(), &schema);
+        assert_eq!(found.len(), 1, "{found:?}");
+        // Negative: the key itself is taken, and the hook without a schema
+        // cannot know either way.
+        assert!(
+            d.validate_table_in_schema(&name, &child("id"), Default::default(), &schema)
+                .is_empty()
+        );
+        assert!(d.validate_table(&name, &child("a")).is_empty());
     }
 }

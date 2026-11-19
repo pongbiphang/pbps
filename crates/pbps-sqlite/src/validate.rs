@@ -14,8 +14,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use pbps_dialect::DialectError;
 use pbps_model::escape::Escaped;
 use pbps_model::{
-    ColumnName, IndexKey, IndexMethod, Module, ModuleId, ModuleKind, ModuleOptions, Role, Table,
-    TableName, ValueSource,
+    ColumnName, IndexKey, IndexMethod, Module, ModuleId, ModuleKind, ModuleOptions, Role, Schema,
+    Table, TableName, ValueSource,
 };
 
 use crate::types::DIALECT;
@@ -358,6 +358,63 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
             found.push(invalid(format!(
                 "the filter of {what} is not one expression SQLite reads whole (empty, unbalanced \
                  parentheses, or a `;`)"
+            )));
+        }
+    }
+    found
+}
+
+/// Foreign keys of `table` whose parent columns are not a key of the parent.
+/// SQLite creates such a child and then refuses every write to it (`foreign
+/// key mismatch`, measured), so nothing at `CREATE` or at apply says so; the
+/// declaration has to. The parent columns must be its primary key, or be held
+/// unique as a set by an index over all of its rows; their order is free.
+///
+/// A parent the schema does not declare is the shared checks' to report.
+#[must_use]
+pub fn foreign_key_parents(name: &TableName, table: &Table, schema: &Schema) -> Vec<DialectError> {
+    let mut found = Vec::new();
+    for (constraint, fk) in &table.foreign_keys {
+        let parent = if fk.references_table == *name {
+            table
+        } else if let Some(parent) = schema.tables.get(&fk.references_table) {
+            parent
+        } else {
+            continue;
+        };
+        let wanted: BTreeSet<&ColumnName> = fk.references_columns.iter().collect();
+        let is = |columns: &mut dyn Iterator<Item = &ColumnName>| {
+            columns.collect::<BTreeSet<_>>() == wanted
+        };
+        let primary = parent
+            .primary_key
+            .as_ref()
+            .is_some_and(|key| is(&mut key.columns.iter()));
+        let unique = parent
+            .unique
+            .values()
+            .any(|unique| is(&mut unique.columns.iter()));
+        let indexed = parent.indexes.values().any(|index| {
+            let plain: Option<Vec<&ColumnName>> = index
+                .columns
+                .iter()
+                .map(|key| match &key.key {
+                    IndexKey::Column(column) if key.collation.is_none() => Some(column),
+                    IndexKey::Column(_) | IndexKey::Expression(_) => None,
+                })
+                .collect();
+            index.unique
+                && index.filter.is_none()
+                && plain.is_some_and(|columns| is(&mut columns.into_iter()))
+        });
+        if !(primary || unique || indexed) {
+            found.push(invalid(format!(
+                "foreign key `{}` of `{}` references columns of `{}` that are not its primary key \
+                 and are not held unique together; SQLite would create the table and then refuse \
+                 every write to it (foreign key mismatch)",
+                constraint.shown(),
+                name.shown(),
+                fk.references_table.shown()
             )));
         }
     }
@@ -1340,6 +1397,162 @@ mod tests {
             refused += usize::from(!here);
         }
         assert!(taken > 5 && refused > 5);
+    }
+
+    /// A foreign key's parent columns must be the parent's primary key or be
+    /// held unique as a set. SQLite creates the child either way and refuses
+    /// every write to it afterwards (`foreign key mismatch`), so the engine's
+    /// answer here is a write, not the `CREATE`.
+    #[test]
+    fn a_foreign_key_must_reference_a_key_of_its_parent() {
+        type Make = fn(&mut Table);
+        // (what, DDL added to the parent, the same in the model, parent columns referenced)
+        let rows: Vec<(&str, &str, Make, &[&str])> = vec![
+            ("the primary key", "", |_| {}, &["id"]),
+            ("a column that is no key", "", |_| {}, &["a"]),
+            (
+                "a unique index",
+                "CREATE UNIQUE INDEX u ON p(a)",
+                |p| {
+                    let mut i = index(&["a"]);
+                    i.unique = true;
+                    p.indexes.insert("u".into(), i);
+                },
+                &["a"],
+            ),
+            (
+                "a unique constraint of the table",
+                "CREATE UNIQUE INDEX u ON p(b)",
+                |p| {
+                    p.unique.insert(
+                        "u".into(),
+                        pbps_model::UniqueConstraint {
+                            columns: vec!["b".into()],
+                            storage_parameters: Default::default(),
+                            filegroup: None,
+                        },
+                    );
+                },
+                &["b"],
+            ),
+            (
+                "an index that is not unique",
+                "CREATE INDEX u ON p(a)",
+                |p| {
+                    p.indexes.insert("u".into(), index(&["a"]));
+                },
+                &["a"],
+            ),
+            (
+                "a unique index over part of the rows",
+                "CREATE UNIQUE INDEX u ON p(a) WHERE a > 0",
+                |p| {
+                    let mut i = index(&["a"]);
+                    i.unique = true;
+                    i.filter = Some("a > 0".into());
+                    p.indexes.insert("u".into(), i);
+                },
+                &["a"],
+            ),
+            (
+                "both columns of a unique pair",
+                "CREATE UNIQUE INDEX u ON p(a, b)",
+                |p| {
+                    let mut i = index(&["a", "b"]);
+                    i.unique = true;
+                    p.indexes.insert("u".into(), i);
+                },
+                &["a", "b"],
+            ),
+            (
+                "a unique pair in the other order",
+                "CREATE UNIQUE INDEX u ON p(a, b)",
+                |p| {
+                    let mut i = index(&["a", "b"]);
+                    i.unique = true;
+                    p.indexes.insert("u".into(), i);
+                },
+                &["b", "a"],
+            ),
+            (
+                "one column of a unique pair",
+                "CREATE UNIQUE INDEX u ON p(a, b)",
+                |p| {
+                    let mut i = index(&["a", "b"]);
+                    i.unique = true;
+                    p.indexes.insert("u".into(), i);
+                },
+                &["a"],
+            ),
+        ];
+        let (mut kept, mut refused) = (0, 0);
+        for (what, extra, make, references) in rows {
+            let value = |column: &str| match column {
+                "id" => "1",
+                "a" => "2",
+                _ => "3",
+            };
+            let children: Vec<String> = (0..references.len()).map(|n| format!("x{n}")).collect();
+            let ddl = [
+                "CREATE TABLE p(id integer primary key, a int, b int); ",
+                extra,
+                "; CREATE TABLE c(",
+                &children
+                    .iter()
+                    .map(|c| [c.as_str(), " int"].concat())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                ", FOREIGN KEY (",
+                &children.join(", "),
+                ") REFERENCES p (",
+                &references.join(", "),
+                "))",
+            ]
+            .concat();
+            assert!(accepts(&ddl), "{what}: the engine creates the child");
+            let write = [
+                ddl.as_str(),
+                "; INSERT INTO p VALUES (1, 2, 3); INSERT INTO c VALUES (",
+                &references
+                    .iter()
+                    .map(|c| value(c))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                ")",
+            ]
+            .concat();
+            let engine = accepts(&write);
+
+            let mut parent = Table::default();
+            for name in ["id", "a", "b"] {
+                parent.columns.insert(name.into(), column());
+            }
+            parent.columns.get_mut("id").expect("id").ty = "integer".parse().expect("type");
+            parent.primary_key = Some(pbps_model::PrimaryKey {
+                name: None,
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+                filegroup: None,
+            });
+            make(&mut parent);
+            let mut child = Table::default();
+            for name in &children {
+                child.columns.insert(name.as_str().into(), column());
+            }
+            let mut key = fk(
+                &children.iter().map(String::as_str).collect::<Vec<_>>(),
+                references,
+            );
+            key.references_table = TableName::new("main", "p");
+            child.foreign_keys.insert("f".into(), key);
+            let mut schema = pbps_model::Schema::default();
+            schema.tables.insert(TableName::new("main", "p"), parent);
+            let found = foreign_key_parents(&TableName::new("main", "c"), &child, &schema);
+            assert_eq!(found.is_empty(), engine, "{what}: {}", said(&found));
+            kept += usize::from(engine);
+            refused += usize::from(!engine);
+        }
+        assert!(kept >= 3 && refused >= 3, "{kept} kept, {refused} refused");
     }
 
     /// The ledger's two names are taken in the one namespace tables, views
