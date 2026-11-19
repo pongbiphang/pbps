@@ -10039,6 +10039,18 @@ parameters, so the one normalization that drops a parameter edit of a rebuilt in
 `AddUnique`. Left in, the `ALTER INDEX` would name the backing index between the teardown
 and the restoration, where it does not exist. With no restoration beside it, the edit stays.
 
+**Judged like an index.** `ADD ... EXCLUDE` evaluates the constraint's key expressions and its
+predicate over the stored rows as the deployment role, as an index build does, so lifting the
+validate refusal made the routine they call a deployment-role execution. An exclusion add (the
+declared one and the restoration) is therefore a table expression of the same kind as an index
+(DEC-2563.4): `table_expressions::carries` reads an adding `SetExclusion` that holds an expression
+key or a predicate, emission sets `Statement.introduces`, and the one binder judges it with the
+owner-trust, fixed-search-path and pin checks of the index path, its keys and predicate labelled
+as the index's are. A key of plain columns with no predicate carries nothing. No pre-flight probe
+evaluates an exclusion (its own add is the one evaluation), so `probed` is false. Before this,
+master's validate refused only a routine the project declares; an exclusion calling a routine the
+project does not declare was admitted with no judgement, which the same arm closes.
+
 **A failed replacement rolls back** with the apply: the old constraint, its definition and
 the rows stand, the ledger holds a `failed` entry and no state (measured on both engines: a
 conflicting add after the drop in one transaction leaves the dropped constraint back).

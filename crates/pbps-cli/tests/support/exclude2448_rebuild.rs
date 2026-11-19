@@ -132,7 +132,7 @@ fn an_exclusion_is_torn_down_and_restored_around_a_function_it_calls() {
             connection,
             "CREATE SCHEMA app; \
              CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE \
-               AS 'SELECT x + 1'; \
+               SET search_path = pg_catalog AS 'SELECT x + 1'; \
              CREATE TABLE app.t (id integer PRIMARY KEY, n integer NOT NULL); \
              INSERT INTO app.t VALUES (1, 1), (2, 10); \
              ALTER TABLE app.t ADD CONSTRAINT x_fn EXCLUDE USING gist \
