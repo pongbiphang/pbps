@@ -1547,8 +1547,8 @@ mod tests {
         )));
         // Another engine's rule is not this one.
         assert_ne!(
-            super::super::reported_rule(Driver::Postgres).unwrap(),
-            super::super::reported_rule(Driver::Mssql).unwrap()
+            <super::super::postgres::PgResolver as crate::resolver::contract::ResolverEngine>::reported_rule().unwrap(),
+            <MssqlResolver as crate::resolver::contract::ResolverEngine>::reported_rule().unwrap()
         );
     }
 

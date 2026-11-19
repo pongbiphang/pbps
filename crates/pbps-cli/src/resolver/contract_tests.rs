@@ -15,18 +15,8 @@ impl PlanningDialect for MinimalDialect {
     // Unused: nothing here connects, so no driver is ever asked for.
     const DRIVER: Driver = Driver::Postgres;
     const NAME: &'static str = "Stand-in";
-    const FILTER_BINDS: bool = false;
     fn configured(_: &[String], _: Option<i64>) -> Self {
         Self
-    }
-    fn binding_classes(_: &Surface) -> Option<&'static [&'static str]> {
-        None
-    }
-    fn dependent_object(
-        _: &pbps_pg::resolver::capture::BindingRecord,
-        _: &BTreeSet<ObjectIdentity>,
-    ) -> Option<ObjectIdentity> {
-        None
     }
 }
 
@@ -220,6 +210,37 @@ fn apply_and_producer_seal_under_one_cluster_domain() {
     let planned = contract::planning(&pbps_mssql::Mssql).unwrap().cluster;
     assert_eq!(planned, ms);
     assert_ne!(pg, ms, "the engines must not share a cluster domain");
+}
+
+/// The seal reads these where it once matched the driver: a string that moved
+/// to the wrong engine would key one engine's evidence under the other's rule.
+#[test]
+fn each_engine_states_the_facts_its_evidence_is_sealed_under() {
+    let pg = contract::planning(&pbps_pg::Postgres::new()).unwrap();
+    assert_eq!(pg.channels_rule, "pbps/pg-channels/v1");
+    assert_eq!(pg.cluster.rule, "pbps/pg-cluster-identity/v1");
+    assert_eq!(pg.cluster.component, "system-identifier");
+    // A supplied database compiles as its own login; a run-owned one
+    // reproduces the deployer.
+    assert_eq!(
+        (pg.reproduction)(ScratchLayout::RunOwned),
+        AuthorizationReproduction::Reproduced
+    );
+    assert_eq!(
+        (pg.reproduction)(ScratchLayout::Supplied),
+        AuthorizationReproduction::LoginStandin
+    );
+    let ms = contract::planning(&pbps_mssql::Mssql).unwrap();
+    assert_eq!(ms.channels_rule, "pbps/mssql-channels/v1");
+    assert_eq!(ms.cluster.rule, "pbps/mssql-instance-identity/v1");
+    assert_eq!(ms.cluster.component, "family-guid");
+    for layout in [ScratchLayout::RunOwned, ScratchLayout::Supplied] {
+        assert_eq!(
+            (ms.reproduction)(layout),
+            AuthorizationReproduction::Reproduced
+        );
+    }
+    assert_ne!(pg.channels_rule, ms.channels_rule);
 }
 
 /// What a run asked of an engine that has none must show nothing but the

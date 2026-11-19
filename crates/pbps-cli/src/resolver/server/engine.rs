@@ -9,9 +9,6 @@
 use super::{Error, ProduceError};
 use crate::resolver::contract::ResolverEngine;
 use pbps_db::Driver;
-use pbps_db::fingerprint::EnvironmentFingerprintKey;
-use pbps_db::resolver::capture::Assessment;
-use pbps_db::resolver::environment::CatalogFacts;
 use pbps_model::Hints;
 use pbps_model::resolver::SurfaceResolution;
 
@@ -53,51 +50,23 @@ pub trait PlanningDialect: pbps_dialect::Dialect + Clone + Send + Sync + 'static
     /// How an engine is named in a refusal. Duplicates `Engine::name` in the
     /// binary, which the library cannot reach; a binary test pins the two equal.
     const NAME: &'static str;
-    /// Whether an index filter binds at creation; see
-    /// `Dialect::filter_binds_expression`.
-    const FILTER_BINDS: bool;
     fn configured(extras: &[String], version: Option<i64>) -> Self;
-    fn binding_classes(surface: &pbps_model::resolver::Surface) -> Option<&'static [&'static str]>;
-    fn dependent_object(
-        record: &BindingRecord,
-        reached: &std::collections::BTreeSet<pbps_model::resolver::ObjectIdentity>,
-    ) -> Option<pbps_model::resolver::ObjectIdentity>;
 }
 impl PlanningDialect for pbps_pg::Postgres {
     type Resolver = postgres::PgResolver;
     const DRIVER: Driver = Driver::Postgres;
     const NAME: &'static str = "PostgreSQL";
-    const FILTER_BINDS: bool = true;
     fn configured(extras: &[String], version: Option<i64>) -> Self {
         let dialect = Self::with_write_path_extras(extras.to_vec());
         version.map_or(dialect.clone(), |v| dialect.with_server_version(v))
-    }
-    fn binding_classes(surface: &pbps_model::resolver::Surface) -> Option<&'static [&'static str]> {
-        pbps_pg::resolver::binding_classes(surface)
-    }
-    fn dependent_object(
-        record: &BindingRecord,
-        reached: &std::collections::BTreeSet<pbps_model::resolver::ObjectIdentity>,
-    ) -> Option<pbps_model::resolver::ObjectIdentity> {
-        pbps_pg::resolver::dependent_object(&record.object, &record.bindings, reached)
     }
 }
 impl PlanningDialect for pbps_mssql::Mssql {
     type Resolver = mssql::MssqlResolver;
     const DRIVER: Driver = Driver::Mssql;
     const NAME: &'static str = "SQL Server";
-    const FILTER_BINDS: bool = false;
     fn configured(_: &[String], _: Option<i64>) -> Self {
         Self
-    }
-    fn binding_classes(surface: &pbps_model::resolver::Surface) -> Option<&'static [&'static str]> {
-        pbps_mssql::resolver::binding_classes(surface)
-    }
-    fn dependent_object(
-        record: &BindingRecord,
-        reached: &std::collections::BTreeSet<pbps_model::resolver::ObjectIdentity>,
-    ) -> Option<pbps_model::resolver::ObjectIdentity> {
-        pbps_mssql::resolver::dependent_object(&record.object, &record.bindings, reached)
     }
 }
 
@@ -273,38 +242,6 @@ pub(super) fn plan<D: PlanningDialect>(
     let dialect = <D::Resolver as ResolverEngine>::dialect(binding, extras);
     pbps_diff::resolver::plan_captured(base, desired, hints, surfaces, &dialect, captured)
         .map_err(|error| Error::Binding(error.to_string()))
-}
-
-pub(super) fn surfaces<D: PlanningDialect>(
-    driver: Driver,
-    base: pbps_diff::Side<'_>,
-    desired: pbps_diff::Side<'_>,
-    opening: &[BindingRecord],
-    compiled: &[BindingRecord],
-    assessment: &Assessment,
-) -> Result<Vec<SurfaceResolution>, Error> {
-    if driver != D::DRIVER {
-        return Err(unsupported());
-    }
-    super::resolution::from_sides::<D>(base, desired, opening, compiled, assessment)
-}
-
-pub(super) fn reported_build(
-    driver: Driver,
-    key: &EnvironmentFingerprintKey,
-    catalog: &CatalogFacts,
-) -> Result<String, Error> {
-    match driver {
-        Driver::Postgres => postgres::reported_build(key, catalog),
-        Driver::Mssql => mssql::reported_build(key, catalog),
-    }
-}
-
-pub(super) fn reported_rule(driver: Driver) -> Result<&'static str, Error> {
-    match driver {
-        Driver::Postgres => Ok(pbps_pg::resolver::compatibility::REPORTED_RULE),
-        Driver::Mssql => Ok(pbps_mssql::resolver::compatibility::REPORTED_RULE),
-    }
 }
 
 /// What a failed scratch capture is. Only an answer about the declarations

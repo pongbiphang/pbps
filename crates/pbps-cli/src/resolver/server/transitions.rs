@@ -5,6 +5,7 @@
 
 use super::Error;
 use super::engine::BindingRecord;
+use crate::resolver::contract::ResolverEngine;
 use pbps_model::ColumnChange;
 use pbps_model::ConstraintChange;
 use pbps_model::ExtensionChange;
@@ -89,7 +90,7 @@ fn reach<D: super::PlanningDialect>(
         let size = found.len();
         let dependents: Vec<_> = records
             .iter()
-            .filter_map(|entry| D::dependent_object(entry, &found))
+            .filter_map(|entry| <D::Resolver as ResolverEngine>::dependent_object(entry, &found))
             .collect();
         found.extend(dependents);
         let named: Vec<_> = records
