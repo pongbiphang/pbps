@@ -160,6 +160,29 @@ pub type Binding<D> = <<D as PlanningDialect>::Resolver as ResolverEngine>::Bind
 /// ```
 pub type Staged<D> = <<D as PlanningDialect>::Resolver as ResolverEngine>::Staged;
 
+/// The run-local history of the target beside its reported scope, for the
+/// engine the dialect names. The history of one engine cannot be compared with
+/// another's:
+///
+/// ```compile_fail
+/// use pbps_cli::resolver::server::scratch::History;
+/// fn for_sql_server(_: History<pbps_mssql::Mssql>) {}
+/// fn read_by_postgres(history: History<pbps_pg::Postgres>) {
+///     for_sql_server(history);
+/// }
+/// ```
+///
+/// ```
+/// use pbps_cli::resolver::server::scratch::History;
+/// fn for_postgres(history: History<pbps_pg::Postgres>) -> History<pbps_pg::Postgres> {
+///     history
+/// }
+/// fn for_sql_server(history: History<pbps_mssql::Mssql>) -> History<pbps_mssql::Mssql> {
+///     history
+/// }
+/// ```
+pub type History<D> = <<D as PlanningDialect>::Resolver as ResolverEngine>::History;
+
 /// What the run acquired and must release, for the engine the dialect names.
 /// What the scratch's compile left to seal, for the engine the dialect names.
 /// It is the type alone: nothing outside this crate can make, read or seal one,

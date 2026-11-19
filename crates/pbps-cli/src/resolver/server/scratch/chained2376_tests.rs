@@ -109,10 +109,7 @@ pub(super) async fn observe(
     let key = capture_key();
     let mut source = connection(target).await;
     let identity = sql::cluster_identity(&mut source).await.unwrap();
-    let (catalog, authorization) = crate::resolver::scope::read_target(
-        &mut source,
-        Driver::Mssql,
-        &request.schemas,
+    let (catalog, authorization) = <crate::resolver::server::scratch::engines::MssqlEngine as crate::resolver::contract::ResolverEngine>::read_target(&mut source, &request.schemas,
         &[],
         &request.schemas,
         &[],

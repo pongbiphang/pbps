@@ -13,7 +13,6 @@ use super::super::producer::{request, request_as_it_stands};
 use super::super::{BindingRequest, Error, PlanningDialect, ProduceError};
 use super::{Provenance, Standard, Tokens};
 use crate::resolver::contract::{self, PreparedView, RehearsalRequest, ResolverEngine};
-use crate::resolver::scope;
 use pbps_db::Conn;
 use pbps_model::resolver::ScratchLayout;
 use pbps_model::role_mapping::RoleMapping;
@@ -95,12 +94,13 @@ pub async fn with_session<D: PlanningDialect, T, E>(
         let db = |what: &'static str| {
             move |error: pbps_db::DbError| Error::Read(format!("{what}: {error}"))
         };
-        let scope_schemas =
-            scope::scope_schemas(driver, &request.schemas, &request.write_path_extras)
-                .map_err(Error::Scope)?;
-        let (target_catalog, authorization) = scope::read_target(
+        let scope_schemas = <D::Resolver as ResolverEngine>::scope_schemas(
+            &request.schemas,
+            &request.write_path_extras,
+        )
+        .map_err(Error::Scope)?;
+        let (target_catalog, authorization) = <D::Resolver as ResolverEngine>::read_target(
             &mut target,
-            driver,
             &request.schemas,
             &request.write_path_extras,
             &scope_schemas,

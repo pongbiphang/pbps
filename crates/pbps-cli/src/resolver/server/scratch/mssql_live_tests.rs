@@ -759,7 +759,7 @@ async fn mssql_supplied_cleanup_names_the_retained_sandbox_after_failure() {
             .await
             .map_err(|error| pbps_db::DbError::Refused(error.to_string()))?;
             let (catalog, authorization) =
-                crate::resolver::scope::read_target(&mut target, Driver::Mssql, &[], &[], &[], &[])
+                <crate::resolver::server::scratch::engines::MssqlEngine as crate::resolver::contract::ResolverEngine>::read_target(&mut target, &[], &[], &[], &[])
                     .await?;
             let prepared = MssqlEngine::prepare(
                 &mut state,
@@ -1379,7 +1379,7 @@ async fn mssql_prepare_renders_missing_external_and_returns_entered_compile_conn
         let identity=sql::cluster_identity(&mut target).await.unwrap();
         let mut admin=connection(&scratch_server).await;
         let (provisioning,mut state)=MssqlEngine::acquire(&mut target,&mut admin,&tokens,&identity,&scratch_server,&request,&(),file,&provenance).await.unwrap();
-        let (catalog,authorization)=crate::resolver::scope::read_target(&mut target,Driver::Mssql,&request.schemas,&[],&request.schemas,&[]).await.unwrap();
+        let (catalog,authorization)=<crate::resolver::server::scratch::engines::MssqlEngine as crate::resolver::contract::ResolverEngine>::read_target(&mut target, &request.schemas,&[],&request.schemas,&[]).await.unwrap();
         let prepared=MssqlEngine::prepare(&mut state, provisioning,&mut admin,&mut target,&catalog,&authorization,&request.schemas,&binding,&[], Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key())).await;
         let verification=tokio::spawn(async move { match prepared {
             Ok(mut prepared) => {
@@ -1440,8 +1440,7 @@ async fn mssql_supplied_type_permissions_release_to_empty_inventory() {
             &request, &(), None, &provenance,
         ).await.unwrap();
         assert_eq!(provisioning, super::Provisioning::Supplied);
-        let (catalog, authorization) = crate::resolver::scope::read_target(
-            &mut target, Driver::Mssql, &request.schemas, &[], &request.schemas, &[],
+        let (catalog, authorization) = <crate::resolver::server::scratch::engines::MssqlEngine as crate::resolver::contract::ResolverEngine>::read_target(&mut target, &request.schemas, &[], &request.schemas, &[],
         ).await.unwrap();
         let mut prepared = MssqlEngine::prepare(&mut state,
             provisioning, &mut admin, &mut target, &catalog, &authorization,
@@ -1525,10 +1524,7 @@ async fn mssql_a_reconnect_to_a_differing_backend_refuses_and_an_equal_one_does_
         )
         .await
         .unwrap();
-        let (catalog, authorization) = crate::resolver::scope::read_target(
-            &mut target,
-            Driver::Mssql,
-            &request.schemas,
+        let (catalog, authorization) = <crate::resolver::server::scratch::engines::MssqlEngine as crate::resolver::contract::ResolverEngine>::read_target(&mut target, &request.schemas,
             &[],
             &request.schemas,
             &[],

@@ -6,6 +6,7 @@ use super::super::producer::fingerprint;
 use super::super::scratch::{Provenance, Provisioning, Tokens};
 use super::super::{BindingRequest, ScopeRequest};
 use super::{Error, ProduceError};
+use crate::resolver::contract::ResolverEngine;
 use crate::resolver::scope;
 use pbps_db::resolver::ScratchNames;
 use pbps_db::resolver::environment::CatalogFacts;
@@ -533,8 +534,8 @@ impl Scratch<'_> {
         let db = |what: &'static str| {
             move |error: pbps_db::DbError| Error::Read(format!("{what}: {error}"))
         };
-        let recipe = scope::recipe(driver, target_catalog)
-            .map_err(|error| Error::Scope(error.to_string()))?;
+        let recipe =
+            <PgResolver as ResolverEngine>::recipe(target_catalog).map_err(Error::Scope)?;
         let names = super::super::names_for(&self.token)?;
         let login = names.login().to_owned();
         let map = scope::Principals::generate(authorization, &request.planned, &login, &self.token);
@@ -647,9 +648,8 @@ impl Scratch<'_> {
         )
         .await
         .map_err(db("the reproduced authorization"))?;
-        let scratch_catalog = scope::read_catalog(
+        let scratch_catalog = <PgResolver as ResolverEngine>::read_catalog(
             &mut session,
-            driver,
             &request.schemas,
             &request.write_path_extras,
         )
@@ -680,7 +680,6 @@ impl Scratch<'_> {
         scope_schemas: &[String],
         fill: &draft::Fill,
     ) -> Result<Prepared, Error> {
-        let driver = self.driver;
         let request = self.request;
         let db = |what: &'static str| {
             move |error: pbps_db::DbError| Error::Read(format!("{what}: {error}"))
@@ -810,10 +809,13 @@ impl Scratch<'_> {
             .install_settings(admin, context)
             .await
             .map_err(db("the deployer's settings"))?;
-        let scratch_catalog =
-            scope::read_catalog(admin, driver, &request.schemas, &request.write_path_extras)
-                .await
-                .map_err(db("the scratch analysis scope"))?;
+        let scratch_catalog = <PgResolver as ResolverEngine>::read_catalog(
+            admin,
+            &request.schemas,
+            &request.write_path_extras,
+        )
+        .await
+        .map_err(db("the scratch analysis scope"))?;
         // A pooler that moved the connection since the checks is caught here,
         // before anything compiles; the cleanup checks again on its own.
         pinned(admin, &self.backend).await?;

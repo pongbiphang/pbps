@@ -2,7 +2,6 @@
 use super::super::{Error, PlanningDialect, ProduceError, producer::request};
 use super::{Provenance, Standard, Tokens};
 use crate::resolver::contract::{PreparedView, ResolverEngine};
-use crate::resolver::scope;
 use pbps_db::resolver::environment::Verdict;
 use pbps_db::{Conn, Driver};
 use pbps_dialect::Dialect;
@@ -132,18 +131,12 @@ pub(super) async fn run(
             Refused::Unavailable(ProduceError::Run(Error::Read(error.to_string())))
         };
         let run = |error| Refused::Unavailable(ProduceError::Run(error));
-        let schemas = scope::scope_schemas(Driver::Postgres, &request.schemas, &[])
-            .map_err(|why| run(Error::Scope(why)))?;
-        let (catalog, authorization) = scope::read_target(
-            &mut target,
-            Driver::Postgres,
-            &request.schemas,
-            &[],
-            &schemas,
-            &[],
-        )
-        .await
-        .map_err(read)?;
+        let schemas =
+            Postgres::scope_schemas(&request.schemas, &[]).map_err(|why| run(Error::Scope(why)))?;
+        let (catalog, authorization) =
+            Postgres::read_target(&mut target, &request.schemas, &[], &schemas, &[])
+                .await
+                .map_err(read)?;
         let mut prepared = Postgres::prepare_code(
             &mut state,
             provisioning,
@@ -154,7 +147,7 @@ pub(super) async fn run(
         )
         .await
         .map_err(run)?;
-        let report = scope::compare_reported(Driver::Postgres, &catalog, prepared.catalog())
+        let report = Postgres::compare_reported(&catalog, prepared.catalog())
             .map_err(|why| run(Error::Scope(why)))?;
         // A different engine version cannot give a verdict about these trees.
         // Missing extension types still reach CREATE, which names the absent type.

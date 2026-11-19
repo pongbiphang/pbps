@@ -7,7 +7,7 @@ use super::{Binding, Closing, Naming, Prepared, Scratch};
 use crate::resolver::contract::{
     ApplyRecheck, BindingView, ClosingInputs, ClusterDomain, FactsError, GrantRecheck, Phase,
     Planning, PreparedView, Rehearsal, RehearsalRequest, Replay, ResolverEngine, Sealable, Step,
-    Support, sealed::Sealed,
+    Support, TargetRead, sealed::Sealed,
 };
 use crate::resolver::scope;
 use crate::resolver::server::scratch::rehearse::Roles;
@@ -15,7 +15,7 @@ use crate::resolver::server::scratch::{Provenance, Provisioning, Tokens};
 use crate::resolver::server::{BindingRequest, Error, PlanningDialect, ProduceError, ScopeRequest};
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
 use pbps_db::resolver::capture::{Assessment, CaptureDifference, CaptureError};
-use pbps_db::resolver::environment::CatalogFacts;
+use pbps_db::resolver::environment::{CatalogFacts, DatabaseRecipe, ScopeReport};
 use pbps_db::{Conn, DbError, Driver};
 use pbps_model::dependency::DependencyName;
 use pbps_model::operation::Captured;
@@ -67,6 +67,7 @@ impl ResolverEngine for PgResolver {
     type Staged = pbps_pg::resolver::capture::Staged;
     type CompiledCapture = Box<Closing>;
     type CapturedInputs = pbps_pg::resolver::capture::CapturedInputs;
+    type History = pbps_pg::resolver::scope_witness::Witness;
 
     fn binding_classes(surface: &Surface) -> Option<&'static [&'static str]> {
         pbps_pg::resolver::binding_classes(surface)
@@ -362,6 +363,95 @@ impl ResolverEngine for PgResolver {
         Default::default()
     }
 
+    fn scope_schemas(schemas: &[String], extras: &[String]) -> Result<Vec<String>, String> {
+        let mut all = schemas.to_vec();
+        for extra in extras {
+            if extra != "pg_temp" && !all.contains(extra) {
+                all.push(extra.clone());
+            }
+        }
+        Ok(all)
+    }
+
+    fn read_catalog<'a>(
+        connection: &'a mut Conn,
+        schemas: &'a [String],
+        extras: &'a [String],
+    ) -> Step<'a, Result<CatalogFacts, DbError>> {
+        Box::pin(async move {
+            let scope = pbps_pg::resolver::environment::Scope {
+                schemas,
+                write_path_extras: extras,
+            };
+            pbps_pg::resolver::environment::read(connection, &scope).await
+        })
+    }
+
+    fn read_target<'a>(
+        connection: &'a mut Conn,
+        schemas: &'a [String],
+        extras: &'a [String],
+        authorization_schemas: &'a [String],
+        _: &'a [scope::PlannedGrant],
+    ) -> Step<'a, Result<(CatalogFacts, scope::Authorization), DbError>> {
+        Box::pin(async move {
+            let scope = pbps_pg::resolver::environment::Scope {
+                schemas,
+                write_path_extras: extras,
+            };
+            let (catalog, authorization) =
+                pbps_pg::resolver::scope_facts(connection, &scope, authorization_schemas).await?;
+            Ok((catalog, scope::Authorization::Postgres(authorization)))
+        })
+    }
+
+    fn read_target_with_history<'a>(
+        connection: &'a mut Conn,
+        schemas: &'a [String],
+        extras: &'a [String],
+        authorization_schemas: &'a [String],
+        _: &'a [scope::PlannedGrant],
+    ) -> Step<'a, Result<TargetRead<Self::History>, DbError>> {
+        Box::pin(async move {
+            let scope = pbps_pg::resolver::environment::Scope {
+                schemas,
+                write_path_extras: extras,
+            };
+            let (catalog, authorization, witness) =
+                pbps_pg::resolver::witnessed_scope_facts(connection, &scope, authorization_schemas)
+                    .await?;
+            Ok((
+                catalog,
+                scope::Authorization::Postgres(authorization),
+                witness,
+            ))
+        })
+    }
+
+    fn recipe(catalog: &CatalogFacts) -> Result<DatabaseRecipe, String> {
+        DatabaseRecipe::from_catalog(catalog).map_err(|error| error.to_string())
+    }
+
+    fn compare_reported(
+        target: &CatalogFacts,
+        resolver: &CatalogFacts,
+    ) -> Result<ScopeReport, String> {
+        Ok(pbps_pg::resolver::compatibility::compare_reported(
+            target, resolver,
+        ))
+    }
+
+    fn limitation(history: &Self::History) -> Option<(&'static str, &'static str)> {
+        history.role_history_limitation()
+    }
+
+    fn history_differences(
+        before: &Self::History,
+        after: &Self::History,
+    ) -> Result<Vec<String>, DbError> {
+        before.differences(after)
+    }
+
     fn through_shape_view(staged: &Self::Staged, error: Error) -> Error {
         super::through_shape_view(error, staged)
     }
@@ -541,7 +631,7 @@ impl ApplyRecheck for PgResolver {
     }
 
     fn scope_schemas(&self, schemas: &[String], extras: &[String]) -> Result<Vec<String>, String> {
-        scope::scope_schemas(Driver::Postgres, schemas, extras)
+        <Self as ResolverEngine>::scope_schemas(schemas, extras)
     }
 
     fn recheck_opening<'a>(

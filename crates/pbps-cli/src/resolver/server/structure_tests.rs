@@ -5,19 +5,29 @@
 /// The first engine mark in `source`'s production code, comments aside.
 ///
 /// Code behind `#[cfg(test)]` is not production code. Such an item is skipped
-/// whole, from its attribute to the closing brace at the margin, rather than
-/// cutting the file at the first one: `resolution.rs` has a test-only helper
-/// with production code after it, which a cut there would leave unread.
+/// whole, from its attribute to the closing brace at the margin (or to its `;`
+/// for a one-line item such as `mod tests;`), rather than cutting the file at
+/// the first one: `resolution.rs` has a test-only helper with production code
+/// after it, which a cut there would leave unread.
 fn engine_named(source: &str) -> Option<&'static str> {
     let mut code = String::new();
-    let mut skipping = false;
+    // `Some(true)`: the item's first line is next; `Some(false)`: inside a
+    // braced item.
+    let mut skipping = None;
     for line in source.lines() {
-        if skipping {
-            skipping = line != "}";
-            continue;
+        match skipping {
+            Some(true) => {
+                skipping = (!line.ends_with(';')).then_some(false);
+                continue;
+            }
+            Some(false) => {
+                skipping = (line != "}").then_some(false);
+                continue;
+            }
+            None => {}
         }
         if line == "#[cfg(test)]" {
-            skipping = true;
+            skipping = Some(true);
             continue;
         }
         if !line.trim_start().starts_with("//") {
@@ -38,6 +48,11 @@ fn the_surface_resolution_leaves_every_engine_decision_to_the_engine() {
 #[test]
 fn the_transition_derivation_leaves_every_engine_decision_to_the_engine() {
     assert_eq!(engine_named(include_str!("transitions.rs")), None);
+}
+
+#[test]
+fn the_scratch_run_leaves_every_engine_decision_to_the_engine() {
+    assert_eq!(engine_named(include_str!("scratch.rs")), None);
 }
 
 #[test]
@@ -65,6 +80,11 @@ fn the_engine_scan_sees_a_driver_branch_and_an_engine_path() {
     ] {
         assert_eq!(engine_named(source), Some(mark), "{source}");
     }
+    // A one-line test-only item does not swallow the production code after it.
+    assert_eq!(
+        engine_named("#[cfg(test)]\nmod live_tests;\nfn f() { Driver::Mssql; }"),
+        Some("Driver")
+    );
     // Comments and test-only items are not production code.
     assert_eq!(
         engine_named("// Driver::Mssql only in a comment\n/// pbps_pg too\nfn f() {}"),
