@@ -207,7 +207,7 @@ pub async fn run<D: crate::emission::Engine + pbps_cli::resolver::server::Planni
         &named,
         async |session, mut reader, roles| {
             let lowered = lowered(plan, driver, roles)?;
-            let findings = rehearse_in(
+            let findings = rehearse_in::<D>(
                 session,
                 reader.as_mut(),
                 lowered.base(

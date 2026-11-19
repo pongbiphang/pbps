@@ -14,6 +14,7 @@ use crate::resolver::contract::{
     Planning, PreparedView, Preview, Rehearsal, RehearsalRequest, Replay, ResolverEngine, Sealable,
     Step, Support, TargetReadStep, sealed::Sealed,
 };
+use crate::resolver::contract::{ExtensionManifests, nothing_to_do};
 use crate::resolver::scope;
 use crate::resolver::server::scratch::rehearse::Roles;
 use crate::resolver::server::scratch::{Provenance, Provisioning, Tokens};
@@ -28,7 +29,10 @@ use pbps_model::resolver::{
     AuthorizationGrant, AuthorizationReproduction, DependencyPlacement, InputManifest,
     ManifestError, ObjectIdentity, OutsideWrites, ScratchLayout, Surface,
 };
-use pbps_model::{ChangeSet, Hints, IdsFile, ModuleDeps, RoleName, Schema, SessionZone};
+use pbps_model::{
+    ChangeSet, Extension, Hints, IdsFile, ModuleDeps, ObjectLocalName, RoleName, Schema,
+    SessionZone,
+};
 use pbps_mssql::resolver::authorization as mssql_auth;
 use pbps_pg::resolver::capture::{BindingRecord, SealError};
 use std::collections::{BTreeMap, BTreeSet};
@@ -493,6 +497,78 @@ impl ResolverEngine for MssqlResolver {
         target: &'a mut Conn,
     ) -> Step<'a, Result<bool, DbError>> {
         Box::pin(async move { condition.recheck(target).await })
+    }
+
+    fn preview_connect(connection: &str) -> Step<'_, Result<Conn, ProduceError>> {
+        Box::pin(async move {
+            Conn::connect(Driver::Mssql, connection)
+                .await
+                .map_err(|e| ProduceError::Acquire(format!("the scratch server: {e}")))
+        })
+    }
+
+    fn preview_scratch<'a, 'b>(
+        admin: &'b mut Conn,
+        connection: &'a str,
+        request: &'a ScopeRequest,
+        provenance: &'a Provenance,
+    ) -> Step<'b, Result<(Provisioning, Self::Scratch<'a>), Error>>
+    where
+        'a: 'b,
+    {
+        Box::pin(async move {
+            let (provisioning, scratch) =
+                super::preview(admin, connection, request, provenance).await?;
+            Ok((provisioning, Box::new(scratch)))
+        })
+    }
+
+    fn preview_owner<'a>(
+        scratch: &'a mut Self::Scratch<'_>,
+        provisioning: Provisioning,
+        admin: &'a mut Conn,
+    ) -> Step<'a, Result<Conn, Error>> {
+        Box::pin(async move {
+            scratch
+                .acquire(provisioning, admin, &DatabaseRecipe::neutral(), None)
+                .await
+                .map(|acquired| acquired.owner)
+        })
+    }
+
+    fn preview_externals<'a>(owner: &'a mut Conn, script: &'a str) -> Step<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            pbps_mssql::resolver::externals::run(owner, script).await?;
+            Ok(())
+        })
+    }
+
+    fn extension_requirements<'a>(
+        _: &'a mut Conn,
+        wanted: &'a BTreeMap<ObjectLocalName, Extension>,
+    ) -> Step<'a, Result<Vec<String>, DbError>> {
+        Box::pin(std::future::ready(
+            nothing_to_do::<pbps_mssql::Mssql>(wanted.is_empty()).map(|()| Vec::new()),
+        ))
+    }
+
+    fn create_extension_schemas<'a>(
+        _: &'a mut Conn,
+        schemas: &'a [String],
+    ) -> Step<'a, Result<(), DbError>> {
+        Box::pin(std::future::ready(nothing_to_do::<pbps_mssql::Mssql>(
+            schemas.is_empty(),
+        )))
+    }
+
+    fn extension_manifests<'a>(
+        _: &'a mut Conn,
+        names: &'a [&'a ObjectLocalName],
+    ) -> Step<'a, Result<ExtensionManifests, DbError>> {
+        Box::pin(std::future::ready(
+            nothing_to_do::<pbps_mssql::Mssql>(names.is_empty())
+                .map(|()| ExtensionManifests::new()),
+        ))
     }
 
     fn through_shape_view(_: &Self::Staged, error: Error) -> Error {

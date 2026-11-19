@@ -29,7 +29,10 @@ use pbps_model::resolver::{
 };
 use pbps_model::resolver::{DependencyPlacement, OutsideWrites};
 use pbps_model::resolver::{InputManifest, ResolverEvidence};
-use pbps_model::{ChangeSet, Hints, IdsFile, ModuleDeps, RoleName, Schema, SessionZone};
+use pbps_model::{
+    ChangeSet, Extension, ExtensionProvider, Hints, IdsFile, ModuleDeps, ObjectLocalName, RoleName,
+    Schema, SessionZone,
+};
 use pbps_pg::resolver::capture::{BindingRecord, SealError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -92,6 +95,9 @@ pub struct Preview;
 /// What a read of the target answers beside its catalog: the deployer's
 /// authorization and the run-local history of the read.
 pub type TargetRead<A, H> = (CatalogFacts, A, H);
+
+/// What each named package owns on the scratch, read after a plan's statements.
+pub type ExtensionManifests = BTreeMap<ObjectLocalName, ExtensionProvider>;
 
 /// A boxed read of the target with its authorization and history.
 pub type TargetReadStep<'a, A, H> = Step<'a, Result<TargetRead<A, H>, DbError>>;
@@ -456,6 +462,47 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
         condition: &'a Self::Condition,
         target: &'a mut Conn,
     ) -> Step<'a, Result<bool, DbError>>;
+    /// The scratch server a target-less preview opens first, before any
+    /// resource is created on it. An engine without a preview refuses by name.
+    fn preview_connect(connection: &str) -> Step<'_, Result<Conn, ProduceError>>;
+    /// The preview's scratch: no target identity or separation verdict is
+    /// manufactured for it. It is released as any scratch is.
+    fn preview_scratch<'a, 'b>(
+        admin: &'b mut Conn,
+        connection: &'a str,
+        request: &'a ScopeRequest,
+        provenance: &'a Provenance,
+    ) -> Step<'b, Result<(Provisioning, Self::Scratch<'a>), Error>>
+    where
+        'a: 'b;
+    /// Target-free acquisition on the preview's scratch (DEC-587.1): the
+    /// connection the rehearsal runs on, owned by the scratch account.
+    fn preview_owner<'a>(
+        scratch: &'a mut Self::Scratch<'_>,
+        provisioning: Provisioning,
+        admin: &'a mut Conn,
+    ) -> Step<'a, Result<Conn, Error>>;
+    /// Runs the dev entry's externals file on the preview's owner connection.
+    fn preview_externals<'a>(owner: &'a mut Conn, script: &'a str) -> Step<'a, anyhow::Result<()>>;
+    /// What the scratch lacks of the packages a rehearsed plan installs, in the
+    /// words the target's own check uses. An empty request is nothing to do;
+    /// an engine with no extensions refuses a non-empty one by name.
+    fn extension_requirements<'a>(
+        conn: &'a mut Conn,
+        wanted: &'a BTreeMap<ObjectLocalName, Extension>,
+    ) -> Step<'a, Result<Vec<String>, DbError>>;
+    /// Creates the schemas a package is installed or moved into on the scratch.
+    /// An empty request is nothing to do.
+    fn create_extension_schemas<'a>(
+        conn: &'a mut Conn,
+        schemas: &'a [String],
+    ) -> Step<'a, Result<(), DbError>>;
+    /// What each named package owns on the scratch, read after the plan's
+    /// statements ran there. An empty request is nothing to do.
+    fn extension_manifests<'a>(
+        conn: &'a mut Conn,
+        names: &'a [&'a ObjectLocalName],
+    ) -> Step<'a, Result<ExtensionManifests, DbError>>;
     /// The externals the base and the plan read are the target's, as for
     /// the resolver: a file that stages something else would rehearse a
     /// plan on a state the target does not hold. The comparison needs the
@@ -837,6 +884,58 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
     ) -> Step<'a, Result<bool, DbError>> {
         match *condition {}
     }
+    fn preview_connect(_: &str) -> Step<'_, Result<Conn, ProduceError>> {
+        Box::pin(std::future::ready(Err(ProduceError::Acquire(
+            refusal_of::<D>(Operation::Preview).to_string(),
+        ))))
+    }
+    fn preview_scratch<'a, 'b>(
+        _: &'b mut Conn,
+        _: &'a str,
+        _: &'a ScopeRequest,
+        _: &'a Provenance,
+    ) -> Step<'b, Result<(Provisioning, Never), Error>>
+    where
+        'a: 'b,
+    {
+        Box::pin(std::future::ready(Err(Error::Unusable(
+            refusal_of::<D>(Operation::Preview).to_string(),
+        ))))
+    }
+    fn preview_owner<'a>(
+        scratch: &'a mut Never,
+        _: Provisioning,
+        _: &'a mut Conn,
+    ) -> Step<'a, Result<Conn, Error>> {
+        match *scratch {}
+    }
+    fn preview_externals<'a>(_: &'a mut Conn, _: &'a str) -> Step<'a, anyhow::Result<()>> {
+        Box::pin(std::future::ready(Err(anyhow::anyhow!(
+            refusal_of::<D>(Operation::Preview).to_string()
+        ))))
+    }
+    fn extension_requirements<'a>(
+        _: &'a mut Conn,
+        wanted: &'a BTreeMap<ObjectLocalName, Extension>,
+    ) -> Step<'a, Result<Vec<String>, DbError>> {
+        Box::pin(std::future::ready(
+            nothing_to_do::<D>(wanted.is_empty()).map(|()| Vec::new()),
+        ))
+    }
+    fn create_extension_schemas<'a>(
+        _: &'a mut Conn,
+        schemas: &'a [String],
+    ) -> Step<'a, Result<(), DbError>> {
+        Box::pin(std::future::ready(nothing_to_do::<D>(schemas.is_empty())))
+    }
+    fn extension_manifests<'a>(
+        _: &'a mut Conn,
+        names: &'a [&'a ObjectLocalName],
+    ) -> Step<'a, Result<ExtensionManifests, DbError>> {
+        Box::pin(std::future::ready(
+            nothing_to_do::<D>(names.is_empty()).map(|()| ExtensionManifests::new()),
+        ))
+    }
     fn rehearsal_base<'a>(
         scratch: &'a Never,
         _: Provisioning,
@@ -922,6 +1021,7 @@ pub enum Operation {
     Planning,
     Rehearsal,
     Preview,
+    Extensions,
 }
 
 impl fmt::Display for Operation {
@@ -930,6 +1030,7 @@ impl fmt::Display for Operation {
             Self::Planning => "resolver-backed planning",
             Self::Rehearsal => "connected rehearsal",
             Self::Preview => "target-less dev rehearsal",
+            Self::Extensions => "extension rehearsal",
         })
     }
 }
@@ -999,7 +1100,57 @@ pub fn rehearsal<D: PlanningDialect>(_: &D) -> Result<&'static Rehearsal, Unsupp
 }
 
 pub fn preview<D: PlanningDialect>(_: &D) -> Result<&'static Preview, Unsupported> {
+    preview_of::<D>()
+}
+
+pub(crate) fn preview_of<D: PlanningDialect>() -> Result<&'static Preview, Unsupported> {
     admit::<D, _>(|support| support.preview, Operation::Preview)
+}
+
+/// The engine's own refusal of an operation it lacks, for the stand-ins whose
+/// questions have no answer to give.
+pub(crate) fn refusal_of<D: PlanningDialect>(operation: Operation) -> Unsupported {
+    Unsupported {
+        engine: D::NAME,
+        operation,
+    }
+}
+
+/// The answer of an engine with no extension rehearsal: an empty request is
+/// nothing to do, and a non-empty one is refused by name rather than run as
+/// another engine's SQL.
+pub(crate) fn nothing_to_do<D: PlanningDialect>(empty: bool) -> Result<(), DbError> {
+    if empty {
+        Ok(())
+    } else {
+        Err(DbError::Refused(
+            refusal_of::<D>(Operation::Extensions).to_string(),
+        ))
+    }
+}
+
+// The extension helpers of the connected rehearsal, asked of the dialect's
+// engine. The binary cannot name the sealed trait, so these are its door.
+
+pub async fn extension_requirements<D: PlanningDialect>(
+    conn: &mut Conn,
+    wanted: &BTreeMap<ObjectLocalName, Extension>,
+) -> Result<Vec<String>, DbError> {
+    <D::Resolver as ResolverEngine>::extension_requirements(conn, wanted).await
+}
+
+pub async fn create_extension_schemas<D: PlanningDialect>(
+    conn: &mut Conn,
+    schemas: &[String],
+) -> Result<(), DbError> {
+    <D::Resolver as ResolverEngine>::create_extension_schemas(conn, schemas).await
+}
+
+pub async fn extension_manifests<D: PlanningDialect>(
+    conn: &mut Conn,
+    names: &[&ObjectLocalName],
+) -> Result<ExtensionManifests, DbError> {
+    <D::Resolver as ResolverEngine>::extension_manifests(conn, names).await
 }
 
 /// The recheck of this engine's resolver evidence. A resolved plan on an
