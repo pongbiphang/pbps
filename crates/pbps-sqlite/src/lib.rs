@@ -18,7 +18,9 @@
 //!
 //! | Module | Item | Holds |
 //! |---|---|---|
-//! | [`dialect`] | 2 | names, quoting, the type table, what is refused by name |
+//! | [`dialect`] | 2 | names, quoting, what is refused by name |
+//! | [`types`] | 2 | the type table, affinity, STRICT's types, what a type change costs |
+//! | [`keywords`] | 2 | the words SQLite cannot take as a bare name |
 //! | [`emit`] | 3 | the SQL for the changes SQLite can make in place |
 //! | [`catalog`] | 4 | the reader: pragmas, then a tokenizer for what only the stored text holds |
 //! | [`state`] | 5 | the ledger, the plan record and the lock, as SQL |
@@ -35,10 +37,12 @@ use pbps_dialect::TransactionFraming;
 pub mod catalog;
 pub mod dialect;
 pub mod emit;
+pub mod keywords;
 pub mod preflight;
 pub mod state;
 #[cfg(test)]
 mod tests;
+pub mod types;
 
 pub use pbps_db::sqlite::Version;
 
