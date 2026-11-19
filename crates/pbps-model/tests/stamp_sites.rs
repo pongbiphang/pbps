@@ -24,6 +24,12 @@ fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// A relative path as the list below spells it. Windows separates with `\`, and
+/// the expected names are written once, with `/`.
+fn slashed(shown: &str) -> String {
+    shown.replace('\\', "/")
+}
+
 /// Lines (path, text) that write the bare constant to a field called `version`.
 fn writers_of_the_number(text: &str) -> Vec<String> {
     text.lines()
@@ -61,7 +67,7 @@ fn no_writer_sets_the_number_outside_stamp() {
         for line in writers_of_the_number(&text) {
             found.push(format!(
                 "{}: {line}",
-                file.strip_prefix(crates).unwrap().display()
+                slashed(&file.strip_prefix(crates).unwrap().to_string_lossy())
             ));
         }
     }
@@ -94,4 +100,15 @@ fn the_scan_finds_each_spelling_of_a_write_and_not_a_comparison() {
     ] {
         assert!(writers_of_the_number(line).is_empty(), "{line}");
     }
+}
+
+#[test]
+fn a_found_line_is_named_alike_on_every_platform() {
+    assert_eq!(
+        slashed("pbps-model\\src\\plan.rs"),
+        "pbps-model/src/plan.rs"
+    );
+    // A name that has no separator, or already has `/`, is not changed.
+    assert_eq!(slashed("plan.rs"), "plan.rs");
+    assert_eq!(slashed("pbps-model/src/plan.rs"), "pbps-model/src/plan.rs");
 }
