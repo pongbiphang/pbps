@@ -13,7 +13,8 @@
 //! `PlanningDialect::Resolver` instead.
 
 use crate::resolver::scope;
-use crate::resolver::server::engine::{CapturedInputs, CompiledCapture, Naming};
+use crate::resolver::server::engine::{CapturedInputs, CompiledCapture};
+use crate::resolver::server::scratch::rehearse::Roles;
 use crate::resolver::server::scratch::{Provenance, Provisioning, Tokens};
 use crate::resolver::server::{BindingRequest, Error, PlanningDialect, ProduceError, ScopeRequest};
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
@@ -24,7 +25,7 @@ use pbps_model::dependency::Dependencies;
 use pbps_model::dependency::DependencyName;
 use pbps_model::resolver::{DependencyPlacement, OutsideWrites};
 use pbps_model::resolver::{InputManifest, ResolverEvidence};
-use pbps_model::{ChangeSet, IdsFile, ModuleDeps, RoleName, Schema, SessionZone};
+use pbps_model::{ChangeSet, Hints, IdsFile, ModuleDeps, RoleName, Schema, SessionZone};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
@@ -268,19 +269,38 @@ pub trait ResolverEngine: sealed::Sealed + Sized + Send + Sync + 'static {
     /// The planning dialect the binding was generated under, from the same
     /// measured capability reconstruction used.
     fn dialect(binding: &Self::Binding, extras: &[String]) -> Self::Dialect;
-    /// How a rehearsal names the roles a plan names on this scratch (see
-    /// `Naming`). SQL Server has no cluster role to name: its roles are the
-    /// scratch database's own and a rehearsal asks
-    /// `scratch::rehearse::principals` instead (DEC-2379.3).
-    fn naming(scratch: &Self::Scratch<'_>) -> Result<Naming, Error>;
-    /// Makes the roles a rehearsal names, by `naming`. `Err` inside is why the
-    /// scratch cannot hold them, and says so.
+    /// The externals the base and the plan read are the target's, as for
+    /// the resolver: a file that stages something else would rehearse a
+    /// plan on a state the target does not hold. The comparison needs the
+    /// resolver's reconstruction, which says which target objects are
+    /// managed, so a rehearsal with nothing staged never builds it. What the
+    /// base itself needs is the engine's: SQL Server compiles it, PostgreSQL
+    /// only compares what was staged.
+    #[allow(clippy::too_many_arguments)]
+    fn rehearsal_base<'a>(
+        scratch: &'a Self::Scratch<'_>,
+        provisioning: Provisioning,
+        prepared: &'a mut Self::Prepared,
+        admin: &'a mut Conn,
+        target: &'a mut Conn,
+        binding: &'a BindingRequest<'a>,
+        base_ids: &'a IdsFile,
+        desired_ids: &'a IdsFile,
+        hints: &'a Hints,
+        desired: &'a Schema,
+        externals: Option<&'a str>,
+    ) -> Step<'a, Result<(), Error>>;
+    /// The roles the plan names, as the run can have them, made on the
+    /// scratch where the engine makes any. `Err` inside is why a rehearsal
+    /// there cannot run the plan's authorization, and says so.
     fn rehearsal_roles<'a>(
         scratch: &'a mut Self::Scratch<'_>,
         admin: &'a mut Conn,
-        roles: &'a [RoleName],
-        naming: Naming,
-    ) -> Step<'a, Result<Result<(), String>, Error>>;
+        named: &'a BTreeSet<RoleName>,
+        base: &'a Schema,
+        desired: &'a Schema,
+        tokens: &'a Tokens,
+    ) -> Step<'a, Result<Roles, Error>>;
 }
 
 /// What the run reads of an engine's prepared scratch. Held on the state's own
@@ -500,15 +520,29 @@ impl<D: PlanningDialect<Resolver = Self>> ResolverEngine for NoResolver<D> {
     fn dialect(binding: &Never, _: &[String]) -> D {
         match *binding {}
     }
-    fn naming(scratch: &Never) -> Result<Naming, Error> {
+    fn rehearsal_base<'a>(
+        scratch: &'a Never,
+        _: Provisioning,
+        _: &'a mut Never,
+        _: &'a mut Conn,
+        _: &'a mut Conn,
+        _: &'a BindingRequest<'a>,
+        _: &'a IdsFile,
+        _: &'a IdsFile,
+        _: &'a Hints,
+        _: &'a Schema,
+        _: Option<&'a str>,
+    ) -> Step<'a, Result<(), Error>> {
         match *scratch {}
     }
     fn rehearsal_roles<'a>(
         scratch: &'a mut Never,
         _: &'a mut Conn,
-        _: &'a [RoleName],
-        _: Naming,
-    ) -> Step<'a, Result<Result<(), String>, Error>> {
+        _: &'a BTreeSet<RoleName>,
+        _: &'a Schema,
+        _: &'a Schema,
+        _: &'a Tokens,
+    ) -> Step<'a, Result<Roles, Error>> {
         match *scratch {}
     }
 }

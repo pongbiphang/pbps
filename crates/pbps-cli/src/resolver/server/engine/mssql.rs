@@ -15,6 +15,7 @@ use sql::recovery as record;
 
 mod chained;
 mod contract;
+mod principals;
 mod recovery;
 
 pub(super) use contract::MssqlResolver;

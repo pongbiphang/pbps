@@ -7,6 +7,7 @@
 //! nothing to find (DEC-2144.1).
 
 use super::super::{CapturedInputs, CompiledCapture, unsupported};
+use super::principals::principals;
 use super::{Binding, Prepared, Scratch};
 use crate::resolver::contract::{
     ApplyRecheck, BindingView, ClosingInputs, ClusterDomain, FactsError, GrantRecheck, Phase,
@@ -14,7 +15,7 @@ use crate::resolver::contract::{
     Support, sealed::Sealed,
 };
 use crate::resolver::scope;
-use crate::resolver::server::engine::Naming;
+use crate::resolver::server::scratch::rehearse::Roles;
 use crate::resolver::server::scratch::{Provenance, Provisioning, Tokens};
 use crate::resolver::server::{BindingRequest, Error, PlanningDialect, ProduceError, ScopeRequest};
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
@@ -23,8 +24,8 @@ use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, DbError, Driver};
 use pbps_model::dependency::DependencyName;
 use pbps_model::resolver::{DependencyPlacement, InputManifest, OutsideWrites};
-use pbps_model::{IdsFile, ModuleDeps, RoleName, SessionZone};
-use std::collections::BTreeMap;
+use pbps_model::{Hints, IdsFile, ModuleDeps, RoleName, Schema, SessionZone};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// SQL Server's resolver: planning, both rehearsals and the apply recheck.
 pub struct MssqlResolver;
@@ -295,20 +296,65 @@ impl ResolverEngine for MssqlResolver {
         <pbps_mssql::Mssql as PlanningDialect>::configured(extras, None)
     }
 
-    /// SQL Server has no cluster role to name: its roles are the scratch
-    /// database's own and a rehearsal asks `scratch::rehearse::principals`
-    /// instead (DEC-2379.3).
-    fn naming(_: &Self::Scratch<'_>) -> Result<Naming, Error> {
-        Err(unsupported())
+    fn rehearsal_base<'a>(
+        scratch: &'a Self::Scratch<'_>,
+        _: Provisioning,
+        prepared: &'a mut Self::Prepared,
+        admin: &'a mut Conn,
+        target: &'a mut Conn,
+        binding: &'a BindingRequest<'a>,
+        base_ids: &'a IdsFile,
+        _: &'a IdsFile,
+        hints: &'a Hints,
+        desired: &'a Schema,
+        _: Option<&'a str>,
+    ) -> Step<'a, Result<(), Error>> {
+        Box::pin(async move {
+            // The base is the target's own managed namespace, compiled the way
+            // the resolver compiles the declarations: through the engine's
+            // creation trials, because a default or computed column that calls
+            // a function the base also holds has no order the plain bootstrap
+            // can write (DEC-2379.3). Its externals were staged and compared
+            // with the target by `prepare`.
+            let mut built = Self::reconstruction(
+                scratch,
+                target,
+                binding,
+                base_ids,
+                &hints.annotations.modules(desired),
+                prepared,
+            )
+            .await?;
+            let mut staged = Self::completed_staged(prepared).ok_or_else(|| {
+                Error::Scope("the prepared scratch holds no staged inventory".into())
+            })?;
+            Self::compile(
+                &mut built,
+                prepared,
+                admin,
+                target,
+                &[],
+                None,
+                OutsideWrites::Refused,
+                &mut staged,
+            )
+            .await?;
+            Ok(())
+        })
     }
 
+    /// SQL Server has no cluster role to name: its roles are the scratch
+    /// database's own, and the principals a plan names are checked against the
+    /// declarations instead (DEC-2379.3).
     fn rehearsal_roles<'a>(
         _: &'a mut Self::Scratch<'_>,
         _: &'a mut Conn,
-        _: &'a [RoleName],
-        _: Naming,
-    ) -> Step<'a, Result<Result<(), String>, Error>> {
-        Box::pin(async move { Err(unsupported()) })
+        named: &'a BTreeSet<RoleName>,
+        base: &'a Schema,
+        desired: &'a Schema,
+        _: &'a Tokens,
+    ) -> Step<'a, Result<Roles, Error>> {
+        Box::pin(async move { Ok(principals(named, base, desired)) })
     }
 }
 

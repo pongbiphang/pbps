@@ -11,6 +11,7 @@ use crate::resolver::contract::{
     sealed::Sealed,
 };
 use crate::resolver::scope;
+use crate::resolver::server::scratch::rehearse::Roles;
 use crate::resolver::server::scratch::{Provenance, Provisioning, Tokens};
 use crate::resolver::server::{BindingRequest, Error, PlanningDialect, ProduceError, ScopeRequest};
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
@@ -22,8 +23,9 @@ use pbps_model::resolver::{DependencyPlacement, OutsideWrites};
 use pbps_model::resolver::{
     InputManifest, ObjectIdentity, ObjectOwnership, ResolverEvidence, Surface,
 };
-use pbps_model::{IdsFile, ModuleDeps, ModuleId, RoleName, SessionZone};
-use std::collections::BTreeMap;
+use pbps_model::role_mapping::RoleMapping;
+use pbps_model::{Hints, IdsFile, ModuleDeps, ModuleId, RoleName, Schema, SessionZone};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// PostgreSQL's resolver: planning, connected rehearsal and the apply recheck.
 /// It has no target-less dev rehearsal, whose scratch lifecycle is SQL
@@ -323,19 +325,87 @@ impl ResolverEngine for PgResolver {
         )
     }
 
-    /// See `Scratch::naming`.
-    fn naming(scratch: &Self::Scratch<'_>) -> Result<Naming, Error> {
-        Ok(scratch.naming())
+    fn rehearsal_base<'a>(
+        scratch: &'a Self::Scratch<'_>,
+        provisioning: Provisioning,
+        prepared: &'a mut Self::Prepared,
+        admin: &'a mut Conn,
+        target: &'a mut Conn,
+        binding: &'a BindingRequest<'a>,
+        _: &'a IdsFile,
+        desired_ids: &'a IdsFile,
+        hints: &'a Hints,
+        desired: &'a Schema,
+        externals: Option<&'a str>,
+    ) -> Step<'a, Result<(), Error>> {
+        Box::pin(async move {
+            if externals.is_some() || prepared.has_filled() {
+                let mut reconstruction = Self::reconstruction(
+                    scratch,
+                    target,
+                    binding,
+                    desired_ids,
+                    &hints.annotations.modules(desired),
+                    prepared,
+                )
+                .await?;
+                if reconstruction.has_fill() {
+                    return Err(Error::Externals(vec![
+                        "the externals fill reads managed relations, which a rehearsal cannot \
+                         create between its statements; turn the rehearsal off with \
+                         `rehearse: false` or `--no-rehearse`"
+                            .into(),
+                    ]));
+                }
+                Self::chains(&mut reconstruction, prepared);
+                Self::compare_externals(
+                    scratch,
+                    provisioning,
+                    prepared,
+                    admin,
+                    target,
+                    &reconstruction,
+                )
+                .await?;
+            }
+            Ok(())
+        })
     }
 
-    /// See `Scratch::rehearsal_roles`.
+    /// The roles of the run, by the naming its placement decides. Here and in the
+    /// one place the plan is lowered again (`OrderedPlan::under_role_names`) is all
+    /// the code that tells the three apart.
     fn rehearsal_roles<'a>(
         scratch: &'a mut Self::Scratch<'_>,
         admin: &'a mut Conn,
-        roles: &'a [RoleName],
-        naming: Naming,
-    ) -> Step<'a, Result<Result<(), String>, Error>> {
-        Box::pin(async move { scratch.rehearsal_roles(admin, roles, naming).await })
+        named: &'a BTreeSet<RoleName>,
+        _: &'a Schema,
+        _: &'a Schema,
+        tokens: &'a Tokens,
+    ) -> Step<'a, Result<Roles, Error>> {
+        Box::pin(async move {
+            // The engine's own roles keep their names: they are the scratch's too.
+            let own = |role: &RoleName| role.raw().starts_with("pg_");
+            let naming = scratch.naming();
+            let mapping = match naming {
+                Naming::Existing => RoleMapping::default(),
+                Naming::Created => {
+                    RoleMapping::unchanged(named.iter().filter(|role| !own(role)).cloned())
+                }
+                Naming::Mapped => {
+                    RoleMapping::generate(named, "pbps_rehearsal", &tokens.scratch, own)
+                }
+            };
+            Ok(
+                match scratch
+                    .rehearsal_roles(admin, mapping.created(), naming)
+                    .await?
+                {
+                    Ok(()) => Ok(mapping),
+                    Err(why) => Err(why),
+                },
+            )
+        })
     }
 }
 
