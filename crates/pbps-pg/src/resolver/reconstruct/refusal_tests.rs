@@ -351,7 +351,18 @@ async fn true_refusals_render_every_pending_declaration_on_both_majors() {
                         pbps_load::render_module(
                             id,
                             module,
-                            deps.get(id).unwrap_or(&Default::default()),
+                            // Module-to-module edges only: no typed shorthand is
+                            // written, so no project is needed to spell them.
+                            &pbps_load::SpelledDeps::new(
+                                &pbps_model::object_ref::Registry::new(&Default::default()),
+                                &pbps_model::object_ref::ObjectDeps::from_legacy(
+                                    &deps
+                                        .iter()
+                                        .filter(|(owner, _)| *owner == id)
+                                        .map(|(owner, targets)| (owner.clone(), targets.clone()))
+                                        .collect(),
+                                ),
+                            ),
                             false,
                         )
                     }

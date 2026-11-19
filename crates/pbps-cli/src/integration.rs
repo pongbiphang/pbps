@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 116;
+pub const SCHEMA_VERSION: u32 = 117;
+// 117: `depends_on:` on a table, an enum or domain type and a role, and a module's `depends_on:` as a list or an owner map (#2469 PR D).
 // 116: a key's `opclass_parameters` in declarations, plans and state, and BRIN's minmax-multi and Bloom classes (#2449 PR R2); 113 and 115 belong to other changes.
 // 114: an exclusion constraint's retirement in the identities a state embeds, and `IndexPart::Exclusion` in a plan (#2448 PR C2); no document changes beyond the version, and 113 belongs to another change.
 // 112: the `method: gin` descriptions name `tsvector` beside `jsonb` (#1984); 110 and 111 belong to other changes.
@@ -739,6 +740,55 @@ mod tests {
                 )
                 .is_err()
             );
+        }
+    }
+
+    /// `depends_on:` takes the same two shapes in the schema as in the loader,
+    /// on every root that has one, and neither takes the field where the
+    /// loader refuses it.
+    #[test]
+    fn depends_on_schema_and_loader_agree_on_every_root_and_shape() {
+        let validator = jsonschema::validator_for(&schema(SchemaKind::Declaration)).unwrap();
+        let roots = [
+            serde_json::json!({"table": "app.t", "columns": {"x": {"type": "int"}}}),
+            serde_json::json!({"view": "app.v", "definition": "SELECT 1"}),
+            serde_json::json!({"role": "reader"}),
+            serde_json::json!({"enum": "app.mood", "values": ["a"]}),
+            serde_json::json!({"domain": "app.d", "type": "int"}),
+        ];
+        let loads = |value: &serde_json::Value| {
+            pbps_load::load_file_str(std::path::Path::new("f.yml"), &value.to_string()).is_ok()
+        };
+        for root in &roots {
+            for (depends_on, accepted) in [
+                (serde_json::json!(["app.f()", "table::app.t"]), true),
+                (
+                    serde_json::json!({"default::app.t.x": ["module::app.f()"]}),
+                    true,
+                ),
+                (serde_json::json!([]), true),
+                (serde_json::json!("app.f()"), false),
+                (serde_json::json!({"default::app.t.x": "app.f()"}), false),
+                (serde_json::json!({"k": {"a": ["b"]}}), false),
+                (serde_json::json!([["app.f()"]]), false),
+                (serde_json::json!(1), false),
+            ] {
+                let mut value = root.clone();
+                value["depends_on"] = depends_on;
+                assert_eq!(validator.is_valid(&value), accepted, "{value}");
+                assert_eq!(loads(&value), accepted, "{value}");
+            }
+        }
+        // Negative: a root with no address takes no `depends_on:` in either.
+        for root in [
+            serde_json::json!({"extension": "citext", "schema": "public", "version": "1.4"}),
+            serde_json::json!({"dependency": "other.dbo.t", "kind": "table",
+                "columns": {"id": {"type": "int", "nullable": false}}}),
+        ] {
+            let mut value = root.clone();
+            value["depends_on"] = serde_json::json!([]);
+            assert!(!validator.is_valid(&value), "{value}");
+            assert!(!loads(&value), "{value}");
         }
     }
 

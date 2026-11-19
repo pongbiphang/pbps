@@ -1514,6 +1514,14 @@
         "row_security_renames_preserve_unmanaged_policy_owners",
         "row_security_policy_targets_must_exist_before_planning_or_bootstrap",
         "row_security_resolver_plans_apply_and_preserve_adopted_policies",
+        "typed_depends_on2469::a_sequence_annotation_holds_the_create_table_group::pg16",
+        "typed_depends_on2469::a_sequence_annotation_holds_the_create_table_group::pg18",
+        "typed_depends_on2469::policy_and_row_security_annotations_order_the_policy_install_and_refuse_the_reverse::pg16",
+        "typed_depends_on2469::policy_and_row_security_annotations_order_the_policy_install_and_refuse_the_reverse::pg18",
+        "typed_depends_on2469::an_exclusion_annotation_orders_the_extracted_constraint::pg16",
+        "typed_depends_on2469::an_exclusion_annotation_orders_the_extracted_constraint::pg18",
+        "typed_depends_on2469::a_project_with_typed_depends_on_applies_in_the_declared_order::pg16",
+        "typed_depends_on2469::a_project_with_typed_depends_on_applies_in_the_declared_order::pg18",
         "a_resolved_plan_builds_declared_enums_and_domains_on_scratch::control::pg16",
         "a_resolved_plan_builds_declared_enums_and_domains_on_scratch::control::pg18",
         "a_resolved_plan_builds_declared_enums_and_domains_on_scratch::domain_type::pg16",
@@ -3614,6 +3622,8 @@
         "darwin"
       ],
       "cases": [
+        "typed_depends_on2469::a_view_index_annotation_holds_the_whole_view_group_on_mssql",
+        "typed_depends_on2469::a_project_with_typed_depends_on_applies_in_the_declared_order_on_mssql",
         "drop_requirements2400_mssql::guarded_drops_record_replace_clear_checksum_and_apply_on_sql_server",
         "drop_requirements2400_mssql::a_late_violating_row_rolls_back_the_drop_and_prior_statements_on_sql_server",
         "drop_requirements2400_mssql::unsafe_requirements_write_nothing_and_referenced_renames_split_the_plan_on_sql_server",

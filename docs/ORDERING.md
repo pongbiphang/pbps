@@ -183,8 +183,14 @@ Otherwise its indivisible group's boundary applies. An owner requiring its own
 contained surface before creation is a named internal cycle. The index describes
 actual operation payloads, so extracted facets are exposed only by their own
 operations. Missing recursive engine metadata is a named refusal pending the
-engine-facet work. No new pass, preference or public YAML follows from this
-library-only projection.
+engine-facet work. No new pass or preference follows from the projection. Its
+input is public YAML since DEC-2469.8: `depends_on:` on a table, a module, a
+role, an enum and a domain, as a list for the declaration or a map from one of
+its parts. Every typed prefix reaches this projector, and an annotation that
+asks a policy or row-level security to precede a module is the verifier's
+refusal, naming both legs, because their installs follow every module. A
+serial column's sequence and a view's index have no step of their own: the
+annotation holds the indivisible group they are created in.
 
 ### Membership-scoped effect contract
 

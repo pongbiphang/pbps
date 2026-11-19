@@ -92,3 +92,4 @@ DECISIONS 465).
 - `112/` words the `method: gin` descriptions to name `tsvector` beside `jsonb`, with `tsvector_ops` as its default class (#1984); 110 and 111 belong to other changes.
 - `114/` carries no document change beyond its version: the retirement of an exclusion constraint lives in the identities a state embeds and `IndexPart::Exclusion` in a plan, neither of which a published schema describes (#2448 PR C2); 113 belongs to another change.
 - `116/` adds an index key's `opclass_parameters:`, the options of a BRIN minmax-multi or Bloom class (#2449 PR R2).
+- `117/` adds `depends_on:` to a table, an enum or domain type and a role, and widens a module's `depends_on:` from a list of modules to a list of references or a map from an owner reference to such a list (#2469 PR D).

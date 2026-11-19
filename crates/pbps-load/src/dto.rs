@@ -15,6 +15,94 @@ use std::collections::BTreeMap;
 
 use pbps_model::{ColumnName, ReferentialAction};
 
+/// `depends_on:` on any declaration root that has an address: a list of
+/// references the root itself must follow, or a map from a part this file
+/// declares to the references that part must follow (DEC-2469.8).
+///
+/// One type for every root, so no kind has a case of its own. It is written
+/// by hand because a derived untagged enum loses the spans of its items
+/// (`serde-saphyr` documents that `Spanned` does not work inside
+/// `#[serde(untagged)]`), and an error on a reference has to point at it.
+/// Map keys are plain strings for the same reason `grants:` keys are.
+#[derive(Debug, Default)]
+pub struct DependsOnDto {
+    /// The list form: edges from the file's root.
+    pub root: Vec<Spanned<String>>,
+    /// The map form: edges from each key, in the order the file wrote them.
+    pub parts: Vec<(String, Vec<Spanned<String>>)>,
+}
+
+impl<'de> serde::Deserialize<'de> for DependsOnDto {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = DependsOnDto;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a list of references, or a map from a declared part to a list")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<DependsOnDto, A::Error> {
+                let mut root = Vec::new();
+                while let Some(item) = seq.next_element::<Spanned<String>>()? {
+                    root.push(item);
+                }
+                Ok(DependsOnDto {
+                    root,
+                    parts: Vec::new(),
+                })
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<DependsOnDto, A::Error> {
+                let mut parts: Vec<(String, Vec<Spanned<String>>)> = Vec::new();
+                while let Some((key, items)) = map.next_entry::<String, Vec<Spanned<String>>>()? {
+                    // A repeated key is the same part written twice, and the
+                    // second list would silently replace the first.
+                    if parts.iter().any(|(seen, _)| *seen == key) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate `depends_on` key `{key}`"
+                        )));
+                    }
+                    parts.push((key, items));
+                }
+                Ok(DependsOnDto {
+                    root: Vec::new(),
+                    parts,
+                })
+            }
+        }
+        d.deserialize_any(Visitor)
+    }
+}
+
+/// The two shapes of a `depends_on:`, for the schema alone.
+#[derive(schemars::JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code, reason = "only its schema is read")]
+enum DependsOnWire {
+    /// References the declaration itself must follow.
+    List(Vec<String>),
+    /// A part this file declares, to the references it must follow.
+    Parts(BTreeMap<String, Vec<String>>),
+}
+
+impl schemars::JsonSchema for DependsOnDto {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "DependsOn".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        concat!(module_path!(), "::DependsOnDto").into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        DependsOnWire::json_schema(generator)
+    }
+}
+
 /// Which kind of declaration a file holds.
 ///
 /// Read first, with unknown fields deliberately **allowed**: this pass only
@@ -81,6 +169,14 @@ pub struct EnumTypeDto {
     pub name: String,
     #[serde(default)]
     pub renamed_from: Option<String>,
+
+    /// What must be created first, where the identifier scan cannot see the
+    /// dependency: a list of references this declaration follows, or a map from
+    /// a part of it (`default::app.t.x`) to the references that part follows.
+    /// A bare name is a module; `table::`, `type::` and the other prefixes name
+    /// the rest. Persistent, like `strategy:`: `fmt` keeps it.
+    #[serde(default)]
+    pub depends_on: DependsOnDto,
     #[schemars(schema_with = "enum_values_schema")]
     pub values: Vec<EnumValueDto>,
 }
@@ -114,6 +210,14 @@ pub struct DomainTypeDto {
     pub name: String,
     #[serde(default)]
     pub renamed_from: Option<String>,
+
+    /// What must be created first, where the identifier scan cannot see the
+    /// dependency: a list of references this declaration follows, or a map from
+    /// a part of it (`default::app.t.x`) to the references that part follows.
+    /// A bare name is a module; `table::`, `type::` and the other prefixes name
+    /// the rest. Persistent, like `strategy:`: `fmt` keeps it.
+    #[serde(default)]
+    pub depends_on: DependsOnDto,
     #[serde(rename = "type")]
     pub base: String,
     #[serde(default)]
@@ -147,6 +251,14 @@ pub struct RoleDto {
     #[serde(default)]
     #[schemars(with = "Option<String>")]
     pub renamed_from: Option<Spanned<pbps_model::RoleName>>,
+
+    /// What must be created first, where the identifier scan cannot see the
+    /// dependency: a list of references this declaration follows, or a map from
+    /// a part of it (`default::app.t.x`) to the references that part follows.
+    /// A bare name is a module; `table::`, `type::` and the other prefixes name
+    /// the rest. Persistent, like `strategy:`: `fmt` keeps it.
+    #[serde(default)]
+    pub depends_on: DependsOnDto,
 
     /// Target to permissions. Order carries no meaning; `fmt` sorts both.
     #[serde(default)]
@@ -380,11 +492,13 @@ pub struct ModuleDto {
     /// [`pbps_model::Module`].
     pub definition: String,
 
-    /// Modules that must be created first, where the identifier scan cannot see
-    /// the dependency. Persistent, like `strategy:`, and preserved by `fmt`.
+    /// What must be created first, where the identifier scan cannot see the
+    /// dependency: a list of references this declaration follows, or a map from
+    /// a part of it (`default::app.t.x`) to the references that part follows.
+    /// A bare name is a module; `table::`, `type::` and the other prefixes name
+    /// the rest. Persistent, like `strategy:`: `fmt` keeps it.
     #[serde(default)]
-    #[schemars(with = "Vec<String>")]
-    pub depends_on: Vec<Spanned<String>>,
+    pub depends_on: DependsOnDto,
 
     /// Opts this routine back in to the engine's default `EXECUTE` to
     /// `PUBLIC`, where the engine has one (ADR-0010 §5). Persistent, like
@@ -450,6 +564,14 @@ pub struct TableDto {
     /// keeps it.
     #[serde(default)]
     pub strategy: Option<StrategyDto>,
+
+    /// What must be created first, where the identifier scan cannot see the
+    /// dependency: a list of references this declaration follows, or a map from
+    /// a part of it (`default::app.t.x`) to the references that part follows.
+    /// A bare name is a module; `table::`, `type::` and the other prefixes name
+    /// the rest. Persistent, like `strategy:`: `fmt` keeps it.
+    #[serde(default)]
+    pub depends_on: DependsOnDto,
 
     /// `IndexMap` preserves the declaration order in the document, which decides
     /// the column layout of `CREATE TABLE`.

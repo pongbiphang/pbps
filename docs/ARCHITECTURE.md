@@ -310,7 +310,9 @@ has a home, the entry links there instead of repeating its content.
    [ADR-0002](ADR-0002-module-model.md#the-dividing-principle).
 8. **Annotations travel beside the model, never inside it.** `strategy:`,
    `depends_on:` and `public_execute:` come back as `Loaded.hints`, or
-   constraint 1 breaks. See also
+   constraint 1 breaks. `depends_on:` of every kind of root is read by one
+   converter into `LoadedFile::depends_on()` and merged into
+   `Hints.annotations` once the project is whole (DEC-2469.8). See also
    [decision 16](decisions/identity.md#decision-16).
 9. See the driver isolation rule in
    [ADR-0007 decision 5](ADR-0007-connection-strategy.md#decision) and its

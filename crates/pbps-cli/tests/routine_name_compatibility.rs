@@ -137,11 +137,17 @@ fn routine_and_module_artifacts_keep_master_bytes_and_filename_components() {
                 pbps_load::fmt::render_module(
                     id,
                     module,
-                    plan.object_deps
-                        .to_deps()
-                        .modules()
-                        .get(id)
-                        .unwrap_or(&Default::default()),
+                    &pbps_load::SpelledDeps::new(
+                        &pbps_model::object_ref::Registry::new(&schema),
+                        &pbps_model::object_ref::ObjectDeps(
+                            plan.object_deps
+                                .to_deps()
+                                .0
+                                .into_iter()
+                                .filter(|(owner, _)| owner.module_id() == Some(id))
+                                .collect(),
+                        ),
+                    ),
                     false,
                 )
             })

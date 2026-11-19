@@ -46,8 +46,8 @@ pub struct Baseline {
     pub ids: ValidIds,
     /// The annotations that travelled beside that revision's declarations.
     ///
-    /// Only `depends_on:` survives usefully — it is an ordering edge the
-    /// identifier scan cannot find, so rebuilding the baseline without it can
+    /// Only `depends_on:` of every kind of file survives usefully — it is an
+    /// ordering edge the identifier scan cannot find, so rebuilding the baseline without it can
     /// fail on declarations that were always valid. A baseline read from a state
     /// file has none: a snapshot records the database, and hints are not in it.
     pub hints: pbps_model::Hints,
@@ -386,8 +386,20 @@ fn load_from_git(
     let mut schema = Schema::default();
     let mut hints = pbps_model::Hints::default();
     let mut count = 0usize;
+    // Each file's annotations wait for the whole revision, as they do when
+    // today's files are loaded: what a spelling means needs every declaration.
+    let mut annotated = Vec::new();
+    let mut external = pbps_model::dependency::Dependencies::default();
     git_objects::read(root, rev, &rel, |path, text| {
-        match pbps_load::load_file_str(Path::new(path), text) {
+        let loaded = pbps_load::load_file_str(Path::new(path), text);
+        // Every kind of file may carry annotations, so they are read through
+        // the one accessor and not in the arm of a kind (DEC-2469.8).
+        if let Ok(file) = &loaded
+            && !file.depends_on().spelled.is_empty()
+        {
+            annotated.push((path.to_owned(), file.depends_on().clone()));
+        }
+        match loaded {
             Ok(pbps_load::LoadedFile::Table(t)) => {
                 let t = *t;
                 schema.tables.insert(t.name, t.table);
@@ -402,9 +414,6 @@ fn load_from_git(
             // A module has no identity to reconstruct, so the baseline needs
             // nothing from it but the state itself (ADR-0002).
             Ok(pbps_load::LoadedFile::Module(m)) => {
-                if !m.depends_on.is_empty() {
-                    hints.annotations.declare_module(m.id.clone(), m.depends_on);
-                }
                 schema.modules.insert(m.id, m.module);
                 count += 1;
             }
@@ -431,7 +440,10 @@ fn load_from_git(
                 count += 1;
             }
             // Dependencies describe assumptions, never baseline schema state.
-            Ok(pbps_load::LoadedFile::Dependency(_)) => {}
+            // They are kept only to read that revision's annotations.
+            Ok(pbps_load::LoadedFile::Dependency(d)) => {
+                external.insert(d.name, d.declaration);
+            }
             Err(errs) => {
                 // The baseline is a historical version. Its being broken should not
                 // halt current work, but it does have to be reported.
@@ -443,6 +455,26 @@ fn load_from_git(
         }
         Ok(())
     })?;
+
+    // That revision's annotations are read the way today's are (DEC-2469.8).
+    // A spelling its own declarations refuse is the baseline's own defect,
+    // reported like a file that does not parse: recorded as parsed, an
+    // ambiguous `table::app.t` would order a removal against the wrong object.
+    // The same-file rule is not asked here. It says where an annotation is
+    // written, never what it means.
+    {
+        let registry = pbps_model::object_ref::Registry::new(&schema);
+        for (path, written) in annotated {
+            if let Some(message) =
+                pbps_load::refused_spellings(&registry, &external, &written).first()
+            {
+                anyhow::bail!(
+                    "`{path}` at `{revision_label}` is refused (the baseline version itself is broken): {message}"
+                );
+            }
+            hints.annotations.declare(written.deps);
+        }
+    }
 
     // The historical side gets the routine-identity pass the current side
     // gets, or a routine respelled since — `f(int)` then, `f(integer)` now,

@@ -140,6 +140,10 @@
             }
           ]
         },
+        "depends_on": {
+          "description": "What must be created first, where the identifier scan cannot see the\ndependency: a list of references this declaration follows, or a map from\na part of it (`default::app.t.x`) to the references that part follows.\nA bare name is a module; `table::`, `type::` and the other prefixes name\nthe rest. Persistent, like `strategy:`: `fmt` keeps it.",
+          "$ref": "#/$defs/DependsOn"
+        },
         "columns": {
           "description": "`IndexMap` preserves the declaration order in the document, which decides\nthe column layout of `CREATE TABLE`.",
           "type": "object",
@@ -304,6 +308,28 @@
         }
       },
       "additionalProperties": false
+    },
+    "DependsOn": {
+      "description": "The two shapes of a `depends_on:`, for the schema alone.",
+      "anyOf": [
+        {
+          "description": "References the declaration itself must follow.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        {
+          "description": "A part this file declares, to the references it must follow.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      ]
     },
     "ColumnDto": {
       "type": "object",
@@ -1751,12 +1777,8 @@
           "type": "string"
         },
         "depends_on": {
-          "description": "Modules that must be created first, where the identifier scan cannot see\nthe dependency. Persistent, like `strategy:`, and preserved by `fmt`.",
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": []
+          "description": "What must be created first, where the identifier scan cannot see the\ndependency: a list of references this declaration follows, or a map from\na part of it (`default::app.t.x`) to the references that part follows.\nA bare name is a module; `table::`, `type::` and the other prefixes name\nthe rest. Persistent, like `strategy:`: `fmt` keeps it.",
+          "$ref": "#/$defs/DependsOn"
         },
         "public_execute": {
           "description": "Opts this routine back in to the engine's default `EXECUTE` to\n`PUBLIC`, where the engine has one (ADR-0010 §5). Persistent, like\n`depends_on:`, and preserved by `fmt`.\n\nAbsent — the common case — means the plan takes that default away as\npart of creating the routine. Writing `false` says the same thing out\nloud and is accepted, so that a declaration can record the decision\nwhere a reader sees it.",
@@ -1912,6 +1934,10 @@
           ],
           "default": null
         },
+        "depends_on": {
+          "description": "What must be created first, where the identifier scan cannot see the\ndependency: a list of references this declaration follows, or a map from\na part of it (`default::app.t.x`) to the references that part follows.\nA bare name is a module; `table::`, `type::` and the other prefixes name\nthe rest. Persistent, like `strategy:`: `fmt` keeps it.",
+          "$ref": "#/$defs/DependsOn"
+        },
         "grants": {
           "description": "Target to permissions. Order carries no meaning; `fmt` sorts both.",
           "type": "object",
@@ -1964,6 +1990,10 @@
             "null"
           ],
           "default": null
+        },
+        "depends_on": {
+          "description": "What must be created first, where the identifier scan cannot see the\ndependency: a list of references this declaration follows, or a map from\na part of it (`default::app.t.x`) to the references that part follows.\nA bare name is a module; `table::`, `type::` and the other prefixes name\nthe rest. Persistent, like `strategy:`: `fmt` keeps it.",
+          "$ref": "#/$defs/DependsOn"
         },
         "values": {
           "type": "array",
@@ -2021,6 +2051,10 @@
             "null"
           ],
           "default": null
+        },
+        "depends_on": {
+          "description": "What must be created first, where the identifier scan cannot see the\ndependency: a list of references this declaration follows, or a map from\na part of it (`default::app.t.x`) to the references that part follows.\nA bare name is a module; `table::`, `type::` and the other prefixes name\nthe rest. Persistent, like `strategy:`: `fmt` keeps it.",
+          "$ref": "#/$defs/DependsOn"
         },
         "type": {
           "type": "string"
@@ -2184,6 +2218,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 116,
+  "x-pbps-schema-version": 117,
   "x-pbps-tool-version": "0.0.0"
 }

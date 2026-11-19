@@ -3608,6 +3608,13 @@ fn load(project: &Project, dialect: &dyn Dialect) -> anyhow::Result<pbps_load::L
     Ok(loaded)
 }
 
+/// The words of a reference that only PostgreSQL has an object for: an enum
+/// or domain, a sequence, a row policy, row-level security, an exclusion
+/// constraint. SQL Server cannot declare any of them, so a dependency naming
+/// one is refused for that reason, not as an unknown target (DEC-2469.8).
+const POSTGRES_ONLY_REFERENCE_WORDS: &[&str] =
+    &["type", "sequence", "policy", "row_security", "exclusion"];
+
 /// The findings on `depends_on:` annotations, under the two codes the module
 /// checks have always used. A module-to-module finding keeps its text; a
 /// reference of another kind is judged by the registry and mapped onto the
@@ -3615,8 +3622,36 @@ fn load(project: &Project, dialect: &dyn Dialect) -> anyhow::Result<pbps_load::L
 fn annotation_findings(
     schema: &pbps_model::Schema,
     annotations: &pbps_model::object_ref::Annotations,
+    dialect: &dyn Dialect,
 ) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
+    // A reference to something this engine does not have is named for that,
+    // and the edge is then not judged again as an unknown target.
+    let mut annotations = annotations.clone();
+    if dialect.name() != "postgres" {
+        let foreign = |reference: &pbps_model::object_ref::ObjectRef| {
+            reference
+                .words()
+                .any(|word| POSTGRES_ONLY_REFERENCE_WORDS.contains(&word))
+        };
+        for (owner, targets) in &annotations.declared.0 {
+            for reference in std::iter::once(owner).chain(targets).filter(|r| foreign(r)) {
+                out.push((
+                    "schema.unknown-dependency",
+                    format!(
+                        "`{}` names an object only PostgreSQL has, and {} cannot declare it",
+                        reference.shown(),
+                        dialect.name()
+                    ),
+                ));
+            }
+        }
+        annotations.declared.0 = std::mem::take(&mut annotations.declared.0)
+            .into_iter()
+            .filter(|(owner, _)| !foreign(owner))
+            .map(|(owner, targets)| (owner, targets.into_iter().filter(|t| !foreign(t)).collect()))
+            .collect();
+    }
     let modules = annotations.declared.modules();
     // A `depends_on:` naming a module nobody declared is silently a no-op in
     // the ordering, so nothing else would ever say so.
@@ -3818,7 +3853,11 @@ fn declaration_problems_with_sources(
     }
     // And a third: a `depends_on:` that names nothing declared or closes a
     // cycle (the checks are in `annotation_findings`).
-    out.extend(annotation_findings(schema, &loaded.hints.annotations));
+    out.extend(annotation_findings(
+        schema,
+        &loaded.hints.annotations,
+        dialect,
+    ));
     // Reference data (ADR-0004). Model rules, not engine rules — a row's
     // key is its identity in every dialect — so they come from the model
     // rather than from `validate_table`.
@@ -4283,8 +4322,14 @@ pub struct IdentityCounts {
 }
 
 /// The names `fmt` judges a `renamed_from` against: every table, role and type
-/// any readable file of the project declares. An unreadable or unparseable file
-/// contributes nothing here.
+/// any readable file of the project declares, and every module, which no intent
+/// reads. An unreadable or unparseable file contributes nothing here.
+///
+/// It is not the merged project: a partition is not in `tables`, because
+/// `RenameSource::of` would then judge more `renamed_from` annotations
+/// redeclared. The modules are what the spelling of a `depends_on:` reference
+/// needs: `Registry::parse` asks the schema only whether a module of that name
+/// is declared (DEC-2469.8).
 fn fmt_declared(files: &[PathBuf]) -> Schema {
     let mut declared = Schema::default();
     for path in files {
@@ -4310,8 +4355,10 @@ fn fmt_declared(files: &[PathBuf]) -> Schema {
             Ok(pbps_load::LoadedFile::Sequence(s)) => {
                 declared.sequences.insert(s.name, s.definition);
             }
-            Ok(pbps_load::LoadedFile::Module(_) | pbps_load::LoadedFile::Dependency(_))
-            | Err(_) => {}
+            Ok(pbps_load::LoadedFile::Module(m)) => {
+                declared.modules.insert(m.id, m.module);
+            }
+            Ok(pbps_load::LoadedFile::Dependency(_)) | Err(_) => {}
         }
     }
     declared
@@ -4327,6 +4374,7 @@ fn canonical_table(
     t: &pbps_load::LoadedTable,
     ids: &IdsFile,
     declared: &Schema,
+    registry: &pbps_model::object_ref::Registry<'_>,
 ) -> (String, Vec<Intent>) {
     // Judged against the declared names, because a `renamed_from`
     // whose source is declared again records a rename that
@@ -4348,6 +4396,7 @@ fn canonical_table(
             &partitions,
             &pending,
             t.strategy.as_ref(),
+            &pbps_load::SpelledDeps::new(registry, &t.depends_on.deps),
         ),
         absorbed,
     )
@@ -4511,9 +4560,16 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
                     .sequences
                     .insert(s.name.clone(), s.definition.clone());
             }
-            pbps_load::LoadedFile::Module(_) | pbps_load::LoadedFile::Dependency(_) => {}
+            pbps_load::LoadedFile::Module(m) => {
+                declared.modules.insert(m.id.clone(), m.module.clone());
+            }
+            pbps_load::LoadedFile::Dependency(_) => {}
         }
     }
+    // Spells every `depends_on:` reference, so a shorthand is written only where
+    // the project's own reader reads it back. That needs the modules `declared`
+    // now holds, not the partitions it lacks (see `fmt_declared`).
+    let registry = pbps_model::object_ref::Registry::new(&declared);
 
     let mut changed: Vec<(PathBuf, Vec<Intent>)> = Vec::new();
     for FmtInput {
@@ -4549,6 +4605,7 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
                         &t.definition,
                         &pending,
                         &t.value_renames,
+                        &pbps_load::SpelledDeps::new(&registry, &t.depends_on.deps),
                     ),
                     absorbed,
                 )
@@ -4565,16 +4622,29 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
             pbps_load::LoadedFile::Module(m) => (
                 // A module has no one-shot annotations to absorb: it carries no
                 // identity, so there is no rename intent to record (ADR-0002).
-                pbps_load::render_module(&m.id, &m.module, &m.depends_on, m.public_execute),
+                pbps_load::render_module(
+                    &m.id,
+                    &m.module,
+                    &pbps_load::SpelledDeps::new(&registry, &m.depends_on.deps),
+                    m.public_execute,
+                ),
                 Vec::new(),
             ),
-            pbps_load::LoadedFile::Table(t) => canonical_table(&t, &ids, &declared),
+            pbps_load::LoadedFile::Table(t) => canonical_table(&t, &ids, &declared, &registry),
             pbps_load::LoadedFile::Role(r) => {
                 let (pending, absorbed): (Vec<Intent>, Vec<Intent>) =
                     r.intents.iter().cloned().partition(|i| {
                         !pbps_diff::intent_is_absorbed(i, &ids, RenameSource::of(i, &declared))
                     });
-                (pbps_load::render_role(&r.name, &r.role, &pending), absorbed)
+                (
+                    pbps_load::render_role(
+                        &r.name,
+                        &r.role,
+                        &pending,
+                        &pbps_load::SpelledDeps::new(&registry, &r.depends_on.deps),
+                    ),
+                    absorbed,
+                )
             }
         };
         if rendered == original {
@@ -7044,6 +7114,7 @@ mod tests {
     #[test]
     fn registry_findings_use_the_two_module_codes_and_leave_module_text_alone() {
         use pbps_model::object_ref::{Annotations, ObjectDeps};
+        let pg = dialect_for(DialectName::Postgres);
         let mut schema = pbps_model::Schema::default();
         schema
             .tables
@@ -7068,7 +7139,11 @@ mod tests {
             ..Default::default()
         };
         // A target that is not declared, and a cycle through a table.
-        let unknown = annotation_findings(&schema, &deps(&[("module::app.v", "table::app.nope")]));
+        let unknown = annotation_findings(
+            &schema,
+            &deps(&[("module::app.v", "table::app.nope")]),
+            pg.as_ref(),
+        );
         assert!(
             matches!(unknown.as_slice(), [("schema.unknown-dependency", why)] if why.contains("table::app.nope")),
             "{unknown:?}"
@@ -7079,6 +7154,7 @@ mod tests {
                 ("module::app.v", "table::app.t"),
                 ("table::app.t", "module::app.v"),
             ]),
+            pg.as_ref(),
         );
         assert!(
             cycle
@@ -7087,21 +7163,73 @@ mod tests {
             "{cycle:?}"
         );
         // Negative: module-only findings keep the text the module checks give.
-        let ghost = annotation_findings(&schema, &deps(&[("module::app.v", "module::app.ghost")]));
+        let ghost = annotation_findings(
+            &schema,
+            &deps(&[("module::app.v", "module::app.ghost")]),
+            pg.as_ref(),
+        );
         assert!(
             matches!(ghost.as_slice(), [("schema.unknown-dependency", why)]
                 if why.contains("which is not a declared module")),
             "{ghost:?}"
         );
         assert!(
-            annotation_findings(&schema, &deps(&[("module::app.v", "module::app.w")])).is_empty()
+            annotation_findings(
+                &schema,
+                &deps(&[("module::app.v", "module::app.w")]),
+                pg.as_ref()
+            )
+            .is_empty()
         );
         // A table that depends on a missing module is nobody's module edge:
         // the registry reports it, once, under the same code.
-        let mixed = annotation_findings(&schema, &deps(&[("table::app.t", "module::app.ghost")]));
+        let mixed = annotation_findings(
+            &schema,
+            &deps(&[("table::app.t", "module::app.ghost")]),
+            pg.as_ref(),
+        );
         assert!(
             matches!(mixed.as_slice(), [("schema.unknown-dependency", why)] if why.contains("module::app.ghost")),
             "{mixed:?}"
+        );
+        // SQL Server names what only PostgreSQL has as such, once, and does not
+        // judge the same edge again as an unknown target. Every word on the
+        // list is refused as an owner and as a target; PostgreSQL has no such
+        // refusal, and a portable reference is not caught by it.
+        let ms = dialect_for(DialectName::Mssql);
+        for foreign in [
+            "type::app.mood",
+            "sequence::app.t.id",
+            "policy::app.t.p",
+            "row_security::app.t",
+            "exclusion::app.t.x",
+            "check::type::app.d.c",
+        ] {
+            for rows in [[("module::app.v", foreign)], [(foreign, "module::app.v")]] {
+                let found = annotation_findings(&schema, &deps(&rows), ms.as_ref());
+                assert!(
+                    matches!(found.as_slice(), [("schema.unknown-dependency", why)]
+                        if why.contains("only PostgreSQL has") && why.contains(foreign)),
+                    "{foreign}: {found:?}"
+                );
+            }
+        }
+        let portable = annotation_findings(
+            &schema,
+            &deps(&[("module::app.v", "table::app.t")]),
+            ms.as_ref(),
+        );
+        assert!(portable.is_empty(), "{portable:?}");
+        let on_postgres = annotation_findings(
+            &schema,
+            &deps(&[("module::app.v", "type::app.mood")]),
+            pg.as_ref(),
+        );
+        assert!(
+            !on_postgres
+                .iter()
+                .any(|(_, why)| why.contains("only PostgreSQL has")),
+            "{on_postgres:?}"
         );
     }
 

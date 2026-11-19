@@ -257,7 +257,14 @@ fn column_collections_keep_master_bytes_checksums_sql_and_declarations() {
                             .is_some_and(|of| &of.parent == n)
                     })
                     .collect();
-                pbps_load::fmt::render_partitioned(n, t, &partitions, &[], None)
+                pbps_load::fmt::render_partitioned(
+                    n,
+                    t,
+                    &partitions,
+                    &[],
+                    None,
+                    &Default::default(),
+                )
             })
             .collect::<Vec<_>>()
             .join("\n---\n");

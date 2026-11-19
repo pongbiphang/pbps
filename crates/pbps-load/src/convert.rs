@@ -7,6 +7,7 @@
 use serde_saphyr::Spanned;
 use std::str::FromStr;
 
+use pbps_model::object_ref::{ObjectDeps, ObjectRef, Root};
 use pbps_model::{
     CheckConstraint, Clustered, Column, ColumnType, DataMode, ForeignKey, GrantTarget, Identity,
     Index, IndexColumn, Intent, Module, ModuleId, ModuleKind, OpClassRef, Permission, PrimaryKey,
@@ -15,10 +16,31 @@ use pbps_model::{
 };
 
 use crate::dto::{
-    ClusteredDto, DataDto, ModuleDto, PrimaryKeyDto, ReplicaIdentityDto, RoleDto, StorageValueDto,
-    SystemTimeDto, TableDto, UniqueDto, ValueDto,
+    ClusteredDto, DataDto, DependsOnDto, ModuleDto, PrimaryKeyDto, ReplicaIdentityDto, RoleDto,
+    StorageValueDto, SystemTimeDto, TableDto, UniqueDto, ValueDto,
 };
 use crate::error::{LoadError, SourceFile, to_span};
+
+/// What one file's `depends_on:` says: the edges, and the spelling of each
+/// reference as the file wrote it. The merge needs the spellings because a
+/// typed spelling can collide with a legacy module name, and the parsed
+/// reference no longer says which spelling the user chose (`object::` is the
+/// escape that never collides). One value for every kind of file (DEC-2469.8).
+#[derive(Debug, Clone, Default)]
+pub struct Written {
+    pub deps: ObjectDeps,
+    pub spelled: Vec<String>,
+}
+
+/// Two files say the same thing when their edges are the same. How each
+/// reference was spelled does not change that, so a file and its formatted
+/// copy are equal.
+impl PartialEq for Written {
+    fn eq(&self, other: &Self) -> bool {
+        self.deps == other.deps
+    }
+}
+impl Eq for Written {}
 
 /// The result of loading one declaration file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +51,9 @@ pub struct LoadedTable {
     /// `None` when the file declares no `strategy:` block. Kept out of `table`
     /// so that `Schema` equality stays a question about the database alone.
     pub strategy: Option<Strategy>,
+    /// What this file's `depends_on:` says. Kept out of `table` like
+    /// `strategy`: creation order is invisible in the database (ADR-0002).
+    pub depends_on: Written,
     /// The partitions this file declares under its table (#1170): each a
     /// table of its own, in the parent's schema unless named otherwise.
     pub partitions: Vec<(TableName, Table)>,
@@ -41,7 +66,7 @@ pub struct LoadedModule {
     pub module: Module,
     /// Kept out of `module` so that `Schema` equality stays a question about
     /// the database alone: creation order is invisible there (ADR-0002).
-    pub depends_on: std::collections::BTreeSet<ModuleId>,
+    pub depends_on: Written,
     /// Whether the declaration asks for the engine's default `EXECUTE` to
     /// `PUBLIC` to be left standing. Kept out of `module` for the same
     /// reason, from the other side: what `PUBLIC` holds is never compared
@@ -58,6 +83,76 @@ pub struct LoadedRole {
     /// A `renamed_from:`, extracted rather than stored — the same one-shot
     /// rule tables follow.
     pub intents: Vec<Intent>,
+    /// What this file's `depends_on:` says, kept out of `role` like a table's.
+    pub depends_on: Written,
+}
+
+/// A `depends_on:` as edges: the list form is from the file's own root, and
+/// each key of the map form is its own owner (DEC-2469.8).
+///
+/// This is the one place YAML becomes references, whatever the kind of file;
+/// the caller passes its root and the converter knows nothing else about it.
+/// `own` is `None` when the file's own name did not parse: its items are
+/// still read, so every bad reference is reported in one pass. Whether an
+/// owner belongs to this file, and whether a reference is declared, needs the
+/// merged project and is asked there.
+pub(crate) fn convert_depends_on(
+    src: &SourceFile,
+    dto: DependsOnDto,
+    own: Option<Root>,
+    errs: &mut Vec<LoadError>,
+) -> Written {
+    let mut spelled = Vec::new();
+    let mut targets_of = |items: &[Spanned<String>], errs: &mut Vec<LoadError>| {
+        let mut targets = std::collections::BTreeSet::new();
+        for item in items {
+            spelled.push(item.value.clone());
+            match parse_at::<ObjectRef>(src, item, "invalid reference in `depends_on`") {
+                Ok(target) => {
+                    targets.insert(target);
+                }
+                Err(e) => errs.push(e),
+            }
+        }
+        targets
+    };
+    let listed = targets_of(&dto.root, errs);
+    let mut deps = ObjectDeps::default();
+    if let (Some(root), false) = (own, listed.is_empty()) {
+        deps.0.push((ObjectRef::whole(root), listed));
+    }
+    let mut keys = Vec::new();
+    for (key, items) in &dto.parts {
+        let targets = targets_of(items, errs);
+        // A key has no span of its own (`Spanned` keys do not deserialize),
+        // so its errors name it instead of pointing at it.
+        let owner = match key.parse::<ObjectRef>() {
+            Ok(owner) => owner,
+            Err(e) => {
+                errs.push(LoadError::Yaml {
+                    path: std::path::PathBuf::from(&src.name),
+                    message: format!("invalid owner in `depends_on`: {e}"),
+                });
+                continue;
+            }
+        };
+        if deps.0.iter().any(|(seen, _)| *seen == owner) {
+            errs.push(LoadError::Yaml {
+                path: std::path::PathBuf::from(&src.name),
+                message: format!(
+                    "`depends_on` names `{}` twice, in two spellings",
+                    owner.shown()
+                ),
+            });
+        } else if !targets.is_empty() {
+            keys.push(key.clone());
+            deps.0.push((owner, targets));
+        }
+    }
+    spelled.extend(keys);
+    // One order for one meaning: a file and its formatted copy load alike.
+    deps.0.sort();
+    Written { deps, spelled }
 }
 
 /// DTO to domain model for one role.
@@ -101,6 +196,12 @@ pub fn convert_role(src: &SourceFile, dto: RoleDto) -> Result<LoadedRole, Vec<Lo
         }
     }
 
+    let depends_on = convert_depends_on(
+        src,
+        dto.depends_on,
+        Some(Root::Role(name.clone())),
+        &mut errs,
+    );
     let mut role = Role {
         description: dto.description.map(pbps_model::Text::from),
         grants: Default::default(),
@@ -165,6 +266,7 @@ pub fn convert_role(src: &SourceFile, dto: RoleDto) -> Result<LoadedRole, Vec<Lo
             name,
             role,
             intents,
+            depends_on,
         })
     } else {
         Err(errs)
@@ -834,6 +936,12 @@ pub(crate) fn convert_for_diagnostics(
         }
     }
 
+    let depends_on = convert_depends_on(
+        src,
+        dto.depends_on,
+        name.clone().map(Root::Table),
+        &mut errs,
+    );
     match (name, errs.is_empty()) {
         (Some(name), true) => Ok((
             LoadedTable {
@@ -885,6 +993,7 @@ pub(crate) fn convert_for_diagnostics(
                 },
                 intents,
                 strategy: dto.strategy.map(|s| Strategy { online: s.online }),
+                depends_on,
                 partitions,
             },
             source_conflicts,
@@ -1577,25 +1686,8 @@ pub fn convert_module(src: &SourceFile, dto: ModuleDto) -> Result<LoadedModule, 
         (_, declared, _) => declared,
     };
 
-    let mut depends_on = std::collections::BTreeSet::new();
-    for v in &dto.depends_on {
-        // The public grammar stays ModuleId-only until the full route ships.
-        // Enter the general model without interpreting old schema names as prefixes.
-        match parse_at::<ModuleId>(src, v, "invalid object name in `depends_on`") {
-            Ok(n) => {
-                let reference = pbps_model::object_ref::ObjectRef::whole(
-                    pbps_model::object_ref::Root::Module(n),
-                );
-                depends_on.insert(
-                    reference
-                        .module_id()
-                        .expect("legacy module reference")
-                        .clone(),
-                );
-            }
-            Err(e) => errs.push(e),
-        }
-    }
+    let depends_on =
+        convert_depends_on(src, dto.depends_on, id.clone().map(Root::Module), &mut errs);
 
     // Only a routine has an `EXECUTE` privilege to leave standing: a view is
     // selected from and a trigger is not invoked by anyone at all, so the key

@@ -14,6 +14,7 @@
 
 use std::fmt::Write as _;
 
+use pbps_model::object_ref::{ObjectDeps, ObjectRef, Registry, Root};
 use pbps_model::{
     Clustered, Intent, Module, ModuleId, ObjectName, PrimaryKey, ReplicaIdentity, Strategy, Table,
     TableName,
@@ -44,7 +45,7 @@ pub fn render(
     intents: &[Intent],
     strategy: Option<&Strategy>,
 ) -> String {
-    render_partitioned(name, table, &[], intents, strategy)
+    render_partitioned(name, table, &[], intents, strategy, &SpelledDeps::default())
 }
 
 /// [`render`], for a partitioned parent with its partitions, which are
@@ -56,6 +57,7 @@ pub fn render_partitioned(
     partitions: &[(&TableName, &Table)],
     intents: &[Intent],
     strategy: Option<&Strategy>,
+    depends_on: &SpelledDeps,
 ) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "table: {}", scalar(&name.raw().to_string()));
@@ -70,6 +72,7 @@ pub fn render_partitioned(
     {
         let _ = writeln!(s, "renamed_from: {}", scalar(&from.raw().to_string()));
     }
+    render_depends_on(&mut s, &Root::Table(name.clone()), depends_on);
 
     // Persistent, unlike `renamed_from`: rewriting the file must preserve it
     // (ADR-0003). The default renders as nothing, so a table that never asked
@@ -510,7 +513,7 @@ fn value(v: &pbps_model::Value) -> String {
 pub fn render_module(
     id: &ModuleId,
     module: &Module,
-    depends_on: &std::collections::BTreeSet<ModuleId>,
+    depends_on: &SpelledDeps,
     public_execute: bool,
 ) -> String {
     let mut s = String::new();
@@ -536,19 +539,7 @@ pub fn render_module(
     if let Some(on) = on.as_deref() {
         let _ = writeln!(s, "on: {}", scalar(on));
     }
-    if !depends_on.is_empty() {
-        let names: Vec<String> = depends_on
-            .iter()
-            .map(|id| {
-                pbps_model::object_ref::ObjectRef::whole(pbps_model::object_ref::Root::Module(
-                    id.clone(),
-                ))
-                .legacy_spelling()
-                .expect("only module annotations are written")
-            })
-            .collect();
-        let _ = writeln!(s, "depends_on: {}", seq(&names));
-    }
+    render_depends_on(&mut s, &Root::Module(id.clone()), depends_on);
     // Written only when it is `true`. `false` is what the absent key means,
     // and a formatter that spelled the default out would put the line into
     // every view and trigger file in the project, where the loader refuses it.
@@ -604,6 +595,7 @@ pub fn render_role(
     name: &pbps_model::RoleName,
     role: &pbps_model::Role,
     pending: &[Intent],
+    depends_on: &SpelledDeps,
 ) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "role: {}", scalar(name.raw()));
@@ -617,6 +609,7 @@ pub fn render_role(
             let _ = writeln!(s, "renamed_from: {}", scalar(from.raw()));
         }
     }
+    render_depends_on(&mut s, &Root::Role(name.clone()), depends_on);
     let grants: Vec<_> = role.declarable_grants().collect();
     if !grants.is_empty() {
         s.push_str("\ngrants:\n");
@@ -631,6 +624,72 @@ pub fn render_role(
         }
     }
     s
+}
+
+/// A file's `depends_on:` edges with every reference already spelled, the way
+/// the project's own reader will read it back (DEC-2469.8).
+///
+/// The spelling is decided here, once, by [`Registry::spell`], and not by the
+/// renderers: a shorthand's meaning depends on what the whole project declares,
+/// and a renderer sees one file. Taking the spelled value as the renderers'
+/// argument also adds no parameter to the ones that carry no edges, which pass
+/// `&Default::default()`.
+#[derive(Debug, Clone, Default)]
+pub struct SpelledDeps(Vec<(ObjectRef, String, Vec<String>)>);
+
+impl SpelledDeps {
+    /// `deps` spelled for `registry`, which must hold every module the project
+    /// declares: that is all `Registry::parse` asks of the schema for a
+    /// reference with no external assumptions, so a shorthand is judged
+    /// ambiguous exactly when the project declares a module of that name. Owners and targets are in the order
+    /// of the reference type, which is also the order of the saved plan, and
+    /// an owner with no targets is dropped.
+    pub fn new(registry: &Registry<'_>, deps: &ObjectDeps) -> Self {
+        let mut entries: Vec<_> = deps
+            .0
+            .iter()
+            .filter(|(_, targets)| !targets.is_empty())
+            .map(|(owner, targets)| {
+                (
+                    owner.clone(),
+                    registry.spell(owner),
+                    targets.iter().map(|t| registry.spell(t)).collect(),
+                )
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        Self(entries)
+    }
+
+    /// [`SpelledDeps::new`] for a file alone: a project that declares nothing,
+    /// so no shorthand is ambiguous. For tests of one file's round trip; a
+    /// writer always has the project.
+    #[cfg(test)]
+    pub(crate) fn alone(deps: &ObjectDeps) -> Self {
+        Self::new(&Registry::new(&pbps_model::Schema::default()), deps)
+    }
+}
+
+/// Writes a file's `depends_on:` (DEC-2469.8), for every kind of root.
+///
+/// Only the root's own edges are the list form. Any other owner makes the
+/// whole key a map, the root's own edges then under its own reference, so a
+/// file reads back to exactly the entries it was written from. A file with no
+/// edges gets no key.
+pub(crate) fn render_depends_on(s: &mut String, root: &Root, deps: &SpelledDeps) {
+    let own = ObjectRef::whole(root.clone());
+    match deps.0.as_slice() {
+        [] => {}
+        [(owner, _, targets)] if *owner == own => {
+            let _ = writeln!(s, "depends_on: {}", seq(targets));
+        }
+        entries => {
+            s.push_str("depends_on:\n");
+            for (_, owner, targets) in entries {
+                let _ = writeln!(s, "  {}: {}", scalar(owner), seq(targets));
+            }
+        }
+    }
 }
 
 fn action(a: pbps_model::ReferentialAction) -> &'static str {
@@ -1125,6 +1184,7 @@ mod tests {
                 &partitions,
                 &t.intents,
                 t.strategy.as_ref(),
+                &Default::default(),
             )
         };
         let out = render_all(a);
@@ -1496,7 +1556,7 @@ mod tests {
                 render_module(
                     &back.id,
                     &back.module,
-                    &back.depends_on,
+                    &SpelledDeps::alone(&back.depends_on.deps),
                     back.public_execute
                 ),
                 out
@@ -1506,10 +1566,18 @@ mod tests {
                 description: Some(s.as_str().into()),
                 ..Default::default()
             };
-            let out = render_role(&pbps_model::RoleName::from("reader"), &role, &[]);
+            let out = render_role(
+                &pbps_model::RoleName::from("reader"),
+                &role,
+                &[],
+                &Default::default(),
+            );
             let back = crate::load_role_str(Path::new("r.yml"), &out).unwrap();
             assert_eq!(back.role, role, "role description: {s:?}");
-            assert_eq!(render_role(&back.name, &back.role, &back.intents), out);
+            assert_eq!(
+                render_role(&back.name, &back.role, &back.intents, &Default::default()),
+                out
+            );
         }
     }
 
@@ -1553,17 +1621,30 @@ mod tests {
             from: "old\rrole".into(),
             to: "role\nname".into(),
         }];
-        let out = render_role(&pbps_model::RoleName::from("role\nname"), &role, &pending);
+        let out = render_role(
+            &pbps_model::RoleName::from("role\nname"),
+            &role,
+            &pending,
+            &Default::default(),
+        );
         let back = crate::load_role_str(Path::new("r.yml"), &out).unwrap();
         assert_eq!(back.name, "role\nname".into());
         assert_eq!(back.intents, pending);
-        assert_eq!(render_role(&back.name, &back.role, &back.intents), out);
+        assert_eq!(
+            render_role(&back.name, &back.role, &back.intents, &Default::default()),
+            out
+        );
     }
 
     fn module_round_trip(yaml: &str) -> String {
         let a = crate::load_module_str(Path::new("m.yml"), yaml)
             .unwrap_or_else(|e| panic!("the original file failed to load: {e:?}"));
-        let out = render_module(&a.id, &a.module, &a.depends_on, a.public_execute);
+        let out = render_module(
+            &a.id,
+            &a.module,
+            &SpelledDeps::alone(&a.depends_on.deps),
+            a.public_execute,
+        );
         let b = crate::load_module_str(Path::new("m.yml"), &out).unwrap_or_else(|e| {
             panic!("the rewritten file does not read back: {e:?}\noutput:\n{out}")
         });
@@ -1572,7 +1653,12 @@ mod tests {
         assert_eq!(a.depends_on, b.depends_on, "output:\n{out}");
         assert_eq!(a.public_execute, b.public_execute, "output:\n{out}");
         assert_eq!(
-            render_module(&b.id, &b.module, &b.depends_on, b.public_execute),
+            render_module(
+                &b.id,
+                &b.module,
+                &SpelledDeps::alone(&b.depends_on.deps),
+                b.public_execute
+            ),
             out,
             "fmt is not idempotent"
         );
@@ -1592,6 +1678,7 @@ mod tests {
                 &pbps_model::RoleName::from(name),
                 &pbps_model::Role::default(),
                 &[],
+                &Default::default(),
             );
             let back = crate::load_role_str(Path::new("r.yml"), &out)
                 .unwrap_or_else(|e| panic!("the rendered file failed to load: {e:?}\n{out}"));
@@ -1608,6 +1695,7 @@ mod tests {
                 from: " was ".into(),
                 to: "kept".into(),
             }],
+            &Default::default(),
         );
         let back = crate::load_role_str(Path::new("r.yml"), &out)
             .unwrap_or_else(|e| panic!("the rendered file failed to load: {e:?}\n{out}"));
@@ -1625,6 +1713,7 @@ mod tests {
             &pbps_model::RoleName::from("   "),
             &pbps_model::Role::default(),
             &[],
+            &Default::default(),
         );
         assert!(
             crate::load_role_str(Path::new("r.yml"), &out).is_err(),
@@ -1654,7 +1743,12 @@ mod tests {
             .into(),
             ..Role::default()
         };
-        let out = render_role(&pbps_model::RoleName::from("writer"), &role, &[]);
+        let out = render_role(
+            &pbps_model::RoleName::from("writer"),
+            &role,
+            &[],
+            &Default::default(),
+        );
         assert!(!out.contains("serial-sequences"), "{out}");
         assert!(!out.contains("hidden"), "{out}");
         let loaded = crate::load_role_str(Path::new("r.yml"), &out).unwrap();
@@ -1675,7 +1769,12 @@ mod tests {
             ..Role::default()
         };
         assert_eq!(
-            render_role(&pbps_model::RoleName::from("writer"), &only, &[]),
+            render_role(
+                &pbps_model::RoleName::from("writer"),
+                &only,
+                &[],
+                &Default::default()
+            ),
             "role: writer\n"
         );
         assert!(
@@ -1701,7 +1800,12 @@ mod tests {
             one(pbps_model::Permission::Insert),
         );
 
-        let out = render_role(&pbps_model::RoleName::from("r"), &role, &[]);
+        let out = render_role(
+            &pbps_model::RoleName::from("r"),
+            &role,
+            &[],
+            &Default::default(),
+        );
         let back = crate::load_role_str(Path::new("r.yml"), &out)
             .unwrap_or_else(|e| panic!("the rendered file failed to load: {e:?}\n{out}"));
         assert_eq!(back.role.grants, role.grants, "output:\n{out}");
@@ -2527,7 +2631,14 @@ indexes:
         );
         // A partition with nothing of its own stays on one line.
         let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
-        let out = render_partitioned(&t.name, &t.table, &partitions, &[], None);
+        let out = render_partitioned(
+            &t.name,
+            &t.table,
+            &partitions,
+            &[],
+            None,
+            &Default::default(),
+        );
         assert!(
             out.contains("\n  ev_plain: {from: [\"2025-01-01\"], to: [MAXVALUE]}\n"),
             "{out}"
@@ -2568,7 +2679,14 @@ indexes:
             ["ev_u_fk"]
         );
         let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
-        let out = render_partitioned(&t.name, &t.table, &partitions, &[], None);
+        let out = render_partitioned(
+            &t.name,
+            &t.table,
+            &partitions,
+            &[],
+            None,
+            &Default::default(),
+        );
         assert!(
             out.contains("\n  ev_plain: {from: [\"2025-01-01\"], to: [MAXVALUE]}\n"),
             "{out}"
@@ -2623,7 +2741,14 @@ indexes:
         assert!(!own("ev_plain").unlogged && own("ev_plain").storage_parameters.is_empty());
         assert!(!t.table.unlogged && t.table.storage_parameters.is_empty());
         let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
-        let out = render_partitioned(&t.name, &t.table, &partitions, &[], None);
+        let out = render_partitioned(
+            &t.name,
+            &t.table,
+            &partitions,
+            &[],
+            None,
+            &Default::default(),
+        );
         assert!(
             out.contains("\n  ev_plain: {from: [\"2025-01-01\"], to: [MAXVALUE]}\n"),
             "{out}"
@@ -2679,7 +2804,14 @@ indexes:
         // The partition declares no column of its own.
         assert!(t.partitions.iter().all(|(_, p)| p.columns.is_empty()));
         let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
-        let out = render_partitioned(&t.name, &t.table, &partitions, &[], None);
+        let out = render_partitioned(
+            &t.name,
+            &t.table,
+            &partitions,
+            &[],
+            None,
+            &Default::default(),
+        );
         assert!(
             out.contains("\n    to: [\"2025-01-01\"]\n    columns:\n      v: {default: \"7\", nullable: false}\n"),
             "{out}"
@@ -2798,7 +2930,14 @@ indexes:
             ]
         );
         let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
-        let out = render_partitioned(&t.name, &t.table, &partitions, &[], None);
+        let out = render_partitioned(
+            &t.name,
+            &t.table,
+            &partitions,
+            &[],
+            None,
+            &Default::default(),
+        );
         assert!(
             out.contains("\npartition_by: [ts]\n\npartitions:\n  ev_old: {from: [MINVALUE], to: [\"2025-01-01\"]}\n  ev_rest: default\n  hist.ev_2026: {from: [\"2026-01-01\"], to: [MAXVALUE]}\n"),
             "{out}"
@@ -2859,6 +2998,7 @@ indexes:
                 &[(&child, &table)],
                 &[],
                 None,
+                &Default::default(),
             );
             let back = crate::load_table_str(Path::new("t.yml"), &out)
                 .unwrap_or_else(|e| panic!("{v:?}: {e:?}\n{out}"));
@@ -2964,7 +3104,14 @@ indexes:
         assert_eq!(written.partitions, reordered.partitions);
         let render_of = |t: &crate::LoadedTable| {
             let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
-            render_partitioned(&t.name, &t.table, &partitions, &[], None)
+            render_partitioned(
+                &t.name,
+                &t.table,
+                &partitions,
+                &[],
+                None,
+                &Default::default(),
+            )
         };
         assert_eq!(render_of(&written), render_of(&reordered));
         // Negative: another value is another bound.
@@ -3549,7 +3696,7 @@ mod strategy_tests {
         let path = Path::new("reader.yml");
         let yaml = "role: reader\ngrants:\n  sequence::app.orders.id: [usage, select, update]\n";
         let loaded = crate::load_role_str(path, yaml).unwrap();
-        let out = render_role(&loaded.name, &loaded.role, &[]);
+        let out = render_role(&loaded.name, &loaded.role, &[], &Default::default());
         assert!(
             out.contains("\"sequence::app.orders.id\": [select, update, usage]"),
             "{out}"

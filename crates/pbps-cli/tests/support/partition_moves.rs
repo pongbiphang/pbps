@@ -312,6 +312,7 @@ fn run_profile(
                     &parts,
                     &[],
                     None,
+                    &Default::default(),
                 ),
             )
             .unwrap();
@@ -442,7 +443,14 @@ fn run_profile(
             .collect();
         std::fs::write(
             p_file,
-            pbps_load::render_partitioned(&parent, &schema.tables[&parent], &parts, &[], None),
+            pbps_load::render_partitioned(
+                &parent,
+                &schema.tables[&parent],
+                &parts,
+                &[],
+                None,
+                &Default::default(),
+            ),
         )
         .unwrap();
         let rejected = d.run(&["validate"]);

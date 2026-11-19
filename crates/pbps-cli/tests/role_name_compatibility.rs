@@ -124,7 +124,7 @@ where
     let yaml = schema
         .roles
         .iter()
-        .map(|(name, role)| pbps_load::fmt::render_role(name, role, &pending))
+        .map(|(name, role)| pbps_load::fmt::render_role(name, role, &pending, &Default::default()))
         .collect::<Vec<_>>()
         .join("\n---\n");
     // Historical fixture paths use `/` on every host.

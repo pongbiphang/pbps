@@ -515,36 +515,13 @@ fn export(
             ));
         }
     }
-    // The exported tree can hold `depends_on:` of modules only. Dropping any
-    // other edge would write a tree that orders differently from the state it
-    // came from, so it is refused by name instead.
+    // Every kind of edge is written: each goes in the file of its owner.
     let deps = entry.snapshot.object_deps.to_deps();
-    if let Some(reference) = entry
-        .snapshot
-        .object_deps
-        .iter()
-        .flat_map(|edge| [&edge.owner, &edge.target])
-        .find(|reference| reference.module_id().is_none())
-    {
-        return Err(Refusal::new(
-            "state.export-annotation-not-writable",
-            format!(
-                "Entry #{} holds a dependency annotation on {}, and an exported tree can hold \
-                 module `depends_on:` only. Nothing was written.",
-                entry.id,
-                reference.shown()
-            ),
-        ));
-    }
     let schema = entry.snapshot.declared.overlay(&entry.snapshot.schema);
     let (stage, copies, files, removed, mut findings) = (|| -> anyhow::Result<_> {
         let stage = adopt::Stage::new("state-export")?;
-        let staged = adopt::write_declarations_with_deps(
-            stage.path(),
-            &schema,
-            &Default::default(),
-            &deps.modules(),
-        )?;
+        let staged =
+            adopt::write_declarations_with_deps(stage.path(), &schema, &Default::default(), &deps)?;
         let loaded = adopt::check_staged(stage.path(), dialect)?;
         let findings = adopt::refuse_policy_errors(project, &loaded, dialect)?;
         let copies: Vec<_> = staged
@@ -846,7 +823,7 @@ mod tests {
     }
 
     #[test]
-    fn state_history_export_writes_module_edges_and_refuses_another_kind_by_name() {
+    fn state_history_export_writes_every_kind_of_edge_and_the_tree_loads_back_to_it() {
         let (_stage, project, mut entry) = fixture("history-object-deps");
         let dialect = crate::dialect(&project).unwrap();
         for view in ["dbo.a", "dbo.b"] {
@@ -862,32 +839,90 @@ mod tests {
         }
         let edge =
             |owner: &str, target: &str| (owner.parse().unwrap(), [target.parse().unwrap()].into());
-        // An edge the tree cannot hold is refused by name and nothing is written.
-        entry.snapshot.object_deps = pbps_model::object_ref::ObjectEdges::from_deps(
-            &pbps_model::object_ref::ObjectDeps(vec![edge("module::dbo.a", "table::dbo.product")]),
-        )
-        .unwrap();
-        let error = export(&project, &entry, true, dialect.as_ref())
-            .err()
-            .unwrap();
-        assert_eq!(error.id, "state.export-annotation-not-writable");
-        assert!(
-            error.message.contains("table::dbo.product"),
-            "{}",
-            error.message
-        );
-        assert!(!project.schema_dir().exists());
-        // Negative: a module-to-module edge is written as `depends_on:`.
-        entry.snapshot.object_deps = pbps_model::object_ref::ObjectEdges::from_deps(
-            &pbps_model::object_ref::ObjectDeps(vec![edge("module::dbo.a", "module::dbo.b")]),
-        )
-        .unwrap();
+        // A view to a table, a table to a view, and a part of the table to a
+        // view: three kinds of owner, each written in the file that declares it.
+        let written = pbps_model::object_ref::ObjectDeps(vec![
+            edge("module::dbo.a", "table::dbo.product"),
+            edge("table::dbo.product", "module::dbo.b"),
+            edge("column::dbo.product.code", "module::dbo.b"),
+        ]);
+        entry.snapshot.object_deps =
+            pbps_model::object_ref::ObjectEdges::from_deps(&written).unwrap();
         assert!(export(&project, &entry, true, dialect.as_ref()).is_ok());
-        let written: String = std::fs::read_dir(project.schema_dir())
+        let files: String = std::fs::read_dir(project.schema_dir())
             .unwrap()
             .map(|file| std::fs::read_to_string(file.unwrap().path()).unwrap())
             .collect();
-        assert!(written.contains("depends_on: [dbo.b]"), "{written}");
+        assert!(
+            files.contains("depends_on: [\"table::dbo.product\"]"),
+            "{files}"
+        );
+        let loaded = pbps_load::load_schema_dir(&project.schema_dir()).unwrap();
+        let mut back = loaded.hints.annotations.declared.0;
+        back.sort();
+        let mut expected = written.0;
+        expected.sort();
+        assert_eq!(back, expected, "{files}");
+        // Negative: an edge no declaration holds has no file to be written in,
+        // and is refused rather than dropped.
+        let (_stage, project, mut entry) = fixture("history-object-deps-orphan");
+        entry.snapshot.object_deps =
+            pbps_model::object_ref::ObjectEdges::from_deps(&pbps_model::object_ref::ObjectDeps(
+                vec![edge("module::dbo.gone", "table::dbo.product")],
+            ))
+            .unwrap();
+        assert!(export(&project, &entry, true, dialect.as_ref()).is_err());
+        assert!(!project.schema_dir().exists());
+    }
+
+    /// A view `product` in the schema `table::dbo` makes the shorthand
+    /// `table::dbo.product` read as that view. The export must write the
+    /// structured escape, or the tree it stages is refused by its own loader.
+    #[test]
+    fn state_history_export_spells_an_edge_the_way_the_loader_reads_it_back() {
+        let view = |definition: &str| pbps_model::Module {
+            kind: pbps_model::ModuleKind::View,
+            definition: definition.into(),
+            description: None,
+            options: Default::default(),
+        };
+        let written = pbps_model::object_ref::ObjectDeps(vec![(
+            "module::dbo.a".parse().unwrap(),
+            ["table::dbo.product".parse().unwrap()].into(),
+        )]);
+        let exported = |label: &str, shadow: bool| {
+            let (_stage, project, mut entry) = fixture(label);
+            let dialect = crate::dialect(&project).unwrap();
+            let schema = &mut entry.snapshot.schema;
+            schema.modules.insert(
+                "dbo.a".parse().unwrap(),
+                view("SELECT code FROM dbo.product"),
+            );
+            if shadow {
+                schema
+                    .modules
+                    .insert("table::dbo.product".parse().unwrap(), view("SELECT 1"));
+            }
+            entry.snapshot.object_deps =
+                pbps_model::object_ref::ObjectEdges::from_deps(&written).unwrap();
+            export(&project, &entry, true, dialect.as_ref())
+                .unwrap_or_else(|e| panic!("{label}: {}", e.message));
+            let text: String = std::fs::read_dir(project.schema_dir())
+                .unwrap()
+                .map(|file| std::fs::read_to_string(file.unwrap().path()).unwrap())
+                .collect();
+            let loaded = pbps_load::load_schema_dir(&project.schema_dir()).unwrap();
+            assert_eq!(
+                loaded.hints.annotations.declared, written,
+                "{label}\n{text}"
+            );
+            text
+        };
+        let escaped = exported("history-spelling-ambiguous", true);
+        assert!(escaped.contains("object::"), "{escaped}");
+        // Negative: with no such view the same edge is the shorthand.
+        let plain = exported("history-spelling-plain", false);
+        assert!(plain.contains("table::dbo.product") && !plain.contains("object::"));
     }
 
     #[test]

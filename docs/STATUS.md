@@ -238,6 +238,10 @@ current snapshot version and cannot recover historical `public_execute`.
 
 All three intent channels now exist: the CLI commands, the YAML annotations, and
 the TTY prompt of SPEC 6.3.
+`depends_on:` takes every typed reference on a table, a module, a role, an enum
+and a domain, as a list or an owner map, and `pbps fmt`, `plan --since` and
+`state export` keep it (#2469 PR D, schema set 117). Part E, typed remedies for
+ordering refusals, is open.
 
 Phase 6 step 3: `pbps ui` serves local read views for environments, drift,
 saved plans, the ledger timeline and schema documentation/ERD. Open the complete
