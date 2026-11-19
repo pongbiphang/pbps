@@ -415,7 +415,7 @@ where
             .shift_remove("filegroup");
     }
     // #2469 PR D adds `depends_on:` to a table, a type and a role, and widens a module's
-    // from a list of names to a list or an owner map (schema set 110); the captured
+    // from a list of names to a list or an owner map (schema set 117); the captured
     // branches predate it.
     for dto in ["TableDto", "RoleDto", "EnumTypeDto", "DomainTypeDto"] {
         // `get_mut`, not an index: indexing a missing definition would insert it.
