@@ -42,6 +42,17 @@ fn ledger_name(what: &str) -> DialectError {
     ))
 }
 
+/// The refusal of a name kept for a rename's middle step: a table renamed to
+/// its own name in another ASCII case passes through `__pbps_rename_<uid>`, and
+/// the step fails if anything holds that name.
+pub(crate) fn intermediate_name(what: &str) -> DialectError {
+    invalid(format!(
+        "{what} starts with `{}`, which this tool keeps for the name a table holds while it is \
+         renamed to its own name in another case; choose another name",
+        names::RENAME_PREFIX
+    ))
+}
+
 pub(crate) fn unsupported(feature: impl Into<String>) -> DialectError {
     DialectError::Unsupported {
         dialect: DIALECT,
@@ -75,6 +86,9 @@ fn object(kind: &str, schema: &str, local: &str, shown: &str, found: &mut Vec<Di
     }
     if names::is_ledger(local) {
         found.push(ledger_name(&format!("the {kind} `{shown}`")));
+    }
+    if names::is_intermediate(local) {
+        found.push(intermediate_name(&format!("the {kind} `{shown}`")));
     }
 }
 
@@ -321,6 +335,9 @@ pub(crate) fn index_errors(
     }
     if names::is_ledger(index.raw()) {
         found.push(ledger_name(&what));
+    }
+    if names::is_intermediate(index.raw()) {
+        found.push(intermediate_name(&what));
     }
     let mut keys = Vec::new();
     for key in &def.columns {
@@ -1735,6 +1752,36 @@ mod tests {
                 expression(text)
             };
             assert!(taken, "{text} is structure this check takes");
+        }
+    }
+
+    /// A case-only rename passes through `__pbps_rename_<uid>`, and SQLite
+    /// refuses that step when a table, a view or an index holds the name. No
+    /// declared object may therefore start with the prefix, in any case.
+    #[test]
+    fn a_name_kept_for_a_rename_s_middle_step_is_refused() {
+        // The engine's side: each holder of the name blocks the step.
+        for holder in [
+            "CREATE TABLE __pbps_rename_x(a)",
+            "CREATE VIEW __PBPS_RENAME_x AS SELECT 1",
+            "CREATE TABLE o(c); CREATE INDEX __pbps_rename_x ON o(c)",
+        ] {
+            let step = "; CREATE TABLE t(a); ALTER TABLE main.t RENAME TO __pbps_rename_x";
+            assert!(accepts(holder), "{holder}");
+            assert!(!accepts(&[holder, step].concat()), "{holder}");
+        }
+        for name in ["__pbps_rename_x", "__PBPS_RENAME_", "__Pbps_Rename_tbl_1"] {
+            assert!(!self::table(&TableName::new("main", name), &base()).is_empty());
+            let mut table = base();
+            table.indexes.insert(name.into(), index(&["c"]));
+            assert!(!errors(&table).is_empty(), "an index named {name}");
+        }
+        // Negative: near the prefix, and the prefix inside a name.
+        for name in ["__pbps_rename", "__pbps_renamed", "x__pbps_rename_x"] {
+            assert!(self::table(&TableName::new("main", name), &base()).is_empty());
+            let mut table = base();
+            table.indexes.insert(name.into(), index(&["c"]));
+            assert!(errors(&table).is_empty(), "an index named {name}");
         }
     }
 

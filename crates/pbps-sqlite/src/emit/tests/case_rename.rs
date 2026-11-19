@@ -59,9 +59,15 @@ fn a_case_only_rename_is_two_statements_through_a_name_of_the_tables_own() {
 }
 
 #[test]
-fn the_intermediate_name_is_one_no_rule_of_this_crate_refuses() {
+fn the_intermediate_name_is_kept_from_declarations_and_taken_by_the_engine() {
     let name = inter();
-    assert!(name.starts_with("__pbps_"));
+    assert!(crate::names::is_intermediate(&name));
+    assert!(
+        crate::validate::table(&TableName::new("main", name.as_str()), &Default::default())
+            .iter()
+            .any(|error| error.to_string().contains(crate::names::RENAME_PREFIX)),
+        "a declared table cannot take {name}"
+    );
     assert!(
         !crate::names::is_ledger(&name),
         "{name} is not one of the ledger's tables"

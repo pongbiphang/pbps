@@ -170,11 +170,12 @@ fn foreign_key_clause(
 }
 
 /// The name a table holds between the two statements of a case-only rename.
-/// The identity makes it the table's own; it starts `__pbps_`, which is not a
-/// ledger name and which no declaration is refused for, and SQLite refuses the
-/// first statement, atomically, if any table, view or index already holds it.
+/// The identity makes it the table's own, and no declared table, view or index
+/// may start with the prefix (`validate`), so nothing this tool manages holds
+/// it. An object the declarations do not know of still can: SQLite then
+/// refuses the first statement, atomically.
 pub(super) fn intermediate(uid: &Uid, schema: &str) -> TableName {
-    TableName::new(schema, ["__pbps_rename_", uid.as_str()].concat())
+    TableName::new(schema, [names::RENAME_PREFIX, uid.as_str()].concat())
 }
 
 /// A rename. The new name is written bare (`RENAME TO main.u` is a syntax
@@ -188,9 +189,12 @@ fn rename(uid: &Uid, from: &TableName, to: &TableName, defaults: &[pbps_model::C
             "renaming the generated default constraints of a table, which are SQL Server's",
         ));
     }
-    if names::is_ledger(&to.name) || ident::has_reserved_prefix(&to.name) {
+    if names::is_ledger(&to.name)
+        || names::is_intermediate(&to.name)
+        || ident::has_reserved_prefix(&to.name)
+    {
         return Err(unsupported(format!(
-            "naming a table `{}`: the name is SQLite's or the ledger's own",
+            "naming a table `{}`: the name is SQLite's or this tool's own",
             to.shown()
         )));
     }
