@@ -6176,6 +6176,12 @@ answers the questions apart.
   `varchar(10)` to `varchar(20)` moves no value and is `Safe`, but it is still a
   change of declaration and is planned as one. Two names of one affinity are
   also two types (`varchar` and `text`), and a change between them is `Safe`.
+- **A change of affinity is `Narrowing`, except into `blob`.** Integer and
+  numeric store alike, so a change between them is `Safe`. Any other change
+  converts what the column holds (a number becomes text, `0012` becomes 12).
+  A `blob` column converts nothing, so a change into it keeps every value and
+  its class from any affinity and is `Safe`; out of it is `Narrowing`. Both
+  directions are measured by a copy on the engine.
 - **One alias table, for spellings that cannot differ in effect:** `double
   precision` is `double`, `character varying` and `varying character` are
   `varchar`, `native character` is `nchar`. Each pair has one affinity, is

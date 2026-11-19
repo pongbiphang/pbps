@@ -424,8 +424,10 @@ pub fn strict_allows(ty: &ColumnType) -> bool {
 ///   note, not this gate.
 /// - Same storage behaviour (`Integer` and `Numeric` store alike; any two
 ///   names of one other affinity): `Safe`.
+/// - Into `blob` affinity, from any other: `Safe`. Such a column converts
+///   nothing, so each value keeps its value and class.
 /// - Any other change of affinity rewrites stored values (a number becomes
-///   text, `0012` becomes 12): `Narrowing`.
+///   text, `0012` becomes 12): `Narrowing`. That includes out of `blob`.
 #[must_use]
 pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
     let (Ok(from), Ok(to)) = (normalize(from), normalize(to)) else {
@@ -444,7 +446,10 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
         Affinity::Blob => Affinity::Blob,
         Affinity::Real => Affinity::Real,
     };
-    if storage(&from) == storage(&to) {
+    // A `blob` column converts nothing, so every value arrives as it was,
+    // whatever it came from (measured). Out of one is not the same: the
+    // target's affinity converts what the column held.
+    if storage(&from) == storage(&to) || affinity_of(&to) == Affinity::Blob {
         TypeChangeRisk::Safe
     } else {
         TypeChangeRisk::Narrowing
@@ -1252,7 +1257,17 @@ mod tests {
         assert_eq!(risk("text", "int"), Narrowing, "`0012` becomes 12");
         assert_eq!(risk("real", "numeric"), Narrowing);
         assert_eq!(risk("numeric", "real"), Narrowing);
-        assert_eq!(risk("text", "blob"), Narrowing);
+        // Into `blob` nothing is converted, from any affinity; out of it the
+        // target's affinity converts what the column held.
+        for from in ["text", "int", "numeric", "real", "uuid"] {
+            assert_eq!(
+                risk(from, "blob"),
+                Safe,
+                "{from} into blob keeps every value"
+            );
+        }
+        assert_eq!(risk("blob", "text"), Narrowing, "a number becomes text");
+        assert_eq!(risk("blob", "int"), Narrowing, "`12` becomes a number");
         // A type that does not normalize is never `Safe`, in either position.
         assert_eq!(risk("serial", "int"), Incompatible);
         assert_eq!(risk("int", "serial"), Incompatible);
@@ -1267,6 +1282,58 @@ mod tests {
     /// The rowid claim, rebuilt by hand on the engine in both directions, for a
     /// key column and a column that is not a key: create the new table, copy,
     /// compare values, storage classes and NULL counts.
+    /// `(typeof, quote)` of each row of a table.
+    type Stored = Vec<(String, String)>;
+
+    /// What a copy into a column of another type does to the values: the rows
+    /// before and after.
+    fn copied(from: &str, to: &str) -> (Stored, Stored) {
+        let mut fresh = mem();
+        let c = fresh.connection();
+        let ddl = [
+            "CREATE TABLE a(n integer primary key, c ",
+            from,
+            "); CREATE TABLE b(n integer primary key, c ",
+            to,
+            "); INSERT INTO a(c) VALUES ('12'), (5), (5.5), ('abc'), ('0012'), (x'00ff'), (NULL); \
+             INSERT INTO b SELECT * FROM a",
+        ]
+        .concat();
+        c.execute_batch(&ddl).expect("copy");
+        let read = |table: &str| {
+            c.query(
+                &["SELECT typeof(c), quote(c) FROM ", table, " ORDER BY n"].concat(),
+                &[],
+            )
+            .expect("read")
+            .iter()
+            .map(|row| {
+                (
+                    row.text(0).expect("typeof").to_owned(),
+                    row.text(1).expect("quote").to_owned(),
+                )
+            })
+            .collect::<Vec<_>>()
+        };
+        (read("a"), read("b"))
+    }
+
+    /// The engine's answer behind the `blob` rows of the risk table: a copy
+    /// into a `blob` column keeps every value and its class, from every
+    /// affinity; a copy out of one does not.
+    #[test]
+    fn a_copy_into_blob_keeps_every_value_and_out_of_it_does_not() {
+        for from in ["text", "int", "numeric", "real", "uuid"] {
+            let (before, after) = copied(from, "blob");
+            assert_eq!(before, after, "{from} into blob");
+        }
+        // Negative: the comparison does see a conversion.
+        let (before, after) = copied("blob", "text");
+        assert_ne!(before, after, "blob into text turns numbers into text");
+        let (before, after) = copied("blob", "int");
+        assert_ne!(before, after, "blob into int turns `12` into a number");
+    }
+
     #[test]
     fn a_rebuild_into_the_rowid_changes_values_and_out_of_it_does_not() {
         fn count(c: &pbps_db::sqlite::Connection, sql: &str) -> i64 {
