@@ -5427,9 +5427,10 @@ Acceptance criteria for that slice:
    tells builds apart. Before the first release a change moves the fingerprint
    and nothing else, and the checked-in copies under `schemas/` must be
    regenerated. After a release the number stays the released one while the
-   fingerprint does, and becomes the released number plus one once the
-   fingerprint changes; a test fails a change that forgets it. A release archives the complete
-   set under `published-schemas/released/<n>/` and never rewrites an archive;
+   fingerprint is unchanged, and becomes the released number plus one once
+   the fingerprint changes; a test fails a change that forgets it. A release
+   archives the complete set under `published-schemas/released/<n>/` and
+   never rewrites an archive;
    the numbered directories from before are history and stay unchanged. This is
    separate from the envelope's wire version (§9.8) and saved-plan or state
    formats. Version 10 established the earlier per-change rule for the
