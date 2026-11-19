@@ -6,13 +6,14 @@
 //! answers. The binding calls below hand the PostgreSQL adapter the managed
 //! declarations and return its comparison; nothing here seals evidence.
 
-use super::scratch::{Provenance, Provisioning, Tokens};
-use super::{BindingRequest, Error, ProduceError, ScopeRequest};
+use super::scratch::Provisioning;
+use super::{BindingRequest, Error, ProduceError};
+use crate::resolver::contract::ResolverEngine;
 use crate::resolver::scope;
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
 use pbps_db::resolver::capture::{Assessment, CaptureDifference, CaptureError};
 use pbps_db::resolver::environment::CatalogFacts;
-use pbps_db::{Conn, DbError, Driver};
+use pbps_db::{Conn, Driver};
 use pbps_model::Hints;
 use pbps_model::resolver::{InputManifest, OutsideWrites, SurfaceResolution};
 
@@ -103,27 +104,26 @@ impl PlanningDialect for pbps_mssql::Mssql {
     }
 }
 
-/// The standard is engine-owned; the PostgreSQL conversion keeps callers of
-/// the supplied-server API from having to construct adapter state themselves.
-#[derive(Clone)]
-pub enum Standard {
-    Postgres(pbps_pg::resolver::standard::Standard),
-    Mssql,
-}
+/// The standard the scratch is put into, for the engine the dialect names. A
+/// standard for another engine is a type error, not a runtime refusal:
+///
+/// ```compile_fail
+/// use pbps_cli::resolver::server::scratch::Standard;
+/// fn for_sql_server(_: Standard<pbps_mssql::Mssql>) {}
+/// for_sql_server(pbps_pg::resolver::standard::Standard::default());
+/// ```
+///
+/// Each engine's own standard is the type its adapter holds:
+///
+/// ```
+/// use pbps_cli::resolver::server::scratch::Standard;
+/// fn for_postgres(_: Standard<pbps_pg::Postgres>) {}
+/// for_postgres(pbps_pg::resolver::standard::Standard::default());
+/// let _: Standard<pbps_mssql::Mssql> = ();
+/// ```
+pub type Standard<D> = <<D as PlanningDialect>::Resolver as ResolverEngine>::Standard;
 
-impl From<&pbps_pg::resolver::standard::Standard> for Standard {
-    fn from(value: &pbps_pg::resolver::standard::Standard) -> Self {
-        Self::Postgres(value.clone())
-    }
-}
-
-impl From<&Standard> for Standard {
-    fn from(value: &Standard) -> Self {
-        value.clone()
-    }
-}
-
-pub(super) enum Scratch<'a> {
+pub enum Scratch<'a> {
     Postgres(Box<postgres::Scratch<'a>>),
     Mssql(Box<mssql::Scratch<'a>>),
 }
@@ -148,99 +148,12 @@ pub(super) enum CapturedInputs {
     Mssql(pbps_mssql::resolver::capture::CapturedInputs),
 }
 
-pub fn declared_standard(
-    driver: Driver,
+/// The standard an entry declares, or the refusal of one the engine cannot
+/// hold.
+pub fn declared_standard<D: PlanningDialect>(
     declared: Option<&pbps_config::resolver::ScratchStandard>,
-) -> Result<Standard, Error> {
-    match driver {
-        Driver::Postgres => Ok(Standard::Postgres(postgres::declared_standard(declared))),
-        Driver::Mssql if declared.is_none() => Ok(Standard::Mssql),
-        Driver::Mssql => Err(Error::Unusable(
-            "SQL Server scratch does not accept a PostgreSQL standard declaration".into(),
-        )),
-    }
-}
-
-/// The string the scratch server is reached by for this run. An ordinary
-/// string is itself; a SQL Server `(localdb)` selector is resolved to the pipe
-/// its instance listens on now, once, so that every connection of the run
-/// opens the same endpoint and a pipe that has gone is a failure rather than a
-/// reason to look again (DEC-2271.2).
-pub(super) async fn endpoint(driver: Driver, connection: &str) -> Result<String, ProduceError> {
-    match driver {
-        Driver::Postgres => Ok(connection.to_owned()),
-        Driver::Mssql => mssql::endpoint(connection).await,
-    }
-}
-
-/// The scratch session that stays open for the whole run: named by the run's
-/// token from its first packet, acting as itself, and told to let the server
-/// notice if its client vanishes (#2410).
-pub(super) async fn connect_scratch(
-    driver: Driver,
-    scratch: &str,
-    tokens: &Tokens,
-) -> Result<Conn, ProduceError> {
-    let mut admin = Conn::connect_named(driver, scratch, &format!("pbps-{}", tokens.scratch))
-        .await
-        .map_err(|error| ProduceError::Acquire(format!("the scratch server: {error}")))?;
-    if driver == Driver::Postgres {
-        postgres::reset_role(&mut admin).await?;
-        postgres::keep(&mut admin).await?;
-    }
-    Ok(admin)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn scratch<'a>(
-    driver: Driver,
-    target: &mut Conn,
-    admin: &mut Conn,
-    tokens: &Tokens,
-    planned_identity: &str,
-    scratch: &'a str,
-    request: &'a ScopeRequest,
-    standard: &'a Standard,
-    externals: Option<&'a str>,
-    provenance: &'a Provenance,
-) -> Result<(Provisioning, Scratch<'a>), ProduceError> {
-    match (driver, standard) {
-        (Driver::Postgres, Standard::Postgres(standard)) => {
-            let (provisioning, scratch) = postgres::scratch(
-                driver,
-                target,
-                admin,
-                tokens,
-                planned_identity,
-                scratch,
-                request,
-                standard,
-                externals,
-                provenance,
-            )
-            .await?;
-            Ok((provisioning, Scratch::Postgres(Box::new(scratch))))
-        }
-        (Driver::Mssql, Standard::Mssql) => {
-            let (provisioning, scratch) = mssql::scratch(
-                target,
-                admin,
-                tokens,
-                planned_identity,
-                scratch,
-                externals,
-                request,
-                provenance,
-            )
-            .await?;
-            Ok((provisioning, Scratch::Mssql(Box::new(scratch))))
-        }
-        (Driver::Mssql, Standard::Postgres(_)) | (Driver::Postgres, Standard::Mssql) => {
-            Err(ProduceError::Run(Error::Unusable(
-                "scratch standard and engine disagree".into(),
-            )))
-        }
-    }
+) -> Result<Standard<D>, Error> {
+    <D::Resolver as ResolverEngine>::standard(declared)
 }
 
 impl Scratch<'_> {
@@ -678,13 +591,6 @@ impl CompiledCapture {
     }
 }
 
-pub(super) async fn target_identity(driver: Driver, target: &mut Conn) -> Result<String, DbError> {
-    match driver {
-        Driver::Postgres => postgres::target_identity(target).await,
-        Driver::Mssql => pbps_mssql::resolver::scratch::cluster_identity(target).await,
-    }
-}
-
 pub(super) async fn recapture(
     target: &mut Conn,
     current: &CapturedInputs,
@@ -697,20 +603,15 @@ pub(super) async fn recapture(
     }
 }
 
-pub(super) fn ordinary(
-    driver: Driver,
+pub(super) fn ordinary<D: PlanningDialect>(
     base: pbps_diff::Side<'_>,
     desired: pbps_diff::Side<'_>,
     hints: &Hints,
     extras: &[String],
 ) -> Result<pbps_diff::order::DiffPlan, Error> {
-    match driver {
-        Driver::Postgres => postgres::ordinary(base, desired, hints, extras),
-        Driver::Mssql => pbps_diff::resolver::ordinary(base, desired, &pbps_mssql::Mssql, hints)
-            .map_err(|errors| {
-                Error::Binding(format!("ordinary typed plan cannot be formed: {errors:?}"))
-            }),
-    }
+    pbps_diff::resolver::ordinary(base, desired, &D::configured(extras, None), hints).map_err(
+        |errors| Error::Binding(format!("ordinary typed plan cannot be formed: {errors:?}")),
+    )
 }
 
 impl Binding {

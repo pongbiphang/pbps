@@ -133,7 +133,9 @@ pub async fn run<D: crate::emission::Engine + pbps_cli::resolver::server::Planni
         );
     }
     let driver = conn.driver();
-    let identity = match crate::resolution::planning_identity(conn, entry.selection()).await {
+    let identity = match crate::resolution::planning_identity(plan.dialect, conn, entry.selection())
+        .await
+    {
         Ok(Some(identity)) => identity,
         Ok(None) => anyhow::bail!("the planning read recorded no cluster identity to bind"),
         Err(Refused::Finding(finding)) => {
@@ -181,7 +183,7 @@ pub async fn run<D: crate::emission::Engine + pbps_cli::resolver::server::Planni
         base: plan.base.schema,
     };
     let open = entry
-        .open(driver, &identity)
+        .open::<D>(&identity)
         .await
         .map_err(|refused| match refused {
             Refused::Finding(finding) => anyhow::anyhow!("{}", finding.message),
@@ -191,8 +193,7 @@ pub async fn run<D: crate::emission::Engine + pbps_cli::resolver::server::Planni
         .session_zone()
         .cloned()
         .unwrap_or_else(pbps_model::SessionZone::utc);
-    let ran = with_session(
-        driver,
+    let ran = with_session::<D, _, _>(
         &open.connection,
         target.connection(),
         &identity,

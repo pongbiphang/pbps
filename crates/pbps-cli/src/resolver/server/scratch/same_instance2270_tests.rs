@@ -1,6 +1,7 @@
 //! The live marker, rather than URL spelling, decides where file consent applies.
 
 use super::*;
+use crate::resolver::server::scratch::engines::{MssqlEngine, ResolverEngine};
 use pbps_model::resolver::{OutsideWrites, SameInstance};
 
 fn policy(same_instance: SameInstance) -> Provenance {
@@ -140,9 +141,8 @@ async fn automatic_externals(default: &'static str) {
         let p = policy(SameInstance::Refused);
         let identity = sql::cluster_identity(&mut target).await.unwrap();
         let mut admin = connection(&scratch_url).await;
-        let (provisioning, mut state) = super::super::engine::scratch(
-            Driver::Mssql, &mut target, &mut admin, &tokens, &identity, &scratch_url,
-            &request, &Standard::Mssql, None, &p,
+        let (provisioning, mut state) = MssqlEngine::acquire(&mut target, &mut admin, &tokens, &identity, &scratch_url,
+            &request, &(), None, &p,
         ).await.unwrap();
         assert_eq!(provisioning, super::super::Provisioning::Supplied);
         let (catalog, authorization) = crate::resolver::scope::read_target(

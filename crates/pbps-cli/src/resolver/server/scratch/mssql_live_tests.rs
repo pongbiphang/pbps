@@ -1,8 +1,9 @@
 //! SQL Server's acquisition boundary, exercised through the shared producer.
 
 use super::super::{BindingRequest, Error, ProduceError, Unsealed};
+use super::Provenance;
 use super::fixtures::{ENVIRONMENT, KEY_LINE, ProjectKey};
-use super::{Provenance, Standard};
+use crate::resolver::server::scratch::engines::{MssqlEngine, ResolverEngine};
 use pbps_db::{Conn, Driver};
 use pbps_model::{Hints, IdsFile, Schema};
 use pbps_mssql::resolver::scratch as sql;
@@ -329,7 +330,6 @@ async fn declared_outcome(
     let run = begin(target, declared).await;
     let (base, desired) = run.sides(declared);
     super::produce_unsealed::<pbps_mssql::Mssql>(
-        Driver::Mssql,
         scratch,
         target,
         &run.identity,
@@ -340,7 +340,7 @@ async fn declared_outcome(
         &[],
         &run.key.project,
         Some(ENVIRONMENT),
-        Standard::Mssql,
+        &(),
         externals,
         provenance,
     )
@@ -365,7 +365,6 @@ async fn declared_plan(
     let run = begin(target, declared).await;
     let (base, desired) = run.sides(declared);
     let plan = super::produce::<pbps_mssql::Mssql>(
-        Driver::Mssql,
         scratch,
         target,
         planned_identity.unwrap_or(&run.identity),
@@ -376,7 +375,7 @@ async fn declared_plan(
         &[],
         &run.key.project,
         Some(ENVIRONMENT),
-        Standard::Mssql,
+        &(),
         None,
         &provenance(),
     )
@@ -642,8 +641,7 @@ async fn mssql_docker_acquisition_runs_once_and_releases_the_container() {
     let hostname = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
     let recorded = hostname.clone();
     let target_for_run = target.clone();
-    super::container::with_container(
-        Driver::Mssql,
+    super::container::with_container::<pbps_mssql::Mssql, _>(
         &target,
         &identity,
         &image,
@@ -737,7 +735,8 @@ async fn mssql_supplied_cleanup_names_the_retained_sandbox_after_failure() {
         pbps_diff::resolver::ordinary(side, side, &pbps_mssql::Mssql, &Hints::default())
             .expect("an empty SQL Server schema has an empty ordinary plan");
     let request =
-        super::super::producer::request(Driver::Mssql, side, side, &Hints::default(), &[]).unwrap();
+        super::super::producer::request::<pbps_mssql::Mssql>(side, side, &Hints::default(), &[])
+            .unwrap();
     for missing_marker in [false, true] {
         let (database, on) = create_database(&primary).await;
         let outcome: Result<_, pbps_db::DbError> = async {
@@ -746,15 +745,14 @@ async fn mssql_supplied_cleanup_names_the_retained_sandbox_after_failure() {
             let identity = sql::cluster_identity(&mut target).await?;
             let tokens = super::Tokens::generate();
             let provenance = provenance();
-            let (provisioning, mut state) = super::engine::scratch(
-                Driver::Mssql,
+            let (provisioning, mut state) = MssqlEngine::acquire(
                 &mut target,
                 &mut admin,
                 &tokens,
                 &identity,
                 &on,
                 &request,
-                &Standard::Mssql,
+                &(),
                 None,
                 &provenance,
             )
@@ -1068,8 +1066,7 @@ async fn mssql_docker_removes_the_container_on_success_failure_and_cancellation(
     for fails in [false, true] {
         let name = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
         let observed = name.clone();
-        let result = super::container::with_container(
-            Driver::Mssql,
+        let result = super::container::with_container::<pbps_mssql::Mssql, _>(
             &target,
             &identity,
             &image,
@@ -1104,8 +1101,7 @@ async fn mssql_docker_removes_the_container_on_success_failure_and_cancellation(
     }
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
-        super::container::with_container(
-            Driver::Mssql,
+        super::container::with_container::<pbps_mssql::Mssql, _>(
             &target,
             &identity,
             &image,
@@ -1382,7 +1378,7 @@ async fn mssql_prepare_renders_missing_external_and_returns_entered_compile_conn
         let provenance=provenance();
         let identity=sql::cluster_identity(&mut target).await.unwrap();
         let mut admin=connection(&scratch_server).await;
-        let (provisioning,mut state)=super::engine::scratch(Driver::Mssql,&mut target,&mut admin,&tokens,&identity,&scratch_server,&request,&Standard::Mssql,file,&provenance).await.unwrap();
+        let (provisioning,mut state)=MssqlEngine::acquire(&mut target,&mut admin,&tokens,&identity,&scratch_server,&request,&(),file,&provenance).await.unwrap();
         let (catalog,authorization)=crate::resolver::scope::read_target(&mut target,Driver::Mssql,&request.schemas,&[],&request.schemas,&[]).await.unwrap();
         let prepared=state.prepare(provisioning,&mut admin,&mut target,&catalog,&authorization,&request.schemas,&binding,&[], Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key())).await;
         let verification=tokio::spawn(async move { match prepared {
@@ -1441,9 +1437,8 @@ async fn mssql_supplied_type_permissions_release_to_empty_inventory() {
         let provenance = provenance();
         let identity = sql::cluster_identity(&mut target).await.unwrap();
         let mut admin = connection(&scratch_url).await;
-        let (provisioning, mut state) = super::engine::scratch(
-            Driver::Mssql, &mut target, &mut admin, &tokens, &identity, &scratch_url,
-            &request, &Standard::Mssql, None, &provenance,
+        let (provisioning, mut state) = MssqlEngine::acquire(&mut target, &mut admin, &tokens, &identity, &scratch_url,
+            &request, &(), None, &provenance,
         ).await.unwrap();
         assert_eq!(provisioning, super::Provisioning::Supplied);
         let (catalog, authorization) = crate::resolver::scope::read_target(
@@ -1519,15 +1514,14 @@ async fn mssql_a_reconnect_to_a_differing_backend_refuses_and_an_equal_one_does_
         let provenance = provenance();
         let identity = sql::cluster_identity(&mut target).await.unwrap();
         let mut admin = connection(&scratch_url).await;
-        let (provisioning, mut state) = super::engine::scratch(
-            Driver::Mssql,
+        let (provisioning, mut state) = MssqlEngine::acquire(
             &mut target,
             &mut admin,
             &tokens,
             &identity,
             &scratch_url,
             &request,
-            &Standard::Mssql,
+            &(),
             None,
             &provenance,
         )

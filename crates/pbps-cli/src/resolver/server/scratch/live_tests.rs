@@ -227,8 +227,7 @@ async fn produce_planned_on(
     key: &ProjectKey,
     standard: &Standard,
 ) -> Result<ResolvedPlan, ProduceError> {
-    super::produce(
-        Driver::Postgres,
+    super::produce::<pbps_pg::Postgres>(
         scratch,
         target,
         planned_identity,
@@ -1821,8 +1820,7 @@ async fn resolver_run_owned_keeps_what_the_reproduction_put_on_its_database() {
         Standard::default(),
     ] {
         answers.push(
-            super::produce(
-                Driver::Postgres,
+            super::produce::<pbps_pg::Postgres>(
                 &scratch.server,
                 &target_url,
                 &identity,
@@ -1973,8 +1971,7 @@ async fn produce_filled(
     let identity = pbps_pg::resolver::scratch::cluster_identity(&mut planning)
         .await
         .unwrap();
-    super::produce(
-        Driver::Postgres,
+    super::produce::<pbps_pg::Postgres>(
         scratch,
         target,
         &identity,
@@ -2004,8 +2001,7 @@ async fn produce_with_extras(
     let identity = pbps_pg::resolver::scratch::cluster_identity(&mut planning)
         .await
         .unwrap();
-    super::produce(
-        Driver::Postgres,
+    super::produce::<pbps_pg::Postgres>(
         scratch,
         target,
         &identity,
@@ -4684,15 +4680,13 @@ async fn produce_in_docker(
         outside_writes,
         same_instance: pbps_model::resolver::SameInstance::NotApplicable,
     };
-    super::container::with_container(
-        Driver::Postgres,
+    super::container::with_container::<pbps_pg::Postgres, _>(
         target,
         &identity,
         image,
         pull,
         async |scratch: &str| {
-            super::produce(
-                Driver::Postgres,
+            super::produce::<pbps_pg::Postgres>(
                 scratch,
                 target,
                 &identity,
@@ -4724,8 +4718,7 @@ async fn resolver_docker_starts_and_removes_its_container_without_root() {
         let (target, image) = (setting(target), setting(image));
         let identity = identity_of(&target).await;
         let before = scratch_containers();
-        let during = super::container::with_container(
-            Driver::Postgres,
+        let during = super::container::with_container::<pbps_pg::Postgres, _>(
             &target,
             &identity,
             &image,
@@ -4763,19 +4756,19 @@ async fn resolver_docker_removes_its_container_when_the_run_fails() {
         let before = scratch_containers();
         let mut ran = false;
         let mut volumes = Vec::new();
-        let result: Result<(), ProduceError> = super::container::with_container(
-            Driver::Postgres,
-            &target,
-            &identity,
-            &image,
-            Default::default(),
-            async |_: &str| {
-                ran = true;
-                volumes = new_container_volumes(&before);
-                Err(ProduceError::Run(Error::Binding("a failed run".into())))
-            },
-        )
-        .await;
+        let result: Result<(), ProduceError> =
+            super::container::with_container::<pbps_pg::Postgres, _>(
+                &target,
+                &identity,
+                &image,
+                Default::default(),
+                async |_: &str| {
+                    ran = true;
+                    volumes = new_container_volumes(&before);
+                    Err(ProduceError::Run(Error::Binding("a failed run".into())))
+                },
+            )
+            .await;
         assert!(ran, "the run was reached");
         for volume in &volumes {
             assert!(
@@ -4805,8 +4798,7 @@ async fn resolver_docker_removes_its_container_when_the_run_is_cancelled() {
     let identity = identity_of(&target).await;
     let before = scratch_containers();
     let (started, running) = tokio::sync::oneshot::channel();
-    let run = super::container::with_container(
-        Driver::Postgres,
+    let run = super::container::with_container::<pbps_pg::Postgres, _>(
         &target,
         &identity,
         &image,
@@ -4848,8 +4840,7 @@ async fn resolver_docker_names_a_volume_its_removal_left() {
     let before = scratch_containers();
     let holder = format!("pbps-v1674-holder-{:016x}", rand::random::<u64>());
     let mut volumes = Vec::new();
-    let result = super::container::with_container(
-        Driver::Postgres,
+    let result = super::container::with_container::<pbps_pg::Postgres, _>(
         &target,
         &identity,
         &image,
@@ -5121,8 +5112,7 @@ async fn resolver_externals_outside_writes_allow_keeps_a_created_role() {
         let target_db = staging_target(&mut target, &guarded_target()).await;
         let target_url = target.on(&target_db);
         let identity = identity_of(&target_url).await;
-        let result = super::produce(
-            Driver::Postgres,
+        let result = super::produce::<pbps_pg::Postgres>(
             &scratch.server,
             &target_url,
             &identity,
@@ -5189,8 +5179,7 @@ async fn resolver_supplied_externals_outside_writes_allow_keeps_the_logins_own_d
         let key = ProjectKey::new(true);
         let target_url = fixture.on(&target_db);
         let identity = identity_of(&target_url).await;
-        let result = super::produce(
-            Driver::Postgres,
+        let result = super::produce::<pbps_pg::Postgres>(
             &fixture.as_login(&scratch_db, &login),
             &target_url,
             &identity,
@@ -5255,8 +5244,7 @@ async fn produce_unsealed(
     let identity = pbps_pg::resolver::scratch::cluster_identity(&mut planning)
         .await
         .unwrap();
-    let result = super::produce_unsealed(
-        Driver::Postgres,
+    let result = super::produce_unsealed::<pbps_pg::Postgres>(
         scratch,
         target,
         &identity,

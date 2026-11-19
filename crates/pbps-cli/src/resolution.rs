@@ -194,12 +194,13 @@ pub struct Request<'a> {
 /// Both kinds of resolver are bound by the engine's lineage identity: a
 /// Docker scratch, like a supplied server, answers for the cluster the plan
 /// was read from (#1674), so neither plans for a role refused the read.
-pub async fn planning_identity(
+pub async fn planning_identity<D: pbps_cli::resolver::server::PlanningDialect>(
+    dialect: &D,
     conn: &mut pbps_db::Conn,
     _selection: &ResolverSelection,
 ) -> Result<Option<String>, Refused> {
     let driver = conn.driver();
-    pbps_cli::resolver::server::target_identity(conn)
+    pbps_cli::resolver::server::target_identity(dialect, conn)
         .await
         .map(Some)
         .map_err(|error| crate::engine::target_identity_unread(driver, error))
@@ -391,7 +392,6 @@ pub(crate) async fn resolve<D: pbps_cli::resolver::server::PlanningDialect>(
     if let Some(finding) = package_created(request) {
         return Err(Refused::Finding(finding));
     }
-    let driver = request.target.driver();
     if let Err(missing) =
         pbps_cli::resolver::sealing::environment_key(request.project, request.target.environment())
     {
@@ -417,7 +417,7 @@ pub(crate) async fn resolve<D: pbps_cli::resolver::server::PlanningDialect>(
                 .context("the declarations' bootstrap cannot be formed"),
         )
     })?;
-    producer::produce::<D>(request, driver, &bootstrap, entry).await
+    producer::produce::<D>(request, &bootstrap, entry).await
 }
 
 /// A resolver's externals file, read only from under the project root.
@@ -464,9 +464,9 @@ pub(crate) struct Entry<'a> {
 }
 
 /// What a use of the entry runs against.
-pub(crate) struct Open {
+pub(crate) struct Open<D: pbps_cli::resolver::server::PlanningDialect> {
     pub connection: String,
-    pub standard: pbps_cli::resolver::server::scratch::Standard,
+    pub standard: pbps_cli::resolver::server::scratch::Standard<D>,
     pub provenance: pbps_cli::resolver::server::scratch::Provenance,
     pub externals: Option<String>,
 }
@@ -493,7 +493,10 @@ impl<'a> Entry<'a> {
     /// to the target's cluster identity before it is started, so a target
     /// connection that reaches another cluster than the planning read
     /// refuses with nothing started.
-    pub async fn open(&mut self, driver: pbps_db::Driver, identity: &str) -> Result<Open, Refused> {
+    pub async fn open<D: pbps_cli::resolver::server::PlanningDialect>(
+        &mut self,
+        identity: &str,
+    ) -> Result<Open<D>, Refused> {
         use pbps_cli::resolver::server::scratch::{self, Provenance};
         use pbps_config::resolver::ResolverProfile;
         let unanswerable = |error: ProduceError| Refused::Unanswerable(error.into());
@@ -529,7 +532,7 @@ impl<'a> Entry<'a> {
                 pbps_model::resolver::OutsideWrites::Allowed
             }
         };
-        let same_instance = producer::same_instance(driver, &self.selection.profile);
+        let same_instance = producer::same_instance(D::DRIVER, &self.selection.profile);
         let entry = self.selection.name.to_owned();
         match &self.selection.profile {
             ResolverProfile::Server {
@@ -541,7 +544,7 @@ impl<'a> Entry<'a> {
                     &self.selection.name,
                     url_env,
                 )?,
-                standard: scratch::declared_standard(driver, standard.as_ref())
+                standard: scratch::declared_standard::<D>(standard.as_ref())
                     .map_err(|error| Refused::Unanswerable(error.into()))?,
                 provenance: Provenance {
                     entry,
@@ -553,11 +556,11 @@ impl<'a> Entry<'a> {
             }),
             ResolverProfile::Docker { image, pull, .. } => {
                 if self.held.is_none() {
-                    scratch::container::bind_target(driver, self.target.connection(), identity)
+                    scratch::container::bind_target::<D>(self.target.connection(), identity)
                         .await
                         .map_err(unanswerable)?;
                     self.held = Some(
-                        scratch::container::Held::start(driver, image, *pull)
+                        scratch::container::Held::start(D::DRIVER, image, *pull)
                             .await
                             .map_err(unanswerable)?,
                     );
@@ -565,7 +568,7 @@ impl<'a> Entry<'a> {
                 let held = self.held.as_ref().expect("the container was just held");
                 Ok(Open {
                     connection: held.connection().to_owned(),
-                    standard: scratch::declared_standard(driver, None)
+                    standard: scratch::declared_standard::<D>(None)
                         .map_err(|error| Refused::Unanswerable(error.into()))?,
                     provenance: Provenance {
                         entry,
@@ -604,7 +607,6 @@ mod producer {
 
     pub(super) async fn produce<D: pbps_cli::resolver::server::PlanningDialect>(
         request: &Request<'_>,
-        driver: pbps_db::Driver,
         bootstrap: &pbps_diff::order::DiffPlan,
         entry: &mut Entry<'_>,
     ) -> Result<pbps_cli::resolver::server::Unsealed<D>, Refused> {
@@ -622,9 +624,8 @@ mod producer {
                 "the planning read recorded no cluster identity for the resolver to bind"
             )));
         };
-        let open = entry.open(driver, identity).await?;
+        let open = entry.open::<D>(identity).await?;
         scratch::produce_unsealed::<D>(
-            driver,
             &open.connection,
             request.target.connection(),
             identity,
@@ -897,12 +898,13 @@ mod tests {
             ))
             .await
             .expect("the fixture");
-            let granted = planning_identity(&mut conn, &server).await;
+            let granted = planning_identity(&pbps_pg::Postgres::new(), &mut conn, &server).await;
             conn.execute(&format!("SET ROLE {role}"))
                 .await
                 .expect("set role");
-            let docker_refused = planning_identity(&mut conn, &docker).await;
-            let refused = planning_identity(&mut conn, &server).await;
+            let docker_refused =
+                planning_identity(&pbps_pg::Postgres::new(), &mut conn, &docker).await;
+            let refused = planning_identity(&pbps_pg::Postgres::new(), &mut conn, &server).await;
             conn.execute("RESET ROLE").await.expect("reset role");
             drop(conn);
             database.drop().await;
@@ -1106,7 +1108,6 @@ mod tests {
             .expect("a runtime");
         let refusal = |target_identity| match rt.block_on(producer::produce::<pbps_pg::Postgres>(
             &request(target_identity),
-            pbps_db::Driver::Postgres,
             &pbps_diff::diff(
                 pbps_diff::Side {
                     schema: &pbps_model::Schema::default(),

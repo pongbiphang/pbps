@@ -1,6 +1,7 @@
 //! The preparation handoff, owned companions and unchanged sandbox boundary.
 
 use super::*;
+use crate::resolver::server::scratch::engines::{MssqlEngine, ResolverEngine};
 use pbps_model::dependency::{
     Comparison, Dependencies, Dependency, DependencyColumn, DependencyKind,
 };
@@ -197,15 +198,14 @@ async fn prepare_probe(
     let tokens = super::super::Tokens::generate();
     let p = provenance();
     let mut admin = connection(scratch).await;
-    let (provisioning, mut state) = super::super::engine::scratch(
-        Driver::Mssql,
+    let (provisioning, mut state) = MssqlEngine::acquire(
         &mut target,
         &mut admin,
         &tokens,
         &identity,
         scratch,
         &request,
-        &Standard::Mssql,
+        &(),
         None,
         &p,
     )

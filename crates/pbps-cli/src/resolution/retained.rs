@@ -14,10 +14,12 @@ pub async fn compare(
     requests: &[RetainedExpression],
 ) -> anyhow::Result<Vec<RetainedExpression>> {
     use pbps_cli::resolver::server::{ProduceError, scratch};
-    let Ok(identity) = pbps_cli::resolver::server::target_identity(conn).await else {
+    let Ok(identity) =
+        pbps_cli::resolver::server::target_identity(&pbps_pg::Postgres::new(), conn).await
+    else {
         return Ok(Vec::new());
     };
-    let Ok(open) = entry.open(conn.driver(), &identity).await else {
+    let Ok(open) = entry.open::<pbps_pg::Postgres>(&identity).await else {
         return Ok(Vec::new());
     };
     match scratch::retained::compare(

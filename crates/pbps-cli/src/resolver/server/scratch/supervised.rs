@@ -1,13 +1,14 @@
 //! Request cancellation cannot own the last cleanup obligation (DEC-1519.1).
 
-use super::{BindingRequest, Error, ProduceError, Run, Standard, Tokens, Unsealed};
-use pbps_db::{Conn, Driver};
+use super::{BindingRequest, Error, ProduceError, Run, Tokens, Unsealed};
+use crate::resolver::contract::ResolverEngine;
+use crate::resolver::server::PlanningDialect;
+use pbps_db::Conn;
 use tokio::sync::oneshot;
 
 // Connection strings and the fingerprint key stay private, without Debug.
 // The task owns every input: the caller may drop its future and its schemas.
-pub(super) struct Request {
-    pub driver: Driver,
+pub(super) struct Request<D: PlanningDialect> {
     pub scratch: String,
     pub target: String,
     pub planned_identity: String,
@@ -20,7 +21,7 @@ pub(super) struct Request {
     pub hints: pbps_model::Hints,
     pub key: pbps_db::fingerprint::EnvironmentFingerprintKey,
     pub scope: super::super::ScopeRequest,
-    pub standard: Standard,
+    pub standard: super::Standard<D>,
     pub externals: Option<String>,
     pub provenance: super::Provenance,
 }
@@ -43,17 +44,15 @@ impl<D> Drop for Reply<D> {
     }
 }
 
-impl Request {
-    pub async fn start<D: super::super::PlanningDialect>(
-        self,
-    ) -> Result<Unsealed<D>, ProduceError> {
+impl<D: PlanningDialect> Request<D> {
+    pub async fn start(self) -> Result<Unsealed<D>, ProduceError> {
         let (sender, receiver) = oneshot::channel();
         #[cfg(test)]
         let context = TestContext::capture();
         // Dropping a JoinHandle detaches it. Runtime shutdown can still stop
         // this owner before release; durable recovery covers that boundary.
         tokio::spawn(async move {
-            let work = self.execute::<D>();
+            let work = self.execute();
             #[cfg(test)]
             let result = context.run(work).await;
             #[cfg(not(test))]
@@ -68,9 +67,8 @@ impl Request {
             .receive()
     }
 
-    async fn execute<D: super::super::PlanningDialect>(self) -> Result<Unsealed<D>, ProduceError> {
+    async fn execute(self) -> Result<Unsealed<D>, ProduceError> {
         let Self {
-            driver,
             scratch,
             target,
             planned_identity,
@@ -102,14 +100,13 @@ impl Request {
             ids: &desired_ids,
         };
         // Preserve endpoint/identity checks and the keeper-before-write order.
-        let scratch = super::super::engine::endpoint(driver, &scratch).await?;
-        let mut target = Conn::connect(driver, &target).await.map_err(|error| {
+        let scratch = <D::Resolver as ResolverEngine>::endpoint(&scratch).await?;
+        let mut target = Conn::connect(D::DRIVER, &target).await.map_err(|error| {
             super::unusable(format!("the target could not be connected: {error}"))
         })?;
         let tokens = Tokens::generate();
-        let mut admin = super::super::engine::connect_scratch(driver, &scratch, &tokens).await?;
-        let (provisioning, state) = super::super::engine::scratch(
-            driver,
+        let mut admin = <D::Resolver as ResolverEngine>::connect_scratch(&scratch, &tokens).await?;
+        let (provisioning, state) = <D::Resolver as ResolverEngine>::acquire(
             &mut target,
             &mut admin,
             &tokens,
@@ -122,7 +119,7 @@ impl Request {
         )
         .await?;
         let mut run = Run {
-            driver,
+            driver: D::DRIVER,
             planned_identity: &planned_identity,
             key: &key,
             request: &scope,

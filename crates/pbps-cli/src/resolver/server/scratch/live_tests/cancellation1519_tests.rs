@@ -307,23 +307,23 @@ async fn a_dropped_supplied_request_restores_standard_and_the_next_request_proce
             .unwrap();
         // All SQL inside this measured call belongs to the supervisor. A lost
         // task-local scope must not silently weaken the existing batch guard.
-        let (next, requests) = pbps_db::request_count::scope(super::super::produce_unsealed(
-            Driver::Postgres,
-            &fixture.as_login(&scratch, &login),
-            &target_url,
-            &identity,
-            &inputs.binding(),
-            inputs.base(),
-            inputs.desired(),
-            &inputs.hints,
-            &[],
-            &key.project,
-            Some(ENVIRONMENT),
-            &Standard::default(),
-            None,
-            &super::super::Provenance::server(),
-        ))
-        .await;
+        let (next, requests) =
+            pbps_db::request_count::scope(super::super::produce_unsealed::<pbps_pg::Postgres>(
+                &fixture.as_login(&scratch, &login),
+                &target_url,
+                &identity,
+                &inputs.binding(),
+                inputs.base(),
+                inputs.desired(),
+                &inputs.hints,
+                &[],
+                &key.project,
+                Some(ENVIRONMENT),
+                &Standard::default(),
+                None,
+                &super::super::Provenance::server(),
+            ))
+            .await;
         let next = match next {
             Ok(unsealed) => {
                 let rechecked = unsealed

@@ -11,7 +11,8 @@
 
 use super::super::engine::container::{self as support_of, Readiness};
 pub use super::super::engine::container::{ContainerSupport, support};
-use super::super::{Error, ProduceError, engine};
+use super::super::{Error, PlanningDialect, ProduceError};
+use crate::resolver::contract::ResolverEngine;
 
 pub mod journal;
 mod recovery;
@@ -37,8 +38,7 @@ const COMMAND: Duration = Duration::from_secs(120);
 /// container whatever the run's outcome. The target is bound by its
 /// cluster identity first, so a target connection that reaches another
 /// cluster than the planning read refuses before anything is started.
-pub async fn with_container<T>(
-    driver: Driver,
+pub async fn with_container<D: PlanningDialect, T>(
     target_connection: &str,
     planned_identity: &str,
     image: &str,
@@ -46,9 +46,9 @@ pub async fn with_container<T>(
     run: impl AsyncFnOnce(&str) -> Result<T, ProduceError>,
 ) -> Result<T, ProduceError> {
     // Refused for want of support before the target is even connected.
-    require(driver)?;
-    bind_target(driver, target_connection, planned_identity).await?;
-    with_started(driver, image, pull, run).await
+    require(D::DRIVER)?;
+    bind_target::<D>(target_connection, planned_identity).await?;
+    with_started(D::DRIVER, image, pull, run).await
 }
 
 /// The same acquisition without a target binding, for preview rehearsal.
@@ -225,19 +225,18 @@ fn require(driver: Driver) -> Result<&'static ContainerSupport, ProduceError> {
 }
 
 /// The planning read's cluster, read again on a fresh target connection.
-pub async fn bind_target(
-    driver: Driver,
+pub async fn bind_target<D: PlanningDialect>(
     target_connection: &str,
     planned_identity: &str,
 ) -> Result<(), ProduceError> {
-    let mut target = Conn::connect(driver, target_connection)
+    let mut target = Conn::connect(D::DRIVER, target_connection)
         .await
         .map_err(|error| {
             ProduceError::Run(Error::Unusable(format!(
                 "the target could not be connected: {error}"
             )))
         })?;
-    let identity = engine::target_identity(driver, &mut target)
+    let identity = <D::Resolver as ResolverEngine>::target_identity(&mut target)
         .await
         .map_err(|error| {
             ProduceError::Run(Error::Read(format!(

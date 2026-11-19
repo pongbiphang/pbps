@@ -11,6 +11,7 @@
 use super::super::recovery;
 use super::dependencies2323::{self, Case};
 use super::*;
+use crate::resolver::server::scratch::engines::{MssqlEngine, ResolverEngine};
 use pbps_mssql::resolver::scratch::recovery as record;
 use std::collections::BTreeSet;
 
@@ -821,15 +822,14 @@ async fn reference_held() {
     let held = connection(&on(&scratch, &reference)).await;
     let p = provenance();
     let mut admin = connection(&scratch).await;
-    let (provisioning, mut state) = Box::pin(super::super::engine::scratch(
-        Driver::Mssql,
+    let (provisioning, mut state) = Box::pin(MssqlEngine::acquire(
         &mut target,
         &mut admin,
         &tokens,
         &identity,
         &scratch,
         &request,
-        &Standard::Mssql,
+        &(),
         None,
         &p,
     ))
@@ -956,15 +956,14 @@ async fn prepared(
     let tokens = super::super::Tokens::generate();
     let p = provenance();
     let mut admin = connection(scratch).await;
-    let (provisioning, mut state) = super::super::engine::scratch(
-        Driver::Mssql,
+    let (provisioning, mut state) = MssqlEngine::acquire(
         &mut target,
         &mut admin,
         &tokens,
         &identity,
         scratch,
         &request,
-        &Standard::Mssql,
+        &(),
         None,
         &p,
     )
@@ -1427,24 +1426,27 @@ async fn a_refused_acquisition_releases_the_lock_on_its_own_session() {
         schema: &schema,
         ids: &ids,
     };
-    let request =
-        super::super::super::producer::request(Driver::Mssql, side, side, &Hints::default(), &[])
-            .unwrap();
+    let request = super::super::super::producer::request::<pbps_mssql::Mssql>(
+        side,
+        side,
+        &Hints::default(),
+        &[],
+    )
+    .unwrap();
     let mut target = connection(&target_url).await;
     let identity = sql::cluster_identity(&mut target).await.unwrap();
     // The session stays open: the lock must be free without its end.
     let mut admin = connection(&supplied.connection).await;
     let tokens = super::super::Tokens::generate();
     let provenance = provenance();
-    let refused = super::super::engine::scratch(
-        Driver::Mssql,
+    let refused = MssqlEngine::acquire(
         &mut target,
         &mut admin,
         &tokens,
         &identity,
         &supplied.connection,
         &request,
-        &Standard::Mssql,
+        &(),
         None,
         &provenance,
     )
