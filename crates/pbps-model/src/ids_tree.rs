@@ -125,7 +125,14 @@ pub struct TableBody {
     /// constraint's name: the table is the file, so its uid is not repeated
     /// (DEC-2448.4).
     pub exclusions: Vec<(String, ExclusionRetirement)>,
+    /// The exclusion constraints a human retired from a partition child of this table, by
+    /// the child's uid and then the constraint's name: a partition has no file of its own,
+    /// so the record sits with the parent that declares it, as a move does (DEC-2448.7).
+    pub partition_exclusions: PartitionExclusions,
 }
+
+/// A partition child's retired exclusion constraints, by the child's uid then the constraint's name.
+pub type PartitionExclusions = Vec<(Uid, BTreeMap<String, ExclusionRetirement>)>;
 
 /// One parsed file: the object it identifies, what it holds, and, for a
 /// dropped object, the tombstone that stays in the file.
@@ -271,6 +278,9 @@ pub fn render(file: &TreeFile) -> String {
                 keyed.iter().map(|(key, r)| (key.as_ref(), *r)),
             ));
         }
+        if !t.partition_exclusions.is_empty() {
+            top.push(section("partition_exclusions", &t.partition_exclusions));
+        }
     }
     format!("{{\n{}\n}}\n", top.join(",\n"))
 }
@@ -356,6 +366,7 @@ struct Raw {
     conversions: Option<Section<Conversion>>,
     rebuilds: Option<Section<Rebuild>>,
     exclusions: Option<Section<ExclusionRetirement>>,
+    partition_exclusions: Option<Section<BTreeMap<String, ExclusionRetirement>>>,
 }
 
 fn malformed(path: &str, message: impl Into<String>) -> TreeError {
@@ -523,6 +534,13 @@ pub fn parse(path: &str, text: &str) -> Result<TreeFile, TreeError> {
             conversions: keyed(path, "conversions", raw.conversions, UidKind::Column, false)?,
             rebuilds: keyed(path, "rebuilds", raw.rebuilds, UidKind::Table, false)?,
             exclusions: by_name(path, "exclusions", raw.exclusions)?,
+            partition_exclusions: keyed(
+                path,
+                "partition_exclusions",
+                raw.partition_exclusions,
+                UidKind::Table,
+                false,
+            )?,
         })
     } else {
         if raw.columns.is_some()
@@ -531,6 +549,7 @@ pub fn parse(path: &str, text: &str) -> Result<TreeFile, TreeError> {
             || raw.conversions.is_some()
             || raw.rebuilds.is_some()
             || raw.exclusions.is_some()
+            || raw.partition_exclusions.is_some()
         {
             return Err(malformed(path, "only a table file has sections"));
         }
@@ -581,7 +600,8 @@ fn check(path: &str, file: &TreeFile) -> Result<(), TreeError> {
             && partitions.is_empty()
             && t.moves.is_empty()
             && t.conversions.is_empty()
-            && t.exclusions.is_empty())
+            && t.exclusions.is_empty()
+            && t.partition_exclusions.is_empty())
     {
         return Err(TreeError::DroppedWithLive {
             path: path.to_owned(),
@@ -596,6 +616,13 @@ fn check(path: &str, file: &TreeFile) -> Result<(), TreeError> {
         .find(|(u, _)| u != &file.uid && !partitions.contains(u))
     {
         return Err(misplaced("moves", uid));
+    }
+    if let Some((uid, _)) = t
+        .partition_exclusions
+        .iter()
+        .find(|(u, _)| !partitions.contains(u))
+    {
+        return Err(misplaced("partition_exclusions", uid));
     }
     // The record is keyed by the source parent; the file is the replacement's.
     if let Some((uid, _)) = t
@@ -763,6 +790,16 @@ pub fn assemble(files: &BTreeMap<String, String>) -> Result<IdsFile, TreeError> 
                 for (uid, r) in &t.rebuilds {
                     claim("rebuilds", uid, path)?;
                     ids.rebuilds.insert(uid.clone(), r.clone());
+                }
+                for (uid, named) in &t.partition_exclusions {
+                    claim("partition_exclusions", uid, path)?;
+                    ids.exclusions.insert(
+                        uid.clone(),
+                        named
+                            .iter()
+                            .map(|(name, r)| (ObjectLocalName::new(name.as_str()), r.clone()))
+                            .collect(),
+                    );
                 }
                 // The file's own uid owns every record in its section, so
                 // another file cannot claim the same table's records.
@@ -987,9 +1024,24 @@ pub fn split(ids: &IdsFile, placement: &Placement) -> Result<BTreeMap<String, St
     }
 
     let mut exclusions: BTreeMap<Uid, Vec<(String, ExclusionRetirement)>> = BTreeMap::new();
+    let mut partition_exclusions: BTreeMap<Uid, PartitionExclusions> = BTreeMap::new();
     for (uid, named) in &ids.exclusions {
-        // A partition has no file of its own, and an exclusion on one is
-        // refused (DEC-2448.3), so the owner is always a table that has one.
+        // A partition has no file of its own, so its retirements sit with the parent that
+        // declares it (DEC-2448.7); any other owner is a table that has one.
+        if let Some(parent) = placement.children.get(uid) {
+            table_file(parent, &mut files)?;
+            partition_exclusions
+                .entry(parent.clone())
+                .or_default()
+                .push((
+                    uid.clone(),
+                    named
+                        .iter()
+                        .map(|(name, r)| (name.raw().to_owned(), r.clone()))
+                        .collect(),
+                ));
+            continue;
+        }
         table_file(uid, &mut files)?;
         exclusions.insert(
             uid.clone(),
@@ -1021,6 +1073,8 @@ pub fn split(ids: &IdsFile, placement: &Placement) -> Result<BTreeMap<String, St
             t.conversions = ordered(conversions.remove(&uid).unwrap_or_default(), None);
             t.rebuilds = ordered(rebuilds.remove(&uid).unwrap_or_default(), None);
             t.exclusions = exclusions.remove(&uid).unwrap_or_default();
+            t.partition_exclusions =
+                ordered(partition_exclusions.remove(&uid).unwrap_or_default(), None);
         }
         check(path, &file)?;
         out.insert(path.clone(), render(&file));

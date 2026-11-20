@@ -449,6 +449,7 @@ pub fn prepare(
         if spec.partition_of.is_some() {
             own.extend(spec.indexes.keys().cloned().map(Part::Index));
             own.extend(spec.unique.keys().cloned().map(Part::Unique));
+            own.extend(spec.exclude.keys().cloned().map(Part::Exclusion));
             own.extend(spec.primary_key.iter().cloned().map(Part::PrimaryKey));
         }
         let at = Schema {
@@ -624,6 +625,12 @@ pub fn index_definitions(table: &Table) -> BTreeMap<IndexPart, PartitionIndexDef
             (
                 IndexPart::Index(n.clone()),
                 PartitionIndexDefinition::Index(k.clone()),
+            )
+        }))
+        .chain(table.exclude.iter().map(|(n, k)| {
+            (
+                IndexPart::Exclusion(n.clone()),
+                PartitionIndexDefinition::Exclusion(k.clone()),
             )
         }))
         .collect()

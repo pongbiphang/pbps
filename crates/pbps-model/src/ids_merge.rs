@@ -356,6 +356,15 @@ fn merge_table(
         &|_| uid.clone(),
     );
     exclusions.sort_by(|a, b| a.0.cmp(&b.0));
+    // A partition child's, by the child's uid (DEC-2448.7).
+    let partition_exclusions = records(
+        "partition_exclusions",
+        &base.partition_exclusions,
+        &ours.partition_exclusions,
+        &theirs.partition_exclusions,
+        &never,
+        conflicts,
+    );
     // Back to the YAML's order (design §2.4 rule 1), through the one rule the
     // writer uses. With no YAML view there is no order to restore, and the
     // order the sides agree on stands.
@@ -370,6 +379,7 @@ fn merge_table(
         conversions: sorted(conversions),
         rebuilds: sorted(rebuilds),
         exclusions,
+        partition_exclusions: sorted(partition_exclusions),
     }
 }
 

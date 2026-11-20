@@ -269,6 +269,9 @@ pub enum DetachedKind {
     ForeignKey,
     Check,
     Index,
+    /// An exclusion constraint's clone, which a detach keeps as the partition's own
+    /// under the engine's name (DEC-2448.7).
+    Exclusion,
 }
 
 /// One change of a plan: a family (DEC-2790.1) and, inside it, the kind of change.
@@ -2928,6 +2931,7 @@ impl Change {
                         PartDefinition::PrimaryKey(k, true)
                     }
                     crate::PartitionIndexDefinition::Unique(k) => PartDefinition::Unique(k, false),
+                    crate::PartitionIndexDefinition::Exclusion(x) => PartDefinition::Exclusion(x),
                 }),
             ),
             Change::Partition(PartitionChange::RebuildPartitionedTable(_))

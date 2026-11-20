@@ -271,3 +271,33 @@ fn a_saved_rebuild_that_lost_a_declared_comment_is_named() {
     assert!(lost_comment(&[other_text, key.clone()], &relation, &declared).is_some());
     assert_eq!(lost_comment(&[table, key], &relation, &declared), None);
 }
+
+/// A parent's parts the rebuild builds through a recipe are its primary key, unique constraints,
+/// indexes and exclusions, each as a part of its own kind; a partition's own are restored as its
+/// own parts instead and are no recipe (DEC-2448.7). Negatives: a table with none yields none,
+/// and an exclusion is never taken for an index of the same name.
+#[test]
+fn a_parents_recipes_cover_its_exclusions_as_parts_of_their_own_kind() {
+    use crate::order::rebuild::index_definitions;
+    use pbps_model::{ExclusionConstraint, IndexPart, PartitionIndexDefinition};
+    let exclusion: ExclusionConstraint =
+        serde_json::from_str(r#"{"method":"btree","keys":[{"key":{"name":"k"},"operator":"="}]}"#)
+            .unwrap();
+    let mut parent = Table::default();
+    assert!(index_definitions(&parent).is_empty());
+    parent.exclude.insert("slot".into(), exclusion.clone());
+    parent.indexes.insert(
+        "slot".into(),
+        serde_json::from_str(r#"{"columns":[{"name":"k"}]}"#).unwrap(),
+    );
+    let found = index_definitions(&parent);
+    assert_eq!(found.len(), 2);
+    assert_eq!(
+        found[&IndexPart::Exclusion("slot".into())],
+        PartitionIndexDefinition::Exclusion(exclusion)
+    );
+    assert!(matches!(
+        found[&IndexPart::Index("slot".into())],
+        PartitionIndexDefinition::Index(_)
+    ));
+}

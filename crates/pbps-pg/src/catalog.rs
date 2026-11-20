@@ -394,6 +394,8 @@ fn partition_tree(root: &str) -> String {
                                                 AND k.coninhcount = 0)
                                        AND k.contype <> 'f'
                                        AND k.contype <> 't'
+                                       AND NOT (k.contype = 'x' AND k.conislocal
+                                                AND k.coninhcount = 0)
                                        AND NOT (k.contype = 'n' AND k.convalidated)))))"
     )
 }
@@ -4011,11 +4013,11 @@ pub async fn detach_clone_names(
            JOIN pg_catalog.pg_class p ON p.oid = x.indrelid
            JOIN pg_catalog.pg_namespace pn ON pn.oid = p.relnamespace
            LEFT JOIN pg_catalog.pg_constraint k
-             ON k.conrelid = t.oid AND k.conindid = ci.oid AND k.contype IN ('p', 'u')
+             ON k.conrelid = t.oid AND k.conindid = ci.oid AND k.contype IN ('p', 'u', 'x')
            LEFT JOIN pg_catalog.pg_constraint pk ON pk.oid = k.conparentid
           WHERE tn.nspname = $1 AND t.relname = $2
             AND pn.nspname = $3 AND p.relname = $4
-            AND (k.contype IS DISTINCT FROM 'u' OR pk.conrelid = p.oid)
+            AND (k.contype NOT IN ('u', 'x') OR pk.conrelid = p.oid)
           ORDER BY ci.relname",
             &[
                 Param::Str(&table.schema),
@@ -4037,6 +4039,7 @@ pub async fn detach_clone_names(
         let kind = match text("kind")?.as_str() {
             "p" => pbps_model::DetachedKind::PrimaryKey,
             "u" => pbps_model::DetachedKind::Unique,
+            "x" => pbps_model::DetachedKind::Exclusion,
             "i" => pbps_model::DetachedKind::Index,
             _ => continue,
         };
@@ -5967,6 +5970,22 @@ mod tests {
         assert!(
             canonical_path(&SessionZone::offline_utc()).contains("standard_conforming_strings")
         );
+    }
+
+    /// A leaf of a partition tree may hold its own exclusion constraint, a local row with no
+    /// inheritance count (a clone has a `conparentid`, which the same clause already skips),
+    /// and still no other key: a primary key, a unique constraint and a constraint of a kind the
+    /// reader does not hold leave the tree out (DEC-2448.7).
+    #[test]
+    fn the_partition_tree_admits_a_leafs_own_exclusion_and_no_other_key() {
+        let tree = partition_tree("pc.oid")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(tree.contains("AND NOT (k.contype = 'x' AND k.conislocal AND k.coninhcount = 0)"));
+        assert!(tree.contains("AND k.conparentid = 0"));
+        // The keys stay refused: nothing admits `p` or `u`.
+        assert!(!tree.contains("k.contype = 'p'") && !tree.contains("k.contype = 'u'"));
     }
 
     /// The filter and the validation are the same rule, and this is the thread

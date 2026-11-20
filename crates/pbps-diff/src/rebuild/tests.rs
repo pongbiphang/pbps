@@ -2453,11 +2453,11 @@ fn copy_stages_bind_a_renamed_input_by_lineage_and_pin_changed_conversions() {
     );
 }
 
-/// The recipes build a parent's index and its clones by name and hold no exclusion's, so a
-/// tree whose parent holds one is not rebuilt, whichever side holds it (DEC-2448.6, #2448).
-/// Negative: the same approval of the tree without one qualifies.
+/// A tree whose parent holds an exclusion is qualified for a rebuild, whichever side holds
+/// it: its recipe builds the parent's alone and attaches each leaf's (DEC-2448.7). Negative:
+/// an approval made before the declaration gained one no longer matches it.
 #[test]
-fn a_tree_whose_parent_holds_an_exclusion_is_not_rebuilt() {
+fn a_tree_whose_parent_holds_an_exclusion_is_qualified_for_a_rebuild() {
     let exclusion = || pbps_model::ExclusionConstraint {
         method: pbps_model::IndexMethod::Btree,
         keys: vec![pbps_model::ExclusionKey {
@@ -2490,11 +2490,15 @@ fn a_tree_whose_parent_holds_an_exclusion_is_not_rebuilt() {
                 .insert("x".into(), exclusion());
         }
         let approval = recorded(&base, &ids, &desired);
-        let error = qualify(side(&base, &ids), side(&desired, &approval), &table()).unwrap_err();
-        assert!(
-            error.why.contains("holds an exclusion constraint") && error.why.contains("#2448"),
-            "{}",
-            error.why
-        );
+        qualify(side(&base, &ids), side(&desired, &approval), &table()).unwrap();
     }
+    let (base, ids, mut desired) = fixture();
+    let stale = recorded(&base, &ids, &desired);
+    desired
+        .tables
+        .get_mut(&table())
+        .unwrap()
+        .exclude
+        .insert("x".into(), exclusion());
+    assert!(qualify(side(&base, &ids), side(&desired, &stale), &table()).is_err());
 }

@@ -240,6 +240,7 @@ impl<'a> Allocation<'a> {
                             .indexes
                             .keys()
                             .chain(shape.unique.keys())
+                            .chain(shape.exclude.keys())
                             .chain(shape.checks.keys())
                             .map(|n| n.raw().to_owned()),
                     );
@@ -306,6 +307,34 @@ impl<'a> Allocation<'a> {
                     .into_iter()
                     .chain(index.include.iter().cloned())
                     .collect()
+            }
+            // The engine names a clone of an exclusion as it names an index's: from the
+            // index's attribute names, keys then `INCLUDE`, an expression's by its label
+            // (DEC-2448.7). The backing index bears the constraint's name, so its
+            // recorded spelling is found by it.
+            (IndexPart::Exclusion(name), PartitionIndexDefinition::Exclusion(x)) => {
+                if let Some(keys) = x.key_columns() {
+                    keys.into_iter().chain(x.include.iter().cloned()).collect()
+                } else {
+                    let label = format!("{} exclusion {}", self.root.table.shown(), name.shown());
+                    if self.root.before[&self.root.table].exclude.get(name) != Some(x) {
+                        return Err(format!(
+                            "{label}: new or changed expression labels require engine evidence; rebuild is refused"
+                        ));
+                    }
+                    return self
+                        .catalog
+                        .spellings
+                        .require(&label)?
+                        .values()
+                        .find(|s| {
+                            s.table == self.root.table
+                                && s.name == *name
+                                && s.kind == NameKind::Index
+                        })
+                        .and_then(|s| s.index_attributes.clone())
+                        .ok_or_else(|| format!("{label}: index attribute labels are absent"));
+                }
             }
             (
                 IndexPart::PrimaryKey

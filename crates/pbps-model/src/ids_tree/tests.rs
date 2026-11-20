@@ -106,6 +106,20 @@ pub(crate) fn sample() -> (IdsFile, Placement) {
         )]
         .into(),
     );
+    // A live partition child's own, which the file of its parent carries (DEC-2448.7).
+    f.exclusions.insert(
+        uid("t_bbbbb1"),
+        [(
+            ObjectLocalName::new("no_overlap"),
+            ExclusionRetirement {
+                was: "{\"method\":\"btree\"}".into(),
+                reason: "the leaf's own".into(),
+                operator: "leon".into(),
+                dropped_at: "2026-11-20".into(),
+            },
+        )]
+        .into(),
+    );
     f.roles.insert(uid("r_aaaaaa"), RoleName::new("app_reader"));
     f.tombstones.insert(uid("r_bbbbbb"), tomb("old_role"));
     f.types
@@ -307,7 +321,7 @@ fn an_exclusion_retirement_is_keyed_by_name_in_its_tables_file() {
     assert!(customer.contains("\"exclusions\": {\n\n    \"no_overlap\": {\"was\": "));
     assert!(customer.find("\"conversions\"").unwrap() < customer.find("\"exclusions\"").unwrap());
     // No other file holds it, and the table's uid is not repeated in the section.
-    assert!(!t["app/events.json"].contains("exclusions"));
+    assert!(!t["app/events.json"].contains("\"exclusions\""));
     assert!(!customer.contains("\"t_aaaaaa\": {\"was\""));
 }
 
@@ -411,18 +425,52 @@ fn an_exclusion_key_with_a_single_leading_underscore_is_refused() {
 }
 
 #[test]
-fn an_exclusion_retirement_for_a_partition_has_no_file_and_is_refused_on_split() {
-    // A partition child has a uid but no file of its own, and an exclusion on one
-    // is refused (DEC-2448.3), so a record for one cannot be placed.
-    let (mut ids, p) = sample();
-    ids.exclusions.insert(
-        uid("t_bbbbb1"),
-        [(
-            ObjectLocalName::new("x"),
-            ids.exclusions[&uid("t_aaaaaa")]["no_overlap"].clone(),
-        )]
-        .into(),
+fn a_partitions_exclusion_retirement_sits_in_its_parents_file_and_round_trips() {
+    // A partition child has a uid but no file of its own, so the record is keyed by the
+    // child's uid in the parent's file, and the parent's own `exclusions` stays apart.
+    let (ids, p) = sample();
+    let t = split(&ids, &p).unwrap();
+    assert!(t["app/events.json"].contains("\"partition_exclusions\""));
+    assert!(t["app/events.json"].contains("\"t_bbbbb1\": {\"no_overlap\""));
+    assert!(!t["app/events.json"].contains("\"exclusions\":"));
+    assert!(!t["dbo/customer.json"].contains("partition_exclusions"));
+    assert_eq!(assemble(&t).unwrap(), ids);
+    // Negative: a table with none carries no section.
+    assert!(!t["dbo/legacy.json"].contains("partition_exclusions"));
+}
+
+#[test]
+fn a_partitions_exclusion_retirement_outside_its_parents_partitions_is_refused() {
+    // The uid must be a live partition child of the file's table: another table's,
+    // or a retired child's, is misplaced rather than read as a record of this one.
+    let t = tree();
+    let stray = edit(
+        &t["app/events.json"],
+        "\"t_bbbbb1\": {\"no_overlap\"",
+        "\"t_aaaaaa\": {\"no_overlap\"",
     );
+    assert!(matches!(
+        refuses("app/events.json", stray),
+        TreeError::Misplaced {
+            section: "partition_exclusions",
+            ..
+        }
+    ));
+    let retired = edit(
+        &t["app/events.json"],
+        "\"t_bbbbb1\": {\"no_overlap\"",
+        "\"t_bbbbb2\": {\"no_overlap\"",
+    );
+    assert!(matches!(
+        refuses("app/events.json", retired),
+        TreeError::Misplaced {
+            section: "partition_exclusions",
+            ..
+        }
+    ));
+    // Negative: a record for a partition nobody placed under a parent has no file to go to.
+    let (ids, mut p) = sample();
+    p.children.remove(&uid("t_bbbbb1"));
     assert!(matches!(split(&ids, &p), Err(TreeError::NoPath { .. })));
 }
 
@@ -435,6 +483,7 @@ fn optional_sections_are_absent_when_empty() {
         "conversions",
         "rebuilds",
         "exclusions",
+        "partition_exclusions",
     ] {
         assert!(!t["dbo/legacy.json"].contains(key), "{key}");
     }

@@ -352,3 +352,52 @@ fn retirements_of_different_constraints_merge_and_the_same_one_differently_confl
     };
     assert!(t.exclusions.is_empty());
 }
+
+fn with_partition_exclusions(mut f: TreeFile, child: &str, records: &[(&str, &str)]) -> TreeFile {
+    let Body::Table(t) = &mut f.body else {
+        unreachable!()
+    };
+    t.partition_exclusions = vec![(
+        uid(child),
+        records
+            .iter()
+            .map(|(name, reason)| ((*name).to_owned(), retirement(reason)))
+            .collect(),
+    )];
+    f
+}
+
+/// DEC-2448.7: a partition child's retirements sit in its parent's file by the child's uid, so
+/// two branches retiring a constraint of two different children both keep theirs, and two
+/// retiring one of the same child with different reasons conflict under the child's uid.
+/// Negative: a record one side deleted and the other left alone is gone.
+#[test]
+fn retirements_of_two_partitions_merge_and_one_partition_retired_two_ways_conflicts() {
+    let none = YamlView::default();
+    let base = base();
+    let ours = with_partition_exclusions(base.clone(), "t_bbbbb1", &[("a", "r")]);
+    let theirs = with_partition_exclusions(base.clone(), "t_bbbbb2", &[("a", "r")]);
+    let merged = merge(Some(&base), Some(&ours), Some(&theirs), &none)
+        .unwrap()
+        .unwrap();
+    let Body::Table(t) = &merged.body else {
+        unreachable!()
+    };
+    let children: Vec<_> = t
+        .partition_exclusions
+        .iter()
+        .map(|(u, _)| u.to_string())
+        .collect();
+    assert_eq!(children, ["t_bbbbb1", "t_bbbbb2"]);
+    let theirs = with_partition_exclusions(base.clone(), "t_bbbbb1", &[("a", "another reason")]);
+    let conflicts = merge(Some(&base), Some(&ours), Some(&theirs), &none).unwrap_err();
+    assert_eq!(conflicts[0].section, "partition_exclusions");
+    assert_eq!(conflicts[0].uid, uid("t_bbbbb1"));
+    let merged = merge(Some(&ours), Some(&base), Some(&ours), &none)
+        .unwrap()
+        .unwrap();
+    let Body::Table(t) = &merged.body else {
+        unreachable!()
+    };
+    assert!(t.partition_exclusions.is_empty());
+}

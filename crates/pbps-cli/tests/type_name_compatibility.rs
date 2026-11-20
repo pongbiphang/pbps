@@ -336,6 +336,12 @@ where
         .as_object_mut()
         .unwrap()
         .shift_remove("description");
+    // #2448 PR E2 adds a partition entry's own `exclude:` (schema set 118); the captured
+    // entry predates it.
+    declaration_schema["$defs"]["PartitionEntryDto"]["properties"]
+        .as_object_mut()
+        .unwrap()
+        .shift_remove("exclude");
     // #2813 adds a SQL Server `filegroup:` to a table and to its keys and indexes (schema set
     // 107); the captured entry predates it.
     for dto in ["TableDto", "PrimaryKeySpecDto", "UniqueSpecDto", "IndexDto"] {

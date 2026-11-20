@@ -749,16 +749,23 @@ pub fn risks(
             Some(name)
         })
         .collect();
+    // A table a rebuild copies rows into is seeded as one the plan inserts into is: its
+    // own exclusion, restored after the copy, has rows to check (DEC-2448.7).
     let seeded: BTreeSet<&TableName> = cs
         .changes
         .iter()
-        .filter_map(|p| {
+        .flat_map(|p| -> Vec<&TableName> {
             if let Change::Row(RowChange::InsertRow { table, .. })
             | Change::Row(RowChange::UpdateRow { table, .. }) = &p.change
             {
-                Some(table)
+                vec![table]
+            } else if let Change::Partition(PartitionChange::CopyTableRows(c)) = &p.change {
+                std::iter::once(&c.target)
+                    .chain(&c.target_partitions)
+                    .map(|r| &r.name)
+                    .collect()
             } else {
-                None
+                Vec::new()
             }
         })
         .collect();
@@ -999,6 +1006,7 @@ fn gather(change: &Change, types: Types) -> Vec<&str> {
                 .into_iter()
                 .chain(i.columns.iter().filter_map(|c| c.key.expression()))
                 .collect(),
+            pbps_model::PartitionIndexDefinition::Exclusion(x) => x.expression_texts().collect(),
             pbps_model::PartitionIndexDefinition::PrimaryKey(_)
             | pbps_model::PartitionIndexDefinition::Unique(_) => Vec::new(),
         },

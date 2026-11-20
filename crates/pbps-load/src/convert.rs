@@ -864,6 +864,8 @@ pub(crate) fn convert_for_diagnostics(
                             .map(|(k, expression)| (k, CheckConstraint { expression }))
                             .collect(),
                         indexes: convert_indexes(src, e.indexes, &mut errs),
+                        // Its own, as a table's, beside its parent's clones (#2448).
+                        exclude: convert_exclusions(src, e.exclude, &mut errs),
                         // Its own, beside its parent's clones (#1632).
                         foreign_keys: convert_foreign_keys(src, e.foreign_keys, &mut errs),
                         // Its own, as a table's, spelled by the same rule

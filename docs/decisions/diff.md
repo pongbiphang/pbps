@@ -10090,27 +10090,27 @@ also runs, reads `server_version_num` (`partitioned_exclusion`, as `roles::unsup
 does for `maintain`), so a saved plan is checksummed as any other and applying it to a 16 server
 fails there and not halfway.
 
-**Refused by name, and why each stands.**
-- **A partition's own exclusion** (`partition_of`): `validate` refuses it as before, and the pull still
-  leaves its tree out. The declaration cannot say it yet (a partition entry has no `exclude:`, which
-  needs the published schema set), and `validate_partition` has no parent to check an own one against
-  the parent's: the adoption above would make the declared guarantee vanish with the parent's.
+**Refused by name in E1, lifted by E2 (DEC-2448.7), and why each stood.**
+- **A partition's own exclusion** (`partition_of`): `validate` refused it, and the pull left its tree
+  out. The declaration could not say it (a partition entry had no `exclude:`, which needs the
+  published schema set), and `validate_partition` had no parent to check an own one against the
+  parent's: the adoption above would make the declared guarantee vanish with the parent's.
 - **A detach of a partition of a parent that holds an exclusion**: the clone becomes an own constraint
-  under the engine's name, which `DetachedKind` cannot name, and the plan wire has no kind for it.
+  under the engine's name, which `DetachedKind` could not name, and the plan wire had no kind for it.
 - **A `RebuildPartitionedTable` of a tree that holds one**: the recipe builds a parent's index and its
-  clones by name (`PartitionIndexDefinition`), and holds none for an exclusion. Both refusals name
-  #2448, the PR that carries them; neither is a deferral.
+  clones by name (`PartitionIndexDefinition`), and held none for an exclusion. Both refusals named
+  #2448, the PR that carried them; neither was a deferral.
 - **An attach** of an ordinary table to a parent that holds one is the engine's: it builds the clone
-  over the rows and refuses a conflict whole. An ordinary table's own exclusion is not declared on a
-  partition, so none is adopted from it.
+  over the rows and refuses a conflict whole. An ordinary table's own exclusion was not declared on a
+  partition, so none was adopted from it.
 - **Nested partitioning** stays outside the model (STATUS); the key rule above is the root's, and the
   engine's per-level measurement (each level needs its own partition key) is the reason a later PR must
   ask it of every level.
 
 **Seam.** E1 is this entry. E2 is the partition's own exclusion (reader, declaration, `validate_partition`
 against its parent's, the attach shape, the own part of a rebuild, a record for its drop in the parent's
-ids file) and the detach and rebuild of a parent's. It needs the published schema set and the ids
-section, and no plan or state number: #2412 PR 2 takes the next plan and state numbers and after it no
+ids file) and the detach and rebuild of a parent's: DEC-2448.7. It needs the published schema set and the
+ids section, and no plan or state number: #2412 PR 2 takes the next plan and state numbers and after it no
 PR writes either before the first release.
 
 Formats: none. `SetExclusion` is plan 73's kind, the snapshot already holds `exclude` for any table,
@@ -10176,3 +10176,63 @@ the plans with no better pair.
 
 Formats: none. No change, plan or state kind is added; the order of changes in a plan moves and no
 wire field does.
+
+<a id="dec-2448-7"></a>
+
+**DEC-2448.7. A partition's own exclusion, and a parent exclusion's detach and rebuild (#2448 PR E2).**
+Measured on 18.6 and 16.15 (`~/gate2448e2/m`, `f1.sql` and `f2.sql` here, `e1`-`e6` of DEC-2448.6): a
+partition's own exclusion is held on **both** engines (`conislocal`, `coninhcount 0`, `conparentid 0`,
+backed by an unattached index); only a parent's is 18's.
+
+| Rule | Measured (18) |
+|---|---|
+| Detach | The clone becomes the partition's own in place: `conislocal t`, `coninhcount 0`, `conparentid 0`, under the engine's name `<leaf>_<keys>_excl`, with the parent's timing, parameters and predicate, enforcing at once. `DETACH ... CONCURRENTLY` is `0A000` beside a DEFAULT partition, as for any detach. A re-`ATTACH` takes it back as a clone. |
+| Attach | An own of the parent's shape is adopted under **its own name**, keeping its own timing (`a_own`, deferrable, `coninhcount 1`); one that differs (here by `INCLUDE`) is kept beside a new clone; a table with none gets a clone built over its rows (E1). |
+| Rebuild | `ALTER TABLE ONLY parent ADD CONSTRAINT .. EXCLUDE ..` leaves the parent's index invalid with no clone; `ALTER TABLE leaf ADD CONSTRAINT <clone> EXCLUDE ..` followed by `ALTER INDEX parent ATTACH PARTITION <clone>` makes the leaf's constraint the parent's clone (`conislocal f`, `coninhcount 1`, `conparentid` set) and the parent's index valid, as a unique constraint's recipe does. A partition created afterwards gets its own clone, and the parent's drop takes every clone. There is no `USING INDEX` form, so the leaf's constraint is added whole. |
+
+**What is held.**
+- **Reader.** `partition_tree` admits a leaf's own `x` row (local, `coninhcount 0`; a clone has a
+  `conparentid` and was always skipped), and the partition pass reads it through `add_exclusion`
+  with the parent's columns lent, as it reads an own index, with its index's parameters. An adopted own
+  reads as a clone and is not the partition's; an `ONLY`-built parent is refused by name as in E1.
+- **Declaration.** `PartitionEntryDto.exclude` is `ExclusionDto`, converted by `convert_exclusions` and
+  written by `render_exclusions`; the published schema set is 118. `validate_partition` runs the
+  exclusion validation with the parent's columns lent and refuses an own that `adopts_exclusion` its
+  parent's (the engine would make it a clone that goes with the parent's, as #1632 holds for a foreign
+  key), and an own named as its parent's constraint (the name is a relation of the schema). A partition
+  read back whose own the engine kept apart from an equal parent's is refused by `validate` as the
+  foreign-key twin is: the declaration cannot say a state the engine only reaches by order.
+- **Differ.** A standing partition's own exclusion is its own change (`SetExclusion`, and
+  `SetIndexStorageParameters` on `IndexPart::Exclusion`, which `ALTER INDEX` takes on a leaf);
+  a created partition's exclusions are the separate changes after its `CREATE` (DEC-2448.3). A
+  parent's new exclusion is refused over an own only if the own stood before the plan: one the plan adds
+  to a standing partition is built after the parent's (the ordering pass of E1) and is not adopted.
+  The attach shape refuses a table's own that the parent's takes, naming the remedy (drop it in an earlier
+  plan), keeps every other, and compares it with the declaration.
+- **Detach.** `DetachedKind::Exclusion` names the clone by its parent's constraint, found through
+  `conparentid` before the detach and renamed as a constraint to the declared name (a constraint rename
+  renames its index), claimed against a relation and a constraint as a unique constraint's is. The
+  declaration of the detached table must hold the clone by definition, and the partition's own as it
+  stands. E1's refusal is lifted.
+- **Rebuild.** A partition's own exclusion is an own part of the replacement (`Part::Exclusion`, restored
+  after the copy), and the dependency reader maps `contype 'x'` to it. A parent's is a
+  `PartitionIndexDefinition::Exclusion` recipe: the parent's alone, then each leaf's whole under the name
+  the engine would choose (`clone_name`, label `excl`, from the keys and `INCLUDE` columns, or the
+  recorded spelling of an unchanged expression key), then the attach. The slot, effect, pin and risk
+  mechanisms treat it as a key's recipe. E1's refusal is lifted. A created replacement table that a
+  rebuild copies into is seeded, so its own exclusion keeps the `constraint` risk (it checks rows).
+- **Retirement.** A leaf's drop is recorded under the leaf's uid, which the in-memory ids already
+  allowed; on disk it sits in the parent's file, in a new section `partition_exclusions` keyed by the
+  child's uid then the constraint's name, as `moves` sit there (DEC-2448.4's precedent). The layout number
+  stays 1 and the mapping's too: an old reader refuses the unknown section (`deny_unknown_fields`). A
+  record whose uid is not a live child of the file's table is refused as misplaced, and `pbps ids`
+  merges it as a record of its own.
+
+**Open, not fixed here.** A parent's `DROP COLUMN` of a column an own exclusion of a partition keys on is
+dropped by the engine silently; the hazard check of DEC-2448.5 reads the changes of one table and does not
+see it. The same gap exists for a partition's own index; it is named, not decided.
+
+Formats: published schema set 118 (the declaration document gains the entry's `exclude:`; the envelope and
+config documents change only in the version); the ids layout gains a section and keeps its numbers. No
+plan or state number, as DEC-2448.6 said: `DetachedKind` and `PartitionIndexDefinition` gain a variant
+each without one.

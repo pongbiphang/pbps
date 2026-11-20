@@ -1,8 +1,10 @@
-//! GiST indexes and exclusion constraints on partitioned tables (#2448 PR E1, DEC-2448.6).
-//! A GiST tree reads, plans and applies as any partition tree does, on both pinned engines. A
-//! parent's exclusion is PostgreSQL 18's: 16 refuses it by name before any statement, and 18
-//! holds it under the engine's key rule, with a clone on every partition, a drop that needs its
-//! record, and no rebuild or detach beside it. A partition's own exclusion stays refused.
+//! GiST indexes and exclusion constraints on partitioned tables (#2448 PR E, DEC-2448.6 and
+//! DEC-2448.7). A GiST tree reads, plans and applies as any partition tree does, on both
+//! pinned engines. A parent's exclusion is PostgreSQL 18's: 16 refuses it by name before any
+//! statement, and 18 holds it under the engine's key rule, with a clone on every partition, a
+//! drop that needs its record, a detach that keeps the clone as the partition's own and a
+//! rebuild that builds it again. A partition's own exclusion is held on both engines, with the
+//! record of its drop in its parent's identity file.
 use super::{
     Demo, OwnDatabase, approved_apply, code, json_output, on_server, scalar, server, stderr,
     stdout, succeeds, try_on_server,
@@ -464,7 +466,7 @@ fn a_parents_exclusion_is_added_enforced_replaced_and_dropped_on_18() {
 /// What 18 holds a parent's exclusion to, refused by name before the engine: the partition key
 /// as a plain `=` key (offline, at `validate`); a rows-refused add rolls back whole, with no
 /// constraint and no state; a parent built `ONLY` (the engine leaves its index invalid and
-/// clones nothing) is left out of the pull; and a partition's own exclusion stays refused.
+/// clones nothing) is left out of the pull.
 #[test]
 #[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
 fn a_parents_exclusion_is_held_to_the_engines_rules_and_a_failed_add_changes_nothing() {
@@ -495,17 +497,6 @@ fn a_parents_exclusion_is_held_to_the_engines_rules_and_a_failed_add_changes_not
             said(&out)
         );
     }
-
-    // A partition's own exclusion is not declared yet.
-    let own_declared = held.replacen(
-        "  ev_rest: default",
-        "  ev_2:\n    from: [\"10\"]\n    to: [\"20\"]\n    exclude:\n      own:\n        method: \
-         btree\n        keys:\n          - column: v\n            operator: \"=\"\n  ev_rest: \
-         default",
-        1,
-    );
-    std::fs::write(&path, own_declared).unwrap();
-    assert_ne!(code(&d.run(&["validate"])), 0);
 
     // A rows-refused add: two rows of one partition collide, the engine refuses the whole
     // statement, and the apply leaves the database and the ledger as they were.
@@ -540,4 +531,542 @@ fn a_parents_exclusion_is_held_to_the_engines_rules_and_a_failed_add_changes_not
     );
     let text = std::fs::read_to_string(fresh.dir.join("schema/app.ev.yml")).unwrap();
     assert!(!text.contains("only_slot"), "{text}");
+}
+
+/// The retirement of `constraint` on a partition, as the parent's identity file holds it: the
+/// partition has no file of its own, so its section sits with the parent's (DEC-2448.7).
+fn ids_holding(d: &Demo, constraint: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack = vec![d.dir.join(".pbps/ids")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if std::fs::read_to_string(&path)
+                .is_ok_and(|t| t.contains("\"partition_exclusions\"") && t.contains(constraint))
+            {
+                found.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            }
+        }
+    }
+    found
+}
+
+/// A leaf's own exclusion on 16 and 18: read from the database, declared under its partition,
+/// created on a partition added later, replaced, edited in its options (`ALTER INDEX` takes
+/// those on a leaf) and dropped, whose drop needs its record, kept in the parent's identity
+/// file under the partition's uid. Each step ends in an empty re-plan and a clean `verify`.
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_partitions_own_exclusion_is_read_declared_created_replaced_and_dropped() {
+    let _ = server();
+    servers(|url, _| {
+        let own = OwnDatabase::new(url, "exclude-own");
+        let connection = own.connection();
+        on_server(
+            connection,
+            &format!(
+                "{TREE}; ALTER TABLE app.ev_1 ADD CONSTRAINT ev_1_own EXCLUDE USING btree (v WITH =)"
+            ),
+        );
+        let d = adopt("exclude-own", connection);
+        let path = d.dir.join("schema/app.ev.yml");
+        let held = std::fs::read_to_string(&path).unwrap();
+        // Read as the partition's, under its entry, and the parent holds none.
+        assert!(
+            held.contains("ev_1_own:") && held.matches("exclude:").count() == 1,
+            "{held}"
+        );
+        succeeds(d.run(&["validate"]));
+        settled(&d, connection);
+
+        // A partition added later with its own exclusion, beside the DEFAULT one.
+        let with_new = held.replacen(
+            "  ev_rest: default",
+            "  ev_2:\n    from: [\"10\"]\n    to: [\"20\"]\n    exclude:\n      ev_2_own:\n        \
+             method: btree\n        keys:\n          - column: v\n            operator: \"=\"\n  \
+             ev_rest: default",
+            1,
+        );
+        assert_ne!(with_new, held, "{held}");
+        std::fs::write(&path, &with_new).unwrap();
+        d.commit();
+        let (plan, script) = plan_sql(&d, connection);
+        assert!(
+            script.contains("ALTER TABLE \"app\".\"ev_2\" ADD CONSTRAINT \"ev_2_own\" EXCLUDE"),
+            "{script}"
+        );
+        succeeds(approved_apply(&d, connection, &plan, BOTH));
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_constraint WHERE contype = 'x' AND conislocal \
+                 AND coninhcount = 0 AND conparentid = 0"
+            ),
+            2,
+            "two own exclusions, no parent's"
+        );
+        assert!(try_on_server(connection, "INSERT INTO app.ev VALUES (11, 5, 'a')").is_ok());
+        assert!(try_on_server(connection, "INSERT INTO app.ev VALUES (12, 5, 'b')").is_err());
+        settled(&d, connection);
+
+        // An option-only edit is `ALTER INDEX` on a leaf, unlike a partitioned parent's.
+        let tuned = with_new.replacen(
+            "      ev_2_own:\n        method: btree\n",
+            "      ev_2_own:\n        method: btree\n        storage_parameters:\n          \
+             fillfactor: 70\n",
+            1,
+        );
+        assert_ne!(tuned, with_new);
+        std::fs::write(&path, &tuned).unwrap();
+        d.commit();
+        let (plan, script) = plan_sql(&d, connection);
+        assert!(
+            script.contains("ALTER INDEX \"app\".\"ev_2_own\" SET (fillfactor")
+                && !script.contains("DROP CONSTRAINT"),
+            "{script}"
+        );
+        succeeds(approved_apply(&d, connection, &plan, &[]));
+        settled(&d, connection);
+
+        // A replacement: another key, one drop and one add in a transaction.
+        let replaced = tuned.replacen(
+            "      ev_1_own:\n        method: btree\n        keys:\n          - column: v\n            \
+             operator: =\n",
+            "      ev_1_own:\n        method: btree\n        keys:\n          - column: v\n            \
+             operator: =\n          - column: note\n            operator: =\n",
+            1,
+        );
+        assert_ne!(replaced, tuned, "{tuned}");
+        std::fs::write(&path, &replaced).unwrap();
+        d.commit();
+        let (plan, script) = plan_sql(&d, connection);
+        assert!(
+            script.find("DROP CONSTRAINT \"ev_1_own\"").unwrap()
+                < script.find("ADD CONSTRAINT \"ev_1_own\"").unwrap(),
+            "{script}"
+        );
+        succeeds(approved_apply(&d, connection, &plan, BOTH));
+        settled(&d, connection);
+
+        // A drop is refused until its reason is recorded, in the parent's file.
+        let dropped = replaced.replacen(
+            "    exclude:\n      ev_2_own:\n        method: btree\n        storage_parameters:\n          \
+             fillfactor: 70\n        keys:\n          - column: v\n            operator: \"=\"\n",
+            "",
+            1,
+        );
+        assert_ne!(dropped, replaced, "{replaced}");
+        std::fs::write(&path, &dropped).unwrap();
+        let refused = d.run(&["plan", "--db", connection]);
+        assert_ne!(code(&refused), 0, "{}", said(&refused));
+        assert!(
+            said(&refused).contains("pbps drop-exclusion app.ev_2 ev_2_own --reason"),
+            "{}",
+            said(&refused)
+        );
+        succeeds(d.run(&[
+            "drop-exclusion",
+            "app.ev_2",
+            "ev_2_own",
+            "--reason",
+            "the booking service enforces it",
+        ]));
+        d.commit();
+        assert_eq!(
+            ids_holding(&d, "ev_2_own"),
+            ["app.ev.json"],
+            "the parent's file"
+        );
+        let (plan, script) = plan_sql(&d, connection);
+        assert!(
+            script.contains("DROP CONSTRAINT \"ev_2_own\"") && !script.contains("DROP INDEX"),
+            "{script}"
+        );
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &plan,
+            &["--allow", "destructive"],
+        ));
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_constraint WHERE conname = 'ev_2_own'"
+            ),
+            0
+        );
+        settled(&d, connection);
+    });
+}
+
+/// What the engine takes for its parent's clone it takes on `ATTACH` and when the parent's is
+/// added, and what it takes goes with the parent's exclusion (measured on 18.6, DEC-2448.7).
+/// So an own equal to the parent's is refused offline whatever its timing, an attach of a table
+/// whose own the parent's would take is refused by name, and an own that differs (here by its
+/// `include`) coexists with the clone: it attaches, stays the partition's own and re-plans clean.
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_partitions_own_exclusion_the_parents_would_take_is_refused_and_one_it_would_not_stays() {
+    let _ = server();
+    let url = std::env::var("PBPS_TEST_PG_DB").expect("PBPS_TEST_PG_DB");
+    const SLOT_SQL: &str = "ALTER TABLE app.ev ADD CONSTRAINT one_per_slot EXCLUDE USING btree \
+                            (k WITH =, v WITH =)";
+    // The table is declared as a partition of the tree, in its own database.
+    let attach = |name: &str, own_sql: &str| {
+        let own = OwnDatabase::new(&url, name);
+        on_server(
+            own.connection(),
+            &format!(
+                "{TREE}; {SLOT_SQL}; CREATE TABLE app.late (k integer NOT NULL, v integer NOT NULL, \
+                 note text, {own_sql})"
+            ),
+        );
+        let d = adopt(name, own.connection());
+        let path = d.dir.join("schema/app.ev.yml");
+        let tree = std::fs::read_to_string(&path).unwrap();
+        let late = d.dir.join("schema/app.late.yml");
+        let late_text = std::fs::read_to_string(&late).unwrap();
+        (own, d, path, tree, late, late_text)
+    };
+
+    // An own equal to the parent's in method, keys, operators, `include` and `where` is
+    // refused offline, with another name and another timing alike; one that differs is not.
+    let (own, d, path, tree, late, late_text) = attach(
+        "exclude-own-equal",
+        "CONSTRAINT late_own EXCLUDE USING btree (k WITH =, v WITH =)",
+    );
+    let connection = own.connection();
+    assert_eq!(parent_constraints(connection, "one_per_slot"), 1);
+    let twin = |extra: &str, include: &str| {
+        tree.replacen(
+            "  ev_rest: default",
+            &format!(
+                "  ev_rest: default\n  ev_2:\n    from: [\"10\"]\n    to: [\"20\"]\n    exclude:\n      \
+                 twin:\n        method: btree\n{extra}        keys:\n          - column: k\n            \
+                 operator: \"=\"\n          - column: v\n            operator: \"=\"\n{include}"
+            ),
+            1,
+        )
+    };
+    for (extra, include) in [
+        ("", ""),
+        (
+            "        deferrable: true\n        initially: deferred\n",
+            "",
+        ),
+    ] {
+        std::fs::write(&path, twin(extra, include)).unwrap();
+        let refused = d.run(&["validate"]);
+        assert_ne!(code(&refused), 0, "{}", said(&refused));
+        assert!(
+            said(&refused).contains("exclusion constraint `twin` is its parent's `one_per_slot`"),
+            "{}",
+            said(&refused)
+        );
+    }
+    std::fs::write(&path, twin("", "        include: [note]\n")).unwrap();
+    succeeds(d.run(&["validate"]));
+
+    // `late` holds an own the parent's would take: attached, the engine would make it the
+    // parent's clone. Declared as a partition without it, its drop needs its record; with the
+    // record, the attach is refused by name (the base still holds the own), and nothing ran.
+    std::fs::remove_file(&late).unwrap();
+    let declared = tree.replacen(
+        "  ev_rest: default",
+        "  late: {from: [\"20\"], to: [\"30\"]}\n  ev_rest: default",
+        1,
+    );
+    std::fs::write(&path, &declared).unwrap();
+    succeeds(d.run(&[
+        "drop-exclusion",
+        "app.late",
+        "late_own",
+        "--reason",
+        "the clone replaces it",
+    ]));
+    let refused = d.run(&["plan"]);
+    assert_ne!(code(&refused), 0, "{}", said(&refused));
+    assert!(
+        said(&refused)
+            .contains("its exclusion constraint `late_own` is its parent's `one_per_slot`"),
+        "{}",
+        said(&refused)
+    );
+    assert_eq!(clones(connection), 2, "nothing ran");
+    let _ = (late_text, declared);
+
+    // An own that differs by its `include` attaches, keeps its own, and gains a clone.
+    let (own, d, path, tree, late, late_text) = attach(
+        "exclude-own-differs",
+        "CONSTRAINT late_own EXCLUDE USING btree (k WITH =, v WITH =) INCLUDE (note)",
+    );
+    let connection = own.connection();
+    assert!(late_text.contains("late_own:"), "{late_text}");
+    let own_entry: String = {
+        let at = late_text.find("exclude:\n").unwrap();
+        late_text[at..]
+            .lines()
+            .map(|l| format!("    {l}\n"))
+            .collect()
+    };
+    std::fs::remove_file(&late).unwrap();
+    std::fs::write(
+        &path,
+        tree.replacen(
+            "  ev_rest: default",
+            &format!(
+                "  late:\n    from: [\"20\"]\n    to: [\"30\"]\n{own_entry}  ev_rest: default"
+            ),
+            1,
+        ),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let (plan, script) = plan_sql(&d, connection);
+    assert!(
+        script.contains("ATTACH PARTITION \"app\".\"late\""),
+        "{script}"
+    );
+    succeeds(approved_apply(&d, connection, &plan, BOTH));
+    assert_eq!(clones(connection), 3, "the engine built late's clone");
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_constraint WHERE contype = 'x' \
+             AND conrelid = 'app.late'::regclass"
+        ),
+        2,
+        "its own beside the clone"
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_constraint WHERE conname = 'late_own' \
+             AND conislocal AND conparentid = 0"
+        ),
+        1
+    );
+    settled(&d, connection);
+
+    // A partition created with an own that differs from the parent's: the clone and the own
+    // coexist, and the re-plan is empty.
+    let held = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        held.replacen(
+            "  ev_rest: default",
+            "  made:\n    from: [\"30\"]\n    to: [\"40\"]\n    exclude:\n      made_own:\n        \
+             method: btree\n        include: [note]\n        keys:\n          - column: k\n            \
+             operator: \"=\"\n          - column: v\n            operator: \"=\"\n  ev_rest: default",
+            1,
+        ),
+    )
+    .unwrap();
+    d.commit();
+    let (plan, _) = plan_sql(&d, connection);
+    succeeds(approved_apply(&d, connection, &plan, BOTH));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_constraint WHERE contype = 'x' \
+             AND conrelid = 'app.made'::regclass"
+        ),
+        2,
+        "the clone beside its own"
+    );
+    settled(&d, connection);
+}
+
+const REBUILD_TREE: &str = "CREATE SCHEMA app; \
+    CREATE TABLE app.p (k integer NOT NULL, bucket integer NOT NULL, label text) \
+      PARTITION BY RANGE (k); \
+    CREATE TABLE app.p1 PARTITION OF app.p FOR VALUES FROM (0) TO (10); \
+    CREATE TABLE app.p2 PARTITION OF app.p DEFAULT; \
+    ALTER TABLE app.p1 ADD CONSTRAINT p1_own EXCLUDE USING btree (label WITH =); \
+    INSERT INTO app.p VALUES (1, 2, 'a'), (3, 4, 'b'), (30, 5, 'c')";
+
+/// A rebuild keeps a partition's own exclusion (16 and 18) and builds a parent's again on 18:
+/// built on the parent alone, then on each leaf and attached, so every leaf has its clone and
+/// the parent's index is valid. The tree is re-keyed, the rows copied, and the empty re-plan and
+/// `verify` find nothing to say.
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_rebuild_keeps_a_partitions_own_exclusion_and_builds_a_parents_again_on_18() {
+    let _ = server();
+    servers(|url, current| {
+        let own = OwnDatabase::new(url, "exclude-rebuild");
+        let connection = own.connection();
+        on_server(connection, REBUILD_TREE);
+        if current {
+            on_server(
+                connection,
+                "ALTER TABLE app.p ADD CONSTRAINT p_x EXCLUDE USING btree \
+                 (k WITH =, bucket WITH =)",
+            );
+        }
+        let d = adopt("exclude-rebuild", connection);
+        let path = d.dir.join("schema/app.p.yml");
+        let held = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            held.contains("p1_own:") && held.contains("partition_by: [k]"),
+            "{held}"
+        );
+        std::fs::write(
+            &path,
+            held.replacen("partition_by: [k]", "partition_by: [bucket]", 1),
+        )
+        .unwrap();
+        succeeds(d.run(&[
+            "rebuild-table",
+            "app.p",
+            "--max-rows",
+            "10",
+            "--reason",
+            "re-key",
+        ]));
+        d.commit();
+        let artifact = d.dir.join("rebuild.json");
+        let planned = succeeds(d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--out",
+            artifact.to_str().unwrap(),
+        ]));
+        assert!(
+            stdout(&planned).contains("blocking rewrite"),
+            "{}",
+            stdout(&planned)
+        );
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &artifact,
+            &["--allow", "destructive,rename,constraint,narrowing,revoke"],
+        ));
+        assert_eq!(scalar(connection, "SELECT count(*) FROM app.p"), 3);
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_constraint WHERE conname = 'p1_own' AND conislocal \
+                 AND conparentid = 0 AND conrelid = 'app.p1'::regclass"
+            ),
+            1,
+            "the own exclusion is rebuilt on the new leaf"
+        );
+        if current {
+            assert_eq!(parent_constraints(connection, "p_x"), 1);
+            assert_eq!(clones(connection), 2, "one clone for each leaf");
+            assert_eq!(
+                scalar(
+                    connection,
+                    "SELECT count(*) FROM pg_index WHERE indexrelid = 'app.p_x'::regclass \
+                     AND indisvalid"
+                ),
+                1,
+                "the parent's index is valid"
+            );
+            assert!(try_on_server(connection, "INSERT INTO app.p VALUES (1, 2, 'z')").is_err());
+        }
+        assert!(try_on_server(connection, "INSERT INTO app.p VALUES (4, 9, 'a')").is_err());
+        settled(&d, connection);
+    });
+}
+
+/// A partition of a parent that holds an exclusion is detached on 18: the partition's clone
+/// becomes its own, as the declaration of the detached table names it, behind the `destructive`
+/// risk, with its rows kept and the parent's exclusion still holding the partitions left. A
+/// declaration without the clone is refused by name before a plan exists.
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_partition_of_a_parent_with_an_exclusion_is_detached_and_its_clone_becomes_its_own() {
+    let _ = server();
+    let url = std::env::var("PBPS_TEST_PG_DB").expect("PBPS_TEST_PG_DB");
+    let own = OwnDatabase::new(&url, "exclude-detach");
+    let connection = own.connection().to_owned();
+    on_server(&connection, "CREATE SCHEMA app");
+    let d = Demo::new("exclude-detach");
+    let columns = "columns:\n  k: {type: integer, nullable: false}\n  v: {type: integer, nullable: false}\n  \
+                   note: {type: text}\n";
+    let slot = "  one_per_slot:\n    method: btree\n    keys:\n      - column: k\n        operator: \"=\"\n      \
+                - column: v\n        operator: \"=\"\n";
+    let tree = |partitions: &str| {
+        std::fs::write(
+            d.dir.join("schema/app.ev.yml"),
+            format!(
+                "table: app.ev\n{columns}partition_by: [k]\npartitions:\n{partitions}exclude:\n{slot}"
+            ),
+        )
+        .unwrap();
+    };
+    let p1 = "  ev_1: {from: [\"0\"], to: [\"10\"]}\n";
+    let p2 = "  ev_2: {from: [\"10\"], to: [\"20\"]}\n";
+    tree(&format!("{p1}{p2}"));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", &connection]));
+    assert_eq!(clones(&connection), 2);
+    on_server(
+        &connection,
+        "INSERT INTO app.ev VALUES (1, 1, 'a'), (11, 1, 'b')",
+    );
+
+    // The clone is missing from the detached table's declaration: refused by name.
+    tree(p2);
+    let archived = d.dir.join("schema/app.ev_1.yml");
+    std::fs::write(&archived, format!("table: app.ev_1\n{columns}")).unwrap();
+    let refused = d.run(&["plan"]);
+    assert_ne!(code(&refused), 0, "{}", said(&refused));
+    assert!(
+        said(&refused).contains("its parent's exclusion constraint `one_per_slot` is missing"),
+        "{}",
+        said(&refused)
+    );
+
+    // Declared with the clone under a name of its own: detached, the clone renamed.
+    std::fs::write(
+        &archived,
+        format!(
+            "table: app.ev_1\n{columns}exclude:\n  archived_slot:\n    method: btree\n    keys:\n      \
+             - column: k\n        operator: \"=\"\n      - column: v\n        operator: \"=\"\n"
+        ),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let planned = succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    assert!(
+        stdout(&planned).contains("detach table app.ev_1 from app.ev"),
+        "{}",
+        stdout(&planned)
+    );
+    assert_ne!(
+        code(&approved_apply(&d, &connection, &plan, &[])),
+        0,
+        "needs its risk"
+    );
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "destructive"],
+    ));
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*) FROM pg_constraint WHERE conname = 'archived_slot' AND contype = 'x' \
+             AND conislocal AND coninhcount = 0 AND conparentid = 0 \
+             AND conrelid = 'app.ev_1'::regclass"
+        ),
+        1,
+        "the clone became the partition's own under the declared name"
+    );
+    assert_eq!(clones(&connection), 1, "the parent still clones to ev_2");
+    assert_eq!(scalar(&connection, "SELECT count(*) FROM app.ev_1"), 1);
+    assert!(try_on_server(&connection, "INSERT INTO app.ev_1 VALUES (1, 1, 'dup')").is_err());
+    settled(&d, &connection);
 }
