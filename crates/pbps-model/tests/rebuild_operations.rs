@@ -231,6 +231,14 @@ fn explicit_index_recipes_own_all_clones_and_refuse_ambiguous_owners() {
         )));
         let named = names(op, &owners, before).unwrap();
         assert_eq!(named.claims.len(), 1 + recipe.clones.len());
+        // An index is named in the schema's relations, a key and an exclusion also as the
+        // constraint they back.
+        let kind = if matches!(recipe.definition, PartitionIndexDefinition::Index(_)) {
+            NameKind::Index
+        } else {
+            NameKind::Key
+        };
+        assert!(named.claims.iter().all(|n| n.address.kind == kind));
         assert!(
             named
                 .claims
