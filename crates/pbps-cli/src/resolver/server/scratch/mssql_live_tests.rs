@@ -1383,7 +1383,6 @@ async fn mssql_prepare_renders_missing_external_and_returns_entered_compile_conn
         let prepared=MssqlEngine::prepare(&mut state, provisioning,&mut admin,&mut target,&catalog,&authorization,&request.schemas,&binding,&[], Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key())).await;
         let verification=tokio::spawn(async move { match prepared {
             Ok(mut prepared) => {
-                assert!(matches!(prepared.map,crate::resolver::scope::Principals::Mssql(_)));
                 assert!(format!("{:?}",prepared.inventory).contains("ext2269"));
                 assert!(prepared.staged.compared().contains(&capture::object("dbo","ext2269")));
                 let rows=prepared.compile.query("SELECT USER_NAME() AS principal,ISNULL(OBJECT_ID(N'dbo.ext2269'),0) AS ext;").await.unwrap();

@@ -39,9 +39,11 @@ pub struct PgResolver;
 
 impl Sealed for PgResolver {}
 
-/// The domain the planning seals the cluster under; apply recomputes it.
+/// The domain the planning seals the cluster under; apply recomputes it. The
+/// publication recheck and apply key the identifier their own session reports
+/// the same way and compare digests (#1516, #616).
 const CLUSTER: ClusterDomain = ClusterDomain {
-    rule: crate::resolver::server::CLUSTER_RULE,
+    rule: "pbps/pg-cluster-identity/v1",
     component: "system-identifier",
 };
 
@@ -473,7 +475,11 @@ impl ResolverEngine for PgResolver {
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
         Ok((
             authorization.canonical(),
-            pg_auth::with_planned(authorization.clone(), &scope::pg_planned(planned)).canonical(),
+            pg_auth::with_planned(
+                authorization.clone(),
+                &super::principals::pg_planned(planned),
+            )
+            .canonical(),
         ))
     }
 
@@ -481,19 +487,22 @@ impl ResolverEngine for PgResolver {
         authorization: &Self::Authorization,
         planned: &[scope::PlannedGrant],
     ) -> Vec<String> {
-        pg_auth::ambiguous_grantors(authorization, &scope::pg_planned(planned))
+        pg_auth::ambiguous_grantors(authorization, &super::principals::pg_planned(planned))
     }
 
     fn unusable_schemas(
         authorization: &Self::Authorization,
         planned: &[scope::PlannedGrant],
     ) -> Vec<String> {
-        pg_auth::with_planned(authorization.clone(), &scope::pg_planned(planned))
-            .schemas
-            .into_iter()
-            .filter(|(_, schema)| schema.privileges.get("USAGE") != Some(&true))
-            .map(|(name, _)| name)
-            .collect()
+        pg_auth::with_planned(
+            authorization.clone(),
+            &super::principals::pg_planned(planned),
+        )
+        .schemas
+        .into_iter()
+        .filter(|(_, schema)| schema.privileges.get("USAGE") != Some(&true))
+        .map(|(name, _)| name)
+        .collect()
     }
 
     fn project_visibility(
@@ -503,7 +512,10 @@ impl ResolverEngine for PgResolver {
         extras: &[String],
         catalog: &mut CatalogFacts,
     ) {
-        let expected = pg_auth::with_planned(authorization.clone(), &scope::pg_planned(planned));
+        let expected = pg_auth::with_planned(
+            authorization.clone(),
+            &super::principals::pg_planned(planned),
+        );
         catalog.visibility = expected_visibility(&expected, schemas, extras);
     }
 

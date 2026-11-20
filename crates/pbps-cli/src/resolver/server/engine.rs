@@ -32,6 +32,7 @@ pub(super) use postgres::{
 // These are logical planning records, not a raw engine capture or a verifier.
 pub(super) use pbps_pg::resolver::capture::BindingRecord;
 
+#[cfg(test)]
 const NO_BINDING_ADAPTER: &str =
     "SQL Server has no binding adapter yet; its design and implementation are #619 and #620";
 

@@ -77,6 +77,11 @@ fn the_producer_leaves_every_engine_decision_to_the_engine() {
 }
 
 #[test]
+fn the_authorization_shell_leaves_every_engine_decision_to_the_engine() {
+    assert_eq!(engine_named(include_str!("../scope.rs")), None);
+}
+
+#[test]
 fn the_scratch_run_leaves_every_engine_decision_to_the_engine() {
     assert_eq!(engine_named(include_str!("scratch.rs")), None);
 }

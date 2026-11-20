@@ -7,7 +7,6 @@ use super::super::scratch::{Provenance, Provisioning, Tokens};
 use super::super::{BindingRequest, ScopeRequest};
 use super::{Error, ProduceError};
 use crate::resolver::contract::ResolverEngine;
-use crate::resolver::scope;
 use pbps_db::resolver::ScratchNames;
 use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, Driver};
@@ -22,6 +21,7 @@ use pbps_pg::resolver::{draft, externals};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod contract;
+mod principals;
 mod recovery;
 mod release;
 
@@ -499,7 +499,8 @@ impl Naming {
 pub struct Prepared {
     sessions: Sessions,
     pub(super) scratch_catalog: CatalogFacts,
-    pub(super) map: scope::Principals,
+    /// The run-local principals that stand in for the target's on scratch.
+    pub(super) map: pg_auth::RoleMap,
     /// Authorization keys the reproduction did not reproduce.
     pub(super) differences: Vec<String>,
     /// What the externals file and the fill ahead of the managed objects
@@ -539,12 +540,15 @@ impl Scratch<'_> {
             <PgResolver as ResolverEngine>::recipe(target_catalog).map_err(Error::Scope)?;
         let names = super::super::names_for(&self.token)?;
         let login = names.login().to_owned();
-        let map = scope::Principals::generate(authorization, &request.planned, &login, &self.token);
+        let map = principals::generate(authorization, &request.planned, &login, &self.token);
         // Recorded before anything is created, so a failure part-way still
         // drops what was made.
         self.created = Created::RunOwned {
             names: names.clone(),
-            roles: map.server_wide_names(),
+            // The server-wide principals this run creates and must drop.
+            // (SQL Server's are database-scoped and go with the scratch
+            // database.)
+            roles: map.run_local_names(),
         };
         pbps_pg::resolver::create_scratch(admin, &names, &recipe)
             .await
@@ -574,7 +578,7 @@ impl Scratch<'_> {
             },
         )
         .await?;
-        scope::prepare(
+        principals::prepare(
             &mut owner,
             &map,
             authorization,
@@ -632,14 +636,13 @@ impl Scratch<'_> {
         standard::put_connection_limit(&mut owner, names.database(), self.standard)
             .await
             .map_err(db("the scratch database's connection limit"))?;
-        let deployer = map
-            .deployer(authorization)
+        let deployer = principals::deployer(&map, authorization)
             .map_err(|reason| Error::Scope(reason.into()))?;
         let grantee = Some(deployer.clone().unwrap_or_else(|| names.login().into()));
-        scope::enter(&mut session, driver, deployer.as_ref())
+        principals::enter(&mut session, deployer.as_ref())
             .await
             .map_err(db("the reproduced deployer"))?;
-        let differences = scope::settle(
+        let differences = principals::settle(
             &mut session,
             &map,
             authorization,
@@ -713,7 +716,7 @@ impl Scratch<'_> {
             .await
             .map_err(db("the scratch database's privileges"))?
             .acl;
-        let map = scope::Principals::supplied(authorization, &principal.login);
+        let map = principals::supplied(authorization, &principal.login);
         // The first object the run creates here, and its record: a run killed
         // after it is found and cleaned by the next one (`recovery`, #2410).
         let claimed = record::claim(
@@ -1690,7 +1693,7 @@ pub(super) async fn capture_desired_for_plan(
     desired: &Managed,
     paths: &Paths,
     key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
-    principals: &crate::resolver::scope::Principals,
+    roles: &pg_auth::RoleMap,
     recorded: pbps_diff::Side<'_>,
     reconstruction: &Reconstruction,
     namespaces: &std::collections::BTreeSet<String>,
@@ -1698,53 +1701,46 @@ pub(super) async fn capture_desired_for_plan(
     staged: &std::collections::BTreeSet<pbps_db::resolver::capture::ObjectIdentity>,
 ) -> Result<(CompiledCapture, CaptureScope), Error> {
     use pbps_pg::resolver::capture;
-    // The principal map names the engine: only PostgreSQL's has an adapter.
-    match principals {
-        crate::resolver::scope::Principals::Postgres(roles) => {
-            let first = capture::capture(connection, &capture::managed_scope(desired))
-                .await
-                .map_err(super::catalog_read_failed)?;
-            // What an externals file staged is read and sealed on both sides, so
-            // the recheck compares the target's complete fingerprints of it
-            // (#1673).
-            let mut scope = capture::scope(&first, &[base, desired], paths);
-            scope.retained.extend(staged.iter().cloned());
-            let routines = recorded
-                .schema
-                .modules
-                .keys()
-                .filter_map(|id| {
-                    reconstruction
-                        .created(id)
-                        .map(|object| (id.clone(), object.clone()))
-                })
-                .collect();
-            let dropped = Default::default();
-            let ownership = capture::RecordedOwnership {
-                schema: recorded.schema,
-                ids: recorded.ids,
-                routines: &routines,
-                dropped: &dropped,
-                namespaces,
-            };
-            // The same lookups the opening sealed: the closing manifest records
-            // what each dropped signature names after the plan, normally none.
-            let captured = capture::capture_identifying_for_plan(
-                connection,
-                &scope,
-                dropped_signatures,
-                key,
-                roles,
-                &ownership,
-            )
-            .await
-            .map_err(super::catalog_read_failed)?;
-            Ok((captured, scope))
-        }
-        crate::resolver::scope::Principals::Mssql(_) => {
-            Err(Error::Binding(super::NO_BINDING_ADAPTER.into()))
-        }
-    }
+    // The principal map is PostgreSQL's: only PostgreSQL has a binding adapter.
+    let first = capture::capture(connection, &capture::managed_scope(desired))
+        .await
+        .map_err(super::catalog_read_failed)?;
+    // What an externals file staged is read and sealed on both sides, so
+    // the recheck compares the target's complete fingerprints of it
+    // (#1673).
+    let mut scope = capture::scope(&first, &[base, desired], paths);
+    scope.retained.extend(staged.iter().cloned());
+    let routines = recorded
+        .schema
+        .modules
+        .keys()
+        .filter_map(|id| {
+            reconstruction
+                .created(id)
+                .map(|object| (id.clone(), object.clone()))
+        })
+        .collect();
+    let dropped = Default::default();
+    let ownership = capture::RecordedOwnership {
+        schema: recorded.schema,
+        ids: recorded.ids,
+        routines: &routines,
+        dropped: &dropped,
+        namespaces,
+    };
+    // The same lookups the opening sealed: the closing manifest records
+    // what each dropped signature names after the plan, normally none.
+    let captured = capture::capture_identifying_for_plan(
+        connection,
+        &scope,
+        dropped_signatures,
+        key,
+        roles,
+        &ownership,
+    )
+    .await
+    .map_err(super::catalog_read_failed)?;
+    Ok((captured, scope))
 }
 
 /// Each in-scope schema's effective path as the qualified scope measured it,

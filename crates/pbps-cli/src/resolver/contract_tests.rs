@@ -201,10 +201,10 @@ fn apply_and_producer_seal_under_one_cluster_domain() {
     let pg = contract::apply(&pbps_pg::Postgres::new())
         .unwrap()
         .cluster();
-    assert_eq!(pg.rule, super::server::CLUSTER_RULE);
+    assert_eq!(pg.rule, "pbps/pg-cluster-identity/v1");
     assert_eq!(pg.component, "system-identifier");
     let ms = contract::apply(&pbps_mssql::Mssql).unwrap().cluster();
-    assert_eq!(ms.rule, super::server::MSSQL_CLUSTER_RULE);
+    assert_eq!(ms.rule, "pbps/mssql-instance-identity/v1");
     assert_eq!(ms.component, "family-guid");
     // Planning declares the same domain apply recomputes.
     let planned = contract::planning(&pbps_mssql::Mssql).unwrap().cluster;

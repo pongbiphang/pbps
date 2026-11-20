@@ -105,9 +105,7 @@ pub(super) async fn execute(
     auth::read_staged_permissions(target, context, &target_owners)
         .await
         .map_err(read)?;
-    let scope::Principals::Mssql(map) = &mut prepared.map else {
-        unreachable!("MSSQL preparation")
-    };
+    let map = &mut prepared.map;
     map.extend_staged(&mut setup, context, &prepared.chaining.token)
         .await
         .map_err(read)?;

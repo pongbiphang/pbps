@@ -153,7 +153,7 @@ ALLOWED = {
         3,
         "role and extension subjects are raw grouping and policy keys, which remain raw",
     ),
-    "crates/pbps-cli/src/resolver/scope.rs": (
+    "crates/pbps-cli/src/resolver/server/engine/postgres/principals.rs": (
         1,
         "quotes a raw role into scratch SET ROLE SQL; SQL remains raw",
     ),

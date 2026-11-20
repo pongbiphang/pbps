@@ -56,14 +56,6 @@ fn scope_of(
     }
 }
 
-/// The domain the sealed cluster identity is keyed under. The publication
-/// recheck and apply key the identifier their own session reports the same
-/// way and compare digests (#1516, #616).
-pub(crate) const CLUSTER_RULE: &str = "pbps/pg-cluster-identity/v1";
-/// SQL Server's instance identity (`family_guid`), keyed under its own label so that
-/// no PostgreSQL digest equals a SQL Server one (#2144, DEC-1685.1).
-pub(crate) const MSSQL_CLUSTER_RULE: &str = "pbps/mssql-instance-identity/v1";
-
 pub(super) fn fingerprint(
     key: &EnvironmentFingerprintKey,
     rule: &str,
