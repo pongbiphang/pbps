@@ -559,6 +559,37 @@ fn a_freeze_refuses_a_missing_or_unreadable_record_naming_its_path() {
 }
 
 #[test]
+fn a_record_without_the_released_key_is_damage_and_not_no_release() {
+    // `{}` parses as JSON and would read as "nothing released" if the key were
+    // optional, which turns every increment check off. The freeze and the
+    // reader both refuse it, naming the path, and the freeze writes nothing.
+    for text in ["{}\n", "{\"note\": 1}\n"] {
+        let scratch = Scratch::new();
+        std::fs::write(scratch.layout().record, text).unwrap();
+        let why = freeze(&scratch.layout(), "v1", &Build::current()).expect_err(text);
+        assert!(
+            why.replace('\\', "/").contains("released_formats.json"),
+            "{why}"
+        );
+        assert!(why.contains("not a release record"), "{why}");
+        let read = read_record(&scratch.layout().record).expect_err(text);
+        assert!(
+            read.replace('\\', "/").contains("released_formats.json"),
+            "{read}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.layout().record).unwrap(),
+            text
+        );
+        assert!(!scratch.layout().archives.exists());
+    }
+    // Positive: the explicit shape is read as no release, and the freeze goes on.
+    let scratch = Scratch::new();
+    assert_eq!(read_record(&scratch.layout().record), Ok(None));
+    freeze(&scratch.layout(), "v1", &Build::current()).expect("the repository's own shape");
+}
+
+#[test]
 fn a_freeze_refuses_an_archive_of_another_set_when_nothing_was_released() {
     // The record says nothing was released, so the record's refusals do not
     // apply, and the archive's is the one left to stop a freeze.

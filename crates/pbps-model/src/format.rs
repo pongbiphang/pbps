@@ -173,7 +173,18 @@ pub fn parse_record(text: &str) -> Result<Option<Released>, serde_json::Error> {
     struct Record {
         released: Option<Released>,
     }
-    serde_json::from_str::<Record>(text).map(|record| record.released)
+    // A derived `Option` field reads a missing key as `None`, so `{}` would mean
+    // "nothing released" and switch every increment check off. The file has two
+    // shapes, `null` and a record, so the key is asked for first.
+    // (`deserialize_with` would do it too, but the model's rule for those fields
+    // also wants a schema marker, and this struct has no schema.)
+    let value: serde_json::Value = serde_json::from_str(text)?;
+    if value.get("released").is_none() {
+        return Err(<serde_json::Error as serde::de::Error>::custom(
+            "the record has no `released` key: it is `null` or a release",
+        ));
+    }
+    serde_json::from_value::<Record>(value).map(|record| record.released)
 }
 
 /// The last release's frozen formats, or `None` while no release exists.
@@ -422,6 +433,31 @@ mod tests {
                 check_increment(format.name, format.current, format.identity(), frozen),
                 Ok(())
             );
+        }
+    }
+
+    #[test]
+    fn a_record_has_exactly_two_legal_shapes() {
+        assert_eq!(parse_record(r#"{"released": null}"#).unwrap(), None);
+        let frozen = |n: u32| format!(r#"{{"version":{n},"fingerprint":"{}"}}"#, "a".repeat(64));
+        let release = format!(
+            r#"{{"released":{{"tag":"v1","plan":{},"state":{},"schema_set":{}}}}}"#,
+            frozen(1),
+            frozen(2),
+            frozen(3)
+        );
+        let parsed = parse_record(&release).unwrap().expect("a release");
+        assert_eq!(parsed.state.version, 2);
+        // Negative: a missing key is damage and not "nothing released", and so is
+        // an unknown field beside it, an empty file and a key with no value.
+        for damaged in [
+            "{}",
+            r#"{"note": 1}"#,
+            r#"{"released": null, "note": 1}"#,
+            "",
+            "null",
+        ] {
+            assert!(parse_record(damaged).is_err(), "{damaged:?}");
         }
     }
 
