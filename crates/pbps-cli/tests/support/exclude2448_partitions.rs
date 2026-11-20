@@ -976,6 +976,153 @@ fn a_rebuild_keeps_a_partitions_own_exclusion_and_builds_a_parents_again_on_18()
     });
 }
 
+/// A rebuild whose target parent holds an exclusion is PostgreSQL 18's too: the parent's
+/// `ADD .. EXCLUDE` on a partitioned table is `0A000` on 16, and the rebuild recipe carries it as a
+/// part of its own kind, so the version gate reads that kind as it reads an added exclusion. 16
+/// refuses by name before any statement and nothing changes; the partition's own exclusion,
+/// which 16 holds, is not what it names.
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_rebuild_with_a_parents_exclusion_is_refused_by_name_on_16_before_any_statement() {
+    let _ = server();
+    let url = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    let own = OwnDatabase::new(&url, "exclude-rebuild-16");
+    let connection = own.connection();
+    on_server(connection, REBUILD_TREE);
+    let d = adopt("exclude-rebuild-16", connection);
+    let path = d.dir.join("schema/app.p.yml");
+    let held = std::fs::read_to_string(&path).unwrap();
+    assert!(held.contains("p1_own:"), "{held}");
+    std::fs::write(
+        &path,
+        format!(
+            "{}\nexclude:\n  p_x:\n    method: btree\n    keys:\n      - column: k\n        \
+             operator: \"=\"\n      - column: bucket\n        operator: \"=\"\n",
+            held.replacen("partition_by: [k]", "partition_by: [bucket]", 1)
+                .trim_end()
+        ),
+    )
+    .unwrap();
+    succeeds(d.run(&["validate"]));
+    succeeds(d.run(&[
+        "rebuild-table",
+        "app.p",
+        "--max-rows",
+        "10",
+        "--reason",
+        "re-key",
+    ]));
+    d.commit();
+    let before = recorded(&d, connection);
+    let oid = scalar(connection, "SELECT 'app.p'::regclass::oid::bigint");
+    let artifact = d.dir.join("rebuild.json");
+    let refused = d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        artifact.to_str().unwrap(),
+    ]);
+    assert_ne!(code(&refused), 0, "{}", said(&refused));
+    assert!(
+        said(&refused)
+            .contains("app.p: an exclusion constraint on a partitioned table needs PostgreSQL 18"),
+        "{}",
+        said(&refused)
+    );
+    assert!(
+        !said(&refused).contains("p1_own"),
+        "a partition's own exclusion is held on 16 and is not named: {}",
+        said(&refused)
+    );
+    assert_eq!(recorded(&d, connection), before);
+    assert_eq!(
+        scalar(connection, "SELECT 'app.p'::regclass::oid::bigint"),
+        oid,
+        "the table was not replaced"
+    );
+    assert_eq!(scalar(connection, "SELECT count(*) FROM app.p"), 3);
+    assert_eq!(parent_constraints(connection, "p_x"), 0);
+}
+
+/// A partition's retired own exclusion survives a rebuild of its tree: the record of the drop
+/// is the partition's, and the rebuild replaces the partition, so the record follows the
+/// replacement of the same name instead of leaving the identity file refusing the approval as an
+/// orphan (DEC-2448.4). On both engines, which hold a partition's own exclusion.
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_rebuild_keeps_the_record_of_a_partitions_retired_own_exclusion() {
+    let _ = server();
+    servers(|url, _| {
+        let own = OwnDatabase::new(url, "exclude-rebuild-retired");
+        let connection = own.connection();
+        on_server(connection, REBUILD_TREE);
+        on_server(
+            connection,
+            "ALTER TABLE app.p1 ADD CONSTRAINT p1_old EXCLUDE USING btree (bucket WITH =)",
+        );
+        let d = adopt("exclude-rebuild-retired", connection);
+        let path = d.dir.join("schema/app.p.yml");
+        let held = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            held.contains("p1_old:") && held.contains("p1_own:"),
+            "{held}"
+        );
+        // Retire `p1_old`: declared away, with the human's record of the drop.
+        let at = held.find("p1_old:").unwrap();
+        let end = held.find("p1_own:").unwrap();
+        assert!(end > at, "p1_old is read before p1_own: {held}");
+        std::fs::write(&path, format!("{}{}", &held[..at], &held[end..])).unwrap();
+        succeeds(d.run(&[
+            "drop-exclusion",
+            "app.p1",
+            "p1_old",
+            "--reason",
+            "not needed",
+        ]));
+        d.commit();
+        let tree = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            tree.replacen("partition_by: [k]", "partition_by: [bucket]", 1),
+        )
+        .unwrap();
+        succeeds(d.run(&[
+            "rebuild-table",
+            "app.p",
+            "--max-rows",
+            "10",
+            "--reason",
+            "re-key",
+        ]));
+        succeeds(d.run(&["validate"]));
+        d.commit();
+        let artifact = d.dir.join("rebuild.json");
+        succeeds(d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--out",
+            artifact.to_str().unwrap(),
+        ]));
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &artifact,
+            &["--allow", "destructive,rename,constraint,narrowing,revoke"],
+        ));
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_constraint WHERE conname = 'p1_old'"
+            ),
+            0
+        );
+        assert_eq!(scalar(connection, "SELECT count(*) FROM app.p"), 3);
+        settled(&d, connection);
+    });
+}
+
 /// A partition of a parent that holds an exclusion is detached on 18: the partition's clone
 /// becomes its own, as the declaration of the detached table names it, behind the `destructive`
 /// risk, with its rows kept and the parent's exclusion still holding the partitions left. A

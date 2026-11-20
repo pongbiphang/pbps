@@ -1109,6 +1109,14 @@ pub(in crate::engine) async fn generation_support(
             &partitioned,
         ));
     }
+    // A rebuild builds a parent's exclusion as a part of its own kind, and the parent is
+    // partitioned by construction, so the version rule applies to it without a catalog read.
+    let rebuilt = pbps_pg::partitioned_exclusion::rebuilt_parents(&changes.changes, |uid| {
+        ids.tables.get(uid).cloned()
+    });
+    problems.extend(pbps_pg::partitioned_exclusion::unsupported(
+        version, &rebuilt, &rebuilt,
+    ));
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
     let mut dependences = BTreeMap::new();
     for p in &changes.changes {

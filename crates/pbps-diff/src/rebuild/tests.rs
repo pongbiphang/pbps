@@ -1345,6 +1345,99 @@ fn an_applied_rewrite_the_files_no_longer_record_is_never_a_drop_and_create() {
     );
 }
 
+fn retirement(was: &str) -> pbps_model::ExclusionRetirement {
+    pbps_model::ExclusionRetirement {
+        was: was.into(),
+        reason: "retired".into(),
+        operator: "operator".into(),
+        dropped_at: "2026-10-23".into(),
+    }
+}
+
+/// A retirement is a human's record about a table's constraint, so a rewrite that replaces the
+/// table keeps it under the replacement of the same name (DEC-2448.4) instead of leaving it as
+/// an orphan that refuses the approval, and withdrawing the approval gives it back.
+#[test]
+fn a_rebuild_carries_a_partitions_exclusion_retirement_to_its_replacement() {
+    let (mut base, _, mut desired) = fixture();
+    let other = TableName::new("app", "other");
+    base.tables.insert(other.clone(), Table::default());
+    desired.tables.insert(other.clone(), Table::default());
+    let mut ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let leaf = TableName::new("app", "p1");
+    let (parent_uid, leaf_uid, other_uid) = (
+        ids.table_uid(&table()).unwrap().clone(),
+        ids.table_uid(&leaf).unwrap().clone(),
+        ids.table_uid(&other).unwrap().clone(),
+    );
+    for (uid, name, was) in [
+        (&parent_uid, "slot", "parent text"),
+        (&leaf_uid, "own", "leaf text"),
+        (&other_uid, "alone", "other text"),
+    ] {
+        ids.exclusions
+            .entry(uid.clone())
+            .or_default()
+            .insert(name.into(), retirement(was));
+    }
+    ids.validate().unwrap();
+    let approval = recorded(&base, &ids, &desired);
+    approval
+        .validate()
+        .expect("no record is left under a retired source");
+    let record = &approval.rebuilds[&parent_uid];
+    let replaced = |name: &TableName| {
+        record
+            .replacement
+            .tables
+            .iter()
+            .find_map(|(uid, n)| (n == name).then_some(uid))
+            .unwrap()
+    };
+    assert_eq!(
+        approval.exclusions[replaced(&leaf)]["own"].was,
+        "leaf text",
+        "the partition's record follows its replacement"
+    );
+    assert_eq!(
+        approval.exclusions[replaced(&table())]["slot"].was,
+        "parent text"
+    );
+    assert!(
+        !approval.exclusions.contains_key(&leaf_uid)
+            && !approval.exclusions.contains_key(&parent_uid),
+        "the sources keep none"
+    );
+    assert_eq!(
+        approval.exclusions[&other_uid], ids.exclusions[&other_uid],
+        "an unrelated table's record is untouched"
+    );
+    assert_eq!(approval.exclusions.len(), 3);
+    assert_eq!(withdraw(&approval, &table()).unwrap(), ids);
+}
+
+/// The negative: a record of a table the declarations no longer hold under the name goes with
+/// that table, as a table drop takes its records, and the file still validates.
+#[test]
+fn a_rebuild_leaves_no_retirement_under_a_source_without_a_namesake() {
+    let (base, ids, mut desired) = fixture();
+    let mut ids = ids;
+    let leaf = TableName::new("app", "p1");
+    let leaf_uid = ids.table_uid(&leaf).unwrap().clone();
+    ids.exclusions
+        .entry(leaf_uid.clone())
+        .or_default()
+        .insert("own".into(), retirement("leaf text"));
+    // The leaf is declared again under another name: the replacement has no `p1`.
+    let moved = desired.tables.remove(&leaf).unwrap();
+    desired.tables.insert(TableName::new("app", "p9"), moved);
+    let approval = recorded(&base, &ids, &desired);
+    approval.validate().unwrap();
+    assert!(approval.exclusions.is_empty(), "{:?}", approval.exclusions);
+}
+
 #[test]
 fn withdrawing_restores_exactly_the_file_before_the_approval() {
     let (base, ids, desired) = fixture();
