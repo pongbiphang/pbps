@@ -55,7 +55,10 @@ pub struct Contract {
     after: Arc<Side>,
     base: Vec<Annotation<BoundRoot>>,
     goal: Vec<Annotation<BoundRoot>>,
-    labels: BTreeMap<Ref, String>,
+    /// How each side spelled the references of its lines. One identity can
+    /// carry two spellings (a rename), so the sides are kept apart.
+    base_labels: BTreeMap<Ref, String>,
+    goal_labels: BTreeMap<Ref, String>,
     demanded: BTreeMap<Root, BTreeSet<ObjectRef>>,
     creation: BTreeMap<pbps_model::operation::Source, (BTreeSet<ObjectRef>, Creation)>,
     pub(crate) extended: bool,
@@ -163,8 +166,11 @@ impl Contract {
             before.ids,
             after.ids,
         );
-        let mut labels = BTreeMap::new();
-        let mut bind = |snapshot: Snapshot<'_>, dependencies: &ObjectDeps, spelling| {
+        let (mut base_labels, mut goal_labels) = (BTreeMap::new(), BTreeMap::new());
+        let bind = |snapshot: Snapshot<'_>,
+                    dependencies: &ObjectDeps,
+                    spelling,
+                    labels: &mut BTreeMap<Ref, String>| {
             let registry = Registry::new(snapshot.schema);
             let problems = registry.validate(dependencies, Some((&owners, spelling)));
             if !problems.is_empty() {
@@ -206,8 +212,8 @@ impl Contract {
                 demanded.entry(root).or_default().insert(reference.clone());
             }
         }
-        let base_edges = bind(before, base, Spelling::Base)?;
-        let goal_edges = bind(after, goal, Spelling::Final)?;
+        let base_edges = bind(before, base, Spelling::Base, &mut base_labels)?;
+        let goal_edges = bind(after, goal, Spelling::Final, &mut goal_labels)?;
         let legacy = |r: &ObjectRef| {
             matches!(
                 r,
@@ -326,7 +332,8 @@ impl Contract {
             after: Arc::new(Side::of(after, &owners, Spelling::Final)?),
             base: base_edges,
             goal: goal_edges,
-            labels,
+            base_labels,
+            goal_labels,
             demanded,
             extended,
             deferred: Vec::new(),
@@ -458,11 +465,12 @@ impl Contract {
                 );
             }
         }
-        for reference in self
+        for (labels, reference) in self
             .base
             .iter()
-            .chain(&self.goal)
-            .flat_map(|a| [&a.owner, &a.provider])
+            .map(|a| (&self.base_labels, a))
+            .chain(self.goal.iter().map(|a| (&self.goal_labels, a)))
+            .flat_map(|(labels, a)| [(labels, &a.owner), (labels, &a.provider)])
         {
             if let BoundRoot::InheritedColumn { column, .. } = &reference.root
                 && let Some(attributes) = changed.get(column)
@@ -480,7 +488,7 @@ impl Contract {
             {
                 return Err(format!(
                     "cannot project `{}`: recursive engine boundary metadata is required",
-                    self.labels[reference]
+                    labels[reference]
                 ));
             }
         }
@@ -533,7 +541,7 @@ impl Contract {
                 })
             } else { None };
             let context=inline.map_or_else(String::new,|why|format!("; {why}"));
-            format!("cannot project {}: {reason}{context}", self.spell(annotation))
+            format!("cannot project {}: {reason}{context}", self.spell(annotation, false))
         })?;
         if facts {
             edges.extend(self.creations(&operations, &owners)?);
@@ -542,7 +550,10 @@ impl Contract {
             .into_iter()
             .map(|(pair, from)| {
                 let spelt = from.into_iter().map(|(reverse, number)| {
-                    self.spell(&if reverse { &self.base } else { &self.goal }[number])
+                    self.spell(
+                        &if reverse { &self.base } else { &self.goal }[number],
+                        reverse,
+                    )
                 });
                 (pair, spelt.collect())
             })
@@ -596,10 +607,15 @@ impl Contract {
 
     /// A line as the user wrote it: the one speller of the projection error
     /// and of the cycle text that names the line.
-    fn spell(&self, annotation: &Annotation<BoundRoot>) -> String {
+    fn spell(&self, annotation: &Annotation<BoundRoot>, baseline: bool) -> String {
+        let labels = if baseline {
+            &self.base_labels
+        } else {
+            &self.goal_labels
+        };
         format!(
             "annotation `{}` depends on `{}`",
-            self.labels[&annotation.owner], self.labels[&annotation.provider]
+            labels[&annotation.owner], labels[&annotation.provider]
         )
     }
 
