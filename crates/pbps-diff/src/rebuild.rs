@@ -280,6 +280,22 @@ fn continuing(
     Some((to, pairs))
 }
 
+/// The tables a rewrite keeps under one name: each replacement table's uid with the source
+/// table's it stands for. A table's retirement records follow it through a rewrite by this
+/// pairing, since the retirement was of a constraint of that table as declared and the
+/// declarations still hold the table under that name; a source table with no namesake leaves
+/// with its records, as any dropped table does (DEC-2448.4).
+fn namesakes(source: &RebuildIdentities, replacement: &RebuildIdentities) -> BTreeMap<Uid, Uid> {
+    replacement
+        .tables
+        .iter()
+        .filter_map(|(to, name)| {
+            let (from, _) = source.tables.iter().find(|(_, n)| *n == name)?;
+            Some((to.clone(), from.clone()))
+        })
+        .collect()
+}
+
 fn reapprove(
     ids: &IdsFile,
     schema: &Schema,
@@ -487,6 +503,15 @@ pub fn record(
             Some((to.clone(), conversion))
         })
         .collect();
+    // A source table is dropped with its tree, so a retirement record left under its uid would
+    // be an orphan: it moves to the replacement of the same name, and is undone by `restored`.
+    for (to, from) in namesakes(&source, &replacement) {
+        if let Some(records) = out.exclusions.remove(&from) {
+            out.exclusions.insert(to, records);
+        }
+    }
+    out.exclusions
+        .retain(|uid, _| !source.tables.contains_key(uid));
     out.tables.extend(replacement.tables.clone());
     out.columns.extend(replacement.columns.clone());
     out.rebuilds.insert(
@@ -519,6 +544,11 @@ pub fn record(
 fn restored(ids: &IdsFile, key: &Uid, record: &Rebuild) -> IdsFile {
     let mut out = ids.clone();
     out.rebuilds.remove(key);
+    for (to, from) in namesakes(&record.source, &record.replacement) {
+        if let Some(records) = out.exclusions.remove(&to) {
+            out.exclusions.entry(from).or_default().extend(records);
+        }
+    }
     for uid in record.replacement.tables.keys() {
         out.tables.remove(uid);
         out.moves.remove(uid);
