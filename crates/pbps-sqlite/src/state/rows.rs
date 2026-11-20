@@ -137,12 +137,24 @@ fn projected_state(row: &Record) -> Result<Result<TimelineState, Unreadable>, Db
         Err(unreadable) => return Ok(Err(unreadable)),
     };
     let Some(version) = version else {
-        let json = optional_text(row, 12, "state_json")?.ok_or_else(|| {
-            DbError::BadRow(
-                "a ledger row with no `state_version` has no `state_json` to read it from".into(),
-            )
-        })?;
-        return Ok(StateSnapshot::read_json(&json).map(|s| TimelineState::from_snapshot(&s)));
+        // The table is not `STRICT`, so a hand-edited row can hold a snapshot
+        // that is not text. That is this row's, like a snapshot that does not
+        // parse. NULL cannot be stored (`NOT NULL`), so it is the statement's.
+        let json = match row.optional_text(12) {
+            Ok(Some(json)) => json,
+            Ok(None) => {
+                return Err(DbError::BadRow(
+                    "a ledger row with no `state_version` has no `state_json` to read it from"
+                        .into(),
+                ));
+            }
+            Err(_) => {
+                return Ok(Err(Unreadable::Malformed(
+                    "`state_json` does not hold text".into(),
+                )));
+            }
+        };
+        return Ok(StateSnapshot::read_json(json).map(|s| TimelineState::from_snapshot(&s)));
     };
     Ok(projection(row, version))
 }

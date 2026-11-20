@@ -523,3 +523,27 @@ fn a_read_puts_the_callers_wait_back() {
     timeline(c, 5).expect("read");
     assert_eq!(wait_now(c), 321);
 }
+
+/// The ledger is not `STRICT`, so a row with no projection can hold a snapshot
+/// that is not text. It is that row's, and the rows around it are read.
+#[test]
+fn a_snapshot_that_is_not_text_is_that_rows_and_the_timeline_goes_on() {
+    let mut fresh = Fresh::memory();
+    let c = fresh.connection();
+    let first = record(c, &snapshot(StateKind::Apply, "op")).expect("recorded");
+    c.execute_batch(&format!(
+        "INSERT INTO {STATE_TABLE} (kind, state_json, operator) VALUES ('apply', x'00ff', 'hand')"
+    ))
+    .expect("a hand-written row");
+    let last = record(c, &snapshot(StateKind::Apply, "op")).expect("recorded");
+    let rows = timeline(c, 10).expect("the timeline is read");
+    assert_eq!(rows.len(), 3);
+    assert_eq!((rows[0].id, rows[2].id), (last, first));
+    assert!(rows[0].state.is_ok() && rows[2].state.is_ok());
+    match &rows[1].state {
+        Err(Unreadable::Malformed(why)) => assert!(why.contains("does not hold text"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    // Negative: the reader that was asked for that entry still fails for it.
+    assert!(entry(c, Some(rows[1].id)).is_err());
+}
