@@ -42,7 +42,7 @@ pub(crate) fn is_busy(error: &DbError) -> bool {
 /// make every later statement on the handle wait where its caller chose not to.
 /// A failure to put it back is reported unless `work` already failed, whose
 /// error is the one that says what went wrong.
-pub(super) fn waiting<T, E: From<DbError>>(
+pub(crate) fn waiting<T, E: From<DbError>>(
     c: &Connection,
     wait: Duration,
     work: impl FnOnce() -> Result<T, E>,
@@ -71,7 +71,7 @@ pub(super) fn waiting<T, E: From<DbError>>(
 /// It is another connection's lock, possibly an application's own, so it is not
 /// this tool's lock and `pbps unlock` does not clear it. The source stays in the
 /// chain, so [`is_busy`] still answers for the result.
-pub(super) fn explained(error: DbError, wait: Duration) -> DbError {
+pub(crate) fn explained(error: DbError, wait: Duration) -> DbError {
     if !is_busy(&error) {
         return error;
     }

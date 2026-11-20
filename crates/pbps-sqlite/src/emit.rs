@@ -35,7 +35,7 @@
 //! newer token. [`allows_under`] is the one place that decision lives (DEC-2950.4).
 
 use pbps_dialect::{DialectError, Statement};
-use pbps_model::{Change, ConstraintChange, PlannedChange, TableChange, TableName};
+use pbps_model::{Change, ColumnChange, ConstraintChange, PlannedChange, TableChange, TableName};
 
 use crate::dialect::Sqlite;
 use crate::validate::{SCHEMA, not_built, unsupported};
@@ -90,6 +90,70 @@ impl Form {
             | Form::AddCheck
             | Form::DropCheck
             | Form::DropForeignKey => Version::new(3, 53, 0),
+        }
+    }
+}
+
+impl Form {
+    /// The in-place form `change` is written in, if it is written in one.
+    ///
+    /// Every kind of change is named, so a new one is a compile error here and
+    /// is classified before the preflight can ask the library about it.
+    pub(crate) fn of(change: &Change) -> Option<Form> {
+        match change {
+            Change::Column(change) => match change {
+                ColumnChange::RenameColumn { .. } => Some(Form::RenameColumn),
+                ColumnChange::DropColumn { .. } => Some(Form::DropColumn),
+                ColumnChange::AlterColumnNullability { to_nullable, .. } => Some(if *to_nullable {
+                    Form::DropNotNull
+                } else {
+                    Form::SetNotNull
+                }),
+                ColumnChange::AddColumn { .. }
+                | ColumnChange::AlterColumnType { .. }
+                | ColumnChange::AlterColumnDefault { .. }
+                | ColumnChange::AlterColumnExpression { .. }
+                | ColumnChange::AddComputedColumn { .. }
+                | ColumnChange::DropComputedColumn { .. }
+                | ColumnChange::AlterColumnNumbering { .. }
+                | ColumnChange::SetColumnDeprecated { .. } => None,
+            },
+            Change::Constraint(change) => match change {
+                ConstraintChange::AddCheck { .. } => Some(Form::AddCheck),
+                ConstraintChange::DropCheck { .. } => Some(Form::DropCheck),
+                ConstraintChange::DropForeignKey { .. } => Some(Form::DropForeignKey),
+                ConstraintChange::SetPrimaryKey { .. }
+                | ConstraintChange::AddUnique { .. }
+                | ConstraintChange::DropUnique { .. }
+                | ConstraintChange::SetExclusion { .. }
+                | ConstraintChange::AddForeignKey { .. } => None,
+            },
+            Change::Table(_)
+            | Change::TableProperty(_)
+            | Change::Partition(_)
+            | Change::Index(_)
+            | Change::Policy(_)
+            | Change::Row(_)
+            | Change::Module(_)
+            | Change::Permission(_)
+            | Change::TypeValue(_)
+            | Change::Role(_)
+            | Change::Type(_)
+            | Change::Extension(_)
+            | Change::Search(_) => None,
+        }
+    }
+
+    /// What the form does, in the words a refusal uses.
+    pub(crate) const fn words(self) -> &'static str {
+        match self {
+            Form::RenameColumn => "renaming a column",
+            Form::DropColumn => "dropping a column",
+            Form::SetNotNull => "setting a column NOT NULL",
+            Form::DropNotNull => "dropping a column's NOT NULL",
+            Form::AddCheck => "adding a check constraint",
+            Form::DropCheck => "dropping a check constraint",
+            Form::DropForeignKey => "dropping a foreign key",
         }
     }
 }

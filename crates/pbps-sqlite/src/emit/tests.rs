@@ -38,7 +38,7 @@ mod plan_dialect;
 mod refusals;
 mod rename_order;
 mod untyped;
-mod versions;
+pub(crate) mod versions;
 
 pub(super) fn ty(text: &str) -> ColumnType {
     text.parse().expect("a type")

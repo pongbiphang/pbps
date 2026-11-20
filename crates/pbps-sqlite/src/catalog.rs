@@ -35,7 +35,7 @@ use facts::Facts;
 use crate::{READ, ident, names};
 
 /// The first release with `pragma_table_list`, which the reader needs.
-const NEEDED: Version = Version::new(3, 37, 0);
+pub(crate) const NEEDED: Version = Version::new(3, 37, 0);
 
 /// A table and everything the pragmas say about it.
 pub(crate) struct RawTable {
