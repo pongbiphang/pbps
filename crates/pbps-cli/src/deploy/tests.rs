@@ -3412,6 +3412,7 @@ fn only_uniquely_identified_renamed_clones_release_their_names() {
         DetachedKind::Index,
         DetachedKind::PrimaryKey,
         DetachedKind::Unique,
+        DetachedKind::Exclusion,
     ] {
         let clone = pbps_pg::catalog::DetachClone {
             kind,
@@ -3547,6 +3548,8 @@ fn a_detach_admits_its_exact_retained_clones_and_internal_exchanges() {
             ),
             (K::Index, "p_v", "a_index", "released_index"),
             (K::Index, "p_kept", "a_kept_index", "a_kept_index"),
+            // An exclusion's clone is an index-backed constraint, named as a unique one is.
+            (K::Exclusion, "p_xc", "a_excl", "released_excl"),
         ];
         let names: Vec<_> = bindings
             .iter()
@@ -3565,7 +3568,7 @@ fn a_detach_admits_its_exact_retained_clones_and_internal_exchanges() {
             })
             .collect();
         let mut facts = detach_clone_slots(&uid, &names, &clones);
-        assert_eq!(facts.detach_releases.len(), if exchange { 3 } else { 1 });
+        assert_eq!(facts.detach_releases.len(), if exchange { 4 } else { 2 });
         assert_eq!(facts.detach_retained.len(), if exchange { 1 } else { 3 });
         let occupants: Vec<_> = clones
             .iter()
@@ -3589,6 +3592,18 @@ fn a_detach_admits_its_exact_retained_clones_and_internal_exchanges() {
         };
         refuse_uninventoried_occupants(&changes, &occupants, &[], "prod", &facts)
             .expect("retaining a_key/a_unique or exchanging them is a valid detach");
+        // A declared name another table's index holds is a clash, an exclusion's clone included
+        // (it is an index-backed constraint, DEC-2448.7).
+        let mut clashing = occupants.clone();
+        clashing.push(NameOccupant {
+            name: TableName::new("app", "released_excl"),
+            kind: "index",
+            owner: Some(TableName::new("app", "other")),
+            owner_column: None,
+        });
+        let refused = refuse_uninventoried_occupants(&changes, &clashing, &[], "prod", &facts)
+            .expect_err("an unmanaged index holds a name the detach gives its clone");
+        assert!(refused.to_string().contains("released_excl"), "{refused}");
         for owner in facts.detach_retained.values_mut() {
             *owner = Uid::derived(UidKind::Table, "other", 0);
         }

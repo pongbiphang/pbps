@@ -1027,15 +1027,19 @@ fn a_tables_move_frees_its_occupant_before_a_later_drop_of_its_column() {
 
 /// A key clone occupies the same schema relation slot as an ordinary index.
 fn detach_handover(cyclic: bool) -> (Plan, CatalogFacts) {
+    detach_handover_of(cyclic, pbps_model::DetachedKind::PrimaryKey)
+}
+
+fn detach_handover_of(cyclic: bool, kind: pbps_model::DetachedKind) -> (Plan, CatalogFacts) {
     use pbps_dialect::slots::Occupant;
-    use pbps_model::{DetachedKind, DetachedName};
+    use pbps_model::DetachedName;
     let detach = |seed: &str, wanted: &str| {
         Change::Partition(PartitionChange::DetachPartition {
             uid: uid(seed),
             table: name(&format!("app.{seed}")),
             parent: name("app.p"),
             names: vec![DetachedName {
-                kind: DetachedKind::PrimaryKey,
+                kind,
                 parent: "p_pk".into(),
                 name: Some(wanted.into()),
             }],
@@ -1131,4 +1135,37 @@ fn the_slot_replay_refuses_a_detach_before_its_catalog_release() {
         schedule.sequence().is_err(),
         "two detaches cannot both claim first"
     );
+}
+
+/// An exclusion's clone is an index-backed constraint, so its detach claims the declared name in
+/// the schema's relations as a key clone's does (DEC-2448.7): the detach that frees the engine's
+/// name goes first, and two that each want the other's cannot be ordered. Negative: with no exact
+/// release the order stays open.
+#[test]
+fn an_exclusion_clone_hands_its_name_over_as_a_key_clone_does() {
+    let dialect = Slotted { exact: true };
+    let (plan, facts) = detach_handover_of(false, pbps_model::DetachedKind::Exclusion);
+    let edges = plan.handovers(&dialect, &facts);
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.before == 1 && e.after == 0 && e.catalog),
+        "{edges:?}"
+    );
+    let (violations, _, _) = plan.run(&[0, 1], &dialect, Some(&facts));
+    assert!(
+        violations
+            .iter()
+            .any(|v| matches!(v, SlotViolation::Held { .. })),
+        "{violations:?}"
+    );
+    let (clear, _, _) = plan.run(&[1, 0], &dialect, Some(&facts));
+    assert!(clear.is_empty(), "{clear:?}");
+    let (cycle, facts) = detach_handover_of(true, pbps_model::DetachedKind::Exclusion);
+    let mut schedule = super::Schedule::new(2);
+    super::slots::schedule(&mut schedule, &cycle.handovers(&dialect, &facts));
+    assert!(schedule.sequence().is_err());
+    let mut kept = facts.clone();
+    kept.detach_releases.clear();
+    assert!(plan.handovers(&dialect, &kept).is_empty());
 }
