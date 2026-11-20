@@ -400,13 +400,14 @@ pub fn canonical(text: &str) -> String {
         match piece {
             Piece::Comment(_) => out.push(' '),
             Piece::Code(code) => out.push_str(&code.to_ascii_lowercase()),
-            Piece::Quoted(run) if run.starts_with('\'') => {
+            // A string and a quoted name are held aside whole and put back
+            // after the layout is collapsed, so nothing inside one is read as
+            // layout or punctuation. A quoted name keeps its case too: SQLite
+            // reads a double-quoted run that names no column as a string.
+            Piece::Quoted(run) => {
                 strings.push(run);
                 out.push('\u{1}');
             }
-            // A quoted name keeps its case: SQLite reads a double-quoted run
-            // that names no column as a string, and a string's case is data.
-            Piece::Quoted(run) => out.push_str(run),
         }
     }
     let mut words = out
@@ -794,6 +795,20 @@ mod tests {
             "CREATE TABLE t(x, CHECK (\"a\" = 'A')); INSERT INTO t VALUES (1)"
         ));
         assert_ne!(canonical("\"A\" = 'A'"), canonical("\"a\" = 'A'"));
+        // Nothing inside a quoted name is layout or punctuation: these are
+        // different columns to the engine.
+        assert!(accepts(
+            "CREATE TABLE t(\"a  b\", \"a b\", \"a ( b\", \"a( b\")"
+        ));
+        for (a, b) in [
+            ("\"a  b\" = 1", "\"a b\" = 1"),
+            ("[a ( b] = 1", "[a( b] = 1"),
+            ("`a , b` = 1", "`a,b` = 1"),
+        ] {
+            assert_ne!(canonical(a), canonical(b), "{a:?} and {b:?}");
+        }
+        // And the layout around one is still forgotten.
+        assert_eq!(canonical("\"a  b\"   =\n1"), canonical("\"a  b\" = 1"));
         assert_eq!(answer("SELECT 'A' = 'a'"), "[Record([Integer(0)])]");
         for (a, b) in [
             ("a = 'A'", "a = 'a'"),
