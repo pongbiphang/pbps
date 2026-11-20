@@ -1070,3 +1070,105 @@ fn a_partition_of_a_parent_with_an_exclusion_is_detached_and_its_clone_becomes_i
     assert!(try_on_server(&connection, "INSERT INTO app.ev_1 VALUES (1, 1, 'dup')").is_err());
     settled(&d, &connection);
 }
+
+/// A partition's own exclusion created out of band, of the parent's planned shape and not
+/// declared, is read now (DEC-2448.7), so the database is seen as it is: drifted from the state
+/// recorded, refused before any statement; adopted, the own is a drop that needs its record, and
+/// with the record the plan drops it first, so the engine has nothing to take for the parent's
+/// clone (#2971).
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn an_undeclared_own_exclusion_the_parents_new_one_would_take_is_named_before_anything_runs() {
+    let _ = server();
+    let url = std::env::var("PBPS_TEST_PG_DB").expect("PBPS_TEST_PG_DB");
+    let own = OwnDatabase::new(&url, "exclude-own-oob");
+    let connection = own.connection();
+    on_server(connection, TREE);
+    let d = adopt("exclude-own-oob", connection);
+    // Out of band, after the baseline: the partition's own, of the shape the parent will take.
+    on_server(
+        connection,
+        "ALTER TABLE app.ev_1 ADD CONSTRAINT oob EXCLUDE USING btree (k WITH =, v WITH =)",
+    );
+    let path = d.dir.join("schema/app.ev.yml");
+    let held = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{held}{SLOT}")).unwrap();
+    d.commit();
+
+    // The database differs from the state recorded, and says so before any statement.
+    let before = recorded(&d, connection);
+    let drifted = d.run(&["plan", "--db", connection]);
+    assert_ne!(code(&drifted), 0, "{}", said(&drifted));
+    assert!(
+        said(&drifted).contains("has drifted from the state recorded"),
+        "{}",
+        said(&drifted)
+    );
+    assert_eq!(parent_constraints(connection, "one_per_slot"), 0);
+    assert_eq!(recorded(&d, connection), before);
+
+    // Adopted as it is, the own is the base's and the declarations lack it: a drop, which
+    // needs its record, and nothing runs until it has one.
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        connection,
+        "--reason",
+        "the own was added by hand",
+    ]));
+    let refused = d.run(&["plan", "--db", connection]);
+    assert_ne!(code(&refused), 0, "{}", said(&refused));
+    assert!(
+        said(&refused).contains("pbps drop-exclusion app.ev_1 oob --reason"),
+        "{}",
+        said(&refused)
+    );
+    assert_eq!(parent_constraints(connection, "one_per_slot"), 0);
+
+    // A drop is recorded against a declaration that held the constraint, and this one never
+    // did: declare it as it stands first (the parent's own not yet added), then drop it.
+    let declared_own = held.replacen(
+        "  ev_1: {from: [\"0\"], to: [\"10\"]}",
+        "  ev_1:\n    from: [\"0\"]\n    to: [\"10\"]\n    exclude:\n      oob:\n        method: btree\n        \
+         keys:\n          - column: k\n            operator: \"=\"\n          - column: v\n            \
+         operator: \"=\"",
+        1,
+    );
+    assert_ne!(declared_own, held, "{held}");
+    std::fs::write(&path, &declared_own).unwrap();
+    d.commit();
+    settled(&d, connection);
+    std::fs::write(&path, format!("{held}{SLOT}")).unwrap();
+
+    // With the drop recorded the own goes first, and every clone of the parent's is the engine's.
+    succeeds(d.run(&[
+        "drop-exclusion",
+        "app.ev_1",
+        "oob",
+        "--reason",
+        "the parent's replaces it",
+    ]));
+    d.commit();
+    let (plan, script) = plan_sql(&d, connection);
+    assert!(
+        script.find("DROP CONSTRAINT \"oob\"").unwrap()
+            < script.find("ADD CONSTRAINT \"one_per_slot\"").unwrap(),
+        "{script}"
+    );
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "destructive", "--allow", "constraint"],
+    ));
+    assert_eq!(parent_constraints(connection, "one_per_slot"), 1);
+    assert_eq!(clones(connection), 2);
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_constraint WHERE conname = 'oob'"
+        ),
+        0
+    );
+    settled(&d, connection);
+}

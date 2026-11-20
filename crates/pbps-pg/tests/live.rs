@@ -8749,7 +8749,7 @@ async fn a_detach_takes_the_parent_before_the_partition() {
 /// A detach names the clone of a parent's exclusion by the parent's constraint, as it names a
 /// unique constraint's, so the plan can tell which engine name the rename vacates (DEC-2448.7,
 /// measured on 18.6; the pinned server). Negative: a partition's own exclusion is no clone, and
-/// a parent that holds none gives none.
+/// a parent that holds none gives none. A plain index's clone is read beside it.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL 18; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_detach_reads_an_exclusions_clone_through_its_parents_constraint() {
@@ -8759,6 +8759,7 @@ async fn a_detach_reads_an_exclusions_clone_through_its_parents_constraint() {
     a.execute(&format!(
         "CREATE TABLE {s}.ev (k integer NOT NULL, v integer NOT NULL) PARTITION BY RANGE (k);
          ALTER TABLE {s}.ev ADD CONSTRAINT ev_slot EXCLUDE USING btree (k WITH =, v WITH =);
+         CREATE INDEX ev_v ON {s}.ev (v);
          CREATE TABLE {s}.ev_1 PARTITION OF {s}.ev FOR VALUES FROM (0) TO (10);
          ALTER TABLE {s}.ev_1 ADD CONSTRAINT ev_1_own EXCLUDE USING btree (v WITH =);
          CREATE TABLE {s}.plain (k integer NOT NULL) PARTITION BY RANGE (k);
@@ -8779,12 +8780,20 @@ async fn a_detach_reads_an_exclusions_clone_through_its_parents_constraint() {
         .collect();
     assert_eq!(
         found,
-        [(
-            pbps_model::DetachedKind::Exclusion,
-            "ev_slot".to_owned(),
-            "ev_1_k_v_excl".to_owned()
-        )],
-        "the clone, and not the partition's own"
+        [
+            (
+                pbps_model::DetachedKind::Exclusion,
+                "ev_slot".to_owned(),
+                "ev_1_k_v_excl".to_owned()
+            ),
+            // A plain index's clone has no constraint behind it, and is still read.
+            (
+                pbps_model::DetachedKind::Index,
+                "ev_v".to_owned(),
+                "ev_1_v_idx".to_owned()
+            ),
+        ],
+        "the clones, and not the partition's own"
     );
     let none = pbps_pg::catalog::detach_clone_names(
         &mut a,
