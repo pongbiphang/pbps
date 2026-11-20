@@ -755,6 +755,53 @@
     }
   },
   {
+    "name": "AlterSearchMapping",
+    "change": {
+      "op": "alter_search_mapping",
+      "uid": "s_aaaaaa",
+      "name": "config app.docs",
+      "before": {
+        "kind": "config",
+        "parser": "pg_catalog.\"default\"",
+        "mappings": {
+          "asciiword": [
+            "app.words"
+          ]
+        }
+      },
+      "after": {
+        "kind": "config",
+        "parser": "pg_catalog.\"default\"",
+        "mappings": {
+          "asciiword": [
+            "app.words",
+            "pg_catalog.simple"
+          ]
+        }
+      }
+    }
+  },
+  {
+    "name": "AlterSearchDictionary",
+    "change": {
+      "op": "alter_search_dictionary",
+      "uid": "s_aaaaaa",
+      "name": "dictionary app.words",
+      "before": {
+        "kind": "dictionary",
+        "template": "pg_catalog.simple",
+        "options": {}
+      },
+      "after": {
+        "kind": "dictionary",
+        "template": "pg_catalog.simple",
+        "options": {
+          "stopwords": "english"
+        }
+      }
+    }
+  },
+  {
     "name": "DropSearch",
     "change": {
       "op": "drop_search",

@@ -269,15 +269,58 @@ pub(super) fn staged_movement(
     )
 }
 
-/// Compares each kind the plan can change, by its own rule below. It never reads
-/// `Schema::search`, deliberately (DEC-2855.1): no plan alters a text search object, so
-/// nothing this plan promised can move one, and what the read-back holds of one is not what
-/// an apply records either (an object is recorded when its identity is held and the
-/// database holds it, and one the previous record holds keeps its recorded definition,
-/// `Schema::as_recorded_after_apply`). A search object changed
-/// during the run is therefore neither blessed by the record nor a movement of the plan's;
-/// `verify` reports it against the carried record. A kind that gains plans that alter it
-/// gains its rule here when it leaves `NameOnly`.
+/// A text search object the plan alters in place is pinned as a package an update changes is
+/// (SPEC §7.6, DEC-2728.4): it stands on its chain, the definition the plan was approved over,
+/// the one after each statement and the one the plan writes, and at the close at the last. A
+/// mapping change of several statements passes through definitions that are neither end, and a
+/// staged apply checkpoints on each. Another session's change is on no step, so it refuses, and
+/// a read-back is never recorded as the result unchecked. No other search object is read.
+fn refuse_unpinned_search(
+    changes: &pbps_model::ChangeSet,
+    held: &Schema,
+    at_close: bool,
+    label: &str,
+) -> anyhow::Result<()> {
+    for p in &changes.changes {
+        if let pbps_model::Change::Search(
+            pbps_model::SearchChange::AlterSearchMapping {
+                name,
+                before,
+                after,
+                ..
+            }
+            | pbps_model::SearchChange::AlterSearchDictionary {
+                name,
+                before,
+                after,
+                ..
+            },
+        ) = &p.change
+        {
+            let now = held.search.get(name);
+            let passes = before.alteration_chain(after);
+            let stands = now
+                .is_some_and(|d| d == before.as_ref() || d == after.as_ref() || passes.contains(d));
+            if !stands || (at_close && now != Some(after.as_ref())) {
+                bail!(
+                    "{} does not match what its plan promised during {label}",
+                    name.shown()
+                )
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compares each kind the plan can change, by its own rule below. It reads `Schema::search`
+/// only for the objects the plan alters in place (DEC-2728.3), pinned to the approved
+/// definitions like a package an update changes. For any other, deliberately (DEC-2855.1): no
+/// plan alters it, so nothing this plan promised can move one, and what the read-back holds
+/// of one is not what an apply records either (an object is recorded when its identity is
+/// held and the database holds it, and one the previous record holds keeps its recorded
+/// definition, `Schema::as_recorded_after_apply`). Such an object changed during the run is
+/// therefore neither blessed by the record nor a movement of the plan's; `verify` reports it
+/// against the carried record.
 #[allow(clippy::wildcard_enum_match_arm)] // Type deltas are checked apart from table/module effects.
 pub(super) fn refuse_pinned_movement(
     dialect: &dyn pbps_dialect::Dialect,
@@ -504,6 +547,8 @@ pub(super) fn refuse_pinned_movement(
             _ => {}
         }
     }
+    refuse_unpinned_search(changes, before, false, label)?;
+    refuse_unpinned_search(changes, after, !matches!(settled, Settled::SoFar), label)?;
     // A managed domain over a type a moved package provides reads back with
     // its base in the new schema and no change of the plan on it: the same
     // carrying as for a column of the table (DEC-2447.12).

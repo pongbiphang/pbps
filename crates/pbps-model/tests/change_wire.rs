@@ -28,6 +28,8 @@ const OPS: &[&str] = &[
     "rename_type",
     "create_search",
     "drop_search",
+    "alter_search_mapping",
+    "alter_search_dictionary",
     "create_extension",
     "drop_extension",
     "update_extension",
@@ -154,6 +156,16 @@ const ACCEPTED: &[(&str, &str, &str)] = &[
         r#"{"op":"drop_search","uid":"s_aaaaaa","name":"dictionary app.words","definition":{"kind":"dictionary","template":"pg_catalog.simple","options":{}}}"#,
         r#"{"op":"drop_search","uid":"s_aaaaaa","name":"dictionary app.words","definition":{"kind":"dictionary","template":"pg_catalog.simple","options":{}}}"#,
     ),
+    (
+        r"alter_search_mapping",
+        r#"{"op":"alter_search_mapping","uid":"s_aaaaaa","name":"config app.docs","before":{"kind":"config","parser":"pg_catalog.\"default\"","mappings":{"word":["app.words"]}},"after":{"kind":"config","parser":"pg_catalog.\"default\"","mappings":{"word":["pg_catalog.simple"]}}}"#,
+        r#"{"op":"alter_search_mapping","uid":"s_aaaaaa","name":"config app.docs","before":{"kind":"config","parser":"pg_catalog.default","mappings":{"word":["app.words"]}},"after":{"kind":"config","parser":"pg_catalog.default","mappings":{"word":["pg_catalog.simple"]}}}"#,
+    ),
+    (
+        r"alter_search_dictionary",
+        r#"{"op":"alter_search_dictionary","uid":"s_aaaaaa","name":"dictionary app.words","before":{"kind":"dictionary","template":"pg_catalog.simple","options":{}},"after":{"kind":"dictionary","template":"pg_catalog.simple","options":{"stopwords":"english"}}}"#,
+        r#"{"op":"alter_search_dictionary","uid":"s_aaaaaa","name":"dictionary app.words","before":{"kind":"dictionary","template":"pg_catalog.simple","options":{}},"after":{"kind":"dictionary","template":"pg_catalog.simple","options":{"stopwords":"english"}}}"#,
+    ),
 ];
 
 /// (what is wrong, input, the refusal by `PlannedChange`, the refusal by `Change`).
@@ -187,7 +199,7 @@ const REFUSED: &[(&str, &str, &str, &str)] = &[
     (
         r"planned ext create bad risk",
         r#"{"op":"create_extension","uid":"e_aaaaaa","name":"citext","definition":{"schema":"public","version":"1.6"},"risks":["nope"]}"#,
-        r"unknown variant `nope`, expected one of `rename`, `destructive`, `narrowing`, `not-null`, `constraint`, `data-update`, `data-delete`, `revoke`, `grant-widen`, `numbering`, `row-security`, `type-rebuild`, `extension-code` at line 1 column 122",
+        r"unknown variant `nope`, expected one of `rename`, `destructive`, `narrowing`, `not-null`, `constraint`, `data-update`, `data-delete`, `revoke`, `grant-widen`, `numbering`, `row-security`, `type-rebuild`, `extension-code`, `stale-results` at line 1 column 122",
         r"unknown field `risks`, expected one of `uid`, `name`, `definition`, `requires`",
     ),
     (

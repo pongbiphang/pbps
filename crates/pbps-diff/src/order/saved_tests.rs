@@ -917,3 +917,78 @@ fn admission_holds_text_search_payloads_to_the_identity_mapping() {
     admit_text(with_search(drop, IdsFile::default()))
         .expect("a drop of a released uid is admitted");
 }
+
+/// An in-place alteration keeps the object's kind, parser or template and recorded identity
+/// (DEC-2728.3): no `ALTER` form changes the first two, so a payload that says it does, or
+/// that names another kind than its variant, or an identity the plan does not record, is
+/// refused at admission whatever its checksum. Negative: the honest alteration passes the
+/// payload checks (the minimal dialect then refuses text search for its own reason).
+#[test]
+fn admission_holds_a_text_search_alteration_to_the_object_it_alters() {
+    let admit_text = |plan: SavedPlan| {
+        let checksum = plan.wire_fingerprint();
+        admit(plan, &MinimalDialect, Path::new("plan.json"), &checksum).map(|_| ())
+    };
+    let words = |template: &str| pbps_model::SearchObject::Dictionary {
+        template: template.parse().unwrap(),
+        options: Default::default(),
+    };
+    let alter = |uid: &str, name: &str, after| {
+        Change::Search(SearchChange::AlterSearchDictionary {
+            uid: uid.parse().unwrap(),
+            name: name.parse().unwrap(),
+            before: Box::new(words("pg_catalog.simple")),
+            after: Box::new(after),
+            opaque: Vec::new(),
+        })
+    };
+    let mut ids = IdsFile::default();
+    ids.search.insert(
+        "s_aaaaaa".parse().unwrap(),
+        "dictionary app.words".parse().unwrap(),
+    );
+    let refused = |change| {
+        admit_text(with_search(change, ids.clone()))
+            .unwrap_err()
+            .to_string()
+    };
+    let honest = refused(alter(
+        "s_aaaaaa",
+        "dictionary app.words",
+        words("pg_catalog.simple"),
+    ));
+    assert!(!honest.contains("text search alteration"), "{honest}");
+    for (what, change) in [
+        (
+            "another template",
+            alter(
+                "s_aaaaaa",
+                "dictionary app.words",
+                words("pg_catalog.synonym"),
+            ),
+        ),
+        (
+            "an identity the plan does not record",
+            alter(
+                "s_bbbbbb",
+                "dictionary app.words",
+                words("pg_catalog.simple"),
+            ),
+        ),
+        (
+            "a name the identity does not hold",
+            alter(
+                "s_aaaaaa",
+                "dictionary app.other",
+                words("pg_catalog.simple"),
+            ),
+        ),
+        (
+            "a configuration named by the dictionary variant",
+            alter("s_aaaaaa", "config app.words", words("pg_catalog.simple")),
+        ),
+    ] {
+        let error = refused(change);
+        assert!(error.contains("text search alteration"), "{what}: {error}");
+    }
+}

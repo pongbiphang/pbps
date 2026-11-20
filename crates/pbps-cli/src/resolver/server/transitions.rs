@@ -683,6 +683,8 @@ Change::Partition(PartitionChange::RebuildPartitionedTable(_)) | Change::Index(I
             // A text search object is named by string literals alone: no surface
             // carries its fingerprint (DEC-2728.2).
             | Change::Search(SearchChange::CreateSearch { .. })
+            | Change::Search(SearchChange::AlterSearchMapping { .. })
+            | Change::Search(SearchChange::AlterSearchDictionary { .. })
             | Change::Search(SearchChange::DropSearch { .. })
             // A package's members are new to the target and no standing
             // object's fingerprint reads them until a declaration does

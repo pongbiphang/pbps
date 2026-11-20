@@ -37,6 +37,7 @@ use pbps_model::PolicyChange;
 use pbps_model::RoleChange;
 use pbps_model::RowChange;
 use pbps_model::SearchChange;
+use pbps_model::SearchObject;
 use pbps_model::TableChange;
 use pbps_model::TablePropertyChange;
 use pbps_model::TypeChange;
@@ -1085,7 +1086,7 @@ pub(crate) fn diff_partial_rebuilding(
         crate::extensions::moves(base, declared, dialect.name(), &hints.extension_moves);
     changes.extend(extension_moves);
     errs.extend(extension_move_errors);
-    changes.extend(diff_search(base, declared, hints.target_read, &mut errs));
+    changes.extend(diff_search(base, declared, hints, &mut errs));
 
     // Definitions match by recorded identity. A rename is never inferred
     // from equal definitions or a pair of disappearing/appearing names.
@@ -2608,6 +2609,8 @@ pub(crate) fn diff_partial_rebuilding(
             c,
             Change::Type(TypeChange::CreateType { .. })
                 | Change::Search(SearchChange::CreateSearch { .. })
+                | Change::Search(SearchChange::AlterSearchMapping { .. })
+                | Change::Search(SearchChange::AlterSearchDictionary { .. })
                 | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
                 | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
                 | Change::TypeValue(TypeValueChange::EnumRebuild {
@@ -2922,10 +2925,25 @@ pub(crate) fn diff_partial_rebuilding(
             }
         })
         .collect();
+    // One altered in place maps what it now maps, so it waits for the packages as a create does.
+    let altered_search: BTreeSet<&pbps_model::SearchRef> = planned
+        .iter()
+        .filter_map(|p| {
+            if let Change::Search(
+                SearchChange::AlterSearchMapping { name, .. }
+                | SearchChange::AlterSearchDictionary { name, .. },
+            ) = &p.change
+            {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
     let search_depths = |schema: &Schema, floor: isize| -> BTreeMap<pbps_model::SearchRef, isize> {
         let start = |name: &pbps_model::SearchRef, object: &pbps_model::SearchObject| {
             if floor > 0
-                && created_search.contains(name)
+                && (created_search.contains(name) || altered_search.contains(name))
                 && object.dictionaries().iter().any(|d| {
                     d.name.schema() != "pg_catalog" && declared.ids.search_uid(d).is_none()
                 })
@@ -2999,7 +3017,12 @@ pub(crate) fn diff_partial_rebuilding(
                 // Behind the packages of this plan it requires, or that require
                 // it for a drop (DEC-2447.6, DEC-2447.8).
                 extension_rank.get(uid).copied().unwrap_or(0)
-            } else if let Change::Search(SearchChange::CreateSearch { name, .. }) = &p.change {
+            } else if let Change::Search(
+                SearchChange::CreateSearch { name, .. }
+                | SearchChange::AlterSearchMapping { name, .. }
+                | SearchChange::AlterSearchDictionary { name, .. },
+            ) = &p.change
+            {
                 // Behind the packages and the dictionaries of this plan it maps.
                 search_rank.get(name).copied().unwrap_or(0)
             } else if let Change::Search(SearchChange::DropSearch { name, .. }) = &p.change {
@@ -6977,19 +7000,58 @@ pub(crate) fn dropped_search<'a>(
         .collect()
 }
 
+/// The text search objects a plan frees from a package whose dictionaries live in
+/// `package_schema` (DEC-2728.2, DEC-2728.3): the ones it drops, and a configuration it keeps
+/// and alters away from a dictionary the project does not hold. The alteration (class 7) runs
+/// before the package's removal. One that may still map such a dictionary stays refused.
+pub(crate) fn released_search<'a>(
+    base: Side<'a>,
+    declared: Side<'_>,
+    package_schema: &str,
+) -> std::collections::BTreeSet<&'a pbps_model::SearchRef> {
+    let held = |used: &pbps_model::SearchRef| {
+        declared.schema.search.contains_key(used) || base.schema.search.contains_key(used)
+    };
+    let package_owned = |used: &pbps_model::SearchRef| {
+        !held(used) && used.name.schema() != "pg_catalog" && used.name.schema() == package_schema
+    };
+    let mut released = dropped_search(base, declared);
+    for (uid, name) in &base.ids.search {
+        let (Some(was), Some(kept)) = (
+            base.schema.search.get(name),
+            declared
+                .ids
+                .search
+                .get(uid)
+                .and_then(|kept| declared.schema.search.get(kept)),
+        ) else {
+            continue;
+        };
+        let (was, now) = (was.dictionaries(), kept.dictionaries());
+        if name.kind == pbps_model::SearchKind::Config
+            && was.iter().any(&package_owned)
+            && !now.iter().any(&package_owned)
+        {
+            released.insert(name);
+        }
+    }
+    released
+}
+
 /// Text search configurations and dictionaries, by kind and name (DEC-2728.1, DEC-2728.2).
 /// A declared object the target lacks is created and one the declarations gave up is
-/// dropped, both by recorded identity. **A difference in a standing one is refused here, by
-/// name**: changing, renaming or re-parsing one arrives in the parts that follow, so a plan
-/// that would leave a declaration unmet is refused rather than made without the change that
-/// says so. An object the target has and the declarations do not, with no identity recorded,
-/// is not this project's and is left alone.
+/// dropped, both by recorded identity, and a standing one whose mappings or options differ is
+/// altered in place (DEC-2728.3). **Refused here, by name**: a changed parser or template
+/// (no `ALTER` form exists), an in-place change whose dependents the target did not list or
+/// the catalog proves stale, and a rename, which arrives in a later part. An object the
+/// target has and the declarations do not, with no identity recorded, is left alone.
 fn diff_search(
     base: Side<'_>,
     declared: Side<'_>,
-    target_read: bool,
+    hints: &Hints,
     errs: &mut Vec<DiffError>,
 ) -> Vec<Change> {
+    let target_read = hints.target_read;
     let mut changes = Vec::new();
     let mut refuse = |name: &pbps_model::SearchRef, reason: &str| {
         errs.push(DiffError::SearchRefused {
@@ -7001,6 +7063,33 @@ fn diff_search(
     // baseline holding it is no answer, since the drop comes after the create (class 18)
     // and the engine's RESTRICT would refuse it while anything still maps it.
     let dropped = dropped_search(base, declared);
+    // A dictionary the project neither declares nor the target holds, in a schema no package
+    // of the project provides and that is not the engine's own, is one the engine would refuse
+    // at `ADD MAPPING`.
+    let unresolved = |object: &SearchObject| -> Vec<pbps_model::SearchRef> {
+        object
+            .dictionaries()
+            .into_iter()
+            .filter(|used| {
+                !declared.schema.search.contains_key(used)
+                    && !base.schema.search.contains_key(used)
+                    && used.name.schema() != "pg_catalog"
+                    && !declared
+                        .schema
+                        .extensions
+                        .values()
+                        .any(|package| package.schema == used.name.schema())
+            })
+            .collect()
+    };
+    let undeclared = |missing: &[pbps_model::SearchRef]| -> String {
+        let shown: Vec<_> = missing.iter().map(|m| m.shown().to_string()).collect();
+        format!(
+            "uses {}, which the project does not declare and the target does not hold; declare \
+             it, or leave the mapping out",
+            shown.join(", ")
+        )
+    };
     for (name, now) in &declared.schema.search {
         let retired: Vec<String> = now
             .dictionaries()
@@ -7036,11 +7125,109 @@ fn diff_search(
         }
         match base.schema.search.get(name) {
             Some(was) if was == now => {}
-            Some(_) => refuse(
-                name,
-                "changing one arrives in a later part of #2728; for now it stands as the \
-                 target holds it",
-            ),
+            Some(was) => {
+                let Some(uid) = declared.ids.search_uid(name) else {
+                    refuse(
+                        name,
+                        "has no recorded identity; run `pbps plan` to record it",
+                    );
+                    continue;
+                };
+                let what = match (was, now) {
+                    (
+                        SearchObject::Config { parser: a, .. },
+                        SearchObject::Config { parser: b, .. },
+                    ) if a != b => {
+                        refuse(
+                            name,
+                            "its parser differs, and no `ALTER` form changes a configuration's \
+                             parser; declare the new one under a new name and move what uses it",
+                        );
+                        continue;
+                    }
+                    (
+                        SearchObject::Dictionary { template: a, .. },
+                        SearchObject::Dictionary { template: b, .. },
+                    ) if a != b => {
+                        refuse(
+                            name,
+                            "its template differs, and no `ALTER` form changes a dictionary's \
+                             template; declare the new one under a new name and move what \
+                             uses it",
+                        );
+                        continue;
+                    }
+                    (SearchObject::Config { .. }, SearchObject::Config { .. }) => "mappings",
+                    (SearchObject::Dictionary { .. }, SearchObject::Dictionary { .. }) => "options",
+                    _ => {
+                        refuse(
+                            name,
+                            "is declared as another kind of object than the target holds",
+                        );
+                        continue;
+                    }
+                };
+                // What was computed with the old behaviour stays until rebuilt, and the
+                // engine does not rebuild it: an index, a stored column or a check over the
+                // object keeps answering as it did. The target's catalog lists them; a plan
+                // without it cannot say there are none. What the catalog proves is refused
+                // by name; what stands behind a node it cannot see into is carried by the
+                // change, which the gated `stale-results` class approves (DEC-2728.3).
+                let Some(stale) = hints.search_dependents.get(name).filter(|_| target_read) else {
+                    refuse(
+                        name,
+                        &format!(
+                            "its {what} differ, and what depends on it is the target's catalog \
+                             to list; plan against the database (`--db`)"
+                        ),
+                    );
+                    continue;
+                };
+                if !stale.stored.is_empty() {
+                    refuse(
+                        name,
+                        &format!(
+                            "its {what} differ, but {} would keep the old behaviour until \
+                             rebuilt; declare the new behaviour under a new name and move the \
+                             dependents, in two plans",
+                            stale.stored.join(", ")
+                        ),
+                    );
+                    continue;
+                }
+                // A reference the standing object already makes resolves: the target holds the
+                // object with it, so the engine accepted it, whether or not the model holds what
+                // it names (a package's or another tool's dictionary). Only what the alteration
+                // adds can be one the engine would refuse.
+                let held = was.dictionaries();
+                let missing: Vec<_> = unresolved(now)
+                    .into_iter()
+                    .filter(|used| !held.contains(used))
+                    .collect();
+                if !missing.is_empty() {
+                    refuse(name, &undeclared(&missing));
+                    continue;
+                }
+                let (uid, name, opaque) = (uid.clone(), name.clone(), stale.opaque.clone());
+                let (before, after) = (Box::new(was.clone()), Box::new(now.clone()));
+                changes.push(Change::Search(if what == "mappings" {
+                    SearchChange::AlterSearchMapping {
+                        uid,
+                        name,
+                        before,
+                        after,
+                        opaque,
+                    }
+                } else {
+                    SearchChange::AlterSearchDictionary {
+                        uid,
+                        name,
+                        before,
+                        after,
+                        opaque,
+                    }
+                }));
+            }
             None => {
                 match declared.ids.search_uid(name) {
                     None => refuse(
@@ -7062,20 +7249,7 @@ fn diff_search(
                         // stands for the target, and a dictionary made on the database
                         // outside pbps is not in it, so the plan goes on and says on its
                         // line that the database settles it (DEC-2728.2).
-                        let missing: Vec<pbps_model::SearchRef> = now
-                            .dictionaries()
-                            .into_iter()
-                            .filter(|used| {
-                                !declared.schema.search.contains_key(used)
-                                    && !base.schema.search.contains_key(used)
-                                    && used.name.schema() != "pg_catalog"
-                                    && !declared
-                                        .schema
-                                        .extensions
-                                        .values()
-                                        .any(|package| package.schema == used.name.schema())
-                            })
-                            .collect();
+                        let missing = unresolved(now);
                         if missing.is_empty() || !target_read {
                             changes.push(Change::Search(SearchChange::CreateSearch {
                                 uid: uid.clone(),
@@ -7084,16 +7258,7 @@ fn diff_search(
                                 unresolved: missing,
                             }));
                         } else {
-                            let shown: Vec<_> =
-                                missing.iter().map(|m| m.shown().to_string()).collect();
-                            refuse(
-                                name,
-                                &format!(
-                                    "uses {}, which the project does not declare and the target \
-                                 does not hold; declare it, or leave the mapping out",
-                                    shown.join(", ")
-                                ),
-                            );
+                            refuse(name, &undeclared(&missing));
                         }
                     }
                 }
@@ -8209,6 +8374,8 @@ fn dependency_rank(
         Change::Table(TableChange::CreateTable { .. })
         // Ranked by their depth where the sort key is built (`search_rank`).
         | Change::Search(SearchChange::CreateSearch { .. })
+        | Change::Search(SearchChange::AlterSearchMapping { .. })
+        | Change::Search(SearchChange::AlterSearchDictionary { .. })
         | Change::Search(SearchChange::DropSearch { .. })
         | Change::Extension(ExtensionChange::CreateExtension { .. })
         | Change::Extension(ExtensionChange::DropExtension { .. })
@@ -9167,8 +9334,10 @@ fn order_key(c: &Change) -> u8 {
         | Change::Type(TypeChange::CreateType { .. })
         // Created before the tables, defaults, indexes and checks that name them by a
         // string literal, and a dictionary before the configuration that maps it
-        // (DEC-2728.2).
+        // (DEC-2728.2). One altered in place goes first of its dependents too (DEC-2728.3).
         | Change::Search(SearchChange::CreateSearch { .. })
+        | Change::Search(SearchChange::AlterSearchMapping { .. })
+        | Change::Search(SearchChange::AlterSearchDictionary { .. })
         | Change::Extension(ExtensionChange::CreateExtension { .. })
         | Change::Extension(ExtensionChange::UpdateExtension { .. })
         | Change::Extension(ExtensionChange::SetExtensionSchema { .. }) => 7,
@@ -11047,6 +11216,72 @@ mod tests {
             }),
             "an engine dictionary has no reason to wait for a package"
         );
+    }
+
+    /// A configuration altered to map a dictionary a package provides waits for the plan's
+    /// create of that package, as a created one does, whatever the identities the run happened
+    /// to mint (DEC-2728.3): the alteration is ranked behind the packages in the draft, where
+    /// its effect edge already puts it.
+    #[test]
+    fn a_configuration_altered_to_map_a_package_dictionary_waits_for_the_packages_create() {
+        use pbps_model::SearchObject;
+        let config = |dictionary: &str| SearchObject::Config {
+            parser: "pg_catalog.\"default\"".parse().unwrap(),
+            mappings: [("word".to_owned(), vec![dictionary.parse().unwrap()])].into(),
+        };
+        let docs: pbps_model::SearchRef = "config app.docs".parse().unwrap();
+        let mut base = Schema::default();
+        base.search
+            .insert(docs.clone(), config("pg_catalog.simple"));
+        let mut declared = Schema::default();
+        declared
+            .search
+            .insert(docs.clone(), config("zz.zz_dictionary"));
+        declared.extensions.insert(
+            "zz_dict".into(),
+            pbps_model::Extension {
+                schema: "zz".into(),
+                version: "1.0".into(),
+            },
+        );
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        for _ in 0..40 {
+            let declared_ids = crate::resolve(&declared, &base_ids, &[], &ctx())
+                .unwrap()
+                .ids;
+            let plan = diff(
+                Side {
+                    schema: &base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: &declared,
+                    ids: &declared_ids,
+                },
+                &Postgres,
+                &Hints {
+                    target_read: true,
+                    search_dependents: [(docs.clone(), Default::default())].into(),
+                    ..Hints::default()
+                },
+            )
+            .unwrap();
+            let at = |wanted: fn(&Change) -> bool| {
+                plan.changes()
+                    .changes
+                    .iter()
+                    .position(|p| wanted(&p.change))
+                    .expect("the plan holds it")
+            };
+            assert!(
+                at(|c| matches!(
+                    c,
+                    Change::Extension(ExtensionChange::CreateExtension { .. })
+                )) < at(|c| matches!(c, Change::Search(SearchChange::AlterSearchMapping { .. })))
+            );
+        }
     }
 
     /// A domain whose check names a configuration this plan creates by a literal
@@ -31546,12 +31781,11 @@ mod meeting_shape_tests {
     }
     /// A text search object the declarations hold is compared with the target's by recorded
     /// identity (DEC-2728.2): one the target lacks is created, one the declarations gave up
-    /// is dropped, and a difference in a standing one is refused by name. An identical one
+    /// is dropped, and a change of a standing one's template is refused by name. An identical one
     /// is no difference, and one only the target has, with no identity, is not this
     /// project's.
     #[test]
-    fn text_search_objects_are_created_and_dropped_by_identity_and_a_standing_difference_is_refused()
-     {
+    fn text_search_objects_are_created_and_dropped_by_identity_and_a_new_template_is_refused() {
         use pbps_model::{SearchKind, SearchObject, SearchRef, Uid, UidKind};
         let name = |kind, text: &str| SearchRef::new(kind, text.parse().unwrap());
         let dictionary = |template: &str| SearchObject::Dictionary {
@@ -31600,7 +31834,10 @@ mod meeting_shape_tests {
                         schema: declared,
                         ids: declared_ids,
                     },
-                    true,
+                    &Hints {
+                        target_read: true,
+                        ..Hints::default()
+                    },
                     &mut errs,
                 );
                 (
@@ -31652,7 +31889,7 @@ mod meeting_shape_tests {
         );
         assert!(
             errs.iter()
-                .any(|m| m.contains("app.same") && m.contains("changing one")),
+                .any(|m| m.contains("app.same") && m.contains("template differs")),
             "{errs:?}"
         );
         let loose = name(SearchKind::Dictionary, "app.loose");
@@ -31699,6 +31936,273 @@ mod meeting_shape_tests {
             changes
                 .iter()
                 .any(|c| matches!(c, Change::Search(SearchChange::CreateSearch { name, .. }) if name == &config))
+        );
+    }
+
+    /// A standing text search object whose mappings or options differ is altered in place
+    /// (DEC-2728.3), and only against the database, and only when nothing stands on it that
+    /// would keep the old behaviour. Refused by name, each with its remedy: a changed parser
+    /// or template, an offline plan or a census that was not read (absent is not empty), a
+    /// dependent of the object or of a configuration that maps the dictionary, a thesaurus
+    /// that names the dictionary, and a mapping to a dictionary nobody declares. Negatives
+    /// beside each: an empty census plans it, and an object that did not change plans nothing.
+    #[test]
+    fn a_standing_text_search_object_is_altered_in_place_unless_something_stale_stands_on_it() {
+        use pbps_model::{SearchKind, SearchObject, SearchRef, Uid, UidKind};
+        let name = |kind, text: &str| SearchRef::new(kind, text.parse().unwrap());
+        let words = name(SearchKind::Dictionary, "app.words");
+        let docs = name(SearchKind::Config, "app.docs");
+        let dictionary = |template: &str, language: &str| SearchObject::Dictionary {
+            template: template.parse().unwrap(),
+            options: [("language".to_owned(), language.to_owned())].into(),
+        };
+        let config = |parser: &str, mapped: &[&str]| SearchObject::Config {
+            parser: parser.parse().unwrap(),
+            mappings: [(
+                "word".to_owned(),
+                mapped.iter().map(|d| d.parse().unwrap()).collect(),
+            )]
+            .into(),
+        };
+        let default = "pg_catalog.\"default\"";
+        let (words_uid, docs_uid) = (
+            Uid::generate(UidKind::Search),
+            Uid::generate(UidKind::Search),
+        );
+        let mut ids = IdsFile::default();
+        ids.search.insert(words_uid.clone(), words.clone());
+        ids.search.insert(docs_uid.clone(), docs.clone());
+        let held = |dictionary: SearchObject, config: SearchObject| {
+            let mut schema = Schema::default();
+            schema.search.insert(words.clone(), dictionary);
+            schema.search.insert(docs.clone(), config);
+            schema
+        };
+        let base = held(
+            dictionary("pg_catalog.snowball", "english"),
+            config(default, &["app.words"]),
+        );
+        let diffed = |declared: &Schema, hints: &Hints| {
+            let mut errs = Vec::new();
+            let changes = diff_search(
+                Side {
+                    schema: &base,
+                    ids: &ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &ids,
+                },
+                hints,
+                &mut errs,
+            );
+            (
+                changes,
+                errs.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            )
+        };
+        let read = |entries: &[(&SearchRef, &[&str])]| Hints {
+            target_read: true,
+            search_dependents: entries
+                .iter()
+                .map(|(n, d)| {
+                    (
+                        (*n).clone(),
+                        pbps_model::SearchCensus {
+                            stored: d.iter().map(ToString::to_string).collect(),
+                            opaque: Vec::new(),
+                        },
+                    )
+                })
+                .collect(),
+            ..Hints::default()
+        };
+        let read_opaque = |name: &SearchRef, stored: &[&str], opaque: &[&str]| Hints {
+            target_read: true,
+            search_dependents: [(
+                name.clone(),
+                pbps_model::SearchCensus {
+                    stored: stored.iter().map(ToString::to_string).collect(),
+                    opaque: opaque.iter().map(ToString::to_string).collect(),
+                },
+            )]
+            .into(),
+            ..Hints::default()
+        };
+        // Nothing changed: nothing planned, whatever the census says.
+        let (changes, errs) = diffed(&base, &Hints::default());
+        assert!(
+            changes.is_empty() && errs.is_empty(),
+            "{changes:?} {errs:?}"
+        );
+        // A new mapping list: an alteration of the configuration alone.
+        let remapped = held(
+            dictionary("pg_catalog.snowball", "english"),
+            config(default, &["app.words", "pg_catalog.simple"]),
+        );
+        let (changes, errs) = diffed(&remapped, &read(&[(&docs, &[])]));
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(matches!(changes.as_slice(),
+            [Change::Search(SearchChange::AlterSearchMapping { uid, name, before, after, opaque })]
+                if uid == &docs_uid && name == &docs && **before != **after && opaque.is_empty()));
+        // A new option: an alteration of the dictionary alone.
+        let reworded = held(
+            dictionary("pg_catalog.snowball", "german"),
+            config(default, &["app.words"]),
+        );
+        let (changes, errs) = diffed(&reworded, &read(&[(&words, &[])]));
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(matches!(changes.as_slice(),
+            [Change::Search(SearchChange::AlterSearchDictionary { uid, name, .. })]
+                if uid == &words_uid && name == &words));
+        // The census names what would stay stale, and the remedy; nothing is planned.
+        let (changes, errs) = diffed(
+            &reworded,
+            &read(&[(&words, &["index app.t_gin", "constraint k on table app.t"])]),
+        );
+        assert!(changes.is_empty(), "{changes:?}");
+        assert!(
+            errs.iter().any(|m| m.contains("app.words")
+                && m.contains("index app.t_gin, constraint k on table app.t")
+                && m.contains("new name")),
+            "{errs:?}"
+        );
+        // What the catalog cannot see into is carried by the change, listed and gated by the
+        // `stale-results` class, and is not a refusal. Negative: with none listed, the change
+        // carries no such class.
+        let behind =
+            "index app.t_gin (behind function app.f(text), whose body the catalog cannot read)";
+        let (changes, errs) = diffed(&reworded, &read_opaque(&words, &[], &[behind]));
+        assert!(errs.is_empty(), "{errs:?}");
+        let [change @ Change::Search(SearchChange::AlterSearchDictionary { opaque, .. })] =
+            changes.as_slice()
+        else {
+            panic!("{changes:?}")
+        };
+        assert_eq!(opaque, &[behind.to_owned()]);
+        assert!(
+            change
+                .intrinsic_risks()
+                .contains(&pbps_model::RiskClass::StaleResults)
+        );
+        let (changes, _) = diffed(&reworded, &read(&[(&words, &[])]));
+        assert!(
+            !changes[0]
+                .intrinsic_risks()
+                .contains(&pbps_model::RiskClass::StaleResults)
+        );
+        // What the catalog proves wins: the same alteration is refused, whatever else is opaque.
+        let (changes, errs) = diffed(
+            &reworded,
+            &read_opaque(&words, &["index app.t_gin"], &[behind]),
+        );
+        assert!(changes.is_empty(), "{changes:?}");
+        assert!(
+            errs.iter().any(|m| m.contains("index app.t_gin")),
+            "{errs:?}"
+        );
+        // Not read is not empty: offline, and a census with no entry for the object.
+        for (what, hints) in [
+            ("offline", Hints::default()),
+            ("an object not read", read(&[(&docs, &[])])),
+            (
+                "an entry from before the database was read",
+                Hints {
+                    target_read: false,
+                    ..read(&[(&words, &[])])
+                },
+            ),
+        ] {
+            let (changes, errs) = diffed(&reworded, &hints);
+            assert!(changes.is_empty(), "{what}: {changes:?}");
+            assert!(
+                errs.iter()
+                    .any(|m| m.contains("app.words") && m.contains("--db")),
+                "{what}: {errs:?}"
+            );
+        }
+        // No `ALTER` form changes a parser or a template: refused by name, in place of a drop
+        // and a create.
+        for (what, declared, needle) in [
+            (
+                "a parser",
+                held(
+                    dictionary("pg_catalog.snowball", "english"),
+                    config("pg_catalog.other", &["app.words"]),
+                ),
+                "parser differs",
+            ),
+            (
+                "a template",
+                held(
+                    dictionary("pg_catalog.simple", "english"),
+                    config(default, &["app.words"]),
+                ),
+                "template differs",
+            ),
+        ] {
+            let (changes, errs) = diffed(&declared, &read(&[(&words, &[]), (&docs, &[])]));
+            assert!(changes.is_empty(), "{what}: {changes:?}");
+            assert!(errs.iter().any(|m| m.contains(needle)), "{what}: {errs:?}");
+        }
+        // A mapping to a dictionary the project does not declare and the target does not hold
+        // is refused against the database, as a create's is.
+        let missing = held(
+            dictionary("pg_catalog.snowball", "english"),
+            config(default, &["app.words", "app.unknown"]),
+        );
+        let (changes, errs) = diffed(&missing, &read(&[(&docs, &[])]));
+        assert!(changes.is_empty(), "{changes:?}");
+        assert!(
+            errs.iter()
+                .any(|m| m.contains("app.docs") && m.contains("app.unknown")),
+            "{errs:?}"
+        );
+        // A reference the standing object already makes is the target's, resolved: changing
+        // something else alters, and only a reference the alteration adds is checked.
+        let standing = held(
+            dictionary("pg_catalog.snowball", "english"),
+            config(default, &["app.words", "app.unknown"]),
+        );
+        let from_standing = |declared: &Schema| {
+            let mut errs = Vec::new();
+            let changes = diff_search(
+                Side {
+                    schema: &standing,
+                    ids: &ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &ids,
+                },
+                &read(&[(&words, &[]), (&docs, &[])]),
+                &mut errs,
+            );
+            (changes, errs)
+        };
+        let (changes, errs) = from_standing(&held(
+            dictionary("pg_catalog.snowball", "english"),
+            config(default, &["app.words", "app.unknown", "pg_catalog.simple"]),
+        ));
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(
+            matches!(
+                changes.as_slice(),
+                [Change::Search(SearchChange::AlterSearchMapping { .. })]
+            ),
+            "{changes:?}"
+        );
+        // Negative: a new reference beside it is still refused.
+        let (changes, errs) = from_standing(&held(
+            dictionary("pg_catalog.snowball", "english"),
+            config(default, &["app.words", "app.unknown", "app.other"]),
+        ));
+        assert!(changes.is_empty(), "{changes:?}");
+        let errs: Vec<_> = errs.iter().map(ToString::to_string).collect();
+        assert!(
+            errs.iter()
+                .any(|m| m.contains("app.other") && !m.contains("app.unknown")),
+            "{errs:?}"
         );
     }
 
@@ -32241,5 +32745,100 @@ mod search_tests {
         assert!(unresolved("config app.fine").is_empty());
         assert!(unresolved("config app.own").is_empty());
         assert!(unresolved("dictionary app.mine").is_empty());
+    }
+
+    /// A configuration that stops mapping a dictionary the plan retires is altered before the
+    /// dictionary is dropped, in every run: the drop waits only for the configurations that go
+    /// away or still map it (DEC-2728.3), and the order shadow refuses a plan whose effects a
+    /// step leaves unmet. Negative: the configuration that keeps mapping it is refused by name,
+    /// and a configuration that is dropped with it is dropped first, as before.
+    #[test]
+    fn a_dictionary_is_dropped_after_the_configuration_that_stopped_mapping_it() {
+        use pbps_model::SearchObject;
+        let dictionary = || SearchObject::Dictionary {
+            template: "pg_catalog.simple".parse().unwrap(),
+            options: Default::default(),
+        };
+        let config = |dictionary: &str| SearchObject::Config {
+            parser: "pg_catalog.\"default\"".parse().unwrap(),
+            mappings: [("word".to_owned(), vec![dictionary.parse().unwrap()])].into(),
+        };
+        let held = |old: Option<&str>, docs: Option<&str>| {
+            let mut schema = Schema::default();
+            for (name, object) in [
+                ("dictionary app.old", old.map(|_| dictionary())),
+                ("dictionary app.new", Some(dictionary())),
+                ("config app.docs", docs.map(config)),
+            ] {
+                if let Some(object) = object {
+                    schema.search.insert(name.parse().unwrap(), object);
+                }
+            }
+            schema
+        };
+        let base = held(Some(""), Some("app.old"));
+        let retire = [Intent::DropSearch {
+            name: "dictionary app.old".parse().unwrap(),
+            reason: pbps_model::Reason::new("retired").unwrap(),
+        }];
+        let run = |declared: &Schema, intents: &[Intent]| {
+            let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+                .unwrap()
+                .ids;
+            let docs: pbps_model::SearchRef = "config app.docs".parse().unwrap();
+            diff(
+                Side {
+                    schema: &base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints {
+                    target_read: true,
+                    search_dependents: [(docs, Default::default())].into(),
+                    ..Hints::default()
+                },
+            )
+        };
+        let kinds = |plan: &ChangeSet| -> Vec<String> {
+            plan.changes
+                .iter()
+                .map(|p| match &p.change {
+                    Change::Search(SearchChange::AlterSearchMapping { .. }) => "alter".to_owned(),
+                    Change::Search(SearchChange::DropSearch { name, .. }) => {
+                        format!("drop {}", name.name.name())
+                    }
+                    other => format!("{other:?}"),
+                })
+                .collect()
+        };
+        for _ in 0..20 {
+            let plan = run(&held(None, Some("app.new")), &retire).unwrap();
+            assert_eq!(kinds(plan.changes()), ["alter", "drop old"]);
+        }
+        // Negative: kept and still mapping it, the configuration is refused by name.
+        let errors = run(&held(None, Some("app.old")), &retire).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.to_string().contains("app.docs") && e.to_string().contains("app.old")),
+            "{errors:?}"
+        );
+        // Negative: dropped with it, the configuration goes first.
+        let both = [
+            retire[0].clone(),
+            Intent::DropSearch {
+                name: "config app.docs".parse().unwrap(),
+                reason: pbps_model::Reason::new("retired").unwrap(),
+            },
+        ];
+        let plan = run(&held(None, None), &both).unwrap();
+        assert_eq!(kinds(plan.changes()), ["drop docs", "drop old"]);
     }
 }

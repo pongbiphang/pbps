@@ -634,4 +634,59 @@ fn search_objects_and_packages_wait_for_each_other_through_the_effects() {
     };
     assert!(releases(true));
     assert!(!releases(false));
+    // A configuration the plan keeps and alters away from the package is released by the
+    // alteration (class 7, earlier), and stands: the package waits for no absence of it
+    // (DEC-2728.3). Negative: a dropped one is still waited for, above.
+    let base_ids = pbps_diff::resolve(&base, &IdsFile::default(), &[], &ctx)
+        .unwrap()
+        .ids;
+    let desired = Schema {
+        search: [(docs.clone(), config("pg_catalog.simple"))].into(),
+        ..Default::default()
+    };
+    let mut kept_ids = base_ids.clone();
+    kept_ids.extensions.clear();
+    let changes = vec![
+        PlannedChange::new(Change::Search(SearchChange::AlterSearchMapping {
+            uid: base_ids.search_uid(&docs).unwrap().clone(),
+            name: docs.clone(),
+            before: Box::new(config("ext.intdict")),
+            after: Box::new(config("pg_catalog.simple")),
+            opaque: Vec::new(),
+        })),
+        PlannedChange::new(Change::Extension(ExtensionChange::DropExtension {
+            uid: base_ids.extension_uid(&"dict_int".into()).unwrap().clone(),
+            name: "dict_int".into(),
+            definition: package.clone(),
+            requirers: Default::default(),
+            releases: Default::default(),
+            index_releases: Default::default(),
+            search_releases: [docs.clone()].into(),
+        })),
+    ];
+    let ops = Operations::of_plan(&changes, ModuleEdits::InPlace);
+    let owners = PlanOwners::new(
+        PlanNames::of(&changes, &kept_ids).unwrap(),
+        &base_ids,
+        &kept_ids,
+    );
+    let (before, after) = (
+        Snapshot {
+            schema: &base,
+            ids: &base_ids,
+        },
+        Snapshot {
+            schema: &desired,
+            ids: &kept_ids,
+        },
+    );
+    let effects = analyse(&ops, &owners, before, after, &Postgres::new()).effects;
+    assert!(
+        !effects[1]
+            .requires
+            .iter()
+            .any(|r| matches!(r, Requirement::Absent(ObjectKey::Search(_)))),
+        "{:?}",
+        effects[1].requires
+    );
 }

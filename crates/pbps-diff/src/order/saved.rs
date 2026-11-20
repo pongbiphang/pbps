@@ -602,6 +602,57 @@ pub fn validate_saved_plan(
             {
                 return Err(AdmissionError::from_error(error));
             }
+        } else if let pbps_model::Change::Search(
+            alteration @ (pbps_model::SearchChange::AlterSearchMapping {
+                uid,
+                name,
+                before,
+                after,
+                ..
+            }
+            | pbps_model::SearchChange::AlterSearchDictionary {
+                uid,
+                name,
+                before,
+                after,
+                ..
+            }),
+        ) = &step.change
+        {
+            use pbps_model::{SearchChange as Alter, SearchKind as Kind, SearchObject as Object};
+            // An alteration keeps the object's kind, parser or template and identity, and its
+            // variant names its kind: no `ALTER` form changes the first two, so a payload that
+            // says it does is not one this tool made.
+            let (kind, same_base) = match (alteration, &**before, &**after) {
+                (
+                    Alter::AlterSearchMapping { .. },
+                    Object::Config { parser: a, .. },
+                    Object::Config { parser: b, .. },
+                ) => (Kind::Config, a == b),
+                (
+                    Alter::AlterSearchDictionary { .. },
+                    Object::Dictionary { template: a, .. },
+                    Object::Dictionary { template: b, .. },
+                ) => (Kind::Dictionary, a == b),
+                _ => (name.kind, false),
+            };
+            if uid.kind() != pbps_model::UidKind::Search
+                || plan.ids.search.get(uid) != Some(name)
+                || name.kind != kind
+                || !same_base
+            {
+                refuse!(
+                    "text search alteration of {} disagrees with the identity mapping",
+                    name.shown()
+                );
+            }
+            if let Some(error) = dialect
+                .validate_search(name, after, &pbps_model::Schema::default())
+                .into_iter()
+                .next()
+            {
+                return Err(AdmissionError::from_error(error));
+            }
         } else if let pbps_model::Change::Search(pbps_model::SearchChange::DropSearch {
             uid,
             name,

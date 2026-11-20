@@ -1640,3 +1640,137 @@ Rejected:
 - **Dropping an identical constraint.** A rebuild would then write a table other than the file's.
 - **Reading a table around a type it cannot hold.** A column read as another type is written back as another column.
 - **Reading a view's columns for the model.** The model has nowhere to put them, and the read is unsafe on a broken view.
+
+<a id="dec-2728-3"></a>
+
+**DEC-2728.3. A standing text search configuration's mappings and dictionary's options are altered in place, and only when nothing stands on them that would keep the old behaviour.**
+Part C of #2728. A declared object that the target holds with other mappings or options is
+changed by `AlterSearchMapping` or `AlterSearchDictionary` under its recorded identity.
+Both carry the whole `before` and `after` definition, so the emit finds the token types or
+options that changed and the plan checksum pins what was compared.
+
+- **Engine facts** (measured on 16.15 and 18.6, identical). `ALTER MAPPING FOR tok WITH
+  d1, d2` replaces the list and keeps its order; on a token type that is not mapped it
+  does nothing and says nothing, and `ADD MAPPING` on a mapped one fails on the unique
+  key, so each token type gets the one verb that does what it says (`DROP`, `ALTER`,
+  `ADD`). `ALTER TEXT SEARCH DICTIONARY d (opt = 'v')` merges, and `(opt)` with no value
+  removes the option; a template that needs it (`snowball`'s `language`) refuses the
+  removal. There is no `ALTER` form for a configuration's parser or a dictionary's
+  template.
+- **Refused by name:** a changed parser or template (the remedy is a new name and moving
+  what uses it); a rename, which is part D.
+- **Stale dependents.** Changing a mapping or an option does not rebuild an expression
+  index, a stored generated column or a materialized view over the configuration, and a
+  check over it keeps its validated rows: they keep answering with the old behaviour
+  (measured: the index still holds `'dog':3 'run':1` after the mapping that produced
+  `dogs`/`running` changed). So a change whose object has such a dependent is refused by
+  name with the dependents listed and the remedy "declare the new behaviour under a new
+  name and move the dependents, in two plans". A view, a plain default and a function are
+  evaluated on use and are not dependents here. Planning the `REINDEX` and the recompute
+  is a separate decision (question 5 of the design, no new risk class).
+- **The census** is read from the target's catalog (`pbps_pg::search::stale_dependents`, the
+  catalog walk of DEC-2728.4): an index, a constraint, a stored generated column's default and
+  a materialized view's rule, over the object, and for a dictionary also over each
+  configuration that maps it (`pg_depend`, and `pg_ts_config_map` for the mapping). The walk
+  is recursive through what only reads at run time (a view, a function the catalog links): the
+  catalog records a materialized view over a view as an edge to the view alone, so a direct
+  read of the object's dependents missed it. A path is stale if it reaches a stored dependent,
+  a read-only chain lists nothing, and the walk stops at a stored dependent (refreshing it
+  recomputes what stands on it). A repeated node ends the walk, so a cycle among views and
+  functions ends too (measured on 16 and 18). A thesaurus's sub-dictionary has no catalog edge
+  (measured), so a dictionary also answers for the held dictionaries that name it in their
+  options, which the model holds. The census is a hint of the connected plan, one entry per
+  object the plan would alter, empty when nothing stands on it; an entry that is missing was
+  not read, and an offline plan is refused for it, because the baseline cannot say what stands
+  on the target now. Dependents the same plan drops still count: drop them in one plan and
+  alter in the next. What the catalog cannot see into is DEC-2728.4's.
+- **Order.** Class 7 beside `CreateSearch`, at the same depth rank, so it precedes every
+  table, index and check created over it; the effects state `Exists` of the object and
+  `Is(Final)` of each dictionary it now maps. A dictionary the plan drops is dropped in class
+  18 after the configuration stopped mapping it; the drop waits (`Absent`) only for the
+  configurations that go away or still map it.
+- **A package's removal.** A configuration the plan keeps and alters so that it stops mapping
+  a dictionary of a package the same plan drops frees the package, as one the plan drops does
+  (`DropExtension.search_releases`). Measured on 16.15 and 18.6: `ALTER` or `DROP MAPPING` away
+  from the dictionary, then `DROP EXTENSION` without `CASCADE`, succeeds; in the other order, or
+  while any token type still maps it, the engine refuses. The alteration is class 7 and the
+  drop class 18, so the order holds, and only a configuration the plan drops is waited for
+  (`Absent`). The differ takes the dictionaries of the package to be the ones neither the
+  project nor the target model holds, outside `pg_catalog`, in the package's schema: a "may"
+  that errs toward refusing.
+- **Risk.** An alteration is listed and gated like a create, and what the catalog proves
+  stale is refused instead. What stands behind a node the catalog cannot see into carries
+  `stale-results` (DEC-2728.4).
+- **Recording.** The state keeps the object as the database holds it after the apply,
+  as it does for a create; a previous record is not carried over a plan's own alteration.
+  What is recorded is therefore held to the plan first (SPEC §7.6): the guard pins the
+  object as a package an update changes is pinned, to the chain of definitions the plan
+  passes through (DEC-2728.4). A change another session makes to the object while the
+  statements run, to a token type or an option the plan does not touch as much as to one it
+  does, is on no step of the chain, so the close refuses and rolls back (a staged run stops on
+  the checkpoint), and the read-back is never taken as the alteration's result unchecked. A
+  change between the plan and the apply is the baseline checksum's, which holds the objects an
+  identity names.
+- **Saved plans** are admitted only if the uid is recorded under the name, the object keeps its
+  kind and its parser or template, and the new definition passes the dialect's checks.
+- **SQL Server** refuses both at emit, as the create.
+
+Formats: none moves. The changes are new `op` values of the plan, and under #2412 no change
+before the first release writes a number (DEC-2412.2); the risk class `stale-results` and the
+`opaque` field are named in DEC-2728.4.
+
+<a id="dec-2728-4"></a>
+
+**DEC-2728.4. The census reads the catalog and nothing else; what it cannot see into is a gated risk class, and the staged pin is the chain.**
+Part C of #2728, after seven review rounds on #2922 (maintainer decision on #2926, option E).
+The rounds found two classes. Each finding of the first was a new path from a stored
+dependent to the object that the census had not followed (a view over a view, a string body that
+names the object, a string wrapper of such a body, a view a body reads, a dictionary pbps does
+not hold that names the object); each fix rebuilt one more kind of edge by matching names in
+text, and the set of kinds is not finite (dictionary options, thesaurus files, `EXECUTE`,
+`format`, other procedural languages, casts). "No edge seen" was read as "no edge", which is
+absent read as empty. The second class was the staged pin comparing whole definitions while a
+mapping change of several statements passes through intermediate ones.
+
+- **The walk is the catalog's.** `pg_depend` through views, view rules, `BEGIN ATOMIC`
+  bodies and user-defined operators (a stored dependent that uses an operator records the
+  operator and not the function behind it, for a materialized view, an index expression and a
+  generated column alike, so the operator's own edge to its function is followed; measured on
+  16.15 and 18.6, and a cast records its function directly, so it needs no arm), plus
+  `pg_ts_config_map` for a dictionary's configurations, and the held model's
+  dictionaries that name a dictionary in their options. Nothing reads a function's text: the
+  name matching (`may_call` over bodies, the call and view closure, the name sets) is gone.
+- **A stored dependent the catalog proves** (an expression index, a stored generated column,
+  a validated check, a materialized view that reaches the object through catalog edges) is
+  refused by name, with DEC-2728.3's remedy: its stored values are certainly computed under the
+  old behaviour.
+- **Opaque nodes are a gated class, not a refusal.** A node the catalog cannot see into is one
+  of: a function with a text body (a `LANGUAGE sql` string body, or a procedural language;
+  `prosqlbody IS NULL` and not `internal` or `c`, outside `pg_catalog` and
+  `information_schema`), which a stored dependent reaches through the catalog's edges; and a
+  dictionary the model does not hold (a template, an owner or an option text it does not read)
+  whose options cannot be read, or name the object or another such dictionary, which the
+  engine records no edge for. A stored dependent behind such a node is listed with the node and
+  the reason, and the alteration carries `stale-results`, which `apply` needs in `--allow`.
+  The class is an approval-policy boundary: the operator has read which stored results may be
+  stale. It is not a claim that they are not. The list is on the change (`opaque`), so the
+  plan's checksum pins it, a saved plan's risks are derived from it, and a plan edited to drop
+  a line changes its checksum. An opaque node with no stored dependent behind it carries
+  nothing. A stored dependent the catalog already proves is listed once, as refused.
+  Without the text read, the function lines are the same for every object altered in the
+  database: any stored dependent that calls a text-bodied function gates every alteration. This
+  is the price of not guessing, and the two-plan remedy of DEC-2728.3 is the way to avoid it.
+  A function in `c` or `internal` outside `pg_catalog` is not listed: it has no text to read,
+  and the maintainer's list does not name it.
+- **The pin is the chain** (SPEC §7.6), as for a package an update changes. The definitions
+  an alteration passes through come from the steps the emit runs (`mapping_steps`: drop the
+  token types given up, alter the changed ones, add the new ones, one statement per group
+  that shares its dictionaries; a dictionary's options are one statement), so a checkpoint is
+  judged against exactly what the statements do. Before its statement and at every checkpoint
+  the object stands on the chain (the approved definition, the one after each statement, the
+  one the plan writes); at the close it stands at the last.
+- **Later, not here.** Recomputing what the catalog proves stale (`REINDEX`, `REFRESH`, option
+  C of #2926) can be added for catalog-proven dependents without reopening the census.
+
+Formats: none moves. The new class and field add values to the plan, and under #2412 a change
+before the first release writes no number (DEC-2412.2).

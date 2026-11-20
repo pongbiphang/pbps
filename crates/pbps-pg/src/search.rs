@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::catalog::{Limitation, LimitationTarget};
 use pbps_dialect::DialectError;
-use pbps_model::{Schema, SearchKind, SearchName, SearchObject, SearchRef, TypeRef};
+use pbps_model::{Schema, SearchCensus, SearchKind, SearchName, SearchObject, SearchRef, TypeRef};
 
 /// The one definition of the engine's own parser and templates this model holds
 /// (measured identical on 16 and 18, `measure` test). The pull's SQL, the census and
@@ -399,28 +399,10 @@ pub(crate) fn create(
                 "CREATE TEXT SEARCH CONFIGURATION {target} (PARSER = {});",
                 qualified(parser.schema(), parser.name())?
             ))];
-            let mut groups: Vec<(&Vec<SearchName>, Vec<&String>)> = Vec::new();
-            for (alias, dictionaries) in mappings {
-                match groups.iter_mut().find(|(used, _)| *used == dictionaries) {
-                    Some((_, aliases)) => aliases.push(alias),
-                    None => groups.push((dictionaries, vec![alias])),
-                }
-            }
-            for (dictionaries, aliases) in groups {
-                let tokens = aliases
-                    .iter()
-                    .map(|alias| crate::quote(alias))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .join(", ");
-                let with = dictionaries
-                    .iter()
-                    .map(|d| qualified(d.schema(), d.name()))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .join(", ");
-                out.push(statement(format!(
-                    "ALTER TEXT SEARCH CONFIGURATION {target} ADD MAPPING FOR {tokens} WITH {with};"
-                )));
-            }
+            out.extend(mapping_statements(
+                &target,
+                &pbps_model::search::mapping_steps(&BTreeMap::new(), mappings),
+            )?);
             out
         }
     };
@@ -433,6 +415,402 @@ pub(crate) fn create(
         });
     }
     Ok(statements)
+}
+
+/// One `ALTER TEXT SEARCH CONFIGURATION ... <verb> MAPPING` per step, so the catalog ends with
+/// the declared rows in the engine's own order (`pbps_model::search::mapping_steps`).
+fn mapping_statements(
+    target: &str,
+    steps: &[pbps_model::search::MappingStep],
+) -> Result<Vec<pbps_dialect::Statement>, DialectError> {
+    steps
+        .iter()
+        .map(|step| {
+            let tokens = step
+                .aliases
+                .iter()
+                .map(|alias| crate::quote(alias))
+                .collect::<Result<Vec<_>, _>>()?
+                .join(", ");
+            let with = step
+                .dictionaries
+                .iter()
+                .map(|d| qualified(d.schema(), d.name()))
+                .collect::<Result<Vec<_>, _>>()?
+                .join(", ");
+            let with = if with.is_empty() {
+                String::new()
+            } else {
+                format!(" WITH {with}")
+            };
+            Ok(pbps_dialect::Statement::new(format!(
+                "ALTER TEXT SEARCH CONFIGURATION {target} {} MAPPING FOR {tokens}{with};",
+                step.verb
+            )))
+        })
+        .collect()
+}
+
+/// The statements that bring `before` to `after` in place, qualified throughout (DEC-2728.3): a
+/// configuration's are `mapping_steps`; a dictionary is one `ALTER` that writes each option that
+/// is new or changed and names, without a value, each one given up, which is how the engine
+/// removes one. The object keeps its identity, so no statement carries one.
+pub(crate) fn alter(
+    name: &SearchRef,
+    before: &SearchObject,
+    after: &SearchObject,
+) -> Result<Vec<pbps_dialect::Statement>, DialectError> {
+    let target = qualified(name.name.schema(), name.name.name())?;
+    match (before, after) {
+        (
+            SearchObject::Config { mappings: was, .. },
+            SearchObject::Config { mappings: now, .. },
+        ) => mapping_statements(&target, &pbps_model::search::mapping_steps(was, now)),
+        (
+            SearchObject::Dictionary { options: was, .. },
+            SearchObject::Dictionary { options: now, .. },
+        ) => {
+            let mut items = Vec::new();
+            for (key, value) in now.iter().filter(|(k, v)| was.get(*k) != Some(*v)) {
+                items.push(format!(
+                    "{} = {}",
+                    crate::quote(key)?,
+                    crate::emit::literal(value)
+                ));
+            }
+            for key in was.keys().filter(|key| !now.contains_key(*key)) {
+                items.push(crate::quote(key)?);
+            }
+            if items.is_empty() {
+                return Ok(Vec::new());
+            }
+            Ok(vec![pbps_dialect::Statement::new(format!(
+                "ALTER TEXT SEARCH DICTIONARY {target} ({});",
+                items.join(", ")
+            ))])
+        }
+        _ => Err(invalid(format!(
+            "{} cannot be altered into another kind of object",
+            name.shown()
+        ))),
+    }
+}
+
+/// Whether the `pg_depend` row `$x` is a stored dependent: an index, a constraint, a stored
+/// generated column's default or a materialized view's rule. A view, a plain default and a
+/// function are evaluated on use and are not (DEC-2728.3).
+macro_rules! stored {
+    ($x:literal) => {
+        concat!(
+            "(",
+            $x,
+            ".classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                AND EXISTS (SELECT 1 FROM pg_catalog.pg_class k
+                             WHERE k.oid = ",
+            $x,
+            ".objid AND k.relkind IN ('i', 'I'))
+              OR ",
+            $x,
+            ".classid = 'pg_catalog.pg_constraint'::pg_catalog.regclass
+              OR ",
+            $x,
+            ".classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass
+                AND EXISTS (SELECT 1 FROM pg_catalog.pg_attrdef a
+                              JOIN pg_catalog.pg_attribute t
+                                ON t.attrelid = a.adrelid AND t.attnum = a.adnum
+                             WHERE a.oid = ",
+            $x,
+            ".objid AND t.attgenerated = 's')
+              OR ",
+            $x,
+            ".classid = 'pg_catalog.pg_rewrite'::pg_catalog.regclass
+                AND EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite w
+                              JOIN pg_catalog.pg_class k ON k.oid = w.ev_class
+                             WHERE w.oid = ",
+            $x,
+            ".objid AND k.relkind = 'm'))"
+        )
+    };
+}
+
+/// How a stored dependent reads in a plan: a materialized view by its relation's name, any other
+/// by its type and identity.
+macro_rules! stored_label {
+    ($cls:literal, $oid:literal, $sub:literal) => {
+        concat!(
+            "CASE WHEN ",
+            $cls,
+            " = 'pg_catalog.pg_rewrite'::pg_catalog.regclass
+                  THEN 'materialized view ' || (SELECT i.identity FROM pg_catalog.pg_identify_object(
+                         'pg_catalog.pg_class'::pg_catalog.regclass,
+                         (SELECT rw.ev_class FROM pg_catalog.pg_rewrite rw WHERE rw.oid = ",
+            $oid,
+            "), 0) i)
+                  ELSE (SELECT i.type || ' ' || i.identity
+                          FROM pg_catalog.pg_identify_object(",
+            $cls,
+            ", ",
+            $oid,
+            ", ",
+            $sub,
+            ") i) END"
+        )
+    };
+}
+
+/// The stored dependents the catalog proves reach one object, and for a dictionary also each
+/// configuration that maps it. The walk follows what only reads at run time (a view, a function
+/// the catalog links) and stops at what stores, so a materialized view over a view over the
+/// object counts and a path that reaches no stored dependent makes none (the `UNION` ends a
+/// cycle). Measured on 16 and 18 (DEC-2728.3): no edge from a thesaurus's sub-dictionary.
+/// An operator is read through too: a stored dependent that uses a user-defined operator records
+/// the operator and not the function behind it, and the function's own edge to the object is the
+/// only link, so a reached function reaches the operator built on it (measured on 16.15 and 18.6).
+const STALE: &str = concat!(
+    "WITH RECURSIVE subject(cls, oid) AS (
+        SELECT 'pg_catalog.pg_ts_config'::pg_catalog.regclass, c.oid
+          FROM pg_catalog.pg_ts_config c
+          JOIN pg_catalog.pg_namespace n ON n.oid = c.cfgnamespace
+         WHERE $1 = 'config' AND n.nspname = $2 AND c.cfgname = $3
+        UNION ALL
+        SELECT 'pg_catalog.pg_ts_dict'::pg_catalog.regclass, d.oid
+          FROM pg_catalog.pg_ts_dict d
+          JOIN pg_catalog.pg_namespace n ON n.oid = d.dictnamespace
+         WHERE $1 = 'dictionary' AND n.nspname = $2 AND d.dictname = $3
+     ), reach(cls, oid) AS (
+        SELECT cls, oid FROM subject
+        UNION
+        SELECT n.cls, n.oid
+          FROM reach r
+          JOIN pg_catalog.pg_depend x ON x.refclassid = r.cls AND x.refobjid = r.oid
+         CROSS JOIN LATERAL (
+              SELECT 'pg_catalog.pg_ts_config'::pg_catalog.regclass, x.objid
+               WHERE x.classid = 'pg_catalog.pg_ts_config'::pg_catalog.regclass
+                 AND r.cls = 'pg_catalog.pg_ts_dict'::pg_catalog.regclass
+              UNION ALL
+              SELECT 'pg_catalog.pg_proc'::pg_catalog.regclass, x.objid
+               WHERE x.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+              UNION ALL
+              SELECT 'pg_catalog.pg_operator'::pg_catalog.regclass, x.objid
+               WHERE x.classid = 'pg_catalog.pg_operator'::pg_catalog.regclass
+              UNION ALL
+              SELECT 'pg_catalog.pg_class'::pg_catalog.regclass, w.ev_class
+                FROM pg_catalog.pg_rewrite w
+                JOIN pg_catalog.pg_class k ON k.oid = w.ev_class
+               WHERE x.classid = 'pg_catalog.pg_rewrite'::pg_catalog.regclass
+                 AND w.oid = x.objid AND k.relkind = 'v'
+         ) n(cls, oid)
+     )
+     SELECT DISTINCT ",
+    stored_label!("x.classid", "x.objid", "x.objsubid"),
+    " AS what
+       FROM reach r
+       JOIN pg_catalog.pg_depend x ON x.refclassid = r.cls AND x.refobjid = r.oid
+      WHERE ",
+    stored!("x"),
+    "
+      ORDER BY 1"
+);
+
+/// The functions the catalog cannot read into that a stored dependent reaches, one row per
+/// `(dependent, function)`, through the functions and views the catalog links (a view's rule, a
+/// `BEGIN ATOMIC` body) and the operators a dependent uses. A function is opaque when its body is
+/// text: a `LANGUAGE sql` string body or any procedural language. Measured on 16.15 and 18.6
+/// (DEC-2728.4): the engine records no edge from such a body to what it names, so the walk stops
+/// there, and nothing reads the text. The operator edge exists because a materialized view, an
+/// index expression or a generated column that uses a user-defined operator records the operator
+/// only, never the function behind it; the operator's own edge to its function is then followed.
+/// A cast is not walked: its dependents record the cast's function directly.
+/// The engine's own functions (`pg_catalog`, `information_schema`) and `internal` and `c` ones
+/// have no text to read and are not listed.
+const OPAQUE: &str = concat!(
+    "WITH RECURSIVE walk(root_cls, root_oid, cls, oid) AS (
+        SELECT DISTINCT x.classid::pg_catalog.regclass, x.objid,
+               x.classid::pg_catalog.regclass, x.objid
+          FROM pg_catalog.pg_depend x
+         WHERE ",
+    stored!("x"),
+    "
+        UNION
+        SELECT w.root_cls, w.root_oid, n.cls, n.oid
+          FROM walk w
+          JOIN pg_catalog.pg_depend x ON x.classid = w.cls AND x.objid = w.oid
+         CROSS JOIN LATERAL (
+              SELECT 'pg_catalog.pg_proc'::pg_catalog.regclass, x.refobjid
+               WHERE x.refclassid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+              UNION ALL
+              SELECT 'pg_catalog.pg_operator'::pg_catalog.regclass, x.refobjid
+               WHERE x.refclassid = 'pg_catalog.pg_operator'::pg_catalog.regclass
+              UNION ALL
+              SELECT 'pg_catalog.pg_rewrite'::pg_catalog.regclass, r.oid
+                FROM pg_catalog.pg_rewrite r
+                JOIN pg_catalog.pg_class k ON k.oid = r.ev_class
+               WHERE x.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                 AND r.ev_class = x.refobjid AND k.relkind = 'v'
+         ) n(cls, oid)
+     )
+     SELECT DISTINCT ",
+    stored_label!("w.root_cls", "w.root_oid", "0"),
+    " AS what, f.identity AS via
+       FROM walk w
+       JOIN pg_catalog.pg_proc p ON p.oid = w.oid
+       JOIN pg_catalog.pg_namespace pn ON pn.oid = p.pronamespace
+       JOIN pg_catalog.pg_language l ON l.oid = p.prolang
+      CROSS JOIN LATERAL pg_catalog.pg_identify_object(w.cls, w.oid, 0) f
+      WHERE w.cls = 'pg_catalog.pg_proc'::pg_catalog.regclass
+        AND p.prosqlbody IS NULL AND l.lanname NOT IN ('internal', 'c')
+        AND pn.nspname NOT IN ('pg_catalog', 'information_schema')
+      ORDER BY 1, 2"
+);
+
+/// Every dictionary a user or a package made, with its options text: the catalog records no edge
+/// from a dictionary to the one it names there, so the census reads them.
+const DICTIONARIES: &str = "SELECT n.nspname::pg_catalog.text AS schema,
+            d.dictname::pg_catalog.text AS name,
+            COALESCE(d.dictinitoption, '') AS options
+       FROM pg_catalog.pg_ts_dict d
+       JOIN pg_catalog.pg_namespace n ON n.oid = d.dictnamespace
+      WHERE d.oid >= 16384
+      ORDER BY 1, 2";
+
+/// The dictionary an unheld dictionary names in its options, or why they cannot be read: the text
+/// does not parse, or the name has no schema, which the engine resolves by the search path of
+/// whoever uses it (DEC-2728.4).
+fn names_in_options(options: &str) -> Result<Option<SearchRef>, String> {
+    let template = TypeRef::new("pg_catalog", "simple").map_err(|e| e.to_string())?;
+    let object = SearchObject::Dictionary {
+        template,
+        options: parse_options(options)?,
+    };
+    if let Some(value) = object.unqualified_sub_dictionary() {
+        return Err(format!(
+            "its option `dictionary` names `{value}` without a schema"
+        ));
+    }
+    Ok(object.dictionaries().into_iter().next())
+}
+
+/// One text column of a row, empty when it is null.
+fn text(row: &pbps_db::Row, column: &str) -> Result<String, pbps_db::DbError> {
+    Ok(row.try_get::<&str>(column)?.unwrap_or_default().to_owned())
+}
+
+/// The stored dependents the catalog proves reach `name`.
+async fn proven(
+    conn: &mut pbps_db::Conn,
+    kind: SearchKind,
+    name: &SearchName,
+) -> Result<Vec<String>, pbps_db::DbError> {
+    let kind = match kind {
+        SearchKind::Config => "config",
+        SearchKind::Dictionary => "dictionary",
+    };
+    let params = [
+        pbps_db::Param::Str(kind),
+        pbps_db::Param::Str(name.schema()),
+        pbps_db::Param::Str(name.name()),
+    ];
+    let rows = conn.query_with(STALE, &params).await?;
+    rows.iter().map(|row| text(row, "what")).collect()
+}
+
+/// For each of `subjects`, what stands on it that would keep the old behaviour if it changed in
+/// place, read from the target's catalog (DEC-2728.4): the stored dependents the catalog proves
+/// (`stored`), and the ones behind a node it cannot see into (`opaque`). A dictionary also
+/// answers for the held dictionaries (`standing`) that name it, transitively; an unheld one is an
+/// opaque node when its options name the subject or another such node, or cannot be read. Every
+/// subject has an entry, empty when nothing stands on it: one that is missing was not read.
+pub async fn stale_dependents(
+    conn: &mut pbps_db::Conn,
+    standing: &BTreeMap<SearchRef, SearchObject>,
+    subjects: &BTreeSet<SearchRef>,
+) -> Result<BTreeMap<SearchRef, SearchCensus>, pbps_db::DbError> {
+    let mut out = BTreeMap::new();
+    if subjects.is_empty() {
+        return Ok(out);
+    }
+    // The same for every subject: nothing reads what a body names.
+    let mut behind_functions = BTreeSet::new();
+    for row in &conn.query_with(OPAQUE, &[]).await? {
+        let (what, via) = (text(row, "what")?, text(row, "via")?);
+        let line = format!("{what} (behind function {via}, whose body the catalog cannot read)");
+        behind_functions.insert((what, line));
+    }
+    // The dictionaries the model does not hold, with what their options say.
+    let mut unheld = Vec::new();
+    if subjects.iter().any(|s| s.kind == SearchKind::Dictionary) {
+        for row in &conn.query_with(DICTIONARIES, &[]).await? {
+            let (schema, name) = (text(row, "schema")?, text(row, "name")?);
+            let reading = names_in_options(&text(row, "options")?);
+            if let Ok(name) = SearchName::new(&schema, &name)
+                && !standing.contains_key(&SearchRef::new(SearchKind::Dictionary, name.clone()))
+            {
+                unheld.push((name, reading));
+            }
+        }
+    }
+    for subject in subjects {
+        let mut members = BTreeSet::from([subject.clone()]);
+        while let Some(user) = standing
+            .iter()
+            .filter(|(_, object)| matches!(object, SearchObject::Dictionary { .. }))
+            .find(|(name, object)| {
+                !members.contains(*name)
+                    && object.dictionaries().iter().any(|d| members.contains(d))
+            })
+            .map(|(name, _)| name.clone())
+        {
+            members.insert(user);
+        }
+        let mut stored = BTreeSet::new();
+        for member in &members {
+            stored.extend(proven(conn, member.kind, &member.name).await?);
+        }
+        let mut opaque = behind_functions.clone();
+        if subject.kind == SearchKind::Dictionary {
+            // An unheld dictionary is opaque when its options cannot be read, name a member, or
+            // name another opaque one: to a fixpoint.
+            let mut reasons = BTreeMap::new();
+            let mut named = members.clone();
+            while let Some((name, why)) = unheld.iter().find_map(|(name, reading)| {
+                let why = match reading {
+                    _ if reasons.contains_key(name) => return None,
+                    Err(why) => format!("its options could not be read: {why}"),
+                    Ok(Some(sub)) if named.contains(sub) => {
+                        format!("its options name {}", sub.shown())
+                    }
+                    Ok(_) => return None,
+                };
+                Some((name, why))
+            }) {
+                named.insert(SearchRef::new(SearchKind::Dictionary, name.clone()));
+                reasons.insert(name, why);
+            }
+            for (name, why) in reasons {
+                for what in proven(conn, SearchKind::Dictionary, name).await? {
+                    let line = format!(
+                        "{what} (behind dictionary {}, which the model does not hold: {why})",
+                        name.shown()
+                    );
+                    opaque.insert((what, line));
+                }
+            }
+        }
+        // What the catalog proves is refused by name already, and is not listed twice.
+        let opaque = opaque
+            .into_iter()
+            .filter(|(what, _)| !stored.contains(what))
+            .map(|(_, line)| line)
+            .collect::<BTreeSet<_>>();
+        out.insert(
+            subject.clone(),
+            SearchCensus {
+                stored: stored.into_iter().collect(),
+                opaque: opaque.into_iter().collect(),
+            },
+        );
+    }
+    Ok(out)
 }
 
 /// `DROP TEXT SEARCH ... RESTRICT`: the engine refuses it while anything depends on the
@@ -921,6 +1299,113 @@ mod tests {
         assert_eq!(emitted(&bare).len(), 1);
     }
 
+    fn alter_change(name: &str, before: SearchObject, after: SearchObject) -> pbps_model::Change {
+        let (uid, name) = ("s_aaaaaa".parse().unwrap(), name.parse().unwrap());
+        let (before, after) = (Box::new(before), Box::new(after));
+        pbps_model::Change::Search(if matches!(after.as_ref(), SearchObject::Config { .. }) {
+            pbps_model::SearchChange::AlterSearchMapping {
+                uid,
+                name,
+                before,
+                after,
+                opaque: Vec::new(),
+            }
+        } else {
+            pbps_model::SearchChange::AlterSearchDictionary {
+                uid,
+                name,
+                before,
+                after,
+                opaque: Vec::new(),
+            }
+        })
+    }
+
+    fn mapped(entries: &[(&str, &[&str])]) -> SearchObject {
+        SearchObject::Config {
+            parser: t("pg_catalog.\"default\""),
+            mappings: entries
+                .iter()
+                .map(|(alias, used)| ((*alias).to_owned(), used.iter().map(|d| n(d)).collect()))
+                .collect(),
+        }
+    }
+
+    /// A configuration is brought to its new mappings with the one verb each token type
+    /// needs: `ADD` for a new one, `ALTER` for a changed list (the engine's `ALTER` on an
+    /// unmapped token type does nothing, and `ADD` on a mapped one fails), `DROP` for a given
+    /// up one; token types that share a list share a statement; an unchanged one is not
+    /// mentioned. No statement carries an identity, since none is created or dropped.
+    /// Negative: two configurations that are the same emit nothing.
+    #[test]
+    fn a_configuration_alter_uses_the_verb_each_token_type_needs() {
+        let before = mapped(&[
+            ("asciiword", &["app.a", "pg_catalog.simple"]),
+            ("word", &["app.a"]),
+            ("email", &["pg_catalog.simple"]),
+            ("url", &["pg_catalog.simple"]),
+        ]);
+        let after = mapped(&[
+            ("asciiword", &["pg_catalog.simple", "app.a"]),
+            ("word", &["pg_catalog.simple", "app.a"]),
+            ("email", &["pg_catalog.simple"]),
+            ("int", &["pg_catalog.simple"]),
+            ("uint", &["pg_catalog.simple"]),
+        ]);
+        let sql = emitted(&alter_change(
+            "config app.docs",
+            before.clone(),
+            after.clone(),
+        ));
+        assert_eq!(
+            sql.iter().map(|s| s.sql.as_str()).collect::<Vec<_>>(),
+            [
+                "ALTER TEXT SEARCH CONFIGURATION \"app\".\"docs\" DROP MAPPING FOR \"url\";",
+                "ALTER TEXT SEARCH CONFIGURATION \"app\".\"docs\" ALTER MAPPING FOR \"asciiword\", \"word\" WITH \"pg_catalog\".\"simple\", \"app\".\"a\";",
+                "ALTER TEXT SEARCH CONFIGURATION \"app\".\"docs\" ADD MAPPING FOR \"int\", \"uint\" WITH \"pg_catalog\".\"simple\";",
+            ]
+        );
+        assert!(sql.iter().all(|s| s.search.is_none()));
+        // One definition per statement, the last the result: a staged apply's checkpoints are
+        // judged against exactly what these statements do (SPEC §7.6, DEC-2728.4).
+        let chain = before.alteration_chain(&after);
+        assert_eq!(chain.len(), sql.len());
+        assert_eq!(chain.last(), Some(&after));
+        assert!(emitted(&alter_change("config app.docs", after.clone(), after)).is_empty());
+    }
+
+    /// A dictionary is one `ALTER` that writes each option that is new or changed with a quoted
+    /// value and names, without one, each option given up (the engine's removal). An option
+    /// that is the same is not written. Negative: an alteration into another kind of object is
+    /// an error and not a statement.
+    #[test]
+    fn a_dictionary_alter_writes_what_changed_and_removes_what_went() {
+        let object = |options: &[(&str, &str)]| SearchObject::Dictionary {
+            template: t("pg_catalog.simple"),
+            options: options
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        };
+        let sql = emitted(&alter_change(
+            "dictionary app.words",
+            object(&[("accept", "false"), ("stopwords", "english"), ("same", "x")]),
+            object(&[("stopwords", "it's"), ("same", "x"), ("synonyms", "s")]),
+        ));
+        assert_eq!(
+            sql.iter().map(|s| s.sql.as_str()).collect::<Vec<_>>(),
+            [
+                "ALTER TEXT SEARCH DICTIONARY \"app\".\"words\" (\"stopwords\" = 'it''s', \"synonyms\" = 's', \"accept\");"
+            ]
+        );
+        let error = super::alter(
+            &"dictionary app.words".parse().unwrap(),
+            &object(&[]),
+            &mapped(&[]),
+        );
+        assert!(error.is_err());
+    }
+
     /// A drop is `RESTRICT` with no `IF EXISTS`: the engine refuses it while anything names the
     /// object, and a lost object is an error and not a silent success (DEC-2728.2). The
     /// statement says it removes the object.
@@ -1130,5 +1615,30 @@ mod tests {
         };
         assert!(found(&config, &parser(PARSER)).is_empty());
         assert!(!found(&config, &parser("myparser")).is_empty());
+    }
+
+    /// What a dictionary the model does not hold says about the dictionary it names, read from
+    /// its options text (DEC-2728.4): the dictionary a thesaurus names when it is spelled with
+    /// its schema, none when it names nothing, and an error when the text cannot be read or the
+    /// name has no schema (the engine resolves that by the search path of whoever uses it, so
+    /// the census must not guess). Negatives: a quoted option and another option's value are not
+    /// a name, and a second `dictionary` option is unreadable.
+    #[test]
+    fn what_an_unheld_dictionary_names_is_read_from_its_options_and_never_guessed() {
+        let named = |text: &str| names_in_options(text);
+        assert_eq!(
+            named("dictfile = 'thesaurus_sample', dictionary = 'app.d1'"),
+            Ok(Some("dictionary app.d1".parse().unwrap()))
+        );
+        assert_eq!(
+            named("DICTIONARY = app.d1"),
+            Ok(Some("dictionary app.d1".parse().unwrap()))
+        );
+        assert_eq!(named(""), Ok(None));
+        assert_eq!(named("stopwords = 'app.d1'"), Ok(None));
+        let bare = named("dictfile = 'x', dictionary = 'english_stem'").unwrap_err();
+        assert!(bare.contains("without a schema"), "{bare}");
+        assert!(named("dictionary = 'a.b', dictionary = 'c.d'").is_err());
+        assert!(named("dictionary").is_err());
     }
 }

@@ -459,6 +459,8 @@ impl Reconstruction {
                 // alterations; one that does is not a bootstrap.
                 Change::TypeValue(_)
                 | Change::Type(TypeChange::DropType { .. })
+                | Change::Search(SearchChange::AlterSearchMapping { .. })
+                | Change::Search(SearchChange::AlterSearchDictionary { .. })
                 | Change::Search(SearchChange::DropSearch { .. })
                 | Change::Type(TypeChange::RenameType { .. })
                 | Change::Table(TableChange::DropTable { .. })

@@ -536,3 +536,41 @@ fn config_with(name: &str, dictionaries: &[&str]) -> Schema {
     );
     schema
 }
+
+/// What a plan alters in place is the plan's own result, like what it creates (DEC-2728.3):
+/// the record takes it as the database holds it after the apply, while an object the plan left
+/// alone keeps the definition it was recorded with, even where the read-back says otherwise.
+/// Negative: an alteration that has not run (the object is gone from the read-back) records
+/// nothing new, and falls back to the previous record.
+#[test]
+fn an_object_a_plan_alters_in_place_is_recorded_as_the_database_holds_it() {
+    let previous = merged(
+        text_search("app.altered", 0),
+        text_search("app.untouched", 0),
+    );
+    let read_back = merged(
+        text_search("app.altered", 1),
+        text_search("app.untouched", 1),
+    );
+    let ids = live(&["app.altered", "app.untouched"]);
+    let name = SearchRef::new(SearchKind::Dictionary, "app.altered".parse().unwrap());
+    let altering = ChangeSet {
+        changes: vec![PlannedChange::new(Change::Search(
+            SearchChange::AlterSearchDictionary {
+                uid: Uid::generate(UidKind::Search),
+                name: name.clone(),
+                before: Box::new(previous.search[&name].clone()),
+                after: Box::new(read_back.search[&name].clone()),
+                opaque: Vec::new(),
+            },
+        ))],
+    };
+    let recorded = read_back
+        .clone()
+        .as_recorded_after_apply(&previous, &altering, &ids);
+    assert_eq!(recorded.search[&name], read_back.search[&name]);
+    let untouched = SearchRef::new(SearchKind::Dictionary, "app.untouched".parse().unwrap());
+    assert_eq!(recorded.search[&untouched], previous.search[&untouched]);
+    let not_run = table("int").as_recorded_after_apply(&previous, &altering, &ids);
+    assert_eq!(not_run.search[&name], previous.search[&name]);
+}

@@ -105,8 +105,8 @@ mod effects_of_each_kind {
 
     use indexmap::IndexMap;
     use pbps_model::operation::{
-        Effects, ModuleEdits, Operations, Origin, PlanOwners, Requirement, Snapshot, Source,
-        effects,
+        Effects, ModuleEdits, ObjectKey, Operations, Origin, PlanOwners, Requirement, Snapshot,
+        Source, effects,
     };
     use pbps_model::plan_names::PlanNames;
     use pbps_model::*;
@@ -548,6 +548,40 @@ mod effects_of_each_kind {
                     name: search_ref("dictionary app.fresh"),
                     definition: Box::new(words_object()),
                     unresolved: Vec::new(),
+                }),
+            ),
+            // Altered in place, each stands before and after and waits for what it now maps.
+            (
+                "AlterSearchMapping",
+                Change::Search(SearchChange::AlterSearchMapping {
+                    uid: uid(UidKind::Search, "docs"),
+                    name: search_ref("config app.docs"),
+                    before: Box::new(docs_object()),
+                    after: Box::new(SearchObject::Config {
+                        parser: "pg_catalog.\"default\"".parse().unwrap(),
+                        mappings: [(
+                            "word".to_owned(),
+                            vec![
+                                "app.words".parse().unwrap(),
+                                "pg_catalog.simple".parse().unwrap(),
+                            ],
+                        )]
+                        .into(),
+                    }),
+                    opaque: Vec::new(),
+                }),
+            ),
+            (
+                "AlterSearchDictionary",
+                Change::Search(SearchChange::AlterSearchDictionary {
+                    uid: uid(UidKind::Search, "words"),
+                    name: search_ref("dictionary app.words"),
+                    before: Box::new(words_object()),
+                    after: Box::new(SearchObject::Dictionary {
+                        template: "pg_catalog.simple".parse().unwrap(),
+                        options: [("stopwords".to_owned(), "english".to_owned())].into(),
+                    }),
+                    opaque: Vec::new(),
                 }),
             ),
             // A dictionary leaves only after the configuration that maps it.
@@ -1332,6 +1366,64 @@ mod effects_of_each_kind {
                 )
             })
             .collect()
+    }
+
+    /// A dictionary's drop waits (`Absent`) for the configurations of the baseline that map it
+    /// and go away, or stay and still map it; one that stays and is altered to stop mapping it
+    /// is ordered by class, before the drop (DEC-2728.3). Negative: the same configuration
+    /// kept unaltered keeps the wait.
+    #[test]
+    fn a_dictionary_drop_waits_only_for_the_configurations_that_still_map_it() {
+        let w = world();
+        let names = PlanNames::of(&[], &w.ids).unwrap();
+        let owners = PlanOwners::new(names, &w.ids, &w.ids);
+        let words = search_ref("dictionary app.words");
+        let docs = search_ref("config app.docs");
+        let drop = Change::Search(SearchChange::DropSearch {
+            uid: uid(UidKind::Search, "words"),
+            name: words,
+            definition: Box::new(words_object()),
+        });
+        let waits_for_docs = |after: &Schema| {
+            let ops = Operations::expanded(
+                1,
+                [(
+                    Origin::Restoration(Source::Change(0)),
+                    PlannedChange::new(drop.clone()),
+                )],
+                ModuleEdits::InPlace,
+            );
+            let fx = effects(
+                &ops.as_slice()[0],
+                &owners,
+                Snapshot {
+                    schema: &w.schema,
+                    ids: &w.ids,
+                },
+                Snapshot {
+                    schema: after,
+                    ids: &w.ids,
+                },
+            )
+            .unwrap();
+            fx.requires.iter().any(|r| {
+                matches!(r, Requirement::Absent(ObjectKey::Search(r)) if r.uid() == &uid(UidKind::Search, "docs"))
+            })
+        };
+        assert!(waits_for_docs(&w.schema), "still mapping it");
+        let mut stopped = w.schema.clone();
+        stopped.search.insert(
+            docs,
+            SearchObject::Config {
+                parser: "pg_catalog.\"default\"".parse().unwrap(),
+                mappings: [(
+                    "asciiword".to_owned(),
+                    vec!["pg_catalog.simple".parse().unwrap()],
+                )]
+                .into(),
+            },
+        );
+        assert!(!waits_for_docs(&stopped), "stopped mapping it");
     }
 
     #[test]

@@ -11,6 +11,18 @@ pub(super) fn emit(search: &SearchChange) -> Sql {
             definition,
             ..
         } => crate::search::create(uid, name, definition),
+        SearchChange::AlterSearchMapping {
+            name,
+            before,
+            after,
+            ..
+        }
+        | SearchChange::AlterSearchDictionary {
+            name,
+            before,
+            after,
+            ..
+        } => crate::search::alter(name, before, after),
         SearchChange::DropSearch { uid, name, .. } => crate::search::drop(uid, name),
     }
 }

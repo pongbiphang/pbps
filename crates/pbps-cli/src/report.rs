@@ -1583,6 +1583,51 @@ fn comment_preview(text: &pbps_model::Text) -> String {
     format!("\"{}{cut}\"", Escaped(&head))
 }
 
+/// The server files a dictionary reads, as a note for its plan line, or nothing.
+fn server_files_note(definition: &pbps_model::SearchObject) -> String {
+    let files = definition.server_files();
+    if files.is_empty() {
+        return String::new();
+    }
+    format!(
+        " (reads server file {}, which pbps does not manage)",
+        files
+            .iter()
+            .map(|(option, file)| format!("`{}` for {}", Escaped(file), Escaped(option)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// What an in-place change of a text search object touches: the token types a configuration
+/// adds, changes or gives up, or the options a dictionary writes or removes.
+fn changed_parts(before: &pbps_model::SearchObject, after: &pbps_model::SearchObject) -> String {
+    use pbps_model::SearchObject::{Config, Dictionary};
+    fn differing<'a, V: PartialEq>(
+        was: &'a std::collections::BTreeMap<String, V>,
+        now: &'a std::collections::BTreeMap<String, V>,
+    ) -> std::collections::BTreeSet<&'a String> {
+        was.keys()
+            .chain(now.keys())
+            .filter(|key| was.get(*key) != now.get(*key))
+            .collect()
+    }
+    let (word, parts) = match (before, after) {
+        (Config { mappings: was, .. }, Config { mappings: now, .. }) => {
+            ("mappings", differing(was, now))
+        }
+        (Dictionary { options: was, .. }, Dictionary { options: now, .. }) => {
+            ("options", differing(was, now))
+        }
+        _ => ("object", Default::default()),
+    };
+    let parts: Vec<_> = parts
+        .into_iter()
+        .map(|part| Escaped(part).to_string())
+        .collect();
+    format!("{word}: {}", parts.join(", "))
+}
+
 pub fn describe(c: &Change) -> String {
     match c {
         Change::Partition(PartitionChange::RebuildPartitionedTable(_))
@@ -1748,22 +1793,7 @@ pub fn describe(c: &Change) -> String {
             unresolved,
             ..
         }) => {
-            let files = definition.server_files();
-            let mut note = String::new();
-            if !files.is_empty() {
-                note = format!(
-                    " (reads server file {}, which pbps does not manage)",
-                    files
-                        .iter()
-                        .map(|(option, file)| format!(
-                            "`{}` for {}",
-                            Escaped(file),
-                            Escaped(option)
-                        ))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
+            let mut note = server_files_note(definition);
             // An offline plan could not look for these; the plan against the database does.
             if !unresolved.is_empty() {
                 note.push_str(&format!(
@@ -1777,6 +1807,36 @@ pub fn describe(c: &Change) -> String {
                 ));
             }
             format!("+ create {}{note}", name.shown())
+        }
+        Change::Search(SearchChange::AlterSearchMapping {
+            name,
+            before,
+            after,
+            opaque,
+            ..
+        })
+        | Change::Search(SearchChange::AlterSearchDictionary {
+            name,
+            before,
+            after,
+            opaque,
+            ..
+        }) => {
+            // What may be stale behind a node the catalog cannot see into (DEC-2728.4).
+            let behind = match opaque.is_empty() {
+                true => String::new(),
+                false => format!(
+                    " (stored results the catalog cannot vouch for, because it cannot see into \
+                     what they call: {})",
+                    Escaped(&opaque.join("; "))
+                ),
+            };
+            format!(
+                "~ alter {} ({}){}{behind}",
+                name.shown(),
+                changed_parts(before, after),
+                server_files_note(after)
+            )
         }
         Change::Search(SearchChange::DropSearch { name, .. }) => format!("- drop {}", name.shown()),
         // A partition has no columns of its own to count; what it is, is its
@@ -3776,5 +3836,115 @@ mod offline_base_tests {
             offline_plan(&cs, &names, Some(("HEAD", "abcdef0123")), "unused"),
             plan(&cs, &names)
         );
+    }
+}
+
+#[cfg(test)]
+mod search_alteration_tests {
+    use super::*;
+    use pbps_model::{SearchObject, SearchRef};
+
+    fn config(mapped: &[(&str, &str)]) -> SearchObject {
+        SearchObject::Config {
+            parser: "pg_catalog.\"default\"".parse().unwrap(),
+            mappings: mapped
+                .iter()
+                .map(|(alias, d)| ((*alias).to_owned(), vec![d.parse().unwrap()]))
+                .collect(),
+        }
+    }
+
+    fn dictionary(options: &[(&str, &str)]) -> SearchObject {
+        SearchObject::Dictionary {
+            template: "pg_catalog.simple".parse().unwrap(),
+            options: options
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        }
+    }
+
+    fn line(name: &str, before: SearchObject, after: SearchObject, opaque: Vec<String>) -> String {
+        let name: SearchRef = name.parse().unwrap();
+        let uid = "s_aaaaaa".parse().unwrap();
+        let (before, after) = (Box::new(before), Box::new(after));
+        describe(&Change::Search(
+            if name.kind == pbps_model::SearchKind::Config {
+                SearchChange::AlterSearchMapping {
+                    uid,
+                    name,
+                    before,
+                    after,
+                    opaque,
+                }
+            } else {
+                SearchChange::AlterSearchDictionary {
+                    uid,
+                    name,
+                    before,
+                    after,
+                    opaque,
+                }
+            },
+        ))
+    }
+
+    /// The plan line of an alteration names the token types or options it touches, each once
+    /// and in order, and the server files the new options read. Negative: a token type or
+    /// option that is the same on both sides is not named.
+    #[test]
+    fn an_alteration_names_what_it_touches_and_not_what_it_leaves() {
+        let said = line(
+            "config app.docs",
+            config(&[
+                ("word", "app.a"),
+                ("email", "pg_catalog.simple"),
+                ("url", "app.a"),
+            ]),
+            config(&[
+                ("word", "app.b"),
+                ("email", "pg_catalog.simple"),
+                ("int", "app.a"),
+            ]),
+            Vec::new(),
+        );
+        assert_eq!(
+            said,
+            "~ alter text search configuration `app.docs` (mappings: int, url, word)"
+        );
+        let said = line(
+            "dictionary app.solo",
+            dictionary(&[("accept", "false"), ("same", "x")]),
+            dictionary(&[("same", "x"), ("stopwords", "english")]),
+            Vec::new(),
+        );
+        assert_eq!(
+            said,
+            "~ alter text search dictionary `app.solo` (options: accept, stopwords) \
+             (reads server file `english` for stopwords, which pbps does not manage)"
+        );
+    }
+
+    /// An alteration with a stored dependent behind a node the catalog cannot see into says so on
+    /// its plan line, naming each one (DEC-2728.3). Negative: with none, the line says nothing of it.
+    #[test]
+    fn an_alteration_names_the_stored_results_the_catalog_cannot_vouch_for() {
+        let (was, now) = (dictionary(&[("a", "1")]), dictionary(&[("a", "2")]));
+        let said = line(
+            "dictionary app.solo",
+            was.clone(),
+            now.clone(),
+            vec![
+                "index app.ix (behind function app.f(text), whose body the catalog cannot read)"
+                    .to_owned(),
+            ],
+        );
+        assert_eq!(
+            said,
+            "~ alter text search dictionary `app.solo` (options: a) (stored results the catalog \
+             cannot vouch for, because it cannot see into what they call: index app.ix (behind \
+             function app.f(text), whose body the catalog cannot read))"
+        );
+        assert!(!line("dictionary app.solo", was, now, Vec::new()).contains("vouch"));
     }
 }

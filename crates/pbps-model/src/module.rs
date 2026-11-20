@@ -1131,6 +1131,12 @@ pub struct Hints {
     pub extension_moves:
         BTreeMap<crate::ObjectLocalName, std::collections::BTreeSet<crate::ProviderMember>>,
 
+    /// What a connected plan found standing on each text search object it would alter in
+    /// place that keeps what was computed with the old behaviour until it is rebuilt
+    /// (DEC-2728.4). A fact about the target, absent offline: an object with no entry was not
+    /// read, which is not the same as an entry with no dependent.
+    pub search_dependents: BTreeMap<crate::SearchRef, crate::SearchCensus>,
+
     /// Whether the base is what a connected plan just read of the target. Offline the
     /// base is the baseline, which stands for the target only as far as the target
     /// matches it, so a check the target alone can answer (a dictionary a mapping names

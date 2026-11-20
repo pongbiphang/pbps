@@ -654,6 +654,8 @@ pub fn names(
         // A module rebuilt in place keeps its name; the rest take none.
         Change::TypeValue(_)
         | Change::Module(ModuleChange::AlterModule { .. })
+        | Change::Search(SearchChange::AlterSearchMapping { .. })
+        | Change::Search(SearchChange::AlterSearchDictionary { .. })
         | Change::Extension(ExtensionChange::UpdateExtension { .. })
         | Change::Extension(ExtensionChange::SetExtensionSchema { .. })
         | Change::Partition(PartitionChange::AttachPartition { .. })

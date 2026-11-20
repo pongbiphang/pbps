@@ -338,6 +338,21 @@ impl<'a> Cx<'a> {
         Some((name, self.after.schema.tables.get(name)?))
     }
 
+    /// The dictionaries a text search object uses: each one the plan holds is final first, and
+    /// one it does not declare is the engine's or a package's.
+    fn search_uses(&mut self, object: &crate::SearchObject) {
+        for dictionary in object.dictionaries() {
+            if let Some(uid) = self.after.ids.search_uid(&dictionary) {
+                self.requires(Requirement::Is(
+                    ObjectKey::Search(Recorded(uid.clone())),
+                    Incarnation::Final,
+                ));
+            } else {
+                self.package_input(dictionary.name.schema());
+            }
+        }
+    }
+
     fn requires(&mut self, requirement: Requirement) {
         if !self.fx.requires.contains(&requirement) {
             self.fx.requires.push(requirement);
@@ -719,24 +734,31 @@ impl Cx<'_> {
             // engine's or a package's: a package standing in its schema is waited
             // for, as for any object a package provides (`package_input`).
             Change::Search(SearchChange::CreateSearch { definition, .. }) => {
-                for dictionary in definition.dictionaries() {
-                    if let Some(uid) = self.after.ids.search_uid(&dictionary) {
-                        self.requires(Requirement::Is(
-                            ObjectKey::Search(Recorded(uid.clone())),
-                            Incarnation::Final,
-                        ));
-                    } else {
-                        self.package_input(dictionary.name.schema());
-                    }
-                }
+                self.search_uses(definition);
+            }
+            // Altered in place, it stands before and after, so no incarnation moves, and
+            // what it now maps is final before it, as for a create (DEC-2728.3).
+            Change::Search(SearchChange::AlterSearchMapping { uid, after, .. })
+            | Change::Search(SearchChange::AlterSearchDictionary { uid, after, .. }) => {
+                self.exists(ObjectKey::Search(Recorded(uid.clone())));
+                self.search_uses(after);
             }
             // The reverse: a dictionary leaves only once every configuration of
-            // the baseline that maps it is gone, as the engine's RESTRICT demands.
+            // the baseline that maps it is gone, as the engine's RESTRICT demands. One the
+            // plan keeps and alters stopped mapping it in class 7, before this drop; the
+            // differ refuses a kept one that still does.
             Change::Search(SearchChange::DropSearch { uid, name, .. }) => {
                 self.exists(ObjectKey::Search(Recorded(uid.clone())));
                 for (other, definition) in &self.before.schema.search {
                     if let Some(user) = self.before.ids.search_uid(other)
                         && definition.dictionaries().contains(name)
+                        && !self
+                            .after
+                            .ids
+                            .search
+                            .get(user)
+                            .and_then(|kept| self.after.schema.search.get(kept))
+                            .is_some_and(|now| !now.dictionaries().contains(name))
                     {
                         self.requires(Requirement::Absent(ObjectKey::Search(Recorded(
                             user.clone(),
@@ -1623,9 +1645,13 @@ impl Cx<'_> {
                 for id in releases {
                     self.requires(Requirement::Absent(ObjectKey::Module(id.clone())));
                 }
-                // So is a configuration that maps a dictionary the package provides.
+                // So is a configuration that maps a dictionary the package provides, when
+                // the plan drops it. One it keeps and alters away from the package stands:
+                // its alteration is class 7 and runs before this drop (DEC-2728.3).
                 for name in search_releases {
-                    if let Some(uid) = self.before.ids.search_uid(name) {
+                    if let Some(uid) = self.before.ids.search_uid(name)
+                        && !self.after.ids.search.contains_key(uid)
+                    {
                         self.requires(Requirement::Absent(ObjectKey::Search(Recorded(
                             uid.clone(),
                         ))));

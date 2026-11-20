@@ -461,6 +461,8 @@ impl Declared {
                 | Change::Partition(PartitionChange::AnalyzeTableTree(_))
                 // A text search object holds no expression text either (DEC-2728.2).
                 | Change::Search(SearchChange::CreateSearch { .. })
+                | Change::Search(SearchChange::AlterSearchMapping { .. })
+                | Change::Search(SearchChange::AlterSearchDictionary { .. })
                 | Change::Search(SearchChange::DropSearch { .. })
                 // A package declares no expression text; its members are not
                 // read as declared types or defaults (DEC-2447.6).

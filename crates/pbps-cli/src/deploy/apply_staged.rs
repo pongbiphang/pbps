@@ -825,9 +825,10 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
         })?;
         let mut snapshot = pbps_model::StateSnapshot::new(
             pbps_model::StateKind::Apply,
-            // No plan alters a text search object: an object is recorded when its identity
-            // is held and the database holds it, and one the previous record holds keeps its
-            // recorded definition, not the read-back's (DEC-2855.1).
+            // An object is recorded when its identity is held and the database holds it,
+            // and one the previous record holds keeps its recorded definition, not the
+            // read-back's (DEC-2855.1), except one the plan creates or alters in place, which
+            // the closing guard has held to the plan's definition (DEC-2728.3).
             after
                 .schema
                 .as_recorded_after_apply(&entry.snapshot.schema, &plan.changes, &plan.ids),

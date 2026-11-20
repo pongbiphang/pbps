@@ -217,12 +217,12 @@ impl NameOnly {
     /// change for it) is recorded with its new identity, and an object no identity names
     /// is not the project's and is never recorded.
     ///
-    /// Which definition: no plan alters one, so an object the previous record holds keeps
-    /// the definition it was recorded with, even where the read-back says otherwise (what
-    /// it holds of the object is not the plan's result, and a record that took it would
-    /// bless a change made outside the plan), and even where the database no longer holds
-    /// it (`verify` names it as gone). The exception is an object `applied` creates: it
-    /// is the plan's own result, and a staged create that was stopped and resumed has a
+    /// Which definition: an object the previous record holds keeps the definition it was
+    /// recorded with, even where the read-back says otherwise (what it holds of the object
+    /// is not the plan's result, and a record that took it would bless a change made
+    /// outside the plan), and even where the database no longer holds it (`verify` names it
+    /// as gone). The exception is an object `applied` creates or alters in place
+    /// (DEC-2728.3): it is the plan's own result, and a staged create that was stopped and resumed has a
     /// previous record (the checkpoint) holding it half made, so the read-back's definition
     /// is the one recorded. Any other is as the read-back holds it, and is recorded only if
     /// it does.
@@ -237,7 +237,12 @@ impl NameOnly {
             .changes
             .iter()
             .filter_map(|planned| {
-                if let Change::Search(SearchChange::CreateSearch { name, .. }) = &planned.change {
+                if let Change::Search(
+                    SearchChange::CreateSearch { name, .. }
+                    | SearchChange::AlterSearchMapping { name, .. }
+                    | SearchChange::AlterSearchDictionary { name, .. },
+                ) = &planned.change
+                {
                     Some(name)
                 } else {
                     None

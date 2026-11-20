@@ -2,13 +2,14 @@
 //! pulled into declaration files, pulled again with no difference and an empty follow-up
 //! plan, a copied configuration expanded, what is not held left out and named, and every
 //! difference in a standing object refused by name. Part B (DEC-2728.2) creates and drops
-//! them: the order, the recorded reason, the server-file advisory. Each case runs on both
-//! pinned engines.
+//! them: the order, the recorded reason, the server-file advisory. Part C (DEC-2728.3) alters a
+//! standing one in place and refuses what would go stale. Each case runs on both pinned
+//! engines.
 
 use super::rehearsal2379::{Fixture, Kind, Options};
 use super::{
-    Demo, OwnDatabase, apply_plan, approved_apply, code, on_server, scalar, server, stderr, stdout,
-    succeeds,
+    Demo, OwnDatabase, apply_plan, approved_apply, code, on_server, plan_checksum, scalar, server,
+    stderr, stdout, succeeds, text_of,
 };
 use std::collections::BTreeMap;
 use std::process::Output;
@@ -259,7 +260,8 @@ fn every_difference_is_refused_by_name_and_an_undeclared_object_is_left_alone() 
         assert_ne!(code(&out), 0, "{}", said(&out));
         assert!(
             said(&out).contains("text search configuration `app.docs`")
-                && said(&out).contains("changing one arrives"),
+                && said(&out).contains("would keep the old behaviour")
+                && said(&out).contains("app.articles"),
             "{}",
             said(&out)
         );
@@ -905,6 +907,119 @@ fn a_configuration_over_a_package_dictionary_is_retired_with_the_package() {
     }
 }
 
+/// A configuration the project keeps, altered to stop mapping the package's dictionary, frees
+/// the package for its removal in the same plan: the alteration (class 7) runs before the drop
+/// (class 18), so the engine's `RESTRICT` sees no dependency, and the re-plan is empty. A
+/// configuration that still maps the package's dictionary stays refused, naming it (DEC-2728.3).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_configuration_altered_away_from_a_package_dictionary_frees_the_package() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        let f = Fixture::new(
+            &server,
+            "search2728g",
+            Kind::Supplied,
+            &Options {
+                externals: Some(
+                    "CREATE SCHEMA IF NOT EXISTS ext; CREATE EXTENSION dict_int SCHEMA ext",
+                ),
+                unselected: true,
+                ..Options::default()
+            },
+        );
+        succeeds(f.d.run(&[
+            "pull",
+            "--force",
+            "--db",
+            f.target(),
+            "--extension",
+            "dict_int",
+        ]));
+        f.d.commit();
+        succeeds(f.d.run(&[
+            "baseline",
+            "--db",
+            f.target(),
+            "--reason",
+            "adopt the package",
+        ]));
+        let mapping = |dictionary: &str| {
+            format!(
+                "text_search_config: app.sdocs\nparser: pg_catalog.default\nmappings:\n  \
+                 asciiword: [{dictionary}]\n"
+            )
+        };
+        declare(
+            &f.d,
+            "app.sdocs.textsearch-config.yml",
+            &mapping("ext.intdict"),
+        );
+        succeeds(f.d.run(&["plan"]));
+        f.d.commit();
+        succeeds(f.plan(&[]));
+        succeeds(f.apply("destructive"));
+        // The package is given up while the configuration keeps mapping its dictionary: refused,
+        // naming the configuration.
+        std::fs::remove_file(f.d.dir.join("schema/extensions/dict_int.yml")).unwrap();
+        succeeds(f.d.run(&["intent", "--drop-extension", "dict_int", "retired"]));
+        f.d.commit();
+        let refused = f.plan(&[]);
+        assert_ne!(code(&refused), 0, "{}", said(&refused));
+        assert!(
+            said(&refused).contains("text search configuration app.sdocs"),
+            "{}",
+            said(&refused)
+        );
+        // Altered away from it, the same plan is valid: the alteration first, then the drop.
+        declare(
+            &f.d,
+            "app.sdocs.textsearch-config.yml",
+            &mapping("pg_catalog.simple"),
+        );
+        let planned = f.plan(&[]);
+        assert_eq!(code(&planned), 0, "{}", said(&planned));
+        let order = subjects(&f.artifact());
+        let kinds: Vec<String> = {
+            let saved: pbps_model::SavedPlan =
+                serde_json::from_slice(&std::fs::read(f.artifact()).unwrap()).unwrap();
+            saved
+                .changes
+                .changes
+                .iter()
+                .map(|p| format!("{:?}", p.change))
+                .collect()
+        };
+        let alter = kinds
+            .iter()
+            .position(|k| k.starts_with("AlterSearchMapping"))
+            .unwrap_or_else(|| panic!("no AlterSearchMapping in {order:?}"));
+        let package = kinds
+            .iter()
+            .position(|k| k.starts_with("DropExtension"))
+            .unwrap_or_else(|| panic!("no DropExtension in {order:?}"));
+        assert!(alter < package, "{order:?}");
+        succeeds(f.apply("destructive"));
+        assert_eq!(
+            scalar(
+                f.target(),
+                "SELECT count(*) FROM pg_extension WHERE extname = 'dict_int'"
+            ),
+            0
+        );
+        assert_eq!(
+            scalar(
+                f.target(),
+                "SELECT count(*) FROM pg_ts_config_map m JOIN pg_ts_config c ON c.oid = m.mapcfg \
+                 JOIN pg_ts_dict d ON d.oid = m.mapdict \
+                 WHERE c.cfgname = 'sdocs' AND d.dictname = 'simple'"
+            ),
+            1
+        );
+        f.d.commit();
+        no_changes(&succeeds(f.d.run(&["plan", "--db", f.target()])));
+    }
+}
+
 /// A staged plan is one logical change, so a configuration's create is the case a stop can
 /// split: `CREATE` and then one `ADD MAPPING` per group. Stopped after the `CREATE`, the
 /// checkpoint holds the configuration as the database holds it, and `--resume` finishes the
@@ -1030,6 +1145,835 @@ fn a_declaration_that_adopts_an_existing_object_is_recorded_and_verifies() {
         );
         assert_eq!(record.ids.search.len(), 2, "{:?}", record.ids.search);
         succeeds(d.run(&["verify", "--db", db]));
+        no_changes(&succeeds(d.run(&["plan", "--db", db])));
+    }
+}
+
+/// The mappings a configuration holds in the catalog, in the engine's order.
+fn mappings_of(db: &str, config: &str) -> String {
+    text_of(
+        db,
+        &format!(
+            "SELECT string_agg(tt.alias || '=' || d.dictname, ',' ORDER BY m.maptokentype, m.mapseqno) \
+               FROM pg_ts_config_map m \
+               JOIN pg_ts_dict d ON d.oid = m.mapdict \
+               JOIN pg_ts_config c ON c.oid = m.mapcfg \
+               JOIN ts_token_type(c.cfgparser) tt ON tt.tokid = m.maptokentype \
+              WHERE c.cfgname = '{config}'"
+        ),
+    )
+}
+
+fn options_of(db: &str, dictionary: &str) -> String {
+    text_of(
+        db,
+        &format!(
+            "SELECT coalesce(dictinitoption, '') FROM pg_ts_dict WHERE dictname = '{dictionary}'"
+        ),
+    )
+}
+
+const SOLO: &str = "text_search_dictionary: app.solo\ntemplate: pg_catalog.simple\n\
+                    options:\n  stopwords: english\n";
+
+/// A standing configuration whose token types are added, changed and given up, and a standing
+/// dictionary whose options are changed and removed, are altered in place with nothing
+/// standing on them: the plan says what it alters, the catalog ends in the declared rows in
+/// the declared order, and the next plan is empty and verifies. The same change planned
+/// without the database is refused, since only the target can say what stands on the object.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_standing_configuration_and_dictionary_are_altered_in_place_and_the_replan_is_empty() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        let own = OwnDatabase::new(&server, "search2728c");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app");
+        let d = Demo::new("search2728c");
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+        declare(&d, "app.words.textsearch-dictionary.yml", WORDS);
+        declare(&d, "app.docs.textsearch-config.yml", DOCS);
+        declare(&d, "app.solo.textsearch-dictionary.yml", SOLO);
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        let path = d.dir.join("alter.plan.json");
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        succeeds(apply_plan(&d, db, &path, false));
+        assert_eq!(
+            mappings_of(db, "docs"),
+            "asciiword=words,word=words,email=simple"
+        );
+        // Token types added (`url`), changed (a second dictionary in a new order, `word`) and
+        // given up (`email`); an option given up (`stopwords`) and one written (`accept`).
+        declare(
+            &d,
+            "app.docs.textsearch-config.yml",
+            "text_search_config: app.docs\nparser: pg_catalog.default\nmappings:\n  \
+             asciiword: [pg_catalog.simple, app.words]\n  url: [pg_catalog.simple]\n  \
+             word: [pg_catalog.simple]\n",
+        );
+        declare(
+            &d,
+            "app.solo.textsearch-dictionary.yml",
+            "text_search_dictionary: app.solo\ntemplate: pg_catalog.simple\noptions:\n  \
+             accept: \"false\"\n",
+        );
+        // Planned without the database, the dependents are unknown: refused, naming the way.
+        let offline = d.run(&["plan", "--no-dev"]);
+        assert_ne!(code(&offline), 0, "{}", said(&offline));
+        assert!(said(&offline).contains("--db"), "{}", said(&offline));
+        let out = succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        let text = said(&out);
+        assert!(
+            text.contains("~ alter text search configuration `app.docs` (mappings: asciiword, email, url, word)")
+                && text.contains("~ alter text search dictionary `app.solo` (options: accept, stopwords)"),
+            "{text}"
+        );
+        // Nothing is dropped or created: the identities stay.
+        assert_eq!(subjects(&path).len(), 2, "{:?}", subjects(&path));
+        succeeds(apply_plan(&d, db, &path, false));
+        assert_eq!(
+            mappings_of(db, "docs"),
+            "asciiword=simple,asciiword=words,word=simple,url=simple"
+        );
+        assert_eq!(options_of(db, "solo"), "accept = 'false'");
+        no_changes(&succeeds(d.run(&["plan", "--db", db])));
+        succeeds(d.run(&["verify", "--db", db]));
+        // The same files pulled back are the declared ones: the alteration left no residue.
+        let before =
+            std::fs::read_to_string(d.dir.join("schema/app.docs.textsearch-config.yml")).unwrap();
+        succeeds(d.run(&["pull", "--force", "--db", db]));
+        let after =
+            std::fs::read_to_string(d.dir.join("schema/app.docs.textsearch-config.yml")).unwrap();
+        assert_eq!(
+            after.split_whitespace().collect::<Vec<_>>(),
+            before.split_whitespace().collect::<Vec<_>>()
+        );
+        d.commit();
+        // A dictionary retired with the configuration kept: the configuration stops mapping it
+        // first (an alteration, class 7), then the dictionary is dropped (class 18); the drop
+        // does not wait for a configuration that stays.
+        declare(
+            &d,
+            "app.docs.textsearch-config.yml",
+            "text_search_config: app.docs\nparser: pg_catalog.default\nmappings:\n  \
+             asciiword: [pg_catalog.simple]\n  url: [pg_catalog.simple]\n  \
+             word: [pg_catalog.simple]\n",
+        );
+        std::fs::remove_file(d.dir.join("schema/app.words.textsearch-dictionary.yml")).unwrap();
+        succeeds(d.run(&["intent", "--drop-search", "dictionary app.words", "retired"]));
+        d.commit();
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        let order = subjects(&path);
+        assert!(
+            at(&order, "config app.docs") < at(&order, "dictionary app.words"),
+            "{order:?}"
+        );
+        succeeds(approved_apply(&d, db, &path, &["--allow", "destructive"]));
+        assert_eq!(
+            mappings_of(db, "docs"),
+            "asciiword=simple,word=simple,url=simple"
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*) FROM pg_ts_dict WHERE dictname = 'words' AND dictnamespace = 'app'::regnamespace"
+            ),
+            0
+        );
+        no_changes(&succeeds(d.run(&["plan", "--db", db])));
+    }
+}
+
+/// A plan pins the object it alters to the definition it was approved over (SPEC §7.6).
+/// Another session that changes a token type or an option the plan does not touch, between the
+/// plan and the apply, moves the database off the plan's baseline and the apply refuses before
+/// statement one. One that changes it while the statements run (an event trigger stands for
+/// the other session: it writes in the transaction, which is what the read-back would see) is
+/// not the plan's result: the close, or a staged run's checkpoint, refuses it and records
+/// nothing, instead of taking the read-back as the alteration's result and keeping the change
+/// beside the plan's own. Ordinary and staged, a mapping and an option. Negative: with no
+/// intervening change the same declaration applies, and the next plan is empty and verifies.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn an_alteration_is_refused_when_another_session_changed_the_object_after_the_plan() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        let own = OwnDatabase::new(&server, "search2728d");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app");
+        let d = Demo::new("search2728d");
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+        declare(&d, "app.words.textsearch-dictionary.yml", WORDS);
+        declare(&d, "app.docs.textsearch-config.yml", DOCS);
+        declare(&d, "app.solo.textsearch-dictionary.yml", SOLO);
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        let path = d.dir.join("moved.plan.json");
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        succeeds(apply_plan(&d, db, &path, false));
+        let held = |db: &str| format!("{} / {}", mappings_of(db, "docs"), options_of(db, "solo"));
+        let mut round = 0;
+        for (mapping, staged, during) in [
+            (true, false, false),
+            (true, false, true),
+            (true, true, true),
+            (false, false, false),
+            (false, false, true),
+            (false, true, true),
+        ] {
+            round += 1;
+            let flip = round % 2 == 1;
+            // The plan changes `word` (or `accept`); the other session changes `email` (or
+            // `stopwords`), which the plan does not.
+            let (other, tag) = if mapping {
+                let word = if flip {
+                    "pg_catalog.simple"
+                } else {
+                    "app.words"
+                };
+                declare(
+                    &d,
+                    "app.docs.textsearch-config.yml",
+                    &format!(
+                        "text_search_config: app.docs\nparser: pg_catalog.default\nmappings:\n  \
+                         asciiword: [app.words]\n  email: [pg_catalog.simple]\n  word: [{word}]\n"
+                    ),
+                );
+                (
+                    "ALTER TEXT SEARCH CONFIGURATION app.docs ALTER MAPPING FOR email WITH app.words",
+                    "ALTER TEXT SEARCH CONFIGURATION",
+                )
+            } else {
+                let accept = if flip { "false" } else { "true" };
+                declare(
+                    &d,
+                    "app.solo.textsearch-dictionary.yml",
+                    &format!(
+                        "text_search_dictionary: app.solo\ntemplate: pg_catalog.simple\n\
+                         options:\n  accept: \"{accept}\"\n  stopwords: english\n"
+                    ),
+                );
+                (
+                    "ALTER TEXT SEARCH DICTIONARY app.solo (stopwords = 'russian')",
+                    "ALTER TEXT SEARCH DICTIONARY",
+                )
+            };
+            let mut plan = vec!["plan", "--db", db, "--out", path.to_str().unwrap()];
+            if staged {
+                plan.push("--staged");
+            }
+            succeeds(d.run(&plan));
+            let unmoved = held(db);
+            if during {
+                // Once per statement of the plan: written only while the other session's
+                // change is not yet there, so the nested statement ends it.
+                let done = if mapping {
+                    "EXISTS (SELECT 1 FROM pg_ts_config_map m JOIN pg_ts_config c ON c.oid = m.mapcfg \
+                     JOIN pg_ts_dict d ON d.oid = m.mapdict WHERE c.cfgname = 'docs' \
+                     AND m.maptokentype = 4 AND d.dictname = 'words')"
+                } else {
+                    "EXISTS (SELECT 1 FROM pg_ts_dict WHERE dictname = 'solo' \
+                     AND dictinitoption LIKE '%russian%')"
+                };
+                on_server(
+                    db,
+                    &format!(
+                        "CREATE SCHEMA witness; \
+                         CREATE FUNCTION witness.the_other_session() RETURNS event_trigger \
+                         LANGUAGE plpgsql AS $$ BEGIN IF NOT {done} THEN {other}; END IF; END $$; \
+                         CREATE EVENT TRIGGER other_session ON ddl_command_end \
+                         WHEN TAG IN ('{tag}') EXECUTE FUNCTION witness.the_other_session()"
+                    ),
+                );
+            } else {
+                on_server(db, other);
+            }
+            let moved = held(db);
+            let refused = apply_plan(&d, db, &path, staged);
+            assert_ne!(code(&refused), 0, "{round}: {}", said(&refused));
+            let text = said(&refused);
+            assert!(
+                text.contains(if during {
+                    "does not match what its plan promised"
+                } else {
+                    "no longer the database this plan was computed against"
+                }),
+                "{round}: {text}"
+            );
+            if during {
+                on_server(
+                    db,
+                    "DROP EVENT TRIGGER other_session; DROP SCHEMA witness CASCADE",
+                );
+            }
+            if !staged {
+                // Rolled back: the database is as it was before the apply, and the record, which
+                // holds what was approved, still agrees with it unless the other session wrote.
+                assert_eq!(
+                    held(db),
+                    if during { unmoved.clone() } else { moved },
+                    "{round}"
+                );
+                if during {
+                    succeeds(d.run(&["verify", "--db", db]));
+                }
+            }
+            if !during || staged {
+                // A staged run stops on a checkpoint, and an apply the plan baseline refused leaves
+                // the other session's change as drift against the record: either way it is
+                // taken as it stands before anything is planned over it.
+                if !during {
+                    assert_ne!(code(&d.run(&["verify", "--db", db])), 0, "{round}");
+                }
+                succeeds(d.run(&[
+                    "baseline",
+                    "--db",
+                    db,
+                    "--reason",
+                    "the other session's change",
+                ]));
+            }
+            // The same declaration planned again sees the object as it now stands: it applies,
+            // closes and leaves nothing to plan.
+            succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+            succeeds(apply_plan(&d, db, &path, false));
+            no_changes(&succeeds(d.run(&["plan", "--db", db])));
+            succeeds(d.run(&["verify", "--db", db]));
+        }
+    }
+}
+
+/// What would keep the old behaviour stops the change, by name, before any statement: a stored
+/// generated column over a configuration stops a change of its mappings and, through the
+/// configuration that maps it, a change of a dictionary's options; a parser or a template that
+/// differs is refused in place of a drop and create. The refusal names the remedy and the
+/// database is as it was. Negative: a dictionary nothing maps, in the same project, is
+/// altered in place.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn what_would_keep_the_old_behaviour_stops_an_alteration_and_a_parser_or_template_change_is_refused()
+ {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        let own = OwnDatabase::new(&server, "search2728d");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app");
+        let d = Demo::new("search2728d");
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+        declare(&d, "app.words.textsearch-dictionary.yml", WORDS);
+        declare(&d, "app.docs.textsearch-config.yml", DOCS);
+        declare(&d, "app.solo.textsearch-dictionary.yml", SOLO);
+        declare(&d, "app.articles.yml", ARTICLES);
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        let path = d.dir.join("stale.plan.json");
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        succeeds(apply_plan(&d, db, &path, false));
+        let refused = |what: &str, needles: &[&str]| {
+            let out = d.run(&["plan", "--db", db]);
+            assert_ne!(code(&out), 0, "{what}: {}", said(&out));
+            for needle in needles {
+                assert!(
+                    said(&out).contains(needle),
+                    "{what}: {needle}: {}",
+                    said(&out)
+                );
+            }
+        };
+        // A materialized view over a view over the configuration stales with it, though the
+        // catalog has no edge between the configuration and the materialized view.
+        on_server(
+            db,
+            "CREATE VIEW app.chain_v AS SELECT to_tsvector('app.docs', body) AS x FROM app.articles; CREATE MATERIALIZED VIEW app.chain_mv AS SELECT x FROM app.chain_v",
+        );
+        // A mapping changed under a stored generated column.
+        let docs =
+            std::fs::read_to_string(d.dir.join("schema/app.docs.textsearch-config.yml")).unwrap();
+        declare(
+            &d,
+            "app.docs.textsearch-config.yml",
+            &docs.replace(
+                "email: [pg_catalog.simple]",
+                "email: [app.words, pg_catalog.simple]",
+            ),
+        );
+        refused(
+            "a mapping",
+            &[
+                "app.docs",
+                "default value for app.articles.tsv",
+                "materialized view app.chain_mv would keep the old behaviour",
+                "new name",
+            ],
+        );
+        // An option of a dictionary that configuration maps: the dependents are the
+        // configuration's.
+        declare(&d, "app.docs.textsearch-config.yml", &docs);
+        declare(
+            &d,
+            "app.words.textsearch-dictionary.yml",
+            &WORDS.replace("english", "german"),
+        );
+        refused(
+            "an option",
+            &[
+                "app.words",
+                "app.articles.tsv",
+                "materialized view app.chain_mv would keep the old behaviour",
+                "new name",
+            ],
+        );
+        // A template that differs, and a parser that is not the built-in one.
+        declare(
+            &d,
+            "app.words.textsearch-dictionary.yml",
+            &WORDS.replace("snowball", "simple"),
+        );
+        refused("a template", &["app.words", "template differs"]);
+        declare(&d, "app.words.textsearch-dictionary.yml", WORDS);
+        declare(
+            &d,
+            "app.docs.textsearch-config.yml",
+            &docs.replace("pg_catalog.default", "pg_catalog.other"),
+        );
+        refused("a parser", &["app.docs", "parser"]);
+        declare(&d, "app.docs.textsearch-config.yml", &docs);
+        no_changes(&succeeds(d.run(&["plan", "--db", db])));
+        assert_eq!(
+            mappings_of(db, "docs"),
+            "asciiword=words,word=words,email=simple"
+        );
+        assert_eq!(options_of(db, "words"), "language = 'english'");
+        // Negative: a dictionary nothing maps has nothing stale on it.
+        declare(
+            &d,
+            "app.solo.textsearch-dictionary.yml",
+            &SOLO.replace("english", "german"),
+        );
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        succeeds(apply_plan(&d, db, &path, false));
+        assert_eq!(options_of(db, "solo"), "stopwords = 'german'");
+        no_changes(&succeeds(d.run(&["plan", "--db", db])));
+    }
+}
+
+/// What the catalog cannot see into does not stop an alteration; it is a gated risk class
+/// (DEC-2728.4). With a stored dependent behind a function with a text body, the plan lists it
+/// with the function, carries `stale-results`, and `apply` without the class in `--allow` is
+/// refused before any statement and with it applies. A dictionary the model does not hold that
+/// names an option unreadably does the same, naming the dictionary. Negatives: a text-bodied
+/// function that no stored dependent calls, and a dictionary nothing maps, alter freely and
+/// carry no such class, and a plan saved with it is refused if the class is stripped.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn an_opaque_node_behind_a_stored_dependent_gates_an_alteration_and_one_without_does_not() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        let own = OwnDatabase::new(&server, "search2728e");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app");
+        let d = Demo::new("search2728e");
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+        declare(&d, "app.words.textsearch-dictionary.yml", WORDS);
+        declare(&d, "app.docs.textsearch-config.yml", DOCS);
+        declare(&d, "app.solo.textsearch-dictionary.yml", SOLO);
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        let path = d.dir.join("opaque.plan.json");
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        succeeds(apply_plan(&d, db, &path, false));
+        // A function with a text body that no stored dependent calls: nothing stands behind it.
+        on_server(
+            db,
+            "CREATE TABLE app.loose (body text); \
+             CREATE FUNCTION app.f_free(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.docs', t) $$",
+        );
+        declare(
+            &d,
+            "app.solo.textsearch-dictionary.yml",
+            &SOLO.replace("english", "german"),
+        );
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved.contains("stale-results") && !saved.contains("\"opaque\""),
+            "{saved}"
+        );
+        succeeds(apply_plan(&d, db, &path, false));
+        assert_eq!(options_of(db, "solo"), "stopwords = 'german'");
+        // Now a stored dependent calls a text-bodied function: an index over a `LANGUAGE sql`
+        // one, and a materialized view over a PL/pgSQL one that nothing catalog-visible links
+        // to the configuration.
+        on_server(
+            db,
+            "CREATE FUNCTION app.f_sql(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.docs', t) $$; \
+             CREATE FUNCTION app.f_pl(t text) RETURNS tsvector LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN RETURN to_tsvector('app.docs'::regconfig, t); END $$; \
+             CREATE INDEX ix_sql ON app.loose USING gin (app.f_sql(body)); \
+             CREATE MATERIALIZED VIEW app.mv_pl AS SELECT app.f_pl(body) AS x FROM app.loose",
+        );
+        let docs =
+            std::fs::read_to_string(d.dir.join("schema/app.docs.textsearch-config.yml")).unwrap();
+        declare(
+            &d,
+            "app.docs.textsearch-config.yml",
+            &docs.replace(
+                "email: [pg_catalog.simple]",
+                "email: [app.words, pg_catalog.simple]",
+            ),
+        );
+        let planned = succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        for needle in [
+            "stale-results",
+            "index app.ix_sql (behind function app.f_sql(pg_catalog.text), whose body the catalog cannot read)",
+            "materialized view app.mv_pl (behind function app.f_pl(pg_catalog.text), whose body the catalog cannot read)",
+        ] {
+            assert!(
+                said(&planned).contains(needle),
+                "{needle}: {}",
+                said(&planned)
+            );
+        }
+        assert!(
+            !said(&planned).contains("behind function app.f_free"),
+            "{}",
+            said(&planned)
+        );
+        let saved: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            saved
+                .changes
+                .changes
+                .iter()
+                .any(|p| p.risks.contains(&pbps_model::RiskClass::StaleResults)),
+            "{saved:?}"
+        );
+        // Without the class the apply is refused before a statement; with it, it applies.
+        let unchanged = mappings_of(db, "docs");
+        let refused = apply_plan(&d, db, &path, false);
+        assert_ne!(code(&refused), 0, "{}", said(&refused));
+        assert!(
+            said(&refused).contains("stale-results"),
+            "{}",
+            said(&refused)
+        );
+        assert_eq!(mappings_of(db, "docs"), unchanged);
+        let checksum = plan_checksum(&path);
+        let allowed = |staged: bool| {
+            let mut args = vec![
+                "apply",
+                "--db",
+                db,
+                "--plan",
+                path.to_str().unwrap(),
+                "--checksum",
+                &checksum,
+                "--allow",
+                "stale-results",
+            ];
+            if staged {
+                args.push("--staged");
+            }
+            d.run(&args)
+        };
+        succeeds(allowed(false));
+        assert_eq!(
+            mappings_of(db, "docs"),
+            "asciiword=words,word=words,email=words,email=simple"
+        );
+        no_changes(&succeeds(d.run(&["plan", "--db", db])));
+        succeeds(d.run(&["verify", "--db", db]));
+        // A thesaurus the model does not hold (it names its sub-dictionary without a schema),
+        // under a configuration the project does not hold, under an index: a dictionary the
+        // catalog cannot read into, with a dependent behind it.
+        on_server(
+            db,
+            "SET search_path = app, pg_catalog; \
+             CREATE TEXT SEARCH DICTIONARY app.th_bare (TEMPLATE = thesaurus, DICTFILE = thesaurus_sample, DICTIONARY = words); \
+             CREATE TEXT SEARCH CONFIGURATION app.oob_th (COPY = pg_catalog.simple); \
+             ALTER TEXT SEARCH CONFIGURATION app.oob_th ALTER MAPPING FOR asciiword WITH app.th_bare; \
+             CREATE INDEX ix_th ON app.loose USING gin (to_tsvector('app.oob_th', body))",
+        );
+        declare(
+            &d,
+            "app.words.textsearch-dictionary.yml",
+            &WORDS.replace("english", "german"),
+        );
+        let planned = succeeds(d.run(&[
+            "plan",
+            "--db",
+            db,
+            "--staged",
+            "--out",
+            path.to_str().unwrap(),
+        ]));
+        for needle in [
+            "stale-results",
+            "index app.ix_th (behind dictionary app.th_bare, which the model does not hold: its options could not be read",
+        ] {
+            assert!(
+                said(&planned).contains(needle),
+                "{needle}: {}",
+                said(&planned)
+            );
+        }
+        let refused = apply_plan(&d, db, &path, true);
+        assert_ne!(code(&refused), 0, "{}", said(&refused));
+        assert!(
+            said(&refused).contains("stale-results"),
+            "{}",
+            said(&refused)
+        );
+        assert_eq!(options_of(db, "words"), "language = 'english'");
+        let checksum = plan_checksum(&path);
+        let allowed_staged = {
+            let args = [
+                "apply",
+                "--db",
+                db,
+                "--plan",
+                path.to_str().unwrap(),
+                "--checksum",
+                &checksum,
+                "--allow",
+                "stale-results",
+                "--staged",
+            ];
+            d.run(&args)
+        };
+        succeeds(allowed_staged);
+        assert_eq!(options_of(db, "words"), "language = 'german'");
+        no_changes(&succeeds(d.run(&["plan", "--db", db])));
+    }
+}
+
+/// A stored dependent that uses a user-defined operator records the operator, never the function
+/// behind it, so the census follows the operator's own edge to its function (DEC-2728.4,
+/// measured on 16.15 and 18.6). A materialized view and an expression index over an operator
+/// backed by a PL/pgSQL function are listed as behind that function and the alteration carries
+/// `stale-results`; a materialized view, an expression index and a stored generated column over an
+/// operator backed by a `BEGIN ATOMIC` function that names the configuration are proven and refuse
+/// the alteration by name. Negatives: an operator over an engine function, and one over a
+/// `BEGIN ATOMIC` function that names nothing altered, add nothing to the plan.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_stored_dependent_behind_an_operator_is_walked_to_its_function() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        let own = OwnDatabase::new(&server, "search2728o");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app");
+        let d = Demo::new("search2728o");
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+        declare(&d, "app.words.textsearch-dictionary.yml", WORDS);
+        declare(&d, "app.docs.textsearch-config.yml", DOCS);
+        declare(&d, "app.solo.textsearch-dictionary.yml", SOLO);
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        let path = d.dir.join("operator.plan.json");
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        succeeds(apply_plan(&d, db, &path, false));
+        // Negatives first: stored dependents over operators that reach nothing altered. An
+        // engine function has no text to read, and a `BEGIN ATOMIC` body the catalog reads names
+        // no text search object.
+        on_server(
+            db,
+            "CREATE TABLE app.loose (body text); \
+             CREATE OPERATOR app.=! (LEFTARG = text, RIGHTARG = text, FUNCTION = pg_catalog.texteq); \
+             CREATE FUNCTION app.f_plain(a text, b text) RETURNS boolean LANGUAGE sql IMMUTABLE \
+               BEGIN ATOMIC SELECT a = b; END; \
+             CREATE OPERATOR app.=? (LEFTARG = text, RIGHTARG = text, FUNCTION = app.f_plain); \
+             CREATE MATERIALIZED VIEW app.mv_engine AS SELECT body OPERATOR(app.=!) 'x' AS m FROM app.loose; \
+             CREATE MATERIALIZED VIEW app.mv_plain AS SELECT body OPERATOR(app.=?) 'x' AS m FROM app.loose",
+        );
+        declare(
+            &d,
+            "app.solo.textsearch-dictionary.yml",
+            &SOLO.replace("english", "german"),
+        );
+        let planned = succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved.contains("stale-results") && !saved.contains("\"opaque\""),
+            "{}{saved}",
+            said(&planned)
+        );
+        assert!(!said(&planned).contains("(behind"), "{}", said(&planned));
+        succeeds(apply_plan(&d, db, &path, false));
+        assert_eq!(options_of(db, "solo"), "stopwords = 'german'");
+        // The same alteration of the configuration, once a materialized view and an index stand
+        // behind an operator over a PL/pgSQL function: listed behind the function, gated.
+        on_server(
+            db,
+            "CREATE FUNCTION app.f_pl(a text, b text) RETURNS boolean LANGUAGE plpgsql IMMUTABLE \
+               AS $$ BEGIN RETURN to_tsvector('app.docs'::regconfig, a) @@ plainto_tsquery('app.docs'::regconfig, b); END $$; \
+             CREATE OPERATOR app.=~ (LEFTARG = text, RIGHTARG = text, FUNCTION = app.f_pl); \
+             CREATE MATERIALIZED VIEW app.mv_op AS SELECT body OPERATOR(app.=~) 'x' AS m FROM app.loose; \
+             CREATE INDEX ix_op ON app.loose (((body OPERATOR(app.=~) 'x')))",
+        );
+        let docs =
+            std::fs::read_to_string(d.dir.join("schema/app.docs.textsearch-config.yml")).unwrap();
+        declare(
+            &d,
+            "app.docs.textsearch-config.yml",
+            &docs.replace(
+                "email: [pg_catalog.simple]",
+                "email: [app.words, pg_catalog.simple]",
+            ),
+        );
+        let planned = succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        for needle in [
+            "stale-results",
+            "materialized view app.mv_op (behind function app.f_pl(pg_catalog.text,pg_catalog.text), whose body the catalog cannot read)",
+            "index app.ix_op (behind function app.f_pl(pg_catalog.text,pg_catalog.text), whose body the catalog cannot read)",
+        ] {
+            assert!(
+                said(&planned).contains(needle),
+                "{needle}: {}",
+                said(&planned)
+            );
+        }
+        for absent in ["app.mv_engine (behind", "app.mv_plain (behind"] {
+            assert!(!said(&planned).contains(absent), "{}", said(&planned));
+        }
+        let saved: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            saved
+                .changes
+                .changes
+                .iter()
+                .any(|p| p.risks.contains(&pbps_model::RiskClass::StaleResults)),
+            "{saved:?}"
+        );
+        let refused = apply_plan(&d, db, &path, false);
+        assert_ne!(code(&refused), 0, "{}", said(&refused));
+        assert!(
+            said(&refused).contains("stale-results"),
+            "{}",
+            said(&refused)
+        );
+        // Now the catalog proves it: a `BEGIN ATOMIC` function that names the configuration,
+        // behind an operator, under a materialized view, an expression index and a stored
+        // generated column. The alteration is refused by name, with no plan.
+        on_server(
+            db,
+            "DROP MATERIALIZED VIEW app.mv_op; DROP INDEX app.ix_op; \
+             CREATE FUNCTION app.f_at(a text, b text) RETURNS boolean LANGUAGE sql IMMUTABLE \
+               BEGIN ATOMIC SELECT to_tsvector('app.docs'::regconfig, a) @@ plainto_tsquery('app.docs'::regconfig, b); END; \
+             CREATE OPERATOR app.=& (LEFTARG = text, RIGHTARG = text, FUNCTION = app.f_at); \
+             CREATE MATERIALIZED VIEW app.mv_at AS SELECT body OPERATOR(app.=&) 'x' AS m FROM app.loose; \
+             CREATE INDEX ix_at ON app.loose (((body OPERATOR(app.=&) 'x'))); \
+             CREATE TABLE app.gen (body text, g boolean GENERATED ALWAYS AS (body OPERATOR(app.=&) 'x') STORED)",
+        );
+        let out = d.run(&["plan", "--db", db]);
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        for needle in [
+            "app.docs",
+            "default value for app.gen.g, index app.ix_at, materialized view app.mv_at would keep the old behaviour",
+            "new name",
+        ] {
+            assert!(said(&out).contains(needle), "{needle}: {}", said(&out));
+        }
+        assert_eq!(
+            mappings_of(db, "docs"),
+            "asciiword=words,word=words,email=simple"
+        );
+    }
+}
+
+/// A mapping change of several statements passes through definitions that are neither end, and a
+/// staged apply checkpoints on each (SPEC §7.6, DEC-2728.4): every checkpoint is admitted and the
+/// close is at the plan's result, and a run stopped on a middle checkpoint (the second statement
+/// refused) resumes and closes. The pin it replaces compared whole definitions with the two ends
+/// and refused the first checkpoint. Negative: the same change applied by an ordinary apply is one
+/// transaction and needs no checkpoint, and the next plan is empty and verifies after each.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_staged_mapping_change_of_several_statements_passes_every_checkpoint_and_resumes() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        let own = OwnDatabase::new(&server, "search2728s");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app");
+        let d = Demo::new("search2728s");
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+        declare(&d, "app.words.textsearch-dictionary.yml", WORDS);
+        declare(&d, "app.docs.textsearch-config.yml", DOCS);
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        let path = d.dir.join("chain.plan.json");
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        succeeds(apply_plan(&d, db, &path, false));
+        // Drops `email`, alters `word`, adds `url`: three statements, two definitions between.
+        let changed = "text_search_config: app.docs\nparser: pg_catalog.default\nmappings:\n  \
+                       asciiword: [app.words]\n  url: [app.words]\n  word: [pg_catalog.simple]\n";
+        declare(&d, "app.docs.textsearch-config.yml", changed);
+        let plan = || {
+            succeeds(d.run(&[
+                "plan",
+                "--db",
+                db,
+                "--staged",
+                "--out",
+                path.to_str().unwrap(),
+            ]))
+        };
+        plan();
+        // The second statement is refused by the engine (as the stop of the create's test).
+        on_server(
+            db,
+            "CREATE SCHEMA witness; \
+             CREATE FUNCTION witness.stop_after_the_first() RETURNS event_trigger \
+             LANGUAGE plpgsql AS $$ BEGIN \
+             IF EXISTS (SELECT 1 FROM pg_ts_config_map m JOIN pg_ts_config c ON c.oid = m.mapcfg \
+                         JOIN pg_ts_dict d ON d.oid = m.mapdict \
+                        WHERE c.cfgname = 'docs' AND m.maptokentype = 2 AND d.dictname = 'simple') \
+                AND NOT EXISTS (SELECT 1 FROM pg_ts_config_map m JOIN pg_ts_config c ON c.oid = m.mapcfg \
+                                 WHERE c.cfgname = 'docs' AND m.maptokentype = 5) \
+             THEN RAISE EXCEPTION 'stop before the second statement commits'; END IF; END $$; \
+             CREATE EVENT TRIGGER stop_second ON ddl_command_end \
+             WHEN TAG IN ('ALTER TEXT SEARCH CONFIGURATION') \
+             EXECUTE FUNCTION witness.stop_after_the_first()",
+        );
+        let stopped = approved_apply(&d, db, &path, &["--staged"]);
+        assert_ne!(code(&stopped), 0, "{}", said(&stopped));
+        assert!(
+            said(&stopped).contains("stop before the second statement"),
+            "refused by the engine, not by the pin: {}",
+            said(&stopped)
+        );
+        let checkpoint = super::latest_snapshot(db);
+        let progress = checkpoint
+            .staged
+            .as_ref()
+            .unwrap_or_else(|| panic!("no checkpoint after the stop: {}", said(&stopped)));
+        assert_eq!(progress.completed, 1, "{}", said(&stopped));
+        // A middle checkpoint: `email` is gone and `word` is not yet changed.
+        assert_eq!(mappings_of(db, "docs"), "asciiword=words,word=words");
+        on_server(db, "DROP EVENT TRIGGER stop_second");
+        succeeds(approved_apply(&d, db, &path, &["--staged", "--resume"]));
+        assert_eq!(
+            mappings_of(db, "docs"),
+            "asciiword=words,word=simple,url=words"
+        );
+        no_changes(&succeeds(d.run(&["plan", "--db", db])));
+        succeeds(d.run(&["verify", "--db", db]));
+        // Every checkpoint of an uninterrupted staged run is admitted too, back again.
+        declare(&d, "app.docs.textsearch-config.yml", DOCS);
+        plan();
+        succeeds(approved_apply(&d, db, &path, &["--staged"]));
+        assert_eq!(
+            mappings_of(db, "docs"),
+            "asciiword=words,word=words,email=simple"
+        );
+        no_changes(&succeeds(d.run(&["plan", "--db", db])));
+        succeeds(d.run(&["verify", "--db", db]));
+        // Negative: the same change, unstaged, is one transaction.
+        declare(&d, "app.docs.textsearch-config.yml", changed);
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        succeeds(apply_plan(&d, db, &path, false));
         no_changes(&succeeds(d.run(&["plan", "--db", db])));
     }
 }

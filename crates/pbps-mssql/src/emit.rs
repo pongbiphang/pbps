@@ -1928,10 +1928,10 @@ mod tests {
         }
     }
 
-    /// SQL Server has no text search objects of this kind: neither the create nor the drop is
-    /// ever emitted, whatever a plan carries (DEC-2728.2).
+    /// SQL Server has no text search objects of this kind: neither the create, the alteration
+    /// nor the drop is ever emitted, whatever a plan carries (DEC-2728.2, DEC-2728.3).
     #[test]
-    fn a_text_search_create_or_drop_is_unsupported_on_sql_server() {
+    fn a_text_search_create_alter_or_drop_is_unsupported_on_sql_server() {
         let definition = pbps_model::SearchObject::Dictionary {
             template: "pg_catalog.simple".parse().unwrap(),
             options: Default::default(),
@@ -1947,6 +1947,13 @@ mod tests {
                 uid: "s_aaaaaa".parse().unwrap(),
                 name: "dictionary app.words".parse().unwrap(),
                 definition: Box::new(definition.clone()),
+            }),
+            Change::Search(SearchChange::AlterSearchDictionary {
+                uid: "s_aaaaaa".parse().unwrap(),
+                name: "dictionary app.words".parse().unwrap(),
+                before: Box::new(definition.clone()),
+                after: Box::new(definition.clone()),
+                opaque: Vec::new(),
             }),
         ] {
             let error = super::emit(&change, Strategy::default())
