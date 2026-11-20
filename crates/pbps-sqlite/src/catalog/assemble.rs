@@ -42,7 +42,7 @@ use super::facts::{Col, Facts, agree, agree_index};
 use super::text::{self, Constraint, Kind, Marker, Place, Reaction, TableText, Target};
 use super::{RawCatalog, RawTable};
 use crate::emit::closed;
-use crate::{ident, lexis, names, types};
+use crate::{ident, lexis, names, types, validate};
 
 /// A table that can be read: its text, its facts and its column types.
 struct Parsed<'a> {
@@ -342,12 +342,13 @@ fn foreign_key(
     })
 }
 
+/// Builds one table, and returns the names it gave its unnamed constraints.
 fn build(
     pulled: &mut Pulled,
     p: &Parsed<'_>,
     by_name: &BTreeMap<&str, &Parsed<'_>>,
     raw: &RawCatalog,
-) {
+) -> Vec<String> {
     let (name, facts, text) = (&p.raw.name, &p.raw.facts, &p.text);
     let mut table = Table::default();
     for (at, (col, ty)) in facts.columns.iter().zip(&p.types).enumerate() {
@@ -403,9 +404,41 @@ fn build(
         };
         note(pulled, name, format!("{at} {what}{outcome}"));
     }
+    // A key over a column with a collation of its own compares by it: `a TEXT
+    // COLLATE NOCASE UNIQUE` holds `'a'` and `'A'` to be one value. The model
+    // has no field for the collation, so the key would be read as another key.
+    let collated: Vec<&str> = text
+        .markers
+        .iter()
+        .filter_map(|m| match (&m.marker, m.target) {
+            (Marker::Collate { name }, Target::Column(at))
+                if !name.eq_ignore_ascii_case("binary") =>
+            {
+                text.columns.get(at).map(String::as_str)
+            }
+            _ => None,
+        })
+        .collect();
+    for (at, c) in text.constraints.iter().enumerate() {
+        if let Kind::PrimaryKey { columns } | Kind::Unique { columns } = &c.kind
+            && columns
+                .iter()
+                .any(|n| collated.iter().any(|k| ident::same(k, n)))
+            && left_out.insert(at)
+        {
+            note(
+                pulled,
+                name,
+                format!(
+                    "{} is over a column with a collation; it is left out",
+                    label(c)
+                ),
+            );
+        }
+    }
     let unnamed = synthetic(p, by_name);
     // The names given that are in the model: one left out is not read under it.
-    let mut given: Vec<&str> = Vec::new();
+    let mut given: Vec<String> = Vec::new();
     for (at, c) in text.constraints.iter().enumerate() {
         if left_out.contains(&at) {
             continue;
@@ -462,21 +495,8 @@ fn build(
             table.foreign_keys.len(),
         );
         if let (None, Some(name), true) = (&c.name, unnamed.get(&at), before != after) {
-            given.push(name);
+            given.push(name.clone());
         }
-    }
-    if !given.is_empty() {
-        let list = given;
-        pulled.warnings.push(format!(
-            "table `{}` has {} constraint(s) with no name in the file, read under the name(s) {}; \
-             SQLite can change one only by rebuilding the table",
-            Escaped(name),
-            list.len(),
-            list.iter()
-                .map(|n| format!("`{n}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
     }
     for index in raw.indexes.iter().filter(|i| ident::same(&i.table, name)) {
         match built_index(index, name, facts) {
@@ -493,6 +513,40 @@ fn build(
         }
     }
     pulled.schema.tables.insert(name_of(name), table);
+    given
+}
+
+/// Leaves out every foreign key whose parent columns are not a key the model
+/// holds for the parent: the key was left out (a collation, a direction, a
+/// conflict clause), or the file never had one. The declaration's own rule
+/// decides, so what is read is what a declaration may say. Returns the names
+/// left out.
+fn unkeyed(pulled: &mut Pulled) -> BTreeSet<(TableName, ObjectLocalName)> {
+    let mut gone = BTreeSet::new();
+    for (name, table) in &pulled.schema.tables {
+        for (local, fk) in &table.foreign_keys {
+            let mut alone = table.clone();
+            alone.foreign_keys = std::iter::once((local.clone(), fk.clone())).collect();
+            if !validate::foreign_key_parents(name, &alone, &pulled.schema).is_empty() {
+                gone.insert((name.clone(), local.clone()));
+            }
+        }
+    }
+    for (name, local) in &gone {
+        if let Some(table) = pulled.schema.tables.get_mut(name) {
+            table.foreign_keys.remove(local);
+        }
+        note(
+            pulled,
+            &name.name,
+            format!(
+                "the foreign key `{}` is left out: the columns it references are not a key of their \
+                 table that is read",
+                local.shown()
+            ),
+        );
+    }
+    gone
 }
 
 fn built_index(raw: &super::RawIndex, table: &str, facts: &Facts) -> Result<Index, String> {
@@ -593,8 +647,26 @@ pub(crate) fn assemble(raw: &RawCatalog) -> Pulled {
         );
     }
     let by_name: BTreeMap<&str, &Parsed<'_>> = readable.iter().map(|(k, v)| (*k, v)).collect();
+    let mut given: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for p in readable.values() {
-        build(&mut pulled, p, &by_name, raw);
+        given.insert(p.raw.name.as_str(), build(&mut pulled, p, &by_name, raw));
+    }
+    let gone = unkeyed(&mut pulled);
+    for (name, mut list) in given {
+        list.retain(|n| !gone.contains(&(name_of(name), ObjectLocalName::new(n))));
+        if list.is_empty() {
+            continue;
+        }
+        pulled.warnings.push(format!(
+            "table `{}` has {} constraint(s) with no name in the file, read under the name(s) {}; \
+             SQLite can change one only by rebuilding the table",
+            Escaped(name),
+            list.len(),
+            list.iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     for v in &raw.views {
         let id = ModuleId::Named(ObjectName::new("main", &v.name));

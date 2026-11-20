@@ -1632,6 +1632,7 @@ Rejected:
 - **Outside `main` is named, not skipped.** The tables and views of an attached database and the objects of `temp` (indexes and triggers included) each get a warning that names them; `sqlite_*`, the ledger and the middle step of a case-only rename (a catalog notice) are not the file's schema.
 - **A view's columns are never read.** The columns of a view that names what is gone are an error (measured), and a rollback after resolving one can leave the connection's schema unreliable, so a view is read from its text alone and an invalid one is still a module.
 - **Absent, empty and unreadable are three answers.** An empty database is an empty result; a table the pragmas do not know is `None` and, for a table just listed in one snapshot, an error; text that is not UTF-8 is an error and never a missing object.
+- **A key is read only as the key it is.** A primary key or a unique constraint over a column with a collation of its own compares by that collation (`a TEXT COLLATE NOCASE UNIQUE` holds `'a'` and `'A'` to be one value, measured), so it is left out with the note, as a key with a collation written on the key column is. A foreign key is then read only when the columns it references are a key the model holds for the parent, by the declaration's own rule (`validate::foreign_key_parents`): what is read is a schema a declaration may say.
 
 Rejected:
 - **Names made of a position** (`unnamed_1`): another constraint added before it would rename it.

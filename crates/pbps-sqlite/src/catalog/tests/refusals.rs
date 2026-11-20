@@ -391,3 +391,55 @@ fn an_index_named_for_a_unique_constraint_is_the_constraints_and_not_an_index() 
     assert!(t.indexes.is_empty(), "{:?}", t.indexes);
     assert!(t.unique.contains_key(&ObjectLocalName::new("u")));
 }
+
+/// A key over a column with its own collation compares by it, and the model has
+/// no field for the collation: the key is left out, never read as an ordinary
+/// one. `COLLATE BINARY` is the ordinary one.
+#[test]
+fn a_key_over_a_collated_column_is_left_out() {
+    // The engine's side: the collation is the key's.
+    assert!(!accepts(
+        "CREATE TABLE t(a TEXT COLLATE NOCASE UNIQUE); INSERT INTO t VALUES ('a'), ('A')"
+    ));
+    let (_, pulled) = read_sql(
+        "CREATE TABLE t(a TEXT COLLATE NOCASE UNIQUE, b TEXT COLLATE nocase, c TEXT COLLATE BINARY, \
+         PRIMARY KEY (b, c), CONSTRAINT u UNIQUE (c))",
+    );
+    let t = table(&pulled, "t");
+    assert!(t.primary_key.is_none());
+    assert_eq!(t.unique.keys().map(|k| k.raw()).collect::<Vec<_>>(), ["u"]);
+    assert!(warned(
+        &pulled,
+        "is over a column with a collation; it is left out"
+    ));
+    assert!(!warned(&pulled, "with no name"), "{:#?}", pulled.warnings);
+}
+
+/// A foreign key is read only when the columns it references are a key the
+/// model holds for the parent: SQLite refuses every write to a child whose
+/// parent has no such key, and a declaration may not say one.
+#[test]
+fn a_foreign_key_to_a_key_that_is_left_out_is_left_out() {
+    let (_, pulled) = read_sql(
+        "CREATE TABLE p(a TEXT, b int, PRIMARY KEY (a COLLATE NOCASE), CONSTRAINT u UNIQUE (b)); \
+         CREATE TABLE c(x REFERENCES p, y int, CONSTRAINT kept FOREIGN KEY (y) REFERENCES p (b), \
+         CONSTRAINT loose FOREIGN KEY (y) REFERENCES p (a))",
+    );
+    assert!(table(&pulled, "p").primary_key.is_none());
+    let c = table(&pulled, "c");
+    assert_eq!(
+        c.foreign_keys.keys().map(|k| k.raw()).collect::<Vec<_>>(),
+        ["kept"]
+    );
+    assert!(warned(&pulled, "are not a key of their table that is read"));
+    // The unnamed one that was left out is not listed as read under a name.
+    assert!(!warned(&pulled, "with no name"), "{:#?}", pulled.warnings);
+    // What is read is a schema the declaration's own rules take.
+    let found: Vec<_> = pulled
+        .schema
+        .tables
+        .iter()
+        .flat_map(|(n, t)| crate::validate::foreign_key_parents(n, t, &pulled.schema))
+        .collect();
+    assert!(found.is_empty(), "{found:?}");
+}

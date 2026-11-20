@@ -403,7 +403,9 @@ pub fn canonical(text: &str) -> String {
         Quoted,
         Punct,
     }
-    let word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '$' | '.') || !c.is_ascii();
+    // A dot is punctuation: `t . a` and `t.a` are one reference, and a number's
+    // dot has no layout beside it to lose.
+    let word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '$') || !c.is_ascii();
     let mut tokens: Vec<(Kind, String)> = Vec::new();
     for piece in pieces(text) {
         match piece {
@@ -803,6 +805,8 @@ mod tests {
             ("f( a ,b )", "F(a, b)"),
             ("a /* x */ > 0 -- y\n", "a > 0"),
             ("a>0", "a > 0"),
+            ("t . a > 0", "t.a>0"),
+            ("\"t\" . \"a\" > 1.5", "\"t\".\"a\">1.5"),
             ("(a)+( b )", "( a ) + (b)"),
         ] {
             assert_eq!(canonical(a), canonical(b), "{a:?} and {b:?}");
