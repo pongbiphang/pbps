@@ -117,7 +117,12 @@ pub(crate) fn read_raw(c: &Connection) -> Result<RawCatalog, DbError> {
         let (name, kind) = (r.text(0)?.to_owned(), r.text(1)?.to_owned());
         listed.push(name.clone());
         // `sqlite_*` is SQLite's, and a shadow table belongs to its virtual one.
-        if ident::has_reserved_prefix(&name) || names::is_ledger(&name) || kind == "shadow" {
+        // Only a table can be the ledger's: a view under one of its names is
+        // the file's own, and is said so by the assembly.
+        if ident::has_reserved_prefix(&name)
+            || kind == "shadow"
+            || (kind == "table" && names::is_ledger(&name))
+        {
             continue;
         }
         match kind.as_str() {

@@ -443,3 +443,75 @@ fn a_foreign_key_to_a_key_that_is_left_out_is_left_out() {
         .collect();
     assert!(found.is_empty(), "{found:?}");
 }
+
+/// The text is read for what the pragmas do not say, so it has to be this
+/// object's: a schema table written by hand can hold another's text, or a
+/// table's kind in one place and not the other.
+#[test]
+fn text_that_is_another_objects_or_another_kind_leaves_the_object_unread() {
+    let mut fresh = Fresh::memory();
+    fresh
+        .connection()
+        .execute_batch(
+            &[
+                KEPT,
+                "CREATE TABLE t(a int); CREATE TABLE s(a int PRIMARY KEY) STRICT, WITHOUT ROWID; \
+                 CREATE VIEW v AS SELECT 1",
+            ]
+            .concat(),
+        )
+        .expect("objects");
+    let read = |c: &mut Fresh| read_raw(c.connection()).expect("reads");
+    let whole = assemble(&read(&mut fresh));
+    assert_eq!(whole.schema.tables.len(), 3);
+    assert_eq!(whole.schema.modules.len(), 1);
+
+    let mut raw = read(&mut fresh);
+    let t = raw.tables.iter_mut().find(|t| t.name == "t").expect("t");
+    t.sql = "CREATE TABLE x(a int)".into();
+    refused(&assemble(&raw), "t", "the text creates `x`");
+
+    for flip in [true, false] {
+        let mut raw = read(&mut fresh);
+        let s = raw.tables.iter_mut().find(|t| t.name == "s").expect("s");
+        if flip {
+            s.facts.strict = false;
+        } else {
+            s.facts.without_rowid = false;
+        }
+        refused(&assemble(&raw), "s", "STRICT or WITHOUT ROWID is in one");
+    }
+
+    let mut raw = read(&mut fresh);
+    raw.views[0].sql = "CREATE VIEW w AS SELECT 1".into();
+    let pulled = assemble(&raw);
+    assert!(pulled.schema.modules.is_empty());
+    assert!(warned(&pulled, "its text creates `w`"));
+}
+
+/// An index or a view under a name this tool keeps for its own tables is valid
+/// SQLite and no declaration: it is left out by name, never read as the file's.
+#[test]
+fn an_index_or_a_view_under_a_name_the_tool_keeps_is_left_out_by_name() {
+    let pulled = beside(
+        "CREATE TABLE t(a int); CREATE INDEX __pbps_state ON t(a); CREATE INDEX __pbps_rename_i ON t(a); \
+         CREATE INDEX kept ON t(a); CREATE VIEW __pbps_rename_v AS SELECT 1; CREATE VIEW seen AS SELECT 1",
+    );
+    let t = table(&pulled, "t");
+    assert_eq!(
+        t.indexes.keys().map(|k| k.raw()).collect::<Vec<_>>(),
+        ["kept"]
+    );
+    assert_eq!(limits(&pulled, "t").len(), 2);
+    assert!(warned(
+        &pulled,
+        "its name is one this tool keeps for its own tables"
+    ));
+    assert_eq!(pulled.schema.modules.len(), 1);
+    assert_eq!(pulled.unmanaged_modules.len(), 1);
+    // A view under one of the ledger's names is the file's own object, and is
+    // said so; only a table there is the ledger.
+    let (_, pulled) = read_sql("CREATE VIEW __pbps_state AS SELECT 1");
+    assert!(pulled.schema.modules.is_empty());
+    assert_eq!(pulled.unmanaged_modules.len(), 1);
+}

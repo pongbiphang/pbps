@@ -78,6 +78,28 @@ fn declared_names(text: &TableText) -> impl Iterator<Item = &str> {
 fn parse(raw: &RawTable) -> Result<Parsed<'_>, String> {
     let text = text::table(&raw.name, &raw.sql).map_err(|unread| unread.to_string())?;
     agree(&text, &raw.facts).map_err(|why| format!("its text and the catalog disagree ({why})"))?;
+    // The text is read for what the pragmas do not say, so it has to be this
+    // table's and of this table's kind: a file whose schema table was written
+    // by hand can hold one beside the other.
+    if text.name != raw.name {
+        return Err(format!(
+            "its text and the catalog disagree (the text creates `{}`)",
+            Escaped(&text.name)
+        ));
+    }
+    let marked = |wanted: &Marker| {
+        text.markers
+            .iter()
+            .any(|m| m.target == Target::Table && m.marker == *wanted)
+    };
+    if marked(&Marker::Strict) != raw.facts.strict
+        || marked(&Marker::WithoutRowid) != raw.facts.without_rowid
+    {
+        return Err(
+            "its text and the catalog disagree (STRICT or WITHOUT ROWID is in one and not the other)"
+                .into(),
+        );
+    }
     let mut types = Vec::new();
     for col in &raw.facts.columns {
         types.push(
@@ -549,9 +571,21 @@ fn unkeyed(pulled: &mut Pulled) -> BTreeSet<(TableName, ObjectLocalName)> {
     gone
 }
 
+/// Why an index or a view cannot be declared under `name`, if it cannot: the
+/// declaration's own rules for a name, asked before anything is read under it.
+fn undeclarable(name: &str) -> Option<&'static str> {
+    if ident::quote(name).is_err() {
+        Some("its name is one SQLite takes and no declaration can write")
+    } else if names::is_ledger(name) || names::is_intermediate(name) {
+        Some("its name is one this tool keeps for its own tables")
+    } else {
+        None
+    }
+}
+
 fn built_index(raw: &super::RawIndex, table: &str, facts: &Facts) -> Result<Index, String> {
-    if ident::quote(&raw.name).is_err() {
-        return Err("its name is one SQLite takes and no declaration can write".into());
+    if let Some(why) = undeclarable(&raw.name) {
+        return Err(why.into());
     }
     let text = text::index(&raw.name, &raw.sql).map_err(|unread| unread.to_string())?;
     let row = facts
@@ -670,19 +704,26 @@ pub(crate) fn assemble(raw: &RawCatalog) -> Pulled {
     }
     for v in &raw.views {
         let id = ModuleId::Named(ObjectName::new("main", &v.name));
-        if ident::quote(&v.name).is_err() {
+        if let Some(why) = undeclarable(&v.name) {
             unmanaged(
                 &mut pulled,
                 "view",
                 LimitationTarget::module(id),
-                format!(
-                    "view `{}` has a name SQLite takes and no declaration can write",
-                    Escaped(&v.name)
-                ),
+                format!("view `{}` is not read: {why}", Escaped(&v.name)),
             );
             continue;
         }
         match text::view(&v.name, &v.sql) {
+            Ok(view) if view.name != v.name => unmanaged(
+                &mut pulled,
+                "view",
+                LimitationTarget::module(id),
+                format!(
+                    "view `{}` is not read: its text creates `{}`",
+                    Escaped(&v.name),
+                    Escaped(&view.name)
+                ),
+            ),
             Ok(view) if view.column_list.is_none() => {
                 pulled.schema.modules.insert(
                     id,
