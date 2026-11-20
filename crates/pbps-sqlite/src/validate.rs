@@ -53,6 +53,15 @@ pub(crate) fn intermediate_name(what: &str) -> DialectError {
     ))
 }
 
+/// The refusal of a constraint name this tool makes for an unnamed one.
+fn synthetic_name(what: &str) -> DialectError {
+    invalid(format!(
+        "{what} starts with `{}`, which this tool keeps for the names it gives constraints a file \
+         leaves unnamed; choose another name",
+        names::UNNAMED_PREFIX
+    ))
+}
+
 pub(crate) fn unsupported(feature: impl Into<String>) -> DialectError {
     DialectError::Unsupported {
         dialect: DIALECT,
@@ -112,6 +121,15 @@ fn columns_of(what: &str, columns: &[ColumnName], table: &Table, found: &mut Vec
                 column.shown()
             )));
         }
+    }
+}
+
+/// A constraint's name: one SQLite can be given, and not one of the names this
+/// tool makes for unnamed constraints.
+fn constraint_name(what: &str, name: &str, found: &mut Vec<DialectError>) {
+    local_name(what, name, found);
+    if names::is_synthetic(name) {
+        found.push(synthetic_name(&format!("{what} `{}`", Escaped(name))));
     }
 }
 
@@ -307,7 +325,7 @@ pub(crate) fn check_errors(
     check: &pbps_model::CheckConstraint,
     found: &mut Vec<DialectError>,
 ) {
-    local_name("check constraint", constraint.raw(), found);
+    constraint_name("check constraint", constraint.raw(), found);
     if !expression(&check.expression) {
         found.push(invalid(format!(
             "check constraint `{}` of `{shown}` is not one expression SQLite reads whole (empty, \
@@ -458,7 +476,7 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
             &mut found,
         );
         if let Some(constraint) = &key.name {
-            local_name("primary key", constraint.raw(), &mut found);
+            constraint_name("primary key", constraint.raw(), &mut found);
         }
         if !key.storage_parameters.is_empty() || key.filegroup.is_some() {
             found.push(unsupported(format!(
@@ -469,7 +487,7 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
     for (constraint, unique) in &table.unique {
         let what = format!("unique constraint `{}` of `{shown}`", constraint.shown());
         columns_of(&what, &unique.columns, table, &mut found);
-        local_name("unique constraint", constraint.raw(), &mut found);
+        constraint_name("unique constraint", constraint.raw(), &mut found);
         if !unique.storage_parameters.is_empty() || unique.filegroup.is_some() {
             found.push(unsupported(format!("storage options on {what}")));
         }
@@ -477,7 +495,7 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
     for (constraint, fk) in &table.foreign_keys {
         let what = format!("foreign key `{}` of `{shown}`", constraint.shown());
         columns_of(&what, &fk.columns, table, &mut found);
-        local_name("foreign key", constraint.raw(), &mut found);
+        constraint_name("foreign key", constraint.raw(), &mut found);
         if fk.references_table.schema != SCHEMA {
             found.push(unsupported(format!(
                 "a schema other than `{SCHEMA}` ({what} references `{}`)",
@@ -1856,5 +1874,72 @@ mod tests {
         assert!(is_unsupported(
             &super::role(&pbps_model::RoleName::new("r"), &role)[0]
         ));
+    }
+
+    /// The reader gives a constraint the file leaves unnamed the name
+    /// `__pbps_unnamed_<kind>_<digest>`; a declared constraint may not take one,
+    /// or a declaration would name a constraint the file has not got.
+    #[test]
+    fn a_constraint_named_like_one_the_reader_makes_is_refused() {
+        // The engine's side: it takes any such name, so the rule is ours.
+        for sql in [
+            "CREATE TABLE t(c, CONSTRAINT __pbps_unnamed_check_x CHECK (c > 0))",
+            "CREATE TABLE t(c, CONSTRAINT __PBPS_UNNAMED_unique_x UNIQUE (c))",
+            "CREATE TABLE t(c, CONSTRAINT __pbps_unnamed_foreign_x FOREIGN KEY (c) REFERENCES t(c))",
+        ] {
+            assert!(accepts(sql), "{sql}");
+        }
+        type Add = fn(&mut Table, &str);
+        let kinds: [(&str, Add); 4] = [
+            ("check", |t, n| {
+                t.checks.insert(
+                    n.into(),
+                    CheckConstraint {
+                        expression: "c > 0".into(),
+                    },
+                );
+            }),
+            ("unique", |t, n| {
+                t.unique.insert(
+                    n.into(),
+                    UniqueConstraint {
+                        columns: vec!["c".into()],
+                        storage_parameters: Default::default(),
+                        filegroup: None,
+                    },
+                );
+            }),
+            ("foreign key", |t, n| {
+                t.foreign_keys.insert(n.into(), fk(&["c"], &["c"]));
+            }),
+            ("primary key", |t, n| {
+                let mut key = primary(&["c"]);
+                key.name = Some(n.into());
+                t.primary_key = Some(key);
+            }),
+        ];
+        for (what, add) in kinds {
+            for name in [
+                "__pbps_unnamed_check_x",
+                "__PBPS_UNNAMED_",
+                "__Pbps_Unnamed_x_2",
+            ] {
+                let mut table = base();
+                add(&mut table, name);
+                let said = said(&errors(&table));
+                assert!(said.contains("__pbps_unnamed_"), "{what} {name}: {said}");
+            }
+            // Negative: near the prefix, and the prefix inside a name.
+            for name in [
+                "__pbps_unnamed",
+                "__pbps_unnamedx",
+                "x__pbps_unnamed_x",
+                "_pbps_unnamed_x",
+            ] {
+                let mut table = base();
+                add(&mut table, name);
+                assert!(errors(&table).is_empty(), "{what} named {name}");
+            }
+        }
     }
 }

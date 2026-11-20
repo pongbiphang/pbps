@@ -79,6 +79,13 @@ impl Dialect for Sqlite {
 
     /// SQLite has no module that is called by a two-part name (no functions or
     /// procedures), so nothing in a definition is one.
+    /// The comparison form of a view's body, read with SQLite's own lexis: only
+    /// layout may separate two bodies that compare equal (the shared scanner
+    /// nests block comments, so it would read some of the text as one).
+    fn normalize_definition(&self, definition: &str) -> String {
+        lexis::layout(definition)
+    }
+
     fn qualified_calls(&self, _text: &str) -> Vec<(String, String)> {
         Vec::new()
     }
@@ -674,5 +681,30 @@ mod tests {
         assert!(d.may_name_qualified_exact("t", "main", "t"));
         assert!(!d.may_name_qualified_exact("T", "main", "t"));
         assert!(d.qualified_calls("main.f(x)").is_empty());
+    }
+
+    /// The shared scanner ends a `--` comment at `\r` and nests block comments;
+    /// SQLite does neither, so the dialect compares definitions with its own
+    /// rules: two bodies the engine runs differently never compare equal.
+    #[test]
+    fn a_definition_is_compared_by_sqlites_rules_not_the_shared_ones() {
+        let d = Sqlite::default();
+        let (cr, lf) = ("SELECT 1 --c\r + 1", "SELECT 1 --c\n + 1");
+        let rows = |sql: &str| {
+            let mut fresh = crate::tests::Fresh::memory();
+            format!("{:?}", fresh.connection().query(sql, &[]).expect("runs"))
+        };
+        assert_ne!(rows(cr), rows(lf));
+        assert_ne!(d.normalize_definition(cr), d.normalize_definition(lf));
+        let (nested, flat) = (
+            "SELECT 1 /* a /* b */   +   '  x  '",
+            "SELECT 1 /* a /* b */ + ' x '",
+        );
+        assert_ne!(d.normalize_definition(nested), d.normalize_definition(flat));
+        // Negative: layout alone is still forgotten.
+        assert_eq!(
+            d.normalize_definition("  SELECT a,\r\n       b\n  FROM t\n"),
+            d.normalize_definition("SELECT a, b FROM t")
+        );
     }
 }

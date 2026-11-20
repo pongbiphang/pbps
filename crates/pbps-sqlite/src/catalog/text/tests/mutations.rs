@@ -57,48 +57,7 @@ fn boundaries(sql: &str) -> Vec<usize> {
 /// A comparison form of an expression: comments gone, layout collapsed, ASCII
 /// case folded outside strings.
 fn canon(text: &str) -> String {
-    // Strings are held aside, so layout rules never touch their text.
-    let mut strings: Vec<&str> = Vec::new();
-    let mut out = String::new();
-    for piece in lexis::pieces(text) {
-        match piece {
-            Piece::Comment(_) => out.push(' '),
-            Piece::Code(code) => out.push_str(&code.to_ascii_lowercase()),
-            Piece::Quoted(run) if run.starts_with('\'') => {
-                strings.push(run);
-                out.push('\u{1}');
-            }
-            Piece::Quoted(run) => out.push_str(&run.to_ascii_lowercase()),
-        }
-    }
-    let mut words = out
-        .split(lexis::is_space)
-        .filter(|w| !w.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    // White space beside a parenthesis or a comma is layout.
-    for (from, to) in [
-        ("( ", "("),
-        (" )", ")"),
-        (" (", "("),
-        (" ,", ","),
-        (", ", ","),
-    ] {
-        while words.contains(from) {
-            words = words.replace(from, to);
-        }
-    }
-    let mut held = strings.into_iter();
-    words
-        .chars()
-        .map(|c| {
-            if c == '\u{1}' {
-                held.next().unwrap_or("").to_owned()
-            } else {
-                c.to_string()
-            }
-        })
-        .collect()
+    lexis::canonical(text)
 }
 
 /// The structure of a table in a form that ignores layout, comments and the

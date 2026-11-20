@@ -19,6 +19,7 @@ use pbps_model::{CheckConstraint, ConstraintChange, ObjectLocalName, TableName};
 
 use super::{Form, Gate, Sql, allowed, closed, local, qualified, rebuild, statement};
 use crate::dialect::Sqlite;
+use crate::names;
 use crate::validate::{self, unsupported};
 
 pub(super) fn emit(dialect: &Sqlite, gate: Gate, change: &ConstraintChange) -> Sql {
@@ -81,6 +82,15 @@ fn drop_constraint(
     name: &ObjectLocalName,
 ) -> Sql {
     allowed(dialect, gate, form, "dropping a constraint")?;
+    // A name this tool made for an unnamed constraint is not one SQLite knows:
+    // `DROP CONSTRAINT` would find nothing. Only the rebuild can change it.
+    if names::is_synthetic(name.raw()) {
+        return Err(rebuild(&format!(
+            "dropping the constraint `{}`, which the file leaves unnamed and this tool named; \
+             SQLite can drop a constraint only by a name it holds",
+            name.shown()
+        )));
+    }
     let sql = [
         "ALTER TABLE ",
         &qualified(table)?,

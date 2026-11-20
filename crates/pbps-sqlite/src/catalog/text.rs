@@ -235,6 +235,10 @@ pub(crate) struct TableText {
     pub name: String,
     /// Column names in the order written.
     pub columns: Vec<String>,
+    /// For each column, whether the text has any type words after its name. A
+    /// quoted empty name (`a ""`) is a type word to the text and an empty
+    /// type to the pragma, so the pragma alone cannot tell it from no type.
+    pub typed: Vec<bool>,
     pub constraints: Vec<Constraint>,
     pub markers: Vec<Marked>,
 }
@@ -704,6 +708,7 @@ fn column(p: &mut Parser<'_>, out: &mut TableText) -> Result<(), Unread> {
     let name = p.name("a column's name")?;
     let at = out.columns.len();
     out.columns.push(name.clone());
+    out.typed.push(false);
     // The type is skipped: the pragma has it. Its words end at the first one
     // that starts a constraint, and a word that cannot be in a type and does
     // not start a constraint is text this module does not understand.
@@ -737,7 +742,10 @@ fn column(p: &mut Parser<'_>, out: &mut TableText) -> Result<(), Unread> {
                     Escaped(tok.text)
                 )));
             }
-            Class::Word | Class::Name | Class::Str => p.at += 1,
+            Class::Word | Class::Name | Class::Str => {
+                out.typed[at] = true;
+                p.at += 1;
+            }
             Class::Number | Class::Punct => {
                 return Err(p.fail("a character that is not part of a type"));
             }
