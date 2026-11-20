@@ -3274,8 +3274,9 @@ what depends on the rows (a `CHECK` a row violates, a `NOT NULL` over a NULL, a
 unique index over duplicates), naming the statement. The plan's statements then
 run as an apply runs them, in one `BEGIN IMMEDIATE` transaction, the scratch is
 read back and compared with the declarations by the ordinary differ, and a view
-the plan leaves naming what is gone, a column default that calls a function that
-does not exist and a foreign key to a column that is no key are refused too,
+the plan leaves naming what is gone, a trigger that no longer compiles, a column
+default that calls a function that does not exist and a foreign key to a column
+that is no key are refused too,
 because SQLite accepts them when they are declared and fails only when they are
 used. What failed in the same words before the plan ran is the file's own and not
 the plan's.

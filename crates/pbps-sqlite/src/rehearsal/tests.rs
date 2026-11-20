@@ -705,3 +705,76 @@ fn a_writer_that_leaves_is_waited_for_and_not_refused() {
     assert_eq!(count(db.connection(), "PRAGMA busy_timeout"), 0);
     writer.join().expect("the writer ended");
 }
+
+/// The reader reads around triggers, and every statement takes a plan that
+/// leaves one naming what is gone. Asked with the same text before and after a
+/// schema change, as a rehearsal asks.
+#[test]
+fn a_trigger_a_plan_leaves_broken_is_found_by_compiling_a_write_and_never_running_one() {
+    let mut db = file(
+        "CREATE TABLE t(a integer, b integer GENERATED ALWAYS AS (a + 1)); \
+         CREATE TABLE gone(x); CREATE TABLE kept(x); \
+         CREATE VIEW v AS SELECT a FROM t; \
+         CREATE TRIGGER on_insert AFTER INSERT ON t BEGIN INSERT INTO gone VALUES (new.a); END; \
+         CREATE TRIGGER on_update AFTER UPDATE OF a ON t BEGIN INSERT INTO kept VALUES (new.a); END; \
+         CREATE TRIGGER on_view INSTEAD OF DELETE ON v BEGIN DELETE FROM gone; END; \
+         INSERT INTO kept VALUES (7)",
+    );
+    let copy = scratch(db.connection(), SCRATCH_LIMIT).expect("copied");
+    let before = resolution(&copy).expect("asked");
+    // A view takes no insert or update without a trigger for it: that fails
+    // before the plan too, in the same words, and is not the plan's.
+    copy.execute_batch("DROP TABLE gone")
+        .expect("the engine takes it");
+    let after = resolution(&copy).expect("asked");
+    let lines = after.new_since(&before);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[0].contains("`t (insert)`") && lines[0].contains("no such table: main.gone"),
+        "{lines:?}"
+    );
+    assert!(lines[1].contains("`v (delete)`"), "{lines:?}");
+    // Nothing was written by the asking: no row in `t`, and `kept` as it was.
+    assert_eq!(count(&copy, "SELECT count(*) FROM t"), 0);
+    assert_eq!(count(&copy, "SELECT count(*) FROM kept"), 1);
+    // Negative: a plan that leaves every trigger whole reports nothing.
+    let whole = scratch(db.connection(), SCRATCH_LIMIT).expect("copied");
+    let before = resolution(&whole).expect("asked");
+    whole
+        .execute_batch("CREATE TABLE other(x)")
+        .expect("harmless");
+    assert!(
+        resolution(&whole)
+            .expect("asked")
+            .new_since(&before)
+            .is_empty()
+    );
+}
+
+/// One answer for the whole database would hide a second table's unusable key
+/// behind a first that the file already had.
+#[test]
+fn a_key_the_engine_cannot_check_is_found_table_by_table() {
+    let mut db = file("CREATE TABLE p(k, z); CREATE TABLE a_old(r REFERENCES p(z))");
+    let copy = scratch(db.connection(), SCRATCH_LIMIT).expect("copied");
+    let before = resolution(&copy).expect("asked");
+    assert!(!before.is_empty(), "the file's own unusable key is seen");
+    copy.execute_batch("CREATE TABLE b_new(r REFERENCES p(z))")
+        .expect("the engine takes it");
+    let lines = resolution(&copy).expect("asked").new_since(&before);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains("foreign keys of `b_new`") && lines[0].contains("mismatch"),
+        "{lines:?}"
+    );
+    // Negative: a table with a usable key adds nothing.
+    let before = resolution(&copy).expect("asked");
+    copy.execute_batch("CREATE TABLE q(k PRIMARY KEY); CREATE TABLE c_fine(r REFERENCES q(k))")
+        .expect("the engine takes it");
+    assert!(
+        resolution(&copy)
+            .expect("asked")
+            .new_since(&before)
+            .is_empty()
+    );
+}

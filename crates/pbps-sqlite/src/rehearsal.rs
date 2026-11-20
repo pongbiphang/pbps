@@ -21,8 +21,8 @@
 //! copied).
 //!
 //! **What a statement does not check** ([`resolution`]): a view that names what is
-//! gone, a default calling a function that does not exist, a foreign key to a
-//! column that is no key. SQLite accepts them when they are declared and refuses
+//! gone, a default calling a function that does not exist, a trigger that names
+//! what is gone, a foreign key to a column that is no key. SQLite accepts them when they are declared and refuses
 //! them when they are used, so a plan that leaves one behind runs every statement
 //! and ends with a database that fails later. Asked before the plan and again
 //! after it on the copy, so only what the plan broke is the plan's.
@@ -124,8 +124,9 @@ struct Unresolved {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Resolution(Vec<Unresolved>);
 
-/// Selects from every view, evaluates every column default and checks the foreign
-/// keys, on `scratch`. Nothing is written. An engine refusal is a finding, not an
+/// Selects from every view, evaluates every column default, compiles a write to
+/// everything that has a trigger and checks each table's foreign keys, on
+/// `scratch`. Nothing is written. An engine refusal is a finding, not an
 /// error: it is the thing being asked.
 pub fn resolution(scratch: &Connection) -> Result<Resolution, DbError> {
     let mut found = Vec::new();
@@ -133,11 +134,13 @@ pub fn resolution(scratch: &Connection) -> Result<Resolution, DbError> {
         "SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'view' ORDER BY name",
         &[],
     )?;
+    let mut broken_views: Vec<String> = Vec::new();
     for view in &views {
         let name = view.text(0)?;
         let sql = format!("SELECT * FROM main.{} LIMIT 0", quote(name));
         if let Err(error) = scratch.query(&sql, &[]) {
             found.push(failed("view", name.to_owned(), &error));
+            broken_views.push(name.to_owned());
         }
     }
     // A virtual table's columns are not asked of (its module may be missing), nor
@@ -156,25 +159,91 @@ pub fn resolution(scratch: &Connection) -> Result<Resolution, DbError> {
             found.push(failed("default", format!("{table}.{name}"), &error));
         }
     }
-    match scratch.query("PRAGMA foreign_key_check", &[]) {
-        Err(error) => found.push(failed("foreign keys", String::new(), &error)),
-        Ok(rows) => {
-            let mut counts: std::collections::BTreeMap<(String, String), u64> = Default::default();
-            for row in &rows {
-                *counts
-                    .entry((row.text(0)?.to_owned(), row.text(2)?.to_owned()))
-                    .or_default() += 1;
-            }
-            for ((table, parent), rows) in counts {
-                found.push(Unresolved {
-                    what: "foreign key",
-                    name: format!("{table} -> {parent}"),
-                    detail: Detail::Rows(rows),
-                });
+    triggers(scratch, &broken_views, &mut found)?;
+    // Asked table by table: a key the engine cannot check (a parent column that
+    // is no key) fails the whole pragma, and one answer for the database would
+    // hide a second such table behind the first.
+    let tables = scratch.query(
+        "SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'table' ORDER BY name",
+        &[],
+    )?;
+    for table in &tables {
+        let table = table.text(0)?;
+        match scratch.query(
+            &format!("PRAGMA main.foreign_key_check({})", quote(table)),
+            &[],
+        ) {
+            Err(error) => found.push(failed("foreign keys", table.to_owned(), &error)),
+            Ok(rows) => {
+                let mut counts: std::collections::BTreeMap<String, u64> = Default::default();
+                for row in &rows {
+                    *counts.entry(row.text(2)?.to_owned()).or_default() += 1;
+                }
+                for (parent, rows) in counts {
+                    found.push(Unresolved {
+                        what: "foreign key",
+                        name: format!("{table} -> {parent}"),
+                        detail: Detail::Rows(rows),
+                    });
+                }
             }
         }
     }
     Ok(Resolution(found))
+}
+
+/// Compiles, and does not run, a write of each kind to every table and view
+/// that has a trigger. The reader reads around triggers, and a trigger that names
+/// what is gone is accepted by every statement and fails the application's next
+/// write to its table. `EXPLAIN` compiles the trigger's program with the
+/// statement (measured: `no such table: main.gone`) and writes nothing.
+///
+/// A view's columns are read only when the view itself resolved: the pragma of a
+/// broken view fails, and that view is a finding already.
+fn triggers(
+    scratch: &Connection,
+    broken_views: &[String],
+    found: &mut Vec<Unresolved>,
+) -> Result<(), DbError> {
+    let owners = scratch.query(
+        "SELECT DISTINCT tbl_name FROM sqlite_schema WHERE type = 'trigger' ORDER BY tbl_name",
+        &[],
+    )?;
+    for owner in &owners {
+        let owner = owner.text(0)?;
+        let target = format!("main.{}", quote(owner));
+        let mut writes = vec![
+            (
+                "insert",
+                format!("EXPLAIN INSERT INTO {target} DEFAULT VALUES"),
+            ),
+            ("delete", format!("EXPLAIN DELETE FROM {target}")),
+        ];
+        if !broken_views.iter().any(|view| view == owner) {
+            // Every column is set to itself, so a trigger `OF` any column fires.
+            let columns = scratch.query(
+                "SELECT name FROM pragma_table_xinfo(?1, 'main') WHERE hidden = 0 ORDER BY cid",
+                &[pbps_db::sqlite::Value::Text(owner.to_owned())],
+            )?;
+            let mut sets = Vec::new();
+            for column in &columns {
+                let name = quote(column.text(0)?);
+                sets.push(format!("{name} = {name}"));
+            }
+            if !sets.is_empty() {
+                writes.push((
+                    "update",
+                    format!("EXPLAIN UPDATE {target} SET {}", sets.join(", ")),
+                ));
+            }
+        }
+        for (kind, sql) in writes {
+            if let Err(error) = scratch.query(&sql, &[]) {
+                found.push(failed("trigger", format!("{owner} ({kind})"), &error));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn failed(what: &'static str, name: String, error: &DbError) -> Unresolved {
@@ -221,8 +290,14 @@ impl Resolution {
                         Escaped(&item.name),
                         Escaped(now)
                     ),
+                    "trigger" => format!(
+                        "a trigger does not compile for the write `{}` after the plan: {}",
+                        Escaped(&item.name),
+                        Escaped(now)
+                    ),
                     _ => format!(
-                        "the foreign keys cannot be checked after the plan: {}",
+                        "the foreign keys of `{}` cannot be checked after the plan: {}",
+                        Escaped(&item.name),
                         Escaped(now)
                     ),
                 }),

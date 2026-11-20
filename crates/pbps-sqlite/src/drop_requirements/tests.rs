@@ -114,7 +114,7 @@ fn a_predicate_cannot_carry_a_second_statement_and_a_trailing_comment_does_not_s
         &guard(&["a > 0); DROP TABLE t; SELECT (1"]),
     )
     .expect_err("one statement only");
-    assert!(refused.contains("could not be evaluated"), "{refused}");
+    assert!(refused.contains("not one expression"), "{refused}");
     assert_eq!(tables(fresh.connection()), 1, "the table is still there");
     // Negative: a comment at the end is closed, and the requirement still counts.
     assert!(check(fresh.connection(), &guard(&["a > 0 -- positive"])).is_ok());
@@ -132,4 +132,22 @@ fn the_check_runs_inside_the_applys_transaction_and_leaves_it_open() {
     assert!(c.in_transaction());
     c.execute_batch("ROLLBACK").expect("ended");
     assert!(check(c, &guard(&["a > 0"])).is_ok());
+}
+
+/// The count is only as good as the wrapper: a predicate that ends it early or
+/// leaves a comment open would be counted as something else.
+#[test]
+fn a_predicate_that_escapes_the_wrapper_is_refused_and_never_counted() {
+    let mut fresh = with_rows("INSERT INTO t VALUES (1, 'x')");
+    for predicate in ["0) /*", "0) OR (1", "a > 0 /* open", "'open"] {
+        let refused = check(fresh.connection(), &guard(&[predicate])).expect_err(predicate);
+        assert!(
+            refused.contains("not one expression"),
+            "{predicate}: {refused}"
+        );
+    }
+    // Negative: the same meanings written whole are counted.
+    assert!(check(fresh.connection(), &guard(&["(0) OR (1)"])).is_ok());
+    assert!(check(fresh.connection(), &guard(&["a > 0 /* closed */"])).is_ok());
+    assert!(check(fresh.connection(), &guard(&["(0)"])).is_err());
 }

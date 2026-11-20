@@ -11,13 +11,28 @@ use pbps_dialect::drop_requirements::check_count;
 use pbps_model::DropGuard;
 use pbps_model::escape::Escaped;
 
-use crate::emit::qualified;
+use crate::emit::{closed, qualified};
+use crate::lexis;
 
 /// `Ok` when every requirement of `guard` holds for every row of its table; the
 /// refusal otherwise, naming the count and the predicate.
 pub fn check(c: &Connection, guard: &DropGuard) -> Result<(), String> {
     let table = qualified(&guard.table).map_err(|error| error.to_string())?;
     for requirement in guard.requirements.values() {
+        // The count is only as good as the wrapper around the predicate: an open
+        // comment or quote would swallow `IS NOT TRUE`, and a parenthesis closed
+        // early would leave it binding to something else.
+        // (A `--` comment at the end is closed with a line feed first, as the
+        // emitter closes one.)
+        if !lexis::is_one_expression(&closed(&requirement.predicate)) {
+            return Err(format!(
+                "the row requirement `{}` of {} is not one expression SQLite reads whole \
+                 (unbalanced parentheses, a `;`, or a comment or quote left open); a requirement \
+                 that cannot be asked never permits removal",
+                Escaped(&requirement.predicate),
+                guard.table.shown()
+            ));
+        }
         // A line feed before the closing parenthesis, so a predicate that ends in a
         // `--` comment does not swallow it. One statement is prepared, so a `;`
         // inside it is refused by the library and writes nothing.
