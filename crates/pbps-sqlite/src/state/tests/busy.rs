@@ -1,0 +1,223 @@
+//! Waiting for another writer, and what a busy refusal says.
+
+use std::time::{Duration, Instant};
+
+use pbps_db::DbError;
+use pbps_db::sqlite::Connection;
+use pbps_model::StateKind;
+
+use super::{in_both_journal_modes, number, snapshot};
+use crate::state::busy::is_busy;
+use crate::state::ddl::ensure_tables_within;
+use crate::state::write::record_within;
+use crate::state::{STATE_TABLE, ensure_tables, is_initialized};
+
+const SHORT: Duration = Duration::from_millis(200);
+
+fn driver(code: Option<&str>) -> DbError {
+    DbError::Driver {
+        message: "x".into(),
+        code: code.map(str::to_owned),
+        diagnostic: None,
+    }
+}
+
+#[test]
+fn every_busy_code_is_busy_and_nothing_else_is() {
+    // 5 busy, 261 recovery, 517 stale snapshot, 773 timeout.
+    for code in ["5", "261", "517", "773"] {
+        assert!(is_busy(&driver(Some(code))), "{code}");
+        // Still busy once a sentence is put around it.
+        assert!(
+            is_busy(&driver(Some(code)).context("while recording")),
+            "{code}"
+        );
+    }
+    // 6 is "locked" in the same connection, 275 a CHECK, 1555 a key.
+    for code in [Some("6"), Some("275"), Some("1555"), Some("x"), None] {
+        assert!(!is_busy(&driver(code)), "{code:?}");
+    }
+    assert!(!is_busy(&DbError::Refused("5".into())));
+}
+
+#[test]
+fn a_free_database_writes_at_once() {
+    in_both_journal_modes(|fresh, _| {
+        // A wait far longer than a loaded machine takes to write a file, so
+        // the bound tells "did not wait" from "slow" and not the reverse.
+        let wait = Duration::from_secs(60);
+        let started = Instant::now();
+        record_within(fresh.connection(), &snapshot(StateKind::Apply, "op"), wait)
+            .expect("recorded");
+        assert!(started.elapsed() < wait / 4, "{:?}", started.elapsed());
+    });
+}
+
+#[test]
+fn a_database_another_connection_is_writing_is_reported_busy_after_the_wait() {
+    in_both_journal_modes(|fresh, second| {
+        second.execute_batch("BEGIN IMMEDIATE").expect("held");
+        let started = Instant::now();
+        let refused = record_within(fresh.connection(), &snapshot(StateKind::Apply, "op"), SHORT)
+            .expect_err("busy");
+        assert!(
+            started.elapsed() >= SHORT,
+            "it waited: {:?}",
+            started.elapsed()
+        );
+        let pbps_db::ledger::LedgerError::Db(error) = refused else {
+            panic!("{refused:?}");
+        };
+        assert!(is_busy(&error), "{error:?}");
+        let said = error.to_string();
+        assert!(
+            said.contains("not this tool's lock") && said.contains("pbps unlock"),
+            "{said}"
+        );
+        assert!(!fresh.connection().in_transaction());
+        // The wait ends the moment the other writer does.
+        second.execute_batch("ROLLBACK").expect("released");
+        ensure_tables_within(fresh.connection(), SHORT).expect("created");
+    });
+}
+
+#[test]
+fn an_existing_ledger_is_not_stopped_by_a_writer_elsewhere_but_a_missing_one_is() {
+    in_both_journal_modes(|fresh, second| {
+        ensure_tables(fresh.connection()).expect("created");
+        second.execute_batch("BEGIN IMMEDIATE").expect("held");
+        // Nothing is missing, so nothing is created and nothing waits. (Whether
+        // the statement is sent cannot be told on this library, which does not
+        // lock for it; see `ensure_tables`.)
+        let started = Instant::now();
+        let wait = Duration::from_secs(60);
+        ensure_tables_within(fresh.connection(), wait).expect("nothing to create");
+        assert!(started.elapsed() < wait / 4, "{:?}", started.elapsed());
+        assert!(is_initialized(fresh.connection()).expect("asked"));
+        second.execute_batch("ROLLBACK").expect("released");
+    });
+    // Negative: with the ledger absent the same hold does stop it, because a
+    // creation does write.
+    in_both_journal_modes(|fresh, second| {
+        second.execute_batch("BEGIN IMMEDIATE").expect("held");
+        let refused = ensure_tables_within(fresh.connection(), SHORT).expect_err("busy");
+        assert!(is_busy(&refused), "{refused:?}");
+        second.execute_batch("ROLLBACK").expect("released");
+    });
+}
+
+#[test]
+fn a_failed_commit_of_the_creation_leaves_no_transaction_open() {
+    // In the delete journal mode a reader blocks the commit of a writer, so the
+    // creation's last step fails after its statements ran.
+    let mut fresh = crate::tests::Fresh::file();
+    let reader =
+        Connection::open(fresh.path(), pbps_db::sqlite::OpenMode::ExistingOnly).expect("second");
+    reader
+        .execute_batch("BEGIN; SELECT count(*) FROM sqlite_schema")
+        .expect("a read held open");
+    let c = fresh.connection();
+    let refused = ensure_tables_within(c, SHORT).expect_err("the commit is refused");
+    assert!(is_busy(&refused), "{refused:?}");
+    assert!(!c.in_transaction(), "the connection was left as it was");
+    assert_eq!(number(c, "SELECT count(*) FROM sqlite_schema"), 0);
+    reader.execute_batch("ROLLBACK").expect("released");
+    ensure_tables_within(c, SHORT).expect("created once the reader left");
+    assert_eq!(number(c, &format!("SELECT count(*) FROM {STATE_TABLE}")), 0);
+}
+
+#[test]
+fn a_failure_that_is_not_busy_is_not_described_as_busy() {
+    let mut fresh = crate::tests::Fresh::memory();
+    let c = fresh.connection();
+    let mut broken = snapshot(StateKind::Apply, "op");
+    broken.reason = Some(pbps_model::Text::from("x".repeat(2000)));
+    let error = match record_within(c, &broken, SHORT) {
+        Err(pbps_db::ledger::LedgerError::Db(error)) => error,
+        other => panic!("{other:?}"),
+    };
+    assert!(!is_busy(&error));
+    assert!(!error.to_string().contains("busy"), "{error}");
+}
+
+/// In WAL a transaction that read before another connection committed is
+/// refused its write at once (code 517). Nothing is locked then, so the
+/// refusal must not say a lock was held for the wait.
+#[test]
+fn a_stale_snapshot_is_not_described_as_a_lock_held_for_the_wait() {
+    let mut fresh = crate::tests::Fresh::file();
+    assert_eq!(
+        super::text(fresh.connection(), "PRAGMA journal_mode = WAL"),
+        "wal"
+    );
+    ensure_tables(fresh.connection()).expect("created");
+    let second =
+        Connection::open(fresh.path(), pbps_db::sqlite::OpenMode::ExistingOnly).expect("second");
+    let first = fresh.connection();
+    first.execute_batch("BEGIN").expect("opened");
+    assert_eq!(
+        number(first, &format!("SELECT count(*) FROM {STATE_TABLE}")),
+        0
+    );
+    crate::state::record(&second, &snapshot(StateKind::Apply, "other")).expect("committed");
+    let started = Instant::now();
+    let refused = record_within(
+        first,
+        &snapshot(StateKind::Apply, "op"),
+        Duration::from_secs(60),
+    )
+    .expect_err("stale");
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "it came at once"
+    );
+    let pbps_db::ledger::LedgerError::Db(error) = refused else {
+        panic!("{refused:?}");
+    };
+    assert_eq!(
+        error.server_error_code().as_deref(),
+        Some("517"),
+        "{error:?}"
+    );
+    assert!(is_busy(&error));
+    let said = error.to_string();
+    assert!(
+        said.contains("Nothing is locked") && said.contains("started again"),
+        "{said}"
+    );
+    assert!(!said.contains("for more than"), "{said}");
+    first.execute_batch("ROLLBACK").expect("closed");
+}
+
+/// The wait is the connection's, so each function puts back what its caller
+/// had, whether it succeeded or not.
+#[test]
+fn the_callers_wait_is_put_back_after_every_ledger_function() {
+    let mut fresh = crate::tests::Fresh::memory();
+    let c = fresh.connection();
+    let wait_now = |c: &Connection| number(c, "PRAGMA busy_timeout");
+    assert_eq!(wait_now(c), 0, "the connection opens waiting for nothing");
+    assert!(!is_initialized(c).expect("asked"));
+    assert_eq!(wait_now(c), 0);
+    ensure_tables(c).expect("created");
+    assert_eq!(wait_now(c), 0);
+    crate::state::record(c, &snapshot(StateKind::Apply, "op")).expect("recorded");
+    assert_eq!(wait_now(c), 0);
+    crate::state::prune(c, 1).expect("pruned");
+    assert_eq!(wait_now(c), 0);
+    // A wait the caller chose is the one put back, not zero.
+    c.set_busy_timeout(Duration::from_millis(1234))
+        .expect("set");
+    crate::state::record(c, &snapshot(StateKind::Apply, "op")).expect("recorded");
+    assert_eq!(wait_now(c), 1234);
+    // And after a failure: a view in the ledger's name refuses everything.
+    c.execute_batch(&format!(
+        "DROP TABLE {STATE_TABLE}; CREATE VIEW __pbps_state AS SELECT 1 AS id"
+    ))
+    .expect("replaced");
+    ensure_tables(c).expect_err("refused");
+    crate::state::record(c, &snapshot(StateKind::Apply, "op")).expect_err("refused");
+    crate::state::prune(c, 1).expect_err("refused");
+    is_initialized(c).expect_err("refused");
+    assert_eq!(wait_now(c), 1234);
+}

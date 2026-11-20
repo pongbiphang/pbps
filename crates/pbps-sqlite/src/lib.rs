@@ -25,7 +25,7 @@
 //! | [`keywords`] | 2 | the words SQLite cannot take as a bare name |
 //! | [`emit`], [`ordering`] | 3 | the SQL for the changes SQLite can make in place, and what the scheduler must know to order it |
 //! | [`catalog`] | 4 | the reader: pragmas, then a tokenizer for what only the stored text holds |
-//! | [`state`] | 5 | the ledger, the plan record and the lock, as SQL |
+//! | [`state`] | 5 | the ledger and the lock, as SQL |
 //! | [`preflight`] | 6 | checks before a plan runs |
 //!
 //! The functions of those modules are synchronous and take a

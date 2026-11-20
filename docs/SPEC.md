@@ -2704,6 +2704,16 @@ ledger from before they existed keeps working via a fallback that parses
 
 `__pbps_lock` stops two pipelines applying at once.
 
+**SQLite (#2950, DEC-2950.11):** the state table is `main.__pbps_state` in the
+database file itself, with the same columns. `id` is `INTEGER PRIMARY KEY
+AUTOINCREMENT` so an id is never reused, the time is ISO 8601 text in UTC with
+three decimals, and the widths are `CHECK`s on characters, equal to
+PostgreSQL's. The table is plain, not `STRICT`, and calls no JSON function, so
+the file still opens in the oldest SQLite the project targets. It is created
+only when the catalog shows it missing, and a view or other object in its name is
+refused. The lock and the rest of the ledger's reads follow in later parts of
+the same item.
+
 **Trust model**: `__pbps_state` protects against mistakes and process disorder,
 **not** against deliberate tampering by someone with DDL rights — whoever can
 change the schema by hand can change this table too. The real audit baseline is
