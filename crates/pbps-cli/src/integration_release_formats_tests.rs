@@ -155,6 +155,17 @@ fn check_record(record: Option<&Released>, layout: &Layout, build: &Build) -> Re
     Ok(())
 }
 
+/// The record a freeze replaces. It must exist and parse: in the repository the
+/// file always does, so an absent or unreadable one is a wrong path or a damaged
+/// checkout, and reading it as "nothing was released" would skip the one check
+/// that a freeze can still make.
+fn read_record(path: &Path) -> Result<Option<Released>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read the record {}: {e}", path.display()))?;
+    format::parse_record(&text)
+        .map_err(|e| format!("the record {} is not a release record: {e}", path.display()))
+}
+
 fn write_archive(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     for (kind, file) in PUBLISHED {
@@ -167,18 +178,38 @@ fn write_archive(dir: &Path) -> Result<(), String> {
 
 /// Writes the record and the set's archive, or says why it will not.
 ///
+/// Before anything is written it reads the record it replaces and holds each
+/// format of this build to it with `format::check_increment`, the whole rule:
+/// a format changed under its released number, or a number moved with nothing
+/// changed, is refused. Without that the freeze would check the build against
+/// the record it has just written, which always agrees, and a missed increment
+/// could not be found again. A record that is absent or unreadable is refused
+/// and not read as "no release".
+///
 /// An archive is never rewritten (the rule of the numbered ones, kept). One that
 /// exists is reused when it is this set, which is what a second release finds if
 /// the documents did not change between two releases, and refused when it is not.
 /// A blank tag is refused. The record is written last, so a failure part way
 /// leaves no record that names a missing archive; what it leaves is an archive
-/// directory, which the message names. The result is read back through the
-/// loader's own parser and put through `check_record`, so a freeze that
+/// directory, which the message names. The result is read back through
+/// the loader's own parser and put through `check_record`, so a freeze that
 /// produces a file the checks refuse fails at once.
 fn freeze(layout: &Layout, tag: &str, build: &Build) -> Result<(), String> {
     let tag = tag.trim();
     if tag.is_empty() {
         return Err(format!("{FREEZE_VARIABLE} must hold the release tag"));
+    }
+    let previous = read_record(&layout.record)?;
+    for (name, now, frozen) in [
+        ("plan", &build.plan, previous.as_ref().map(|r| &r.plan)),
+        ("state", &build.state, previous.as_ref().map(|r| &r.state)),
+        (
+            "schema set",
+            &build.schema_set,
+            previous.as_ref().map(|r| &r.schema_set),
+        ),
+    ] {
+        format::check_increment(name, now.version, &now.fingerprint, frozen)?;
     }
     let dir = layout.archive(build.schema_set.version);
     if dir.exists() {
@@ -246,11 +277,18 @@ fn freeze_the_formats_for_a_release() {
 /// A directory of this test's own, removed when it goes out of scope.
 struct Scratch(PathBuf);
 
+/// The record as the repository holds it before the first release.
+const NO_RELEASE: &str = "{\"released\": null}\n";
+
 impl Scratch {
+    /// A directory laid out like the repository: the record exists and says
+    /// nothing was released, and there is no archive directory yet.
     fn new() -> Self {
         let dir = std::env::temp_dir().join(format!("pbps-freeze-{}", rand::random::<u64>()));
         std::fs::create_dir_all(&dir).unwrap();
-        Scratch(dir)
+        let scratch = Scratch(dir);
+        std::fs::write(scratch.layout().record, NO_RELEASE).unwrap();
+        scratch
     }
 
     fn layout(&self) -> Layout {
@@ -265,6 +303,36 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// The release a scratch directory's record names.
+fn recorded(scratch: &Scratch) -> Released {
+    let text = std::fs::read_to_string(scratch.layout().record).unwrap();
+    format::parse_record(&text).unwrap().expect("a release")
+}
+
+/// Every path under `dir`, relative and in order: what a refused freeze must
+/// leave as it found it. A missing `dir` lists nothing.
+fn listing(dir: &Path) -> Vec<String> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            out.push(
+                path.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
+            walk(root, &path, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
 }
 
 /// A freeze into a scratch directory, and the record it wrote.
@@ -301,7 +369,10 @@ fn a_freeze_writes_the_numbers_the_fingerprints_and_the_set_archive() {
 fn nothing_is_written_unless_a_freeze_is_asked_for() {
     let scratch = Scratch::new();
     freeze_if_asked(None, &scratch.layout(), &Build::current());
-    assert!(!scratch.layout().record.exists());
+    assert_eq!(
+        std::fs::read_to_string(scratch.layout().record).unwrap(),
+        NO_RELEASE
+    );
     assert!(!scratch.layout().archives.exists());
 }
 
@@ -309,14 +380,17 @@ fn nothing_is_written_unless_a_freeze_is_asked_for() {
 fn an_asked_freeze_writes_and_a_blank_tag_writes_nothing() {
     let scratch = Scratch::new();
     freeze_if_asked(Some("v2".into()), &scratch.layout(), &Build::current());
-    assert!(scratch.layout().record.exists());
+    assert_eq!(recorded(&scratch).tag, "v2");
     // Negative: an empty and a blank tag are refused before any file is made.
     let other = Scratch::new();
     for tag in ["", "  \t"] {
         let why = freeze(&other.layout(), tag, &Build::current()).expect_err("no tag");
         assert!(why.contains(FREEZE_VARIABLE), "{why}");
     }
-    assert!(!other.layout().record.exists());
+    assert_eq!(
+        std::fs::read_to_string(other.layout().record).unwrap(),
+        NO_RELEASE
+    );
     assert!(!other.layout().archives.exists());
 }
 
@@ -359,6 +433,127 @@ fn a_second_freeze_does_not_rewrite_an_archive_of_another_set_or_the_record() {
     assert!(why.contains("never rewritten"), "{why}");
     assert_eq!(std::fs::read(&scratch.layout().record).unwrap(), before);
     assert_eq!(std::fs::read_to_string(&file).unwrap(), archived);
+}
+
+/// A format's name and one way to change a build's record of it.
+type Edit = (&'static str, fn(&mut Build));
+
+/// The three formats of a build, each with a change of its fingerprint under
+/// the same number.
+fn edits() -> [Edit; 3] {
+    [
+        ("plan", |b| b.plan.fingerprint = "f".repeat(64)),
+        ("state", |b| b.state.fingerprint = "f".repeat(64)),
+        ("schema set", |b| b.schema_set.fingerprint = "f".repeat(64)),
+    ]
+}
+
+#[test]
+fn a_freeze_refuses_a_format_changed_under_its_released_number() {
+    let scratch = Scratch::new();
+    let build = Build::current();
+    frozen_in(&scratch, &build);
+    let record = std::fs::read(scratch.layout().record).unwrap();
+    let tree = listing(&scratch.layout().archives);
+    for (name, edit) in edits() {
+        let mut changed = Build::current();
+        edit(&mut changed);
+        let why = freeze(&scratch.layout(), "v1.0.1", &changed).expect_err(name);
+        assert!(
+            why.contains(&format!("the {name} format has changed")),
+            "{why}"
+        );
+        assert_eq!(std::fs::read(scratch.layout().record).unwrap(), record);
+        assert_eq!(listing(&scratch.layout().archives), tree, "{name}");
+    }
+}
+
+#[test]
+fn a_freeze_refuses_a_number_moved_with_nothing_changed() {
+    let scratch = Scratch::new();
+    frozen_in(&scratch, &Build::current());
+    let record = std::fs::read(scratch.layout().record).unwrap();
+    let tree = listing(&scratch.layout().archives);
+    let bumps: [Edit; 3] = [
+        ("plan", |b| b.plan.version += 1),
+        ("state", |b| b.state.version += 1),
+        ("schema set", |b| b.schema_set.version += 1),
+    ];
+    for (name, bump) in bumps {
+        let mut moved = Build::current();
+        bump(&mut moved);
+        let why = freeze(&scratch.layout(), "v1.0.1", &moved).expect_err(name);
+        assert!(
+            why.contains(&format!("the {name} format has not changed")),
+            "{why}"
+        );
+        assert_eq!(std::fs::read(scratch.layout().record).unwrap(), record);
+        assert_eq!(listing(&scratch.layout().archives), tree, "{name}");
+    }
+}
+
+#[test]
+fn a_freeze_accepts_a_changed_format_whose_number_moved_by_one() {
+    let scratch = Scratch::new();
+    frozen_in(&scratch, &Build::current());
+    let mut next = Build::current();
+    next.plan.fingerprint = "f".repeat(64);
+    next.plan.version += 1;
+    next.state.fingerprint = "e".repeat(64);
+    next.state.version += 1;
+    freeze(&scratch.layout(), "v1.0.1", &next).expect("each change carries its increment");
+    let released = recorded(&scratch);
+    assert_eq!(released.tag, "v1.0.1");
+    assert_eq!(released.plan, next.plan);
+    assert_eq!(released.state, next.state);
+}
+
+#[test]
+fn a_freeze_refuses_a_missing_or_unreadable_record_naming_its_path() {
+    // Absent and unparseable are two failures, and neither reads as "no release".
+    let missing = Scratch::new();
+    std::fs::remove_file(missing.layout().record).unwrap();
+    let why = freeze(&missing.layout(), "v1", &Build::current()).expect_err("no record");
+    assert!(
+        why.replace('\\', "/").contains("released_formats.json"),
+        "{why}"
+    );
+    assert!(why.contains("cannot read"), "{why}");
+    assert!(!missing.layout().archives.exists());
+
+    let broken = Scratch::new();
+    std::fs::write(broken.layout().record, "{ not json").unwrap();
+    let why = freeze(&broken.layout(), "v1", &Build::current()).expect_err("bad record");
+    assert!(
+        why.replace('\\', "/").contains("released_formats.json"),
+        "{why}"
+    );
+    assert!(why.contains("not a release record"), "{why}");
+    assert_eq!(
+        std::fs::read_to_string(broken.layout().record).unwrap(),
+        "{ not json"
+    );
+    assert!(!broken.layout().archives.exists());
+}
+
+#[test]
+fn a_freeze_refuses_an_archive_of_another_set_when_nothing_was_released() {
+    // The record says nothing was released, so the record's refusals do not
+    // apply, and the archive's is the one left to stop a freeze.
+    let scratch = Scratch::new();
+    let dir = scratch.layout().archive(SCHEMA_VERSION);
+    write_archive(&dir).unwrap();
+    let file = dir.join(PUBLISHED[0].1);
+    let mut document: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    document["description"] = "another set".into();
+    std::fs::write(&file, document.to_string()).unwrap();
+    let why = freeze(&scratch.layout(), "v1", &Build::current()).expect_err("another set");
+    assert!(why.contains("another set"), "{why}");
+    assert_eq!(
+        std::fs::read_to_string(scratch.layout().record).unwrap(),
+        NO_RELEASE
+    );
 }
 
 #[test]

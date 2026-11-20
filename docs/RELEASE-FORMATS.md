@@ -46,6 +46,14 @@ own parser and runs the `check` conditions on the result, so a freeze that
 produces something the checks refuse fails at once.
 
 - It refuses a blank tag.
+- It reads the record it replaces before it writes anything, and holds each of
+  the three formats of this build to it with the same increment rule the `check`
+  mode uses: a format changed under its released number, or a number moved with
+  nothing changed, is refused and nothing is written. Without this the freeze
+  would check the build against the record it has just written, which always
+  agrees, and a missed increment could not be found again. A record that is
+  missing or does not parse is refused, naming its path; it is never read as "no
+  release", because in the repository the file always exists.
 - It never rewrites an archive. When `released/<n>/` already exists it is reused
   if it holds this set, which is what a second release finds when the documents
   did not change since the first, and the freeze stops if it holds another set.

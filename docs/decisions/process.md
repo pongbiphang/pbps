@@ -2217,7 +2217,10 @@ moves once per merged change and that every number has an archive.
   anonymous. `check` holds the record to its archive and to this build; `freeze`
   writes `released_formats.json` and the set's archive. It reuses an archive that is
   already this set, which a second release finds when the documents did not change
-  between two releases, and refuses one that is another set. The procedure is `docs/RELEASE-FORMATS.md`.
+  between two releases, and refuses one that is another set. Before it writes anything
+  it holds each format to the record it replaces with the same increment rule, so a
+  freeze cannot hide a missed increment by recording it. The procedure is
+  `docs/RELEASE-FORMATS.md`.
 - **What retired.** `a_published_version_keeps_its_archived_schema_contract` made
   every change add an archive, and
   `the_archived_set_at_the_current_number_has_the_binarys_fingerprint` tied that rule
