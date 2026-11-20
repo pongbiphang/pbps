@@ -1752,3 +1752,100 @@ fn connected_call_candidates_include_payloads_and_old_bindings_without_computed_
     );
     assert!(pbps_mssql::schema_bound_call_names(&view(false), &before, &after).is_empty());
 }
+
+/// `t(a)` to `t(b)`, a new column identity, in the order given (the plan's
+/// operations are `0` the drop of `a` and `1` the add of `b`), and, for the
+/// requirement's own sake, with the table's other column kept when `keeps` is
+/// set (`t(a, k)` to `t(k, b)`).
+fn replacement_violations(order: &[usize], keeps: bool) -> Vec<Violation> {
+    let int = || Column::new("int".parse().unwrap());
+    let (a, b, k) = (
+        Uid::derived(UidKind::Column, "t.a", 0),
+        Uid::derived(UidKind::Column, "t.b", 0),
+        Uid::derived(UidKind::Column, "t.k", 0),
+    );
+    let table = |columns: &[&str]| Table {
+        columns: columns.iter().map(|c| ((*c).into(), int())).collect(),
+        ..Table::default()
+    };
+    let (was, now) = if keeps {
+        (table(&["a", "k"]), table(&["k", "b"]))
+    } else {
+        (table(&["a"]), table(&["b"]))
+    };
+    let side = |table: Table, columns: &[(&Uid, &str)]| {
+        let mut schema = Schema::default();
+        schema.tables.insert(t(), table);
+        let mut ids = IdsFile::default();
+        ids.tables.insert(Uid::derived(UidKind::Table, "t", 0), t());
+        for (uid, name) in columns {
+            ids.columns.insert((*uid).clone(), t().column(*name));
+        }
+        (schema, ids)
+    };
+    let (base, base_ids) = if keeps {
+        side(was, &[(&a, "a"), (&k, "k")])
+    } else {
+        side(was, &[(&a, "a")])
+    };
+    let (declared, declared_ids) = if keeps {
+        side(now, &[(&k, "k"), (&b, "b")])
+    } else {
+        side(now, &[(&b, "b")])
+    };
+    let logical: Vec<PlannedChange> = vec![
+        Change::Column(ColumnChange::DropColumn {
+            uid: a.clone(),
+            column: t().column("a"),
+        }),
+        Change::Column(ColumnChange::AddColumn {
+            uid: b.clone(),
+            table: t(),
+            name: "b".into(),
+            column: Box::new(int()),
+        }),
+    ]
+    .into_iter()
+    .map(PlannedChange::new)
+    .collect();
+    let ops = Operations::of_plan(&logical, ModuleEdits::InPlace);
+    let names = PlanNames::of(&logical, &declared_ids).unwrap();
+    let owners = PlanOwners::new(names, &base_ids, &declared_ids);
+    let before = Snapshot {
+        schema: &base,
+        ids: &base_ids,
+    };
+    let after = Snapshot {
+        schema: &declared,
+        ids: &declared_ids,
+    };
+    let baseline = Baseline::of(before, &owners);
+    let shadowed = analyse(&ops, &owners, before, after, &Mssql);
+    assert!(shadowed.unowned.is_empty(), "{:?}", shadowed.unowned);
+    let ordered = pbps_diff::order::reordered_operations(&ops, order);
+    let effects: Vec<_> = order.iter().map(|&i| shadowed.effects[i].clone()).collect();
+    pbps_diff::order::verify(ordered.as_slice(), &effects, &baseline, &Default::default())
+}
+
+#[test]
+fn the_last_data_column_is_dropped_only_after_the_column_that_replaces_it() {
+    // The add first, then the drop: SQL Server takes it (Msg 4923 is the
+    // refusal of the other order).
+    assert_eq!(replacement_violations(&[1, 0], false), []);
+    // The drop first leaves the table without a data column.
+    let refused = replacement_violations(&[0, 1], false);
+    assert!(!refused.is_empty(), "{refused:?}");
+}
+
+#[test]
+fn a_drop_with_a_kept_column_in_the_table_requires_nothing_of_the_add() {
+    // Negative: `k` stays, so either order is one the engine performs.
+    assert_eq!(replacement_violations(&[0, 1], true), []);
+    assert_eq!(replacement_violations(&[1, 0], true), []);
+}
+
+#[test]
+fn sql_server_refuses_the_last_data_column_and_postgresql_does_not() {
+    use pbps_dialect::Dialect as _;
+    assert!(Mssql.refuses_dropping_last_column());
+}

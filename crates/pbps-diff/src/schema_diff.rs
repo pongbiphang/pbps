@@ -469,6 +469,24 @@ pub enum DiffError {
         renames: Vec<(TableName, TableName)>,
     },
 
+    /// A table's only column replaced by a new column of the same name
+    /// (#2963, DEC-2963.1). The engine will not drop a table's last column and
+    /// will not add a name that stands, so neither order performs it, and a
+    /// temporary name is the deployer's to choose, as for renames.
+    #[error(
+        "{table} replaces its only column `{column}` with a new column of the same name, and no \
+         order of those two changes is one the engine performs: it will not drop a table's last \
+         column, and it will not add a name that is still there. Keep the column's identity, so \
+         that it is one column, or make the change in two revisions: add a column of another name \
+         first, then replace it",
+        table = .table.shown(),
+        column = .column.shown(),
+    )]
+    LastColumnReplacedByItsName {
+        table: TableName,
+        column: ColumnName,
+    },
+
     /// `depends_on:` declarations that close a cycle (#2083, DEC-2083.1):
     /// no order honours them all, and planning the members in name order
     /// would break one without saying which. Refused here as well as by
@@ -3010,6 +3028,9 @@ pub(crate) fn diff_partial_rebuilding(
     });
     for cycle in crate::order::rename_order::order(&mut planned, base, &renames, dialect) {
         errs.push(DiffError::TableRenameCycle { renames: cycle });
+    }
+    for (table, column) in crate::order::last_column::order(&mut planned, base, declared, dialect) {
+        errs.push(DiffError::LastColumnReplacedByItsName { table, column });
     }
     let mut changes = ChangeSet { changes: planned };
     if let Err(reason) = crate::drop_requirements::assign(&mut changes, base.ids, declared.ids)

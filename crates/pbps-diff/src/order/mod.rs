@@ -51,6 +51,7 @@ pub mod deployment;
 pub mod edges;
 pub mod expand;
 pub mod generated;
+pub(crate) mod last_column;
 pub mod membership;
 pub mod new_tables;
 pub(crate) mod normalization;
