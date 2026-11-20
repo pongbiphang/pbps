@@ -383,16 +383,51 @@ impl Connection {
     /// pragma is the connection's and is not copied).
     pub fn copy_to_memory(&self, limit: u64, wait: Duration) -> Result<Connection, DbError> {
         let deadline = std::time::Instant::now() + wait;
-        // This connection's own wait is zero, and a writer that is committing makes
-        // even these two reads busy: they are retried for the same wait as the copy.
-        let (size, page_size) =
-            retry_busy(deadline, || Ok((self.size()?, self.number("page_size")?)))?;
-        if size > limit {
-            return Err(DbError::Refused(format!(
-                "the database is {size} bytes and a copy is limited to {limit}"
-            )));
+        self.pinned(deadline, || {
+            let (size, page_size) = (self.size()?, self.number("page_size")?);
+            if size > limit {
+                return Err(DbError::Refused(format!(
+                    "the database is {size} bytes and a copy is limited to {limit}"
+                )));
+            }
+            self.copy_pages(page_size, limit / page_size, deadline)
+        })
+    }
+
+    /// Runs `work` while this connection holds a read lock on the database, so
+    /// what `work` reads first and what it copies after are one snapshot.
+    ///
+    /// The page bound of a copy is counted in pages of the size read before it.
+    /// Without the lock another connection could `VACUUM` the file to a larger
+    /// page size between the two, and the same number of pages would be many
+    /// times the bytes. With it that `VACUUM` is busy until the copy is done
+    /// (delete mode), or is not allowed at all (a write-ahead file keeps its
+    /// page size).
+    ///
+    /// Inside the caller's own transaction nothing is opened or closed. Outside
+    /// one, a read transaction is opened and rolled back, and the connection is
+    /// left as it was. This connection's own wait is zero, and a writer that is
+    /// committing makes even the first read busy: it is retried until `deadline`.
+    fn pinned<T>(
+        &self,
+        deadline: std::time::Instant,
+        work: impl FnOnce() -> Result<T, DbError>,
+    ) -> Result<T, DbError> {
+        let own = !self.in_transaction();
+        if own {
+            self.inner.execute_batch("BEGIN").map_err(driver_error)?;
         }
-        self.copy_pages(page_size, limit / page_size, deadline)
+        // The read that takes the lock; a `BEGIN` alone takes none.
+        let done = retry_busy(deadline, || {
+            self.query("SELECT count(*) FROM sqlite_schema", &[])
+        })
+        .and_then(|_| work());
+        if own {
+            // A read transaction: there is nothing to undo, and a failure to end
+            // it cannot replace the answer.
+            let _ = self.inner.execute_batch("ROLLBACK");
+        }
+        done
     }
 
     fn copy_pages(
@@ -438,6 +473,14 @@ impl Connection {
                     Err(e) => return Err(driver_error(e)),
                 }
             }
+        }
+        // The bound counted pages of `page_size`. The read lock held around this
+        // makes another size impossible; were it not, the bound meant nothing.
+        let copied = copy.number("page_size")?;
+        if copied != page_size {
+            return Err(DbError::Refused(format!(
+                "the database's page size changed from {page_size} to {copied} while it was copied"
+            )));
         }
         // The bound was for the copy; what a run does to the copy is its own.
         copy.inner

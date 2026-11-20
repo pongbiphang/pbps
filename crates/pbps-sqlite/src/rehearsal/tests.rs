@@ -778,3 +778,25 @@ fn a_key_the_engine_cannot_check_is_found_table_by_table() {
             .is_empty()
     );
 }
+
+/// The size is read before the copy, and a database that is busy for that read
+/// is told with the same way out as one that is busy for the copy.
+#[test]
+fn a_database_busy_for_the_size_read_gets_the_sentence_and_the_way_out_too() {
+    let mut db = file("CREATE TABLE t(a integer)");
+    let path = db.path().to_path_buf();
+    let other = Connection::open(&path, pbps_db::sqlite::OpenMode::ExistingOnly).expect("a second");
+    other
+        .execute_batch("BEGIN EXCLUSIVE")
+        .expect("held by another connection");
+    let error = scratch_within(db.connection(), SCRATCH_LIMIT, Duration::from_millis(150))
+        .expect_err("busy");
+    let sentence = error.to_string();
+    assert!(
+        sentence.contains("stayed busy") && sentence.contains("`--no-rehearse`"),
+        "{sentence}"
+    );
+    other.execute_batch("ROLLBACK").expect("ended");
+    // Negative: free, it is copied.
+    assert!(scratch_within(db.connection(), SCRATCH_LIMIT, Duration::from_millis(150)).is_ok());
+}

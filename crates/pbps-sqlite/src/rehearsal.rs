@@ -69,7 +69,8 @@ pub(crate) fn scratch_within(
         "the rehearsal runs the plan on a copy of this database made in this process, in \
          memory, on SQLite {library}"
     );
-    let size = waiting(target, wait, || target.size())?;
+    let size = waiting(target, wait, || target.size())
+        .map_err(|error| explain_copy(error, &what, limit, wait))?;
     if size > limit {
         return Err(DbError::Refused(format!(
             "{what}, and the database is {} where a copy may be {} at most, so this plan \
@@ -89,14 +90,18 @@ pub(crate) fn scratch_within(
 fn explain_copy(error: DbError, what: &str, limit: u64, wait: Duration) -> DbError {
     if matches!(error, DbError::Refused(_)) {
         return DbError::Refused(format!(
-            "{what}, and the database grew past {} while it was copied. Run again, or \
-             {WAY_OUT}",
+            "{what}, and the database grew past {} or changed its page size while it was \
+             copied. Run again, or {WAY_OUT}",
             mib(limit)
         ));
     }
-    if error.server_error_code().as_deref() == Some("5") {
+    let busy = error
+        .server_error_code()
+        .and_then(|code| code.parse::<u32>().ok())
+        .is_some_and(|code| code & 0xff == 5);
+    if busy {
         return error.context(format!(
-            "{what}, and the database stayed busy for {} s while it was copied: another \
+            "{what}, and the database stayed busy for {} s while it was read or copied: another \
              connection is writing it, or this connection is inside a write transaction. Run \
              again when it is free. {WAY_OUT}",
             wait.as_secs_f64()

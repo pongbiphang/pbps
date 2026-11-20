@@ -239,3 +239,46 @@ fn a_writer_in_the_middle_never_shows_a_copy_half_a_transaction() {
         assert!(!seen.is_empty());
     }
 }
+
+/// The copy's bound is counted in pages of the size read before it, so nothing
+/// may change that size between the read and the copy.
+#[test]
+fn while_a_copy_is_made_no_other_connection_can_change_the_page_size() {
+    let (_dir, path) = file();
+    let c = source(&path);
+    let other = open(&path);
+    let seen = c
+        .pinned(Instant::now() + LONG, || {
+            let refused = other
+                .execute_batch("PRAGMA page_size = 65536; VACUUM")
+                .expect_err("the copy's read lock is held");
+            assert_eq!(
+                refused.server_error_code().as_deref(),
+                Some("5"),
+                "{refused}"
+            );
+            c.number("page_size")
+        })
+        .expect("pinned");
+    assert!(!c.in_transaction(), "the connection is left as it was");
+    assert_eq!(c.number("page_size").expect("size"), seen);
+    // Inside the caller's own transaction nothing is opened or closed.
+    c.execute_batch("BEGIN").expect("the caller's");
+    c.pinned(Instant::now() + LONG, || Ok(())).expect("pinned");
+    assert!(c.in_transaction());
+    c.execute_batch("ROLLBACK").expect("ended");
+    // Negative: with no copy in progress the same statement is taken.
+    other
+        .execute_batch("PRAGMA page_size = 65536; VACUUM")
+        .expect("free");
+    // (A connection answers with the size it last read: read the file first.)
+    count(&c, "SELECT count(*) FROM sqlite_schema");
+    assert_eq!(c.number("page_size").expect("size"), 65536);
+    // And a size that did change is refused, never copied under a wrong bound.
+    match c.copy_pages(seen, u64::from(u32::MAX), Instant::now() + LONG) {
+        Err(DbError::Refused(message)) => {
+            assert!(message.contains("page size changed"), "{message}")
+        }
+        other => panic!("expected a refusal: {other:?}"),
+    }
+}
