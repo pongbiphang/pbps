@@ -201,13 +201,16 @@ pub(super) fn create(c: &Connection, missing: &[&Recipe]) -> Result<(), DbError>
     in_a_unit(c, || {
         for recipe in missing {
             c.execute_batch(&recipe.create())?;
-            if let Some(seed) = recipe.seed {
-                c.execute(seed, &[])?;
-            }
         }
         let names: Vec<&str> = missing.iter().map(|r| r.name).collect();
         let held = occupants(c, &names)?;
         refuse_a_stranger(&held)?;
+        // Only now: a seed run before the check would be sent at whatever holds
+        // the name, and a view there would answer with the engine's own error
+        // in place of the refusal.
+        for seed in missing.iter().filter_map(|recipe| recipe.seed) {
+            c.execute(seed, &[])?;
+        }
         match names.iter().find(|name| {
             !held
                 .iter()

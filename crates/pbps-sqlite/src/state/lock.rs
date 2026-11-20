@@ -159,25 +159,65 @@ enum Attempt {
 
 /// The file `main` was opened from, as SQLite names it, or `None` for a database
 /// with none.
-fn database_file(c: &Connection) -> Result<Option<PathBuf>, DbError> {
+///
+/// Asked for as bytes (in hexadecimal, which every row accessor can carry): a
+/// file name on Unix need not be UTF-8, the connection opens such a file, and a
+/// name read as text would be refused. `Err(why)` is a name this platform
+/// cannot turn back into a path, which leaves the row alone.
+fn database_file(c: &Connection) -> Result<Result<Option<PathBuf>, RowOnly>, DbError> {
     let rows = c.query(
-        "SELECT file FROM pragma_database_list WHERE name = 'main'",
+        "SELECT hex(CAST(file AS BLOB)) FROM pragma_database_list WHERE name = 'main'",
         &[],
     )?;
-    match rows.first() {
-        None => Err(DbError::BadRow(
+    let Some(row) = rows.first() else {
+        return Err(DbError::BadRow(
             "`pragma_database_list` does not list `main`".into(),
-        )),
-        Some(row) => {
-            let file = row.text(0)?;
-            Ok((!file.is_empty()).then(|| PathBuf::from(file)))
-        }
+        ));
+    };
+    let hex = row.text(0)?.as_bytes();
+    let digit = |b: u8| {
+        char::from(b)
+            .to_digit(16)
+            .and_then(|d| u8::try_from(d).ok())
+    };
+    let bytes: Option<Vec<u8>> = hex
+        .chunks(2)
+        .map(|pair| match pair {
+            [high, low] => Some(digit(*high)? << 4 | digit(*low)?),
+            _ => None,
+        })
+        .collect();
+    let Some(bytes) = bytes else {
+        return Err(DbError::BadRow(
+            "`hex()` of the database's file name is not hexadecimal".into(),
+        ));
+    };
+    if bytes.is_empty() {
+        return Ok(Ok(None));
     }
+    Ok(path_of(bytes).map(Some))
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)]
+fn path_of(bytes: Vec<u8>) -> Result<PathBuf, RowOnly> {
+    use std::os::unix::ffi::OsStringExt;
+    Ok(PathBuf::from(OsString::from_vec(bytes)))
+}
+
+/// SQLite's file names are UTF-8 on every platform but Unix.
+#[cfg(not(unix))]
+fn path_of(bytes: Vec<u8>) -> Result<PathBuf, RowOnly> {
+    String::from_utf8(bytes).map(PathBuf::from).map_err(|_| {
+        RowOnly::Unavailable("the database's file name cannot be read as a path".to_owned())
+    })
 }
 
 fn attempt(c: &Connection) -> Result<Attempt, DbError> {
-    let Some(database) = database_file(c)? else {
-        return Ok(Attempt::Without(RowOnly::NoFile));
+    let database = match database_file(c)? {
+        Ok(Some(database)) => database,
+        Ok(None) => return Ok(Attempt::Without(RowOnly::NoFile)),
+        Err(why) => return Ok(Attempt::Without(why)),
     };
     let path = sidecar_path(&database);
     let shown = path.display().to_string();
@@ -472,5 +512,12 @@ pub fn session_application_name(_c: &Connection) -> Result<String, DbError> {
 #[must_use]
 pub fn session_lookup(locked_by: &str) -> Option<String> {
     pbps_db::holder_application_name(locked_by)?;
-    Some(lookup(PROOF_FILE, None))
+    // The text alone does not say how the lock was taken, so neither does this.
+    Some(
+        "SQLite keeps no list of sessions to search. A holder that is gone is cleared by the \
+         next run itself only when the lock was taken with the lock file beside the database \
+         and that run can take it; a lock taken without it is cleared only by `pbps unlock`, \
+         after confirming on the host named above that the process has exited."
+            .to_owned(),
+    )
 }

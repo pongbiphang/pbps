@@ -356,3 +356,31 @@ fn a_view_that_appears_after_the_probe_is_refused_by_the_creation_itself() {
     crate::state::ddl::create(c, &missing).expect("created");
     assert!(is_initialized(c).expect("asked"));
 }
+
+/// A seed is sent only after the catalog confirms what holds the name: a view
+/// that appeared in the environment's name is refused in this tool's words and
+/// not answered by the engine's error for an insert into a view.
+#[test]
+fn a_view_in_a_seeded_tables_name_is_refused_before_the_seed_is_sent() {
+    let mut fresh = Fresh::memory();
+    let c = fresh.connection();
+    c.execute_batch("CREATE VIEW __pbps_environment AS SELECT 1 AS id, 'x' AS environment_id")
+        .expect("the view");
+    let missing: Vec<&crate::state::ddl::Recipe> = RECIPE.iter().collect();
+    let refused = crate::state::ddl::create(c, &missing).expect_err("refused");
+    assert!(
+        refused
+            .to_string()
+            .contains("is a view, not an ordinary table"),
+        "{refused}"
+    );
+    assert!(!c.in_transaction());
+    assert_eq!(
+        number(
+            c,
+            "SELECT count(*) FROM main.sqlite_schema WHERE type = 'table'"
+        ),
+        0,
+        "nothing of a ledger is left beside it"
+    );
+}

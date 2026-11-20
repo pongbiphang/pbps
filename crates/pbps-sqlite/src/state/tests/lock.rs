@@ -510,6 +510,15 @@ fn the_session_helpers_say_what_a_file_database_can_and_cannot_tell() {
     .render();
     let lookup = session_lookup(&rendered).expect("a holder with an application name");
     assert!(lookup.contains("pbps unlock"), "{lookup}");
+    // It is given the text alone, so it must hold for a lock taken either way.
+    assert!(
+        lookup.contains("only when the lock was taken with the lock file"),
+        "{lookup}"
+    );
+    assert!(
+        lookup.contains("without it is cleared only by `pbps unlock`"),
+        "{lookup}"
+    );
     // Negative: a holder recorded without one has nothing to look up.
     assert!(session_lookup("leon [pid 1]").is_none());
 }
@@ -582,4 +591,23 @@ fn a_killed_holders_lock_is_released_and_its_row_is_cleared() {
         "child holder [pid 1]"
     );
     assert_eq!(taken.guard.proof(), &Proof::File);
+}
+
+/// A file name on Unix need not be UTF-8. The connection opens such a file, so
+/// the lock must find its sidecar and not fail on the name.
+#[cfg(unix)]
+#[test]
+fn a_database_whose_file_name_is_not_utf8_is_locked_with_its_sidecar() {
+    use std::os::unix::ffi::OsStringExt;
+    // Beside a harness file, so the directory is removed with it.
+    let fresh = Fresh::file();
+    let name = std::ffi::OsString::from_vec(vec![b'd', 0xff, 0xfe, b'.', b'd', b'b']);
+    let path = fresh.path().with_file_name(name);
+    let c = pbps_db::sqlite::Connection::open(&path, pbps_db::sqlite::OpenMode::CreateIfMissing)
+        .expect("opened");
+    let taken = lock(&c, "op [pid 1]").expect("locked");
+    assert_eq!(taken.guard.proof(), &Proof::File);
+    let sidecar = sidecar_path(&std::fs::canonicalize(&path).expect("the real path"));
+    assert!(sidecar.exists(), "{}", sidecar.display());
+    assert!(release(&c, taken.guard).expect("released"));
 }
