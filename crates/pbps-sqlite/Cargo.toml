@@ -19,6 +19,9 @@ pbps-model.workspace = true
 # The sealed plan type `PlanDialect::Plan` names: an emitter takes a plan only
 # through `pbps_diff::order::PlanView`.
 pbps-diff.workspace = true
+# The snapshot is written to the ledger as JSON, as `pbps-pg` and `pbps-mssql`
+# write it.
+serde_json.workspace = true
 
 [dev-dependencies]
 # A one-operation plan and the differ's own route, for the emitter's tests.
