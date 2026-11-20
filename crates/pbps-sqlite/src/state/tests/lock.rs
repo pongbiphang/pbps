@@ -654,3 +654,32 @@ fn a_holder_that_locked_through_a_hard_link_is_never_cleared_by_the_other_path()
     assert_eq!(taken.cleared.expect("cleared").locked_by, HOLDER);
     release(&third, taken.guard).expect("released");
 }
+
+/// A view put in the lock's name while a run holds the lock must not take the
+/// release's delete: a trigger on it would run.
+#[test]
+fn release_refuses_a_view_in_the_locks_name_and_runs_no_trigger() {
+    let mut fresh = Fresh::memory();
+    let c = fresh.connection();
+    let taken = lock(c, HOLDER).expect("locked");
+    c.execute_batch(
+        "DROP TABLE main.__pbps_lock;
+         CREATE TABLE hits (n INTEGER);
+         CREATE VIEW __pbps_lock AS SELECT 1 AS id, 'x' AS token;
+         CREATE TRIGGER fired INSTEAD OF DELETE ON __pbps_lock
+         BEGIN INSERT INTO hits VALUES (1); END;",
+    )
+    .expect("the lock table replaced by a view");
+    let refused = release(c, taken.guard).expect_err("refused");
+    assert!(
+        refused
+            .to_string()
+            .contains("is a view, not an ordinary table"),
+        "{refused}"
+    );
+    assert_eq!(
+        number(c, "SELECT count(*) FROM hits"),
+        0,
+        "the trigger did not run"
+    );
+}

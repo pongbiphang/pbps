@@ -498,7 +498,11 @@ pub(crate) fn lock_within(
 /// same: the next run then finds a stale row and clears it.
 pub fn release(c: &Connection, mut guard: LockGuard) -> Result<bool, DbError> {
     let deleted = waiting(c, BUSY_WAIT, || {
-        if occupants(c, &[LOCK_TABLE_NAME])?.is_empty() {
+        // A view put in the lock's name while this run held it would take the
+        // delete, and a trigger on the view would run.
+        let held = occupants(c, &[LOCK_TABLE_NAME])?;
+        refuse_a_stranger(&held)?;
+        if held.is_empty() {
             return Ok(false);
         }
         Ok(c.execute(
