@@ -22,9 +22,11 @@
 use std::collections::BTreeSet;
 
 use pbps_model::operation::{
-    Effects, Operation, OwnerError, Owners, Requirement, Snapshot, module_key,
+    Effects, Operation, OwnerError, Owners, Requirement, Snapshot, base_table, module_key,
 };
-use pbps_model::{Change, ColumnChange, Module, ModuleChange, ModuleId, ModuleKind, Schema};
+use pbps_model::{
+    Change, ColumnChange, Module, ModuleChange, ModuleId, ModuleKind, Schema, TableName,
+};
 
 use crate::dialect::Sqlite;
 use crate::{ident, lexis};
@@ -41,32 +43,51 @@ fn views(schema: &Schema) -> impl Iterator<Item = (&ModuleId, &Module)> {
         .filter(|(_, module)| module.kind == ModuleKind::View)
 }
 
-/// The views of `base` that `change` alone leaves invalid.
-fn blocked_by(base: &Schema, change: &Change) -> BTreeSet<ModuleId> {
-    let reading = |table: &str, column: Option<&str>| -> BTreeSet<ModuleId> {
-        views(base)
-            .filter(|(_, view)| {
-                may_name(&view.definition, table)
-                    && column.is_none_or(|name| may_name(&view.definition, name))
-            })
-            .map(|(id, _)| id.clone())
-            .collect()
-    };
+/// Whether a view's `text` may read `name`, a table, view or column. Wider than
+/// [`may_name`]: a single-quoted run counts, since SQLite reads one as a name
+/// where a string cannot stand (`FROM 't'`, `t.'b'`).
+fn may_read(text: &str, name: &str) -> bool {
+    lexis::names_or_quotes(text, name, ident::same)
+}
+
+/// The views of `base` that may read `name`, other than `but`.
+fn readers(base: &Schema, name: &str, but: Option<&ModuleId>) -> BTreeSet<ModuleId> {
+    views(base)
+        .filter(|(id, view)| Some(*id) != but && may_read(&view.definition, name))
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// The views of `base` that `change` alone leaves invalid. `was` is the name
+/// the baseline holds a table under: a step spells a renamed table by its new
+/// name, and the views of the baseline read the old one.
+fn blocked_by(
+    base: &Schema,
+    change: &Change,
+    was: &dyn Fn(&TableName) -> String,
+) -> BTreeSet<ModuleId> {
     match change {
+        // A view reads the column when it names it and reaches the table,
+        // directly or through views: `SELECT b FROM v` over `v AS SELECT *
+        // FROM t` names `t` nowhere.
         Change::Column(ColumnChange::DropColumn { column, .. }) => {
-            reading(&column.table.name, Some(column.name.raw()))
+            let mut reach = readers(base, &was(&column.table), None);
+            close(base, &mut reach);
+            reach
+                .into_iter()
+                .filter(|id| {
+                    base.modules
+                        .get(id)
+                        .is_some_and(|view| may_read(&view.definition, column.name.raw()))
+                })
+                .collect()
         }
-        Change::Table(pbps_model::TableChange::DropTable { name, .. }) => reading(&name.name, None),
+        Change::Table(pbps_model::TableChange::DropTable { name, .. }) => {
+            readers(base, &name.name, None)
+        }
         Change::Module(ModuleChange::DropModule { id, .. }) => id
             .referenced_name()
-            .map(|name| {
-                views(base)
-                    .filter(|(reader, view)| {
-                        *reader != id && may_name(&view.definition, &name.name)
-                    })
-                    .map(|(reader, _)| reader.clone())
-                    .collect()
-            })
+            .map(|name| readers(base, &name.name, Some(id)))
             .unwrap_or_default(),
         // Every other change leaves a valid view valid: a rename rewrites the
         // views that read the old name, an added column or index is read by no
@@ -99,7 +120,7 @@ fn close(base: &Schema, torn: &mut BTreeSet<ModuleId>) {
                 !torn.contains(*id)
                     && torn.iter().any(|gone| {
                         gone.referenced_name()
-                            .is_some_and(|name| may_name(&view.definition, &name.name))
+                            .is_some_and(|name| may_read(&view.definition, &name.name))
                     })
             })
             .map(|(id, _)| id.clone())
@@ -112,8 +133,12 @@ fn close(base: &Schema, torn: &mut BTreeSet<ModuleId>) {
 }
 
 /// The views `change` leaves invalid, with the views that read them.
-fn torn_down_by(base: &Schema, change: &Change) -> BTreeSet<ModuleId> {
-    let mut torn = blocked_by(base, change);
+fn torn_down_by(
+    base: &Schema,
+    change: &Change,
+    was: &dyn Fn(&TableName) -> String,
+) -> BTreeSet<ModuleId> {
+    let mut torn = blocked_by(base, change, was);
     close(base, &mut torn);
     torn
 }
@@ -121,9 +146,23 @@ fn torn_down_by(base: &Schema, change: &Change) -> BTreeSet<ModuleId> {
 /// What the differ rebuilds: every view the changes leave invalid that the
 /// declaration keeps. A view the plan drops or creates needs nothing more.
 pub(crate) fn teardown(base: &Schema, declared: &Schema, changes: &[Change]) -> BTreeSet<ModuleId> {
+    // The plan's own renames say what a table was called.
+    let was = |table: &TableName| {
+        changes
+            .iter()
+            .find_map(|change| {
+                if let Change::Table(pbps_model::TableChange::RenameTable { from, to, .. }) = change
+                {
+                    (to == table).then(|| from.name.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| table.name.clone())
+    };
     let mut torn: BTreeSet<ModuleId> = changes
         .iter()
-        .flat_map(|change| blocked_by(base, change))
+        .flat_map(|change| blocked_by(base, change, &was))
         .collect();
     close(base, &mut torn);
     torn.into_iter()
@@ -145,7 +184,15 @@ pub(crate) fn effects(
     // name what it renames.
     let mut fx =
         pbps_dialect::engine_effects::text_dependents(dialect, op, owners, before, after, false)?;
-    for view in torn_down_by(before.schema, op.change()) {
+    // The owners say which table of the baseline the step means.
+    let base_name = if let Change::Column(ColumnChange::DropColumn { column, .. }) = op.change() {
+        base_table(op, owners, before, &column.table)?.map(|found| found.name.name.clone())
+    } else {
+        None
+    };
+    let was = |table: &TableName| base_name.clone().unwrap_or_else(|| table.name.clone());
+    let torn = torn_down_by(before.schema, op.change(), &was);
+    for view in torn {
         fx.requires.push(Requirement::Absent(module_key(&view)));
     }
     Ok(fx)
@@ -177,7 +224,6 @@ mod tests {
             ("SELECT a FROM t -- b\n WHERE a > b", true),
             ("SELECT * FROM t", false),
             ("SELECT a FROM t", false),
-            ("SELECT a, 'b' FROM t", false),
             ("SELECT a /* b */ FROM t", false),
             ("SELECT a FROM t -- b", false),
             ("SELECT a AS bb FROM t", false),
@@ -191,6 +237,12 @@ mod tests {
         // reads a double-quoted `"b"` as the string it falls back to, so the view
         // survives the drop, and the scan still counts it a name.
         check_body("SELECT \"b\" FROM t", false, true);
+        // A single-quoted run is a name where a string cannot stand, and a
+        // string everywhere else; the scan counts both.
+        check_body("SELECT b FROM 't'", true, true);
+        check_body("SELECT t.'b' FROM t", true, true);
+        check_body("SELECT a AS 'b' FROM t", false, true);
+        check_body("SELECT a, 'b' FROM t", false, true);
     }
 
     fn check_body(body: &str, refused: bool, scan_says: bool) {
@@ -201,7 +253,7 @@ mod tests {
         c.execute_batch(&["CREATE VIEW v AS ", body].concat())
             .unwrap_or_else(|e| panic!("{body}: {e}"));
         let engine_refuses = c.execute_batch("ALTER TABLE t DROP COLUMN b").is_err();
-        let scan = may_name(body, "b");
+        let scan = may_read(body, "b");
         assert_eq!(engine_refuses, refused, "the engine's answer for {body}");
         assert!(scan || !engine_refuses, "a false no for {body}");
         assert_eq!(scan, scan_says, "{body}");
@@ -237,6 +289,10 @@ mod tests {
         s
     }
 
+    fn same_name(table: &TableName) -> String {
+        table.name.clone()
+    }
+
     fn id(name: &str) -> ModuleId {
         ModuleId::Named(pbps_model::ObjectName::new("main", name))
     }
@@ -257,7 +313,7 @@ mod tests {
             ("star", "SELECT * FROM t"),
             ("over_view", "SELECT * FROM reads_b"),
         ]);
-        let torn = torn_down_by(&base, &drop_column("t", "b"));
+        let torn = torn_down_by(&base, &drop_column("t", "b"), &same_name);
         // `other_table` names `b` but not `t`: no view of it is torn.
         assert_eq!(torn, [id("reads_b"), id("over_view")].into_iter().collect());
         let dropped_table = Change::Table(pbps_model::TableChange::DropTable {
@@ -265,7 +321,7 @@ mod tests {
             name: pbps_model::TableName::new("main", "t"),
             detach_from: None,
         });
-        let torn = torn_down_by(&base, &dropped_table);
+        let torn = torn_down_by(&base, &dropped_table, &same_name);
         assert_eq!(
             torn,
             [id("reads_b"), id("reads_a"), id("star"), id("over_view")]
@@ -280,7 +336,34 @@ mod tests {
             to: "c".into(),
             table_was: None,
         });
-        assert!(torn_down_by(&base, &rename).is_empty());
+        assert!(torn_down_by(&base, &rename, &same_name).is_empty());
+    }
+
+    /// A view reaches a table through the views it reads, and a view over a
+    /// star names the column its own text does not.
+    #[test]
+    fn a_column_read_through_a_star_view_or_a_quoted_table_name_is_found() {
+        let base = schema_of(&[
+            ("star", "SELECT * FROM t"),
+            ("through", "SELECT b FROM star"),
+            ("further", "SELECT * FROM through"),
+            ("quoted", "SELECT b FROM 't'"),
+            ("elsewhere", "SELECT b FROM u"),
+        ]);
+        assert_eq!(
+            torn_down_by(&base, &drop_column("t", "b"), &same_name),
+            [id("through"), id("further"), id("quoted")]
+                .into_iter()
+                .collect()
+        );
+        // A step spells a renamed table by its new name; the baseline's views
+        // read the old one.
+        let was_t = |_: &TableName| "t".to_owned();
+        assert_eq!(
+            torn_down_by(&base, &drop_column("renamed", "b"), &was_t).len(),
+            3
+        );
+        assert!(torn_down_by(&base, &drop_column("renamed", "b"), &same_name).is_empty());
     }
 
     #[test]
@@ -295,7 +378,7 @@ mod tests {
             kind: ModuleKind::View,
         });
         assert_eq!(
-            torn_down_by(&base, &dropped),
+            torn_down_by(&base, &dropped, &same_name),
             [id("v2")].into_iter().collect()
         );
     }

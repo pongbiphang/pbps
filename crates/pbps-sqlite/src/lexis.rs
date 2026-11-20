@@ -318,12 +318,25 @@ pub fn first_word(text: &str) -> Option<String> {
 /// torn down and built again; a false no costs an apply the engine refuses.
 #[must_use]
 pub fn names(text: &str, name: &str, same: impl Fn(&str, &str) -> bool) -> bool {
+    named(text, name, same, false)
+}
+
+/// [`names`], and a `'…'` run too. SQLite reads a single-quoted run as a name
+/// wherever a string cannot stand (`FROM 't'`, `t.'b'`), and only the grammar
+/// knows which those places are, so a scan that must not miss a name counts
+/// every one: a string that happens to spell the name is one more false yes.
+#[must_use]
+pub fn names_or_quotes(text: &str, name: &str, same: impl Fn(&str, &str) -> bool) -> bool {
+    named(text, name, same, true)
+}
+
+fn named(text: &str, name: &str, same: impl Fn(&str, &str) -> bool, strings: bool) -> bool {
     pieces(text).iter().any(|piece| match piece {
         Piece::Code(code) => code
             .split(|c| !crate::ident::identifier_continues(c))
             .any(|word| !word.is_empty() && same(word, name)),
         Piece::Quoted(run) => match run.chars().next() {
-            Some(q @ ('"' | '`')) => {
+            Some(q @ ('"' | '`' | '\'')) if q != '\'' || strings => {
                 let inner = run[1..].strip_suffix(q).unwrap_or(&run[1..]);
                 same(
                     &inner.replace(&[q, q].iter().collect::<String>(), &q.to_string()),

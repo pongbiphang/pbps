@@ -564,3 +564,106 @@ fn a_view_naming_the_column_after_a_comment_the_shared_scanner_would_nest_is_tor
         "{out:#?}"
     );
 }
+
+/// Runs a plan that drops `t.b` (or `u.b` after a rename) and checks the view
+/// named `torn` is dropped before the column and created after it.
+fn torn_around_the_drop(
+    base: (&Schema, &IdsFile, &str),
+    declared: (&Schema, &IdsFile, &str),
+    torn: &str,
+) {
+    let base_sql = base.2;
+    let out = scenario(base, declared);
+    let at = |start: &str| {
+        out.iter()
+            .position(|s| s.starts_with(start) && s.contains(&["\"", torn, "\""].concat()))
+            .unwrap_or_else(|| panic!("{start} {torn}: {out:#?}"))
+    };
+    let column = out
+        .iter()
+        .position(|s| s.contains("DROP COLUMN"))
+        .expect("drops the column");
+    assert!(
+        at("DROP VIEW") < column && column < at("CREATE VIEW"),
+        "{out:#?}"
+    );
+    assert!(bare_refusal(base_sql, "ALTER TABLE t DROP COLUMN b").contains("error in view"));
+}
+
+#[test]
+fn a_view_of_a_table_that_is_renamed_and_loses_the_column_is_torn_down() {
+    let (base, declared) = (
+        schema(&[("t", ab())], &[("v", "SELECT b FROM t")]),
+        schema(
+            &[("u", table(&[("a", col("integer"))]))],
+            &[("v", "SELECT a FROM u")],
+        ),
+    );
+    let (bi, di) = (view_ids(&base, &[]), view_ids(&declared, &[("u", "t")]));
+    torn_around_the_drop(
+        (
+            &base,
+            &bi,
+            "CREATE TABLE t(a integer, b text); CREATE VIEW v AS SELECT b FROM t",
+        ),
+        (
+            &declared,
+            &di,
+            "CREATE TABLE u(a integer); CREATE VIEW v AS SELECT a FROM u",
+        ),
+        "v",
+    );
+}
+
+#[test]
+fn a_view_that_reads_the_column_through_a_star_view_is_torn_down() {
+    let (base, declared) = (
+        schema(
+            &[("t", ab())],
+            &[("v1", "SELECT * FROM t"), ("v2", "SELECT b FROM v1")],
+        ),
+        schema(
+            &[("t", table(&[("a", col("integer"))]))],
+            &[("v1", "SELECT * FROM t"), ("v2", "SELECT a FROM v1")],
+        ),
+    );
+    let (bi, di) = (view_ids(&base, &[]), view_ids(&declared, &[]));
+    torn_around_the_drop(
+        (
+            &base,
+            &bi,
+            "CREATE TABLE t(a integer, b text); CREATE VIEW v1 AS SELECT * FROM t; CREATE VIEW v2 AS SELECT b FROM v1",
+        ),
+        (
+            &declared,
+            &di,
+            "CREATE TABLE t(a integer); CREATE VIEW v1 AS SELECT * FROM t; CREATE VIEW v2 AS SELECT a FROM v1",
+        ),
+        "v2",
+    );
+}
+
+#[test]
+fn a_view_that_names_its_table_in_single_quotes_is_torn_down() {
+    let (base, declared) = (
+        schema(&[("t", ab())], &[("v", "SELECT b FROM 't'")]),
+        schema(
+            &[("t", table(&[("a", col("integer"))]))],
+            &[("v", "SELECT a FROM 't'")],
+        ),
+    );
+    let (bi, di) = (view_ids(&base, &[]), view_ids(&declared, &[]));
+    torn_around_the_drop(
+        (
+            &base,
+            &bi,
+            "CREATE TABLE t(a integer, b text); CREATE VIEW v AS SELECT b FROM 't'",
+        ),
+        (
+            &declared,
+            &di,
+            "CREATE TABLE t(a integer); CREATE VIEW v AS SELECT a FROM 't'",
+        ),
+        "v",
+    );
+}
