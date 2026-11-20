@@ -431,7 +431,12 @@ fn a_foreign_key_to_a_key_that_is_left_out_is_left_out() {
         c.foreign_keys.keys().map(|k| k.raw()).collect::<Vec<_>>(),
         ["kept"]
     );
-    assert!(warned(&pulled, "are not a key of their table that is read"));
+    assert!(warned(&pulled, "is left out: "), "{:#?}", pulled.warnings);
+    assert!(
+        warned(&pulled, "are not its primary key"),
+        "{:#?}",
+        pulled.warnings
+    );
     // The unnamed one that was left out is not listed as read under a name.
     assert!(!warned(&pulled, "with no name"), "{:#?}", pulled.warnings);
     // What is read is a schema the declaration's own rules take.
@@ -514,4 +519,50 @@ fn an_index_or_a_view_under_a_name_the_tool_keeps_is_left_out_by_name() {
     let (_, pulled) = read_sql("CREATE VIEW __pbps_state AS SELECT 1");
     assert!(pulled.schema.modules.is_empty());
     assert_eq!(pulled.unmanaged_modules.len(), 1);
+}
+
+/// SQLite takes a key or an index that names a column twice and a foreign key
+/// whose two sides differ in length; a declaration may say none of them. Each
+/// is left out with the declaration's own reason, and what is read passes the
+/// declaration's rules whole.
+#[test]
+fn a_part_the_declarations_rules_refuse_is_left_out_with_their_reason() {
+    let sql = "CREATE TABLE p(a int, b int, PRIMARY KEY (a, b)); \
+         CREATE TABLE c(x REFERENCES p, y int, z int, CONSTRAINT twice UNIQUE (y, y), \
+         CONSTRAINT pair FOREIGN KEY (y, y) REFERENCES p (a, b), \
+         CONSTRAINT good FOREIGN KEY (y, z) REFERENCES p, CONSTRAINT ok UNIQUE (y, z)); \
+         CREATE INDEX doubled ON c(z, z); CREATE INDEX plain ON c(z)";
+    assert!(accepts(sql), "the engine takes all of it");
+    let (_, pulled) = read_sql(sql);
+    let c = table(&pulled, "c");
+    assert_eq!(c.unique.keys().map(|k| k.raw()).collect::<Vec<_>>(), ["ok"]);
+    assert_eq!(
+        c.indexes.keys().map(|k| k.raw()).collect::<Vec<_>>(),
+        ["plain"]
+    );
+    assert_eq!(
+        c.foreign_keys.keys().map(|k| k.raw()).collect::<Vec<_>>(),
+        ["good"]
+    );
+    assert_eq!(limits(&pulled, "c").len(), 4, "{:#?}", limits(&pulled, "c"));
+    for part in [
+        "the unique constraint `twice` is left out: ",
+        "the index `doubled` is left out: ",
+        "the foreign key `pair` is left out: ",
+    ] {
+        assert!(warned(&pulled, part), "{part}: {:#?}", pulled.warnings);
+    }
+    // The unnamed one-to-two foreign key is not listed as read under a name.
+    assert!(!warned(&pulled, "with no name"), "{:#?}", pulled.warnings);
+    let named = super::declarable(&pulled.schema);
+    let found: Vec<_> = named
+        .tables
+        .iter()
+        .flat_map(|(n, t)| {
+            let mut found = crate::validate::table(n, t);
+            found.extend(crate::validate::foreign_key_parents(n, t, &named));
+            found
+        })
+        .collect();
+    assert!(found.is_empty(), "{found:?}");
 }

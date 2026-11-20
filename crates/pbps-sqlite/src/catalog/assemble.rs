@@ -538,35 +538,120 @@ fn build(
     given
 }
 
-/// Leaves out every foreign key whose parent columns are not a key the model
-/// holds for the parent: the key was left out (a collation, a direction, a
-/// conflict clause), or the file never had one. The declaration's own rule
-/// decides, so what is read is what a declaration may say. Returns the names
-/// left out.
-fn unkeyed(pulled: &mut Pulled) -> BTreeSet<(TableName, ObjectLocalName)> {
+/// The table with its columns and nothing else, to hold one part alone.
+fn bare(table: &Table) -> Table {
+    let mut bare = table.clone();
+    bare.primary_key = None;
+    bare.unique.clear();
+    bare.checks.clear();
+    bare.foreign_keys.clear();
+    bare.indexes.clear();
+    bare
+}
+
+/// The name a part is held under while it is asked about: a name this tool
+/// gave is not one a declaration may write, and is not what is being asked.
+fn asked_as(local: &ObjectLocalName) -> ObjectLocalName {
+    if names::is_synthetic(local.raw()) {
+        ObjectLocalName::new("unnamed")
+    } else {
+        local.clone()
+    }
+}
+
+/// Holds what was read to the declaration's own rules, one part at a time, and
+/// leaves out each part they refuse, with their reason: a key or an index that
+/// names a column twice, a foreign key whose two sides differ in length or
+/// whose parent columns are not a key that is read. SQLite takes all of these;
+/// a declaration may say none, and a schema read is one a plan starts from.
+/// Returns the names left out.
+fn declarable(pulled: &mut Pulled) -> BTreeSet<(TableName, ObjectLocalName)> {
     let mut gone = BTreeSet::new();
+    let mut notes: Vec<(TableName, String)> = Vec::new();
+    let first = |found: Vec<pbps_dialect::DialectError>| found.first().map(ToString::to_string);
+    for (name, table) in &mut pulled.schema.tables {
+        let columns = bare(table);
+        let alone = |put: &dyn Fn(&mut Table)| {
+            let mut probe = columns.clone();
+            put(&mut probe);
+            first(validate::table(name, &probe))
+        };
+        if let Some(why) = table
+            .primary_key
+            .clone()
+            .and_then(|key| alone(&|t| t.primary_key = Some(key.clone())))
+        {
+            table.primary_key = None;
+            notes.push((name.clone(), format!("the primary key is left out: {why}")));
+        }
+        let mut out: Vec<(&'static str, ObjectLocalName, String)> = Vec::new();
+        for (local, unique) in &table.unique {
+            if let Some(why) = alone(&|t| {
+                t.unique.insert(asked_as(local), unique.clone());
+            }) {
+                out.push(("unique constraint", local.clone(), why));
+            }
+        }
+        for (local, check) in &table.checks {
+            if let Some(why) = alone(&|t| {
+                t.checks.insert(asked_as(local), check.clone());
+            }) {
+                out.push(("check", local.clone(), why));
+            }
+        }
+        for (local, index) in &table.indexes {
+            if let Some(why) = alone(&|t| {
+                t.indexes.insert(local.clone(), index.clone());
+            }) {
+                out.push(("index", local.clone(), why));
+            }
+        }
+        for (kind, local, why) in out {
+            match kind {
+                "unique constraint" => drop(table.unique.remove(&local)),
+                "check" => drop(table.checks.remove(&local)),
+                _ => drop(table.indexes.remove(&local)),
+            }
+            notes.push((
+                name.clone(),
+                format!("the {kind} `{}` is left out: {why}", local.shown()),
+            ));
+            gone.insert((name.clone(), local));
+        }
+    }
+    // The foreign keys last: whether a parent's columns are a key is asked of
+    // the keys that are still read.
+    let mut unkeyed = Vec::new();
     for (name, table) in &pulled.schema.tables {
         for (local, fk) in &table.foreign_keys {
-            let mut alone = table.clone();
-            alone.foreign_keys = std::iter::once((local.clone(), fk.clone())).collect();
-            if !validate::foreign_key_parents(name, &alone, &pulled.schema).is_empty() {
-                gone.insert((name.clone(), local.clone()));
+            let only = |mut probe: Table| {
+                probe.foreign_keys = std::iter::once((asked_as(local), fk.clone())).collect();
+                probe
+            };
+            let why = first(validate::table(name, &only(bare(table)))).or_else(|| {
+                first(validate::foreign_key_parents(
+                    name,
+                    &only(table.clone()),
+                    &pulled.schema,
+                ))
+            });
+            if let Some(why) = why {
+                unkeyed.push((name.clone(), local.clone(), why));
             }
         }
     }
-    for (name, local) in &gone {
-        if let Some(table) = pulled.schema.tables.get_mut(name) {
-            table.foreign_keys.remove(local);
+    for (name, local, why) in unkeyed {
+        if let Some(table) = pulled.schema.tables.get_mut(&name) {
+            table.foreign_keys.remove(&local);
         }
-        note(
-            pulled,
-            &name.name,
-            format!(
-                "the foreign key `{}` is left out: the columns it references are not a key of their \
-                 table that is read",
-                local.shown()
-            ),
-        );
+        notes.push((
+            name.clone(),
+            format!("the foreign key `{}` is left out: {why}", local.shown()),
+        ));
+        gone.insert((name, local));
+    }
+    for (name, detail) in notes {
+        note(pulled, &name.name, detail);
     }
     gone
 }
@@ -685,7 +770,7 @@ pub(crate) fn assemble(raw: &RawCatalog) -> Pulled {
     for p in readable.values() {
         given.insert(p.raw.name.as_str(), build(&mut pulled, p, &by_name, raw));
     }
-    let gone = unkeyed(&mut pulled);
+    let gone = declarable(&mut pulled);
     for (name, mut list) in given {
         list.retain(|n| !gone.contains(&(name_of(name), ObjectLocalName::new(n))));
         if list.is_empty() {
