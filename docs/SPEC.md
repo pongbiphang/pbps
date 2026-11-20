@@ -4522,7 +4522,7 @@ could fail validation against the envelope schema published before it
 - These keep the wire version: a field added to an open object, an optional
   field removed from one, and a type narrowed so that every value it now
   allows was allowed before (`number` to `integer`, a string to an enum). The
-  schema-set version records them (DECISIONS 465).
+  schema-set fingerprint records them (DECISIONS 465, DEC-2412.3).
 - These move it: a required field removed or renamed, a type widened or
   changed so that a value the old schema refused can be emitted, a new enum
   value, or a field added to one of the few objects that constrain the
@@ -4531,8 +4531,10 @@ could fail validation against the envelope schema published before it
   `patternProperties` or `maxProperties`.
 
 Until the first tagged release, none of these moves it either. The wire
-version stays 1. The schema-set version records the change, and the change
-raises the archive check's floor to its own set (DEC-1734.1).
+version stays 1. The schema-set fingerprint records the change, and the change
+raises the archive check's floor to the highest archive that still validates
+the new envelope, or adds one envelope archive of its own (DEC-1734.1, amended
+by DEC-2412.3).
 
 A consumer that parses `data` strictly accepts that it must update with the
 tool.
@@ -5418,16 +5420,22 @@ Acceptance criteria for that slice:
    deterministic.
 6. Generated artifacts carry the pbps version and the schema version, so editor
    assistance and templates cannot silently drift from the installed binary.
-   The published JSON Schema set advances once per merged change to any kind's
-   JSON content, including editor annotations, rather than once per release.
-   All kinds share `x-pbps-schema-version`; whitespace, object-key order and
-   the top-level `x-pbps-tool-version` stamp do not require a change. Each new
-   version archives the complete set, and existing archives remain unchanged.
-   Comparing generated documents with the archive selected by their version
-   catches a stale number even when the generator and current copies agree.
-   This is separate from the envelope's wire version (§9.8) and saved-plan or
-   state formats. Version 10 establishes this rule for the accumulated changes
-   after 9; previously published version-9 documents remain ambiguous (465).
+   The published JSON Schema set has one version for all kinds,
+   `x-pbps-schema-version`, and it names a release, not each change. A
+   fingerprint of the set's content, including editor annotations and excluding
+   whitespace, object-key order and the top-level `x-pbps-tool-version` stamp,
+   tells builds apart. Before the first release a change moves the fingerprint
+   and nothing else, and the checked-in copies under `schemas/` must be
+   regenerated. After a release the number stays the released one while the
+   fingerprint is unchanged, and becomes the released number plus one once
+   the fingerprint changes; a test fails a change that forgets it. A release
+   archives the complete set under `published-schemas/released/<n>/` and
+   never rewrites an archive;
+   the numbered directories from before are history and stay unchanged. This is
+   separate from the envelope's wire version (§9.8) and saved-plan or state
+   formats. Version 10 established the earlier per-change rule for the
+   accumulated changes after 9; previously published version-9 documents remain
+   ambiguous (465, amended by DEC-2412.3).
 
 ### 14.3 Product guardrails
 

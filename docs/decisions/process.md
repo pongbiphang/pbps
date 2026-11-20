@@ -2160,3 +2160,98 @@ is the same snapshot). The published schema set follows in #2412's next pull req
   recomputed, where the old additive range kept an older row readable. The first release
   promises no compatibility (STATUS) and the refusal says what to run. Rows written
   before this change are at an older number and stay readable.
+
+<a id="dec-2412-3"></a>
+
+**DEC-2412.3. The published schema set follows the same rule as the plan and the
+snapshot, per-change archives end, and a release is one documented procedure and
+one test (#2412).** DEC-2412.1 made the fingerprints and DEC-2412.2 recorded them
+for the two formats that are files and rows. This entry does the published set, the
+literal assertions and the release step, and closes #2412. It amends DECISIONS 465
+and the practice of DEC-1734.1 and SPEC 14.2 item 6, which said the set's number
+moves once per merged change and that every number has an archive.
+
+- **The rule.** `integration::schema_set_fingerprint()` is the set's value, and one
+  test hands it with `SCHEMA_VERSION` and the last release's frozen record to
+  `format::check_increment`, the function the plan and the state use. With no release
+  the number is a label and nothing is asserted. After a release an unchanged value
+  keeps the frozen number and a changed one makes it frozen plus one, both ways. The
+  function exists only in test builds: no artifact records the set's value (see
+  choice 1), so the binary never needs it.
+- **Choice 1: no fingerprint in the published documents.** The value is computed from
+  the documents, without the two stamps. A stamp would change every published byte,
+  move the set to 118 and add the last per-change archive, to tell a reader of a file
+  on disk which build wrote it, which no reader of those files asks. No published
+  byte changes with this entry, `schemas/*.json` stay as they are, and the set stays
+  117.
+- **Choice 2: the old archives stay, and none is added.** The numbered directories
+  under `published-schemas/` are history: three tests read one each as golden input,
+  the envelope corpus reads them all, and #1159 decided to retain their identities.
+  Deleting 13 MB to save a rule nobody breaks would also drown the diff. They are
+  never edited. A release's archive goes under `published-schemas/released/<n>/`,
+  apart from them, because after the reset to 1 the old numbers 2 to 9 would name two
+  different sets.
+- **Choice 3: the wire-rule corpus floor stays one constant.**
+  `FIRST_SET_UNDER_THE_WIRE_RULE` is the first archived set whose envelope schema every
+  emitted envelope must still validate against (DEC-1038.1). DEC-1734.1 raised it "to
+  its own set" for a breaking envelope change, and there are no longer sets of one's
+  own. Such a change now raises the constant to the highest existing archive that
+  still validates the new envelope, or adds one `envelope.schema.json` under
+  `published-schemas/wire/<n>/`, `n` being a number no other directory uses. The floor
+  moved twice (89 and 103), so the case is rare, and the first change that takes the
+  second way also teaches `envelope_archives.rs` to read that directory. A released
+  set's envelope joins the corpus with no floor: `envelope_archives.rs` reads every
+  `published-schemas/released/<n>/envelope.schema.json`, so every emitted envelope
+  must keep validating against it while the wire version is unchanged, and a
+  released directory with no readable envelope fails the test. This replaces that
+  sentence of DEC-1734.1 and nothing else in it.
+- **Choice 4: the release step is a procedure and one test target.** No new `pbps`
+  command, because a command widens the surface for something done once per release,
+  and no script, because the three fingerprints come out of this binary's types and a
+  script would have to start the binary to learn them. The module
+  `integration::release_formats` has a `check` mode that every `cargo test` runs and a
+  `freeze` mode a release runs by hand with `PBPS_FREEZE_FORMATS=<tag>`; unset it does
+  nothing. The variable and not an `#[ignore]`d test, because `cargo test` takes no
+  flag for one test and an ignored test needs an inventory entry that a release would
+  have to keep in step; the value is the tag, so a freeze cannot be accidental or
+  anonymous. `check` holds the record to its archive and to this build; `freeze`
+  writes `released_formats.json` and the set's archive. It reuses an archive that is
+  already this set, which a second release finds when the documents did not change
+  between two releases, and refuses one that is another set. A freeze checks everything,
+  then writes once. Before it writes anything it holds each format to the record it
+  replaces with the same increment rule, so a freeze cannot hide a missed increment by
+  recording it, and it checks the new record and the archive's stamps before the record
+  is replaced, in one step through a temporary file and a rename. A failed freeze leaves
+  the record's bytes as they were and the archive directory absent or complete. The
+  record has exactly two legal shapes, `{"released": null}` and a release; a missing key
+  is damage. The procedure is `docs/RELEASE-FORMATS.md`.
+- **What retired.** `a_published_version_keeps_its_archived_schema_contract` made
+  every change add an archive, and
+  `the_archived_set_at_the_current_number_has_the_binarys_fingerprint` tied that rule
+  to the fingerprint. Before a release their protection is deliberately gone: a
+  changed document moves the fingerprint and nothing is asserted about the number
+  (DEC-2412.2, point 5 of the issue). `the_checked_in_schemas_are_what_this_binary_produces`
+  stays, so a document changed without regenerating `schemas/*.json` still fails.
+  After a release the rule above and the `check` mode carry the rest.
+- **The rule for a later change.** Before the first release a change that moves a
+  persisted or published format writes **no number, no archive and no history
+  comment**. It adds a DEC entry in its topic file and regenerates `schemas/*.json`
+  when it changes a published document. After a release the first changing pull
+  request of a cycle writes `released + 1` once, and the rule test says so if it does
+  not. A second concurrent pull request writes the same line, which merges without a
+  conflict while nobody puts a comment beside it. Tests assert no literal format
+  number: a source test fails a comparison of a format constant with a literal,
+  except a historical boundary listed with its reason (the oldest readable state
+  number and the number at which `object_deps` began). It does not find a `version`
+  field against a literal, because the text does not say which format the field
+  belongs to and a guess would flag other formats' numbers once #1159 resets the
+  three to 1; such a test fails by itself when the number moves. The history
+  comments stay as written and take no new line.
+- **Later hardening, not done here (O12).** After a release, a ledger row or plan at
+  the number the release froze but with another fingerprint was written by a build
+  from before the release. The reader checks only the current number, so it reads
+  that row as it does today. Checking an older number against the frozen record would
+  refuse it, and belongs with the release that makes it possible.
+- **Not done.** No number moves, no published byte changes, and no freeze is run: #1159
+  owns the reset to 1, the removal of `OLDEST_READABLE_VERSION`'s legacy path and the
+  first freeze.

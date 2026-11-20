@@ -146,7 +146,7 @@ impl std::fmt::Display for ForeignBuild {
 }
 
 /// A released format's number and fingerprint, frozen at the release.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Frozen {
     pub version: u32,
@@ -154,7 +154,7 @@ pub struct Frozen {
 }
 
 /// What the last release froze. Written only by the release step.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Released {
     pub tag: String,
@@ -163,24 +163,37 @@ pub struct Released {
     pub schema_set: Frozen,
 }
 
+/// Reads the record file's text: `{"released": null}`, or `{"released": {...}}`.
+///
+/// One parser for the loader below and for the release step's own check of what
+/// it wrote, so the two cannot come to accept different files.
+pub fn parse_record(text: &str) -> Result<Option<Released>, serde_json::Error> {
+    // A derived `Option` field reads a missing key as `None`, so `{}` would mean
+    // "nothing released" and switch every increment check off. A newtype of the
+    // option is not an option to the derive: its key must be written, and `null`
+    // is still `None`. The derive keeps refusing a key written twice, which a
+    // look at the parsed value first would lose (the last one wins there).
+    #[derive(serde::Deserialize)]
+    struct Written(Option<Released>);
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Record {
+        released: Written,
+    }
+    serde_json::from_str::<Record>(text).map(|record| record.released.0)
+}
+
 /// The last release's frozen formats, or `None` while no release exists.
 ///
 /// The data file sits beside this module so that the crate that reads it owns
 /// it, and the schema-set rule of a later change reads it through here too.
 pub fn released() -> Option<&'static Released> {
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Record {
-        released: Option<Released>,
-    }
     static RECORD: OnceLock<Option<Released>> = OnceLock::new();
     RECORD
         .get_or_init(|| {
-            serde_json::from_str::<Record>(include_str!("released_formats.json"))
-                .expect(
-                    "released_formats.json is read by a test and edited only by the release step",
-                )
-                .released
+            parse_record(include_str!("released_formats.json")).expect(
+                "released_formats.json is read by a test and edited only by the release step",
+            )
         })
         .as_ref()
 }
@@ -314,14 +327,8 @@ mod tests {
         );
         assert_eq!(PLAN.check_raw(&same), Ok(()));
         // Negative: text with no readable envelope is the callers' to refuse.
-        for text in [
-            "",
-            "{",
-            "null",
-            "[]",
-            r#"{"version":"x"}"#,
-            r#"{"version":83,"version":84}"#,
-        ] {
+        let duplicate = format!(r#"{{"version":{number},"version":{}}}"#, number + 1);
+        for text in ["", "{", "null", "[]", r#"{"version":"x"}"#, &duplicate] {
             assert_eq!(PLAN.check_raw(text), Ok(()), "{text}");
         }
         assert_eq!(
@@ -367,7 +374,7 @@ mod tests {
 
     #[test]
     fn nothing_is_asserted_about_the_number_while_nothing_is_released() {
-        for number in [0, 1, 83, u32::MAX] {
+        for number in [0, 1, PLAN.current, u32::MAX] {
             assert_eq!(
                 check_increment("plan", number, &another_build(), None),
                 Ok(())
@@ -422,6 +429,38 @@ mod tests {
                 check_increment(format.name, format.current, format.identity(), frozen),
                 Ok(())
             );
+        }
+    }
+
+    #[test]
+    fn a_record_has_exactly_two_legal_shapes() {
+        assert_eq!(parse_record(r#"{"released": null}"#).unwrap(), None);
+        let frozen = |n: u32| format!(r#"{{"version":{n},"fingerprint":"{}"}}"#, "a".repeat(64));
+        let release = format!(
+            r#"{{"released":{{"tag":"v1","plan":{},"state":{},"schema_set":{}}}}}"#,
+            frozen(1),
+            frozen(2),
+            frozen(3)
+        );
+        let parsed = parse_record(&release).unwrap().expect("a release");
+        assert_eq!(parsed.state.version, 2);
+        // Negative: a missing key is damage and not "nothing released", and so is
+        // an unknown field beside it, an empty file and a key with no value.
+        for damaged in [
+            "{}",
+            r#"{"note": 1}"#,
+            r#"{"released": null, "note": 1}"#,
+            "",
+            "null",
+            // The key twice: a reader that kept the last one would read the
+            // second of these as "nothing released".
+            r#"{"released": null, "released": null}"#,
+            &format!(
+                r#"{{{}, "released": null}}"#,
+                &release[1..release.len() - 1]
+            ),
+        ] {
+            assert!(parse_record(damaged).is_err(), "{damaged:?}");
         }
     }
 

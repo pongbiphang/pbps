@@ -590,6 +590,12 @@ how to add an entry here.
      the current document refuses it under a distinct schema-set version,
      while both accept a positive limit and reject a future envelope version.
 
+     *Amended by [DEC-2412.3](process.md#dec-2412-3): the number names a
+     release and not each change, a change moves the set's fingerprint, and no
+     change adds an archive. A release archives the set under
+     `published-schemas/released/<n>/`. The numbered archives that exist stay
+     unchanged and are history.*
+
 <a id="decision-481"></a>
 
 481. **Explain's optional environment must use the saved plan's dialect.**
@@ -685,6 +691,11 @@ updates them in the same change.
 wire version stays 1. A change this rule would count as moving it is recorded
 by the schema-set version instead, and it raises DEC-1038.1's
 `FIRST_SET_UNDER_THE_WIRE_RULE` to its own set.*
+
+*Amended by [DEC-2412.3](process.md#dec-2412-3): that change is recorded by the
+set's fingerprint, and raises `FIRST_SET_UNDER_THE_WIRE_RULE` to the highest
+archive that still validates the new envelope, or adds an envelope archive of
+its own.*
 
 <a id="dec-1038-1"></a>
 
@@ -815,6 +826,12 @@ set (#1740 review).
 Moving the version now, as DEC-997.1 reads, was the alternative. It pays
 the costs above for a consumer that does not exist, and the release then
 resets it anyway.
+
+*Amended by [DEC-2412.3](process.md#dec-2412-3): a set has no number of its
+own to raise the floor to. Such a change records itself by the set's
+fingerprint, and raises `FIRST_SET_UNDER_THE_WIRE_RULE` to the highest existing
+archive that still validates the new envelope, or adds one
+`envelope.schema.json` under `published-schemas/wire/<n>/`.*
 
 <a id="dec-1703-1"></a>
 

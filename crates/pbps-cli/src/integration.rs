@@ -37,10 +37,18 @@ pub enum SchemaKind {
 
 /// The version of the *published schemas*, independent of the tool's.
 ///
-/// Advance once per merged change to the published JSON content of any kind,
-/// excluding only whitespace, object-key order and the tool-version stamp.
-/// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
-/// acceptance criterion 6, DECISIONS 465).
+/// It names the set's *release*, not each change to it (DEC-2412.3, which
+/// amends DECISIONS 465). Before the first release no change moves it and none
+/// adds an archive: a change to a document moves the set's fingerprint
+/// (`schema_set_fingerprint`), and `the_checked_in_schemas_are_what_this_binary_produces`
+/// makes it regenerate the copies under `schemas/`. After a release the first
+/// change of a cycle writes the released number plus one, once, and
+/// `the_schema_set_version_follows_the_increment_rule` fails a change that
+/// forgot to. A release archives the complete set under
+/// `published-schemas/released/<n>/` (docs/RELEASE-FORMATS.md).
+///
+/// The lines below are history, kept as written. History now lives in DEC
+/// entries, so a change adds no line here.
 pub const SCHEMA_VERSION: u32 = 117;
 // 117: `depends_on:` on a table, an enum or domain type and a role, and a module's `depends_on:` as a list or an owner map (#2469 PR D).
 // 116: a key's `opclass_parameters` in declarations, plans and state, and BRIN's minmax-multi and Bloom classes (#2449 PR R2); 113 and 115 belong to other changes.
@@ -293,6 +301,7 @@ pub fn schema(kind: SchemaKind) -> serde_json::Value {
 }
 
 /// The published documents, each under the file it is archived and checked in as.
+#[cfg(test)]
 const PUBLISHED: [(SchemaKind, &str); 3] = [
     (SchemaKind::Declaration, "declaration.schema.json"),
     (SchemaKind::Config, "pbps.yml.schema.json"),
@@ -305,19 +314,17 @@ const PUBLISHED: [(SchemaKind, &str); 3] = [
 /// The two stamps are left out. The tool version names a build and the schema
 /// version is the number this fingerprint is compared with, so neither can be
 /// part of what is compared. Everything else is: unlike the persisted formats,
-/// the `description` of a published schema is content an editor shows, and the
-/// versioning rule above counts it (DECISIONS 465). Key order is not, so the
-/// fingerprint follows the same rule as the archive comparison.
+/// the `description` of a published schema is content an editor shows, and
+/// DECISIONS 465 counts it as content. Key order is not.
 //
-// Nothing outside the tests calls it until the writers record it (#2412 PR 2).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "first caller lands with #2412 PR 2")
-)]
+// Only tests read it: no artifact records it (DEC-2412.3), so the rule is a
+// test and the binary never needs the value.
+#[cfg(test)]
 pub fn schema_set_fingerprint() -> String {
     set_fingerprint(PUBLISHED.map(|(kind, file)| (file, schema(kind))))
 }
 
+#[cfg(test)]
 fn set_fingerprint<'a>(
     documents: impl IntoIterator<Item = (&'a str, serde_json::Value)>,
 ) -> String {
@@ -409,6 +416,10 @@ pub fn cmd_man(dir: &std::path::Path) -> anyhow::Result<()> {
 #[cfg(test)]
 #[path = "integration_databases_tests.rs"]
 mod databases_tests;
+
+#[cfg(test)]
+#[path = "integration_release_formats_tests.rs"]
+mod release_formats;
 
 #[cfg(test)]
 mod tests {
@@ -792,45 +803,49 @@ mod tests {
         }
     }
 
-    /// Current output and the mutable copies may drift together. An archived
-    /// document selected by the version does not drift with either of them.
+    /// The set's number follows the same rule as the other two formats
+    /// (DEC-2412.3): with nothing released it is a label, and after a release it
+    /// moves exactly when the set's fingerprint does, by one.
     #[test]
-    fn a_published_version_keeps_its_archived_schema_contract() {
-        for (kind, file) in [
-            (SchemaKind::Declaration, "declaration.schema.json"),
-            (SchemaKind::Config, "pbps.yml.schema.json"),
-            (SchemaKind::Envelope, "envelope.schema.json"),
-        ] {
-            let mut current = schema(kind);
-            let mut published = archived_schema(SCHEMA_VERSION, file);
-            // This annotation identifies a build, not the schema contract.
-            current
-                .as_object_mut()
-                .unwrap()
-                .remove("x-pbps-tool-version");
-            published
-                .as_object_mut()
-                .unwrap()
-                .remove("x-pbps-tool-version");
-            assert!(
-                current == published,
-                "{file} changed under published schema version {SCHEMA_VERSION}; \
-                 bump the schema-set version and add its archive, keeping existing archives"
-            );
-        }
+    fn the_schema_set_version_follows_the_increment_rule() {
+        let released = pbps_model::format::released();
+        assert_eq!(
+            pbps_model::format::check_increment(
+                "schema set",
+                SCHEMA_VERSION,
+                &schema_set_fingerprint(),
+                released.map(|r| &r.schema_set),
+            ),
+            Ok(())
+        );
     }
 
-    /// The archive at the current number is the set's content by definition
-    /// (SPEC §14.2), so its fingerprint is the binary's. This ties the new
-    /// mechanism to the rule it will replace: while the two agree, "same
-    /// number" and "same fingerprint" say the same thing about published
-    /// content.
+    /// The rule above, driven with made-up frozen records because no release
+    /// exists to drive it with: both directions, each with its negative.
     #[test]
-    fn the_archived_set_at_the_current_number_has_the_binarys_fingerprint() {
-        let archived = set_fingerprint(
-            PUBLISHED.map(|(_, file)| (file, archived_schema(SCHEMA_VERSION, file))),
-        );
-        assert_eq!(archived, schema_set_fingerprint());
+    fn the_schema_set_rule_binds_a_released_set_in_both_directions() {
+        use pbps_model::format::{Frozen, check_increment};
+        let now = schema_set_fingerprint();
+        let rule = |frozen_number: u32, frozen_fingerprint: &str| {
+            let frozen = Frozen {
+                version: frozen_number,
+                fingerprint: frozen_fingerprint.to_owned(),
+            };
+            check_increment("schema set", SCHEMA_VERSION, &now, Some(&frozen))
+        };
+        let another = "f".repeat(64);
+        // The set is what the release froze, at the number it froze.
+        assert_eq!(rule(SCHEMA_VERSION, &now), Ok(()));
+        // The set changed since the release and the cycle wrote released + 1.
+        assert_eq!(rule(SCHEMA_VERSION - 1, &another), Ok(()));
+        // Negative: a change that forgot its number.
+        let forgot = rule(SCHEMA_VERSION, &another).expect_err("changed, same number");
+        assert!(forgot.contains("has changed since the release"), "{forgot}");
+        // Negative: a number moved for a set that did not change.
+        let idle = rule(SCHEMA_VERSION - 1, &now).expect_err("unchanged, new number");
+        assert!(idle.contains("has not changed since the release"), "{idle}");
+        // Negative: a number that jumped.
+        assert!(rule(SCHEMA_VERSION - 2, &another).is_err());
     }
 
     fn mutated(edit: impl Fn(&mut serde_json::Value)) -> String {

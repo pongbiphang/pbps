@@ -1,22 +1,31 @@
 # Published schema contracts
 
 Each numbered directory is a fixed copy of the three published JSON Schema
-kinds carrying that `x-pbps-schema-version`. Tests select the directory using
-the binary's published schema-set version, independently of the mutable copies
-in the repository's top-level `schemas/` directory.
+kinds carrying that `x-pbps-schema-version`. They are history: they were added
+once per merged change until DEC-2412.3 (#2412) ended that rule, and none is
+added or edited now. Three tests and the envelope corpus (DEC-997.1, DEC-1038.1)
+still read them as golden input, selected by number, independently of the
+mutable copies in the repository's top-level `schemas/` directory.
 
-Keep existing directories unchanged. When a change to the published schema
-contract merges, increment `integration::SCHEMA_VERSION` once for the complete
-change, regenerate the top-level copies, and add the complete new set under the
-new number. Rebase a pending change onto the latest published set before
-choosing its number. Do not refresh an existing archive to make a test pass.
+Keep existing directories unchanged. Do not refresh one to make a test pass.
+
+A change to the published schema contract adds nothing here. Before the first
+release it moves the set's fingerprint and nothing else: regenerate the
+top-level copies (`pbps schema`), and write no number and no archive. After a
+release the first change of a cycle writes `integration::SCHEMA_VERSION` as the
+released number plus one, once. A release archives the complete set under
+`released/<n>/` (`<n>` is the released number), with the one procedure in
+[docs/RELEASE-FORMATS.md](../../../../../docs/RELEASE-FORMATS.md). That directory
+is kept apart from the numbered ones because after the reset to 1 the old
+numbers 2 to 9 would name two different sets. The envelope corpus reads every
+`released/<n>/envelope.schema.json` with no floor. A breaking envelope change that
+cannot raise the corpus floor to an existing archive adds one
+`envelope.schema.json` under `wire/<n>/`.
 
 Comparison uses parsed JSON and excludes only the top-level
-`x-pbps-tool-version` annotation. Whitespace and object-key order do not count;
-all other content, including editor descriptions and array order, does. This
-conservative equality check guarantees equal validation behavior for the same
-version without attempting general JSON Schema equivalence. It also catches a
-constraint or enum edit when the generator and top-level copies change together.
+`x-pbps-tool-version` and `x-pbps-schema-version` annotations. Whitespace and
+object-key order do not count; all other content, including editor descriptions
+and array order, does. The fingerprint is a hash of exactly that content.
 
 - `9/` is copied verbatim from commit
   `9a01bfa85a7d6ac2832b867a979f8870eea61899`. It is a real legacy publication
