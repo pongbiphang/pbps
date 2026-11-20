@@ -12,7 +12,7 @@ use crate::catalog::facts::read;
 pub(in super::super) use crate::catalog::facts::{Facts, agree, agree_index};
 
 pub(in super::super) fn facts(c: &Connection, table: &str) -> Facts {
-    read(c, table).expect("the pragmas")
+    read(c, table).expect("the pragmas").expect("the table")
 }
 
 fn int(row: &pbps_db::sqlite::Record, i: usize) -> i64 {

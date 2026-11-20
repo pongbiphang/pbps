@@ -90,9 +90,20 @@ fn nullable(row: &Record, i: usize) -> Result<Option<String>, DbError> {
     })
 }
 
-/// Reads the pragmas for one table of `main`.
-pub(crate) fn read(c: &Connection, table: &str) -> Result<Facts, DbError> {
+/// Reads the pragmas for one table of `main`. `None` is a table that is not
+/// there, which is not a table with no columns, no keys and no flags: it is
+/// asked first, by the name as SQLite compares names (ASCII case folded), so a
+/// table found under another spelling of its name keeps its flags.
+pub(crate) fn read(c: &Connection, table: &str) -> Result<Option<Facts>, DbError> {
     let arg = [Value::Text(table.to_owned())];
+    let flags = c.query(
+        "SELECT wr, strict FROM pragma_table_list WHERE schema = 'main' AND name = ?1 COLLATE NOCASE",
+        &arg,
+    )?;
+    let Some(row) = flags.first() else {
+        return Ok(None);
+    };
+    let (without_rowid, strict) = (int(row, 0)? == 1, int(row, 1)? == 1);
     let mut columns = Vec::new();
     for r in c.query(
         "SELECT name, type, \"notnull\", dflt_value IS NULL, COALESCE(dflt_value, ''), pk, hidden \
@@ -146,21 +157,13 @@ pub(crate) fn read(c: &Connection, table: &str) -> Result<Facts, DbError> {
             on_delete: text(&r, 7)?,
         });
     }
-    let flags = c.query(
-        "SELECT wr, strict FROM pragma_table_list WHERE schema = 'main' AND name = ?1",
-        &arg,
-    )?;
-    let (without_rowid, strict) = match flags.first() {
-        Some(r) => (int(r, 0)? == 1, int(r, 1)? == 1),
-        None => (false, false),
-    };
-    Ok(Facts {
+    Ok(Some(Facts {
         columns,
         indexes,
         foreign,
         without_rowid,
         strict,
-    })
+    }))
 }
 
 fn action_word(action: Option<Reaction>) -> &'static str {

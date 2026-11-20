@@ -134,7 +134,9 @@ fn a_null_is_read_as_absent_and_text_as_text() {
          e REFERENCES p, f REFERENCES p(k)); \
          CREATE INDEX i ON t(a, (a + 1))",
     );
-    let found = read(fresh.connection(), "t").expect("reads");
+    let found = read(fresh.connection(), "t")
+        .expect("reads")
+        .expect("the table");
     let defaults: Vec<Option<&str>> = found.columns.iter().map(|c| c.default.as_deref()).collect();
     // No default is absent. `DEFAULT NULL` and `DEFAULT ''` are text, and the
     // empty string is not an absent default.
@@ -152,7 +154,37 @@ fn a_null_is_read_as_absent_and_text_as_text() {
         .map(|k| k.0.as_deref())
         .collect();
     assert_eq!(keys, [Some("a"), None]);
-    // A table that is not there has no facts, and that is not an error.
-    let none = read(fresh.connection(), "missing").expect("reads");
-    assert!(none.columns.is_empty() && none.indexes.is_empty() && none.foreign.is_empty());
+    // A table that is not there is absent, which is neither an error nor a
+    // table with nothing in it.
+    assert_eq!(read(fresh.connection(), "missing").expect("reads"), None);
+}
+
+/// SQLite finds a table under any ASCII case of its name, and so must the
+/// flags: a `STRICT` table asked for as `T` is still strict, or its key
+/// column's implied `NOT NULL` would read as a disagreement.
+#[test]
+fn a_table_asked_for_in_another_case_keeps_its_flags_and_agrees() {
+    let mut fresh = Fresh::memory();
+    let sql = "CREATE TABLE t(a INT PRIMARY KEY) STRICT";
+    fresh.connection().execute_batch(sql).expect("creates");
+    for name in ["t", "T"] {
+        let found = read(fresh.connection(), name)
+            .expect("reads")
+            .expect("the table");
+        assert!(found.strict, "{name}");
+        let text = crate::catalog::text::table("t", sql).expect("tokenizes");
+        agree(&text, &found).unwrap_or_else(|e| panic!("{name}: {e}"));
+    }
+    // Negative: a rowid table is not strict under either spelling.
+    let mut plain = Fresh::memory();
+    plain
+        .connection()
+        .execute_batch("CREATE TABLE t(a INT PRIMARY KEY)")
+        .expect("creates");
+    assert!(
+        !read(plain.connection(), "T")
+            .expect("reads")
+            .expect("the table")
+            .strict
+    );
 }

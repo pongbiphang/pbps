@@ -386,7 +386,7 @@ pub fn layout(text: &str) -> String {
 }
 
 /// What an expression is, apart from how it is written: comments gone, code
-/// and names lower-cased (ASCII), strings kept, layout collapsed and none
+/// lower-cased (ASCII), strings and quoted names kept, layout collapsed and none
 /// beside a parenthesis or a comma. For comparing two spellings and for the
 /// digest of a constraint's name; never for what is returned of a text.
 // Read by the catalog reader, the next part of the item (the digest of an unnamed
@@ -404,7 +404,9 @@ pub fn canonical(text: &str) -> String {
                 strings.push(run);
                 out.push('\u{1}');
             }
-            Piece::Quoted(run) => out.push_str(&run.to_ascii_lowercase()),
+            // A quoted name keeps its case: SQLite reads a double-quoted run
+            // that names no column as a string, and a string's case is data.
+            Piece::Quoted(run) => out.push_str(run),
         }
     }
     let mut words = out
@@ -780,10 +782,18 @@ mod tests {
             ("a >= 0", "A  >=\n0"),
             ("f( a ,b )", "F(a, b)"),
             ("a /* x */ > 0 -- y\n", "a > 0"),
-            ("\"A\" > 0", "\"a\" > 0"),
         ] {
             assert_eq!(canonical(a), canonical(b), "{a:?} and {b:?}");
         }
+        // A double-quoted run that names no column is a string to the engine,
+        // so its case is kept: these two checks say different things.
+        assert!(accepts(
+            "CREATE TABLE t(x, CHECK (\"A\" = 'A')); INSERT INTO t VALUES (1)"
+        ));
+        assert!(!accepts(
+            "CREATE TABLE t(x, CHECK (\"a\" = 'A')); INSERT INTO t VALUES (1)"
+        ));
+        assert_ne!(canonical("\"A\" = 'A'"), canonical("\"a\" = 'A'"));
         assert_eq!(answer("SELECT 'A' = 'a'"), "[Record([Integer(0)])]");
         for (a, b) in [
             ("a = 'A'", "a = 'a'"),
