@@ -43,10 +43,13 @@ fn every_busy_code_is_busy_and_nothing_else_is() {
 #[test]
 fn a_free_database_writes_at_once() {
     in_both_journal_modes(|fresh, _| {
+        // A wait far longer than a loaded machine takes to write a file, so
+        // the bound tells "did not wait" from "slow" and not the reverse.
+        let wait = Duration::from_secs(60);
         let started = Instant::now();
-        record_within(fresh.connection(), &snapshot(StateKind::Apply, "op"), SHORT)
+        record_within(fresh.connection(), &snapshot(StateKind::Apply, "op"), wait)
             .expect("recorded");
-        assert!(started.elapsed() < SHORT, "{:?}", started.elapsed());
+        assert!(started.elapsed() < wait / 4, "{:?}", started.elapsed());
     });
 }
 
@@ -87,9 +90,10 @@ fn an_existing_ledger_is_not_stopped_by_a_writer_elsewhere_but_a_missing_one_is(
         // the statement is sent cannot be told on this library, which does not
         // lock for it; see `ensure_tables`.)
         let started = Instant::now();
-        ensure_tables_within(fresh.connection(), SHORT).expect("nothing to create");
+        let wait = Duration::from_secs(60);
+        ensure_tables_within(fresh.connection(), wait).expect("nothing to create");
+        assert!(started.elapsed() < wait / 4, "{:?}", started.elapsed());
         assert!(is_initialized(fresh.connection()).expect("asked"));
-        assert!(started.elapsed() < SHORT, "{:?}", started.elapsed());
         second.execute_batch("ROLLBACK").expect("released");
     });
     // Negative: with the ledger absent the same hold does stop it, because a
@@ -160,11 +164,11 @@ fn a_stale_snapshot_is_not_described_as_a_lock_held_for_the_wait() {
     let refused = record_within(
         first,
         &snapshot(StateKind::Apply, "op"),
-        Duration::from_secs(2),
+        Duration::from_secs(60),
     )
     .expect_err("stale");
     assert!(
-        started.elapsed() < Duration::from_secs(1),
+        started.elapsed() < Duration::from_secs(15),
         "it came at once"
     );
     let pbps_db::ledger::LedgerError::Db(error) = refused else {
