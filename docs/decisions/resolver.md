@@ -5046,12 +5046,11 @@ Each actual diagnosis snapshots its statement ordinal, success generation, unmet
 soft preferences and local successes. Failed-range successes are labelled rolled
 back, separately from a committed earlier range. Hard-blocked declarations carry
 no invented engine verdict. True creation cycles require a declaration change;
-they receive no hard-cycle annotation or two-plan suggestion. A module remedy is
+they receive no hard-cycle annotation or two-plan suggestion. A module remedy was
 available only for a sole positioned named-module provider outside the refused set,
-when adding its hard edge is acyclic and no fill is pending. A positioned routine
-family alone is not an overload identity. A possible creation-time return path
-through other declarations also suppresses advice. Other typed targets and owners remain
-#2469. None of these facts enters Schema equality, saved artifacts or evidence.
+when adding its hard edge is acyclic and no fill is pending; DEC-2469.9 supersedes
+that: no real run could print it, so the refusal prints no `depends_on:` line. A
+positioned routine family alone is not an overload identity. None of these facts enters Schema equality, saved artifacts or evidence.
 
 
 <a id="dec-2465-3"></a>

@@ -90,7 +90,6 @@ fn refusal_fixture() -> Refusal {
             declaration: "view app.v".into(),
             subject: trial_tests::module("app.v", ModuleKind::View, "SELECT 1"),
             owner: Some(owner),
-            dependency: None,
             last: Some(Diagnosis {
                 error: std::sync::Arc::new(error(None)),
                 statement: 0,
@@ -425,86 +424,6 @@ async fn true_refusals_render_every_pending_declaration_on_both_majors() {
                     2
                 );
             }
-        }
-    }
-}
-
-#[test]
-fn module_remedies_require_an_exact_provider_and_no_cycle_or_fill() {
-    use super::trial_tests::{build, module};
-    for (routine, cycle) in [(false, false), (false, true), (true, false)] {
-        let pg = crate::Postgres::new().with_server_version(180006);
-        let changes = if routine {
-            vec![
-                module("app.v", ModuleKind::View, "SELECT app.w(1) AS n"),
-                module(
-                    "app.w(text)",
-                    ModuleKind::Function,
-                    "(text) RETURNS text LANGUAGE sql RETURN $1",
-                ),
-            ]
-        } else {
-            vec![
-                module("app.v", ModuleKind::View, "SELECT * FROM app.w"),
-                module(
-                    "app.w",
-                    ModuleKind::View,
-                    if cycle {
-                        "SELECT * FROM app.v"
-                    } else {
-                        "SELECT 1 AS n"
-                    },
-                ),
-            ]
-        };
-        let r = build(&pg, &changes, &Default::default(), true);
-        let at = r
-            .steps
-            .iter()
-            .position(|s| s.module.as_ref() == Some(&"app.v".parse().unwrap()))
-            .unwrap();
-        let sql = crate::statement::submitted(&r.lowered.groups()[at].statements()[0], 1);
-        let byte = sql.find("app.w").unwrap();
-        let mut e = error(Some(ErrorPosition::Original(
-            sql[..byte].chars().count() as u32 + 1,
-        )));
-        if routine && let DbError::Driver { code, .. } = &mut e {
-            *code = Some("42883".into());
-        }
-        let last = r.diagnosis(
-            at,
-            0,
-            crate::statement::Failure {
-                error: e,
-                command: 1,
-            },
-            &[],
-            vec![],
-        );
-        let pending = Pending {
-            declaration: r.steps[at].declaration.clone(),
-            subject: r.steps[at].subject.clone(),
-            owner: r.steps[at].owner.clone(),
-            dependency: None,
-            last: Some(last),
-            recovery: None,
-            blocked: vec![],
-            why: vec![],
-        };
-        for fill in [false, true] {
-            let mut r = r.clone();
-            if fill {
-                r.fixture_fill_at(1, Vec::new());
-            }
-            let ReconstructError::Refused(report) =
-                r.refusal(180006, vec![pending.clone()], true, vec![])
-            else {
-                unreachable!()
-            };
-            assert_eq!(
-                report.pending[0].dependency.is_some(),
-                !routine && !fill && !cycle
-            );
         }
     }
 }

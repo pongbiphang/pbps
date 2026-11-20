@@ -42,7 +42,6 @@ pub struct Pending {
     pub declaration: String,
     pub subject: pbps_model::Change,
     pub owner: Option<Declaration>,
-    pub dependency: Option<pbps_model::ModuleId>,
     pub last: Option<Diagnosis>,
     pub recovery: Option<Diagnosis>,
     pub blocked: Vec<String>,
@@ -405,68 +404,13 @@ impl Reconstruction {
             overtaken,
         }
     }
-    // Initial module order does not retain every text dependency as an edge.
-    // A possible return path must suppress advice, even without a hard cycle.
-    fn may_need(&self, provider: usize, owner: usize) -> bool {
-        let mut pending = vec![provider];
-        let mut seen = std::collections::BTreeSet::new();
-        while let Some(at) = pending.pop() {
-            if at == owner {
-                return true;
-            }
-            if seen.insert(at)
-                && let Some(body) = &self.steps[at].body
-            {
-                let regions: Vec<_> = std::iter::once(body.clone())
-                    .chain(crate::LEXICON.string_literals(body))
-                    .collect();
-                pending.extend(
-                    self.steps
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, step)| {
-                            step.module.as_ref().is_some_and(|id| {
-                                regions.iter().any(|region| {
-                                    crate::Postgres::new().generation_may_call(region, id.name())
-                                })
-                            })
-                        })
-                        .map(|(at, _)| at),
-                );
-            }
-        }
-        false
-    }
     pub(super) fn refusal(
         &self,
         version: i64,
-        mut pending: Vec<Pending>,
+        pending: Vec<Pending>,
         stalled: bool,
         overtakes: Vec<(String, usize, Vec<String>)>,
     ) -> super::ReconstructError {
-        let owners: Vec<_> = pending.iter().filter_map(|p| p.owner.clone()).collect();
-        for item in &mut pending {
-            if let (Some(Declaration::Module(owner)), Some(last)) = (&item.owner, &item.last)
-                && !self.has_fill()
-                && last.reference.is_some()
-                && let [Candidate::Declaration(Declaration::Module(provider))] =
-                    last.candidates.as_slice()
-                && matches!(provider, pbps_model::ModuleId::Named(_))
-                && !owners.contains(&Declaration::Module(provider.clone()))
-                && let (Some(before), Some(after)) = (
-                    self.steps
-                        .iter()
-                        .position(|s| s.module.as_ref() == Some(provider)),
-                    self.steps
-                        .iter()
-                        .position(|s| s.module.as_ref() == Some(owner)),
-                )
-                && self.trial.can_precede(before, after)
-                && !self.may_need(before, after)
-            {
-                item.dependency = Some(provider.clone());
-            }
-        }
         super::ReconstructError::Refused(Arc::new(Refusal {
             version,
             pending,

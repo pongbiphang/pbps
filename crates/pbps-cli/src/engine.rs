@@ -3896,7 +3896,6 @@ mod tests {
                     }),
                 }),
                 owner: None,
-                dependency: None,
                 blocked: vec![],
                 why: vec![],
                 recovery: None,
