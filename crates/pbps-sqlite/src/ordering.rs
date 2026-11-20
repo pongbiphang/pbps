@@ -67,18 +67,22 @@ fn blocked_by(
     was: &dyn Fn(&TableName) -> String,
 ) -> BTreeSet<ModuleId> {
     match change {
-        // A view reads the column when it names it and reaches the table,
-        // directly or through views: `SELECT b FROM v` over `v AS SELECT *
-        // FROM t` names `t` nowhere.
+        // A view reads the column when it reaches the table, directly or
+        // through views (`SELECT b FROM v` over `v AS SELECT * FROM t` names
+        // `t` nowhere), and names the column or takes it by a star. A star
+        // counts because the number of columns is part of what a view means:
+        // `SELECT * FROM t UNION SELECT * FROM u` is invalid from the drop on
+        // one side to the drop on the other.
         Change::Column(ColumnChange::DropColumn { column, .. }) => {
             let mut reach = readers(base, &was(&column.table), None);
             close(base, &mut reach);
             reach
                 .into_iter()
                 .filter(|id| {
-                    base.modules
-                        .get(id)
-                        .is_some_and(|view| may_read(&view.definition, column.name.raw()))
+                    base.modules.get(id).is_some_and(|view| {
+                        may_read(&view.definition, column.name.raw())
+                            || lexis::has_star(&view.definition)
+                    })
                 })
                 .collect()
         }
@@ -314,8 +318,14 @@ mod tests {
             ("over_view", "SELECT * FROM reads_b"),
         ]);
         let torn = torn_down_by(&base, &drop_column("t", "b"), &same_name);
-        // `other_table` names `b` but not `t`: no view of it is torn.
-        assert_eq!(torn, [id("reads_b"), id("over_view")].into_iter().collect());
+        // `other_table` names `b` but not `t`: no view of it is torn. `star`
+        // takes every column, so how many there are is part of it.
+        assert_eq!(
+            torn,
+            [id("reads_b"), id("star"), id("over_view")]
+                .into_iter()
+                .collect()
+        );
         let dropped_table = Change::Table(pbps_model::TableChange::DropTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "t", 0),
             name: pbps_model::TableName::new("main", "t"),
@@ -352,7 +362,7 @@ mod tests {
         ]);
         assert_eq!(
             torn_down_by(&base, &drop_column("t", "b"), &same_name),
-            [id("through"), id("further"), id("quoted")]
+            [id("star"), id("through"), id("further"), id("quoted")]
                 .into_iter()
                 .collect()
         );
@@ -361,7 +371,7 @@ mod tests {
         let was_t = |_: &TableName| "t".to_owned();
         assert_eq!(
             torn_down_by(&base, &drop_column("renamed", "b"), &was_t).len(),
-            3
+            4
         );
         assert!(torn_down_by(&base, &drop_column("renamed", "b"), &same_name).is_empty());
     }

@@ -330,6 +330,16 @@ pub fn names_or_quotes(text: &str, name: &str, same: impl Fn(&str, &str) -> bool
     named(text, name, same, true)
 }
 
+/// Whether the code of `text` holds a `*`: a result or an argument that takes
+/// every column there is (`SELECT *`, `t.*`), or a multiplication, which the
+/// scan cannot tell from it without the grammar.
+#[must_use]
+pub fn has_star(text: &str) -> bool {
+    pieces(text)
+        .iter()
+        .any(|piece| matches!(piece, Piece::Code(code) if code.contains('*')))
+}
+
 fn named(text: &str, name: &str, same: impl Fn(&str, &str) -> bool, strings: bool) -> bool {
     pieces(text).iter().any(|piece| match piece {
         Piece::Code(code) => code

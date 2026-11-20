@@ -253,8 +253,10 @@ fn a_view_over_a_view_that_reads_the_column_is_torn_down_with_it() {
     assert_eq!(drops.len(), 2, "{out:#?}");
 }
 
+/// A star view survives the drop of a column by itself, and is rebuilt all the
+/// same: the scan cannot tell it from one whose column count matters.
 #[test]
-fn a_view_that_reads_every_column_by_star_is_left_alone() {
+fn a_view_that_reads_every_column_by_star_is_rebuilt_around_the_drop() {
     let (base, declared) = (
         schema(&[("t", ab())], &[("v", "SELECT * FROM t")]),
         schema(
@@ -275,7 +277,39 @@ fn a_view_that_reads_every_column_by_star_is_left_alone() {
             "CREATE TABLE t(a integer); CREATE VIEW v AS SELECT * FROM t",
         ),
     );
-    assert!(!out.iter().any(|s| s.contains("VIEW")), "{out:#?}");
+    assert!(
+        out[0].starts_with("DROP VIEW") && out[2].starts_with("CREATE VIEW"),
+        "{out:#?}"
+    );
+}
+
+/// The number of columns is part of a view: a union of two stars is invalid
+/// from the drop on one side to the drop on the other.
+#[test]
+fn a_union_of_stars_is_torn_down_around_the_drops_on_both_sides() {
+    let two = || table(&[("a", col("integer")), ("b", col("text"))]);
+    let one = || table(&[("a", col("integer"))]);
+    let body = "SELECT * FROM t UNION SELECT * FROM u";
+    let (base, declared) = (
+        schema(&[("t", two()), ("u", two())], &[("v", body)]),
+        schema(&[("t", one()), ("u", one())], &[("v", body)]),
+    );
+    let (bi, di) = (view_ids(&base, &[]), view_ids(&declared, &[]));
+    let base_sql = "CREATE TABLE t(a integer, b text); CREATE TABLE u(a integer, b text); CREATE VIEW v AS SELECT * FROM t UNION SELECT * FROM u";
+    let out = scenario(
+        (&base, &bi, base_sql),
+        (
+            &declared,
+            &di,
+            "CREATE TABLE t(a integer); CREATE TABLE u(a integer); CREATE VIEW v AS SELECT * FROM t UNION SELECT * FROM u",
+        ),
+    );
+    assert!(
+        out.first().is_some_and(|s| s.starts_with("DROP VIEW"))
+            && out.last().is_some_and(|s| s.starts_with("CREATE VIEW")),
+        "{out:#?}"
+    );
+    assert!(bare_refusal(base_sql, "ALTER TABLE t DROP COLUMN b").contains("error in view"));
 }
 
 #[test]
