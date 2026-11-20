@@ -569,9 +569,10 @@ fn the_only_column_replaced_by_a_column_of_the_same_name_is_refused_when_the_pla
     let refused =
         plan((&base, &bi), (&declared, &di), &Sqlite::default()).expect_err("no order performs it");
     assert!(
-        refused.contains("replaces its only column `a`"),
+        refused.contains("replaces every one of its columns"),
         "{refused}"
     );
+    assert!(refused.contains("`a`"), "{refused}");
     assert!(refused.contains("two revisions"), "{refused}");
     // Negative: the same column under its own identity is no replacement.
     assert!(plan((&base, &bi), (&base, &bi), &Sqlite::default()).is_ok());
@@ -598,7 +599,10 @@ fn names_that_differ_only_by_case_are_one_name_to_sqlite_and_are_refused_alike()
     let (bi, di) = (ids(&base, &[]), ids(&declared, &[]));
     let refused = plan((&base, &bi), (&declared, &di), &Sqlite::default())
         .expect_err("SQLite folds the names");
-    assert!(refused.contains("replaces its only column"), "{refused}");
+    assert!(
+        refused.contains("replaces every one of its columns"),
+        "{refused}"
+    );
 }
 
 #[test]

@@ -2044,6 +2044,8 @@
         "key_spelling::exported_updates_keep_key_capture_variables_in_separate_batches",
         "last_column2963::a_name_that_differs_only_by_case_is_added_first_and_the_collation_decides",
         "last_column2963::a_table_that_keeps_one_column_drops_first_as_it_always_did",
+        "last_column2963::an_identity_replaced_by_an_identity_adds_another_column_first_and_applies",
+        "last_column2963::an_identity_replaced_by_an_identity_with_nothing_else_to_add_is_refused_at_plan_time",
         "last_column2963::replacing_two_columns_keeps_a_data_column_at_every_statement",
         "last_column2963::the_only_column_is_replaced_by_adding_before_dropping_and_the_old_order_is_refused",
         "ledger_tables_their_history_and_their_views_are_not_pulled",

@@ -10145,11 +10145,24 @@ no baseline column's in any ASCII case if there is one, then the last in declare
 last before the add that takes the drop's name, which then follows the drop, so the declared order
 holds wherever it can). Equal names are those equal under the dialect's own `fold_ident`.
 
-**What no order performs, and what is not refused.** The table's only column replaced by one of
-the same name: dropping first leaves no column and adding first repeats the name. It is refused
-when the plan is made (`LastColumnReplacedByItsName`), naming the table and the column, with the
-way out: keep the column's identity, or make the change in two revisions. No temporary name is
-written, as for a rename cycle (DEC-541.1).
+**The pair has to be one the engine performs.** At the moment the add runs, the only baseline
+column still standing is the drop. SQL Server holds one IDENTITY column per table (Msg 2744, the
+rule `pbps-mssql` `validate` already states; SQLite declares no identity column, and PostgreSQL is
+not on this path), so a drop that is an IDENTITY column is never paired with an add that is one.
+That add (the table has at most one) **follows the drop**, as the add that takes the drop's name
+does: `Replacement::Order` carries both as `follows`, the differ moves each behind the drop, and
+the add's `engine_effects` requires the drop's column gone. When the drop is an IDENTITY, the
+pair takes another add; when it has none, another drop (the preference order above, among the
+valid pairs only). The add of a non-IDENTITY drop is not restricted.
+
+**What no order performs, and what is not refused.** A table that keeps no column and has no
+valid pair: the only column replaced by one of the same name (dropping first leaves no column,
+adding first repeats the name), or an IDENTITY column replaced by an IDENTITY column with no other
+add to go first (adding first holds two). It is refused when the plan is made
+(`LastColumnReplacementUnorderable`, with the reason `Block::SameName` or `Block::Identity`),
+naming the table and the column, with the way out: keep the existing column, or make the change in
+two revisions, with a column of another kind or name between. No temporary name is written, as
+for a rename cycle (DEC-541.1).
 
 Names that differ only by case are **not** refused, and no collation setting is added. A database
 may be case-sensitive, where `a` and `A` are two names and the plan is valid, and a plan made

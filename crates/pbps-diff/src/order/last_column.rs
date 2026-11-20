@@ -16,7 +16,7 @@
 use std::collections::BTreeSet;
 
 use pbps_dialect::Dialect;
-use pbps_dialect::last_column::{Replacement, replacement};
+use pbps_dialect::last_column::{Block, Replacement, replacement};
 use pbps_model::{Change, ColumnChange, ColumnName, PlannedChange, TableName, Uid};
 
 use crate::Side;
@@ -34,8 +34,8 @@ fn add_at(planned: &[PlannedChange], wanted: &Uid) -> Option<usize> {
 }
 
 /// Moves each replaced table's last drop behind its add, and returns the
-/// tables whose only column is replaced by one of the same name, as the table
-/// and the column, for the caller to refuse: no order performs those.
+/// tables no order of whose replacement the engine performs, as the table, the
+/// column and the reason, for the caller to refuse.
 ///
 /// Nothing moves earlier, and nothing but the drop (and the add that takes its
 /// name, when that is already ahead of it) moves at all.
@@ -44,7 +44,7 @@ pub(crate) fn order(
     base: Side<'_>,
     declared: Side<'_>,
     dialect: &(impl Dialect + ?Sized),
-) -> Vec<(TableName, ColumnName)> {
+) -> Vec<(TableName, ColumnName, Block)> {
     if !dialect.refuses_dropping_last_column() {
         return Vec::new();
     }
@@ -74,11 +74,11 @@ pub(crate) fn order(
             (declared.schema, &declared_ids, &now),
         ) {
             None => {}
-            Some(Replacement::Unorderable { column }) => refused.push((now, column)),
+            Some(Replacement::Unorderable { column, block }) => refused.push((now, column, block)),
             Some(Replacement::Order {
                 drop,
                 after,
-                reused_by,
+                follows,
             }) => {
                 if let (Some(d), Some(x)) = (drop_at(planned, &drop), add_at(planned, &after))
                     && d < x
@@ -88,15 +88,18 @@ pub(crate) fn order(
                     let moved = planned.remove(d);
                     planned.insert(x, moved);
                 }
-                // The add that takes the drop's name cannot run before the
-                // drop; it follows it, unless it already does.
-                if let (Some(d), Some(y)) = (
-                    drop_at(planned, &drop),
-                    reused_by.and_then(|y| add_at(planned, &y)),
-                ) && y < d
-                {
-                    let moved = planned.remove(y);
-                    planned.insert(d, moved);
+                // An add that cannot run beside the drop (it takes the drop's
+                // name, or it is the IDENTITY one beside an IDENTITY drop)
+                // follows it, unless it already does. The last one goes
+                // first, so that the adds keep their declared order behind
+                // the drop.
+                for follower in follows.iter().rev() {
+                    if let (Some(d), Some(y)) = (drop_at(planned, &drop), add_at(planned, follower))
+                        && y < d
+                    {
+                        let moved = planned.remove(y);
+                        planned.insert(d, moved);
+                    }
                 }
             }
         }
@@ -400,7 +403,7 @@ mod tests {
         let errors = diffed(&REFUSES, &ids).unwrap_err();
         let refused: Vec<String> = errors
             .iter()
-            .filter(|e| matches!(e, DiffError::LastColumnReplacedByItsName { .. }))
+            .filter(|e| matches!(e, DiffError::LastColumnReplacementUnorderable { .. }))
             .map(ToString::to_string)
             .collect();
         assert_eq!(refused.len(), 1, "{errors:?}");
@@ -422,7 +425,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| matches!(e, DiffError::LastColumnReplacedByItsName { .. })),
+                .any(|e| matches!(e, DiffError::LastColumnReplacementUnorderable { .. })),
             "{errors:?}"
         );
     }
@@ -433,5 +436,103 @@ mod tests {
         let steps = steps(&diffed(&REFUSES, &ids).unwrap());
         // `A` differs from `a` by case only, so `c` is the better one to add first.
         assert_eq!(steps, ["+A", "+c", "-a"]);
+    }
+
+    /// `ids` with each named column of the baseline (`was`) and of the
+    /// declaration (`now`) numbered by an IDENTITY.
+    fn numbered(
+        (mut base, base_ids, mut declared, declared_ids): (Schema, IdsFile, Schema, IdsFile),
+        (was, now): (&[&str], &[&str]),
+    ) -> (Schema, IdsFile, Schema, IdsFile) {
+        let table: pbps_model::TableName = "app.t".parse().unwrap();
+        for (schema, names) in [(&mut base, was), (&mut declared, now)] {
+            for name in names {
+                schema
+                    .tables
+                    .get_mut(&table)
+                    .unwrap()
+                    .columns
+                    .get_mut(*name)
+                    .unwrap()
+                    .value_source =
+                    pbps_model::ValueSource::Identity(pbps_model::Identity::new(1, 1));
+            }
+        }
+        (base, base_ids, declared, declared_ids)
+    }
+
+    #[test]
+    fn an_identity_replaced_by_an_identity_adds_a_column_that_is_not_one_first() {
+        // `b` is declared first, but the engine holds one IDENTITY column, so
+        // `c` goes first and `b` follows the drop.
+        let ids = numbered(identities(&["a"], &["b", "c"], &[], &[]), (&["a"], &["b"]));
+        let steps = steps(&diffed(&REFUSES, &ids).unwrap());
+        assert_eq!(steps, ["+c", "-a", "+b"]);
+        assert!(fewest_columns(1, &steps) >= 1);
+        // Declared the other way round, nothing has to move but the drop.
+        let ids = numbered(identities(&["a"], &["c", "b"], &[], &[]), (&["a"], &["b"]));
+        assert_eq!(steps_of(&ids), ["+c", "-a", "+b"]);
+    }
+
+    fn steps_of(ids: &(Schema, IdsFile, Schema, IdsFile)) -> Vec<String> {
+        steps(&diffed(&REFUSES, ids).unwrap())
+    }
+
+    #[test]
+    fn another_drop_is_chosen_when_the_last_one_is_an_identity_with_only_an_identity_to_add() {
+        // `b` is the last column and an IDENTITY, and so is `c`: the first
+        // column is the one to drop last, after `c`.
+        let ids = numbered(identities(&["a", "b"], &["c"], &[], &[]), (&["b"], &["c"]));
+        let steps = steps_of(&ids);
+        assert_eq!(steps, ["-b", "+c", "-a"]);
+        assert!(fewest_columns(2, &steps) >= 1);
+    }
+
+    #[test]
+    fn an_identity_replaced_by_an_identity_with_nothing_else_to_add_is_refused() {
+        let ids = numbered(identities(&["a"], &["b"], &[], &[]), (&["a"], &["b"]));
+        let errors = diffed(&REFUSES, &ids).unwrap_err();
+        let refused: Vec<String> = errors
+            .iter()
+            .filter(|e| matches!(e, DiffError::LastColumnReplacementUnorderable { .. }))
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(refused.len(), 1, "{errors:?}");
+        for part in [
+            "app.t",
+            "`a`",
+            "IDENTITY",
+            "two revisions",
+            "another kind or name",
+        ] {
+            assert!(refused[0].contains(part), "{part}: {}", refused[0]);
+        }
+        assert!(!refused[0].contains("same name"), "{}", refused[0]);
+        // An engine that allows a table with no column plans it.
+        assert_eq!(steps(&diffed(&PERMISSIVE, &ids).unwrap()), ["-a", "+b"]);
+    }
+
+    #[test]
+    fn an_identity_on_one_side_only_keeps_the_order_the_replacement_has() {
+        // The add is the IDENTITY one, the drop is not: nothing numbers the
+        // column that stands while it runs.
+        let ids = numbered(identities(&["a"], &["b"], &[], &[]), (&[], &["b"]));
+        assert_eq!(steps_of(&ids), ["+b", "-a"]);
+        // The drop is one, the add is not.
+        let ids = numbered(identities(&["a"], &["b"], &[], &[]), (&["a"], &[]));
+        assert_eq!(steps_of(&ids), ["+b", "-a"]);
+    }
+
+    #[test]
+    fn adds_that_wait_behind_the_drop_keep_their_declared_order() {
+        // The new `a` waits for its name and the IDENTITY `b` for the drop's
+        // IDENTITY; `c` goes first, and the two follow the drop as declared.
+        let ids = numbered(
+            identities(&["a"], &["a", "b", "c"], &["a"], &[]),
+            (&["a"], &["b"]),
+        );
+        let steps = steps_of(&ids);
+        assert_eq!(steps, ["+c", "-a", "+a", "+b"]);
+        assert!(fewest_columns(1, &steps) >= 1);
     }
 }

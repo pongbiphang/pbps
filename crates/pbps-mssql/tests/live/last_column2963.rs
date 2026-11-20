@@ -52,6 +52,14 @@ async fn rows_of_t(db: &mut TestDb) -> i64 {
         .unwrap()
 }
 
+/// A column numbered by an IDENTITY, which SQL Server holds one of per table.
+fn numbered(mut t: Table, name: &str) -> Table {
+    let column = t.columns.get_mut(name).expect("the column");
+    column.nullable = false;
+    column.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity::new(1, 1));
+    t
+}
+
 /// The baseline built by the plan from nothing, two rows in it, and the plan
 /// from it to `declared` with the identity the differ keeps.
 async fn setup(
@@ -60,6 +68,18 @@ async fn setup(
     declared: &Schema,
     renewed: &[&str],
 ) -> (Schema, pbps_model::ChangeSet) {
+    let (state, base_ids, declared_ids) = prepare(db, base, declared, renewed).await;
+    let migration = plan(&state, &base_ids, declared, &declared_ids);
+    (state, migration)
+}
+
+/// What `setup` plans from, for a plan that may be refused.
+async fn prepare(
+    db: &mut TestDb,
+    base: &Schema,
+    declared: &Schema,
+    renewed: &[&str],
+) -> (Schema, IdsFile, IdsFile) {
     let base_ids = mint_ids(base, &IdsFile::default(), &[]);
     apply(
         &mut db.conn,
@@ -106,8 +126,7 @@ async fn setup(
     let state = pbps_mssql::catalog::introspect(&mut db.conn)
         .await
         .expect("introspect the baseline");
-    let migration = plan(&state.schema, &base_ids, declared, &declared_ids);
-    (state.schema, migration)
+    (state.schema, base_ids, declared_ids)
 }
 
 #[tokio::test]
@@ -214,4 +233,73 @@ async fn a_name_that_differs_only_by_case_is_added_first_and_the_collation_decid
     insensitive.drop().await;
     assert_eq!(unchanged.schema, before, "atomic: nothing changed");
     assert_eq!(rows, 2);
+}
+
+/// SQL Server holds one IDENTITY column per table (Msg 2744), so replacing an
+/// IDENTITY column by another cannot add first, and dropping first meets the
+/// last data column (Msg 4923): the add that goes first is a column that is
+/// none, and the new IDENTITY column follows the drop.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn an_identity_replaced_by_an_identity_adds_another_column_first_and_applies() {
+    let base = schema_of(numbered(table(&[("a", "int")]), "a"));
+    let declared = schema_of(numbered(table(&[("b", "int"), ("c", "int")]), "b"));
+    let mut db = TestDb::create("last_column2963_identity").await;
+    let (_, migration) = setup(&mut db, &base, &declared, &[]).await;
+    assert_eq!(steps(&migration), ["+c", "-a", "+b"], "{migration:?}");
+
+    // The order that adds the new IDENTITY column first is the engine's Msg
+    // 2744, and the table is as it was.
+    let mut wrong = migration.clone();
+    wrong.changes.swap(0, 2);
+    let refused = try_apply(&mut db.conn, &wrong)
+        .await
+        .expect_err("a second IDENTITY column is refused");
+    assert!(refused.contains("Multiple identity columns"), "{refused}");
+    assert_eq!(rows_of_t(&mut db).await, 2, "the refusal changed nothing");
+
+    apply(&mut db.conn, &migration).await;
+    let after = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect the result");
+    let rows = rows_of_t(&mut db).await;
+    db.drop().await;
+    // The column order is the plan's: `c` before `b`, the engine's own.
+    let order: Vec<&str> = after.schema.tables[&TableName::new("dbo", "t")]
+        .columns
+        .keys()
+        .map(|c| c.raw())
+        .collect();
+    assert_eq!(order, ["c", "b"]);
+    assert_eq!(rows, 2, "the rows stay");
+}
+
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn an_identity_replaced_by_an_identity_with_nothing_else_to_add_is_refused_at_plan_time() {
+    let base = schema_of(numbered(table(&[("id", "int")]), "id"));
+    let declared = schema_of(numbered(table(&[("id2", "int")]), "id2"));
+    let mut db = TestDb::create("last_column2963_identity_refused").await;
+    let (state, base_ids, declared_ids) = prepare(&mut db, &base, &declared, &[]).await;
+    let refused = pbps_diff::diff(
+        pbps_diff::Side {
+            schema: &state,
+            ids: &base_ids,
+        },
+        pbps_diff::Side {
+            schema: &declared,
+            ids: &declared_ids,
+        },
+        &Mssql,
+        &pbps_model::Hints::default(),
+    )
+    .expect_err("no order of the two changes is one the engine performs");
+    let rows = rows_of_t(&mut db).await;
+    db.drop().await;
+    let said: Vec<String> = refused.iter().map(ToString::to_string).collect();
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(said[0].contains("IDENTITY"), "{}", said[0]);
+    assert!(said[0].contains("`id`"), "{}", said[0]);
+    assert!(said[0].contains("two revisions"), "{}", said[0]);
+    assert_eq!(rows, 2, "a plan that is refused touches nothing");
 }
