@@ -386,57 +386,78 @@ pub fn layout(text: &str) -> String {
 }
 
 /// What an expression is, apart from how it is written: comments gone, code
-/// lower-cased (ASCII), strings and quoted names kept, layout collapsed and none
-/// beside a parenthesis or a comma. For comparing two spellings and for the
-/// digest of a constraint's name; never for what is returned of a text.
-// Read by the catalog reader, the next part of the item (the digest of an unnamed
-// constraint); the tests read it now.
-#[cfg_attr(not(test), allow(dead_code))]
+/// lower-cased (ASCII), strings and quoted names kept, and layout only where two
+/// tokens would otherwise run together. For comparing two spellings and for
+/// the digest of a constraint's name; never for what is returned of a text.
+///
+/// A token is a run of word characters, a quoted run, or one other character.
+/// A space is kept between two tokens that are not punctuation (`a b`, `x 'ab'`,
+/// `'a' 'b'`) and between the pairs that would read as one token or a comment
+/// if they touched (`- -`, `/ *`); everywhere else layout is dropped, so
+/// `a>0`, `a > 0` and `A  >\n0` are one expression.
 #[must_use]
 pub fn canonical(text: &str) -> String {
-    let mut strings: Vec<&str> = Vec::new();
-    let mut out = String::new();
+    #[derive(PartialEq, Clone, Copy)]
+    enum Kind {
+        Word,
+        Quoted,
+        Punct,
+    }
+    // A dot is punctuation: `t . a` and `t.a` are one reference, and a number's
+    // dot has no layout beside it to lose.
+    let word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '$') || !c.is_ascii();
+    let mut tokens: Vec<(Kind, String)> = Vec::new();
     for piece in pieces(text) {
         match piece {
-            Piece::Comment(_) => out.push(' '),
-            Piece::Code(code) => out.push_str(&code.to_ascii_lowercase()),
-            // A string and a quoted name are held aside whole and put back
-            // after the layout is collapsed, so nothing inside one is read as
-            // layout or punctuation. A quoted name keeps its case too: SQLite
-            // reads a double-quoted run that names no column as a string.
-            Piece::Quoted(run) => {
-                strings.push(run);
-                out.push('\u{1}');
+            Piece::Comment(_) => tokens.push((Kind::Punct, String::new())),
+            // A quoted name keeps its case: SQLite reads a double-quoted run that
+            // names no column as a string, and a string's case is data.
+            Piece::Quoted(run) => tokens.push((Kind::Quoted, run.to_owned())),
+            Piece::Code(code) => {
+                let mut current = String::new();
+                for c in code.chars() {
+                    if word(c) {
+                        current.push(c.to_ascii_lowercase());
+                        continue;
+                    }
+                    if !current.is_empty() {
+                        tokens.push((Kind::Word, std::mem::take(&mut current)));
+                    }
+                    // Layout is a break between tokens: the empty one.
+                    let kind = if is_space(c) {
+                        String::new()
+                    } else {
+                        c.to_string()
+                    };
+                    tokens.push((Kind::Punct, kind));
+                }
+                if !current.is_empty() {
+                    tokens.push((Kind::Word, current));
+                }
             }
         }
     }
-    let mut words = out
-        .split(is_space)
-        .filter(|w| !w.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    for (from, to) in [
-        ("( ", "("),
-        (" )", ")"),
-        (" (", "("),
-        (" ,", ","),
-        (", ", ","),
-    ] {
-        while words.contains(from) {
-            words = words.replace(from, to);
+    let mut out = String::new();
+    // The last real token, and whether a break (layout or a comment) came after.
+    let mut last: Option<(Kind, String)> = None;
+    let mut broke = false;
+    for (kind, token) in tokens {
+        if token.is_empty() {
+            broke = true;
+            continue;
         }
-    }
-    let mut held = strings.into_iter();
-    words
-        .chars()
-        .map(|c| {
-            if c == '\u{1}' {
-                held.next().unwrap_or("").to_owned()
-            } else {
-                c.to_string()
+        if let Some((before, text)) = &last {
+            let runs_together = *before != Kind::Punct && kind != Kind::Punct;
+            let merges = matches!((text.as_str(), token.as_str()), ("-", "-") | ("/", "*"));
+            if broke && (runs_together || merges) {
+                out.push(' ');
             }
-        })
-        .collect()
+        }
+        out.push_str(&token);
+        last = Some((kind, token));
+        broke = false;
+    }
+    out
 }
 
 /// Whether the code of `text` may name `name`: as a bare word, or as a quoted
@@ -806,6 +827,10 @@ mod tests {
             ("a >= 0", "A  >=\n0"),
             ("f( a ,b )", "F(a, b)"),
             ("a /* x */ > 0 -- y\n", "a > 0"),
+            ("a>0", "a > 0"),
+            ("t . a > 0", "t.a>0"),
+            ("\"t\" . \"a\" > 1.5", "\"t\".\"a\">1.5"),
+            ("(a)+( b )", "( a ) + (b)"),
         ] {
             assert_eq!(canonical(a), canonical(b), "{a:?} and {b:?}");
         }
@@ -837,8 +862,23 @@ mod tests {
             ("a = 'A'", "a = 'a'"),
             ("a = 'x  y'", "a = 'x y'"),
             ("a > 0", "a > 1"),
+            // Layout that keeps two tokens apart is not layout.
+            ("a - -1", "a--1"),
+            ("a / *b", "a/*b*/"),
+            ("x 'ab'", "x'ab'"),
+            ("a b", "ab"),
+            // A comment is a break between tokens, as layout is.
+            ("a/**/b", "ab"),
         ] {
             assert_ne!(canonical(a), canonical(b), "{a:?} and {b:?}");
+        }
+        assert_ne!(answer("SELECT 5 - -1"), answer("SELECT 5--1"));
+        assert_ne!(answer("SELECT x'41'"), answer("SELECT x '41'"));
+        assert_eq!(canonical("a/**/b"), canonical("a b"));
+        // What it writes must lex as the same tokens, or the digest of a name
+        // would depend on a second pass: `- -` and `/ *` keep their space.
+        for text in ["a - -1", "a / *b", "a-/**/-1", "x 'ab'", "a b"] {
+            assert_eq!(canonical(&canonical(text)), canonical(text), "{text:?}");
         }
         // The engine's side for the first rule: a name's case does not change
         // what a check says.

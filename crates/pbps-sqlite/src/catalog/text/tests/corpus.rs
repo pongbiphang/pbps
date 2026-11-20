@@ -6,13 +6,13 @@ use crate::tests::Fresh;
 
 /// A statement and what has to exist before it runs.
 #[derive(Clone)]
-pub(super) struct Case {
+pub(in crate::catalog) struct Case {
     pub setup: &'static str,
     pub sql: String,
 }
 
 /// Parents for the foreign keys of the corpus.
-pub(super) const PARENTS: &str = "CREATE TABLE p(id integer primary key, x int, y int, UNIQUE(x, y)); CREATE TABLE q(a int, b int, PRIMARY KEY (a, b))";
+pub(in crate::catalog) const PARENTS: &str = "CREATE TABLE p(id integer primary key, x int, y int, UNIQUE(x, y)); CREATE TABLE q(a int, b int, PRIMARY KEY (a, b))";
 
 fn case(sql: &str) -> Case {
     Case {
@@ -22,7 +22,7 @@ fn case(sql: &str) -> Case {
 }
 
 /// Whether the engine takes `case`.
-pub(super) fn takes(case: &Case) -> bool {
+pub(in crate::catalog) fn takes(case: &Case) -> bool {
     let mut fresh = Fresh::memory();
     let c = fresh.connection();
     c.execute_batch(case.setup).expect("the setup");
@@ -30,12 +30,12 @@ pub(super) fn takes(case: &Case) -> bool {
 }
 
 /// The cases the engine takes.
-pub(super) fn accepted(cases: Vec<Case>) -> Vec<Case> {
+pub(in crate::catalog) fn accepted(cases: Vec<Case>) -> Vec<Case> {
     cases.into_iter().filter(takes).collect()
 }
 
 /// Every table text of the corpus. One statement each, named `t`.
-pub(super) fn tables() -> Vec<Case> {
+pub(in crate::catalog) fn tables() -> Vec<Case> {
     let mut out: Vec<Case> = Vec::new();
     let mut add = |sql: &str| out.push(case(sql));
     // Types and layout.
@@ -275,7 +275,7 @@ pub(super) fn tables() -> Vec<Case> {
 }
 
 /// Every index text of the corpus, on the table `t(a, b, c)`.
-pub(super) fn indexes() -> Vec<Case> {
+pub(in crate::catalog) fn indexes() -> Vec<Case> {
     const TABLE: &str = "CREATE TABLE t(a int, b int, c text, \"d e\" int)";
     let mut out = Vec::new();
     for sql in [
@@ -321,7 +321,7 @@ pub(super) fn indexes() -> Vec<Case> {
 }
 
 /// Every view text of the corpus, over the table `t(a, b)`.
-pub(super) fn views() -> Vec<Case> {
+pub(in crate::catalog) fn views() -> Vec<Case> {
     const TABLE: &str = "CREATE TABLE t(a int, b int)";
     let mut out = Vec::new();
     for sql in [

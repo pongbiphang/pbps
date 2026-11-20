@@ -48,7 +48,7 @@ pub(super) fn col(text: &str) -> Column {
     Column::new(ty(text))
 }
 
-pub(super) fn tn(name: &str) -> TableName {
+pub(crate) fn tn(name: &str) -> TableName {
     TableName::new("main", name)
 }
 
@@ -88,7 +88,7 @@ pub(super) fn schema(tables: &[(&str, Table)], views: &[(&str, &str)]) -> Schema
 /// identity across a rename by taking the same seed: `seeds` maps the key a
 /// table (`t`) or a column (`t.b`) has in this schema to the seed it was first
 /// given.
-pub(super) fn ids(schema: &Schema, seeds: &[(&str, &str)]) -> IdsFile {
+pub(crate) fn ids(schema: &Schema, seeds: &[(&str, &str)]) -> IdsFile {
     let seed = |key: &str| {
         seeds
             .iter()
@@ -121,7 +121,7 @@ pub(super) fn ids(schema: &Schema, seeds: &[(&str, &str)]) -> IdsFile {
 
 /// The differ's own route from a base to a declared schema: diff, schedule,
 /// order, lower. What a plan would run, statement by statement.
-pub(super) fn plan(
+pub(crate) fn plan(
     base: (&Schema, &IdsFile),
     declared: (&Schema, &IdsFile),
     dialect: &Sqlite,
@@ -175,7 +175,7 @@ pub(super) fn statements(dialect: &Sqlite, change: Change) -> Result<Vec<Stateme
 }
 
 /// Runs statements in order on a connection.
-pub(super) fn run(c: &Connection, statements: &[Statement]) -> Result<(), String> {
+pub(crate) fn run(c: &Connection, statements: &[Statement]) -> Result<(), String> {
     for statement in statements {
         c.execute_batch(&statement.sql)
             .map_err(|error| [statement.sql.as_str(), ": ", &error.to_string()].concat())?;

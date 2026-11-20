@@ -75,9 +75,6 @@
 //! `RENAME` rewrites and quotes names, `DROP COLUMN` removes a definition.
 //! Layout and comments are anywhere between tokens.
 
-// Read by the catalog reader, the next part of the item; the tests read it now.
-#![allow(dead_code)]
-
 use pbps_model::escape::Escaped;
 
 use crate::lexis::{self, Piece};
@@ -91,6 +88,7 @@ pub(crate) struct Unread {
 }
 
 impl Unread {
+    #[cfg(test)]
     pub(crate) fn what(&self) -> &str {
         &self.what
     }
@@ -1200,4 +1198,4 @@ pub(crate) fn view(object: &str, sql: &str) -> Result<ViewText, Unread> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(in crate::catalog) mod tests;

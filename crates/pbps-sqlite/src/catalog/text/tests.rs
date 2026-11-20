@@ -8,8 +8,8 @@
 //! random sequences with the stored text tokenised after every step
 //! (`closure`).
 
-mod closure;
-mod corpus;
+pub(in crate::catalog) mod closure;
+pub(in crate::catalog) mod corpus;
 mod facts;
 mod mutations;
 mod oracles;
