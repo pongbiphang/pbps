@@ -1897,28 +1897,14 @@ impl Dialect for Postgres {
                 "foreign key"
             } else if parent.exclude.contains_key(name) {
                 "exclusion constraint"
-            } else if own == "exclusion constraint"
-                && parent
-                    .primary_key
-                    .as_ref()
-                    .is_some_and(|key| key.name.as_ref() == Some(name))
-            {
-                // An exclusion is built on an index named as it is, and the parent's
-                // key index holds that name in the schema, so the engine refuses it as an
-                // existing relation (42P07, measured on 18.6, #2448). A check or a foreign
-                // key has no index, and takes the name: the partition's own key clone is
-                // named after the partition.
-                "primary key"
-            } else if own == "exclusion constraint" && parent.unique.contains_key(name) {
-                "unique constraint"
             } else {
                 continue;
             };
             found.push(DialectError::Invalid {
                 dialect: crate::types::DIALECT,
                 message: format!(
-                    "{own} `{name}` is named as its parent's {kind}, which already holds that \
-                     name for the partition; name it otherwise",
+                    "{own} `{name}` is named as its parent's {kind}, which the partition already \
+                     has under that name; name it otherwise",
                     name = name.shown(),
                 ),
             });
@@ -3659,17 +3645,19 @@ mod tests {
         assert!(!found(&leaf("own", exclusion(&["ghost"]))).is_empty());
     }
 
-    /// An exclusion builds an index named as it is, and the parent's key and unique indexes
-    /// hold their names in the schema, so the engine refuses an own exclusion under either as an
-    /// existing relation (`42P07`, measured on 18.6, #2448). A check or a foreign key builds
-    /// none, and a name that is no key's is free.
+    /// An exclusion constraint is built on an index of its own name, a relation of its schema,
+    /// so the whole-schema relation-name check holds it as it holds a key: a table's or a
+    /// partition's own exclusion named as an index or a key of another table in the same schema
+    /// is refused (`42P07`, measured on 18.6, #2448 PR E2), and the same name in another schema
+    /// is free. A check builds no index, and against the table's own keys the table-local rule
+    /// speaks, not this check.
     #[test]
-    fn a_partitions_own_exclusion_takes_no_name_its_parents_key_or_unique_holds() {
+    fn an_exclusion_is_a_relation_of_its_schema_as_a_key_is() {
         use pbps_model::{
             ExclusionConstraint, ExclusionKey, ExclusionTiming, IndexColumn, OperatorRef,
-            PartitionBound, PartitionOf, PrimaryKey, UniqueConstraint,
+            PartitionBound, PartitionOf, PrimaryKey,
         };
-        let own = ExclusionConstraint {
+        let exclusion = || ExclusionConstraint {
             method: pbps_model::IndexMethod::Btree,
             keys: vec![ExclusionKey {
                 key: IndexColumn::column("v"),
@@ -3680,63 +3668,95 @@ mod tests {
             storage_parameters: Default::default(),
             timing: ExclusionTiming::Immediate,
         };
-        let mut parent = partitioned(&["id", "v"], &["id"]);
-        parent.primary_key = Some(PrimaryKey {
-            name: Some("ev_pk".into()),
-            columns: vec!["id".into()],
+        let index = || pbps_model::Index {
+            columns: vec![IndexColumn::column("v")],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+            filegroup: None,
+        };
+        let pg = super::Postgres::new();
+        let holder = |schema: &str, exclusion_name: &str, partition: bool| {
+            let mut s = Schema::default();
+            let mut t = Table::default();
+            t.indexes.insert("ix".into(), index());
+            s.tables.insert(TableName::new("app", "t"), t);
+            let mut u = Table {
+                exclude: [(exclusion_name.into(), exclusion())].into_iter().collect(),
+                partition_of: partition.then(|| PartitionOf {
+                    parent: "app.t".parse().unwrap(),
+                    bound: PartitionBound::Default,
+                    columns: Default::default(),
+                }),
+                ..Default::default()
+            };
+            u.primary_key = None;
+            s.tables.insert(TableName::new(schema, "u"), u);
+            s
+        };
+        for partition in [false, true] {
+            let found = pbps_dialect::check_index_names(&holder("app", "ix", partition), &pg);
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert!(
+                found[0].contains("index `app.t.ix`")
+                    && found[0].contains("exclusion constraint `app.u.ix`"),
+                "{found:?}"
+            );
+            // Negative: another schema, and another name, are free.
+            assert!(
+                pbps_dialect::check_index_names(&holder("other", "ix", partition), &pg).is_empty()
+            );
+            assert!(
+                pbps_dialect::check_index_names(&holder("app", "u_x", partition), &pg).is_empty()
+            );
+        }
+        // A key of another table holds its name as an index does, and a partition's own
+        // exclusion under its parent's key name is refused here, with no second finding from
+        // the partition check.
+        let mut keyed = holder("app", "t_pk", true);
+        keyed
+            .tables
+            .get_mut(&TableName::new("app", "t"))
+            .unwrap()
+            .primary_key = Some(PrimaryKey {
+            name: Some("t_pk".into()),
+            columns: vec!["v".into()],
             storage_parameters: Default::default(),
             filegroup: None,
         });
-        parent.unique.insert(
-            "ev_uq".into(),
-            UniqueConstraint {
-                columns: vec!["id".into(), "v".into()],
-                storage_parameters: Default::default(),
-                filegroup: None,
-            },
-        );
-        let name = "app.p1".parse().unwrap();
-        let leaf = |name: &str| Table {
-            partition_of: Some(PartitionOf {
-                parent: "app.t".parse().unwrap(),
-                bound: PartitionBound::Default,
-                columns: Default::default(),
-            }),
-            exclude: [(name.into(), own.clone())].into_iter().collect(),
+        let found = pbps_dialect::check_index_names(&keyed, &pg);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("primary key `app.t.t_pk`"), "{found:?}");
+        // Negative: a check under an index's name builds no index, and a table's own exclusion
+        // beside its own key is the table-local rule's alone.
+        let mut own = Schema::default();
+        let mut table = Table {
+            exclude: [("k".into(), exclusion())].into_iter().collect(),
             ..Default::default()
         };
-        let found = |partition: &Table| -> Vec<String> {
-            Postgres::new()
-                .validate_partition(&name, partition, &parent)
-                .iter()
-                .map(ToString::to_string)
-                .collect()
-        };
-        for (taken, kind) in [("ev_pk", "primary key"), ("ev_uq", "unique constraint")] {
-            let got = found(&leaf(taken));
-            assert!(
-                got.iter().any(|m| m.contains(&format!(
-                    "exclusion constraint `{taken}` is named as its parent's {kind}"
-                ))),
-                "{got:?}"
+        table.primary_key = Some(PrimaryKey {
+            name: Some("k".into()),
+            columns: vec!["v".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        });
+        own.tables.insert(TableName::new("app", "u"), table);
+        assert!(pbps_dialect::check_index_names(&own, &pg).is_empty());
+        let mut checked = holder("app", "u_x", false);
+        checked
+            .tables
+            .get_mut(&TableName::new("app", "u"))
+            .unwrap()
+            .checks
+            .insert(
+                "ix".into(),
+                pbps_model::CheckConstraint {
+                    expression: "v > 0".into(),
+                },
             );
-        }
-        // Negative: a name that is no key's is accepted; so is a check under a key's name,
-        // which builds no index.
-        let said = found(&leaf("p1_own"));
-        assert!(said.is_empty(), "{said:?}");
-        let mut check = Table {
-            partition_of: leaf("x").partition_of,
-            ..Default::default()
-        };
-        check.checks.insert(
-            "ev_pk".into(),
-            pbps_model::CheckConstraint {
-                expression: "v > 0".into(),
-            },
-        );
-        let said = found(&check);
-        assert!(said.is_empty(), "{said:?}");
+        assert!(pbps_dialect::check_index_names(&checked, &pg).is_empty());
     }
 
     /// A partition's own trigger takes no name its parent's row trigger

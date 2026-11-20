@@ -4600,7 +4600,8 @@ pub fn name_read_sequences(schema: &mut Schema, dialect: &(impl Dialect + ?Sized
 /// table's declared index, primary-key and unique-constraint names are folded
 /// in, each checked against everything already claimed. A check or
 /// foreign-key constraint has no backing index and is not in this union
-/// (ADR-0009 §1; issue #179 owns per-table constraint-kind reuse).
+/// (ADR-0009 §1; issue #179 owns per-table constraint-kind reuse). An exclusion
+/// constraint is backed by an index of its name, so it is in it.
 /// Declared owned-sequence names are fixed claims too (DEC-1898.1), checked
 /// against those names and one another. Engine-generated relations may yield
 /// to them, so these fixed names do not themselves collide with a generated
@@ -4730,6 +4731,24 @@ fn declared_relation_claims<'a>(
                         "unique constraint `{table_name}.{unique_name}`",
                         table_name = table_name.shown(),
                         unique_name = unique_name.shown(),
+                    ),
+                    key_of: Some(table_name),
+                },
+            ));
+        }
+        // An exclusion constraint is built on an index of its own name, a relation of its
+        // schema, so it collides with an index or a key of another table, as a key does
+        // (42P07, measured on 18.6, #2448 PR E2). A partition is a table here, so its own
+        // exclusions are claimed as a table's are. It is a constraint of its table too, so
+        // against that table's own keys and exclusions the table-local rule speaks, once.
+        for exclusion in table.exclude.keys() {
+            declared.push((
+                exclusion.raw(),
+                RelationClaim {
+                    descriptor: format!(
+                        "exclusion constraint `{table_name}.{exclusion}`",
+                        table_name = table_name.shown(),
+                        exclusion = exclusion.shown(),
                     ),
                     key_of: Some(table_name),
                 },
