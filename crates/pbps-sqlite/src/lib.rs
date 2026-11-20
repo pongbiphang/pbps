@@ -72,3 +72,12 @@ pub const TRANSACTION: TransactionFraming = TransactionFraming {
     commit: Cow::Borrowed("COMMIT"),
     rollback: Cow::Borrowed("ROLLBACK"),
 };
+
+/// The framing of a read: a deferred transaction, which holds a snapshot and
+/// takes no write lock. `TRANSACTION` takes the write lock at once, which an
+/// apply wants and a read does not.
+pub const READ: TransactionFraming = TransactionFraming {
+    begin: Cow::Borrowed("BEGIN"),
+    commit: Cow::Borrowed("COMMIT"),
+    rollback: Cow::Borrowed("ROLLBACK"),
+};

@@ -12,9 +12,6 @@
 //! nullable column is selected with its own `IS NULL`, so no unreadable value
 //! can read as "nothing there".
 
-// Read by the catalog reader, the next part of the item; the tests read it now.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use pbps_db::DbError;
 use pbps_db::sqlite::{Connection, Record, Value};
 

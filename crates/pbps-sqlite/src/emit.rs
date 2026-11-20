@@ -48,7 +48,7 @@ mod module;
 mod refused;
 mod table;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// What a change emits.
 pub(crate) type Sql = Result<Vec<Statement>, DialectError>;

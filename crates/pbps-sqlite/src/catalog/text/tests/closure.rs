@@ -26,7 +26,7 @@ impl Rng {
     }
 }
 
-const BASES: &[&str] = &[
+pub(in crate::catalog) const BASES: &[&str] = &[
     "CREATE TABLE t(id integer NOT NULL, owner int NOT NULL, name text DEFAULT 'x', qty int, PRIMARY KEY (id), CONSTRAINT u_name UNIQUE (owner, name), CONSTRAINT c_qty CHECK (qty >= 0), CONSTRAINT f_owner FOREIGN KEY (owner) REFERENCES p(id) ON DELETE CASCADE)",
     "CREATE TABLE t(a int CONSTRAINT nn NOT NULL CONSTRAINT ck CHECK (a > 0), b text DEFAULT 'q' REFERENCES p(id), c int, d int UNIQUE, e int CONSTRAINT dd DEFAULT 5)",
     "CREATE TABLE t(a /* one */, b -- two\n, c)",
@@ -53,6 +53,17 @@ fn one_table(fresh: &mut Fresh) -> (String, String) {
 
 /// One sequence: returns the statements that took effect.
 fn sequence(seed: u64, base: &str, steps: usize) -> Vec<String> {
+    sequence_with(seed, base, steps, &mut |_, _| {})
+}
+
+/// The same, calling `after` with the database and the table's name after
+/// every step that took effect (the reader's own closure test uses it).
+pub(in crate::catalog) fn sequence_with(
+    seed: u64,
+    base: &str,
+    steps: usize,
+    after: &mut dyn FnMut(&mut Fresh, &str),
+) -> Vec<String> {
     let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
     let mut fresh = Fresh::memory();
     fresh.connection().execute_batch(PARENTS).expect("parents");
@@ -186,6 +197,7 @@ fn sequence(seed: u64, base: &str, steps: usize) -> Vec<String> {
         agree(&read, &facts(fresh.connection(), &name)).unwrap_or_else(|e| {
             panic!("seed {seed} step {step}: {e}\n  {sql}\n  after {history:#?}")
         });
+        after(&mut fresh, &name);
     }
     // The names claimed at the end are the names the engine finds.
     let (name, sql) = one_table(&mut fresh);
