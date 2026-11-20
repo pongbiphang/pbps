@@ -41,9 +41,11 @@ PBPS_FREEZE_FORMATS=v1.0.0 cargo test -p pbps-cli --bin pbps \
   integration::release_formats::freeze_the_formats_for_a_release
 ```
 
-It writes the record and the archive, reads the record back with the loader's
-own parser and runs the `check` conditions on the result, so a freeze that
-produces something the checks refuse fails at once.
+A freeze checks everything, then writes the record once. It builds the new
+record's text, runs it through the loader's own parser and the `check`
+conditions (the archive's stamps and fingerprint included) and only then
+replaces the record. A freeze that would produce something the checks refuse
+fails before the record is touched.
 
 - It refuses a blank tag.
 - It reads the record it replaces before it writes anything, and holds each of
@@ -52,7 +54,7 @@ produces something the checks refuse fails at once.
   nothing changed, is refused and nothing is written. Without this the freeze
   would check the build against the record it has just written, which always
   agrees, and a missed increment could not be found again. A record that is
-  missing or does not parse is refused, naming its path; it is never read as "no
+  missing, does not parse or has no `released` key is refused, naming its path; it is never read as "no
   release", because in the repository the file always exists.
 - It never rewrites an archive. When `released/<n>/` already exists it is reused
   if it holds this set, which is what a second release finds when the documents
@@ -63,8 +65,15 @@ produces something the checks refuse fails at once.
   it removes that directory and reports the write's error, so a failed freeze
   leaves no partial `released/<n>/` for the next one to trip on. If the removal
   fails too, the message says the directory remains and names it.
-- It writes the record last. If writing the record fails, the archive is complete
-  and stays, and a second freeze reuses it.
+- It replaces the record in one step: the text goes to `released_formats.json.tmp`
+  beside it and is renamed over it. If either step fails the temporary file is
+  removed and the error names the record, which keeps its bytes.
+- What a failed freeze may leave is one thing: the record's bytes are as they
+  were, and the archive directory is absent or complete. A complete archive that
+  the call wrote is not removed, and a second freeze reuses it.
+- A record with no `released` key (`{}`) is damage and is refused, naming its
+  path, like a missing or unparseable one. The file has two shapes,
+  `{"released": null}` and `{"released": {...}}`.
 
 ## After the freeze
 

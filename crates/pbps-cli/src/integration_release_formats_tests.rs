@@ -195,26 +195,51 @@ fn write_archive(dir: &Path, documents: &[(&str, String)]) -> Result<(), String>
     Ok(())
 }
 
+/// Replaces `path` with `text` in one step, or leaves `path` as it was.
+///
+/// A plain `write` truncates first, so a failure part way (a full disk) would
+/// leave the record it replaces half written. The text goes to a sibling in the
+/// same directory, which `rename` then puts over the record; `rename` replaces
+/// an existing file on Windows as well. If either step fails the sibling is
+/// removed and the error names the record. `rename` is a parameter so that a
+/// test can make it fail.
+fn replace_record_with(
+    path: &Path,
+    text: &str,
+    rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    let mut name = path.file_name().expect("the record is a file").to_owned();
+    name.push(".tmp");
+    let temporary = path.with_file_name(name);
+    std::fs::write(&temporary, text)
+        .and_then(|()| rename(&temporary, path))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&temporary);
+            format!("cannot replace the record {}: {e}", path.display())
+        })
+}
+
 /// Writes the record and the set's archive, or says why it will not.
 ///
-/// Before anything is written it reads the record it replaces and holds each
-/// format of this build to it with `format::check_increment`, the whole rule:
-/// a format changed under its released number, or a number moved with nothing
-/// changed, is refused. Without that the freeze would check the build against
-/// the record it has just written, which always agrees, and a missed increment
-/// could not be found again. A record that is absent or unreadable is refused
-/// and not read as "no release".
+/// Everything is checked, then the record is written once. Before anything is
+/// written it reads the record it replaces and holds each format of this build
+/// to it with `format::check_increment`, the whole rule: a format changed under
+/// its released number, or a number moved with nothing changed, is refused.
+/// Without that the freeze would check the build against the record it has just
+/// written, which always agrees, and a missed increment could not be found
+/// again. A record that is absent, unreadable or of no legal shape is refused
+/// and not read as "no release". A blank tag is refused.
 ///
 /// An archive is never rewritten (the rule of the numbered ones, kept). One that
 /// exists is reused when it is this set, which is what a second release finds if
 /// the documents did not change between two releases, and refused when it is not.
-/// A blank tag is refused. The archive is written into a directory the call
-/// makes, and a failed write removes it, so a failure leaves nothing for the
-/// next freeze to trip on. The record is written last, so a failure there leaves
-/// no record that names a missing archive; it leaves a complete archive, which
-/// the message names and a second freeze reuses. The result is read back through
-/// the loader's own parser and put through `check_record`, so a freeze that
-/// produces a file the checks refuse fails at once.
+/// A new one is written into a directory the call makes, and a failed write
+/// removes it. With the archive there, the record's text is built and put
+/// through the loader's own parser and `check_record`, stamps included, before
+/// it is written, and it replaces the old record in one step
+/// (`replace_record_with`). A failed freeze therefore leaves the record's bytes
+/// as they were, and the archive directory absent or complete; a complete one
+/// is not removed, and a second freeze reuses it.
 fn freeze(layout: &Layout, tag: &str, build: &Build) -> Result<(), String> {
     let tag = tag.trim();
     if tag.is_empty() {
@@ -255,15 +280,9 @@ fn freeze(layout: &Layout, tag: &str, build: &Build) -> Result<(), String> {
     let text = serde_json::to_string_pretty(&serde_json::json!({ "released": released }))
         .map_err(|e| e.to_string())?
         + "\n";
-    std::fs::write(&layout.record, &text).map_err(|e| {
-        format!(
-            "cannot write {}: {e}; the archive {} stays, and a second freeze reuses it",
-            layout.record.display(),
-            dir.display()
-        )
-    })?;
-    let read = format::parse_record(&text).map_err(|e| e.to_string())?;
-    check_record(read.as_ref(), layout, build)
+    let parsed = format::parse_record(&text).map_err(|e| e.to_string())?;
+    check_record(parsed.as_ref(), layout, build)?;
+    replace_record_with(&layout.record, &text, |from, to| std::fs::rename(from, to))
 }
 
 /// The test a release runs. Without the variable it returns at once.
@@ -607,6 +626,99 @@ fn a_freeze_refuses_an_archive_of_another_set_when_nothing_was_released() {
     assert_eq!(
         std::fs::read_to_string(scratch.layout().record).unwrap(),
         NO_RELEASE
+    );
+}
+
+/// Rewrites the stamp of the first document of the archive at `dir`: a change
+/// the set's fingerprint does not see, because it leaves the stamps out.
+fn restamp(dir: &Path, number: u32) {
+    let file = dir.join(PUBLISHED[0].1);
+    let mut document: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    document["x-pbps-schema-version"] = number.into();
+    std::fs::write(&file, document.to_string()).unwrap();
+}
+
+#[test]
+fn a_reused_archive_with_a_wrong_stamp_is_refused_before_the_record_is_written() {
+    let documents = PUBLISHED.map(|(kind, file)| (file, rendered(kind)));
+    let wrong = SCHEMA_VERSION + 1;
+    // Nothing was released: the record is `NO_RELEASE` and an archive is there.
+    let none = Scratch::new();
+    let dir = none.layout().archive(SCHEMA_VERSION);
+    write_archive(&dir, &documents).unwrap();
+    restamp(&dir, wrong);
+    let tree = listing(&none.layout().archives);
+    let why = freeze(&none.layout(), "v1", &Build::current()).expect_err("a wrong stamp");
+    assert!(why.contains("is stamped"), "{why}");
+    assert_eq!(
+        std::fs::read_to_string(none.layout().record).unwrap(),
+        NO_RELEASE
+    );
+    assert_eq!(listing(&none.layout().archives), tree);
+    // After a release: the same archive, restamped, with a record that names it.
+    let released = Scratch::new();
+    frozen_in(&released, &Build::current());
+    restamp(&released.layout().archive(SCHEMA_VERSION), wrong);
+    let record = std::fs::read(released.layout().record).unwrap();
+    let tree = listing(&released.layout().archives);
+    let why = freeze(&released.layout(), "v1.0.1", &Build::current()).expect_err("a wrong stamp");
+    assert!(why.contains("is stamped"), "{why}");
+    assert_eq!(std::fs::read(released.layout().record).unwrap(), record);
+    assert_eq!(listing(&released.layout().archives), tree);
+}
+
+#[test]
+fn a_failed_record_write_leaves_the_previous_record_whole_and_no_temporary_file() {
+    let scratch = Scratch::new();
+    let record = scratch.layout().record;
+    let before = std::fs::read(&record).unwrap();
+    let files = listing(&scratch.0);
+    // The rename fails after the temporary file was written: it is removed.
+    let why = replace_record_with(&record, "{\"released\": null, \"x\": 1}", |_, _| {
+        Err(std::io::Error::other("no space"))
+    })
+    .expect_err("the rename fails");
+    assert!(
+        why.replace('\\', "/").contains("released_formats.json"),
+        "{why}"
+    );
+    assert!(why.contains("no space"), "{why}");
+    assert_eq!(std::fs::read(&record).unwrap(), before);
+    assert_eq!(listing(&scratch.0), files);
+    // The write fails: a directory holds the temporary file's name. The record
+    // keeps its bytes, and the directory is not ours to remove.
+    let blocker = scratch.0.join("released_formats.json.tmp");
+    std::fs::create_dir(&blocker).unwrap();
+    let why = replace_record_with(&record, "new", |from, to| std::fs::rename(from, to))
+        .expect_err("the write fails");
+    assert!(
+        why.replace('\\', "/").contains("released_formats.json"),
+        "{why}"
+    );
+    assert_eq!(std::fs::read(&record).unwrap(), before);
+    assert!(blocker.is_dir());
+}
+
+#[test]
+fn a_successful_record_write_replaces_the_record_and_leaves_no_temporary_file() {
+    let scratch = Scratch::new();
+    let record = scratch.layout().record;
+    replace_record_with(&record, "replaced", |from, to| std::fs::rename(from, to))
+        .expect("an ordinary replace");
+    assert_eq!(std::fs::read_to_string(&record).unwrap(), "replaced");
+    assert_eq!(listing(&scratch.0), ["released_formats.json"]);
+    // The whole freeze leaves the same: the record, and the archive tree.
+    let frozen = Scratch::new();
+    frozen_in(&frozen, &Build::current());
+    let names = listing(&frozen.0);
+    assert!(
+        names.iter().all(|name| !name.ends_with(".tmp")),
+        "{names:?}"
+    );
+    assert!(
+        names.contains(&"released_formats.json".to_owned()),
+        "{names:?}"
     );
 }
 
