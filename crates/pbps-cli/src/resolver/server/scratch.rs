@@ -34,8 +34,8 @@ use pbps_model::Hints;
 use pbps_model::resolver::{OutsideWrites, ResolverRuntime, ScratchLayout, ScratchSource};
 
 pub use super::engine::{
-    Binding, CapturedInputs, CompiledCapture, History, Prepared, Staged, Standard,
-    declared_standard,
+    Authorization, Binding, CapturedInputs, CompiledCapture, Condition, History, Prepared, Staged,
+    Standard, declared_standard,
 };
 
 pub mod domain;
@@ -259,7 +259,8 @@ impl<D: super::PlanningDialect> Run<'_, D> {
             )
             .await
             .map_err(db("the target's analysis scope"))?;
-        let ambiguous = authorization.unpredictable(&request.planned);
+        let ambiguous =
+            <D::Resolver as ResolverEngine>::unpredictable(&authorization, &request.planned);
         if !ambiguous.is_empty() {
             return Err(Error::Scope(format!(
                 "the grantor of a planned grant cannot be predicted on the target: {}",
@@ -284,7 +285,8 @@ impl<D: super::PlanningDialect> Run<'_, D> {
         .await?;
         // The expected visibility is the deployer's after the plan's own
         // grants.
-        authorization.project_visibility(
+        <D::Resolver as ResolverEngine>::project_visibility(
+            &authorization,
             &request.planned,
             &request.schemas,
             &request.write_path_extras,
@@ -498,7 +500,8 @@ impl<D: super::PlanningDialect> Run<'_, D> {
             surfaces,
             captured,
         };
-        let authorization_condition = prepared.authorization_condition(target).await?;
+        let authorization_condition =
+            <D::Resolver as ResolverEngine>::authorization_condition(&mut prepared, target).await?;
         let sealing = Sealing {
             planned: request.planned.clone(),
             opening_catalog,

@@ -183,6 +183,52 @@ pub type Staged<D> = <<D as PlanningDialect>::Resolver as ResolverEngine>::Stage
 /// ```
 pub type History<D> = <<D as PlanningDialect>::Resolver as ResolverEngine>::History;
 
+/// The deployment authorization context of the target, for the engine the
+/// dialect names. What one engine's deployer may do is not another's, and the
+/// two cannot be compared or digested as if they were:
+///
+/// ```compile_fail
+/// use pbps_cli::resolver::server::scratch::Authorization;
+/// fn for_sql_server(_: Authorization<pbps_mssql::Mssql>) {}
+/// fn read_by_postgres(context: Authorization<pbps_pg::Postgres>) {
+///     for_sql_server(context);
+/// }
+/// ```
+///
+/// ```
+/// use pbps_cli::resolver::server::scratch::Authorization;
+/// fn for_postgres(context: Authorization<pbps_pg::Postgres>) -> Authorization<pbps_pg::Postgres> {
+///     context
+/// }
+/// fn for_sql_server(context: Authorization<pbps_mssql::Mssql>) -> Authorization<pbps_mssql::Mssql> {
+///     context
+/// }
+/// ```
+pub type Authorization<D> = <<D as PlanningDialect>::Resolver as ResolverEngine>::Authorization;
+
+/// What the engine measured of the authorization after the plan's grants ran
+/// on the reproduction, for the engine the dialect names. A measurement of one
+/// engine cannot stand for another's:
+///
+/// ```compile_fail
+/// use pbps_cli::resolver::server::scratch::Condition;
+/// fn for_sql_server(_: Condition<pbps_mssql::Mssql>) {}
+/// fn measured_by_postgres(condition: Condition<pbps_pg::Postgres>) {
+///     for_sql_server(condition);
+/// }
+/// ```
+///
+/// ```
+/// use pbps_cli::resolver::server::scratch::Condition;
+/// fn for_postgres(condition: Condition<pbps_pg::Postgres>) -> Condition<pbps_pg::Postgres> {
+///     condition
+/// }
+/// fn for_sql_server(condition: Condition<pbps_mssql::Mssql>) -> Condition<pbps_mssql::Mssql> {
+///     condition
+/// }
+/// ```
+pub type Condition<D> = <<D as PlanningDialect>::Resolver as ResolverEngine>::Condition;
+
 /// What the run acquired and must release, for the engine the dialect names.
 /// What the scratch's compile left to seal, for the engine the dialect names.
 /// It is the type alone: nothing outside this crate can make, read or seal one,

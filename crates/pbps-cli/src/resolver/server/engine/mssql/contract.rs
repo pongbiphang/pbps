@@ -12,7 +12,7 @@ use super::{Binding, Closing, Prepared, Scratch};
 use crate::resolver::contract::{
     ApplyRecheck, BindingView, ClosingInputs, ClusterDomain, FactsError, GrantRecheck, Phase,
     Planning, PreparedView, Preview, Rehearsal, RehearsalRequest, Replay, ResolverEngine, Sealable,
-    Step, Support, TargetRead, sealed::Sealed,
+    Step, Support, TargetReadStep, sealed::Sealed,
 };
 use crate::resolver::scope;
 use crate::resolver::server::scratch::rehearse::Roles;
@@ -29,6 +29,7 @@ use pbps_model::resolver::{
     ManifestError, ObjectIdentity, OutsideWrites, ScratchLayout, Surface,
 };
 use pbps_model::{ChangeSet, Hints, IdsFile, ModuleDeps, RoleName, Schema, SessionZone};
+use pbps_mssql::resolver::authorization as mssql_auth;
 use pbps_pg::resolver::capture::{BindingRecord, SealError};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -75,6 +76,8 @@ impl ResolverEngine for MssqlResolver {
     type CompiledCapture = Box<Closing>;
     type CapturedInputs = pbps_mssql::resolver::capture::CapturedInputs;
     type History = ();
+    type Authorization = Box<mssql_auth::AuthorizationContext>;
+    type Condition = Box<mssql_auth::Condition>;
 
     fn binding_classes(surface: &Surface) -> Option<&'static [&'static str]> {
         pbps_mssql::resolver::binding_classes(surface)
@@ -190,7 +193,7 @@ impl ResolverEngine for MssqlResolver {
         _: Provisioning,
         _: &'a mut Conn,
         _: &'a CatalogFacts,
-        _: &'a scope::Authorization,
+        _: &'a Self::Authorization,
         _: &'a [String],
     ) -> Step<'a, Result<Prepared, Error>> {
         Box::pin(async move { Err(unsupported()) })
@@ -202,7 +205,7 @@ impl ResolverEngine for MssqlResolver {
         admin: &'a mut Conn,
         target_connection: &'a mut Conn,
         target: &'a CatalogFacts,
-        authorization: &'a scope::Authorization,
+        authorization: &'a Self::Authorization,
         schemas: &'a [String],
         binding: &'a BindingRequest<'a>,
         _: &'a [String],
@@ -378,7 +381,7 @@ impl ResolverEngine for MssqlResolver {
         _: &'a [String],
         authorization_schemas: &'a [String],
         planned: &'a [scope::PlannedGrant],
-    ) -> Step<'a, Result<(CatalogFacts, scope::Authorization), DbError>> {
+    ) -> Step<'a, Result<(CatalogFacts, Self::Authorization), DbError>> {
         Box::pin(async move {
             let scope = pbps_mssql::resolver::environment::Scope { schemas };
             // The planned grants' principals are resolved to the catalog's
@@ -392,10 +395,7 @@ impl ResolverEngine for MssqlResolver {
                 &names,
             )
             .await?;
-            Ok((
-                catalog,
-                scope::Authorization::Mssql(Box::new(authorization)),
-            ))
+            Ok((catalog, Box::new(authorization)))
         })
     }
 
@@ -405,7 +405,7 @@ impl ResolverEngine for MssqlResolver {
         extras: &'a [String],
         authorization_schemas: &'a [String],
         planned: &'a [scope::PlannedGrant],
-    ) -> Step<'a, Result<TargetRead<Self::History>, DbError>> {
+    ) -> TargetReadStep<'a, Self::Authorization, Self::History> {
         Box::pin(async move {
             let (catalog, authorization) =
                 Self::read_target(connection, schemas, extras, authorization_schemas, planned)
@@ -433,6 +433,64 @@ impl ResolverEngine for MssqlResolver {
 
     fn history_differences(_: &Self::History, _: &Self::History) -> Result<Vec<String>, DbError> {
         Ok(Vec::new())
+    }
+
+    fn same_context(a: &Self::Authorization, b: &Self::Authorization) -> bool {
+        a.canonical() == b.canonical()
+    }
+
+    fn canonical(authorization: &Self::Authorization) -> Vec<u8> {
+        authorization.canonical()
+    }
+
+    fn authorization_rule() -> Result<&'static str, String> {
+        Ok(mssql_auth::RULE)
+    }
+
+    fn transition(
+        _: &Self::Authorization,
+        _: &[scope::PlannedGrant],
+        measured: Option<&Self::Condition>,
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let measured = measured.ok_or(
+            "the SQL Server authorization after-state was not read from the verified reproduction",
+        )?;
+        Ok((measured.before().canonical(), measured.after().canonical()))
+    }
+
+    fn unpredictable(_: &Self::Authorization, _: &[scope::PlannedGrant]) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn unusable_schemas(_: &Self::Authorization, _: &[scope::PlannedGrant]) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn project_visibility(
+        _: &Self::Authorization,
+        _: &[scope::PlannedGrant],
+        _: &[String],
+        _: &[String],
+        _: &mut CatalogFacts,
+    ) {
+    }
+
+    fn authorization_condition<'a>(
+        prepared: &'a mut Self::Prepared,
+        target: &'a mut Conn,
+    ) -> Step<'a, Result<Option<Self::Condition>, Error>> {
+        Box::pin(async move {
+            Prepared::authorization_condition(prepared, target)
+                .await
+                .map(Some)
+        })
+    }
+
+    fn recheck_condition<'a>(
+        condition: &'a Self::Condition,
+        target: &'a mut Conn,
+    ) -> Step<'a, Result<bool, DbError>> {
+        Box::pin(async move { condition.recheck(target).await })
     }
 
     fn through_shape_view(_: &Self::Staged, error: Error) -> Error {
@@ -529,17 +587,6 @@ impl BindingView for Box<Binding> {
 }
 
 impl PreparedView for Prepared {
-    fn authorization_condition<'a>(
-        &'a mut self,
-        target: &'a mut Conn,
-    ) -> Step<'a, Result<Option<Box<pbps_mssql::resolver::authorization::Condition>>, Error>> {
-        Box::pin(async move {
-            Prepared::authorization_condition(self, target)
-                .await
-                .map(Some)
-        })
-    }
-
     fn dependency_placements(&self) -> BTreeMap<DependencyName, DependencyPlacement> {
         Prepared::dependency_placements(self)
     }
@@ -652,7 +699,7 @@ impl ApplyRecheck for MssqlResolver {
         &'a self,
         conn: &'a mut Conn,
         r: Replay<'a>,
-    ) -> Step<'a, Result<(CatalogFacts, scope::Authorization), FactsError>> {
+    ) -> Step<'a, Result<(CatalogFacts, Vec<u8>), FactsError>> {
         Box::pin(async move {
             let target = &r.evidence.qualification().target_scope;
             // The bracketed double read the planning used, inside the apply's
@@ -672,9 +719,6 @@ impl ApplyRecheck for MssqlResolver {
                 // What the plan sealed is the deployer's answers, not the
                 // catalog read alone: the engine-read effective
                 // permissions of the same questions (DEC-2143.1).
-                let scope::Authorization::Mssql(read) = read else {
-                    unreachable!("a SQL Server read answers with SQL Server's context")
-                };
                 let planned_principals: Vec<_> = planned
                     .iter()
                     .map(|grant| grant.principal.clone())
@@ -688,7 +732,7 @@ impl ApplyRecheck for MssqlResolver {
                     r.key,
                 )
                 .await?;
-                Ok::<_, DbError>((catalog, scope::Authorization::Mssql(Box::new(answered))))
+                Ok::<_, DbError>((catalog, answered.canonical()))
             }
             .await
             .map_err(|error| FactsError::Unread(error.to_string()))

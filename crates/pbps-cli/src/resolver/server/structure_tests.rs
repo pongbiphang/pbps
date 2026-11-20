@@ -62,6 +62,21 @@ fn the_transition_derivation_leaves_every_engine_decision_to_the_engine() {
 }
 
 #[test]
+fn the_apply_recheck_leaves_every_engine_decision_to_the_engine() {
+    assert_eq!(engine_named(include_str!("../apply.rs")), None);
+}
+
+/// `producer.rs` names no engine but as the default type parameter of the
+/// three public run types (`Unsealed<D = pbps_pg::Postgres>` and its two
+/// companions), which keeps their one-parameter spelling for callers; a
+/// default is a name, not a decision. Everything else is scanned.
+#[test]
+fn the_producer_leaves_every_engine_decision_to_the_engine() {
+    let source = include_str!("producer.rs").replace("= pbps_pg::Postgres>", ">");
+    assert_eq!(engine_named(&source), None);
+}
+
+#[test]
 fn the_scratch_run_leaves_every_engine_decision_to_the_engine() {
     assert_eq!(engine_named(include_str!("scratch.rs")), None);
 }
@@ -91,6 +106,14 @@ fn the_engine_scan_sees_a_driver_branch_and_an_engine_path() {
     ] {
         assert_eq!(engine_named(source), Some(mark), "{source}");
     }
+    // The producer's one exemption is a default type parameter, not a call.
+    assert_eq!(
+        engine_named(
+            &"struct S<D = pbps_pg::Postgres>(D); fn f() { pbps_pg::Postgres::new(); }"
+                .replace("= pbps_pg::Postgres>", ">")
+        ),
+        Some("pbps_pg")
+    );
     // A one-line test-only item does not swallow the production code after it.
     assert_eq!(
         engine_named("#[cfg(test)]\nmod live_tests;\nfn f() { Driver::Mssql; }"),

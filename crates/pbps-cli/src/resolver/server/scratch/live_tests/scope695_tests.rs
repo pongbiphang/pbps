@@ -35,7 +35,7 @@ impl Case {
         &self,
     ) -> (
         pbps_db::resolver::environment::CatalogFacts,
-        crate::resolver::scope::Authorization,
+        pbps_pg::resolver::authorization::AuthorizationContext,
     ) {
         let schemas = vec![cases::SCHEMA.to_owned()];
         let mut reader = Conn::connect(Driver::Postgres, &self.target).await.unwrap();
@@ -72,7 +72,7 @@ impl Case {
         let after = self.facts().await;
         assert_eq!(before.0, after.0, "reported endpoint facts were restored");
         assert!(
-            before.1.same_context(&after.1),
+            <crate::resolver::server::scratch::engines::PgEngine as crate::resolver::contract::ResolverEngine>::same_context(&before.1, &after.1),
             "endpoint authorization was restored"
         );
         let refused = match Box::pin(recheck(unsealed, &self.target)).await {
@@ -132,7 +132,7 @@ impl Case {
             "reported endpoint facts were restored: {named}"
         );
         assert!(
-            before.1.same_context(&after.1),
+            <crate::resolver::server::scratch::engines::PgEngine as crate::resolver::contract::ResolverEngine>::same_context(&before.1, &after.1),
             "authorization was restored: {named}"
         );
         let changed = history.differences(&self.witness().await).unwrap();
@@ -168,7 +168,7 @@ impl Case {
             before.0, after.0,
             "real UPDATE/back restores extension facts"
         );
-        assert!(before.1.same_context(&after.1));
+        assert!(<crate::resolver::server::scratch::engines::PgEngine as crate::resolver::contract::ResolverEngine>::same_context(&before.1, &after.1));
         let refused = match Box::pin(recheck(unsealed, &self.target)).await {
             Ok(_) => panic!("a real extension UPDATE/back must refuse publication"),
             Err((reason, _)) => reason,

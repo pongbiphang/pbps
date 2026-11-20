@@ -84,8 +84,8 @@ pub(super) struct Sealing<D: super::PlanningDialect> {
     /// The same read, visibility expected after the plan's grants.
     pub target_catalog: pbps_db::resolver::environment::CatalogFacts,
     pub scratch_catalog: pbps_db::resolver::environment::CatalogFacts,
-    pub authorization: scope::Authorization,
-    pub authorization_condition: Option<Box<pbps_mssql::resolver::authorization::Condition>>,
+    pub authorization: <D::Resolver as ResolverEngine>::Authorization,
+    pub authorization_condition: Option<<D::Resolver as ResolverEngine>::Condition>,
     pub schemas: Vec<String>,
     pub write_path_extras: Vec<String>,
     pub identity: Identity,
@@ -139,20 +139,26 @@ pub(super) fn seal<D: super::PlanningDialect, S>(
         ));
     }
     let mut projected = opening_catalog.clone();
-    authorization.project_visibility(&grants, &schemas, &write_path_extras, &mut projected);
+    <D::Resolver as ResolverEngine>::project_visibility(
+        &authorization,
+        &grants,
+        &schemas,
+        &write_path_extras,
+        &mut projected,
+    );
     if projected != target_catalog {
         return Err(Error::Scope(
             "the final grant projection disagrees with the qualified target facts".into(),
         ));
     }
-    let persisted = authorization
-        .persisted_after(
-            key,
-            &changes,
-            object_grants,
-            authorization_condition.as_deref(),
-        )
-        .map_err(Error::Scope)?;
+    let persisted = scope::persisted_after::<D::Resolver>(
+        &authorization,
+        key,
+        &changes,
+        object_grants,
+        authorization_condition.as_ref(),
+    )
+    .map_err(Error::Scope)?;
     let compiled_records = producer
         .compiled
         .planning_records()
@@ -337,12 +343,14 @@ impl<D: super::PlanningDialect> Unsealed<D> {
         if catalog != self.sealing.opening_catalog {
             changed.push("the target's reported facts".to_owned());
         }
-        if !authorization.same_context(&self.sealing.authorization) {
+        if !<D::Resolver as ResolverEngine>::same_context(
+            &authorization,
+            &self.sealing.authorization,
+        ) {
             changed.push("the target deployer's authorization".to_owned());
         }
         if let Some(condition) = &self.sealing.authorization_condition
-            && !condition
-                .recheck(target)
+            && !<D::Resolver as ResolverEngine>::recheck_condition(condition, target)
                 .await
                 .map_err(read("authorization condition"))?
         {

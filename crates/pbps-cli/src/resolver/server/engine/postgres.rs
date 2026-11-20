@@ -13,6 +13,7 @@ use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, Driver};
 use pbps_model::escape::Escaped;
 use pbps_model::resolver::OutsideWrites;
+use pbps_pg::resolver::authorization as pg_auth;
 use pbps_pg::resolver::capture::{self, Managed, Paths, RecordedOwnership, StageError, Staged};
 use pbps_pg::resolver::recovery as record;
 use pbps_pg::resolver::scratch::{self as sql, Placement};
@@ -525,7 +526,7 @@ impl Scratch<'_> {
         &mut self,
         admin: &mut Conn,
         target_catalog: &CatalogFacts,
-        authorization: &scope::Authorization,
+        authorization: &pg_auth::AuthorizationContext,
         scope_schemas: &[String],
         fill: &draft::Fill,
     ) -> Result<Prepared, Error> {
@@ -579,7 +580,6 @@ impl Scratch<'_> {
             authorization,
             &request.planned,
             names.database(),
-            names.login(),
         )
         .await
         .map_err(db("the deployer's reproduced authorization"))?;
@@ -676,7 +676,7 @@ impl Scratch<'_> {
     async fn supplied(
         &mut self,
         admin: &mut Conn,
-        authorization: &scope::Authorization,
+        authorization: &pg_auth::AuthorizationContext,
         scope_schemas: &[String],
         fill: &draft::Fill,
     ) -> Result<Prepared, Error> {
@@ -713,13 +713,7 @@ impl Scratch<'_> {
             .await
             .map_err(db("the scratch database's privileges"))?
             .acl;
-        let scope::Authorization::Postgres(context) = authorization else {
-            return Err(Error::Scope(
-                "the resolver is implemented for PostgreSQL only".into(),
-            ));
-        };
-        let map =
-            scope::Principals::supplied(authorization, &principal.login).map_err(Error::Scope)?;
+        let map = scope::Principals::supplied(authorization, &principal.login);
         // The first object the run creates here, and its record: a run killed
         // after it is found and cleaned by the next one (`recovery`, #2410).
         let claimed = record::claim(
@@ -786,11 +780,11 @@ impl Scratch<'_> {
         let after = inventory(admin).await?;
         let created = externals::created(&before, &after);
         let filled_objects = descriptions(&externals::created(&mid, &after));
-        let unusable = authorization
-            .unusable_schemas(&request.planned)
-            .into_iter()
-            .filter(|schema| scope_schemas.contains(schema))
-            .collect::<Vec<_>>();
+        let unusable =
+            <PgResolver as ResolverEngine>::unusable_schemas(authorization, &request.planned)
+                .into_iter()
+                .filter(|schema| scope_schemas.contains(schema))
+                .collect::<Vec<_>>();
         let usable = sql::revoke_usage(admin, &unusable)
             .await
             .map_err(db("the schemas the deployer cannot use"))?;
@@ -806,7 +800,7 @@ impl Scratch<'_> {
             )));
         }
         state
-            .install_settings(admin, context)
+            .install_settings(admin, authorization)
             .await
             .map_err(db("the deployer's settings"))?;
         let scratch_catalog = <PgResolver as ResolverEngine>::read_catalog(
@@ -1833,7 +1827,7 @@ impl Scratch<'_> {
         provisioning: Provisioning,
         admin: &mut Conn,
         target_catalog: &CatalogFacts,
-        authorization: &scope::Authorization,
+        authorization: &pg_auth::AuthorizationContext,
         scope_schemas: &[String],
         fill: &draft::Fill,
     ) -> Result<Prepared, Error> {

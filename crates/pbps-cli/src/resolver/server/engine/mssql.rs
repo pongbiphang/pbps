@@ -659,7 +659,7 @@ impl Scratch<'_> {
         admin: &mut Conn,
         target: &CatalogFacts,
         target_connection: &mut Conn,
-        authorization: &scope::Authorization,
+        authorization: &auth::AuthorizationContext,
         schemas: &[String],
         binding: &BindingRequest<'_>,
         key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
@@ -712,14 +712,9 @@ impl Scratch<'_> {
             .iter()
             .map(|g| g.principal.clone())
             .collect::<Vec<_>>();
-        let scope::Authorization::Mssql(captured_context) = authorization else {
-            return Err(Error::Scope(
-                "the SQL Server authorization belongs to another engine".into(),
-            ));
-        };
         let mut context = auth::staged_inventory(
             target_connection,
-            captured_context,
+            authorization,
             &planned_principals,
             &required,
             binding.dependencies,
@@ -735,10 +730,7 @@ impl Scratch<'_> {
         let planned = scope::mssql_planned(&self.request.planned);
         let mut map = auth::PrincipalMap::generate(&context, &planned, &token);
         let mut setup_context = context.clone();
-        let initially_held = match authorization {
-            scope::Authorization::Mssql(context) => &context.schemas,
-            _ => unreachable!("authorization checked above"),
-        };
+        let initially_held = &authorization.schemas;
         setup_context
             .schemas
             .retain(|name, _| initially_held.contains_key(name));

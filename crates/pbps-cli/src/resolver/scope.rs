@@ -23,13 +23,10 @@
 
 pub(crate) mod object_grants;
 
-use pbps_db::resolver::Observation;
-use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_db::{DbError, Driver};
 use pbps_mssql::resolver::authorization as mssql_auth;
 use pbps_pg::resolver::authorization as pg_auth;
-use std::collections::BTreeMap;
 
 /// A schema grant or revoke the plan performs before its DDL. A GRANT keeps
 /// the emitter's whole comma-separated privilege mask in one entry; REVOKE
@@ -43,7 +40,7 @@ pub struct PlannedGrant {
     pub revoke: bool,
 }
 
-fn pg_planned(planned: &[PlannedGrant]) -> Vec<pg_auth::PlannedGrant> {
+pub(in crate::resolver) fn pg_planned(planned: &[PlannedGrant]) -> Vec<pg_auth::PlannedGrant> {
     planned
         .iter()
         .map(|grant| pg_auth::PlannedGrant {
@@ -75,13 +72,6 @@ pub(in crate::resolver) fn mssql_planned(
         .collect()
 }
 
-/// The deployment authorization context of one engine.
-#[derive(Debug, Clone)]
-pub enum Authorization {
-    Postgres(pg_auth::AuthorizationContext),
-    Mssql(Box<mssql_auth::AuthorizationContext>),
-}
-
 /// The run-local principals that stand in for the target's on scratch.
 #[derive(Debug, Clone)]
 pub enum Principals {
@@ -93,7 +83,12 @@ pub enum Principals {
 /// rule's so that no authorization digest equals a catalog one.
 const AUTHORIZATION_RULE: &str = "pbps/authorization-context/v1";
 
-fn authorization_digest(
+/// Seals a deployer context, given as its engine's canonical bytes, together
+/// with the selected object-grant answers. Their keyed fingerprints use the
+/// same endpoint as the context, and remain separate from catalog binding
+/// inputs. The producer seals with it and apply compares with it, so the two
+/// cannot frame a context differently.
+pub(crate) fn authorization_digest(
     key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
     canonical: &[u8],
     grants: &[String],
@@ -203,188 +198,75 @@ pub(crate) fn planned_schema_grants(
     Ok(planned)
 }
 
-impl Authorization {
-    /// The publication recheck compares the engine's complete context, before
-    /// any grant projection, rather than only its persisted digest.
-    pub(crate) fn same_context(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Postgres(left), Self::Postgres(right)) => left.canonical() == right.canonical(),
-            (Self::Mssql(left), Self::Mssql(right)) => left.canonical() == right.canonical(),
-            (Self::Postgres(_), Self::Mssql(_)) | (Self::Mssql(_), Self::Postgres(_)) => false,
-        }
+/// The persisted authorization condition: what the plan's schema grants and
+/// revokes do to the deployer's context, digested before and after. The shell
+/// is the same for every engine; what the context becomes is the engine's
+/// (`transition`): PostgreSQL projects the planned grants onto it, and SQL
+/// Server takes what the verified reproduction measured, and refuses without it.
+pub(crate) fn persisted_after<E: crate::resolver::contract::ResolverEngine>(
+    authorization: &E::Authorization,
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+    changes: &pbps_model::ChangeSet,
+    object_grants: Vec<pbps_model::resolver::AuthorizationGrant>,
+    measured: Option<&E::Condition>,
+) -> Result<pbps_model::resolver::AuthorizationCondition, String> {
+    use pbps_model::Change;
+    let planned = planned_schema_grants(changes)?;
+    if !E::unpredictable(authorization, &planned).is_empty() {
+        return Err("the adapter cannot derive the approved authorization transition".into());
     }
-
-    /// The name of the versioned authorization rule the context was read
-    /// under.
-    pub(crate) fn rule(&self) -> &'static str {
-        match self {
-            Self::Postgres(_) => pg_auth::RULE,
-            Self::Mssql(_) => mssql_auth::RULE,
-        }
-    }
-
-    /// Seal the freshly read deployer context together with the selected
-    /// object-grant answers. Their keyed fingerprints use the same endpoint
-    /// as the context, and remain separate from catalog binding inputs.
-    pub(crate) fn digest(
-        &self,
-        key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
-        grants: &[String],
-    ) -> Option<String> {
-        match self {
-            Self::Postgres(context) => {
-                Some(authorization_digest(key, &context.canonical(), grants))
-            }
-            Self::Mssql(context) => Some(authorization_digest(key, &context.canonical(), grants)),
-        }
-    }
-
-    pub fn persisted(
-        &self,
-        key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
-        changes: &pbps_model::ChangeSet,
-        object_grants: Vec<pbps_model::resolver::AuthorizationGrant>,
-    ) -> Result<pbps_model::resolver::AuthorizationCondition, String> {
-        self.persisted_after(key, changes, object_grants, None)
-    }
-
-    pub(crate) fn persisted_after(
-        &self,
-        key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
-        changes: &pbps_model::ChangeSet,
-        object_grants: Vec<pbps_model::resolver::AuthorizationGrant>,
-        measured: Option<&mssql_auth::Condition>,
-    ) -> Result<pbps_model::resolver::AuthorizationCondition, String> {
-        use pbps_model::Change;
-        let planned = planned_schema_grants(changes)?;
-        if !self.unpredictable(&planned).is_empty() {
-            return Err("the adapter cannot derive the approved authorization transition".into());
-        }
-        let (before, after) = match self {
-            Self::Postgres(context) => (
-                context.canonical(),
-                pg_auth::with_planned(context.clone(), &pg_planned(&planned)).canonical(),
-            ),
-            Self::Mssql(_) => {
-                let measured = measured.ok_or("the SQL Server authorization after-state was not read from the verified reproduction")?;
-                (measured.before().canonical(), measured.after().canonical())
-            }
-        };
-        let before_grants: Vec<_> = object_grants
+    let (before, after) = E::transition(authorization, &planned, measured)?;
+    let before_grants: Vec<_> = object_grants
+        .iter()
+        .map(|g| g.before.fingerprint.clone())
+        .collect();
+    let after_grants: Vec<_> = object_grants
+        .iter()
+        .map(|g| g.after.fingerprint.clone())
+        .collect();
+    Ok(pbps_model::resolver::AuthorizationCondition {
+        rule: E::authorization_rule()?.into(),
+        before: authorization_digest(key, &before, &before_grants),
+        after: authorization_digest(key, &after, &after_grants),
+        object_grants,
+        changes: changes
+            .changes
             .iter()
-            .map(|g| g.before.fingerprint.clone())
-            .collect();
-        let after_grants: Vec<_> = object_grants
-            .iter()
-            .map(|g| g.after.fingerprint.clone())
-            .collect();
-        Ok(pbps_model::resolver::AuthorizationCondition {
-            rule: self.rule().into(),
-            before: authorization_digest(key, &before, &before_grants),
-            after: authorization_digest(key, &after, &after_grants),
-            object_grants,
-            changes: changes
-                .changes
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| {
-                    matches!(
-                        p.change,
-                        Change::Permission(_)
-                            | Change::TypeValue(_)
-                            | Change::Type(_)
-                            | Change::Role(_)
-                    )
-                })
-                .map(|(i, _)| i)
-                .collect(),
-        })
-    }
-
-    /// Planned grants whose outcome the adapter cannot stand behind, named.
-    /// PostgreSQL's is a grantor the engine would pick among several
-    /// inherited option holders; SQL Server runs the grants through the
-    /// engine and has nothing to predict.
-    pub(crate) fn unpredictable(&self, planned: &[PlannedGrant]) -> Vec<String> {
-        match self {
-            Self::Postgres(context) => pg_auth::ambiguous_grantors(context, &pg_planned(planned)),
-            Self::Mssql(_) => Vec::new(),
-        }
-    }
-
-    /// The in-scope schemas the deployer cannot use once the plan's grants
-    /// and revokes have run. A supplied scratch login owns every schema it
-    /// compiles in and so uses all of them; these it must give up, or the
-    /// comparison sees a schema the target's deployer will not, and a valid
-    /// plan is refused (#1678 review). SQL Server has no supplied layout.
-    pub(crate) fn unusable_schemas(&self, planned: &[PlannedGrant]) -> Vec<String> {
-        match self {
-            Self::Postgres(context) => pg_auth::with_planned(context.clone(), &pg_planned(planned))
-                .schemas
-                .into_iter()
-                .filter(|(_, schema)| schema.privileges.get("USAGE") != Some(&true))
-                .map(|(name, _)| name)
-                .collect(),
-            Self::Mssql(_) => Vec::new(),
-        }
-    }
-
-    /// Rewrites the target's visibility facts to what the deployer is meant
-    /// to see once the plan's grants have run. On PostgreSQL a planned USAGE
-    /// grant changes the effective search order, so it is derived from the
-    /// projected context; on SQL Server a grant changes no binding order, so
-    /// the facts stand as read.
-    pub(crate) fn project_visibility(
-        &self,
-        planned: &[PlannedGrant],
-        schemas: &[String],
-        extras: &[String],
-        catalog: &mut CatalogFacts,
-    ) {
-        match self {
-            Self::Postgres(context) => {
-                let expected = pg_auth::with_planned(context.clone(), &pg_planned(planned));
-                catalog.visibility = expected_visibility(&expected, schemas, extras);
-            }
-            Self::Mssql(_) => {}
-        }
-    }
+            .enumerate()
+            .filter(|(_, p)| {
+                matches!(
+                    p.change,
+                    Change::Permission(_)
+                        | Change::TypeValue(_)
+                        | Change::Type(_)
+                        | Change::Role(_)
+                )
+            })
+            .map(|(i, _)| i)
+            .collect(),
+    })
 }
 
 impl Principals {
     /// `login` is the scratch run login and `token` the run's unique suffix.
     pub(crate) fn generate(
-        authorization: &Authorization,
+        context: &pg_auth::AuthorizationContext,
         planned: &[PlannedGrant],
         login: &str,
         token: &str,
     ) -> Self {
-        match authorization {
-            Authorization::Postgres(context) => Self::Postgres(pg_auth::RoleMap::generate(
-                context,
-                &pg_planned(planned),
-                login,
-                token,
-            )),
-            Authorization::Mssql(context) => Self::Mssql(mssql_auth::PrincipalMap::generate(
-                context,
-                &mssql_planned(planned),
-                token,
-            )),
-        }
+        Self::Postgres(pg_auth::RoleMap::generate(
+            context,
+            &pg_planned(planned),
+            login,
+            token,
+        ))
     }
 
     /// The map of a supplied scratch login that reproduces no role: it
     /// stands for the deployer (#1672).
-    pub(crate) fn supplied(authorization: &Authorization, login: &str) -> Result<Self, String> {
-        match authorization {
-            Authorization::Postgres(context) => {
-                Ok(Self::Postgres(pg_auth::RoleMap::supplied(context, login)))
-            }
-            Authorization::Mssql(_) => {
-                Err("a supplied scratch login is implemented for PostgreSQL only".into())
-            }
-        }
+    pub(crate) fn supplied(context: &pg_auth::AuthorizationContext, login: &str) -> Self {
+        Self::Postgres(pg_auth::RoleMap::supplied(context, login))
     }
 
     /// The server-wide principals this run creates and must drop. SQL
@@ -396,31 +278,17 @@ impl Principals {
         }
     }
 
-    /// The principal the compilation session switches to, or `None` when the
-    /// session is already it (a SQL Server `dbo` deployer: the run login owns
-    /// its scratch database).
+    /// The principal the compilation session switches to.
     pub(crate) fn deployer(
         &self,
-        authorization: &Authorization,
+        context: &pg_auth::AuthorizationContext,
     ) -> Result<Option<pbps_model::RoleName>, &'static str> {
-        match (self, authorization) {
-            (Self::Postgres(map), Authorization::Postgres(context)) => map
+        match self {
+            Self::Postgres(map) => map
                 .deployer(context)
                 .map(Some)
                 .ok_or("no run-local deployer role was mapped"),
-            (Self::Mssql(map), Authorization::Mssql(context)) => {
-                if context.principal.superuser {
-                    Ok(None)
-                } else {
-                    map.deployer(context)
-                        .map(Some)
-                        .ok_or("no run-local deployer user was mapped")
-                }
-            }
-            (Self::Postgres(_), Authorization::Mssql(_))
-            | (Self::Mssql(_), Authorization::Postgres(_)) => {
-                Err("the principal map belongs to another engine")
-            }
+            Self::Mssql(_) => Err("the principal map belongs to another engine"),
         }
     }
 }
@@ -429,29 +297,23 @@ const MIXED: &str = "the authorization context and the principal map belong to d
 
 /// Builds the reproduction through an administrative connection in the
 /// scratch database: principals, memberships, schemas, grants and login
-/// defaults. PostgreSQL also runs the plan's grants here, as the mapped
-/// deployer; SQL Server runs them in [`settle`], after the reproduction has
-/// been verified.
+/// defaults, and runs the plan's grants here, as the mapped deployer.
 pub(crate) async fn prepare(
     admin: &mut impl ExecuteConnection,
     principals: &Principals,
-    authorization: &Authorization,
+    context: &pg_auth::AuthorizationContext,
     planned: &[PlannedGrant],
     database: &str,
-    run_login: &str,
 ) -> Result<(), DbError> {
-    match (principals, authorization) {
-        (Principals::Postgres(map), Authorization::Postgres(context)) => {
+    match principals {
+        Principals::Postgres(map) => {
             pg_auth::reconstruct(admin, map, context, database).await?;
             let deployer = map
                 .deployer(context)
                 .ok_or_else(|| DbError::BadRow("no run-local deployer role was mapped".into()))?;
             pg_auth::apply_planned(admin, map, &deployer, &pg_planned(planned)).await
         }
-        (Principals::Mssql(map), Authorization::Mssql(context)) => {
-            mssql_auth::reconstruct(admin, map, context, run_login).await
-        }
-        _ => Err(DbError::BadRow(MIXED.into())),
+        Principals::Mssql(_) => Err(DbError::BadRow(MIXED.into())),
     }
 }
 
@@ -481,146 +343,48 @@ pub(crate) async fn enter(
 pub(crate) async fn settle(
     session: &mut impl QueryConnection,
     principals: &Principals,
-    authorization: &Authorization,
+    context: &pg_auth::AuthorizationContext,
     planned: &[PlannedGrant],
     schemas: &[String],
 ) -> Result<Vec<String>, DbError> {
-    match (principals, authorization) {
-        (Principals::Postgres(map), Authorization::Postgres(context)) => {
+    match principals {
+        Principals::Postgres(map) => {
             let expected = pg_auth::with_planned(context.clone(), &pg_planned(planned));
             pg_auth::verify(session, map, &expected, schemas).await
         }
-        (Principals::Mssql(map), Authorization::Mssql(context)) => {
-            let differences = mssql_auth::verify(session, map, context, schemas).await?;
-            if differences.is_empty() {
-                mssql_auth::apply_planned(session, map, &mssql_planned(planned)).await?;
-            }
-            Ok(differences)
-        }
-        _ => Err(DbError::BadRow(MIXED.into())),
+        Principals::Mssql(_) => Err(DbError::BadRow(MIXED.into())),
     }
-}
-
-/// The effective schema order a PostgreSQL deployer would see on each
-/// in-scope path, derived from the (post-plan) authorization: `pg_catalog`
-/// first, then each of the path's schemas the deployer has USAGE on, in
-/// order. This is what `current_schemas(true)` returns once the temporary
-/// namespaces are stripped, so a reproduction that grants the same USAGE
-/// matches it, and a planned USAGE change is compared against its intended
-/// effect.
-fn expected_visibility(
-    auth: &pg_auth::AuthorizationContext,
-    paths: &[String],
-    extras: &[String],
-) -> BTreeMap<String, Observation> {
-    paths
-        .iter()
-        .map(|start| {
-            let mut visible = vec!["pg_catalog".to_owned()];
-            for schema in std::iter::once(start).chain(extras.iter()) {
-                let usable = auth
-                    .schemas
-                    .get(schema)
-                    .and_then(|s| s.privileges.get("USAGE"))
-                    .copied()
-                    .unwrap_or(false);
-                // `current_schemas` lists each namespace once, at its first
-                // occurrence, so a schema repeated on the path (or an extra
-                // equal to the start) is not duplicated here (finding on #688).
-                if usable && !visible.contains(schema) {
-                    visible.push(schema.clone());
-                }
-            }
-            let rendered = pbps_db::resolver::environment::render_visibility(&visible);
-            (start.clone(), Observation::reported(Some(&rendered)))
-        })
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resolver::server::PlanningDialect;
+    use std::collections::BTreeMap;
 
-    #[test]
-    fn expected_visibility_is_pg_catalog_then_the_usable_path_schemas_in_order() {
-        use pbps_pg::resolver::authorization::{AuthorizationContext, SchemaAuthorization};
-        let schema = |usage: bool| SchemaAuthorization {
-            owner: "o".into(),
-            privileges: [("USAGE".to_owned(), usage), ("CREATE".to_owned(), false)]
-                .into_iter()
-                .collect(),
-            acl: pbps_pg::resolver::authorization::SchemaAcl::Default,
-        };
-        let context = AuthorizationContext {
-            principal: pbps_db::resolver::environment::DeploymentPrincipal {
-                login: "d".into(),
-                effective: "d".into(),
-                superuser: false,
-            },
-            schemas: [
-                ("app".to_owned(), schema(true)),
-                ("secret".to_owned(), schema(false)),
-                ("ext".to_owned(), schema(true)),
-            ]
-            .into_iter()
-            .collect(),
-            roles: BTreeMap::new(),
-            settings: BTreeMap::new(),
-        };
-        let extras = vec!["ext".to_owned()];
-        let visibility =
-            expected_visibility(&context, &["app".to_owned(), "secret".to_owned()], &extras);
-        // app is usable and ext (an extra) is usable, in path order after pg_catalog.
-        assert_eq!(
-            visibility["app"],
-            Observation::reported(Some(r#"["pg_catalog","app","ext"]"#))
-        );
-        // secret is not usable, so only pg_catalog and the usable extra remain.
-        assert_eq!(
-            visibility["secret"],
-            Observation::reported(Some(r#"["pg_catalog","ext"]"#))
-        );
+    type Pg = <pbps_pg::Postgres as PlanningDialect>::Resolver;
+
+    #[cfg(unix)]
+    fn fixed_key() -> pbps_db::fingerprint::EnvironmentFingerprintKey {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path =
+            std::env::temp_dir().join(format!("pbps2798-digest-key-{}", rand::random::<u64>()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
+            .unwrap();
+        let key = pbps_db::fingerprint::EnvironmentFingerprintKey::from_file(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        key
     }
 
-    #[test]
-    fn a_planned_revoke_makes_the_schema_one_the_supplied_login_gives_up() {
-        let context = Authorization::Postgres(pg_auth::AuthorizationContext {
-            principal: pbps_db::resolver::environment::DeploymentPrincipal {
-                login: "d".into(),
-                effective: "d".into(),
-                superuser: false,
-            },
-            schemas: [(
-                "app".to_owned(),
-                // The deployer owns it, so its revoke from itself is one it
-                // has the authority to make.
-                pg_auth::SchemaAuthorization {
-                    owner: "d".into(),
-                    privileges: BTreeMap::from([("USAGE".into(), true), ("CREATE".into(), true)]),
-                    acl: pbps_pg::resolver::authorization::SchemaAcl::Default,
-                },
-            )]
-            .into_iter()
-            .collect(),
-            roles: BTreeMap::new(),
-            settings: BTreeMap::new(),
-        });
-        // Negative: with nothing planned the deployer keeps its usage.
-        assert!(context.unusable_schemas(&[]).is_empty());
-        let revoke = [PlannedGrant {
-            principal: "d".into(),
-            schema: "app".into(),
-            privilege: "USAGE".into(),
-            revoke: true,
-        }];
-        assert_eq!(context.unusable_schemas(&revoke), ["app"]);
-    }
-
-    /// The persisted after-digest moves with a planned grant, and the
-    /// before-digest does not: the two are different facts.
-    #[test]
-    fn a_planned_grant_moves_the_after_digest_and_not_the_before() {
-        let postgres = Authorization::Postgres(pg_auth::AuthorizationContext {
+    pub(super) fn pg_fixture() -> pg_auth::AuthorizationContext {
+        pg_auth::AuthorizationContext {
             principal: pbps_db::resolver::environment::DeploymentPrincipal {
                 login: "d".into(),
                 effective: "d".into(),
@@ -638,53 +402,196 @@ mod tests {
             .collect(),
             roles: BTreeMap::new(),
             settings: BTreeMap::new(),
-        });
-        assert_eq!(postgres.rule(), "pg-auth-v2");
-        #[cfg(unix)]
-        {
-            use pbps_db::fingerprint::EnvironmentFingerprintKey;
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let path =
-                std::env::temp_dir().join(format!("pbps614-auth-key-{}", rand::random::<u64>()));
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)
-                .unwrap();
-            file.write_all(b"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
-                .unwrap();
-            let key = EnvironmentFingerprintKey::from_file(&path).unwrap();
-            std::fs::remove_file(path).unwrap();
-            let unchanged = postgres
-                .persisted(&key, &pbps_model::ChangeSet::default(), Vec::new())
-                .unwrap();
-            assert_eq!(unchanged.before, unchanged.after);
-            let changes = pbps_model::ChangeSet {
-                changes: vec![pbps_model::PlannedChange::new(
-                    pbps_model::Change::Permission(pbps_model::GrantChange::Grant {
-                        role: "PUBLIC".into(),
-                        target: pbps_model::GrantTarget::Schema("app".into()),
-                        permissions: std::collections::BTreeSet::from([
-                            pbps_model::Permission::Usage,
-                        ]),
-                    }),
-                )],
-            };
-            let projected = postgres.persisted(&key, &changes, Vec::new()).unwrap();
-            assert_eq!(projected.before, unchanged.before);
-            assert_ne!(projected.before, projected.after);
-            assert_eq!(projected.changes, std::collections::BTreeSet::from([0]));
-            let unsupported = pbps_model::ChangeSet {
-                changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Role(
-                    pbps_model::RoleChange::CreateRole {
-                        uid: "r_aaaaaa".parse().unwrap(),
-                        name: "new_role".into(),
-                    },
-                ))],
-            };
-            assert!(postgres.persisted(&key, &unsupported, Vec::new()).is_err());
         }
+    }
+
+    /// What apply compares the sealed digest with: the shared framing over the
+    /// engine's canonical bytes, with and without object-grant fingerprints.
+    /// The expected values were recorded from the union's `digest` before it
+    /// was removed (its equality with this framing was asserted then), for a
+    /// fixed context of each engine and the fixed key.
+    #[cfg(unix)]
+    #[test]
+    fn the_digest_of_each_engines_context_is_the_shared_framing_over_its_canonical_bytes() {
+        let key = fixed_key();
+        let pg = pg_fixture().canonical();
+        let ms = mssql_auth::fixture_context().canonical();
+        let two = ["aa".to_owned(), "bb".to_owned()];
+        for (name, canonical, grants, expected) in [
+            (
+                "postgres",
+                &pg,
+                &[][..],
+                "f0e9dc9ac0184ca6faac24ff7a4601d4c5caaf34332aaeead452f284a5d193e4",
+            ),
+            (
+                "postgres",
+                &pg,
+                &two[..],
+                "c82ec2630df9af38dbe54a2b05b2d1ae474579f3a68a397340daa2b4998451dd",
+            ),
+            (
+                "mssql",
+                &ms,
+                &[][..],
+                "531c26ef913988967c07f2f11ceca3def7e717ce4928570740dae14af64e1a30",
+            ),
+            (
+                "mssql",
+                &ms,
+                &two[..],
+                "cf58e5d043593850885fa7a3ef4f5dd7706003174935a7adeedfd0eefcd81cb7",
+            ),
+        ] {
+            assert_eq!(
+                authorization_digest(&key, canonical, grants),
+                expected,
+                "{name} with {} object grants",
+                grants.len()
+            );
+        }
+        // Negative: the two engines' contexts never digest alike.
+        assert_ne!(
+            authorization_digest(&key, &pg, &[]),
+            authorization_digest(&key, &ms, &[])
+        );
+    }
+
+    /// The persisted after-digest moves with a planned grant, and the
+    /// before-digest does not: the two are different facts.
+    #[cfg(unix)]
+    #[test]
+    fn a_planned_grant_moves_the_after_digest_and_not_the_before() {
+        let postgres = pg_fixture();
+        assert_eq!(
+            <Pg as crate::resolver::contract::ResolverEngine>::authorization_rule().unwrap(),
+            "pg-auth-v2"
+        );
+        let key = fixed_key();
+        let persisted = |changes: &pbps_model::ChangeSet| {
+            persisted_after::<Pg>(&postgres, &key, changes, Vec::new(), None)
+        };
+        let unchanged = persisted(&pbps_model::ChangeSet::default()).unwrap();
+        assert_eq!(unchanged.before, unchanged.after);
+        let changes = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::Permission(pbps_model::GrantChange::Grant {
+                    role: "PUBLIC".into(),
+                    target: pbps_model::GrantTarget::Schema("app".into()),
+                    permissions: std::collections::BTreeSet::from([pbps_model::Permission::Usage]),
+                }),
+            )],
+        };
+        let projected = persisted(&changes).unwrap();
+        assert_eq!(projected.before, unchanged.before);
+        assert_ne!(projected.before, projected.after);
+        assert_eq!(projected.changes, std::collections::BTreeSet::from([0]));
+        let unsupported = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Role(
+                pbps_model::RoleChange::CreateRole {
+                    uid: "r_aaaaaa".parse().unwrap(),
+                    name: "new_role".into(),
+                },
+            ))],
+        };
+        assert!(persisted(&unsupported).is_err());
+    }
+
+    /// SQL Server's after-state is what the verified reproduction measured; a
+    /// seal without that measurement is refused, never read as "unchanged".
+    #[cfg(unix)]
+    #[test]
+    fn sql_server_refuses_to_persist_an_authorization_it_did_not_measure() {
+        type Ms = <pbps_mssql::Mssql as PlanningDialect>::Resolver;
+        let context = Box::new(mssql_auth::fixture_context());
+        let refused = persisted_after::<Ms>(
+            &context,
+            &fixed_key(),
+            &pbps_model::ChangeSet::default(),
+            Vec::new(),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            refused,
+            "the SQL Server authorization after-state was not read from the verified reproduction"
+        );
+    }
+
+    fn facts() -> pbps_db::resolver::environment::CatalogFacts {
+        pbps_db::resolver::environment::CatalogFacts {
+            observations: BTreeMap::new(),
+            extensions: Vec::new(),
+            available_extensions: BTreeMap::new(),
+            collations: Vec::new(),
+            settings: BTreeMap::new(),
+            visibility: BTreeMap::from([(
+                "app".to_owned(),
+                pbps_db::resolver::Observation::reported(Some("as read")),
+            )]),
+        }
+    }
+
+    /// The recheck compares each engine's complete context by its canonical
+    /// bytes, the predicate it had: an unchanged read is the same context, and
+    /// a changed field of either engine's is not.
+    #[test]
+    fn each_engine_compares_its_own_contexts_by_their_canonical_bytes() {
+        use crate::resolver::contract::ResolverEngine;
+        type Ms = <pbps_mssql::Mssql as PlanningDialect>::Resolver;
+        let pg = pg_fixture();
+        assert!(Pg::same_context(&pg, &pg.clone()));
+        let mut revoked = pg.clone();
+        revoked
+            .schemas
+            .get_mut("app")
+            .unwrap()
+            .privileges
+            .insert("USAGE".into(), false);
+        assert!(!Pg::same_context(&pg, &revoked));
+        let ms = Box::new(mssql_auth::fixture_context());
+        assert!(Ms::same_context(&ms, &ms.clone()));
+        let mut moved = ms.clone();
+        moved.language = "german".into();
+        assert!(!Ms::same_context(&ms, &moved));
+    }
+
+    /// PostgreSQL derives the deployer's visibility from the projected
+    /// context; SQL Server's grants change no binding order, so its facts
+    /// stand as read. Nothing planned on SQL Server is "unpredictable".
+    #[test]
+    fn only_postgres_rewrites_visibility_and_only_it_can_find_a_grant_unpredictable() {
+        use crate::resolver::contract::ResolverEngine;
+        type Ms = <pbps_mssql::Mssql as PlanningDialect>::Resolver;
+        let planned = [PlannedGrant {
+            principal: "d".into(),
+            schema: "app".into(),
+            privilege: "USAGE".into(),
+            revoke: true,
+        }];
+        let schemas = ["app".to_owned()];
+        let mut postgres = facts();
+        // A superuser keeps USAGE whatever is revoked; the deployer here does not.
+        let mut deployer = pg_fixture();
+        deployer.principal.superuser = false;
+        Pg::project_visibility(&deployer, &planned, &schemas, &[], &mut postgres);
+        assert_eq!(
+            postgres.visibility["app"],
+            pbps_db::resolver::Observation::reported(Some(r#"["pg_catalog"]"#)),
+            "the revoked USAGE leaves only pg_catalog on the path"
+        );
+        let mut sql_server = facts();
+        Ms::project_visibility(
+            &Box::new(mssql_auth::fixture_context()),
+            &planned,
+            &schemas,
+            &[],
+            &mut sql_server,
+        );
+        assert_eq!(sql_server, facts());
+        assert!(Ms::unpredictable(&Box::new(mssql_auth::fixture_context()), &planned).is_empty());
+        assert!(
+            Ms::unusable_schemas(&Box::new(mssql_auth::fixture_context()), &planned).is_empty()
+        );
     }
 }
