@@ -84,12 +84,13 @@ fn is_literal(operand: &str) -> bool {
 
 fn names_a_format_constant(operand: &str) -> bool {
     let name = operand.rsplit("::").next().unwrap_or(operand);
-    // The scan reads code with its whitespace removed, so `if PLAN.current != 1`
-    // reaches here as `ifPLAN.current`: take the keyword off the front.
-    let name = ["if", "while", "return"]
-        .iter()
-        .find_map(|keyword| name.strip_prefix(keyword))
-        .unwrap_or(name);
+    // The scan reads code with its whitespace removed, so a keyword before the
+    // operand is glued to it: `if PLAN.current != 1` reaches here as
+    // `ifPLAN.current`, and `} else if` as `elseif`. Every listed name starts
+    // with a capital and a keyword has none, so the lower-case run at the front
+    // is never part of the name. No list of keywords is kept: it would have to
+    // grow with each one a comparison can follow.
+    let name = name.trim_start_matches(|c: char| c.is_ascii_lowercase());
     FORMAT_CONSTANTS.contains(&name)
 }
 
@@ -216,10 +217,18 @@ fn the_scan_finds_a_format_constant_against_a_literal() {
         "assert_eq!(pbps_model::format::PLAN.current, 83);",
         "assert!(format::STATE.current == 52);",
         "assert_eq!(52u32, STATE.current);",
+        // A keyword glued to the name by the whitespace removal, whichever it is.
         "if PLAN.current != 1 {",
         "if CURRENT_VERSION != 7 {",
+        "} else if STATE.current == 52 {",
+        "return SCHEMA_VERSION == 117;",
+        "while CURRENT_VERSION != 83 {",
     ] {
         assert!(!offences(line).is_empty(), "{line}");
+    }
+    // What taking the lower-case front off a name relies on.
+    for name in FORMAT_CONSTANTS {
+        assert!(name.starts_with(|c: char| c.is_ascii_uppercase()), "{name}");
     }
 }
 
