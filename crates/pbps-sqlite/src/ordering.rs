@@ -195,6 +195,14 @@ pub(crate) fn effects(
         None
     };
     let was = |table: &TableName| base_name.clone().unwrap_or_else(|| table.name.clone());
+    // A view's own drop waits for nothing: SQLite drops a view whatever reads
+    // it, and what it refuses beside an invalid view is a column drop or a
+    // rename, which come after every module drop. The scan is lexical, so a
+    // requirement here could also be a cycle no engine has: two views that
+    // take each other's names as column aliases.
+    if matches!(op.change(), Change::Module(ModuleChange::DropModule { .. })) {
+        return Ok(fx);
+    }
     let torn = torn_down_by(before.schema, op.change(), &was);
     for view in torn {
         fx.requires.push(Requirement::Absent(module_key(&view)));

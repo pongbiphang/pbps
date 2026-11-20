@@ -701,3 +701,35 @@ fn a_view_that_names_its_table_in_single_quotes_is_torn_down() {
         "v",
     );
 }
+
+/// SQLite drops a view whatever reads it, so a view's own drop waits for
+/// nothing. The scan is lexical: two views that only take each other's names
+/// as column aliases would otherwise each wait for the other.
+#[test]
+fn two_dropped_views_that_spell_each_others_names_wait_for_nothing() {
+    let (base, declared) = (
+        schema(
+            &[("t", ab())],
+            &[
+                ("v1", "SELECT a AS v2 FROM t"),
+                ("v2", "SELECT a AS v1 FROM t"),
+            ],
+        ),
+        schema(&[("t", ab())], &[]),
+    );
+    let (bi, di) = (view_ids(&base, &[]), view_ids(&declared, &[]));
+    let base_sql = "CREATE TABLE t(a integer, b text); CREATE VIEW v1 AS SELECT a AS v2 FROM t; CREATE VIEW v2 AS SELECT a AS v1 FROM t";
+    let out = scenario(
+        (&base, &bi, base_sql),
+        (&declared, &di, "CREATE TABLE t(a integer, b text)"),
+    );
+    assert_eq!(out.len(), 2, "{out:#?}");
+    // And one that does read the other: the engine drops the read one first
+    // without complaint.
+    let mut db = built(
+        "CREATE TABLE t(a integer); CREATE VIEW v1 AS SELECT a FROM t; CREATE VIEW v2 AS SELECT a FROM v1",
+    );
+    db.connection()
+        .execute_batch("DROP VIEW v1; DROP VIEW v2")
+        .expect("a read view is dropped first");
+}
