@@ -9,11 +9,14 @@
 //! stays what it was.
 //!
 //! The scan reads every Rust source of the workspace and looks for one shape
-//! of comparison (`assert_eq!`, `assert_ne!`, `==`, `!=`): a format constant
-//! (`FORMAT_CONSTANTS`: the three current numbers and two
-//! historical boundaries) against a digit literal, whatever the number. Its few legitimate hits
-//! are listed below with their reasons, and an entry that no longer matches a
-//! line fails the test, so the list cannot outlive what it excuses.
+//! of comparison (`assert_eq!`, `assert_ne!`, `==`, `!=`): a name of a format's
+//! number (`FORMAT_CONSTANTS`) against a digit literal, whatever the number.
+//! The names are the constants, the two historical boundaries, and the plan's
+//! and the state's descriptors `PLAN.current` and `STATE.current`, which are
+//! the same two numbers spelled through `format::PLAN` and `format::STATE`.
+//! Its few legitimate hits are listed below with their reasons, and an entry
+//! that no longer matches a line fails the test, so the list cannot outlive
+//! what it excuses.
 //!
 //! The limit, in plain words: a `version` field against a literal, as in
 //! `assert_eq!(plan.version, 83)`, is not found. The text does not name which
@@ -21,6 +24,8 @@
 //! UI's, the resolver manifest's, a hook's), which would fail a release for
 //! nothing once the three numbers are reset to 1 (#1159). Such a test fails by
 //! itself when the number moves, and its author takes the constant then.
+//! The same reason refuses a bare `.current` and a local variable: only the two
+//! exact descriptor spellings name a format.
 
 use std::path::Path;
 
@@ -29,11 +34,14 @@ mod source_scan;
 use source_scan::{relative, sources};
 
 /// The constants that name a format's number or a boundary in its history.
-const FORMAT_CONSTANTS: [&str; 4] = [
+const FORMAT_CONSTANTS: [&str; 6] = [
     "CURRENT_VERSION",
     "SCHEMA_VERSION",
     "OLDEST_READABLE_VERSION",
     "OBJECT_DEPS_VERSION",
+    // The descriptors of `pbps_model::format`: `current` is `CURRENT_VERSION`.
+    "PLAN.current",
+    "STATE.current",
 ];
 
 /// Comparisons of a format constant with a literal that stay on purpose: path
@@ -75,7 +83,14 @@ fn is_literal(operand: &str) -> bool {
 }
 
 fn names_a_format_constant(operand: &str) -> bool {
-    FORMAT_CONSTANTS.contains(&operand.rsplit("::").next().unwrap_or(operand))
+    let name = operand.rsplit("::").next().unwrap_or(operand);
+    // The scan reads code with its whitespace removed, so `if PLAN.current != 1`
+    // reaches here as `ifPLAN.current`: take the keyword off the front.
+    let name = ["if", "while", "return"]
+        .iter()
+        .find_map(|keyword| name.strip_prefix(keyword))
+        .unwrap_or(name);
+    FORMAT_CONSTANTS.contains(&name)
 }
 
 /// The two operands an `assert_eq!`/`assert_ne!` compares, from the text after
@@ -198,6 +213,11 @@ fn the_scan_finds_a_format_constant_against_a_literal() {
         "assert!(CURRENT_VERSION == 83);",
         "if state::CURRENT_VERSION != 7 {",
         "assert_eq!(value[\"x\"], 1_000); assert_eq!(SCHEMA_VERSION, 1_17);",
+        "assert_eq!(pbps_model::format::PLAN.current, 83);",
+        "assert!(format::STATE.current == 52);",
+        "assert_eq!(52u32, STATE.current);",
+        "if PLAN.current != 1 {",
+        "if CURRENT_VERSION != 7 {",
     ] {
         assert!(!offences(line).is_empty(), "{line}");
     }
@@ -211,6 +231,15 @@ fn the_scan_leaves_symbols_other_fields_and_comments_alone() {
         "assert_eq!(read.version, OBJECT_DEPS_VERSION - 1);",
         "assert!(OBJECT_DEPS_VERSION <= CURRENT_VERSION);",
         "snapshot.version = CURRENT_VERSION + 1;",
+        // A descriptor against a symbol, and another value's `current`.
+        "assert_eq!(plan.version, format::PLAN.current);",
+        "assert_eq!(format::STATE.current, state::CURRENT_VERSION);",
+        "assert_eq!(PLAN.current + 1, next.version);",
+        "assert_eq!(cursor.current, 3);",
+        "assert_eq!(current, 83);",
+        "assert_eq!(self.current, 52);",
+        "assert_eq!(OTHER.current, 83);",
+        "assert_eq!(plan_current, 83);",
         // The limit: a `version` field against a literal names no format, so it
         // is not found, whether the number is current or an old fixture's.
         "assert_eq!(plan.version, 83);",
