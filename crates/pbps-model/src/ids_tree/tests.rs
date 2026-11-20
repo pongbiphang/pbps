@@ -475,6 +475,25 @@ fn a_partitions_exclusion_retirement_outside_its_parents_partitions_is_refused()
 }
 
 #[test]
+fn a_partitions_exclusion_retirement_with_a_blank_name_is_refused_like_a_tables() {
+    // The nested name is converted to a local name on assembly, so it needs the same
+    // check as a name in `exclusions`, or an empty one would reach the plan.
+    let t = tree();
+    let blank = edit(
+        &t["app/events.json"],
+        "\"t_bbbbb1\": {\"no_overlap\"",
+        "\"t_bbbbb1\": {\"\"",
+    );
+    assert!(matches!(
+        refuses("app/events.json", blank),
+        TreeError::BadName { .. }
+    ));
+    // Negative: a valid name is read as it was.
+    let (ids, p) = sample();
+    assert_eq!(assemble(&split(&ids, &p).unwrap()).unwrap(), ids);
+}
+
+#[test]
 fn optional_sections_are_absent_when_empty() {
     let t = tree();
     for key in [
