@@ -578,13 +578,25 @@ impl Contract {
             schema: &self.after.schema,
             ids: &self.after.ids,
         };
-        // A step whose owners are not readable here states nothing, as the
-        // release check treats it: a fact it cannot read refuses nothing.
+        // A step whose effects cannot be read is an error, not an empty set:
+        // its facts would vanish and a line that reverses one would be
+        // followed. The debug check keeps such a step in `unowned` and says
+        // so; here it refuses the annotated plan and names the step. The
+        // owners of every step were already read by `defines` above, and a
+        // rebuild root is expanded before any pass settles, so a plan the
+        // differ emits does not reach this (DEC-2469.10).
         let fx: Vec<_> = operations
             .as_slice()
             .iter()
-            .map(|op| effects(op, owners, before, after).unwrap_or_default())
-            .collect();
+            .map(|op| {
+                effects(op, owners, before, after).map_err(|why| {
+                    format!(
+                        "the creation facts of step `{}` cannot be read: {why}",
+                        pbps_model::Text::from(op.change().subject()).shown()
+                    )
+                })
+            })
+            .collect::<Result<_, _>>()?;
         let graph = graph(
             operations.as_slice(),
             &fx,
