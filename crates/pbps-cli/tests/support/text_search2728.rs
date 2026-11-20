@@ -1748,6 +1748,141 @@ fn an_opaque_node_behind_a_stored_dependent_gates_an_alteration_and_one_without_
     }
 }
 
+/// A stored dependent that uses a user-defined operator records the operator, never the function
+/// behind it, so the census follows the operator's own edge to its function (DEC-2728.4,
+/// measured on 16.15 and 18.6). A materialized view and an expression index over an operator
+/// backed by a PL/pgSQL function are listed as behind that function and the alteration carries
+/// `stale-results`; a materialized view, an expression index and a stored generated column over an
+/// operator backed by a `BEGIN ATOMIC` function that names the configuration are proven and refuse
+/// the alteration by name. Negatives: an operator over an engine function, and one over a
+/// `BEGIN ATOMIC` function that names nothing altered, add nothing to the plan.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_stored_dependent_behind_an_operator_is_walked_to_its_function() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        let own = OwnDatabase::new(&server, "search2728o");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app");
+        let d = Demo::new("search2728o");
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+        declare(&d, "app.words.textsearch-dictionary.yml", WORDS);
+        declare(&d, "app.docs.textsearch-config.yml", DOCS);
+        declare(&d, "app.solo.textsearch-dictionary.yml", SOLO);
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        let path = d.dir.join("operator.plan.json");
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        succeeds(apply_plan(&d, db, &path, false));
+        // Negatives first: stored dependents over operators that reach nothing altered. An
+        // engine function has no text to read, and a `BEGIN ATOMIC` body the catalog reads names
+        // no text search object.
+        on_server(
+            db,
+            "CREATE TABLE app.loose (body text); \
+             CREATE OPERATOR app.=! (LEFTARG = text, RIGHTARG = text, FUNCTION = pg_catalog.texteq); \
+             CREATE FUNCTION app.f_plain(a text, b text) RETURNS boolean LANGUAGE sql IMMUTABLE \
+               BEGIN ATOMIC SELECT a = b; END; \
+             CREATE OPERATOR app.=? (LEFTARG = text, RIGHTARG = text, FUNCTION = app.f_plain); \
+             CREATE MATERIALIZED VIEW app.mv_engine AS SELECT body OPERATOR(app.=!) 'x' AS m FROM app.loose; \
+             CREATE MATERIALIZED VIEW app.mv_plain AS SELECT body OPERATOR(app.=?) 'x' AS m FROM app.loose",
+        );
+        declare(
+            &d,
+            "app.solo.textsearch-dictionary.yml",
+            &SOLO.replace("english", "german"),
+        );
+        let planned = succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved.contains("stale-results") && !saved.contains("\"opaque\""),
+            "{}{saved}",
+            said(&planned)
+        );
+        assert!(!said(&planned).contains("(behind"), "{}", said(&planned));
+        succeeds(apply_plan(&d, db, &path, false));
+        assert_eq!(options_of(db, "solo"), "stopwords = 'german'");
+        // The same alteration of the configuration, once a materialized view and an index stand
+        // behind an operator over a PL/pgSQL function: listed behind the function, gated.
+        on_server(
+            db,
+            "CREATE FUNCTION app.f_pl(a text, b text) RETURNS boolean LANGUAGE plpgsql IMMUTABLE \
+               AS $$ BEGIN RETURN to_tsvector('app.docs'::regconfig, a) @@ plainto_tsquery('app.docs'::regconfig, b); END $$; \
+             CREATE OPERATOR app.=~ (LEFTARG = text, RIGHTARG = text, FUNCTION = app.f_pl); \
+             CREATE MATERIALIZED VIEW app.mv_op AS SELECT body OPERATOR(app.=~) 'x' AS m FROM app.loose; \
+             CREATE INDEX ix_op ON app.loose (((body OPERATOR(app.=~) 'x')))",
+        );
+        let docs =
+            std::fs::read_to_string(d.dir.join("schema/app.docs.textsearch-config.yml")).unwrap();
+        declare(
+            &d,
+            "app.docs.textsearch-config.yml",
+            &docs.replace(
+                "email: [pg_catalog.simple]",
+                "email: [app.words, pg_catalog.simple]",
+            ),
+        );
+        let planned = succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        for needle in [
+            "stale-results",
+            "materialized view app.mv_op (behind function app.f_pl(pg_catalog.text,pg_catalog.text), whose body the catalog cannot read)",
+            "index app.ix_op (behind function app.f_pl(pg_catalog.text,pg_catalog.text), whose body the catalog cannot read)",
+        ] {
+            assert!(
+                said(&planned).contains(needle),
+                "{needle}: {}",
+                said(&planned)
+            );
+        }
+        for absent in ["app.mv_engine (behind", "app.mv_plain (behind"] {
+            assert!(!said(&planned).contains(absent), "{}", said(&planned));
+        }
+        let saved: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            saved
+                .changes
+                .changes
+                .iter()
+                .any(|p| p.risks.contains(&pbps_model::RiskClass::StaleResults)),
+            "{saved:?}"
+        );
+        let refused = apply_plan(&d, db, &path, false);
+        assert_ne!(code(&refused), 0, "{}", said(&refused));
+        assert!(
+            said(&refused).contains("stale-results"),
+            "{}",
+            said(&refused)
+        );
+        // Now the catalog proves it: a `BEGIN ATOMIC` function that names the configuration,
+        // behind an operator, under a materialized view, an expression index and a stored
+        // generated column. The alteration is refused by name, with no plan.
+        on_server(
+            db,
+            "DROP MATERIALIZED VIEW app.mv_op; DROP INDEX app.ix_op; \
+             CREATE FUNCTION app.f_at(a text, b text) RETURNS boolean LANGUAGE sql IMMUTABLE \
+               BEGIN ATOMIC SELECT to_tsvector('app.docs'::regconfig, a) @@ plainto_tsquery('app.docs'::regconfig, b); END; \
+             CREATE OPERATOR app.=& (LEFTARG = text, RIGHTARG = text, FUNCTION = app.f_at); \
+             CREATE MATERIALIZED VIEW app.mv_at AS SELECT body OPERATOR(app.=&) 'x' AS m FROM app.loose; \
+             CREATE INDEX ix_at ON app.loose (((body OPERATOR(app.=&) 'x'))); \
+             CREATE TABLE app.gen (body text, g boolean GENERATED ALWAYS AS (body OPERATOR(app.=&) 'x') STORED)",
+        );
+        let out = d.run(&["plan", "--db", db]);
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        for needle in [
+            "app.docs",
+            "default value for app.gen.g, index app.ix_at, materialized view app.mv_at would keep the old behaviour",
+            "new name",
+        ] {
+            assert!(said(&out).contains(needle), "{needle}: {}", said(&out));
+        }
+        assert_eq!(
+            mappings_of(db, "docs"),
+            "asciiword=words,word=words,email=simple"
+        );
+    }
+}
+
 /// A mapping change of several statements passes through definitions that are neither end, and a
 /// staged apply checkpoints on each (SPEC §7.6, DEC-2728.4): every checkpoint is admitted and the
 /// close is at the plan's result, and a run stopped on a middle checkpoint (the second statement

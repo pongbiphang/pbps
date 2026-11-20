@@ -1732,8 +1732,12 @@ text, and the set of kinds is not finite (dictionary options, thesaurus files, `
 absent read as empty. The second class was the staged pin comparing whole definitions while a
 mapping change of several statements passes through intermediate ones.
 
-- **The walk is the catalog's.** `pg_depend` through views, view rules and `BEGIN ATOMIC`
-  bodies, plus `pg_ts_config_map` for a dictionary's configurations, and the held model's
+- **The walk is the catalog's.** `pg_depend` through views, view rules, `BEGIN ATOMIC`
+  bodies and user-defined operators (a stored dependent that uses an operator records the
+  operator and not the function behind it, for a materialized view, an index expression and a
+  generated column alike, so the operator's own edge to its function is followed; measured on
+  16.15 and 18.6, and a cast records its function directly, so it needs no arm), plus
+  `pg_ts_config_map` for a dictionary's configurations, and the held model's
   dictionaries that name a dictionary in their options. Nothing reads a function's text: the
   name matching (`may_call` over bodies, the call and view closure, the name sets) is gone.
 - **A stored dependent the catalog proves** (an expression index, a stored generated column,

@@ -563,6 +563,9 @@ macro_rules! stored_label {
 /// the catalog links) and stops at what stores, so a materialized view over a view over the
 /// object counts and a path that reaches no stored dependent makes none (the `UNION` ends a
 /// cycle). Measured on 16 and 18 (DEC-2728.3): no edge from a thesaurus's sub-dictionary.
+/// An operator is read through too: a stored dependent that uses a user-defined operator records
+/// the operator and not the function behind it, and the function's own edge to the object is the
+/// only link, so a reached function reaches the operator built on it (measured on 16.15 and 18.6).
 const STALE: &str = concat!(
     "WITH RECURSIVE subject(cls, oid) AS (
         SELECT 'pg_catalog.pg_ts_config'::pg_catalog.regclass, c.oid
@@ -588,6 +591,9 @@ const STALE: &str = concat!(
               SELECT 'pg_catalog.pg_proc'::pg_catalog.regclass, x.objid
                WHERE x.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
               UNION ALL
+              SELECT 'pg_catalog.pg_operator'::pg_catalog.regclass, x.objid
+               WHERE x.classid = 'pg_catalog.pg_operator'::pg_catalog.regclass
+              UNION ALL
               SELECT 'pg_catalog.pg_class'::pg_catalog.regclass, w.ev_class
                 FROM pg_catalog.pg_rewrite w
                 JOIN pg_catalog.pg_class k ON k.oid = w.ev_class
@@ -608,9 +614,13 @@ const STALE: &str = concat!(
 
 /// The functions the catalog cannot read into that a stored dependent reaches, one row per
 /// `(dependent, function)`, through the functions and views the catalog links (a view's rule, a
-/// `BEGIN ATOMIC` body). A function is opaque when its body is text: a `LANGUAGE sql` string body
-/// or any procedural language. Measured on 16.15 and 18.6 (DEC-2728.4): the engine records no
-/// edge from such a body to what it names, so the walk stops there, and nothing reads the text.
+/// `BEGIN ATOMIC` body) and the operators a dependent uses. A function is opaque when its body is
+/// text: a `LANGUAGE sql` string body or any procedural language. Measured on 16.15 and 18.6
+/// (DEC-2728.4): the engine records no edge from such a body to what it names, so the walk stops
+/// there, and nothing reads the text. The operator edge exists because a materialized view, an
+/// index expression or a generated column that uses a user-defined operator records the operator
+/// only, never the function behind it; the operator's own edge to its function is then followed.
+/// A cast is not walked: its dependents record the cast's function directly.
 /// The engine's own functions (`pg_catalog`, `information_schema`) and `internal` and `c` ones
 /// have no text to read and are not listed.
 const OPAQUE: &str = concat!(
@@ -628,6 +638,9 @@ const OPAQUE: &str = concat!(
          CROSS JOIN LATERAL (
               SELECT 'pg_catalog.pg_proc'::pg_catalog.regclass, x.refobjid
                WHERE x.refclassid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+              UNION ALL
+              SELECT 'pg_catalog.pg_operator'::pg_catalog.regclass, x.refobjid
+               WHERE x.refclassid = 'pg_catalog.pg_operator'::pg_catalog.regclass
               UNION ALL
               SELECT 'pg_catalog.pg_rewrite'::pg_catalog.regclass, r.oid
                 FROM pg_catalog.pg_rewrite r
