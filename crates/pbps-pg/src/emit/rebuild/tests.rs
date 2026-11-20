@@ -157,3 +157,91 @@ fn the_copy_names_the_columns_it_lists_so_the_guard_judges_the_defaults_of_the_r
         pbps_dialect::RowOperation::Copy { columns: listed }
     );
 }
+
+/// A recipe builds its parent definition with the ordinary statement over the copied rows,
+/// so the routines its key expressions and predicate call are judged as the same definition's
+/// ordinary change is, for every definition a recipe carries. A definition of plain columns
+/// carries nothing, and no probe evaluates a recipe (the preflight skips it).
+#[test]
+fn a_rebuild_recipe_carries_the_expressions_its_definition_holds() {
+    let recipe = fixture::index_recipe();
+    let with = |definition: serde_json::Value| {
+        let mut r = recipe.clone();
+        r.definition = serde_json::from_value(definition).unwrap();
+        Change::Index(IndexChange::BuildPartitionedIndex(Box::new(r)))
+    };
+    let exclusion = |key: serde_json::Value, filter: Option<&str>| {
+        with(serde_json::json!({"exclusion":{
+            "method":"btree",
+            "keys":[{"key":key,"operator":"="}],
+            "include":[],
+            "storage_parameters":{},
+            "filter":filter,
+            "timing":"immediate"
+        }}))
+    };
+    let call = serde_json::json!({"expression":"app.ok(k)"});
+    let column = serde_json::json!({"name":"k"});
+    // Positive: an exclusion's key expression, and its predicate.
+    assert!(crate::table_expressions::carries(&exclusion(
+        call.clone(),
+        None
+    )));
+    assert!(crate::table_expressions::carries(&exclusion(
+        column.clone(),
+        Some("app.ok(k)")
+    )));
+    // Positive: a plain index recipe holds the same gap, closed in the same arm.
+    assert!(crate::table_expressions::carries(&with(
+        serde_json::json!({"index":{"columns":[call]}})
+    )));
+    assert!(crate::table_expressions::carries(&with(
+        serde_json::json!({"index":{"columns":[column.clone()],"filter":"app.ok(k)"}})
+    )));
+    // Negative: columns only, no predicate, in each definition.
+    assert!(!crate::table_expressions::carries(&exclusion(
+        column.clone(),
+        None
+    )));
+    assert!(!crate::table_expressions::carries(&Change::Index(
+        IndexChange::BuildPartitionedIndex(Box::new(recipe.clone()))
+    )));
+    for key in [
+        serde_json::json!({"unique":{"columns":["k"]}}),
+        serde_json::json!({"primary_key":{"name":"p_idx","columns":["k"]}}),
+    ] {
+        assert!(!crate::table_expressions::carries(&with(key)));
+    }
+    // No probe evaluates a recipe, so leaving one unjudged leaves the probes running.
+    assert!(!crate::table_expressions::probed(&exclusion(call, None)));
+}
+
+/// The first statement of a recipe that holds an expression carries the recipe, so the executor
+/// judges it before the ADD runs over the copied rows; a recipe of plain columns carries none.
+#[test]
+fn the_first_statement_of_a_recipe_with_an_expression_introduces_it() {
+    let pg = Postgres::new();
+    let recipe = fixture::index_recipe();
+    let build = |keys: serde_json::Value| {
+        let mut r = recipe.clone();
+        r.definition = serde_json::from_value(serde_json::json!({"exclusion":{
+            "method":"btree",
+            "keys":[{"key":keys,"operator":"="}],
+            "include":[],
+            "storage_parameters":{},
+            "timing":"immediate"
+        }}))
+        .unwrap();
+        emit(
+            &pg,
+            &Change::Index(IndexChange::BuildPartitionedIndex(Box::new(r))),
+            Strategy::default(),
+        )
+        .unwrap()
+    };
+    let held = build(serde_json::json!({"expression":"app.ok(k)"}));
+    assert!(held[0].introduces.is_some(), "{held:?}");
+    assert!(held[1..].iter().all(|s| s.introduces.is_none()));
+    let plain = build(serde_json::json!({"name":"k"}));
+    assert!(plain.iter().all(|s| s.introduces.is_none()), "{plain:?}");
+}

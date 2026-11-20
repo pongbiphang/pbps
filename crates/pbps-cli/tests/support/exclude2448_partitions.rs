@@ -1123,6 +1123,94 @@ fn a_rebuild_keeps_the_record_of_a_partitions_retired_own_exclusion() {
     });
 }
 
+/// A rebuild builds a parent's exclusion again over the copied rows, so the routine its key
+/// expression calls is judged before the ADD runs, as a plain `ADD .. EXCLUDE` over the same
+/// expression is: a routine with no fixed `search_path` is refused with the fix and nothing is
+/// changed, and the same routine with one is admitted and the tree is rebuilt. PostgreSQL 18's:
+/// 16 holds no parent exclusion.
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_rebuilds_parent_exclusion_calling_a_function_is_judged_before_it_runs_on_18() {
+    let _ = server();
+    let url = std::env::var("PBPS_TEST_PG_DB").expect("PBPS_TEST_PG_DB");
+    for fixed in [false, true] {
+        let name = format!("exclude-rebuild-fn-{fixed}");
+        let own = OwnDatabase::new(&url, &name);
+        let connection = own.connection().to_owned();
+        let connection = connection.as_str();
+        let path = if fixed {
+            "SET search_path = pg_catalog, pg_temp "
+        } else {
+            ""
+        };
+        on_server(connection, REBUILD_TREE);
+        on_server(
+            connection,
+            &format!(
+                "CREATE FUNCTION app.ok(x integer) RETURNS integer LANGUAGE sql IMMUTABLE \
+                   {path}AS 'SELECT x + 0'; \
+                 ALTER TABLE app.p ADD CONSTRAINT p_x EXCLUDE USING btree \
+                   (k WITH =, bucket WITH =, (app.ok(bucket)) WITH =)"
+            ),
+        );
+        let d = adopt(&name, connection);
+        let file = d.dir.join("schema/app.p.yml");
+        let held = std::fs::read_to_string(&file).unwrap();
+        assert!(held.contains("partition_by: [k]"), "{held}");
+        std::fs::write(
+            &file,
+            held.replacen("partition_by: [k]", "partition_by: [bucket]", 1),
+        )
+        .unwrap();
+        succeeds(d.run(&[
+            "rebuild-table",
+            "app.p",
+            "--max-rows",
+            "10",
+            "--reason",
+            "re-key",
+        ]));
+        d.commit();
+        let oid = scalar(connection, "SELECT 'app.p'::regclass::oid::bigint");
+        let artifact = d.dir.join("rebuild.json");
+        let planned = succeeds(d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--out",
+            artifact.to_str().unwrap(),
+        ]));
+        assert!(
+            stdout(&planned).contains("blocking rewrite"),
+            "{}",
+            stdout(&planned)
+        );
+        let allow = ["--allow", "destructive,rename,constraint,narrowing,revoke"];
+        let applied = approved_apply(&d, connection, &artifact, &allow);
+        let shown = said(&applied);
+        let replaced = scalar(connection, "SELECT 'app.p'::regclass::oid::bigint") != oid;
+        if fixed {
+            assert_eq!(code(&applied), 0, "{shown}");
+            assert!(replaced, "the table was replaced");
+            assert_eq!(scalar(connection, "SELECT count(*) FROM app.p"), 3);
+        } else {
+            assert_ne!(code(&applied), 0, "{shown}");
+            // Judged where the constraint is added, by the key's own refusal, and not later at
+            // the copy that writes into the index, whose write guard speaks of an existing index.
+            assert!(
+                shown.contains("key 3 of exclusion constraint `p_x` on app.__pbps_rebuild_")
+                    && shown.contains(
+                        "ALTER FUNCTION app.ok(integer) SET search_path = pg_catalog, pg_temp"
+                    )
+                    && shown.contains("nothing has been changed"),
+                "{shown}"
+            );
+            assert!(!replaced, "the table was not replaced");
+        }
+        assert_eq!(parent_constraints(connection, "p_x"), 1);
+    }
+}
+
 /// A partition of a parent that holds an exclusion is detached on 18: the partition's clone
 /// becomes its own, as the declaration of the detached table names it, behind the `destructive`
 /// risk, with its rows kept and the parent's exclusion still holding the partitions left. A
