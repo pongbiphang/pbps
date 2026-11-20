@@ -175,8 +175,9 @@ fn rename(
 /// any of that. The order does for the dependents: the shared effects require
 /// each gone first and the views torn down around the drop (`ordering`), and the
 /// keys and unique constraints, which SQLite cannot drop in place, are the
-/// rebuild's own refusals. The last column is the one refusal left to the
-/// engine (see the test that pins it).
+/// rebuild's own refusals. The last column is the order's too: a table that
+/// replaces every column adds before it drops the last one, by the differ's
+/// rule and the effect that verifies it (#2963, DEC-2963.1).
 fn drop(dialect: &Sqlite, gate: Gate, column: &pbps_model::ColumnRef) -> Sql {
     allowed(dialect, gate, Form::DropColumn, "dropping a column")?;
     let sql = [

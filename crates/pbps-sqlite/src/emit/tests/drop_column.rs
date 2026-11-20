@@ -457,23 +457,13 @@ fn rows(db: &mut Fresh) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// The one `DROP COLUMN` refusal that reaches the engine. SQLite will not drop
-/// the only column of a table, and a plan that replaces every column of a table
-/// (`t(a)` to `t(b)`, with a new column identity) is ordered with the drop
-/// before the add, so the drop is the plan's first statement and fails when it
-/// runs, inside the plan's transaction.
-///
-/// The dialect cannot prevent it. The effects a dialect states only verify an
-/// order, they do not move a statement (a requirement that the added column
-/// exist first fails the order audit instead of reordering); the emitter is
-/// given the column and not the baseline's other columns, so it cannot know the
-/// drop is the last one; and validation sees only the declared table. The
-/// ordering rule that fixes it for every engine is issue #2963; until it lands,
-/// this is the engine's refusal, atomic, and a rehearsal of the plan on an
-/// in-memory database catches it before a plan is written.
+/// SQLite will not drop the only column of a table, so a plan that replaces
+/// every column of a table (`t(a)` to `t(b)`, a new column identity) adds before
+/// it drops: the order the differ writes for an engine that refuses the last
+/// column (#2963, DEC-2963.1). The bare drop is the engine's refusal, and the
+/// plan that reaches the declared schema is the one the order made.
 #[test]
-fn replacing_every_column_of_a_table_fails_atomically_at_the_engine_until_the_scheduler_orders_it()
-{
+fn replacing_every_column_of_a_table_adds_before_it_drops_the_last_and_applies() {
     let (base, declared) = (
         schema(&[("t", table(&[("a", col("integer"))]))], &[]),
         schema(&[("t", table(&[("b", col("text"))]))], &[]),
@@ -482,21 +472,137 @@ fn replacing_every_column_of_a_table_fails_atomically_at_the_engine_until_the_sc
     let statements = plan((&base, &bi), (&declared, &di), &Sqlite::default()).expect("plans");
     let text = sql_text(&statements);
     assert!(
-        text[0].contains("DROP COLUMN"),
-        "the drop is first: {text:#?}"
+        text[0].contains("ADD COLUMN"),
+        "the add is first: {text:#?}"
     );
-    let mut db = built("CREATE TABLE t(a integer); INSERT INTO t VALUES (1), (2)");
-    let (catalog_before, rows_before) = (catalog_of(&mut db), rows(&mut db));
+    let base_sql = "CREATE TABLE t(a integer); INSERT INTO t VALUES (1), (2)";
+    assert!(
+        bare_refusal(base_sql, "ALTER TABLE t DROP COLUMN a").contains("no other columns exist")
+    );
+    let mut db = built(base_sql);
     db.connection().execute_batch("BEGIN").expect("begin");
-    let failure = run(db.connection(), &statements).expect_err("the engine refuses");
-    assert!(failure.contains("no other columns exist"), "{failure}");
-    db.connection().execute_batch("ROLLBACK").expect("rollback");
+    run(db.connection(), &statements).expect("applies");
+    db.connection().execute_batch("COMMIT").expect("commit");
     assert_same(
-        &catalog_before,
         &catalog_of(&mut db),
-        "the catalog is as it was",
+        &catalog_of(&mut built("CREATE TABLE t(b text)")),
+        "the plan reaches the declared schema",
     );
-    assert_eq!(rows_before, rows(&mut db), "and so are the rows");
+    assert_eq!(
+        rows(&mut db),
+        vec![vec!["NULL".to_owned()], vec!["NULL".to_owned()]],
+        "and the rows stay"
+    );
+}
+
+#[test]
+fn replacing_two_columns_keeps_a_column_at_every_statement_and_converges() {
+    let (base, declared) = (
+        schema(
+            &[("t", table(&[("a", col("integer")), ("b", col("integer"))]))],
+            &[],
+        ),
+        schema(
+            &[("t", table(&[("c", col("text")), ("d", col("integer"))]))],
+            &[],
+        ),
+    );
+    let (bi, di) = (ids(&base, &[]), ids(&declared, &[]));
+    let statements = plan((&base, &bi), (&declared, &di), &Sqlite::default()).expect("plans");
+    let mut db = built("CREATE TABLE t(a integer, b integer); INSERT INTO t VALUES (1, 2)");
+    db.connection().execute_batch("BEGIN").expect("begin");
+    run(db.connection(), &statements)
+        .unwrap_or_else(|e| panic!("{e}\n{:#?}", sql_text(&statements)));
+    db.connection().execute_batch("COMMIT").expect("commit");
+    assert_same(
+        &catalog_of(&mut db),
+        &catalog_of(&mut built("CREATE TABLE t(c text, d integer)")),
+        "the plan reaches the declared schema",
+    );
+}
+
+#[test]
+fn a_generated_column_does_not_count_as_the_column_that_stays() {
+    // `g` is generated and stays out of the count: `a` is the last ordinary
+    // column, so its drop waits for the add of `b` (measured: "must have at
+    // least one non-generated column").
+    let generated = |expression: &str| {
+        let mut g = col("integer");
+        g.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
+            expression: expression.into(),
+            stored: false,
+        });
+        g
+    };
+    let (base, declared) = (
+        schema(
+            &[("t", table(&[("a", col("integer")), ("g", generated("1"))]))],
+            &[],
+        ),
+        schema(&[("t", table(&[("b", col("integer"))]))], &[]),
+    );
+    let (bi, di) = (ids(&base, &[]), ids(&declared, &[]));
+    let statements = plan((&base, &bi), (&declared, &di), &Sqlite::default()).expect("plans");
+    let base_sql = "CREATE TABLE t(a integer, g integer GENERATED ALWAYS AS (1) VIRTUAL)";
+    let mut db = built(base_sql);
+    db.connection().execute_batch("BEGIN").expect("begin");
+    run(db.connection(), &statements)
+        .unwrap_or_else(|e| panic!("{e}\n{:#?}", sql_text(&statements)));
+    db.connection().execute_batch("COMMIT").expect("commit");
+    assert_same(
+        &catalog_of(&mut db),
+        &catalog_of(&mut built("CREATE TABLE t(b integer)")),
+        "the plan reaches the declared schema",
+    );
+}
+
+/// No order performs it: the old column cannot go first (the only one), and the
+/// new one cannot come first (the name stands). Refused when the plan is made,
+/// with the way out, and never reaching the engine.
+#[test]
+fn the_only_column_replaced_by_a_column_of_the_same_name_is_refused_when_the_plan_is_made() {
+    let (base, declared) = (
+        schema(&[("t", table(&[("a", col("integer"))]))], &[]),
+        schema(&[("t", table(&[("a", col("text"))]))], &[]),
+    );
+    let (bi, di) = (ids(&base, &[]), ids(&declared, &[("t.a", "t.a_again")]));
+    let refused =
+        plan((&base, &bi), (&declared, &di), &Sqlite::default()).expect_err("no order performs it");
+    assert!(
+        refused.contains("replaces every one of its columns"),
+        "{refused}"
+    );
+    assert!(refused.contains("`a`"), "{refused}");
+    assert!(refused.contains("two revisions"), "{refused}");
+    // Negative: the same column under its own identity is no replacement.
+    assert!(plan((&base, &bi), (&base, &bi), &Sqlite::default()).is_ok());
+    // And the engine's two refusals are what the plan avoids.
+    assert!(
+        bare_refusal("CREATE TABLE t(a integer)", "ALTER TABLE t DROP COLUMN a")
+            .contains("no other columns exist")
+    );
+    assert!(
+        bare_refusal(
+            "CREATE TABLE t(a integer)",
+            "ALTER TABLE t ADD COLUMN a text"
+        )
+        .contains("duplicate column name")
+    );
+}
+
+#[test]
+fn names_that_differ_only_by_case_are_one_name_to_sqlite_and_are_refused_alike() {
+    let (base, declared) = (
+        schema(&[("t", table(&[("a", col("integer"))]))], &[]),
+        schema(&[("t", table(&[("A", col("integer"))]))], &[]),
+    );
+    let (bi, di) = (ids(&base, &[]), ids(&declared, &[]));
+    let refused = plan((&base, &bi), (&declared, &di), &Sqlite::default())
+        .expect_err("SQLite folds the names");
+    assert!(
+        refused.contains("replaces every one of its columns"),
+        "{refused}"
+    );
 }
 
 #[test]
@@ -732,4 +838,73 @@ fn two_dropped_views_that_spell_each_others_names_wait_for_nothing() {
     db.connection()
         .execute_batch("DROP VIEW v1; DROP VIEW v2")
         .expect("a read view is dropped first");
+}
+
+/// The audit's half of the order: SQLite's own requirement that the add that
+/// replaces the last column exists before its drop, checked by the verifier
+/// over each order of the two changes, with a kept column as the negative.
+#[test]
+fn the_last_columns_drop_requires_its_replacement_to_exist_first() {
+    use pbps_diff::order::{Baseline, analyse, reordered_operations, verify};
+    use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
+    use pbps_model::plan_names::PlanNames;
+    use pbps_model::{Change, ColumnChange, PlannedChange};
+
+    let violations = |was: &[&str], now: &[&str], order: &[usize]| {
+        let columns = |names: &[&str]| {
+            table(
+                &names
+                    .iter()
+                    .map(|n| (*n, col("integer")))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let (base, declared) = (
+            schema(&[("t", columns(was))], &[]),
+            schema(&[("t", columns(now))], &[]),
+        );
+        let (bi, di) = (ids(&base, &[]), ids(&declared, &[]));
+        let name = base.tables.keys().next().unwrap().clone();
+        let uid =
+            |ids: &IdsFile, column: &str| ids.column_uid(&name.column(column)).cloned().unwrap();
+        let logical: Vec<PlannedChange> = vec![
+            Change::Column(ColumnChange::DropColumn {
+                uid: uid(&bi, "a"),
+                column: name.column("a"),
+            }),
+            Change::Column(ColumnChange::AddColumn {
+                uid: uid(&di, "b"),
+                table: name.clone(),
+                name: "b".into(),
+                column: Box::new(col("integer")),
+            }),
+        ]
+        .into_iter()
+        .map(PlannedChange::new)
+        .collect();
+        let ops = Operations::of_plan(&logical, ModuleEdits::InPlace);
+        let owners = PlanOwners::new(PlanNames::of(&logical, &di).unwrap(), &bi, &di);
+        let (before, after) = (
+            Snapshot {
+                schema: &base,
+                ids: &bi,
+            },
+            Snapshot {
+                schema: &declared,
+                ids: &di,
+            },
+        );
+        let baseline = Baseline::of(before, &owners);
+        let shadowed = analyse(&ops, &owners, before, after, &Sqlite::default());
+        assert!(shadowed.unowned.is_empty(), "{:?}", shadowed.unowned);
+        let ordered = reordered_operations(&ops, order);
+        let effects: Vec<_> = order.iter().map(|&i| shadowed.effects[i].clone()).collect();
+        verify(ordered.as_slice(), &effects, &baseline, &Default::default())
+    };
+    // `a` replaced by `b`: the add first is the order SQLite performs.
+    assert_eq!(violations(&["a"], &["b"], &[1, 0]), []);
+    assert!(!violations(&["a"], &["b"], &[0, 1]).is_empty());
+    // Negative: `k` stays, so either order is one the engine performs.
+    assert_eq!(violations(&["a", "k"], &["k", "b"], &[0, 1]), []);
+    assert_eq!(violations(&["a", "k"], &["k", "b"], &[1, 0]), []);
 }

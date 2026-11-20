@@ -50,6 +50,24 @@ use pbps_model::{
     Table, TableName, Uid, UniqueConstraint, Value, ValueSource,
 };
 
+/// What makes a table's replacement unorderable, for the one message that
+/// serves every reason (`LastColumnReplacementUnorderable`).
+fn last_column_reason(column: &ColumnName, block: pbps_dialect::last_column::Block) -> String {
+    use pbps_dialect::last_column::Block;
+    match block {
+        Block::SameName => format!(
+            "its only column `{}` is replaced by a new column of the same name, and the engine \
+             will not drop a table's last column, nor add a name that is still there",
+            column.shown()
+        ),
+        Block::Identity => format!(
+            "its IDENTITY column `{}` is replaced by a new IDENTITY column, and the engine will \
+             not drop a table's last column, nor hold two IDENTITY columns",
+            column.shown()
+        ),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DiffError {
     #[error("{reason}")]
@@ -467,6 +485,25 @@ pub enum DiffError {
     )]
     TableRenameCycle {
         renames: Vec<(TableName, TableName)>,
+    },
+
+    /// A table's columns all replaced, and no order of the replacement is one
+    /// the engine performs (#2963, DEC-2963.1): the engine will not drop a
+    /// table's last column, and the add that would come first is one it
+    /// refuses (a name that stands, a second IDENTITY column). A temporary
+    /// name is the deployer's to choose, as for renames.
+    #[error(
+        "{table} replaces every one of its columns, and no order of those changes is one the \
+         engine performs: {reason}. Keep the existing column instead of replacing it, or \
+         make the change in two revisions: add a column of another kind or name first, then \
+         replace it",
+        table = .table.shown(),
+        reason = last_column_reason(.column, *.block),
+    )]
+    LastColumnReplacementUnorderable {
+        table: TableName,
+        column: ColumnName,
+        block: pbps_dialect::last_column::Block,
     },
 
     /// `depends_on:` declarations that close a cycle (#2083, DEC-2083.1):
@@ -3010,6 +3047,15 @@ pub(crate) fn diff_partial_rebuilding(
     });
     for cycle in crate::order::rename_order::order(&mut planned, base, &renames, dialect) {
         errs.push(DiffError::TableRenameCycle { renames: cycle });
+    }
+    for (table, column, block) in
+        crate::order::last_column::order(&mut planned, base, declared, dialect)
+    {
+        errs.push(DiffError::LastColumnReplacementUnorderable {
+            table,
+            column,
+            block,
+        });
     }
     let mut changes = ChangeSet { changes: planned };
     if let Err(reason) = crate::drop_requirements::assign(&mut changes, base.ids, declared.ids)

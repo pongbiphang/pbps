@@ -176,7 +176,7 @@ pub(crate) fn teardown(base: &Schema, declared: &Schema, changes: &[Change]) -> 
 
 /// What only SQLite knows about a step: the checks and filtered indexes that
 /// name a column stand in the way of dropping it, as do the views that read
-/// it.
+/// it, and the last column's drop waits for the add that replaces it.
 pub(crate) fn effects(
     dialect: &Sqlite,
     op: &Operation,
@@ -187,7 +187,10 @@ pub(crate) fn effects(
     // A rename does not block: SQLite rewrites the checks and indexes that
     // name what it renames.
     let mut fx =
-        pbps_dialect::engine_effects::text_dependents(dialect, op, owners, before, after, false)?;
+        pbps_dialect::engine_effects::text_dependents(dialect, op, owners, before, after, false)?
+            .merged(pbps_dialect::last_column::requirements(
+                dialect, op, owners, before, after,
+            )?);
     // The owners say which table of the baseline the step means.
     let base_name = if let Change::Column(ColumnChange::DropColumn { column, .. }) = op.change() {
         base_table(op, owners, before, &column.table)?.map(|found| found.name.name.clone())

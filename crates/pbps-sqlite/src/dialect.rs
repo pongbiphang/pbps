@@ -58,6 +58,12 @@ impl Dialect for Sqlite {
         types::DIALECT
     }
 
+    /// **Yes**, measured: `cannot drop column: no other columns exist`, and a
+    /// generated column is not one that stays (#2963, DEC-2963.1).
+    fn refuses_dropping_last_column(&self) -> bool {
+        true
+    }
+
     fn lexicon(&self) -> Lexicon {
         ident::LEXICON
     }

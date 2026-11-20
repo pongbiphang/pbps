@@ -18297,6 +18297,9 @@ mod capture2141;
 #[path = "live/binding619.rs"]
 mod binding619;
 
+#[path = "live/last_column2963.rs"]
+mod last_column2963;
+
 /// #351. Every declared and recorded schema used to be bound into one
 /// schema-permission statement, so an estate with more schemas than the
 /// server's parameter ceiling read the whole schema answer as unreadable. The

@@ -44,6 +44,7 @@ pub mod creation;
 pub mod drop_requirements;
 pub mod engine_effects;
 pub mod estimate;
+pub mod last_column;
 pub mod lower;
 pub mod plan_rows;
 pub mod predicate;
@@ -3515,6 +3516,15 @@ pub trait Dialect {
     /// DEC-1889.1). SQL Server has no `ALTER` for an identity, and a change
     /// to one is refused there (DECISIONS 5).
     fn changes_numbering(&self) -> bool {
+        false
+    }
+
+    /// Whether the engine refuses to drop the last ordinary column of a table
+    /// (SQLite: "no other columns exist"; SQL Server: Msg 4923). A plan that
+    /// replaces every column of a table then adds a column before it drops the
+    /// last one (#2963, DEC-2963.1). PostgreSQL allows a table with no column,
+    /// so its plans keep the order they have always had.
+    fn refuses_dropping_last_column(&self) -> bool {
         false
     }
 

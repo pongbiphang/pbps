@@ -37,6 +37,7 @@
     {"target": ["pbps-mssql", "test", "live"], "prefix": "externals2269::", "owner": "resolver-mssql"},
     {"target": ["pbps-mssql", "test", "live"], "prefix": "future_grants_tests::", "owner": "mssql"},
     {"target": ["pbps-mssql", "test", "live"], "prefix": "key_spelling::", "owner": "mssql"},
+    {"target": ["pbps-mssql", "test", "live"], "prefix": "last_column2963::", "owner": "mssql"},
     {"target": ["pbps-mssql", "test", "live"], "prefix": "null_predelete_tests::", "owner": "mssql"},
     {"target": ["pbps-mssql", "test", "live"], "prefix": "plan_names_tests::", "owner": "mssql"},
     {"target": ["pbps-mssql", "test", "live"], "prefix": "positional_preflight_tests::", "owner": "mssql"},

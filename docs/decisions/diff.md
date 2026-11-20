@@ -10115,3 +10115,64 @@ PR writes either before the first release.
 
 Formats: none. `SetExclusion` is plan 73's kind, the snapshot already holds `exclude` for any table,
 the published documents name no part of this, and the ids file is the parent's own.
+
+<a id="dec-2963-1"></a>
+
+**DEC-2963.1. A table that replaces every column adds before it drops the last (#2963).**
+The classes drop a column (class 5) before they add one (class 8), so `t(a)` to `t(b)`, a new
+column identity, wrote `DROP COLUMN a` and then `ADD COLUMN b`. Measured: SQLite refuses the first
+(`cannot drop column "a": no other columns exist`, and a generated column is not one that stays),
+and SQL Server 17.0.4075.5 refuses it with Msg 4923 (`the only data column`; a computed column is
+not a data column, before or after it is added). PostgreSQL 16.15 and 18.6 allow a table with no
+column, and the add-first order gives the same table there: the same `attnum`, the same rows, the
+same defaults and identity values, the same refusal of `NOT NULL` with no default over rows.
+
+**The rule.** On an engine whose `Dialect::refuses_dropping_last_column` is true (SQL Server and
+SQLite; default false, so PostgreSQL's plans are byte-identical and a test pins them), a table
+that keeps no baseline column (by uid: a renamed column is a kept one) and adds an ordinary column
+puts **one** drop behind **one** add. Every other drop and add keeps its class position, and a
+table that keeps a baseline column keeps today's order exactly. Generated and computed columns are
+in neither set. One function chooses the pair, `pbps_dialect::last_column::replacement`: the
+differ moves the drop by it (`order::last_column`, a pass after the sort, inside `diff`, so a
+release build orders by it too) and each engine's `engine_effects` requires the add before the
+drop by it, so the audit verifies the order by the rule that made it. The requirement is on the
+moved drop only: a requirement on every drop would contradict the drop that has to precede an add
+that takes its name.
+
+**The pair.** The drop is the baseline's last ordinary column that no add takes the name of, else
+its last column. The add is, among the adds the drop's name is not taken by, one whose name equals
+no baseline column's in any ASCII case if there is one, then the last in declared order (or the
+last before the add that takes the drop's name, which then follows the drop, so the declared order
+holds wherever it can). Equal names are those equal under the dialect's own `fold_ident`.
+
+**The pair has to be one the engine performs.** At the moment the add runs, the only baseline
+column still standing is the drop. SQL Server holds one IDENTITY column per table (Msg 2744, the
+rule `pbps-mssql` `validate` already states; SQLite declares no identity column, and PostgreSQL is
+not on this path), so a drop that is an IDENTITY column is never paired with an add that is one.
+That add (the table has at most one) **follows the drop**, as the add that takes the drop's name
+does: `Replacement::Order` carries both as `follows`, the differ moves each behind the drop, and
+the add's `engine_effects` requires the drop's column gone. When the drop is an IDENTITY, the
+pair takes another add; when it has none, another drop (the preference order above, among the
+valid pairs only). The add of a non-IDENTITY drop is not restricted.
+
+**What no order performs, and what is not refused.** A table that keeps no column and has no
+valid pair: the only column replaced by one of the same name (dropping first leaves no column,
+adding first repeats the name), or an IDENTITY column replaced by an IDENTITY column with no other
+add to go first (adding first holds two). It is refused when the plan is made
+(`LastColumnReplacementUnorderable`, with the reason `Block::SameName` or `Block::Identity`),
+naming the table and the column, with the way out: keep the existing column, or make the change in
+two revisions, with a column of another kind or name between. No temporary name is written, as
+for a rename cycle (DEC-541.1).
+
+Names that differ only by case are **not** refused, and no collation setting is added. A database
+may be case-sensitive, where `a` and `A` are two names and the plan is valid, and a plan made
+offline does not know the collation (the reasoning of DECISIONS 474). So only names equal under
+`fold_ident` are the unorderable class (on SQL Server that is exact equality; SQLite folds ASCII
+case, so there `a` and `A` are one name and are refused alike). A pair that differs only by case
+is ordered add first: a case-sensitive database takes it, and a case-insensitive one refuses the
+add with its own duplicate-name error (Msg 2705, measured), atomically, with the table as it was.
+The preference for an add that equals no baseline name in any case is what keeps that refusal for
+the plans with no better pair.
+
+Formats: none. No change, plan or state kind is added; the order of changes in a plan moves and no
+wire field does.

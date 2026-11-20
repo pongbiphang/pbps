@@ -269,6 +269,12 @@ impl Dialect for Mssql {
         types::DIALECT
     }
 
+    /// **Yes**, measured on 17.0.4075.5: Msg 4923, "the only data column in
+    /// table". A computed column is not a data column (#2963, DEC-2963.1).
+    fn refuses_dropping_last_column(&self) -> bool {
+        true
+    }
+
     fn creation_inline(&self, name: &TableName, table: &Table) -> pbps_dialect::creation::Inline {
         generated::inline(name, table)
     }
@@ -340,7 +346,9 @@ impl Dialect for Mssql {
     ///   name a computed column stands in the way of dropping that;
     /// - what a retype, a collation change or a nullability change has to
     ///   have out of its way, by the policy the differ rebuilds dependents by
-    ///   (`retype_blockers`, #1998).
+    ///   (`retype_blockers`, #1998);
+    /// - the last data column's drop waits for the add that replaces it
+    ///   (`last_column`, #2963).
     ///
     /// "May" by the lexer, which over-approximates: a false yes costs an edge,
     /// a false no costs an apply the engine refuses (DEC-1174.1).
@@ -362,6 +370,9 @@ impl Dialect for Mssql {
         let mut fx =
             pbps_dialect::engine_effects::text_dependents(self, op, owners, before, after, true)?
                 .merged(pbps_dialect::engine_effects::retype_blockers(
+                    self, op, owners, before, after,
+                )?)
+                .merged(pbps_dialect::last_column::requirements(
                     self, op, owners, before, after,
                 )?);
         // A module bound to what this step changes must be gone while it
