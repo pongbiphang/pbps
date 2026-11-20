@@ -4482,6 +4482,21 @@ fn detached_names(
 ) -> Result<Vec<DetachedName>, Vec<String>> {
     let mut names = Vec::new();
     let mut what = Vec::new();
+    // Its clone of the parent's exclusion becomes its own on a detach, under a name
+    // the engine chose (measured on 18.6), and no recipe names it yet (DEC-2448.6).
+    if !parent.exclude.is_empty() {
+        what.push(format!(
+            "its parent holds exclusion constraint(s) {}, whose clone a detach would keep as \
+             an own constraint under the engine's name; detaching a partition of such a parent \
+             is not supported yet (DEC-2448.6, #2448)",
+            parent
+                .exclude
+                .keys()
+                .map(|n| format!("`{}`", n.shown()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     // Its own are matched by name before the parent's by definition: a
     // detach renames only what it gave the partition, so an own check or
     // index declared under another name, or changed, is a change this plan
@@ -5621,7 +5636,8 @@ fn refuse_partition_changes(
         | Change::Constraint(ConstraintChange::AddCheck { table, .. })
         | Change::Constraint(ConstraintChange::DropCheck { table, .. })
         | Change::Constraint(ConstraintChange::AddForeignKey { table, .. })
-        | Change::Constraint(ConstraintChange::DropForeignKey { table, .. }) = change
+        | Change::Constraint(ConstraintChange::DropForeignKey { table, .. })
+        | Change::Constraint(ConstraintChange::SetExclusion { table, .. }) = change
             && parent_standing(base.schema, table)
             && parent_standing(declared.schema, table)
         {
@@ -5865,6 +5881,54 @@ fn refuse_parent_index(
     if let Change::Constraint(ConstraintChange::AddUnique { constraint, .. }) = change {
         return missing_key(&constraint.columns).map(without_key);
     }
+    // A parent's new exclusion (PostgreSQL 18 only; DEC-2448.6): the engine requires
+    // every partition-key column as a plain key with an equality, and takes a
+    // partition's own exclusion of the same shape as the parent's clone, which the
+    // parent's drop then removes. A drop has nothing to ask.
+    if let Change::Constraint(ConstraintChange::SetExclusion {
+        name,
+        to: Some(exclusion),
+        ..
+    }) = change
+    {
+        if let Some(missing) = parent.partition_by.as_ref().and_then(|by| {
+            by.columns
+                .iter()
+                .find(|key| !holds_key_with_equality(exclusion, key))
+                .cloned()
+        }) {
+            return Some(format!(
+                "add exclusion constraint `{name}` without the partition key column `{missing}` \
+                 as a plain key excluded with `=`, which PostgreSQL refuses on a partitioned \
+                 table; add `{missing}` WITH `=` to its keys",
+                missing = missing.shown(),
+                name = name.shown(),
+            ));
+        }
+        let adopted: Vec<String> = partitions()
+            .flat_map(|(partition, t)| {
+                t.exclude
+                    .iter()
+                    .filter(|(_, own)| adopts_exclusion(exclusion, own))
+                    .map(move |(own, _)| {
+                        format!(
+                            "{partition}'s `{own}`",
+                            partition = partition.shown(),
+                            own = own.shown(),
+                        )
+                    })
+            })
+            .collect();
+        return (!adopted.is_empty()).then(|| {
+            format!(
+                "add exclusion constraint `{name}`, which can take {} as the partition's copy \
+                 of it and leave the partition without its own; drop or rename the \
+                 partition's own exclusion in an earlier plan",
+                adopted.join(", "),
+                name = name.shown(),
+            )
+        });
+    }
     // A partition's own check under the parent's new check's name is
     // absorbed into it, measured on 16 and 18: the same expression makes it
     // the parent's clone, which the parent's later drop removes, and another
@@ -5968,6 +6032,49 @@ pub fn adopts(parent: &pbps_model::Index, own: &pbps_model::Index) -> bool {
                 (Some(p_column), Some(o_column)) => p_column == o_column && p.opclass == o.opclass,
                 _ => true,
             }
+        })
+}
+
+/// Whether `key` is held by `exclusion` as a plain column key excluded with
+/// `=`: what PostgreSQL 18 requires of each partition-key column of a
+/// partitioned table's exclusion (DEC-2448.6). An `INCLUDE` column, a cast and
+/// an expression over the column do not hold it (measured on 18.6).
+pub fn holds_key_with_equality(
+    exclusion: &pbps_model::ExclusionConstraint,
+    key: &ColumnName,
+) -> bool {
+    exclusion
+        .keys
+        .iter()
+        .any(|k| k.key.key.column() == Some(key) && k.operator.as_symbol() == "=")
+}
+
+/// Whether a parent's new exclusion can take a partition's own as its clone:
+/// the one predicate the differ, the attach path and validation share
+/// (DEC-2448.6). Measured on 18.6, on `ATTACH` and on a parent's `ADD` over a
+/// standing partition: the method, the keys in order with their classes,
+/// collations and operators, the `INCLUDE` columns and the predicate must
+/// match; the timing, the storage parameters and the name need not. As for
+/// an index, an expression key or a predicate matches whatever its text, since
+/// the engine compares what each binds to.
+pub fn adopts_exclusion(
+    parent: &pbps_model::ExclusionConstraint,
+    own: &pbps_model::ExclusionConstraint,
+) -> bool {
+    parent.method == own.method
+        && parent.filter.is_some() == own.filter.is_some()
+        && parent.include == own.include
+        && parent.keys.len() == own.keys.len()
+        && parent.keys.iter().zip(&own.keys).all(|(p, o)| {
+            p.operator == o.operator
+                && match (p.key.key.column(), o.key.key.column()) {
+                    (Some(p_column), Some(o_column)) => {
+                        p_column == o_column
+                            && p.key.opclass == o.key.opclass
+                            && p.key.collation == o.key.collation
+                    }
+                    _ => true,
+                }
         })
 }
 
@@ -7104,6 +7211,13 @@ fn diff_exclusions(
                     )
                 });
                 match edit {
+                    // A partitioned parent's index takes no `ALTER INDEX SET`/`RESET`
+                    // (42809, measured on 18.6 for its exclusion's index): the edit is a
+                    // replacement, whose add carries the final options (DEC-2449.1).
+                    Some(ParameterEdit::Alter { .. }) if declared.partition_by.is_some() => {
+                        changes.push(drop_half(key, was));
+                        changes.push(add_half(key, now));
+                    }
                     Some(ParameterEdit::Alter { set, reset }) => {
                         changes.push(Change::Index(IndexChange::SetIndexStorageParameters {
                             table: name.clone(),
@@ -12336,6 +12450,174 @@ mod tests {
         assert_eq!(kinds(&cs), ["SetExclusion", "SetExclusion"]);
     }
 
+    /// A parent exclusion that the engine takes: the partition key `a` as a plain key
+    /// with `=`, then the overlap.
+    fn parent_exclusion() -> pbps_model::ExclusionConstraint {
+        let mut x = exclusion("int4range(b, c)", "&&");
+        x.keys.insert(
+            0,
+            pbps_model::ExclusionKey {
+                key: IndexColumn::column("a"),
+                operator: pbps_model::OperatorRef::symbol("=").unwrap(),
+            },
+        );
+        x
+    }
+
+    /// `app.booking` partitioned by `a`, holding `parent` and a standing partition that
+    /// holds `own` (an own exclusion no declaration can hold yet, so a test builds it).
+    fn partitioned_booking(
+        parent: &[(&str, pbps_model::ExclusionConstraint)],
+        own: &[(&str, pbps_model::ExclusionConstraint)],
+    ) -> Schema {
+        let mut s = booking(parent);
+        let booking_table: TableName = "app.booking".parse().unwrap();
+        s.tables.get_mut(&booking_table).unwrap().partition_by = Some(pbps_model::PartitionBy {
+            external: false,
+            columns: vec!["a".into()],
+            strategy: Default::default(),
+        });
+        let mut leaf = Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: booking_table,
+                bound: pbps_model::PartitionBound::Default,
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        };
+        for (name, x) in own {
+            leaf.exclude.insert((*name).into(), x.clone());
+        }
+        s.tables.insert("app.booking_1".parse().unwrap(), leaf);
+        s
+    }
+
+    /// `adopts_exclusion` is the engine's rule (measured on 18.6, on `ATTACH` and on a
+    /// parent's `ADD` over a standing leaf): method, keys with operators, `INCLUDE` and
+    /// the predicate decide; timing, storage parameters and name do not (DEC-2448.6).
+    #[test]
+    fn an_own_exclusion_is_taken_as_a_clone_by_shape_and_not_by_timing_or_options() {
+        let parent = parent_exclusion();
+        assert!(adopts_exclusion(&parent, &parent));
+        let mut timed = parent.clone();
+        timed.timing = pbps_model::ExclusionTiming::DeferrableDeferred;
+        timed
+            .storage_parameters
+            .insert("fillfactor".into(), "70".into());
+        assert!(adopts_exclusion(&parent, &timed));
+        assert!(adopts_exclusion(&timed, &parent));
+        // Each of the shape's parts, changed, is another constraint.
+        let mut other = parent.clone();
+        other.include = vec!["id".into()];
+        assert!(!adopts_exclusion(&parent, &other));
+        let mut other = parent.clone();
+        other.filter = Some("id > 0".into());
+        assert!(!adopts_exclusion(&parent, &other));
+        let mut other = parent.clone();
+        other.keys.reverse();
+        assert!(!adopts_exclusion(&parent, &other));
+        let mut other = parent.clone();
+        other.keys[1].operator = pbps_model::OperatorRef::symbol("-|-").unwrap();
+        assert!(!adopts_exclusion(&parent, &other));
+        let mut other = parent.clone();
+        other.method = IndexMethod::Btree;
+        assert!(!adopts_exclusion(&parent, &other));
+        let mut other = parent.clone();
+        other.keys.pop();
+        assert!(!adopts_exclusion(&parent, &other));
+    }
+
+    /// A standing parent takes an exclusion by one change; the engine's key rule and
+    /// its adoption of a partition's own are refused by name, an option-only edit is a
+    /// replacement (a partitioned index takes no `ALTER INDEX SET`), and a drop needs
+    /// its record as any other (DEC-2448.6).
+    #[test]
+    fn a_standing_parents_exclusion_is_added_replaced_and_dropped_under_the_engines_rules() {
+        let none = partitioned_booking(&[], &[]);
+        let held = partitioned_booking(&[("x", parent_exclusion())], &[]);
+        let cs = exclusion_plan(&none, &held, &[]).unwrap();
+        assert_eq!(kinds(&cs), ["SetExclusion"]);
+        assert!(cs.risks().contains(&RiskClass::Constraint));
+        // Negative: without the partition key as a plain `=` key it is refused by name.
+        for bad in [
+            exclusion("int4range(b, c)", "&&"),
+            {
+                let mut x = parent_exclusion();
+                x.keys[0].operator = pbps_model::OperatorRef::symbol("<>").unwrap();
+                x
+            },
+            {
+                let mut x = parent_exclusion();
+                x.keys[0].key = IndexColumn {
+                    key: pbps_model::IndexKey::Expression("a::bigint".into()),
+                    ..IndexColumn::column("a")
+                };
+                x
+            },
+        ] {
+            let said = exclusion_plan(&none, &partitioned_booking(&[("x", bad)], &[]), &[])
+                .unwrap_err()
+                .join("\n");
+            assert!(
+                said.contains("without the partition key column `a`"),
+                "{said}"
+            );
+        }
+        // A partition's own of the same shape would be taken as the clone: refused, even
+        // with another timing, and accepted when it differs in shape or is the parent's
+        // alone.
+        let mut own = parent_exclusion();
+        own.timing = pbps_model::ExclusionTiming::DeferrableImmediate;
+        let said = exclusion_plan(
+            &partitioned_booking(&[], &[("mine", own.clone())]),
+            &partitioned_booking(&[("x", parent_exclusion())], &[("mine", own.clone())]),
+            &[],
+        )
+        .unwrap_err()
+        .join("\n");
+        assert!(
+            said.contains("which can take app.booking_1's `mine`"),
+            "{said}"
+        );
+        own.include = vec!["id".into()];
+        assert_eq!(
+            kinds(
+                &exclusion_plan(
+                    &partitioned_booking(&[], &[("mine", own.clone())]),
+                    &partitioned_booking(&[("x", parent_exclusion())], &[("mine", own)]),
+                    &[],
+                )
+                .unwrap()
+            ),
+            ["SetExclusion"]
+        );
+        // An option-only edit is a drop and an add carrying the final options.
+        let mut tuned = parent_exclusion();
+        tuned
+            .storage_parameters
+            .insert("fillfactor".into(), "70".into());
+        let cs = exclusion_plan(
+            &held,
+            &partitioned_booking(&[("x", tuned.clone())], &[]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(kinds(&cs), ["SetExclusion", "SetExclusion"]);
+        // Negative: on an ordinary table the same edit is the in-place `ALTER INDEX`.
+        let ordinary = |x| booking(&[("x", x)]);
+        let cs = exclusion_plan(&ordinary(parent_exclusion()), &ordinary(tuned), &[]).unwrap();
+        assert_eq!(kinds(&cs), ["SetIndexStorageParameters"]);
+        // A drop needs the retirement record under the parent's uid, as on any table.
+        let said = exclusion_plan(&held, &none, &[]).unwrap_err().join("\n");
+        assert!(
+            said.contains("pbps drop-exclusion app.booking x --reason"),
+            "{said}"
+        );
+        let cs = exclusion_plan(&held, &none, &["x"]).unwrap();
+        assert_eq!(kinds(&cs), ["SetExclusion"]);
+        assert!(cs.risks().contains(&RiskClass::Destructive));
+    }
+
     /// The engine's silent loss of a guarantee under a column change is refused
     /// by name: a drop of a key column is allowed only where the same plan drops
     /// the constraint; a retype is allowed and states the constraint's drop and
@@ -17322,6 +17604,44 @@ mod tests {
         let (_, stay_ids, stays) = outcome(&base, &base, &[]);
         assert!(stays.expect("nothing changes").changes.is_empty());
         assert_eq!(on(&stay_ids, "app.t").len(), 3);
+    }
+
+    /// A detach keeps the partition's clone of its parent's exclusion as an own constraint
+    /// under the engine's name (measured on 18.6), which no recipe names yet: a partition of
+    /// a parent that holds one is not detached (DEC-2448.6, #2448). Negative: the same detach
+    /// of a parent with none is planned.
+    #[test]
+    fn a_partition_of_a_parent_with_an_exclusion_is_not_detached() {
+        let mut parent = booking(&[])
+            .tables
+            .remove(&"app.booking".parse::<TableName>().unwrap())
+            .unwrap();
+        parent.partition_by = Some(pbps_model::PartitionBy {
+            external: false,
+            columns: vec!["a".into()],
+            strategy: Default::default(),
+        });
+        let partition = Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: "app.booking".parse().unwrap(),
+                bound: pbps_model::PartitionBound::Default,
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let declared = Table {
+            partition_by: None,
+            ..parent.clone()
+        };
+        let detach =
+            |parent: &Table| detached_names(parent, &partition, &declared, &MinimalDialect, false);
+        assert!(detach(&parent).is_ok());
+        parent.exclude.insert("x".into(), parent_exclusion());
+        let said = detach(&parent).unwrap_err().join("\n");
+        assert!(
+            said.contains("holds exclusion constraint(s) `x`") && said.contains("#2448"),
+            "{said}"
+        );
     }
 
     /// A partition declared as an ordinary table of its parent's shape is

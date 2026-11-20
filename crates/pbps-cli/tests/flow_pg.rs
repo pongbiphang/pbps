@@ -234,6 +234,8 @@ mod comments2729;
 mod exclude2448;
 #[path = "support/exclude2448_operators.rs"]
 mod exclude2448_operators;
+#[path = "support/exclude2448_partitions.rs"]
+mod exclude2448_partitions;
 #[path = "support/exclude2448_rebuild.rs"]
 mod exclude2448_rebuild;
 #[path = "support/extensions2447.rs"]

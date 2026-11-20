@@ -1026,6 +1026,8 @@ pub(in crate::engine) async fn permission_support(
 }
 
 /// The PostgreSQL body of `generation_support`, which apply also calls.
+// The two scans for a plan's exclusions and partitioned tables name the one change each wants.
+#[allow(clippy::wildcard_enum_match_arm)]
 pub(in crate::engine) async fn generation_support(
     conn: &mut Conn,
     changes: &ChangeSet,
@@ -1057,6 +1059,56 @@ pub(in crate::engine) async fn generation_support(
             ));
         }
     }
+    // An exclusion added to a partitioned table needs PostgreSQL 18 (DEC-2448.6).
+    let adding: std::collections::BTreeSet<pbps_model::TableName> = changes
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            pbps_model::Change::Constraint(pbps_model::ConstraintChange::SetExclusion {
+                table,
+                to: Some(_),
+                ..
+            }) => Some(table.clone()),
+            _ => None,
+        })
+        .collect();
+    if !adding.is_empty() && version < pbps_pg::partitioned_exclusion::ARRIVED_IN {
+        // The catalog holds a renamed table under its old name, and a replaced one
+        // as the table the plan drops, so the names are resolved first.
+        let renames: Vec<(pbps_model::TableName, pbps_model::TableName)> = changes
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                pbps_model::Change::Table(pbps_model::TableChange::RenameTable {
+                    from,
+                    to,
+                    ..
+                }) => Some((from.clone(), to.clone())),
+                _ => None,
+            })
+            .collect();
+        let created: BTreeMap<pbps_model::TableName, bool> = changes
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                pbps_model::Change::Table(pbps_model::TableChange::CreateTable {
+                    name,
+                    table,
+                    ..
+                }) => Some((name.clone(), table.partition_by.is_some())),
+                _ => None,
+            })
+            .collect();
+        let asked = pbps_pg::partitioned_exclusion::asked(&adding, &renames, &created);
+        let standing = pbps_pg::partitioned_exclusion::standing_partitioned(conn, &asked).await?;
+        let partitioned =
+            pbps_pg::partitioned_exclusion::partitioned(&standing, &renames, &created);
+        problems.extend(pbps_pg::partitioned_exclusion::unsupported(
+            version,
+            &adding,
+            &partitioned,
+        ));
+    }
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
     let mut dependences = BTreeMap::new();
     for p in &changes.changes {
@@ -1077,8 +1129,9 @@ pub(in crate::engine) async fn generation_support(
         status: "passed",
         message: format!(
             "PostgreSQL server_version_num {version}: every generated-column change this plan \
-             makes has an in-place form here, and no column it retypes or drops is one a live \
-             generated column still reads at that point"
+             makes has an in-place form here, no column it retypes or drops is one a live \
+             generated column still reads at that point, and every exclusion it adds to a \
+             partitioned table is one this server has"
         ),
     })
 }

@@ -2007,19 +2007,45 @@ pub fn before_its_partitions_indexes(
     declared: &Schema,
     dialect: &dyn Dialect,
 ) -> Result<(), String> {
-    let adoptable_by = |parent: &TableName, index: &pbps_model::Index, c: &Change| {
-        let Change::Index(IndexChange::AddIndex {
-            table, index: own, ..
-        }) = c
-        else {
+    // The index or exclusion an adding change builds: a parent's can take a
+    // partition's own of the same kind as its clone (DEC-2448.6 for an
+    // exclusion, where `from: None` is an add and a drop adopts nothing).
+    enum Building<'a> {
+        Index(&'a pbps_model::Index),
+        Exclusion(&'a pbps_model::ExclusionConstraint),
+    }
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn added(c: &Change) -> Option<(TableName, Building<'_>)> {
+        match c {
+            Change::Index(IndexChange::AddIndex { table, index, .. }) => {
+                Some((table.clone(), Building::Index(index)))
+            }
+            Change::Constraint(ConstraintChange::SetExclusion {
+                table,
+                from: None,
+                to: Some(x),
+                ..
+            }) => Some((table.clone(), Building::Exclusion(x))),
+            _ => None,
+        }
+    }
+    let adoptable_by = |parent: &TableName, mine: &Building<'_>, c: &Change| {
+        let Some((table, own)) = added(c) else {
             return false;
         };
         declared
             .tables
-            .get(table)
+            .get(&table)
             .and_then(|t| t.partition_of.as_ref())
             .is_some_and(|of| of.parent == *parent)
-            && crate::schema_diff::adopts(index, own)
+            && match (mine, own) {
+                (Building::Index(p), Building::Index(o)) => crate::schema_diff::adopts(p, o),
+                (Building::Exclusion(p), Building::Exclusion(o)) => {
+                    crate::schema_diff::adopts_exclusion(p, o)
+                }
+                (Building::Index(_), Building::Exclusion(_))
+                | (Building::Exclusion(_), Building::Index(_)) => false,
+            }
     };
     // Changes a partition's index may carry past the parent's: none creates
     // a table, a column or a module.
@@ -2041,16 +2067,11 @@ pub fn before_its_partitions_indexes(
     let mut stretch: Option<(usize, usize)> = None;
     let mut adoptions: Vec<(usize, usize)> = Vec::new();
     for (k, p) in cs.changes.iter().enumerate() {
-        let Change::Index(IndexChange::AddIndex {
-            table: parent,
-            index,
-            ..
-        }) = &p.change
-        else {
+        let Some((parent, mine)) = added(&p.change) else {
             continue;
         };
         for (j, q) in cs.changes.iter().enumerate() {
-            if adoptable_by(parent, index, &q.change) {
+            if adoptable_by(&parent, &mine, &q.change) {
                 schedule.edge(k, j, Source::Effect, OrderReason::Structural);
                 adoptions.push((k, j));
                 if j < k {
@@ -2092,7 +2113,8 @@ pub fn before_its_partitions_indexes(
         Err(crate::order::Refusal::Cycle { members, .. }) => {
             // `k` is a parent's `AddIndex`, as every adoption's first end is.
             let named = |i: usize| {
-                if let Change::Index(IndexChange::AddIndex { table, name, .. }) =
+                if let Change::Index(IndexChange::AddIndex { table, name, .. })
+                | Change::Constraint(ConstraintChange::SetExclusion { table, name, .. }) =
                     &cs.changes[i].change
                 {
                     (name.shown().to_string(), table.shown().to_string())

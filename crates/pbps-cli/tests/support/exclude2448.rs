@@ -224,7 +224,8 @@ fn a_declaration_this_tool_cannot_hold_is_refused_and_an_unreadable_exclusion_is
     // Control: the same table with a held exclusion validates.
     write(&format!("  x:\n    method: btree\n{key}"));
     succeeds(d.run(&["validate"]));
-    // A partitioned table's exclusion is the next PR's, by name.
+    // A partitioned table's exclusion must hold the partition key (DEC-2448.6): this one
+    // excludes on `n` only, so the key `id` it lacks is named.
     std::fs::write(
         d.dir.join("schema/app.t.yml"),
         "table: app.t\ncolumns:\n  id: {type: integer}\n  n: {type: integer}\npartition_by: [id]\n\
@@ -235,7 +236,7 @@ fn a_declaration_this_tool_cannot_hold_is_refused_and_an_unreadable_exclusion_is
     let out = d.run(&["validate"]);
     assert_eq!(code(&out), 2, "{}", said(&out));
     assert!(
-        said(&out).contains("partitioned table or a partition"),
+        said(&out).contains("must hold the partition key column `id`"),
         "{}",
         said(&out)
     );

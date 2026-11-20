@@ -331,15 +331,31 @@ fn exclusion(
 ) -> Vec<DialectError> {
     let what = format!("exclusion constraint `{name}`", name = name.shown());
     let mut found = Vec::new();
-    // A partitioned parent's and a partition's own arrive in PR E: the engine
-    // differs by version (16 refuses a parent's, 18 requires the partition key).
-    if table.partition_by.is_some() || table.partition_of.is_some() {
+    // A partition's own exclusion arrives with E2 (DEC-2448.6): the engine takes one
+    // as its parent's clone when it is attached or the parent's is added after it, and
+    // a declaration cannot yet say so (`validate_partition` has no parent to ask).
+    if table.partition_of.is_some() {
         found.push(invalid(format!(
-            "{what} is declared on a partitioned table or a partition, which this tool does not \
-             hold yet: PostgreSQL 16 refuses one on a partitioned table and 18 requires the \
-             partition key (DEC-2448.3)"
+            "{what} is declared on a partition, which this tool does not hold yet: PostgreSQL \
+             takes an own exclusion as its parent's clone when the partition is attached or \
+             the parent's is added after it, and the guarantee then goes with the parent's \
+             (DEC-2448.6, #2448)"
         )));
         return found;
+    }
+    // A partitioned parent's (PostgreSQL 18 only; 16 refuses it, which the plan says by
+    // name against a connected server, DEC-2448.6) holds every partition-key column.
+    if let Some(by) = &table.partition_by {
+        for column in &by.columns {
+            if !pbps_diff::holds_key_with_equality(x, column) {
+                found.push(invalid(format!(
+                    "{what} is declared on a partitioned table and must hold the partition key \
+                     column `{column}` as a plain key (not an expression, not `include`) \
+                     excluded with `=`, or PostgreSQL 18 refuses it (DEC-2448.6)",
+                    column = column.shown()
+                )));
+            }
+        }
     }
     if !x.method.policy().exclusion {
         found.push(invalid(format!(
@@ -2628,17 +2644,50 @@ mod tests {
         let mut missing = exclusion_table(Btree, &[("n", "")]);
         missing.exclude.get_mut("x").unwrap().include = vec!["ghost".into()];
         assert!(said(&missing).contains("ghost"), "{}", said(&missing));
-        // A partitioned table or a partition is PR E's.
-        let mut partitioned = exclusion_table(Btree, &[("n", "")]);
-        partitioned.partition_by = Some(pbps_model::PartitionBy {
+        // A partitioned parent holds every partition-key column as a plain key
+        // excluded with `=` (DEC-2448.6, measured on 18.6); the engine's own refusal of
+        // an expression key, an `INCLUDE` or another operator is the same rule.
+        let by = |columns: &[&str]| pbps_model::PartitionBy {
             external: false,
-            columns: vec!["n".into()],
+            columns: columns.iter().map(|c| (*c).into()).collect(),
             strategy: Default::default(),
-        });
-        assert!(said(&partitioned).contains("partitioned table or a partition"));
-        // A partition declares no columns of its own, so `table_structure` is
-        // not asked of it; the refusal is still, as the public entry is the
-        // path every declaration takes.
+        };
+        let equal = |mut table: Table, columns: &[&str]| {
+            for x in table.exclude.values_mut() {
+                for key in &mut x.keys {
+                    key.operator = pbps_model::OperatorRef::symbol("=").unwrap();
+                }
+            }
+            table.partition_by = Some(by(columns));
+            table
+        };
+        let partitioned = equal(exclusion_table(Btree, &[("n", "")]), &["n"]);
+        assert!(entry(&partitioned).is_empty(), "{}", said(&partitioned));
+        // A key that is an expression over the column, or the column in `include`,
+        // does not hold it.
+        let cast = equal(exclusion_table(Btree, &[("(n + 0)", "")]), &["n"]);
+        assert!(said(&cast).contains("must hold the partition key column `n`"));
+        let mut included = equal(exclusion_table(Btree, &[("body", "")]), &["n"]);
+        included.exclude.get_mut("x").unwrap().include = vec!["n".into()];
+        assert!(said(&included).contains("must hold the partition key column `n`"));
+        // Another operator on the column does not either.
+        let mut unequal = equal(exclusion_table(Btree, &[("n", "")]), &["n"]);
+        unequal.exclude.get_mut("x").unwrap().keys[0].operator =
+            pbps_model::OperatorRef::symbol("<>").unwrap();
+        assert!(said(&unequal).contains("must hold the partition key column `n`"));
+        // Every column of a composite key is asked, and one missing is named.
+        let composite = equal(exclusion_table(Btree, &[("n", "")]), &["n", "body"]);
+        let composite_said = said(&composite);
+        assert!(
+            composite_said.contains("column `body`") && !composite_said.contains("column `n`"),
+            "{composite_said}"
+        );
+        let covered = equal(
+            exclusion_table(Btree, &[("n", ""), ("body", "")]),
+            &["n", "body"],
+        );
+        assert!(entry(&covered).is_empty(), "{}", said(&covered));
+        // A partition's own exclusion is not held yet; a partition with none is untouched.
         let mut partition = exclusion_table(Btree, &[("n", "")]);
         partition.columns.clear();
         partition.partition_of = Some(pbps_model::PartitionOf {
@@ -2646,7 +2695,7 @@ mod tests {
             bound: pbps_model::PartitionBound::Default,
             columns: Default::default(),
         });
-        assert!(said(&partition).contains("partitioned table or a partition"));
+        assert!(said(&partition).contains("declared on a partition"));
         let ordinary_partition = Table {
             partition_of: partition.partition_of.clone(),
             ..Default::default()
