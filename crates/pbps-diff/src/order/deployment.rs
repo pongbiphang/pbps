@@ -2623,8 +2623,13 @@ pub fn after_the_rebuilds(
         schedule.edge(last, i, Source::Inferred, OrderReason::Structural);
     }
     let count = moves.iter().filter(|m| **m).count();
+    // An extended annotation makes the contract compute the creation facts
+    // (DEC-2469.10), and a cycle it refuses must name its members, so the
+    // steps are described by their subjects. Any other plan keeps the older
+    // text, in which a step prints as `#n`, so its bytes do not change.
+    let named = has_handovers || cs.annotations.is_some();
     let settled = schedule.settle(cs.clone()).map_err(|refusal| {
-        if has_handovers {
+        if named {
             refusal.describe(cs)
         } else {
             refusal.to_string()

@@ -1272,6 +1272,8 @@ struct Contradiction {
     yaml: String,
     owner: &'static str,
     provider: &'static str,
+    /// The members the refusal names, where a case pins them.
+    members: Option<&'static str>,
 }
 
 fn tbl(schema: &str, cols: &str, rest: &str) -> String {
@@ -1301,6 +1303,7 @@ fn own(
             "table::dbo.t"
         },
         provider,
+        members: None,
     }
 }
 
@@ -1322,6 +1325,7 @@ fn contradictions() -> Vec<Contradiction> {
             yaml: "depends_on: [\"type::app.value\"]\n".into(),
             owner: "type::app.positive",
             provider: "type::app.value",
+            members: None,
         },
         Contradiction {
             name: "enum-under-domain",
@@ -1334,6 +1338,7 @@ fn contradictions() -> Vec<Contradiction> {
             yaml: "depends_on: [\"type::app.d\"]\n".into(),
             owner: "type::app.mood",
             provider: "type::app.d",
+            members: None,
         },
         Contradiction {
             name: "enum-under-column",
@@ -1346,6 +1351,7 @@ fn contradictions() -> Vec<Contradiction> {
             yaml: "depends_on: [\"table::app.t\"]\n".into(),
             owner: "type::app.mood",
             provider: "table::app.t",
+            members: None,
         },
         Contradiction {
             name: "domain-under-column",
@@ -1358,6 +1364,7 @@ fn contradictions() -> Vec<Contradiction> {
             yaml: "depends_on: [\"table::app.t\"]\n".into(),
             owner: "type::app.d",
             provider: "table::app.t",
+            members: None,
         },
         // Typed facts the check did not even report (2c).
         own(
@@ -1379,6 +1386,7 @@ fn contradictions() -> Vec<Contradiction> {
             yaml: "depends_on:\n  \"table::app.p\": [\"table::app.c1\"]\n".into(),
             owner: "table::app.p",
             provider: "table::app.c1",
+            members: None,
         },
         Contradiction {
             name: "trigger-before-table-pg",
@@ -1398,6 +1406,7 @@ fn contradictions() -> Vec<Contradiction> {
             yaml: "depends_on: [\"module::app.t.trg\"]\n".into(),
             owner: "table::app.t",
             provider: "module::app.t.trg",
+            members: Some("`app.t`, `app.t.trg`"),
         },
         Contradiction {
             name: "trigger-before-table-ms",
@@ -1413,6 +1422,7 @@ fn contradictions() -> Vec<Contradiction> {
             yaml: "depends_on: [\"module::dbo.t.trg\"]\n".into(),
             owner: "table::dbo.t",
             provider: "module::dbo.t.trg",
+            members: Some("`dbo.t`, `dbo.t.trg`"),
         },
         // A table's own parts (2a), which the CREATE TABLE group refused
         // already and which now name the line too.
@@ -1446,6 +1456,7 @@ fn contradictions() -> Vec<Contradiction> {
         yaml: "depends_on:\n  \"table::dbo.t\": ['object::{\"root\":{\"table\":\"dbo.t\"},\"part\":{\"computed\":\"x\"}}']\n".into(),
         owner: "table::dbo.t",
         provider: "object::{\"root\":{\"table\":\"dbo.t\"},\"part\":{\"computed\":\"x\"}}",
+        members: None,
     });
     cases.push(Contradiction {
         name: "own-sequence-pg",
@@ -1458,6 +1469,7 @@ fn contradictions() -> Vec<Contradiction> {
         yaml: "depends_on:\n  \"table::app.t\": [\"sequence::app.t.id\"]\n".into(),
         owner: "table::app.t",
         provider: "sequence::app.t.id",
+        members: None,
     });
     cases.push(Contradiction {
         name: "own-view-index-ms",
@@ -1473,6 +1485,7 @@ fn contradictions() -> Vec<Contradiction> {
         yaml: "depends_on:\n  \"module::dbo.v\": [\"index::module::dbo.v.ix\"]\n".into(),
         owner: "module::dbo.v",
         provider: "index::module::dbo.v.ix",
+        members: None,
     });
     cases
 }
@@ -1518,6 +1531,24 @@ fn a_line_that_contradicts_a_creation_fact_is_refused_naming_the_line() {
                 && !text.contains("cannot project annotation")
             {
                 return Some(format!("{name}: refused, but not as a cycle: {text}"));
+            }
+            // The cycle names its members: a step printed as `#<n>` is not a
+            // name (acceptance 3 of #2469).
+            if let Some(members) = text
+                .split("wait on one another: ")
+                .nth(1)
+                .and_then(|rest| rest.split("; because").next())
+                && members.split(", ").any(|m| {
+                    m.strip_prefix('#')
+                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                })
+            {
+                return Some(format!("{name}: a member is a placeholder: {members}"));
+            }
+            if let Some(members) = case.members
+                && !text.contains(&format!("wait on one another: {members}; because"))
+            {
+                return Some(format!("{name}: members are not `{members}`: {text}"));
             }
             (!text.contains(&case.line())).then(|| {
                 format!(
