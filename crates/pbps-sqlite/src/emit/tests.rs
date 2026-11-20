@@ -32,7 +32,7 @@ mod case_rename;
 mod constraints;
 mod differential;
 mod drop_column;
-mod golden;
+pub(crate) mod golden;
 mod names;
 mod plan_dialect;
 mod refusals;
@@ -40,11 +40,11 @@ mod rename_order;
 mod untyped;
 pub(crate) mod versions;
 
-pub(super) fn ty(text: &str) -> ColumnType {
+pub(crate) fn ty(text: &str) -> ColumnType {
     text.parse().expect("a type")
 }
 
-pub(super) fn col(text: &str) -> Column {
+pub(crate) fn col(text: &str) -> Column {
     Column::new(ty(text))
 }
 
@@ -52,7 +52,7 @@ pub(crate) fn tn(name: &str) -> TableName {
     TableName::new("main", name)
 }
 
-pub(super) fn table(columns: &[(&str, Column)]) -> Table {
+pub(crate) fn table(columns: &[(&str, Column)]) -> Table {
     let mut table = Table::default();
     for (name, column) in columns {
         table.columns.insert((*name).into(), column.clone());
@@ -72,7 +72,7 @@ pub(super) fn view(name: &str, body: &str) -> (ModuleId, Module) {
     )
 }
 
-pub(super) fn schema(tables: &[(&str, Table)], views: &[(&str, &str)]) -> Schema {
+pub(crate) fn schema(tables: &[(&str, Table)], views: &[(&str, &str)]) -> Schema {
     let mut schema = Schema::default();
     for (name, table) in tables {
         schema.tables.insert(tn(name), table.clone());

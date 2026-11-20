@@ -3263,6 +3263,32 @@ record, refusals and `apply` behaviour (#2379, DEC-2379.3). Three things differ.
 The rehearsal reads no key anyone configured: the captures it reuses fingerprint
 what they read, and it compares in memory and seals nothing, so it uses a key of
 its own that lives for the run.
+#### The in-process rehearsal (SQLite, #2950, DEC-2950.16)
+
+SQLite is a library and not a server, so its rehearsal needs no entry, no
+container and nothing to vouch for. The scratch is a copy of the database's own
+pages, made in memory in the running process on the linked library, schema and
+rows alike: a function, collation or virtual-table module the library lacks cannot
+be replayed from text and is copied all the same, and the engine itself refuses
+what depends on the rows (a `CHECK` a row violates, a `NOT NULL` over a NULL, a
+unique index over duplicates), naming the statement. The plan's statements then
+run as an apply runs them, in one `BEGIN IMMEDIATE` transaction, the scratch is
+read back and compared with the declarations by the ordinary differ, and a view
+the plan leaves naming what is gone, a column default that calls a function that
+does not exist and a foreign key to a column that is no key are refused too,
+because SQLite accepts them when they are declared and fails only when they are
+used. What failed in the same words before the plan ran is the file's own and not
+the plan's.
+
+A copy is limited to 512 MiB. A larger database, one that grows past the limit
+while it is copied, and one that stays busy for the whole wait are refused, and the
+refusal names `--no-rehearse` as the way out; the plan is then recorded as not
+rehearsed. The database itself is not changed: no setting, no wait, no transaction
+and no byte of the file. The copy holds the ledger as the file does and nothing
+reads it. The rehearsal runs on the bundled library, so it shows that this library
+takes the statements and not that an older one the project's floor allows would
+(the floor note of 7.5).
+
 #### 9.3.2 Engine-assisted planning (PostgreSQL planning and apply delivered)
 
 Delivered for PostgreSQL (#1514–#1517, #616): `plan` publishes the resolver's
