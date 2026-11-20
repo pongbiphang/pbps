@@ -39,7 +39,7 @@ fn bounded_operator(snapshot: &StateSnapshot) -> Cow<'_, StateSnapshot> {
 /// The column's `CHECK` cannot be the bound: `length()` stops at an embedded
 /// NUL, so a text with one passes it however long it is (measured). A value the
 /// user supplied is refused and never cut, as the `CHECK` would refuse it.
-fn fits(what: &str, value: Option<&str>, most: usize) -> Result<(), LedgerError> {
+pub(super) fn fits(what: &str, value: Option<&str>, most: usize) -> Result<(), LedgerError> {
     let Some(found) = value.map(|v| v.chars().count()).filter(|n| *n > most) else {
         return Ok(());
     };

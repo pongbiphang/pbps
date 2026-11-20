@@ -7,11 +7,13 @@
 //! and none of them names a driver type or a `Conn`: the wiring (item 7) runs
 //! them on a blocking thread behind the trait of `pbps_db::engine`.
 //!
-//! This part holds the state table, the write path ([`ensure_tables`],
-//! [`is_initialized`], [`record`], [`prune`]) and the reads ([`latest`], [`entry`],
-//! [`deployed_revision`], [`has_applied_plan`], [`timeline`]). The lock and the
-//! integrity check are later parts of the same item and add to the same list
-//! of tables ([`ddl::RECIPE`]); nothing here is written for one table only.
+//! The parts: the state table and its write path ([`ensure_tables`],
+//! [`is_initialized`], [`record`], [`prune`]), the reads ([`latest`], [`entry`],
+//! [`deployed_revision`], [`has_applied_plan`], [`timeline`]), the lock ([`lock`],
+//! [`release`], [`unlock`], [`lock_holder`]) and the environment identifier
+//! ([`environment_identity`]). The integrity check is the last part of the same
+//! item. All of them work from one list of tables ([`ddl::RECIPE`]); nothing here
+//! is written for one table only.
 //!
 //! # Where the ledger lives, and how it is named
 //!
@@ -34,17 +36,32 @@
 
 mod busy;
 mod ddl;
+mod identity;
+mod lock;
 mod read;
 mod rows;
 mod write;
 
 pub use busy::BUSY_WAIT;
 pub use ddl::{ensure_tables, is_initialized};
+pub use identity::{ENVIRONMENT_ID_CHARS, environment_identity};
+pub use lock::{
+    LOCK_FILE_SUFFIX, LockGuard, Proof, RowOnly, Taken, lock, lock_holder, release,
+    session_application_name, session_lookup, sidecar_path, unlock,
+};
 pub use read::{deployed_revision, entry, has_applied_plan, latest, timeline};
 pub use write::{prune, record};
 
 /// The state table as the statements spell it. See the module header on `main.`.
 pub const STATE_TABLE: &str = "main.__pbps_state";
+
+/// The lock table, spelled the same way.
+pub const LOCK_TABLE: &str = "main.__pbps_lock";
+
+/// The environment table's name, which `pbps_db::ledger` has no constant for, and
+/// its spelling in statements.
+pub const ENVIRONMENT_TABLE_NAME: &str = "__pbps_environment";
+pub const ENVIRONMENT_TABLE: &str = "main.__pbps_environment";
 
 /// The width of `reason`, in **characters**, which is what `length()` counts and
 /// what PostgreSQL's `varchar(1000)` counts. A state recorded under any engine

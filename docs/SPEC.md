@@ -2704,15 +2704,32 @@ ledger from before they existed keeps working via a fallback that parses
 
 `__pbps_lock` stops two pipelines applying at once.
 
-**SQLite (#2950, DEC-2950.11):** the state table is `main.__pbps_state` in the
-database file itself, with the same columns. `id` is `INTEGER PRIMARY KEY
-AUTOINCREMENT` so an id is never reused, the time is ISO 8601 text in UTC with
-three decimals, and the widths are `CHECK`s on characters, equal to
-PostgreSQL's. The table is plain, not `STRICT`, and calls no JSON function, so
-the file still opens in the oldest SQLite the project targets. It is created
-only when the catalog shows it missing, and a view or other object in its name is
-refused. The lock and the rest of the ledger's reads follow in later parts of
-the same item.
+**SQLite (#2950, DEC-2950.11, DEC-2950.13):** the ledger is three tables in
+the database file itself: `main.__pbps_state` with the columns above,
+`main.__pbps_lock` and `main.__pbps_environment`. The state table's `id` is
+`INTEGER PRIMARY KEY AUTOINCREMENT` so an id is never reused, the time is ISO 8601
+text in UTC with three decimals, and the widths are `CHECK`s on characters, equal
+to PostgreSQL's. The tables are plain, not `STRICT`, and call no JSON function, so
+the file still opens in the oldest SQLite the project targets. They are created
+only when the catalog shows one missing, and a view or other object in a ledger
+name is refused.
+
+The lock is a row in `__pbps_lock`, backed by an operating-system lock on a file
+beside the database, `<database>-pbps-lock`, which the run holds until it
+releases the lock or its process ends, however it ends. A run that finds a row
+tries that lock: when it cannot take it, the holder is alive and the run is
+refused naming the holder; when it can, the holder is gone, its row is cleared
+and replaced, and the run prints whose row it cleared (SQLite rolls back a
+transaction a dead process left, so nothing it did is half done). The sidecar is
+empty and is never deleted. Where the lock file cannot be created or locked, or
+the database has no file (it is in memory), the row alone holds and only
+`pbps unlock` clears it. A network file system is not detected: where the system
+reports the lock taken, it is believed. `pbps unlock` clears the row whoever
+holds it and does not touch the sidecar.
+
+`__pbps_environment` holds one row, an identifier of 32 hexadecimal characters
+written when the ledger is made and never changed. It follows a copy of the file,
+so it names a lineage of a database, not a file.
 
 **Trust model**: `__pbps_state` protects against mistakes and process disorder,
 **not** against deliberate tampering by someone with DDL rights — whoever can
