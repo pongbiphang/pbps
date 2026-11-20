@@ -246,21 +246,21 @@ async fn read(
                         }),
                     }
                 }
-                "unique" | "foreign" | "check" | "index" | "default" | "generated" | "policy" => {
-                    Holds::TablePart {
-                        table: table.clone(),
-                        part: match m.kind.as_str() {
-                            "unique" => Part::Unique(m.part.clone().into()),
-                            "foreign" => Part::ForeignKey(m.part.clone().into()),
-                            "check" => Part::Check(m.part.clone().into()),
-                            "index" => Part::Index(m.part.clone().into()),
-                            "default" => Part::Default(m.part.clone().into()),
-                            "generated" => Part::Generated(m.part.clone().into()),
-                            "policy" => Part::Policy(m.part.clone()),
-                            _ => unreachable!("enumerated table parts"),
-                        },
-                    }
-                }
+                "unique" | "exclusion" | "foreign" | "check" | "index" | "default"
+                | "generated" | "policy" => Holds::TablePart {
+                    table: table.clone(),
+                    part: match m.kind.as_str() {
+                        "unique" => Part::Unique(m.part.clone().into()),
+                        "exclusion" => Part::Exclusion(m.part.clone().into()),
+                        "foreign" => Part::ForeignKey(m.part.clone().into()),
+                        "check" => Part::Check(m.part.clone().into()),
+                        "index" => Part::Index(m.part.clone().into()),
+                        "default" => Part::Default(m.part.clone().into()),
+                        "generated" => Part::Generated(m.part.clone().into()),
+                        "policy" => Part::Policy(m.part.clone()),
+                        _ => unreachable!("enumerated table parts"),
+                    },
+                },
                 _ => {
                     Holds::Unrepresentable(format!("unsupported catalog kind {}", Escaped(&m.kind)))
                 }
@@ -272,7 +272,7 @@ async fn read(
             || (id.catalog == "pg_constraint"
                 && m.constraint_kind
                     .as_deref()
-                    .is_some_and(|k| matches!(k, "p" | "u" | "f" | "c")))
+                    .is_some_and(|k| matches!(k, "p" | "u" | "x" | "f" | "c")))
         {
             spellings.insert(
                 id.clone(),
@@ -733,7 +733,7 @@ const METADATA: &str = "WITH input AS (SELECT $1::text AS catalog, $2::int8::oid
  WHEN c.relkind='v' THEN 'view'
  WHEN proc.prokind IN ('f','p') THEN 'routine'
  WHEN tg.oid IS NOT NULL AND NOT tg.tgisinternal THEN 'trigger'
- WHEN con.conrelid<>0 THEN CASE con.contype WHEN 'p' THEN 'primary' WHEN 'u' THEN 'unique' WHEN 'f' THEN 'foreign' WHEN 'c' THEN 'check' ELSE 'constraint:'||con.contype::text END
+ WHEN con.conrelid<>0 THEN CASE con.contype WHEN 'p' THEN 'primary' WHEN 'u' THEN 'unique' WHEN 'f' THEN 'foreign' WHEN 'c' THEN 'check' WHEN 'x' THEN 'exclusion' ELSE 'constraint:'||con.contype::text END
  WHEN c.relkind IN ('i','I') THEN 'index'
  WHEN def.oid IS NOT NULL THEN CASE WHEN attr.attgenerated<>'' THEN 'generated' ELSE 'default' END
  WHEN pol.oid IS NOT NULL THEN 'policy'

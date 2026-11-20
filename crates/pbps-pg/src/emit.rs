@@ -2284,7 +2284,7 @@ fn detach_partition(
                  WHERE k.conrelid = o AND k.contype = 'p'"
                     .to_owned(),
             ),
-            K::Unique | K::ForeignKey => Some(format!(
+            K::Unique | K::ForeignKey | K::Exclusion => Some(format!(
                 "SELECT k.conname FROM pg_catalog.pg_constraint k \
                  JOIN pg_catalog.pg_constraint pk ON pk.oid = k.conparentid \
                  WHERE k.conrelid = o \
@@ -2350,7 +2350,9 @@ fn detach_partition(
         );
         let holder = match n.kind {
             K::Index => relation,
-            K::PrimaryKey | K::Unique => format!("COALESCE({relation}, {on_table})"),
+            K::PrimaryKey | K::Unique | K::Exclusion => {
+                format!("COALESCE({relation}, {on_table})")
+            }
             K::ForeignKey | K::Check => on_table,
         };
         claims.push(format!(
@@ -6087,6 +6089,59 @@ mod tests {
         assert_ne!(
             signature(&id).unwrap(),
             "s.\"x\\n\\\\\\u{200b}\"[], integer"
+        );
+    }
+
+    /// An exclusion's clone is found through its parent's constraint before the detach, as a
+    /// unique constraint's is, and renamed as a constraint (which renames its index); the
+    /// declared name is claimed against a relation and a constraint both, since the index
+    /// behind it is a relation of the schema (measured on 18.6, DEC-2448.7). Negative: a clone
+    /// already under its declared name is left where it is.
+    #[test]
+    fn a_detach_renames_an_exclusions_clone_found_through_its_parents_constraint() {
+        use pbps_model::{DetachedKind as K, DetachedName};
+        let sql = Postgres::new()
+            .fixture_emit(
+                &Change::Partition(PartitionChange::DetachPartition {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    table: "app.p1".parse().unwrap(),
+                    parent: "app.ev".parse().unwrap(),
+                    names: vec![
+                        DetachedName {
+                            kind: K::Exclusion,
+                            parent: "slot".into(),
+                            name: Some("arch_slot".into()),
+                        },
+                        DetachedName {
+                            kind: K::Exclusion,
+                            parent: "kept".into(),
+                            name: Some("kept".into()),
+                        },
+                    ],
+                    shape: Box::default(),
+                }),
+                Default::default(),
+            )
+            .expect("emit")
+            .remove(0)
+            .sql;
+        assert!(
+            sql.contains("JOIN pg_catalog.pg_constraint pk ON pk.oid = k.conparentid")
+                && sql.contains("pk.conname = 'slot'")
+                && sql.contains("pk.conname = 'kept'"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("RENAME CONSTRAINT %I TO %I")
+                && !sql.contains("ALTER INDEX \"app\".%I RENAME"),
+            "{sql}"
+        );
+        // Claimed as a unique constraint is: against a relation, then a constraint of the table.
+        let claim = sql.find("held := COALESCE(").expect(&sql);
+        assert!(sql[claim..].contains("pg_catalog.pg_class cl"), "{sql}");
+        assert!(
+            sql[claim..].contains("pg_catalog.pg_constraint k WHERE k.conrelid = o"),
+            "{sql}"
         );
     }
 

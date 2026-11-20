@@ -1063,6 +1063,11 @@ pub struct PartitionEntryDto {
     /// written here.
     #[serde(default)]
     pub indexes: BTreeMap<pbps_model::ObjectLocalName, IndexDto>,
+    /// The partition's own exclusion constraints (#2448), written as a table's. The parent's
+    /// reach it as clones without being written here, and one the engine would take for the
+    /// parent's clone (same method, keys, operators, `include` and `where`) is refused.
+    #[serde(default)]
+    pub exclude: BTreeMap<pbps_model::ObjectLocalName, ExclusionDto>,
     /// The partition's own foreign keys (#1632); the parent's reach it as
     /// clones without being written here, and one equal to a parent's is
     /// refused, since the engine may take it for the parent's clone.

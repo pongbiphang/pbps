@@ -50,6 +50,38 @@ fn physical_parts_keep_explicit_copy_analysis_and_owned_index_sql() {
             bodies.into(),
         ));
     }
+    // An exclusion has no `USING INDEX` form: built on the parent alone, then whole on each
+    // leaf under its clone's name with the parent's timing, parameters and predicate, and
+    // attached (measured on 18.6, DEC-2448.7).
+    let mut exclusion = recipe.clone();
+    exclusion.definition = serde_json::from_value(serde_json::json!({"exclusion":{
+        "method":"btree",
+        "keys":[{"key":{"name":"k"},"operator":"="}],
+        "include":["note"],
+        "storage_parameters":{"fillfactor":"70"},
+        "filter":"k > 0",
+        "timing":"deferrable_immediate"
+    }}))
+    .unwrap();
+    let clause = |name: &str| {
+        format!(
+            "CONSTRAINT \"{name}\" EXCLUDE USING btree (\"k\" ASC WITH OPERATOR(\"pg_catalog\".=)) \
+             INCLUDE (\"note\") WITH (fillfactor = '70') WHERE (k > 0\n) DEFERRABLE INITIALLY IMMEDIATE"
+        )
+    };
+    cases.push((
+        Change::Index(IndexChange::BuildPartitionedIndex(Box::new(
+            exclusion.clone(),
+        ))),
+        vec![
+            format!(
+                "ALTER TABLE ONLY \"app\".\"tmp_p\" ADD {};",
+                clause("p_idx")
+            ),
+            format!("ALTER TABLE \"app\".\"tmp_p1\" ADD {};", clause("p1_k_idx")),
+            "ALTER INDEX \"app\".\"p_idx\" ATTACH PARTITION \"app\".\"p1_k_idx\";".into(),
+        ],
+    ));
     for (change, bodies) in cases {
         let expected: Vec<_> = bodies
             .iter()

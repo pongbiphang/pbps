@@ -207,10 +207,8 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
     found
 }
 
-/// The checks of a table's exclusion constraints. Apart from
-/// [`table_structure`]: that one is skipped for a partition, whose columns are
-/// its parent's, but an exclusion declared on a partition is the very thing
-/// `exclusion` refuses, so these run for every declaration.
+/// The checks of a table's exclusion constraints, apart from [`table_structure`] since
+/// a partition's own (DEC-2448.7) are checked with its parent's columns lent.
 pub(crate) fn table_exclusions(table: &Table) -> Vec<DialectError> {
     table
         .exclude
@@ -331,18 +329,6 @@ fn exclusion(
 ) -> Vec<DialectError> {
     let what = format!("exclusion constraint `{name}`", name = name.shown());
     let mut found = Vec::new();
-    // A partition's own exclusion arrives with E2 (DEC-2448.6): the engine takes one
-    // as its parent's clone when it is attached or the parent's is added after it, and
-    // a declaration cannot yet say so (`validate_partition` has no parent to ask).
-    if table.partition_of.is_some() {
-        found.push(invalid(format!(
-            "{what} is declared on a partition, which this tool does not hold yet: PostgreSQL \
-             takes an own exclusion as its parent's clone when the partition is attached or \
-             the parent's is added after it, and the guarantee then goes with the parent's \
-             (DEC-2448.6, #2448)"
-        )));
-        return found;
-    }
     // A partitioned parent's (PostgreSQL 18 only; 16 refuses it, which the plan says by
     // name against a connected server, DEC-2448.6) holds every partition-key column.
     if let Some(by) = &table.partition_by {
@@ -2687,7 +2673,9 @@ mod tests {
             &["n", "body"],
         );
         assert!(entry(&covered).is_empty(), "{}", said(&covered));
-        // A partition's own exclusion is not held yet; a partition with none is untouched.
+        // A partition's own exclusion is held to its parent's columns by `validate_partition`
+        // (DEC-2448.7), which lends them; the table entry has nothing to say of one, as it has
+        // nothing to say of a partition's own index. A partition with none is untouched.
         let mut partition = exclusion_table(Btree, &[("n", "")]);
         partition.columns.clear();
         partition.partition_of = Some(pbps_model::PartitionOf {
@@ -2695,7 +2683,21 @@ mod tests {
             bound: pbps_model::PartitionBound::Default,
             columns: Default::default(),
         });
-        assert!(said(&partition).contains("declared on a partition"));
+        assert!(said(&partition).is_empty(), "{}", said(&partition));
+        // Negative: lent a column the exclusion does not name, the same exclusion is refused.
+        let mut lent = partition.clone();
+        lent.partition_of = None;
+        lent.columns.insert(
+            "other".into(),
+            pbps_model::Column::new("integer".parse().unwrap()),
+        );
+        assert!(
+            table_exclusions(&lent)
+                .iter()
+                .any(|e| e.to_string().contains("`n`")),
+            "{:?}",
+            table_exclusions(&lent)
+        );
         let ordinary_partition = Table {
             partition_of: partition.partition_of.clone(),
             ..Default::default()

@@ -529,15 +529,18 @@ depends_on:
   partition moved out of `partitions:` into a file of its own, declared with its
   parent's columns, keys, constraints and indexes under any names, is detached
   and kept with its rows, `destructive` since they leave the parent; any other
-  shape is refused, to be changed in a later revision (DEC-1544.1). A standing
-  partition's own indexes, checks, column defaults, NOT NULLs, storage
+  shape is refused, to be changed in a later revision (DEC-1544.1). A clone of
+  the parent's exclusion becomes the detached table's own constraint, which the
+  declaration names (DEC-2448.7). A standing
+  partition's own indexes, checks, exclusion constraints, column defaults, NOT NULLs, storage
   parameters and persistence are changed on it alone; a parent's default the
   plan sets is followed by each partition's own (DEC-1581.1). An ordinary
   table moved into its parent's `partitions:` under its own name is attached
   and keeps its rows, `constraint` since the engine checks every row against
   its bound. The table must already hold its parent's columns, in order, and
   none of the keys or constraints a partition does not hold, or it is refused
-  by name. What it keeps of its own is then brought to the declaration in the
+  by name; an exclusion constraint of its own that its parent's would take as its
+  clone is refused too, and any other stays its own (DEC-2448.7). What it keeps of its own is then brought to the declaration in the
   same plan, and its column uids leave the ids file. The apply's pre-flight
   refuses rows of the table outside the range, and DEFAULT-partition rows
   inside it (DEC-1545.1); outside a list's values, or a hash's remainder,
@@ -614,9 +617,15 @@ depends_on:
   for that definition, behind the `destructive` risk; a changed definition at one
   name is a replacement of two changes and needs none, and a change of its storage
   parameters alone is an `ALTER INDEX` that leaves it standing. Dropping a column it
-  holds is allowed only in a plan that drops the constraint; a retype and a
-  partitioned table's constraint are refused by name until the parts that deliver
-  them (DEC-2448.3, DEC-2448.4). SQL Server has no such constraint.
+  holds is allowed only in a plan that drops the constraint; a retype is stated
+  as the constraint's drop and add beside it (DEC-2448.3, DEC-2448.4, DEC-2448.5).
+  A partitioned parent holds one on PostgreSQL 18 only (16 refuses it by name
+  before any statement), and only with every partition-key column as a plain key
+  excluded with `=` (DEC-2448.6). A partition holds its own under its entry's
+  `exclude:`, written as a table's; one the engine would take for its parent's
+  clone (same method, keys, operators, `include:` and `where:`) is refused, and
+  its drop is recorded in the parent's identity file under the partition's uid
+  (DEC-2448.7). SQL Server has no such constraint.
 - **A stored generated column is `generated: {expression: "a * 2", stored:
   true}`** (PostgreSQL): computed on every write, never a default, and its
   kind always said. Its expression changes in place on PostgreSQL 17 and

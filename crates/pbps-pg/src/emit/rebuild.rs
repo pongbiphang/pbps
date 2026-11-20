@@ -9,8 +9,42 @@ pub(super) fn build_partitioned_index(pg: &Postgres, recipe: &BuildPartitionedIn
     recipe
         .validate()
         .map_err(|message| invalid(message.into()))?;
+    // An exclusion is built where a unique constraint is: on the parent alone (`ONLY`, which
+    // PostgreSQL 18 leaves invalid until every leaf's is attached), then on each leaf under its
+    // own name and attached to the parent's. It has no `USING INDEX` form, so each leaf's
+    // constraint is added whole, with the parent's timing, parameters and predicate, which a
+    // clone carries (measured on 18.6, DEC-2448.7).
+    if let Definition::Exclusion(x) = &recipe.definition {
+        let parent = &recipe.parent.name;
+        let mut out = vec![on(
+            pg,
+            parent,
+            &add_key_sql(parent, &exclusion_clause(recipe.name.raw(), x)?, true)?,
+        )?];
+        for clone in &recipe.clones {
+            let leaf = &clone.leaf.name;
+            out.push(on(
+                pg,
+                leaf,
+                &add_key_sql(leaf, &exclusion_clause(clone.name.raw(), x)?, false)?,
+            )?);
+            out.push(on(
+                pg,
+                parent,
+                &format!(
+                    "ALTER INDEX {}.{} ATTACH PARTITION {}.{};",
+                    quote(&parent.schema)?,
+                    quote(recipe.name.raw())?,
+                    quote(&leaf.schema)?,
+                    quote(clone.name.raw())?
+                ),
+            )?);
+        }
+        return Ok(out);
+    }
     let (index, clause, kind) = match &recipe.definition {
         Definition::Index(index) => (index.clone(), None, None),
+        Definition::Exclusion(_) => unreachable!("built above"),
         definition @ (Definition::PrimaryKey(_) | Definition::Unique(_)) => {
             let (columns, parameters, clause, kind) = match definition {
                 Definition::PrimaryKey(key) => (
@@ -25,7 +59,7 @@ pub(super) fn build_partitioned_index(pg: &Postgres, recipe: &BuildPartitionedIn
                     unique_clause(recipe.name.raw(), key)?,
                     "UNIQUE",
                 ),
-                Definition::Index(_) => unreachable!(),
+                Definition::Index(_) | Definition::Exclusion(_) => unreachable!(),
             };
             let index = Index {
                 columns: columns
