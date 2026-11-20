@@ -3,7 +3,7 @@
 //! subset is pinned as such, so the line between "refused" and "read" is a
 //! decision a test holds and not an accident of the code.
 
-use super::super::table;
+use super::super::{index, table, view};
 use super::corpus::{self, Case};
 
 /// (text, a fragment of the sentence, whether the engine takes the text).
@@ -203,6 +203,42 @@ fn an_object_name_is_escaped_in_what_is_said_about_it() {
     assert!(refused.what().contains("x\\ny"), "{refused}");
     let refused = table("t", "CREATE TABLE t(a int DEFAULT 'a\nb' + 1 `x`)").expect_err("refused");
     assert!(!refused.what().chars().any(char::is_control), "{refused}");
+}
+
+#[test]
+fn an_index_and_a_view_are_refused_the_same_way() {
+    for sql in [
+        "CREATE INDEX i ON t()",
+        "CREATE INDEX i ON t(a,)",
+        "CREATE INDEX i ON t(,a)",
+        "CREATE INDEX i ON t(a",
+        "CREATE INDEX i ON t(a) WHERE",
+        "CREATE INDEX i ON t(a) WHERE b > 0; DROP TABLE t",
+        "CREATE INDEX i ON t(a) WHERE 'x",
+        "CREATE UNIQUE i ON t(a)",
+        "CREATE INDEX i t(a)",
+        "CREATE INDEX i ON t(a) b",
+        "CREATE TABLE t(a)",
+        "",
+    ] {
+        let refused = index("i", sql).expect_err(sql);
+        assert!(refused.what().starts_with("`i`: "), "{sql}: {refused}");
+    }
+    for sql in [
+        "CREATE VIEW v",
+        "CREATE VIEW v AS",
+        "CREATE VIEW v(x AS SELECT 1",
+        "CREATE VIEW v() AS SELECT 1",
+        "CREATE TEMP VIEW v AS SELECT 1",
+        "CREATE VIEW v AS SELECT 1; SELECT 2",
+        "CREATE VIEW v SELECT 1",
+        "CREATE VIEW v AS SELECT 'x",
+        "CREATE TABLE v(a)",
+        "",
+    ] {
+        let refused = view("v", sql).expect_err(sql);
+        assert!(refused.what().starts_with("`v`: "), "{sql}: {refused}");
+    }
 }
 
 #[test]

@@ -273,3 +273,87 @@ pub(super) fn tables() -> Vec<Case> {
     add(&["CREATE TABLE t(", &wide.join(", "), ")"].concat());
     out
 }
+
+/// Every index text of the corpus, on the table `t(a, b, c)`.
+pub(super) fn indexes() -> Vec<Case> {
+    const TABLE: &str = "CREATE TABLE t(a int, b int, c text, \"d e\" int)";
+    let mut out = Vec::new();
+    for sql in [
+        "CREATE INDEX i ON t(a)",
+        "CREATE UNIQUE INDEX i ON t(a, b)",
+        "CREATE INDEX i ON t(a DESC, b ASC)",
+        "CREATE INDEX i ON t(c COLLATE nocase)",
+        "CREATE INDEX i ON t(lower(c))",
+        "CREATE INDEX i ON t(a + b, c)",
+        "CREATE INDEX i ON t((a))",
+        "CREATE INDEX i ON t(a) WHERE b > 0",
+        "CREATE UNIQUE INDEX i ON t(a) WHERE b IS NOT NULL AND (c <> 'x' OR a < 3)",
+        "CREATE INDEX i ON t(a) WHERE c <> ')'",
+        "CREATE INDEX i ON t(a) WHERE a /* ) */ > 0 -- )\n",
+        "CREATE INDEX i ON t(a) WHERE a /* /* */ > 0",
+        "CREATE INDEX i ON t(a)\n  WHERE\n    b > 0",
+        "CREATE INDEX \"i\"\"j\" ON \"t\"(\"d e\")",
+        "CREATE INDEX `i` ON [t](`d e`)",
+        "CREATE INDEX 'i' ON t('a')",
+        "create unique index if not exists main.i on t(a)",
+        "CREATE INDEX /*c*/ i /*c*/ ON /*c*/ t /*c*/ ( /*c*/ a /*c*/ , b ) /*c*/ WHERE /*c*/ a > 0",
+        "CREATE INDEX i ON t(a, b, c, \"d e\")",
+        "CREATE INDEX i ON t(abs(a), (b), c)",
+        "CREATE INDEX i ON t(max(a, b), c)",
+        "CREATE INDEX i ON t(coalesce(a, b, 0) DESC, 'x,y' || c)",
+        "CREATE INDEX i ON t(a) WHERE (b)",
+        "CREATE INDEX i ON t(a) WHERE b > 0 -- note",
+        "CREATE INDEX i ON t(a) WHERE b > 0 /* why */",
+        "CREATE INDEX i ON t(a) WHERE b > 0\n-- note\n",
+        "CREATE INDEX i ON t(a) WHERE b > 0;",
+        "CREATE INDEX i ON t(a) WHERE /* c */ b > 0",
+        "CREATE INDEX i ON t(a) WHERE -- c\n b > 0",
+        "CREATE INDEX i ON t(a) /* c */ WHERE b > 0   \n",
+        "CREATE INDEX i ON t(a) -- c\n WHERE /* d */ b > 0 /* e */ -- f\n",
+        "CREATE INDEX i ON t(a) WHERE b > 0 -- note\n;",
+    ] {
+        out.push(Case {
+            setup: TABLE,
+            sql: sql.to_owned(),
+        });
+    }
+    out
+}
+
+/// Every view text of the corpus, over the table `t(a, b)`.
+pub(super) fn views() -> Vec<Case> {
+    const TABLE: &str = "CREATE TABLE t(a int, b int)";
+    let mut out = Vec::new();
+    for sql in [
+        "CREATE VIEW v AS SELECT a FROM t",
+        "CREATE VIEW v(x, y) AS SELECT a, b FROM t",
+        "CREATE VIEW v (\"x y\", [z]) AS SELECT a, b FROM t",
+        "CREATE VIEW v AS WITH x AS (SELECT 1 AS a) SELECT a FROM x",
+        "CREATE VIEW v AS VALUES (1), (2)",
+        "CREATE VIEW v AS SELECT a /* ; */ FROM t -- AS\n WHERE b > 0",
+        "CREATE VIEW v /* c */ AS -- note\n SELECT a FROM t",
+        "CREATE VIEW \"v\"\"w\" AS SELECT 'AS' AS \"AS\" FROM t",
+        "CREATE VIEW `v` AS SELECT a FROM [t]",
+        "CREATE VIEW 'v' AS SELECT a FROM t",
+        "CREATE VIEW IF NOT EXISTS main.v AS SELECT a FROM t",
+        "CREATE VIEW v AS SELECT a FROM t UNION SELECT b FROM t",
+        "CREATE VIEW v AS SELECT (a) FROM t WHERE (b) > (SELECT 1)",
+        "create view v as select a from t",
+        "CREATE VIEW v AS\n\n   SELECT\ta\n FROM t\n",
+        "CREATE VIEW v AS SELECT a FROM t -- note",
+        "CREATE VIEW v AS SELECT a FROM t /* why */",
+        "CREATE VIEW v AS SELECT a FROM t\n-- note\n",
+        "CREATE VIEW v AS SELECT a FROM t;",
+        "CREATE VIEW v AS SELECT a FROM t /* a */ -- b\n /* c */",
+        "CREATE VIEW v AS /* c */ SELECT a FROM t",
+        "CREATE VIEW v AS -- c\n SELECT a FROM t",
+        "CREATE VIEW v /* c */ AS\n\n  SELECT a FROM t   \n\n",
+        "CREATE VIEW v AS SELECT a FROM t -- note\n;",
+    ] {
+        out.push(Case {
+            setup: TABLE,
+            sql: sql.to_owned(),
+        });
+    }
+    out
+}
