@@ -41,6 +41,22 @@ pub fn is_intermediate(name: &str) -> bool {
         .is_some_and(|start| ident::same(start, RENAME_PREFIX))
 }
 
+/// The start of the name this tool gives a constraint the file leaves
+/// unnamed (a `CHECK`, `UNIQUE` or `FOREIGN KEY` written without
+/// `CONSTRAINT name`), which the model, keyed by name, cannot hold otherwise.
+/// No declared constraint may start with it, so a synthetic name never names a
+/// declared one, and no statement changes a constraint by it (SQLite has no
+/// way to name what it did not name): that is the table rebuild's.
+pub const UNNAMED_PREFIX: &str = "__pbps_unnamed_";
+
+/// Whether `name` starts with [`UNNAMED_PREFIX`], ASCII case ignored as SQLite
+/// would.
+#[must_use]
+pub fn is_synthetic(name: &str) -> bool {
+    name.get(..UNNAMED_PREFIX.len())
+        .is_some_and(|start| ident::same(start, UNNAMED_PREFIX))
+}
+
 /// Problems among the tables, views and indexes a schema declares: they share
 /// one namespace per database, and two names there that differ only in ASCII
 /// case are one name. Names equal letter for letter are the shared checks'

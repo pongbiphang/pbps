@@ -3,4 +3,5 @@
 //! `CREATE` text (CHECK, partial index predicates, constraint names, view
 //! bodies). Text it does not fully recognise is refused, never compared.
 
+pub(crate) mod facts;
 pub(crate) mod text;

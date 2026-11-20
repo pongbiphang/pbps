@@ -429,3 +429,60 @@ fn a_nullability_change_through_partitions_is_refused_and_not_written() {
         Err(DialectError::Unsupported { .. })
     ));
 }
+
+/// The reader names a constraint the file leaves unnamed (`__pbps_unnamed_*`),
+/// and a name SQLite never stored cannot be dropped by a statement: only the
+/// rebuild changes such a constraint.
+#[test]
+fn dropping_a_constraint_by_a_name_the_reader_gave_is_the_rebuilds_and_not_a_statement() {
+    let synthetic = "__pbps_unnamed_check_0123456789abcdef";
+    // The engine's side: the name finds nothing, for a check and for a key.
+    for setup in [
+        "CREATE TABLE t(a integer, CHECK (a > 0))",
+        "CREATE TABLE p(id integer PRIMARY KEY); CREATE TABLE t(a integer REFERENCES p(id))",
+    ] {
+        let mut db = built(setup);
+        let sql = format!("ALTER TABLE main.t DROP CONSTRAINT \"{synthetic}\"");
+        db.connection()
+            .execute_batch(&sql)
+            .expect_err("the engine holds no constraint by that name");
+    }
+    for change in [drop_check("t", synthetic), drop_fk("t", synthetic)] {
+        match statements(&Sqlite::default(), change) {
+            Err(DialectError::NotBuilt { part, .. }) => {
+                assert!(part.contains("table rebuild"), "{part}");
+                assert!(part.contains(synthetic), "{part}");
+            }
+            other => panic!("expected the rebuild's refusal, got {other:?}"),
+        }
+    }
+    // Negative: the prefix in any case, and a name near it, which only the
+    // first kind is refused for.
+    assert!(statements(&Sqlite::default(), drop_check("t", "__PBPS_UNNAMED_x")).is_err());
+    for name in ["__pbps_unnamed", "x__pbps_unnamed_check", "_pbps_unnamed_x"] {
+        assert_eq!(
+            sql_of(drop_check("t", name)),
+            vec![format!(
+                "ALTER TABLE main.\"t\" DROP CONSTRAINT \"{name}\";"
+            )]
+        );
+    }
+}
+
+#[test]
+fn a_check_added_under_a_name_the_reader_keeps_is_refused() {
+    assert!(
+        statements(
+            &Sqlite::default(),
+            add_check("t", "__pbps_unnamed_check_x", "a > 0")
+        )
+        .is_err()
+    );
+    assert!(
+        statements(
+            &Sqlite::default(),
+            add_check("t", "unnamed_check_x", "a > 0")
+        )
+        .is_ok()
+    );
+}

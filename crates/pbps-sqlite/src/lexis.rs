@@ -327,6 +327,118 @@ pub fn unquote(run: &str) -> Option<String> {
     Some(inner.replace(&doubled, &quote.to_string()))
 }
 
+/// The comparison form of a definition (a view's body): white space in code
+/// collapses to one space, and the edges lose theirs; strings and quoted names
+/// are kept as written, and a comment keeps its words and loses its layout. The line ending that stops a `--` comment
+/// is not layout, so one is kept where a comment needs it: collapsing it would
+/// splice the next line into the comment. ASCII white space only, comments
+/// that do not nest: SQLite's own rules, which the shared scanner does not
+/// have.
+#[must_use]
+pub fn layout(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    // White space seen since the last thing written, and whether it held a
+    // line ending; and whether that last thing was a `--` comment.
+    let mut pending: Option<bool> = None;
+    let mut after_line_comment = false;
+    let mut write = |out: &mut String, run: &str, pending: &mut Option<bool>, line: bool| {
+        if let Some(newline) = pending.take()
+            && !out.is_empty()
+        {
+            out.push(if after_line_comment && newline {
+                '\n'
+            } else {
+                ' '
+            });
+        }
+        out.push_str(run);
+        after_line_comment = line;
+    };
+    for piece in pieces(text) {
+        match piece {
+            Piece::Code(code) => {
+                let mut start = None;
+                for (at, c) in code.char_indices() {
+                    if is_space(c) {
+                        if let Some(from) = start.take() {
+                            write(&mut out, &code[from..at], &mut pending, false);
+                        }
+                        pending = Some(pending.unwrap_or(false) || c == '\n');
+                    } else if start.is_none() {
+                        start = Some(at);
+                    }
+                }
+                if let Some(from) = start {
+                    write(&mut out, &code[from..], &mut pending, false);
+                }
+            }
+            Piece::Quoted(run) => write(&mut out, run, &mut pending, false),
+            // Nothing inside a comment is structure, so its layout collapses
+            // like code's, as the shared scanner's does.
+            Piece::Comment(run) => {
+                let inside = run.split(is_space).filter(|w| !w.is_empty());
+                let run = inside.collect::<Vec<_>>().join(" ");
+                write(&mut out, &run, &mut pending, run.starts_with("--"));
+            }
+        }
+    }
+    out
+}
+
+/// What an expression is, apart from how it is written: comments gone, code
+/// lower-cased (ASCII), strings and quoted names kept, layout collapsed and none
+/// beside a parenthesis or a comma. For comparing two spellings and for the
+/// digest of a constraint's name; never for what is returned of a text.
+// Read by the catalog reader, the next part of the item (the digest of an unnamed
+// constraint); the tests read it now.
+#[cfg_attr(not(test), allow(dead_code))]
+#[must_use]
+pub fn canonical(text: &str) -> String {
+    let mut strings: Vec<&str> = Vec::new();
+    let mut out = String::new();
+    for piece in pieces(text) {
+        match piece {
+            Piece::Comment(_) => out.push(' '),
+            Piece::Code(code) => out.push_str(&code.to_ascii_lowercase()),
+            // A string and a quoted name are held aside whole and put back
+            // after the layout is collapsed, so nothing inside one is read as
+            // layout or punctuation. A quoted name keeps its case too: SQLite
+            // reads a double-quoted run that names no column as a string.
+            Piece::Quoted(run) => {
+                strings.push(run);
+                out.push('\u{1}');
+            }
+        }
+    }
+    let mut words = out
+        .split(is_space)
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    for (from, to) in [
+        ("( ", "("),
+        (" )", ")"),
+        (" (", "("),
+        (" ,", ","),
+        (", ", ","),
+    ] {
+        while words.contains(from) {
+            words = words.replace(from, to);
+        }
+    }
+    let mut held = strings.into_iter();
+    words
+        .chars()
+        .map(|c| {
+            if c == '\u{1}' {
+                held.next().unwrap_or("").to_owned()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 /// Whether the code of `text` may name `name`: as a bare word, or as a quoted
 /// name (`"…"`, `` `…` `` or `[…]`, quotes undoubled), never in a comment or a
 /// `'…'` string. `same` says when two spellings are one name. An
@@ -578,5 +690,163 @@ mod tests {
         assert_eq!(first_word("'x'"), None);
         assert_eq!(first_word(""), None);
         assert!(!has_second_statement("SELECT 1") && has_second_statement("SELECT 1; x"));
+    }
+
+    /// What the engine answers for a statement, as one comparable string: its
+    /// rows, or `error`.
+    fn answer(sql: &str) -> String {
+        match Fresh::memory().connection().query(sql, &[]) {
+            Ok(rows) => format!("{rows:?}"),
+            Err(_) => "error".to_owned(),
+        }
+    }
+
+    /// Two bodies the engine answers alike and that differ in layout only
+    /// compare equal.
+    #[test]
+    fn layout_is_the_only_difference_layout_forgets() {
+        for (a, b) in [
+            ("SELECT 1,\n  2", "SELECT\t1,\r\n2"),
+            ("  SELECT 1 + 1\r\n", "SELECT 1 +\x0c1"),
+            ("SELECT 1 /*  a\n b */ + 1", "SELECT 1 /* a b */ + 1"),
+            ("SELECT 1 -- a   b\n + 1", "SELECT 1 -- a b\n\n   + 1"),
+            (
+                "SELECT \"a  b\" FROM (SELECT 1 AS \"a  b\")",
+                "SELECT \"a  b\"   FROM (SELECT 1 AS \"a  b\")",
+            ),
+        ] {
+            assert_eq!(answer(a), answer(b), "{a:?} and {b:?} run alike");
+            assert_eq!(layout(a), layout(b), "{a:?} and {b:?}");
+        }
+        // Negative: what is data is not forgotten, each pair told apart by the
+        // engine as well.
+        for (a, b) in [
+            ("SELECT 'a  b'", "SELECT 'a b'"),
+            (
+                "SELECT \"a  b\" FROM (SELECT 1 AS \"a  b\")",
+                "SELECT \"a b\" FROM (SELECT 1 AS \"a  b\")",
+            ),
+            // The line ending is what ends a `--` comment: without it the next
+            // line is part of the comment.
+            ("SELECT 1 -- c\n + 1", "SELECT 1 -- c + 1"),
+            // SQLite ends the comment at `\n` only, a `\r` does not.
+            ("SELECT 1 --c\r + 1", "SELECT 1 --c\n + 1"),
+            // Code is not folded: a name's case is the name's.
+            ("SELECT 1 AS a", "SELECT 1 AS A"),
+        ] {
+            assert_ne!(layout(a), layout(b), "{a:?} and {b:?}");
+        }
+        for (a, b) in [
+            ("SELECT 'a  b'", "SELECT 'a b'"),
+            ("SELECT 1 -- c\n + 1", "SELECT 1 -- c + 1"),
+            ("SELECT 1 --c\r + 1", "SELECT 1 --c\n + 1"),
+        ] {
+            assert_ne!(
+                answer(a),
+                answer(b),
+                "{a:?} and {b:?} differ for the engine"
+            );
+        }
+    }
+
+    /// A block comment ends at its first `*/`: the rest is code, whose layout
+    /// is layout and whose strings are data.
+    #[test]
+    fn layout_reads_block_comments_as_the_engine_does_which_is_not_nested() {
+        let body = "SELECT 1 /* a /* b */   +   '  x  '";
+        assert_eq!(layout(body), "SELECT 1 /* a /* b */ + '  x  '");
+        // The engine's side: nested, this would be an unterminated comment.
+        assert_eq!(
+            answer("SELECT 1 /* a /* b */ + 1"),
+            answer("SELECT 2"),
+            "the engine ends the comment at the first `*/`"
+        );
+        assert_eq!(answer("SELECT 1 /* a /* b */ + 1 */"), "error");
+        assert_eq!(
+            layout("SELECT 1 /* a /* b */ + 1 */"),
+            "SELECT 1 /* a /* b */ + 1 */"
+        );
+    }
+
+    #[test]
+    fn layout_is_total_idempotent_and_keeps_what_it_cannot_close() {
+        let mut texts: Vec<&str> = BODIES.iter().map(|(b, _)| *b).collect();
+        texts.extend([
+            "",
+            "  ",
+            "-- c",
+            "/* c",
+            "'x  ",
+            "\"a  ",
+            "[a  ",
+            "SELECT 1 --",
+            "\n--\n\n",
+        ]);
+        for text in texts {
+            let once = layout(text);
+            assert_eq!(layout(&once), once, "{text:?}");
+            // The edges lose their white space, unless it is inside a string
+            // or a name that never closes.
+            if !text.contains(['\'', '"', '[']) {
+                assert!(
+                    !once.starts_with(is_space) && !once.ends_with(is_space),
+                    "{text:?}"
+                );
+            }
+        }
+        // Negative: a string and a name that never close keep their white space.
+        assert_eq!(layout("SELECT 'a   b"), "SELECT 'a   b");
+        assert_eq!(layout("SELECT [a   b"), "SELECT [a   b");
+    }
+
+    /// The comparison form of an expression: only what the engine ignores.
+    #[test]
+    fn canonical_forgets_comments_case_and_layout_and_keeps_strings() {
+        for (a, b) in [
+            ("a >= 0", "A  >=\n0"),
+            ("f( a ,b )", "F(a, b)"),
+            ("a /* x */ > 0 -- y\n", "a > 0"),
+        ] {
+            assert_eq!(canonical(a), canonical(b), "{a:?} and {b:?}");
+        }
+        // A double-quoted run that names no column is a string to the engine,
+        // so its case is kept: these two checks say different things.
+        assert!(accepts(
+            "CREATE TABLE t(x, CHECK (\"A\" = 'A')); INSERT INTO t VALUES (1)"
+        ));
+        assert!(!accepts(
+            "CREATE TABLE t(x, CHECK (\"a\" = 'A')); INSERT INTO t VALUES (1)"
+        ));
+        assert_ne!(canonical("\"A\" = 'A'"), canonical("\"a\" = 'A'"));
+        // Nothing inside a quoted name is layout or punctuation: these are
+        // different columns to the engine.
+        assert!(accepts(
+            "CREATE TABLE t(\"a  b\", \"a b\", \"a ( b\", \"a( b\")"
+        ));
+        for (a, b) in [
+            ("\"a  b\" = 1", "\"a b\" = 1"),
+            ("[a ( b] = 1", "[a( b] = 1"),
+            ("`a , b` = 1", "`a,b` = 1"),
+        ] {
+            assert_ne!(canonical(a), canonical(b), "{a:?} and {b:?}");
+        }
+        // And the layout around one is still forgotten.
+        assert_eq!(canonical("\"a  b\"   =\n1"), canonical("\"a  b\" = 1"));
+        assert_eq!(answer("SELECT 'A' = 'a'"), "[Record([Integer(0)])]");
+        for (a, b) in [
+            ("a = 'A'", "a = 'a'"),
+            ("a = 'x  y'", "a = 'x y'"),
+            ("a > 0", "a > 1"),
+        ] {
+            assert_ne!(canonical(a), canonical(b), "{a:?} and {b:?}");
+        }
+        // The engine's side for the first rule: a name's case does not change
+        // what a check says.
+        assert!(accepts(
+            "CREATE TABLE t(a, CHECK (A >= 0)); INSERT INTO t VALUES (1)"
+        ));
+        assert!(!accepts(
+            "CREATE TABLE t(a, CHECK (A >= 0)); INSERT INTO t VALUES (-1)"
+        ));
     }
 }
