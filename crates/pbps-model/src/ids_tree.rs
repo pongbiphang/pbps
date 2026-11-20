@@ -699,7 +699,13 @@ fn check_names(path: &str, file: &TreeFile) -> Result<(), TreeError> {
                     Rec::Dead(tomb) => nonempty(&tomb.was)?,
                 }
             }
-            for (name, _) in &t.exclusions {
+            // A partition's retirements are keyed by name as the table's own are, so a
+            // blank one is refused alike rather than read as an empty local name.
+            for name in t.exclusions.iter().map(|(name, _)| name).chain(
+                t.partition_exclusions
+                    .iter()
+                    .flat_map(|(_, named)| named.keys()),
+            ) {
                 nonempty(name)?;
             }
         }
