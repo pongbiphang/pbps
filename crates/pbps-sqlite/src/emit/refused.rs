@@ -102,7 +102,10 @@ pub(super) fn extension(change: &ExtensionChange) -> Sql {
 
 pub(super) fn search(change: &SearchChange) -> Sql {
     match change {
-        SearchChange::CreateSearch { .. } | SearchChange::DropSearch { .. } => Err(unsupported(
+        SearchChange::CreateSearch { .. }
+        | SearchChange::AlterSearchMapping { .. }
+        | SearchChange::AlterSearchDictionary { .. }
+        | SearchChange::DropSearch { .. } => Err(unsupported(
             "declared text search configurations and dictionaries",
         )),
     }

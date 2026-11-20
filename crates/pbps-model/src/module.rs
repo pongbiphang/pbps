@@ -1132,12 +1132,10 @@ pub struct Hints {
         BTreeMap<crate::ObjectLocalName, std::collections::BTreeSet<crate::ProviderMember>>,
 
     /// What a connected plan found standing on each text search object it would alter in
-    /// place that keeps what was computed with the old behaviour until it is rebuilt: an
-    /// index, a stored generated column, a check or a materialized view over the object,
-    /// or over a configuration that maps a dictionary it changes (DEC-2728.3). One line
-    /// per dependent. A fact about the target, absent offline: an object with no entry was
-    /// not read, which is not the same as an entry with no dependent.
-    pub search_dependents: BTreeMap<crate::SearchRef, Vec<String>>,
+    /// place that keeps what was computed with the old behaviour until it is rebuilt
+    /// (DEC-2728.4). A fact about the target, absent offline: an object with no entry was not
+    /// read, which is not the same as an entry with no dependent.
+    pub search_dependents: BTreeMap<crate::SearchRef, crate::SearchCensus>,
 
     /// Whether the base is what a connected plan just read of the target. Offline the
     /// base is the baseline, which stands for the target only as far as the target

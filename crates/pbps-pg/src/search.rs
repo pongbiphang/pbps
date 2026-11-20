@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::catalog::{Limitation, LimitationTarget};
 use pbps_dialect::DialectError;
-use pbps_model::{Schema, SearchKind, SearchName, SearchObject, SearchRef, TypeRef};
+use pbps_model::{Schema, SearchCensus, SearchKind, SearchName, SearchObject, SearchRef, TypeRef};
 
 /// The one definition of the engine's own parser and templates this model holds
 /// (measured identical on 16 and 18, `measure` test). The pull's SQL, the census and
@@ -399,7 +399,10 @@ pub(crate) fn create(
                 "CREATE TEXT SEARCH CONFIGURATION {target} (PARSER = {});",
                 qualified(parser.schema(), parser.name())?
             ))];
-            out.extend(mapping_statements(&target, "ADD", mappings.iter())?);
+            out.extend(mapping_statements(
+                &target,
+                &pbps_model::search::mapping_steps(&BTreeMap::new(), mappings),
+            )?);
             out
         }
     };
@@ -414,48 +417,44 @@ pub(crate) fn create(
     Ok(statements)
 }
 
-/// One `ALTER TEXT SEARCH CONFIGURATION ... <verb> MAPPING` per group of token types that
-/// share their dictionaries, so the catalog ends with the declared rows in the engine's own
-/// order (measured: the order of the groups does not matter, the order inside one does).
-fn mapping_statements<'a>(
+/// One `ALTER TEXT SEARCH CONFIGURATION ... <verb> MAPPING` per step, so the catalog ends with
+/// the declared rows in the engine's own order (`pbps_model::search::mapping_steps`).
+fn mapping_statements(
     target: &str,
-    verb: &str,
-    mappings: impl Iterator<Item = (&'a String, &'a Vec<SearchName>)>,
+    steps: &[pbps_model::search::MappingStep],
 ) -> Result<Vec<pbps_dialect::Statement>, DialectError> {
-    let mut groups: Vec<(&Vec<SearchName>, Vec<&String>)> = Vec::new();
-    for (alias, dictionaries) in mappings {
-        match groups.iter_mut().find(|(used, _)| *used == dictionaries) {
-            Some((_, aliases)) => aliases.push(alias),
-            None => groups.push((dictionaries, vec![alias])),
-        }
-    }
-    let mut out = Vec::new();
-    for (dictionaries, aliases) in groups {
-        let tokens = aliases
-            .iter()
-            .map(|alias| crate::quote(alias))
-            .collect::<Result<Vec<_>, _>>()?
-            .join(", ");
-        let with = dictionaries
-            .iter()
-            .map(|d| qualified(d.schema(), d.name()))
-            .collect::<Result<Vec<_>, _>>()?
-            .join(", ");
-        out.push(pbps_dialect::Statement::new(format!(
-            "ALTER TEXT SEARCH CONFIGURATION {target} {verb} MAPPING FOR {tokens} WITH {with};"
-        )));
-    }
-    Ok(out)
+    steps
+        .iter()
+        .map(|step| {
+            let tokens = step
+                .aliases
+                .iter()
+                .map(|alias| crate::quote(alias))
+                .collect::<Result<Vec<_>, _>>()?
+                .join(", ");
+            let with = step
+                .dictionaries
+                .iter()
+                .map(|d| qualified(d.schema(), d.name()))
+                .collect::<Result<Vec<_>, _>>()?
+                .join(", ");
+            let with = if with.is_empty() {
+                String::new()
+            } else {
+                format!(" WITH {with}")
+            };
+            Ok(pbps_dialect::Statement::new(format!(
+                "ALTER TEXT SEARCH CONFIGURATION {target} {} MAPPING FOR {tokens}{with};",
+                step.verb
+            )))
+        })
+        .collect()
 }
 
-/// The statements that bring `before` to `after` in place, qualified throughout
-/// (DEC-2728.3). A configuration adds the token types it newly maps, replaces the dictionary
-/// list of the ones it changes and drops the ones it gives up: `ALTER MAPPING` on a token
-/// type that is not mapped does nothing and `ADD MAPPING` on one that is fails (measured on
-/// 16 and 18), so each token type gets the one verb that does what it says. A dictionary is
-/// one `ALTER` that writes each option that is new or changed and names, without a value,
-/// each one given up, which is how the engine removes one. The object keeps its identity, so
-/// no statement carries one.
+/// The statements that bring `before` to `after` in place, qualified throughout (DEC-2728.3): a
+/// configuration's are `mapping_steps`; a dictionary is one `ALTER` that writes each option that
+/// is new or changed and names, without a value, each one given up, which is how the engine
+/// removes one. The object keeps its identity, so no statement carries one.
 pub(crate) fn alter(
     name: &SearchRef,
     before: &SearchObject,
@@ -466,32 +465,7 @@ pub(crate) fn alter(
         (
             SearchObject::Config { mappings: was, .. },
             SearchObject::Config { mappings: now, .. },
-        ) => {
-            let changed =
-                |(alias, list): &(&String, &Vec<SearchName>)| was.get(*alias) != Some(*list);
-            let mut out = Vec::new();
-            let gone: Vec<_> = was
-                .keys()
-                .filter(|alias| !now.contains_key(*alias))
-                .collect();
-            if !gone.is_empty() {
-                let tokens = gone
-                    .iter()
-                    .map(|alias| crate::quote(alias))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .join(", ");
-                out.push(pbps_dialect::Statement::new(format!(
-                    "ALTER TEXT SEARCH CONFIGURATION {target} DROP MAPPING FOR {tokens};"
-                )));
-            }
-            let (standing, fresh): (Vec<_>, Vec<_>) = now
-                .iter()
-                .filter(|entry| changed(entry))
-                .partition(|(alias, _)| was.contains_key(*alias));
-            out.extend(mapping_statements(&target, "ALTER", standing.into_iter())?);
-            out.extend(mapping_statements(&target, "ADD", fresh.into_iter())?);
-            Ok(out)
-        }
+        ) => mapping_statements(&target, &pbps_model::search::mapping_steps(was, now)),
         (
             SearchObject::Dictionary { options: was, .. },
             SearchObject::Dictionary { options: now, .. },
@@ -522,20 +496,75 @@ pub(crate) fn alter(
     }
 }
 
-/// What stands on one object and keeps what the old behaviour computed: an index, a
-/// constraint (a check over the object), a stored generated column and a materialized view.
-/// A view, a plain default and a function are evaluated on use and are not here. A
-/// dictionary also answers for the configurations that map it (`pg_depend` holds that edge),
-/// whose dependents stale with it. The walk follows what only reads at run time (a view, a
-/// function) and stops at what stores: a materialized view over a view over the object is as
-/// stale as one over the object itself, and a path that reaches no stored dependent makes
-/// none (the `UNION` drops a repeated node, so a cycle ends). Measured on 16 and 18 (DEC-2728.3): the catalog lists an
-/// expression index, a generated column's default, a check, a view and a materialized view
-/// over `'app.docs'::regconfig` as dependents of the configuration, and not a thesaurus's
-/// sub-dictionary, which the model reads from the options instead. Each row is a stored
-/// dependent (`what`) or a function or view the walk crossed (`via`, the identity [`CALLS`]
-/// uses): a body that names the second kind reaches the object, though no edge says so.
-const STALE: &str = "WITH RECURSIVE subject(cls, oid) AS (
+/// Whether the `pg_depend` row `$x` is a stored dependent: an index, a constraint, a stored
+/// generated column's default or a materialized view's rule. A view, a plain default and a
+/// function are evaluated on use and are not (DEC-2728.3).
+macro_rules! stored {
+    ($x:literal) => {
+        concat!(
+            "(",
+            $x,
+            ".classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                AND EXISTS (SELECT 1 FROM pg_catalog.pg_class k
+                             WHERE k.oid = ",
+            $x,
+            ".objid AND k.relkind IN ('i', 'I'))
+              OR ",
+            $x,
+            ".classid = 'pg_catalog.pg_constraint'::pg_catalog.regclass
+              OR ",
+            $x,
+            ".classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass
+                AND EXISTS (SELECT 1 FROM pg_catalog.pg_attrdef a
+                              JOIN pg_catalog.pg_attribute t
+                                ON t.attrelid = a.adrelid AND t.attnum = a.adnum
+                             WHERE a.oid = ",
+            $x,
+            ".objid AND t.attgenerated = 's')
+              OR ",
+            $x,
+            ".classid = 'pg_catalog.pg_rewrite'::pg_catalog.regclass
+                AND EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite w
+                              JOIN pg_catalog.pg_class k ON k.oid = w.ev_class
+                             WHERE w.oid = ",
+            $x,
+            ".objid AND k.relkind = 'm'))"
+        )
+    };
+}
+
+/// How a stored dependent reads in a plan: a materialized view by its relation's name, any other
+/// by its type and identity.
+macro_rules! stored_label {
+    ($cls:literal, $oid:literal, $sub:literal) => {
+        concat!(
+            "CASE WHEN ",
+            $cls,
+            " = 'pg_catalog.pg_rewrite'::pg_catalog.regclass
+                  THEN 'materialized view ' || (SELECT i.identity FROM pg_catalog.pg_identify_object(
+                         'pg_catalog.pg_class'::pg_catalog.regclass,
+                         (SELECT rw.ev_class FROM pg_catalog.pg_rewrite rw WHERE rw.oid = ",
+            $oid,
+            "), 0) i)
+                  ELSE (SELECT i.type || ' ' || i.identity
+                          FROM pg_catalog.pg_identify_object(",
+            $cls,
+            ", ",
+            $oid,
+            ", ",
+            $sub,
+            ") i) END"
+        )
+    };
+}
+
+/// The stored dependents the catalog proves reach one object, and for a dictionary also each
+/// configuration that maps it. The walk follows what only reads at run time (a view, a function
+/// the catalog links) and stops at what stores, so a materialized view over a view over the
+/// object counts and a path that reaches no stored dependent makes none (the `UNION` ends a
+/// cycle). Measured on 16 and 18 (DEC-2728.3): no edge from a thesaurus's sub-dictionary.
+const STALE: &str = concat!(
+    "WITH RECURSIVE subject(cls, oid) AS (
         SELECT 'pg_catalog.pg_ts_config'::pg_catalog.regclass, c.oid
           FROM pg_catalog.pg_ts_config c
           JOIN pg_catalog.pg_namespace n ON n.oid = c.cfgnamespace
@@ -566,87 +595,34 @@ const STALE: &str = "WITH RECURSIVE subject(cls, oid) AS (
                  AND w.oid = x.objid AND k.relkind = 'v'
          ) n(cls, oid)
      )
-     SELECT what, via FROM (
-     SELECT DISTINCT CASE WHEN x.classid = 'pg_catalog.pg_rewrite'::pg_catalog.regclass
-                 THEN 'materialized view ' || (SELECT i.identity FROM pg_catalog.pg_identify_object(
-                        'pg_catalog.pg_class'::pg_catalog.regclass,
-                        (SELECT w.ev_class FROM pg_catalog.pg_rewrite w WHERE w.oid = x.objid), 0) i)
-                 ELSE (SELECT i.type || ' ' || i.identity
-                         FROM pg_catalog.pg_identify_object(x.classid, x.objid, x.objsubid) i)
-            END AS what, NULL::text AS via
+     SELECT DISTINCT ",
+    stored_label!("x.classid", "x.objid", "x.objsubid"),
+    " AS what
        FROM reach r
        JOIN pg_catalog.pg_depend x ON x.refclassid = r.cls AND x.refobjid = r.oid
-      WHERE (x.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
-             AND EXISTS (SELECT 1 FROM pg_catalog.pg_class k
-                          WHERE k.oid = x.objid AND k.relkind IN ('i', 'I')))
-         OR x.classid = 'pg_catalog.pg_constraint'::pg_catalog.regclass
-         OR (x.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass
-             AND EXISTS (SELECT 1 FROM pg_catalog.pg_attrdef a
-                           JOIN pg_catalog.pg_attribute t
-                             ON t.attrelid = a.adrelid AND t.attnum = a.adnum
-                          WHERE a.oid = x.objid AND t.attgenerated = 's'))
-         OR (x.classid = 'pg_catalog.pg_rewrite'::pg_catalog.regclass
-             AND EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite w
-                           JOIN pg_catalog.pg_class k ON k.oid = w.ev_class
-                          WHERE w.oid = x.objid AND k.relkind = 'm'))
-     UNION
-     SELECT NULL::text, i.identity
-       FROM reach r
-      CROSS JOIN LATERAL pg_catalog.pg_identify_object(r.cls, r.oid, 0) i
-      WHERE r.cls IN ('pg_catalog.pg_proc'::pg_catalog.regclass,
-                      'pg_catalog.pg_class'::pg_catalog.regclass)
-     ) s
-      ORDER BY 1, 2";
+      WHERE ",
+    stored!("x"),
+    "
+      ORDER BY 1"
+);
 
-/// The user functions, views and materialized views the catalog says something reaches, one
-/// row per `(root, node)`: the roots are every stored dependent (an index, a constraint, a
-/// stored generated column, a materialized view) and every user function, view and
-/// materialized view, and each row names a node the root reaches through `pg_depend`, through a
-/// view's rule and through a function whose SQL-standard body (`BEGIN ATOMIC`) calls another. A
-/// node reaches itself. Measured on 16.15 and 18.6 (DEC-2728.3): the engine records no edge
-/// from a `LANGUAGE sql` string body or a PL/pgSQL body to anything it names, a configuration,
-/// a function or a view, so [`STALE`] cannot see it and neither can this walk past such a body;
-/// [`named_in_bodies`] adds those hops. The text of a function in `pg_catalog` or
-/// `information_schema`, one with a SQL-standard body and one written in `internal` or `c` is
-/// not read (it has none, or no text of the kind), and a view has none to read.
-const CALLS: &str = "WITH RECURSIVE start(stored, cls, oid) AS (
-        SELECT true, 'pg_catalog.pg_class'::pg_catalog.regclass, c.oid
-          FROM pg_catalog.pg_class c
-          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-         WHERE c.relkind IN ('i', 'I') AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
-        UNION ALL
-        SELECT true, 'pg_catalog.pg_constraint'::pg_catalog.regclass, k.oid
-          FROM pg_catalog.pg_constraint k
-          JOIN pg_catalog.pg_namespace n ON n.oid = k.connamespace
-         WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
-        UNION ALL
-        SELECT true, 'pg_catalog.pg_attrdef'::pg_catalog.regclass, a.oid
-          FROM pg_catalog.pg_attrdef a
-          JOIN pg_catalog.pg_attribute t ON t.attrelid = a.adrelid AND t.attnum = a.adnum
-          JOIN pg_catalog.pg_class c ON c.oid = a.adrelid
-          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-         WHERE t.attgenerated = 's' AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
-        UNION ALL
-        SELECT k.relkind = 'm', 'pg_catalog.pg_rewrite'::pg_catalog.regclass, w.oid
-          FROM pg_catalog.pg_rewrite w
-          JOIN pg_catalog.pg_class k ON k.oid = w.ev_class
-          JOIN pg_catalog.pg_namespace n ON n.oid = k.relnamespace
-         WHERE k.relkind IN ('v', 'm') AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
-        UNION ALL
-        SELECT false, 'pg_catalog.pg_rewrite'::pg_catalog.regclass, w.oid
-          FROM pg_catalog.pg_rewrite w
-          JOIN pg_catalog.pg_class k ON k.oid = w.ev_class
-          JOIN pg_catalog.pg_namespace n ON n.oid = k.relnamespace
-         WHERE k.relkind = 'm' AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
-        UNION ALL
-        SELECT false, 'pg_catalog.pg_proc'::pg_catalog.regclass, p.oid
-          FROM pg_catalog.pg_proc p
-          JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-         WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
-     ), walk(stored, root_cls, root_oid, cls, oid) AS (
-        SELECT stored, cls, oid, cls, oid FROM start
+/// The functions the catalog cannot read into that a stored dependent reaches, one row per
+/// `(dependent, function)`, through the functions and views the catalog links (a view's rule, a
+/// `BEGIN ATOMIC` body). A function is opaque when its body is text: a `LANGUAGE sql` string body
+/// or any procedural language. Measured on 16.15 and 18.6 (DEC-2728.4): the engine records no
+/// edge from such a body to what it names, so the walk stops there, and nothing reads the text.
+/// The engine's own functions (`pg_catalog`, `information_schema`) and `internal` and `c` ones
+/// have no text to read and are not listed.
+const OPAQUE: &str = concat!(
+    "WITH RECURSIVE walk(root_cls, root_oid, cls, oid) AS (
+        SELECT DISTINCT x.classid::pg_catalog.regclass, x.objid,
+               x.classid::pg_catalog.regclass, x.objid
+          FROM pg_catalog.pg_depend x
+         WHERE ",
+    stored!("x"),
+    "
         UNION
-        SELECT w.stored, w.root_cls, w.root_oid, n.cls, n.oid
+        SELECT w.root_cls, w.root_oid, n.cls, n.oid
           FROM walk w
           JOIN pg_catalog.pg_depend x ON x.classid = w.cls AND x.objid = w.oid
          CROSS JOIN LATERAL (
@@ -660,183 +636,106 @@ const CALLS: &str = "WITH RECURSIVE start(stored, cls, oid) AS (
                  AND r.ev_class = x.refobjid AND k.relkind = 'v'
          ) n(cls, oid)
      )
-     SELECT DISTINCT
-            CASE WHEN w.stored AND w.root_cls = 'pg_catalog.pg_rewrite'::pg_catalog.regclass
-                 THEN 'materialized view ' || (SELECT i.identity FROM pg_catalog.pg_identify_object(
-                        'pg_catalog.pg_class'::pg_catalog.regclass,
-                        (SELECT r.ev_class FROM pg_catalog.pg_rewrite r WHERE r.oid = w.root_oid), 0) i)
-                 WHEN w.stored
-                 THEN (SELECT i.type || ' ' || i.identity
-                         FROM pg_catalog.pg_identify_object(w.root_cls, w.root_oid, 0) i)
-            END AS what,
-            CASE WHEN NOT w.stored
-                 THEN (SELECT i.identity FROM pg_catalog.pg_identify_object(
-                        CASE WHEN w.root_cls = 'pg_catalog.pg_rewrite'::pg_catalog.regclass
-                             THEN 'pg_catalog.pg_class'::pg_catalog.regclass ELSE w.root_cls END,
-                        CASE WHEN w.root_cls = 'pg_catalog.pg_rewrite'::pg_catalog.regclass
-                             THEN (SELECT r.ev_class FROM pg_catalog.pg_rewrite r WHERE r.oid = w.root_oid)
-                             ELSE w.root_oid END, 0) i)
-            END AS caller,
-            t.via, t.kind, t.name, t.src
+     SELECT DISTINCT ",
+    stored_label!("w.root_cls", "w.root_oid", "0"),
+    " AS what, f.identity AS via
        FROM walk w
-      CROSS JOIN LATERAL (
-            SELECT i.identity, 'function', p.proname::text,
-                   CASE WHEN p.prosqlbody IS NULL AND l.lanname NOT IN ('internal', 'c')
-                        THEN p.prosrc ELSE '' END
-              FROM pg_catalog.pg_proc p
-              JOIN pg_catalog.pg_namespace pn ON pn.oid = p.pronamespace
-              JOIN pg_catalog.pg_language l ON l.oid = p.prolang
-             CROSS JOIN LATERAL pg_catalog.pg_identify_object(w.cls, w.oid, 0) i
-             WHERE w.cls = 'pg_catalog.pg_proc'::pg_catalog.regclass AND p.oid = w.oid
-               AND pn.nspname NOT IN ('pg_catalog', 'information_schema')
-            UNION ALL
-            SELECT i.identity,
-                   CASE k.relkind WHEN 'm' THEN 'materialized view' ELSE 'view' END,
-                   k.relname::text, ''
-              FROM pg_catalog.pg_rewrite r
-              JOIN pg_catalog.pg_class k ON k.oid = r.ev_class
-              JOIN pg_catalog.pg_namespace kn ON kn.oid = k.relnamespace
-             CROSS JOIN LATERAL pg_catalog.pg_identify_object(
-                    'pg_catalog.pg_class'::pg_catalog.regclass, k.oid, 0) i
-             WHERE w.cls = 'pg_catalog.pg_rewrite'::pg_catalog.regclass AND r.oid = w.oid
-               AND k.relkind IN ('v', 'm') AND kn.nspname NOT IN ('pg_catalog', 'information_schema')
-      ) t(via, kind, name, src)
-      ORDER BY 1, 2, 3";
+       JOIN pg_catalog.pg_proc p ON p.oid = w.oid
+       JOIN pg_catalog.pg_namespace pn ON pn.oid = p.pronamespace
+       JOIN pg_catalog.pg_language l ON l.oid = p.prolang
+      CROSS JOIN LATERAL pg_catalog.pg_identify_object(w.cls, w.oid, 0) f
+      WHERE w.cls = 'pg_catalog.pg_proc'::pg_catalog.regclass
+        AND p.prosqlbody IS NULL AND l.lanname NOT IN ('internal', 'c')
+        AND pn.nspname NOT IN ('pg_catalog', 'information_schema')
+      ORDER BY 1, 2"
+);
 
-/// The configurations, of any parser and whoever declared them, that map one dictionary: the
-/// names a function's text may spell to reach it (`pg_ts_config_map` holds one row per token
-/// type).
-const MAPPING_CONFIGS: &str = "SELECT DISTINCT c.cfgname AS name
-       FROM pg_catalog.pg_ts_config_map m
-       JOIN pg_catalog.pg_ts_config c ON c.oid = m.mapcfg
-       JOIN pg_catalog.pg_ts_dict d ON d.oid = m.mapdict
+/// Every dictionary a user or a package made, with its options text: the catalog records no edge
+/// from a dictionary to the one it names there, so the census reads them.
+const DICTIONARIES: &str = "SELECT n.nspname::pg_catalog.text AS schema,
+            d.dictname::pg_catalog.text AS name,
+            COALESCE(d.dictinitoption, '') AS options
+       FROM pg_catalog.pg_ts_dict d
        JOIN pg_catalog.pg_namespace n ON n.oid = d.dictnamespace
-      WHERE n.nspname = $1 AND d.dictname = $2
-      ORDER BY 1";
+      WHERE d.oid >= 16384
+      ORDER BY 1, 2";
 
-/// One row of [`CALLS`]: `node`, a function, a view or a materialized view, is reached,
-/// through the catalog's edges, from a stored dependent (`what`) or from another node (`caller`).
-struct Call {
-    what: Option<String>,
-    caller: Option<String>,
-    node: String,
-    kind: String,
-    name: String,
-    body: String,
+/// The dictionary an unheld dictionary names in its options, or why they cannot be read: the text
+/// does not parse, or the name has no schema, which the engine resolves by the search path of
+/// whoever uses it (DEC-2728.4).
+fn names_in_options(options: &str) -> Result<Option<SearchRef>, String> {
+    let template = TypeRef::new("pg_catalog", "simple").map_err(|e| e.to_string())?;
+    let object = SearchObject::Dictionary {
+        template,
+        options: parse_options(options)?,
+    };
+    if let Some(value) = object.unqualified_sub_dictionary() {
+        return Err(format!(
+            "its option `dictionary` names `{value}` without a schema"
+        ));
+    }
+    Ok(object.dictionaries().into_iter().next())
 }
 
-/// The census lines the names in bodies add (DEC-2728.3): every stored dependent that reaches a
-/// function whose body names one of `names`, or a node in `touched` (a function or view the
-/// catalog says reads the object) that a body names, and that the catalog did not list
-/// (`listed`). The nodes a dependent reaches are the fixpoint of two steps, from what it
-/// calls in the catalog (the rows of [`CALLS`]) to what the text of each reached function
-/// names in turn: a body that spells another user function, view or materialized view, of
-/// any schema, reaches it, and the catalog's edges lead on from there. The engine records no
-/// edge for a call or a read made inside a string body, so a wrapper of a wrapper of a
-/// function that spells the object, or of a view over it, is invisible to the catalog alone. A
-/// repeated node ends the walk, so mutually recursive functions end it. A name counts when the
-/// body holds it as a whole identifier, or the same read inside a string literal
-/// (`'app.docs'::regconfig`): a bare name folds ASCII case as the engine does, a quoted one is
-/// exact, and the schema is not compared, so a "yes" is a "may" that errs toward refusing
-/// (`generated::may_call`). A name built at run time is never spelled, and the catalog cannot
-/// show it.
-///
-/// In Rust and not in a recursive query, because the matcher is Rust's: a second one in SQL
-/// would read names differently, and the walk is over the nodes of one database, read once.
-fn named_in_bodies(
-    rows: &[Call],
-    names: &BTreeSet<String>,
-    touched: &BTreeSet<String>,
-    listed: &BTreeSet<String>,
-) -> BTreeSet<String> {
-    let mut nodes: BTreeMap<&str, &Call> = BTreeMap::new();
-    let mut calls: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    let mut stored: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for row in rows {
-        nodes.insert(&row.node, row);
-        match (&row.what, &row.caller) {
-            (Some(what), _) => stored.entry(what).or_default().push(&row.node),
-            (None, Some(caller)) => calls.entry(caller).or_default().push(&row.node),
-            (None, None) => {}
-        }
-    }
-    let mut lines = BTreeSet::new();
-    for (what, direct) in stored {
-        let mut seen = BTreeSet::new();
-        // `true` marks a node a body named: the one the line is about, not what the catalog
-        // reaches from it.
-        let mut todo: Vec<(&str, bool)> = direct.into_iter().map(|node| (node, false)).collect();
-        while let Some((node, spelled)) = todo.pop() {
-            if !seen.insert((node, spelled)) {
-                continue;
-            }
-            todo.extend(
-                calls
-                    .get(node)
-                    .into_iter()
-                    .flatten()
-                    .map(|next| (*next, false)),
-            );
-            let Call { kind, body, .. } = nodes[node];
-            // A node the catalog links to the object already made its dependent a catalog line.
-            if spelled && touched.contains(node) && !listed.contains(what) {
-                lines.insert(format!(
-                    "{what} (reached through {kind} {node}, which a body names)"
-                ));
-            }
-            if body.is_empty() {
-                continue;
-            }
-            todo.extend(
-                nodes
-                    .iter()
-                    .filter(|(_, other)| crate::generated::may_call(body, &other.name))
-                    .map(|(identity, _)| (*identity, true)),
-            );
-            if names
-                .iter()
-                .any(|name| crate::generated::may_call(body, name))
-            {
-                lines.insert(format!(
-                    "{what} (reached through {kind} {node}, named in its body)"
-                ));
-            }
-        }
-    }
-    lines
+/// One text column of a row, empty when it is null.
+fn text(row: &pbps_db::Row, column: &str) -> Result<String, pbps_db::DbError> {
+    Ok(row.try_get::<&str>(column)?.unwrap_or_default().to_owned())
 }
 
-/// For each of `subjects`, the dependents that would go stale if it changed in place, one
-/// line each, read from the target's `pg_depend` (DEC-2728.3). `standing` is what the target
-/// holds: a thesaurus names its sub-dictionary in its options and the catalog records no edge
-/// for it, so a dictionary also answers for the dictionaries that name it, transitively. Every
-/// subject has an entry, empty when nothing stands on it: an entry that is not there was not
-/// read.
+/// The stored dependents the catalog proves reach `name`.
+async fn proven(
+    conn: &mut pbps_db::Conn,
+    kind: SearchKind,
+    name: &SearchName,
+) -> Result<Vec<String>, pbps_db::DbError> {
+    let kind = match kind {
+        SearchKind::Config => "config",
+        SearchKind::Dictionary => "dictionary",
+    };
+    let params = [
+        pbps_db::Param::Str(kind),
+        pbps_db::Param::Str(name.schema()),
+        pbps_db::Param::Str(name.name()),
+    ];
+    let rows = conn.query_with(STALE, &params).await?;
+    rows.iter().map(|row| text(row, "what")).collect()
+}
+
+/// For each of `subjects`, what stands on it that would keep the old behaviour if it changed in
+/// place, read from the target's catalog (DEC-2728.4): the stored dependents the catalog proves
+/// (`stored`), and the ones behind a node it cannot see into (`opaque`). A dictionary also
+/// answers for the held dictionaries (`standing`) that name it, transitively; an unheld one is an
+/// opaque node when its options name the subject or another such node, or cannot be read. Every
+/// subject has an entry, empty when nothing stands on it: one that is missing was not read.
 pub async fn stale_dependents(
     conn: &mut pbps_db::Conn,
     standing: &BTreeMap<SearchRef, SearchObject>,
     subjects: &BTreeSet<SearchRef>,
-) -> Result<BTreeMap<SearchRef, Vec<String>>, pbps_db::DbError> {
+) -> Result<BTreeMap<SearchRef, SearchCensus>, pbps_db::DbError> {
     let mut out = BTreeMap::new();
-    // One read of every node a stored dependent or another node reaches; asked only when there
-    // is a subject, and not per subject.
-    let mut bodies = Vec::new();
-    if !subjects.is_empty() {
-        for row in &conn.query_with(CALLS, &[]).await? {
-            let text = |column: &str| -> Result<Option<String>, pbps_db::DbError> {
-                Ok(row.try_get::<&str>(column)?.map(str::to_owned))
-            };
-            bodies.push(Call {
-                what: text("what")?,
-                caller: text("caller")?,
-                node: text("via")?.unwrap_or_default(),
-                kind: text("kind")?.unwrap_or_default(),
-                name: text("name")?.unwrap_or_default(),
-                body: text("src")?.unwrap_or_default(),
-            });
+    if subjects.is_empty() {
+        return Ok(out);
+    }
+    // The same for every subject: nothing reads what a body names.
+    let mut behind_functions = BTreeSet::new();
+    for row in &conn.query_with(OPAQUE, &[]).await? {
+        let (what, via) = (text(row, "what")?, text(row, "via")?);
+        let line = format!("{what} (behind function {via}, whose body the catalog cannot read)");
+        behind_functions.insert((what, line));
+    }
+    // The dictionaries the model does not hold, with what their options say.
+    let mut unheld = Vec::new();
+    if subjects.iter().any(|s| s.kind == SearchKind::Dictionary) {
+        for row in &conn.query_with(DICTIONARIES, &[]).await? {
+            let (schema, name) = (text(row, "schema")?, text(row, "name")?);
+            let reading = names_in_options(&text(row, "options")?);
+            if let Ok(name) = SearchName::new(&schema, &name)
+                && !standing.contains_key(&SearchRef::new(SearchKind::Dictionary, name.clone()))
+            {
+                unheld.push((name, reading));
+            }
         }
     }
-    let bodies = &bodies;
     for subject in subjects {
         let mut members = BTreeSet::from([subject.clone()]);
         while let Some(user) = standing
@@ -850,63 +749,53 @@ pub async fn stale_dependents(
         {
             members.insert(user);
         }
-        let mut lines = BTreeSet::new();
-        // What a function's text may spell to reach the object: its own name and, for a
-        // dictionary, the name of each configuration that maps it, read from the catalog
-        // and not from the held model: a configuration with a parser the project does not
-        // hold, or one it never declared, maps it all the same (a thesaurus's
-        // sub-dictionary is a member already).
-        let mut names = BTreeSet::new();
+        let mut stored = BTreeSet::new();
         for member in &members {
-            names.insert(member.name.name().to_owned());
-            if member.kind == SearchKind::Dictionary {
-                let rows = conn
-                    .query_with(
-                        MAPPING_CONFIGS,
-                        &[
-                            pbps_db::Param::Str(member.name.schema()),
-                            pbps_db::Param::Str(member.name.name()),
-                        ],
-                    )
-                    .await?;
-                for row in &rows {
-                    names.insert(row.try_get::<&str>("name")?.unwrap_or_default().to_owned());
-                }
-            }
+            stored.extend(proven(conn, member.kind, &member.name).await?);
         }
-        let mut listed = BTreeSet::new();
-        let mut touched = BTreeSet::new();
-        for member in &members {
-            let kind = match member.kind {
-                SearchKind::Config => "config",
-                SearchKind::Dictionary => "dictionary",
-            };
-            let rows = conn
-                .query_with(
-                    STALE,
-                    &[
-                        pbps_db::Param::Str(kind),
-                        pbps_db::Param::Str(member.name.schema()),
-                        pbps_db::Param::Str(member.name.name()),
-                    ],
-                )
-                .await?;
-            for row in &rows {
-                if let Some(what) = row.try_get::<&str>("what")? {
-                    // A stored materialized view is a node a body can read as well.
-                    if let Some(view) = what.strip_prefix("materialized view ") {
-                        touched.insert(view.to_owned());
+        let mut opaque = behind_functions.clone();
+        if subject.kind == SearchKind::Dictionary {
+            // An unheld dictionary is opaque when its options cannot be read, name a member, or
+            // name another opaque one: to a fixpoint.
+            let mut reasons = BTreeMap::new();
+            let mut named = members.clone();
+            while let Some((name, why)) = unheld.iter().find_map(|(name, reading)| {
+                let why = match reading {
+                    _ if reasons.contains_key(name) => return None,
+                    Err(why) => format!("its options could not be read: {why}"),
+                    Ok(Some(sub)) if named.contains(sub) => {
+                        format!("its options name {}", sub.shown())
                     }
-                    listed.insert(what.to_owned());
-                }
-                if let Some(via) = row.try_get::<&str>("via")? {
-                    touched.insert(via.to_owned());
+                    Ok(_) => return None,
+                };
+                Some((name, why))
+            }) {
+                named.insert(SearchRef::new(SearchKind::Dictionary, name.clone()));
+                reasons.insert(name, why);
+            }
+            for (name, why) in reasons {
+                for what in proven(conn, SearchKind::Dictionary, name).await? {
+                    let line = format!(
+                        "{what} (behind dictionary {}, which the model does not hold: {why})",
+                        name.shown()
+                    );
+                    opaque.insert((what, line));
                 }
             }
         }
-        lines.extend(listed.iter().cloned());
-        lines.extend(named_in_bodies(bodies, &names, &touched, &listed));
-        out.insert(subject.clone(), lines.into_iter().collect());
+        // What the catalog proves is refused by name already, and is not listed twice.
+        let opaque = opaque
+            .into_iter()
+            .filter(|(what, _)| !stored.contains(what))
+            .map(|(_, line)| line)
+            .collect::<BTreeSet<_>>();
+        out.insert(
+            subject.clone(),
+            SearchCensus {
+                stored: stored.into_iter().collect(),
+                opaque: opaque.into_iter().collect(),
+            },
+        );
     }
     Ok(out)
 }
@@ -1406,6 +1295,7 @@ mod tests {
                 name,
                 before,
                 after,
+                opaque: Vec::new(),
             }
         } else {
             pbps_model::SearchChange::AlterSearchDictionary {
@@ -1413,6 +1303,7 @@ mod tests {
                 name,
                 before,
                 after,
+                opaque: Vec::new(),
             }
         })
     }
@@ -1462,6 +1353,11 @@ mod tests {
             ]
         );
         assert!(sql.iter().all(|s| s.search.is_none()));
+        // One definition per statement, the last the result: a staged apply's checkpoints are
+        // judged against exactly what these statements do (SPEC §7.6, DEC-2728.4).
+        let chain = before.alteration_chain(&after);
+        assert_eq!(chain.len(), sql.len());
+        assert_eq!(chain.last(), Some(&after));
         assert!(emitted(&alter_change("config app.docs", after.clone(), after)).is_empty());
     }
 
@@ -1708,219 +1604,28 @@ mod tests {
         assert!(!found(&config, &parser("myparser")).is_empty());
     }
 
-    fn call(from: (Option<&str>, Option<&str>), function: &str, body: &str) -> Call {
-        Call {
-            what: from.0.map(str::to_owned),
-            caller: from.1.map(str::to_owned),
-            node: format!("app.{function}(text)"),
-            kind: "function".to_owned(),
-            name: function.to_owned(),
-            body: body.to_owned(),
-        }
-    }
-
-    fn spelled(rows: &[Call], names: &BTreeSet<String>) -> BTreeSet<String> {
-        named_in_bodies(rows, names, &BTreeSet::new(), &BTreeSet::new())
-    }
-
-    fn names(list: &[&str]) -> BTreeSet<String> {
-        list.iter().map(|s| (*s).to_owned()).collect()
-    }
-
-    /// A function's text names an object the way the engine would read it (DEC-2728.3): the
-    /// bare name case-insensitively, the same inside a literal (`'app.docs'::regconfig`), and a
-    /// quoted name exactly. Negatives: another name, a quoted name of another case, a name
-    /// inside a comment, a name that is only part of a longer identifier, and no names at all.
+    /// What a dictionary the model does not hold says about the dictionary it names, read from
+    /// its options text (DEC-2728.4): the dictionary a thesaurus names when it is spelled with
+    /// its schema, none when it names nothing, and an error when the text cannot be read or the
+    /// name has no schema (the engine resolves that by the search path of whoever uses it, so
+    /// the census must not guess). Negatives: a quoted option and another option's value are not
+    /// a name, and a second `dictionary` option is unreadable.
     #[test]
-    fn a_function_body_names_an_object_by_whole_identifier_and_exact_quoted_case() {
-        let row = |body: &str| vec![call((Some("index app.ix"), None), "f", body)];
-        let said = "index app.ix (reached through function app.f(text), named in its body)";
-        for body in [
-            "SELECT to_tsvector('app.docs', t)",
-            "SELECT to_tsvector('docs'::regconfig, t)",
-            "SELECT to_tsvector(app.DOCS::regconfig, t)",
-            "SELECT to_tsvector(\"docs\", t)",
-            "BEGIN RETURN to_tsvector('app.docs'::regconfig, t); END",
-        ] {
-            assert_eq!(
-                spelled(&row(body), &names(&["docs"])),
-                [said.to_owned()].into(),
-                "{body}"
-            );
-        }
-        for body in [
-            "SELECT to_tsvector('app.other', t)",
-            "SELECT to_tsvector(\"DOCS\", t)",
-            "SELECT 1 -- docs",
-            "SELECT /* docs */ 1",
-            "SELECT to_tsvector('app.docs_v2', t)",
-        ] {
-            assert!(spelled(&row(body), &names(&["docs"])).is_empty(), "{body}");
-        }
-        // A quoted name of mixed case is matched as it was written, and a bare spelling of it
-        // is not its name.
-        assert!(spelled(&row("SELECT 'app.\"Docs\"'"), &names(&["docs"])).is_empty());
-        assert!(!spelled(&row("SELECT 'app.\"Docs\"'"), &names(&["Docs"])).is_empty());
-        assert!(spelled(&row("SELECT docs"), &names(&["Docs"])).is_empty());
-        assert!(!spelled(&row("SELECT \"Docs\""), &names(&["Docs"])).is_empty());
-        assert!(spelled(&row("SELECT docs"), &BTreeSet::new()).is_empty());
-    }
-
-    /// The functions a dependent reaches are the fixpoint of the catalog's edges and of the
-    /// names in the text (DEC-2728.3): a wrapper of a wrapper of a function that spells the
-    /// object is reached though no edge joins them, a `BEGIN ATOMIC` hop (a catalog edge)
-    /// continues the walk, and a pair of functions that name each other ends it. Negatives: a
-    /// chain that ends in a function naming another object, a callee spelled by a run-time
-    /// built name (the documented limit), and a name that is only a longer identifier.
-    #[test]
-    fn the_functions_a_dependent_reaches_are_the_fixpoint_of_edges_and_called_names() {
-        let stored = (Some("index app.ix"), None);
-        let said = |function: &str| -> BTreeSet<String> {
-            [format!(
-                "index app.ix (reached through function app.{function}(text), named in its body)"
-            )]
-            .into()
-        };
-        let named = "SELECT to_tsvector('app.docs', t)";
-        // A function reaches itself in the rows, as the query returns it.
-        let own = |function: &str, body: &str| {
-            call(
-                (None, Some(&format!("app.{function}(text)"))),
-                function,
-                body,
-            )
-        };
-        // ix -> w1 in the catalog; w1's text calls w2; w2's text calls leaf, which names it.
-        let chain = |leaf_body: &str, w2_body: &str| {
-            vec![
-                call(stored, "w1", "SELECT app.w2(t)"),
-                own("w1", "SELECT app.w2(t)"),
-                own("w2", w2_body),
-                own("leaf", leaf_body),
-            ]
-        };
+    fn what_an_unheld_dictionary_names_is_read_from_its_options_and_never_guessed() {
+        let named = |text: &str| names_in_options(text);
         assert_eq!(
-            spelled(&chain(named, "SELECT app.leaf(t)"), &names(&["docs"])),
-            said("leaf")
+            named("dictfile = 'thesaurus_sample', dictionary = 'app.d1'"),
+            Ok(Some("dictionary app.d1".parse().unwrap()))
         );
-        // A catalog hop (`BEGIN ATOMIC`) from the dependent's function to a wrapper with no
-        // text, whose text-called function then names the object.
-        let mut atomic = vec![
-            call(stored, "hop", ""),
-            call((None, Some("app.hop(text)")), "w1", "SELECT app.leaf(t)"),
-            own("leaf", named),
-        ];
-        atomic.push(own("hop", ""));
-        assert_eq!(spelled(&atomic, &names(&["docs"])), said("leaf"));
-        // A cycle ends and still finds what one of its members names.
-        let cycle = vec![
-            call(stored, "a", "SELECT app.b(t)"),
-            call(stored, "b", "SELECT app.a(t), 'docs'"),
-        ];
-        assert_eq!(spelled(&cycle, &names(&["docs"])), said("b"));
-        assert!(spelled(&cycle, &names(&["other"])).is_empty());
-        // Negatives.
-        assert!(
-            spelled(
-                &chain("SELECT to_tsvector('app.other', t)", "SELECT app.leaf(t)"),
-                &names(&["docs"])
-            )
-            .is_empty()
-        );
-        assert!(
-            spelled(
-                &chain(named, "SELECT app.run('le' || 'af', t)"),
-                &names(&["docs"])
-            )
-            .is_empty()
-        );
-        assert!(spelled(&chain(named, "SELECT app.leaf_v2(t)"), &names(&["docs"])).is_empty());
-    }
-
-    /// A body that reads a view reaches the view although the catalog records no edge to it
-    /// (DEC-2728.3): the view counts when the catalog links it to the object (`touched`), or
-    /// when the catalog leads from it to a function whose text names the object. A view the
-    /// catalog already lists for the dependent adds no second line. Negatives: a view no
-    /// catalog edge links, a longer identifier that only starts with the view's name, and a
-    /// dependent the catalog listed already.
-    #[test]
-    fn a_view_a_body_reads_is_a_node_of_the_walk() {
-        let view = |from: (Option<&str>, Option<&str>), name: &str, kind: &str| Call {
-            what: from.0.map(str::to_owned),
-            caller: from.1.map(str::to_owned),
-            node: format!("app.{name}"),
-            kind: kind.to_owned(),
-            name: name.to_owned(),
-            body: String::new(),
-        };
-        let stored = (Some("materialized view app.mv"), None);
-        let rows = |body: &str| {
-            vec![
-                call(stored, "w", body),
-                call((None, Some("app.w(text)")), "w", body),
-                view((None, Some("app.v1")), "v1", "view"),
-                // The view reads a function whose text names the object.
-                call((None, Some("app.v1")), "leaf", "SELECT 'app.docs'"),
-            ]
-        };
-        let touched = |nodes: &[&str]| -> BTreeSet<String> {
-            nodes.iter().map(|n| (*n).to_owned()).collect()
-        };
-        let none = BTreeSet::new();
-        let said = "materialized view app.mv (reached through view app.v1, which a body names)";
-        let found = named_in_bodies(
-            &rows("SELECT * FROM app.v1"),
-            &none,
-            &touched(&["app.v1"]),
-            &none,
-        );
-        assert_eq!(found, [said.to_owned()].into());
-        // The view's own functions are walked from it, whose text names the object.
         assert_eq!(
-            named_in_bodies(&rows("SELECT * FROM app.v1"), &names(&["docs"]), &none, &none),
-            [
-                "materialized view app.mv (reached through function app.leaf(text), named in its body)"
-                    .to_owned()
-            ]
-            .into()
+            named("DICTIONARY = app.d1"),
+            Ok(Some("dictionary app.d1".parse().unwrap()))
         );
-        // Negatives.
-        assert!(
-            named_in_bodies(
-                &rows("SELECT * FROM app.v1"),
-                &none,
-                &touched(&["app.other"]),
-                &none
-            )
-            .is_empty()
-        );
-        assert!(
-            named_in_bodies(
-                &rows("SELECT * FROM app.v10"),
-                &names(&["docs"]),
-                &touched(&["app.v1"]),
-                &none
-            )
-            .is_empty()
-        );
-        // A view over a view the catalog links is one line, about the view the body names.
-        let mut nested = rows("SELECT * FROM app.v2");
-        nested.push(view((None, Some("app.v2")), "v2", "view"));
-        nested.push(view((None, Some("app.v2")), "v1", "view"));
-        let both = touched(&["app.v1", "app.v2"]);
-        assert_eq!(
-            named_in_bodies(&nested, &none, &both, &none),
-            [said.replace("app.v1", "app.v2")].into()
-        );
-        let listed = touched(&["materialized view app.mv"]);
-        assert!(
-            named_in_bodies(
-                &rows("SELECT * FROM app.v1"),
-                &none,
-                &touched(&["app.v1"]),
-                &listed
-            )
-            .is_empty()
-        );
+        assert_eq!(named(""), Ok(None));
+        assert_eq!(named("stopwords = 'app.d1'"), Ok(None));
+        let bare = named("dictfile = 'x', dictionary = 'english_stem'").unwrap_err();
+        assert!(bare.contains("without a schema"), "{bare}");
+        assert!(named("dictionary = 'a.b', dictionary = 'c.d'").is_err());
+        assert!(named("dictionary").is_err());
     }
 }

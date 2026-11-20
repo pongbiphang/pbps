@@ -939,6 +939,7 @@ fn admission_holds_a_text_search_alteration_to_the_object_it_alters() {
             name: name.parse().unwrap(),
             before: Box::new(words("pg_catalog.simple")),
             after: Box::new(after),
+            opaque: Vec::new(),
         })
     };
     let mut ids = IdsFile::default();

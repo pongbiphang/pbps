@@ -2217,6 +2217,7 @@ planning still changes neither declarations nor identities on disk.
 | `grant-widen` | A permission is granted (4.7) | Access widens. Labelled, **not gated**: the merge request reviews the grant |
 | `numbering` | A PostgreSQL identity put on a column, a `serial` turned into one, or a numbering source taken off (DEC-1889.1); the bound a sequence counts toward set or tightened with a non-cycling destination, or its cycle turned off (DEC-1921.1) | An insert supplying its own value, calling the old sequence by name, or leaving the column to the source now gone fails; or the numbers run out sooner. A tightened bound with a cycling destination only wraps sooner |
 | `type-rebuild` | An enum's label is removed or retained labels are reordered, so the type is rebuilt under its uid (DEC-1635.7) | Every table with a column of the type is rewritten under an ACCESS EXCLUSIVE lock, even for a pure reorder, and the defaults, checks, foreign keys, indexes, views, bodies and triggers that name it are dropped and restored |
+| `stale-results` | A text search configuration or dictionary is altered in place while a stored dependent (an expression index, a stored generated column, a check or a materialized view) reaches a function with a text body (`LANGUAGE sql` string body or a procedural language), or a dictionary the model does not hold that may name the object, which the catalog cannot see into (DEC-2728.4); the plan lists each dependent and the node | A stored result may keep the old text search behaviour. **Gated**: the operator has read the list; it is not a claim that nothing is stale. What the catalog proves stale is refused by name instead |
 
 On standing tables, ENABLE, FORCE, creating a restrictive policy and dropping a
 permissive policy carry `revoke`. Every policy replacement carries both `revoke`
@@ -2490,11 +2491,12 @@ two halves:
    through and at the close at the last, and each one the plan drops stands as pinned
    until its statement and is absent from the close on; installed packages
    outside the declarations are not compared.
-   A text search configuration or dictionary the plan alters in place (DEC-2728.3)
-   stands at the definition the plan was approved over or at the one it writes, before
-   its statement and at every checkpoint, and at the close at the one it writes
-   (mappings per token type in order, options as the plan canonicalised them); one
-   the plan does not alter is not compared (DEC-2855.1).
+   A text search configuration or dictionary the plan alters in place (DEC-2728.3,
+   DEC-2728.4) stands at a definition its chain passes through (the one the plan was
+   approved over, the one after each of its statements, the one it writes), before its
+   statement and at every checkpoint, and at the close at the last (mappings per token
+   type in order, options as the plan canonicalised them); one the plan does not alter is
+   not compared (DEC-2855.1).
    A closing mismatch refuses success recording and rolls the transaction back;
    a failed-attempt entry retains the previously recorded schema and identities.
 

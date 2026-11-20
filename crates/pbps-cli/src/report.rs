@@ -1603,32 +1603,29 @@ fn server_files_note(definition: &pbps_model::SearchObject) -> String {
 /// adds, changes or gives up, or the options a dictionary writes or removes.
 fn changed_parts(before: &pbps_model::SearchObject, after: &pbps_model::SearchObject) -> String {
     use pbps_model::SearchObject::{Config, Dictionary};
-    let (word, parts): (&str, Vec<&String>) = match (before, after) {
-        (Config { mappings: was, .. }, Config { mappings: now, .. }) => (
-            "mappings",
-            was.keys()
-                .chain(now.keys())
-                .filter(|alias| was.get(*alias) != now.get(*alias))
-                .collect(),
-        ),
-        (Dictionary { options: was, .. }, Dictionary { options: now, .. }) => (
-            "options",
-            was.keys()
-                .chain(now.keys())
-                .filter(|key| was.get(*key) != now.get(*key))
-                .collect(),
-        ),
-        _ => ("object", Vec::new()),
+    fn differing<'a, V: PartialEq>(
+        was: &'a std::collections::BTreeMap<String, V>,
+        now: &'a std::collections::BTreeMap<String, V>,
+    ) -> std::collections::BTreeSet<&'a String> {
+        was.keys()
+            .chain(now.keys())
+            .filter(|key| was.get(*key) != now.get(*key))
+            .collect()
+    }
+    let (word, parts) = match (before, after) {
+        (Config { mappings: was, .. }, Config { mappings: now, .. }) => {
+            ("mappings", differing(was, now))
+        }
+        (Dictionary { options: was, .. }, Dictionary { options: now, .. }) => {
+            ("options", differing(was, now))
+        }
+        _ => ("object", Default::default()),
     };
-    let parts: std::collections::BTreeSet<_> = parts.into_iter().collect();
-    format!(
-        "{word}: {}",
-        parts
-            .iter()
-            .map(|part| Escaped(part).to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
+    let parts: Vec<_> = parts
+        .into_iter()
+        .map(|part| Escaped(part).to_string())
+        .collect();
+    format!("{word}: {}", parts.join(", "))
 }
 
 pub fn describe(c: &Change) -> String {
@@ -1815,19 +1812,32 @@ pub fn describe(c: &Change) -> String {
             name,
             before,
             after,
+            opaque,
             ..
         })
         | Change::Search(SearchChange::AlterSearchDictionary {
             name,
             before,
             after,
+            opaque,
             ..
-        }) => format!(
-            "~ alter {} ({}){}",
-            name.shown(),
-            changed_parts(before, after),
-            server_files_note(after)
-        ),
+        }) => {
+            // What may be stale behind a node the catalog cannot see into (DEC-2728.4).
+            let behind = match opaque.is_empty() {
+                true => String::new(),
+                false => format!(
+                    " (stored results the catalog cannot vouch for, because it cannot see into \
+                     what they call: {})",
+                    Escaped(&opaque.join("; "))
+                ),
+            };
+            format!(
+                "~ alter {} ({}){}{behind}",
+                name.shown(),
+                changed_parts(before, after),
+                server_files_note(after)
+            )
+        }
         Change::Search(SearchChange::DropSearch { name, .. }) => format!("- drop {}", name.shown()),
         // A partition has no columns of its own to count; what it is, is its
         // parent and the rows it takes (#1170).
@@ -3854,7 +3864,7 @@ mod search_alteration_tests {
         }
     }
 
-    fn line(name: &str, before: SearchObject, after: SearchObject) -> String {
+    fn line(name: &str, before: SearchObject, after: SearchObject, opaque: Vec<String>) -> String {
         let name: SearchRef = name.parse().unwrap();
         let uid = "s_aaaaaa".parse().unwrap();
         let (before, after) = (Box::new(before), Box::new(after));
@@ -3865,6 +3875,7 @@ mod search_alteration_tests {
                     name,
                     before,
                     after,
+                    opaque,
                 }
             } else {
                 SearchChange::AlterSearchDictionary {
@@ -3872,6 +3883,7 @@ mod search_alteration_tests {
                     name,
                     before,
                     after,
+                    opaque,
                 }
             },
         ))
@@ -3894,6 +3906,7 @@ mod search_alteration_tests {
                 ("email", "pg_catalog.simple"),
                 ("int", "app.a"),
             ]),
+            Vec::new(),
         );
         assert_eq!(
             said,
@@ -3903,11 +3916,35 @@ mod search_alteration_tests {
             "dictionary app.solo",
             dictionary(&[("accept", "false"), ("same", "x")]),
             dictionary(&[("same", "x"), ("stopwords", "english")]),
+            Vec::new(),
         );
         assert_eq!(
             said,
             "~ alter text search dictionary `app.solo` (options: accept, stopwords) \
              (reads server file `english` for stopwords, which pbps does not manage)"
         );
+    }
+
+    /// An alteration with a stored dependent behind a node the catalog cannot see into says so on
+    /// its plan line, naming each one (DEC-2728.3). Negative: with none, the line says nothing of it.
+    #[test]
+    fn an_alteration_names_the_stored_results_the_catalog_cannot_vouch_for() {
+        let (was, now) = (dictionary(&[("a", "1")]), dictionary(&[("a", "2")]));
+        let said = line(
+            "dictionary app.solo",
+            was.clone(),
+            now.clone(),
+            vec![
+                "index app.ix (behind function app.f(text), whose body the catalog cannot read)"
+                    .to_owned(),
+            ],
+        );
+        assert_eq!(
+            said,
+            "~ alter text search dictionary `app.solo` (options: a) (stored results the catalog \
+             cannot vouch for, because it cannot see into what they call: index app.ix (behind \
+             function app.f(text), whose body the catalog cannot read))"
+        );
+        assert!(!line("dictionary app.solo", was, now, Vec::new()).contains("vouch"));
     }
 }

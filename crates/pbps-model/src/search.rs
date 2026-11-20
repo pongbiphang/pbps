@@ -215,6 +215,116 @@ impl SearchObject {
     }
 }
 
+/// What the target's catalog says stands on a text search object a plan would alter in place
+/// (DEC-2728.3, DEC-2728.4), one line per dependent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchCensus {
+    /// Stored dependents the catalog proves reach the object: refused by name.
+    pub stored: Vec<String>,
+    /// Stored dependents behind a function body or a dictionary the catalog cannot see into,
+    /// each line naming both: carried by the alteration, which needs `stale-results`.
+    pub opaque: Vec<String>,
+}
+
+/// One statement of a configuration's change: `DROP`, `ALTER` or `ADD`, the token types it
+/// names, and the dictionaries it maps them to (none for a `DROP`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MappingStep {
+    pub verb: &'static str,
+    pub aliases: Vec<String>,
+    pub dictionaries: Vec<SearchName>,
+}
+
+/// The statements that bring the mappings `was` to `now`, in the order they run. `ALTER MAPPING`
+/// on a token type that is not mapped does nothing and `ADD MAPPING` on one that is fails
+/// (measured on 16 and 18), so each token type gets the one verb that does what it says: the
+/// ones given up are dropped, the ones changed altered and the new ones added, one statement per
+/// group of token types that share their dictionaries (the order of the groups does not matter,
+/// the order inside one does). The emit and the chain a staged apply checkpoints on
+/// (`SearchObject::alteration_chain`) both come from here, so a checkpoint is judged against
+/// exactly what the statements do.
+#[must_use]
+pub fn mapping_steps(
+    was: &BTreeMap<String, Vec<SearchName>>,
+    now: &BTreeMap<String, Vec<SearchName>>,
+) -> Vec<MappingStep> {
+    let gone: Vec<String> = was
+        .keys()
+        .filter(|alias| !now.contains_key(*alias))
+        .cloned()
+        .collect();
+    let mut steps = Vec::new();
+    if !gone.is_empty() {
+        steps.push(MappingStep {
+            verb: "DROP",
+            aliases: gone,
+            dictionaries: Vec::new(),
+        });
+    }
+    for verb in ["ALTER", "ADD"] {
+        let changed = now
+            .iter()
+            .filter(|(alias, list)| was.get(*alias) != Some(*list))
+            .filter(|(alias, _)| was.contains_key(*alias) == (verb == "ALTER"));
+        let mut groups: Vec<MappingStep> = Vec::new();
+        for (alias, list) in changed {
+            match groups.iter_mut().find(|g| &g.dictionaries == list) {
+                Some(group) => group.aliases.push(alias.clone()),
+                None => groups.push(MappingStep {
+                    verb,
+                    aliases: vec![alias.clone()],
+                    dictionaries: list.clone(),
+                }),
+            }
+        }
+        steps.extend(groups);
+    }
+    steps
+}
+
+impl SearchObject {
+    /// The definitions an in-place change from `self` to `after` stands at after each of its
+    /// statements, in order, the last being `after` (DEC-2728.3). Empty when no statement runs.
+    /// A mapping change of several statements passes through definitions that are neither end,
+    /// and a staged apply checkpoints on each; the options of a dictionary are one statement.
+    #[must_use]
+    pub fn alteration_chain(&self, after: &Self) -> Vec<Self> {
+        match (self, after) {
+            (
+                Self::Config { mappings: was, .. },
+                Self::Config {
+                    mappings: now,
+                    parser,
+                },
+            ) => {
+                let mut standing = was.clone();
+                mapping_steps(was, now)
+                    .into_iter()
+                    .map(|step| {
+                        for alias in step.aliases {
+                            if step.dictionaries.is_empty() {
+                                standing.remove(&alias);
+                            } else {
+                                standing.insert(alias, step.dictionaries.clone());
+                            }
+                        }
+                        Self::Config {
+                            parser: parser.clone(),
+                            mappings: standing.clone(),
+                        }
+                    })
+                    .collect()
+            }
+            (Self::Dictionary { options: was, .. }, Self::Dictionary { options: now, .. })
+                if was != now =>
+            {
+                vec![after.clone()]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,5 +458,94 @@ mod tests {
                 .is_empty()
         );
         assert!(config(&[("word", &["app.a"])]).server_files().is_empty());
+    }
+
+    fn steps(was: &[(&str, &[&str])], now: &[(&str, &[&str])]) -> Vec<String> {
+        let map = |entries: &[(&str, &[&str])]| match config(entries) {
+            SearchObject::Config { mappings, .. } => mappings,
+            SearchObject::Dictionary { .. } => unreachable!(),
+        };
+        mapping_steps(&map(was), &map(now))
+            .into_iter()
+            .map(|step| {
+                format!(
+                    "{} {} -> {}",
+                    step.verb,
+                    step.aliases.join("+"),
+                    step.dictionaries
+                        .iter()
+                        .map(|d| format!("{}.{}", d.schema(), d.name()))
+                        .collect::<Vec<_>>()
+                        .join("+")
+                )
+            })
+            .collect()
+    }
+
+    /// A configuration's change is the one verb each token type needs, in the order they run: the
+    /// ones given up are dropped, the ones changed are altered and the new ones added, and token
+    /// types that share their dictionaries share a statement (DEC-2728.3). Negatives: a token type
+    /// that is the same on both sides is not a step, and the same mappings are no step at all.
+    #[test]
+    fn a_configurations_change_is_one_statement_per_group_with_the_verb_each_token_type_needs() {
+        let was = [
+            ("asciiword", &["app.a"][..]),
+            ("email", &["app.a"]),
+            ("url", &["app.a"]),
+            ("word", &["app.a"]),
+        ];
+        let now = [
+            ("asciiword", &["app.a"][..]),
+            ("int", &["app.b"]),
+            ("uint", &["app.b"]),
+            ("url", &["app.b"]),
+            ("word", &["app.b"]),
+        ];
+        assert_eq!(
+            steps(&was, &now),
+            [
+                "DROP email -> ",
+                "ALTER url+word -> app.b",
+                "ADD int+uint -> app.b"
+            ]
+        );
+        assert!(steps(&was, &was).is_empty());
+        // Created from nothing, every token type is an `ADD`.
+        assert_eq!(steps(&[], &was[..2]), ["ADD asciiword+email -> app.a"]);
+    }
+
+    /// The definitions an alteration stands at between its statements are the ones each statement
+    /// leaves, the last being the result, and they come from the same steps the emit runs
+    /// (SPEC §7.6, DEC-2728.4): a mapping change of three statements has three, none of which
+    /// need be either end; a dictionary's options are one statement. Negatives: no change has no
+    /// statement and so no definition, and another kind of object has none either.
+    #[test]
+    fn an_alteration_stands_at_the_definition_after_each_of_its_statements() {
+        let was = config(&[
+            ("email", &["app.a"]),
+            ("url", &["app.a"]),
+            ("word", &["app.a"]),
+        ]);
+        let now = config(&[
+            ("int", &["app.b"]),
+            ("url", &["app.b"]),
+            ("word", &["app.a"]),
+        ]);
+        let chain = was.alteration_chain(&now);
+        assert_eq!(chain.len(), 3);
+        assert_eq!(
+            chain,
+            [
+                config(&[("url", &["app.a"]), ("word", &["app.a"])]),
+                config(&[("url", &["app.b"]), ("word", &["app.a"])]),
+                now.clone(),
+            ]
+        );
+        assert!(!chain.contains(&was));
+        assert!(was.alteration_chain(&was).is_empty());
+        let (one, two) = (dictionary(&[("a", "1")]), dictionary(&[("a", "2")]));
+        assert_eq!(one.alteration_chain(&two), std::slice::from_ref(&two));
+        assert!(one.alteration_chain(&one).is_empty());
+        assert!(one.alteration_chain(&was).is_empty());
     }
 }

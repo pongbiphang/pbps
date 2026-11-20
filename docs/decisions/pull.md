@@ -1668,56 +1668,22 @@ options that changed and the plan checksum pins what was compared.
   name and move the dependents, in two plans". A view, a plain default and a function are
   evaluated on use and are not dependents here. Planning the `REINDEX` and the recompute
   is a separate decision (question 5 of the design, no new risk class).
-- **The census** is read from the target's `pg_depend` (`pbps_pg::search::stale_dependents`):
-  an index, a constraint, a stored generated column's default and a materialized view's
-  rule, over the object, and for a dictionary also over each configuration that maps it.
-  The walk is recursive through what only reads at run time (a view, a function): the
+- **The census** is read from the target's catalog (`pbps_pg::search::stale_dependents`, the
+  catalog walk of DEC-2728.4): an index, a constraint, a stored generated column's default and
+  a materialized view's rule, over the object, and for a dictionary also over each
+  configuration that maps it (`pg_depend`, and `pg_ts_config_map` for the mapping). The walk
+  is recursive through what only reads at run time (a view, a function the catalog links): the
   catalog records a materialized view over a view as an edge to the view alone, so a direct
-  read of the object's dependents missed it. A path is stale if it reaches a stored
-  dependent, a read-only chain lists nothing, and the walk stops at a stored dependent
-  (refreshing it recomputes what stands on it). A repeated node ends the walk, so a cycle
-  among views and functions ends too (measured on 16 and 18).
-  A function with a string body (`LANGUAGE sql` text or PL/pgSQL) leaves no edge to what
-  it names (measured on 16.15 and 18.6, for an index expression, a stored generated column,
-  a constraint and a materialized view alike: the edge from the stored dependent to the
-  function is there, the edge from the function to the configuration is not), and the same
-  holds for what it calls or reads: a PL/pgSQL or `LANGUAGE sql` wrapper records no edge to
-  the function it calls and none to the view it selects from, a `BEGIN ATOMIC` one records
-  both (measured on 16.15 and 18.6). So the census reaches everything the catalog links, plus
-  every user function, view or materialized view a string body names; a name built at run time
-  is the only limit. The nodes a stored dependent reaches are the fixpoint of two steps: the
-  catalog's edges (from a stored dependent, through a view's rule and through a `BEGIN ATOMIC`
-  function, to functions and views), and the **lexical name**: the text of a reached function
-  that names another user function, view or materialized view, of any schema ("may" errs
-  toward refusing), reaches it, and the catalog's edges lead on from there. A matched
-  materialized view is a stored dependent and is reached the same way. A visited set ends the
-  walk, so mutually recursive functions end it. The text of every reached function that is not
-  in `pg_catalog` or `information_schema`, has no SQL-standard body and is not `internal` or
-  `c` is then read for the object's names, and a view or materialized view that a body names
-  and that the catalog links to the object (through views and functions alike) counts as
-  reaching it. A dependent the catalog already lists gets no second line. It is done in Rust
-  over one read of every user function, view and materialized view with its catalog edges, not
-  in a recursive query, because the whole-identifier matcher is Rust's and a second one in SQL
-  would read names differently. A function whose text names the object counts as reaching it,
-  and the refusal line says "reached through function `<schema.fn>`, named in its body"; a
-  view a body names says "reached through view `<schema.view>`, which a body names". "Names"
-  is the whole-identifier read of `generated::may_call` (DEC-1364.1): a bare name folds
-  ASCII case, a quoted one is exact, the same read inside a string literal counts
-  (`'app.docs'::regconfig`), and the schema is not compared, so a match is a "may". For a
-  dictionary the names are its own, a thesaurus's, and each configuration that maps it, read
-  from `pg_ts_config_map` and not from the model: a configuration with a custom parser, or one
-  the project never declared, maps the dictionary all the same.
-  **The limit:** a name, a function or a view that is built at run time (`EXECUTE`, `format`,
-  concatenation) and never spelled is outside what the catalog can show, and the census
-  does not refuse for it. Refusing every string-bodied function would block any database
-  that uses PL/pgSQL in an index, so the tool names what it can read and says what it
-  cannot.
-  A thesaurus's sub-dictionary has no catalog edge (measured), so a dictionary also answers
-  for the dictionaries that name it in their options, which the model holds. The census is
-  a hint of the connected plan, one entry per object the plan would alter, empty when
-  nothing stands on it; an entry that is missing was not read, and an offline plan is
-  refused for it, because the baseline cannot say what stands on the target now.
-  Dependents the same plan drops still count: drop them in one plan and alter in the next.
+  read of the object's dependents missed it. A path is stale if it reaches a stored dependent,
+  a read-only chain lists nothing, and the walk stops at a stored dependent (refreshing it
+  recomputes what stands on it). A repeated node ends the walk, so a cycle among views and
+  functions ends too (measured on 16 and 18). A thesaurus's sub-dictionary has no catalog edge
+  (measured), so a dictionary also answers for the held dictionaries that name it in their
+  options, which the model holds. The census is a hint of the connected plan, one entry per
+  object the plan would alter, empty when nothing stands on it; an entry that is missing was
+  not read, and an offline plan is refused for it, because the baseline cannot say what stands
+  on the target now. Dependents the same plan drops still count: drop them in one plan and
+  alter in the next. What the catalog cannot see into is DEC-2728.4's.
 - **Order.** Class 7 beside `CreateSearch`, at the same depth rank, so it precedes every
   table, index and check created over it; the effects state `Exists` of the object and
   `Is(Final)` of each dictionary it now maps. A dictionary the plan drops is dropped in class
@@ -1732,21 +1698,75 @@ options that changed and the plan checksum pins what was compared.
   (`Absent`). The differ takes the dictionaries of the package to be the ones neither the
   project nor the target model holds, outside `pg_catalog`, in the package's schema: a "may"
   that errs toward refusing.
-- **Risk.** No new class: an alteration is listed and gated like a create, and what it could
-  corrupt silently is refused instead.
+- **Risk.** An alteration is listed and gated like a create, and what the catalog proves
+  stale is refused instead. What stands behind a node the catalog cannot see into carries
+  `stale-results` (DEC-2728.4).
 - **Recording.** The state keeps the object as the database holds it after the apply,
   as it does for a create; a previous record is not carried over a plan's own alteration.
   What is recorded is therefore held to the plan first (SPEC §7.6): the guard pins the
-  object as a package an update changes is pinned, at the definition the plan was approved
-  over or at the one it writes before the close and at a checkpoint, and at the one it writes
-  at the close. A change another session makes to the object while the statements run, to a
-  token type or an option the plan does not touch as much as to one it does, is neither, so
-  the close refuses and rolls back (a staged run stops on the checkpoint), and the read-back
-  is never taken as the alteration's result unchecked. A change between the plan and the
-  apply is the baseline checksum's, which holds the objects an identity names.
+  object as a package an update changes is pinned, to the chain of definitions the plan
+  passes through (DEC-2728.4). A change another session makes to the object while the
+  statements run, to a token type or an option the plan does not touch as much as to one it
+  does, is on no step of the chain, so the close refuses and rolls back (a staged run stops on
+  the checkpoint), and the read-back is never taken as the alteration's result unchecked. A
+  change between the plan and the apply is the baseline checksum's, which holds the objects an
+  identity names.
 - **Saved plans** are admitted only if the uid is recorded under the name, the object keeps its
   kind and its parser or template, and the new definition passes the dialect's checks.
 - **SQL Server** refuses both at emit, as the create.
 
-Formats: plan 83 (an older build refuses the new changes). State, schema set and ids file do
-not move.
+Formats: none moves. The changes are new `op` values of the plan, and under #2412 no change
+before the first release writes a number (DEC-2412.2); the risk class `stale-results` and the
+`opaque` field are named in DEC-2728.4.
+
+<a id="dec-2728-4"></a>
+
+**DEC-2728.4. The census reads the catalog and nothing else; what it cannot see into is a gated risk class, and the staged pin is the chain.**
+Part C of #2728, after seven review rounds on #2922 (maintainer decision on #2926, option E).
+The rounds found two classes. Each finding of the first was a new path from a stored
+dependent to the object that the census had not followed (a view over a view, a string body that
+names the object, a string wrapper of such a body, a view a body reads, a dictionary pbps does
+not hold that names the object); each fix rebuilt one more kind of edge by matching names in
+text, and the set of kinds is not finite (dictionary options, thesaurus files, `EXECUTE`,
+`format`, other procedural languages, casts). "No edge seen" was read as "no edge", which is
+absent read as empty. The second class was the staged pin comparing whole definitions while a
+mapping change of several statements passes through intermediate ones.
+
+- **The walk is the catalog's.** `pg_depend` through views, view rules and `BEGIN ATOMIC`
+  bodies, plus `pg_ts_config_map` for a dictionary's configurations, and the held model's
+  dictionaries that name a dictionary in their options. Nothing reads a function's text: the
+  name matching (`may_call` over bodies, the call and view closure, the name sets) is gone.
+- **A stored dependent the catalog proves** (an expression index, a stored generated column,
+  a validated check, a materialized view that reaches the object through catalog edges) is
+  refused by name, with DEC-2728.3's remedy: its stored values are certainly computed under the
+  old behaviour.
+- **Opaque nodes are a gated class, not a refusal.** A node the catalog cannot see into is one
+  of: a function with a text body (a `LANGUAGE sql` string body, or a procedural language;
+  `prosqlbody IS NULL` and not `internal` or `c`, outside `pg_catalog` and
+  `information_schema`), which a stored dependent reaches through the catalog's edges; and a
+  dictionary the model does not hold (a template, an owner or an option text it does not read)
+  whose options cannot be read, or name the object or another such dictionary, which the
+  engine records no edge for. A stored dependent behind such a node is listed with the node and
+  the reason, and the alteration carries `stale-results`, which `apply` needs in `--allow`.
+  The class is an approval-policy boundary: the operator has read which stored results may be
+  stale. It is not a claim that they are not. The list is on the change (`opaque`), so the
+  plan's checksum pins it, a saved plan's risks are derived from it, and a plan edited to drop
+  a line changes its checksum. An opaque node with no stored dependent behind it carries
+  nothing. A stored dependent the catalog already proves is listed once, as refused.
+  Without the text read, the function lines are the same for every object altered in the
+  database: any stored dependent that calls a text-bodied function gates every alteration. This
+  is the price of not guessing, and the two-plan remedy of DEC-2728.3 is the way to avoid it.
+  A function in `c` or `internal` outside `pg_catalog` is not listed: it has no text to read,
+  and the maintainer's list does not name it.
+- **The pin is the chain** (SPEC §7.6), as for a package an update changes. The definitions
+  an alteration passes through come from the steps the emit runs (`mapping_steps`: drop the
+  token types given up, alter the changed ones, add the new ones, one statement per group
+  that shares its dictionaries; a dictionary's options are one statement), so a checkpoint is
+  judged against exactly what the statements do. Before its statement and at every checkpoint
+  the object stands on the chain (the approved definition, the one after each statement, the
+  one the plan writes); at the close it stands at the last.
+- **Later, not here.** Recomputing what the catalog proves stale (`REINDEX`, `REFRESH`, option
+  C of #2926) can be added for catalog-proven dependents without reopening the census.
+
+Formats: none moves. The new class and field add values to the plan, and under #2412 a change
+before the first release writes no number (DEC-2412.2).

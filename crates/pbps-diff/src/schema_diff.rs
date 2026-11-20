@@ -7002,11 +7002,8 @@ pub(crate) fn dropped_search<'a>(
 
 /// The text search objects a plan frees from a package whose dictionaries live in
 /// `package_schema` (DEC-2728.2, DEC-2728.3): the ones it drops, and a configuration it keeps
-/// and alters so that it stops mapping a dictionary the project does not hold, none of which
-/// is left in that schema. The alteration (class 7) runs before the package's removal, so the
-/// engine no longer sees the dependency. A configuration that still maps a dictionary this
-/// plan cannot place elsewhere (not held, not `pg_catalog`, in the package's schema) is a
-/// "may still depend", which stays refused: a yes here is only ever too cautious.
+/// and alters away from a dictionary the project does not hold. The alteration (class 7) runs
+/// before the package's removal. One that may still map such a dictionary stays refused.
 pub(crate) fn released_search<'a>(
     base: Side<'a>,
     declared: Side<'_>,
@@ -7046,10 +7043,8 @@ pub(crate) fn released_search<'a>(
 /// dropped, both by recorded identity, and a standing one whose mappings or options differ is
 /// altered in place (DEC-2728.3). **Refused here, by name**: a changed parser or template
 /// (no `ALTER` form exists), an in-place change whose dependents the target did not list or
-/// that would go stale, and a rename, which arrives in a later part, so a plan that would
-/// leave a declaration unmet is refused rather than made without the change that says so. An
-/// object the target has and the declarations do not, with no identity recorded, is not this
-/// project's and is left alone.
+/// the catalog proves stale, and a rename, which arrives in a later part. An object the
+/// target has and the declarations do not, with no identity recorded, is left alone.
 fn diff_search(
     base: Side<'_>,
     declared: Side<'_>,
@@ -7095,32 +7090,6 @@ fn diff_search(
             shown.join(", ")
         )
     };
-    fn alter_mapping(
-        uid: pbps_model::Uid,
-        name: pbps_model::SearchRef,
-        before: Box<SearchObject>,
-        after: Box<SearchObject>,
-    ) -> SearchChange {
-        SearchChange::AlterSearchMapping {
-            uid,
-            name,
-            before,
-            after,
-        }
-    }
-    fn alter_dictionary(
-        uid: pbps_model::Uid,
-        name: pbps_model::SearchRef,
-        before: Box<SearchObject>,
-        after: Box<SearchObject>,
-    ) -> SearchChange {
-        SearchChange::AlterSearchDictionary {
-            uid,
-            name,
-            before,
-            after,
-        }
-    }
     for (name, now) in &declared.schema.search {
         let retired: Vec<String> = now
             .dictionaries()
@@ -7164,7 +7133,7 @@ fn diff_search(
                     );
                     continue;
                 };
-                let (alter, what): (fn(_, _, _, _) -> SearchChange, _) = match (was, now) {
+                let what = match (was, now) {
                     (
                         SearchObject::Config { parser: a, .. },
                         SearchObject::Config { parser: b, .. },
@@ -7188,12 +7157,8 @@ fn diff_search(
                         );
                         continue;
                     }
-                    (SearchObject::Config { .. }, SearchObject::Config { .. }) => {
-                        (alter_mapping, "mappings")
-                    }
-                    (SearchObject::Dictionary { .. }, SearchObject::Dictionary { .. }) => {
-                        (alter_dictionary, "options")
-                    }
+                    (SearchObject::Config { .. }, SearchObject::Config { .. }) => "mappings",
+                    (SearchObject::Dictionary { .. }, SearchObject::Dictionary { .. }) => "options",
                     _ => {
                         refuse(
                             name,
@@ -7205,7 +7170,9 @@ fn diff_search(
                 // What was computed with the old behaviour stays until rebuilt, and the
                 // engine does not rebuild it: an index, a stored column or a check over the
                 // object keeps answering as it did. The target's catalog lists them; a plan
-                // without it cannot say there are none (DEC-2728.3).
+                // without it cannot say there are none. What the catalog proves is refused
+                // by name; what stands behind a node it cannot see into is carried by the
+                // change, which the gated `stale-results` class approves (DEC-2728.3).
                 let Some(stale) = hints.search_dependents.get(name).filter(|_| target_read) else {
                     refuse(
                         name,
@@ -7216,14 +7183,14 @@ fn diff_search(
                     );
                     continue;
                 };
-                if !stale.is_empty() {
+                if !stale.stored.is_empty() {
                     refuse(
                         name,
                         &format!(
                             "its {what} differ, but {} would keep the old behaviour until \
                              rebuilt; declare the new behaviour under a new name and move the \
                              dependents, in two plans",
-                            stale.join(", ")
+                            stale.stored.join(", ")
                         ),
                     );
                     continue;
@@ -7233,12 +7200,25 @@ fn diff_search(
                     refuse(name, &undeclared(&missing));
                     continue;
                 }
-                changes.push(Change::Search(alter(
-                    uid.clone(),
-                    name.clone(),
-                    Box::new(was.clone()),
-                    Box::new(now.clone()),
-                )));
+                let (uid, name, opaque) = (uid.clone(), name.clone(), stale.opaque.clone());
+                let (before, after) = (Box::new(was.clone()), Box::new(now.clone()));
+                changes.push(Change::Search(if what == "mappings" {
+                    SearchChange::AlterSearchMapping {
+                        uid,
+                        name,
+                        before,
+                        after,
+                        opaque,
+                    }
+                } else {
+                    SearchChange::AlterSearchDictionary {
+                        uid,
+                        name,
+                        before,
+                        after,
+                        opaque,
+                    }
+                }));
             }
             None => {
                 match declared.ids.search_uid(name) {
@@ -11275,7 +11255,7 @@ mod tests {
                 &Postgres,
                 &Hints {
                     target_read: true,
-                    search_dependents: [(docs.clone(), Vec::new())].into(),
+                    search_dependents: [(docs.clone(), Default::default())].into(),
                     ..Hints::default()
                 },
             )
@@ -32017,8 +31997,28 @@ mod meeting_shape_tests {
             target_read: true,
             search_dependents: entries
                 .iter()
-                .map(|(n, d)| ((*n).clone(), d.iter().map(ToString::to_string).collect()))
+                .map(|(n, d)| {
+                    (
+                        (*n).clone(),
+                        pbps_model::SearchCensus {
+                            stored: d.iter().map(ToString::to_string).collect(),
+                            opaque: Vec::new(),
+                        },
+                    )
+                })
                 .collect(),
+            ..Hints::default()
+        };
+        let read_opaque = |name: &SearchRef, stored: &[&str], opaque: &[&str]| Hints {
+            target_read: true,
+            search_dependents: [(
+                name.clone(),
+                pbps_model::SearchCensus {
+                    stored: stored.iter().map(ToString::to_string).collect(),
+                    opaque: opaque.iter().map(ToString::to_string).collect(),
+                },
+            )]
+            .into(),
             ..Hints::default()
         };
         // Nothing changed: nothing planned, whatever the census says.
@@ -32035,8 +32035,8 @@ mod meeting_shape_tests {
         let (changes, errs) = diffed(&remapped, &read(&[(&docs, &[])]));
         assert!(errs.is_empty(), "{errs:?}");
         assert!(matches!(changes.as_slice(),
-            [Change::Search(SearchChange::AlterSearchMapping { uid, name, before, after })]
-                if uid == &docs_uid && name == &docs && **before != **after));
+            [Change::Search(SearchChange::AlterSearchMapping { uid, name, before, after, opaque })]
+                if uid == &docs_uid && name == &docs && **before != **after && opaque.is_empty()));
         // A new option: an alteration of the dictionary alone.
         let reworded = held(
             dictionary("pg_catalog.snowball", "german"),
@@ -32057,6 +32057,40 @@ mod meeting_shape_tests {
             errs.iter().any(|m| m.contains("app.words")
                 && m.contains("index app.t_gin, constraint k on table app.t")
                 && m.contains("new name")),
+            "{errs:?}"
+        );
+        // What the catalog cannot see into is carried by the change, listed and gated by the
+        // `stale-results` class, and is not a refusal. Negative: with none listed, the change
+        // carries no such class.
+        let behind =
+            "index app.t_gin (behind function app.f(text), whose body the catalog cannot read)";
+        let (changes, errs) = diffed(&reworded, &read_opaque(&words, &[], &[behind]));
+        assert!(errs.is_empty(), "{errs:?}");
+        let [change @ Change::Search(SearchChange::AlterSearchDictionary { opaque, .. })] =
+            changes.as_slice()
+        else {
+            panic!("{changes:?}")
+        };
+        assert_eq!(opaque, &[behind.to_owned()]);
+        assert!(
+            change
+                .intrinsic_risks()
+                .contains(&pbps_model::RiskClass::StaleResults)
+        );
+        let (changes, _) = diffed(&reworded, &read(&[(&words, &[])]));
+        assert!(
+            !changes[0]
+                .intrinsic_risks()
+                .contains(&pbps_model::RiskClass::StaleResults)
+        );
+        // What the catalog proves wins: the same alteration is refused, whatever else is opaque.
+        let (changes, errs) = diffed(
+            &reworded,
+            &read_opaque(&words, &["index app.t_gin"], &[behind]),
+        );
+        assert!(changes.is_empty(), "{changes:?}");
+        assert!(
+            errs.iter().any(|m| m.contains("index app.t_gin")),
             "{errs:?}"
         );
         // Not read is not empty: offline, and a census with no entry for the object.
@@ -32713,7 +32747,7 @@ mod search_tests {
                 &MinimalDialect,
                 &Hints {
                     target_read: true,
-                    search_dependents: [(docs, Vec::new())].into(),
+                    search_dependents: [(docs, Default::default())].into(),
                     ..Hints::default()
                 },
             )

@@ -561,6 +561,7 @@ fn an_object_a_plan_alters_in_place_is_recorded_as_the_database_holds_it() {
                 name: name.clone(),
                 before: Box::new(previous.search[&name].clone()),
                 after: Box::new(read_back.search[&name].clone()),
+                opaque: Vec::new(),
             },
         ))],
     };

@@ -161,7 +161,7 @@ pub use schema::{
     ReferentialAction, ReplicaIdentity, Retention, RetentionUnit, RowPolicy, RowSecurity, Schema,
     SequenceOptions, SystemTime, SystemVersioning, Table, UniqueConstraint, ValueSource,
 };
-pub use search::{SearchKind, SearchName, SearchObject, SearchRef};
+pub use search::{SearchCensus, SearchKind, SearchName, SearchObject, SearchRef};
 pub use sequence::Sequence;
 pub use state::{StagedProgress, StateKind, StateSnapshot, Unreadable, check_readable_version};
 pub use strategy::{Strategies, Strategy};

@@ -568,6 +568,7 @@ mod effects_of_each_kind {
                         )]
                         .into(),
                     }),
+                    opaque: Vec::new(),
                 }),
             ),
             (
@@ -580,6 +581,7 @@ mod effects_of_each_kind {
                         template: "pg_catalog.simple".parse().unwrap(),
                         options: [("stopwords".to_owned(), "english".to_owned())].into(),
                     }),
+                    opaque: Vec::new(),
                 }),
             ),
             // A dictionary leaves only after the configuration that maps it.

@@ -168,12 +168,14 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
             name: "dictionary app.words".parse().unwrap(),
             before: Box::new(search.clone()),
             after: Box::new(search.clone()),
+            opaque: Vec::new(),
         }),
         Change::Search(SearchChange::AlterSearchMapping {
             uid: "s_bbbbbb".parse().unwrap(),
             name: "config app.docs".parse().unwrap(),
             before: Box::new(search.clone()),
             after: Box::new(search),
+            opaque: Vec::new(),
         }),
     ] {
         pin(change, vec![], vec![], None);

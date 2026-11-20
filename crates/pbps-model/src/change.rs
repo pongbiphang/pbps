@@ -102,6 +102,11 @@ pub enum RiskClass {
     /// of the role that applies it. The plan pins the exact members the
     /// rehearsal read and the apply rolls back on any other.
     ExtensionCode,
+    /// A stored result may be stale beyond what the catalog can show (DEC-2728.4): a text search
+    /// object is altered in place while a stored dependent stands behind a function body or a
+    /// dictionary the catalog cannot see into. The plan lists each; approving it says the
+    /// operator read the list, not that nothing is stale.
+    StaleResults,
 }
 
 impl RiskClass {
@@ -121,6 +126,7 @@ impl RiskClass {
             RiskClass::RowSecurity => "row-security",
             RiskClass::TypeRebuild => "type-rebuild",
             RiskClass::ExtensionCode => "extension-code",
+            RiskClass::StaleResults => "stale-results",
         }
     }
 
@@ -177,13 +183,16 @@ impl RiskClass {
             RiskClass::ExtensionCode => {
                 "the package's install script runs in the database with the applying role's privileges; the plan pins the members the rehearsal saw, and the apply rolls back on any other"
             }
+            RiskClass::StaleResults => {
+                "a stored result (an index, a generated column, a check or a materialized view) may keep answering with the old text search behaviour: it reaches a function body or a dictionary the catalog cannot see into, and the plan lists each one"
+            }
             RiskClass::Numbering => {
                 "how the column is numbered changes: an insert that supplies its own value, calls the old sequence by name, or leaves the column to a source now gone fails, or one fails sooner because the numbers now end earlier"
             }
         }
     }
 
-    pub const ALL: [RiskClass; 13] = [
+    pub const ALL: [RiskClass; 14] = [
         RiskClass::Rename,
         RiskClass::Destructive,
         RiskClass::Narrowing,
@@ -197,6 +206,7 @@ impl RiskClass {
         RiskClass::RowSecurity,
         RiskClass::TypeRebuild,
         RiskClass::ExtensionCode,
+        RiskClass::StaleResults,
     ];
 }
 
@@ -345,6 +355,11 @@ pub enum SearchChange {
         name: crate::SearchRef,
         before: Box<crate::SearchObject>,
         after: Box<crate::SearchObject>,
+        /// The stored dependents the catalog cannot show are clear of the object, one line
+        /// each: what stands behind which function or dictionary it cannot see into. Not
+        /// empty carries [`RiskClass::StaleResults`]. Pinned by the plan's checksum.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        opaque: Vec<String>,
     },
     /// `ALTER TEXT SEARCH DICTIONARY ... (options)` of a standing dictionary whose options
     /// differ and whose template does not (DEC-2728.3). Shaped like
@@ -354,6 +369,9 @@ pub enum SearchChange {
         name: crate::SearchRef,
         before: Box<crate::SearchObject>,
         after: Box<crate::SearchObject>,
+        /// As on [`SearchChange::AlterSearchMapping`].
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        opaque: Vec<String>,
     },
 }
 
@@ -3243,6 +3261,17 @@ Change::Partition(PartitionChange::CopyTableRows(_)) | Change::Partition(Partiti
             Change::TypeValue(TypeValueChange::EnumRebuild { .. }) => {
                 r.insert(RiskClass::TypeRebuild);
             }
+            // An alteration carries the class only when the catalog could not show what stands
+            // behind a function body or a dictionary it cannot read (DEC-2728.3); what the
+            // catalog proves stale is refused at planning, not gated.
+            Change::Search(
+                SearchChange::AlterSearchMapping { opaque, .. }
+                | SearchChange::AlterSearchDictionary { opaque, .. },
+            ) => {
+                if !opaque.is_empty() {
+                    r.insert(RiskClass::StaleResults);
+                }
+            }
             Change::Extension(ExtensionChange::CreateExtension { .. }) => {
                 r.insert(RiskClass::ExtensionCode);
             }
@@ -3497,8 +3526,6 @@ Change::Partition(PartitionChange::CopyTableRows(_)) | Change::Partition(Partiti
             | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
             | Change::Type(TypeChange::CreateType { .. })
             | Change::Search(SearchChange::CreateSearch { .. })
-            | Change::Search(SearchChange::AlterSearchMapping { .. })
-            | Change::Search(SearchChange::AlterSearchDictionary { .. })
             | Change::Role(RoleChange::CreateRole { .. })
             // A replica identity changes what logical replication carries to
             // name an old row, not a row or an access: no class here gates it
@@ -4652,6 +4679,60 @@ mod tests {
                 [RiskClass::GrantWiden].into_iter().collect()
             );
         }
+    }
+
+    /// An in-place text search alteration carries `stale-results` exactly when the catalog could
+    /// not see into a node a stored dependent stands behind, and the class is gated, named for
+    /// `--allow` and explained to the reviewer (DEC-2728.4). Negatives: with nothing opaque it
+    /// carries no class, and a create and a drop carry none for this reason.
+    #[test]
+    fn a_text_search_alteration_is_gated_only_for_what_the_catalog_could_not_see_into() {
+        let object = crate::SearchObject::Dictionary {
+            template: "pg_catalog.simple".parse().unwrap(),
+            options: Default::default(),
+        };
+        let alter = |opaque: Vec<String>| {
+            Change::Search(SearchChange::AlterSearchDictionary {
+                uid: "s_aaaaaa".parse().unwrap(),
+                name: "dictionary app.words".parse().unwrap(),
+                before: Box::new(object.clone()),
+                after: Box::new(object.clone()),
+                opaque,
+            })
+        };
+        let behind = vec!["index app.ix (behind function app.f(text), body unread)".to_owned()];
+        assert_eq!(
+            alter(behind.clone()).intrinsic_risks(),
+            [RiskClass::StaleResults].into()
+        );
+        assert!(alter(Vec::new()).intrinsic_risks().is_empty());
+        assert!(
+            !Change::Search(SearchChange::CreateSearch {
+                uid: "s_aaaaaa".parse().unwrap(),
+                name: "dictionary app.words".parse().unwrap(),
+                definition: Box::new(object.clone()),
+                unresolved: Vec::new(),
+            })
+            .intrinsic_risks()
+            .contains(&RiskClass::StaleResults)
+        );
+        assert!(RiskClass::StaleResults.is_gated());
+        assert_eq!("stale-results".parse(), Ok(RiskClass::StaleResults));
+        assert!(RiskClass::StaleResults.why().contains("stored result"));
+        // The list is on the change, so it is pinned by the plan and survives the wire.
+        let cs = ChangeSet {
+            changes: vec![PlannedChange::new(alter(behind))],
+        };
+        let json = serde_json::to_string(&cs).unwrap();
+        assert!(json.contains("\"opaque\""), "{json}");
+        assert_eq!(serde_json::from_str::<ChangeSet>(&json).unwrap(), cs);
+        let bare = serde_json::to_string(&PlannedChange::new(alter(Vec::new()))).unwrap();
+        assert!(!bare.contains("opaque"), "{bare}");
+        assert_eq!(cs.unapproved_risks(&Default::default()).len(), 1);
+        assert!(
+            cs.unapproved_risks(&[RiskClass::StaleResults].into())
+                .is_empty()
+        );
     }
 
     #[test]

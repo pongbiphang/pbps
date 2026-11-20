@@ -269,12 +269,12 @@ pub(super) fn staged_movement(
     )
 }
 
-/// A text search object the plan alters in place (DEC-2728.3) is pinned as a package an update
-/// changes is: it stands at the definition the plan was approved over or at the one it writes,
-/// before its statement and at every checkpoint, and at the close at the one it writes. Another
-/// session's change to it is neither, so it refuses here, and the record never takes a read-back
-/// as the alteration's result without this comparison. Both definitions are the plan's own
-/// canonical ones, as the differ compared them, not catalog text. No other search object is read.
+/// A text search object the plan alters in place is pinned as a package an update changes is
+/// (SPEC §7.6, DEC-2728.4): it stands on its chain, the definition the plan was approved over,
+/// the one after each statement and the one the plan writes, and at the close at the last. A
+/// mapping change of several statements passes through definitions that are neither end, and a
+/// staged apply checkpoints on each. Another session's change is on no step, so it refuses, and
+/// a read-back is never recorded as the result unchecked. No other search object is read.
 fn refuse_unpinned_search(
     changes: &pbps_model::ChangeSet,
     held: &Schema,
@@ -298,7 +298,9 @@ fn refuse_unpinned_search(
         ) = &p.change
         {
             let now = held.search.get(name);
-            let stands = now.is_some_and(|d| d == before.as_ref() || d == after.as_ref());
+            let passes = before.alteration_chain(after);
+            let stands = now
+                .is_some_and(|d| d == before.as_ref() || d == after.as_ref() || passes.contains(d));
             if !stands || (at_close && now != Some(after.as_ref())) {
                 bail!(
                     "{} does not match what its plan promised during {label}",

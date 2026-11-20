@@ -1953,6 +1953,7 @@ mod tests {
                 name: "dictionary app.words".parse().unwrap(),
                 before: Box::new(definition.clone()),
                 after: Box::new(definition.clone()),
+                opaque: Vec::new(),
             }),
         ] {
             let error = super::emit(&change, Strategy::default())

@@ -652,6 +652,7 @@ fn search_objects_and_packages_wait_for_each_other_through_the_effects() {
             name: docs.clone(),
             before: Box::new(config("ext.intdict")),
             after: Box::new(config("pg_catalog.simple")),
+            opaque: Vec::new(),
         })),
         PlannedChange::new(Change::Extension(ExtensionChange::DropExtension {
             uid: base_ids.extension_uid(&"dict_int".into()).unwrap().clone(),

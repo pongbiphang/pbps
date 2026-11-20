@@ -8,8 +8,8 @@
 
 use super::rehearsal2379::{Fixture, Kind, Options};
 use super::{
-    Demo, OwnDatabase, apply_plan, approved_apply, code, on_server, scalar, server, stderr, stdout,
-    succeeds, text_of,
+    Demo, OwnDatabase, apply_plan, approved_apply, code, on_server, plan_checksum, scalar, server,
+    stderr, stdout, succeeds, text_of,
 };
 use std::collections::BTreeMap;
 use std::process::Output;
@@ -1558,17 +1558,16 @@ fn what_would_keep_the_old_behaviour_stops_an_alteration_and_a_parser_or_templat
     }
 }
 
-/// The catalog records no edge from a function's string body to the configuration it names,
-/// so a stored dependent that calls such a function is found by reading the body (DEC-2728.3):
-/// an index over a `LANGUAGE sql` function and a materialized view over a PL/pgSQL one stop a
-/// change of the mappings, and the refusal names the dependent and the function. Negative: a
-/// function that does not name the object lets the alteration go, and the same object is
-/// refused once a function that names it stands under a materialized view. A materialized
-/// view over a PL/pgSQL function that reads a view over the configuration is refused too.
+/// What the catalog cannot see into does not stop an alteration; it is a gated risk class
+/// (DEC-2728.4). With a stored dependent behind a function with a text body, the plan lists it
+/// with the function, carries `stale-results`, and `apply` without the class in `--allow` is
+/// refused before any statement and with it applies. A dictionary the model does not hold that
+/// names an option unreadably does the same, naming the dictionary. Negatives: a text-bodied
+/// function that no stored dependent calls, and a dictionary nothing maps, alter freely and
+/// carry no such class, and a plan saved with it is refused if the class is stripped.
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
-fn a_string_bodied_function_that_names_the_object_stops_an_alteration_and_one_that_does_not_lets_it_go()
- {
+fn an_opaque_node_behind_a_stored_dependent_gates_an_alteration_and_one_without_does_not() {
     for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
         let own = OwnDatabase::new(&server, "search2728e");
         let db = own.connection();
@@ -1581,24 +1580,37 @@ fn a_string_bodied_function_that_names_the_object_stops_an_alteration_and_one_th
         declare(&d, "app.solo.textsearch-dictionary.yml", SOLO);
         succeeds(d.run(&["plan", "--no-dev"]));
         d.commit();
-        let path = d.dir.join("bodies.plan.json");
+        let path = d.dir.join("opaque.plan.json");
         succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
         succeeds(apply_plan(&d, db, &path, false));
-        // Out of band, over a table the project does not declare: two functions that name the
-        // configuration in a string body, and what stores their results.
+        // A function with a text body that no stored dependent calls: nothing stands behind it.
         on_server(
             db,
             "CREATE TABLE app.loose (body text); \
-             CREATE FUNCTION app.f_sql(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.docs', t) $$; \
+             CREATE FUNCTION app.f_free(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.docs', t) $$",
+        );
+        declare(
+            &d,
+            "app.solo.textsearch-dictionary.yml",
+            &SOLO.replace("english", "german"),
+        );
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved.contains("stale-results") && !saved.contains("\"opaque\""),
+            "{saved}"
+        );
+        succeeds(apply_plan(&d, db, &path, false));
+        assert_eq!(options_of(db, "solo"), "stopwords = 'german'");
+        // Now a stored dependent calls a text-bodied function: an index over a `LANGUAGE sql`
+        // one, and a materialized view over a PL/pgSQL one that nothing catalog-visible links
+        // to the configuration.
+        on_server(
+            db,
+            "CREATE FUNCTION app.f_sql(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.docs', t) $$; \
              CREATE FUNCTION app.f_pl(t text) RETURNS tsvector LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN RETURN to_tsvector('app.docs'::regconfig, t); END $$; \
              CREATE INDEX ix_sql ON app.loose USING gin (app.f_sql(body)); \
-             CREATE MATERIALIZED VIEW app.mv_pl AS SELECT app.f_pl(body) AS x FROM app.loose; \
-             CREATE FUNCTION app.w_in(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.docs', t) $$; \
-             CREATE FUNCTION app.w_pl(t text) RETURNS tsvector LANGUAGE plpgsql AS $$ BEGIN RETURN app.w_in(t); END $$; \
-             CREATE MATERIALIZED VIEW app.mv_w AS SELECT app.w_pl(body) AS x FROM app.loose; \
-             CREATE VIEW app.vw_docs AS SELECT to_tsvector('app.docs', body) AS x FROM app.loose; \
-             CREATE FUNCTION app.rd_view(t text) RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN RETURN (SELECT count(*) FROM app.vw_docs); END $$; \
-             CREATE MATERIALIZED VIEW app.mv_rd AS SELECT app.rd_view(body) AS x FROM app.loose",
+             CREATE MATERIALIZED VIEW app.mv_pl AS SELECT app.f_pl(body) AS x FROM app.loose",
         );
         let docs =
             std::fs::read_to_string(d.dir.join("schema/app.docs.textsearch-config.yml")).unwrap();
@@ -1610,113 +1622,223 @@ fn a_string_bodied_function_that_names_the_object_stops_an_alteration_and_one_th
                 "email: [app.words, pg_catalog.simple]",
             ),
         );
-        let out = d.run(&["plan", "--db", db]);
-        assert_ne!(code(&out), 0, "{}", said(&out));
+        let planned = succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
         for needle in [
-            "index app.ix_sql (reached through function app.f_sql(pg_catalog.text), named in its body)",
-            "materialized view app.mv_pl (reached through function app.f_pl(pg_catalog.text), named in its body)",
-            "materialized view app.mv_w (reached through function app.w_in(pg_catalog.text), named in its body)",
-            "materialized view app.mv_rd (reached through view app.vw_docs, which a body names)",
-            "would keep the old behaviour",
+            "stale-results",
+            "index app.ix_sql (behind function app.f_sql(pg_catalog.text), whose body the catalog cannot read)",
+            "materialized view app.mv_pl (behind function app.f_pl(pg_catalog.text), whose body the catalog cannot read)",
         ] {
-            assert!(said(&out).contains(needle), "{needle}: {}", said(&out));
+            assert!(
+                said(&planned).contains(needle),
+                "{needle}: {}",
+                said(&planned)
+            );
         }
-        declare(&d, "app.docs.textsearch-config.yml", &docs);
-        // Negative: a function that does not name the dictionary, under an index and a
-        // materialized view, stops nothing.
+        assert!(
+            !said(&planned).contains("behind function app.f_free"),
+            "{}",
+            said(&planned)
+        );
+        let saved: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            saved
+                .changes
+                .changes
+                .iter()
+                .any(|p| p.risks.contains(&pbps_model::RiskClass::StaleResults)),
+            "{saved:?}"
+        );
+        // Without the class the apply is refused before a statement; with it, it applies.
+        let unchanged = mappings_of(db, "docs");
+        let refused = apply_plan(&d, db, &path, false);
+        assert_ne!(code(&refused), 0, "{}", said(&refused));
+        assert!(
+            said(&refused).contains("stale-results"),
+            "{}",
+            said(&refused)
+        );
+        assert_eq!(mappings_of(db, "docs"), unchanged);
+        let checksum = plan_checksum(&path);
+        let allowed = |staged: bool| {
+            let mut args = vec![
+                "apply",
+                "--db",
+                db,
+                "--plan",
+                path.to_str().unwrap(),
+                "--checksum",
+                &checksum,
+                "--allow",
+                "stale-results",
+            ];
+            if staged {
+                args.push("--staged");
+            }
+            d.run(&args)
+        };
+        succeeds(allowed(false));
+        assert_eq!(
+            mappings_of(db, "docs"),
+            "asciiword=words,word=words,email=words,email=simple"
+        );
+        no_changes(&succeeds(d.run(&["plan", "--db", db])));
+        succeeds(d.run(&["verify", "--db", db]));
+        // A thesaurus the model does not hold (it names its sub-dictionary without a schema),
+        // under a configuration the project does not hold, under an index: a dictionary the
+        // catalog cannot read into, with a dependent behind it.
         on_server(
             db,
-            "CREATE FUNCTION app.f_other(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.docs', t) $$; \
-             CREATE INDEX ix_other ON app.loose USING gin (app.f_other(body)); \
-             CREATE MATERIALIZED VIEW app.mv_other AS SELECT app.f_other(body) AS x FROM app.loose",
+            "SET search_path = app, pg_catalog; \
+             CREATE TEXT SEARCH DICTIONARY app.th_bare (TEMPLATE = thesaurus, DICTFILE = thesaurus_sample, DICTIONARY = words); \
+             CREATE TEXT SEARCH CONFIGURATION app.oob_th (COPY = pg_catalog.simple); \
+             ALTER TEXT SEARCH CONFIGURATION app.oob_th ALTER MAPPING FOR asciiword WITH app.th_bare; \
+             CREATE INDEX ix_th ON app.loose USING gin (to_tsvector('app.oob_th', body))",
         );
         declare(
             &d,
-            "app.solo.textsearch-dictionary.yml",
-            &SOLO.replace("english", "german"),
+            "app.words.textsearch-dictionary.yml",
+            &WORDS.replace("english", "german"),
         );
-        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
-        succeeds(apply_plan(&d, db, &path, false));
-        assert_eq!(options_of(db, "solo"), "stopwords = 'german'");
-        // A function that names the dictionary, under a materialized view: now it is refused.
-        on_server(
+        let planned = succeeds(d.run(&[
+            "plan",
+            "--db",
             db,
-            "CREATE FUNCTION app.f_solo(t text) RETURNS text[] LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN RETURN ts_lexize('app.solo'::regdictionary, t); END $$; \
-             CREATE MATERIALIZED VIEW app.mv_solo AS SELECT app.f_solo(body) AS x FROM app.loose",
-        );
-        declare(
-            &d,
-            "app.solo.textsearch-dictionary.yml",
-            &SOLO.replace("english", "french"),
-        );
-        let out = d.run(&["plan", "--db", db]);
-        assert_ne!(code(&out), 0, "{}", said(&out));
+            "--staged",
+            "--out",
+            path.to_str().unwrap(),
+        ]));
+        for needle in [
+            "stale-results",
+            "index app.ix_th (behind dictionary app.th_bare, which the model does not hold: its options could not be read",
+        ] {
+            assert!(
+                said(&planned).contains(needle),
+                "{needle}: {}",
+                said(&planned)
+            );
+        }
+        let refused = apply_plan(&d, db, &path, true);
+        assert_ne!(code(&refused), 0, "{}", said(&refused));
         assert!(
-            said(&out).contains(
-                "materialized view app.mv_solo (reached through function app.f_solo(pg_catalog.text), named in its body)"
-            ),
+            said(&refused).contains("stale-results"),
             "{}",
-            said(&out)
+            said(&refused)
         );
-        assert!(
-            !said(&out).contains("through function app.f_other"),
-            "{}",
-            said(&out)
-        );
-        assert_eq!(options_of(db, "solo"), "stopwords = 'german'");
-        // A configuration the project does not hold (a custom parser) that maps the
-        // dictionary is read from the catalog, not from the held model. Negative first: one
-        // that maps another dictionary, named by a function under a materialized view, stops
-        // nothing.
-        let extra = SOLO.replace("app.solo", "app.extra");
-        declare(&d, "app.solo.textsearch-dictionary.yml", SOLO);
-        declare(&d, "app.extra.textsearch-dictionary.yml", &extra);
+        assert_eq!(options_of(db, "words"), "language = 'english'");
+        let checksum = plan_checksum(&path);
+        let allowed_staged = {
+            let args = [
+                "apply",
+                "--db",
+                db,
+                "--plan",
+                path.to_str().unwrap(),
+                "--checksum",
+                &checksum,
+                "--allow",
+                "stale-results",
+                "--staged",
+            ];
+            d.run(&args)
+        };
+        succeeds(allowed_staged);
+        assert_eq!(options_of(db, "words"), "language = 'german'");
+        no_changes(&succeeds(d.run(&["plan", "--db", db])));
+    }
+}
+
+/// A mapping change of several statements passes through definitions that are neither end, and a
+/// staged apply checkpoints on each (SPEC §7.6, DEC-2728.4): every checkpoint is admitted and the
+/// close is at the plan's result, and a run stopped on a middle checkpoint (the second statement
+/// refused) resumes and closes. The pin it replaces compared whole definitions with the two ends
+/// and refused the first checkpoint. Negative: the same change applied by an ordinary apply is one
+/// transaction and needs no checkpoint, and the next plan is empty and verifies after each.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_staged_mapping_change_of_several_statements_passes_every_checkpoint_and_resumes() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        let own = OwnDatabase::new(&server, "search2728s");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app");
+        let d = Demo::new("search2728s");
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+        declare(&d, "app.words.textsearch-dictionary.yml", WORDS);
+        declare(&d, "app.docs.textsearch-config.yml", DOCS);
         succeeds(d.run(&["plan", "--no-dev"]));
         d.commit();
-        declare(
-            &d,
-            "app.solo.textsearch-dictionary.yml",
-            &SOLO.replace("english", "german"),
-        );
+        let path = d.dir.join("chain.plan.json");
         succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
         succeeds(apply_plan(&d, db, &path, false));
+        // Drops `email`, alters `word`, adds `url`: three statements, two definitions between.
+        let changed = "text_search_config: app.docs\nparser: pg_catalog.default\nmappings:\n  \
+                       asciiword: [app.words]\n  url: [app.words]\n  word: [pg_catalog.simple]\n";
+        declare(&d, "app.docs.textsearch-config.yml", changed);
+        let plan = || {
+            succeeds(d.run(&[
+                "plan",
+                "--db",
+                db,
+                "--staged",
+                "--out",
+                path.to_str().unwrap(),
+            ]))
+        };
+        plan();
+        // The second statement is refused by the engine (as the stop of the create's test).
         on_server(
             db,
-            "CREATE TEXT SEARCH PARSER app.oobparser (START = prsd_start, GETTOKEN = prsd_nexttoken, END = prsd_end, LEXTYPES = prsd_lextype); \
-             CREATE TEXT SEARCH CONFIGURATION app.oob_far (PARSER = app.oobparser); \
-             ALTER TEXT SEARCH CONFIGURATION app.oob_far ADD MAPPING FOR word WITH pg_catalog.simple; \
-             CREATE FUNCTION app.f_far(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.oob_far', t) $$; \
-             CREATE MATERIALIZED VIEW app.mv_far AS SELECT app.f_far(body) AS x FROM app.loose",
+            "CREATE SCHEMA witness; \
+             CREATE FUNCTION witness.stop_after_the_first() RETURNS event_trigger \
+             LANGUAGE plpgsql AS $$ BEGIN \
+             IF EXISTS (SELECT 1 FROM pg_ts_config_map m JOIN pg_ts_config c ON c.oid = m.mapcfg \
+                         JOIN pg_ts_dict d ON d.oid = m.mapdict \
+                        WHERE c.cfgname = 'docs' AND m.maptokentype = 2 AND d.dictname = 'simple') \
+                AND NOT EXISTS (SELECT 1 FROM pg_ts_config_map m JOIN pg_ts_config c ON c.oid = m.mapcfg \
+                                 WHERE c.cfgname = 'docs' AND m.maptokentype = 5) \
+             THEN RAISE EXCEPTION 'stop before the second statement commits'; END IF; END $$; \
+             CREATE EVENT TRIGGER stop_second ON ddl_command_end \
+             WHEN TAG IN ('ALTER TEXT SEARCH CONFIGURATION') \
+             EXECUTE FUNCTION witness.stop_after_the_first()",
         );
-        declare(
-            &d,
-            "app.extra.textsearch-dictionary.yml",
-            &extra.replace("english", "german"),
+        let stopped = approved_apply(&d, db, &path, &["--staged"]);
+        assert_ne!(code(&stopped), 0, "{}", said(&stopped));
+        assert!(
+            said(&stopped).contains("stop before the second statement"),
+            "refused by the engine, not by the pin: {}",
+            said(&stopped)
         );
+        let checkpoint = super::latest_snapshot(db);
+        let progress = checkpoint
+            .staged
+            .as_ref()
+            .unwrap_or_else(|| panic!("no checkpoint after the stop: {}", said(&stopped)));
+        assert_eq!(progress.completed, 1, "{}", said(&stopped));
+        // A middle checkpoint: `email` is gone and `word` is not yet changed.
+        assert_eq!(mappings_of(db, "docs"), "asciiword=words,word=words");
+        on_server(db, "DROP EVENT TRIGGER stop_second");
+        succeeds(approved_apply(&d, db, &path, &["--staged", "--resume"]));
+        assert_eq!(
+            mappings_of(db, "docs"),
+            "asciiword=words,word=simple,url=words"
+        );
+        no_changes(&succeeds(d.run(&["plan", "--db", db])));
+        succeeds(d.run(&["verify", "--db", db]));
+        // Every checkpoint of an uninterrupted staged run is admitted too, back again.
+        declare(&d, "app.docs.textsearch-config.yml", DOCS);
+        plan();
+        succeeds(approved_apply(&d, db, &path, &["--staged"]));
+        assert_eq!(
+            mappings_of(db, "docs"),
+            "asciiword=words,word=words,email=simple"
+        );
+        no_changes(&succeeds(d.run(&["plan", "--db", db])));
+        succeeds(d.run(&["verify", "--db", db]));
+        // Negative: the same change, unstaged, is one transaction.
+        declare(&d, "app.docs.textsearch-config.yml", changed);
         succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
         succeeds(apply_plan(&d, db, &path, false));
-        // Now one that maps the dictionary: the alteration is refused, naming it.
-        on_server(
-            db,
-            "CREATE TEXT SEARCH CONFIGURATION app.oob_maps (PARSER = app.oobparser); \
-             ALTER TEXT SEARCH CONFIGURATION app.oob_maps ADD MAPPING FOR word WITH app.extra; \
-             CREATE FUNCTION app.f_maps(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.oob_maps', t) $$; \
-             CREATE MATERIALIZED VIEW app.mv_maps AS SELECT app.f_maps(body) AS x FROM app.loose",
-        );
-        declare(&d, "app.extra.textsearch-dictionary.yml", &extra);
-        let out = d.run(&["plan", "--db", db]);
-        assert_ne!(code(&out), 0, "{}", said(&out));
-        assert!(
-            said(&out).contains(
-                "materialized view app.mv_maps (reached through function app.f_maps(pg_catalog.text), named in its body)"
-            ),
-            "{}",
-            said(&out)
-        );
-        assert!(
-            !said(&out).contains("through function app.f_far"),
-            "{}",
-            said(&out)
-        );
+        no_changes(&succeeds(d.run(&["plan", "--db", db])));
     }
 }

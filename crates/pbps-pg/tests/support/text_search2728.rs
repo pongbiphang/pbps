@@ -196,8 +196,8 @@ async fn measure() {
         let subject = |text: &str| -> std::collections::BTreeSet<SearchRef> {
             [text.parse().unwrap()].into()
         };
-        let census = |found: std::collections::BTreeMap<SearchRef, Vec<String>>| {
-            found.into_values().next().unwrap().join("; ")
+        let census = |found: std::collections::BTreeMap<SearchRef, pbps_model::SearchCensus>| {
+            found.into_values().next().unwrap().stored.join("; ")
         };
         let standing = Default::default();
         let by_config = census(
@@ -257,8 +257,8 @@ async fn a_stored_dependent_behind_a_view_or_a_function_is_found_and_a_read_only
         db.run("CREATE FUNCTION fn_ts(t text) RETURNS tsvector LANGUAGE sql BEGIN ATOMIC SELECT to_tsvector('app.c_fn', t); END; CREATE VIEW fn_v AS SELECT fn_ts(body) AS x FROM docs; CREATE MATERIALIZED VIEW fn_mv AS SELECT x FROM fn_v").await;
         db.run("CREATE VIEW read_v1 AS SELECT to_tsvector('app.c_read', body) AS x FROM docs; CREATE VIEW read_v2 AS SELECT x FROM read_v1; CREATE FUNCTION read_fn() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT count(*) FROM read_v2; END").await;
         db.run("CREATE VIEW cyc_v AS SELECT to_tsvector('app.c_cycle', body) AS x FROM docs; CREATE FUNCTION cyc_fn() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT count(*) FROM cyc_v; END; CREATE OR REPLACE VIEW cyc_v AS SELECT to_tsvector('app.c_cycle', body) AS x FROM docs WHERE cyc_fn() >= 0").await;
-        let census = |found: std::collections::BTreeMap<SearchRef, Vec<String>>| {
-            found.into_values().next().unwrap()
+        let census = |found: std::collections::BTreeMap<SearchRef, pbps_model::SearchCensus>| {
+            found.into_values().next().unwrap().stored
         };
         let standing = Default::default();
         for (config, stored) in [
@@ -298,302 +298,182 @@ async fn a_stored_dependent_behind_a_view_or_a_function_is_found_and_a_read_only
     }
 }
 
-/// The catalog has no edge from a function's string body to what it names (measured on 16 and
-/// 18: a `LANGUAGE sql` string body and a PL/pgSQL body, called by an index, a stored
-/// generated column and a materialized view, each leave only the edge from the stored
-/// dependent to the function), so the census reads the body (DEC-2728.3): a stored dependent
-/// that calls, directly, through a view or through a `BEGIN ATOMIC` function, a string body
-/// that names the object is listed with that function. Negatives: a body that names another
-/// object, a quoted name of another case, a body that only builds the name at run time (the
-/// limit the decision states) and a function used by no stored dependent list nothing; a
-/// dictionary answers for the name of a configuration that maps it, read from the catalog (one
-/// of a custom parser, not held, included), and one nothing maps does not.
+/// The catalog has no edge from a function's text body to what it names (measured on 16 and 18:
+/// a `LANGUAGE sql` string body and a PL/pgSQL body, called by an index, a stored generated
+/// column, a check and a materialized view, each leave only the edge from the stored dependent
+/// to the function), so the census does not guess (DEC-2728.4): a stored dependent that reaches
+/// such a function, directly, through a view or through a `BEGIN ATOMIC` wrapper, is listed as
+/// opaque with that function, whatever the body says, and nothing reads the body. Negatives: a
+/// function no stored dependent reaches, a `BEGIN ATOMIC` function (the catalog proves its
+/// edge, so its dependent is a stored one and not an opaque one) and a built-in function list
+/// nothing opaque; a dependent the catalog proves stale is listed once, as stored.
 #[tokio::test]
 #[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
-async fn a_stored_dependent_of_a_function_whose_body_names_the_object_is_found() {
+async fn a_stored_dependent_behind_a_text_bodied_function_is_opaque_and_nothing_else_is() {
     let _live = super::live_ledger().await;
     for variable in SERVERS {
-        let mut db = Private::on(variable, "bodies").await;
-        db.run("CREATE TEXT SEARCH DICTIONARY d1 (TEMPLATE = simple); CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = simple); CREATE TEXT SEARCH CONFIGURATION c1 (PARSER = default); ALTER TEXT SEARCH CONFIGURATION c1 ADD MAPPING FOR asciiword WITH d1; CREATE TABLE docs (body text)").await;
-        for config in [
-            "c_sql", "c_pl", "c_wrap", "c_view", "c_none", "c_q", "c_dyn", "c_unused", "other",
-        ] {
-            db.run(&format!(
-                "CREATE TEXT SEARCH CONFIGURATION {config} (COPY = pg_catalog.simple)"
-            ))
-            .await;
-        }
-        // A string body, SQL and PL/pgSQL, under an index, a generated column and a
-        // materialized view.
-        db.run("CREATE FUNCTION f_sql(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.c_sql', t) $$; CREATE INDEX ix_sql ON docs USING gin (f_sql(body))").await;
-        db.run("CREATE FUNCTION f_pl(t text) RETURNS tsvector LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN RETURN to_tsvector('app.c_pl'::regconfig, t); END $$; ALTER TABLE docs ADD COLUMN g_pl tsvector GENERATED ALWAYS AS (f_pl(body)) STORED; CREATE MATERIALIZED VIEW mv_pl AS SELECT f_pl(body) AS x FROM docs").await;
-        // A string body one hop down: a SQL-standard function calls it, a view calls it.
-        db.run("CREATE FUNCTION f_inner(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.c_wrap', t) $$; CREATE FUNCTION f_wrap(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE BEGIN ATOMIC SELECT f_inner(t); END; CREATE INDEX ix_wrap ON docs USING gin (f_wrap(body))").await;
-        db.run("CREATE FUNCTION f_v(t text) RETURNS tsvector LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN RETURN to_tsvector('APP.C_VIEW', t); END $$; CREATE VIEW v_view AS SELECT f_v(body) AS x FROM docs; CREATE MATERIALIZED VIEW mv_view AS SELECT x FROM v_view").await;
-        // Negatives: another name, a quoted name of another case, a name built at run time,
-        // and a function that no stored dependent calls.
-        db.run("CREATE FUNCTION f_none(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.other', t) $$; CREATE INDEX ix_none ON docs USING gin (f_none(body))").await;
-        db.run("CREATE FUNCTION f_q(t text) RETURNS tsvector LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN RETURN to_tsvector('app.\"C_Q\"'::regconfig, t); END $$; CREATE MATERIALIZED VIEW mv_q AS SELECT f_q(body) AS x FROM docs").await;
-        db.run("CREATE FUNCTION f_dyn(t text) RETURNS tsvector LANGUAGE plpgsql IMMUTABLE AS $$ DECLARE r tsvector; BEGIN EXECUTE format('SELECT to_tsvector(%L, $1)', 'app.c_' || 'dyn') INTO r USING t; RETURN r; END $$; CREATE MATERIALIZED VIEW mv_dyn AS SELECT f_dyn(body) AS x FROM docs").await;
-        db.run("CREATE FUNCTION f_unused(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.c_unused', t) $$; CREATE VIEW v_unused AS SELECT f_unused(body) AS x FROM docs").await;
-        // The measured premise: no edge from any of these functions to a configuration.
-        assert_eq!(
-            db.one("SELECT count(*)::text FROM pg_depend d JOIN pg_proc p ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid WHERE p.pronamespace = 'app'::regnamespace AND d.refclassid = 'pg_ts_config'::regclass").await,
-            "0"
+        let mut db = Private::on(variable, "opaque").await;
+        db.run("CREATE TEXT SEARCH DICTIONARY d1 (TEMPLATE = simple); CREATE TEXT SEARCH CONFIGURATION c1 (PARSER = default); ALTER TEXT SEARCH CONFIGURATION c1 ADD MAPPING FOR asciiword WITH d1; CREATE TABLE docs (body text)").await;
+        db.run("CREATE FUNCTION f_sql(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.c1', t) $$; \
+                CREATE FUNCTION f_pl(t text) RETURNS tsvector LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN RETURN to_tsvector('app.c1', t); END $$; \
+                CREATE FUNCTION f_other(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('simple', t) $$; \
+                CREATE FUNCTION f_unused(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.c1', t) $$; \
+                CREATE FUNCTION f_wrap(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE BEGIN ATOMIC SELECT f_sql(t); END; \
+                CREATE FUNCTION f_atomic(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE BEGIN ATOMIC SELECT to_tsvector('app.c1', t); END").await;
+        db.run("CREATE INDEX ix_sql ON docs USING gin (f_sql(body)); \
+                CREATE INDEX ix_other ON docs USING gin (f_other(body)); \
+                CREATE INDEX ix_wrap ON docs USING gin (f_wrap(body)); \
+                CREATE INDEX ix_atomic ON docs USING gin (f_atomic(body)); \
+                CREATE TABLE gen (body text, tsv tsvector GENERATED ALWAYS AS (f_pl(body)) STORED, CONSTRAINT k CHECK (f_pl(body) IS NOT NULL)); \
+                CREATE VIEW v_pl AS SELECT f_pl(body) AS x FROM docs; \
+                CREATE MATERIALIZED VIEW mv_pl AS SELECT x FROM v_pl; \
+                CREATE INDEX ix_builtin ON docs USING gin (to_tsvector('simple', body))").await;
+        let subject: std::collections::BTreeSet<SearchRef> =
+            ["config app.c1".parse().unwrap()].into();
+        let found = pbps_pg::search::stale_dependents(db.conn(), &Default::default(), &subject)
+            .await
+            .unwrap()
+            .into_values()
+            .next()
+            .unwrap();
+        let behind = |what: &str, function: &str| {
+            format!(
+                "{what} (behind function app.{function}(pg_catalog.text), whose body the catalog cannot read)"
+            )
+        };
+        // The catalog proves the `BEGIN ATOMIC` function's edge to the configuration, so its index
+        // is a stored dependent, and the wrapper over a string body is not one.
+        assert_eq!(found.stored, ["index app.ix_atomic"], "{found:?}");
+        let mut opaque = vec![
+            behind("index app.ix_other", "f_other"),
+            behind("index app.ix_sql", "f_sql"),
+            behind("index app.ix_wrap", "f_sql"),
+            behind("materialized view app.mv_pl", "f_pl"),
+            behind("default value for app.gen.tsv", "f_pl"),
+            behind("table constraint k on app.gen", "f_pl"),
+        ];
+        opaque.sort();
+        assert_eq!(found.opaque, opaque, "{found:?}");
+        // A body is never read: the dependent of a function that names another configuration is
+        // listed too, and the unused function and the built-in one are not.
+        assert!(
+            !found
+                .opaque
+                .iter()
+                .any(|l| l.contains("f_unused") || l.contains("ix_builtin"))
         );
-        assert_eq!(
-            db.one("SELECT count(*)::text FROM pg_depend d WHERE d.refclassid = 'pg_proc'::regclass AND d.refobjid = 'app.f_pl(text)'::regprocedure AND d.classid IN ('pg_attrdef'::regclass, 'pg_rewrite'::regclass)").await,
-            "2"
-        );
-        let census = |found: std::collections::BTreeMap<SearchRef, Vec<String>>| {
+        // Nothing stands behind a function for a project that has none: the same database with
+        // those dependents gone lists nothing opaque.
+        db.run("DROP MATERIALIZED VIEW mv_pl; DROP VIEW v_pl; DROP TABLE gen; DROP INDEX ix_sql, ix_other, ix_wrap").await;
+        let found = pbps_pg::search::stale_dependents(db.conn(), &Default::default(), &subject)
+            .await
+            .unwrap()
+            .into_values()
+            .next()
+            .unwrap();
+        assert!(found.opaque.is_empty(), "{found:?}");
+        db.finish().await;
+    }
+}
+
+/// A dictionary the model does not hold is an opaque node when its options cannot be read as
+/// written (a `dictionary` option with no schema), or name the subject, or another such
+/// dictionary (a thesaurus's sub-dictionary leaves no catalog edge, measured on 16 and 18);
+/// the stored dependents behind it are listed with it (DEC-2728.4). Negatives: the same
+/// dictionary is a held one, and so a proven member of the closure and not an opaque node, when
+/// the model holds it; a dictionary that names another dictionary, and one that names
+/// nothing, are not nodes; and an opaque dictionary nothing stored stands behind lists nothing.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_dictionary_the_model_does_not_hold_that_may_name_the_object_is_an_opaque_node() {
+    let _live = super::live_ledger().await;
+    for variable in SERVERS {
+        let mut db = Private::on(variable, "unheld").await;
+        db.run("CREATE TEXT SEARCH DICTIONARY d1 (TEMPLATE = simple); CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = simple); CREATE TABLE docs (body text)").await;
+        // `th_named` names d1 with its schema, `th_bare` names it without one, `th_plain` names a
+        // dictionary that is not d1, and `th_idle` names d1 but nothing maps it.
+        db.run("CREATE TEXT SEARCH DICTIONARY th_named (TEMPLATE = thesaurus, DICTFILE = thesaurus_sample, DICTIONARY = app.d1); \
+                CREATE TEXT SEARCH DICTIONARY th_bare (TEMPLATE = thesaurus, DICTFILE = thesaurus_sample, DICTIONARY = d2); \
+                CREATE TEXT SEARCH DICTIONARY th_plain (TEMPLATE = thesaurus, DICTFILE = thesaurus_sample, DICTIONARY = app.d2); \
+                CREATE TEXT SEARCH DICTIONARY th_idle (TEMPLATE = thesaurus, DICTFILE = thesaurus_sample, DICTIONARY = app.d1)").await;
+        db.run("CREATE TEXT SEARCH CONFIGURATION c_named (PARSER = default); ALTER TEXT SEARCH CONFIGURATION c_named ADD MAPPING FOR asciiword WITH th_named; \
+                CREATE TEXT SEARCH CONFIGURATION c_bare (PARSER = default); ALTER TEXT SEARCH CONFIGURATION c_bare ADD MAPPING FOR asciiword WITH th_bare; \
+                CREATE TEXT SEARCH CONFIGURATION c_plain (PARSER = default); ALTER TEXT SEARCH CONFIGURATION c_plain ADD MAPPING FOR asciiword WITH th_plain; \
+                CREATE INDEX ix_named ON docs USING gin (to_tsvector('app.c_named', body)); \
+                CREATE INDEX ix_bare ON docs USING gin (to_tsvector('app.c_bare', body)); \
+                CREATE INDEX ix_plain ON docs USING gin (to_tsvector('app.c_plain', body))").await;
+        let subject = |text: &str| -> std::collections::BTreeSet<SearchRef> {
+            [text.parse().unwrap()].into()
+        };
+        let census = |found: std::collections::BTreeMap<SearchRef, pbps_model::SearchCensus>| {
             found.into_values().next().unwrap()
         };
-        let by = |function: &str, what: &str| {
-            format!(
-                "{what} (reached through function app.{function}(pg_catalog.text), named in its body)"
+        // None of them is held: the census reads them from the catalog.
+        let found = census(
+            pbps_pg::search::stale_dependents(
+                db.conn(),
+                &Default::default(),
+                &subject("dictionary app.d1"),
             )
-        };
-        let mut standing = std::collections::BTreeMap::new();
-        standing.insert(
-            "config app.c1".parse::<SearchRef>().unwrap(),
-            SearchObject::Config {
-                parser: "pg_catalog.default".parse().unwrap(),
-                mappings: [("asciiword".to_owned(), vec!["app.d1".parse().unwrap()])].into(),
-            },
+            .await
+            .unwrap(),
         );
-        for (config, stored) in [
-            ("c_sql", vec![by("f_sql", "index app.ix_sql")]),
-            (
-                "c_pl",
-                vec![
-                    by("f_pl", "default value for app.docs.g_pl"),
-                    by("f_pl", "materialized view app.mv_pl"),
-                ],
-            ),
-            ("c_wrap", vec![by("f_inner", "index app.ix_wrap")]),
-            ("c_view", vec![by("f_v", "materialized view app.mv_view")]),
-            ("c_none", vec![]),
-            ("c_q", vec![]),
-            ("c_dyn", vec![]),
-            ("c_unused", vec![]),
-        ] {
-            let subject: std::collections::BTreeSet<SearchRef> =
-                [format!("config app.{config}").parse().unwrap()].into();
-            let found = census(
-                pbps_pg::search::stale_dependents(db.conn(), &standing, &subject)
-                    .await
-                    .unwrap(),
-            );
-            assert_eq!(found, stored, "{config}");
-        }
-        // A dictionary answers for the name of the configuration that maps it.
-        db.run("CREATE FUNCTION f_d(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.c1', t) $$; CREATE INDEX ix_d ON docs USING gin (f_d(body))").await;
-        // So does a configuration the project does not hold, a custom parser's here: the
-        // catalog says what maps the dictionary, not the held model. One that maps another
-        // dictionary does not make it answer.
-        db.run("CREATE TEXT SEARCH PARSER myparser (START = prsd_start, GETTOKEN = prsd_nexttoken, END = prsd_end, LEXTYPES = prsd_lextype); CREATE TEXT SEARCH CONFIGURATION c_custom (PARSER = myparser); ALTER TEXT SEARCH CONFIGURATION c_custom ADD MAPPING FOR word WITH d1; CREATE TEXT SEARCH CONFIGURATION c_other (PARSER = myparser); ALTER TEXT SEARCH CONFIGURATION c_other ADD MAPPING FOR word WITH d2").await;
-        db.run("CREATE FUNCTION f_custom(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.c_custom', t) $$; CREATE INDEX ix_custom ON docs USING gin (f_custom(body))").await;
-        db.run("CREATE FUNCTION f_far(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.c_other', t) $$; CREATE INDEX ix_far ON docs USING gin (f_far(body))").await;
-        for (dictionary, stored) in [
-            (
-                "d1",
-                vec![
-                    by("f_custom", "index app.ix_custom"),
-                    by("f_d", "index app.ix_d"),
-                ],
-            ),
-            ("d2", vec![by("f_far", "index app.ix_far")]),
-        ] {
-            let subject: std::collections::BTreeSet<SearchRef> =
-                [format!("dictionary app.{dictionary}").parse().unwrap()].into();
-            let found = census(
-                pbps_pg::search::stale_dependents(db.conn(), &standing, &subject)
-                    .await
-                    .unwrap(),
-            );
-            assert_eq!(found, stored, "{dictionary}");
-            // The held model adds nothing the catalog does not say: with none held, the same.
-            let found = census(
-                pbps_pg::search::stale_dependents(db.conn(), &Default::default(), &subject)
-                    .await
-                    .unwrap(),
-            );
-            assert_eq!(found, stored, "{dictionary}, none held");
-        }
-        // Negative: a dictionary nothing maps answers for no name.
-        db.run("CREATE TEXT SEARCH DICTIONARY d3 (TEMPLATE = simple)")
+        assert!(found.stored.is_empty(), "{found:?}");
+        let named = "its options name text search dictionary `app.d1`";
+        let bare =
+            "its options could not be read: its option `dictionary` names `d2` without a schema";
+        assert_eq!(
+            found.opaque,
+            [
+                format!(
+                    "index app.ix_bare (behind dictionary app.th_bare, which the model does not hold: {bare})"
+                ),
+                format!(
+                    "index app.ix_named (behind dictionary app.th_named, which the model does not hold: {named})"
+                ),
+            ],
+            "{found:?}"
+        );
+        // A configuration is never named by a dictionary's options: nothing opaque for it.
+        let found = census(
+            pbps_pg::search::stale_dependents(
+                db.conn(),
+                &Default::default(),
+                &subject("config app.c_plain"),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(found.stored, ["index app.ix_plain"]);
+        assert!(found.opaque.is_empty(), "{found:?}");
+        // Held by the model: a named qualified sub-dictionary is a proven member of the closure,
+        // so its configuration's dependent is a stored one. The bare one stays unreadable.
+        let rows = db
+            .one(&format!(
+                "SELECT jsonb_agg(to_jsonb(q))::text FROM ({}) q",
+                query()
+            ))
             .await;
-        let subject: std::collections::BTreeSet<SearchRef> =
-            ["dictionary app.d3".parse().unwrap()].into();
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&rows).unwrap();
+        let (held, _) = decode(&rows).unwrap();
+        let found = census(
+            pbps_pg::search::stale_dependents(db.conn(), &held, &subject("dictionary app.d1"))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(found.stored, ["index app.ix_named"], "{found:?}");
         assert!(
-            census(
-                pbps_pg::search::stale_dependents(db.conn(), &standing, &subject)
-                    .await
-                    .unwrap()
-            )
-            .is_empty()
+            !found.opaque.iter().any(|l| l.contains("th_named")),
+            "{found:?}"
         );
-        db.finish().await;
-    }
-}
-
-/// The catalog has no edge from a string body to a function it calls either (measured on 16 and
-/// 18: a PL/pgSQL wrapper and a `LANGUAGE sql` string wrapper record none to their callee, a
-/// `BEGIN ATOMIC` wrapper does), so the functions a stored dependent reaches are the fixpoint
-/// of the catalog's edges and of the user functions a body names (DEC-2728.3): a materialized
-/// view over a PL/pgSQL wrapper of a string function that names the object, an index over a
-/// wrapper of a wrapper, and a materialized view over a mutually recursive pair (which must
-/// end) list the dependent with the function whose text names the object. Negatives: a
-/// wrapper whose callee names another configuration, and a wrapper that builds its callee's
-/// name at run time (the limit the decision states) list nothing for this one.
-#[tokio::test]
-#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
-async fn a_stored_dependent_behind_wrappers_of_string_bodies_is_found_through_the_names_they_call()
-{
-    let _live = super::live_ledger().await;
-    for variable in SERVERS {
-        let mut db = Private::on(variable, "wrappers").await;
-        for config in ["c_a", "c_b", "c_cyc", "c_other"] {
-            db.run(&format!(
-                "CREATE TEXT SEARCH CONFIGURATION {config} (COPY = pg_catalog.simple)"
-            ))
-            .await;
-        }
-        db.run("CREATE TABLE docs (body text)").await;
-        // leaf_a names c_a; a PL/pgSQL wrapper calls it, a matview stands over the wrapper.
-        db.run("CREATE FUNCTION leaf_a(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.c_a', t) $$; CREATE FUNCTION w_pl(t text) RETURNS tsvector LANGUAGE plpgsql AS $$ BEGIN RETURN app.leaf_a(t); END $$; CREATE MATERIALIZED VIEW mv_w AS SELECT w_pl(body) AS x FROM docs").await;
-        // A `BEGIN ATOMIC` wrapper of the same function, under an index (the catalog edge).
-        db.run("CREATE FUNCTION w_atomic(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE BEGIN ATOMIC SELECT app.leaf_a(t); END; CREATE INDEX ix_at ON docs USING gin (w_atomic(body))").await;
-        // Two SQL string wrappers deep, under an index.
-        db.run("CREATE FUNCTION leaf_b(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.c_b', t) $$; CREATE FUNCTION s2(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT app.leaf_b(t) $$; CREATE FUNCTION s1(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT app.s2(t) $$; CREATE INDEX ix_c ON docs USING gin (s1(body))").await;
-        // Two PL/pgSQL functions that call each other; one names the configuration.
-        db.run("CREATE FUNCTION ca(t text) RETURNS tsvector LANGUAGE plpgsql AS $$ BEGIN RETURN app.cb(t); END $$; CREATE FUNCTION cb(t text) RETURNS tsvector LANGUAGE plpgsql AS $$ BEGIN IF t = '' THEN RETURN to_tsvector('app.c_cyc', t); END IF; RETURN app.ca(t); END $$; CREATE MATERIALIZED VIEW mv_cyc AS SELECT ca(body) AS x FROM docs").await;
-        // Negatives: a wrapper whose callee names another configuration, and a wrapper that
-        // builds its callee's name at run time.
-        db.run("CREATE FUNCTION leaf_o(t text) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector('app.c_other', t) $$; CREATE FUNCTION w_neg(t text) RETURNS tsvector LANGUAGE plpgsql AS $$ BEGIN RETURN app.leaf_o(t); END $$; CREATE MATERIALIZED VIEW mv_neg AS SELECT w_neg(body) AS x FROM docs").await;
-        db.run("CREATE FUNCTION w_dyn(t text) RETURNS tsvector LANGUAGE plpgsql AS $$ DECLARE r tsvector; BEGIN EXECUTE format('SELECT app.%I($1)', 'leaf_' || 'a') INTO r USING t; RETURN r; END $$; CREATE MATERIALIZED VIEW mv_dyn AS SELECT w_dyn(body) AS x FROM docs").await;
-        // The measured premise: edges to the callee from the PL/pgSQL, SQL-string and
-        // PL/pgSQL-recursive wrappers: none; from the `BEGIN ATOMIC` wrapper: one.
-        for (caller, edges) in [
-            ("w_pl", "0"),
-            ("s1", "0"),
-            ("s2", "0"),
-            ("ca", "0"),
-            ("w_atomic", "1"),
-        ] {
-            assert_eq!(
-                db.one(&format!("SELECT count(*)::text FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass AND d.refclassid = 'pg_proc'::regclass AND d.objid = 'app.{caller}(text)'::regprocedure")).await,
-                edges,
-                "{caller}"
-            );
-        }
-        let by = |function: &str, what: &str| {
-            format!(
-                "{what} (reached through function app.{function}(pg_catalog.text), named in its body)"
-            )
-        };
-        for (config, stored) in [
-            (
-                "c_a",
-                vec![
-                    by("leaf_a", "index app.ix_at"),
-                    by("leaf_a", "materialized view app.mv_w"),
-                ],
-            ),
-            ("c_b", vec![by("leaf_b", "index app.ix_c")]),
-            ("c_cyc", vec![by("cb", "materialized view app.mv_cyc")]),
-            (
-                "c_other",
-                vec![by("leaf_o", "materialized view app.mv_neg")],
-            ),
-        ] {
-            let subject: std::collections::BTreeSet<SearchRef> =
-                [format!("config app.{config}").parse().unwrap()].into();
-            let found = pbps_pg::search::stale_dependents(db.conn(), &Default::default(), &subject)
+        // An opaque dictionary with nothing stored behind it carries nothing.
+        db.run("DROP INDEX ix_bare").await;
+        let found = census(
+            pbps_pg::search::stale_dependents(db.conn(), &held, &subject("dictionary app.d1"))
                 .await
-                .unwrap()
-                .into_values()
-                .next()
-                .unwrap();
-            assert_eq!(found, stored, "{config}");
-        }
-        db.finish().await;
-    }
-}
-
-/// A string body records no edge to a view it reads either (measured on 16 and 18: a PL/pgSQL
-/// and a `LANGUAGE sql` string reader record none to the view, a `BEGIN ATOMIC` reader one), so
-/// a view is a node of the same walk as a function (DEC-2728.3): a materialized view over a
-/// PL/pgSQL function that reads a view over `to_tsvector('app.c_v', ...)`, an index over a
-/// SQL function that reads a view over a view naming the configuration, and a function that
-/// reads a materialized view that names it each list the dependent with the view the body
-/// names. Negatives: a function that reads a view over another configuration lists nothing
-/// for this one, and a view the body does not name (a longer identifier) lists nothing.
-#[tokio::test]
-#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
-async fn a_stored_dependent_behind_a_function_that_reads_a_view_is_found_through_the_name_it_reads()
-{
-    let _live = super::live_ledger().await;
-    for variable in SERVERS {
-        let mut db = Private::on(variable, "views").await;
-        for config in ["c_v", "c_vv", "c_m", "c_other"] {
-            db.run(&format!(
-                "CREATE TEXT SEARCH CONFIGURATION {config} (COPY = pg_catalog.simple)"
-            ))
-            .await;
-        }
-        db.run("CREATE TABLE docs (body text)").await;
-        // A view over the configuration, read by a PL/pgSQL function under a matview.
-        db.run("CREATE VIEW vw_a AS SELECT to_tsvector('app.c_v', body) AS x FROM docs; CREATE FUNCTION rd_pl(t text) RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN RETURN (SELECT count(*) FROM app.vw_a); END $$; CREATE MATERIALIZED VIEW mv_pl AS SELECT rd_pl(body) AS x FROM docs").await;
-        // A view over a view over the configuration, read by a SQL function under an index.
-        db.run("CREATE VIEW vw_b AS SELECT to_tsvector('app.c_vv', body) AS x FROM docs; CREATE VIEW vw_bb AS SELECT x FROM vw_b; CREATE FUNCTION rd_sql(t text) RETURNS bigint LANGUAGE sql IMMUTABLE AS $$ SELECT count(*) FROM app.vw_bb $$; CREATE INDEX ix_v ON docs (rd_sql(body))").await;
-        // A materialized view over the configuration, read by a function under an index.
-        db.run("CREATE MATERIALIZED VIEW mv_in AS SELECT to_tsvector('app.c_m', body) AS x FROM docs; CREATE FUNCTION rd_mv(t text) RETURNS bigint LANGUAGE sql IMMUTABLE AS $$ SELECT count(*) FROM app.mv_in $$; CREATE INDEX ix_m ON docs (rd_mv(body))").await;
-        // Negatives: a view over another configuration, and a view whose name is only the
-        // start of the longer identifier the body reads.
-        db.run("CREATE VIEW vw_o AS SELECT to_tsvector('app.c_other', body) AS x FROM docs; CREATE FUNCTION rd_o(t text) RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN RETURN (SELECT count(*) FROM app.vw_o); END $$; CREATE MATERIALIZED VIEW mv_o AS SELECT rd_o(body) AS x FROM docs").await;
-        db.run("CREATE VIEW vw_c AS SELECT to_tsvector('app.c_vv', body) AS x FROM docs; CREATE VIEW vw_c2 AS SELECT 1 AS x; CREATE FUNCTION rd_long(t text) RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN RETURN (SELECT count(*) FROM app.vw_c2); END $$; CREATE MATERIALIZED VIEW mv_long AS SELECT rd_long(body) AS x FROM docs").await;
-        // The measured premise: no edge from either string reader to its view, one from the
-        // `BEGIN ATOMIC` reader.
-        db.run("CREATE FUNCTION rd_atomic(t text) RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT count(*) FROM app.vw_a; END").await;
-        for (reader, edges) in [("rd_pl", "0"), ("rd_sql", "0"), ("rd_atomic", "1")] {
-            assert_eq!(
-                db.one(&format!("SELECT count(*)::text FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass AND d.refclassid = 'pg_class'::regclass AND d.objid = 'app.{reader}(text)'::regprocedure")).await,
-                edges,
-                "{reader}"
-            );
-        }
-        let by = |view: &str, kind: &str, what: &str| {
-            format!("{what} (reached through {kind} app.{view}, which a body names)")
-        };
-        for (config, stored) in [
-            (
-                "c_v",
-                vec![by("vw_a", "view", "materialized view app.mv_pl")],
-            ),
-            ("c_vv", vec![by("vw_bb", "view", "index app.ix_v")]),
-            (
-                "c_m",
-                vec![
-                    by("mv_in", "materialized view", "index app.ix_m"),
-                    "materialized view app.mv_in".to_owned(),
-                ],
-            ),
-            (
-                "c_other",
-                vec![by("vw_o", "view", "materialized view app.mv_o")],
-            ),
-        ] {
-            let subject: std::collections::BTreeSet<SearchRef> =
-                [format!("config app.{config}").parse().unwrap()].into();
-            let found = pbps_pg::search::stale_dependents(db.conn(), &Default::default(), &subject)
-                .await
-                .unwrap()
-                .into_values()
-                .next()
-                .unwrap();
-            assert_eq!(found, stored, "{config}");
-        }
+                .unwrap(),
+        );
+        assert!(found.opaque.is_empty(), "{found:?}");
         db.finish().await;
     }
 }

@@ -199,7 +199,7 @@ const REFUSED: &[(&str, &str, &str, &str)] = &[
     (
         r"planned ext create bad risk",
         r#"{"op":"create_extension","uid":"e_aaaaaa","name":"citext","definition":{"schema":"public","version":"1.6"},"risks":["nope"]}"#,
-        r"unknown variant `nope`, expected one of `rename`, `destructive`, `narrowing`, `not-null`, `constraint`, `data-update`, `data-delete`, `revoke`, `grant-widen`, `numbering`, `row-security`, `type-rebuild`, `extension-code` at line 1 column 122",
+        r"unknown variant `nope`, expected one of `rename`, `destructive`, `narrowing`, `not-null`, `constraint`, `data-update`, `data-delete`, `revoke`, `grant-widen`, `numbering`, `row-security`, `type-rebuild`, `extension-code`, `stale-results` at line 1 column 122",
         r"unknown field `risks`, expected one of `uid`, `name`, `definition`, `requires`",
     ),
     (
