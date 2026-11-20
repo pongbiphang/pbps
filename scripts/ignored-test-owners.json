@@ -967,6 +967,7 @@
         "exclude2448_partitions::a_partitions_own_exclusion_is_read_declared_created_replaced_and_dropped",
         "exclude2448_partitions::a_partitions_own_exclusion_the_parents_would_take_is_refused_and_one_it_would_not_stays",
         "exclude2448_partitions::a_rebuild_keeps_a_partitions_own_exclusion_and_builds_a_parents_again_on_18",
+        "exclude2448_partitions::an_undeclared_own_exclusion_the_parents_new_one_would_take_is_named_before_anything_runs",
         "exclude2448_partitions::a_partition_of_a_parent_with_an_exclusion_is_detached_and_its_clone_becomes_its_own",
         "partition_trigger1811::a_trigger_on_the_default_partition_added_with_a_new_partition_applies_and_reads_back",
         "partition_trigger1811::parent_and_member_triggers_apply_with_a_new_partition_and_read_back",

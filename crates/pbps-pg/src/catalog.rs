@@ -4017,7 +4017,7 @@ pub async fn detach_clone_names(
            LEFT JOIN pg_catalog.pg_constraint pk ON pk.oid = k.conparentid
           WHERE tn.nspname = $1 AND t.relname = $2
             AND pn.nspname = $3 AND p.relname = $4
-            AND (k.contype NOT IN ('u', 'x') OR pk.conrelid = p.oid)
+            AND (k.contype IS NULL OR k.contype NOT IN ('u', 'x') OR pk.conrelid = p.oid)
           ORDER BY ci.relname",
             &[
                 Param::Str(&table.schema),
