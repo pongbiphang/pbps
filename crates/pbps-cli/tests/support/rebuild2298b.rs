@@ -14,6 +14,127 @@ fn approved_rebuilds_copy_conversions_and_chains_atomically_on_pg16() {
     negatives(&old_server());
 }
 
+#[test]
+#[ignore = "needs live pg18"]
+fn a_connected_rebuild_of_a_project_with_a_depends_on_line_still_plans_and_applies() {
+    rebuild_with_a_depends_on_line(&server());
+}
+
+/// The negative is the `key` kind of `acceptance`: the same text, the same
+/// change and no line.
+///
+/// The contract of an extended `depends_on:` line reads the effects of every
+/// step (DEC-2469.10) and the effects refuse a rebuild root, so a connected
+/// rebuild must reach the contract only after it is expanded. This measures it
+/// on an engine: a true line on the function the rebuild restores, a plan that
+/// carries it, and an apply that succeeds.
+fn rebuild_with_a_depends_on_line(server: &str) {
+    let reader = Reader {
+        server,
+        name: format!("w2298b_line_reader_{}", std::process::id()),
+    };
+    on_server(
+        server,
+        &format!(
+            "DROP ROLE IF EXISTS {}; CREATE ROLE {}",
+            reader.name, reader.name
+        ),
+    );
+    let own = OwnDatabase::new(server, "rebuild2298b_line");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; CREATE TABLE app.p(k integer NOT NULL,bucket integer NOT NULL,label text) PARTITION BY RANGE(k); CREATE TABLE app.p1 PARTITION OF app.p FOR VALUES FROM(0) TO(10); INSERT INTO app.p VALUES(1,2,'a'),(3,4,'b')",
+    );
+    on_server(connection, &dependents_sql(&reader.name));
+    on_server(
+        connection,
+        &format!("GRANT USAGE ON SCHEMA app TO {}", reader.name),
+    );
+    let d = Demo::new("rebuild2298b-line");
+    succeeds(d.run(&["pull", "--db", connection]));
+    // The function reads `app.p`, so the line is true; it is typed, so the
+    // input is extended and the contract is built for the plan.
+    let function = declaration(&d.dir.join("schema"), "function: app.f()");
+    let text = std::fs::read_to_string(&function).unwrap();
+    let first = text.lines().next().unwrap();
+    std::fs::write(
+        &function,
+        text.replacen(
+            first,
+            &format!("{first}\ndepends_on: [\"table::app.p\"]"),
+            1,
+        ),
+    )
+    .unwrap();
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    let source = latest_snapshot(connection);
+    let mut desired = source.schema.clone();
+    let root: pbps_model::TableName = "app.p".parse().unwrap();
+    desired
+        .tables
+        .get_mut(&root)
+        .unwrap()
+        .partition_by
+        .as_mut()
+        .unwrap()
+        .columns = vec!["bucket".into()];
+    write_tree(&d, &desired);
+    approve(&d, "10");
+    let path = d.dir.join("rebuild.json");
+    let planned = succeeds(d.run(&["plan", "--db", connection, "--out", path.to_str().unwrap()]));
+    assert!(
+        stdout(&planned).contains("blocking rewrite"),
+        "{}",
+        stdout(&planned)
+    );
+    // The saved plan carries the line as an object edge: the plan was ordered
+    // with an extended annotation, so the contract was built.
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(
+        saved["object_deps"]
+            .as_array()
+            .is_some_and(|edges| !edges.is_empty()),
+        "the plan carries no annotation: {}",
+        saved["object_deps"]
+    );
+    succeeds(apply(&d, connection, &path));
+    assert_eq!(scalar(connection, "SELECT count(*) FROM app.p"), 2);
+    assert_eq!(scalar(connection, "SELECT count(*) FROM app.v"), 2);
+    assert_eq!(scalar(connection, "SELECT app.f()"), 4);
+    on_server(connection, "INSERT INTO app.p VALUES(5,6,'c')");
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM app.p WHERE k=5 AND label='c!'"
+        ),
+        1,
+        "the trigger is restored"
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+/// The one file of a project tree that holds the line `needle`.
+fn declaration(dir: &std::path::Path, needle: &str) -> std::path::PathBuf {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in std::fs::read_dir(&next).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if std::fs::read_to_string(&path)
+                .is_ok_and(|text| text.lines().any(|line| line == needle))
+            {
+                found.push(path);
+            }
+        }
+    }
+    assert_eq!(found.len(), 1, "`{needle}` is in {found:?}");
+    found.remove(0)
+}
+
 fn write_tree(d: &Demo, schema: &pbps_model::Schema) {
     let root: pbps_model::TableName = "app.p".parse().unwrap();
     let partitions: Vec<_> = schema
@@ -69,6 +190,16 @@ impl Drop for Reader<'_> {
     }
 }
 
+/// The dependents of `app.p` the acceptance builds beside it: keys, indexes, a
+/// foreign key each way, a view, a function, a trigger and the grants to
+/// `reader`. Shared so a second test builds the same text.
+fn dependents_sql(reader: &str) -> String {
+    format!(
+        "ALTER TABLE app.p ADD CONSTRAINT pk_p PRIMARY KEY(k,bucket); CREATE INDEX p_label ON app.p(label); CREATE INDEX p1_label_own ON app.p1(label); CREATE TABLE app.lookup(id integer PRIMARY KEY); INSERT INTO app.lookup SELECT generate_series(0,10); ALTER TABLE app.p ADD CONSTRAINT outgoing FOREIGN KEY(k) REFERENCES app.lookup(id); CREATE TABLE app.ref(k integer,bucket integer, CONSTRAINT incoming FOREIGN KEY(k,bucket) REFERENCES app.p(k,bucket)); INSERT INTO app.ref VALUES(1,2),(3,4); CREATE VIEW app.v AS SELECT k,bucket FROM app.p; CREATE FUNCTION app.f() RETURNS bigint LANGUAGE SQL BEGIN ATOMIC SELECT sum(k)::bigint FROM app.p; END; CREATE FUNCTION app.tg() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS 'BEGIN NEW.label := NEW.label || ''!''; RETURN NEW; END'; CREATE TRIGGER label_trigger BEFORE INSERT ON app.p FOR EACH ROW EXECUTE FUNCTION app.tg(); GRANT SELECT ON app.p,app.v TO {}; GRANT EXECUTE ON FUNCTION app.f() TO {}",
+        reader, reader
+    )
+}
+
 fn acceptance(server: &str) {
     let reader = Reader {
         server,
@@ -93,13 +224,7 @@ fn acceptance(server: &str) {
         }
         let dependents = matches!(kind, "key" | "type");
         if dependents {
-            on_server(
-                connection,
-                &format!(
-                    "ALTER TABLE app.p ADD CONSTRAINT pk_p PRIMARY KEY(k,bucket); CREATE INDEX p_label ON app.p(label); CREATE INDEX p1_label_own ON app.p1(label); CREATE TABLE app.lookup(id integer PRIMARY KEY); INSERT INTO app.lookup SELECT generate_series(0,10); ALTER TABLE app.p ADD CONSTRAINT outgoing FOREIGN KEY(k) REFERENCES app.lookup(id); CREATE TABLE app.ref(k integer,bucket integer, CONSTRAINT incoming FOREIGN KEY(k,bucket) REFERENCES app.p(k,bucket)); INSERT INTO app.ref VALUES(1,2),(3,4); CREATE VIEW app.v AS SELECT k,bucket FROM app.p; CREATE FUNCTION app.f() RETURNS bigint LANGUAGE SQL BEGIN ATOMIC SELECT sum(k)::bigint FROM app.p; END; CREATE FUNCTION app.tg() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS 'BEGIN NEW.label := NEW.label || ''!''; RETURN NEW; END'; CREATE TRIGGER label_trigger BEFORE INSERT ON app.p FOR EACH ROW EXECUTE FUNCTION app.tg(); GRANT SELECT ON app.p,app.v TO {}; GRANT EXECUTE ON FUNCTION app.f() TO {}",
-                    reader.name, reader.name
-                ),
-            );
+            on_server(connection, &dependents_sql(&reader.name));
         }
         if dependents {
             on_server(

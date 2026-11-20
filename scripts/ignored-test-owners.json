@@ -1492,6 +1492,7 @@
         "recorded_rebuild_plans_without_changing_the_source_tree",
         "rebuild2298b::approved_rebuilds_copy_conversions_and_chains_atomically_on_pg18",
         "rebuild2298b::approved_rebuilds_copy_conversions_and_chains_atomically_on_pg16",
+        "rebuild2298b::a_connected_rebuild_of_a_project_with_a_depends_on_line_still_plans_and_applies",
         "recorded_triggers_run_but_their_names_cannot_authorize_replacements",
         "reference_data_applies_pulls_defaults_and_refuses_rows_arriving_after_the_plan",
         "referential_action_locks_exclude_plain_children_and_hold_partitions",
