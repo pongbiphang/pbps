@@ -12,7 +12,7 @@ use super::*;
 /// Plans `base` to `declared`, runs the plan on a database built from
 /// `base_sql`, and compares with `declared_sql` built directly. Returns the
 /// statements, so a scenario can pin the order too.
-fn scenario(
+pub(super) fn scenario(
     (base, base_ids, base_sql): (&Schema, &IdsFile, &str),
     (declared, declared_ids, declared_sql): (&Schema, &IdsFile, &str),
 ) -> Vec<String> {
@@ -28,11 +28,11 @@ fn scenario(
     sql_text(&out).into_iter().map(str::to_owned).collect()
 }
 
-fn ab() -> Table {
+pub(super) fn ab() -> Table {
     table(&[("a", col("integer")), ("b", col("text"))])
 }
 
-fn ac() -> Table {
+pub(super) fn ac() -> Table {
     table(&[("a", col("integer")), ("c", col("text"))])
 }
 

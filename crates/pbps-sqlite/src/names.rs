@@ -27,6 +27,20 @@ pub fn is_ledger(name: &str) -> bool {
     LEDGER_TABLES.iter().any(|ours| ident::same(ours, name))
 }
 
+/// The start of the name a table holds between the two statements of a rename
+/// that changes only its ASCII case (`emit`). No declared table, view or index
+/// may start with it, so no object this tool manages can hold the name the
+/// rename passes through.
+pub const RENAME_PREFIX: &str = "__pbps_rename_";
+
+/// Whether `name` starts with [`RENAME_PREFIX`], ASCII case ignored as SQLite
+/// would.
+#[must_use]
+pub fn is_intermediate(name: &str) -> bool {
+    name.get(..RENAME_PREFIX.len())
+        .is_some_and(|start| ident::same(start, RENAME_PREFIX))
+}
+
 /// Problems among the tables, views and indexes a schema declares: they share
 /// one namespace per database, and two names there that differ only in ASCII
 /// case are one name. Names equal letter for letter are the shared checks'
@@ -225,6 +239,18 @@ mod tests {
     fn the_ledger_names_are_held_as_the_engine_holds_them() {
         for name in ["__pbps_state", "__pbps_lock", "__PBPS_STATE", "__Pbps_Lock"] {
             assert!(is_ledger(name), "{name}");
+        }
+        for name in ["__pbps_rename_", "__pbps_rename_x", "__PBPS_Rename_x"] {
+            assert!(is_intermediate(name) && !is_ledger(name), "{name}");
+        }
+        for name in [
+            "__pbps_rename",
+            "_pbps_rename_x",
+            "x__pbps_rename_",
+            "é__pbps_rename_",
+            "",
+        ] {
+            assert!(!is_intermediate(name), "{name}");
         }
         for name in ["__pbps_statements", "pbps_state", "__pbps_state_", "é"] {
             assert!(!is_ledger(name), "{name}");

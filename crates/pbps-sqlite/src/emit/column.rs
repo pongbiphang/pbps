@@ -4,8 +4,7 @@ use pbps_dialect::Created;
 use pbps_model::{Column, ColumnChange, ColumnName, TableName, ValueSource};
 
 use super::{
-    Form, Gate, Sql, allows_under, closed, is_rowid_name, later, local, qualified, rebuild,
-    statement,
+    Form, Gate, Sql, allowed, closed, is_rowid_name, local, qualified, rebuild, statement,
 };
 use crate::dialect::Sqlite;
 use crate::types;
@@ -22,12 +21,19 @@ pub(super) fn emit(dialect: &Sqlite, gate: Gate, change: &ColumnChange) -> Sql {
         ColumnChange::RenameColumn {
             table, from, to, ..
         } => rename(dialect, gate, table, from, to),
-        ColumnChange::DropColumn { .. } => {
-            Err(later("dropping a column (ALTER TABLE .. DROP COLUMN)"))
-        }
-        ColumnChange::AlterColumnNullability { .. } => Err(later(
-            "making a column NOT NULL or nullable (ALTER TABLE .. ALTER COLUMN)",
-        )),
+        ColumnChange::DropColumn { column, .. } => drop(dialect, gate, column),
+        ColumnChange::AlterColumnNullability {
+            column,
+            to_nullable,
+            through_external_partitions,
+            ..
+        } => nullability(
+            dialect,
+            gate,
+            column,
+            *to_nullable,
+            *through_external_partitions,
+        ),
         ColumnChange::AlterColumnType { .. } => Err(rebuild("changing a column's type")),
         ColumnChange::AlterColumnDefault { .. } => Err(rebuild("changing a column's default")),
         ColumnChange::AlterColumnExpression { .. }
@@ -137,13 +143,7 @@ fn rename(
     to: &ColumnName,
 ) -> Sql {
     let at = qualified(table)?;
-    if !allows_under(gate, dialect.floor(), Form::RenameColumn) {
-        return Err(rebuild(&format!(
-            "renaming a column needs SQLite {}, and this project's floor is {}",
-            Form::RenameColumn.arrival(),
-            dialect.floor()
-        )));
-    }
+    allowed(dialect, gate, Form::RenameColumn, "renaming a column")?;
     if is_rowid_name(from.raw()) || is_rowid_name(to.raw()) {
         return Err(rebuild(
             "renaming a column to or from rowid, _rowid_ or oid, which SQLite refuses",
@@ -156,6 +156,67 @@ fn rename(
         &local(from.raw())?,
         " TO ",
         &local(to.raw())?,
+    ]
+    .concat();
+    Ok(vec![statement(sql)])
+}
+
+/// `ALTER TABLE .. DROP COLUMN`. SQLite refuses it for a column in an index, a
+/// key, a table check, a foreign key, a view, a trigger or a generated column,
+/// and for the last column of a table (measured), and the statement cannot see
+/// any of that. The order does for the dependents: the shared effects require
+/// each gone first and the views torn down around the drop (`ordering`), and the
+/// keys and unique constraints, which SQLite cannot drop in place, are the
+/// rebuild's own refusals. The last column is the one refusal left to the
+/// engine (see the test that pins it).
+fn drop(dialect: &Sqlite, gate: Gate, column: &pbps_model::ColumnRef) -> Sql {
+    allowed(dialect, gate, Form::DropColumn, "dropping a column")?;
+    let sql = [
+        "ALTER TABLE ",
+        &qualified(&column.table)?,
+        " DROP COLUMN ",
+        &local(column.name.raw())?,
+    ]
+    .concat();
+    Ok(vec![statement(sql)])
+}
+
+/// `ALTER COLUMN .. SET NOT NULL` or `DROP NOT NULL`. `SET` scans the table and
+/// is refused, with the table unchanged, when a row holds NULL: the engine's
+/// refusal at apply, inside the plan's transaction, which the shared risk class
+/// `NotNull` already puts in front of a reviewer. No other dependent blocks
+/// either form (measured: indexes, views, checks, keys, either side of a
+/// foreign key).
+fn nullability(
+    dialect: &Sqlite,
+    gate: Gate,
+    column: &pbps_model::ColumnRef,
+    to_nullable: bool,
+    through_external_partitions: bool,
+) -> Sql {
+    if through_external_partitions {
+        return Err(unsupported("partitions"));
+    }
+    let (form, tail, what) = if to_nullable {
+        (
+            Form::DropNotNull,
+            " DROP NOT NULL",
+            "making a column nullable",
+        )
+    } else {
+        (
+            Form::SetNotNull,
+            " SET NOT NULL",
+            "making a column NOT NULL",
+        )
+    };
+    allowed(dialect, gate, form, what)?;
+    let sql = [
+        "ALTER TABLE ",
+        &qualified(&column.table)?,
+        " ALTER COLUMN ",
+        &local(column.name.raw())?,
+        tail,
     ]
     .concat();
     Ok(vec![statement(sql)])

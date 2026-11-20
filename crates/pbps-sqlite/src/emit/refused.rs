@@ -2,11 +2,11 @@
 //! rebuilt, answered by name (#2950). Each variant is listed: no wildcard arm.
 
 use pbps_model::{
-    ConstraintChange, ExtensionChange, GrantChange, PartitionChange, PolicyChange, RoleChange,
-    RowChange, SearchChange, TablePropertyChange, TypeChange, TypeValueChange,
+    ExtensionChange, GrantChange, PartitionChange, PolicyChange, RoleChange, RowChange,
+    SearchChange, TablePropertyChange, TypeChange, TypeValueChange,
 };
 
-use super::{Sql, later, rebuild};
+use super::Sql;
 use crate::validate::{not_built, unsupported};
 
 pub(super) fn table_property(change: &TablePropertyChange) -> Sql {
@@ -31,23 +31,6 @@ pub(super) fn partition(change: &PartitionChange) -> Sql {
         | PartitionChange::SetPartitionDefault { .. }
         | PartitionChange::SetPartitionNotNull { .. } => Err(unsupported("partitions")),
     }
-}
-
-pub(super) fn constraint(change: &ConstraintChange) -> Sql {
-    Err(match change {
-        ConstraintChange::SetPrimaryKey { .. } => rebuild("changing a table's primary key"),
-        ConstraintChange::AddUnique { .. } | ConstraintChange::DropUnique { .. } => {
-            rebuild("adding or dropping a unique constraint")
-        }
-        ConstraintChange::AddForeignKey { .. } => rebuild("adding a foreign key"),
-        ConstraintChange::DropForeignKey { .. } => {
-            later("dropping a foreign key (ALTER TABLE .. DROP CONSTRAINT)")
-        }
-        ConstraintChange::AddCheck { .. } | ConstraintChange::DropCheck { .. } => {
-            later("adding or dropping a check constraint (ALTER TABLE .. ADD/DROP CONSTRAINT)")
-        }
-        ConstraintChange::SetExclusion { .. } => unsupported("exclusion constraints"),
-    })
 }
 
 pub(super) fn policy(change: &PolicyChange) -> Sql {

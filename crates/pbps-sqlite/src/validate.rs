@@ -42,6 +42,17 @@ fn ledger_name(what: &str) -> DialectError {
     ))
 }
 
+/// The refusal of a name kept for a rename's middle step: a table renamed to
+/// its own name in another ASCII case passes through `__pbps_rename_<uid>`, and
+/// the step fails if anything holds that name.
+pub(crate) fn intermediate_name(what: &str) -> DialectError {
+    invalid(format!(
+        "{what} starts with `{}`, which this tool keeps for the name a table holds while it is \
+         renamed to its own name in another case; choose another name",
+        names::RENAME_PREFIX
+    ))
+}
+
 pub(crate) fn unsupported(feature: impl Into<String>) -> DialectError {
     DialectError::Unsupported {
         dialect: DIALECT,
@@ -75,6 +86,9 @@ fn object(kind: &str, schema: &str, local: &str, shown: &str, found: &mut Vec<Di
     }
     if names::is_ledger(local) {
         found.push(ledger_name(&format!("the {kind} `{shown}`")));
+    }
+    if names::is_intermediate(local) {
+        found.push(intermediate_name(&format!("the {kind} `{shown}`")));
     }
 }
 
@@ -253,6 +267,56 @@ pub(crate) fn column_errors(
     }
 }
 
+/// Constraint names of one table that differ only in ASCII case. The shared
+/// rule (`Table::constraint_name_conflicts`, called in `table`) compares names
+/// exactly and reports the pairs that are letter for letter alike; SQLite folds
+/// ASCII case, which is what this adds. SQLite takes a `CREATE TABLE` that
+/// gives two constraints the same name, and then `DROP CONSTRAINT` drops the
+/// first of them whatever its kind and `ADD CONSTRAINT` refuses the name
+/// (measured), so a declaration that does it could never be changed in place.
+fn constraint_names_by_case(shown: &str, table: &Table, found: &mut Vec<DialectError>) {
+    let named = table
+        .primary_key
+        .iter()
+        .filter_map(|key| key.name.as_ref())
+        .map(|name| (name, "primary key"))
+        .chain(table.unique.keys().map(|name| (name, "unique constraint")))
+        .chain(table.foreign_keys.keys().map(|name| (name, "foreign key")))
+        .chain(table.checks.keys().map(|name| (name, "check constraint")));
+    let mut seen: Vec<(&ObjectLocalName, &str)> = Vec::new();
+    for (name, kind) in named {
+        if let Some((_, was)) = seen
+            .iter()
+            .find(|(other, _)| other.raw() != name.raw() && ident::same(other.raw(), name.raw()))
+        {
+            found.push(invalid(format!(
+                "the {was} and the {kind} of `{shown}` are named alike in another ASCII case (`{}`); \
+                 SQLite folds the case, so it drops whichever comes first and refuses to add a second",
+                name.shown()
+            )));
+        }
+        seen.push((name, kind));
+    }
+}
+
+/// What is wrong with one declared check: a name SQLite cannot be given, or an
+/// expression it would not read whole.
+pub(crate) fn check_errors(
+    shown: &str,
+    constraint: &ObjectLocalName,
+    check: &pbps_model::CheckConstraint,
+    found: &mut Vec<DialectError>,
+) {
+    local_name("check constraint", constraint.raw(), found);
+    if !expression(&check.expression) {
+        found.push(invalid(format!(
+            "check constraint `{}` of `{shown}` is not one expression SQLite reads whole (empty, \
+             unbalanced parentheses, or a `;`)",
+            constraint.shown()
+        )));
+    }
+}
+
 /// What is wrong with one declared index. The columns are held to the table's
 /// only when the table is at hand: an emitter given just the index cannot.
 pub(crate) fn index_errors(
@@ -271,6 +335,9 @@ pub(crate) fn index_errors(
     }
     if names::is_ledger(index.raw()) {
         found.push(ledger_name(&what));
+    }
+    if names::is_intermediate(index.raw()) {
+        found.push(intermediate_name(&what));
     }
     let mut keys = Vec::new();
     for key in &def.columns {
@@ -426,15 +493,10 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
         }
     }
     for (constraint, check) in &table.checks {
-        local_name("check constraint", constraint.raw(), &mut found);
-        if !expression(&check.expression) {
-            found.push(invalid(format!(
-                "check constraint `{}` of `{shown}` is not one expression SQLite reads whole (empty, \
-                 unbalanced parentheses, or a `;`)",
-                constraint.shown()
-            )));
-        }
+        check_errors(&shown, constraint, check, &mut found);
     }
+    found.extend(table.constraint_name_conflicts().into_iter().map(invalid));
+    constraint_names_by_case(&shown, table, &mut found);
     for (index, def) in &table.indexes {
         index_errors(&shown, index, def, Some(table), &mut found);
     }
@@ -1690,6 +1752,36 @@ mod tests {
                 expression(text)
             };
             assert!(taken, "{text} is structure this check takes");
+        }
+    }
+
+    /// A case-only rename passes through `__pbps_rename_<uid>`, and SQLite
+    /// refuses that step when a table, a view or an index holds the name. No
+    /// declared object may therefore start with the prefix, in any case.
+    #[test]
+    fn a_name_kept_for_a_rename_s_middle_step_is_refused() {
+        // The engine's side: each holder of the name blocks the step.
+        for holder in [
+            "CREATE TABLE __pbps_rename_x(a)",
+            "CREATE VIEW __PBPS_RENAME_x AS SELECT 1",
+            "CREATE TABLE o(c); CREATE INDEX __pbps_rename_x ON o(c)",
+        ] {
+            let step = "; CREATE TABLE t(a); ALTER TABLE main.t RENAME TO __pbps_rename_x";
+            assert!(accepts(holder), "{holder}");
+            assert!(!accepts(&[holder, step].concat()), "{holder}");
+        }
+        for name in ["__pbps_rename_x", "__PBPS_RENAME_", "__Pbps_Rename_tbl_1"] {
+            assert!(!self::table(&TableName::new("main", name), &base()).is_empty());
+            let mut table = base();
+            table.indexes.insert(name.into(), index(&["c"]));
+            assert!(!errors(&table).is_empty(), "an index named {name}");
+        }
+        // Negative: near the prefix, and the prefix inside a name.
+        for name in ["__pbps_rename", "__pbps_renamed", "x__pbps_rename_x"] {
+            assert!(self::table(&TableName::new("main", name), &base()).is_empty());
+            let mut table = base();
+            table.indexes.insert(name.into(), index(&["c"]));
+            assert!(errors(&table).is_empty(), "an index named {name}");
         }
     }
 

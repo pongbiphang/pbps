@@ -198,3 +198,73 @@ fn the_boolean_default_means_a_constant_only_from_its_release() {
     assert_eq!(rows[0].integer(0).expect("an integer, not text"), 1);
     assert_eq!(BOOLEAN_WORDS, Version::new(3, 23, 0));
 }
+
+/// Each in-place form written by the second part of the emitter, with the change
+/// that writes it.
+fn forms() -> Vec<(Form, Change)> {
+    use super::constraints::{add_check, drop_check, drop_fk, nullability};
+    vec![
+        (
+            Form::DropColumn,
+            Change::Column(ColumnChange::DropColumn {
+                uid: uid(UidKind::Column, "t.b"),
+                column: pbps_model::ColumnRef {
+                    table: tn("t"),
+                    name: "b".into(),
+                },
+            }),
+        ),
+        (Form::SetNotNull, nullability(false)),
+        (Form::DropNotNull, nullability(true)),
+        (Form::AddCheck, add_check("t", "k", "a > 0")),
+        (Form::DropCheck, drop_check("t", "k")),
+        (Form::DropForeignKey, drop_fk("t", "f")),
+    ]
+}
+
+#[test]
+fn every_form_is_written_under_the_text_gate_whatever_the_floor() {
+    for (form, change) in forms() {
+        for floor in [
+            Version::new(3, 8, 0),
+            Version::new(3, 34, 0),
+            Version::new(3, 52, 0),
+        ] {
+            let out = emit_under(Gate::Text, &Sqlite::with_floor(floor), &change);
+            assert!(out.is_ok(), "{form:?} at {floor}: {out:?}");
+        }
+    }
+}
+
+#[test]
+fn under_the_form_gate_each_is_the_rebuilds_below_its_release_and_written_at_it() {
+    for (form, change) in forms() {
+        let arrival = form.arrival();
+        // A release before the form's own minor.
+        let before = Version::new(arrival.major, arrival.minor - 1, 99);
+        assert!(
+            emit_under(Gate::EveryForm, &Sqlite::with_floor(arrival), &change).is_ok(),
+            "{form:?} at {arrival}"
+        );
+        match emit_under(Gate::EveryForm, &Sqlite::with_floor(before), &change) {
+            Err(DialectError::NotBuilt { part, .. }) => {
+                assert!(part.contains("table rebuild"), "{form:?}: {part}");
+                assert!(part.contains(&arrival.to_string()), "{form:?}: {part}");
+            }
+            other => panic!("{form:?} below {arrival} must be the rebuild's, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn the_form_table_in_this_test_is_every_form_the_gate_knows_but_the_first() {
+    // The first, renaming a column, has its own test above.
+    let tested: Vec<Form> = forms().into_iter().map(|(form, _)| form).collect();
+    for form in Form::ALL {
+        assert_eq!(
+            tested.contains(&form),
+            form != Form::RenameColumn,
+            "{form:?}"
+        );
+    }
+}

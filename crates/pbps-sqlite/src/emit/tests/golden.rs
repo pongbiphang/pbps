@@ -243,13 +243,6 @@ fn rename_table_writes_the_new_name_bare_and_records_the_rename() {
 }
 
 #[test]
-fn a_rename_that_differs_only_in_case_is_the_next_part_and_never_a_statement() {
-    let err = statements(&sqlite(), rename_table("t", "T")).expect_err("not built");
-    assert!(matches!(err, DialectError::NotBuilt { .. }), "{err:?}");
-    assert!(err.to_string().contains("next part of item 3"), "{err}");
-}
-
-#[test]
 fn add_column_forms_and_their_catalogs() {
     let cases: [(&str, Column, &str, &str); 4] = [
         (

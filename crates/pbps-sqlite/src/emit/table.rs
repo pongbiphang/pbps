@@ -3,10 +3,10 @@
 use pbps_dialect::Created;
 use pbps_model::{
     CheckConstraint, ForeignKey, ObjectLocalName, PrimaryKey, ReferentialAction, Table,
-    TableChange, TableName, UniqueConstraint,
+    TableChange, TableName, Uid, UniqueConstraint,
 };
 
-use super::{Sql, closed, column, index, later, local, qualified, statement};
+use super::{Sql, closed, column, index, local, qualified, statement};
 use crate::validate::{self, SCHEMA, unsupported};
 use crate::{ident, names};
 
@@ -34,8 +34,11 @@ pub(super) fn emit(change: &TableChange) -> Sql {
             Ok(vec![statement(["DROP TABLE ", &qualified(name)?].concat())])
         }
         TableChange::RenameTable {
-            from, to, defaults, ..
-        } => rename(from, to, defaults),
+            uid,
+            from,
+            to,
+            defaults,
+        } => rename(uid, from, to, defaults),
     }
 }
 
@@ -166,35 +169,48 @@ fn foreign_key_clause(
     .concat())
 }
 
-/// A plain rename. The new name is written bare (`RENAME TO main.u` is a syntax
-/// error). Two names that differ only in ASCII case are one name to SQLite, which
-/// refuses the direct rename as an existing table: that is the next part of the
-/// item, through a name in between.
-fn rename(from: &TableName, to: &TableName, defaults: &[pbps_model::ColumnName]) -> Sql {
+/// The name a table holds between the two statements of a case-only rename.
+/// The identity makes it the table's own, and no declared table, view or index
+/// may start with the prefix (`validate`), so nothing this tool manages holds
+/// it. An object the declarations do not know of still can: SQLite then
+/// refuses the first statement, atomically.
+pub(super) fn intermediate(uid: &Uid, schema: &str) -> TableName {
+    TableName::new(schema, [names::RENAME_PREFIX, uid.as_str()].concat())
+}
+
+/// A rename. The new name is written bare (`RENAME TO main.u` is a syntax
+/// error). Two names that differ only in ASCII case are one name to SQLite,
+/// which refuses the direct rename as an existing table, so such a rename is two
+/// statements through a name in between, and the statements record it, so the
+/// plan sees a name that is in neither the baseline nor the declaration.
+fn rename(uid: &Uid, from: &TableName, to: &TableName, defaults: &[pbps_model::ColumnName]) -> Sql {
     if !defaults.is_empty() {
         return Err(unsupported(
             "renaming the generated default constraints of a table, which are SQL Server's",
         ));
     }
-    if ident::same(&from.name, &to.name) && from.name != to.name {
-        return Err(later(
-            "renaming a table to its own name in another ASCII case",
-        ));
-    }
-    if names::is_ledger(&to.name) || ident::has_reserved_prefix(&to.name) {
+    if names::is_ledger(&to.name)
+        || names::is_intermediate(&to.name)
+        || ident::has_reserved_prefix(&to.name)
+    {
         return Err(unsupported(format!(
-            "naming a table `{}`: the name is SQLite's or the ledger's own",
+            "naming a table `{}`: the name is SQLite's or this tool's own",
             to.shown()
         )));
     }
-    let sql = [
-        "ALTER TABLE ",
-        &qualified(from)?,
-        " RENAME TO ",
-        &local(&to.name)?,
-    ]
-    .concat();
     // Both ends in `main`.
+    let old = qualified(from)?;
     qualified(to)?;
-    Ok(vec![statement(sql).renaming(from.clone(), to.clone())])
+    let step = |at: &str, name: &TableName| -> Result<String, pbps_dialect::DialectError> {
+        Ok(["ALTER TABLE ", at, " RENAME TO ", &local(&name.name)?].concat())
+    };
+    if ident::same(&from.name, &to.name) && from.name != to.name {
+        let between = intermediate(uid, &from.schema);
+        let first = statement(step(&old, &between)?).renaming(from.clone(), between.clone());
+        let second = statement(step(&qualified(&between)?, to)?).renaming(between, to.clone());
+        return Ok(vec![first, second]);
+    }
+    Ok(vec![
+        statement(step(&old, to)?).renaming(from.clone(), to.clone()),
+    ])
 }

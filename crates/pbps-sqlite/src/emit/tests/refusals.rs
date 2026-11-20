@@ -5,8 +5,8 @@
 //! success.
 
 use pbps_model::{
-    CheckConstraint, ColumnChange, ConstraintChange, ForeignKey, ObjectLocalName, PrimaryKey,
-    ReferentialAction, RoleChange, UniqueConstraint,
+    ColumnChange, ConstraintChange, ForeignKey, ObjectLocalName, PrimaryKey, ReferentialAction,
+    RoleChange, UniqueConstraint,
 };
 
 use super::golden::{index, uid};
@@ -16,8 +16,6 @@ use super::*;
 enum Answer {
     /// The table rebuild (item 8).
     Rebuild,
-    /// The next part of this item.
-    Later,
     /// Refused by validation; the emitter answers too.
     Unsupported,
 }
@@ -27,9 +25,6 @@ fn answer(change: Change) -> Answer {
         Ok(out) => panic!("a statement was written: {:?}", sql_text(&out)),
         Err(DialectError::NotBuilt { part, .. }) if part.contains("table rebuild") => {
             Answer::Rebuild
-        }
-        Err(DialectError::NotBuilt { part, .. }) if part.contains("next part of item 3") => {
-            Answer::Later
         }
         Err(DialectError::Unsupported { .. }) => Answer::Unsupported,
         Err(other) => panic!("unexpected answer: {other:?}"),
@@ -130,58 +125,6 @@ fn what_sqlite_cannot_change_in_place_is_the_rebuilds() {
     ];
     for (what, change) in cases {
         assert_eq!(answer(change), Answer::Rebuild, "{what}");
-    }
-}
-
-#[test]
-fn the_forms_of_the_next_part_are_said_to_be_so_and_never_written() {
-    let n = || ObjectLocalName::new("k");
-    let cases = [
-        (
-            "drop foreign key",
-            Change::Constraint(ConstraintChange::DropForeignKey {
-                table: tn("t"),
-                name: n(),
-            }),
-        ),
-        (
-            "add check",
-            Change::Constraint(ConstraintChange::AddCheck {
-                table: tn("t"),
-                name: n(),
-                constraint: CheckConstraint {
-                    expression: "a > 0".into(),
-                },
-            }),
-        ),
-        (
-            "drop check",
-            Change::Constraint(ConstraintChange::DropCheck {
-                table: tn("t"),
-                name: n(),
-            }),
-        ),
-        (
-            "drop column",
-            Change::Column(ColumnChange::DropColumn {
-                uid: uid(UidKind::Column, "t.a"),
-                column: c("a"),
-            }),
-        ),
-        (
-            "nullability",
-            Change::Column(ColumnChange::AlterColumnNullability {
-                uid: uid(UidKind::Column, "t.a"),
-                column: c("a"),
-                ty: ty("integer"),
-                to_nullable: false,
-                collation: None,
-                through_external_partitions: false,
-            }),
-        ),
-    ];
-    for (what, change) in cases {
-        assert_eq!(answer(change), Answer::Later, "{what}");
     }
 }
 

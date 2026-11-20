@@ -28,7 +28,10 @@ use crate::dialect::Sqlite;
 use crate::lexis::{self, Piece};
 use crate::tests::Fresh;
 
+mod case_rename;
+mod constraints;
 mod differential;
+mod drop_column;
 mod golden;
 mod names;
 mod plan_dialect;
