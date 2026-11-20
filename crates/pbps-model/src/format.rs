@@ -168,23 +168,19 @@ pub struct Released {
 /// One parser for the loader below and for the release step's own check of what
 /// it wrote, so the two cannot come to accept different files.
 pub fn parse_record(text: &str) -> Result<Option<Released>, serde_json::Error> {
+    // A derived `Option` field reads a missing key as `None`, so `{}` would mean
+    // "nothing released" and switch every increment check off. A newtype of the
+    // option is not an option to the derive: its key must be written, and `null`
+    // is still `None`. The derive keeps refusing a key written twice, which a
+    // look at the parsed value first would lose (the last one wins there).
+    #[derive(serde::Deserialize)]
+    struct Written(Option<Released>);
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Record {
-        released: Option<Released>,
+        released: Written,
     }
-    // A derived `Option` field reads a missing key as `None`, so `{}` would mean
-    // "nothing released" and switch every increment check off. The file has two
-    // shapes, `null` and a record, so the key is asked for first.
-    // (`deserialize_with` would do it too, but the model's rule for those fields
-    // also wants a schema marker, and this struct has no schema.)
-    let value: serde_json::Value = serde_json::from_str(text)?;
-    if value.get("released").is_none() {
-        return Err(<serde_json::Error as serde::de::Error>::custom(
-            "the record has no `released` key: it is `null` or a release",
-        ));
-    }
-    serde_json::from_value::<Record>(value).map(|record| record.released)
+    serde_json::from_str::<Record>(text).map(|record| record.released.0)
 }
 
 /// The last release's frozen formats, or `None` while no release exists.
@@ -456,6 +452,13 @@ mod tests {
             r#"{"released": null, "note": 1}"#,
             "",
             "null",
+            // The key twice: a reader that kept the last one would read the
+            // second of these as "nothing released".
+            r#"{"released": null, "released": null}"#,
+            &format!(
+                r#"{{{}, "released": null}}"#,
+                &release[1..release.len() - 1]
+            ),
         ] {
             assert!(parse_record(damaged).is_err(), "{damaged:?}");
         }
