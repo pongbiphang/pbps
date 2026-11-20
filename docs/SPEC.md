@@ -2721,7 +2721,8 @@ tries that lock: when it cannot take it, the holder is alive and the run is
 refused naming the holder; when it can, the holder is gone, its row is cleared
 and replaced, and the run prints whose row it cleared (SQLite rolls back a
 transaction a dead process left, so nothing it did is half done). The sidecar is
-empty and is never deleted. Where the lock file cannot be created or locked, or
+empty and is never deleted. A row whose holder locked another sidecar (the same
+database reached through a hard link) is never cleared automatically. Where the lock file cannot be created or locked, or
 the database has no file (it is in memory), the row alone holds and only
 `pbps unlock` clears it. A network file system is not detected: where the system
 reports the lock taken, it is believed. `pbps unlock` clears the row whoever

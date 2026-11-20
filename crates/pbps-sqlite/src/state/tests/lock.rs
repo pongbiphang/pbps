@@ -60,11 +60,24 @@ fn locked_info(result: Result<Taken, LedgerError>) -> LockInfo {
     }
 }
 
-/// A stale row as a dead run with a proof leaves it.
+/// A stale row as a dead run leaves it: for a proof of `file`, with the sidecar
+/// a run on this connection would lock.
 fn stale_row(c: &Connection, holder: &str, proof: &str) {
     ensure_tables(c).expect("created");
+    let sidecar = if proof == "file" {
+        // A lock taken and dropped leaves exactly that row; keep its sidecar.
+        let taken = lock(c, "probe").expect("a free lock");
+        drop(taken);
+        let key = text(c, &format!("SELECT sidecar FROM {LOCK_TABLE}"));
+        c.execute_batch(&format!("DELETE FROM {LOCK_TABLE}"))
+            .expect("emptied");
+        format!("'{key}'")
+    } else {
+        "NULL".to_owned()
+    };
     c.execute_batch(&format!(
-        "INSERT INTO {LOCK_TABLE} (id, locked_by, proof, token) VALUES (1, '{holder}', '{proof}', 'ghost')"
+        "INSERT INTO {LOCK_TABLE} (id, locked_by, proof, sidecar, token) \
+         VALUES (1, '{holder}', '{proof}', {sidecar}, 'ghost')"
     ))
     .expect("a row left behind");
 }
@@ -246,6 +259,8 @@ fn a_run_without_a_proof_cannot_clear_a_row_that_had_one_and_says_why() {
     let mut fresh = Fresh::file();
     let path = fresh.path().to_path_buf();
     stale_row(fresh.connection(), "ghost [pid 9]", "file");
+    // The lock file a holder left is put out of reach: a directory in its name.
+    std::fs::remove_file(sidecar_path(&path)).expect("the file the holder left");
     std::fs::create_dir(sidecar_path(&path)).expect("a directory");
     let info = locked_info(lock(fresh.connection(), HOLDER));
     let lookup = info.session_lookup.expect("said");
@@ -610,4 +625,32 @@ fn a_database_whose_file_name_is_not_utf8_is_locked_with_its_sidecar() {
     let sidecar = sidecar_path(&std::fs::canonicalize(&path).expect("the real path"));
     assert!(sidecar.exists(), "{}", sidecar.display());
     assert!(release(&c, taken.guard).expect("released"));
+}
+
+/// Two hard links to one database file are two paths to everything, so each has
+/// a sidecar of its own. The lock a run takes on one says nothing about a holder
+/// that locked the other: its row is never cleared, alive or gone.
+#[test]
+fn a_holder_that_locked_through_a_hard_link_is_never_cleared_by_the_other_path() {
+    let fresh = Fresh::file();
+    let real = fresh.path().to_path_buf();
+    let linked = real.with_file_name("hard.db");
+    std::fs::hard_link(&real, &linked).expect("a hard link to the file");
+    let first = open(&real);
+    let taken = lock(&first, HOLDER).expect("locked");
+    let second = open(&linked);
+    // Alive: the other path's sidecar is free, and the row still holds.
+    let info = locked_info(lock(&second, "x"));
+    assert_eq!(info.locked_by, HOLDER);
+    let said = info.session_lookup.expect("said");
+    assert!(said.contains("through another path"), "{said}");
+    assert!(said.contains("pbps unlock"), "{said}");
+    // Gone: still not cleared from the other path, which cannot know.
+    drop(taken);
+    assert_eq!(locked_info(lock(&second, "x")).locked_by, HOLDER);
+    // Negative: the path the holder used clears it, as for any dead holder.
+    let third = open(&real);
+    let taken = lock(&third, "y").expect("the same path proves the holder gone");
+    assert_eq!(taken.cleared.expect("cleared").locked_by, HOLDER);
+    release(&third, taken.guard).expect("released");
 }

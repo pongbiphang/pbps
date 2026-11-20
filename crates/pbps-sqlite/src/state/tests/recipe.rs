@@ -30,6 +30,7 @@ const LOCK_TEXT: &str = "CREATE TABLE __pbps_lock (
     locked_by TEXT    NOT NULL CHECK (length(locked_by) <= 256),
     locked_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
     proof     TEXT    NOT NULL CHECK (proof IN ('file', 'row')),
+    sidecar   TEXT,
     token     TEXT    NOT NULL
 )";
 

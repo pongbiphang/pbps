@@ -74,13 +74,15 @@ const STATE_BODY: &str = "__pbps_state (
 /// unrepresentable, as the other engines' lock tables do).
 ///
 /// `proof` says whether the holder's liveness could be proved by the lock on the
-/// sidecar file, and `token` is random and tells a run its own row from another's.
-/// Both are written by `lock` and read only by this tool.
+/// sidecar file, `sidecar` names that file (its path's bytes in hexadecimal, NULL
+/// without a proof), and `token` is random and tells a run its own row from
+/// another's. All three are written by `lock` and read only by this tool.
 const LOCK_BODY: &str = "__pbps_lock (
     id        INTEGER PRIMARY KEY CHECK (id = 1),
     locked_by TEXT    NOT NULL CHECK (length(locked_by) <= 256),
     locked_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
     proof     TEXT    NOT NULL CHECK (proof IN ('file', 'row')),
+    sidecar   TEXT,
     token     TEXT    NOT NULL
 )";
 

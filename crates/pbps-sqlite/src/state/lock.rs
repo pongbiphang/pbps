@@ -52,8 +52,15 @@
 //! can be made safe against a run opening it at that moment. It is empty and
 //! stays beside the database. Its name is resolved from the connection's own file
 //! name (`PRAGMA database_list`), which SQLite has made absolute with symbolic
-//! links followed (measured), so two spellings of one file meet on one sidecar. Two
-//! hard links to one file are two paths to SQLite as well, and do not.
+//! links followed on Unix (measured); the path is made canonical here as well,
+//! for the platforms where SQLite does not follow links. So two spellings of one
+//! file meet on one sidecar.
+//!
+//! Two hard links to one file are two paths to everything, and do not meet. So
+//! the row records **which** sidecar its holder locked, and a run clears a stale
+//! row only when that is the sidecar it holds itself: the lock this run took
+//! says nothing about a holder that locked another file. Such a row is refused
+//! and left for `pbps unlock`, as a row with no proof is.
 //!
 //! A network file system cannot be detected portably and is not tried: where the
 //! system reports the lock taken, it is believed.
@@ -149,8 +156,8 @@ pub fn sidecar_path(database: &Path) -> PathBuf {
 
 /// What trying the operating-system lock came to.
 enum Attempt {
-    /// This run holds it.
-    Held(File),
+    /// This run holds it, on the sidecar named by this key.
+    Held(File, String),
     /// Another holds it: the holder is alive.
     Alive,
     /// It cannot be used.
@@ -219,6 +226,16 @@ fn attempt(c: &Connection) -> Result<Attempt, DbError> {
         Ok(None) => return Ok(Attempt::Without(RowOnly::NoFile)),
         Err(why) => return Ok(Attempt::Without(why)),
     };
+    // SQLite follows links on Unix and not everywhere; without this, one file
+    // reached through a link would have a sidecar per spelling.
+    let database = match std::fs::canonicalize(&database) {
+        Ok(real) => real,
+        Err(error) => {
+            return Ok(Attempt::Without(RowOnly::Unavailable(format!(
+                "the database's own path cannot be resolved: {error}"
+            ))));
+        }
+    };
     let path = sidecar_path(&database);
     let shown = path.display().to_string();
     let file = match OpenOptions::new()
@@ -237,7 +254,7 @@ fn attempt(c: &Connection) -> Result<Attempt, DbError> {
         }
     };
     match file.try_lock() {
-        Ok(()) => Ok(Attempt::Held(file)),
+        Ok(()) => Ok(Attempt::Held(file, key(&path))),
         Err(TryLockError::WouldBlock) => Ok(Attempt::Alive),
         // Unsupported, or failed in some other way: not "held", and not to be
         // trusted as "free" either.
@@ -248,11 +265,27 @@ fn attempt(c: &Connection) -> Result<Attempt, DbError> {
     }
 }
 
+/// A sidecar's path as the row holds it: its bytes in hexadecimal, so a path
+/// that is not text is held too and two keys are equal exactly when the paths
+/// are.
+fn key(sidecar: &Path) -> String {
+    use std::fmt::Write;
+    sidecar
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(String::new(), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+}
+
 /// What the lock table's row says.
 struct Row {
     locked_by: String,
     locked_at: String,
     proof: String,
+    sidecar: Option<String>,
 }
 
 /// The `proof` column's words.
@@ -269,7 +302,7 @@ fn read_row(c: &Connection) -> Result<Option<Row>, DbError> {
         return Ok(None);
     }
     let rows = c.query(
-        &format!("SELECT locked_by, locked_at, proof FROM {LOCK_TABLE} WHERE id = 1"),
+        &format!("SELECT locked_by, locked_at, proof, sidecar FROM {LOCK_TABLE} WHERE id = 1"),
         &[],
     )?;
     rows.first()
@@ -278,6 +311,7 @@ fn read_row(c: &Connection) -> Result<Option<Row>, DbError> {
                 locked_by: row.text(0)?.to_owned(),
                 locked_at: row.text(1)?.to_owned(),
                 proof: row.text(2)?.to_owned(),
+                sidecar: row.optional_text(3)?.map(str::to_owned),
             })
         })
         .transpose()
@@ -288,7 +322,7 @@ fn read_row(c: &Connection) -> Result<Option<Row>, DbError> {
 /// SQLite keeps no list of sessions, so there is nothing to search; what can be
 /// said is whether this tool could tell the holder is alive, and what to do when
 /// it could not.
-fn lookup(row_proof: &str, ours: Option<&Proof>) -> String {
+fn lookup(row_proof: &str, same_sidecar: bool, ours: Option<&Proof>) -> String {
     let confirm = "Confirm on the host named above that the process has exited before \
                    `pbps unlock --db ...`; SQLite rolls back a transaction a dead process left, \
                    so what it was doing is not left half done";
@@ -297,6 +331,12 @@ fn lookup(row_proof: &str, ours: Option<&Proof>) -> String {
         (PROOF_ROW, _) => format!(
             "This lock was taken without a liveness check, so only `pbps unlock` clears it. \
              {confirm}."
+        ),
+        // This run locked a file, and it is not the one that holder locked.
+        (_, Some(Proof::File)) if !same_sidecar => format!(
+            "This lock was taken through another path to the same database (a hard link, or a \
+             path this system does not resolve), so the lock file this run can see says \
+             nothing about its holder, and only `pbps unlock` clears it. {confirm}."
         ),
         (_, Some(Proof::File)) => "That holder is alive: it holds the operating-system lock on \
              the lock file beside the database. Wait for it to finish. A holder that is gone is \
@@ -313,8 +353,11 @@ fn lookup(row_proof: &str, ours: Option<&Proof>) -> String {
     }
 }
 
-fn info(row: Row, ours: Option<&Proof>) -> LockInfo {
-    let session_lookup = Some(lookup(&row.proof, ours));
+fn info(row: Row, ours: Option<&Proof>, sidecar: Option<&str>) -> LockInfo {
+    // With no sidecar of this run's to compare (a read, or no proof), nothing
+    // is claimed about which file the holder locked.
+    let same = sidecar.is_none() || row.sidecar.as_deref() == sidecar;
+    let session_lookup = Some(lookup(&row.proof, same, ours));
     LockInfo {
         locked_by: row.locked_by,
         locked_at: row.locked_at,
@@ -328,9 +371,9 @@ fn info(row: Row, ours: Option<&Proof>) -> LockInfo {
 /// between, and is reported as contention without a name, as on the other engines:
 /// a sentence with a hole in it would claim a holder this call cannot name, and
 /// claiming the lock would claim one this call did not win.
-fn locked(c: &Connection, ours: Option<&Proof>) -> LedgerError {
+fn locked(c: &Connection, ours: Option<&Proof>, sidecar: Option<&str>) -> LedgerError {
     match read_row(c) {
-        Ok(Some(row)) => LedgerError::Locked(info(row, ours)),
+        Ok(Some(row)) => LedgerError::Locked(info(row, ours, sidecar)),
         Ok(None) => LedgerError::Locked(LockInfo {
             locked_by: "another operation, which is taking or releasing the lock".to_owned(),
             locked_at: "just now".to_owned(),
@@ -350,26 +393,28 @@ enum Written {
     Lost,
 }
 
-/// Clears a stale row (only when this run holds the proof, and only one that had
-/// it) and inserts this run's, in one unit.
+/// Clears a stale row (only when this run holds the proof, and only one whose
+/// holder locked the same sidecar) and inserts this run's, in one unit.
 fn write_row(
     c: &Connection,
     holder: &str,
     proof: &Proof,
+    sidecar: Option<&str>,
     wait: std::time::Duration,
 ) -> Result<Written, DbError> {
-    let (word, clears) = match proof {
-        Proof::File => (PROOF_FILE, true),
-        Proof::RowOnly(_) => (PROOF_ROW, false),
+    let word = match proof {
+        Proof::File => PROOF_FILE,
+        Proof::RowOnly(_) => PROOF_ROW,
     };
+    let mine = sidecar.map_or(Value::Null, |key| Value::Text(key.to_owned()));
     super::ddl::in_a_unit(c, || {
-        let cleared = if clears {
+        let cleared = if sidecar.is_some() {
             c.query(
                 &format!(
                     "DELETE FROM {LOCK_TABLE} WHERE id = 1 AND proof = '{PROOF_FILE}' \
-                     RETURNING locked_by, locked_at"
+                     AND sidecar = ?1 RETURNING locked_by, locked_at"
                 ),
-                &[],
+                std::slice::from_ref(&mine),
             )?
             .first()
             .map(|row| Ok::<_, DbError>((row.text(0)?.to_owned(), row.text(1)?.to_owned())))
@@ -379,11 +424,15 @@ fn write_row(
         };
         let rows = c.query(
             &format!(
-                "INSERT INTO {LOCK_TABLE} (id, locked_by, proof, token) \
-                 VALUES (1, ?1, ?2, lower(hex(randomblob(8)))) \
+                "INSERT INTO {LOCK_TABLE} (id, locked_by, proof, sidecar, token) \
+                 VALUES (1, ?1, ?2, ?3, lower(hex(randomblob(8)))) \
                  ON CONFLICT (id) DO NOTHING RETURNING token"
             ),
-            &[Value::Text(holder.to_owned()), Value::Text(word.to_owned())],
+            &[
+                Value::Text(holder.to_owned()),
+                Value::Text(word.to_owned()),
+                mine,
+            ],
         )?;
         match rows.first() {
             Some(row) => Ok(Written::Won {
@@ -417,14 +466,15 @@ pub(crate) fn lock_within(
     fits("lock holder", Some(holder), LOCKED_BY_CHARS)?;
     waiting(c, wait, || {
         ensure_tables_within(c, wait)?;
-        let (file, proof) = match attempt(c)? {
-            Attempt::Held(file) => (Some(file), Proof::File),
-            Attempt::Without(why) => (None, Proof::RowOnly(why)),
-            Attempt::Alive => return Err(locked(c, Some(&Proof::File))),
+        let (file, sidecar, proof) = match attempt(c)? {
+            Attempt::Held(file, key) => (Some(file), Some(key), Proof::File),
+            Attempt::Without(why) => (None, None, Proof::RowOnly(why)),
+            // Refused by the sidecar itself, so whoever holds it locked this one.
+            Attempt::Alive => return Err(locked(c, Some(&Proof::File), None)),
         };
         // From here `file` is dropped, and the operating-system lock with it, on
         // every way out but a won lock.
-        match write_row(c, holder, &proof, wait)? {
+        match write_row(c, holder, &proof, sidecar.as_deref(), wait)? {
             Written::Won { token, cleared } => Ok(Taken {
                 // Nothing to say about a holder that is gone, so no lookup.
                 cleared: cleared.map(|(locked_by, locked_at)| LockInfo {
@@ -434,7 +484,7 @@ pub(crate) fn lock_within(
                 }),
                 guard: LockGuard { file, token, proof },
             }),
-            Written::Lost => Err(locked(c, Some(&proof))),
+            Written::Lost => Err(locked(c, Some(&proof), sidecar.as_deref())),
         }
     })
 }
@@ -496,7 +546,7 @@ pub fn lock_holder(c: &Connection) -> Result<Option<LockInfo>, DbError> {
     waiting(c, BUSY_WAIT, || {
         Ok(read_row(c)
             .map_err(|e| explained(e, BUSY_WAIT))?
-            .map(|row| info(row, None)))
+            .map(|row| info(row, None, None)))
     })
 }
 
