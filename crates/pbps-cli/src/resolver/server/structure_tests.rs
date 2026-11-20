@@ -82,6 +82,24 @@ fn the_authorization_shell_leaves_every_engine_decision_to_the_engine() {
 }
 
 #[test]
+fn the_target_less_preview_leaves_every_engine_decision_to_the_engine() {
+    assert_eq!(engine_named(include_str!("scratch/preview.rs")), None);
+}
+
+/// `dev.rs` is the binary's, beside the resolver tree, and read the same way.
+#[test]
+fn the_dev_rehearsal_leaves_every_engine_decision_to_the_engine() {
+    assert_eq!(engine_named(include_str!("../../dev.rs")), None);
+}
+
+/// The connected rehearsal's core names no engine either: its extension steps
+/// are the engine's own answers.
+#[test]
+fn the_rehearsal_core_leaves_every_engine_decision_to_the_engine() {
+    assert_eq!(engine_named(include_str!("../../rehearsal.rs")), None);
+}
+
+#[test]
 fn the_scratch_run_leaves_every_engine_decision_to_the_engine() {
     assert_eq!(engine_named(include_str!("scratch.rs")), None);
 }

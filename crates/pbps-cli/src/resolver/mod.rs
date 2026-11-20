@@ -9,7 +9,9 @@ pub mod apply;
 
 mod contract;
 pub use contract::{
-    CannotRecheck, NoResolver, Operation, Unsupported, planning, preview, rehearsal,
+    CannotRecheck, ExtensionManifests, NoResolver, Operation, Unsupported,
+    create_extension_schemas, extension_manifests, extension_requirements, planning, preview,
+    rehearsal,
 };
 
 pub mod scope;

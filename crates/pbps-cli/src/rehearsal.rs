@@ -328,7 +328,7 @@ impl Findings {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn rehearse_in(
+pub async fn rehearse_in<D: pbps_cli::resolver::server::PlanningDialect>(
     conn: &mut Conn,
     reader: Option<&mut Conn>,
     base: Base<'_>,
@@ -382,7 +382,7 @@ pub async fn rehearse_in(
     }
     crate::engine::require_scratch_extensions(conn, &standing).await?;
     if !created.is_empty() {
-        let problems = pbps_pg::resolver::scratch::extension_requirements(conn, &created).await?;
+        let problems = pbps_cli::resolver::extension_requirements::<D>(conn, &created).await?;
         anyhow::ensure!(problems.is_empty(), "{}", problems.join("; "));
     }
     // The target was checked for the schema, so the scratch that stands for it
@@ -395,7 +395,7 @@ pub async fn rehearse_in(
         .into_iter()
         .collect();
     if !schemas.is_empty() {
-        pbps_pg::resolver::scratch::create_schemas(conn, &schemas).await?;
+        pbps_cli::resolver::create_extension_schemas::<D>(conn, &schemas).await?;
     }
     // The rehearsal reads the rows back and compares; a spelling the engine
     // reads differently would fail that comparison without saying which
@@ -471,7 +471,7 @@ pub async fn rehearse_in(
         Default::default()
     } else {
         let names: Vec<_> = created.keys().chain(changed.keys()).collect();
-        pbps_pg::resolver::scratch::extension_manifests(conn, &names)
+        pbps_cli::resolver::extension_manifests::<D>(conn, &names)
             .await
             .context(words.read)?
     };

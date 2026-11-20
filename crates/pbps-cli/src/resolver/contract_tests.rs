@@ -171,6 +171,7 @@ fn every_unsupported_operation_names_the_engine() {
         contract::rehearsal(&engine).err().unwrap().to_string(),
         contract::preview(&engine).err().unwrap().to_string(),
         contract::apply(&engine).err().unwrap().to_string(),
+        contract::refusal_of::<MinimalDialect>(Operation::Extensions).to_string(),
     ];
     assert_eq!(
         refused,
@@ -179,6 +180,7 @@ fn every_unsupported_operation_names_the_engine() {
             "Stand-in does not support connected rehearsal",
             "Stand-in does not support target-less dev rehearsal",
             "Stand-in cannot recheck this plan's resolver evidence",
+            "Stand-in does not support extension rehearsal",
         ]
     );
     // The shipped engines say yes where they have it, and PostgreSQL has no
@@ -371,6 +373,85 @@ async fn an_engine_without_rehearsal_support_is_refused_before_a_connection_open
         Ok(_) => panic!("an engine without a resolver rehearsed"),
     }
     assert_eq!(requests, 0, "the refusal must precede every connection");
+}
+
+/// The target-less preview opens no target connection and, for an engine
+/// without it, no connection at all: the refusal is the engine's own and comes
+/// first, through the library's door as through `dev`'s admission. The
+/// stand-in has no resolver; PostgreSQL has one but no preview.
+#[tokio::test]
+async fn an_engine_without_a_preview_is_refused_before_a_connection_opens() {
+    use super::server::ProduceError;
+    use super::server::scratch::preview::{Cancellation, with_server};
+    async fn refused<D: PlanningDialect>() -> (ProduceError, u64) {
+        let mut cancellation = Cancellation::new().unwrap();
+        let (outcome, requests) = pbps_db::request_count::scope(with_server::<D, ()>(
+            "invalid scratch connection",
+            Some("-- never run"),
+            &mut cancellation,
+            async |_| Ok(()),
+        ))
+        .await;
+        (
+            outcome.expect_err("an engine without a preview ran one"),
+            requests,
+        )
+    }
+    for (error, requests, engine) in [
+        {
+            let (e, r) = refused::<MinimalDialect>().await;
+            (e, r, "Stand-in")
+        },
+        {
+            let (e, r) = refused::<pbps_pg::Postgres>().await;
+            (e, r, "PostgreSQL")
+        },
+    ] {
+        match error {
+            ProduceError::Acquire(why) => {
+                assert_eq!(
+                    why,
+                    format!("{engine} does not support target-less dev rehearsal")
+                );
+            }
+            other @ (ProduceError::Run(_) | ProduceError::Cleanup(_)) => {
+                panic!("not the engine's refusal: {other}")
+            }
+        }
+        assert_eq!(
+            requests, 0,
+            "{engine}: the refusal must precede every connection"
+        );
+    }
+}
+
+/// An engine with no extension rehearsal has nothing to do for an empty
+/// request and refuses a non-empty one by name, rather than running another
+/// engine's SQL on its connection.
+#[test]
+fn an_engine_without_extension_rehearsal_does_nothing_for_nothing_and_refuses_the_rest() {
+    use super::contract::nothing_to_do;
+    assert!(nothing_to_do::<MinimalDialect>(true).is_ok());
+    assert!(nothing_to_do::<pbps_mssql::Mssql>(true).is_ok());
+    for refused in [
+        nothing_to_do::<MinimalDialect>(false)
+            .unwrap_err()
+            .to_string(),
+        nothing_to_do::<pbps_mssql::Mssql>(false)
+            .unwrap_err()
+            .to_string(),
+    ] {
+        assert!(
+            refused.contains("does not support extension rehearsal"),
+            "{refused}"
+        );
+    }
+    assert!(
+        nothing_to_do::<pbps_mssql::Mssql>(false)
+            .unwrap_err()
+            .to_string()
+            .contains("SQL Server")
+    );
 }
 
 /// What a resolver the engine does not have can still be asked, and answers

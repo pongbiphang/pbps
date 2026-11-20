@@ -9,6 +9,7 @@ use crate::resolver::contract::{
     Phase, Planning, PreparedView, Rehearsal, RehearsalRequest, Replay, ResolverEngine, Sealable,
     Step, Support, TargetReadStep, sealed::Sealed,
 };
+use crate::resolver::contract::{ExtensionManifests, Operation, refusal_of};
 use crate::resolver::scope;
 use crate::resolver::server::scratch::rehearse::Roles;
 use crate::resolver::server::scratch::{Provenance, Provisioning, Tokens};
@@ -27,7 +28,10 @@ use pbps_model::resolver::{
     InputManifest, ManifestError, ObjectIdentity, ObjectOwnership, ResolverEvidence, Surface,
 };
 use pbps_model::role_mapping::RoleMapping;
-use pbps_model::{ChangeSet, Hints, IdsFile, ModuleDeps, ModuleId, RoleName, Schema, SessionZone};
+use pbps_model::{
+    ChangeSet, Extension, Hints, IdsFile, ModuleDeps, ModuleId, ObjectLocalName, RoleName, Schema,
+    SessionZone,
+};
 use pbps_pg::resolver::authorization as pg_auth;
 use pbps_pg::resolver::capture::{BindingRecord, SealError};
 use std::collections::{BTreeMap, BTreeSet};
@@ -531,6 +535,65 @@ impl ResolverEngine for PgResolver {
         _: &'a mut Conn,
     ) -> Step<'a, Result<bool, DbError>> {
         match *condition {}
+    }
+
+    fn preview_connect(_: &str) -> Step<'_, Result<Conn, ProduceError>> {
+        Box::pin(std::future::ready(Err(ProduceError::Acquire(
+            refusal_of::<pbps_pg::Postgres>(Operation::Preview).to_string(),
+        ))))
+    }
+
+    fn preview_scratch<'a, 'b>(
+        _: &'b mut Conn,
+        _: &'a str,
+        _: &'a ScopeRequest,
+        _: &'a Provenance,
+    ) -> Step<'b, Result<(Provisioning, Self::Scratch<'a>), Error>>
+    where
+        'a: 'b,
+    {
+        Box::pin(std::future::ready(Err(Error::Unusable(
+            refusal_of::<pbps_pg::Postgres>(Operation::Preview).to_string(),
+        ))))
+    }
+
+    fn preview_owner<'a>(
+        _: &'a mut Self::Scratch<'_>,
+        _: Provisioning,
+        _: &'a mut Conn,
+    ) -> Step<'a, Result<Conn, Error>> {
+        Box::pin(std::future::ready(Err(Error::Unusable(
+            refusal_of::<pbps_pg::Postgres>(Operation::Preview).to_string(),
+        ))))
+    }
+
+    fn preview_externals<'a>(_: &'a mut Conn, _: &'a str) -> Step<'a, anyhow::Result<()>> {
+        Box::pin(std::future::ready(Err(anyhow::anyhow!(
+            refusal_of::<pbps_pg::Postgres>(Operation::Preview).to_string()
+        ))))
+    }
+
+    fn extension_requirements<'a>(
+        conn: &'a mut Conn,
+        wanted: &'a BTreeMap<ObjectLocalName, Extension>,
+    ) -> Step<'a, Result<Vec<String>, DbError>> {
+        Box::pin(pbps_pg::resolver::scratch::extension_requirements(
+            conn, wanted,
+        ))
+    }
+
+    fn create_extension_schemas<'a>(
+        conn: &'a mut Conn,
+        schemas: &'a [String],
+    ) -> Step<'a, Result<(), DbError>> {
+        Box::pin(pbps_pg::resolver::scratch::create_schemas(conn, schemas))
+    }
+
+    fn extension_manifests<'a>(
+        conn: &'a mut Conn,
+        names: &'a [&'a ObjectLocalName],
+    ) -> Step<'a, Result<ExtensionManifests, DbError>> {
+        Box::pin(pbps_pg::resolver::scratch::extension_manifests(conn, names))
     }
 
     fn through_shape_view(staged: &Self::Staged, error: Error) -> Error {

@@ -7006,3 +7006,42 @@ in `producer.rs`.
 Pinned by those scans, the cluster-domain test (now against the strings), the
 authorization tests of DEC-2798.14, and the live scratch and apply tests of both
 engines. Formats: none. No sealed bytes, plan, state or evidence change.
+
+<a id="dec-2798-16"></a>
+
+**DEC-2798.16. The target-less preview and the extension rehearsal are the
+engine's operations; `dev` and the preview name no engine (#2798, route step 3).**
+The preview's admission was already the contract's (`Support.preview`,
+DEC-2798.5): `dev` asks it first and refuses an engine without a preview by name,
+before anything is acquired. What remained was the preview's own lifecycle, which
+hardcoded SQL Server in four places, and `dev`'s container start, which named the
+driver. Both are now the dialect's.
+
+**What moved.** The scratch server's first connection, the preview's scratch,
+the acquisition on it and the externals runner are `ResolverEngine` functions
+(`preview_connect`, `preview_scratch`, `preview_owner`, `preview_externals`),
+SQL Server's bodies moved unchanged from `with_server` with their messages. What
+is the same for any engine stays in `with_server`: the provenance, the race
+against cancellation, the workload connection dropped before release, the
+release and its cleanup verdict. `with_server` asks the admission itself, as its
+first statement, as `produce_unsealed` and `with_session` do: it is `pub`, so a
+caller that skipped `dev`'s check is refused by name before any connection and
+cannot reach SQL Server's connect with another engine's string. An engine
+without a preview answers each preview function with the same refusal, as an
+explicit named error. `dev` starts the container for `D::DRIVER`.
+
+The connected rehearsal's three extension helpers (what the scratch lacks of the
+packages a plan installs, the schemas they are installed into, what each owns
+after the plan ran) are `ResolverEngine` functions too. PostgreSQL delegates to
+its own; an engine with no extensions answers an empty request with nothing to do
+and a non-empty one with `{engine} does not support extension rehearsal`. The one
+change from before: a non-empty request that reached SQL Server ran PostgreSQL's
+SQL on a SQL Server connection and failed with an engine error; SQL Server's model
+carries no extension payload, so nothing could ask, and the question is now
+refused by name.
+
+Pinned by `an_engine_without_a_preview_is_refused_before_a_connection_opens`
+(the stand-in and PostgreSQL, zero requests), the extension helpers' answers,
+scans of `dev.rs`, `preview.rs` and `rehearsal.rs` with planted-token cases, and
+the live dev and rehearsal flows of both engines. Formats: none. No sealed bytes,
+plan, state or evidence change.

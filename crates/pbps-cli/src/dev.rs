@@ -118,10 +118,11 @@ pub fn rehearse<D: crate::emission::Engine + pbps_cli::resolver::server::Plannin
     selected: &D,
     hints: &pbps_model::Hints,
 ) -> anyhow::Result<crate::rehearsal::Findings> {
-    // The scratch-database lifecycle and container setup below are SQL
-    // Server-specific (SPEC §9.3). Dispatching catalog reads by connection
-    // cannot make that lifecycle safe for another dialect, so an engine says
-    // whether it has one, and the answer is asked before anything else.
+    // The scratch-database lifecycle and container setup below are an
+    // engine's own (SQL Server's, SPEC §9.3). Dispatching catalog reads by
+    // connection cannot make that lifecycle safe for another dialect, so an
+    // engine says whether it has one, and the answer is asked before anything
+    // else.
     if let Err(unsupported) = pbps_cli::resolver::preview(selected) {
         bail!(
             "{unsupported}. Remove --dev and the dev block in pbps.yml to generate an offline \
@@ -162,8 +163,8 @@ pub fn rehearse<D: crate::emission::Engine + pbps_cli::resolver::server::Plannin
         use pbps_cli::resolver::server::scratch::{container, preview};
         let mut cancellation = preview::Cancellation::new()?;
         let mut run = async |connection: &str| {
-            preview::with_server(connection, externals, &mut cancellation, async |conn| {
-                let mut report = crate::rehearsal::rehearse_in(
+            preview::with_server::<D, _>(connection, externals, &mut cancellation, async |conn| {
+                let mut report = crate::rehearsal::rehearse_in::<D>(
                     conn,
                     None,
                     crate::rehearsal::Base::Baseline {
@@ -185,7 +186,7 @@ pub fn rehearse<D: crate::emission::Engine + pbps_cli::resolver::server::Plannin
         match source {
             Source::Server(url) => run(&url).await,
             Source::Docker(image, pull) => {
-                container::with_started(pbps_db::Driver::Mssql, &image, pull, run).await
+                container::with_started(D::DRIVER, &image, pull, run).await
             }
         }
         // Flattened once, here. `ProduceError::Run` displays the error it also
