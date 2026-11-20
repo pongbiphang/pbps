@@ -7195,7 +7195,15 @@ fn diff_search(
                     );
                     continue;
                 }
-                let missing = unresolved(now);
+                // A reference the standing object already makes resolves: the target holds the
+                // object with it, so the engine accepted it, whether or not the model holds what
+                // it names (a package's or another tool's dictionary). Only what the alteration
+                // adds can be one the engine would refuse.
+                let held = was.dictionaries();
+                let missing: Vec<_> = unresolved(now)
+                    .into_iter()
+                    .filter(|used| !held.contains(used))
+                    .collect();
                 if !missing.is_empty() {
                     refuse(name, &undeclared(&missing));
                     continue;
@@ -32148,6 +32156,52 @@ mod meeting_shape_tests {
         assert!(
             errs.iter()
                 .any(|m| m.contains("app.docs") && m.contains("app.unknown")),
+            "{errs:?}"
+        );
+        // A reference the standing object already makes is the target's, resolved: changing
+        // something else alters, and only a reference the alteration adds is checked.
+        let standing = held(
+            dictionary("pg_catalog.snowball", "english"),
+            config(default, &["app.words", "app.unknown"]),
+        );
+        let from_standing = |declared: &Schema| {
+            let mut errs = Vec::new();
+            let changes = diff_search(
+                Side {
+                    schema: &standing,
+                    ids: &ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &ids,
+                },
+                &read(&[(&words, &[]), (&docs, &[])]),
+                &mut errs,
+            );
+            (changes, errs)
+        };
+        let (changes, errs) = from_standing(&held(
+            dictionary("pg_catalog.snowball", "english"),
+            config(default, &["app.words", "app.unknown", "pg_catalog.simple"]),
+        ));
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(
+            matches!(
+                changes.as_slice(),
+                [Change::Search(SearchChange::AlterSearchMapping { .. })]
+            ),
+            "{changes:?}"
+        );
+        // Negative: a new reference beside it is still refused.
+        let (changes, errs) = from_standing(&held(
+            dictionary("pg_catalog.snowball", "english"),
+            config(default, &["app.words", "app.unknown", "app.other"]),
+        ));
+        assert!(changes.is_empty(), "{changes:?}");
+        let errs: Vec<_> = errs.iter().map(ToString::to_string).collect();
+        assert!(
+            errs.iter()
+                .any(|m| m.contains("app.other") && !m.contains("app.unknown")),
             "{errs:?}"
         );
     }
