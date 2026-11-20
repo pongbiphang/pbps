@@ -172,7 +172,10 @@ use schemars::JsonSchema;
 /// the section.
 /// Version 51 records a key's `opclass_parameters` (DEC-2449.2); every older snapshot
 /// truthfully holds none, and an older build would reject the field.
-pub const CURRENT_VERSION: u32 = 51;
+/// Version 52 records `format_fingerprint` next to the number (DEC-2412.2). It is the last
+/// number moved by a change: from here the number moves once per release, and what tells
+/// two builds apart is the fingerprint.
+pub const CURRENT_VERSION: u32 = 52;
 
 /// The first version that records `object_deps` and no longer `module_deps`.
 ///
@@ -348,6 +351,11 @@ impl std::fmt::Display for StateKind {
 #[serde(deny_unknown_fields)]
 pub struct StateSnapshot {
     pub version: u32,
+    /// The format identity of the build that recorded this snapshot (DEC-2412.2): what
+    /// tells two development builds with the same `version` apart. Absent in every
+    /// snapshot before version 52. Set only by [`StateSnapshot::stamp`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_fingerprint: Option<String>,
     /// Absent in versions 6–30: no evidence, so the parent refusal remains.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_evidence: Option<crate::baseline_evidence::BaselineEvidence>,
@@ -451,8 +459,9 @@ impl StagedProgress {
 
 impl StateSnapshot {
     pub fn new(kind: StateKind, schema: Schema, ids: IdsFile, operator: impl Into<String>) -> Self {
-        Self {
-            version: CURRENT_VERSION,
+        let mut snapshot = Self {
+            version: 0,
+            format_fingerprint: None,
             baseline_evidence: None,
             kind,
             data_work: None,
@@ -466,7 +475,27 @@ impl StateSnapshot {
             reason: None,
             staged: None,
             declared: Declared::default(),
-        }
+        };
+        snapshot.stamp();
+        snapshot
+    }
+
+    /// Records this build's format number and fingerprint together.
+    ///
+    /// The one place either is written, so a row re-stamped by a later write
+    /// cannot take the number and keep another build's fingerprint (DEC-2412.2).
+    pub fn stamp(&mut self) {
+        self.version = CURRENT_VERSION;
+        self.format_fingerprint = Some(format_identity().to_owned());
+    }
+
+    /// A snapshot as a build at `version` wrote it, for a test that compares it
+    /// with bytes captured then. Such a build recorded no fingerprint.
+    #[doc(hidden)]
+    pub fn as_written_at(mut self, version: u32) -> Self {
+        self.version = version;
+        self.format_fingerprint = None;
+        self
     }
 
     /// Copy the previous managed state rather than reconstructing it from the
@@ -485,7 +514,7 @@ impl StateSnapshot {
             ));
         }
         let mut next = self.clone();
-        next.version = CURRENT_VERSION;
+        next.stamp();
         next.kind = StateKind::DataWork;
         next.data_work = Some(work);
         // The copied row's assertions belong to the apply that wrote it, not
@@ -578,11 +607,20 @@ impl StateSnapshot {
         #[derive(serde::Deserialize)]
         struct Envelope {
             version: u32,
+            #[serde(default)]
+            format_fingerprint: Option<String>,
         }
 
         let envelope: Envelope =
             serde_json::from_str(json).map_err(|e| Unreadable::Malformed(e.to_string()))?;
         check_version_number(envelope.version).map_err(Unreadable::UnsupportedVersion)?;
+        // At this build's number only, and before the strict parse: another build's
+        // row would otherwise be refused as an unknown field (DEC-2412.2).
+        crate::format::STATE
+            .check(envelope.version, envelope.format_fingerprint.as_deref())
+            .map_err(|e| {
+                Unreadable::UnsupportedVersion(format!("this state {e}. {}", e.remedy()))
+            })?;
         let snapshot: Self = if envelope.version < OBJECT_DEPS_VERSION {
             Self::read_before_object_deps(json, envelope.version)?
         } else {
@@ -753,6 +791,16 @@ impl std::fmt::Display for Unreadable {
             Self::Denied(m) => write!(f, "denied: {m}"),
         }
     }
+}
+
+/// What a snapshot records as the build that wrote it (DEC-2412.2): the fingerprint
+/// of its shape, generated once per process.
+///
+/// The one function every writer, reader and rule test calls. A snapshot stores no
+/// checksum of its own contents (`plan_checksum` is the applied plan's, only compared
+/// for equality), so unlike a plan's it folds nothing else in.
+pub fn format_identity() -> &'static str {
+    crate::fingerprint::state_snapshot()
 }
 
 /// Refuses a version this build cannot read faithfully.
@@ -1241,8 +1289,9 @@ mod tests {
     /// is not the same as empty.
     #[test]
     fn an_unknown_field_in_a_readable_version_is_still_refused() {
+        let stamp = crate::format::STATE.stamp_members();
         let current = format!(
-            r#"{{"version":{CURRENT_VERSION},"kind":"apply","schema":{{"tables":{{}}}},"ids":{{"version":1,"tables":{{}},"columns":{{}}}},"operator":"leon","invented":true}}"#
+            r#"{{{stamp},"kind":"apply","schema":{{"tables":{{}}}},"ids":{{"version":1,"tables":{{}},"columns":{{}}}},"operator":"leon","invented":true}}"#
         );
         let e = StateSnapshot::from_json(&current).expect_err("an unknown field is refused");
         assert!(e.contains("malformed"), "{e}");
@@ -1331,7 +1380,7 @@ mod tests {
             IdsFile::default(),
             "tester",
         );
-        snapshot.version = 30;
+        snapshot = snapshot.as_written_at(30);
         // Version 30 can have table provenance, but cannot have domain provenance.
         snapshot
             .declared
@@ -1346,7 +1395,7 @@ mod tests {
         assert_eq!(read.declared.overlay(&read.schema), schema);
         assert_eq!(read, snapshot);
 
-        snapshot.version = CURRENT_VERSION;
+        snapshot.stamp();
         snapshot.declared = Declared::from_schema(&schema);
         let round_trip =
             StateSnapshot::read_json(&serde_json::to_string(&snapshot).unwrap()).unwrap();
@@ -1662,5 +1711,143 @@ mod tests {
         assert!(why.contains("edge 0") && why.contains("note"), "{why}");
         let why = read(serde_json::json!({"app.a": ["app.x"]})).unwrap_err();
         assert!(why.contains("malformed"), "{why}");
+    }
+    fn fresh() -> StateSnapshot {
+        StateSnapshot::new(
+            StateKind::Apply,
+            Schema::default(),
+            IdsFile::default(),
+            "leon",
+        )
+    }
+
+    fn as_row(snapshot: &StateSnapshot) -> String {
+        serde_json::to_string(snapshot).unwrap()
+    }
+
+    #[test]
+    fn a_new_snapshot_records_this_builds_number_and_identity_together() {
+        let snapshot = fresh();
+        assert_eq!(snapshot.version, CURRENT_VERSION);
+        assert_eq!(
+            snapshot.format_fingerprint.as_deref(),
+            Some(format_identity())
+        );
+        let text = as_row(&snapshot);
+        assert!(
+            text.starts_with(&format!(
+                r#"{{"version":{CURRENT_VERSION},"format_fingerprint":""#
+            )),
+            "{text}"
+        );
+        assert_eq!(StateSnapshot::read_json(&text).unwrap(), snapshot);
+    }
+
+    /// The same number is three results: this build's fingerprint, another
+    /// build's, and none (DEC-2412.2).
+    #[test]
+    fn a_row_at_this_number_from_another_build_is_refused_by_its_build() {
+        let mut snapshot = fresh();
+        snapshot.format_fingerprint = Some("ab".repeat(32));
+        let Err(Unreadable::UnsupportedVersion(why)) = StateSnapshot::read_json(&as_row(&snapshot))
+        else {
+            panic!("a row from another build is unsupported, not malformed");
+        };
+        assert_eq!(
+            why,
+            format!(
+                "this state was written by a different development build of pbps (state format \
+                 {CURRENT_VERSION}, fingerprint abababababab; this build's fingerprint is {}). \
+                 Re-record it with `pbps baseline --reason ...`; a state file is taken again from \
+                 a database this build recorded.",
+                &format_identity()[..12]
+            )
+        );
+        snapshot.format_fingerprint = None;
+        let why = StateSnapshot::from_json(&as_row(&snapshot)).unwrap_err();
+        assert!(
+            why.contains("no fingerprint recorded") && why.contains("pbps baseline"),
+            "{why}"
+        );
+    }
+
+    /// A row from another build usually also holds a field this build lacks.
+    /// It is refused for its build, which is the cause, and not for the field.
+    #[test]
+    fn the_build_is_checked_before_the_strict_parse() {
+        let mut row: serde_json::Value = serde_json::to_value(fresh()).unwrap();
+        row["format_fingerprint"] = "0".repeat(64).into();
+        row["a_field_of_another_build"] = true.into();
+        let why = StateSnapshot::from_json(&row.to_string()).unwrap_err();
+        assert!(why.contains("different development build"), "{why}");
+        assert!(!why.contains("malformed"), "{why}");
+        // Negative: the same row from this build is refused by the strict parse.
+        row["format_fingerprint"] = format_identity().into();
+        let why = StateSnapshot::from_json(&row.to_string()).unwrap_err();
+        assert!(
+            why.contains("malformed") && why.contains("a_field_of_another_build"),
+            "{why}"
+        );
+    }
+
+    /// Every row written before this number has no fingerprint and stays
+    /// readable, so upgrading re-baselines nothing.
+    #[test]
+    fn an_older_row_without_a_fingerprint_is_read_as_before() {
+        let older = fresh().as_written_at(CURRENT_VERSION - 1);
+        assert_eq!(StateSnapshot::read_json(&as_row(&older)).unwrap(), older);
+        assert!(!as_row(&older).contains("format_fingerprint"));
+    }
+
+    /// A newer number keeps today's sentence, whatever fingerprint it holds.
+    #[test]
+    fn a_newer_row_keeps_the_newer_pbps_sentence() {
+        let mut newer = fresh();
+        newer.version = CURRENT_VERSION + 1;
+        newer.format_fingerprint = Some("0".repeat(64));
+        let why = StateSnapshot::from_json(&as_row(&newer)).unwrap_err();
+        assert!(why.contains("recorded by a newer pbps"), "{why}");
+        assert!(!why.contains("development build"), "{why}");
+    }
+
+    /// The timeline's projected path has only the number, so it stays number-only
+    /// (DEC-2412.2): a row from another build is still listed.
+    #[test]
+    fn the_projected_number_check_does_not_ask_for_a_fingerprint() {
+        assert!(check_readable_version(CURRENT_VERSION).is_ok());
+        assert!(check_readable_version(CURRENT_VERSION + 1).is_err());
+    }
+
+    #[test]
+    fn recording_data_work_stamps_the_row_it_writes() {
+        let old = fresh().as_written_at(30);
+        assert_eq!(old.format_fingerprint, None);
+        let work = crate::DataWorkRecord {
+            identity: crate::DataWorkIdentity::ExternalVersion {
+                version: "job-v7".into(),
+            },
+            expand_checksum: "a".repeat(64),
+            outcome: crate::DataWorkOutcome::Completed,
+            notes: None,
+        };
+        let next = old
+            .recording_data_work(
+                work,
+                "leon".into(),
+                crate::Reason::new("backfill").unwrap(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(next.version, CURRENT_VERSION);
+        assert_eq!(next.format_fingerprint.as_deref(), Some(format_identity()));
+    }
+
+    #[test]
+    fn the_state_version_follows_the_increment_rule() {
+        let released = crate::format::released().map(|r| &r.state);
+        assert_eq!(
+            crate::format::check_increment("state", CURRENT_VERSION, format_identity(), released),
+            Ok(())
+        );
     }
 }

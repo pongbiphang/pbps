@@ -222,8 +222,8 @@ where
     std::fs::remove_dir_all(dir).unwrap();
     // Pin the captured artifact versions while explain exercises this build's
     // current reader, as in the other hostile-name compatibility suites.
-    plan.version = 46;
-    state.version = 29;
+    plan = plan.as_written_at(46);
+    state = state.as_written_at(29);
     state.plan_checksum = Some(plan.wire_fingerprint());
     // Strip the type branches from set 54 (extended in sets 56 and 59) and the
     // dependency branch from set 58. Captured legacy branches must still

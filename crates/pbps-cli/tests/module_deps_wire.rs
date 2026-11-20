@@ -107,8 +107,9 @@ fn scenario(dialect: &str) -> serde_json::Value {
 }
 
 /// The parts of a plan that depend on the annotations: the order of the
-/// changes and the persisted `object_deps`. Times and checksums are left out
-/// because they move with every run.
+/// changes and the persisted `object_deps`. Times and checksums are left out because
+/// they move with every run, and so is the format number, which the increment rule
+/// owns (DEC-2412.2) and which a copy here would pin a second time.
 fn pinned(plan: &serde_json::Value) -> serde_json::Value {
     let changes: Vec<_> = plan["changes"]["changes"]
         .as_array()
@@ -117,14 +118,13 @@ fn pinned(plan: &serde_json::Value) -> serde_json::Value {
         .map(|c| serde_json::json!([c["op"], c["id"], c["name"]]))
         .collect();
     serde_json::json!({
-        "version": plan["version"],
         "object_deps": plan["object_deps"],
         "changes": changes,
     })
 }
 
-const MSSQL: &str = r#"{"version":82,"object_deps":[{"owner":{"root":{"module":"dbo.a_first"},"part":"whole"},"target":{"root":{"module":"dbo.z_last"},"part":"whole"}},{"owner":{"root":{"module":"dbo.fresh"},"part":"whole"},"target":{"root":{"module":"dbo.keep"},"part":"whole"}},{"owner":{"root":{"module":"dbo.keep"},"part":"whole"},"target":{"root":{"module":"dbo.base"},"part":"whole"}}],"changes":[["drop_module","dbo.old",null],["create_table",null,"dbo.t"],["create_module","dbo.z_last",null],["create_module","dbo.a_first",null],["create_module","dbo.fresh",null]]}"#;
-const POSTGRES: &str = r#"{"version":82,"object_deps":[{"owner":{"root":{"module":"dbo.a_first"},"part":"whole"},"target":{"root":{"module":"dbo.z_last"},"part":"whole"}},{"owner":{"root":{"module":"dbo.fresh"},"part":"whole"},"target":{"root":{"module":"dbo.keep"},"part":"whole"}},{"owner":{"root":{"module":"dbo.keep"},"part":"whole"},"target":{"root":{"module":"dbo.base"},"part":"whole"}}],"changes":[["drop_module","dbo.old",null],["create_table",null,"dbo.t"],["alter_module","dbo.base",null],["create_module","dbo.z_last",null],["create_module","dbo.a_first",null],["alter_module","dbo.keep",null],["create_module","dbo.fresh",null]]}"#;
+const MSSQL: &str = r#"{"object_deps":[{"owner":{"root":{"module":"dbo.a_first"},"part":"whole"},"target":{"root":{"module":"dbo.z_last"},"part":"whole"}},{"owner":{"root":{"module":"dbo.fresh"},"part":"whole"},"target":{"root":{"module":"dbo.keep"},"part":"whole"}},{"owner":{"root":{"module":"dbo.keep"},"part":"whole"},"target":{"root":{"module":"dbo.base"},"part":"whole"}}],"changes":[["drop_module","dbo.old",null],["create_table",null,"dbo.t"],["create_module","dbo.z_last",null],["create_module","dbo.a_first",null],["create_module","dbo.fresh",null]]}"#;
+const POSTGRES: &str = r#"{"object_deps":[{"owner":{"root":{"module":"dbo.a_first"},"part":"whole"},"target":{"root":{"module":"dbo.z_last"},"part":"whole"}},{"owner":{"root":{"module":"dbo.fresh"},"part":"whole"},"target":{"root":{"module":"dbo.keep"},"part":"whole"}},{"owner":{"root":{"module":"dbo.keep"},"part":"whole"},"target":{"root":{"module":"dbo.base"},"part":"whole"}}],"changes":[["drop_module","dbo.old",null],["create_table",null,"dbo.t"],["alter_module","dbo.base",null],["create_module","dbo.z_last",null],["create_module","dbo.a_first",null],["alter_module","dbo.keep",null],["create_module","dbo.fresh",null]]}"#;
 
 fn expected(text: &str) -> serde_json::Value {
     serde_json::from_str(text).unwrap()

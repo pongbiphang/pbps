@@ -170,7 +170,7 @@ pub(super) fn failed_apply_snapshot(
     // that row's version. Written under it, the row would hold `object_deps`
     // below the version that introduced the field, and every later read
     // refuses such a row (DEC-2469.7).
-    current.version = pbps_model::state::CURRENT_VERSION;
+    current.stamp();
     current.kind = StateKind::Failed;
     current.data_work = None;
     // The newest row's assertions passed for the plan that wrote it; this row

@@ -45,6 +45,11 @@ pub fn supported_files(dialect: &str) {
         if version >= pbps_model::state::OBJECT_DEPS_VERSION {
             snapshot["object_deps"] = json!([]);
         }
+        // At this build's number the row names the build that wrote it
+        // (DEC-2412.2); an older row has no such field.
+        if version == pbps_model::state::CURRENT_VERSION {
+            snapshot["format_fingerprint"] = json!(pbps_model::format::STATE.identity());
+        }
         std::fs::write(&base, snapshot.to_string()).unwrap();
         let report: Value = serde_json::from_str(&success(
             &d,
@@ -106,6 +111,8 @@ pub fn corrupt_files(dialect: &str) {
         "schema-unknown",
         "future",
         "too-old",
+        "another-build",
+        "no-fingerprint",
         "malformed",
         "absent",
     ] {
@@ -192,6 +199,18 @@ pub fn corrupt_files(dialect: &str) {
             "too-old" => {
                 bad["version"] = json!(0);
                 "version 0".into()
+            }
+            // At this build's number, so only the build check can refuse them
+            // (DEC-2412.2): the remedy names how to take the file again.
+            "another-build" | "no-fingerprint" => {
+                bad["version"] = json!(pbps_model::state::CURRENT_VERSION);
+                bad["object_deps"] = json!([]);
+                if case == "another-build" {
+                    bad["format_fingerprint"] = json!("ab".repeat(32));
+                    "fingerprint abababababab; this build's fingerprint is".into()
+                } else {
+                    "no fingerprint recorded".into()
+                }
             }
             "malformed" | "absent" => "baseline file".into(),
             _ => unreachable!(),

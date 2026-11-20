@@ -163,6 +163,70 @@ fn a_plan_with_module_deps_is_refused_by_its_version_and_not_translated() {
     }
 }
 
+fn current_plan() -> SavedPlan {
+    SavedPlan::new(
+        PlanOrigin::Database,
+        "mssql",
+        "2026-11-19T00:00:00Z",
+        PlanBaseline {
+            description: "prod as queried".into(),
+            checksum: "deadbeef".into(),
+            database_collation: None,
+            time_zone: None,
+        },
+        ChangeSet::default(),
+        IdsFile::default(),
+    )
+}
+
+/// A plan another development build wrote at this build's number is refused for
+/// its build, with the regeneration remedy and before any target contact, by
+/// every reader: it is not "not a pbps plan" and not an unknown field
+/// (DEC-2412.2). The same plan from this build is accepted.
+#[test]
+fn a_plan_from_another_development_build_is_refused_with_the_regeneration_remedy() {
+    let mut other = serde_json::to_value(current_plan()).unwrap();
+    other["format_fingerprint"] = "ab".repeat(32).into();
+    let mut missing = serde_json::to_value(current_plan()).unwrap();
+    missing
+        .as_object_mut()
+        .unwrap()
+        .shift_remove("format_fingerprint");
+    // A field this build does not know: the strict parse alone would say so.
+    let mut invented = other.clone();
+    invented["a_field_of_another_build"] = true.into();
+    for (name, plan, recorded) in [
+        ("another fingerprint", &other, "fingerprint abababababab"),
+        ("no fingerprint", &missing, "no fingerprint recorded"),
+        ("an unknown field", &invented, "fingerprint abababababab"),
+    ] {
+        for command in ["text", "json", "apply"] {
+            let diagnostic =
+                refused(&Artifact::new(&plan.to_string()).run(command, &"00".repeat(32)));
+            for wanted in [
+                "was written by a different development build of pbps",
+                recorded,
+                "Recompute it with `pbps plan --db ... --out ...` on this build",
+            ] {
+                assert!(
+                    diagnostic.contains(wanted),
+                    "{name}, {command}: {diagnostic}"
+                );
+            }
+            assert!(
+                !diagnostic.contains("not a pbps plan"),
+                "{name}, {command}: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains("unknown field"),
+                "{name}, {command}: {diagnostic}"
+            );
+        }
+    }
+    let ok = Artifact::new(&serde_json::to_string(&current_plan()).unwrap()).run("text", "");
+    assert_eq!(ok.status.code(), Some(0), "{ok:?}");
+}
+
 #[test]
 fn future_wire_changes_still_report_the_unsupported_version() {
     let raw = V11
@@ -182,10 +246,7 @@ fn malformed_versions_and_missing_current_analysis_remain_invalid_artifacts() {
         cases.push(V11.replace("\"version\": 11", &format!("\"version\": {value}")));
     }
     cases.push(V11.replace("\"version\": 11", "\"version\": 11, \"version\": 999"));
-    cases.push(V11.replace(
-        "\"version\": 11",
-        &format!("\"version\": {}", pbps_model::plan::CURRENT_VERSION),
-    ));
+    cases.push(V11.replace("\"version\": 11", &pbps_model::format::PLAN.stamp_members()));
     cases.push(format!("{V11} trailing"));
     for raw in cases {
         for command in ["text", "json", "apply"] {

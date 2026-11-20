@@ -6,6 +6,11 @@ use anyhow::Context as _;
 use pbps_model::SavedPlan;
 
 pub(crate) fn decode(raw: &str, path: &Path) -> anyhow::Result<SavedPlan> {
+    // Before the strict parse: a plan another development build wrote at this
+    // build's number would otherwise be refused as an unknown field (DEC-2412.2).
+    if let Err(foreign) = pbps_model::format::PLAN.check_raw(raw) {
+        anyhow::bail!("`{}` {foreign}.\n{}", path.display(), foreign.remedy());
+    }
     match crate::artifact::decode(raw, serde_json::from_str::<SavedPlan>) {
         Ok(plan) => Ok(plan),
         Err(error) => {

@@ -318,7 +318,10 @@ use crate::zone::SessionZone;
 // 82 adds a key's `opclass_parameters`, the options of BRIN's minmax-multi and Bloom classes
 // (DEC-2449.2): an older build would reject the field as unknown instead of as a newer plan;
 // 81 belongs to another change.
-pub const CURRENT_VERSION: u32 = 82;
+// 83 records `format_fingerprint` next to the number (DEC-2412.2). It is the last number
+// moved by a change: from here the number moves once per release, and what tells two builds
+// apart is the fingerprint.
+pub const CURRENT_VERSION: u32 = 83;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -422,6 +425,12 @@ pub struct SavedPlan {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dependencies: crate::dependency::PlannedDependencies,
     pub version: u32,
+
+    /// The format identity of the build that wrote this plan (DEC-2412.2): what tells
+    /// two development builds with the same `version` apart. Set only by
+    /// [`SavedPlan::stamp`], and covered by the plan checksum like every field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_fingerprint: Option<String>,
 
     pub origin: PlanOrigin,
 
@@ -755,9 +764,10 @@ impl SavedPlan {
         changes: ChangeSet,
         ids: IdsFile,
     ) -> Self {
-        Self {
+        let mut plan = Self {
             dependencies: BTreeMap::new(),
-            version: CURRENT_VERSION,
+            version: 0,
+            format_fingerprint: None,
             origin,
             analysis: crate::resolver::PlanAnalysis::Ordinary,
             mode: PlanMode::Transactional,
@@ -782,7 +792,34 @@ impl SavedPlan {
             trusted_roles: Default::default(),
             rehearsal: None,
             target_assertions: Vec::new(),
-        }
+        };
+        plan.stamp();
+        plan
+    }
+
+    /// Records this build's format number and fingerprint together.
+    ///
+    /// The one place either is written, so a number can never be set without
+    /// the fingerprint that goes with it (DEC-2412.2).
+    pub fn stamp(&mut self) {
+        self.version = CURRENT_VERSION;
+        self.format_fingerprint = Some(format_identity().to_owned());
+    }
+
+    /// Refuses a plan at this build's number that another build wrote. Asked of
+    /// a plan already parsed; [`crate::format::Format::check_raw`] asks it of the
+    /// text before the strict parse.
+    pub fn check_build(&self) -> Result<(), crate::format::ForeignBuild> {
+        crate::format::PLAN.check(self.version, self.format_fingerprint.as_deref())
+    }
+
+    /// A plan as a build at `version` wrote it, for a test that compares it with
+    /// bytes captured then. Such a build recorded no fingerprint.
+    #[doc(hidden)]
+    pub fn as_written_at(mut self, version: u32) -> Self {
+        self.version = version;
+        self.format_fingerprint = None;
+        self
     }
 
     /// Attach already sealed evidence without permitting an offline or staged
@@ -902,6 +939,56 @@ pub fn drift_checksum(schema: &Schema, ids: &IdsFile) -> String {
     let mut bare = schema.clone();
     bare.clear_descriptions();
     state_checksum(&bare, ids)
+}
+
+/// What a plan records as the build that wrote it (DEC-2412.2): one value that
+/// folds the shape of the file with what the checksums mean.
+///
+/// The shape alone cannot see an algorithm that changes while the fields stay
+/// (`apply` recomputes [`state_checksum`] against a plan another build wrote), so
+/// the checksum of a fixed sample is part of the value. The one function every
+/// writer, reader and rule test calls; nothing else computes it.
+pub fn format_identity() -> &'static str {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let (schema, ids) = checksum_sample();
+        identity_of(
+            crate::fingerprint::saved_plan(),
+            &state_checksum(&schema, &ids),
+        )
+    })
+}
+
+fn identity_of(shape: &str, state_checksum: &str) -> String {
+    digest_of(&("shape", shape, "state_checksum", state_checksum))
+}
+
+/// A fixed table whose columns are declared out of order, with its identity.
+fn checksum_sample() -> (Schema, IdsFile) {
+    use crate::name::TableName;
+    use crate::schema::{Column, Table};
+    let columns = ["id", "note", "email"]
+        .map(|c| {
+            (
+                c.into(),
+                Column::new("nvarchar(200)".parse().expect("a fixed type")),
+            )
+        })
+        .into_iter()
+        .collect();
+    let table = TableName::new("dbo", "customer");
+    let mut schema = Schema::default();
+    schema.tables.insert(
+        table.clone(),
+        Table {
+            columns,
+            ..Default::default()
+        },
+    );
+    let mut ids = IdsFile::default();
+    ids.tables
+        .insert("t_a1b2c3".parse().expect("a fixed uid"), table);
+    (schema, ids)
 }
 
 /// The fingerprint of a plan, for the ledger.
@@ -1155,21 +1242,8 @@ mod tests {
         assert_eq!(state_checksum(&one, &ids), state_checksum(&other, &ids));
     }
 
-    /// A saved plan is the one artifact carrying a fingerprint *written* by one
-    /// build and *recomputed* by another: `apply` compares `baseline.checksum`
-    /// against what it computes from the live database. So the value below is
-    /// pinned. If it changes, the algorithm changed, and
-    /// [`CURRENT_VERSION`] has to change with it (DECISIONS 238) — otherwise
-    /// a plan from the previous build is refused as drift against a database
-    /// nobody touched, which names the wrong problem and sends the operator
-    /// to reconcile nothing.
-    #[test]
-    fn the_fingerprint_is_pinned_to_the_plan_format_version() {
-        assert_eq!(
-            state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
-            "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
-        );
-        let plan = SavedPlan::new(
+    fn plan_for_identity() -> SavedPlan {
+        SavedPlan::new(
             PlanOrigin::Database,
             "postgres",
             "2026-10-29T00:00:00Z",
@@ -1181,8 +1255,108 @@ mod tests {
             },
             ChangeSet::default(),
             IdsFile::default(),
+        )
+    }
+
+    /// A saved plan is the one artifact carrying a fingerprint *written* by one
+    /// build and *recomputed* by another: `apply` compares `baseline.checksum`
+    /// against what it computes from the live database. So what a plan records
+    /// folds in the checksum of a fixed sample, and an algorithm that changes
+    /// while the shape stays moves the identity too (DEC-2412.2). Nothing is
+    /// pinned as a literal.
+    #[test]
+    fn the_recorded_identity_folds_in_the_state_checksum_of_the_fixed_sample() {
+        let (schema, ids) = checksum_sample();
+        let checksum = state_checksum(&schema, &ids);
+        assert_eq!(
+            format_identity(),
+            identity_of(crate::fingerprint::saved_plan(), &checksum)
         );
+        assert_ne!(format_identity(), crate::fingerprint::saved_plan());
+        // Negative: the same shape under another checksum, or the same checksum
+        // under another shape, is another identity.
+        assert_ne!(
+            identity_of(crate::fingerprint::saved_plan(), "another"),
+            format_identity()
+        );
+        assert_ne!(identity_of("another", &checksum), format_identity());
+        // The sample is declared out of order, so a checksum that stopped
+        // sorting columns would move the identity.
+        let reordered = schema_of(&["email", "note", "id"]);
+        assert_eq!(state_checksum(&reordered, &ids), checksum);
+    }
+
+    #[test]
+    fn a_new_plan_records_this_builds_number_and_identity_together() {
+        let plan = plan_for_identity();
         assert_eq!(plan.version, CURRENT_VERSION);
+        assert_eq!(plan.format_fingerprint.as_deref(), Some(format_identity()));
+        assert_eq!(plan.check_build(), Ok(()));
+        // Directly after the version, so a reader of the file sees them together.
+        let text = serde_json::to_string(&plan).unwrap();
+        assert!(
+            text.starts_with(&format!(
+                r#"{{"version":{CURRENT_VERSION},"format_fingerprint":""#
+            )),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_stamp_replaces_another_builds_value() {
+        let mut plan = plan_for_identity();
+        plan.version = 1;
+        plan.format_fingerprint = Some("0".repeat(64));
+        assert!(
+            plan.check_build().is_ok(),
+            "an older number is not judged by it"
+        );
+        plan.stamp();
+        assert_eq!(
+            (plan.version, plan.format_fingerprint.as_deref()),
+            (CURRENT_VERSION, Some(format_identity()))
+        );
+    }
+
+    /// The approver's checksum names the build that wrote the plan, so a plan
+    /// re-stamped by hand is not the artifact that was approved.
+    #[test]
+    fn the_fingerprint_is_inside_the_plan_checksum() {
+        let plan = plan_for_identity();
+        let mut other = plan.clone();
+        other.format_fingerprint = Some("0".repeat(64));
+        assert_ne!(plan.wire_fingerprint(), other.wire_fingerprint());
+    }
+
+    #[test]
+    fn a_plan_at_this_number_with_another_or_no_fingerprint_fails_the_build_check() {
+        let mut plan = plan_for_identity();
+        plan.format_fingerprint = Some("0".repeat(64));
+        assert!(plan.check_build().is_err());
+        plan.format_fingerprint = None;
+        assert!(
+            plan.check_build()
+                .unwrap_err()
+                .to_string()
+                .contains("no fingerprint recorded")
+        );
+        // As an older build wrote it: no field, and not refused by this check.
+        let old = plan.as_written_at(CURRENT_VERSION - 1);
+        assert_eq!(old.check_build(), Ok(()));
+        assert!(
+            !serde_json::to_string(&old)
+                .unwrap()
+                .contains("format_fingerprint")
+        );
+    }
+
+    #[test]
+    fn the_plan_version_follows_the_increment_rule() {
+        let released = crate::format::released().map(|r| &r.plan);
+        assert_eq!(
+            crate::format::check_increment("plan", CURRENT_VERSION, format_identity(), released),
+            Ok(())
+        );
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads
@@ -1684,7 +1858,6 @@ mod tests {
             Default::default(),
             Default::default(),
         );
-        assert_eq!(plan.version, 82);
         let bare = serde_json::to_value(&plan).unwrap();
         assert!(bare.get("extension_drops").is_none(), "{bare}");
         assert!(bare.get("extension_changes").is_none(), "{bare}");

@@ -283,8 +283,8 @@ fn column_collections_keep_master_bytes_checksums_sql_and_declarations() {
         assert!(explain.status.success(), "{explain:?}");
         // Pin captured artifact envelopes; explain above still exercises the
         // current applicable plan, whose checksum advances with its version.
-        plan.version = 44;
-        state.version = 27;
+        plan = plan.as_written_at(44);
+        state = state.as_written_at(27);
         state.plan_checksum = Some(plan.wire_fingerprint());
         let outputs = [
             ("schema.json", serde_json::to_string(&schema).unwrap()),
