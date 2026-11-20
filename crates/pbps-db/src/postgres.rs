@@ -1703,18 +1703,33 @@ mod tests {
     ///
     /// `is_linux: false` regardless of the platform actually running this
     /// test — the point is the *ordering*, which `connect_as` lets a test
-    /// pin without needing to run on the other platform for real. The host
-    /// is `.invalid` (RFC 2606): never resolved, because nothing here
-    /// reaches far enough to resolve it if the refusal runs where it
-    /// should.
+    /// pin without needing to run on the other platform for real.
+    ///
+    /// The endpoint is a loopback listener that would accept, and what is
+    /// asserted is that it was never dialled. An earlier form named an
+    /// unresolvable host and bounded the refusal by 200 ms, which told "no
+    /// socket" from "a slow machine" only while the machine was idle (#2981).
+    /// A listener's backlog does not depend on the clock: a refusal that ran
+    /// after `open_socket` leaves a connection in it, and one that ran before
+    /// leaves none. The error's type cannot tell the two apart here, since
+    /// both orders end in the same refusal once the dial succeeds.
     #[tokio::test]
     async fn a_tcp_user_timeout_the_platform_cannot_honour_is_refused_before_any_socket_opens() {
-        let started = std::time::Instant::now();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let addr = listener.local_addr().expect("the listener's address");
+        listener
+            .set_nonblocking(true)
+            .expect("a listener that answers at once when nothing waits");
+
         // A `match` rather than `expect_err`, because `Conn` has no `Debug` —
         // a connection is not a value to print (the same reason
         // `crates/pbps-pg/tests/live.rs`'s `refusal` helper does the same).
         let error = match Conn::connect_as(
-            "host=nowhere.invalid port=5432 user=u tcp_user_timeout=5",
+            &format!(
+                "host={} port={} user=u tcp_user_timeout=5",
+                addr.ip(),
+                addr.port()
+            ),
             false,
         )
         .await
@@ -1722,17 +1737,30 @@ mod tests {
             Ok(_) => panic!("this connection string must be refused, not connected"),
             Err(error) => error,
         };
-        let elapsed = started.elapsed();
 
         assert!(
             matches!(error, DbError::BadConnectionString(_)),
             "{error:?}"
         );
         assert!(error.to_string().contains("tcp_user_timeout"), "{error}");
-        assert!(
-            elapsed < std::time::Duration::from_millis(200),
-            "a refusal that runs before any socket opens cannot be waiting on \
-             anything network-shaped: took {elapsed:?}"
+        match listener.accept() {
+            Err(nothing) if nothing.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok((_, peer)) => panic!(
+                "the refusal must run before any socket opens, but {peer} had already connected"
+            ),
+            Err(other) => panic!("the listener could not say whether it was dialled: {other}"),
+        }
+
+        // The control: the same listener does report a dial, so the empty
+        // backlog above is an observation and not a listener that sees nothing.
+        let dialled = std::net::TcpStream::connect(addr).expect("the listener accepts a dial");
+        listener
+            .set_nonblocking(false)
+            .expect("a listener that waits for the dial just made");
+        let (_, peer) = listener.accept().expect("the dial reaches the backlog");
+        assert_eq!(
+            peer,
+            dialled.local_addr().expect("the dialling socket's address")
         );
     }
 
