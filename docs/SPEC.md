@@ -2704,7 +2704,7 @@ ledger from before they existed keeps working via a fallback that parses
 
 `__pbps_lock` stops two pipelines applying at once.
 
-**SQLite (#2950, DEC-2950.11, DEC-2950.13):** the ledger is three tables in
+**SQLite (#2950, DEC-2950.11, DEC-2950.13, DEC-2950.14):** the ledger is three tables in
 the database file itself: `main.__pbps_state` with the columns above,
 `main.__pbps_lock` and `main.__pbps_environment`. The state table's `id` is
 `INTEGER PRIMARY KEY AUTOINCREMENT` so an id is never reused, the time is ISO 8601
@@ -2731,6 +2731,19 @@ holds it and does not touch the sidecar.
 `__pbps_environment` holds one row, an identifier of 32 hexadecimal characters
 written when the ledger is made and never changed. It follows a copy of the file,
 so it names a lineage of a database, not a file.
+
+Every command that writes the SQLite ledger first compares the stored text of
+each of its tables with the text this tool creates them from, and refuses before
+its first write when a table differs or something else hangs off one: a trigger
+or an index on a ledger table, a foreign key from another table onto one, a view
+or a user table in a ledger name, a column added, renamed or dropped, a table
+rebuilt `WITHOUT ROWID` or `STRICT`, a virtual table, a name in another case.
+`record`, `lock`, `prune`, `unlock` and the release of a lock ask; a read does not.
+A ledger table that is not there is not a difference: the next write makes it.
+The check reads the file's own catalog only, and not the rows (the lock's holder,
+the identifier, the sequence of the ids) or edits that leave the stored text as it
+was (DEC-2950.14). The refusal names each object and says to restore the tables or
+to rename or drop them, and that dropping the state table deletes the history.
 
 **Trust model**: `__pbps_state` protects against mistakes and process disorder,
 **not** against deliberate tampering by someone with DDL rights — whoever can

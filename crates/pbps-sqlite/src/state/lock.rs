@@ -77,6 +77,7 @@ use pbps_model::escape::Escaped;
 use super::LOCK_TABLE;
 use super::busy::{BUSY_WAIT, explained, waiting};
 use super::ddl::{ensure_tables_within, occupants, refuse_a_stranger};
+use super::problems::refuse_untrusted;
 use super::write::fits;
 
 /// What is appended to the database's path to name the sidecar. It cannot meet
@@ -505,6 +506,7 @@ pub fn release(c: &Connection, mut guard: LockGuard) -> Result<bool, DbError> {
         if held.is_empty() {
             return Ok(false);
         }
+        refuse_untrusted(c, BUSY_WAIT)?;
         Ok(c.execute(
             &format!("DELETE FROM {LOCK_TABLE} WHERE id = 1 AND token = ?1"),
             &[Value::Text(guard.token.clone())],
@@ -533,6 +535,7 @@ pub fn unlock(c: &Connection) -> Result<bool, DbError> {
         if held.is_empty() {
             return Ok(false);
         }
+        refuse_untrusted(c, BUSY_WAIT)?;
         Ok(
             c.execute(&format!("DELETE FROM {LOCK_TABLE} WHERE id = 1"), &[])
                 .map_err(|e| explained(e, BUSY_WAIT))?

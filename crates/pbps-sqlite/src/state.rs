@@ -11,8 +11,8 @@
 //! [`is_initialized`], [`record`], [`prune`]), the reads ([`latest`], [`entry`],
 //! [`deployed_revision`], [`has_applied_plan`], [`timeline`]), the lock ([`lock`],
 //! [`release`], [`unlock`], [`lock_holder`]) and the environment identifier
-//! ([`environment_identity`]). The integrity check is the last part of the same
-//! item. All of them work from one list of tables ([`ddl::RECIPE`]); nothing here
+//! ([`environment_identity`]) and the integrity check ([`ledger_problems`]). All
+//! of them work from one list of tables ([`ddl::RECIPE`]); nothing here
 //! is written for one table only.
 //!
 //! # Where the ledger lives, and how it is named
@@ -38,6 +38,7 @@ mod busy;
 mod ddl;
 mod identity;
 mod lock;
+mod problems;
 mod read;
 mod rows;
 mod write;
@@ -49,6 +50,7 @@ pub use lock::{
     LOCK_FILE_SUFFIX, LockGuard, Proof, RowOnly, Taken, lock, lock_holder, release,
     session_application_name, session_lookup, sidecar_path, unlock,
 };
+pub use problems::{ledger_problems, untrusted_ledger_message};
 pub use read::{deployed_revision, entry, has_applied_plan, latest, timeline};
 pub use write::{prune, record};
 

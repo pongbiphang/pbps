@@ -12,6 +12,7 @@ use crate::tests::Fresh;
 mod busy;
 mod identity;
 mod lock;
+mod problems;
 mod read;
 mod recipe;
 mod write;

@@ -10,6 +10,7 @@ use pbps_model::StateSnapshot;
 
 use super::busy::{self, BUSY_WAIT};
 use super::ddl::{ensure_tables_within, is_initialized};
+use super::problems::refuse_untrusted;
 use super::{OPERATOR_CHARS, REASON_CHARS, STATE_TABLE};
 
 /// The widths of the other bounded columns, in characters, as the recipe's
@@ -160,6 +161,7 @@ fn delete_all_but(c: &Connection, keep: u32, wait: Duration) -> Result<u64, Ledg
     if !is_initialized(c)? {
         return Err(LedgerError::NotInitialized);
     }
+    refuse_untrusted(c, wait)?;
     let ids: Vec<i64> = c
         .query(
             &format!("SELECT id FROM {STATE_TABLE} ORDER BY id DESC"),

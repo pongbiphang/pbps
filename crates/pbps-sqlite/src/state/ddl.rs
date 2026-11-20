@@ -9,6 +9,7 @@ use pbps_model::escape::Escaped;
 
 use super::ENVIRONMENT_TABLE_NAME;
 use super::busy::{self, BUSY_WAIT};
+use super::problems::{refuse_untrusted, stranger};
 
 /// One table of the ledger: its name and the text of its `CREATE` from the name
 /// on.
@@ -32,9 +33,8 @@ impl Recipe {
         format!("CREATE TABLE IF NOT EXISTS main.{}", self.body)
     }
 
-    /// The text the engine stores for the table once created. Read only by the
-    /// tests until the integrity check compares live tables with it.
-    #[cfg(test)]
+    /// The text the engine stores for the table once created, which the
+    /// integrity check compares each live table's stored text with.
     pub(crate) fn stored(&self) -> String {
         format!("CREATE TABLE {}", self.body)
     }
@@ -177,6 +177,7 @@ fn ensure(c: &Connection, wait: Duration) -> Result<(), DbError> {
     let names: Vec<&str> = RECIPE.iter().map(|r| r.name).collect();
     let held = occupants(c, &names).map_err(|e| busy::explained(e, wait))?;
     refuse_a_stranger(&held)?;
+    refuse_untrusted(c, wait)?;
     let missing: Vec<&Recipe> = RECIPE
         .iter()
         .filter(|r| {
@@ -278,19 +279,13 @@ pub(super) fn occupants(c: &Connection, names: &[&str]) -> Result<Vec<(String, S
 /// Refuses when any of `held` is not an ordinary table.
 ///
 /// This catches a view, an index, a trigger and the like. A virtual table is
-/// also `table` here and is a difference the integrity check compares by text.
+/// also `table` here and is a difference the integrity check compares by text
+/// ([`super::ledger_problems`]).
 pub(super) fn refuse_a_stranger(held: &[(String, String)]) -> Result<(), DbError> {
     let strangers: Vec<String> = held
         .iter()
         .filter(|(_, kind)| kind != "table")
-        .map(|(name, kind)| {
-            format!(
-                "`{}` is {} {}, not an ordinary table",
-                Escaped(name),
-                if kind == "index" { "an" } else { "a" },
-                Escaped(kind)
-            )
-        })
+        .map(|(name, kind)| stranger(name, kind))
         .collect();
     if strangers.is_empty() {
         return Ok(());
