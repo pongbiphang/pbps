@@ -126,8 +126,19 @@ impl Refusal {
                 ..
             } => {
                 let members: Vec<String> = members.iter().map(|&i| name(i)).collect();
+                // An effect edge between a pair another edge already orders
+                // the same way adds nothing to why the steps wait, so it is
+                // not told twice: a table's own part keeps the text it had
+                // before the creation facts were edges.
+                let told = |e: &&Constraint| {
+                    e.source != Source::Effect
+                        || !edges.iter().any(|o| {
+                            o.source != Source::Effect && (o.before, o.after) == (e.before, e.after)
+                        })
+                };
                 let edges: Vec<String> = edges
                     .iter()
+                    .filter(told)
                     .map(|e| {
                         format!(
                             "{} before {} ({}, {:?})",
@@ -218,6 +229,9 @@ pub struct Schedule {
     obligations: Vec<Obligation>,
     symbolic_constraints: BTreeSet<Constraint>,
     creation_contexts: BTreeMap<usize, String>,
+    /// The `depends_on:` lines an annotation edge came from, by the pair it
+    /// orders: what a refused cycle names of what the user wrote.
+    lines: BTreeMap<(usize, usize), BTreeSet<String>>,
 }
 
 impl Schedule {
@@ -338,12 +352,18 @@ impl Schedule {
         if let Some(contract) = &plan.annotations {
             schedule.inline_contexts(plan.changes(), &contract.inline);
         }
-        for edge in plan.annotation_edges().map_err(|refusal| {
-            Refusal::Unmet(vec![Obligation {
-                operation: 0,
-                refusal,
-            }])
-        })? {
+        let (edges, lines) = plan
+            .annotations
+            .as_ref()
+            .map_or_else(|| Ok(Default::default()), |a| a.settling(&plan))
+            .map_err(|refusal| {
+                Refusal::Unmet(vec![Obligation {
+                    operation: 0,
+                    refusal,
+                }])
+            })?;
+        schedule.lines = lines;
+        for edge in edges {
             schedule.edge(edge.before, edge.after, edge.source, edge.reason);
         }
         if plan.annotations.as_ref().is_some_and(|a| a.extended) {
@@ -592,8 +612,18 @@ impl Schedule {
                     .filter_map(|at| self.creation_contexts.get(at))
                     .cloned(),
             );
-            let remedy =
-                (!context.is_empty()).then(|| context.into_iter().collect::<Vec<_>>().join("; "));
+            // The lines the user wrote come last, so the text before them is
+            // what it was.
+            let mut told: Vec<String> = context.into_iter().collect();
+            told.extend(
+                edges
+                    .iter()
+                    .filter(|edge| edge.source == Source::Annotation)
+                    .filter_map(|edge| self.lines.get(&(edge.before, edge.after)))
+                    .flatten()
+                    .map(|line| format!("line you wrote: {line}")),
+            );
+            let remedy = (!told.is_empty()).then(|| told.join("; "));
             return Err(Refusal::Cycle {
                 members,
                 edges,

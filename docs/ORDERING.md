@@ -169,6 +169,17 @@ the engine object. The transient contract carries the engine policy even
 before operation identities are allocated; defaults and other facets acquire
 no continuity claim merely by having both boundaries.
 
+A plan with an extended annotation also settles by its creation facts
+(DEC-2469.10). The differ holds most of them, such as a table's types, a
+partition's parent and a trigger's table, in its sort class and rank, where no
+line can make a cycle. `Contract::settling` takes the `Because::Creates` edges
+of the effect graph of the plan's own steps, over the logical timeline, and
+returns them as `Source::Effect` constraints beside the annotation edges. A
+line that reverses a fact is then a cycle like any other, and its refusal
+appends the line the user wrote. The effect table stays the only home of the
+facts. A plan with no annotation computes nothing. Facts read from a text (a
+view over a view) stay displaceable by a line.
+
 Annotation edges cannot enter the legacy declared-edge cycle fallback. An
 extended annotation can displace only explicitly tagged textual or conservative
 inference through the existing Guess SCC policy. Typed, effect, catalog and

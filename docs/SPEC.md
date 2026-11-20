@@ -372,7 +372,11 @@ depends_on:
   declared by the file that holds it. References bind to existing identities,
   so a rename keeps the edge. An extension, a text-search object, a
   standalone sequence and a dependency file take no `depends_on:`. `pbps fmt`
-  keeps it, in the order of the saved plan.
+  keeps it, in the order of the saved plan. A line that puts a step before
+  something it needs first, such as a trigger before its table or a type after
+  the column that uses it, is refused as a cycle that names the line
+  (DEC-2469.10); a fact read from a text, such as a view over a view, is
+  followed.
 - **`columns` is a map, not a list**, and the key is the column name. One less
   level of nesting, and duplicate names become impossible to express.
 - **`nullable` defaults to `true`** and is written only when needed. The field

@@ -1,6 +1,7 @@
 //! Transient annotation identities, reprojected at each existing settlement.
 use std::sync::Arc;
 
+use super::super::edges::{Baseline, Because, Checks, graph};
 use super::*;
 use pbps_model::ColumnChange;
 use pbps_model::IndexChange;
@@ -12,6 +13,7 @@ use pbps_model::TypeChange;
 use pbps_model::TypeValueChange;
 use pbps_model::diagnostic::Declaration;
 use pbps_model::object_ref::{BoundRoot, Registry};
+use pbps_model::operation::effects;
 use pbps_model::operation::symbolic::Attribute;
 use pbps_model::operation::{
     ColumnKey, ModuleEdits, ObjectKey, Operations, Origin, Owners, PartKey, PlanOwners, Snapshot,
@@ -21,6 +23,10 @@ use pbps_model::plan_names::{At, PlanNames};
 use pbps_model::{IdsFile, Schema, Table, Uid};
 
 type Ref = ObjectRef<BoundRoot>;
+
+/// The edges a pass settles by, and the lines each annotation edge came from,
+/// spelled and by the pair the edge orders.
+pub(crate) type Settling = (Vec<Constraint>, BTreeMap<(usize, usize), BTreeSet<String>>);
 
 #[derive(Debug, Clone)]
 struct Side {
@@ -366,6 +372,24 @@ impl Contract {
         &self,
         plan: &super::super::PlanningPlan<S>,
     ) -> Result<Vec<Constraint>, String> {
+        self.edges(plan, false).map(|(edges, _)| edges)
+    }
+
+    /// What a pass settles by: the annotation edges and the creation facts the
+    /// plan's effects state, so a line that contradicts a fact is a cycle like
+    /// any other (DEC-2469.10); and the line each annotation edge came from.
+    pub(crate) fn settling<S>(
+        &self,
+        plan: &super::super::PlanningPlan<S>,
+    ) -> Result<Settling, String> {
+        self.edges(plan, true)
+    }
+
+    fn edges<S>(
+        &self,
+        plan: &super::super::PlanningPlan<S>,
+        facts: bool,
+    ) -> Result<Settling, String> {
         // Snapshot names follow logical sources; retained operations separately
         // carry their immutable input address versions (DEC-2296.9).
         let mut logical = self.logical.changes.clone();
@@ -489,7 +513,7 @@ impl Contract {
                 &installers,
             )?;
         }
-        index.project(&self.base, &self.goal).map_err(|error| {
+        let (mut edges, origins) = index.project_from(&self.base, &self.goal).map_err(|error| {
             let (number, reason) = match error {
                 ProjectionError::Missing(n) => (n, "an endpoint has no installation boundary or recorded baseline presence"),
                 ProjectionError::InternalCycle(n) => (n, "an internal creation cycle: the indivisible owner's contained surface requires the owner first"),
@@ -509,8 +533,74 @@ impl Contract {
                 })
             } else { None };
             let context=inline.map_or_else(String::new,|why|format!("; {why}"));
-            format!("cannot project annotation `{}` depends on `{}`: {reason}{context}", self.labels[&annotation.owner], self.labels[&annotation.provider])
-        })
+            format!("cannot project {}: {reason}{context}", self.spell(annotation))
+        })?;
+        if facts {
+            edges.extend(self.creations(&operations, &owners)?);
+        }
+        let lines = origins
+            .into_iter()
+            .map(|(pair, from)| {
+                let spelt = from.into_iter().map(|(reverse, number)| {
+                    self.spell(&if reverse { &self.base } else { &self.goal }[number])
+                });
+                (pair, spelt.collect())
+            })
+            .collect();
+        Ok((edges, lines))
+    }
+
+    /// The `Creates` edges of the plan's own effects, over the logical
+    /// timeline `constraints` already holds. The differ keeps these facts in
+    /// its sort class and rank, which no line can contradict by making a
+    /// cycle; stated as edges they meet the user's lines in one search.
+    fn creations(
+        &self,
+        operations: &Operations,
+        owners: &PlanOwners,
+    ) -> Result<Vec<Constraint>, String> {
+        let before = Snapshot {
+            schema: &self.before.schema,
+            ids: &self.before.ids,
+        };
+        let after = Snapshot {
+            schema: &self.after.schema,
+            ids: &self.after.ids,
+        };
+        // A step whose owners are not readable here states nothing, as the
+        // release check treats it: a fact it cannot read refuses nothing.
+        let fx: Vec<_> = operations
+            .as_slice()
+            .iter()
+            .map(|op| effects(op, owners, before, after).unwrap_or_default())
+            .collect();
+        let graph = graph(
+            operations.as_slice(),
+            &fx,
+            &Baseline::of(before, owners),
+            &Default::default(),
+            Checks::ALL,
+        );
+        Ok(graph
+            .edges
+            .into_iter()
+            .filter(|edge| matches!(edge.because, Because::Creates(_)))
+            .map(|edge| Constraint {
+                before: edge.before,
+                after: edge.after,
+                source: Source::Effect,
+                reason: OrderReason::Structural,
+            })
+            .collect())
+    }
+
+    /// A line as the user wrote it: the one speller of the projection error
+    /// and of the cycle text that names the line.
+    fn spell(&self, annotation: &Annotation<BoundRoot>) -> String {
+        format!(
+            "annotation `{}` depends on `{}`",
+            self.labels[&annotation.owner], self.labels[&annotation.provider]
+        )
     }
 
     fn record(
