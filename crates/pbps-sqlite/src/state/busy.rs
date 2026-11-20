@@ -20,13 +20,19 @@ pub const BUSY_WAIT: Duration = Duration::from_secs(5);
 /// (a stale snapshot) and 773 (timeout) all carry it in their low byte.
 const BUSY: u32 = 5;
 
+/// The extended code of a write refused because the transaction read before
+/// another connection committed (`SQLITE_BUSY_SNAPSHOT`, WAL only). It comes at
+/// once, with no wait, and nothing holds a lock when it does.
+const STALE_SNAPSHOT: u32 = 517;
+
+fn code(error: &DbError) -> Option<u32> {
+    error.server_error_code()?.parse().ok()
+}
+
 /// Whether `error` is the engine saying another connection holds a lock.
 #[must_use]
 pub(crate) fn is_busy(error: &DbError) -> bool {
-    error
-        .server_error_code()
-        .and_then(|code| code.parse::<u32>().ok())
-        .is_some_and(|code| code & 0xff == BUSY)
+    code(error).is_some_and(|code| code & 0xff == BUSY)
 }
 
 /// Sets the wait on `c`.
@@ -42,6 +48,15 @@ pub(super) fn wait_up_to(c: &Connection, wait: Duration) -> Result<(), DbError> 
 pub(super) fn explained(error: DbError, wait: Duration) -> DbError {
     if !is_busy(&error) {
         return error;
+    }
+    // Not a wait that ran out: the lock may be long gone. Saying it was held
+    // for the wait would send a person looking for a writer that is not there.
+    if code(&error) == Some(STALE_SNAPSHOT) {
+        return error.context(
+            "the database was changed by another connection after this transaction first read \
+             it, so SQLite refuses its write. Nothing is locked, and `pbps unlock` does not \
+             apply: the transaction has to be started again",
+        );
     }
     error.context(format!(
         "the database is busy: another connection has held SQLite's own write lock for more \

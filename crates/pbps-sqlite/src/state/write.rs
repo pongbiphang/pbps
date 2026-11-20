@@ -10,7 +10,13 @@ use pbps_model::StateSnapshot;
 
 use super::busy::{self, BUSY_WAIT};
 use super::ddl::{ensure_tables_within, is_initialized};
-use super::{OPERATOR_CHARS, STATE_TABLE};
+use super::{OPERATOR_CHARS, REASON_CHARS, STATE_TABLE};
+
+/// The widths of the other bounded columns, in characters, as the recipe's
+/// `CHECK`s have them.
+const KIND_CHARS: usize = 16;
+const GIT_SHA_CHARS: usize = 40;
+const CHECKSUM_CHARS: usize = 64;
 
 /// The snapshot with its operator cut to [`OPERATOR_CHARS`], cloned only when it
 /// has to be.
@@ -26,6 +32,21 @@ fn bounded_operator(snapshot: &StateSnapshot) -> Cow<'_, StateSnapshot> {
     let mut bounded = snapshot.clone();
     bounded.operator = snapshot.operator.chars().take(OPERATOR_CHARS).collect();
     Cow::Owned(bounded)
+}
+
+/// Refuses a value longer than its column holds, counted here in characters.
+///
+/// The column's `CHECK` cannot be the bound: `length()` stops at an embedded
+/// NUL, so a text with one passes it however long it is (measured). A value the
+/// user supplied is refused and never cut, as the `CHECK` would refuse it.
+fn fits(what: &str, value: Option<&str>, most: usize) -> Result<(), LedgerError> {
+    let Some(found) = value.map(|v| v.chars().count()).filter(|n| *n > most) else {
+        return Ok(());
+    };
+    Err(LedgerError::Db(DbError::Refused(format!(
+        "the {what} to record is {found} characters and the ledger holds {most}; nothing was \
+         recorded"
+    ))))
 }
 
 /// A count as the `INTEGER` columns hold it. It cannot exceed `i64` on a real
@@ -86,13 +107,23 @@ pub(crate) fn record_within(
         Some(progress) => (count(progress.completed), count(progress.total)),
         None => (Value::Null, Value::Null),
     };
+    let git_sha = snapshot.git_sha.as_ref().map(pbps_model::Text::raw);
+    let reason = snapshot.reason.as_ref().map(pbps_model::Text::raw);
+    fits("kind", Some(snapshot.kind.as_str()), KIND_CHARS)?;
+    fits("git revision", git_sha, GIT_SHA_CHARS)?;
+    fits(
+        "plan checksum",
+        snapshot.plan_checksum.as_deref(),
+        CHECKSUM_CHARS,
+    )?;
+    fits("reason", reason, REASON_CHARS)?;
     let params = [
         Value::Text(snapshot.kind.as_str().to_owned()),
-        text(snapshot.git_sha.as_ref().map(pbps_model::Text::raw)),
+        text(git_sha),
         text(snapshot.plan_checksum.as_deref()),
         Value::Text(state_json),
         Value::Text(snapshot.operator.clone()),
-        text(snapshot.reason.as_ref().map(pbps_model::Text::raw)),
+        text(reason),
         Value::Integer(i64::from(snapshot.version)),
         count(snapshot.schema.tables.len()),
         count(snapshot.schema.modules.len()),

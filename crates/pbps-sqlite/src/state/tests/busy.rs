@@ -135,3 +135,52 @@ fn a_failure_that_is_not_busy_is_not_described_as_busy() {
     assert!(!is_busy(&error));
     assert!(!error.to_string().contains("busy"), "{error}");
 }
+
+/// In WAL a transaction that read before another connection committed is
+/// refused its write at once (code 517). Nothing is locked then, so the
+/// refusal must not say a lock was held for the wait.
+#[test]
+fn a_stale_snapshot_is_not_described_as_a_lock_held_for_the_wait() {
+    let mut fresh = crate::tests::Fresh::file();
+    assert_eq!(
+        super::text(fresh.connection(), "PRAGMA journal_mode = WAL"),
+        "wal"
+    );
+    ensure_tables(fresh.connection()).expect("created");
+    let second =
+        Connection::open(fresh.path(), pbps_db::sqlite::OpenMode::ExistingOnly).expect("second");
+    let first = fresh.connection();
+    first.execute_batch("BEGIN").expect("opened");
+    assert_eq!(
+        number(first, &format!("SELECT count(*) FROM {STATE_TABLE}")),
+        0
+    );
+    crate::state::record(&second, &snapshot(StateKind::Apply, "other")).expect("committed");
+    let started = Instant::now();
+    let refused = record_within(
+        first,
+        &snapshot(StateKind::Apply, "op"),
+        Duration::from_secs(2),
+    )
+    .expect_err("stale");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "it came at once"
+    );
+    let pbps_db::ledger::LedgerError::Db(error) = refused else {
+        panic!("{refused:?}");
+    };
+    assert_eq!(
+        error.server_error_code().as_deref(),
+        Some("517"),
+        "{error:?}"
+    );
+    assert!(is_busy(&error));
+    let said = error.to_string();
+    assert!(
+        said.contains("Nothing is locked") && said.contains("started again"),
+        "{said}"
+    );
+    assert!(!said.contains("for more than"), "{said}");
+    first.execute_batch("ROLLBACK").expect("closed");
+}

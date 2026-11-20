@@ -196,13 +196,49 @@ fn a_reason_over_the_width_fails_loudly_and_the_best_effort_cut_fits() {
     };
     // The width is in characters: 1000 emoji are 4000 bytes and fit.
     record(c, &with_reason(emoji(REASON_CHARS))).expect("a full width fits");
-    // One more does not, and the failure is the engine's CHECK, not a cut.
+    // One more does not, and it is refused, never cut.
     let refused = record(c, &with_reason(emoji(REASON_CHARS + 1))).expect_err("too long");
     assert!(
-        refused.to_string().contains("CHECK constraint failed"),
+        refused
+            .to_string()
+            .contains("the reason to record is 1001 characters and the ledger holds 1000"),
         "{refused}"
     );
     assert_eq!(rows(c), 1, "the refused entry was not recorded");
+    // The column's CHECK is the backstop for a row written past this function.
+    let by_hand = c.execute_batch(&format!(
+        "INSERT INTO {STATE_TABLE} (kind, state_json, operator, reason) \
+         VALUES ('apply', '{{}}', 'op', printf('%.*c', 1001, 'x'))"
+    ));
+    assert!(
+        by_hand
+            .expect_err("the CHECK")
+            .to_string()
+            .contains("CHECK constraint failed")
+    );
+    // And it is not the bound: `length()` stops at a NUL, so the CHECK takes a
+    // text with one however long it is. The count made here does not.
+    assert_eq!(
+        number(c, "SELECT length('ab' || char(0) || 'cd')"),
+        2,
+        "the engine's count stops at the NUL"
+    );
+    let hidden = format!("a\0{}", "x".repeat(REASON_CHARS + 5));
+    let refused = record(c, &with_reason(hidden)).expect_err("too long behind a NUL");
+    assert!(
+        refused.to_string().contains("the ledger holds 1000"),
+        "{refused}"
+    );
+    let mut long_checksum = snapshot(StateKind::Apply, "op");
+    long_checksum.plan_checksum = Some(format!("\0{}", "c".repeat(70)));
+    let refused = record(c, &long_checksum).expect_err("a checksum too long behind a NUL");
+    assert!(
+        refused
+            .to_string()
+            .contains("the plan checksum to record is 71 characters"),
+        "{refused}"
+    );
+    assert_eq!(rows(c), 1, "nothing refused was recorded");
     // The best-effort path cuts first, in characters, and then it records.
     let cut = truncate_reason(&emoji(3000));
     assert_eq!(cut.chars().count(), REASON_CHARS);
