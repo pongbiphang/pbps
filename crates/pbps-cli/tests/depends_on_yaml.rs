@@ -963,3 +963,215 @@ fn fmt_keeps_an_owner_map_and_is_idempotent_through_the_command() {
     // The formatted project plans what the original did.
     assert_eq!(p.plan().unwrap().1, 2);
 }
+
+// The review examples of #2423 and the implicit-regclass view (#2469, acceptance
+// 1): each is planned from YAML on the route without a resolver, and one
+// `depends_on:` line orders it. The examples are the findings of
+// https://github.com/pongbiphang/pbps/pull/2423 that a text match misread.
+
+/// A PostgreSQL project of these files, planned.
+fn planned(files: &[(&str, String)]) -> Result<(Vec<String>, usize), String> {
+    let p = Project::new("postgres");
+    for (name, body) in files {
+        p.file(name, body);
+    }
+    p.plan()
+}
+
+fn with_line(body: &str, line: &str) -> String {
+    body.replace("{dep}", line)
+}
+
+fn without_line(body: &str) -> String {
+    body.replace("{dep}", "")
+}
+
+/// The domain `app.a` and `app.b`, each with a text default that is the other's name
+/// (review r4376835811).
+const DOMAIN_A: &str = "domain: app.a\n{dep}type: text\ndefault: \"'b'\"\n";
+const DOMAIN_B: &str = "domain: app.b\n{dep}type: text\ndefault: \"'a'\"\n";
+/// A default that names a view only through a regclass literal: the scan does
+/// not read it as a dependency, and the engine resolves it when it creates the
+/// table.
+const REGCLASS_TABLE: &str = "table: app.t\n{dep}columns:\n  id: {type: int, nullable: false}\n  x: {type: int, default: \"('app.w'::regclass)::oid::integer\"}\n";
+const REGCLASS_VIEW: &str = "view: app.w\n{dep}definition: SELECT 1 AS n\n";
+
+#[test]
+fn text_names_that_are_data_or_literals_are_ordered_by_one_depends_on_line() {
+    let a = |line: &str| ("app.a.yml", with_line(DOMAIN_A, line));
+    let b = |line: &str| ("app.b.yml", with_line(DOMAIN_B, line));
+    let t = |line: &str| ("app.t.yml", with_line(REGCLASS_TABLE, line));
+    let w = |line: &str| ("app.w.yml", with_line(REGCLASS_VIEW, line));
+    let both = &["create_type app.a", "create_type app.b"];
+    let w_first = &["create_module app.w", "create_table app.t"];
+    let cases = [
+        // Two domains whose defaults match each other's names: the strings are
+        // data, so nothing orders them, and the line chooses.
+        (
+            "domain defaults that are each other's names",
+            vec![a(""), b("")],
+            both,
+            vec![a("depends_on: [\"type::app.b\"]\n"), b("")],
+            &["create_type app.b", "create_type app.a"][..],
+        ),
+        // A default that names a view only in a regclass literal: the table
+        // would be created before the view the engine needs, and a line on the
+        // table puts the view first.
+        (
+            "a table default that names a view by regclass",
+            vec![t(""), w("")],
+            &["create_table app.t", "create_module app.w"],
+            vec![t("depends_on: [\"module::app.w\"]\n"), w("")],
+            w_first,
+        ),
+        // The same, with the line on the default part alone: the table stays
+        // first and its default follows the view.
+        (
+            "the default part of that table",
+            vec![t(""), w("")],
+            &["create_table app.t", "create_module app.w"],
+            vec![
+                t("depends_on:\n  \"default::app.t.x\": [\"module::app.w\"]\n"),
+                w(""),
+            ],
+            &[
+                "create_table app.t",
+                "create_module app.w",
+                "alter_column_default",
+            ],
+        ),
+    ];
+    for (name, plain_files, plain, annotated_files, then) in cases {
+        let (steps, edges) = planned(&plain_files).unwrap_or_else(|why| panic!("{name}: {why}"));
+        assert_eq!(steps, plain, "{name} without the line");
+        assert_eq!(edges, 0, "{name} without the line");
+        let (steps, edges) =
+            planned(&annotated_files).unwrap_or_else(|why| panic!("{name}: {why}"));
+        assert_eq!(steps, then, "{name} with the line");
+        assert_eq!(edges, 1, "{name} with the line");
+    }
+}
+
+#[test]
+fn a_line_on_the_wrong_owner_leaves_the_order_that_text_gave() {
+    let a = |line: &str| ("app.a.yml", with_line(DOMAIN_A, line));
+    let b = |line: &str| ("app.b.yml", with_line(DOMAIN_B, line));
+    let t = ("app.t.yml", without_line(REGCLASS_TABLE));
+    let w = |line: &str| ("app.w.yml", with_line(REGCLASS_VIEW, line));
+    // `app.b` following `app.a` is the order the plain plan already has.
+    let (steps, edges) = planned(&[a(""), b("depends_on: [\"type::app.a\"]\n")]).unwrap();
+    assert_eq!(steps, ["create_type app.a", "create_type app.b"]);
+    assert_eq!(edges, 1);
+    // The view following the table does not move the table's default behind
+    // the view: the table is still created first, and the line is not the fix.
+    let (steps, edges) = planned(&[t, w("depends_on: [\"table::app.t\"]\n")]).unwrap();
+    assert_eq!(steps, ["create_table app.t", "create_module app.w"]);
+    assert_eq!(edges, 1);
+}
+
+#[test]
+fn a_review_example_the_scan_already_orders_keeps_that_order_with_one_line() {
+    const F: &str = "function: app.f(integer)\n{dep}definition: |-\n  (id integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN id\n";
+    // A generated column that calls `app.f` and is declared before its input,
+    // and an index named like the routine's parameter (review r4377973392).
+    const HELD: &str = "table: app.t\n{dep}columns:\n  id: {type: int, nullable: false}\n  x: {type: text}\n  g: {type: int, generated: {expression: \"app.f(z)\", stored: true}}\n  z: {type: int}\nindexes:\n  id: {columns: [x]}\n";
+    // A view named like the built-in type of a column it reads (r4380096888).
+    const READER: &str = "view: app.text\n{dep}definition: SELECT x FROM app.t\n";
+    const PLAIN_TABLE: &str = "table: app.t\n{dep}columns:\n  x: {type: text}\n";
+    // `app.value` is a domain over `app.positive`, whose check holds `VALUE`
+    // (r4377973376).
+    const POSITIVE: &str = "domain: app.positive\n{dep}type: int\nchecks:\n  c: \"VALUE > 0\"\n";
+    const VALUE: &str = "domain: app.value\n{dep}type: app.positive\n";
+    // A view named in a regclass literal of a view over the table (r4383911676).
+    const SIZE: &str = "view: app.v\n{dep}definition: SELECT pg_relation_size('app.t') AS n\n";
+    // Two routines that call each other late, and a routine that declares a
+    // view's row type (the draft rounds 1 and 2).
+    const CALLS_G: &str = "function: app.f()\n{dep}definition: |-\n  () RETURNS integer LANGUAGE plpgsql AS $$ BEGIN RETURN app.g(); END $$\n";
+    const CALLS_F: &str = "function: app.g()\n{dep}definition: |-\n  () RETURNS integer LANGUAGE plpgsql AS $$ BEGIN RETURN app.f(); END $$\n";
+    const VIEW: &str = "view: app.v\n{dep}definition: SELECT 1 AS n\n";
+    const ROWTYPE: &str = "function: app.r()\n{dep}definition: |-\n  () RETURNS integer LANGUAGE plpgsql AS $$ DECLARE x app.v%ROWTYPE; BEGIN RETURN 1; END $$\n";
+    type Scene = (
+        &'static str,
+        Vec<(&'static str, &'static str)>,
+        usize,
+        &'static str,
+        &'static [&'static str],
+    );
+    // (name, files, index of the file that takes the line, the line, the order)
+    let scenes: Vec<Scene> = vec![
+        (
+            "a held table before the function it calls, and an index named like its parameter",
+            vec![("f.yml", F), ("t.yml", HELD)],
+            1,
+            "depends_on: [\"module::app.f(integer)\"]\n",
+            &["create_module app.f(integer)", "create_table app.t"],
+        ),
+        (
+            "a view named like a built-in type, after the table it reads",
+            vec![("t.yml", PLAIN_TABLE), ("v.yml", READER)],
+            1,
+            "depends_on: [\"table::app.t\"]\n",
+            &["create_table app.t", "create_module app.text"],
+        ),
+        (
+            "a domain named VALUE over a domain whose check holds VALUE",
+            vec![("p.yml", POSITIVE), ("v.yml", VALUE)],
+            1,
+            "depends_on: [\"type::app.positive\"]\n",
+            &["create_type app.positive", "create_type app.value"],
+        ),
+        (
+            "a view over a table named in an implicit regclass argument",
+            vec![
+                (
+                    "t.yml",
+                    "table: app.t\n{dep}columns:\n  id: {type: int, nullable: false}\n",
+                ),
+                ("v.yml", SIZE),
+            ],
+            1,
+            "depends_on: [\"table::app.t\"]\n",
+            &["create_table app.t", "create_module app.v"],
+        ),
+        (
+            "two routines that call each other late",
+            vec![("f.yml", CALLS_G), ("g.yml", CALLS_F)],
+            1,
+            "depends_on: [\"module::app.f()\"]\n",
+            &["create_module app.f()", "create_module app.g()"],
+        ),
+        (
+            "a routine that declares the row type of a view",
+            vec![("v.yml", VIEW), ("r.yml", ROWTYPE)],
+            1,
+            "depends_on: [\"module::app.v\"]\n",
+            &["create_module app.v", "create_module app.r()"],
+        ),
+    ];
+    for (name, files, owner, line, order) in scenes {
+        let plain: Vec<_> = files
+            .iter()
+            .map(|(file, body)| (*file, without_line(body)))
+            .collect();
+        let (steps, edges) = planned(&plain).unwrap_or_else(|why| panic!("{name}: {why}"));
+        assert_eq!(steps, order, "{name} without the line");
+        assert_eq!(edges, 0, "{name} without the line");
+        let annotated: Vec<_> = files
+            .iter()
+            .enumerate()
+            .map(|(i, (file, body))| {
+                (
+                    *file,
+                    if i == owner {
+                        with_line(body, line)
+                    } else {
+                        without_line(body)
+                    },
+                )
+            })
+            .collect();
+        let (steps, edges) = planned(&annotated).unwrap_or_else(|why| panic!("{name}: {why}"));
+        assert_eq!(steps, order, "{name} with the line");
+        assert_eq!(edges, 1, "{name} with the line");
+    }
+}
