@@ -14,8 +14,12 @@
 //! Without that, the first `plan` after a `snapshot` would propose dropping the
 //! ledger — the declarations do not mention it.
 
+use pbps_db::ledger::flow::{
+    self, ClipUnit, ProjectedRow, RowLimit, entry_from_row, ordinary_params, projected_row,
+    projected_row_unmigrated, stored_entry_from_row,
+};
 use pbps_db::ledger::{
-    LedgerEntry, LedgerError, LockInfo, TimelineEntry, TimelineStaged, TimelineState, ids_to_prune,
+    LedgerEntry, LedgerError, LockInfo, TimelineEntry, TimelineState, ids_to_prune,
 };
 use pbps_db::{Conn, DbError, Param};
 use pbps_model::{StateKind, StateSnapshot, Unreadable};
@@ -99,42 +103,17 @@ BEGIN
 END;";
 
 /// The width of `__pbps_state.reason`, in the unit `NVARCHAR(n)` is measured
-/// in: UTF-16 code units, not characters. Measured, not assumed — an
-/// `NVARCHAR(4)` refused two emoji plus one ASCII letter with Msg 2628.
+/// in: UTF-16 code units ([`ClipUnit::Utf16Units`]), not characters.
 pub const REASON_UTF16_UNITS: usize = 1000;
 
-/// The snapshot with its operator cut to the `NVARCHAR(128)` column in that
-/// column's measure, UTF-16 code units, and never inside a surrogate pair,
-/// which the engine refuses as invalid UTF-16; cloned only when it has to be
-/// (#1205). Cut in the snapshot rather than only in the bound column, so
-/// `state_json` and its projection agree on what was recorded.
-fn bounded_operator(snapshot: &StateSnapshot) -> std::borrow::Cow<'_, StateSnapshot> {
-    if snapshot.operator.encode_utf16().count() <= pbps_db::OPERATOR_CHARS {
-        return std::borrow::Cow::Borrowed(snapshot);
-    }
-    let mut bounded = snapshot.clone();
-    bounded.operator = pbps_db::clip_utf16(&snapshot.operator, pbps_db::OPERATOR_CHARS);
-    std::borrow::Cow::Owned(bounded)
+/// Cuts a reason down to what the ledger column can hold; see
+/// [`flow::truncate_reason`] for the unit and for when it is used.
+pub fn truncate_reason(text: &str) -> String {
+    flow::truncate_reason(text, ClipUnit::Utf16Units, REASON_UTF16_UNITS)
 }
 
-/// Cuts a reason down to what the ledger column can hold.
-///
-/// Counts `char::len_utf16`, because a Rust `char` above U+FFFF occupies two
-/// units and a count of characters could hand the column twice its width. The
-/// cut never splits a character, so what remains is valid text. Used on the
-/// best-effort audit paths, where a failed attempt that cannot be recorded is
-/// the opposite of what the row exists for; a user-supplied `--reason` is not
-/// truncated and fails loudly instead, since an audit text silently shortened
-/// is a different kind of loss.
-pub fn truncate_reason(text: &str) -> String {
-    let mut units = 0;
-    text.chars()
-        .take_while(|ch| {
-            units += ch.len_utf16();
-            units <= REASON_UTF16_UNITS
-        })
-        .collect()
-}
+/// How `TOP (n)` is bound here: a signed 32-bit integer, saturating.
+const ROW_LIMIT: RowLimit = RowLimit::SaturatingI32;
 
 const CREATE_LOCK: &str = "\
 IF OBJECT_ID(N'dbo.__pbps_lock', N'U') IS NULL
@@ -540,7 +519,7 @@ pub async fn history(conn: &mut Conn, limit: u32) -> Result<Vec<LedgerEntry>, Le
         return Err(LedgerError::NotInitialized);
     }
     let rows = conn
-        .query_with(SELECT_HISTORY, &[top(limit).into()])
+        .query_with(SELECT_HISTORY, &[ROW_LIMIT.param(limit)])
         .await?;
     rows.iter().map(entry_from_row).collect()
 }
@@ -572,12 +551,12 @@ pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>,
     // `legacy_ids` below whichever one ran).
     let projected: Vec<ProjectedRow> = if timeline_columns_present(conn).await? {
         let rows = conn
-            .query_with(SELECT_TIMELINE, &[top(limit).into()])
+            .query_with(SELECT_TIMELINE, &[ROW_LIMIT.param(limit)])
             .await?;
         rows.iter().map(projected_row).collect::<Result<_, _>>()?
     } else {
         let rows = conn
-            .query_with(SELECT_TIMELINE_UNMIGRATED, &[top(limit).into()])
+            .query_with(SELECT_TIMELINE_UNMIGRATED, &[ROW_LIMIT.param(limit)])
             .await?;
         rows.iter()
             .map(projected_row_unmigrated)
@@ -665,23 +644,6 @@ pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>,
         .collect())
 }
 
-/// `TOP (n)` takes a signed integer, and the count is unsigned.
-///
-/// Saturating rather than `as`, which wraps: `--limit 4294967295` became `-1`
-/// and the server refused the query, so a number too large to mean anything
-/// turned into a failure rather than into "all of them" (DECISIONS 217).
-fn top(limit: u32) -> i32 {
-    i32::try_from(limit).unwrap_or(i32::MAX)
-}
-
-/// A count or version as the `INT` columns hold it: saturating, like [`top`]
-/// — a table, module or staged-statement count that does not fit `i32` is not
-/// a real schema, and a wrapped negative would misreport the count rather
-/// than merely cap it.
-fn saturating_i32(n: u64) -> i32 {
-    i32::try_from(n).unwrap_or(i32::MAX)
-}
-
 /// Appends one state to the ledger and returns its id.
 ///
 /// The columns beside `state_json` are projected from the snapshot rather than
@@ -696,7 +658,8 @@ pub async fn record(conn: &mut Conn, snapshot: &StateSnapshot) -> Result<i64, Le
             message: e.to_string(),
         })?;
     ensure_tables(conn).await?;
-    let snapshot = &*bounded_operator(snapshot);
+    let snapshot =
+        &*flow::bounded_operator(snapshot, ClipUnit::Utf16Units, pbps_db::OPERATOR_CHARS);
     let state_json = serde_json::to_string(snapshot).map_err(|e| LedgerError::BadEntry {
         id: 0,
         message: format!("the snapshot could not be serialized: {e}"),
@@ -722,34 +685,6 @@ pub async fn record(conn: &mut Conn, snapshot: &StateSnapshot) -> Result<i64, Le
             "the ledger insert returned no id".into(),
         ))),
     }
-}
-
-/// [`record`]'s parameters; `true` when the two staged columns are bound.
-fn ordinary_params<'a>(snapshot: &'a StateSnapshot, state_json: &'a str) -> (Vec<Param<'a>>, bool) {
-    let kind = snapshot.kind.as_str();
-    let state_version = saturating_i32(u64::from(snapshot.version));
-    let tables_count = saturating_i32(snapshot.schema.tables.len() as u64);
-    let modules_count = saturating_i32(snapshot.schema.modules.len() as u64);
-    let mut params: Vec<Param<'a>> = vec![
-        kind.into(),
-        snapshot.git_sha.as_ref().map(pbps_model::Text::raw).into(),
-        snapshot.plan_checksum.as_deref().into(),
-        state_json.into(),
-        snapshot.operator.as_str().into(),
-        snapshot.reason.as_ref().map(pbps_model::Text::raw).into(),
-        state_version.into(),
-        tables_count.into(),
-        modules_count.into(),
-    ];
-    let staged = match &snapshot.staged {
-        Some(progress) => {
-            params.push(saturating_i32(progress.completed as u64).into());
-            params.push(saturating_i32(progress.total as u64).into());
-            true
-        }
-        None => false,
-    };
-    (params, staged)
 }
 
 /// Deletes all but the `keep` newest entries; returns how many went.
@@ -905,209 +840,6 @@ pub async fn lock_holder(conn: &mut Conn) -> Result<Option<LockInfo>, DbError> {
     }
 }
 
-fn entry_from_row(row: &pbps_db::Row) -> Result<LedgerEntry, LedgerError> {
-    let stored = stored_entry_from_row(row)?;
-    let id = stored.id;
-    stored.read().map_err(|error| LedgerError::BadEntry {
-        id,
-        message: error.to_string(),
-    })
-}
-
-fn stored_entry_from_row(row: &pbps_db::Row) -> Result<pbps_db::ledger::StoredEntry, LedgerError> {
-    Ok(pbps_db::ledger::StoredEntry {
-        id: get(row, "id")?,
-        applied_at: opt::<&str>(row, "applied_at")?
-            .ok_or_else(|| DbError::BadRow("`applied_at` is unexpectedly NULL".into()))?
-            .to_owned(),
-        state_json: get::<&str>(row, "state_json")?.to_owned(),
-    })
-}
-
-/// A ledger row's projected columns, without `state_json` (DECISIONS 435):
-/// [`SELECT_TIMELINE`] never asks for it. `state` is `None` exactly when this
-/// row predates issue #103's migration — `state_version IS NULL` — and
-/// [`timeline`] must still ask [`select_legacy_state_json`] for it.
-///
-/// `Some(Err(_))` is a third shape, distinct from `None`: a row whose columns
-/// *are* populated but whose version this build does not read — a row a
-/// newer pbps wrote. That is not "legacy" and must never reach the JSON
-/// fallback, which would find nothing wrong with a `state_json` this build
-/// simply has not been asked to parse; refusing it here, before the fallback
-/// even runs, is what [`pbps_db::ledger::TimelineState::from_projected`]
-/// makes unavoidable (a round-1 review finding on #103's own PR).
-struct ProjectedRow {
-    id: i64,
-    applied_at: String,
-    kind: String,
-    git_sha: Option<String>,
-    plan_checksum: Option<String>,
-    operator: String,
-    reason: Option<String>,
-    state: Option<Result<TimelineState, Unreadable>>,
-}
-
-/// A count or a version read back from an `INT` column. Negative is
-/// impossible by construction — [`record`] only ever writes what
-/// [`saturating_i32`] produces — so it is reported rather than clamped: a
-/// negative here means the row and this reader have gone out of step, not
-/// that the count was merely large.
-///
-/// Reported **for that row**, as `Unreadable::Malformed`, and not thrown: a
-/// `BadRow` here used to `?` out of [`projected_row`] and take every other row
-/// of the `timeline()` batch with it, which is the "thrown, not carried"
-/// shape DECISIONS 218 rules out (#372, DEC-372.1).
-fn as_count(n: i32, column: &str) -> Result<usize, Unreadable> {
-    usize::try_from(n).map_err(|_| Unreadable::Malformed(format!("`{column}` is {n}, not a count")))
-}
-
-/// The version's counterpart of [`as_count`], carried the same way: a
-/// negative `state_version` is a malformed row like a negative count, not
-/// evidence the whole read is wrong — a query that had drifted from the table
-/// would show on every row and every column, not on one value (DEC-372.1).
-fn as_version(n: i32, column: &str) -> Result<u32, Unreadable> {
-    u32::try_from(n).map_err(|_| Unreadable::Malformed(format!("`{column}` is {n}, not a version")))
-}
-
-/// A count column of a migrated row: NULL beside a non-NULL `state_version`
-/// is a row `record` never writes, and is carried as malformed with the same
-/// disposition as a negative count — two routes into one kind of bad row
-/// (#372). Only a failure to read the column at all is thrown.
-fn count(row: &pbps_db::Row, column: &str) -> Result<Result<usize, Unreadable>, DbError> {
-    Ok(match opt::<i32>(row, column)? {
-        Some(n) => as_count(n, column),
-        None => Err(Unreadable::Malformed(format!(
-            "`{column}` is NULL beside a `state_version`"
-        ))),
-    })
-}
-
-fn projected_row(row: &pbps_db::Row) -> Result<ProjectedRow, LedgerError> {
-    let id: i64 = get(row, "id")?;
-
-    // `state_version` is the migration's own marker: written by every
-    // `record` from here on, and NULL on every row from before it. It is the
-    // one column this test asks about rather than `tables_count` or the
-    // staged pair, because those three project independently of whether a
-    // row is staged and would each need their own "is this really absent"
-    // rule; `state_version` has only one meaning either way.
-    let state = match opt::<i32>(row, "state_version")? {
-        None => None,
-        Some(version) => Some(migrated_state(row, version)?),
-    };
-
-    ledger_row(row, id, state)
-}
-
-/// The state of a migrated row, or why this build cannot read it.
-///
-/// Every value `record` never writes — a negative or NULL count, a negative
-/// version, a half-populated staged pair — is carried as this row's
-/// `Unreadable`, and `timeline()` answers with every other row intact
-/// (DECISIONS 218, #372). Only a failure to read a column at all is thrown.
-///
-/// The version is checked before any other projected column is even read,
-/// not only before `TimelineState` is built from them (a round-3 review
-/// finding on #103's own PR): `from_projected` already refuses an
-/// unsupported version, but a newer pbps that wrote both an unsupported
-/// version and a count this build cannot parse must refuse just that row —
-/// the one ordering the JSON fallback never got wrong (`read_json` checks
-/// the version before it touches the rest of the document at all). This is a
-/// second call to the same `check_readable_version` `from_projected` already
-/// calls, not a second check that could disagree with it.
-fn migrated_state(
-    row: &pbps_db::Row,
-    version: i32,
-) -> Result<Result<TimelineState, Unreadable>, DbError> {
-    let version = match as_version(version, "state_version") {
-        Ok(v) => v,
-        Err(e) => return Ok(Err(e)),
-    };
-    if let Err(e) = pbps_model::check_readable_version(version) {
-        return Ok(Err(e));
-    }
-    let tables = match count(row, "tables_count")? {
-        Ok(n) => n,
-        Err(e) => return Ok(Err(e)),
-    };
-    let modules = match count(row, "modules_count")? {
-        Ok(n) => n,
-        Err(e) => return Ok(Err(e)),
-    };
-    // `(Some, Some)` and `(None, None)` are the only two pairs `record` ever
-    // writes — it always writes both columns together or neither, driven from
-    // the JSON side's `Option<StagedProgress>`, where `completed`/`total` are
-    // one field, not two, and cannot come apart (a round-4 review finding on
-    // #103's own PR). These two independently nullable columns can still
-    // represent a pair no write path produces — a hand-edited row, or a
-    // migration gone wrong — and it is refused as `Malformed` rather than read
-    // as "not staged" the same as a genuine `(None, None)`, by the same
-    // reasoning `read_json`'s strict parse refuses an inconsistent document.
-    let staged = match (
-        opt::<i32>(row, "staged_completed")?,
-        opt::<i32>(row, "staged_total")?,
-    ) {
-        (Some(completed), Some(total)) => match (
-            as_count(completed, "staged_completed"),
-            as_count(total, "staged_total"),
-        ) {
-            (Ok(completed), Ok(total)) => Some(TimelineStaged { completed, total }),
-            (Err(e), _) | (_, Err(e)) => return Ok(Err(e)),
-        },
-        // A migrated row that is not a staged checkpoint: both are NULL
-        // together, which is what "not mid-deployment" means
-        // (`pbps_model::StagedProgress`'s own doc comment).
-        (None, None) => None,
-        (Some(completed), None) => {
-            return Ok(Err(Unreadable::Malformed(format!(
-                "`staged_completed` is {completed} but `staged_total` is NULL"
-            ))));
-        }
-        (None, Some(total)) => {
-            return Ok(Err(Unreadable::Malformed(format!(
-                "`staged_total` is {total} but `staged_completed` is NULL"
-            ))));
-        }
-    };
-    Ok(Ok(TimelineState::from_projected(
-        version, tables, modules, staged,
-    )
-    .expect("the version was already checked as readable above")))
-}
-
-/// A row from [`SELECT_TIMELINE_UNMIGRATED`]: the six columns a `__pbps_state`
-/// from before issue #103 has, and nothing else — `state` is always `None`,
-/// because a table with no timeline columns has no row that could be
-/// anything but legacy.
-fn projected_row_unmigrated(row: &pbps_db::Row) -> Result<ProjectedRow, LedgerError> {
-    let id: i64 = get(row, "id")?;
-    ledger_row(row, id, None)
-}
-
-/// The six columns every shape of `__pbps_state` this crate reads has, shared
-/// by [`projected_row`] and [`projected_row_unmigrated`] so the two never
-/// drift on how one of them is read.
-fn ledger_row(
-    row: &pbps_db::Row,
-    id: i64,
-    state: Option<Result<TimelineState, Unreadable>>,
-) -> Result<ProjectedRow, LedgerError> {
-    Ok(ProjectedRow {
-        id,
-        applied_at: opt::<&str>(row, "applied_at")?
-            .ok_or_else(|| DbError::BadRow("`applied_at` is unexpectedly NULL".into()))?
-            .to_owned(),
-        // The projected columns, which are what makes an unreadable row still
-        // a row worth showing.
-        kind: get::<&str>(row, "kind")?.to_owned(),
-        git_sha: opt::<&str>(row, "git_sha")?.map(str::to_owned),
-        plan_checksum: opt::<&str>(row, "plan_checksum")?.map(str::to_owned),
-        operator: get::<&str>(row, "operator")?.to_owned(),
-        reason: opt::<&str>(row, "reason")?.map(str::to_owned),
-        state,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1145,10 +877,16 @@ mod tests {
     /// the timeline, which reads as "that is all there is".
     #[test]
     fn a_count_above_the_signed_range_saturates_rather_than_wrapping() {
-        assert_eq!(top(1), 1);
-        assert_eq!(top(i32::MAX as u32), i32::MAX);
-        assert_eq!(top(i32::MAX as u32 + 1), i32::MAX);
-        assert_eq!(top(u32::MAX), i32::MAX);
+        let bound = |limit| match ROW_LIMIT.param(limit) {
+            Param::I32(n) => n,
+            Param::I64(_) | Param::Str(_) | Param::OptStr(_) => {
+                panic!("`TOP` is bound as a 32-bit integer")
+            }
+        };
+        assert_eq!(bound(1), 1);
+        assert_eq!(bound(i32::MAX as u32), i32::MAX);
+        assert_eq!(bound(i32::MAX as u32 + 1), i32::MAX);
+        assert_eq!(bound(u32::MAX), i32::MAX);
     }
 
     /// The constant and the DDL have to agree, or the truncation is measured
@@ -1264,26 +1002,5 @@ mod tests {
             select_legacy_state_json(1),
             "SELECT id, state_json FROM dbo.__pbps_state WHERE id IN (@P1);"
         );
-    }
-
-    /// A count too large for `i32` saturates rather than wrapping — the same
-    /// rule [`top`] follows, applied to what `record` writes.
-    #[test]
-    fn a_count_too_large_for_the_column_saturates() {
-        assert_eq!(saturating_i32(0), 0);
-        assert_eq!(saturating_i32(i32::MAX as u64), i32::MAX);
-        assert_eq!(saturating_i32(i32::MAX as u64 + 1), i32::MAX);
-        assert_eq!(saturating_i32(u64::MAX), i32::MAX);
-    }
-
-    /// A negative value in a column this build only ever writes non-negative
-    /// numbers to is reported rather than clamped to zero — clamping would
-    /// read as "no tables" about a row that is actually corrupted.
-    #[test]
-    fn a_negative_count_or_version_is_reported_not_clamped() {
-        assert!(as_count(-1, "tables_count").is_err());
-        assert_eq!(as_count(5, "tables_count").unwrap(), 5);
-        assert!(as_version(-1, "state_version").is_err());
-        assert_eq!(as_version(7, "state_version").unwrap(), 7);
     }
 }
