@@ -144,10 +144,12 @@ fn problems(c: &Connection) -> Result<Vec<String>, DbError> {
     // pragma does not load a virtual table's module, so a table of a module this
     // library lacks answers with no keys and does not fail the question on an
     // application's file (measured, and a test keeps it so).
+    // The pragma is asked of `main` by name: unqualified, a `TEMP` table of the
+    // child's name would answer in its place, with no key.
     let referring = c.query(
         &format!(
             "SELECT DISTINCT m.name, f.\"table\" FROM main.sqlite_schema AS m, \
-             pragma_foreign_key_list(m.name) AS f \
+             pragma_foreign_key_list(m.name, 'main') AS f \
              WHERE m.type = 'table' \
              AND f.\"table\" COLLATE NOCASE IN ({slots}) ORDER BY m.name, f.\"table\""
         ),

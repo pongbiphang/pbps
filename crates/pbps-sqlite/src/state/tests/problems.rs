@@ -530,3 +530,30 @@ fn the_identity_and_the_holder_are_not_read_from_a_user_table_of_the_name() {
     );
     assert!(crate::state::lock_holder(c).expect("read").is_none());
 }
+
+/// A `TEMP` table of the referring table's name must not answer for it: the
+/// key is on the table in `main`.
+#[test]
+fn a_foreign_key_is_found_though_a_temp_table_shadows_the_referring_table() {
+    let mut fresh = Fresh::memory();
+    let c = fresh.connection();
+    crate::state::ensure_tables(c).expect("created");
+    c.execute_batch(
+        "CREATE TABLE main.audit (state_id INTEGER REFERENCES __pbps_state (id) ON DELETE CASCADE);
+         CREATE TEMP TABLE audit (state_id INTEGER);",
+    )
+    .expect("a child in main and its shadow in temp");
+    let found = crate::state::ledger_problems(c).expect("read");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].contains("`audit` has a foreign key onto `__pbps_state`"),
+        "{found:?}"
+    );
+    // Negative: a key that exists only on a temp table is not the file's.
+    c.execute_batch(
+        "DROP TABLE main.audit; DROP TABLE temp.audit;
+         CREATE TEMP TABLE audit (state_id INTEGER REFERENCES __pbps_state (id));",
+    )
+    .expect("only the temp table has a key");
+    assert!(crate::state::ledger_problems(c).expect("read").is_empty());
+}
