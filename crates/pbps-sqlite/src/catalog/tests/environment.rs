@@ -231,3 +231,62 @@ fn absent_empty_and_unreadable_are_three_answers() {
     );
     assert!(read_raw(fresh.connection()).expect("reads").tables.len() == 1);
 }
+
+/// What reading a database set up by `sql` says, as a refusal.
+fn refusal(sql: &str) -> String {
+    let mut fresh = Fresh::memory();
+    fresh.connection().execute_batch(sql).expect("setup");
+    match introspect(fresh.connection()) {
+        Err(DbError::Refused(m)) => m,
+        other => panic!(
+            "{sql}: expected a refusal, got {:?}",
+            other.map(|p| p.warnings)
+        ),
+    }
+}
+
+#[test]
+fn an_object_named_like_a_pragma_function_refuses_the_read_and_is_named() {
+    // Each of these takes the place of the catalog function in `FROM pragma_x`
+    // (measured: the rows of the user's table are answered, with no error).
+    for (sql, named) in [
+        (
+            "CREATE TABLE pragma_table_list(schema, name, type)",
+            "`pragma_table_list` in `main`",
+        ),
+        (
+            "CREATE TEMP TABLE pragma_table_list(schema, name, type)",
+            "`pragma_table_list` in `temp`",
+        ),
+        (
+            "CREATE VIEW pragma_table_xinfo AS SELECT 1 AS a",
+            "`pragma_table_xinfo` in `main`",
+        ),
+        (
+            "CREATE TABLE \"PRAGMA_Table_List\"(a)",
+            "`PRAGMA_Table_List` in `main`",
+        ),
+        (
+            "ATTACH DATABASE ':memory:' AS \"o\"\"x\"; CREATE TABLE \"o\"\"x\".pragma_table_list(a)",
+            "`pragma_table_list` in `o\"x`",
+        ),
+    ] {
+        let message = refusal(sql);
+        assert!(message.contains(named), "{sql}: {message}");
+        assert!(message.contains("rename or drop it"), "{message}");
+    }
+}
+
+#[test]
+fn a_name_that_only_looks_like_a_pragma_function_reads_normally() {
+    // Negative: the prefix is `pragma_` at the start, and only a table or view
+    // can take a function's place.
+    let (_, pulled) = read_sql(
+        "CREATE TABLE pragmatic(a int); CREATE TABLE xpragma_table_list(a int); \
+         CREATE TABLE pragma(a int); CREATE TABLE t(a int); CREATE INDEX pragma_i ON t(a); \
+         ATTACH DATABASE ':memory:' AS o; CREATE TABLE o.other(a)",
+    );
+    for name in ["pragmatic", "xpragma_table_list", "pragma", "t"] {
+        table(&pulled, name);
+    }
+}

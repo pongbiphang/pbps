@@ -84,6 +84,44 @@ fn unreadable(what: &str, name: &str) -> DbError {
     ))
 }
 
+/// `FROM pragma_table_list` resolves to a user table or view of that name first,
+/// in `main`, `temp` or an attached database (measured), and answers its rows
+/// as the catalog's with no error; the statement form is never shadowed. The
+/// reader cannot tell the two apart, so such an object refuses the read.
+fn refuse_shadowed_pragma_functions(c: &Connection) -> Result<(), DbError> {
+    let mut schemas = vec!["main".to_owned(), "temp".to_owned()];
+    for r in c.query("PRAGMA database_list", &[])? {
+        let name = r.text(1)?;
+        if name != "main" && name != "temp" {
+            schemas.push(name.to_owned());
+        }
+    }
+    let mut shadows = Vec::new();
+    for schema in schemas {
+        let sql = format!(
+            "SELECT name FROM \"{}\".sqlite_schema WHERE type IN ('table', 'view')",
+            schema.replace('"', "\"\"")
+        );
+        for r in c.query(&sql, &[])? {
+            let name = r.text(0)?;
+            if name
+                .as_bytes()
+                .get(..7)
+                .is_some_and(|p| p.eq_ignore_ascii_case(b"pragma_"))
+            {
+                shadows.push(format!("`{}` in `{}`", Escaped(name), Escaped(&schema)));
+            }
+        }
+    }
+    if shadows.is_empty() {
+        return Ok(());
+    }
+    Err(DbError::Refused(format!(
+        "a table or view named like a pragma function ({}) takes its place in a query, so the catalog functions of that name cannot be told from it; rename or drop it",
+        shadows.join(", ")
+    )))
+}
+
 /// Runs the queries. Sorted by name, whatever order the engine answers in.
 pub(crate) fn read_raw(c: &Connection) -> Result<RawCatalog, DbError> {
     let version = c.version()?;
@@ -92,6 +130,7 @@ pub(crate) fn read_raw(c: &Connection) -> Result<RawCatalog, DbError> {
             "reading a SQLite catalog needs {NEEDED} or later (`pragma_table_list`); this library is {version}"
         )));
     }
+    refuse_shadowed_pragma_functions(c)?;
     let mut raw = RawCatalog::default();
     // The stored text of every object, by kind and name. A NULL is an object
     // with no text (an automatic index); it is kept apart from an empty one.
