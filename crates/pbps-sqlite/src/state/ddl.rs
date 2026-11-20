@@ -136,13 +136,37 @@ pub(crate) fn ensure_tables_within(c: &Connection, wait: Duration) -> Result<(),
     if missing.is_empty() {
         return Ok(());
     }
+    create(c, &missing).map_err(|e| busy::explained(e, wait))
+}
+
+/// Creates `missing` in one unit, and confirms inside it that each is now an
+/// ordinary table.
+///
+/// The probe that found them missing took no lock, so another connection can
+/// have made a view of a name since, and `CREATE TABLE IF NOT EXISTS` over a
+/// view succeeds and makes nothing. The catalog is therefore read again after
+/// the statements, in the same unit: a stranger is refused as it is when found
+/// first, and the unit is undone, so no part of a ledger is left beside it.
+pub(super) fn create(c: &Connection, missing: &[&Recipe]) -> Result<(), DbError> {
     in_a_unit(c, || {
-        for recipe in &missing {
+        for recipe in missing {
             c.execute_batch(&recipe.create())?;
         }
-        Ok(())
+        let names: Vec<&str> = missing.iter().map(|r| r.name).collect();
+        let held = occupants(c, &names)?;
+        refuse_a_stranger(&held)?;
+        match names.iter().find(|name| {
+            !held
+                .iter()
+                .any(|(found, _)| crate::ident::same(found, name))
+        }) {
+            None => Ok(()),
+            Some(name) => Err(DbError::BadRow(format!(
+                "the ledger table `{}` was created and the catalog does not list it",
+                Escaped(name)
+            ))),
+        }
     })
-    .map_err(|e| busy::explained(e, wait))
 }
 
 /// Runs `work` under a savepoint: released when it succeeds, undone when it does

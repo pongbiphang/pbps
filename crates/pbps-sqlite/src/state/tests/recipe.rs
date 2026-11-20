@@ -236,3 +236,31 @@ fn a_unit_inside_a_transaction_undoes_only_itself() {
         1
     );
 }
+
+/// The probe takes no lock, so a view of the ledger's name can appear between
+/// it and the statement, and `CREATE TABLE IF NOT EXISTS` over a view succeeds
+/// and makes nothing. The creation reads the catalog again and refuses.
+#[test]
+fn a_view_that_appears_after_the_probe_is_refused_by_the_creation_itself() {
+    let mut fresh = Fresh::memory();
+    let c = fresh.connection();
+    // What the race leaves: the probe saw nothing, and now there is a view.
+    c.execute_batch("CREATE VIEW __pbps_state AS SELECT 1 AS id")
+        .expect("the view");
+    let missing: Vec<&crate::state::ddl::Recipe> = RECIPE.iter().collect();
+    // The engine's side: the statement alone reports nothing.
+    c.execute_batch(&RECIPE[0].create())
+        .expect("a silent no-op");
+    let refused = crate::state::ddl::create(c, &missing).expect_err("refused");
+    assert!(
+        refused
+            .to_string()
+            .contains("is a view, not an ordinary table"),
+        "{refused}"
+    );
+    assert!(!c.in_transaction());
+    // Negative: with the name free the same call creates the table.
+    c.execute_batch("DROP VIEW __pbps_state").expect("dropped");
+    crate::state::ddl::create(c, &missing).expect("created");
+    assert!(is_initialized(c).expect("asked"));
+}
