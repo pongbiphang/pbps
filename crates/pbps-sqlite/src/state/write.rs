@@ -91,6 +91,10 @@ pub(crate) fn record_within(
     snapshot: &StateSnapshot,
     wait: Duration,
 ) -> Result<i64, LedgerError> {
+    busy::waiting(c, wait, || append(c, snapshot, wait))
+}
+
+fn append(c: &Connection, snapshot: &StateSnapshot, wait: Duration) -> Result<i64, LedgerError> {
     snapshot
         .validate_data_work()
         .map_err(|e| LedgerError::BadEntry {
@@ -149,10 +153,13 @@ pub(crate) fn record_within(
 /// a contiguous tail, so one `<=` covers it exactly, and an entry recorded
 /// between the read and the delete is newer than the boundary and is not touched.
 pub fn prune(c: &Connection, keep: u32) -> Result<u64, LedgerError> {
+    busy::waiting(c, BUSY_WAIT, || delete_all_but(c, keep, BUSY_WAIT))
+}
+
+fn delete_all_but(c: &Connection, keep: u32, wait: Duration) -> Result<u64, LedgerError> {
     if !is_initialized(c)? {
         return Err(LedgerError::NotInitialized);
     }
-    let wait = BUSY_WAIT;
     let ids: Vec<i64> = c
         .query(
             &format!("SELECT id FROM {STATE_TABLE} ORDER BY id DESC"),

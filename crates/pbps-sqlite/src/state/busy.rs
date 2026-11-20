@@ -5,7 +5,8 @@
 //! once otherwise. That is wrong for the ledger. Measured with eight processes
 //! creating it at once: with no wait seven of them failed `database is locked`,
 //! with a two-second wait all eight succeeded. The connection has no getter for
-//! its timeout, so every function here sets it before it starts.
+//! its timeout, so every function here sets it for its own statements and puts
+//! back what the pragma said before ([`waiting`]).
 
 use std::time::Duration;
 
@@ -35,12 +36,37 @@ pub(crate) fn is_busy(error: &DbError) -> bool {
     code(error).is_some_and(|code| code & 0xff == BUSY)
 }
 
-/// Sets the wait on `c`.
-pub(super) fn wait_up_to(c: &Connection, wait: Duration) -> Result<(), DbError> {
-    c.set_busy_timeout(wait)
+/// Runs `work` with the wait set on `c`, and puts back the wait the caller had.
+///
+/// The wait is the connection's, not a statement's, so one left behind would
+/// make every later statement on the handle wait where its caller chose not to.
+/// A failure to put it back is reported unless `work` already failed, whose
+/// error is the one that says what went wrong.
+pub(super) fn waiting<T, E: From<DbError>>(
+    c: &Connection,
+    wait: Duration,
+    work: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let before = match c.query("PRAGMA busy_timeout", &[])?.first() {
+        Some(row) => Duration::from_millis(u64::try_from(row.integer(0)?).unwrap_or(0)),
+        None => {
+            return Err(DbError::BadRow("`PRAGMA busy_timeout` returned no row".into()).into());
+        }
+    };
+    c.set_busy_timeout(wait)?;
+    let outcome = work();
+    let restored = c.set_busy_timeout(before);
+    match (outcome, restored) {
+        (Ok(_), Err(error)) => Err(error.into()),
+        (outcome, _) => outcome,
+    }
 }
 
 /// `error`, with the sentence that tells a person what a busy refusal is **not**.
+///
+/// It does not say the wait ran out: the engine also refuses at once, with the
+/// same code, where waiting would be a deadlock (a reader that asks to write
+/// while a writer waits for readers to leave).
 ///
 /// It is another connection's lock, possibly an application's own, so it is not
 /// this tool's lock and `pbps unlock` does not clear it. The source stays in the
@@ -59,8 +85,9 @@ pub(super) fn explained(error: DbError, wait: Duration) -> DbError {
         );
     }
     error.context(format!(
-        "the database is busy: another connection has held SQLite's own write lock for more \
-         than {} s. That is not this tool's lock, and `pbps unlock` does not clear it",
+        "the database is busy: another connection holds one of SQLite's own locks, and a \
+         statement of the ledger waits at most {} s for it. That is not this tool's lock, and \
+         `pbps unlock` does not clear it",
         wait.as_secs_f64()
     ))
 }

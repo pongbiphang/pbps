@@ -184,3 +184,36 @@ fn a_stale_snapshot_is_not_described_as_a_lock_held_for_the_wait() {
     assert!(!said.contains("for more than"), "{said}");
     first.execute_batch("ROLLBACK").expect("closed");
 }
+
+/// The wait is the connection's, so each function puts back what its caller
+/// had, whether it succeeded or not.
+#[test]
+fn the_callers_wait_is_put_back_after_every_ledger_function() {
+    let mut fresh = crate::tests::Fresh::memory();
+    let c = fresh.connection();
+    let wait_now = |c: &Connection| number(c, "PRAGMA busy_timeout");
+    assert_eq!(wait_now(c), 0, "the connection opens waiting for nothing");
+    assert!(!is_initialized(c).expect("asked"));
+    assert_eq!(wait_now(c), 0);
+    ensure_tables(c).expect("created");
+    assert_eq!(wait_now(c), 0);
+    crate::state::record(c, &snapshot(StateKind::Apply, "op")).expect("recorded");
+    assert_eq!(wait_now(c), 0);
+    crate::state::prune(c, 1).expect("pruned");
+    assert_eq!(wait_now(c), 0);
+    // A wait the caller chose is the one put back, not zero.
+    c.set_busy_timeout(Duration::from_millis(1234))
+        .expect("set");
+    crate::state::record(c, &snapshot(StateKind::Apply, "op")).expect("recorded");
+    assert_eq!(wait_now(c), 1234);
+    // And after a failure: a view in the ledger's name refuses everything.
+    c.execute_batch(&format!(
+        "DROP TABLE {STATE_TABLE}; CREATE VIEW __pbps_state AS SELECT 1 AS id"
+    ))
+    .expect("replaced");
+    ensure_tables(c).expect_err("refused");
+    crate::state::record(c, &snapshot(StateKind::Apply, "op")).expect_err("refused");
+    crate::state::prune(c, 1).expect_err("refused");
+    is_initialized(c).expect_err("refused");
+    assert_eq!(wait_now(c), 1234);
+}

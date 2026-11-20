@@ -88,10 +88,11 @@ const UNIT: &str = "pbps_ledger";
 /// code for "no such table" (it is the generic error 1, with text only), and
 /// `main.sqlite_schema` is always readable.
 pub fn is_initialized(c: &Connection) -> Result<bool, DbError> {
-    busy::wait_up_to(c, BUSY_WAIT)?;
-    let held = occupants(c, &[STATE_TABLE_NAME]).map_err(|e| busy::explained(e, BUSY_WAIT))?;
-    refuse_a_stranger(&held)?;
-    Ok(!held.is_empty())
+    busy::waiting(c, BUSY_WAIT, || {
+        let held = occupants(c, &[STATE_TABLE_NAME]).map_err(|e| busy::explained(e, BUSY_WAIT))?;
+        refuse_a_stranger(&held)?;
+        Ok(!held.is_empty())
+    })
 }
 
 /// Creates the ledger's tables that are not there yet.
@@ -121,7 +122,10 @@ pub fn ensure_tables(c: &Connection) -> Result<(), DbError> {
 
 /// [`ensure_tables`] with the wait given, so a test need not wait five seconds.
 pub(crate) fn ensure_tables_within(c: &Connection, wait: Duration) -> Result<(), DbError> {
-    busy::wait_up_to(c, wait)?;
+    busy::waiting(c, wait, || ensure(c, wait))
+}
+
+fn ensure(c: &Connection, wait: Duration) -> Result<(), DbError> {
     let names: Vec<&str> = RECIPE.iter().map(|r| r.name).collect();
     let held = occupants(c, &names).map_err(|e| busy::explained(e, wait))?;
     refuse_a_stranger(&held)?;
