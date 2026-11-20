@@ -44,7 +44,7 @@ pub struct Verdict {
     pub notes: Vec<String>,
 }
 
-/// One connection setting the plan's statements depend on, the value it must
+/// One numeric connection setting the plan's statements depend on, the value it must
 /// have, and what goes wrong otherwise (each measured on the bundled library).
 struct Setting {
     pragma: &'static str,
@@ -111,7 +111,29 @@ pub fn connection_problems(c: &Connection) -> Result<Vec<String>, DbError> {
             ));
         }
     }
+    found.extend(journal_off(c)?);
     Ok(found)
+}
+
+/// The line for a connection whose rollback journal is off, if it is.
+///
+/// SQLite documents a rollback as undefined with `journal_mode = OFF`. Measured:
+/// a small rolled-back transaction is dropped from the page cache, and one large
+/// enough to have written pages reports success and leaves them in the file. So
+/// a failed apply could keep part of what ran, and the probe of [`writable`]
+/// rests on a rollback too.
+fn journal_off(c: &Connection) -> Result<Option<String>, DbError> {
+    let rows = c.query("PRAGMA journal_mode", &[])?;
+    let Some(row) = rows.first() else {
+        return Err(DbError::BadRow(
+            "`PRAGMA journal_mode` returned no row".into(),
+        ));
+    };
+    Ok(row.text(0)?.eq_ignore_ascii_case("off").then(|| {
+        "`PRAGMA journal_mode` reads off on this connection and this tool needs a journal: \
+         without one a rollback is not reliable, so a failed apply could keep part of what ran"
+            .to_owned()
+    }))
 }
 
 /// What the library's version cannot do that the plan or the reader needs, one
@@ -173,6 +195,10 @@ pub fn writable(c: &Connection) -> Result<(), DbError> {
 /// [`writable`] with the wait given, so a test need not wait five seconds.
 pub(crate) fn writable_within(c: &Connection, wait: Duration) -> Result<(), DbError> {
     waiting(c, wait, || {
+        // The probe is undone by a rollback, which is not reliable without a journal.
+        if let Some(line) = journal_off(c)? {
+            return Err(DbError::Refused(line));
+        }
         let name = probe_name(c)?;
         // The apply's own framing: the write lock is taken at once, so a second
         // writer is named as busy and not as an unwritable file.
@@ -287,6 +313,8 @@ fn verdict_for(
     if stage == Stage::Apply {
         match writable(c) {
             Ok(()) => {}
+            // The journal's line is the connection's too; said once.
+            Err(DbError::Refused(line)) if verdict.problems.contains(&line) => {}
             Err(DbError::Refused(line)) => verdict.problems.push(line),
             Err(other) => return Err(other),
         }

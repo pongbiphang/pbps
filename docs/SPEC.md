@@ -2460,7 +2460,8 @@ different write behavior. PostgreSQL keeps its existing type-change plan shape
 file and does not read the rows. Before the first statement an apply refuses,
 naming each, a connection whose settings change what the statements mean
 (`foreign_keys` off, `legacy_alter_table` or `ignore_check_constraints` or
-`defer_foreign_keys` or `query_only` or `writable_schema` on); a library older
+`defer_foreign_keys` or `query_only` or `writable_schema` on, or the
+rollback journal off); a library older
 than a release the plan's in-place statements need; a ledger that is not the one
 this tool creates (7.5 above, 8.1); and a database it cannot write, which it
 finds by making and rolling back a table of a random name, so that a

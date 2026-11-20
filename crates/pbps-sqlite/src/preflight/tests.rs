@@ -465,3 +465,49 @@ fn the_probe_waits_for_a_writer_that_leaves_instead_of_failing_at_once() {
     writable_within(fresh.connection(), Duration::from_secs(60)).expect("waited and wrote");
     writer.join().expect("the writer ended");
 }
+
+/// Without a journal a rollback is not reliable, and both an apply and the
+/// probe rest on one.
+#[test]
+fn a_connection_with_the_journal_off_is_refused_and_the_probe_writes_nothing() {
+    let mut fresh = Fresh::file();
+    let c = fresh.connection();
+    c.execute_batch("CREATE TABLE app(a)").expect("a table");
+    assert_eq!(text(c, "PRAGMA journal_mode = OFF"), "off");
+    let found = connection_problems(c).expect("asked");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].contains("`PRAGMA journal_mode` reads off"),
+        "{found:?}"
+    );
+    match writable(c) {
+        Err(DbError::Refused(line)) => assert_eq!(line, found[0]),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(!c.in_transaction());
+    assert_eq!(
+        c.query(
+            "SELECT count(*) FROM sqlite_schema WHERE name LIKE '__pbps_probe_%'",
+            &[]
+        )
+        .expect("query")[0]
+            .integer(0)
+            .expect("count"),
+        0
+    );
+    // Said once by the whole check, though both the connection and the probe say it.
+    let verdict = before_apply(c, &plan([]), Version::new(3, 35, 0), Stage::Apply).expect("asked");
+    assert_eq!(
+        verdict
+            .problems
+            .iter()
+            .filter(|line| line.contains("journal_mode"))
+            .count(),
+        1,
+        "{verdict:?}"
+    );
+    // Negative: with the journal back, neither refuses.
+    assert_eq!(text(c, "PRAGMA journal_mode = DELETE"), "delete");
+    assert_eq!(connection_problems(c).expect("asked"), Vec::<String>::new());
+    writable(c).expect("writable");
+}
