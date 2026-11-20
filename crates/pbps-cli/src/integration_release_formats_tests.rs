@@ -166,12 +166,31 @@ fn read_record(path: &Path) -> Result<Option<Released>, String> {
         .map_err(|e| format!("the record {} is not a release record: {e}", path.display()))
 }
 
-fn write_archive(dir: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    for (kind, file) in PUBLISHED {
+/// Writes `documents` into a directory this call makes, or leaves no directory.
+///
+/// The leaf is made with `create_dir`, so it is never one that was there: a
+/// half-written archive would otherwise be found by the next freeze, which
+/// cannot read it as a set and stops. The documents are a parameter so that a
+/// test can hand over one whose write fails.
+fn write_archive(dir: &Path, documents: &[(&str, String)]) -> Result<(), String> {
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    std::fs::create_dir(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    for (file, text) in documents {
         let path = dir.join(file);
-        std::fs::write(&path, rendered(kind))
-            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        if let Err(e) = std::fs::write(&path, text) {
+            return Err(match std::fs::remove_dir_all(dir) {
+                Ok(()) => format!("cannot write {}: {e}", path.display()),
+                Err(removed) => format!(
+                    "cannot write {}: {e}; the directory {} remains, and could not be \
+                     removed: {removed}",
+                    path.display(),
+                    dir.display()
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -189,9 +208,11 @@ fn write_archive(dir: &Path) -> Result<(), String> {
 /// An archive is never rewritten (the rule of the numbered ones, kept). One that
 /// exists is reused when it is this set, which is what a second release finds if
 /// the documents did not change between two releases, and refused when it is not.
-/// A blank tag is refused. The record is written last, so a failure part way
-/// leaves no record that names a missing archive; what it leaves is an archive
-/// directory, which the message names. The result is read back through
+/// A blank tag is refused. The archive is written into a directory the call
+/// makes, and a failed write removes it, so a failure leaves nothing for the
+/// next freeze to trip on. The record is written last, so a failure there leaves
+/// no record that names a missing archive; it leaves a complete archive, which
+/// the message names and a second freeze reuses. The result is read back through
 /// the loader's own parser and put through `check_record`, so a freeze that
 /// produces a file the checks refuse fails at once.
 fn freeze(layout: &Layout, tag: &str, build: &Build) -> Result<(), String> {
@@ -222,7 +243,8 @@ fn freeze(layout: &Layout, tag: &str, build: &Build) -> Result<(), String> {
             ));
         }
     } else {
-        write_archive(&dir)?;
+        let documents = PUBLISHED.map(|(kind, file)| (file, rendered(kind)));
+        write_archive(&dir, &documents)?;
     }
     let released = Released {
         tag: tag.to_owned(),
@@ -542,7 +564,8 @@ fn a_freeze_refuses_an_archive_of_another_set_when_nothing_was_released() {
     // apply, and the archive's is the one left to stop a freeze.
     let scratch = Scratch::new();
     let dir = scratch.layout().archive(SCHEMA_VERSION);
-    write_archive(&dir).unwrap();
+    let documents = PUBLISHED.map(|(kind, file)| (file, rendered(kind)));
+    write_archive(&dir, &documents).unwrap();
     let file = dir.join(PUBLISHED[0].1);
     let mut document: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
@@ -554,6 +577,41 @@ fn a_freeze_refuses_an_archive_of_another_set_when_nothing_was_released() {
         std::fs::read_to_string(scratch.layout().record).unwrap(),
         NO_RELEASE
     );
+}
+
+#[test]
+fn a_failed_archive_write_leaves_no_directory_and_a_later_freeze_succeeds() {
+    let scratch = Scratch::new();
+    let dir = scratch.layout().archive(SCHEMA_VERSION);
+    // The second file's directory does not exist, so its write fails after the
+    // first has succeeded: a partial archive, which must not stay.
+    let documents = [
+        ("first.json", "{}".to_owned()),
+        ("missing/second.json", "{}".to_owned()),
+    ];
+    let why = write_archive(&dir, &documents).expect_err("the second write fails");
+    assert!(why.contains("cannot write"), "{why}");
+    assert!(
+        why.replace('\\', "/").contains("missing/second.json"),
+        "{why}"
+    );
+    assert!(!dir.exists(), "a partial archive stays: {why}");
+    freeze(&scratch.layout(), "v1", &Build::current()).expect("nothing is in the way");
+    assert!(dir.join(PUBLISHED[0].1).exists());
+}
+
+#[test]
+fn an_archive_write_never_touches_a_directory_that_was_already_there() {
+    // The failure cleanup removes only what the call made. A directory that
+    // exists is refused, with its contents as they were.
+    let scratch = Scratch::new();
+    let dir = scratch.layout().archive(SCHEMA_VERSION);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("keep.json"), "kept").unwrap();
+    let documents = [("a.json", "{}".to_owned())];
+    let why = write_archive(&dir, &documents).expect_err("it exists");
+    assert!(why.contains("cannot create"), "{why}");
+    assert_eq!(listing(&dir), ["keep.json"]);
 }
 
 #[test]

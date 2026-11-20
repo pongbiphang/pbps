@@ -59,8 +59,12 @@ produces something the checks refuse fails at once.
   did not change since the first, and the freeze stops if it holds another set.
   In that case the set changed without its number moving, which is the thing the
   rule test exists to refuse.
-- It writes the record last. If writing the record fails, the archive stays and a
-  second freeze reuses it.
+- It writes the archive into a directory it makes itself. If a file write fails,
+  it removes that directory and reports the write's error, so a failed freeze
+  leaves no partial `released/<n>/` for the next one to trip on. If the removal
+  fails too, the message says the directory remains and names it.
+- It writes the record last. If writing the record fails, the archive is complete
+  and stays, and a second freeze reuses it.
 
 ## After the freeze
 
