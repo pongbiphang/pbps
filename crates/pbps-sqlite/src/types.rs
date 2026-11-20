@@ -26,6 +26,25 @@ use crate::keywords;
 
 pub const DIALECT: &str = "sqlite";
 
+/// The reserved spelling of a column with no declared type. SQLite takes
+/// `CREATE TABLE t(a)` and a catalog read finds many such columns, but a type
+/// cannot be empty in the model, so the column is declared and read as this
+/// word and **written as no type at all** (`emit::column::definition`). It is
+/// never written into the file: declared there the word would be an ordinary
+/// type name with NUMERIC affinity, which stores `'1'` as the integer 1 where a
+/// column with no type keeps the text. Only the bare word is reserved
+/// (`untyped int` and `untyped(5)` are ordinary types), and `blob` is not the
+/// answer: a later rebuild would write `blob` into the file and change what
+/// an application's own `CREATE` text says.
+pub const UNTYPED: &str = "untyped";
+
+/// Whether a type is the reserved spelling: the word alone, with no arguments,
+/// in any ASCII case.
+#[must_use]
+pub fn is_untyped(ty: &ColumnType) -> bool {
+    ty.args.is_empty() && ty.base.eq_ignore_ascii_case(UNTYPED)
+}
+
 /// The five column affinities. `Integer` and `Numeric` store every value
 /// identically; they differ in a `CAST` to the type and in whether the column
 /// can be the rowid (see [`rowid_alias`]).
@@ -78,10 +97,17 @@ pub fn affinity(declared: &str) -> Affinity {
 }
 
 /// [`affinity`] of a column type, which is the affinity of its name: the
-/// arguments are digits and change nothing.
+/// arguments are digits and change nothing. The reserved [`UNTYPED`] is the
+/// exception, and the only one: it stands for a column with no declared type,
+/// so it has that column's affinity, BLOB, and not the NUMERIC the word itself
+/// would get if it were written.
 #[must_use]
 pub fn affinity_of(ty: &ColumnType) -> Affinity {
-    affinity(&ty.base)
+    if is_untyped(ty) {
+        Affinity::Blob
+    } else {
+        affinity(&ty.base)
+    }
 }
 
 /// Whether a column of this type can be the table's rowid: the declared type
@@ -201,6 +227,9 @@ pub enum Standing {
     /// what that affinity does: `uuid` has NUMERIC affinity, so all-digit text
     /// is stored as a number.
     Unlisted,
+    /// The reserved spelling of a column with no declared type (see
+    /// [`UNTYPED`]): it is not written as a name but as no type.
+    Untyped,
     /// A name pbps will not write, with the reason.
     Refused(&'static str),
 }
@@ -215,8 +244,9 @@ pub enum Standing {
 /// 2. A name with a word on the promise list is refused (see [`PROMISES`]),
 ///    wherever it stands: `int auto_increment` and `int identity(1,1)` are
 ///    accepted by SQLite as a type whose text contains the word.
-/// 3. A documented name is [`Standing::Documented`].
-/// 4. Every other name is [`Standing::Unlisted`].
+/// 3. The word [`UNTYPED`] alone is [`Standing::Untyped`].
+/// 4. A documented name is [`Standing::Documented`].
+/// 5. Every other name is [`Standing::Unlisted`].
 ///
 /// To close the catalogue (option A, a documented name or nothing) change the
 /// last line to return [`Standing::Refused`]; the policy table in the tests
@@ -224,6 +254,9 @@ pub enum Standing {
 /// that then changes.
 #[must_use]
 pub fn standing(base: &str) -> Standing {
+    if base.eq_ignore_ascii_case(UNTYPED) {
+        return Standing::Untyped;
+    }
     for word in base.split_ascii_whitespace() {
         if keywords::ends_type(word) {
             return Standing::Refused(
@@ -326,9 +359,8 @@ fn takes_argument(arg: &TypeArg) -> bool {
 /// written, and the two meet in this function.
 ///
 /// Known gaps, valid SQLite this refuses, for the catalog reader to report by
-/// name (DEC-2950.2): a column with no declared type; a comment inside the
-/// parentheses; and, on purpose, an array spelling, a promise-list word and a
-/// quoted keyword, which would say something else once written unquoted. Each
+/// name (DEC-2950.2): a comment inside the parentheses; and, on purpose, an
+/// array spelling, a promise-list word and a quoted keyword, which would say something else once written unquoted. Each
 /// is pinned by a test that names it.
 pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
     if ty.type_ref().is_some() {
@@ -352,13 +384,13 @@ pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
     }
     let words: Vec<&str> = ty.base.split_ascii_whitespace().collect();
     if words.is_empty() {
-        // Known gap: SQLite takes a column with no declared type (BLOB
-        // affinity, no conversion) and a catalog read finds many of them, but
-        // the model has no spelling for it: a type must not be empty, and the
-        // empty string does not survive the saved plan's own round trip.
+        // SQLite takes a column with no declared type (BLOB affinity, no
+        // conversion), but a type must not be empty in the model, and the
+        // empty string does not survive the saved plan's own round trip: the
+        // reserved word `untyped` is the spelling.
         return Err(invalid(format!(
             "`{}` is an empty type. SQLite accepts a column with no declared type (it keeps \
-             every value as given), but a declaration cannot say so; declare `blob`",
+             every value as given); declare `untyped` for one",
             ty.shown()
         )));
     }
@@ -403,6 +435,50 @@ pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
         )));
     }
     Ok(ColumnType::new(base, ty.args.clone()))
+}
+
+/// The type of a column as the catalog reports it, which is the text the engine
+/// stored: the declared type as written, a column with no type reported as
+/// empty. Empty is [`UNTYPED`]; anything else parses and normalizes as a
+/// declared type does, so a read type and a declared one meet in the same form.
+///
+/// Empty is not proof of no type: a column declared with a quoted empty name
+/// (`a ""`) is reported empty too and has NUMERIC affinity (measured), so the
+/// caller must also see in the stored text that the column has no type words.
+/// A quoted name of only white space (`a " "`) is reported as that white space
+/// and is NUMERIC as well; it is refused here, never read as no type.
+///
+/// A column really declared `untyped` is refused, by name: read as the
+/// reserved word it would be written back with no type, and the column would
+/// change from NUMERIC affinity (what the word gives) to BLOB (what no type
+/// gives), converting what it stores. Only the bare word collides; `untyped
+/// int` and `untyped(5)` are ordinary types.
+pub fn read_back(declared: &str) -> Result<ColumnType, DialectError> {
+    if declared.is_empty() {
+        return Ok(ColumnType::new(UNTYPED, Vec::new()));
+    }
+    if declared.chars().all(|c| c.is_ascii_whitespace()) {
+        return Err(invalid(
+            "a column is declared with a quoted type name of only white space: it has NUMERIC \
+             affinity, and this tool cannot write that name back"
+                .to_owned(),
+        ));
+    }
+    let parsed: ColumnType = declared.parse().map_err(|_| {
+        invalid(format!(
+            "the declared type `{}` is not one this tool reads",
+            pbps_model::escape::Escaped(declared)
+        ))
+    })?;
+    if is_untyped(&parsed) {
+        return Err(invalid(format!(
+            "a column is declared with the type `{}`, which this tool reserves for a column with no \
+             type: it has NUMERIC affinity, and reading it as no type would write it back as a \
+             BLOB column",
+            pbps_model::escape::Escaped(declared)
+        )));
+    }
+    normalize(&parsed)
 }
 
 /// The only types a STRICT table accepts, which it then enforces.
@@ -1447,3 +1523,6 @@ mod tests {
         assert_eq!((omitted("integer"), omitted("int")), (1, 0));
     }
 }
+
+#[cfg(test)]
+mod untyped_tests;

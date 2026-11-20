@@ -50,7 +50,9 @@ pub(super) fn emit(dialect: &Sqlite, gate: Gate, change: &ColumnChange) -> Sql {
 }
 
 /// One column as `CREATE TABLE` and `ADD COLUMN` write it: name, type, `NOT
-/// NULL`, `DEFAULT`. The type is the normalized one, and the default is the one
+/// NULL`, `DEFAULT`. The type is the normalized one (and for the reserved
+/// [`types::UNTYPED`] nothing: that is the one place the word is turned into no
+/// type, and the only place a type's text enters SQL), and the default is the one
 /// form [`validate::default_value`] admits; `TRUE` and `FALSE` are text that
 /// stays in the file, so they need the floor to read them as constants.
 pub(super) fn definition(
@@ -58,7 +60,13 @@ pub(super) fn definition(
     column: &Column,
 ) -> Result<String, pbps_dialect::DialectError> {
     let ty = types::normalize(&column.ty)?;
-    let mut sql = [local(name.raw())?, " ".to_owned(), ty.raw().to_string()].concat();
+    let mut sql = local(name.raw())?;
+    // The reserved word stands for no type: written, it would be a NUMERIC
+    // column.
+    if !types::is_untyped(&ty) {
+        sql.push(' ');
+        sql.push_str(&ty.raw().to_string());
+    }
     if !column.nullable {
         sql.push_str(" NOT NULL");
     }
