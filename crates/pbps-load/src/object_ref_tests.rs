@@ -10,7 +10,7 @@ fn module_with(depends_on: &str) -> Result<LoadedModule, Vec<LoadError>> {
 #[test]
 fn legacy_module_targets_keep_their_loader_formatter_and_json_bytes() {
     for name in ["dbo.base", "app.f(integer)", "app.t.tr", "表.檢視"] {
-        let owner = module_with(&render_scalar(name)).unwrap();
+        let owner = module_with(&fmt::scalar(name)).unwrap();
         let references = owner.depends_on.deps.clone();
         let original = references.modules();
         assert_eq!(ObjectDeps::from_legacy(&original), references);
@@ -38,7 +38,7 @@ fn legacy_module_targets_keep_their_loader_formatter_and_json_bytes() {
         // The bare name is what the file keeps, byte for byte.
         let spelled = ObjectRef::legacy(name).unwrap().legacy_spelling().unwrap();
         assert!(
-            rendered.contains(&format!("depends_on: [{}]", render_scalar(&spelled))),
+            rendered.contains(&format!("depends_on: [{}]", fmt::scalar(&spelled))),
             "{rendered}"
         );
     }

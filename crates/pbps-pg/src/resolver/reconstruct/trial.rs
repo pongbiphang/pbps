@@ -94,7 +94,6 @@ impl Reconstruction {
                             declaration: self.steps[at].declaration.clone(),
                             subject: self.steps[at].subject.clone(),
                             owner: self.steps[at].owner.clone(),
-                            dependency: None,
                             last: Some(diagnosis),
                             recovery: None,
                             blocked: Vec::new(),
@@ -126,7 +125,6 @@ impl Reconstruction {
                 declaration: self.steps[at].declaration.clone(),
                 subject: self.steps[at].subject.clone(),
                 owner: self.steps[at].owner.clone(),
-                dependency: None,
                 last: last[at].clone(),
                 recovery: recoveries[at].clone(),
                 blocked: cursor

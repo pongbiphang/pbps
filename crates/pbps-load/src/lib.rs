@@ -2082,9 +2082,6 @@ indexes:
     }
 }
 
-/// The same scalar renderer used by declaration formatting.
-pub use fmt::scalar as render_scalar;
-
 #[cfg(test)]
 mod source_index_tests {
     use super::*;
@@ -2115,36 +2112,6 @@ mod source_index_tests {
         assert!(load_schema_dir(dir.as_path()).is_err());
         assert!(Loaded::default().sources.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
-    }
-}
-
-#[cfg(test)]
-mod dependency_remedy_tests {
-    #[test]
-    fn a_rendered_module_remedy_passes_the_real_dependency_validator() {
-        let provider: pbps_model::ModuleId = "app.g(integer)".parse().unwrap();
-        let yaml = super::render_scalar(&provider.raw().to_string());
-        let text = format!("view: app.v\ndefinition: SELECT 1 AS n\ndepends_on: [{yaml}]\n");
-        let owner = super::load_module_str(std::path::Path::new("v.yaml"), &text).unwrap();
-        let target = super::load_module_str(std::path::Path::new("g.yaml"), "function: app.g(integer)\ndefinition: (integer) RETURNS integer LANGUAGE sql RETURN 1\n").unwrap();
-        let mut schema = pbps_model::Schema::default();
-        schema.modules.insert(owner.id.clone(), owner.module);
-        schema.modules.insert(target.id, target.module);
-        let deps = owner.depends_on.deps.modules();
-        assert!(pbps_model::module::check_dependencies(&schema, &deps).is_empty());
-        assert!(
-            super::load_module_str(
-                std::path::Path::new("bad.yaml"),
-                "view: app.v\ndefinition: SELECT 1\ndepends_on: [table::app.t]\n"
-            )
-            .is_ok()
-        );
-        let invalid = [(
-            "app.v".parse().unwrap(),
-            ["table::app.t".parse().unwrap()].into(),
-        )]
-        .into();
-        assert!(!pbps_model::module::check_dependencies(&schema, &invalid).is_empty());
     }
 }
 

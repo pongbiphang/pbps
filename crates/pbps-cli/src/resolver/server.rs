@@ -82,14 +82,6 @@ impl std::fmt::Display for CreationFailure {
                 .map(|path| pbps_model::escape::Escaped(&path.to_string_lossy()).to_string())
         };
         write!(f, "{}", self.report.render(path))?;
-        for pending in &self.report.pending {
-            if let (Some(owner), Some(provider)) = (&pending.owner, &pending.dependency)
-                && let Some(file) = path(owner)
-            {
-                let yaml = pbps_load::render_scalar(&provider.raw().to_string());
-                write!(f, "\n  fix: add to {file}\n         depends_on: [{yaml}]")?;
-            }
-        }
         for context in &self.context {
             write!(f, "\n{context}")?;
         }

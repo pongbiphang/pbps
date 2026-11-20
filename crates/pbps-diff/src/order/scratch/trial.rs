@@ -75,9 +75,9 @@ impl<E: Engine> TrialProgram<E> {
         })
     }
 
-    /// A remedy must not close a known dependency cycle, even when one of its
-    /// legs is only inferred. An uncertain guess may suppress advice, never
-    /// justify a hard-cycle remedy.
+    /// Whether `before` may run ahead of `after` without closing a known
+    /// dependency cycle: a path from `before` back to `after` through hard
+    /// edges, or through an inferred leg, answers no.
     pub fn can_precede(&self, before: usize, after: usize) -> bool {
         let mut pending = vec![before];
         let mut seen = BTreeSet::new();
