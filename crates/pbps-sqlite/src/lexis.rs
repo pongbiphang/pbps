@@ -139,7 +139,7 @@ pub fn has_token(text: &str) -> bool {
 /// not runs to the end of the text, and takes with it whatever is written
 /// after the text: a `--` comment with no line end, a `/*` with no `*/`, a
 /// string or a quoted name with no closer.
-fn closes(piece: Piece<'_>) -> bool {
+pub(crate) fn closes(piece: Piece<'_>) -> bool {
     match piece {
         Piece::Code(_) => true,
         Piece::Comment(run) if run.starts_with("--") => false,
@@ -307,6 +307,24 @@ pub fn first_word(text: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The name a quoted run spells, its quotes undone: `"a""b"` and `` `a``b` ``
+/// double their closer, `[a b]` does not, and `'a''b'` is a string that
+/// SQLite also takes as a name in a few places. `None` for a run that is not
+/// one of the four, or that does not close.
+#[must_use]
+pub fn unquote(run: &str) -> Option<String> {
+    let quote = run.chars().next()?;
+    if quote == '[' {
+        return run.strip_suffix(']').map(|rest| rest[1..].to_owned());
+    }
+    if !matches!(quote, '"' | '`' | '\'') || quoted_len(run, quote) != (run.len(), true) {
+        return None;
+    }
+    let inner = &run[1..run.len() - 1];
+    let doubled: String = [quote, quote].iter().collect();
+    Some(inner.replace(&doubled, &quote.to_string()))
 }
 
 /// Whether the code of `text` may name `name`: as a bare word, or as a quoted
