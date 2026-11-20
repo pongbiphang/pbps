@@ -59,7 +59,9 @@ pub(crate) fn ledger_problems_within(
 /// The refusal in front of every statement that writes to the ledger, given by
 /// [`ensure_tables`](super::ensure_tables) (so by `record` and `lock`), `prune`,
 /// `unlock` and `release`: a `DELETE` fires a trigger exactly as an `INSERT`
-/// does. Reads do not ask.
+/// does. Two reads ask as well, `environment_identity` and `lock_holder`: each
+/// answers from a one-row table, and a user's own table of that name and
+/// columns would answer in its place. The reads of the state table do not.
 pub(super) fn refuse_untrusted(c: &Connection, wait: Duration) -> Result<(), DbError> {
     let found = problems(c).map_err(|e| busy::explained(e, wait))?;
     if found.is_empty() {
@@ -73,7 +75,8 @@ pub(super) fn refuse_untrusted(c: &Connection, wait: Duration) -> Result<(), DbE
 pub fn untrusted_ledger_message(problems: &[String]) -> String {
     format!(
         "{}.\n\
-         The ledger tables are not the ones this tool creates, so it will not write to them: \
+         The ledger tables are not the ones this tool creates, so it will not write to them, nor \
+         take the lock's holder or the environment's identifier from them: \
          a trigger on one would run with every write, and a table of another shape does not \
          keep what the ledger promises. If they were made by this tool and changed by hand, \
          restore them; otherwise rename or drop them and let this tool create its own. \

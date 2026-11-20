@@ -20,6 +20,7 @@ use pbps_db::sqlite::Connection;
 
 use super::busy::{BUSY_WAIT, explained, waiting};
 use super::ddl::{occupants, refuse_a_stranger};
+use super::problems::refuse_untrusted;
 use super::{ENVIRONMENT_TABLE, ENVIRONMENT_TABLE_NAME};
 
 /// The identifier's length, in characters.
@@ -36,6 +37,11 @@ pub const ENVIRONMENT_ID_CHARS: usize = 32;
 ///   damage and is never read as absence.
 pub fn environment_identity(c: &Connection) -> Result<Option<String>, DbError> {
     waiting(c, BUSY_WAIT, || {
+        // This read asks the integrity check, though the state reads do not: a
+        // user's own table of this name with this column would otherwise answer
+        // as the identity (measured), and that answer is what an environment is
+        // known by.
+        refuse_untrusted(c, BUSY_WAIT)?;
         let held = occupants(c, &[ENVIRONMENT_TABLE_NAME]).map_err(|e| explained(e, BUSY_WAIT))?;
         refuse_a_stranger(&held)?;
         if held.is_empty() {

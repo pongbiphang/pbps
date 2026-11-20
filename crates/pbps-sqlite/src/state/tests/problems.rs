@@ -378,11 +378,12 @@ fn every_write_is_refused_on_an_untrusted_ledger_and_reads_are_not() {
     // Refused means untouched: the row of the lock and the entry are still there.
     assert_eq!(number(c, &format!("SELECT count(*) FROM {LOCK_TABLE}")), 1);
     assert_eq!(number(c, &format!("SELECT count(*) FROM {STATE_TABLE}")), 1);
-    // A read answers, as on the other engines: it writes nothing.
+    // A read of the states answers, as on the other engines: it writes nothing.
     assert!(latest(c).expect("read").is_some());
     assert_eq!(timeline(c, 10).expect("read").len(), 1);
-    assert!(lock_holder(c).expect("read").is_some());
-    assert!(environment_identity(c).expect("read").is_some());
+    // The two reads that answer from a one-row table ask the check as well.
+    assert!(matches!(lock_holder(c), Err(DbError::Refused(_))));
+    assert!(matches!(environment_identity(c), Err(DbError::Refused(_))));
 }
 
 #[test]
@@ -495,4 +496,37 @@ fn a_user_table_in_a_ledger_name_makes_a_read_fail_when_its_columns_differ() {
     .expect("user tables");
     assert!(environment_identity(c).is_err());
     assert!(lock_holder(c).is_err());
+}
+
+/// A user's own table that has a one-row ledger table's name and its column
+/// names answered in its place before these two reads asked the check.
+#[test]
+fn the_identity_and_the_holder_are_not_read_from_a_user_table_of_the_name() {
+    let mut fresh = Fresh::memory();
+    let c = fresh.connection();
+    c.execute_batch(
+        "CREATE TABLE __pbps_environment (id INTEGER, environment_id TEXT);
+         INSERT INTO __pbps_environment VALUES (1, '0123456789abcdef0123456789abcdef');
+         CREATE TABLE __pbps_lock (id INTEGER, locked_by TEXT, locked_at TEXT, proof TEXT,
+                                   sidecar TEXT, token TEXT);
+         INSERT INTO __pbps_lock VALUES (1, 'nobody [pid 1]', 'then', 'row', NULL, 't');",
+    )
+    .expect("two user tables");
+    for refused in [
+        crate::state::environment_identity(c).map(drop),
+        crate::state::lock_holder(c).map(drop),
+    ] {
+        let said = refused.expect_err("refused").to_string();
+        assert!(said.contains("not the ones this tool creates"), "{said}");
+    }
+    // Negative: the genuine tables answer.
+    c.execute_batch("DROP TABLE __pbps_environment; DROP TABLE __pbps_lock")
+        .expect("dropped");
+    crate::state::ensure_tables(c).expect("created");
+    assert!(
+        crate::state::environment_identity(c)
+            .expect("read")
+            .is_some()
+    );
+    assert!(crate::state::lock_holder(c).expect("read").is_none());
 }

@@ -2738,7 +2738,9 @@ its first write when a table differs or something else hangs off one: a trigger
 or an index on a ledger table, a foreign key from another table onto one, a view
 or a user table in a ledger name, a column added, renamed or dropped, a table
 rebuilt `WITHOUT ROWID` or `STRICT`, a virtual table, a name in another case.
-`record`, `lock`, `prune`, `unlock` and the release of a lock ask; a read does not.
+`record`, `lock`, `prune`, `unlock` and the release of a lock ask, and so do the
+two reads that answer from a one-row table (who holds the lock, and the
+environment identifier); the reads of the recorded states do not.
 A ledger table that is not there is not a difference: the next write makes it.
 The check reads the file's own catalog only, and not the rows (the lock's holder,
 the identifier, the sequence of the ids) or edits that leave the stored text as it

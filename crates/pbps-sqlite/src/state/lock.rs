@@ -551,6 +551,9 @@ pub fn unlock(c: &Connection) -> Result<bool, DbError> {
 /// not look" must never read as "nothing there".
 pub fn lock_holder(c: &Connection) -> Result<Option<LockInfo>, DbError> {
     waiting(c, BUSY_WAIT, || {
+        // Asked here too: a user's own table of the lock's name and columns
+        // would otherwise be read as a holder (measured).
+        refuse_untrusted(c, BUSY_WAIT)?;
         Ok(read_row(c)
             .map_err(|e| explained(e, BUSY_WAIT))?
             .map(|row| info(row, None, None)))
