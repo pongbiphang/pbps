@@ -3431,6 +3431,69 @@ fn a_parents_new_exclusion_refuses_every_own_it_would_take_and_not_one_that_diff
     assert_eq!(kinds(&cs).len(), 2, "{:?}", kinds(&cs));
 }
 
+/// A standing partition's own exclusion that a parent's new one would take, and that the
+/// plan drops or replaces, is dropped before the parent's add: the engine refuses the drop
+/// of a constraint the parent's add already made a clone (`cannot drop inherited
+/// constraint`, measured on 18.7), and the drop alone runs first. A drop is a
+/// `SetExclusion` in the class of the add, so only the ordering pass puts it first
+/// (DEC-2448.7). Negative: an adoptable own the declaration keeps is still refused by name.
+#[test]
+fn a_standing_own_exclusion_the_plan_drops_or_replaces_goes_before_the_parents_add() {
+    let leaf: TableName = "app.booking_1".parse().unwrap();
+    let mut differs = parent_exclusion();
+    differs.include = vec!["id".into()];
+    let standing = partitioned_booking(&[], &[("mine", parent_exclusion())]);
+    // Where the parent's add and the leaf's drop of `mine` sit in a plan.
+    let at = |cs: &ChangeSet| {
+        let find = |table: &TableName, drop: bool| {
+            cs.changes.iter().position(|p| {
+                matches!(&p.change, Change::Constraint(ConstraintChange::SetExclusion {
+                    table: t, from, to, ..
+                }) if t == table && from.is_some() == drop && to.is_some() != drop)
+            })
+        };
+        let parent: TableName = "app.booking".parse().unwrap();
+        (find(&leaf, true), find(&parent, false))
+    };
+    // Dropped under its own name, another one added under a new name.
+    let declared = partitioned_booking(&[("x", parent_exclusion())], &[("other", differs.clone())]);
+    let cs = exclusion_plan_with(&standing, &declared, |ids, _| {
+        let uid = ids.table_uid(&leaf).unwrap().clone();
+        ids.exclusions.entry(uid).or_default().insert(
+            "mine".into(),
+            retirement(parent_exclusion().canonical_text()),
+        );
+    })
+    .unwrap();
+    let (dropped, added) = at(&cs);
+    assert!(
+        dropped.unwrap() < added.unwrap(),
+        "the leaf's drop runs before the parent's add: {:?}",
+        kinds(&cs)
+    );
+    // Redefined under its own name to a shape the parent's does not take.
+    let declared = partitioned_booking(&[("x", parent_exclusion())], &[("mine", differs)]);
+    let cs = exclusion_plan(&standing, &declared, &[]).unwrap();
+    let (dropped, added) = at(&cs);
+    assert!(
+        dropped.unwrap() < added.unwrap(),
+        "the leaf's redefinition drops before the parent's add: {:?}",
+        kinds(&cs)
+    );
+    // Negative: an adoptable own the declaration keeps is refused by name, not ordered.
+    let declared = partitioned_booking(
+        &[("x", parent_exclusion())],
+        &[("mine", parent_exclusion())],
+    );
+    let said = exclusion_plan(&standing, &declared, &[])
+        .unwrap_err()
+        .join("\n");
+    assert!(
+        said.contains("which can take app.booking_1's `mine`"),
+        "{said}"
+    );
+}
+
 /// An ordinary table attached as a partition: its own exclusion the parent's would take
 /// is refused by name (the engine makes it the parent's clone on `ATTACH`, so it would
 /// vanish with the parent's), and one that differs stays the partition's own and is

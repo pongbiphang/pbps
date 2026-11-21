@@ -2002,6 +2002,15 @@ fn expand_new_tables(
 /// index the parent's rests on is a cycle no order satisfies, refused by name,
 /// as is one that would carry a change that could create a table, a column
 /// or a module: what rests on that is not read.
+///
+/// A parent's new exclusion also comes after every removal (a drop, or the drop
+/// half of a redefinition) of a partition's own exclusion it could take: the
+/// engine makes the own the parent's inherited clone when the add runs, and
+/// refuses the drop of an inherited constraint (measured on 18.7, DEC-2448.7).
+/// The differ's classes already put a drop ahead of an add; the edge keeps
+/// that when a pass before moved the add. An index has no such edge: its drop
+/// is a class-2 change as the exclusion's is, and the frozen oracle of this
+/// pass covers indexes only.
 pub fn before_its_partitions_indexes(
     cs: &mut PlanningPlan,
     declared: &Schema,
@@ -2029,15 +2038,31 @@ pub fn before_its_partitions_indexes(
             _ => None,
         }
     }
+    // The exclusion a change removes or replaces: a drop, and the drop half of a
+    // redefinition, which the differ emits as a drop and an add.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn removed(c: &Change) -> Option<(TableName, &pbps_model::ExclusionConstraint)> {
+        match c {
+            Change::Constraint(ConstraintChange::SetExclusion {
+                table,
+                from: Some(old),
+                ..
+            }) => Some((table.clone(), old)),
+            _ => None,
+        }
+    }
+    let partition_of = |parent: &TableName, table: &TableName| {
+        declared
+            .tables
+            .get(table)
+            .and_then(|t| t.partition_of.as_ref())
+            .is_some_and(|of| of.parent == *parent)
+    };
     let adoptable_by = |parent: &TableName, mine: &Building<'_>, c: &Change| {
         let Some((table, own)) = added(c) else {
             return false;
         };
-        declared
-            .tables
-            .get(&table)
-            .and_then(|t| t.partition_of.as_ref())
-            .is_some_and(|of| of.parent == *parent)
+        partition_of(parent, &table)
             && match (mine, own) {
                 (Building::Index(p), Building::Index(o)) => crate::schema_diff::adopts(p, o),
                 (Building::Exclusion(p), Building::Exclusion(o)) => {
@@ -2066,10 +2091,25 @@ pub fn before_its_partitions_indexes(
     // ahead of a parent's that could take it, to the last such parent's.
     let mut stretch: Option<(usize, usize)> = None;
     let mut adoptions: Vec<(usize, usize)> = Vec::new();
+    // A partition's own exclusion the plan removes or replaces, and the parent's new
+    // one that could take it: the removal first, or the engine refuses it as a drop of
+    // an inherited constraint (measured on 18.7, DEC-2448.7).
+    let mut removals: Vec<(usize, usize)> = Vec::new();
     for (k, p) in cs.changes.iter().enumerate() {
         let Some((parent, mine)) = added(&p.change) else {
             continue;
         };
+        if let Building::Exclusion(parents) = &mine {
+            for (j, q) in cs.changes.iter().enumerate() {
+                if let Some((table, old)) = removed(&q.change)
+                    && partition_of(&parent, &table)
+                    && crate::schema_diff::adopts_exclusion(parents, old)
+                {
+                    schedule.edge(j, k, Source::Effect, OrderReason::Structural);
+                    removals.push((j, k));
+                }
+            }
+        }
         for (j, q) in cs.changes.iter().enumerate() {
             if adoptable_by(&parent, &mine, &q.change) {
                 schedule.edge(k, j, Source::Effect, OrderReason::Structural);
@@ -2080,17 +2120,19 @@ pub fn before_its_partitions_indexes(
             }
         }
     }
-    let Some((lo, hi)) = stretch else {
+    if stretch.is_none() && removals.is_empty() {
         return Ok(());
-    };
-    for later in lo..=hi {
-        for earlier in lo..later {
-            if rests_on(
-                &cs.changes[later].change,
-                &cs.changes[earlier].change,
-                dialect,
-            ) {
-                schedule.edge(earlier, later, Source::Effect, OrderReason::Structural);
+    }
+    if let Some((lo, hi)) = stretch {
+        for later in lo..=hi {
+            for earlier in lo..later {
+                if rests_on(
+                    &cs.changes[later].change,
+                    &cs.changes[earlier].change,
+                    dialect,
+                ) {
+                    schedule.edge(earlier, later, Source::Effect, OrderReason::Structural);
+                }
             }
         }
     }
@@ -2144,6 +2186,21 @@ pub fn before_its_partitions_indexes(
                         "it would pass a change to {}",
                         pbps_model::escape::Escaped(&cs.changes[c].change.subject())
                     ),
+                ));
+            }
+            // The parent's exclusion that cannot follow the own it could take, which the plan
+            // removes: the removal rests on something the parent's add precedes.
+            if let Some(&(j, k)) = removals
+                .iter()
+                .find(|(j, k)| members.contains(j) && members.contains(k))
+            {
+                let (name, parent) = named(k);
+                let (own, partition) = named(j);
+                return Err(format!(
+                    "the exclusion `{name}` on {parent} could take {partition}'s `{own}` as its \
+                     copy, which this plan drops or replaces, and its add cannot follow that \
+                     removal: the removal waits for a change the add must precede; make them in \
+                     separate plans"
                 ));
             }
             // The parent's index rests on a partition's it could take.
