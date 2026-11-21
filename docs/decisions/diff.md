@@ -10234,6 +10234,9 @@ backed by an unattached index); only a parent's is 18's.
   `<child uid>/<name>`, as `exclusions` is one per name, so a text merge and `pbps ids` both keep two
   branches' retirements of different constraints of one child, and a conflict is a same (child, name) that
   differs, named by the child. The section is unreleased, so its layout changed without a new number.
+  A rebuild moves a table's records to its replacement of the same name, and a source table with no
+  namesake hands them to the approval's `Rebuild.exclusions` (omitted when empty, so no layout number
+  moves), which a withdrawal restores exactly.
 
 **Open, not fixed here.** A parent's `DROP COLUMN` of a column an own exclusion of a partition keys on is
 dropped by the engine silently; the hazard check of DEC-2448.5 reads the changes of one table and does not

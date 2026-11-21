@@ -91,6 +91,7 @@ pub(crate) fn sample() -> (IdsFile, Placement) {
             operator: "leon".into(),
             types: BTreeMap::new(),
             conversions: BTreeMap::new(),
+            exclusions: BTreeMap::new(),
         },
     );
     f.exclusions.insert(
@@ -536,6 +537,32 @@ fn a_partitions_retirements_sit_one_to_a_line_so_a_text_merge_keeps_both() {
             "{bad}"
         );
     }
+}
+
+#[test]
+fn a_rebuilds_kept_retirements_round_trip_and_are_absent_when_none() {
+    // The approval keeps the retirements of a source table with no namesake (DEC-2448.4), as part
+    // of its record, so the rebuilds section needs no layout of its own for them.
+    let (mut ids, p) = sample();
+    let plain = split(&ids, &p).unwrap();
+    assert!(!plain["dbo/orders.json"].contains("\"exclusions\""));
+    let record = ids.rebuilds.get_mut(&uid("t_dddddd")).unwrap();
+    record.exclusions.insert(
+        uid("t_dddddd"),
+        [(
+            ObjectLocalName::new("kept"),
+            ExclusionRetirement {
+                was: "{\"method\":\"gist\"}".into(),
+                reason: "enforced elsewhere".into(),
+                operator: "leon".into(),
+                dropped_at: "2026-11-15".into(),
+            },
+        )]
+        .into(),
+    );
+    let kept = split(&ids, &p).unwrap();
+    assert!(kept["dbo/orders.json"].contains("\"exclusions\": {\"t_dddddd\": {\"kept\""));
+    assert_eq!(assemble(&kept).unwrap(), ids);
 }
 
 #[test]
