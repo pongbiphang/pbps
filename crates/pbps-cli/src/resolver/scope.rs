@@ -67,10 +67,7 @@ pub(crate) fn authorization_digest(
 pub(crate) fn planned_schema_grants(
     changes: &pbps_model::ChangeSet,
 ) -> Result<Vec<PlannedGrant>, String> {
-    use pbps_model::GrantChange;
-    use pbps_model::IndexChange;
-    use pbps_model::PartitionChange;
-    use pbps_model::{Change, GrantTarget};
+    use pbps_model::{Change, GrantTarget, PermissionChange};
     let mut planned = Vec::new();
     for p in &changes.changes {
         if matches!(p.change, Change::Role(_)) {
@@ -78,73 +75,45 @@ pub(crate) fn planned_schema_grants(
                 "persistent resolver authorization cannot project role identity changes".into(),
             );
         }
-        let statement = match &p.change {
-            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
-            | Change::Index(IndexChange::BuildPartitionedIndex(_))
-            | Change::Partition(PartitionChange::CopyTableRows(_))
-            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => {
-                return Err(format!(
-                    "blocking rewrite for `{}` is unavailable",
-                    p.change.table().unwrap().shown()
-                ));
-            }
-            Change::Permission(GrantChange::Grant {
-                role,
-                target: GrantTarget::Schema(schema),
-                permissions,
-            })
-            | Change::Permission(GrantChange::Revoke {
-                role,
-                target: GrantTarget::Schema(schema),
-                permissions,
-            }) => Some((role, schema, permissions)),
-            Change::Table(_)
-            | Change::Partition(PartitionChange::DetachPartition { .. })
-            | Change::Partition(PartitionChange::AttachPartition { .. })
-            | Change::Column(_)
-            | Change::Policy(_)
-            | Change::TableProperty(_)
-            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
-            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
-            | Change::Constraint(_)
-            | Change::Index(IndexChange::AddIndex { .. })
-            | Change::Index(IndexChange::DropIndex { .. })
-            | Change::Row(_)
-            | Change::Module(_)
-            | Change::TypeValue(_)
-            | Change::Role(_)
-            | Change::Type(_)
-            | Change::Search(_)
-            | Change::Extension(_)
-            | Change::Permission(_) => None,
+        if let Some((_, table)) = p.change.pending_rebuild() {
+            return Err(format!(
+                "blocking rewrite for `{}` is unavailable",
+                table.shown()
+            ));
+        }
+        // Only a role's grant on a schema moves the schema authorization: a
+        // grant on anything else, and `PUBLIC`'s execution, project nothing.
+        let Some((role, GrantTarget::Schema(schema), moved)) = p.change.grant() else {
+            continue;
         };
-        if let Some((role, schema, permissions)) = statement {
-            let privileges = permissions
-                .iter()
-                .map(|permission| permission.as_str().to_ascii_uppercase().replace('-', " "))
-                .collect::<Vec<_>>();
-            if privileges.is_empty() {
-                return Err("a planned schema grant names no permission".into());
-            }
-            if matches!(&p.change, Change::Permission(GrantChange::Grant { .. })) {
+        let (permissions, revoke) = match moved {
+            PermissionChange::Granted(permissions) => (permissions, false),
+            PermissionChange::Revoked(permissions) => (permissions, true),
+        };
+        let privileges = permissions
+            .iter()
+            .map(|permission| permission.as_str().to_ascii_uppercase().replace('-', " "))
+            .collect::<Vec<_>>();
+        if privileges.is_empty() {
+            return Err("a planned schema grant names no permission".into());
+        }
+        if revoke {
+            // PostgreSQL emits one REVOKE statement per permission.
+            for privilege in privileges {
                 planned.push(PlannedGrant {
                     principal: role.clone(),
                     schema: schema.clone(),
-                    privilege: privileges.join(", "),
-                    revoke: false,
+                    privilege,
+                    revoke: true,
                 });
-            } else {
-                // PostgreSQL emits one REVOKE statement per permission.
-                for privilege in privileges {
-                    planned.push(PlannedGrant {
-                        principal: role.clone(),
-                        schema: schema.clone(),
-                        privilege,
-                        revoke: true,
-                    });
-                }
             }
+        } else {
+            planned.push(PlannedGrant {
+                principal: role.clone(),
+                schema: schema.clone(),
+                privilege: privileges.join(", "),
+                revoke: false,
+            });
         }
     }
     Ok(planned)
@@ -438,5 +407,104 @@ mod tests {
         assert!(
             Ms::unusable_schemas(&Box::new(mssql_auth::fixture_context()), &planned).is_empty()
         );
+    }
+}
+
+// One change of every kind, the corpus `pbps-model` keeps complete
+// (`the_equivalence_corpus_covers_every_change_kind`).
+#[cfg(test)]
+#[path = "../../../pbps-model/tests/support/part_effect_cases.rs"]
+mod change_kinds;
+
+#[cfg(test)]
+mod planned_schema_grants_tests {
+    use super::*;
+    use pbps_model::{Change, ChangeSet, GrantChange, GrantTarget, Permission, PlannedChange};
+    use std::collections::BTreeSet;
+
+    fn one(change: Change) -> ChangeSet {
+        ChangeSet {
+            changes: vec![PlannedChange::new(change)],
+        }
+    }
+
+    fn on(target: GrantTarget, permissions: &[Permission], revoke: bool) -> ChangeSet {
+        let permissions: BTreeSet<_> = permissions.iter().copied().collect();
+        one(Change::Permission(if revoke {
+            GrantChange::Revoke {
+                role: "reader".into(),
+                target,
+                permissions,
+            }
+        } else {
+            GrantChange::Grant {
+                role: "reader".into(),
+                target,
+                permissions,
+            }
+        }))
+    }
+
+    /// The corpus grants and revokes on a table, so every kind in it but the
+    /// two refused classes projects nothing.
+    #[test]
+    fn every_kind_but_a_schema_grant_projects_nothing_or_is_refused() {
+        for (name, change) in change_kinds::cases() {
+            let answer = planned_schema_grants(&one(change.clone()));
+            match name.split('/').next().unwrap() {
+                "CreateRole" | "DropRole" | "RenameRole" => assert_eq!(
+                    answer.unwrap_err(),
+                    "persistent resolver authorization cannot project role identity changes",
+                    "{name}"
+                ),
+                "RebuildPartitionedTable"
+                | "CopyTableRows"
+                | "AnalyzeTableTree"
+                | "BuildPartitionedIndex" => assert_eq!(
+                    answer.unwrap_err(),
+                    format!(
+                        "blocking rewrite for `{}` is unavailable",
+                        change.table().unwrap().shown()
+                    ),
+                    "{name}"
+                ),
+                _ => assert_eq!(answer, Ok(Vec::new()), "{name}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_schema_grant_is_one_entry_and_a_schema_revoke_is_one_per_permission() {
+        let both = [Permission::Usage, Permission::Create];
+        let entry = |privilege: &str, revoke| PlannedGrant {
+            principal: "reader".into(),
+            schema: "app".into(),
+            privilege: privilege.into(),
+            revoke,
+        };
+        assert_eq!(
+            planned_schema_grants(&on(GrantTarget::Schema("app".into()), &both, false)),
+            Ok(vec![entry("USAGE, CREATE", false)])
+        );
+        assert_eq!(
+            planned_schema_grants(&on(GrantTarget::Schema("app".into()), &both, true)),
+            Ok(vec![entry("USAGE", true), entry("CREATE", true)])
+        );
+        // Negative: the same permissions on a table are not a schema's.
+        let table = GrantTarget::Object("app.t".parse().unwrap());
+        assert_eq!(
+            planned_schema_grants(&on(table, &[Permission::Select], false)),
+            Ok(Vec::new())
+        );
+    }
+
+    #[test]
+    fn a_schema_grant_that_names_no_permission_is_refused() {
+        for revoke in [false, true] {
+            assert_eq!(
+                planned_schema_grants(&on(GrantTarget::Schema("app".into()), &[], revoke)),
+                Err("a planned schema grant names no permission".into())
+            );
+        }
     }
 }
