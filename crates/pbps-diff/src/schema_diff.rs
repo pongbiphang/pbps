@@ -1088,181 +1088,14 @@ pub(crate) fn diff_partial_rebuilding(
     errs.extend(extension_move_errors);
     changes.extend(diff_search(base, declared, hints, &mut errs));
 
-    // Definitions match by recorded identity. A rename is never inferred
-    // from equal definitions or a pair of disappearing/appearing names.
-    let types = TypeResolver::new(base.ids, declared.ids);
-    let unrecorded_base = Schema {
-        types: base
-            .schema
-            .types
-            .iter()
-            .filter(|(name, _)| {
-                matches!(
-                    types.resolve(TypeSide::Base, name),
-                    TypeIdentity::ExternalOrUnrecorded(_)
-                ) && matches!(
-                    types.resolve(TypeSide::Desired, name),
-                    TypeIdentity::ExternalOrUnrecorded(_)
-                )
-            })
-            .map(|(n, d)| (n.clone(), d.clone()))
-            .collect(),
-        ..Default::default()
-    };
-    errs.extend(type_differences(
-        &unrecorded_base,
-        declared.schema,
+    let types = diff_types(
+        base,
+        declared,
         dialect,
-        false,
-    ));
-    let mut type_renames = BTreeMap::new();
-    for (uid, old_name) in &base.ids.types {
-        let Some(old) = base.schema.types.get(old_name) else {
-            continue;
-        };
-        match declared
-            .ids
-            .types
-            .get(uid)
-            .and_then(|name| declared.schema.types.get(name).map(|ty| (name, ty)))
-        {
-            None => {
-                let used = types.has_retained_dependent(base.schema, declared.schema, uid);
-                if used {
-                    errs.push(DiffError::TypeLifecycleUnsupported { name: old_name.clone(), reason: "a retained declaration still uses this type; drop or change its dependents first".into() });
-                }
-                changes.push(Change::Type(TypeChange::DropType {
-                    uid: uid.clone(),
-                    name: old_name.clone(),
-                    definition: Box::new(old.clone()),
-                }));
-            }
-            Some((name, new)) => {
-                let mut comparable = old.clone();
-                if let pbps_model::ManagedType::Domain { base: ty, .. } = &mut comparable {
-                    types.remap(ty, TypeSide::Base, TypeSide::Desired);
-                }
-                let old_schema = Schema {
-                    types: [(name.clone(), comparable)].into(),
-                    ..Default::default()
-                };
-                let new_schema = Schema {
-                    types: [(name.clone(), new.clone())].into(),
-                    ..Default::default()
-                };
-                let mut refused = Vec::new();
-                // An enum's labels and a domain's every attribute have their
-                // own changes; only a change of kind is refused here
-                // (DEC-1635.6, DEC-1635.8, DEC-1635.9).
-                if !matches!(
-                    (&old_schema.types[name], new),
-                    (
-                        pbps_model::ManagedType::Enum { .. },
-                        pbps_model::ManagedType::Enum { .. }
-                    ) | (
-                        pbps_model::ManagedType::Domain { .. },
-                        pbps_model::ManagedType::Domain { .. }
-                    )
-                ) {
-                    refused = type_differences(&old_schema, &new_schema, dialect, true);
-                }
-                // A retained domain changes its checks, default and NOT NULL
-                // in place: what it drops before the plan's rows, and what it
-                // adds after them. A base or collation change was refused
-                // above and plans nothing (DEC-1635.8).
-                let comparable = &old_schema.types[name];
-                let alters = refused.is_empty()
-                    && !rebuilt_domains.uids.contains_key(uid)
-                    && matches!(
-                        (comparable, new),
-                        (
-                            pbps_model::ManagedType::Domain { .. },
-                            pbps_model::ManagedType::Domain { .. }
-                        )
-                    );
-                if alters && let Some(delta) = pbps_model::DomainDelta::of(comparable, new) {
-                    for (half, wanted) in [
-                        (pbps_model::DomainHalf::Loosen, delta.loosens()),
-                        (pbps_model::DomainHalf::Tighten, delta.tightens()),
-                    ] {
-                        if wanted {
-                            changes.push(Change::TypeValue(TypeValueChange::AlterDomain {
-                                uid: uid.clone(),
-                                name: name.clone(),
-                                from: Box::new(comparable.clone()),
-                                to: Box::new(new.clone()),
-                                half,
-                            }));
-                        }
-                    }
-                }
-                errs.extend(refused);
-                if old_name != name {
-                    type_renames.insert(old_name.clone(), name.clone());
-                    changes.push(Change::Type(TypeChange::RenameType {
-                        uid: uid.clone(),
-                        from: old_name.clone(),
-                        to: name.clone(),
-                        // What stands when the rename runs: an enum's labels
-                        // and a domain the plan alters are the old ones, the
-                        // domain under the spellings of the types it is over
-                        // that the plan leaves.
-                        definition: Box::new(match (old, alters) {
-                            (pbps_model::ManagedType::Enum { .. }, _) => old.clone(),
-                            (pbps_model::ManagedType::Domain { .. }, true) => comparable.clone(),
-                            (pbps_model::ManagedType::Domain { .. }, false) => new.clone(),
-                        }),
-                    }));
-                }
-            }
-        }
-    }
-    for (uid, name) in &declared.ids.types {
-        if base
-            .ids
-            .types
-            .get(uid)
-            .and_then(|old| base.schema.types.get(old))
-            .is_none()
-            && let Some(definition) = declared.schema.types.get(name)
-        {
-            changes.push(Change::Type(TypeChange::CreateType {
-                uid: uid.clone(),
-                name: name.clone(),
-                definition: Box::new(definition.clone()),
-            }));
-        }
-    }
-    for start in type_renames.keys() {
-        let mut seen = BTreeSet::new();
-        let mut name = start;
-        while let Some(next) = type_renames.get(name) {
-            if !seen.insert(name) {
-                errs.push(DiffError::TypeLifecycleUnsupported {
-                    name: start.clone(),
-                    reason: "type rename cycle (swap) is refused; use separate plans".into(),
-                });
-                break;
-            }
-            name = next;
-        }
-    }
-
-    // A retained uid is still a managed claim after a manual drop and a
-    // baseline. It cannot become an unheld identity in an empty apply.
-    for (uid, name) in &declared.ids.types {
-        if !declared.schema.types.contains_key(name)
-            && types
-                .name(TypeSide::Base, uid)
-                .and_then(|old| base.schema.types.get(old))
-                .is_none()
-        {
-            errs.push(DiffError::TypeLifecycleUnsupported {
-                name: name.clone(),
-                reason: "its identity remains recorded but its declaration is absent".into(),
-            });
-        }
-    }
+        &rebuilt_domains.uids,
+        &mut changes,
+        &mut errs,
+    );
 
     let base_tables = &base.ids.tables;
     let declared_tables = &declared.ids.tables;
@@ -1864,148 +1697,7 @@ pub(crate) fn diff_partial_rebuilding(
     refuse_unjoinable_foreign_keys(declared.schema, dialect, &changes, &mut errs);
     refuse_rows_referencing_late_inserts(declared, &changes, &mut errs);
     refuse_partition_changes(base, declared, &index, hints, dialect, &changes, &mut errs);
-    // A module declaration can stay byte-for-byte identical while a new
-    // overload or shadow changes what it should bind to. Ask the dialect
-    // before sorting, rather than appending unreviewed SQL at apply time.
-    let arriving: Vec<ModuleId> = changes
-        .iter()
-        .filter_map(|change| match change {
-            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
-            | Change::Index(IndexChange::BuildPartitionedIndex(_))
-            | Change::Partition(PartitionChange::CopyTableRows(_))
-            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => None,
-            Change::Module(ModuleChange::CreateModule { id, .. }) => Some(id.clone()),
-            Change::Table(TableChange::CreateTable { name, .. }) => {
-                Some(ModuleId::Named(name.clone()))
-            }
-            Change::Table(TableChange::RenameTable { to, .. }) => Some(ModuleId::Named(to.clone())),
-            Change::Table(TableChange::DropTable { .. })
-            | Change::Partition(PartitionChange::DetachPartition { .. })
-            | Change::Partition(PartitionChange::AttachPartition { .. })
-            | Change::Column(_)
-            | Change::TableProperty(_)
-            | Change::Constraint(_)
-            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
-            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
-            | Change::Policy(_)
-            | Change::Index(IndexChange::AddIndex { .. })
-            | Change::Index(IndexChange::DropIndex { .. })
-            | Change::Row(_)
-            | Change::Module(ModuleChange::AlterModule { .. })
-            | Change::Module(ModuleChange::DropModule { .. })
-            | Change::TypeValue(_)
-            | Change::Role(_)
-            | Change::Type(_)
-            | Change::Search(_)
-            | Change::Extension(_)
-            | Change::Permission(_) => None,
-        })
-        .collect();
-    let changed: BTreeSet<ModuleId> = changes
-        .iter()
-        .filter_map(|change| match change {
-            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
-            | Change::Index(IndexChange::BuildPartitionedIndex(_))
-            | Change::Partition(PartitionChange::CopyTableRows(_))
-            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => None,
-            Change::Module(ModuleChange::CreateModule { id, .. })
-            | Change::Module(ModuleChange::AlterModule { id, .. })
-            | Change::Module(ModuleChange::DropModule { id, .. }) => Some(id.clone()),
-            Change::Table(_)
-            | Change::Partition(PartitionChange::DetachPartition { .. })
-            | Change::Partition(PartitionChange::AttachPartition { .. })
-            | Change::Column(_)
-            | Change::TableProperty(_)
-            | Change::Constraint(_)
-            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
-            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
-            | Change::Policy(_)
-            | Change::Index(IndexChange::AddIndex { .. })
-            | Change::Index(IndexChange::DropIndex { .. })
-            | Change::Row(_)
-            | Change::TypeValue(_)
-            | Change::Role(_)
-            | Change::Type(_)
-            | Change::Search(_)
-            | Change::Extension(_)
-            | Change::Permission(_) => None,
-        })
-        .collect();
-    // One set, so a module both the dialect and the caller ask for is rebuilt
-    // once.
-    let candidates = match rebinding {
-        Rebinding::Candidates => dialect.rebound_modules(declared.schema, &arriving, &changed),
-        Rebinding::Evidence => BTreeSet::new(),
-    };
-    let rebound: BTreeSet<ModuleId> = candidates
-        .into_iter()
-        .chain(also.iter().cloned())
-        .chain(hints.enum_dependents.iter().cloned())
-        .collect();
-    for id in rebound {
-        if !changed.contains(&id)
-            && base.schema.modules.contains_key(&id)
-            && let Some(module) = declared.schema.modules.get(&id)
-        {
-            changes.push(Change::Module(ModuleChange::AlterModule {
-                id,
-                module: Box::new(module.clone()),
-            }));
-        }
-    }
-    // A module over a rebuilt enum's column cannot be restated in place after
-    // the retype: it comes down in class 0 and goes back in class 14, around
-    // the retypes and the swap (DEC-1635.7).
-    if !hints.enum_dependents.is_empty() {
-        let mut split = Vec::new();
-        for change in std::mem::take(&mut changes) {
-            if let Change::Module(ModuleChange::AlterModule { id, module }) = &change
-                && hints.enum_dependents.contains(id)
-            {
-                split.push(Change::Module(ModuleChange::DropModule {
-                    id: id.clone(),
-                    kind: module.kind,
-                }));
-                split.push(Change::Module(ModuleChange::CreateModule {
-                    id: id.clone(),
-                    module: module.clone(),
-                }));
-            } else {
-                split.push(change);
-            }
-        }
-        changes = split;
-    }
-    // A module the engine binds to what this plan changes cannot stand beside
-    // the change, whether the declarations edited it or not (SQL Server's
-    // SCHEMABINDING, DEC-2329.1). It goes as a drop and comes back as a
-    // create: the classes put the first before the table changes and the
-    // second after them, as they do for any module. Before `diff_roles`, so
-    // the grants a rebuilt module loses are written again.
-    for id in dialect.schema_bound_teardown(base.schema, declared.schema, &changes) {
-        let (Some(before), Some(module)) = (
-            base.schema.modules.get(&id),
-            declared.schema.modules.get(&id),
-        ) else {
-            continue;
-        };
-        if changes.iter().any(|c| {
-            matches!(c, Change::Module(ModuleChange::DropModule { id: other, .. }) | Change::Module(ModuleChange::CreateModule { id: other, .. }) if *other == id)
-        }) {
-            continue;
-        }
-        changes.retain(|c| !matches!(c, Change::Module(ModuleChange::AlterModule { id: other, .. }) if *other == id));
-        changes.push(Change::Module(ModuleChange::DropModule {
-            id: id.clone(),
-            kind: before.kind,
-        }));
-        changes.push(Change::Module(ModuleChange::CreateModule {
-            id,
-            module: Box::new(module.clone()),
-        }));
-    }
+    changes = rebind_modules(base, declared, dialect, hints, also, rebinding, changes);
     diff_roles(base, declared, dialect, &mut changes);
     revoke_public_execution(base.schema, dialect, hints, &mut changes);
 
@@ -3097,6 +2789,363 @@ pub(crate) fn diff_partial_rebuilding(
         changes,
         errors: errs,
     }
+}
+
+/// The types phase of `diff_partial_rebuilding`: refusals for types that no
+/// identity file records, then drop, alter and rename of the recorded ones, the
+/// creates, and the refusals for rename cycles and for retained identities
+/// whose declaration is gone.
+///
+/// It pushes into the caller's lists instead of returning its own, because the
+/// order of `errors` is part of the result and the passes that follow read
+/// `changes` as the earlier phases left it. It returns the resolver the tables
+/// phase reads.
+fn diff_types<'a>(
+    base: Side<'a>,
+    declared: Side<'a>,
+    dialect: &(impl Dialect + ?Sized),
+    rebuilt_domain_uids: &BTreeMap<Uid, crate::domain_rebuild::Why>,
+    changes: &mut Vec<Change>,
+    errs: &mut Vec<DiffError>,
+) -> TypeResolver<'a> {
+    // Definitions match by recorded identity. A rename is never inferred
+    // from equal definitions or a pair of disappearing/appearing names.
+    let types = TypeResolver::new(base.ids, declared.ids);
+    let unrecorded_base = Schema {
+        types: base
+            .schema
+            .types
+            .iter()
+            .filter(|(name, _)| {
+                matches!(
+                    types.resolve(TypeSide::Base, name),
+                    TypeIdentity::ExternalOrUnrecorded(_)
+                ) && matches!(
+                    types.resolve(TypeSide::Desired, name),
+                    TypeIdentity::ExternalOrUnrecorded(_)
+                )
+            })
+            .map(|(n, d)| (n.clone(), d.clone()))
+            .collect(),
+        ..Default::default()
+    };
+    errs.extend(type_differences(
+        &unrecorded_base,
+        declared.schema,
+        dialect,
+        false,
+    ));
+    let mut type_renames = BTreeMap::new();
+    for (uid, old_name) in &base.ids.types {
+        let Some(old) = base.schema.types.get(old_name) else {
+            continue;
+        };
+        match declared
+            .ids
+            .types
+            .get(uid)
+            .and_then(|name| declared.schema.types.get(name).map(|ty| (name, ty)))
+        {
+            None => {
+                let used = types.has_retained_dependent(base.schema, declared.schema, uid);
+                if used {
+                    errs.push(DiffError::TypeLifecycleUnsupported { name: old_name.clone(), reason: "a retained declaration still uses this type; drop or change its dependents first".into() });
+                }
+                changes.push(Change::Type(TypeChange::DropType {
+                    uid: uid.clone(),
+                    name: old_name.clone(),
+                    definition: Box::new(old.clone()),
+                }));
+            }
+            Some((name, new)) => {
+                let mut comparable = old.clone();
+                if let pbps_model::ManagedType::Domain { base: ty, .. } = &mut comparable {
+                    types.remap(ty, TypeSide::Base, TypeSide::Desired);
+                }
+                let old_schema = Schema {
+                    types: [(name.clone(), comparable)].into(),
+                    ..Default::default()
+                };
+                let new_schema = Schema {
+                    types: [(name.clone(), new.clone())].into(),
+                    ..Default::default()
+                };
+                let mut refused = Vec::new();
+                // An enum's labels and a domain's every attribute have their
+                // own changes; only a change of kind is refused here
+                // (DEC-1635.6, DEC-1635.8, DEC-1635.9).
+                if !matches!(
+                    (&old_schema.types[name], new),
+                    (
+                        pbps_model::ManagedType::Enum { .. },
+                        pbps_model::ManagedType::Enum { .. }
+                    ) | (
+                        pbps_model::ManagedType::Domain { .. },
+                        pbps_model::ManagedType::Domain { .. }
+                    )
+                ) {
+                    refused = type_differences(&old_schema, &new_schema, dialect, true);
+                }
+                // A retained domain changes its checks, default and NOT NULL
+                // in place: what it drops before the plan's rows, and what it
+                // adds after them. A base or collation change was refused
+                // above and plans nothing (DEC-1635.8).
+                let comparable = &old_schema.types[name];
+                let alters = refused.is_empty()
+                    && !rebuilt_domain_uids.contains_key(uid)
+                    && matches!(
+                        (comparable, new),
+                        (
+                            pbps_model::ManagedType::Domain { .. },
+                            pbps_model::ManagedType::Domain { .. }
+                        )
+                    );
+                if alters && let Some(delta) = pbps_model::DomainDelta::of(comparable, new) {
+                    for (half, wanted) in [
+                        (pbps_model::DomainHalf::Loosen, delta.loosens()),
+                        (pbps_model::DomainHalf::Tighten, delta.tightens()),
+                    ] {
+                        if wanted {
+                            changes.push(Change::TypeValue(TypeValueChange::AlterDomain {
+                                uid: uid.clone(),
+                                name: name.clone(),
+                                from: Box::new(comparable.clone()),
+                                to: Box::new(new.clone()),
+                                half,
+                            }));
+                        }
+                    }
+                }
+                errs.extend(refused);
+                if old_name != name {
+                    type_renames.insert(old_name.clone(), name.clone());
+                    changes.push(Change::Type(TypeChange::RenameType {
+                        uid: uid.clone(),
+                        from: old_name.clone(),
+                        to: name.clone(),
+                        // What stands when the rename runs: an enum's labels
+                        // and a domain the plan alters are the old ones, the
+                        // domain under the spellings of the types it is over
+                        // that the plan leaves.
+                        definition: Box::new(match (old, alters) {
+                            (pbps_model::ManagedType::Enum { .. }, _) => old.clone(),
+                            (pbps_model::ManagedType::Domain { .. }, true) => comparable.clone(),
+                            (pbps_model::ManagedType::Domain { .. }, false) => new.clone(),
+                        }),
+                    }));
+                }
+            }
+        }
+    }
+    for (uid, name) in &declared.ids.types {
+        if base
+            .ids
+            .types
+            .get(uid)
+            .and_then(|old| base.schema.types.get(old))
+            .is_none()
+            && let Some(definition) = declared.schema.types.get(name)
+        {
+            changes.push(Change::Type(TypeChange::CreateType {
+                uid: uid.clone(),
+                name: name.clone(),
+                definition: Box::new(definition.clone()),
+            }));
+        }
+    }
+    for start in type_renames.keys() {
+        let mut seen = BTreeSet::new();
+        let mut name = start;
+        while let Some(next) = type_renames.get(name) {
+            if !seen.insert(name) {
+                errs.push(DiffError::TypeLifecycleUnsupported {
+                    name: start.clone(),
+                    reason: "type rename cycle (swap) is refused; use separate plans".into(),
+                });
+                break;
+            }
+            name = next;
+        }
+    }
+
+    // A retained uid is still a managed claim after a manual drop and a
+    // baseline. It cannot become an unheld identity in an empty apply.
+    for (uid, name) in &declared.ids.types {
+        if !declared.schema.types.contains_key(name)
+            && types
+                .name(TypeSide::Base, uid)
+                .and_then(|old| base.schema.types.get(old))
+                .is_none()
+        {
+            errs.push(DiffError::TypeLifecycleUnsupported {
+                name: name.clone(),
+                reason: "its identity remains recorded but its declaration is absent".into(),
+            });
+        }
+    }
+    types
+}
+
+/// The module rebinding phase of `diff_partial_rebuilding`: the modules the
+/// dialect, the caller or an enum's dependents ask to have rebuilt around the
+/// plan's changes, and the modules a schema-bound teardown takes down.
+///
+/// It takes the list of `changes` built so far and hands it back rebuilt, not a
+/// list of its own to append afterwards: it rewrites entries already in the
+/// list, and `diff_roles`, the exclusion hazards and the sort read the list as
+/// this phase leaves it. Moving the list in and out keeps its order.
+fn rebind_modules(
+    base: Side<'_>,
+    declared: Side<'_>,
+    dialect: &(impl Dialect + ?Sized),
+    hints: &Hints,
+    also: &BTreeSet<ModuleId>,
+    rebinding: Rebinding,
+    mut changes: Vec<Change>,
+) -> Vec<Change> {
+    // A module declaration can stay byte-for-byte identical while a new
+    // overload or shadow changes what it should bind to. Ask the dialect
+    // before sorting, rather than appending unreviewed SQL at apply time.
+    let arriving: Vec<ModuleId> = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => None,
+            Change::Module(ModuleChange::CreateModule { id, .. }) => Some(id.clone()),
+            Change::Table(TableChange::CreateTable { name, .. }) => {
+                Some(ModuleId::Named(name.clone()))
+            }
+            Change::Table(TableChange::RenameTable { to, .. }) => Some(ModuleId::Named(to.clone())),
+            Change::Table(TableChange::DropTable { .. })
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Column(_)
+            | Change::TableProperty(_)
+            | Change::Constraint(_)
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(_)
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(_)
+            | Change::Module(ModuleChange::AlterModule { .. })
+            | Change::Module(ModuleChange::DropModule { .. })
+            | Change::TypeValue(_)
+            | Change::Role(_)
+            | Change::Type(_)
+            | Change::Search(_)
+            | Change::Extension(_)
+            | Change::Permission(_) => None,
+        })
+        .collect();
+    let changed: BTreeSet<ModuleId> = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => None,
+            Change::Module(ModuleChange::CreateModule { id, .. })
+            | Change::Module(ModuleChange::AlterModule { id, .. })
+            | Change::Module(ModuleChange::DropModule { id, .. }) => Some(id.clone()),
+            Change::Table(_)
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Column(_)
+            | Change::TableProperty(_)
+            | Change::Constraint(_)
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(_)
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(_)
+            | Change::TypeValue(_)
+            | Change::Role(_)
+            | Change::Type(_)
+            | Change::Search(_)
+            | Change::Extension(_)
+            | Change::Permission(_) => None,
+        })
+        .collect();
+    // One set, so a module both the dialect and the caller ask for is rebuilt
+    // once.
+    let candidates = match rebinding {
+        Rebinding::Candidates => dialect.rebound_modules(declared.schema, &arriving, &changed),
+        Rebinding::Evidence => BTreeSet::new(),
+    };
+    let rebound: BTreeSet<ModuleId> = candidates
+        .into_iter()
+        .chain(also.iter().cloned())
+        .chain(hints.enum_dependents.iter().cloned())
+        .collect();
+    for id in rebound {
+        if !changed.contains(&id)
+            && base.schema.modules.contains_key(&id)
+            && let Some(module) = declared.schema.modules.get(&id)
+        {
+            changes.push(Change::Module(ModuleChange::AlterModule {
+                id,
+                module: Box::new(module.clone()),
+            }));
+        }
+    }
+    // A module over a rebuilt enum's column cannot be restated in place after
+    // the retype: it comes down in class 0 and goes back in class 14, around
+    // the retypes and the swap (DEC-1635.7).
+    if !hints.enum_dependents.is_empty() {
+        let mut split = Vec::new();
+        for change in std::mem::take(&mut changes) {
+            if let Change::Module(ModuleChange::AlterModule { id, module }) = &change
+                && hints.enum_dependents.contains(id)
+            {
+                split.push(Change::Module(ModuleChange::DropModule {
+                    id: id.clone(),
+                    kind: module.kind,
+                }));
+                split.push(Change::Module(ModuleChange::CreateModule {
+                    id: id.clone(),
+                    module: module.clone(),
+                }));
+            } else {
+                split.push(change);
+            }
+        }
+        changes = split;
+    }
+    // A module the engine binds to what this plan changes cannot stand beside
+    // the change, whether the declarations edited it or not (SQL Server's
+    // SCHEMABINDING, DEC-2329.1). It goes as a drop and comes back as a
+    // create: the classes put the first before the table changes and the
+    // second after them, as they do for any module. Before `diff_roles`, so
+    // the grants a rebuilt module loses are written again.
+    for id in dialect.schema_bound_teardown(base.schema, declared.schema, &changes) {
+        let (Some(before), Some(module)) = (
+            base.schema.modules.get(&id),
+            declared.schema.modules.get(&id),
+        ) else {
+            continue;
+        };
+        if changes.iter().any(|c| {
+            matches!(c, Change::Module(ModuleChange::DropModule { id: other, .. }) | Change::Module(ModuleChange::CreateModule { id: other, .. }) if *other == id)
+        }) {
+            continue;
+        }
+        changes.retain(|c| !matches!(c, Change::Module(ModuleChange::AlterModule { id: other, .. }) if *other == id));
+        changes.push(Change::Module(ModuleChange::DropModule {
+            id: id.clone(),
+            kind: before.kind,
+        }));
+        changes.push(Change::Module(ModuleChange::CreateModule {
+            id,
+            module: Box::new(module.clone()),
+        }));
+    }
+    changes
 }
 
 /// What one comparison produced: the changes the differ could express, and the
