@@ -322,3 +322,65 @@ fn a_composed_rebuilds_base_spelling_is_what_the_environment_holds() {
         .is_err()
     );
 }
+
+/// DEC-2448.4: the retirements an approval keeps for withdraw() are validated like the top-level
+/// ones. A record `validate` accepted here would be put back at top level by a withdrawal and
+/// refused there, which blocks the withdrawal.
+#[test]
+fn a_rebuilds_kept_retirements_are_validated_like_the_top_level_ones() {
+    let (root, _, desired, _) = fixture::approval();
+    let parent = root.intent.source_root().unwrap().clone();
+    let source_uid = root.intent.source.tables.keys().next().unwrap().clone();
+    let retired = || ExclusionRetirement {
+        was: "{\"method\":\"gist\"}".into(),
+        reason: "enforced elsewhere".into(),
+        operator: "leon".into(),
+        dropped_at: "2026-11-15".into(),
+    };
+    let keep = |ids: &mut IdsFile, uid: &Uid, record: ExclusionRetirement| {
+        ids.rebuilds
+            .get_mut(&parent)
+            .unwrap()
+            .exclusions
+            .insert(uid.clone(), [("kept".into(), record)].into());
+    };
+    // Valid kept retirements under a source table validate.
+    let mut ok = desired.clone();
+    keep(&mut ok, &source_uid, retired());
+    ok.validate().unwrap();
+    // Negative: a blank field in any of the four.
+    for blank in 0..4 {
+        let mut r = retired();
+        match blank {
+            0 => r.was = " ".into(),
+            1 => r.reason = "\t".into(),
+            2 => r.operator = String::new(),
+            _ => r.dropped_at = "\n".into(),
+        }
+        let mut bad = desired.clone();
+        keep(&mut bad, &source_uid, r);
+        assert!(
+            matches!(
+                bad.validate(),
+                Err(pbps_model::ids::IdsError::InvalidRebuild { .. })
+            ),
+            "blank field {blank}"
+        );
+    }
+    // Negative: a uid that is no table of the source.
+    let mut foreign = desired.clone();
+    let stranger = root
+        .intent
+        .replacement
+        .tables
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    assert!(!root.intent.source.tables.contains_key(&stranger));
+    keep(&mut foreign, &stranger, retired());
+    assert!(matches!(
+        foreign.validate(),
+        Err(pbps_model::ids::IdsError::InvalidRebuild { .. })
+    ));
+}

@@ -728,24 +728,12 @@ impl IdsFile {
             }
         }
         // The same for a retirement: a table drop takes its records with it.
-        for (uid, named) in &self.exclusions {
-            if !self.tables.contains_key(uid) {
-                return Err(IdsError::OrphanExclusion { uid: uid.clone() });
-            }
-            for (name, record) in named {
-                let blank = |t: &str| t.trim().is_empty();
-                if blank(&record.was)
-                    || blank(&record.reason)
-                    || blank(&record.operator)
-                    || blank(&record.dropped_at)
-                {
-                    return Err(IdsError::InvalidExclusion {
-                        uid: uid.clone(),
-                        name: name.raw().to_owned(),
-                    });
-                }
-            }
-        }
+        check_exclusion_records(
+            &self.exclusions,
+            |u| self.tables.contains_key(u),
+            |uid| IdsError::OrphanExclusion { uid },
+            |uid, name| IdsError::InvalidExclusion { uid, name },
+        )?;
         // A conversion belongs to a live column, and says what it converts
         // between: the tool drops one with its column or its type, so a record
         // left without either was written by hand or a bad merge (#2331).
@@ -775,6 +763,15 @@ impl IdsFile {
             }) {
                 return Err(IdsError::InvalidRebuild { uid: uid.clone() });
             }
+            // The retirements the approval keeps are the same records a withdrawal
+            // puts back at top level, so one that would be refused there is
+            // refused here, while the withdrawal is still possible.
+            check_exclusion_records(
+                &rebuild.exclusions,
+                |u| rebuild.source.tables.contains_key(u),
+                |_| IdsError::InvalidRebuild { uid: uid.clone() },
+                |_, _| IdsError::InvalidRebuild { uid: uid.clone() },
+            )?;
             let source = rebuild.source.as_ids();
             let target = rebuild.replacement.as_ids();
             let held = |u: &Uid| {
@@ -813,6 +810,33 @@ impl IdsFile {
         }
         Ok(())
     }
+}
+
+/// The records of one exclusion-retirement map: each belongs to a table `owns`
+/// admits, and none has a blank field. One body serves the live map and the
+/// retirements a rebuild approval keeps, so the two cannot drift apart.
+fn check_exclusion_records(
+    map: &BTreeMap<Uid, BTreeMap<crate::ObjectLocalName, ExclusionRetirement>>,
+    owns: impl Fn(&Uid) -> bool,
+    orphan: impl Fn(Uid) -> IdsError,
+    invalid: impl Fn(Uid, String) -> IdsError,
+) -> Result<(), IdsError> {
+    let blank = |t: &str| t.trim().is_empty();
+    for (uid, named) in map {
+        if !owns(uid) {
+            return Err(orphan(uid.clone()));
+        }
+        for (name, record) in named {
+            if blank(&record.was)
+                || blank(&record.reason)
+                || blank(&record.operator)
+                || blank(&record.dropped_at)
+            {
+                return Err(invalid(uid.clone(), name.raw().to_owned()));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Name-to-uid lookups over one [`IdsFile`], built in one pass, for the
