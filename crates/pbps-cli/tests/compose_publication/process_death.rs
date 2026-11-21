@@ -179,11 +179,12 @@ fn killed_at(f: &Fixture, mode: &str, operation: &str) -> String {
 }
 
 /// Runs `child_report_within` against a shell child. A client thread connects
-/// after `delay` and sends `line`, standing in for the child's own connect.
+/// after `delay` and sends `line` if there is one, else holds the connection
+/// open and silent, standing in for the child's own connect.
 /// Returns the report or the panic text, and the child.
 fn probe(
     script: &str,
-    client: Option<(Duration, &'static str)>,
+    client: Option<(Duration, Option<&'static str>)>,
     guard: Duration,
 ) -> (Result<String, String>, Child) {
     let socket = crate::unix_socket::Socket::bind();
@@ -197,15 +198,23 @@ fn probe(
         .unwrap();
     socket.listener().set_nonblocking(true).unwrap();
     let path = socket.path().to_owned();
+    let (finished, done) = std::sync::mpsc::channel::<()>();
     let client = client.map(|(delay, line)| {
         std::thread::spawn(move || {
             std::thread::sleep(delay);
-            writeln!(UnixStream::connect(path).unwrap(), "{line}").unwrap();
+            let mut connection = UnixStream::connect(path).unwrap();
+            match line {
+                Some(line) => writeln!(connection, "{line}").unwrap(),
+                // Held until the probe is over: a fixed sleep could end
+                // before a stalled reader looks, and EOF is not silence.
+                None => drop(done.recv()),
+            }
         })
     });
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         child_report_within(socket.listener(), &mut child, &log, "probe", guard)
     }));
+    drop(finished);
     if let Some(client) = client {
         client.join().unwrap();
     }
@@ -238,11 +247,22 @@ fn a_child_that_never_connects_is_killed_once_the_guard_passes() {
 
 #[test]
 fn a_child_that_connects_late_is_accepted_and_its_report_returned() {
-    let late = Some((Duration::from_millis(800), "reported-late"));
+    let late = Some((Duration::from_millis(800), Some("reported-late")));
     let (result, mut child) = probe("exec sleep 600", late, Duration::from_secs(60));
     assert_eq!(result.unwrap(), "reported-late");
     child.kill().unwrap();
     child.wait().unwrap();
+}
+
+#[test]
+fn a_child_that_connects_but_never_reports_is_killed_once_the_guard_passes() {
+    let silent = Some((Duration::ZERO, None));
+    let (result, mut child) = probe("exec sleep 600", silent, Duration::from_millis(500));
+    assert_eq!(
+        result.unwrap_err(),
+        "probe: child missed its synchronized boundary"
+    );
+    assert!(!child.try_wait().unwrap().unwrap().success());
 }
 
 fn receipt(f: &Fixture, id: &str) -> serde_json::Value {
