@@ -2,7 +2,7 @@
 //! what happens when either is missing.
 
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -300,7 +300,7 @@ fn two_spellings_of_one_file_meet_on_one_sidecar() {
         let fresh = Fresh::file();
         let real = fresh.path().to_path_buf();
         let dir = real.parent().expect("a directory").to_path_buf();
-        let by_link: PathBuf = dir.join("link.db");
+        let by_link = dir.join("link.db");
         std::os::unix::fs::symlink(&real, &by_link).expect("a symbolic link to the file");
         let aliased = dir.join("alias");
         std::os::unix::fs::symlink(&dir, &aliased).expect("a symbolic link to the directory");
