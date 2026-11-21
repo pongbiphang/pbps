@@ -728,7 +728,7 @@ fn a_parent_that_is_gone_is_found_though_the_child_has_no_row() {
     let after = resolution(&copy).expect("asked");
     let new = after.new_since(&before, &Renamed::default());
     assert_eq!(new.len(), 1, "{new:?}");
-    assert!(new[0].contains("insert into `c`"), "{new:?}");
+    assert!(new[0].contains("foreign keys of `c`"), "{new:?}");
     assert!(new[0].contains("no such table"), "{new:?}");
     // The engine agrees at the next insert.
     assert!(copy.execute_batch("INSERT INTO c VALUES (1)").is_err());
@@ -762,7 +762,10 @@ fn a_write_that_never_compiled_is_not_new_when_the_plan_takes_an_orphaned_key_aw
     let before = resolution(&copy).expect("asked");
     let was = before.failing();
     assert!(was.iter().any(|l| l.contains("1 row(s)")), "{was:?}");
-    assert!(was.iter().any(|l| l.contains("write `c`")), "{was:?}");
+    assert!(
+        was.iter().any(|l| l.contains("foreign keys `c`")),
+        "{was:?}"
+    );
     copy.execute_batch(
         "PRAGMA foreign_keys = OFF; \
          CREATE TABLE c_new(d DEFAULT (missing()), a, b REFERENCES q(x)); \
@@ -774,7 +777,52 @@ fn a_write_that_never_compiled_is_not_new_when_the_plan_takes_an_orphaned_key_aw
     let new = after.new_since(&before, &Renamed::default());
     assert!(new.is_empty(), "{new:?}");
     // Negative: the write is still a finding of its own, before and after.
-    assert!(after.failing().iter().any(|l| l.contains("write `c`")));
+    assert!(
+        after
+            .failing()
+            .iter()
+            .any(|l| l.contains("foreign keys `c`"))
+    );
+}
+
+#[test]
+fn a_write_that_never_compiled_is_not_new_when_the_plan_takes_an_uncheckable_key_away() {
+    // The check itself fails (the parent column is no key), and the default
+    // never evaluated. The plan drops the key: the write is not newly broken.
+    let mut db = file(
+        "CREATE TABLE p(x); CREATE TABLE q(x PRIMARY KEY); \
+         CREATE TABLE c(d DEFAULT (missing()), a, b REFERENCES q(x), \
+         CONSTRAINT fk_bad FOREIGN KEY(a) REFERENCES p(x))",
+    );
+    let copy = scratch(db.connection(), SCRATCH_LIMIT).expect("copied");
+    let before = resolution(&copy).expect("asked");
+    let was = before.failing();
+    assert!(
+        was.iter().any(|l| l.contains("foreign keys `c`")),
+        "{was:?}"
+    );
+    assert!(
+        was.iter().any(|l| l.contains("foreign keys `c`")),
+        "{was:?}"
+    );
+    copy.execute_batch(
+        "PRAGMA foreign_keys = OFF; \
+         CREATE TABLE c_new(d DEFAULT (missing()), a, b REFERENCES q(x)); \
+         DROP TABLE c; ALTER TABLE c_new RENAME TO c; PRAGMA foreign_keys = ON",
+    )
+    .expect("the uncheckable key is gone");
+    let after = resolution(&copy).expect("asked");
+    let new = after.new_since(&before, &Renamed::default());
+    assert!(new.is_empty(), "{new:?}");
+    // Negative: a key the plan makes uncheckable is still new.
+    copy.execute_batch(
+        "PRAGMA foreign_keys = OFF; CREATE TABLE e(a REFERENCES p(x)); \
+         PRAGMA foreign_keys = ON",
+    )
+    .expect("a key to a column that is no key");
+    let later = resolution(&copy).expect("asked");
+    let new = later.new_since(&after, &Renamed::default());
+    assert!(new.iter().any(|l| l.contains("`e`")), "{new:?}");
 }
 
 #[test]

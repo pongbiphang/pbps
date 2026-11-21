@@ -281,16 +281,37 @@ pub fn resolution(scratch: &Connection) -> Result<Resolution, DbError> {
     )?;
     for table in &tables {
         let table = table.text(0)?;
-        match scratch.query(
+        let keys = scratch.query(
+            &format!("PRAGMA main.foreign_key_list({})", quote(table)),
+            &[],
+        )?;
+        if keys.is_empty() {
+            continue;
+        }
+        // One answer for a table with a key: its check, and a write compiled
+        // for it, on that condition alone. A check with no child row has
+        // nothing to look a parent up for, so a parent that is gone goes unsaid
+        // (measured) until the next insert fails. And the two are **one**
+        // finding, the check's words first: asked apart, or the write only when
+        // the check passed, what never compiled (a default the library cannot
+        // evaluate) reads as new once a plan takes an orphaned or uncheckable
+        // key away.
+        let insert = format!("EXPLAIN INSERT INTO main.{} DEFAULT VALUES", quote(table));
+        let written = scratch.query(&insert, &[]).err();
+        let checked = scratch.query(
             &format!("PRAGMA main.foreign_key_check({})", quote(table)),
             &[],
-        ) {
-            Err(error) => found.push(failed(
+        );
+        if let Some(error) = checked.as_ref().err().or(written.as_ref()) {
+            found.push(failed(
                 "foreign keys",
                 table.to_owned(),
                 vec![About::Table(table.to_owned())],
-                &error,
-            )),
+                error,
+            ));
+        }
+        match checked {
+            Err(_) => {}
             Ok(rows) => {
                 // Counted for each key and not for each parent: a plan that
                 // replaces one key to a parent by another over other columns
@@ -299,30 +320,6 @@ pub fn resolution(scratch: &Connection) -> Result<Resolution, DbError> {
                 let mut counts: std::collections::BTreeMap<i64, u64> = Default::default();
                 for row in &rows {
                     *counts.entry(row.integer(3)?).or_default() += 1;
-                }
-                let keys = scratch.query(
-                    &format!("PRAGMA main.foreign_key_list({})", quote(table)),
-                    &[],
-                )?;
-                if keys.is_empty() {
-                    continue;
-                }
-                // No row is no answer about the parent: with no child row the
-                // check has nothing to look up, and a parent that is gone goes
-                // unsaid (measured) until the next insert fails. So a write is
-                // compiled for every table with a key, **whatever else was
-                // found about it**: asked on one condition before a plan and
-                // another after it, a write that never compiled (a default the
-                // library cannot evaluate) would read as new when the plan only
-                // took the orphan rows' key away.
-                let insert = format!("EXPLAIN INSERT INTO main.{} DEFAULT VALUES", quote(table));
-                if let Err(error) = scratch.query(&insert, &[]) {
-                    found.push(failed(
-                        "write",
-                        table.to_owned(),
-                        vec![About::Table(table.to_owned())],
-                        &error,
-                    ));
                 }
                 for (id, rows) in counts {
                     let (mut parent, mut from, mut to) = (String::new(), Vec::new(), Vec::new());
@@ -570,14 +567,9 @@ impl Resolution {
                         Escaped(&item.name),
                         Escaped(now)
                     ),
-                    "write" => format!(
-                        "an insert into `{}`, which has a foreign key, does not compile after \
-                         the plan: {}",
-                        Escaped(&item.name),
-                        Escaped(now)
-                    ),
                     _ => format!(
-                        "the foreign keys of `{}` cannot be checked after the plan: {}",
+                        "the foreign keys of `{}` cannot be checked, or a row cannot be inserted, after \
+                         the plan: {}",
                         Escaped(&item.name),
                         Escaped(now)
                     ),
