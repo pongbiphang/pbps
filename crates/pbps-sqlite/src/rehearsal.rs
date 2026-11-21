@@ -32,6 +32,7 @@ use std::time::Duration;
 use pbps_db::DbError;
 use pbps_db::sqlite::Connection;
 use pbps_model::escape::Escaped;
+use pbps_model::{Change, ChangeSet, ColumnChange, TableChange};
 
 use crate::state::{BUSY_WAIT, waiting};
 
@@ -121,8 +122,98 @@ enum Detail {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Unresolved {
     what: &'static str,
+    /// As it is shown: the names the database has when it is asked.
     name: String,
+    /// What it is a finding about, part by part, so that a finding from before
+    /// a plan can be found again under the names the plan gave.
+    about: Vec<About>,
     detail: Detail,
+}
+
+/// One part of what a finding is about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum About {
+    /// A table or a view.
+    Table(String),
+    /// A column of a table.
+    Column(String, String),
+    /// Which write of a trigger's owner.
+    Write(&'static str),
+}
+
+/// The names a plan changes, so that what failed before it under one name is
+/// not counted as new under the other. Names are compared as SQLite compares
+/// them, without ASCII case.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Renamed {
+    /// A table's name before the plan and after it.
+    tables: Vec<(String, String)>,
+    /// A column's table as the plan leaves it named, then its name before and after.
+    columns: Vec<(String, String, String)>,
+}
+
+impl Renamed {
+    /// The table and column renames of `plan`.
+    #[must_use]
+    pub fn of(plan: &ChangeSet) -> Self {
+        let mut renamed = Self::default();
+        for planned in &plan.changes {
+            // Every other change renames nothing the findings are named by.
+            if let Change::Table(TableChange::RenameTable { from, to, .. }) = &planned.change {
+                renamed.tables.push((from.name.clone(), to.name.clone()));
+            }
+            if let Change::Column(ColumnChange::RenameColumn {
+                table, from, to, ..
+            }) = &planned.change
+            {
+                renamed.columns.push((
+                    table.name.clone(),
+                    from.raw().to_owned(),
+                    to.raw().to_owned(),
+                ));
+            }
+        }
+        renamed
+    }
+
+    fn table(&self, before: &str) -> String {
+        self.tables
+            .iter()
+            .find(|(from, _)| from.eq_ignore_ascii_case(before))
+            .map_or_else(|| before.to_owned(), |(_, to)| to.clone())
+    }
+
+    /// `about`, a part of a finding from before the plan, under the plan's names.
+    fn after(&self, about: &About) -> About {
+        match about {
+            About::Table(table) => About::Table(self.table(table)),
+            About::Column(table, column) => {
+                let table = self.table(table);
+                let column = self
+                    .columns
+                    .iter()
+                    .find(|(of, from, _)| {
+                        of.eq_ignore_ascii_case(&table) && from.eq_ignore_ascii_case(column)
+                    })
+                    .map_or_else(|| column.clone(), |(_, _, to)| to.clone());
+                About::Column(table, column)
+            }
+            About::Write(kind) => About::Write(kind),
+        }
+    }
+}
+
+impl About {
+    fn same(&self, other: &About) -> bool {
+        match (self, other) {
+            (About::Table(a), About::Table(b)) => a.eq_ignore_ascii_case(b),
+            (About::Column(a, x), About::Column(b, y)) => {
+                a.eq_ignore_ascii_case(b) && x.eq_ignore_ascii_case(y)
+            }
+            (About::Write(a), About::Write(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 /// What does not resolve in a database now. Compare two with [`Resolution::new_since`].
@@ -149,7 +240,12 @@ pub fn resolution(scratch: &Connection) -> Result<Resolution, DbError> {
         let name = view.text(0)?;
         let sql = format!("SELECT * FROM main.{} LIMIT 0", quote(name));
         if let Err(error) = scratch.query(&sql, &[]) {
-            found.push(failed("view", name.to_owned(), &error));
+            found.push(failed(
+                "view",
+                name.to_owned(),
+                vec![About::Table(name.to_owned())],
+                &error,
+            ));
             broken_views.push(name.to_owned());
         }
     }
@@ -166,7 +262,12 @@ pub fn resolution(scratch: &Connection) -> Result<Resolution, DbError> {
         // A line feed before the closing parenthesis, so a default that ends in a
         // `--` comment does not swallow it.
         if let Err(error) = scratch.query(&format!("SELECT ({default}\n)"), &[]) {
-            found.push(failed("default", format!("{table}.{name}"), &error));
+            found.push(failed(
+                "default",
+                format!("{table}.{name}"),
+                vec![About::Column(table.to_owned(), name.to_owned())],
+                &error,
+            ));
         }
     }
     triggers(scratch, &broken_views, &mut found)?;
@@ -183,7 +284,12 @@ pub fn resolution(scratch: &Connection) -> Result<Resolution, DbError> {
             &format!("PRAGMA main.foreign_key_check({})", quote(table)),
             &[],
         ) {
-            Err(error) => found.push(failed("foreign keys", table.to_owned(), &error)),
+            Err(error) => found.push(failed(
+                "foreign keys",
+                table.to_owned(),
+                vec![About::Table(table.to_owned())],
+                &error,
+            )),
             Ok(rows) => {
                 let mut counts: std::collections::BTreeMap<String, u64> = Default::default();
                 for row in &rows {
@@ -193,6 +299,7 @@ pub fn resolution(scratch: &Connection) -> Result<Resolution, DbError> {
                     found.push(Unresolved {
                         what: "foreign key",
                         name: format!("{table} -> {parent}"),
+                        about: vec![About::Table(table.to_owned()), About::Table(parent)],
                         detail: Detail::Rows(rows),
                     });
                 }
@@ -249,17 +356,23 @@ fn triggers(
         }
         for (kind, sql) in writes {
             if let Err(error) = scratch.query(&sql, &[]) {
-                found.push(failed("trigger", format!("{owner} ({kind})"), &error));
+                found.push(failed(
+                    "trigger",
+                    format!("{owner} ({kind})"),
+                    vec![About::Table(owner.to_owned()), About::Write(kind)],
+                    &error,
+                ));
             }
         }
     }
     Ok(())
 }
 
-fn failed(what: &'static str, name: String, error: &DbError) -> Unresolved {
+fn failed(what: &'static str, name: String, about: Vec<About>, error: &DbError) -> Unresolved {
     Unresolved {
         what,
         name,
+        about,
         detail: Detail::Failed(error.to_string()),
     }
 }
@@ -279,14 +392,22 @@ impl Resolution {
     /// application's function fails the same way before the plan ran, and is not
     /// the plan's fault; a view that fails for another reason after, or that was
     /// fine before, is. Foreign-key rows count only the ones added.
+    ///
+    /// `renamed` is what the plan renames: a finding from before is looked for
+    /// under the names the plan gave, so rows that had no parent in `p` are not
+    /// new rows without a parent in `p2` when the plan only renamed the table.
     #[must_use]
-    pub fn new_since(&self, before: &Resolution) -> Vec<String> {
+    pub fn new_since(&self, before: &Resolution, renamed: &Renamed) -> Vec<String> {
         let mut lines = Vec::new();
         for item in &self.0 {
-            let earlier = before
-                .0
-                .iter()
-                .find(|b| b.what == item.what && b.name == item.name);
+            let earlier = before.0.iter().find(|b| {
+                b.what == item.what
+                    && b.about.len() == item.about.len()
+                    && b.about
+                        .iter()
+                        .zip(&item.about)
+                        .all(|(was, now)| renamed.after(was).same(now))
+            });
             match (&item.detail, earlier.map(|b| &b.detail)) {
                 (Detail::Failed(now), Some(Detail::Failed(was))) if now == was => {}
                 (Detail::Failed(now), _) => lines.push(match item.what {

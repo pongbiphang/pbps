@@ -7067,4 +7067,5 @@ Rejected:
 - **A replay of the stored text.** See above.
 - **`run_to_completion` for the copy.** It never returns on a busy source.
 - **Counting a view that failed before the plan as the plan's.** A file that uses an application function would be refused by every plan.
+- **Matching a finding from before the plan by the name it had then.** A plan that renames a table or a column leaves what already failed failing under the new name (measured: after `ALTER TABLE p RENAME TO p2`, `foreign_key_check` names `p2` for the same orphan rows), and by name alone it would read as new and refuse a plan that broke nothing. Each finding is keyed by what it is about, and one from before is looked for under the names the plan's own renames give (`Renamed::of`).
 - **A silent downgrade above the limit.** A rehearsal that says "converged" about a smaller thing than was asked is the failure this tool exists to prevent.

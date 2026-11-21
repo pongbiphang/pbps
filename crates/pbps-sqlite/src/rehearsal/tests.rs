@@ -14,8 +14,8 @@ use pbps_dialect::Statement;
 use pbps_model::{CheckConstraint, IdsFile, Schema};
 
 use super::{
-    Detail, Resolution, SCRATCH_LIMIT, Unresolved, explain_copy, resolution, scratch,
-    scratch_within,
+    About, Detail, Renamed, Resolution, SCRATCH_LIMIT, Unresolved, explain_copy, resolution,
+    scratch, scratch_within,
 };
 use crate::TRANSACTION;
 use crate::catalog::introspect;
@@ -92,7 +92,7 @@ fn rehearse(
     Ok(Ran {
         statements,
         read_back,
-        new: after.new_since(&before),
+        new: after.new_since(&before, &Renamed::default()),
     })
 }
 
@@ -410,7 +410,7 @@ fn a_view_a_plan_leaves_broken_passes_every_statement_and_the_read_back_and_only
     // The reader never selects from a view, so it reads what is left without a word.
     assert!(introspect(&mut copy).is_ok());
     let after = resolution(&copy).expect("asked");
-    let lines = after.new_since(&before);
+    let lines = after.new_since(&before, &Renamed::default());
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(
         lines[0].contains("view `v`") && lines[0].contains("no such table"),
@@ -435,13 +435,15 @@ fn what_failed_the_same_way_before_the_plan_ran_is_not_the_plans_fault() {
     copy.execute_batch("CREATE TABLE z(a)").expect("runs");
     let after = resolution(&copy).expect("asked");
     assert!(
-        after.new_since(&before).is_empty(),
+        after.new_since(&before, &Renamed::default()).is_empty(),
         "{:?}",
-        after.new_since(&before)
+        after.new_since(&before, &Renamed::default())
     );
     // Negative: the same view failing for a different reason is the plan's.
     copy.execute_batch("CREATE TABLE nope(a)").expect("runs");
-    let changed = resolution(&copy).expect("asked").new_since(&before);
+    let changed = resolution(&copy)
+        .expect("asked")
+        .new_since(&before, &Renamed::default());
     assert_eq!(changed.len(), 1, "{changed:?}");
     assert!(
         changed[0].contains("view `v`") && changed[0].contains("no such column"),
@@ -450,11 +452,99 @@ fn what_failed_the_same_way_before_the_plan_ran_is_not_the_plans_fault() {
     // Negative: a new default of the same kind is the plan's.
     copy.execute_batch("CREATE TABLE e(a DEFAULT (nosuchfn()))")
         .expect("runs");
-    let grown = resolution(&copy).expect("asked").new_since(&before);
+    let grown = resolution(&copy)
+        .expect("asked")
+        .new_since(&before, &Renamed::default());
     assert!(grown.iter().any(|line| line.contains("`e.a`")), "{grown:?}");
     assert!(
         !grown.iter().any(|line| line.contains("`d.a`")),
         "{grown:?}"
+    );
+}
+
+#[test]
+fn what_failed_before_a_rename_is_not_new_under_the_new_name() {
+    // Orphan rows and a default that fail already; the plan renames the parent,
+    // the child, and the table and the column with the default. (A trigger that
+    // does not compile is not here: the engine refuses a rename beside one.)
+    let mut db = file(
+        "CREATE TABLE p(x PRIMARY KEY); CREATE TABLE c(y REFERENCES p(x)); \
+         CREATE TABLE d(a DEFAULT (nosuchfn()))",
+    );
+    db.connection()
+        .execute_batch("PRAGMA foreign_keys = OFF; INSERT INTO c VALUES (7), (8)")
+        .expect("orphans");
+    let copy = scratch(db.connection(), SCRATCH_LIMIT).expect("copied");
+    let before = resolution(&copy).expect("asked");
+    assert!(!before.is_empty());
+    copy.execute_batch(
+        "ALTER TABLE p RENAME TO P2; ALTER TABLE c RENAME TO c2; \
+         ALTER TABLE d RENAME TO d2; ALTER TABLE d2 RENAME COLUMN a TO b",
+    )
+    .expect("the renames");
+    let after = resolution(&copy).expect("asked");
+    let renamed = Renamed {
+        tables: vec![
+            ("p".into(), "p2".into()),
+            ("C".into(), "c2".into()),
+            ("d".into(), "d2".into()),
+        ],
+        columns: vec![("d2".into(), "a".into(), "b".into())],
+    };
+    let new = after.new_since(&before, &renamed);
+    assert!(new.is_empty(), "{new:?}");
+    // Negative: without the plan's renames every one of them reads as new, and
+    // a rename the plan did not make does not excuse a finding.
+    let unknown = after.new_since(&before, &Renamed::default());
+    assert_eq!(unknown.len(), before.0.len(), "{unknown:?}");
+    let other = Renamed {
+        tables: vec![("p".into(), "elsewhere".into())],
+        columns: Vec::new(),
+    };
+    assert!(!after.new_since(&before, &other).is_empty());
+    // And rows added under the new names are still counted, the old ones not.
+    copy.execute_batch("PRAGMA foreign_keys = OFF; INSERT INTO c2 VALUES (9)")
+        .expect("one more");
+    let grown = resolution(&copy)
+        .expect("asked")
+        .new_since(&before, &renamed);
+    assert_eq!(grown.len(), 1, "{grown:?}");
+    assert!(grown[0].starts_with("1 more row(s)"), "{grown:?}");
+}
+
+#[test]
+fn the_renames_of_a_plan_are_read_from_its_changes() {
+    let from = declared_from("CREATE TABLE t(a integer)");
+    let to = declared_from("CREATE TABLE u(b integer)");
+    let base_ids = ids(&from, &[]);
+    let hints = pbps_model::Hints::default();
+    // The same identities under new names: a table rename and a column rename.
+    let to_ids = ids(&to, &[("u", "t"), ("u.b", "t.a")]);
+    let plan = pbps_diff::diff(
+        pbps_diff::Side {
+            schema: &from,
+            ids: &base_ids,
+        },
+        pbps_diff::Side {
+            schema: &to,
+            ids: &to_ids,
+        },
+        &Sqlite::default(),
+        &hints,
+    )
+    .expect("plans");
+    let renamed = Renamed::of(&plan);
+    assert_eq!(renamed.tables, vec![("t".to_owned(), "u".to_owned())]);
+    assert_eq!(
+        renamed.columns,
+        vec![("u".to_owned(), "a".to_owned(), "b".to_owned())]
+    );
+    // Negative: a plan that renames nothing names nothing.
+    assert_eq!(
+        Renamed::of(&pbps_model::ChangeSet {
+            changes: Vec::new()
+        }),
+        Renamed::default()
     );
 }
 
@@ -464,15 +554,19 @@ fn foreign_key_rows_count_only_the_ones_the_plan_added() {
         Resolution(vec![Unresolved {
             what: "foreign key",
             name: "c -> p".into(),
+            about: vec![About::Table("c".into()), About::Table("p".into())],
             detail: Detail::Rows(n),
         }])
     };
-    assert!(rows(2).new_since(&rows(2)).is_empty());
-    assert!(rows(1).new_since(&rows(2)).is_empty(), "fewer is not worse");
-    let more = rows(5).new_since(&rows(2));
+    assert!(rows(2).new_since(&rows(2), &Renamed::default()).is_empty());
+    assert!(
+        rows(1).new_since(&rows(2), &Renamed::default()).is_empty(),
+        "fewer is not worse"
+    );
+    let more = rows(5).new_since(&rows(2), &Renamed::default());
     assert_eq!(more.len(), 1);
     assert!(more[0].starts_with("3 more row(s)"), "{more:?}");
-    let fresh = rows(4).new_since(&Resolution::default());
+    let fresh = rows(4).new_since(&Resolution::default(), &Renamed::default());
     assert!(fresh[0].starts_with("4 more row(s)"), "{fresh:?}");
 }
 
@@ -490,7 +584,7 @@ fn the_orphan_rows_a_file_already_had_are_found_on_the_copy_and_are_not_the_plan
     assert!(
         resolution(&copy)
             .expect("asked")
-            .new_since(&before)
+            .new_since(&before, &Renamed::default())
             .is_empty()
     );
 }
@@ -746,7 +840,7 @@ fn a_trigger_a_plan_leaves_broken_is_found_by_compiling_a_write_and_never_runnin
     copy.execute_batch("DROP TABLE gone")
         .expect("the engine takes it");
     let after = resolution(&copy).expect("asked");
-    let lines = after.new_since(&before);
+    let lines = after.new_since(&before, &Renamed::default());
     assert_eq!(lines.len(), 2, "{lines:?}");
     assert!(
         lines[0].contains("`t (insert)`") && lines[0].contains("no such table: main.gone"),
@@ -765,7 +859,7 @@ fn a_trigger_a_plan_leaves_broken_is_found_by_compiling_a_write_and_never_runnin
     assert!(
         resolution(&whole)
             .expect("asked")
-            .new_since(&before)
+            .new_since(&before, &Renamed::default())
             .is_empty()
     );
 }
@@ -780,7 +874,9 @@ fn a_key_the_engine_cannot_check_is_found_table_by_table() {
     assert!(!before.is_empty(), "the file's own unusable key is seen");
     copy.execute_batch("CREATE TABLE b_new(r REFERENCES p(z))")
         .expect("the engine takes it");
-    let lines = resolution(&copy).expect("asked").new_since(&before);
+    let lines = resolution(&copy)
+        .expect("asked")
+        .new_since(&before, &Renamed::default());
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(
         lines[0].contains("foreign keys of `b_new`") && lines[0].contains("mismatch"),
@@ -793,7 +889,7 @@ fn a_key_the_engine_cannot_check_is_found_table_by_table() {
     assert!(
         resolution(&copy)
             .expect("asked")
-            .new_since(&before)
+            .new_since(&before, &Renamed::default())
             .is_empty()
     );
 }
