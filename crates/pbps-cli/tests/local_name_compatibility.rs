@@ -406,7 +406,7 @@ where
         .as_object_mut()
         .unwrap()
         .shift_remove("description");
-    // #2448 PR E2 adds a partition entry's own `exclude:` (schema set 118); the captured
+    // #2448 PR E2 adds a partition entry's own `exclude:` (the published set, before its first release); the captured
     // entry predates it.
     declaration_schema["$defs"]["PartitionEntryDto"]["properties"]
         .as_object_mut()
