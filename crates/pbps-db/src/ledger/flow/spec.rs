@@ -1,5 +1,5 @@
-//! What an engine hands the shared flow: its statements, its codes and the
-//! few values the flow branches on.
+//! What an engine hands the shared flow: its statements, its codes, the few
+//! values the flow branches on, and the steps that are the engine's own.
 //!
 //! # Why whole statements
 //!
@@ -13,7 +13,7 @@
 
 use std::borrow::Cow;
 
-use super::RowLimit;
+use super::{ClipUnit, RowLimit};
 use crate::{Conn, DbError};
 
 /// One statement's text. Borrowed where the engine writes it out, owned where
@@ -44,12 +44,45 @@ pub struct LedgerSpec {
     /// whose kind is one of the next `kinds` values. Built from the count,
     /// never from a kind's text.
     pub select_deployed_revision: fn(kinds: usize) -> String,
+    /// The newest rows as the timeline shows them, without `state_json`; the
+    /// one bound value is the row limit.
+    pub select_timeline: Statement,
+    /// The same rows of a ledger whose timeline columns are not there yet.
+    pub select_timeline_unmigrated: Statement,
+    /// `id` and `state_json` of the rows whose ids are the `ids` bound values.
+    /// Built from the count, never from an id.
+    pub select_legacy_state_json: fn(ids: usize) -> String,
+    /// The insert of a row with staged progress (eleven values), returning
+    /// its `id`.
+    pub insert_state_staged: Statement,
+    /// The insert of a row without it (nine values), returning its `id`.
+    pub insert_state_not_staged: Statement,
+    /// Every `id`, newest first.
+    pub select_ids: Statement,
+    /// Deletes the rows at or below the one bound id.
+    pub delete_up_to: Statement,
     /// The lock's one row: `locked_by`, `locked_at` as text.
     pub select_lock: Statement,
+    /// Takes the lock for the holder that is the one bound value.
+    pub insert_lock: Statement,
+    /// Releases it.
+    pub delete_lock: Statement,
+    /// The application name the server holds for this session, as `name`.
+    pub session_application_name: Statement,
     /// How a row limit is bound.
     pub row_limit: RowLimit,
+    /// The most values one statement may bind: the legacy `state_json` query
+    /// is sent in pieces of at most this many ids.
+    pub max_parameters: usize,
+    /// The unit and the width the `operator` column is counted in.
+    pub operator_clip: (ClipUnit, usize),
+    /// What [`LedgerSpec::insert_lock`] does when the lock is already held.
+    pub held_lock: HeldLock,
     /// The server's code for "the table this statement names is not there".
     pub missing_table: &'static str,
+    /// The server's code for "this session may not read that", as the legacy
+    /// `state_json` query can meet it.
+    pub select_denied: &'static str,
     /// The savepoint the engine needs around a statement whose failure the
     /// flow handles; `None` where a failed statement leaves the transaction
     /// usable.
@@ -72,6 +105,12 @@ impl LedgerSpec {
         e.server_error_code().as_deref() == Some(self.missing_table)
     }
 
+    /// Whether a failure means "this session may not read that".
+    #[must_use]
+    pub fn is_select_denied(&self, e: &DbError) -> bool {
+        e.server_error_code().as_deref() == Some(self.select_denied)
+    }
+
     /// Every statement this spec can send, for the engine's tests of "the SQL
     /// here". A statement built from a count is sampled at three.
     ///
@@ -87,9 +126,24 @@ impl LedgerSpec {
             select_history,
             select_applied_plan,
             select_deployed_revision,
+            select_timeline,
+            select_timeline_unmigrated,
+            select_legacy_state_json,
+            insert_state_staged,
+            insert_state_not_staged,
+            select_ids,
+            delete_up_to,
             select_lock,
+            insert_lock,
+            delete_lock,
+            // It names no table.
+            session_application_name: _,
             row_limit: _,
+            max_parameters: _,
+            operator_clip: _,
+            held_lock: _,
             missing_table: _,
+            select_denied: _,
             // Its statements name no table.
             savepoint: _,
             session_lookup: _,
@@ -102,10 +156,56 @@ impl LedgerSpec {
                 select_history.to_string(),
                 select_applied_plan.to_string(),
                 select_deployed_revision(3),
+                select_timeline.to_string(),
+                select_timeline_unmigrated.to_string(),
+                select_legacy_state_json(3),
+                insert_state_staged.to_string(),
+                insert_state_not_staged.to_string(),
+                select_ids.to_string(),
+                delete_up_to.to_string(),
             ],
-            lock: vec![select_lock.to_string()],
+            lock: vec![
+                select_lock.to_string(),
+                insert_lock.to_string(),
+                delete_lock.to_string(),
+            ],
         }
     }
+}
+
+/// What the lock's insert does when another holder is already there.
+///
+/// The engines differ in the statement they can write, and so in where the
+/// answer arrives; which one applies is a fact about the statement, so it
+/// travels with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldLock {
+    /// The insert succeeds and changes no row. Any failure of it is a real
+    /// failure and is returned as it is.
+    ChangesNoRow,
+    /// The insert fails. A failure with a holder to name is "locked"; one
+    /// with no holder is returned as it is.
+    FailsTheInsert,
+}
+
+/// The steps the flow calls and does not contain (DEC-2988.1).
+///
+/// Each is the engine's own work, found by measurement on that engine: how
+/// the ledger is created and migrated, what makes a ledger unfit to write
+/// through, and how the shape of the state table is asked.
+pub trait LedgerSteps {
+    /// Creates the ledger's tables when they are absent and brings an older
+    /// ledger to the current shape. Called before every write that may be the
+    /// first.
+    fn ensure_tables(conn: &mut Conn) -> impl Future<Output = Result<(), DbError>> + Send;
+    /// Refuses a ledger this engine must not delete through. Called before
+    /// the deletes of `prune` and `unlock`; an absent ledger is not refused.
+    fn refuse_untrusted(conn: &mut Conn) -> impl Future<Output = Result<(), DbError>> + Send;
+    /// Whether the state table has the timeline's columns. Asked by a read,
+    /// so it must need no more than a read does.
+    fn timeline_columns_present(
+        conn: &mut Conn,
+    ) -> impl Future<Output = Result<bool, DbError>> + Send;
 }
 
 /// The statements of a savepoint, and the code that says there was no
@@ -198,6 +298,10 @@ mod tests {
         format!("state kinds({count})")
     }
 
+    fn legacy(ids: usize) -> String {
+        format!("state legacy({ids})")
+    }
+
     fn no_lookup(_: &str) -> Option<String> {
         None
     }
@@ -210,9 +314,23 @@ mod tests {
             select_history: String::from("state history").into(),
             select_applied_plan: "state applied plan".into(),
             select_deployed_revision: kinds,
+            select_timeline: "state timeline".into(),
+            select_timeline_unmigrated: "state timeline unmigrated".into(),
+            select_legacy_state_json: legacy,
+            insert_state_staged: "state insert staged".into(),
+            insert_state_not_staged: "state insert".into(),
+            select_ids: "state ids".into(),
+            delete_up_to: "state delete".into(),
             select_lock: "lock holder".into(),
+            insert_lock: "lock take".into(),
+            delete_lock: "lock release".into(),
+            session_application_name: "session name".into(),
             row_limit: RowLimit::I64,
+            max_parameters: 2,
+            operator_clip: (ClipUnit::Characters, 8),
+            held_lock: HeldLock::ChangesNoRow,
             missing_table: "42P01",
+            select_denied: "42501",
             savepoint: None,
             session_lookup: no_lookup,
         }
@@ -232,11 +350,23 @@ mod tests {
                 "state by id",
                 "state history",
                 "state applied plan",
-                "state kinds(3)"
+                "state kinds(3)",
+                "state timeline",
+                "state timeline unmigrated",
+                "state legacy(3)",
+                "state insert staged",
+                "state insert",
+                "state ids",
+                "state delete"
             ]
         );
-        assert_eq!(listed.lock, ["lock holder"]);
+        assert_eq!(listed.lock, ["lock holder", "lock take", "lock release"]);
         assert!(listed.lock.iter().all(|sql| !sql.starts_with("state")));
+        let all = [listed.state, listed.lock].concat();
+        assert!(
+            !all.contains(&"session name".to_owned()),
+            "the session's name is read from no table"
+        );
     }
 
     /// Only the spec's own code means "the table is not there". A different
@@ -255,5 +385,20 @@ mod tests {
         assert!(!spec.is_missing_table(&server(Some("42501"))));
         assert!(!spec.is_missing_table(&server(None)));
         assert!(!spec.is_missing_table(&DbError::BadRow("no code at all".into())));
+    }
+
+    /// A denial is its own code: a missing table is not one, and neither is a
+    /// failure with no code.
+    #[test]
+    fn only_the_specs_code_means_a_denied_read() {
+        let spec = spec();
+        let server = |code: Option<&str>| DbError::Driver {
+            diagnostic: None,
+            message: "server sentence".into(),
+            code: code.map(str::to_owned),
+        };
+        assert!(spec.is_select_denied(&server(Some("42501"))));
+        assert!(!spec.is_select_denied(&server(Some("42P01"))));
+        assert!(!spec.is_select_denied(&server(None)));
     }
 }

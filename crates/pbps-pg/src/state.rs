@@ -37,15 +37,14 @@
 use std::sync::LazyLock;
 
 use pbps_db::ledger::flow::{
-    self, ClipUnit, LedgerSpec, ProjectedRow, Recoverable, RowLimit, Savepoint, missing, number,
-    ordinary_params, projected_row, projected_row_unmigrated, text,
+    self, ClipUnit, HeldLock, LedgerSpec, LedgerSteps, Recoverable, RowLimit, Savepoint, missing,
+    number, text,
 };
 use pbps_db::ledger::{
     LOCK_TABLE_NAME, LedgerEntry, LedgerError, LockInfo, STATE_TABLE_NAME, TimelineEntry,
-    TimelineState, ids_to_prune,
 };
-use pbps_db::{Conn, DbError, Param, Row};
-use pbps_model::{StateSnapshot, Unreadable};
+use pbps_db::{Conn, DbError, Row};
+use pbps_model::StateSnapshot;
 
 /// The schema this engine's ledger lives in. See the module header.
 pub const LEDGER_SCHEMA: &str = "public";
@@ -421,8 +420,25 @@ static LEDGER: LazyLock<LedgerSpec> = LazyLock::new(|| LedgerSpec {
     select_applied_plan: SELECT_APPLIED_PLAN.into(),
     select_deployed_revision,
     select_lock: select_lock().into(),
+    select_timeline: select_timeline().into(),
+    select_timeline_unmigrated: select_timeline_unmigrated().into(),
+    select_legacy_state_json,
+    insert_state_staged: INSERT_STATE_STAGED.into(),
+    insert_state_not_staged: INSERT_STATE_NOT_STAGED.into(),
+    select_ids: SELECT_IDS.into(),
+    delete_up_to: DELETE_UP_TO.into(),
+    insert_lock: INSERT_LOCK.into(),
+    delete_lock: DELETE_LOCK.into(),
+    session_application_name: SESSION_APPLICATION_NAME.into(),
     row_limit: ROW_LIMIT,
+    max_parameters: MAX_PARAMETERS,
+    operator_clip: (ClipUnit::Characters, OPERATOR_CHARS),
+    // `ON CONFLICT DO NOTHING`: a held lock is an insert that changed nothing,
+    // so a failed insert here is never "locked" — and inside a transaction it
+    // has aborted the transaction, so the holder could not be read after it.
+    held_lock: HeldLock::ChangesNoRow,
     missing_table: UNDEFINED_TABLE,
+    select_denied: INSUFFICIENT_PRIVILEGE,
     savepoint: Some(Savepoint {
         take: SAVEPOINT,
         release: RELEASE_SAVEPOINT,
@@ -431,6 +447,23 @@ static LEDGER: LazyLock<LedgerSpec> = LazyLock::new(|| LedgerSpec {
     }),
     session_lookup,
 });
+
+/// The steps of the shared flow that are this engine's own work.
+struct Steps;
+
+impl LedgerSteps for Steps {
+    async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
+        ensure_tables(conn).await
+    }
+
+    async fn refuse_untrusted(conn: &mut Conn) -> Result<(), DbError> {
+        refuse_an_untrusted_ledger(conn).await
+    }
+
+    async fn timeline_columns_present(conn: &mut Conn) -> Result<bool, DbError> {
+        timeline_columns_present(conn).await
+    }
+}
 
 /// How many of the two tables the catalog holds.
 async fn ledger_present(conn: &mut Conn) -> Result<i64, DbError> {
@@ -1348,121 +1381,7 @@ pub async fn history(conn: &mut Conn, limit: u32) -> Result<Vec<LedgerEntry>, Le
 /// fully-migrated ledger whose `state_json` this role may not see still
 /// answers `state list`.
 pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>, LedgerError> {
-    if !is_initialized(conn).await? {
-        return Err(LedgerError::NotInitialized);
-    }
-    // `state list` is a read and must not require ownership to run, so it
-    // cannot call `ensure_tables` to make an unmigrated ledger's columns
-    // appear — it asks the shape instead, with the same catalog probe
-    // `migrate_timeline_columns` already uses, and sends the query that
-    // matches (round-1 review finding on #103's own PR: `timeline` is the
-    // only reader of `public.__pbps_state`'s shape, and both branches meet
-    // at `legacy_ids` below whichever one ran).
-    let projected: Vec<ProjectedRow> = if timeline_columns_present(conn).await? {
-        let rows = conn
-            .query_with(&select_timeline(), &[ROW_LIMIT.param(limit)])
-            .await?;
-        rows.iter().map(projected_row).collect::<Result<_, _>>()?
-    } else {
-        let rows = conn
-            .query_with(&select_timeline_unmigrated(), &[ROW_LIMIT.param(limit)])
-            .await?;
-        rows.iter()
-            .map(projected_row_unmigrated)
-            .collect::<Result<_, _>>()?
-    };
-
-    let legacy_ids: Vec<i64> = projected
-        .iter()
-        .filter(|r| r.state.is_none())
-        .map(|r| r.id)
-        .collect();
-    let mut legacy: std::collections::HashMap<i64, Result<TimelineState, Unreadable>> =
-        std::collections::HashMap::new();
-    // In pieces of at most `MAX_PARAMETERS` ids, not one statement for every
-    // legacy id: this query binds one parameter per id, and until a deployer
-    // has run a deployment after upgrading, every row is legacy, so a
-    // long-lived ledger's ordinary `state list` is exactly the case that
-    // could reach the extended protocol's own parameter-count ceiling in a
-    // single request (a round-2 review finding on #103's own PR — the
-    // pre-#103 query needed only its `$1` limit parameter and had no such
-    // ceiling; the fix mirrors `pbps_mssql::state::timeline`'s identical
-    // chunking of the same shape, one dialect apart).
-    for chunk in legacy_ids.chunks(MAX_PARAMETERS) {
-        let sql = select_legacy_state_json(chunk.len());
-        let params: Vec<Param<'_>> = chunk.iter().map(|&id| id.into()).collect();
-        // Under a savepoint, because the denial below is *handled*: a failed
-        // statement aborts a caller's open transaction, and returning `Ok`
-        // over an aborted transaction turns its next statement into `25P02`
-        // and its `COMMIT` into a silent rollback (#361). See [`Recoverable`].
-        let guard = Recoverable::take(conn, &LEDGER).await?;
-        let answer = conn.query_with(&sql, &params).await;
-        match &answer {
-            Ok(_) => guard.release(conn).await?,
-            Err(e) if is_select_denied(e) => guard.rewind(conn).await?,
-            Err(_) => guard.rewind_quietly(conn).await,
-        }
-        match answer {
-            Ok(rows) => {
-                for row in &rows {
-                    let id: i64 = number(row, "id")?;
-                    let state_json = text(row, "state_json")?;
-                    // `read_json`, the same reader the pre-migration
-                    // `timeline_from_row` used: version before shape, and the
-                    // failure carried rather than returned (DECISIONS 222).
-                    let state = StateSnapshot::read_json(&state_json)
-                        .map(|s| TimelineState::from_snapshot(&s));
-                    legacy.insert(id, state);
-                }
-            }
-            // Denied specifically, never a hard failure of the whole call:
-            // this is the fallback query, run only for rows a fresh ledger
-            // never has, and DECISIONS 218's promise — a row this build
-            // cannot read is carried, not thrown — extends to a row this
-            // build was refused, not only one it could not parse (DECISIONS
-            // 433). Every legacy id in this chunk shares one answer, because
-            // a permission denial is not sensitive to which row is read; a
-            // later chunk still asks for itself.
-            Err(e) if is_select_denied(&e) => {
-                let denied = Err(Unreadable::Denied(e.to_string()));
-                for id in chunk {
-                    legacy.insert(*id, denied.clone());
-                }
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-
-    Ok(projected
-        .into_iter()
-        .map(|r| TimelineEntry {
-            id: r.id,
-            applied_at: r.applied_at,
-            kind: r.kind,
-            git_sha: r.git_sha.map(pbps_model::Text::from),
-            plan_checksum: r.plan_checksum,
-            operator: r.operator,
-            reason: r.reason.map(pbps_model::Text::from),
-            state: match r.state {
-                // A version this build does not read, refused before the
-                // JSON fallback ever runs — see [`ProjectedRow`]'s doc
-                // comment on why this is neither `Some(Ok(_))` nor `None`.
-                Some(Err(e)) => Err(e),
-                Some(Ok(state)) => Ok(state),
-                // The fallback query answered for every id it was asked
-                // about; a legacy id missing from its answer means the row
-                // left the ledger between the two queries (a concurrent
-                // `state prune`), not that it was ever malformed or denied.
-                None => legacy.remove(&r.id).unwrap_or_else(|| {
-                    Err(Unreadable::Malformed(
-                        "this row's state_json could not be re-read; it may have been \
-                         pruned while the timeline was being read"
-                            .to_owned(),
-                    ))
-                }),
-            },
-        })
-        .collect())
+    flow::timeline::<Steps>(conn, &LEDGER, limit).await
 }
 
 /// Appends one state to the ledger and returns its id.
@@ -1472,65 +1391,12 @@ pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>,
 /// and a caller able to set them independently could make them lie. The five
 /// issue #103 added follow the same rule (DECISIONS 435).
 pub async fn record(conn: &mut Conn, snapshot: &StateSnapshot) -> Result<i64, LedgerError> {
-    snapshot
-        .validate_data_work()
-        .map_err(|e| LedgerError::BadEntry {
-            id: 0,
-            message: e.to_string(),
-        })?;
-    ensure_tables(conn).await?;
-    let snapshot = &*flow::bounded_operator(snapshot, ClipUnit::Characters, OPERATOR_CHARS);
-    let state_json = serde_json::to_string(snapshot).map_err(|e| LedgerError::BadEntry {
-        id: 0,
-        message: format!("the snapshot could not be serialized: {e}"),
-    })?;
-
-    let (params, sql) = ordinary_insert(snapshot, &state_json);
-    let rows = conn.query_with(sql, &params).await?;
-    match rows.first() {
-        Some(row) => Ok(number(row, "id")?),
-        None => Err(LedgerError::Db(DbError::BadRow(
-            "the ledger insert returned no id".into(),
-        ))),
-    }
-}
-
-/// [`record`]'s insert and its parameters.
-fn ordinary_insert<'a>(
-    snapshot: &'a StateSnapshot,
-    state_json: &'a str,
-) -> (Vec<Param<'a>>, &'static str) {
-    let (params, staged) = ordinary_params(snapshot, state_json);
-    let sql = if staged {
-        INSERT_STATE_STAGED
-    } else {
-        INSERT_STATE_NOT_STAGED
-    };
-    (params, sql)
+    flow::record::<Steps>(conn, &LEDGER, snapshot).await
 }
 
 /// Deletes all but the `keep` newest entries; returns how many went.
 pub async fn prune(conn: &mut Conn, keep: u32) -> Result<u64, LedgerError> {
-    if !is_initialized(conn).await? {
-        return Err(LedgerError::NotInitialized);
-    }
-    refuse_an_untrusted_ledger(conn).await?;
-    let ids: Vec<i64> = conn
-        .query(SELECT_IDS)
-        .await?
-        .iter()
-        .map(|row| number(row, "id"))
-        .collect::<Result<_, _>>()?;
-
-    // The policy is decided in `pbps-db` and tested without a server; all that
-    // is left here is the delete. Because ids come from an identity column and
-    // the list is newest-first, the prunable set is always a contiguous tail,
-    // so one `<=` covers it exactly.
-    let doomed = ids_to_prune(&ids, keep);
-    let Some(highest) = doomed.first().copied() else {
-        return Ok(0);
-    };
-    Ok(conn.execute_with(DELETE_UP_TO, &[highest.into()]).await?)
+    flow::prune::<Steps>(conn, &LEDGER, keep).await
 }
 
 /// Takes the apply lock, or reports who already holds it.
@@ -1540,38 +1406,17 @@ pub async fn prune(conn: &mut Conn, keep: u32) -> Result<u64, LedgerError> {
 /// once the insert has reported that it changed nothing, and then only to name
 /// the holder.
 pub async fn lock(conn: &mut Conn, holder: &str) -> Result<(), LedgerError> {
-    ensure_tables(conn).await?;
-    if conn.execute_with(INSERT_LOCK, &[holder.into()]).await? > 0 {
-        return Ok(());
-    }
-    match lock_holder(conn).await? {
-        Some(info) => Err(LedgerError::Locked(info)),
-        // The row was there when the insert ran and is gone now: whoever held
-        // the lock released it in between. Reporting a holder this call cannot
-        // name would be a sentence with a hole in it, and claiming the lock
-        // would be a claim this call did not win, so it is neither — the caller
-        // is told the lock was contended and can try again.
-        None => Err(LedgerError::Locked(LockInfo {
-            locked_by: "another operation, which released the lock while this one was reading it"
-                .to_owned(),
-            locked_at: "just now".to_owned(),
-            session_lookup: None,
-        })),
-    }
+    flow::lock::<Steps>(conn, &LEDGER, holder).await
 }
 
 /// The application name this session carries, as the server holds it: the
 /// server cuts a longer one to 63 bytes, and the lock must record the name a
 /// search of `pg_stat_activity` will match (#1188).
 pub async fn session_application_name(conn: &mut Conn) -> Result<String, DbError> {
-    let rows = conn
-        .query("SELECT current_setting('application_name') AS name")
-        .await?;
-    let row = rows
-        .first()
-        .ok_or_else(|| DbError::BadRow("current_setting returned no row".into()))?;
-    text(row, "name")
+    flow::session_application_name(conn, &LEDGER).await
 }
+
+const SESSION_APPLICATION_NAME: &str = "SELECT current_setting('application_name') AS name";
 
 /// How an operator finds a lock holder's sessions here, from what
 /// `locked_by` recorded; `None` when it recorded no application name.
@@ -1599,6 +1444,12 @@ pub fn session_lookup(locked_by: &str) -> Option<String> {
 /// the code for one that is there and may not be read — that is `42501`,
 /// `insufficient_privilege`, and keeping the two apart is the whole point of
 /// asking by SQLSTATE.
+///
+/// A schema that is not there answers the same way — measured, a reference to
+/// `no_such_schema.t` is `42P01: relation "no_such_schema.t" does not exist`,
+/// not `3F000` — which is the right answer for a caller asking whether the
+/// ledger is there: it is not, and `bootstrap` or `baseline` is what makes both
+/// the schema's absence and the ledger's visible.
 const UNDEFINED_TABLE: &str = "42P01";
 
 /// `duplicate_table` and `unique_violation`: what a concurrent creator leaves
@@ -1610,17 +1461,6 @@ const UNIQUE_VIOLATION: &str = "23505";
 /// insert (#898, DEC-898.1).
 const DUPLICATE_OBJECT: &str = "42710";
 
-/// Whether a failure means "that table does not exist".
-///
-/// A schema that is not there answers the same way — measured, a reference to
-/// `no_such_schema.t` is `42P01: relation "no_such_schema.t" does not exist`,
-/// not `3F000` — which is the right answer for a caller asking whether the
-/// ledger is there: it is not, and `bootstrap` or `baseline` is what makes both
-/// the schema's absence and the ledger's visible.
-fn is_missing_table(e: &DbError) -> bool {
-    e.server_error_code().as_deref() == Some(UNDEFINED_TABLE)
-}
-
 /// `insufficient_privilege`: this engine's one code for "you may not touch
 /// this", table-level and column-level alike — unlike the other engine, which
 /// has 229 and 230 for the two. By the time [`timeline`]'s fallback query
@@ -1628,10 +1468,6 @@ fn is_missing_table(e: &DbError) -> bool {
 /// already succeeded against this same table, so a 42501 here can only be
 /// about `state_json` — the shape issue #103's sharp test builds.
 const INSUFFICIENT_PRIVILEGE: &str = "42501";
-
-fn is_select_denied(e: &DbError) -> bool {
-    e.server_error_code().as_deref() == Some(INSUFFICIENT_PRIVILEGE)
-}
 
 /// Whether a failure means "somebody else created it first".
 fn made_by_someone_else(e: &DbError) -> bool {
@@ -1643,34 +1479,7 @@ fn made_by_someone_else(e: &DbError) -> bool {
 
 /// Releases the lock. `false` means it was not held.
 pub async fn unlock(conn: &mut Conn) -> Result<bool, DbError> {
-    // The *lock* table, not the state table. Guarding on `is_initialized` would
-    // mean a database whose `__pbps_state` had been dropped by hand reported
-    // "not held" and left a live lock in place — with no command able to clear
-    // it.
-    //
-    // The integrity check first (#396): a DELETE runs a trigger on the lock
-    // table, or writes through a view at its name, just as `lock`'s INSERT
-    // would. An absent lock table has no problems, so it still answers "not
-    // held" below.
-    refuse_an_untrusted_ledger(conn).await?;
-    let guard = Recoverable::take(conn, &LEDGER).await?;
-    match conn.execute_with(DELETE_LOCK, &[]).await {
-        Ok(n) => {
-            guard.release(conn).await?;
-            Ok(n > 0)
-        }
-        // The tolerated answer is an error, so it needs the rewind the others
-        // do: a `pbps unlock` against a database with no lock table must not
-        // leave the caller's transaction dead on its way to saying "not held".
-        Err(e) if is_missing_table(&e) => {
-            guard.rewind(conn).await?;
-            Ok(false)
-        }
-        Err(e) => {
-            guard.rewind_quietly(conn).await;
-            Err(e)
-        }
-    }
+    flow::unlock::<Steps>(conn, &LEDGER).await
 }
 
 /// Who holds the deployment lock, if anyone.
@@ -1687,6 +1496,7 @@ pub async fn lock_holder(conn: &mut Conn) -> Result<Option<LockInfo>, DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_db::Param;
 
     /// #898: the three ways a concurrent creator's `CREATE TABLE` surfaces in
     /// the loser are all handed to the catalog recheck, which alone decides
@@ -1749,27 +1559,15 @@ mod tests {
     /// list, which names every field; the rest are listed here. Some are
     /// built rather than written, which is why the list holds `String`s.
     fn state_statements() -> Vec<String> {
-        [
-            CREATE_STATE,
-            ADD_TIMELINE_COLUMNS,
-            INSERT_STATE_STAGED,
-            INSERT_STATE_NOT_STAGED,
-            SELECT_IDS,
-            DELETE_UP_TO,
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .chain([
-            select_timeline(),
-            select_timeline_unmigrated(),
-            select_legacy_state_json(3),
-        ])
-        .chain(LEDGER.statements().state)
-        .collect()
+        [CREATE_STATE, ADD_TIMELINE_COLUMNS]
+            .into_iter()
+            .map(str::to_owned)
+            .chain(LEDGER.statements().state)
+            .collect()
     }
 
     fn lock_statements() -> Vec<String> {
-        [CREATE_LOCK, INSERT_LOCK, DELETE_LOCK]
+        [CREATE_LOCK]
             .into_iter()
             .map(str::to_owned)
             .chain(LEDGER.statements().lock)
@@ -1786,8 +1584,22 @@ mod tests {
         assert_eq!(LEDGER.select_latest, select_latest());
         assert_eq!(LEDGER.select_history, select_history());
         assert_eq!(LEDGER.select_lock, select_lock());
+        assert_eq!(LEDGER.select_timeline, select_timeline());
+        assert_eq!(
+            LEDGER.select_timeline_unmigrated,
+            select_timeline_unmigrated()
+        );
+        assert_eq!(LEDGER.insert_state_staged, INSERT_STATE_STAGED);
+        assert_eq!(LEDGER.insert_state_not_staged, INSERT_STATE_NOT_STAGED);
+        assert_eq!(LEDGER.select_ids, SELECT_IDS);
+        assert_eq!(LEDGER.delete_up_to, DELETE_UP_TO);
+        assert_eq!(LEDGER.insert_lock, INSERT_LOCK);
+        assert_eq!(LEDGER.delete_lock, DELETE_LOCK);
         assert_eq!(LEDGER.missing_table, "42P01");
+        assert_eq!(LEDGER.select_denied, "42501");
         assert_eq!(LEDGER.row_limit, RowLimit::I64);
+        assert_eq!(LEDGER.max_parameters, 65535);
+        assert_eq!(LEDGER.operator_clip, (ClipUnit::Characters, 128));
         let savepoint = LEDGER.savepoint.expect("a failed statement aborts here");
         assert_eq!(savepoint.outside_a_transaction, "25P01");
         for sql in [savepoint.take, savepoint.release, savepoint.rewind] {
@@ -1808,11 +1620,30 @@ mod tests {
             )
         );
         assert_eq!(slots(&(LEDGER.select_deployed_revision)(1)), 2);
+        assert_eq!(slots(&LEDGER.select_timeline), 1);
+        assert_eq!(slots(&LEDGER.select_timeline_unmigrated), 1);
+        assert_eq!(slots(&(LEDGER.select_legacy_state_json)(3)), 3);
+        assert_eq!(slots(&LEDGER.insert_state_staged), 11);
+        assert_eq!(slots(&LEDGER.insert_state_not_staged), 9);
+        assert_eq!(slots(&LEDGER.select_ids), 0);
+        assert_eq!(slots(&LEDGER.delete_up_to), 1);
+        assert_eq!(slots(&LEDGER.insert_lock), 1);
+        assert_eq!(slots(&LEDGER.delete_lock), 0);
+        assert_eq!(slots(&LEDGER.session_application_name), 0);
         // No value is written into a statement: the only quoted text in any
         // of them is the timestamp pattern.
         for sql in LEDGER.statements().state {
             assert!(!sql.replace(TIMESTAMP_PATTERN, "").contains('\''), "{sql}");
         }
+    }
+
+    /// The flow reads a held lock where the insert reports it. Here the
+    /// insert steps aside on a conflict, so a held lock is a count of zero —
+    /// and a spec that said otherwise would take a lock it did not win.
+    #[test]
+    fn a_held_lock_is_read_where_this_insert_reports_it() {
+        assert!(LEDGER.insert_lock.contains("ON CONFLICT (id) DO NOTHING"));
+        assert_eq!(LEDGER.held_lock, HeldLock::ChangesNoRow);
     }
 
     /// How many distinct `$n` a statement binds, which must be `$1..=$n`.
