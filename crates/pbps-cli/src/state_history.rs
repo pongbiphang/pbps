@@ -800,6 +800,7 @@ mod tests {
                 operator: "o".into(),
                 types: Default::default(),
                 conversions: Default::default(),
+                exclusions: Default::default(),
             },
         );
         current.validate().unwrap();
@@ -1478,6 +1479,7 @@ mod tests {
                     operator: "selected".into(),
                     types: Default::default(),
                     conversions: Default::default(),
+                    exclusions: Default::default(),
                 },
             )]
             .into(),
@@ -1641,6 +1643,7 @@ mod tests {
                     operator: "selected".into(),
                     types: Default::default(),
                     conversions: Default::default(),
+                    exclusions: Default::default(),
                 },
             )]
             .into(),

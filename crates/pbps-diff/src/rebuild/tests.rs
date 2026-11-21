@@ -1436,6 +1436,9 @@ fn a_rebuild_leaves_no_retirement_under_a_source_without_a_namesake() {
     let approval = recorded(&base, &ids, &desired);
     approval.validate().unwrap();
     assert!(approval.exclusions.is_empty(), "{:?}", approval.exclusions);
+    // The record left the live file only because its table did; it is the human's
+    // authorization, so withdrawing the approval gives it back exactly.
+    assert_eq!(withdraw(&approval, &table()).unwrap(), ids);
 }
 
 #[test]

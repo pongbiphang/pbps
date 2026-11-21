@@ -3714,6 +3714,7 @@ mod tests {
                             operator: "operator".into(),
                             types: Default::default(),
                             conversions: Default::default(),
+                            exclusions: Default::default(),
                         },
                     },
                 ))),

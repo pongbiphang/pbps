@@ -284,7 +284,7 @@ fn continuing(
 /// table's it stands for. A table's retirement records follow it through a rewrite by this
 /// pairing, since the retirement was of a constraint of that table as declared and the
 /// declarations still hold the table under that name; a source table with no namesake leaves
-/// with its records, as any dropped table does (DEC-2448.4).
+/// the live file with its records, which the approval keeps for a withdrawal (DEC-2448.4).
 fn namesakes(source: &RebuildIdentities, replacement: &RebuildIdentities) -> BTreeMap<Uid, Uid> {
     replacement
         .tables
@@ -504,14 +504,21 @@ pub fn record(
         })
         .collect();
     // A source table is dropped with its tree, so a retirement record left under its uid would
-    // be an orphan: it moves to the replacement of the same name, and is undone by `restored`.
+    // be an orphan: it moves to the replacement of the same name, and is undone by `restored`;
+    // a table with no namesake hands its records to the `Rebuild` below.
     for (to, from) in namesakes(&source, &replacement) {
         if let Some(records) = out.exclusions.remove(&from) {
             out.exclusions.insert(to, records);
         }
     }
-    out.exclusions
-        .retain(|uid, _| !source.tables.contains_key(uid));
+    // What is left under a source table has no namesake. Live records belong to live tables, so
+    // they leave the file, but into the record, not away: a withdrawal is the human changing
+    // their mind, and it must not cost them the retirement they recorded.
+    let unmatched = source
+        .tables
+        .keys()
+        .filter_map(|uid| Some((uid.clone(), out.exclusions.remove(uid)?)))
+        .collect();
     out.tables.extend(replacement.tables.clone());
     out.columns.extend(replacement.columns.clone());
     out.rebuilds.insert(
@@ -520,6 +527,7 @@ pub fn record(
             source,
             types: shapes(desired, &replacement),
             conversions,
+            exclusions: unmatched,
             replacement,
             replacement_root,
             continues,
@@ -548,6 +556,12 @@ fn restored(ids: &IdsFile, key: &Uid, record: &Rebuild) -> IdsFile {
         if let Some(records) = out.exclusions.remove(&to) {
             out.exclusions.entry(from).or_default().extend(records);
         }
+    }
+    for (uid, records) in &record.exclusions {
+        out.exclusions
+            .entry(uid.clone())
+            .or_default()
+            .extend(records.clone());
     }
     for uid in record.replacement.tables.keys() {
         out.tables.remove(uid);
