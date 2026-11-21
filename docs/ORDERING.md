@@ -318,6 +318,7 @@ The differ sorts every planned change by, in order:
    | 15 | `CreateRole` |
    | 16 | `Grant` |
    | 17 | `SetDataMode`, `SetEnsureKeys` |
+   | 18 | `DropType`, `DropSearch`, `DropExtension`: after every module the plan drops and every package they require is gone (DEC-2447.8); a domain before its base and a package before the packages it requires, by the reverse depth rank |
 
 2. **A rank inside the class**, `sort_class` and `dependency_rank` in the same
    file:
