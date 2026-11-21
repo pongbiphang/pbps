@@ -10,7 +10,9 @@
 use super::http::Http;
 use super::*;
 use std::io::{BufRead, BufReader};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::process::Child;
+use std::time::Instant;
 
 const CHILD: &str = "publication::process_death::publication_stop_child";
 
@@ -79,6 +81,81 @@ pub(super) fn assert_no_core_dumps() {
     assert_eq!(core.split_whitespace().nth(4), Some("0"), "{core}");
 }
 
+/// How long a live child may take to reach its boundary before it is called
+/// hung (#1500). It is a hang guard, not a performance limit: a dead child is
+/// noticed at once through `try_wait`. A loaded machine slows the children
+/// several times over, and a fixed 30 s budget failed a healthy test.
+const CHILD_HANG_GUARD: Duration = Duration::from_secs(300);
+
+/// Waits for the spawned `child` to connect to `listener` (nonblocking) and
+/// returns the line it reports. Panics if the child exits first, with its log,
+/// or if it neither connects nor reports within the hang guard.
+pub(super) fn child_report(
+    listener: &UnixListener,
+    child: &mut Child,
+    log_path: &Path,
+    mode: &str,
+) -> String {
+    child_report_within(listener, child, log_path, mode, CHILD_HANG_GUARD)
+}
+
+/// `child_report` with the guard as a parameter, so a test can use a short one.
+fn child_report_within(
+    listener: &UnixListener,
+    child: &mut Child,
+    log_path: &Path,
+    mode: &str,
+    guard: Duration,
+) -> String {
+    let deadline = Instant::now() + guard;
+    let connection = child_connection(listener, child, log_path, mode, deadline);
+    let mut line = String::new();
+    if BufReader::new(connection).read_line(&mut line).is_err() {
+        hung(child, mode);
+    }
+    line.trim().to_owned()
+}
+
+/// Kills and reaps a child that missed its boundary, then fails the test.
+fn hung(child: &mut Child, mode: &str) -> ! {
+    child.kill().unwrap();
+    child.wait().unwrap();
+    panic!("{mode}: child missed its synchronized boundary");
+}
+
+/// Waits until `deadline` for the child's connection. It takes the deadline,
+/// not a duration, so the report that follows is read against the same one:
+/// the connection's reads get the time left, never a second guard.
+fn child_connection(
+    listener: &UnixListener,
+    child: &mut Child,
+    log_path: &Path,
+    mode: &str,
+    deadline: Instant,
+) -> UnixStream {
+    let connection = loop {
+        if let Ok((connection, _)) = listener.accept() {
+            break connection;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!(
+                "{mode}: child exited {status}: {}",
+                fs::read_to_string(log_path).unwrap()
+            );
+        }
+        if Instant::now() > deadline {
+            hung(child, mode);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    // A zero timeout is an error, so the last moment still gets 1 ms.
+    let left = deadline.saturating_duration_since(Instant::now());
+    connection
+        .set_read_timeout(Some(left.max(Duration::from_millis(1))))
+        .unwrap();
+    connection
+}
+
 /// Runs the child in `mode` until it parks, then SIGKILLs it. Core dumps are
 /// disabled; SIGKILL writes none, and a child that aborts instead must not
 /// leave one behind either. Returns the operation the child reported.
@@ -100,32 +177,9 @@ fn killed_at(f: &Fixture, mode: &str, operation: &str) -> String {
         .stderr(Stdio::from(log))
         .spawn()
         .unwrap();
-    let started = std::time::Instant::now();
-    let connection = loop {
-        if let Ok((connection, _)) = listener.accept() {
-            break connection;
-        }
-        if let Some(status) = child.try_wait().unwrap() {
-            panic!(
-                "{mode}: child exited {status}: {}",
-                fs::read_to_string(&log_path).unwrap()
-            );
-        }
-        if started.elapsed() > Duration::from_secs(60) {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("{mode}: child missed its synchronized boundary");
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    };
-    connection
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let mut id = String::new();
-    BufReader::new(connection).read_line(&mut id).unwrap();
+    let id = child_report(listener, &mut child, &log_path, mode);
     child.kill().unwrap();
     assert!(!child.wait().unwrap().success());
-    let id = id.trim().to_owned();
     assert_eq!(id.len(), 64, "{mode}");
     // A Git child of the killed process sees EOF only after its parent dies.
     let lock = f
@@ -141,6 +195,119 @@ fn killed_at(f: &Fixture, mode: &str, operation: &str) -> String {
         "{mode}: a real Git transaction kept its lock"
     );
     id
+}
+
+/// Runs `child_report_within` against a shell child. A client thread connects
+/// after `delay` and sends `line` if there is one, else holds the connection
+/// open and silent, standing in for the child's own connect.
+/// Returns the report or the panic text, and the child.
+fn probe(
+    script: &str,
+    client: Option<(Duration, Option<&'static str>)>,
+    guard: Duration,
+) -> (Result<String, String>, Child) {
+    let socket = crate::unix_socket::Socket::bind();
+    let log = socket.path().with_file_name("child.log");
+    let out = fs::File::create(&log).unwrap();
+    let mut child = Command::new("sh")
+        .args(["-c", script])
+        .stdout(Stdio::from(out.try_clone().unwrap()))
+        .stderr(Stdio::from(out))
+        .spawn()
+        .unwrap();
+    socket.listener().set_nonblocking(true).unwrap();
+    let path = socket.path().to_owned();
+    let (finished, done) = std::sync::mpsc::channel::<()>();
+    let client = client.map(|(delay, line)| {
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            let mut connection = UnixStream::connect(path).unwrap();
+            match line {
+                Some(line) => writeln!(connection, "{line}").unwrap(),
+                // Held until the probe is over: a fixed sleep could end
+                // before a stalled reader looks, and EOF is not silence.
+                None => drop(done.recv()),
+            }
+        })
+    });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        child_report_within(socket.listener(), &mut child, &log, "probe", guard)
+    }));
+    drop(finished);
+    if let Some(client) = client {
+        client.join().unwrap();
+    }
+    (
+        result.map_err(|panic| *panic.downcast::<String>().unwrap()),
+        child,
+    )
+}
+
+#[test]
+fn a_child_that_exits_before_connecting_is_reported_with_its_log() {
+    let (result, _) = probe("echo the-child-log; exit 3", None, Duration::from_secs(60));
+    let message = result.unwrap_err();
+    assert!(message.starts_with("probe: child exited"), "{message}");
+    assert!(message.contains("the-child-log"), "{message}");
+}
+
+#[test]
+fn a_child_that_never_connects_is_killed_once_the_guard_passes() {
+    let started = Instant::now();
+    let (result, mut child) = probe("exec sleep 600", None, Duration::from_millis(500));
+    assert_eq!(
+        result.unwrap_err(),
+        "probe: child missed its synchronized boundary"
+    );
+    assert!(started.elapsed() >= Duration::from_millis(500));
+    // The helper reaped it: a status is already known, and it was a kill.
+    assert!(!child.try_wait().unwrap().unwrap().success());
+}
+
+#[test]
+fn a_child_that_connects_late_is_accepted_and_its_report_returned() {
+    let late = Some((Duration::from_millis(800), Some("reported-late")));
+    let (result, mut child) = probe("exec sleep 600", late, Duration::from_secs(60));
+    assert_eq!(result.unwrap(), "reported-late");
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
+fn a_child_that_connects_but_never_reports_is_killed_once_the_guard_passes() {
+    let silent = Some((Duration::ZERO, None));
+    let (result, mut child) = probe("exec sleep 600", silent, Duration::from_millis(500));
+    assert_eq!(
+        result.unwrap_err(),
+        "probe: child missed its synchronized boundary"
+    );
+    assert!(!child.try_wait().unwrap().unwrap().success());
+}
+
+#[test]
+fn a_late_connection_leaves_the_report_only_the_rest_of_the_guard() {
+    // No wall-clock ceiling: load can only make the connection later and the
+    // time left shorter, so a slow machine cannot fail this.
+    let socket = crate::unix_socket::Socket::bind();
+    socket.listener().set_nonblocking(true).unwrap();
+    let log = socket.path().with_file_name("child.log");
+    let mut child = Command::new("sleep").arg("600").spawn().unwrap();
+    let guard = Duration::from_secs(60);
+    let deadline = Instant::now() + guard;
+    let path = socket.path().to_owned();
+    // The client returns its end, so the connection stays open until the join.
+    let client = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        UnixStream::connect(path).unwrap()
+    });
+    let connection = child_connection(socket.listener(), &mut child, &log, "probe", deadline);
+    let left = connection.read_timeout().unwrap().unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    drop(client.join().unwrap());
+    // The client slept 200 ms after the deadline was fixed. The other 100 ms
+    // allows the kernel to round the timeout, not the scheduler to be late.
+    assert!(left <= guard - Duration::from_millis(100), "{left:?}");
 }
 
 fn receipt(f: &Fixture, id: &str) -> serde_json::Value {

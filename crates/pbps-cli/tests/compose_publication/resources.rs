@@ -1157,7 +1157,6 @@ fn resource_stop_child() {
 
 #[test]
 fn actual_process_death_preserves_acquisition_ref_handoff_and_retirement_evidence() {
-    use std::io::{BufRead, BufReader};
     for mode in [
         "snapshot-created",
         "commit-root-created",
@@ -1218,32 +1217,8 @@ fn actual_process_death_preserves_acquisition_ref_handoff_and_retirement_evidenc
             .stderr(Stdio::from(log))
             .spawn()
             .unwrap();
-        let started = std::time::Instant::now();
-        let connection = loop {
-            if let Ok((connection, _)) = listener.accept() {
-                break connection;
-            }
-            if let Some(status) = child.try_wait().unwrap() {
-                panic!(
-                    "{mode}: child exited {status}: {}",
-                    fs::read_to_string(&log_path).unwrap()
-                );
-            }
-            if started.elapsed() > Duration::from_secs(30) {
-                child.kill().unwrap();
-                child.wait().unwrap();
-                panic!("{mode}: child missed its synchronized boundary");
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        };
-        connection
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut operation = String::new();
-        BufReader::new(connection)
-            .read_line(&mut operation)
-            .unwrap();
-        let id = operation.trim();
+        let id = super::process_death::child_report(listener, &mut child, &log_path, mode);
+        let id = id.as_str();
         assert_eq!(id.len(), 64);
         if mode.starts_with("rejection-") {
             let resource: serde_json::Value = serde_json::from_slice(
