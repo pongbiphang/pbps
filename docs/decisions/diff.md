@@ -10205,8 +10205,9 @@ backed by an unattached index); only a parent's is 18's.
 - **Differ.** A standing partition's own exclusion is its own change (`SetExclusion`, and
   `SetIndexStorageParameters` on `IndexPart::Exclusion`, which `ALTER INDEX` takes on a leaf);
   a created partition's exclusions are the separate changes after its `CREATE` (DEC-2448.3). A
-  parent's new exclusion is refused over an own only if the own stood before the plan: one the plan adds
-  to a standing partition is built after the parent's (the ordering pass of E1) and is not adopted.
+  parent's new exclusion is refused over every own the parent's would adopt, whether the own stood before
+  the plan or the plan adds it, consistent with the declaration rule above; the same-plan order the
+  engine allows is #2992's.
   The attach shape refuses a table's own that the parent's takes, naming the remedy (drop it in an earlier
   plan), keeps every other, and compares it with the declaration.
 - **Detach.** `DetachedKind::Exclusion` names the clone by its parent's constraint, found through

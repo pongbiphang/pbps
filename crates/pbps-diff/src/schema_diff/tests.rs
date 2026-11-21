@@ -3379,20 +3379,25 @@ fn a_standing_partitions_own_exclusion_is_added_edited_replaced_and_dropped_as_i
     assert!(cs.risks().contains(&RiskClass::Destructive));
 }
 
-/// A parent's new exclusion takes an own one only if it stood before the plan: one the
-/// plan adds to a standing partition is built after the parent's, which the ordering pass
-/// puts first, and is the partition's own, so it is not refused (measured on 18.6: an own
-/// added to a standing, already-cloned leaf is not adopted). Negative: the same own,
-/// standing already, is refused by name (E1's rule).
+/// A parent's new exclusion is refused over every own exclusion it would adopt, whether
+/// the own stood before the plan or the plan adds it, as the declaration rule refuses the
+/// same pair (DEC-2448.7; the same-plan order the engine allows is #2992's). Negatives: an
+/// own that differs (by `INCLUDE`) is not refused, and a plan that leaves the own out of
+/// the declaration has nothing left to take.
 #[test]
-fn a_parents_new_exclusion_does_not_refuse_an_own_the_same_plan_adds_to_a_standing_partition() {
+fn a_parents_new_exclusion_refuses_every_own_it_would_take_and_not_one_that_differs() {
     let none = partitioned_booking(&[], &[]);
     let both = partitioned_booking(
         &[("x", parent_exclusion())],
         &[("mine", parent_exclusion())],
     );
-    let cs = exclusion_plan(&none, &both, &[]).unwrap();
-    assert_eq!(kinds(&cs), ["SetExclusion", "SetExclusion"]);
+    // The own the plan adds to a standing partition: refused by name.
+    let said = exclusion_plan(&none, &both, &[]).unwrap_err().join("\n");
+    assert!(
+        said.contains("which can take app.booking_1's `mine`"),
+        "{said}"
+    );
+    // The own standing already: refused the same.
     let standing = partitioned_booking(&[], &[("mine", parent_exclusion())]);
     let said = exclusion_plan(&standing, &both, &[])
         .unwrap_err()
@@ -3401,7 +3406,13 @@ fn a_parents_new_exclusion_does_not_refuse_an_own_the_same_plan_adds_to_a_standi
         said.contains("which can take app.booking_1's `mine`"),
         "{said}"
     );
-    // Negative: dropping the standing own in the same plan leaves nothing to take.
+    // Negative: an own that differs is the partition's own, added beside the parent's.
+    let mut differs = parent_exclusion();
+    differs.include = vec!["id".into()];
+    let other = partitioned_booking(&[("x", parent_exclusion())], &[("mine", differs)]);
+    let cs = exclusion_plan(&none, &other, &[]).unwrap();
+    assert_eq!(kinds(&cs), ["SetExclusion", "SetExclusion"]);
+    // Negative: the standing own left out of the declaration is dropped, leaving nothing to take.
     let cs = exclusion_plan_with(
         &standing,
         &partitioned_booking(&[("x", parent_exclusion())], &[]),
