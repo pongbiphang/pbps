@@ -9587,3 +9587,6 @@ mod meeting_shape_tests;
 #[cfg(test)]
 #[allow(clippy::wildcard_enum_match_arm)]
 mod search_tests;
+
+#[cfg(test)]
+mod split_pin_tests;
