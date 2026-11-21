@@ -25,7 +25,7 @@ use pbps_db::sqlite::Connection;
 use pbps_model::ChangeSet;
 
 use crate::emit::Form;
-use crate::state::{self, BUSY_WAIT, explained, waiting};
+use crate::state::{self, BUSY_WAIT, explained_as, waiting};
 use crate::{Version, catalog};
 
 /// When the check runs: `plan` reads and writes nothing, so it does not ask
@@ -223,11 +223,14 @@ pub(crate) fn writable_within(c: &Connection, wait: Duration) -> Result<(), DbEr
             // with none free refuses that page, not the write: a plan that only
             // renames, or writes where there is room, still commits there
             // (measured). So it is no answer to this question, and the plan is
-            // not refused for it. In a write-protected directory the journal
-            // fails first (measured), so that refusal is not lost.
-            (Err(error), Ok(())) if is_full(&error) => Ok(()),
+            // not refused for it. Only at that limit: the same code comes from
+            // a volume or a quota with no room, where the first real write
+            // fails too, and that stays the engine's error. In a
+            // write-protected directory the journal fails first (measured), so
+            // that refusal is not lost.
+            (Err(error), Ok(())) if is_full(&error) && at_the_page_limit(c)? => Ok(()),
             (Err(error), _) => Err(unwritable(error, wait)),
-            (Ok(()), Err(error)) => Err(explained(error, wait)),
+            (Ok(()), Err(error)) => Err(busy(error, wait)),
             (Ok(()), Ok(())) => Ok(()),
         }
     })
@@ -245,6 +248,26 @@ fn probe_name(c: &Connection) -> Result<String, DbError> {
 /// The primary result code of a write that needed a page the database may not
 /// grow by (`SQLITE_FULL`).
 const FULL: u32 = 13;
+
+/// Whether the database stands at `max_page_count` with no free page, which is
+/// when a new table cannot be had and an existing page still can be written.
+/// The pragma without a value reads the limit and does not set it.
+fn at_the_page_limit(c: &Connection) -> Result<bool, DbError> {
+    let integer = |sql: &str| -> Result<i64, DbError> {
+        match c.query(sql, &[])?.first() {
+            Some(row) => row.integer(0),
+            None => Err(DbError::BadRow(format!("`{sql}` returned no row"))),
+        }
+    };
+    Ok(integer("PRAGMA main.freelist_count")? == 0
+        && integer("PRAGMA main.page_count")? >= integer("PRAGMA main.max_page_count")?)
+}
+
+/// A busy refusal of the probe, in the probe's name: it is not a statement of
+/// the ledger that waited.
+fn busy(error: DbError, wait: Duration) -> DbError {
+    explained_as(error, wait, "the check that the file can be written")
+}
 
 fn is_full(error: &DbError) -> bool {
     error
@@ -266,7 +289,7 @@ fn unwritable(error: DbError, wait: Duration) -> DbError {
         return error;
     };
     if code & 0xff != READONLY {
-        return explained(error, wait);
+        return busy(error, wait);
     }
     DbError::Refused(if code == READONLY_DIRECTORY {
         format!(

@@ -72,6 +72,13 @@ pub(crate) fn waiting<T, E: From<DbError>>(
 /// this tool's lock and `pbps unlock` does not clear it. The source stays in the
 /// chain, so [`is_busy`] still answers for the result.
 pub(crate) fn explained(error: DbError, wait: Duration) -> DbError {
+    explained_as(error, wait, "a statement of the ledger")
+}
+
+/// [`explained`] for a statement that is not the ledger's: `waiter` names what
+/// waited, so the sentence does not send a person to the ledger for a lock met
+/// elsewhere.
+pub(crate) fn explained_as(error: DbError, wait: Duration, waiter: &str) -> DbError {
     if !is_busy(&error) {
         return error;
     }
@@ -85,8 +92,8 @@ pub(crate) fn explained(error: DbError, wait: Duration) -> DbError {
         );
     }
     error.context(format!(
-        "the database is busy: another connection holds one of SQLite's own locks, and a \
-         statement of the ledger waits at most {} s for it. That is not this tool's lock, and \
+        "the database is busy: another connection holds one of SQLite's own locks, and \
+         {waiter} waits at most {} s for it. That is not this tool's lock, and \
          `pbps unlock` does not clear it",
         wait.as_secs_f64()
     ))

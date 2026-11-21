@@ -243,6 +243,26 @@ fn fill_to_the_limit(c: &Connection) {
 }
 
 #[test]
+fn a_full_code_away_from_the_page_limit_is_not_let_through() {
+    // Negative: the code alone does not pass. The same code comes from a volume
+    // with no room, which no test can make; what tells the two apart can be
+    // shown, on a database with a free page and on one below its limit.
+    let mut fresh = Fresh::file();
+    let c = fresh.connection();
+    assert!(
+        !super::at_the_page_limit(c).expect("asked"),
+        "a new file has no limit near"
+    );
+    fill_to_the_limit(c);
+    assert!(super::at_the_page_limit(c).expect("asked"));
+    c.execute_batch("DROP TABLE app").expect("a page is freed");
+    assert!(
+        !super::at_the_page_limit(c).expect("asked"),
+        "a free page is room"
+    );
+}
+
+#[test]
 fn a_database_at_its_page_limit_is_not_called_unwritable() {
     let mut fresh = Fresh::file();
     let c = fresh.connection();
@@ -301,6 +321,13 @@ fn a_database_another_connection_is_writing_is_busy_and_not_unwritable() {
         .expect_err("another writer holds the lock");
     assert!(!matches!(error, DbError::Refused(_)), "{error}");
     assert!(error.to_string().contains("busy"), "{error}");
+    // Named as what waited: this check, and not a statement of the ledger.
+    let text = error.to_string();
+    assert!(
+        text.contains("the check that the file can be written waits"),
+        "{text}"
+    );
+    assert!(!text.contains("of the ledger"), "{text}");
     assert!(started.elapsed() < Duration::from_secs(30));
     assert!(!fresh.connection().in_transaction(), "nothing left open");
     second.execute_batch("ROLLBACK").expect("released");
