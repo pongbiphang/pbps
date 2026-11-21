@@ -291,15 +291,47 @@ pub fn resolution(scratch: &Connection) -> Result<Resolution, DbError> {
                 &error,
             )),
             Ok(rows) => {
-                let mut counts: std::collections::BTreeMap<String, u64> = Default::default();
+                // Counted for each key and not for each parent: a plan that
+                // replaces one key to a parent by another over other columns
+                // can leave as many orphan rows as there were, and they are
+                // not the ones there were.
+                let mut counts: std::collections::BTreeMap<i64, u64> = Default::default();
                 for row in &rows {
-                    *counts.entry(row.text(2)?.to_owned()).or_default() += 1;
+                    *counts.entry(row.integer(3)?).or_default() += 1;
                 }
-                for (parent, rows) in counts {
+                if counts.is_empty() {
+                    continue;
+                }
+                let keys = scratch.query(
+                    &format!("PRAGMA main.foreign_key_list({})", quote(table)),
+                    &[],
+                )?;
+                for (id, rows) in counts {
+                    let (mut parent, mut from, mut to) = (String::new(), Vec::new(), Vec::new());
+                    for key in &keys {
+                        if key.integer(0)? == id {
+                            key.text(2)?.clone_into(&mut parent);
+                            from.push(key.text(3)?.to_owned());
+                            // Absent when the key names no parent column (the
+                            // parent's primary key is meant).
+                            to.extend(key.optional_text(4)?.map(str::to_owned));
+                        }
+                    }
+                    let mut about =
+                        vec![About::Table(table.to_owned()), About::Table(parent.clone())];
+                    about.extend(
+                        from.iter()
+                            .map(|c| About::Column(table.to_owned(), c.clone())),
+                    );
+                    about.extend(to.iter().map(|c| About::Column(parent.clone(), c.clone())));
                     found.push(Unresolved {
                         what: "foreign key",
-                        name: format!("{table} -> {parent}"),
-                        about: vec![About::Table(table.to_owned()), About::Table(parent)],
+                        name: format!(
+                            "{table}({}) -> {parent}({})",
+                            from.join(", "),
+                            to.join(", ")
+                        ),
+                        about,
                         detail: Detail::Rows(rows),
                     });
                 }

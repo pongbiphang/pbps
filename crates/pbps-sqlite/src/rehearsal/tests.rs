@@ -549,6 +549,41 @@ fn the_renames_of_a_plan_are_read_from_its_changes() {
 }
 
 #[test]
+fn orphan_rows_of_another_key_to_the_same_parent_are_new_though_as_many() {
+    // Two rows have no parent by `y`. The plan's result has a key over `z`
+    // instead, with two orphan rows of its own: as many, and not the same.
+    let mut db = file(
+        "CREATE TABLE p(x PRIMARY KEY, w UNIQUE); \
+         CREATE TABLE c(y REFERENCES p(x), z)",
+    );
+    db.connection()
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF; INSERT INTO p VALUES (1, 1); \
+             INSERT INTO c VALUES (7, 1), (8, 1)",
+        )
+        .expect("orphans by y");
+    let copy = scratch(db.connection(), SCRATCH_LIMIT).expect("copied");
+    let before = resolution(&copy).expect("asked");
+    copy.execute_batch(
+        "PRAGMA foreign_keys = OFF; \
+         CREATE TABLE c_new(y, z REFERENCES p(w)); \
+         INSERT INTO c_new SELECT 1, 5 FROM c; DROP TABLE c; \
+         ALTER TABLE c_new RENAME TO c",
+    )
+    .expect("the other key");
+    let after = resolution(&copy).expect("asked");
+    let new = after.new_since(&before, &Renamed::default());
+    assert_eq!(new.len(), 1, "{new:?}");
+    assert!(new[0].starts_with("2 more row(s)"), "{new:?}");
+    assert!(new[0].contains("c(z) -> p(w)"), "{new:?}");
+    // Negative: the same key with the same rows is not new, and a key that
+    // names no parent column is its own, apart from one that names it.
+    assert!(before.new_since(&before, &Renamed::default()).is_empty());
+    assert_eq!(before.0.len(), 1);
+    assert_eq!(before.0[0].name, "c(y) -> p(x)");
+}
+
+#[test]
 fn foreign_key_rows_count_only_the_ones_the_plan_added() {
     let rows = |n: u64| {
         Resolution(vec![Unresolved {
