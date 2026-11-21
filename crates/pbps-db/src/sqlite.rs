@@ -344,6 +344,163 @@ impl Connection {
         Version::parse(row.text(0)?)
     }
 
+    /// The database's size in bytes, `page_count * page_size`.
+    pub fn size(&self) -> Result<u64, DbError> {
+        Ok(self.number("page_count")? * self.number("page_size")?)
+    }
+
+    fn number(&self, pragma: &str) -> Result<u64, DbError> {
+        let rows = self.query(&format!("PRAGMA {pragma}"), &[])?;
+        let row = rows
+            .first()
+            .ok_or_else(|| DbError::BadRow(format!("`PRAGMA {pragma}` returned no row")))?;
+        u64::try_from(row.integer(0)?)
+            .map_err(|_| DbError::BadRow(format!("`PRAGMA {pragma}` is negative")))
+    }
+
+    /// A private in-memory copy of this database's pages, schema and rows alike,
+    /// for a run that must change something and leave this database as it is.
+    ///
+    /// **Bounded twice.** The size is read first and a database over `limit` is
+    /// refused before a page is read. The file can grow between that read and the
+    /// copy, so the copy's own `max_page_count` is `limit` in pages: a source that
+    /// has grown past it stops the copy with a refusal, and what was copied so far
+    /// is dropped, never kept as a partial copy.
+    ///
+    /// **One consistent snapshot.** All pages go in one step under the one read
+    /// lock it takes, so a writer waits (delete mode) or commits after the
+    /// snapshot (WAL) and the copy is never restarted. (The library would also
+    /// restart a copy made page by page if the source changed between steps;
+    /// measured to give the same copies, so nothing here relies on it, and a test
+    /// cannot tell the two apart.) A source that is busy, another connection's
+    /// `EXCLUSIVE` lock or **this connection's own write transaction** (measured:
+    /// it is busy for as long as it lasts, and the library's own retry loop never
+    /// returns), is retried every 10 ms for `wait` and then fails with the
+    /// library's busy code (5), so a caller's busy test answers. It never hangs.
+    ///
+    /// This connection is left as it was: no setting, no transaction, and its own
+    /// busy wait, which is zero while the copy is made, is put back. The
+    /// copy is opened through the ordinary setup, so `foreign_keys` is on (the
+    /// pragma is the connection's and is not copied).
+    pub fn copy_to_memory(&self, limit: u64, wait: Duration) -> Result<Connection, DbError> {
+        let deadline = std::time::Instant::now() + wait;
+        // `wait` is the whole bound, and it is kept by the retries below. The
+        // library's own wait would run inside each read before a retry is
+        // asked, so a connection set to wait longer than `wait` would wait
+        // that long instead: it is zero while the copy is made, and put back.
+        let before = Duration::from_millis(self.number("busy_timeout")?);
+        self.set_busy_timeout(Duration::ZERO)?;
+        let copied = self.pinned(deadline, || {
+            let (size, page_size) = (self.size()?, self.number("page_size")?);
+            if size > limit {
+                return Err(DbError::Refused(format!(
+                    "the database is {size} bytes and a copy is limited to {limit}"
+                )));
+            }
+            self.copy_pages(page_size, limit / page_size, deadline)
+        });
+        // A copy that was made is not kept on a connection left changed.
+        let restored = self.set_busy_timeout(before);
+        let copy = copied?;
+        restored?;
+        Ok(copy)
+    }
+
+    /// Runs `work` while this connection holds a read lock on the database, so
+    /// what `work` reads first and what it copies after are one snapshot.
+    ///
+    /// The page bound of a copy is counted in pages of the size read before it.
+    /// Without the lock another connection could `VACUUM` the file to a larger
+    /// page size between the two, and the same number of pages would be many
+    /// times the bytes. With it that `VACUUM` is busy until the copy is done
+    /// (delete mode), or is not allowed at all (a write-ahead file keeps its
+    /// page size).
+    ///
+    /// Inside the caller's own transaction nothing is opened or closed. Outside
+    /// one, a read transaction is opened and rolled back, and the connection is
+    /// left as it was. The caller has set this connection's own wait to zero, and a writer that is
+    /// committing makes even the first read busy: it is retried until `deadline`.
+    fn pinned<T>(
+        &self,
+        deadline: std::time::Instant,
+        work: impl FnOnce() -> Result<T, DbError>,
+    ) -> Result<T, DbError> {
+        let own = !self.in_transaction();
+        if own {
+            self.inner.execute_batch("BEGIN").map_err(driver_error)?;
+        }
+        // The read that takes the lock; a `BEGIN` alone takes none.
+        let done = retry_busy(deadline, || {
+            self.query("SELECT count(*) FROM sqlite_schema", &[])
+        })
+        .and_then(|_| work());
+        if own {
+            // A read transaction: there is nothing to undo, and a failure to end
+            // it cannot replace the answer.
+            let _ = self.inner.execute_batch("ROLLBACK");
+        }
+        done
+    }
+
+    fn copy_pages(
+        &self,
+        page_size: u64,
+        max_pages: u64,
+        deadline: std::time::Instant,
+    ) -> Result<Connection, DbError> {
+        use rusqlite::backup::{Backup, StepResult};
+        let mut copy = Self::open_in_memory()?;
+        // The copy takes the source's page size by itself (measured, 512 to 65536),
+        // and its `max_page_count` counts those pages.
+        copy.inner
+            .execute_batch(&format!("PRAGMA max_page_count = {max_pages}"))
+            .map_err(driver_error)?;
+        {
+            let backup = Backup::new(&self.inner, &mut copy.inner).map_err(driver_error)?;
+            loop {
+                match backup.step(-1) {
+                    Ok(StepResult::Done) => break,
+                    Ok(StepResult::Busy | StepResult::Locked) => {
+                        let left = deadline.saturating_duration_since(std::time::Instant::now());
+                        if left.is_zero() {
+                            return Err(DbError::Driver {
+                                message: "database is locked: it stayed busy for the whole wait \
+                                          while it was copied"
+                                    .into(),
+                                code: Some("5".into()),
+                                diagnostic: None,
+                            });
+                        }
+                        std::thread::sleep(left.min(Duration::from_millis(10)));
+                    }
+                    Ok(_) => {}
+                    Err(rusqlite::Error::SqliteFailure(failure, _))
+                        if failure.code == rusqlite::ErrorCode::DiskFull =>
+                    {
+                        return Err(DbError::Refused(format!(
+                            "the database grew past {} bytes while it was copied",
+                            max_pages * page_size
+                        )));
+                    }
+                    Err(e) => return Err(driver_error(e)),
+                }
+            }
+        }
+        // The bound counted pages of `page_size`. The read lock held around this
+        // makes another size impossible; were it not, the bound meant nothing.
+        let copied = copy.number("page_size")?;
+        if copied != page_size {
+            return Err(DbError::Refused(format!(
+                "the database's page size changed from {page_size} to {copied} while it was copied"
+            )));
+        }
+        // The bound was for the copy; what a run does to the copy is its own.
+        copy.inner
+            .execute_batch("PRAGMA max_page_count = 4294967294")
+            .map_err(driver_error)?;
+        Ok(copy)
+    }
+
     /// Runs one or more statements that return no rows.
     pub fn execute_batch(&self, sql: &str) -> Result<(), DbError> {
         self.inner.execute_batch(sql).map_err(driver_error)
@@ -500,6 +657,31 @@ fn enable_foreign_keys(inner: &rusqlite::Connection) -> Result<(), DbError> {
     }
 }
 
+/// Runs `read` again, every 10 ms, while it fails busy and `deadline` is ahead;
+/// a busy failure at the deadline is the answer. Any other failure is at once.
+fn retry_busy<T>(
+    deadline: std::time::Instant,
+    mut read: impl FnMut() -> Result<T, DbError>,
+) -> Result<T, DbError> {
+    loop {
+        match read() {
+            Err(error)
+                if error
+                    .server_error_code()
+                    .and_then(|code| code.parse::<u32>().ok())
+                    .is_some_and(|code| code & 0xff == 5) =>
+            {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return Err(error);
+                }
+                std::thread::sleep(left.min(Duration::from_millis(10)));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// A failure the library reported. The code is the extended result code as
 /// decimal text (5 busy, 26 not a database, 787 foreign key), which is what
 /// SQLite documents; a name would hide the number a person looks up.
@@ -512,6 +694,9 @@ fn driver_error(error: rusqlite::Error) -> DbError {
         diagnostic: None,
     }
 }
+
+#[cfg(test)]
+mod copy_tests;
 
 #[cfg(test)]
 mod tests {

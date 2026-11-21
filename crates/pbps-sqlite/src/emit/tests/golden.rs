@@ -13,7 +13,7 @@ use pbps_model::{
 use super::*;
 use crate::dialect::Sqlite;
 
-pub(super) trait WithDefault {
+pub(crate) trait WithDefault {
     fn with_default(self, text: &str) -> Self;
 }
 
@@ -24,7 +24,7 @@ impl WithDefault for Column {
     }
 }
 
-pub(super) fn uid(kind: UidKind, seed: &str) -> Uid {
+pub(crate) fn uid(kind: UidKind, seed: &str) -> Uid {
     Uid::derived(kind, seed, 0)
 }
 
@@ -32,7 +32,7 @@ fn names(columns: &[&str]) -> Vec<pbps_model::ColumnName> {
     columns.iter().map(|c| (*c).into()).collect()
 }
 
-pub(super) fn index(columns: &[&str], unique: bool, filter: Option<&str>) -> Index {
+pub(crate) fn index(columns: &[&str], unique: bool, filter: Option<&str>) -> Index {
     Index {
         columns: columns.iter().map(|c| IndexColumn::column(*c)).collect(),
         include: Vec::new(),

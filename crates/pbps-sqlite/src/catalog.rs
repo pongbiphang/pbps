@@ -88,7 +88,7 @@ fn unreadable(what: &str, name: &str) -> DbError {
 /// in `main`, `temp` or an attached database (measured), and answers its rows
 /// as the catalog's with no error; the statement form is never shadowed. The
 /// reader cannot tell the two apart, so such an object refuses the read.
-fn refuse_shadowed_pragma_functions(c: &Connection) -> Result<(), DbError> {
+pub(crate) fn refuse_shadowed_pragma_functions(c: &Connection) -> Result<(), DbError> {
     let mut schemas = vec!["main".to_owned(), "temp".to_owned()];
     for r in c.query("PRAGMA database_list", &[])? {
         let name = r.text(1)?;
