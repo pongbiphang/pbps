@@ -5975,8 +5975,8 @@ fn refuse_parent_index(
                 .is_some_and(|of| of.parent == *table)
         })
     };
-    // The partition as the base held it, if it did: what a parent's new index or exclusion
-    // can adopt is what stood before the plan.
+    // The partition as the base held it, if it did: what a parent's new index can adopt is
+    // what stood before the plan.
     let held_before = |partition: &TableName| {
         declared
             .ids
@@ -6034,24 +6034,16 @@ fn refuse_parent_index(
                 name = name.shown(),
             ));
         }
-        // Only an own exclusion standing when the parent's is built, as for an index below:
-        // one the plan adds to a standing partition is built after the parent's and is its
-        // own (measured on 18.6, and `before_its_partitions_indexes` orders it so).
+        // Every declared own the parent's would adopt, whether it stood before the plan or
+        // is added by it: the declaration rule (`validate_partition`, DEC-2448.7) already
+        // refuses an own of the parent's shape, because the state it declares is one the
+        // engine reaches only by order. An index is different (below): its same-plan own is
+        // legal. The same-plan order the engine allows is #2992's. A redefined own (a drop
+        // and an add under one name) is the declared one, so it is refused as well.
         let adopted: Vec<String> = partitions()
             .flat_map(|(partition, t)| {
-                let before = held_before(partition);
                 t.exclude
                     .iter()
-                    .filter(move |(own, _)| {
-                        before.is_none_or(|b| {
-                            b.exclude.contains_key(own.raw())
-                                && !changes.iter().any(|c| {
-                                    matches!(c, Change::Constraint(ConstraintChange::SetExclusion {
-                                        table, name, to: None, ..
-                                    }) if table == partition && name == *own)
-                                })
-                        })
-                    })
                     .filter(|(_, own)| adopts_exclusion(exclusion, own))
                     .map(move |(own, _)| {
                         format!(
