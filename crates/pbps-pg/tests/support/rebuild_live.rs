@@ -155,6 +155,12 @@ async fn expansion_replays_own_parts_external_bindings_and_member_lifetimes() {
                             };
                             n.clone()
                         }
+                        PartitionIndexDefinition::Exclusion(_) => {
+                            let IndexPart::Exclusion(n) = &part else {
+                                unreachable!()
+                            };
+                            n.clone()
+                        }
                     };
                     Ok(BuildPartitionedIndex {
                         parent: RebuildRelation {

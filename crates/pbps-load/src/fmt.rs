@@ -324,6 +324,7 @@ pub fn render_partitioned(
                 // (#1632) of its own.
                 if t.checks.is_empty()
                     && t.indexes.is_empty()
+                    && t.exclude.is_empty()
                     && t.foreign_keys.is_empty()
                     && own_columns.is_none_or(std::collections::BTreeMap::is_empty)
                     && !t.unlogged
@@ -2647,6 +2648,50 @@ indexes:
             out.contains("\n  ev_rest:\n    default: true\n    indexes:\n      rest_id:\n"),
             "{out}"
         );
+    }
+
+    /// A partition's own exclusion constraints are written under its entry, as a table's are,
+    /// and round-trip with their keys, operators, payload, predicate, parameters and timing
+    /// (#2448). The parent's stay the parent's, and a partition with none stays on one line.
+    #[test]
+    fn a_partitions_own_exclusions_round_trip_under_its_entry() {
+        let yaml = "table: app.ev\ncolumns:\n  k: {type: int, nullable: false}\n  v: {type: int}\n  note: {type: text}\n\npartition_by: [k]\n\npartitions:\n  ev_1:\n    from: [\"0\"]\n    to: [\"10\"]\n    exclude:\n      ev_1_own:\n        method: btree\n        include: [note]\n        where: v > 0\n        storage_parameters:\n          fillfactor: 70\n        deferrable: true\n        initially: deferred\n        keys:\n          - column: v\n            operator: =\n  ev_plain: {from: [\"10\"], to: [\"20\"]}\n";
+        round_trip(yaml);
+        let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        let own = |n: &str| {
+            &t.partitions
+                .iter()
+                .find(|(name, _)| name.name == n)
+                .unwrap_or_else(|| panic!("{n}"))
+                .1
+        };
+        let x = &own("ev_1").exclude["ev_1_own"];
+        assert_eq!(x.keys[0].operator.raw().to_string(), "=");
+        assert_eq!(x.include, [pbps_model::ColumnName::from("note")]);
+        assert_eq!(x.filter.as_deref(), Some("v > 0"));
+        assert_eq!(x.storage_parameters["fillfactor"], "70");
+        assert_eq!(x.timing, pbps_model::ExclusionTiming::DeferrableDeferred);
+        assert!(own("ev_plain").exclude.is_empty());
+        assert!(t.table.exclude.is_empty());
+        let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
+        let out = render_partitioned(
+            &t.name,
+            &t.table,
+            &partitions,
+            &[],
+            None,
+            &Default::default(),
+        );
+        assert!(
+            out.contains("\n  ev_plain: {from: [\"10\"], to: [\"20\"]}\n"),
+            "{out}"
+        );
+        // Negative: an unknown field under the entry's exclusion is refused as a table's is,
+        // and a key with no operator is no key of an exclusion.
+        let bad = yaml.replace("method: btree", "method: btree\n        unknown: 1");
+        assert!(crate::load_table_str(Path::new("t.yml"), &bad).is_err());
+        let keyless = yaml.replace("            operator: =\n", "");
+        assert!(crate::load_table_str(Path::new("t.yml"), &keyless).is_err());
     }
 
     /// A partition's own foreign keys are written under its entry, before its

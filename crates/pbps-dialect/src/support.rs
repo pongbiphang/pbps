@@ -170,7 +170,7 @@ pub const RECORDS: &[Record] = &[
                     add, drop, replace and retire held, DEC-2448.3, DEC-2448.4; teardown and \
                     restoration across rebuilds held, DEC-2448.5; a partitioned parent's on PostgreSQL 18 \
                     held, DEC-2448.6; a partition's own, and the detach and rebuild of a tree \
-                    that holds one, next)",
+                    that holds a parent's, held, DEC-2448.7)",
             today: "partly held",
             tracking: "#2448",
         }),

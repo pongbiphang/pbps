@@ -98,6 +98,38 @@ pub fn partitioned(
     found
 }
 
+/// The partitioned parents a plan's rebuild builds an exclusion on, each under the name the
+/// plan leaves it by (`final_name` answers for a recipe's parent uid, which may sit under a
+/// temporary name at that step).
+///
+/// A rebuild carries a parent's exclusion as a `BuildPartitionedIndex`, never as a
+/// `SetExclusion`, so the scan for added exclusions does not see it; yet it is the same
+/// `ALTER TABLE ONLY .. ADD .. EXCLUDE` on a partitioned table, and 16 answers `0A000` mid-apply.
+/// A leaf's own exclusion in the rebuild is an ordinary `SetExclusion` on a table that is not
+/// partitioned, and 16 holds it (DEC-2448.6), so it is not named here.
+#[must_use]
+pub fn rebuilt_parents(
+    changes: &[pbps_model::PlannedChange],
+    final_name: impl Fn(&pbps_model::Uid) -> Option<TableName>,
+) -> BTreeSet<TableName> {
+    changes
+        .iter()
+        .filter_map(|p| {
+            if let pbps_model::Change::Index(pbps_model::IndexChange::BuildPartitionedIndex(r)) =
+                &p.change
+                && matches!(
+                    r.definition,
+                    pbps_model::PartitionIndexDefinition::Exclusion(_)
+                )
+            {
+                Some(final_name(&r.parent.uid).unwrap_or_else(|| r.parent.name.clone()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// One refusal per partitioned table a plan adds an exclusion to, empty from
 /// PostgreSQL 18. `adding` are the tables an exclusion is added to, `partitioned`
 /// those of them that are partitioned tables, standing or created by the plan.
@@ -191,5 +223,80 @@ mod tests {
         // A name that is only the `from` of a rename, with nothing created, is
         // the old table's and is not asked.
         assert!(asked(&set(&["a"]), &renames, &BTreeMap::new()).is_empty());
+    }
+
+    fn exclusion() -> pbps_model::ExclusionConstraint {
+        serde_json::from_str(r#"{"method":"btree","keys":[{"key":{"name":"k"},"operator":"="}]}"#)
+            .unwrap()
+    }
+
+    fn build(
+        parent: &str,
+        definition: pbps_model::PartitionIndexDefinition,
+    ) -> pbps_model::PlannedChange {
+        let relation = |table: &str| pbps_model::RebuildRelation {
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
+            name: TableName::new("app", table),
+        };
+        pbps_model::PlannedChange::new(pbps_model::Change::Index(
+            pbps_model::IndexChange::BuildPartitionedIndex(Box::new(
+                pbps_model::BuildPartitionedIndex {
+                    parent: relation(parent),
+                    name: "x".into(),
+                    definition,
+                    clones: Vec::new(),
+                },
+            )),
+        ))
+    }
+
+    fn own(leaf: &str) -> pbps_model::PlannedChange {
+        pbps_model::PlannedChange::new(pbps_model::Change::Constraint(
+            pbps_model::ConstraintChange::SetExclusion {
+                table: TableName::new("app", leaf),
+                name: "own".into(),
+                from: None,
+                to: Some(Box::new(exclusion())),
+            },
+        ))
+    }
+
+    #[test]
+    fn a_rebuilds_parent_exclusion_needs_18_and_a_leafs_own_does_not() {
+        let rebuild = [
+            build(
+                "p",
+                pbps_model::PartitionIndexDefinition::Exclusion(exclusion()),
+            ),
+            own("p1"),
+        ];
+        let parents = rebuilt_parents(&rebuild, |_| None);
+        assert_eq!(parents, set(&["p"]), "only the parent's exclusion is named");
+        let refused = unsupported(160_015, &parents, &parents);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].contains("app.p") && refused[0].contains("PostgreSQL 18"));
+        assert!(unsupported(180_006, &parents, &parents).is_empty());
+        // A rebuild with only a leaf's own exclusion has nothing for 16 to refuse.
+        let own_only = rebuilt_parents(&[own("p1")], |_| None);
+        assert!(own_only.is_empty());
+        assert!(unsupported(160_015, &own_only, &own_only).is_empty());
+    }
+
+    #[test]
+    fn a_rebuilds_other_index_parts_and_the_final_name_are_read_correctly() {
+        let key = pbps_model::PartitionIndexDefinition::Unique(pbps_model::UniqueConstraint {
+            columns: vec!["k".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        });
+        // A unique constraint is held on 16: not named.
+        assert!(rebuilt_parents(&[build("p", key)], |_| None).is_empty());
+        // The parent is named by what the plan leaves it as, not the step's address.
+        let change = build(
+            "p_new",
+            pbps_model::PartitionIndexDefinition::Exclusion(exclusion()),
+        );
+        let found = rebuilt_parents(&[change], |_| Some(TableName::new("app", "p")));
+        assert_eq!(found, set(&["p"]));
     }
 }

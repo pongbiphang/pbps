@@ -194,6 +194,13 @@ fn explicit_index_recipes_own_all_clones_and_refuse_ambiguous_owners() {
             storage_parameters: Default::default(),
             filegroup: None,
         }),
+        // A parent's exclusion (DEC-2448.7): named as a key is, a part of its own kind.
+        PartitionIndexDefinition::Exclusion(
+            serde_json::from_str(
+                r#"{"method":"btree","keys":[{"key":{"name":"k"},"operator":"="}]}"#,
+            )
+            .unwrap(),
+        ),
         PartitionIndexDefinition::PrimaryKey(PrimaryKey {
             name: Some(recipe.name.clone()),
             columns: vec!["k".into()],
@@ -202,6 +209,10 @@ fn explicit_index_recipes_own_all_clones_and_refuse_ambiguous_owners() {
         }),
     ] {
         recipe.definition = definition;
+        assert_eq!(
+            matches!(recipe.definition, PartitionIndexDefinition::Exclusion(_)),
+            recipe.part() == IndexPart::Exclusion(recipe.name.clone())
+        );
         let ops = Operations::expanded(
             1,
             [(
@@ -220,6 +231,14 @@ fn explicit_index_recipes_own_all_clones_and_refuse_ambiguous_owners() {
         )));
         let named = names(op, &owners, before).unwrap();
         assert_eq!(named.claims.len(), 1 + recipe.clones.len());
+        // An index is named in the schema's relations, a key and an exclusion also as the
+        // constraint they back.
+        let kind = if matches!(recipe.definition, PartitionIndexDefinition::Index(_)) {
+            NameKind::Index
+        } else {
+            NameKind::Key
+        };
+        assert!(named.claims.iter().all(|n| n.address.kind == kind));
         assert!(
             named
                 .claims

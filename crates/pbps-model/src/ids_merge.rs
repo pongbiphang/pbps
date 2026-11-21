@@ -17,8 +17,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
-use crate::ids::Tombstone;
-use crate::ids_tree::{Body, Rec, TableBody, TreeFile, next_order};
+use crate::ids::{ExclusionRetirement, Tombstone};
+use crate::ids_tree::{
+    Body, Rec, TableBody, TreeFile, flat_partition_exclusions, group_partition_exclusions,
+    next_order,
+};
 use crate::uid::Uid;
 
 /// What the resolved YAML says about the file's declaration.
@@ -356,6 +359,24 @@ fn merge_table(
         &|_| uid.clone(),
     );
     exclusions.sort_by(|a, b| a.0.cmp(&b.0));
+    // A partition child's, by the child's uid and the constraint's name, one
+    // record each: two branches retiring different constraints of one child both
+    // keep theirs, and a conflict is named by the child (DEC-2448.7).
+    let flat = |t: &TableBody| -> Vec<((Uid, String), ExclusionRetirement)> {
+        flat_partition_exclusions(&t.partition_exclusions)
+            .map(|(child, name, r)| ((child.clone(), name.to_owned()), r.clone()))
+            .collect()
+    };
+    let mut partition_exclusions = records_by(
+        "partition_exclusions",
+        &flat(base),
+        &flat(ours),
+        &flat(theirs),
+        &never,
+        conflicts,
+        &|(child, _)| child.clone(),
+    );
+    partition_exclusions.sort_by(|a, b| a.0.cmp(&b.0));
     // Back to the YAML's order (design §2.4 rule 1), through the one rule the
     // writer uses. With no YAML view there is no order to restore, and the
     // order the sides agree on stands.
@@ -370,6 +391,7 @@ fn merge_table(
         conversions: sorted(conversions),
         rebuilds: sorted(rebuilds),
         exclusions,
+        partition_exclusions: group_partition_exclusions(partition_exclusions),
     }
 }
 

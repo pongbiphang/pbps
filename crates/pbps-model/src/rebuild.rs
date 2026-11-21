@@ -62,6 +62,12 @@ pub struct Rebuild {
     /// The global map continues to describe live columns only (DEC-2298.13).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub conversions: BTreeMap<Uid, crate::Conversion>,
+    /// The exclusion retirements of source tables that no replacement table
+    /// stands for by name. They cannot stay in the live map, whose records
+    /// belong to live tables, and they are a human's authorization, so the
+    /// approval keeps them for a withdrawal to give back (DEC-2448.4).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub exclusions: BTreeMap<Uid, BTreeMap<crate::ObjectLocalName, crate::ExclusionRetirement>>,
 }
 
 /// A replacement column's type and collation at approval.

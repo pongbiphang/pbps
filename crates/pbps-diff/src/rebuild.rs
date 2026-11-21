@@ -280,6 +280,22 @@ fn continuing(
     Some((to, pairs))
 }
 
+/// The tables a rewrite keeps under one name: each replacement table's uid with the source
+/// table's it stands for. A table's retirement records follow it through a rewrite by this
+/// pairing, since the retirement was of a constraint of that table as declared and the
+/// declarations still hold the table under that name; a source table with no namesake leaves
+/// the live file with its records, which the approval keeps for a withdrawal (DEC-2448.4).
+fn namesakes(source: &RebuildIdentities, replacement: &RebuildIdentities) -> BTreeMap<Uid, Uid> {
+    replacement
+        .tables
+        .iter()
+        .filter_map(|(to, name)| {
+            let (from, _) = source.tables.iter().find(|(_, n)| *n == name)?;
+            Some((to.clone(), from.clone()))
+        })
+        .collect()
+}
+
 fn reapprove(
     ids: &IdsFile,
     schema: &Schema,
@@ -487,6 +503,22 @@ pub fn record(
             Some((to.clone(), conversion))
         })
         .collect();
+    // A source table is dropped with its tree, so a retirement record left under its uid would
+    // be an orphan: it moves to the replacement of the same name, and is undone by `restored`;
+    // a table with no namesake hands its records to the `Rebuild` below.
+    for (to, from) in namesakes(&source, &replacement) {
+        if let Some(records) = out.exclusions.remove(&from) {
+            out.exclusions.insert(to, records);
+        }
+    }
+    // What is left under a source table has no namesake. Live records belong to live tables, so
+    // they leave the file, but into the record, not away: a withdrawal is the human changing
+    // their mind, and it must not cost them the retirement they recorded.
+    let unmatched = source
+        .tables
+        .keys()
+        .filter_map(|uid| Some((uid.clone(), out.exclusions.remove(uid)?)))
+        .collect();
     out.tables.extend(replacement.tables.clone());
     out.columns.extend(replacement.columns.clone());
     out.rebuilds.insert(
@@ -495,6 +527,7 @@ pub fn record(
             source,
             types: shapes(desired, &replacement),
             conversions,
+            exclusions: unmatched,
             replacement,
             replacement_root,
             continues,
@@ -519,6 +552,17 @@ pub fn record(
 fn restored(ids: &IdsFile, key: &Uid, record: &Rebuild) -> IdsFile {
     let mut out = ids.clone();
     out.rebuilds.remove(key);
+    for (to, from) in namesakes(&record.source, &record.replacement) {
+        if let Some(records) = out.exclusions.remove(&to) {
+            out.exclusions.entry(from).or_default().extend(records);
+        }
+    }
+    for (uid, records) in &record.exclusions {
+        out.exclusions
+            .entry(uid.clone())
+            .or_default()
+            .extend(records.clone());
+    }
     for uid in record.replacement.tables.keys() {
         out.tables.remove(uid);
         out.moves.remove(uid);
@@ -744,19 +788,6 @@ pub fn qualify(
         } else {
             stale()
         });
-    }
-    // A parent's exclusion cannot be rebuilt around: the recipes build a parent's index
-    // and its clones by name, and no recipe holds an exclusion's (DEC-2448.6, #2448).
-    if tree(base.schema, table)
-        .into_iter()
-        .chain(tree(desired.schema, table))
-        .any(|(_, t)| !t.exclude.is_empty())
-    {
-        return Err(refused(
-            table,
-            "the tree holds an exclusion constraint, and rebuilding one is not supported yet \
-             (DEC-2448.6, #2448)",
-        ));
     }
     shape(base.schema, desired.schema, table, used.len() == 1)?;
     if intent.conversions
