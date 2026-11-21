@@ -307,29 +307,22 @@ pub fn resolution(scratch: &Connection) -> Result<Resolution, DbError> {
                 if keys.is_empty() {
                     continue;
                 }
-                if counts.is_empty() {
-                    // No row is no answer about the parent: with no child row
-                    // the check has nothing to look up, and a parent that is
-                    // gone goes unsaid (measured) until the next insert fails.
-                    // So a write is compiled, as for a trigger's owner, unless
-                    // that owner's own write already failed and is a finding.
-                    let told = found.iter().any(|f| {
-                        f.what == "trigger"
-                            && f.about
-                                .first()
-                                .is_some_and(|a| a.same(&About::Table(table.to_owned())))
-                    });
-                    let insert =
-                        format!("EXPLAIN INSERT INTO main.{} DEFAULT VALUES", quote(table));
-                    if !told && let Err(error) = scratch.query(&insert, &[]) {
-                        found.push(failed(
-                            "foreign keys",
-                            table.to_owned(),
-                            vec![About::Table(table.to_owned())],
-                            &error,
-                        ));
-                    }
-                    continue;
+                // No row is no answer about the parent: with no child row the
+                // check has nothing to look up, and a parent that is gone goes
+                // unsaid (measured) until the next insert fails. So a write is
+                // compiled for every table with a key, **whatever else was
+                // found about it**: asked on one condition before a plan and
+                // another after it, a write that never compiled (a default the
+                // library cannot evaluate) would read as new when the plan only
+                // took the orphan rows' key away.
+                let insert = format!("EXPLAIN INSERT INTO main.{} DEFAULT VALUES", quote(table));
+                if let Err(error) = scratch.query(&insert, &[]) {
+                    found.push(failed(
+                        "write",
+                        table.to_owned(),
+                        vec![About::Table(table.to_owned())],
+                        &error,
+                    ));
                 }
                 for (id, rows) in counts {
                     let (mut parent, mut from, mut to) = (String::new(), Vec::new(), Vec::new());
@@ -574,6 +567,12 @@ impl Resolution {
                     ),
                     "trigger" => format!(
                         "a trigger does not compile for the write `{}` after the plan: {}",
+                        Escaped(&item.name),
+                        Escaped(now)
+                    ),
+                    "write" => format!(
+                        "an insert into `{}`, which has a foreign key, does not compile after \
+                         the plan: {}",
                         Escaped(&item.name),
                         Escaped(now)
                     ),

@@ -728,7 +728,7 @@ fn a_parent_that_is_gone_is_found_though_the_child_has_no_row() {
     let after = resolution(&copy).expect("asked");
     let new = after.new_since(&before, &Renamed::default());
     assert_eq!(new.len(), 1, "{new:?}");
-    assert!(new[0].contains("foreign keys of `c`"), "{new:?}");
+    assert!(new[0].contains("insert into `c`"), "{new:?}");
     assert!(new[0].contains("no such table"), "{new:?}");
     // The engine agrees at the next insert.
     assert!(copy.execute_batch("INSERT INTO c VALUES (1)").is_err());
@@ -742,6 +742,39 @@ fn a_parent_that_is_gone_is_found_though_the_child_has_no_row() {
     let copy = scratch(fine.connection(), SCRATCH_LIMIT).expect("copied");
     let found = resolution(&copy).expect("asked");
     assert!(found.is_empty(), "{:?}", found.failing());
+}
+
+#[test]
+fn a_write_that_never_compiled_is_not_new_when_the_plan_takes_an_orphaned_key_away() {
+    // The default never evaluated, and one of two keys has an orphan row. The
+    // plan drops that key: nothing it left behind is broken that was not.
+    let mut db = file(
+        "CREATE TABLE p(x PRIMARY KEY); CREATE TABLE q(x PRIMARY KEY); \
+         CREATE TABLE c(d DEFAULT (missing()), a REFERENCES p(x), b REFERENCES q(x))",
+    );
+    db.connection()
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF; INSERT INTO q VALUES (1); \
+             INSERT INTO c VALUES (0, 7, 1); PRAGMA foreign_keys = ON",
+        )
+        .expect("an orphan by a");
+    let copy = scratch(db.connection(), SCRATCH_LIMIT).expect("copied");
+    let before = resolution(&copy).expect("asked");
+    let was = before.failing();
+    assert!(was.iter().any(|l| l.contains("1 row(s)")), "{was:?}");
+    assert!(was.iter().any(|l| l.contains("write `c`")), "{was:?}");
+    copy.execute_batch(
+        "PRAGMA foreign_keys = OFF; \
+         CREATE TABLE c_new(d DEFAULT (missing()), a, b REFERENCES q(x)); \
+         INSERT INTO c_new SELECT d, a, b FROM c; DROP TABLE c; \
+         ALTER TABLE c_new RENAME TO c; PRAGMA foreign_keys = ON",
+    )
+    .expect("the orphaned key is gone");
+    let after = resolution(&copy).expect("asked");
+    let new = after.new_since(&before, &Renamed::default());
+    assert!(new.is_empty(), "{new:?}");
+    // Negative: the write is still a finding of its own, before and after.
+    assert!(after.failing().iter().any(|l| l.contains("write `c`")));
 }
 
 #[test]
