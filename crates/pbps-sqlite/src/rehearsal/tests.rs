@@ -826,6 +826,76 @@ fn a_write_that_never_compiled_is_not_new_when_the_plan_takes_an_uncheckable_key
 }
 
 #[test]
+fn rows_an_uncheckable_key_hid_are_not_new_when_the_plan_takes_that_key_away() {
+    // The check of `c` fails for `fk_bad`, so the orphan row of the key to `q`
+    // is counted by nobody. The plan drops `fk_bad` and the row is seen.
+    let mut db = file(
+        "CREATE TABLE p(x); CREATE TABLE q(x PRIMARY KEY); \
+         CREATE TABLE c(a, b REFERENCES q(x), CONSTRAINT fk_bad FOREIGN KEY(a) REFERENCES p(x)); \
+         CREATE TABLE d(b REFERENCES q(x))",
+    );
+    db.connection()
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF; INSERT INTO c VALUES (NULL, 7); \
+             PRAGMA foreign_keys = ON",
+        )
+        .expect("an orphan the check cannot reach");
+    let copy = scratch(db.connection(), SCRATCH_LIMIT).expect("copied");
+    let before = resolution(&copy).expect("asked");
+    assert_eq!(before.failing().len(), 1, "{:?}", before.failing());
+    assert!(!before.is_empty());
+    copy.execute_batch(
+        "PRAGMA foreign_keys = OFF; CREATE TABLE c_new(a, b REFERENCES q(x)); \
+         INSERT INTO c_new SELECT a, b FROM c; DROP TABLE c; \
+         ALTER TABLE c_new RENAME TO c; INSERT INTO d VALUES (9); PRAGMA foreign_keys = ON",
+    )
+    .expect("the uncheckable key is gone, and another table gains an orphan");
+    let after = resolution(&copy).expect("asked");
+    let new = after.new_since(&before, &Renamed::default());
+    // Negative: the unknown about `c` excuses nothing about `d`.
+    assert_eq!(new.len(), 1, "{new:?}");
+    assert!(new[0].contains("`d(b) -> q(x)`"), "{new:?}");
+    let noted = after.not_compared(&before, &Renamed::default());
+    assert_eq!(noted.len(), 1, "{noted:?}");
+    assert!(
+        noted[0].contains("1 row(s)") && noted[0].contains("`c(b) -> q(x)`"),
+        "{noted:?}"
+    );
+    // Negative: with a check that passed before, the same row is the plan's.
+    let clean = Resolution::default();
+    assert_eq!(after.new_since(&clean, &Renamed::default()).len(), 2);
+}
+
+#[test]
+fn an_update_a_broken_view_could_not_be_asked_is_not_new_when_the_plan_mends_the_view() {
+    let mut db = file(
+        "CREATE TABLE t(a); CREATE VIEW v AS SELECT a FROM t; \
+         CREATE TRIGGER g INSTEAD OF UPDATE ON v BEGIN INSERT INTO gone VALUES (1); END",
+    );
+    db.connection()
+        .execute_batch(
+            "PRAGMA writable_schema = ON; \
+             UPDATE sqlite_schema SET sql = 'CREATE VIEW v AS SELECT a FROM nowhere' \
+             WHERE name = 'v'; PRAGMA writable_schema = RESET",
+        )
+        .expect("a view over a table that is not there");
+    let copy = scratch(db.connection(), SCRATCH_LIMIT).expect("copied");
+    let before = resolution(&copy).expect("asked");
+    let was = before.failing();
+    assert!(was.iter().all(|l| !l.contains("trigger")), "{was:?}");
+    copy.execute_batch("CREATE TABLE nowhere(a)")
+        .expect("mended");
+    let after = resolution(&copy).expect("asked");
+    assert!(after.failing().iter().any(|l| l.contains("trigger")));
+    let new = after.new_since(&before, &Renamed::default());
+    assert!(new.is_empty(), "{new:?}");
+    assert_eq!(after.not_compared(&before, &Renamed::default()).len(), 1);
+    // Negative: asked and clean before, the same trigger is the plan's.
+    let new = after.new_since(&Resolution::default(), &Renamed::default());
+    assert_eq!(new.len(), 1, "{new:?}");
+}
+
+#[test]
 fn foreign_key_rows_count_only_the_ones_the_plan_added() {
     let rows = |n: u64| {
         Resolution(vec![Unresolved {

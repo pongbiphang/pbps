@@ -118,6 +118,13 @@ enum Detail {
     Failed(String),
     /// A count of rows.
     Rows(u64),
+    /// The question could not be put: what it needs is itself broken (a key
+    /// check that fails counts no row; a view whose columns cannot be read has
+    /// no update to compile). It is a third answer, neither "resolves" nor
+    /// "fails", and it is recorded because an answer that is absent reads as a
+    /// clean one: once a plan mends what stood in the way, what was there all
+    /// along is counted for the first time (#3021).
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,7 +318,13 @@ pub fn resolution(scratch: &Connection) -> Result<Resolution, DbError> {
             ));
         }
         match checked {
-            Err(_) => {}
+            // Not "no orphan row": none could be counted, for any key.
+            Err(_) => found.push(Unresolved {
+                what: "foreign key",
+                name: table.to_owned(),
+                about: vec![About::Table(table.to_owned())],
+                detail: Detail::Unknown,
+            }),
             Ok(rows) => {
                 // Counted for each key and not for each parent: a plan that
                 // replaces one key to a parent by another over other columns
@@ -396,6 +409,14 @@ fn triggers(
         let broken = broken_views
             .iter()
             .any(|view| view.eq_ignore_ascii_case(owner));
+        if asks("update") && broken {
+            found.push(Unresolved {
+                what: "trigger",
+                name: format!("{owner} (update)"),
+                about: vec![About::Table(owner.to_owned()), About::Write("update")],
+                detail: Detail::Unknown,
+            });
+        }
         if asks("update") && !broken {
             // Every column is set to itself, so a trigger `OF` any column fires.
             let columns = scratch.query(
@@ -499,7 +520,7 @@ fn quote(name: &str) -> String {
 impl Resolution {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.0.iter().all(|item| item.detail == Detail::Unknown)
     }
 
     /// One line for each thing that does not resolve, as a note and not a
@@ -510,18 +531,51 @@ impl Resolution {
     pub fn failing(&self) -> Vec<String> {
         self.0
             .iter()
-            .map(|item| match &item.detail {
-                Detail::Failed(words) => format!(
+            .filter_map(|item| match &item.detail {
+                Detail::Failed(words) => Some(format!(
                     "{} `{}` does not resolve: {}",
                     item.what,
                     Escaped(&item.name),
                     Escaped(words)
-                ),
-                Detail::Rows(rows) => {
-                    format!("{rows} row(s) have no parent in `{}`", Escaped(&item.name))
-                }
+                )),
+                Detail::Rows(rows) => Some(format!(
+                    "{rows} row(s) have no parent in `{}`",
+                    Escaped(&item.name)
+                )),
+                // What stands in its way is a line of its own.
+                Detail::Unknown => None,
             })
             .collect()
+    }
+
+    /// One line for each thing that fails now and could not be asked before the
+    /// plan: not charged to the plan by [`Resolution::new_since`], and not known
+    /// to be older than it either. A note beside [`Resolution::failing`].
+    #[must_use]
+    pub fn not_compared(&self, before: &Resolution, renamed: &Renamed) -> Vec<String> {
+        let now = Resolution(
+            self.0
+                .iter()
+                .filter(|item| before.unknown(item, renamed))
+                .cloned()
+                .collect(),
+        );
+        now.failing()
+    }
+
+    /// Whether `item`'s question could not be put when `self` was asked: an
+    /// unknown of the same kind about the same things, or about the first of
+    /// them (every key of a table at once).
+    fn unknown(&self, item: &Unresolved, renamed: &Renamed) -> bool {
+        self.0.iter().any(|b| {
+            b.detail == Detail::Unknown
+                && b.what == item.what
+                && b.about.len() <= item.about.len()
+                && b.about
+                    .iter()
+                    .zip(&item.about)
+                    .all(|(was, now)| renamed.after(was).same(now))
+        })
     }
 
     /// One line for each thing that fails now and did not fail before: what the
@@ -532,7 +586,10 @@ impl Resolution {
     /// engine's to reword (#3016). So a thing already broken that a plan breaks
     /// in another way is not reported here; it did not work before the plan
     /// either, and [`Resolution::failing`] of the one from before names it.
-    /// Foreign-key rows count only the ones added, for each key.
+    /// Foreign-key rows count only the ones added, for each key. And what could
+    /// not be asked before the plan is not the plan's because it can be asked
+    /// after it: absent, failing and unknown are three answers (#3021), and
+    /// [`Resolution::not_compared`] names those.
     ///
     /// `renamed` is what the plan renames: a finding from before is looked for
     /// under the names the plan gave, so rows that had no parent in `p` are not
@@ -541,6 +598,9 @@ impl Resolution {
     pub fn new_since(&self, before: &Resolution, renamed: &Renamed) -> Vec<String> {
         let mut lines = Vec::new();
         for item in &self.0 {
+            if item.detail == Detail::Unknown || before.unknown(item, renamed) {
+                continue;
+            }
             let earlier = before.0.iter().find(|b| {
                 b.what == item.what
                     && b.about.len() == item.about.len()
@@ -574,12 +634,13 @@ impl Resolution {
                         Escaped(now)
                     ),
                 }),
+                (Detail::Unknown, _) => {}
                 (Detail::Rows(now), Some(Detail::Rows(was))) if now <= was => {}
                 (Detail::Rows(now), was) => {
                     let new = now
                         - was.map_or(0, |was| match was {
                             Detail::Rows(n) => *n,
-                            Detail::Failed(_) => 0,
+                            Detail::Failed(_) | Detail::Unknown => 0,
                         });
                     lines.push(format!(
                         "{new} more row(s) have no parent in `{}` after the plan",
