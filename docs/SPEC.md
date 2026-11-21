@@ -2456,6 +2456,24 @@ reported as managed limitations before writes, rather than recreated with
 different write behavior. PostgreSQL keeps its existing type-change plan shape
 (DECISIONS 461).
 
+**SQLite (#2950, DEC-2950.15):** the pre-flight asks the connection and the
+file and does not read the rows. Before the first statement an apply refuses,
+naming each, a connection whose settings change what the statements mean
+(`foreign_keys` off, `legacy_alter_table` or `ignore_check_constraints` or
+`defer_foreign_keys` or `query_only` or `writable_schema` on, or the
+rollback journal off); a library older
+than a release the plan's in-place statements need; a ledger that is not the one
+this tool creates (7.5 above, 8.1); and a database it cannot write, which it
+finds by making and rolling back a table of a random name, so that a
+write-protected directory is named as such and not as `attempt to write a
+readonly database`. `plan` asks the same except the last. When the project's
+floor is older than the library that runs the plan it prints a note, not a
+refusal: only the text this tool writes into the file is held to the floor, and
+only for `TRUE` and `FALSE`, so a declared default, check, index filter or view
+body can keep syntax the floor's library cannot open. SQLite has no data probes:
+the engine refuses a violated `CHECK`, `NOT NULL` or unique index itself, inside
+the plan's transaction, and nothing is recorded wrongly.
+
 **Nothing user-supplied runs between the approval and the statements.** The
 pre-flight is derived from the plan; the exec hooks of 13.5 run after an apply
 has finished. That gap is closed deliberately: anything executing inside it

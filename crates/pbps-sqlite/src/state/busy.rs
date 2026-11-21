@@ -42,7 +42,7 @@ pub(crate) fn is_busy(error: &DbError) -> bool {
 /// make every later statement on the handle wait where its caller chose not to.
 /// A failure to put it back is reported unless `work` already failed, whose
 /// error is the one that says what went wrong.
-pub(super) fn waiting<T, E: From<DbError>>(
+pub(crate) fn waiting<T, E: From<DbError>>(
     c: &Connection,
     wait: Duration,
     work: impl FnOnce() -> Result<T, E>,
@@ -71,7 +71,14 @@ pub(super) fn waiting<T, E: From<DbError>>(
 /// It is another connection's lock, possibly an application's own, so it is not
 /// this tool's lock and `pbps unlock` does not clear it. The source stays in the
 /// chain, so [`is_busy`] still answers for the result.
-pub(super) fn explained(error: DbError, wait: Duration) -> DbError {
+pub(crate) fn explained(error: DbError, wait: Duration) -> DbError {
+    explained_as(error, wait, "a statement of the ledger")
+}
+
+/// [`explained`] for a statement that is not the ledger's: `waiter` names what
+/// waited, so the sentence does not send a person to the ledger for a lock met
+/// elsewhere.
+pub(crate) fn explained_as(error: DbError, wait: Duration, waiter: &str) -> DbError {
     if !is_busy(&error) {
         return error;
     }
@@ -85,8 +92,8 @@ pub(super) fn explained(error: DbError, wait: Duration) -> DbError {
         );
     }
     error.context(format!(
-        "the database is busy: another connection holds one of SQLite's own locks, and a \
-         statement of the ledger waits at most {} s for it. That is not this tool's lock, and \
+        "the database is busy: another connection holds one of SQLite's own locks, and \
+         {waiter} waits at most {} s for it. That is not this tool's lock, and \
          `pbps unlock` does not clear it",
         wait.as_secs_f64()
     ))

@@ -44,6 +44,7 @@ mod rows;
 mod write;
 
 pub use busy::BUSY_WAIT;
+pub(crate) use busy::{explained_as, waiting};
 pub use ddl::{ensure_tables, is_initialized};
 pub use identity::{ENVIRONMENT_ID_CHARS, environment_identity};
 pub use lock::{

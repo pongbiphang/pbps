@@ -53,7 +53,12 @@ fn the_text_gate_allows_every_form_and_the_form_gate_follows_the_arrival_table()
     assert_eq!(GATE, Gate::Text);
 }
 
-fn rename_column() -> Change {
+/// A change written in place that needs no newer form.
+pub(crate) fn add_column_change() -> Change {
+    super::golden::add_column("t", "x", super::col("integer"))
+}
+
+pub(crate) fn rename_column() -> Change {
     Change::Column(ColumnChange::RenameColumn {
         uid: uid(UidKind::Column, "t.b"),
         table: tn("t"),
@@ -201,7 +206,7 @@ fn the_boolean_default_means_a_constant_only_from_its_release() {
 
 /// Each in-place form written by the second part of the emitter, with the change
 /// that writes it.
-fn forms() -> Vec<(Form, Change)> {
+pub(crate) fn forms() -> Vec<(Form, Change)> {
     use super::constraints::{add_check, drop_check, drop_fk, nullability};
     vec![
         (
