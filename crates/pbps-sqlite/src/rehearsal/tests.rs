@@ -716,6 +716,35 @@ fn the_event_of_a_trigger_is_read_from_its_code_only() {
 }
 
 #[test]
+fn a_parent_that_is_gone_is_found_though_the_child_has_no_row() {
+    let mut db = file("CREATE TABLE p(x PRIMARY KEY); CREATE TABLE c(y REFERENCES p(x))");
+    let copy = scratch(db.connection(), SCRATCH_LIMIT).expect("copied");
+    let before = resolution(&copy).expect("asked");
+    assert!(before.is_empty(), "{:?}", before.failing());
+    // Enforcement is on, as an apply has it; off only for the drop, which stands
+    // for a statement of a plan.
+    copy.execute_batch("PRAGMA foreign_keys = OFF; DROP TABLE p; PRAGMA foreign_keys = ON")
+        .expect("the engine takes it");
+    let after = resolution(&copy).expect("asked");
+    let new = after.new_since(&before, &Renamed::default());
+    assert_eq!(new.len(), 1, "{new:?}");
+    assert!(new[0].contains("foreign keys of `c`"), "{new:?}");
+    assert!(new[0].contains("no such table"), "{new:?}");
+    // The engine agrees at the next insert.
+    assert!(copy.execute_batch("INSERT INTO c VALUES (1)").is_err());
+    // Negative: an empty child whose parent stands, and a table with no key,
+    // are no findings; and a NOT NULL column without a default does not make
+    // the compiled write one.
+    let mut fine = file(
+        "CREATE TABLE p(x PRIMARY KEY); CREATE TABLE c(y NOT NULL REFERENCES p(x)); \
+         CREATE TABLE lone(z NOT NULL)",
+    );
+    let copy = scratch(fine.connection(), SCRATCH_LIMIT).expect("copied");
+    let found = resolution(&copy).expect("asked");
+    assert!(found.is_empty(), "{:?}", found.failing());
+}
+
+#[test]
 fn foreign_key_rows_count_only_the_ones_the_plan_added() {
     let rows = |n: u64| {
         Resolution(vec![Unresolved {

@@ -300,13 +300,37 @@ pub fn resolution(scratch: &Connection) -> Result<Resolution, DbError> {
                 for row in &rows {
                     *counts.entry(row.integer(3)?).or_default() += 1;
                 }
-                if counts.is_empty() {
-                    continue;
-                }
                 let keys = scratch.query(
                     &format!("PRAGMA main.foreign_key_list({})", quote(table)),
                     &[],
                 )?;
+                if keys.is_empty() {
+                    continue;
+                }
+                if counts.is_empty() {
+                    // No row is no answer about the parent: with no child row
+                    // the check has nothing to look up, and a parent that is
+                    // gone goes unsaid (measured) until the next insert fails.
+                    // So a write is compiled, as for a trigger's owner, unless
+                    // that owner's own write already failed and is a finding.
+                    let told = found.iter().any(|f| {
+                        f.what == "trigger"
+                            && f.about
+                                .first()
+                                .is_some_and(|a| a.same(&About::Table(table.to_owned())))
+                    });
+                    let insert =
+                        format!("EXPLAIN INSERT INTO main.{} DEFAULT VALUES", quote(table));
+                    if !told && let Err(error) = scratch.query(&insert, &[]) {
+                        found.push(failed(
+                            "foreign keys",
+                            table.to_owned(),
+                            vec![About::Table(table.to_owned())],
+                            &error,
+                        ));
+                    }
+                    continue;
+                }
                 for (id, rows) in counts {
                     let (mut parent, mut from, mut to) = (String::new(), Vec::new(), Vec::new());
                     for key in &keys {
