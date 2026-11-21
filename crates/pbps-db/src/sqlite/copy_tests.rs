@@ -236,8 +236,10 @@ fn a_writer_in_the_middle_never_shows_a_copy_half_a_transaction() {
         )
         .expect("two counters");
         let stop = Arc::new(AtomicBool::new(false));
+        let writing = Arc::new(AtomicBool::new(false));
         let writer = {
             let (stop, path) = (Arc::clone(&stop), path.clone());
+            let writing = Arc::clone(&writing);
             thread::spawn(move || {
                 let w = open(&path);
                 w.set_busy_timeout(LONG).expect("wait");
@@ -251,10 +253,18 @@ fn a_writer_in_the_middle_never_shows_a_copy_half_a_transaction() {
                     )
                     .expect("a commit");
                     commits += 1;
+                    writing.store(true, Ordering::Relaxed);
                 }
                 commits
             })
         };
+        // The copies are made beside a writer that has begun: on a loaded machine
+        // all of them could be over before its thread made a first commit.
+        let begun = Instant::now();
+        while !writing.load(Ordering::Relaxed) {
+            assert!(begun.elapsed() < LONG, "the writer never began (wal {wal})");
+            thread::yield_now();
+        }
         let mut seen = std::collections::BTreeSet::new();
         for _ in 0..15 {
             let copy = c.copy_to_memory(BIG, LONG).expect("copied");
