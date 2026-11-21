@@ -4,7 +4,8 @@
 //! values of an insert, and the clipping that keeps a value inside its column.
 //! The submodules are the part that talks to the server: [`LedgerSpec`] is
 //! what an engine supplies, [`Recoverable`] is the guard around a statement
-//! whose failure is an answer, and the reads are the functions re-exported
+//! whose failure is an answer, [`LedgerSteps`] is the work that stays the
+//! engine's own, and the reads and writes are the functions re-exported
 //! below.
 //!
 //! # Why this is here and the statements are not
@@ -22,11 +23,16 @@
 
 mod read;
 mod spec;
+mod write;
 
 pub use read::{
     deployed_revision, entry, has_applied_plan, history, is_initialized, latest, lock_holder,
+    timeline,
 };
-pub use spec::{LedgerSpec, Recoverable, Savepoint, SpecStatements, Statement};
+pub use spec::{
+    HeldLock, LedgerSpec, LedgerSteps, Recoverable, Savepoint, SpecStatements, Statement,
+};
+pub use write::{lock, prune, record, session_application_name, unlock};
 
 use std::borrow::Cow;
 
@@ -139,7 +145,7 @@ pub fn saturating_i32(n: u64) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
 }
 
-/// [`record`](crate)'s parameters; `true` when the two staged columns are
+/// [`record`]'s parameters; `true` when the two staged columns are
 /// bound.
 ///
 /// `staged_completed`/`staged_total` cannot be bound as NULL through

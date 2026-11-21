@@ -4,12 +4,17 @@
 //! own statement; what is here is the order of the questions and what each
 //! answer means. A read never creates or migrates the ledger.
 
-use pbps_model::StateKind;
+use std::collections::HashMap;
+
+use pbps_model::{StateKind, StateSnapshot, Unreadable};
 
 use super::{
-    LedgerSpec, Recoverable, entry_from_row, number, optional_text, stored_entry_from_row, text,
+    LedgerSpec, LedgerSteps, ProjectedRow, Recoverable, entry_from_row, number, optional_text,
+    projected_row, projected_row_unmigrated, stored_entry_from_row, text,
 };
-use crate::ledger::{LedgerEntry, LedgerError, LockInfo, StateRevision, StoredEntry};
+use crate::ledger::{
+    LedgerEntry, LedgerError, LockInfo, StateRevision, StoredEntry, TimelineEntry, TimelineState,
+};
 use crate::{Conn, DbError, Param, Row};
 
 /// The rows of one statement, or `None` when the table it names is not there.
@@ -54,7 +59,10 @@ pub async fn is_initialized(conn: &mut Conn, spec: &LedgerSpec) -> Result<bool, 
         .is_some())
 }
 
-async fn require_initialized(conn: &mut Conn, spec: &LedgerSpec) -> Result<(), LedgerError> {
+pub(super) async fn require_initialized(
+    conn: &mut Conn,
+    spec: &LedgerSpec,
+) -> Result<(), LedgerError> {
     if is_initialized(conn, spec).await? {
         Ok(())
     } else {
@@ -151,6 +159,136 @@ pub async fn history(
         .query_with(&spec.select_history, &[spec.row_limit.param(limit)])
         .await?;
     rows.iter().map(entry_from_row).collect()
+}
+
+/// The most recent `limit` rows as a timeline, newest first.
+///
+/// A row whose recorded state this build cannot read is carried with its
+/// reason rather than failing the call: an environment upgraded across a
+/// state-format change keeps rows older than `OLDEST_READABLE_VERSION`, and
+/// one of them must not erase the history above it (DECISIONS 218).
+///
+/// The timeline statement never asks for `state_json` (DECISIONS 435): a
+/// second query, [`LedgerSpec::select_legacy_state_json`], asks for it only
+/// for the rows that predate the migration — `state_version IS NULL` — and
+/// only for those ids. In the common case, once a ledger's rows are all
+/// migrated, that second query is never sent, which is the property issue
+/// #103's sharp test pins: a fully-migrated ledger whose `state_json` this
+/// session may not see still answers `state list`.
+pub async fn timeline<S: LedgerSteps>(
+    conn: &mut Conn,
+    spec: &LedgerSpec,
+    limit: u32,
+) -> Result<Vec<TimelineEntry>, LedgerError> {
+    require_initialized(conn, spec).await?;
+    // `state list` is a read and must not need the rights a migration needs,
+    // so it cannot call `ensure_tables` to make an unmigrated ledger's
+    // columns appear — it asks the shape instead and sends the query that
+    // matches (round-1 review finding on #103's own PR: this is the only
+    // reader of the state table's shape, and both branches meet at
+    // `legacy_ids` below whichever one ran).
+    let limit = [spec.row_limit.param(limit)];
+    let projected: Vec<ProjectedRow> = if S::timeline_columns_present(conn).await? {
+        let rows = conn.query_with(&spec.select_timeline, &limit).await?;
+        rows.iter().map(projected_row).collect::<Result<_, _>>()?
+    } else {
+        let rows = conn
+            .query_with(&spec.select_timeline_unmigrated, &limit)
+            .await?;
+        rows.iter()
+            .map(projected_row_unmigrated)
+            .collect::<Result<_, _>>()?
+    };
+
+    let legacy_ids: Vec<i64> = projected
+        .iter()
+        .filter(|r| r.state.is_none())
+        .map(|r| r.id)
+        .collect();
+    let mut legacy: HashMap<i64, Result<TimelineState, Unreadable>> = HashMap::new();
+    // In pieces of at most `max_parameters` ids, not one statement for every
+    // legacy id: this query binds one parameter per id, and until a deployer
+    // has run a deployment after upgrading, every row is legacy, so a
+    // long-lived ledger's ordinary `state list` is exactly the case that
+    // could reach the server's parameter ceiling in a single request (a
+    // review finding on #103's own PR — the pre-#103 query needed only its
+    // limit parameter and had no such ceiling).
+    for chunk in legacy_ids.chunks(spec.max_parameters.max(1)) {
+        let sql = (spec.select_legacy_state_json)(chunk.len());
+        let params: Vec<Param<'_>> = chunk.iter().map(|&id| id.into()).collect();
+        // Under the engine's guard, because the denial below is *handled*:
+        // where a failed statement aborts a caller's open transaction,
+        // returning `Ok` over an aborted transaction turns its next statement
+        // into a failure and its `COMMIT` into a silent rollback (#361). See
+        // [`Recoverable`].
+        let guard = Recoverable::take(conn, spec).await?;
+        let answer = conn.query_with(&sql, &params).await;
+        match &answer {
+            Ok(_) => guard.release(conn).await?,
+            Err(e) if spec.is_select_denied(e) => guard.rewind(conn).await?,
+            Err(_) => guard.rewind_quietly(conn).await,
+        }
+        match answer {
+            Ok(rows) => {
+                for row in &rows {
+                    let id: i64 = number(row, "id")?;
+                    let state_json = text(row, "state_json")?;
+                    // `read_json`, the same reader the pre-migration timeline
+                    // used: version before shape, and the failure carried
+                    // rather than returned (DECISIONS 222).
+                    let state = StateSnapshot::read_json(&state_json)
+                        .map(|s| TimelineState::from_snapshot(&s));
+                    legacy.insert(id, state);
+                }
+            }
+            // Denied specifically, never a hard failure of the whole call:
+            // this is the fallback query, run only for rows a fresh ledger
+            // never has, and DECISIONS 218's promise — a row this build
+            // cannot read is carried, not thrown — extends to a row this
+            // build was refused, not only one it could not parse (DECISIONS
+            // 433). Every legacy id in this chunk shares one answer, because
+            // a denial is not sensitive to which row is read; a later chunk
+            // still asks for itself.
+            Err(e) if spec.is_select_denied(&e) => {
+                let denied = Err(Unreadable::Denied(e.to_string()));
+                for id in chunk {
+                    legacy.insert(*id, denied.clone());
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Ok(projected
+        .into_iter()
+        .map(|r| TimelineEntry {
+            id: r.id,
+            applied_at: r.applied_at,
+            kind: r.kind,
+            git_sha: r.git_sha.map(pbps_model::Text::from),
+            plan_checksum: r.plan_checksum,
+            operator: r.operator,
+            reason: r.reason.map(pbps_model::Text::from),
+            state: match r.state {
+                // A version this build does not read, refused before the
+                // JSON fallback ever runs — see [`ProjectedRow`]'s doc
+                // comment on why this is neither `Some(Ok(_))` nor `None`.
+                Some(Err(e)) => Err(e),
+                Some(Ok(state)) => Ok(state),
+                // The fallback query answered for every id it was asked
+                // about; a legacy id missing from its answer means the row
+                // left the ledger between the two queries (a concurrent
+                // `state prune`), not that it was ever malformed or denied.
+                None => legacy.remove(&r.id).unwrap_or_else(|| {
+                    Err(Unreadable::Malformed(
+                        "this row's state_json could not be re-read; it may have been \
+                         pruned while the timeline was being read"
+                            .to_owned(),
+                    ))
+                }),
+            },
+        })
+        .collect())
 }
 
 /// Who holds the deployment lock, if anyone.
