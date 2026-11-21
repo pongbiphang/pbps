@@ -1190,491 +1190,22 @@ pub(crate) fn diff_partial_rebuilding(
 
     crate::row_defaults::catalog(&mut planned, base, declared, &hints.row_guard_defaults);
 
-    let (create_rank, drop_rank) = module_ranks(base, declared, dialect, &module_deps);
-    // The tiebreaker within an ordering class is the table name, then the
-    // change's rendering. Debug output alone would sort by uid, which is random
-    // at mint time — the plan would be correct but differently ordered per
-    // project, and a reviewer diffing two plan.sql files would see noise.
-    //
-    // `subject()` does not speak for one side consistently: `RenameTable` and
-    // `RenameRole` answer with the name the object is losing, everything else
-    // with the name it will have. Two changes to one object are therefore
-    // sorted against two different spellings of it, and the alphabet — not the
-    // dependency — decides which wins. Anything with a real order between them
-    // belongs in ordering classes or explicit dependency edges; this
-    // tiebreaker cannot express it.
-    let (attach_parents, data_rank) = attach_parents_and_data_rank(&planned, declared);
-    // Roles that are dropped together are ordered parent before member.
-    let role_rank = member_depth(&planned);
-    let tables_claiming_a_column_name = column_name_claims(&planned);
-    // Whether this drop can be what frees a name a `RenameColumn` above is
-    // waiting for. A column drop and nothing else: no other change gives up a
-    // column name.
-    let frees_a_renamed_column = |c: &Change| -> bool {
-        match c {
-            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
-            | Change::Index(IndexChange::BuildPartitionedIndex(_))
-            | Change::Partition(PartitionChange::CopyTableRows(_))
-            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => false,
-            Change::Column(ColumnChange::DropColumn { column, .. }) => {
-                tables_claiming_a_column_name.contains(&column.table)
-            }
-            Change::Table(_)
-            | Change::Partition(PartitionChange::DetachPartition { .. })
-            | Change::Partition(PartitionChange::AttachPartition { .. })
-            | Change::Column(ColumnChange::AddColumn { .. })
-            | Change::Column(ColumnChange::RenameColumn { .. })
-            | Change::Column(ColumnChange::AlterColumnType { .. })
-            | Change::Column(ColumnChange::AlterColumnNullability { .. })
-            | Change::Column(ColumnChange::AlterColumnDefault { .. })
-            | Change::Column(ColumnChange::AlterColumnExpression { .. })
-            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
-            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
-            | Change::TableProperty(_)
-            | Change::Constraint(_)
-            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
-            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
-            | Change::Policy(_)
-            | Change::Index(IndexChange::AddIndex { .. })
-            | Change::Column(ColumnChange::AddComputedColumn { .. })
-            | Change::Column(ColumnChange::DropComputedColumn { .. })
-            | Change::Index(IndexChange::DropIndex { .. })
-            | Change::Row(_)
-            | Change::Module(_)
-            | Change::TypeValue(_)
-            | Change::Role(_)
-            | Change::Type(_)
-            | Change::Search(_)
-            | Change::Extension(_)
-            | Change::Permission(_) => false,
-        }
-    };
-    let chain_depth = rename_chain_depths(&planned, &mut errs);
-    // The class, and a rank inside it, so a change can sit between two
-    // classes without a new ordinal shifting every one below it — the cost
-    // `order_key`'s own doc names.
-    let generated_in_base = generated_columns_in_base(base, &index);
-    let row_tables = row_change_tables(&planned);
-    let identified = identities_put_on(planned.iter().map(|p| &p.change));
-    let inserted = tables_with_inserts(planned.iter().map(|p| &p.change));
-    let late = numbering_after_deletes(planned.iter().map(|p| &p.change));
-    let installed = numbering_put_on(planned.iter().map(|p| &p.change));
-    let held_back = columns_held_back(&planned);
-    let bounds_first = columns_whose_bounds_go_first(&planned, dialect);
-    let early_release = sequence_release_ranks(&planned, &held_back, &mut errs);
-    let late_attach = late_attach_ranks(declared, &attach_parents, &row_tables, &data_rank);
-    let follows_late_attach = |c: &Change| -> bool {
-        if let Change::Partition(PartitionChange::SetPartitionDefault { table, .. })
-        | Change::Partition(PartitionChange::SetPartitionNotNull { table, .. })
-        | Change::TableProperty(TablePropertyChange::SetTablePersistence { table, .. })
-        | Change::TableProperty(TablePropertyChange::SetStorageParameters { table, .. })
-        | Change::Index(IndexChange::SetIndexStorageParameters { table, .. }) = c
-        {
-            late_attach.contains_key(table)
-        } else {
-            false
-        }
-    };
-    // A function a computed column calls is dropped after the column, by a
-    // connected plan's pass over the catalog's own edges
-    // (`order_computed_by_edges`, DEC-1431.1). An offline plan is never
-    // applied, and a text scan here took one function for another (#1174
-    // review), so the differ moves nothing for it.
-    let (fk_graph, deepest) = persistence_fk_graph(&planned, declared);
-    let parent_moved = parent_columns_moved(&planned);
-    let parent_columns_change = parents_with_column_changes(&planned, declared);
-    let moved_out_of = defaults_moved_out_of(&planned);
-    let follows_its_parent = |c: &Change| -> bool {
-        let (Change::Partition(PartitionChange::SetPartitionDefault { table, column, .. })
-        | Change::Partition(PartitionChange::SetPartitionNotNull { table, column, .. })) = c
-        else {
-            return false;
-        };
-        declared
-            .schema
-            .tables
-            .get(table)
-            .and_then(|t| t.partition_of.as_ref())
-            .is_some_and(|of| parent_moved.contains(&(of.parent.clone(), column.clone())))
-    };
-    let (type_rank, drop_type_rank) = domain_type_ranks(base, declared, &mut errs);
-    let sort_class = |c: &Change| -> (u8, usize) {
-        if matches!(
-            c,
-            Change::Type(TypeChange::CreateType { .. })
-                | Change::Search(SearchChange::CreateSearch { .. })
-                | Change::Search(SearchChange::AlterSearchMapping { .. })
-                | Change::Search(SearchChange::AlterSearchDictionary { .. })
-                | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
-                | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
-                | Change::TypeValue(TypeValueChange::EnumRebuild {
-                    step: pbps_model::EnumRebuildStep::Create { .. },
-                    ..
-                })
-        ) {
-            return (7, 0);
-        }
-        // The columns move and the type is swapped among the type-changing
-        // alterations of class 9, ranked with a retype (DEC-1635.7).
-        if matches!(
-            c,
-            Change::TypeValue(TypeValueChange::EnumRebuild {
-                step: pbps_model::EnumRebuildStep::Retype { .. }
-                    | pbps_model::EnumRebuildStep::Swap { .. },
-                ..
-            })
-        ) {
-            return (COLUMN_ALTERATIONS, 1);
-        }
-
-        // After every module and its PUBLIC decision, then policies before
-        // either flag. Keep the established class ordinals (DEC-1172.1).
-        if matches!(c, Change::Policy(PolicyChange::CreatePolicy { .. })) {
-            return (14, 2);
-        }
-        if matches!(c, Change::Policy(PolicyChange::SetRowSecurity { .. })) {
-            return (14, 3);
-        }
-        if let Change::Column(ColumnChange::AlterColumnNumbering { column, .. }) = c
-            && bounds_first.contains(column)
-        {
-            return (COLUMN_ALTERATIONS, 0);
-        }
-        if let Change::Partition(PartitionChange::AttachPartition { table, .. }) = c
-            && late_attach.contains_key(table)
-        {
-            return (ROW_DELETIONS - 1, 1);
-        }
-        if follows_late_attach(c) {
-            return (ROW_DELETIONS - 1, 2);
-        }
-        // A DEFAULT partition's own NOT NULL, tightened in a plan that moves
-        // rows out of it, comes after every create that moves them, whatever
-        // class the create lands in (7, or (9, 5) under a parent whose columns
-        // change): the rows the move takes may be the ones holding NULL there,
-        // and the engine scans what is left. Its own checks and uniques are of
-        // class 13, after every create already (#1763 review).
-        if let Change::Partition(PartitionChange::SetPartitionNotNull {
-            table,
-            not_null: true,
-            ..
-        }) = c
-            && moved_out_of.contains(table)
-        {
-            return (COLUMN_ALTERATIONS, 6);
-        }
-        if follows_its_parent(c) {
-            return (COLUMN_ALTERATIONS, 4);
-        }
-        if let Change::TableProperty(TablePropertyChange::SetTablePersistence {
-            table,
-            unlogged,
-            ..
-        }) = c
-        {
-            let depth = fk_graph.as_ref().map_or(0, |g| g.depth(table));
-            return (
-                COLUMN_ALTERATIONS,
-                10 + if *unlogged { deepest - depth } else { depth },
-            );
-        }
-        // A replica identity whose target stands before the plan is set
-        // first, under the table's old name: before the drops of class 2 can
-        // take its old index, which would leave the table identifying no row
-        // (DEC-1444.1).
-        if let Change::TableProperty(TablePropertyChange::SetReplicaIdentity { uid, to, .. }) = c
-            && early_identity.contains(&(uid.clone(), to.clone()))
-        {
-            return (0, 1);
-        }
-        // A tightening of a table whose rows this plan writes or deletes runs
-        // after them, at the end of the deletes' class: the rows may be what
-        // fills or removes its NULLs, and no row change needs the column NOT
-        // NULL first. Still before the additions of class 13, a primary key
-        // among them, which SQL Server refuses over a nullable column (#1367).
-        //
-        // An identity this plan puts on follows its tightening there, since
-        // the engine refuses one on a nullable column: after the deletes,
-        // which may remove the rows holding NULL. Any source put on follows
-        // them too, since it continues past the values left, and those a
-        // delete removes may be the greatest. The table's own inserts follow
-        // the source, since a declared row leaves the numbered column out to
-        // take its number. Where the plan inserts rows into the table and
-        // deletes none, the source, and an identity's tightening, stay in
-        // class 9 ahead of the inserts, where a referencing table's rows can
-        // still follow them (#1930 review).
-        let early =
-            |column: &ColumnRef| inserted.contains(&column.table) && !late.contains(&column.table);
-        if let Change::Column(ColumnChange::AlterColumnNullability {
-            column,
-            to_nullable: false,
-            ..
-        }) = c
-            && row_tables.contains(&column.table)
-            && !(identified.contains(column) && early(column))
-        {
-            return (ROW_DELETIONS, 2);
-        }
-        if let Change::Column(ColumnChange::AlterColumnNumbering { column, .. }) = c
-            && installed.contains(column)
-            && row_tables.contains(&column.table)
-            && !early(column)
-        {
-            return (ROW_DELETIONS, 3);
-        }
-        if let Change::Row(RowChange::InsertRow { table, .. }) = c
-            && late.contains(table)
-        {
-            return (ROW_DELETIONS, 4);
-        }
-        // An owned sequence given up, or renamed, frees its name before the
-        // tables and columns this plan creates, one of which may take it:
-        // after the drops of class 6, which free names too, and before
-        // `CreateTable` (#1930 review). None needs anything class 9 does
-        // first: giving one up drops a default and a sequence, a rename keeps
-        // the sequence, and a conversion to an identity needs the column
-        // `NOT NULL`, which a column this plan does not tighten already is.
-        // An identity put on a column retyped after it moves with it.
-        //
-        // Among them, a rename to a name another of them frees follows it,
-        // down the chain (#1930 review).
-        if let Change::Column(ColumnChange::AlterColumnNumbering { column, .. }) = c
-            && let Some(depth) = early_release.get(column)
-        {
-            return (6, 1 + depth);
-        }
-        // A generated column is dropped before the ordinary columns of its
-        // class, and added after every column change of the class beyond:
-        // the additions, and the in-place alterations of class 9. Measured,
-        // the engine refuses to drop a column a generated column reads,
-        // refuses a generation expression over a column that is not there yet,
-        // and refuses to retype one a generated column reads. A generated
-        // column never reads another, and nothing in class 9 needs one that is
-        // new, so one layer each way is the whole order (DEC-1168.1).
-        let drops_generated = matches!(c, Change::Column(ColumnChange::DropColumn { uid, .. }) if generated_in_base.contains(uid));
-        if frees_a_renamed_column(c) {
-            // The layer holds here too: every drop of a table that renames a
-            // column comes to this class, the generated one and its input
-            // alike, so the generated one keeps its place ahead.
-            if drops_generated {
-                return (2, 2);
-            }
-            // Between the constraint and index drops of class 2 — a column a
-            // check or an index names cannot be dropped while they stand —
-            // and the `RenameColumn` of class 3 that is waiting for its name.
-            //
-            // Measured on the pinned images, this is the difference between a
-            // reviewed plan and one the engine refuses: SQL Server answers
-            // `sp_rename` with `Msg 15335, The new name 'note' is already in
-            // use as a COLUMN name and would cause a duplicate that is not
-            // permitted`, PostgreSQL with `column "note" of relation "s"
-            // already exists` (DECISIONS 474, issue #398).
-            //
-            // Only the drop that frees a claimed name moves. A rename into a
-            // name nothing here gives up is refused by `resolve` as an
-            // occupied target and never reaches this sort, which is the
-            // property `a_single_revision_cannot_rename_into_an_occupied_baseline_name`
-            // holds.
-            return (2, 3);
-        }
-        if drops_generated {
-            return (order_key(c), 0);
-        }
-        if let Change::Column(ColumnChange::AddColumn { column, .. }) = c
-            && (match &column.value_source {
-                ValueSource::Generated(_) => true,
-                ValueSource::None
-                | ValueSource::Default(_)
-                | ValueSource::Identity(_)
-                | ValueSource::Sequence(_) => false,
-            })
-        {
-            return (COLUMN_ALTERATIONS, 2);
-        }
-        // A computed column comes down after every index and constraint drop
-        // of class 2, the ones that free a renamed column's name (2, 3)
-        // included, and goes up after every alteration of class 9: it reads
-        // the columns, in their final type, and nothing in either class reads
-        // it (#1174).
-        if matches!(c, Change::Column(ColumnChange::DropComputedColumn { .. })) {
-            return (2, 4);
-        }
-        // A package's own objects are what a column, a domain or a module of
-        // the plan may use (DEC-2447.12), and its create, update and move share
-        // the type class with them, so they go first inside it: nothing else
-        // there is ordered against them, and a tie would be decided by a random
-        // uid.
-        if matches!(
-            c,
-            Change::Extension(ExtensionChange::CreateExtension { .. })
-                | Change::Extension(ExtensionChange::UpdateExtension { .. })
-                | Change::Extension(ExtensionChange::SetExtensionSchema { .. })
-        ) {
-            return (order_key(c), 0);
-        }
-        if matches!(c, Change::Column(ColumnChange::AddComputedColumn { .. })) {
-            return (COLUMN_ALTERATIONS, 3);
-        }
-        // A detach comes after every table drop of its class: it claims the
-        // declared names of what it keeps, and a dropped table's index or
-        // key may be what holds one now. A drop claims no name, so nothing
-        // waits the other way (#1544).
-        if matches!(
-            c,
-            Change::Partition(PartitionChange::DetachPartition { .. })
-        ) {
-            return (order_key(c), 2);
-        }
-        // A partition is created after every parent, whose columns, keys and
-        // indexes the engine gives it as it is made (#1170). Under a parent
-        // whose columns this plan changes, after those changes too: its own
-        // default may name a column the parent adds, and a parent's default
-        // set or dropped afterwards would overwrite its own (#1692 review).
-        if let Change::Table(TableChange::CreateTable { table, .. }) = c
-            && let Some(of) = &table.partition_of
-        {
-            if parent_columns_change.contains(&of.parent) {
-                return (COLUMN_ALTERATIONS, 5);
-            }
-            return (order_key(c), 2);
-        }
-        // A partitioned parent's index first in its class, before any
-        // partition's own: built after one, it would take it as its clone
-        // (#1737 review, DEC-1688.1). First rather than the partition's own
-        // last, which would put it after a replica identity naming it. A
-        // parent's index reads only its columns, all of earlier classes.
-        if let Change::Index(IndexChange::AddIndex { table, .. }) = c
-            && declared
-                .schema
-                .tables
-                .get(table)
-                .is_some_and(|t| t.partition_by.is_some())
-        {
-            return (order_key(c), 0);
-        }
-        if let Change::Column(ColumnChange::RenameColumn { table, from, .. }) = c {
-            let depth = chain_depth
-                .get(&(table.clone(), from.clone()))
-                .copied()
-                .unwrap_or(0);
-            (order_key(c), 1 + depth)
-        } else {
-            (order_key(c), 1)
-        }
-    };
+    let (facts, mut planned, errs) = sort_facts(
+        planned,
+        base,
+        declared,
+        dialect,
+        module_deps,
+        index,
+        early_identity,
+        errs,
+    );
     // Cached: `sort_by_key` computed this key, `Debug` text and all, on both
     // sides of every comparison, a third of a 4,000-table plan's CPU
     // (#1908). The cache keeps equal keys in their original order, as the
     // stable sort did, so the order is the same.
-    let extension_rank = crate::extensions::depths(planned.iter().map(|p| &p.change));
-    let package_floor = package_floor_of(&planned, &extension_rank);
-    let (created_search, altered_search) = searches_in_the_plan(&planned);
-    let (search_rank, drop_search_rank) = search_ranks(
-        base,
-        declared,
-        package_floor,
-        &created_search,
-        &altered_search,
-    );
-    let domain_floor =
-        domain_floor_behind_searches(&planned, dialect, &created_search, &search_rank);
-    crate::order::normalization::sort_draft(&mut planned, |p| {
-        let (class, within) = sort_class(&p.change);
-        (
-            class,
-            within,
-            if let Change::Partition(PartitionChange::AttachPartition { table, .. }) = &p.change
-                && let Some(rank) = late_attach.get(table)
-            {
-                *rank
-            } else if let Change::Extension(ExtensionChange::CreateExtension { uid, .. })
-            | Change::Extension(ExtensionChange::DropExtension { uid, .. })
-            | Change::Extension(ExtensionChange::UpdateExtension { uid, .. }) = &p.change
-            {
-                // Behind the packages of this plan it requires, or that require
-                // it for a drop (DEC-2447.6, DEC-2447.8).
-                extension_rank.get(uid).copied().unwrap_or(0)
-            } else if let Change::Search(
-                SearchChange::CreateSearch { name, .. }
-                | SearchChange::AlterSearchMapping { name, .. }
-                | SearchChange::AlterSearchDictionary { name, .. },
-            ) = &p.change
-            {
-                // Behind the packages and the dictionaries of this plan it maps.
-                search_rank.get(name).copied().unwrap_or(0)
-            } else if let Change::Search(SearchChange::DropSearch { name, .. }) = &p.change {
-                -drop_search_rank.get(name).copied().unwrap_or(0)
-            } else if let Change::Extension(ExtensionChange::SetExtensionSchema { uid, .. }) =
-                &p.change
-            {
-                // One rank behind the package's own update, whose result the
-                // move starts from: the two rewrite one package, and the draft
-                // is what orders two writes (DEC-2447.11).
-                extension_rank.get(uid).copied().unwrap_or(0) + 1
-            } else {
-                dependency_rank(
-                    &p.change,
-                    &create_rank,
-                    &drop_rank,
-                    &data_rank,
-                    &role_rank,
-                    &type_rank,
-                    &drop_type_rank,
-                ) + if built_domain(&p.change).is_some() {
-                    package_floor.max(domain_floor)
-                } else {
-                    0
-                }
-            },
-            rebuild_subject(&p.change),
-            // Columns added to one table in the order they are declared:
-            // the engine appends each, so this is the table's column order,
-            // which a pull writes and a positional `INSERT` binds to. Left
-            // to the rendering below, the column's random uid decided it
-            // (#2080).
-            if let Change::Column(ColumnChange::AddColumn { table, name, .. }) = &p.change {
-                declared
-                    .schema
-                    .tables
-                    .get(table)
-                    .and_then(|t| t.columns.get_index_of(name))
-                    .unwrap_or(0)
-            } else {
-                0
-            },
-            tie_break_text(&p.change),
-        )
-    });
-    for cycle in crate::order::rename_order::order(&mut planned, base, &renames, dialect) {
-        errs.push(DiffError::TableRenameCycle { renames: cycle });
-    }
-    for (table, column, block) in
-        crate::order::last_column::order(&mut planned, base, declared, dialect)
-    {
-        errs.push(DiffError::LastColumnReplacementUnorderable {
-            table,
-            column,
-            block,
-        });
-    }
-    let mut changes = ChangeSet { changes: planned };
-    if let Err(reason) = crate::drop_requirements::assign(&mut changes, base.ids, declared.ids)
-        .and_then(|()| crate::drop_requirements::validate(&changes, base.ids, declared.ids))
-    {
-        errs.push(DiffError::DropRequirement { reason });
-    }
-    // Replacement risk belongs to both policy parts, including in partial
-    // reports. Reuse the same UID/name pairing as final plan admission.
-    let risks = crate::order::generated::risks(&changes, declared.ids, dialect);
-    for (part, risks) in changes.changes.iter_mut().zip(risks) {
-        part.risks = risks;
-    }
-    errs.extend(crate::enum_labels::unsafe_uses(&changes, declared, dialect));
-    Diffed {
-        changes,
-        errors: errs,
-    }
+    crate::order::normalization::sort_draft(&mut planned, |p| facts.key(p));
+    finish_sort(planned, base, declared, dialect, renames, errs)
 }
 
 /// The types phase of `diff_partial_rebuilding`: refusals for types that no
@@ -3409,6 +2940,655 @@ fn domain_floor_behind_searches(
         0
     };
     domain_floor
+}
+
+/// What the sort of `diff_partial_rebuilding` reads, built once by `sort_facts` before
+/// the sort takes the plan mutably. Every field is owned: a fact that borrows
+/// `planned` is only an input to another fact and cannot be kept here.
+struct SortFacts<'a> {
+    /// The tables a `RenameColumn` of this plan claims a column name on: `frees_a_renamed_column` reads it.
+    tables_claiming_a_column_name: BTreeSet<TableName>,
+    /// The uids of the base's generated columns: `class` puts their drops first in their class.
+    generated_in_base: BTreeSet<pbps_model::Uid>,
+    /// The tables this plan writes rows into or deletes rows from: `class` orders the tightening and the numbering of their columns after the rows.
+    row_tables: BTreeSet<TableName>,
+    /// The columns this plan puts an identity on: `class` leaves the tightening of one ahead of the inserts of a table that deletes no rows.
+    identified: BTreeSet<ColumnRef>,
+    /// The tables this plan inserts rows into: `class` reads it with `late`.
+    inserted: BTreeSet<TableName>,
+    /// The tables a plan puts a numbering source on and both deletes and inserts rows of: `class` orders their inserts after the source.
+    late: BTreeSet<TableName>,
+    /// The columns this plan puts a numbering source on: `class` orders them after the deletes.
+    installed: BTreeSet<ColumnRef>,
+    /// The identity columns whose sequence bounds are retuned before their retype: `class` puts their numbering change first.
+    bounds_first: BTreeSet<ColumnRef>,
+    /// How deep each owned-sequence release sits in its chain of renames: `class` ranks it by that.
+    early_release: BTreeMap<ColumnRef, usize>,
+    /// The attached partitions that wait among the row changes, with the rank of their parent: `class` and `key` read it.
+    late_attach: BTreeMap<TableName, isize>,
+    /// The foreign-key graph a persistence switch is ordered by, none without a switch: `class` reads it.
+    fk_graph: Option<ForeignKeyGraph<'a>>,
+    /// The depth of the deepest table of `fk_graph`: `class` reads it for a switch to unlogged.
+    deepest: usize,
+    /// The columns of a parent whose default, numbering source or NULL-ness this plan changes: `follows_its_parent` reads it.
+    parent_moved: BTreeSet<(TableName, ColumnName)>,
+    /// The partitioned parents whose columns this plan changes: `class` creates their partitions after those changes.
+    parent_columns_change: BTreeSet<TableName>,
+    /// The DEFAULT partitions a create of this plan moves rows out of: `class` orders their NOT NULL after those creates.
+    moved_out_of: BTreeSet<TableName>,
+    /// The replica identities whose target stands before the plan: `class` sets them first.
+    early_identity: BTreeSet<(Uid, Option<ReplicaIdentity>)>,
+    /// How many renames each `RenameColumn` waits on: `class` ranks it by that.
+    chain_depth: BTreeMap<Rename, usize>,
+    /// The declarations: `follows_its_parent`, `class` and `key` read the partitioning and the column order of their tables.
+    declared: Side<'a>,
+    /// The creation rank of each module among the modules: `key` ranks the module creates by it.
+    create_rank: BTreeMap<ModuleId, usize>,
+    /// The drop rank of each module among the modules: `key` ranks the module drops by it.
+    drop_rank: BTreeMap<ModuleId, usize>,
+    /// The rank of the tables that receive rows or attaches: `key` ranks their changes by it.
+    data_rank: BTreeMap<TableName, usize>,
+    /// How deep each role sits among the roles dropped together: `key` drops a parent before its members.
+    role_rank: BTreeMap<pbps_model::RoleName, usize>,
+    /// How deep each type sits in its chain of base domains, in the declarations: `key` ranks the type changes by it.
+    type_rank: BTreeMap<pbps_model::TypeRef, isize>,
+    /// How deep each type sits in its chain of base domains, in the base: `key` ranks the type drops by it.
+    drop_type_rank: BTreeMap<pbps_model::TypeRef, isize>,
+    /// The depth of each package change among the packages it requires: `key` ranks the extension changes by it.
+    extension_rank: BTreeMap<pbps_model::Uid, isize>,
+    /// The depth of each search object among the references in the declarations: `key` ranks the search changes by it.
+    search_rank: BTreeMap<pbps_model::SearchRef, isize>,
+    /// The depth of each search object among the references in the base: `key` ranks the search drops by it.
+    drop_search_rank: BTreeMap<pbps_model::SearchRef, isize>,
+    /// The rank behind the last package change of the plan: `key` adds it to the rank of a created domain.
+    package_floor: isize,
+    /// The rank the created domains that name a created search object sort behind: `key` adds it to their rank.
+    domain_floor: isize,
+}
+
+impl SortFacts<'_> {
+    /// Whether `c` is the drop that frees a column name a `RenameColumn` of this plan claims:
+    /// `class` asks it of every change.
+    // Whether this drop can be what frees a name a `RenameColumn` above is
+    // waiting for. A column drop and nothing else: no other change gives up a
+    // column name.
+    fn frees_a_renamed_column(&self, c: &Change) -> bool {
+        match c {
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => false,
+            Change::Column(ColumnChange::DropColumn { column, .. }) => {
+                self.tables_claiming_a_column_name.contains(&column.table)
+            }
+            Change::Table(_)
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Column(ColumnChange::AddColumn { .. })
+            | Change::Column(ColumnChange::RenameColumn { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+            | Change::TableProperty(_)
+            | Change::Constraint(_)
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(_)
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(_)
+            | Change::Module(_)
+            | Change::TypeValue(_)
+            | Change::Role(_)
+            | Change::Type(_)
+            | Change::Search(_)
+            | Change::Extension(_)
+            | Change::Permission(_) => false,
+        }
+    }
+
+    /// Whether `c` is a setting on a partition that waits among the row changes: `class` asks it.
+    fn follows_late_attach(&self, c: &Change) -> bool {
+        if let Change::Partition(PartitionChange::SetPartitionDefault { table, .. })
+        | Change::Partition(PartitionChange::SetPartitionNotNull { table, .. })
+        | Change::TableProperty(TablePropertyChange::SetTablePersistence { table, .. })
+        | Change::TableProperty(TablePropertyChange::SetStorageParameters { table, .. })
+        | Change::Index(IndexChange::SetIndexStorageParameters { table, .. }) = c
+        {
+            self.late_attach.contains_key(table)
+        } else {
+            false
+        }
+    }
+
+    /// Whether `c` sets a partition's default or NOT NULL on a column its parent's change moves:
+    /// `class` asks it.
+    fn follows_its_parent(&self, c: &Change) -> bool {
+        let Self {
+            declared,
+            parent_moved,
+            ..
+        } = self;
+        let (Change::Partition(PartitionChange::SetPartitionDefault { table, column, .. })
+        | Change::Partition(PartitionChange::SetPartitionNotNull { table, column, .. })) = c
+        else {
+            return false;
+        };
+        declared
+            .schema
+            .tables
+            .get(table)
+            .and_then(|t| t.partition_of.as_ref())
+            .is_some_and(|of| parent_moved.contains(&(of.parent.clone(), column.clone())))
+    }
+
+    /// The ordering class of `c` and a rank inside it: the first two parts of the sort key.
+    // The class, and a rank inside it, so a change can sit between two
+    // classes without a new ordinal shifting every one below it — the cost
+    // `order_key`'s own doc names.
+    fn class(&self, c: &Change) -> (u8, usize) {
+        let Self {
+            generated_in_base,
+            row_tables,
+            identified,
+            inserted,
+            late,
+            installed,
+            bounds_first,
+            early_release,
+            late_attach,
+            fk_graph,
+            deepest,
+            parent_columns_change,
+            moved_out_of,
+            early_identity,
+            chain_depth,
+            declared,
+            ..
+        } = self;
+        if matches!(
+            c,
+            Change::Type(TypeChange::CreateType { .. })
+                | Change::Search(SearchChange::CreateSearch { .. })
+                | Change::Search(SearchChange::AlterSearchMapping { .. })
+                | Change::Search(SearchChange::AlterSearchDictionary { .. })
+                | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
+                | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
+                | Change::TypeValue(TypeValueChange::EnumRebuild {
+                    step: pbps_model::EnumRebuildStep::Create { .. },
+                    ..
+                })
+        ) {
+            return (7, 0);
+        }
+        // The columns move and the type is swapped among the type-changing
+        // alterations of class 9, ranked with a retype (DEC-1635.7).
+        if matches!(
+            c,
+            Change::TypeValue(TypeValueChange::EnumRebuild {
+                step: pbps_model::EnumRebuildStep::Retype { .. }
+                    | pbps_model::EnumRebuildStep::Swap { .. },
+                ..
+            })
+        ) {
+            return (COLUMN_ALTERATIONS, 1);
+        }
+
+        // After every module and its PUBLIC decision, then policies before
+        // either flag. Keep the established class ordinals (DEC-1172.1).
+        if matches!(c, Change::Policy(PolicyChange::CreatePolicy { .. })) {
+            return (14, 2);
+        }
+        if matches!(c, Change::Policy(PolicyChange::SetRowSecurity { .. })) {
+            return (14, 3);
+        }
+        if let Change::Column(ColumnChange::AlterColumnNumbering { column, .. }) = c
+            && bounds_first.contains(column)
+        {
+            return (COLUMN_ALTERATIONS, 0);
+        }
+        if let Change::Partition(PartitionChange::AttachPartition { table, .. }) = c
+            && late_attach.contains_key(table)
+        {
+            return (ROW_DELETIONS - 1, 1);
+        }
+        if self.follows_late_attach(c) {
+            return (ROW_DELETIONS - 1, 2);
+        }
+        // A DEFAULT partition's own NOT NULL, tightened in a plan that moves
+        // rows out of it, comes after every create that moves them, whatever
+        // class the create lands in (7, or (9, 5) under a parent whose columns
+        // change): the rows the move takes may be the ones holding NULL there,
+        // and the engine scans what is left. Its own checks and uniques are of
+        // class 13, after every create already (#1763 review).
+        if let Change::Partition(PartitionChange::SetPartitionNotNull {
+            table,
+            not_null: true,
+            ..
+        }) = c
+            && moved_out_of.contains(table)
+        {
+            return (COLUMN_ALTERATIONS, 6);
+        }
+        if self.follows_its_parent(c) {
+            return (COLUMN_ALTERATIONS, 4);
+        }
+        if let Change::TableProperty(TablePropertyChange::SetTablePersistence {
+            table,
+            unlogged,
+            ..
+        }) = c
+        {
+            let depth = fk_graph.as_ref().map_or(0, |g| g.depth(table));
+            return (
+                COLUMN_ALTERATIONS,
+                10 + if *unlogged { deepest - depth } else { depth },
+            );
+        }
+        // A replica identity whose target stands before the plan is set
+        // first, under the table's old name: before the drops of class 2 can
+        // take its old index, which would leave the table identifying no row
+        // (DEC-1444.1).
+        if let Change::TableProperty(TablePropertyChange::SetReplicaIdentity { uid, to, .. }) = c
+            && early_identity.contains(&(uid.clone(), to.clone()))
+        {
+            return (0, 1);
+        }
+        // A tightening of a table whose rows this plan writes or deletes runs
+        // after them, at the end of the deletes' class: the rows may be what
+        // fills or removes its NULLs, and no row change needs the column NOT
+        // NULL first. Still before the additions of class 13, a primary key
+        // among them, which SQL Server refuses over a nullable column (#1367).
+        //
+        // An identity this plan puts on follows its tightening there, since
+        // the engine refuses one on a nullable column: after the deletes,
+        // which may remove the rows holding NULL. Any source put on follows
+        // them too, since it continues past the values left, and those a
+        // delete removes may be the greatest. The table's own inserts follow
+        // the source, since a declared row leaves the numbered column out to
+        // take its number. Where the plan inserts rows into the table and
+        // deletes none, the source, and an identity's tightening, stay in
+        // class 9 ahead of the inserts, where a referencing table's rows can
+        // still follow them (#1930 review).
+        let early =
+            |column: &ColumnRef| inserted.contains(&column.table) && !late.contains(&column.table);
+        if let Change::Column(ColumnChange::AlterColumnNullability {
+            column,
+            to_nullable: false,
+            ..
+        }) = c
+            && row_tables.contains(&column.table)
+            && !(identified.contains(column) && early(column))
+        {
+            return (ROW_DELETIONS, 2);
+        }
+        if let Change::Column(ColumnChange::AlterColumnNumbering { column, .. }) = c
+            && installed.contains(column)
+            && row_tables.contains(&column.table)
+            && !early(column)
+        {
+            return (ROW_DELETIONS, 3);
+        }
+        if let Change::Row(RowChange::InsertRow { table, .. }) = c
+            && late.contains(table)
+        {
+            return (ROW_DELETIONS, 4);
+        }
+        // An owned sequence given up, or renamed, frees its name before the
+        // tables and columns this plan creates, one of which may take it:
+        // after the drops of class 6, which free names too, and before
+        // `CreateTable` (#1930 review). None needs anything class 9 does
+        // first: giving one up drops a default and a sequence, a rename keeps
+        // the sequence, and a conversion to an identity needs the column
+        // `NOT NULL`, which a column this plan does not tighten already is.
+        // An identity put on a column retyped after it moves with it.
+        //
+        // Among them, a rename to a name another of them frees follows it,
+        // down the chain (#1930 review).
+        if let Change::Column(ColumnChange::AlterColumnNumbering { column, .. }) = c
+            && let Some(depth) = early_release.get(column)
+        {
+            return (6, 1 + depth);
+        }
+        // A generated column is dropped before the ordinary columns of its
+        // class, and added after every column change of the class beyond:
+        // the additions, and the in-place alterations of class 9. Measured,
+        // the engine refuses to drop a column a generated column reads,
+        // refuses a generation expression over a column that is not there yet,
+        // and refuses to retype one a generated column reads. A generated
+        // column never reads another, and nothing in class 9 needs one that is
+        // new, so one layer each way is the whole order (DEC-1168.1).
+        let drops_generated = matches!(c, Change::Column(ColumnChange::DropColumn { uid, .. }) if generated_in_base.contains(uid));
+        if self.frees_a_renamed_column(c) {
+            // The layer holds here too: every drop of a table that renames a
+            // column comes to this class, the generated one and its input
+            // alike, so the generated one keeps its place ahead.
+            if drops_generated {
+                return (2, 2);
+            }
+            // Between the constraint and index drops of class 2 — a column a
+            // check or an index names cannot be dropped while they stand —
+            // and the `RenameColumn` of class 3 that is waiting for its name.
+            //
+            // Measured on the pinned images, this is the difference between a
+            // reviewed plan and one the engine refuses: SQL Server answers
+            // `sp_rename` with `Msg 15335, The new name 'note' is already in
+            // use as a COLUMN name and would cause a duplicate that is not
+            // permitted`, PostgreSQL with `column "note" of relation "s"
+            // already exists` (DECISIONS 474, issue #398).
+            //
+            // Only the drop that frees a claimed name moves. A rename into a
+            // name nothing here gives up is refused by `resolve` as an
+            // occupied target and never reaches this sort, which is the
+            // property `a_single_revision_cannot_rename_into_an_occupied_baseline_name`
+            // holds.
+            return (2, 3);
+        }
+        if drops_generated {
+            return (order_key(c), 0);
+        }
+        if let Change::Column(ColumnChange::AddColumn { column, .. }) = c
+            && (match &column.value_source {
+                ValueSource::Generated(_) => true,
+                ValueSource::None
+                | ValueSource::Default(_)
+                | ValueSource::Identity(_)
+                | ValueSource::Sequence(_) => false,
+            })
+        {
+            return (COLUMN_ALTERATIONS, 2);
+        }
+        // A computed column comes down after every index and constraint drop
+        // of class 2, the ones that free a renamed column's name (2, 3)
+        // included, and goes up after every alteration of class 9: it reads
+        // the columns, in their final type, and nothing in either class reads
+        // it (#1174).
+        if matches!(c, Change::Column(ColumnChange::DropComputedColumn { .. })) {
+            return (2, 4);
+        }
+        // A package's own objects are what a column, a domain or a module of
+        // the plan may use (DEC-2447.12), and its create, update and move share
+        // the type class with them, so they go first inside it: nothing else
+        // there is ordered against them, and a tie would be decided by a random
+        // uid.
+        if matches!(
+            c,
+            Change::Extension(ExtensionChange::CreateExtension { .. })
+                | Change::Extension(ExtensionChange::UpdateExtension { .. })
+                | Change::Extension(ExtensionChange::SetExtensionSchema { .. })
+        ) {
+            return (order_key(c), 0);
+        }
+        if matches!(c, Change::Column(ColumnChange::AddComputedColumn { .. })) {
+            return (COLUMN_ALTERATIONS, 3);
+        }
+        // A detach comes after every table drop of its class: it claims the
+        // declared names of what it keeps, and a dropped table's index or
+        // key may be what holds one now. A drop claims no name, so nothing
+        // waits the other way (#1544).
+        if matches!(
+            c,
+            Change::Partition(PartitionChange::DetachPartition { .. })
+        ) {
+            return (order_key(c), 2);
+        }
+        // A partition is created after every parent, whose columns, keys and
+        // indexes the engine gives it as it is made (#1170). Under a parent
+        // whose columns this plan changes, after those changes too: its own
+        // default may name a column the parent adds, and a parent's default
+        // set or dropped afterwards would overwrite its own (#1692 review).
+        if let Change::Table(TableChange::CreateTable { table, .. }) = c
+            && let Some(of) = &table.partition_of
+        {
+            if parent_columns_change.contains(&of.parent) {
+                return (COLUMN_ALTERATIONS, 5);
+            }
+            return (order_key(c), 2);
+        }
+        // A partitioned parent's index first in its class, before any
+        // partition's own: built after one, it would take it as its clone
+        // (#1737 review, DEC-1688.1). First rather than the partition's own
+        // last, which would put it after a replica identity naming it. A
+        // parent's index reads only its columns, all of earlier classes.
+        if let Change::Index(IndexChange::AddIndex { table, .. }) = c
+            && declared
+                .schema
+                .tables
+                .get(table)
+                .is_some_and(|t| t.partition_by.is_some())
+        {
+            return (order_key(c), 0);
+        }
+        if let Change::Column(ColumnChange::RenameColumn { table, from, .. }) = c {
+            let depth = chain_depth
+                .get(&(table.clone(), from.clone()))
+                .copied()
+                .unwrap_or(0);
+            (order_key(c), 1 + depth)
+        } else {
+            (order_key(c), 1)
+        }
+    }
+
+    /// The sort key of `p`: its class, a rank among the dependencies of its kind, then the
+    /// tiebreakers. `sort_draft` calls it once per change.
+    // The tiebreaker within an ordering class is the table name, then the
+    // change's rendering. Debug output alone would sort by uid, which is random
+    // at mint time — the plan would be correct but differently ordered per
+    // project, and a reviewer diffing two plan.sql files would see noise.
+    //
+    // `subject()` does not speak for one side consistently: `RenameTable` and
+    // `RenameRole` answer with the name the object is losing, everything else
+    // with the name it will have. Two changes to one object are therefore
+    // sorted against two different spellings of it, and the alphabet — not the
+    // dependency — decides which wins. Anything with a real order between them
+    // belongs in ordering classes or explicit dependency edges; this
+    // tiebreaker cannot express it.
+    fn key(&self, p: &PlannedChange) -> (u8, usize, isize, String, usize, String) {
+        let (class, within) = self.class(&p.change);
+        (
+            class,
+            within,
+            if let Change::Partition(PartitionChange::AttachPartition { table, .. }) = &p.change
+                && let Some(rank) = self.late_attach.get(table)
+            {
+                *rank
+            } else if let Change::Extension(ExtensionChange::CreateExtension { uid, .. })
+            | Change::Extension(ExtensionChange::DropExtension { uid, .. })
+            | Change::Extension(ExtensionChange::UpdateExtension { uid, .. }) = &p.change
+            {
+                // Behind the packages of this plan it requires, or that require
+                // it for a drop (DEC-2447.6, DEC-2447.8).
+                self.extension_rank.get(uid).copied().unwrap_or(0)
+            } else if let Change::Search(
+                SearchChange::CreateSearch { name, .. }
+                | SearchChange::AlterSearchMapping { name, .. }
+                | SearchChange::AlterSearchDictionary { name, .. },
+            ) = &p.change
+            {
+                // Behind the packages and the dictionaries of this plan it maps.
+                self.search_rank.get(name).copied().unwrap_or(0)
+            } else if let Change::Search(SearchChange::DropSearch { name, .. }) = &p.change {
+                -self.drop_search_rank.get(name).copied().unwrap_or(0)
+            } else if let Change::Extension(ExtensionChange::SetExtensionSchema { uid, .. }) =
+                &p.change
+            {
+                // One rank behind the package's own update, whose result the
+                // move starts from: the two rewrite one package, and the draft
+                // is what orders two writes (DEC-2447.11).
+                self.extension_rank.get(uid).copied().unwrap_or(0) + 1
+            } else {
+                dependency_rank(
+                    &p.change,
+                    &self.create_rank,
+                    &self.drop_rank,
+                    &self.data_rank,
+                    &self.role_rank,
+                    &self.type_rank,
+                    &self.drop_type_rank,
+                ) + if built_domain(&p.change).is_some() {
+                    self.package_floor.max(self.domain_floor)
+                } else {
+                    0
+                }
+            },
+            rebuild_subject(&p.change),
+            // Columns added to one table in the order they are declared:
+            // the engine appends each, so this is the table's column order,
+            // which a pull writes and a positional `INSERT` binds to. Left
+            // to the rendering below, the column's random uid decided it
+            // (#2080).
+            if let Change::Column(ColumnChange::AddColumn { table, name, .. }) = &p.change {
+                self.declared
+                    .schema
+                    .tables
+                    .get(table)
+                    .and_then(|t| t.columns.get_index_of(name))
+                    .unwrap_or(0)
+            } else {
+                0
+            },
+            tie_break_text(&p.change),
+        )
+    }
+}
+
+/// The facts the sort reads, computed in the order the passes ran before the split:
+/// the three that push into `errs` are `rename_chain_depths`, `sequence_release_ranks`
+/// and `domain_type_ranks`, in that order. The plan and the list go in by value and
+/// come back, because the sort and the finish go on with them.
+#[allow(clippy::too_many_arguments)] // Each fact reads one of these; the parent function is allowed the same.
+fn sort_facts<'a>(
+    planned: Vec<PlannedChange>,
+    base: Side<'a>,
+    declared: Side<'a>,
+    dialect: &(impl Dialect + ?Sized),
+    module_deps: pbps_model::module::ModuleDeps,
+    index: Indexes<'a>,
+    early_identity: BTreeSet<(Uid, Option<ReplicaIdentity>)>,
+    mut errs: Vec<DiffError>,
+) -> (SortFacts<'a>, Vec<PlannedChange>, Vec<DiffError>) {
+    let (create_rank, drop_rank) = module_ranks(base, declared, dialect, &module_deps);
+    let (attach_parents, data_rank) = attach_parents_and_data_rank(&planned, declared);
+    // Roles that are dropped together are ordered parent before member.
+    let role_rank = member_depth(&planned);
+    let tables_claiming_a_column_name = column_name_claims(&planned);
+    let chain_depth = rename_chain_depths(&planned, &mut errs);
+    let generated_in_base = generated_columns_in_base(base, &index);
+    let row_tables = row_change_tables(&planned);
+    let identified = identities_put_on(planned.iter().map(|p| &p.change));
+    let inserted = tables_with_inserts(planned.iter().map(|p| &p.change));
+    let late = numbering_after_deletes(planned.iter().map(|p| &p.change));
+    let installed = numbering_put_on(planned.iter().map(|p| &p.change));
+    let held_back = columns_held_back(&planned);
+    let bounds_first = columns_whose_bounds_go_first(&planned, dialect);
+    let early_release = sequence_release_ranks(&planned, &held_back, &mut errs);
+    let late_attach = late_attach_ranks(declared, &attach_parents, &row_tables, &data_rank);
+    // A function a computed column calls is dropped after the column, by a
+    // connected plan's pass over the catalog's own edges
+    // (`order_computed_by_edges`, DEC-1431.1). An offline plan is never
+    // applied, and a text scan here took one function for another (#1174
+    // review), so the differ moves nothing for it.
+    let (fk_graph, deepest) = persistence_fk_graph(&planned, declared);
+    let parent_moved = parent_columns_moved(&planned);
+    let parent_columns_change = parents_with_column_changes(&planned, declared);
+    let moved_out_of = defaults_moved_out_of(&planned);
+    let (type_rank, drop_type_rank) = domain_type_ranks(base, declared, &mut errs);
+    let extension_rank = crate::extensions::depths(planned.iter().map(|p| &p.change));
+    let package_floor = package_floor_of(&planned, &extension_rank);
+    let (created_search, altered_search) = searches_in_the_plan(&planned);
+    let (search_rank, drop_search_rank) = search_ranks(
+        base,
+        declared,
+        package_floor,
+        &created_search,
+        &altered_search,
+    );
+    let domain_floor =
+        domain_floor_behind_searches(&planned, dialect, &created_search, &search_rank);
+    (
+        SortFacts {
+            tables_claiming_a_column_name,
+            generated_in_base,
+            row_tables,
+            identified,
+            inserted,
+            late,
+            installed,
+            bounds_first,
+            early_release,
+            late_attach,
+            fk_graph,
+            deepest,
+            parent_moved,
+            parent_columns_change,
+            moved_out_of,
+            early_identity,
+            chain_depth,
+            declared,
+            create_rank,
+            drop_rank,
+            data_rank,
+            role_rank,
+            type_rank,
+            drop_type_rank,
+            extension_rank,
+            search_rank,
+            drop_search_rank,
+            package_floor,
+            domain_floor,
+        },
+        planned,
+        errs,
+    )
+}
+
+/// What `diff_partial_rebuilding` does after the sort: the rename order and the
+/// last-column order, the drop requirements, the risks and the unsafe label uses.
+/// It pushes into `errs` in place: the order of `errors` is part of the result.
+fn finish_sort(
+    mut planned: Vec<PlannedChange>,
+    base: Side<'_>,
+    declared: Side<'_>,
+    dialect: &(impl Dialect + ?Sized),
+    renames: Renames,
+    mut errs: Vec<DiffError>,
+) -> Diffed {
+    for cycle in crate::order::rename_order::order(&mut planned, base, &renames, dialect) {
+        errs.push(DiffError::TableRenameCycle { renames: cycle });
+    }
+    for (table, column, block) in
+        crate::order::last_column::order(&mut planned, base, declared, dialect)
+    {
+        errs.push(DiffError::LastColumnReplacementUnorderable {
+            table,
+            column,
+            block,
+        });
+    }
+    let mut changes = ChangeSet { changes: planned };
+    if let Err(reason) = crate::drop_requirements::assign(&mut changes, base.ids, declared.ids)
+        .and_then(|()| crate::drop_requirements::validate(&changes, base.ids, declared.ids))
+    {
+        errs.push(DiffError::DropRequirement { reason });
+    }
+    // Replacement risk belongs to both policy parts, including in partial
+    // reports. Reuse the same UID/name pairing as final plan admission.
+    let risks = crate::order::generated::risks(&changes, declared.ids, dialect);
+    for (part, risks) in changes.changes.iter_mut().zip(risks) {
+        part.risks = risks;
+    }
+    errs.extend(crate::enum_labels::unsafe_uses(&changes, declared, dialect));
+    Diffed {
+        changes,
+        errors: errs,
+    }
 }
 
 /// What one comparison produced: the changes the differ could express, and the
