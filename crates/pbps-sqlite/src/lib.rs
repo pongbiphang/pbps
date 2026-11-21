@@ -27,6 +27,7 @@
 //! | [`catalog`] | 4 | the reader: pragmas, then a tokenizer for what only the stored text holds |
 //! | [`state`] | 5 | the ledger and the lock, as SQL |
 //! | [`preflight`] | 6 | checks before a plan runs |
+//! | [`rehearsal`], [`drop_requirements`] | 6 | the scratch a plan is rehearsed on, and what a statement does not check |
 //!
 //! The functions of those modules are synchronous and take a
 //! `pbps_db::sqlite::Connection`; the wiring (item 7) runs them on a blocking
@@ -38,6 +39,7 @@ use pbps_dialect::TransactionFraming;
 
 pub mod catalog;
 pub mod dialect;
+pub mod drop_requirements;
 pub mod emit;
 pub mod ident;
 pub mod keywords;
@@ -45,6 +47,7 @@ pub mod lexis;
 pub mod names;
 pub mod ordering;
 pub mod preflight;
+pub mod rehearsal;
 pub mod state;
 #[cfg(test)]
 mod tests;

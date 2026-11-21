@@ -108,7 +108,7 @@ rand       = "0.10"
 # 3.54 differ in 15 of 662 steps). `default-features = false` drops `cache`
 # (`hashlink`, unused) and `ffi-sqlite-wasm-rs`, a wasm-only package that
 # would still enter the lock file. Named in one file only, `pbps-db::sqlite`.
-rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled"] }
+rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled", "backup"] }
 
 serde_json = { version = "1", features = ["preserve_order"] }
 
