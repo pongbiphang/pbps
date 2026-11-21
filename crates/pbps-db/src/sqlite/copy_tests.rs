@@ -144,6 +144,38 @@ fn a_source_that_grew_past_the_limit_during_the_copy_is_refused_and_nothing_is_k
 }
 
 #[test]
+fn a_connection_set_to_wait_longer_still_stops_at_the_wait_given_and_keeps_its_setting() {
+    let (_dir, path) = file();
+    let c = source(&path);
+    c.set_busy_timeout(LONG).expect("the caller's own wait");
+    let other = open(&path);
+    other
+        .execute_batch("BEGIN EXCLUSIVE")
+        .expect("held by another connection");
+    let wait = Duration::from_millis(150);
+    let started = Instant::now();
+    let error = c.copy_to_memory(BIG, wait).expect_err("busy");
+    assert_eq!(error.server_error_code().as_deref(), Some("5"), "{error}");
+    assert!(started.elapsed() >= wait);
+    // The connection's own wait would have been `LONG`.
+    assert!(started.elapsed() < LONG / 2, "{:?}", started.elapsed());
+    let long = i64::try_from(LONG.as_millis()).expect("fits");
+    assert_eq!(
+        count(&c, "PRAGMA busy_timeout"),
+        long,
+        "put back after a failure"
+    );
+    other.execute_batch("ROLLBACK").expect("ended");
+    // Negative: free again it is copied, and the setting is still the caller's.
+    assert!(c.copy_to_memory(BIG, wait).is_ok());
+    assert_eq!(
+        count(&c, "PRAGMA busy_timeout"),
+        long,
+        "put back after a copy"
+    );
+}
+
+#[test]
 fn a_connection_inside_a_write_transaction_is_busy_after_the_wait_and_never_hangs() {
     for wal in [false, true] {
         let (_dir, path) = file();

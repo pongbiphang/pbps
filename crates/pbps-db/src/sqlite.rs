@@ -378,12 +378,19 @@ impl Connection {
     /// returns), is retried every 10 ms for `wait` and then fails with the
     /// library's busy code (5), so a caller's busy test answers. It never hangs.
     ///
-    /// This connection is not changed: no setting, no wait, no transaction. The
+    /// This connection is left as it was: no setting, no transaction, and its own
+    /// busy wait, which is zero while the copy is made, is put back. The
     /// copy is opened through the ordinary setup, so `foreign_keys` is on (the
     /// pragma is the connection's and is not copied).
     pub fn copy_to_memory(&self, limit: u64, wait: Duration) -> Result<Connection, DbError> {
         let deadline = std::time::Instant::now() + wait;
-        self.pinned(deadline, || {
+        // `wait` is the whole bound, and it is kept by the retries below. The
+        // library's own wait would run inside each read before a retry is
+        // asked, so a connection set to wait longer than `wait` would wait
+        // that long instead: it is zero while the copy is made, and put back.
+        let before = Duration::from_millis(self.number("busy_timeout")?);
+        self.set_busy_timeout(Duration::ZERO)?;
+        let copied = self.pinned(deadline, || {
             let (size, page_size) = (self.size()?, self.number("page_size")?);
             if size > limit {
                 return Err(DbError::Refused(format!(
@@ -391,7 +398,12 @@ impl Connection {
                 )));
             }
             self.copy_pages(page_size, limit / page_size, deadline)
-        })
+        });
+        // A copy that was made is not kept on a connection left changed.
+        let restored = self.set_busy_timeout(before);
+        let copy = copied?;
+        restored?;
+        Ok(copy)
     }
 
     /// Runs `work` while this connection holds a read lock on the database, so
@@ -406,7 +418,7 @@ impl Connection {
     ///
     /// Inside the caller's own transaction nothing is opened or closed. Outside
     /// one, a read transaction is opened and rolled back, and the connection is
-    /// left as it was. This connection's own wait is zero, and a writer that is
+    /// left as it was. The caller has set this connection's own wait to zero, and a writer that is
     /// committing makes even the first read busy: it is retried until `deadline`.
     fn pinned<T>(
         &self,
