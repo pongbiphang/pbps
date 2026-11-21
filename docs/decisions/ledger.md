@@ -1357,3 +1357,22 @@ Rejected:
 - **A list of dangers** (triggers, indexes, views). It is the open set DEC-313.1 refuses to maintain; the text and the catalog rows under a ledger name are closed.
 - **Reading `temp` as well.** Only the connection that made a `temp` object can see it, and the connection is this tool's.
 - **Checking the rows** (`proof`, `token`, the identifier, the sequence). They are data and the tables' own `CHECK`s bound the ones that can be bounded; a check of them is the record problem DEC-313.1 leaves to the trust model.
+
+
+<a id="dec-2988-1"></a>
+
+**DEC-2988.1. The ledger flow that is the same on every engine is written once, in `pbps-db`; an engine supplies whole statements and its codes as one `LedgerSpec`, and the steps that are its own are hooks (#2988).** `pbps_pg::state` and `pbps_mssql::state` held two copies of the reads, the timeline, the writes and the lock, kept in step by comments in one that pointed at the other for the reasons, and a third engine was about to add a third copy. The copies differed in the statement sent, in a few codes, and in whether a tolerated failure needs a savepoint.
+
+- **The flow lives in `pbps_db::ledger::flow`, beside the ledger's types.** It needs `Conn`, `Row`, `Param` and `LedgerError`, which `pbps-db` owns. `pbps-dialect` has no connection, and `pbps-db` depends on it, not the reverse. `pbps-db` still holds no engine SQL: every statement is text in its engine's crate and reaches the flow as a value.
+- **A statement is the engine's whole text.** The engines differ in shape, not in spelling: `TOP (n)` goes before the column list and `LIMIT n` after the ordering, `OUTPUT INSERTED.id` before `VALUES` and `RETURNING id` after it, and `ONLY` exists on one of them. A whole text stays reviewable beside the measurement that explains it, and a rule such as "no statement interpolates a value" still reads a statement and not the pieces of one. A statement whose length depends on a count is a function of that count.
+- **What differs by a value is a field of the spec, not a branch on the engine.** These are the code for a missing table, how a row limit is bound, the session-lookup text, and the savepoint. An engine on which a failed statement aborts the transaction supplies the savepoint's statements and the code for "no transaction"; another supplies none, and the same guard then sends nothing. The flow never asks which engine it runs on.
+- **The spec lists its own statements.** `LedgerSpec::statements` names every field, so a statement added to the spec does not compile until it is listed, and each engine's statement tests read that list: every statement names its qualified table and binds every value.
+- **The steps the flow calls and does not contain are three hooks:** `ensure_tables` (creation, its race, the trust or misspelling check, the migration), `refuse_untrusted` (asked before the deletes of `prune` and `unlock`) and `timeline_columns_present`. They are a small trait beside the spec and arrive with the flow that calls them; the reads need none.
+- **The engines keep their public functions.** `pbps_pg::state::latest(conn)` and the like stay, as one call into the flow with the engine's spec, with the engine's measured reasons in their comments. No caller and no live test changes; both live suites passing unchanged is the acceptance of each step.
+- **The stop point of #2988 is recorded as not met.** Measured before any code, the flow that is the same is about a third of PostgreSQL's module and somewhat over half of SQL Server's, so neither module ends "well under half". The larger part of each is that engine's own safety work. The maintainer chose to go ahead: a fix to the flow is then made once, and a new engine writes no flow, only its statements, its codes and its own hazards.
+
+Rejected:
+- **Statements built from fragments** (a table, a placeholder style, a timestamp rendering, a limit clause). It removes more lines and puts each engine's grammar in `pbps-db`; an engine with neither `RETURNING` nor `OUTPUT` would then need a change to the builder and to the flow.
+- **Default ledger methods on the `Engine` trait.** The trait would then own the flow and every engine's spec would have to be reachable through it; a free function that takes the spec leaves the trait as it is.
+- **The flow in `pbps-dialect`.** It has no connection.
+- **A trait with one method per statement.** Plain data can be listed and tested as data; methods cannot be enumerated, so the statement tests would go back to hand-kept lists.

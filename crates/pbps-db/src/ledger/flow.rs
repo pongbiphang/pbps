@@ -1,18 +1,32 @@
-//! The part of the ledger flow that is the same on every engine and needs no
-//! statement: decoding a row, the bound values of an insert, and the clipping
-//! that keeps a value inside its column.
+//! The ledger flow that is the same on every engine.
+//!
+//! This file is the part that needs no statement: decoding a row, the bound
+//! values of an insert, and the clipping that keeps a value inside its column.
+//! The submodules are the part that talks to the server: [`LedgerSpec`] is
+//! what an engine supplies, [`Recoverable`] is the guard around a statement
+//! whose failure is an answer, and the reads are the functions re-exported
+//! below.
 //!
 //! # Why this is here and the statements are not
 //!
 //! `pbps_pg::state` and `pbps_mssql::state` used to hold two copies of this
 //! code, kept in step by comments that pointed from one to the other for the
-//! reasons. Everything here is a function of a [`Row`] or of a snapshot; the
-//! statement text, the connection round trip and the engine's error codes
-//! stay in the engine crates, so `pbps-db` still holds no engine SQL.
+//! reasons. The flow needs [`Conn`](crate::Conn), [`Row`] and
+//! [`LedgerError`], which this crate owns; the statement text and the
+//! engine's error codes stay in the engine crates and arrive as values of a
+//! [`LedgerSpec`], so `pbps-db` still holds no engine SQL (DEC-2988.1).
 //!
 //! The few places where the engines differ by a value, not by behaviour, are
-//! arguments: [`ClipUnit`] for the unit a column's width is counted in and
-//! [`RowLimit`] for how a row limit is bound.
+//! arguments or fields of the spec: [`ClipUnit`] for the unit a column's width
+//! is counted in and [`RowLimit`] for how a row limit is bound.
+
+mod read;
+mod spec;
+
+pub use read::{
+    deployed_revision, entry, has_applied_plan, history, is_initialized, latest, lock_holder,
+};
+pub use spec::{LedgerSpec, Recoverable, Savepoint, SpecStatements, Statement};
 
 use std::borrow::Cow;
 

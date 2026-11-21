@@ -14,17 +14,19 @@
 //! Without that, the first `plan` after a `snapshot` would propose dropping the
 //! ledger — the declarations do not mention it.
 
+use std::borrow::Cow;
+
 use pbps_db::ledger::flow::{
-    self, ClipUnit, ProjectedRow, RowLimit, entry_from_row, ordinary_params, projected_row,
-    projected_row_unmigrated, stored_entry_from_row,
+    self, ClipUnit, LedgerSpec, ProjectedRow, RowLimit, ordinary_params, projected_row,
+    projected_row_unmigrated,
 };
 use pbps_db::ledger::{
     LedgerEntry, LedgerError, LockInfo, TimelineEntry, TimelineState, ids_to_prune,
 };
 use pbps_db::{Conn, DbError, Param};
-use pbps_model::{StateKind, StateSnapshot, Unreadable};
+use pbps_model::{StateSnapshot, Unreadable};
 
-use crate::catalog::{get, opt};
+use crate::catalog::get;
 
 /// The schema this engine's ledger lives in (SPEC §8.1).
 ///
@@ -143,6 +145,26 @@ const SELECT_HISTORY: &str = "\
 SELECT TOP (@P1) id, CONVERT(varchar(23), applied_at, 126) AS applied_at, state_json
   FROM dbo.__pbps_state
  ORDER BY id DESC;";
+
+/// One entry by its id: the three columns [`SELECT_LATEST`] returns.
+const SELECT_BY_ID: &str =
+    "SELECT id, CONVERT(varchar(23), applied_at, 126) AS applied_at, state_json
+               FROM dbo.__pbps_state WHERE id = @P1;";
+
+/// The newest row of one kind that carries one plan checksum; both are bound.
+const SELECT_APPLIED_PLAN: &str = "SELECT TOP (1) id FROM dbo.__pbps_state WHERE kind = @P1 AND plan_checksum = @P2 ORDER BY id DESC";
+
+/// The newest row at or below an id whose kind is one of `kinds` bound
+/// values. Built from the count alone, like [`select_legacy_state_json`].
+fn select_deployed_revision(kinds: usize) -> String {
+    let slots = (0..kinds)
+        .map(|i| format!("@P{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT TOP (1) id, git_sha FROM dbo.__pbps_state WHERE id <= @P1 AND kind IN ({slots}) ORDER BY id DESC"
+    )
+}
 
 /// The timeline reads the projected columns — including the five issue #103
 /// added — and never `state_json`: the whole point is that a row whose
@@ -412,6 +434,24 @@ fn migration_error(e: DbError) -> DbError {
 /// it exists to answer rather than "is every column of this table readable".
 const PROBE_STATE: &str = "SELECT TOP (0) id AS present FROM dbo.__pbps_state;";
 
+/// This engine's ledger, as the shared flow reads it (DEC-2988.1).
+///
+/// No savepoint: a failed statement here leaves the transaction as it was, so
+/// a tolerated failure needs nothing to rewind to.
+static LEDGER: LedgerSpec = LedgerSpec {
+    probe_state: Cow::Borrowed(PROBE_STATE),
+    select_latest: Cow::Borrowed(SELECT_LATEST),
+    select_by_id: Cow::Borrowed(SELECT_BY_ID),
+    select_history: Cow::Borrowed(SELECT_HISTORY),
+    select_applied_plan: Cow::Borrowed(SELECT_APPLIED_PLAN),
+    select_deployed_revision,
+    select_lock: Cow::Borrowed(SELECT_LOCK),
+    row_limit: ROW_LIMIT,
+    missing_table: INVALID_OBJECT_NAME,
+    savepoint: None,
+    session_lookup,
+};
+
 /// Whether this database has a ledger at all.
 ///
 /// Every read has to ask first: querying a table that does not exist fails with
@@ -432,11 +472,7 @@ const PROBE_STATE: &str = "SELECT TOP (0) id AS present FROM dbo.__pbps_state;";
 /// them: 208 when the table is absent, 229 when it is there and hidden, and
 /// every other failure stays a failure (DECISIONS 219).
 pub async fn is_initialized(conn: &mut Conn) -> Result<bool, DbError> {
-    match conn.query(PROBE_STATE).await {
-        Ok(_) => Ok(true),
-        Err(e) if is_missing_table(&e) => Ok(false),
-        Err(e) => Err(e),
-    }
+    flow::is_initialized(conn, &LEDGER).await
 }
 
 /// The newest state, which is the environment's current baseline.
@@ -446,11 +482,7 @@ pub async fn is_initialized(conn: &mut Conn) -> Result<bool, DbError> {
 /// no ledger at all. The two need different remedies, so they are different
 /// answers.
 pub async fn latest(conn: &mut Conn) -> Result<Option<LedgerEntry>, LedgerError> {
-    if !is_initialized(conn).await? {
-        return Err(LedgerError::NotInitialized);
-    }
-    let rows = conn.query(SELECT_LATEST).await?;
-    rows.first().map(entry_from_row).transpose()
+    flow::latest(conn, &LEDGER).await
 }
 
 /// Commit evidence at or before the snapshot the caller already observed.
@@ -459,32 +491,13 @@ pub async fn deployed_revision(
     conn: &mut Conn,
     observed_id: i64,
 ) -> Result<Option<pbps_db::ledger::StateRevision>, LedgerError> {
-    let allowed: Vec<_> = StateKind::ALL
-        .iter()
-        .copied()
-        .filter(|kind| kind.establishes_schema())
-        .collect();
-    let kinds = (0..allowed.len())
-        .map(|i| format!("@P{}", i + 2))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut params: Vec<Param<'_>> = vec![observed_id.into()];
-    params.extend(allowed.iter().map(|kind| Param::from(kind.as_str())));
-    let rows = conn.query_with(&format!("SELECT TOP (1) id, git_sha FROM dbo.__pbps_state WHERE id <= @P1 AND kind IN ({kinds}) ORDER BY id DESC"), &params).await?;
-    rows.first()
-        .map(|row| {
-            Ok(pbps_db::ledger::StateRevision {
-                id: get(row, "id")?,
-                git_sha: opt::<&str>(row, "git_sha")?.map(pbps_model::Text::from),
-            })
-        })
-        .transpose()
+    flow::deployed_revision(conn, &LEDGER, observed_id).await
 }
 
 /// A retained successful apply is the evidence for an expand, not a baseline
 /// or another report that happens to name the same checksum (DEC-2402.1).
 pub async fn has_applied_plan(conn: &mut Conn, checksum: &str) -> Result<bool, LedgerError> {
-    Ok(!conn.query_with("SELECT TOP (1) id FROM dbo.__pbps_state WHERE kind = @P1 AND plan_checksum = @P2 ORDER BY id DESC", &[StateKind::Apply.as_str().into(), checksum.into()]).await?.is_empty())
+    flow::has_applied_plan(conn, &LEDGER, checksum).await
 }
 
 /// A selected historical entry, or the newest when no id is supplied.
@@ -493,21 +506,7 @@ pub async fn entry(
     conn: &mut Conn,
     id: Option<i64>,
 ) -> Result<Option<pbps_db::ledger::StoredEntry>, LedgerError> {
-    if !is_initialized(conn).await? {
-        return Err(LedgerError::NotInitialized);
-    }
-    let rows = match id {
-        Some(id) => {
-            conn.query_with(
-                "SELECT id, CONVERT(varchar(23), applied_at, 126) AS applied_at, state_json
-               FROM dbo.__pbps_state WHERE id = @P1;",
-                &[id.into()],
-            )
-            .await?
-        }
-        None => conn.query(SELECT_LATEST).await?,
-    };
-    rows.first().map(stored_entry_from_row).transpose()
+    flow::entry(conn, &LEDGER, id).await
 }
 
 /// The most recent `limit` entries, newest first.
@@ -515,13 +514,7 @@ pub async fn entry(
 /// Every one of them has to be readable: a caller asking for entries wants the
 /// states, and half a state is not one. [`timeline`] is the other question.
 pub async fn history(conn: &mut Conn, limit: u32) -> Result<Vec<LedgerEntry>, LedgerError> {
-    if !is_initialized(conn).await? {
-        return Err(LedgerError::NotInitialized);
-    }
-    let rows = conn
-        .query_with(SELECT_HISTORY, &[ROW_LIMIT.param(limit)])
-        .await?;
-    rows.iter().map(entry_from_row).collect()
+    flow::history(conn, &LEDGER, limit).await
 }
 
 /// The most recent `limit` rows as a timeline, newest first.
@@ -780,14 +773,6 @@ pub async fn unlock(conn: &mut Conn) -> Result<bool, DbError> {
     }
 }
 
-/// Who holds the deployment lock, if anyone.
-///
-/// A missing lock table answers `None` rather than failing: nothing can be
-/// holding a lock that does not exist. That is deliberately *not* the same as
-/// the table being unreadable, which stays an error — callers report the two
-/// differently, and "I could not look" must never be flattened into "nothing
-/// there". See [`is_missing_table`] for why that distinction cannot be made by
-/// asking the catalog first.
 /// The application name this session carries, as the server holds it, so the
 /// lock records the name `sys.dm_exec_sessions.program_name` will show
 /// (#1188).
@@ -821,23 +806,16 @@ pub fn session_lookup(locked_by: &str) -> Option<String> {
     ))
 }
 
+/// Who holds the deployment lock, if anyone.
+///
+/// A missing lock table answers `None` rather than failing: nothing can be
+/// holding a lock that does not exist. That is deliberately *not* the same as
+/// the table being unreadable, which stays an error — callers report the two
+/// differently, and "I could not look" must never be flattened into "nothing
+/// there". See [`is_missing_table`] for why that distinction cannot be made by
+/// asking the catalog first.
 pub async fn lock_holder(conn: &mut Conn) -> Result<Option<LockInfo>, DbError> {
-    let rows = match conn.query(SELECT_LOCK).await {
-        Ok(rows) => rows,
-        Err(e) if is_missing_table(&e) => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    match rows.first() {
-        Some(row) => {
-            let locked_by = get::<&str>(row, "locked_by")?.to_owned();
-            Ok(Some(LockInfo {
-                session_lookup: session_lookup(&locked_by),
-                locked_by,
-                locked_at: get::<&str>(row, "locked_at")?.to_owned(),
-            }))
-        }
-        None => Ok(None),
-    }
+    flow::lock_holder(conn, &LEDGER).await
 }
 
 #[cfg(test)]
@@ -956,6 +934,72 @@ mod tests {
         for sql in [CREATE_LOCK, SELECT_LOCK, INSERT_LOCK, DELETE_LOCK] {
             assert!(sql.contains("__pbps_lock"), "{sql}");
         }
+        // What the shared flow sends comes from the spec's own list, which
+        // names every field: a statement added there is covered here.
+        let spec = LEDGER.statements();
+        for sql in &spec.state {
+            assert!(sql.contains(STATE_TABLE), "{sql}");
+            assert!(!sql.contains(LOCK_TABLE_NAME), "{sql}");
+        }
+        for sql in &spec.lock {
+            assert!(sql.contains(LOCK_TABLE), "{sql}");
+            assert!(!sql.contains(STATE_TABLE_NAME), "{sql}");
+        }
+    }
+
+    /// The spec hands the shared flow this module's own statements and codes,
+    /// and each of its statements binds exactly the values the flow sends:
+    /// a slot too few is a refused query, a slot too many reads a value that
+    /// was never bound.
+    #[test]
+    fn the_spec_carries_this_engines_statements_and_binds_every_value() {
+        assert_eq!(LEDGER.probe_state, PROBE_STATE);
+        assert_eq!(LEDGER.select_latest, SELECT_LATEST);
+        assert_eq!(LEDGER.select_history, SELECT_HISTORY);
+        assert_eq!(LEDGER.select_lock, SELECT_LOCK);
+        assert_eq!(LEDGER.missing_table, "208");
+        assert_eq!(LEDGER.row_limit, RowLimit::SaturatingI32);
+        assert!(
+            LEDGER.savepoint.is_none(),
+            "a failed statement leaves the transaction usable here"
+        );
+
+        assert_eq!(slots(&LEDGER.probe_state), 0);
+        assert_eq!(slots(&LEDGER.select_latest), 0);
+        assert_eq!(slots(&LEDGER.select_lock), 0);
+        assert_eq!(slots(&LEDGER.select_by_id), 1);
+        assert_eq!(slots(&LEDGER.select_history), 1);
+        assert_eq!(slots(&LEDGER.select_applied_plan), 2);
+        assert_eq!(
+            (LEDGER.select_deployed_revision)(3),
+            format!(
+                "SELECT TOP (1) id, git_sha FROM {STATE_TABLE} WHERE id <= @P1 AND kind IN (@P2, @P3, @P4) \
+                 ORDER BY id DESC"
+            )
+        );
+        assert_eq!(slots(&(LEDGER.select_deployed_revision)(1)), 2);
+        // No value is written into a statement: none of them quotes anything.
+        let spec = LEDGER.statements();
+        for sql in spec.state.iter().chain(&spec.lock) {
+            assert!(!sql.contains('\''), "{sql}");
+        }
+    }
+
+    /// How many distinct `@Pn` a statement binds, which must be `@P1..=@Pn`.
+    fn slots(sql: &str) -> usize {
+        let count = (1..=20).take_while(|n| has_slot(sql, *n)).count();
+        assert!(
+            (count + 1..=20).all(|n| !has_slot(sql, n)),
+            "the slots of this statement are not contiguous: {sql}"
+        );
+        count
+    }
+
+    /// `@P1` is not found inside `@P10`.
+    fn has_slot(sql: &str, n: usize) -> bool {
+        let slot = format!("@P{n}");
+        sql.match_indices(&slot)
+            .any(|(at, _)| !sql[at + slot.len()..].starts_with(|c: char| c.is_ascii_digit()))
     }
 
     /// Every user-supplied value reaches the server as a parameter. A `'` in an
@@ -971,7 +1015,10 @@ mod tests {
             DELETE_UP_TO,
             INSERT_LOCK,
             DELETE_LOCK,
+            SELECT_BY_ID,
+            SELECT_APPLIED_PLAN,
             &select_legacy_state_json(3),
+            &select_deployed_revision(3),
         ] {
             assert!(
                 !sql.contains("'{") && !sql.contains("{}"),
