@@ -10196,7 +10196,7 @@ backed by an unattached index); only a parent's is 18's.
   with the parent's columns lent, as it reads an own index, with its index's parameters. An adopted own
   reads as a clone and is not the partition's; an `ONLY`-built parent is refused by name as in E1.
 - **Declaration.** `PartitionEntryDto.exclude` is `ExclusionDto`, converted by `convert_exclusions` and
-  written by `render_exclusions`; the published schema set is 118. `validate_partition` runs the
+  written by `render_exclusions`; the published schema set's fingerprint moves, its number does not (DEC-2412.3). `validate_partition` runs the
   exclusion validation with the parent's columns lent and refuses an own that `adopts_exclusion` its
   parent's (the engine would make it a clone that goes with the parent's, as #1632 holds for a foreign
   key), and an own named as its parent's constraint (the name is a relation of the schema). A partition
@@ -10236,7 +10236,7 @@ backed by an unattached index); only a parent's is 18's.
 dropped by the engine silently; the hazard check of DEC-2448.5 reads the changes of one table and does not
 see it. The same gap exists for a partition's own index; it is named, not decided.
 
-Formats: published schema set 118 (the declaration document gains the entry's `exclude:`; the envelope and
-config documents change only in the version); the ids layout gains a section and keeps its numbers. No
-plan or state number, as DEC-2448.6 said: `DetachedKind` and `PartitionIndexDefinition` gain a variant
-each without one.
+Formats: the published declaration document gains the entry's `exclude:`, which moves the set's fingerprint
+and not `SCHEMA_VERSION`, no archive being added before the first release (DEC-2412.3); the ids layout
+gains a section and keeps its numbers. No plan or state number, as DEC-2448.6 said: `DetachedKind` and
+`PartitionIndexDefinition` gain a variant each without one.
