@@ -132,8 +132,13 @@ pub struct Resolution(Vec<Unresolved>);
 /// Selects from every view, evaluates every column default, compiles a write to
 /// everything that has a trigger and checks each table's foreign keys, on
 /// `scratch`. Nothing is written. An engine refusal is a finding, not an
-/// error: it is the thing being asked.
+/// error: it is the thing being asked. `Refused` when an object named like a
+/// pragma function stands where the catalog's own is asked.
 pub fn resolution(scratch: &Connection) -> Result<Resolution, DbError> {
+    // The questions below select from the catalog's table-valued functions, and
+    // a table of such a name answers in their place with no error: asked of the
+    // reader's own check, so a wrong answer cannot be read as "all resolves".
+    crate::catalog::refuse_shadowed_pragma_functions(scratch)?;
     let mut found = Vec::new();
     let views = scratch.query(
         "SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'view' ORDER BY name",

@@ -361,22 +361,41 @@ fn the_three_declarations_the_dialect_cannot_judge_are_refused_naming_the_statem
 }
 
 #[test]
-fn a_plan_that_replaces_a_tables_only_column_is_refused_in_the_engines_words() {
-    // #2963: the differ drops the column before adding its replacement.
+fn a_plan_that_replaces_a_tables_only_column_runs_and_converges() {
+    // The differ adds the replacement before it drops the column (#2963), so the
+    // table is never left with none.
     let mut db = file("CREATE TABLE t(a integer)");
     let declared = declared_from("CREATE TABLE t(b integer)");
-    let refused = refusal(rehearse(&mut db, &declared, &ids(&declared, &[])));
-    assert_eq!(refused.at, 1, "{}", refused.sql);
-    assert!(refused.sql.contains("DROP COLUMN"), "{}", refused.sql);
+    let ran = rehearse(&mut db, &declared, &ids(&declared, &[])).unwrap_or_else(|r| {
+        panic!("statement {}: {}: {}", r.at, r.sql, r.error);
+    });
+    assert!(converged(&ran, &declared));
+    // Negative: the engine's refusal of a table left with no column still stops
+    // a rehearsal, at the statement and in the engine's words.
+    let copy = scratch(db.connection(), SCRATCH_LIMIT).expect("copied");
+    let error = copy
+        .execute_batch("ALTER TABLE t DROP COLUMN a")
+        .expect_err("the only column");
     assert!(
-        refused.error.to_string().contains("no other columns exist"),
-        "{}",
-        refused.error
+        error.to_string().contains("no other columns exist"),
+        "{error}"
     );
-    // Negative: a table that keeps a column is not refused.
-    let mut keeps = file("CREATE TABLE t(a integer, b integer)");
-    let declared = declared_from("CREATE TABLE t(b integer, c integer)");
-    assert!(rehearse(&mut keeps, &declared, &ids(&declared, &[])).is_ok());
+}
+
+#[test]
+fn a_table_named_like_a_pragma_function_refuses_the_resolution() {
+    let mut db = file("CREATE TABLE t(a integer); CREATE VIEW v AS SELECT a FROM t");
+    let copy = scratch(db.connection(), SCRATCH_LIMIT).expect("copied");
+    assert!(resolution(&copy).expect("asked").is_empty());
+    // An empty namesake would answer "no views, no tables": everything resolves.
+    copy.execute_batch("DROP TABLE t; CREATE TABLE pragma_table_list(schema, name, type)")
+        .expect("the engine takes it");
+    let refused = resolution(&copy).expect_err("not asked of a namesake");
+    assert!(matches!(refused, DbError::Refused(_)), "{refused:?}");
+    assert!(
+        refused.to_string().contains("pragma_table_list"),
+        "{refused}"
+    );
 }
 
 #[test]
