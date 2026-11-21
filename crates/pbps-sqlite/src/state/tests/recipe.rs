@@ -25,6 +25,95 @@ const STATE_TEXT: &str = "CREATE TABLE __pbps_state (
     staged_total     INTEGER
 )";
 
+const LOCK_TEXT: &str = "CREATE TABLE __pbps_lock (
+    id        INTEGER PRIMARY KEY CHECK (id = 1),
+    locked_by TEXT    NOT NULL CHECK (length(locked_by) <= 256),
+    locked_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+    proof     TEXT    NOT NULL CHECK (proof IN ('file', 'row')),
+    sidecar   TEXT,
+    token     TEXT    NOT NULL
+)";
+
+const ENVIRONMENT_TEXT: &str = "CREATE TABLE __pbps_environment (
+    id             INTEGER PRIMARY KEY CHECK (id = 1),
+    environment_id TEXT    NOT NULL CHECK (length(environment_id) = 32)
+)";
+
+#[test]
+fn the_stored_text_of_the_lock_and_the_environment_tables_is_the_recipe() {
+    let mut fresh = Fresh::memory();
+    let c = fresh.connection();
+    ensure_tables(c).expect("created");
+    for (name, golden, index) in [
+        ("__pbps_lock", LOCK_TEXT, 1),
+        ("__pbps_environment", ENVIRONMENT_TEXT, 2),
+    ] {
+        let stored = text(
+            c,
+            &format!("SELECT sql FROM sqlite_schema WHERE name = '{name}'"),
+        );
+        assert_eq!(stored, RECIPE[index].stored(), "{name}");
+        assert_eq!(stored, golden, "{name}");
+    }
+}
+
+#[test]
+fn the_recipe_names_are_exactly_the_reserved_ledger_names() {
+    let mut recipe: Vec<&str> = RECIPE.iter().map(|r| r.name).collect();
+    let mut reserved: Vec<&str> = names::LEDGER_TABLES.to_vec();
+    recipe.sort_unstable();
+    reserved.sort_unstable();
+    assert_eq!(recipe, reserved);
+    // Only the environment table is seeded.
+    assert_eq!(
+        RECIPE.iter().filter(|r| r.seed.is_some()).count(),
+        1,
+        "one table holds a row from the day it is made"
+    );
+}
+
+#[test]
+fn a_view_in_the_lock_or_environment_name_is_refused_beside_an_existing_state_table() {
+    for name in ["__pbps_lock", "__pbps_environment"] {
+        let mut fresh = Fresh::memory();
+        let c = fresh.connection();
+        c.execute_batch(&format!("CREATE VIEW {name} AS SELECT 1 AS id"))
+            .expect("ddl");
+        let refused = ensure_tables(c).expect_err(name);
+        assert!(
+            matches!(refused, DbError::Refused(_)),
+            "{name}: {refused:?}"
+        );
+        // Nothing was made: not even the state table.
+        assert_eq!(
+            number(c, "SELECT count(*) FROM sqlite_schema WHERE type = 'table'"),
+            0,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_ledger_that_lacks_the_newer_tables_gets_them_at_its_next_write_and_not_before() {
+    let mut fresh = Fresh::memory();
+    let c = fresh.connection();
+    // A ledger with only a state table, as an earlier build made it.
+    c.execute_batch(&RECIPE[0].create()).expect("ddl");
+    assert!(
+        is_initialized(c).expect("asked"),
+        "the state table is the ledger"
+    );
+    assert_eq!(
+        number(c, "SELECT count(*) FROM sqlite_schema WHERE type = 'table'"),
+        2
+    );
+    ensure_tables(c).expect("completed");
+    assert_eq!(
+        number(c, "SELECT count(*) FROM sqlite_schema WHERE type = 'table'"),
+        4
+    );
+}
+
 #[test]
 fn every_recipe_table_is_a_reserved_ledger_name_and_spelled_main_qualified() {
     for recipe in &RECIPE {
@@ -75,14 +164,18 @@ fn the_ledger_creates_once_and_is_initialized_afterwards() {
         before,
         text(c, "SELECT group_concat(sql) FROM sqlite_schema")
     );
-    // `AUTOINCREMENT` makes the engine keep its own counter table, and nothing
-    // else is made.
+    // The three tables, and `AUTOINCREMENT`'s own counter table, and nothing else.
     assert_eq!(
         number(
             c,
-            "SELECT count(*) FROM sqlite_schema WHERE name NOT IN ('__pbps_state', 'sqlite_sequence')"
+            "SELECT count(*) FROM sqlite_schema WHERE name NOT IN \
+             ('__pbps_state', '__pbps_lock', '__pbps_environment', 'sqlite_sequence')"
         ),
         0
+    );
+    assert_eq!(
+        number(c, "SELECT count(*) FROM sqlite_schema WHERE type = 'table'"),
+        4
     );
 }
 
@@ -263,4 +356,32 @@ fn a_view_that_appears_after_the_probe_is_refused_by_the_creation_itself() {
     c.execute_batch("DROP VIEW __pbps_state").expect("dropped");
     crate::state::ddl::create(c, &missing).expect("created");
     assert!(is_initialized(c).expect("asked"));
+}
+
+/// A seed is sent only after the catalog confirms what holds the name: a view
+/// that appeared in the environment's name is refused in this tool's words and
+/// not answered by the engine's error for an insert into a view.
+#[test]
+fn a_view_in_a_seeded_tables_name_is_refused_before_the_seed_is_sent() {
+    let mut fresh = Fresh::memory();
+    let c = fresh.connection();
+    c.execute_batch("CREATE VIEW __pbps_environment AS SELECT 1 AS id, 'x' AS environment_id")
+        .expect("the view");
+    let missing: Vec<&crate::state::ddl::Recipe> = RECIPE.iter().collect();
+    let refused = crate::state::ddl::create(c, &missing).expect_err("refused");
+    assert!(
+        refused
+            .to_string()
+            .contains("is a view, not an ordinary table"),
+        "{refused}"
+    );
+    assert!(!c.in_transaction());
+    assert_eq!(
+        number(
+            c,
+            "SELECT count(*) FROM main.sqlite_schema WHERE type = 'table'"
+        ),
+        0,
+        "nothing of a ledger is left beside it"
+    );
 }

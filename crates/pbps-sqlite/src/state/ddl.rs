@@ -3,10 +3,11 @@
 use std::time::Duration;
 
 use pbps_db::DbError;
-use pbps_db::ledger::STATE_TABLE_NAME;
+use pbps_db::ledger::{LOCK_TABLE_NAME, STATE_TABLE_NAME};
 use pbps_db::sqlite::{Connection, Value};
 use pbps_model::escape::Escaped;
 
+use super::ENVIRONMENT_TABLE_NAME;
 use super::busy::{self, BUSY_WAIT};
 
 /// One table of the ledger: its name and the text of its `CREATE` from the name
@@ -20,6 +21,9 @@ use super::busy::{self, BUSY_WAIT};
 pub(crate) struct Recipe {
     pub(crate) name: &'static str,
     pub(crate) body: &'static str,
+    /// A statement run in the same unit as the table's creation and never
+    /// otherwise: for a table that holds a row from the day it is made.
+    pub(crate) seed: Option<&'static str>,
 }
 
 impl Recipe {
@@ -66,18 +70,62 @@ const STATE_BODY: &str = "__pbps_state (
     staged_total     INTEGER
 )";
 
-/// Every table of the ledger. A later part adds a table here and
+/// The lock: one row, and only ever one (`CHECK (id = 1)` makes a second
+/// unrepresentable, as the other engines' lock tables do).
+///
+/// `proof` says whether the holder's liveness could be proved by the lock on the
+/// sidecar file, `sidecar` names that file (its path's bytes in hexadecimal, NULL
+/// without a proof), and `token` is random and tells a run its own row from
+/// another's. All three are written by `lock` and read only by this tool.
+const LOCK_BODY: &str = "__pbps_lock (
+    id        INTEGER PRIMARY KEY CHECK (id = 1),
+    locked_by TEXT    NOT NULL CHECK (length(locked_by) <= 256),
+    locked_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+    proof     TEXT    NOT NULL CHECK (proof IN ('file', 'row')),
+    sidecar   TEXT,
+    token     TEXT    NOT NULL
+)";
+
+/// The environment identifier: one row, written when the table is made and never
+/// altered. 32 hexadecimal characters of SQLite's own randomness, so no
+/// dependency is involved (DEC-2950.13).
+const ENVIRONMENT_BODY: &str = "__pbps_environment (
+    id             INTEGER PRIMARY KEY CHECK (id = 1),
+    environment_id TEXT    NOT NULL CHECK (length(environment_id) = 32)
+)";
+
+/// `INSERT OR IGNORE`, so a creator that raced this one leaves the first
+/// identifier and writes no second.
+const ENVIRONMENT_SEED: &str = "INSERT OR IGNORE INTO main.__pbps_environment \
+     (id, environment_id) VALUES (1, lower(hex(randomblob(16))))";
+
+/// Every table of the ledger. A part that adds a table adds it here, and
 /// [`ensure_tables`], [`is_initialized`] and the refusal below take it without
 /// another code path.
-pub(crate) const RECIPE: [Recipe; 1] = [Recipe {
-    name: STATE_TABLE_NAME,
-    body: STATE_BODY,
-}];
+pub(crate) const RECIPE: [Recipe; 3] = [
+    Recipe {
+        name: STATE_TABLE_NAME,
+        body: STATE_BODY,
+        seed: None,
+    },
+    Recipe {
+        name: LOCK_TABLE_NAME,
+        body: LOCK_BODY,
+        seed: None,
+    },
+    Recipe {
+        name: ENVIRONMENT_TABLE_NAME,
+        body: ENVIRONMENT_BODY,
+        seed: Some(ENVIRONMENT_SEED),
+    },
+];
 
 /// The name of the savepoint every unit of ledger work runs under.
 const UNIT: &str = "pbps_ledger";
 
-/// Whether the ledger's state table is there.
+/// Whether the ledger's state table is there. The state table is the ledger: a
+/// lock or identifier table missing beside it is made by the next write, and is
+/// not another answer here.
 ///
 /// `true` for an ordinary table, `false` for none, and an error when something
 /// else holds the name: a view there is not an absent ledger that a `bootstrap`
@@ -159,6 +207,12 @@ pub(super) fn create(c: &Connection, missing: &[&Recipe]) -> Result<(), DbError>
         let names: Vec<&str> = missing.iter().map(|r| r.name).collect();
         let held = occupants(c, &names)?;
         refuse_a_stranger(&held)?;
+        // Only now: a seed run before the check would be sent at whatever holds
+        // the name, and a view there would answer with the engine's own error
+        // in place of the refusal.
+        for seed in missing.iter().filter_map(|recipe| recipe.seed) {
+            c.execute(seed, &[])?;
+        }
         match names.iter().find(|name| {
             !held
                 .iter()
@@ -203,7 +257,7 @@ pub(super) fn in_a_unit<T>(
 
 /// The `(name, kind)` of every catalog entry of `main` that has one of `names`,
 /// ASCII case ignored as SQLite ignores it, sorted by name.
-fn occupants(c: &Connection, names: &[&str]) -> Result<Vec<(String, String)>, DbError> {
+pub(super) fn occupants(c: &Connection, names: &[&str]) -> Result<Vec<(String, String)>, DbError> {
     let slots = (1..=names.len())
         .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()
@@ -225,7 +279,7 @@ fn occupants(c: &Connection, names: &[&str]) -> Result<Vec<(String, String)>, Db
 ///
 /// This catches a view, an index, a trigger and the like. A virtual table is
 /// also `table` here and is a difference the integrity check compares by text.
-fn refuse_a_stranger(held: &[(String, String)]) -> Result<(), DbError> {
+pub(super) fn refuse_a_stranger(held: &[(String, String)]) -> Result<(), DbError> {
     let strangers: Vec<String> = held
         .iter()
         .filter(|(_, kind)| kind != "table")

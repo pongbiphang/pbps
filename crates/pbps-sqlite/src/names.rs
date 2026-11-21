@@ -16,10 +16,11 @@ use pbps_model::Schema;
 
 use crate::ident;
 
-/// The two tables this tool keeps its ledger in (SPEC 8.1). Compared without
+/// The tables this tool keeps its ledger in (SPEC 8.1): the states, the lock and
+/// the environment identifier. Compared without
 /// regard to ASCII case, because SQLite would. No table, view or index may
 /// take either name: the three share one namespace (`validate`).
-pub const LEDGER_TABLES: [&str; 2] = ["__pbps_state", "__pbps_lock"];
+pub const LEDGER_TABLES: [&str; 3] = ["__pbps_state", "__pbps_lock", "__pbps_environment"];
 
 /// Whether `name` is one of the ledger's tables, or one SQLite holds as one.
 #[must_use]

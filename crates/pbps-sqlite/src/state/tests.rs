@@ -10,6 +10,8 @@ use pbps_model::{IdsFile, Schema, StateKind, StateSnapshot};
 use crate::tests::Fresh;
 
 mod busy;
+mod identity;
+mod lock;
 mod read;
 mod recipe;
 mod write;
