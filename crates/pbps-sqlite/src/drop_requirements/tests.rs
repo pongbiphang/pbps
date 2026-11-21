@@ -78,6 +78,33 @@ fn a_violated_requirement_names_the_count_and_the_predicate_and_removes_nothing(
 }
 
 #[test]
+fn a_column_named_like_a_boolean_word_cannot_stand_in_for_the_test() {
+    // `TRUE` is a name before it is a constant: with a column of that name
+    // holding 0, `(a > 0) IS NOT TRUE` compared the answer with the column and
+    // counted nothing.
+    for word in ["true", "TRUE", "false"] {
+        let mut fresh = Fresh::memory();
+        fresh
+            .connection()
+            .execute_batch(&format!(
+                "CREATE TABLE t(a integer, \"{word}\"); INSERT INTO t VALUES (0, 0), (NULL, NULL)"
+            ))
+            .expect("rows");
+        let refused = check(fresh.connection(), &guard(&["a > 0"])).expect_err("neither is true");
+        assert!(refused.contains("2 row(s)"), "{word}: {refused}");
+        // Negative: with every row meeting it, the same table permits.
+        fresh
+            .connection()
+            .execute_batch("UPDATE t SET a = 1")
+            .expect("rows");
+        assert!(
+            check(fresh.connection(), &guard(&["a > 0"])).is_ok(),
+            "{word}"
+        );
+    }
+}
+
+#[test]
 fn a_null_answer_is_a_violation_as_is_not_true_makes_it_on_the_other_engines() {
     let mut fresh = with_rows("INSERT INTO t VALUES (NULL, 'x'), (1, 'y')");
     let refused = check(fresh.connection(), &guard(&["a > 0"])).expect_err("a null is not true");

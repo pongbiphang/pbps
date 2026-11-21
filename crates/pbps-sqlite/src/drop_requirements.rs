@@ -3,7 +3,8 @@
 //! A plan that drops a table can carry the human's requirement that its rows hold
 //! a predicate. The check runs inside the apply's transaction, before the drop,
 //! and counts the rows for which the predicate is not true: a NULL answer is a
-//! row that violates it, as `IS NOT TRUE` makes it on the other engines. A missing
+//! row that violates it, as `IS NOT TRUE` makes it on the other engines (asked
+//! here with a `CASE`, whose words no column can take). A missing
 //! or unreadable answer never permits the removal.
 
 use pbps_db::sqlite::Connection;
@@ -20,7 +21,7 @@ pub fn check(c: &Connection, guard: &DropGuard) -> Result<(), String> {
     let table = qualified(&guard.table).map_err(|error| error.to_string())?;
     for requirement in guard.requirements.values() {
         // The count is only as good as the wrapper around the predicate: an open
-        // comment or quote would swallow `IS NOT TRUE`, and a parenthesis closed
+        // comment or quote would swallow the rest of it, and a parenthesis closed
         // early would leave it binding to something else.
         // (A `--` comment at the end is closed with a line feed first, as the
         // emitter closes one.)
@@ -36,8 +37,14 @@ pub fn check(c: &Connection, guard: &DropGuard) -> Result<(), String> {
         // A line feed before the closing parenthesis, so a predicate that ends in a
         // `--` comment does not swallow it. One statement is prepared, so a `;`
         // inside it is refused by the library and writes nothing.
+        //
+        // `CASE` and not `IS NOT TRUE`: in SQLite `TRUE` is a name before it is a
+        // constant, so a column named `true` takes its place (measured: with such
+        // a column holding 0, a row that fails `x > 0` was counted as none). The
+        // words of a `CASE` are reserved and cannot be a column's. A NULL answer
+        // takes the `ELSE`, so it is still a violation.
         let sql = format!(
-            "SELECT count(*) FROM {table} WHERE ({}\n) IS NOT TRUE",
+            "SELECT count(*) FROM {table} WHERE CASE WHEN ({}\n) THEN 0 ELSE 1 END",
             requirement.predicate
         );
         let rows = c.query(&sql, &[]).map_err(|error| {
