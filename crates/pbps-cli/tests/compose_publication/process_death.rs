@@ -107,12 +107,32 @@ fn child_report_within(
     mode: &str,
     guard: Duration,
 ) -> String {
-    let hung = |child: &mut Child| -> ! {
-        child.kill().unwrap();
-        child.wait().unwrap();
-        panic!("{mode}: child missed its synchronized boundary");
-    };
-    let started = Instant::now();
+    let deadline = Instant::now() + guard;
+    let connection = child_connection(listener, child, log_path, mode, deadline);
+    let mut line = String::new();
+    if BufReader::new(connection).read_line(&mut line).is_err() {
+        hung(child, mode);
+    }
+    line.trim().to_owned()
+}
+
+/// Kills and reaps a child that missed its boundary, then fails the test.
+fn hung(child: &mut Child, mode: &str) -> ! {
+    child.kill().unwrap();
+    child.wait().unwrap();
+    panic!("{mode}: child missed its synchronized boundary");
+}
+
+/// Waits until `deadline` for the child's connection. It takes the deadline,
+/// not a duration, so the report that follows is read against the same one:
+/// the connection's reads get the time left, never a second guard.
+fn child_connection(
+    listener: &UnixListener,
+    child: &mut Child,
+    log_path: &Path,
+    mode: &str,
+    deadline: Instant,
+) -> UnixStream {
     let connection = loop {
         if let Ok((connection, _)) = listener.accept() {
             break connection;
@@ -123,22 +143,17 @@ fn child_report_within(
                 fs::read_to_string(log_path).unwrap()
             );
         }
-        if started.elapsed() > guard {
-            hung(child);
+        if Instant::now() > deadline {
+            hung(child, mode);
         }
         std::thread::sleep(Duration::from_millis(5));
     };
-    // The child reports right after it connects. The read gets what is left
-    // of the one guard, not a second one. A zero timeout is an error.
-    let left = guard.saturating_sub(started.elapsed());
+    // A zero timeout is an error, so the last moment still gets 1 ms.
+    let left = deadline.saturating_duration_since(Instant::now());
     connection
         .set_read_timeout(Some(left.max(Duration::from_millis(1))))
         .unwrap();
-    let mut line = String::new();
-    if BufReader::new(connection).read_line(&mut line).is_err() {
-        hung(child);
-    }
-    line.trim().to_owned()
+    connection
 }
 
 /// Runs the child in `mode` until it parks, then SIGKILLs it. Core dumps are
@@ -270,20 +285,29 @@ fn a_child_that_connects_but_never_reports_is_killed_once_the_guard_passes() {
 }
 
 #[test]
-fn one_guard_bounds_the_connection_and_the_report_together() {
-    // Connects at 3 s of a 4 s guard and stays silent: the helper gives up at
-    // about 4 s. A second full guard for the read would end at 7 s or later.
-    // The bound sits far from both, so a loaded machine does not decide it.
-    let started = Instant::now();
-    let silent = Some((Duration::from_secs(3), None));
-    let (result, _) = probe("exec sleep 600", silent, Duration::from_secs(4));
-    assert_eq!(
-        result.unwrap_err(),
-        "probe: child missed its synchronized boundary"
-    );
-    let took = started.elapsed();
-    assert!(took >= Duration::from_secs(4), "{took:?}");
-    assert!(took < Duration::from_millis(6500), "{took:?}");
+fn a_late_connection_leaves_the_report_only_the_rest_of_the_guard() {
+    // No wall-clock ceiling: load can only make the connection later and the
+    // time left shorter, so a slow machine cannot fail this.
+    let socket = crate::unix_socket::Socket::bind();
+    socket.listener().set_nonblocking(true).unwrap();
+    let log = socket.path().with_file_name("child.log");
+    let mut child = Command::new("sleep").arg("600").spawn().unwrap();
+    let guard = Duration::from_secs(60);
+    let deadline = Instant::now() + guard;
+    let path = socket.path().to_owned();
+    // The client returns its end, so the connection stays open until the join.
+    let client = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        UnixStream::connect(path).unwrap()
+    });
+    let connection = child_connection(socket.listener(), &mut child, &log, "probe", deadline);
+    let left = connection.read_timeout().unwrap().unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    drop(client.join().unwrap());
+    // The client slept 200 ms after the deadline was fixed. The other 100 ms
+    // allows the kernel to round the timeout, not the scheduler to be late.
+    assert!(left <= guard - Duration::from_millis(100), "{left:?}");
 }
 
 fn receipt(f: &Fixture, id: &str) -> serde_json::Value {
