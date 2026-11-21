@@ -875,14 +875,6 @@ pub fn diff_partial(
     )
 }
 
-/// The DEFAULT partition a new range or list partition is made beside, under
-/// the name the plan leaves it (#1547, DEC-1547.1, #1632): one the base holds
-/// as the parent's DEFAULT and the declarations keep as that parent's. Its
-/// rows in the new range or list are moved into the partition before it is attached, so the
-/// plan is the same whether it holds any or not. A parent the plan creates
-/// has none, and neither has a DEFAULT the plan drops, detaches or makes:
-/// one leaving goes in class 6, before the partition is created, and a new
-/// one starts empty. The name is the declared one because renames run in
 /// Lifecycle refusals for the attributes no executable change covers, shared
 /// with connected prerequisite admission so a missing declared type is named
 /// before its column's reference gate. `alterable` leaves out what a retained
@@ -944,6 +936,14 @@ pub fn type_differences(
     errs
 }
 
+/// The DEFAULT partition a new range or list partition is made beside, under
+/// the name the plan leaves it (#1547, DEC-1547.1, #1632): one the base holds
+/// as the parent's DEFAULT and the declarations keep as that parent's. Its
+/// rows in the new range or list are moved into the partition before it is attached, so the
+/// plan is the same whether it holds any or not. A parent the plan creates
+/// has none, and neither has a DEFAULT the plan drops, detaches or makes:
+/// one leaving goes in class 6, before the partition is created, and a new
+/// one starts empty. The name is the declared one because renames run in
 /// class 1, before every create.
 fn standing_default(
     base: Side<'_>,
@@ -3951,12 +3951,6 @@ fn row_table(change: &Change) -> Option<&TableName> {
     }
 }
 
-/// A tightening folded into a retype comes out of it when the plan writes or
-/// deletes rows of its table. The retype keeps the column nullable, and an
-/// `AlterColumnNullability` tightens it after the rows, which may be what
-/// fills or removes its NULLs (#1367). The same split DEC-1168.1 makes for a
-/// recomputed column, for the same reason: the check has to meet the values
-/// the plan leaves, not the ones it found.
 /// A NOT NULL a parent with external partitions drops (#1533) reaches every
 /// partition, but on 18 one a partition set of its own outlives it
 /// (DEC-1687.1). A declared partition is brought back by its own change after
@@ -3990,6 +3984,12 @@ fn clear_external_partitions_after_loosening(declared: &Schema, changes: &mut [C
     }
 }
 
+/// A tightening folded into a retype comes out of it when the plan writes or
+/// deletes rows of its table. The retype keeps the column nullable, and an
+/// `AlterColumnNullability` tightens it after the rows, which may be what
+/// fills or removes its NULLs (#1367). The same split DEC-1168.1 makes for a
+/// recomputed column, for the same reason: the check has to meet the values
+/// the plan leaves, not the ones it found.
 ///
 /// Not on a column the plan puts an identity on in a table it inserts rows
 /// into: the column must be NOT NULL before the identity, and the identity
@@ -4380,9 +4380,6 @@ fn recreate_retyped_dependents(
     }
 }
 
-/// Constraints and indexes are always matched by name and never modified in
-/// place — the database itself does drop + add, and pretending otherwise would
-/// only give the emitter one more path that can fail.
 /// The column a change renames, drops, retypes or tightens or relaxes on
 /// `table`, under the name its expression would use, and what the change
 /// does to it. Every one is an `ALTER COLUMN` or an `sp_rename` the engine
@@ -6973,6 +6970,9 @@ fn diff_filegroups(name: &TableName, base: &Table, declared: &Table, errs: &mut 
     }
 }
 
+/// Constraints and indexes are always matched by name and never modified in
+/// place — the database itself does drop + add, and pretending otherwise would
+/// only give the emitter one more path that can fail.
 fn diff_constraints(
     name: &TableName,
     base: &Table,
