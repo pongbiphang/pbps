@@ -419,7 +419,7 @@ fn a_view_a_plan_leaves_broken_passes_every_statement_and_the_read_back_and_only
 }
 
 #[test]
-fn what_failed_the_same_way_before_the_plan_ran_is_not_the_plans_fault() {
+fn what_failed_before_the_plan_ran_is_not_the_plans_fault_whatever_the_words() {
     // A view that is already broken, a default calling a function that does not
     // exist, and a foreign key to a column that is no key: all three exist in the
     // file the plan starts from.
@@ -439,15 +439,32 @@ fn what_failed_the_same_way_before_the_plan_ran_is_not_the_plans_fault() {
         "{:?}",
         after.new_since(&before, &Renamed::default())
     );
-    // Negative: the same view failing for a different reason is the plan's.
+    // A view already broken that fails in other words after is not the plan's:
+    // it did not work before the plan either, and the engine's words are not
+    // compared (#3016). The note from before the plan names it.
     copy.execute_batch("CREATE TABLE nope(a)").expect("runs");
-    let changed = resolution(&copy)
-        .expect("asked")
-        .new_since(&before, &Renamed::default());
-    assert_eq!(changed.len(), 1, "{changed:?}");
+    let reworded = resolution(&copy).expect("asked");
     assert!(
-        changed[0].contains("view `v`") && changed[0].contains("no such column"),
-        "{changed:?}"
+        reworded
+            .failing()
+            .iter()
+            .any(|l| l.contains("no such column"))
+    );
+    assert!(
+        reworded.new_since(&before, &Renamed::default()).is_empty(),
+        "{:?}",
+        reworded.new_since(&before, &Renamed::default())
+    );
+    let noted = before.failing();
+    assert!(
+        noted
+            .iter()
+            .any(|l| l.contains("view `v`") && l.contains("no such table")),
+        "{noted:?}"
+    );
+    assert!(
+        noted.iter().any(|l| l.contains("default `d.a`")),
+        "{noted:?}"
     );
     // Negative: a new default of the same kind is the plan's.
     copy.execute_batch("CREATE TABLE e(a DEFAULT (nosuchfn()))")
@@ -581,6 +598,45 @@ fn orphan_rows_of_another_key_to_the_same_parent_are_new_though_as_many() {
     assert!(before.new_since(&before, &Renamed::default()).is_empty());
     assert_eq!(before.0.len(), 1);
     assert_eq!(before.0[0].name, "c(y) -> p(x)");
+}
+
+#[test]
+fn a_key_that_could_not_be_checked_before_a_rename_is_not_the_plans_after_it() {
+    // The child references a column that is no key, so its keys cannot be
+    // checked; the engine's sentence quotes the parent's name.
+    let mut db = file("CREATE TABLE p(x, w); CREATE TABLE c(y REFERENCES p(w))");
+    let copy = scratch(db.connection(), SCRATCH_LIMIT).expect("copied");
+    let before = resolution(&copy).expect("asked");
+    let was = before.failing();
+    assert_eq!(was.len(), 1, "{was:?}");
+    copy.execute_batch("ALTER TABLE p RENAME TO p2")
+        .expect("the rename");
+    let after = resolution(&copy).expect("asked");
+    let now = after.failing();
+    assert_eq!(now.len(), 1, "{now:?}");
+    assert_ne!(was, now, "the sentence follows the name, which is the case");
+    let renamed = Renamed {
+        tables: vec![("p".into(), "p2".into())],
+        columns: Vec::new(),
+    };
+    assert!(after.new_since(&before, &renamed).is_empty());
+    // Negative: a key that could be checked before and cannot after is the
+    // plan's, in the engine's words.
+    let mut fine = file("CREATE TABLE p(x, w UNIQUE); CREATE TABLE c(y REFERENCES p(w))");
+    let copy = scratch(fine.connection(), SCRATCH_LIMIT).expect("copied");
+    let before = resolution(&copy).expect("asked");
+    assert!(before.is_empty());
+    copy.execute_batch(
+        "PRAGMA foreign_keys = OFF; CREATE TABLE p_new(x, w); DROP TABLE p; \
+         ALTER TABLE p_new RENAME TO p",
+    )
+    .expect("the key's parent column is no key now");
+    let broke = resolution(&copy)
+        .expect("asked")
+        .new_since(&before, &Renamed::default());
+    assert_eq!(broke.len(), 1, "{broke:?}");
+    assert!(broke[0].contains("foreign keys of `c`"), "{broke:?}");
+    assert!(broke[0].contains("mismatch"), "{broke:?}");
 }
 
 #[test]

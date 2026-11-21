@@ -419,11 +419,37 @@ impl Resolution {
         self.0.is_empty()
     }
 
-    /// One line for each thing that fails now and did not fail, in the same words,
-    /// before: what the plan broke. A view that fails because the library lacks an
-    /// application's function fails the same way before the plan ran, and is not
-    /// the plan's fault; a view that fails for another reason after, or that was
-    /// fine before, is. Foreign-key rows count only the ones added.
+    /// One line for each thing that does not resolve, as a note and not a
+    /// refusal: asked of the resolution from before a plan, it is what was
+    /// already broken, which [`Resolution::new_since`] does not charge the plan
+    /// with.
+    #[must_use]
+    pub fn failing(&self) -> Vec<String> {
+        self.0
+            .iter()
+            .map(|item| match &item.detail {
+                Detail::Failed(words) => format!(
+                    "{} `{}` does not resolve: {}",
+                    item.what,
+                    Escaped(&item.name),
+                    Escaped(words)
+                ),
+                Detail::Rows(rows) => {
+                    format!("{rows} row(s) have no parent in `{}`", Escaped(&item.name))
+                }
+            })
+            .collect()
+    }
+
+    /// One line for each thing that fails now and did not fail before: what the
+    /// plan broke. What failed before the plan and fails after it is not the
+    /// plan's, **whatever the two sentences say**: a view over a function the
+    /// library lacks fails before every plan, and the engine's words are not
+    /// compared, because they quote names a plan may change and are the
+    /// engine's to reword (#3016). So a thing already broken that a plan breaks
+    /// in another way is not reported here; it did not work before the plan
+    /// either, and [`Resolution::failing`] of the one from before names it.
+    /// Foreign-key rows count only the ones added, for each key.
     ///
     /// `renamed` is what the plan renames: a finding from before is looked for
     /// under the names the plan gave, so rows that had no parent in `p` are not
@@ -441,7 +467,7 @@ impl Resolution {
                         .all(|(was, now)| renamed.after(was).same(now))
             });
             match (&item.detail, earlier.map(|b| &b.detail)) {
-                (Detail::Failed(now), Some(Detail::Failed(was))) if now == was => {}
+                (Detail::Failed(_), Some(Detail::Failed(_))) => {}
                 (Detail::Failed(now), _) => lines.push(match item.what {
                     "view" => format!(
                         "the view `{}` cannot be selected from after the plan: {}",
