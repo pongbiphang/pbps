@@ -10223,7 +10223,12 @@ backed by an unattached index); only a parent's is 18's.
   `PartitionIndexDefinition::Exclusion` recipe: the parent's alone, then each leaf's whole under the name
   the engine would choose (`clone_name`, label `excl`, from the keys and `INCLUDE` columns, or the
   recorded spelling of an unchanged expression key), then the attach. The slot, effect, pin and risk
-  mechanisms treat it as a key's recipe. E1's refusal is lifted. A created replacement table that a
+  mechanisms treat it as a key's recipe. E1's refusal is lifted. Every statement of a recipe, a leaf's
+  too, runs on the PARENT's `search_path`: the apply-time vet judges the parent's key expressions and
+  predicate as bound there and only the first statement carries it, so a leaf statement on a cross-schema
+  leaf's own path would bind an unqualified call to a routine nothing vetted (measured on 18.6: the decoy
+  ran as the deployer, then the attach refused the mismatched index; #2989), the same for an index
+  recipe. A created replacement table that a
   rebuild copies into is seeded, so its own exclusion keeps the `constraint` risk (it checks rows).
 - **Retirement.** A leaf's drop is recorded under the leaf's uid, which the in-memory ids already
   allowed; on disk it sits in the parent's file, in a new section `partition_exclusions` keyed by the

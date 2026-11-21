@@ -331,8 +331,10 @@ fn bound_table(change: &Change) -> Option<&str> {
 /// The change whose expressions are judged for `change`. A rebuild's recipe builds a parent
 /// index, key or exclusion with the ordinary statement over the copied rows, so its
 /// expressions are those of the ordinary change it stands for (`parent_change`): without
-/// this, a recipe's key or predicate would call a routine as the deployer, unjudged. Every
-/// other change is its own.
+/// this, a recipe's key or predicate would call a routine as the deployer, unjudged. The
+/// judgment holds for the binding on the parent's `search_path`, so the recipe's emit runs
+/// every statement, a leaf's too, on that path (`build_partitioned_index`); a statement on
+/// another path would call what this never judged. Every other change is its own.
 fn judged(change: &Change) -> std::borrow::Cow<'_, Change> {
     if let Change::Index(IndexChange::BuildPartitionedIndex(recipe)) = change {
         std::borrow::Cow::Owned(recipe.parent_change())

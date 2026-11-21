@@ -14,6 +14,15 @@ pub(super) fn build_partitioned_index(pg: &Postgres, recipe: &BuildPartitionedIn
     // own name and attached to the parent's. It has no `USING INDEX` form, so each leaf's
     // constraint is added whole, with the parent's timing, parameters and predicate, which a
     // clone carries (measured on 18.6, DEC-2448.7).
+    //
+    // Every statement of a recipe runs on the PARENT's `search_path`, a leaf's too, though a
+    // leaf may live in another schema. The apply-time vet (`table_expressions::judged`) judges
+    // the parent's key expressions and predicate as bound on the parent's path, and only the
+    // first statement carries it. A leaf statement on the leaf's own path would bind an
+    // unqualified call to a routine of the leaf's schema that no vet admitted, and run it as
+    // the deployer over the copied rows; the ATTACH would then refuse the mismatched index
+    // after the call. Table names are qualified, so the leaf is still the table built on
+    // (measured on 18.6, a decoy `f` in the leaf's schema; DEC-2448.7).
     if let Definition::Exclusion(x) = &recipe.definition {
         let parent = &recipe.parent.name;
         let mut out = vec![on(
@@ -25,7 +34,7 @@ pub(super) fn build_partitioned_index(pg: &Postgres, recipe: &BuildPartitionedIn
             let leaf = &clone.leaf.name;
             out.push(on(
                 pg,
-                leaf,
+                parent,
                 &add_key_sql(leaf, &exclusion_clause(clone.name.raw(), x)?, false)?,
             )?);
             out.push(on(
@@ -93,13 +102,13 @@ pub(super) fn build_partitioned_index(pg: &Postgres, recipe: &BuildPartitionedIn
         let leaf = &clone.leaf.name;
         out.push(on(
             pg,
-            leaf,
+            parent,
             &create_index(leaf, clone.name.raw(), &index, Strategy::default())?,
         )?);
         if let Some(kind) = kind {
             out.push(on(
                 pg,
-                leaf,
+                parent,
                 &add_key_sql(
                     leaf,
                     &format!(

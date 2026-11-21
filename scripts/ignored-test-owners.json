@@ -2812,6 +2812,7 @@
         "index_gist2448::a_key_collation_is_the_engines_where_the_model_holds_it",
         "index_gist2448::an_array_of_a_collatable_element_takes_a_key_collation_and_reads_back",
         "index_gist2448::a_gist_option_change_alters_in_place_and_a_drop_needs_nothing_else",
+        "index_gist2448::a_recipes_leaf_builds_bind_the_parents_routine_not_one_of_the_leafs_schema",
         "index_policy2448::the_policy_capabilities_are_the_engines_own",
         "text_search2728::measure",
         "text_search2728::a_stored_dependent_behind_a_view_or_a_function_is_found_and_a_read_only_chain_is_not",

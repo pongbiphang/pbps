@@ -245,3 +245,82 @@ fn the_first_statement_of_a_recipe_with_an_expression_introduces_it() {
     let plain = build(serde_json::json!({"name":"k"}));
     assert!(plain.iter().all(|s| s.introduces.is_none()), "{plain:?}");
 }
+
+/// A leaf may live in another schema than its parent, and its build evaluates the parent's
+/// declared key expressions and predicate, which the apply-time vet judged as bound on the
+/// parent's `search_path`. So every statement of a recipe, a leaf's included, sets the
+/// parent's path and never the leaf's: an unqualified call on the leaf's path would bind to a
+/// routine of the leaf's schema that nothing admitted (measured on 18.6: the decoy ran as
+/// the deployer, then the ATTACH refused the mismatched index). The leaf stays named in its
+/// own statements by the qualified table name, and the declared text is carried verbatim.
+#[test]
+fn every_recipe_statement_runs_on_the_parents_path_even_for_a_cross_schema_leaf() {
+    let pg = Postgres::new();
+    let recipe = fixture::index_recipe();
+    assert_eq!(recipe.parent.name.schema, "app");
+    let exclusion = |key: serde_json::Value, filter: Option<&str>| {
+        serde_json::json!({"exclusion":{
+            "method":"btree",
+            "keys":[{"key":key,"operator":"="}],
+            "include":[],
+            "storage_parameters":{},
+            "filter":filter,
+            "timing":"immediate"
+        }})
+    };
+    let call = serde_json::json!({"expression":"ok(k)"});
+    let column = serde_json::json!({"name":"k"});
+    let definitions = [
+        // The expression arms: a key call, and a predicate call, in each definition.
+        exclusion(call.clone(), None),
+        exclusion(column.clone(), Some("ok(k)")),
+        serde_json::json!({"index":{"columns":[call.clone()]}}),
+        serde_json::json!({"index":{"columns":[column.clone()],"filter":"ok(k)"}}),
+        // Negatives: the arms that hold no expression run on the parent's path as well, so
+        // the rule has no exception to remember.
+        exclusion(column, None),
+        serde_json::json!({"index":{"columns":[{"name":"k"}]}}),
+        serde_json::json!({"unique":{"columns":["k"]}}),
+        serde_json::json!({"primary_key":{"name":"p_idx","columns":["k"]}}),
+    ];
+    for definition in definitions {
+        for leaf_schema in ["leaf_schema", "app"] {
+            let mut r = recipe.clone();
+            r.definition = serde_json::from_value(definition.clone()).unwrap();
+            r.clones[0].leaf.name.schema = leaf_schema.into();
+            let statements = emit(
+                &pg,
+                &Change::Index(IndexChange::BuildPartitionedIndex(Box::new(r))),
+                Strategy::default(),
+            )
+            .unwrap();
+            assert!(statements.len() >= 3, "{definition}: {statements:?}");
+            for s in &statements {
+                assert!(
+                    s.sql
+                        .starts_with("SET search_path = \"app\", \"pg_temp\";\n"),
+                    "{definition} leaf in {leaf_schema}: {}",
+                    s.sql
+                );
+                assert!(
+                    leaf_schema == "app" || !s.sql.contains("\"leaf_schema\", \"pg_temp\""),
+                    "{definition}: {}",
+                    s.sql
+                );
+                let commands = &s.execution.as_ref().unwrap().commands;
+                assert_eq!(commands[0], "SET search_path = \"app\", \"pg_temp\";");
+            }
+            // The leaf is still the table built on, by its qualified name.
+            let leaf = format!("\"{leaf_schema}\".\"tmp_p1\"");
+            assert!(
+                statements[1].sql.contains(&leaf),
+                "{definition}: {}",
+                statements[1].sql
+            );
+            // The declared text reaches the leaf's statement unchanged, a qualified call too.
+            if definition.to_string().contains("ok(k)") {
+                assert!(statements[1].sql.contains("ok(k)"), "{}", statements[1].sql);
+            }
+        }
+    }
+}
