@@ -34,6 +34,7 @@ use pbps_db::sqlite::Connection;
 use pbps_model::escape::Escaped;
 use pbps_model::{Change, ChangeSet, ColumnChange, TableChange};
 
+use crate::lexis;
 use crate::state::{BUSY_WAIT, waiting};
 
 /// The most a copy may take, in bytes: 512 MiB. A larger database is refused, and
@@ -361,14 +362,27 @@ fn triggers(
     for owner in &owners {
         let owner = owner.text(0)?;
         let target = format!("main.{}", quote(owner));
-        let mut writes = vec![
-            (
+        // A view takes a write only of a kind it has an `INSTEAD OF` trigger for
+        // (measured: the others are refused as writes to a view, with no trigger
+        // at fault), so only those are asked of it. A table takes every kind.
+        let asked = view_writes(scratch, owner)?;
+        let asks = |kind: &str| asked.as_ref().is_none_or(|kinds| kinds.contains(kind));
+        let mut writes = Vec::new();
+        if asks("insert") {
+            writes.push((
                 "insert",
                 format!("EXPLAIN INSERT INTO {target} DEFAULT VALUES"),
-            ),
-            ("delete", format!("EXPLAIN DELETE FROM {target}")),
-        ];
-        if !broken_views.iter().any(|view| view == owner) {
+            ));
+        }
+        if asks("delete") {
+            writes.push(("delete", format!("EXPLAIN DELETE FROM {target}")));
+        }
+        // A trigger's owner is stored as the trigger wrote it, and a view's name
+        // as the view did: one name to the engine, whatever the case.
+        let broken = broken_views
+            .iter()
+            .any(|view| view.eq_ignore_ascii_case(owner));
+        if asks("update") && !broken {
             // Every column is set to itself, so a trigger `OF` any column fires.
             let columns = scratch.query(
                 "SELECT name FROM pragma_table_xinfo(?1, 'main') WHERE hidden = 0 ORDER BY cid",
@@ -398,6 +412,61 @@ fn triggers(
         }
     }
     Ok(())
+}
+
+/// The kinds of write the view `owner` has a trigger for, or `None` when
+/// `owner` is a table (which takes every kind).
+fn view_writes(
+    scratch: &Connection,
+    owner: &str,
+) -> Result<Option<std::collections::BTreeSet<&'static str>>, DbError> {
+    let name = [pbps_db::sqlite::Value::Text(owner.to_owned())];
+    let views = scratch.query(
+        "SELECT 1 FROM sqlite_schema WHERE type = 'view' AND name = ?1 COLLATE NOCASE",
+        &name,
+    )?;
+    if views.is_empty() {
+        return Ok(None);
+    }
+    let triggers = scratch.query(
+        "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ?1 COLLATE NOCASE",
+        &name,
+    )?;
+    let mut kinds = std::collections::BTreeSet::new();
+    for trigger in &triggers {
+        match trigger_event(trigger.text(0)?) {
+            Some(kind) => {
+                kinds.insert(kind);
+            }
+            // A definition this cannot read: every kind is asked, as of a table,
+            // and none is skipped on a guess.
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(kinds))
+}
+
+/// The event of a `CREATE TRIGGER` definition: the first of `DELETE`, `INSERT`
+/// and `UPDATE` as a bare word in its code. The three are reserved, so none can
+/// be the trigger's unquoted name, and a quoted name or a comment is not code.
+fn trigger_event(definition: &str) -> Option<&'static str> {
+    for piece in lexis::pieces(definition) {
+        let lexis::Piece::Code(code) = piece else {
+            continue;
+        };
+        for word in code.split(|c| !crate::ident::identifier_continues(c)) {
+            for (event, kind) in [
+                ("DELETE", "delete"),
+                ("INSERT", "insert"),
+                ("UPDATE", "update"),
+            ] {
+                if word.eq_ignore_ascii_case(event) {
+                    return Some(kind);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn failed(what: &'static str, name: String, about: Vec<About>, error: &DbError) -> Unresolved {

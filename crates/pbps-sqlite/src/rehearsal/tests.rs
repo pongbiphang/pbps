@@ -640,6 +640,82 @@ fn a_key_that_could_not_be_checked_before_a_rename_is_not_the_plans_after_it() {
 }
 
 #[test]
+fn a_view_is_asked_only_the_writes_it_has_a_trigger_for() {
+    // A delete trigger alone: an insert into the view is refused as a write to
+    // a view, which is no fault of a trigger and no finding.
+    let mut db = file(
+        "CREATE TABLE t(a integer); CREATE VIEW v AS SELECT a FROM t; \
+         CREATE TRIGGER \"insert\" /* UPDATE */ INSTEAD OF DELETE ON v BEGIN \
+         DELETE FROM t WHERE a = old.a; END",
+    );
+    let copy = scratch(db.connection(), SCRATCH_LIMIT).expect("copied");
+    let found = resolution(&copy).expect("asked");
+    assert!(found.is_empty(), "{:?}", found.failing());
+    // Negative: the kind it has is asked, and a trigger that names what is
+    // gone is found there.
+    copy.execute_batch("DROP TABLE t; CREATE TABLE t(b integer)")
+        .expect("the trigger's column is gone");
+    let broken = resolution(&copy).expect("asked").failing();
+    assert!(
+        broken
+            .iter()
+            .any(|line| line.contains("trigger `v (delete)`")),
+        "{broken:?}"
+    );
+    assert!(
+        !broken.iter().any(|line| line.contains("(insert)")),
+        "{broken:?}"
+    );
+}
+
+#[test]
+fn a_broken_view_whose_trigger_spells_it_in_another_case_is_a_finding_and_not_an_error() {
+    let mut db = file(
+        "CREATE TABLE t(a integer); CREATE VIEW v AS SELECT a FROM t; \
+         CREATE TRIGGER g INSTEAD OF UPDATE ON V BEGIN SELECT 1; END",
+    );
+    let copy = scratch(db.connection(), SCRATCH_LIMIT).expect("copied");
+    assert!(resolution(&copy).expect("asked").is_empty());
+    copy.execute_batch("DROP TABLE t")
+        .expect("the view is broken");
+    // The view is the finding; its columns cannot be read, and are not asked.
+    let found = resolution(&copy)
+        .expect("a finding, not an error")
+        .failing();
+    assert!(
+        found.iter().any(|line| line.contains("view `v`")),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn the_event_of_a_trigger_is_read_from_its_code_only() {
+    for (definition, event) in [
+        (
+            "CREATE TRIGGER g AFTER INSERT ON t BEGIN DELETE FROM t; END",
+            Some("insert"),
+        ),
+        (
+            "create trigger g instead of update of a on v begin select 1; end",
+            Some("update"),
+        ),
+        (
+            "CREATE TRIGGER \"delete\" /* INSERT */ -- update\n BEFORE DELETE ON t BEGIN SELECT 1; END",
+            Some("delete"),
+        ),
+        (
+            "CREATE TRIGGER [update] DELETE ON t BEGIN SELECT 1; END",
+            Some("delete"),
+        ),
+        // Negative: nothing that names an event, and a longer word is not one.
+        ("CREATE TRIGGER g", None),
+        ("CREATE TRIGGER inserted ON t", None),
+    ] {
+        assert_eq!(super::trigger_event(definition), event, "{definition}");
+    }
+}
+
+#[test]
 fn foreign_key_rows_count_only_the_ones_the_plan_added() {
     let rows = |n: u64| {
         Resolution(vec![Unresolved {
