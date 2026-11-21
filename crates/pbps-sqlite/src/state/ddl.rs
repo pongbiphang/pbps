@@ -160,10 +160,10 @@ pub fn is_initialized(c: &Connection) -> Result<bool, DbError> {
 /// reports no error (measured), so without the check this would return `Ok` over
 /// a database with no ledger.
 ///
-/// The missing tables are created in one savepoint, so a half-made ledger cannot
-/// exist, and a savepoint and not `BEGIN` so that this behaves the same inside an
-/// apply's transaction (a `record` runs inside it) and outside one (a `lock`
-/// runs before it), and neither commits what the caller has not.
+/// The missing tables are created in one unit, so a half-made ledger cannot
+/// exist: a savepoint inside an apply's transaction (a `record` runs inside it),
+/// which commits nothing the caller has not, and a transaction of its own
+/// outside one (a `lock` runs before it).
 pub fn ensure_tables(c: &Connection) -> Result<(), DbError> {
     ensure_tables_within(c, BUSY_WAIT)
 }
@@ -228,21 +228,36 @@ pub(super) fn create(c: &Connection, missing: &[&Recipe]) -> Result<(), DbError>
     })
 }
 
-/// Runs `work` under a savepoint: released when it succeeds, undone when it does
-/// not, and the connection left as the caller had it either way.
+/// Runs `work` as one unit: kept when it succeeds, undone when it does not, and
+/// the connection left as the caller had it either way.
 ///
-/// Outside a transaction a savepoint opens one and releasing it commits, so a
-/// failed release there (a reader in the journal mode where readers block a
-/// commit) leaves a transaction this function opened; it is rolled back. Inside
-/// one it only nests, and undoing it leaves the caller's transaction open.
+/// Inside a transaction it is a savepoint, which only nests, and undoing it
+/// leaves the caller's transaction open.
+///
+/// Outside one it is `BEGIN IMMEDIATE`, not a savepoint: a savepoint opens a
+/// transaction that takes the write lock only at its first write. A unit that
+/// reads first, or whose first statement turns out to write nothing (`CREATE
+/// TABLE IF NOT EXISTS` over a table another run has just made), then asks for
+/// the write lock while it holds a read one, and with another writer at work the
+/// engine refuses that at once, without waiting, because waiting could be a
+/// deadlock (measured: six runs taking the lock on a new file, one in about a
+/// hundred attempts answered "busy" within milliseconds). Taking the write lock
+/// first waits for it like any statement. A commit that fails there (a reader in
+/// the journal mode where readers block a commit) leaves the transaction this
+/// function opened; it is rolled back.
 pub(super) fn in_a_unit<T>(
     c: &Connection,
     work: impl FnOnce() -> Result<T, DbError>,
 ) -> Result<T, DbError> {
     let nested = c.in_transaction();
-    c.execute_batch(&format!("SAVEPOINT {UNIT}"))?;
+    let (open, keep) = if nested {
+        (format!("SAVEPOINT {UNIT}"), format!("RELEASE {UNIT}"))
+    } else {
+        ("BEGIN IMMEDIATE".to_owned(), "COMMIT".to_owned())
+    };
+    c.execute_batch(&open)?;
     let outcome = work().and_then(|value| {
-        c.execute_batch(&format!("RELEASE {UNIT}"))?;
+        c.execute_batch(&keep)?;
         Ok(value)
     });
     if outcome.is_err() {

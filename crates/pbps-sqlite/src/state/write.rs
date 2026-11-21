@@ -81,7 +81,7 @@ RETURNING id";
 /// It runs plain statements and never `BEGIN`: inside an apply's transaction it
 /// is rolled back with it, and outside one it is a statement of its own, atomic
 /// as any is. (The ledger is created first when it is not there, under
-/// [`ensure_tables`](super::ensure_tables)'s savepoint.)
+/// [`ensure_tables`](super::ensure_tables)'s unit.)
 pub fn record(c: &Connection, snapshot: &StateSnapshot) -> Result<i64, LedgerError> {
     record_within(c, snapshot, BUSY_WAIT)
 }

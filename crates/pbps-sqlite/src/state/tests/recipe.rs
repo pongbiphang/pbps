@@ -323,6 +323,67 @@ fn a_unit_that_fails_leaves_nothing_and_one_that_succeeds_commits() {
 }
 
 #[test]
+fn a_unit_that_reads_before_it_writes_waits_for_another_writer() {
+    // The shape that was refused at once: the unit holds a read lock when it asks
+    // for the write lock, and another connection is writing.
+    super::in_both_journal_modes(|fresh, _| {
+        fresh
+            .connection()
+            .execute_batch("CREATE TABLE seen (x)")
+            .expect("made");
+        let path = fresh.path().to_path_buf();
+        let (held, wait_for_it) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let other =
+                pbps_db::sqlite::Connection::open(&path, pbps_db::sqlite::OpenMode::ExistingOnly)
+                    .expect("opens");
+            other
+                .execute_batch("BEGIN IMMEDIATE; CREATE TABLE theirs (x)")
+                .expect("holds the write lock");
+            held.send(()).expect("told");
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            other.execute_batch("COMMIT").expect("commits");
+        });
+        wait_for_it.recv().expect("the writer holds the lock");
+        let c = fresh.connection();
+        c.set_busy_timeout(std::time::Duration::from_secs(20))
+            .expect("set");
+        in_a_unit(c, || {
+            c.query("SELECT count(*) FROM seen", &[])?;
+            c.execute_batch("CREATE TABLE ours (x)")
+        })
+        .expect("the unit waited for the writer and then wrote");
+        writer.join().expect("joined");
+        assert!(!c.in_transaction());
+        assert_eq!(
+            number(
+                c,
+                "SELECT count(*) FROM sqlite_schema WHERE name IN ('ours', 'theirs')"
+            ),
+            2
+        );
+    });
+}
+
+#[test]
+fn a_unit_does_not_wait_longer_than_the_connection_allows() {
+    // Negative: the wait is the caller's, and a writer that stays is still an error.
+    super::in_both_journal_modes(|fresh, second| {
+        second
+            .execute_batch("BEGIN IMMEDIATE; CREATE TABLE theirs (x)")
+            .expect("holds the write lock");
+        let c = fresh.connection();
+        c.set_busy_timeout(std::time::Duration::from_millis(50))
+            .expect("set");
+        let refused = in_a_unit(c, || c.execute_batch("CREATE TABLE ours (x)"))
+            .expect_err("the writer never left");
+        assert!(crate::state::busy::is_busy(&refused), "{refused:?}");
+        assert!(!c.in_transaction(), "no transaction is left open");
+        second.execute_batch("ROLLBACK").expect("undone");
+    });
+}
+
+#[test]
 fn a_unit_inside_a_transaction_undoes_only_itself() {
     let mut fresh = Fresh::memory();
     let c = fresh.connection();
