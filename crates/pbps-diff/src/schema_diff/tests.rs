@@ -1,0 +1,21384 @@
+use super::omitted_defaults;
+
+/// The key is never one of them, an identity column is the engine's,
+/// and a column the row spells needs no default; every other defaulted
+/// column the row omits travels with the insert (DECISIONS 117).
+#[test]
+fn an_inserted_row_carries_the_defaults_of_the_columns_it_omits() {
+    use pbps_model::{Column, ColumnType, Row, Table, Value};
+    use std::str::FromStr;
+    let mut t = Table::default();
+    let mut col = |name: &str, ty: &str, default: Option<&str>, identity: bool| {
+        let mut c = Column::new(ColumnType::from_str(ty).unwrap());
+        c.value_source =
+            default.map_or(ValueSource::None, |text| ValueSource::Default(text.into()));
+        if identity {
+            c.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
+                seed: 1,
+                increment: 1,
+                options: Default::default(),
+            });
+        }
+        t.columns.insert(name.into(), c);
+    };
+    col("id", "int", Some("(1)"), false);
+    col("status_code", "varchar(10)", Some("('old')"), false);
+    col("label", "nvarchar(50)", Some("N'x'"), false);
+    col("rank", "int", None, false);
+    col("seq", "int", Some("(0)"), true);
+    let mut row = Row::default();
+    row.0.insert("label".into(), Value::Text("spelled".into()));
+    let (defaults, types) = omitted_defaults(&t, "id", &row);
+    assert_eq!(
+        defaults.into_iter().collect::<Vec<_>>(),
+        [(ColumnName::from("status_code"), "('old')".to_owned())]
+    );
+    // And the type of every non-key column, so the emitter can hold the
+    // row to the default it left a column at (DECISIONS 133), to NULL
+    // where the table gives none (136), and to a spelled cell by the
+    // rendering that reads it back (137). Not the key, not the identity
+    // column.
+    assert_eq!(
+        types.keys().collect::<Vec<_>>(),
+        [
+            &pbps_model::ColumnName::from("label").to_owned(),
+            &pbps_model::ColumnName::from("rank").to_owned(),
+            &pbps_model::ColumnName::from("status_code").to_owned()
+        ]
+    );
+}
+/// The invariant the SQL Server preflight reads, stated as a property
+/// rather than as a list.
+///
+/// For a non-key column, **absent from `types` means `IDENTITY`**, and
+/// `pbps_mssql::preflight` uses exactly that to tell a column an insert
+/// leaves at NULL from one the engine assigns. Projecting NULL for an
+/// identity column made two inserted rows identical there, so a unique
+/// constraint over it reported a duplicate the engine would never produce
+/// and a valid plan was refused.
+///
+/// So narrowing `types` for some other reason has to fail here. The test
+/// above pins the list this table produces; this one pins what the list
+/// *means*, which is the part a reader updating the list would otherwise
+/// step over.
+#[test]
+fn an_inserts_types_name_every_non_key_column_except_the_identity_ones() {
+    use pbps_model::{Column, ColumnType, Row, Table, Value};
+    use std::collections::BTreeSet;
+    use std::str::FromStr;
+    let mut t = Table::default();
+    let mut col = |name: &str, ty: &str, identity: bool| {
+        let mut c = Column::new(ColumnType::from_str(ty).unwrap());
+        if identity {
+            c.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
+                seed: 1,
+                increment: 1,
+                options: Default::default(),
+            });
+        }
+        t.columns.insert(name.into(), c);
+    };
+    col("code", "varchar(10)", false);
+    col("label", "nvarchar(50)", false);
+    col("seq", "int", true);
+    let mut row = Row::default();
+    row.0.insert("label".into(), Value::Text("spelled".into()));
+
+    let (_, types) = omitted_defaults(&t, "code", &row);
+    let expected: BTreeSet<ColumnName> = t
+        .columns
+        .iter()
+        .filter(|(c, spec)| {
+            c.raw() != "code"
+                && (match &spec.value_source {
+                    ValueSource::Identity(_) | ValueSource::Sequence(_) => false,
+                    ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => true,
+                })
+        })
+        .map(|(c, _)| c.clone())
+        .collect();
+    assert_eq!(types.keys().cloned().collect::<BTreeSet<_>>(), expected);
+
+    // The negative half, which is the one the preflight actually reads: a
+    // spelled column is present, and the identity column is the absence.
+    assert!(types.contains_key("label"));
+    assert!(!types.contains_key("seq"));
+    assert!(!types.contains_key("code"));
+}
+
+use super::*;
+use crate::identity::Context;
+use indexmap::IndexMap;
+use pbps_dialect::MinimalDialect;
+use pbps_model::ColumnChange;
+use pbps_model::ConstraintChange;
+use pbps_model::ExtensionChange;
+use pbps_model::GrantChange;
+use pbps_model::IndexChange;
+use pbps_model::ModuleChange;
+use pbps_model::PartitionChange;
+use pbps_model::PolicyChange;
+use pbps_model::RowChange;
+use pbps_model::SearchChange;
+use pbps_model::TableChange;
+use pbps_model::TablePropertyChange;
+use pbps_model::TypeChange;
+use pbps_model::TypeValueChange;
+use pbps_model::{
+    CheckConstraint, Column, ColumnType, ForeignKey, IdsFile, Index, IndexColumn, Intent,
+    PrimaryKey, ReferentialAction, RiskClass, Row, Uid, UniqueConstraint,
+};
+
+#[test]
+fn row_reconciliation_distinguishes_raw_columns_from_their_shown_spelling() {
+    let raw = ColumnName::from("cell\n\r\u{1b}[31m\\\u{200b}名前");
+    let literal = ColumnName::from(raw.shown().to_string());
+    let base = Table {
+        columns: [
+            ("id".into(), Column::new(ty("int")).not_null()),
+            (raw.clone(), Column::new(ty("int"))),
+            (literal.clone(), Column::new(ty("int"))),
+        ]
+        .into(),
+        primary_key: Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        }),
+        data: Some(pbps_model::TableData {
+            mode: DataMode::Ensure,
+            rows: [(
+                "1".into(),
+                Row([
+                    (raw.clone(), Value::Int(1)),
+                    (literal.clone(), Value::Int(9)),
+                ]
+                .into()),
+            )]
+            .into(),
+        }),
+        ..Default::default()
+    };
+    let mut declared = base.clone();
+    declared
+        .data
+        .as_mut()
+        .unwrap()
+        .rows
+        .get_mut(&pbps_model::RowKey::from("1"))
+        .unwrap()
+        .0
+        .insert(raw.clone(), Value::Int(2));
+    let mapping = base
+        .columns
+        .keys()
+        .map(|c| (c.clone(), c.clone()))
+        .collect();
+    let (mut changes, mut errors) = (Vec::new(), Vec::new());
+    diff_data(
+        &TableName::new("app", "t"),
+        &base,
+        &declared,
+        &mapping,
+        &mut changes,
+        &mut errors,
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+    let [
+        Change::Row(RowChange::UpdateRow {
+            columns,
+            unchanged,
+            types,
+            ..
+        }),
+    ] = changes.as_slice()
+    else {
+        panic!("one cell update: {changes:?}");
+    };
+    assert_eq!(
+        columns.get(raw.raw()),
+        Some(&(Cell::Value(Value::Int(1)), Cell::Value(Value::Int(2))))
+    );
+    assert!(!columns.contains_key(literal.raw()));
+    assert_eq!(
+        unchanged.get(literal.raw()),
+        Some(&Cell::Value(Value::Int(9)))
+    );
+    assert!(types.contains_key(raw.raw()) && types.contains_key(literal.raw()));
+}
+
+#[test]
+fn attachment_refusals_escape_column_lists_once() {
+    use pbps_model::{PartitionBound, PartitionBy, PartitionOf};
+    let raw = "col\nline\\tail";
+    let other = "other\rline\\tail";
+    let parent_name = TableName::new("app", "parent");
+    let child_name = TableName::new("app", "child");
+    let mut parent = table(&[(raw, Column::new(ty("int")))]);
+    parent.partition_by = Some(PartitionBy {
+        columns: vec![raw.into()],
+        strategy: Default::default(),
+        external: false,
+    });
+    let base = Schema {
+        tables: [(parent_name.clone(), parent.clone())].into(),
+        ..Default::default()
+    };
+    let of = PartitionOf {
+        parent: parent_name,
+        bound: PartitionBound::Default,
+        columns: Default::default(),
+    };
+    let declared = Table {
+        partition_of: Some(of.clone()),
+        ..Default::default()
+    };
+    let ids = IdsFile::default();
+    let ask = |ordinary: &Table| {
+        super::attached(
+            Side {
+                schema: &base,
+                ids: &ids,
+            },
+            &child_name,
+            &child_name,
+            ordinary,
+            &declared,
+            &of,
+            &MinimalDialect,
+            None,
+            None,
+        )
+    };
+    let ordinary = table(&[(other, Column::new(ty("int")))]);
+    match ask(&ordinary) {
+        Err(problems) => {
+            let error = DiffError::AttachedShape {
+                table: child_name.clone(),
+                parent: of.parent.clone(),
+                what: problems,
+            };
+            assert_eq!(
+                error.to_string(),
+                r"app.child is attached to app.parent as a partition, but its columns are (other\rline\\tail), and its parent's are (col\nline\\tail), in that order. Bring the table to its parent's shape in an earlier plan, then attach it."
+            );
+        }
+        Ok(_) => panic!("different raw column identities cannot attach"),
+    }
+    // Negative: matching raw identities can attach without a refusal.
+    let matching = Table {
+        columns: parent.columns,
+        ..Default::default()
+    };
+    assert!(ask(&matching).is_ok());
+}
+
+fn ctx() -> Context {
+    Context {
+        operator: "leon".into(),
+        today: "2026-08-30".into(),
+    }
+}
+
+fn ty(s: &str) -> ColumnType {
+    s.parse().unwrap()
+}
+
+fn table(cols: &[(&str, Column)]) -> Table {
+    let mut columns = IndexMap::new();
+    for (n, c) in cols {
+        columns.insert((*n).into(), c.clone());
+    }
+    Table {
+        columns,
+        ..Default::default()
+    }
+}
+
+fn schema_of(name: &str, t: Table) -> Schema {
+    let mut s = Schema::default();
+    s.tables.insert(name.parse().unwrap(), t);
+    s
+}
+
+/// A SQL Server table's, key's and index's filegroup: a change of any is
+/// refused by name and plans nothing; the same one, and an object the plan
+/// adds with its own, are not (#2813, DEC-2813.1).
+#[test]
+fn a_changed_filegroup_is_refused_by_name_and_an_unchanged_or_added_one_is_not() {
+    use pbps_model::Filegroup;
+    let fg = |n: &str| Some(Filegroup::new(n));
+    let world = |table_fg: Option<&str>, key_fg: Option<&str>, index_fg: Option<&str>| {
+        let mut t = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("v", Column::new(ty("int"))),
+        ]);
+        t.filegroup = table_fg.and_then(fg);
+        t.primary_key = Some(pbps_model::PrimaryKey {
+            name: Some("pk_t".into()),
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+            filegroup: key_fg.and_then(fg),
+        });
+        t.indexes.insert(
+            "ix_v".into(),
+            Index {
+                columns: vec![pbps_model::IndexColumn::column("v")],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+                filegroup: index_fg.and_then(fg),
+            },
+        );
+        schema_of("dbo.t", t)
+    };
+    let errors = |base: &Schema, declared: &Schema| {
+        let ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        diff(
+            Side {
+                schema: base,
+                ids: &ids,
+            },
+            Side {
+                schema: declared,
+                ids: &ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .map_err(|e| {
+            e.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    };
+    let base = world(Some("fgx"), Some("fgk"), Some("fgi"));
+    // Unchanged: nothing to plan, nothing refused.
+    assert_eq!(errors(&base, &base.clone()).unwrap().changes.len(), 0);
+    for (declared, named) in [
+        (world(Some("fgy"), Some("fgk"), Some("fgi")), "the table"),
+        (
+            world(Some("fgx"), Some("fgz"), Some("fgi")),
+            "the primary key",
+        ),
+        (world(Some("fgx"), Some("fgk"), Some("fgz")), "index ix_v"),
+        // Declaring none where the database has one is a change too.
+        (world(None, Some("fgk"), Some("fgi")), "the table"),
+    ] {
+        let said = errors(&base, &declared).unwrap_err();
+        assert!(said.contains(named), "{named}: {said}");
+        assert!(said.contains("dbo.t"), "{said}");
+        assert!(said.contains("DEC-2813.1"), "{said}");
+    }
+    let said = errors(&base, &world(Some("fgy"), Some("fgk"), Some("fgi"))).unwrap_err();
+    assert!(said.contains("`fgx`") && said.contains("`fgy`"), "{said}");
+    // A different spelling of the same name is no change.
+    assert!(errors(&base, &world(Some("FGX"), Some("fgk"), Some("fgi"))).is_ok());
+    // An object the plan adds names its filegroup freely: nothing to compare.
+    let mut declared = world(Some("fgx"), Some("fgk"), Some("fgi"));
+    let t = declared.tables.get_mut(&"dbo.t".parse().unwrap()).unwrap();
+    let mut more = t.indexes["ix_v"].clone();
+    more.filegroup = fg("fgn");
+    t.indexes.insert("ix_new".into(), more);
+    let changes = errors(&base, &declared).unwrap();
+    assert_eq!(kinds(&changes), ["AddIndex"]);
+}
+
+/// The domain `app.code` of a table `app.t` that uses it, as a schema.
+fn domain_world(domain: pbps_model::ManagedType, extra_column: bool, rows: bool) -> Schema {
+    let mut t = table(&[
+        ("id", Column::new(ty("int")).not_null()),
+        ("v", Column::new(ty("app.code"))),
+    ]);
+    if extra_column {
+        t.columns.insert("w".into(), Column::new(ty("app.code")));
+    }
+    let mut s = schema_of("app.t", t);
+    s.types.insert("app.code".parse().unwrap(), domain);
+    if rows {
+        let mut u = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("name", Column::new(ty("text"))),
+        ]);
+        u.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        });
+        u.data = Some(pbps_model::TableData {
+            mode: pbps_model::DataMode::Ensure,
+            rows: [(
+                pbps_model::RowKey::from("1"),
+                pbps_model::Row([("name".into(), pbps_model::Value::Text("a".into()))].into()),
+            )]
+            .into(),
+        });
+        s.tables.insert("app.u".parse().unwrap(), u);
+    }
+    s
+}
+
+fn code(
+    not_null: bool,
+    default: Option<&str>,
+    checks: &[(&str, &str)],
+    base: &str,
+) -> pbps_model::ManagedType {
+    pbps_model::ManagedType::Domain {
+        base: ty(base),
+        not_null,
+        default: default.map(str::to_owned),
+        checks: checks
+            .iter()
+            .map(|(n, t)| ((*n).into(), (*t).to_owned()))
+            .collect(),
+        collation: None,
+    }
+}
+
+fn alter_domain(
+    base: &Schema,
+    declared: &Schema,
+    intents: &[Intent],
+) -> Result<ChangeSet, Vec<DiffError>> {
+    let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+        .unwrap()
+        .ids;
+    diff(
+        Side {
+            schema: base,
+            ids: &base_ids,
+        },
+        Side {
+            schema: declared,
+            ids: &declared_ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+    )
+    .map(|plan| plan.changes().clone())
+}
+
+/// DEC-1635.8: what a retained domain changes in place, by half.
+#[test]
+fn a_retained_domains_checks_default_and_not_null_plan_their_halves() {
+    use pbps_model::DomainHalf::{Loosen, Tighten};
+    let base = domain_world(
+        code(
+            false,
+            Some("'a'"),
+            &[("c1", "VALUE <> ''"), ("c2", "length(VALUE) < 9")],
+            "text",
+        ),
+        false,
+        false,
+    );
+    let halves = |wanted: pbps_model::ManagedType| -> Vec<pbps_model::DomainHalf> {
+        alter_domain(&base, &domain_world(wanted, false, false), &[])
+            .expect("an in-place alteration plans")
+            .changes
+            .iter()
+            .map(|p| match &p.change {
+                Change::TypeValue(TypeValueChange::AlterDomain { half, .. }) => *half,
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    };
+    let two = |c1: &'static str| [("c1", c1), ("c2", "length(VALUE) < 9")];
+    assert_eq!(
+        halves(code(false, Some("'a'"), &two("VALUE <> ''"), "text")),
+        []
+    );
+    // A changed check is a drop and an add under its name.
+    assert_eq!(
+        halves(code(false, Some("'a'"), &two("VALUE <> 'x'"), "text")),
+        [Loosen, Tighten]
+    );
+    // An added check tightens; a dropped one loosens.
+    let added = [
+        ("c1", "VALUE <> ''"),
+        ("c2", "length(VALUE) < 9"),
+        ("c3", "VALUE <> 'z'"),
+    ];
+    assert_eq!(halves(code(false, Some("'a'"), &added, "text")), [Tighten]);
+    assert_eq!(
+        halves(code(false, Some("'a'"), &[("c1", "VALUE <> ''")], "text")),
+        [Loosen]
+    );
+    // The default is set, changed or dropped with the loosening half.
+    for default in [Some("'b'"), None] {
+        assert_eq!(
+            halves(code(false, default, &two("VALUE <> ''"), "text")),
+            [Loosen]
+        );
+    }
+    // NOT NULL set tightens and dropped loosens.
+    assert_eq!(
+        halves(code(true, Some("'a'"), &two("VALUE <> ''"), "text")),
+        [Tighten]
+    );
+    let held = domain_world(code(true, None, &[], "text"), false, false);
+    let released = domain_world(code(false, None, &[], "text"), false, false);
+    let plan = alter_domain(&held, &released, &[]).unwrap();
+    assert!(matches!(
+        &plan.changes[..],
+        [p] if matches!(&p.change, Change::TypeValue(TypeValueChange::AlterDomain { half: Loosen, .. }))
+    ));
+    // Everything at once plans both halves.
+    assert_eq!(
+        halves(code(true, None, &[("c1", "VALUE <> 'x'")], "text")),
+        [Loosen, Tighten]
+    );
+}
+
+/// A collation change is the rebuild's and plans no alteration; an
+/// unconvertible base is refused with a pointer to #2331; so is a domain
+/// whose identity is not recorded.
+#[test]
+fn a_domains_base_or_collation_change_plans_no_alteration_and_is_left_to_the_rebuild() {
+    let base = domain_world(code(false, None, &[], "text"), false, false);
+    let mut collated = code(false, None, &[], "text");
+    if let pbps_model::ManagedType::Domain { collation, .. } = &mut collated {
+        *collation = Some("pg_catalog.\"C\"".parse().unwrap());
+    }
+    // A collation change is the rebuild's, with no in-place alteration.
+    let plan = alter_domain(&base, &domain_world(collated, false, false), &[])
+        .expect("a collation change plans the rebuild");
+    assert!(
+        !plan.changes.is_empty()
+            && plan.changes.iter().all(|p| matches!(
+                p.change,
+                Change::TypeValue(TypeValueChange::EnumRebuild { .. })
+            )),
+        "{plan:?}"
+    );
+    // A base the dialect does not convert by itself is refused by name,
+    // pointing at the conversion the author states.
+    let errors = alter_domain(
+        &base,
+        &domain_world(code(false, None, &[], "varchar(20)"), false, false),
+        &[],
+    )
+    .expect_err("an unconvertible base is refused");
+    assert!(
+        errors.iter().any(|e| {
+            let said = e.to_string();
+            said.contains("app.code") && said.contains("#2331")
+        }),
+        "{errors:?}"
+    );
+    // Beside a base change, a changed check plans no half either.
+    let both = domain_world(
+        code(false, None, &[("c", "VALUE <> ''")], "varchar(20)"),
+        false,
+        false,
+    );
+    assert!(alter_domain(&base, &both, &[]).is_err());
+    // No identity recorded for the type: nothing to alter by.
+    let ids = IdsFile::default();
+    let errors = diff(
+        Side {
+            schema: &base,
+            ids: &ids,
+        },
+        Side {
+            schema: &domain_world(code(true, None, &[], "text"), false, false),
+            ids: &ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+    )
+    .expect_err("an unrecorded domain is not altered");
+    assert!(
+        errors.iter().any(|e| e.to_string().contains("app.code")),
+        "{errors:?}"
+    );
+}
+
+/// DEC-1635.8: a loosening goes in after the domain's rename and before
+/// the plan's other writes; a tightening after them.
+#[test]
+fn a_domain_alterations_halves_sort_around_the_plans_columns_and_rows() {
+    let base = domain_world(
+        code(false, None, &[("short", "length(VALUE) < 5")], "text"),
+        false,
+        false,
+    );
+    let desired = domain_world(
+        code(false, None, &[("short", "length(VALUE) < 9")], "text"),
+        true,
+        true,
+    );
+    let plan = alter_domain(&base, &desired, &[]).unwrap();
+    let name = |p: &PlannedChange| match &p.change {
+        Change::TypeValue(TypeValueChange::AlterDomain { half, .. }) => format!("{half:?}"),
+        Change::Column(ColumnChange::AddColumn { .. }) => "AddColumn".to_owned(),
+        Change::Table(TableChange::CreateTable { .. }) => "CreateTable".to_owned(),
+        Change::Row(RowChange::InsertRow { .. }) => "InsertRow".to_owned(),
+        other => panic!("{other:?}"),
+    };
+    let order: Vec<String> = plan.changes.iter().map(name).collect();
+    let at = |kind: &str| order.iter().position(|k| k == kind).unwrap();
+    assert!(at("Loosen") < at("CreateTable"), "{order:?}");
+    assert!(at("Loosen") < at("AddColumn"), "{order:?}");
+    assert!(at("AddColumn") < at("InsertRow"), "{order:?}");
+    assert!(at("InsertRow") < at("Tighten"), "{order:?}");
+    // Tightening only: after the same writes.
+    let only = domain_world(
+        code(
+            false,
+            None,
+            &[("short", "length(VALUE) < 5"), ("more", "VALUE <> 'x'")],
+            "text",
+        ),
+        true,
+        true,
+    );
+    let order: Vec<String> = alter_domain(&base, &only, &[])
+        .unwrap()
+        .changes
+        .iter()
+        .map(name)
+        .collect();
+    assert!(!order.contains(&"Loosen".to_owned()), "{order:?}");
+    assert!(
+        order.iter().position(|k| k == "InsertRow") < order.iter().position(|k| k == "Tighten"),
+        "{order:?}"
+    );
+    // A domain nothing changes plans nothing.
+    assert!(alter_domain(&base, &base, &[]).unwrap().changes.is_empty());
+}
+
+/// A default the loosening sets can name a label the plan renames or adds,
+/// so that half waits for the type changes; one that drops it, or sets
+/// nothing, stays with the checks it drops.
+#[test]
+fn a_loosening_that_sets_a_default_waits_for_the_label_changes() {
+    let no_default = code(false, None, &[], "text");
+    let with_default = code(false, Some("'b'"), &[], "text");
+    let with_check = code(false, None, &[("c", "VALUE <> 'a'")], "text");
+    let loosen = |from: &pbps_model::ManagedType, to: &pbps_model::ManagedType| {
+        Change::TypeValue(TypeValueChange::AlterDomain {
+            uid: "y_000001".parse().unwrap(),
+            name: "app.code".parse().unwrap(),
+            from: Box::new(from.clone()),
+            to: Box::new(to.clone()),
+            half: pbps_model::DomainHalf::Loosen,
+        })
+    };
+    let rename = Change::TypeValue(TypeValueChange::RenameEnumValue {
+        uid: "y_000002".parse().unwrap(),
+        name: "app.e".parse().unwrap(),
+        from: "a".into(),
+        to: "b".into(),
+        ordinal: 0,
+        retained: Vec::new(),
+        definition: Box::new(pbps_model::ManagedType::Enum {
+            values: vec!["b".into()],
+        }),
+    });
+    assert_eq!(
+        order_key(&loosen(&no_default, &with_default)),
+        order_key(&rename)
+    );
+    assert_eq!(order_key(&loosen(&with_default, &no_default)), 2);
+    assert_eq!(order_key(&loosen(&with_check, &no_default)), 2);
+    // And within the class it follows every label change.
+    let (type_rank, drop_type_rank) = (BTreeMap::new(), BTreeMap::new());
+    let rank = |c: &Change| {
+        dependency_rank(
+            c,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &type_rank,
+            &drop_type_rank,
+        )
+    };
+    assert!(rank(&loosen(&no_default, &with_default)) > rank(&rename));
+}
+
+#[test]
+fn row_security_creation_is_explicit_and_unchanged_standing_policies_are_noops() {
+    let plain = schema_of("app.t", table(&[("id", Column::new(ty("integer")))]));
+    for enabled in [false, true] {
+        for forced in [false, true] {
+            let mut secured = plain.clone();
+            let table = secured.tables.values_mut().next().unwrap();
+            table.row_security = pbps_model::RowSecurity { enabled, forced };
+            table.row_policies.insert(
+                "tenant_rows".into(),
+                pbps_model::RowPolicy {
+                    using: Some("id>0".into()),
+                    ..Default::default()
+                },
+            );
+            let created = run(&Schema::default(), &secured, &[]);
+            assert!(matches!(
+                created.changes[0].change,
+                Change::Table(TableChange::CreateTable { .. })
+            ));
+            assert!(matches!(
+                created.changes[1].change,
+                Change::Policy(PolicyChange::CreatePolicy { .. })
+            ));
+            assert_eq!(created.changes.len(), if enabled || forced { 3 } else { 2 });
+            assert!(created.changes.iter().all(|p| p.risks.is_empty()));
+            assert!(run(&secured, &secured, &[]).is_empty());
+            let mut unrelated = secured.clone();
+            unrelated
+                .tables
+                .values_mut()
+                .next()
+                .unwrap()
+                .columns
+                .insert(
+                    "label".into(),
+                    Column {
+                        nullable: true,
+                        ..Column::new(ty("text"))
+                    },
+                );
+            let change = run(&secured, &unrelated, &[]);
+            assert!(
+                matches!(&change.changes[..], [p] if matches!(p.change, Change::Column(ColumnChange::AddColumn { .. })))
+            );
+        }
+    }
+}
+
+#[test]
+fn row_security_standing_policy_transitions_keep_full_payloads_and_pair_replacements() {
+    use pbps_model::{PolicyCommand, PolicyRoles, RiskClass, RowPolicy, RowSecurityOrigin};
+    let plain = schema_of("app.t", table(&[("id", Column::new(ty("integer")))]));
+    let name: TableName = "app.t".parse().unwrap();
+    for restrictive in [false, true] {
+        let old = RowPolicy {
+            restrictive,
+            using: Some("id>0".into()),
+            with_check: Some("id<100".into()),
+            ..Default::default()
+        };
+        let mut base = plain.clone();
+        base.tables
+            .get_mut(&name)
+            .unwrap()
+            .row_policies
+            .insert("p".into(), old.clone());
+        // Latent policies still change access intent with both flags off.
+        assert!(base.tables[&name].row_security.is_default());
+        for field in 0..7 {
+            let mut new = old.clone();
+            match field {
+                0 => new.command = PolicyCommand::Update,
+                1 => new.restrictive = !restrictive,
+                2 => new.to = PolicyRoles::Roles(["app_user".into(), "auditor".into()].into()),
+                3 => new.using = Some("id>5".into()),
+                4 => new.with_check = Some("id<50".into()),
+                5 => new.using = None,
+                _ => new.with_check = None,
+            }
+            let mut declared = plain.clone();
+            declared
+                .tables
+                .get_mut(&name)
+                .unwrap()
+                .row_policies
+                .insert("p".into(), new.clone());
+            for (before, after, old, new) in [
+                (&base, &declared, &old, &new),
+                (&declared, &base, &new, &old),
+            ] {
+                let changes = run(before, after, &[]);
+                assert_eq!(changes.changes.len(), 2, "{restrictive}, field {field}");
+                assert_eq!(
+                    changes.changes[0].change,
+                    Change::Policy(PolicyChange::DropPolicy {
+                        table: name.clone(),
+                        name: "p".into(),
+                        policy: old.clone(),
+                    })
+                );
+                assert_eq!(
+                    changes.changes[1].change,
+                    Change::Policy(PolicyChange::CreatePolicy {
+                        table: name.clone(),
+                        name: "p".into(),
+                        policy: new.clone(),
+                        origin: RowSecurityOrigin::Standing,
+                    })
+                );
+                assert!(
+                    changes
+                        .changes
+                        .iter()
+                        .all(|p| p.risks == [RiskClass::Revoke, RiskClass::RowSecurity].into())
+                );
+            }
+            for (before, after, expected) in [
+                (
+                    &plain,
+                    &declared,
+                    Change::Policy(PolicyChange::CreatePolicy {
+                        table: name.clone(),
+                        name: "p".into(),
+                        policy: new.clone(),
+                        origin: RowSecurityOrigin::Standing,
+                    }),
+                ),
+                (
+                    &declared,
+                    &plain,
+                    Change::Policy(PolicyChange::DropPolicy {
+                        table: name.clone(),
+                        name: "p".into(),
+                        policy: new.clone(),
+                    }),
+                ),
+            ] {
+                let changes = run(before, after, &[]);
+                assert_eq!(changes.changes.len(), 1);
+                assert_eq!(changes.changes[0].change, expected);
+                assert_eq!(
+                    changes.changes[0].risks,
+                    MinimalDialect.change_risks(&expected)
+                );
+            }
+            assert!(run(&declared, &declared, &[]).is_empty());
+        }
+    }
+}
+
+#[test]
+fn row_security_policy_moves_between_names_or_owners_are_not_replacement_pairs() {
+    use pbps_model::{RiskClass, RowPolicy};
+    let a = TableName::new("app", "a");
+    let b = TableName::new("app", "b");
+    let mut base = schema_of("app.a", table(&[("id", Column::new(ty("integer")))]));
+    base.tables.insert(b.clone(), base.tables[&a].clone());
+    base.tables
+        .get_mut(&a)
+        .unwrap()
+        .row_policies
+        .insert("p".into(), RowPolicy::default());
+    for (owner, name) in [(a.clone(), "q"), (b, "p")] {
+        let mut declared = base.clone();
+        declared.tables.get_mut(&a).unwrap().row_policies.clear();
+        declared
+            .tables
+            .get_mut(&owner)
+            .unwrap()
+            .row_policies
+            .insert(name.into(), RowPolicy::default());
+        let changes = run(&base, &declared, &[]);
+        assert_eq!(kinds(&changes), ["DropPolicy", "CreatePolicy"]);
+        assert_eq!(changes.changes[0].risks, [RiskClass::Revoke].into());
+        assert_eq!(changes.changes[1].risks, [RiskClass::RowSecurity].into());
+    }
+}
+
+#[test]
+fn row_security_standing_flags_compare_both_independent_bits_in_all_sixteen_transitions() {
+    use pbps_model::{RowPolicy, RowSecurity, RowSecurityOrigin};
+    let name: TableName = "app.t".parse().unwrap();
+    let flags = [false, true]
+        .into_iter()
+        .flat_map(|enabled| [false, true].map(|forced| RowSecurity { enabled, forced }))
+        .collect::<Vec<_>>();
+    let mut plain = schema_of("app.t", table(&[("id", Column::new(ty("integer")))]));
+    plain
+        .tables
+        .get_mut(&name)
+        .unwrap()
+        .row_policies
+        .insert("latent".into(), RowPolicy::default());
+    let ids = crate::resolve(&plain, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let uid = ids
+        .tables
+        .iter()
+        .find(|(_, table)| *table == &name)
+        .unwrap()
+        .0;
+    for &from in &flags {
+        for &to in &flags {
+            let mut base = plain.clone();
+            let mut declared = plain.clone();
+            base.tables.get_mut(&name).unwrap().row_security = from;
+            declared.tables.get_mut(&name).unwrap().row_security = to;
+            let changes = diff(
+                Side {
+                    schema: &base,
+                    ids: &ids,
+                },
+                Side {
+                    schema: &declared,
+                    ids: &ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .unwrap();
+            if from == to {
+                assert!(changes.is_empty());
+            } else {
+                let expected = Change::Policy(PolicyChange::SetRowSecurity {
+                    uid: uid.clone(),
+                    table: name.clone(),
+                    from,
+                    to,
+                    origin: RowSecurityOrigin::Standing,
+                });
+                assert_eq!(changes.changes.len(), 1);
+                assert_eq!(changes.changes[0].change, expected);
+                assert_eq!(
+                    changes.changes[0].risks,
+                    MinimalDialect.change_risks(&expected)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn row_security_replacements_follow_renamed_identity_and_keep_reused_name_creation_separate() {
+    use pbps_model::{RiskClass, RowPolicy, RowSecurity, RowSecurityOrigin};
+    let old_name: TableName = "app.old".parse().unwrap();
+    let new_name: TableName = "app.renamed".parse().unwrap();
+    let mut base = schema_of("app.old", table(&[("id", Column::new(ty("integer")))]));
+    let old = RowPolicy {
+        using: Some("id>0".into()),
+        ..Default::default()
+    };
+    base.tables
+        .get_mut(&old_name)
+        .unwrap()
+        .row_policies
+        .insert("p".into(), old.clone());
+    let mut declared = Schema::default();
+    let mut renamed = base.tables[&old_name].clone();
+    let new = RowPolicy {
+        restrictive: true,
+        ..old.clone()
+    };
+    renamed.row_policies.insert("p".into(), new.clone());
+    renamed.row_security = RowSecurity {
+        enabled: false,
+        forced: true,
+    };
+    declared.tables.insert(new_name.clone(), renamed);
+    declared
+        .tables
+        .insert(old_name.clone(), base.tables[&old_name].clone());
+    let intent = Intent::RenameTable {
+        from: old_name.clone(),
+        to: new_name.clone(),
+    };
+    // Record the rename before reusing the old declaration path. A
+    // source still present cannot also consume a rename intent.
+    let before_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let renamed_only = schema_of("app.renamed", declared.tables[&new_name].clone());
+    let renamed_ids = crate::resolve(
+        &renamed_only,
+        &before_ids,
+        std::slice::from_ref(&intent),
+        &ctx(),
+    )
+    .unwrap()
+    .ids;
+    let after_ids = crate::resolve(&declared, &renamed_ids, &[], &ctx())
+        .unwrap()
+        .ids;
+    let changes = diff(
+        Side {
+            schema: &base,
+            ids: &before_ids,
+        },
+        Side {
+            schema: &declared,
+            ids: &after_ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+    )
+    .unwrap();
+    assert!(
+        matches!(&changes.changes[0].change, Change::Policy(PolicyChange::DropPolicy { table, policy, .. }) if table == &old_name && policy == &old)
+    );
+    assert!(
+        matches!(&changes.changes[1].change, Change::Table(TableChange::RenameTable { from, to, .. }) if from == &old_name && to == &new_name)
+    );
+    let installed = changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let Change::Policy(PolicyChange::CreatePolicy {
+                table,
+                policy,
+                origin,
+                ..
+            }) = &p.change
+            {
+                Some((table, policy, origin, &p.risks))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(installed.len(), 2);
+    for (table, policy, origin, risks) in installed {
+        if table == &new_name {
+            assert_eq!(policy, &new);
+            assert_eq!(*origin, RowSecurityOrigin::Standing);
+            assert_eq!(*risks, [RiskClass::Revoke, RiskClass::RowSecurity].into());
+        } else {
+            assert_eq!(table, &old_name);
+            assert_eq!(*origin, RowSecurityOrigin::Created);
+            assert!(risks.is_empty());
+        }
+    }
+    let (table_uid, _) = changes
+        .changes
+        .iter()
+        .find_map(|p| {
+            if let Change::Table(TableChange::RenameTable { uid, to, .. }) = &p.change {
+                Some((uid, to))
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert!(
+        matches!(&changes.changes.last().unwrap().change, Change::Policy(PolicyChange::SetRowSecurity { uid, table, origin: RowSecurityOrigin::Standing, .. }) if uid == table_uid && table == &new_name)
+    );
+    assert_eq!(
+        changes.changes[0].risks,
+        [RiskClass::Revoke, RiskClass::RowSecurity].into()
+    );
+    // A bare rename of an unchanged policy does not become a replacement.
+    declared.tables.remove(&old_name);
+    declared
+        .tables
+        .insert(new_name, base.tables[&old_name].clone());
+    assert!(
+        matches!(&run(&base, &declared, &[intent]).changes[..], [p] if matches!(p.change, Change::Table(TableChange::RenameTable { .. })))
+    );
+}
+
+#[test]
+fn row_security_dropped_owners_have_no_policy_drops_and_replacement_uids_use_created_origin() {
+    use pbps_model::{RowPolicy, RowSecurity, RowSecurityOrigin};
+    let name: TableName = "app.t".parse().unwrap();
+    let mut base = schema_of("app.t", table(&[("id", Column::new(ty("integer")))]));
+    let t = base.tables.get_mut(&name).unwrap();
+    t.row_policies.insert("p".into(), RowPolicy::default());
+    t.row_security = RowSecurity {
+        enabled: true,
+        forced: true,
+    };
+    let dropped = run(
+        &base,
+        &Schema::default(),
+        &[Intent::DropTable {
+            table: name,
+            reason: "retired".parse().unwrap(),
+        }],
+    );
+    assert!(
+        matches!(&dropped.changes[..], [p] if matches!(p.change, Change::Table(TableChange::DropTable { .. })))
+    );
+    let before_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let after_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    assert_ne!(
+        before_ids.tables.keys().next(),
+        after_ids.tables.keys().next()
+    );
+    let replaced = diff(
+        Side {
+            schema: &base,
+            ids: &before_ids,
+        },
+        Side {
+            schema: &base,
+            ids: &after_ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        kinds(&replaced),
+        ["DropTable", "CreateTable", "CreatePolicy", "SetRowSecurity"]
+    );
+    assert!(matches!(
+        replaced.changes[2].change,
+        Change::Policy(PolicyChange::CreatePolicy {
+            origin: RowSecurityOrigin::Created,
+            ..
+        })
+    ));
+    assert!(matches!(
+        replaced.changes[3].change,
+        Change::Policy(PolicyChange::SetRowSecurity {
+            origin: RowSecurityOrigin::Created,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn row_security_partial_reports_keep_both_replacement_risks_when_other_changes_refuse() {
+    use pbps_model::{RiskClass, RowPolicy};
+    let name: TableName = "app.t".parse().unwrap();
+    let mut base = schema_of("app.t", table(&[("id", Column::new(ty("integer")))]));
+    base.tables
+        .get_mut(&name)
+        .unwrap()
+        .row_policies
+        .insert("p".into(), RowPolicy::default());
+    let ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let mut declared = base.clone();
+    let t = declared.tables.get_mut(&name).unwrap();
+    t.row_policies.get_mut("p").unwrap().restrictive = true;
+    t.columns.get_mut("id").unwrap().value_source = ValueSource::Identity(pbps_model::Identity {
+        seed: 1,
+        increment: 1,
+        options: Default::default(),
+    });
+    let partial = diff_partial(
+        Side {
+            schema: &base,
+            ids: &ids,
+        },
+        Side {
+            schema: &declared,
+            ids: &ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+    );
+    assert!(
+        partial
+            .errors
+            .iter()
+            .any(|e| matches!(e, DiffError::IdentityChangeUnsupported { .. }))
+    );
+    assert_eq!(kinds(&partial.changes), ["DropPolicy", "CreatePolicy"]);
+    assert!(
+        partial
+            .changes
+            .changes
+            .iter()
+            .all(|p| p.risks == [RiskClass::Revoke, RiskClass::RowSecurity].into())
+    );
+}
+
+#[test]
+fn row_security_policy_drops_precede_every_rank_of_a_deep_module_drop_chain() {
+    use pbps_model::{ModuleKind, RowPolicy};
+    let name: TableName = "app.t".parse().unwrap();
+    let mut base = schema_of("app.t", table(&[("id", Column::new(ty("integer")))]));
+    base.tables.get_mut(&name).unwrap().row_policies.insert(
+        "p".into(),
+        RowPolicy {
+            using: Some("app.f7(id)>0".into()),
+            ..Default::default()
+        },
+    );
+    for i in 0..8 {
+        base.modules.insert(
+            format!("app.f{i}(integer)").parse().unwrap(),
+            a_module(
+                ModuleKind::Function,
+                &if i == 0 {
+                    "SELECT 1".into()
+                } else {
+                    format!("SELECT app.f{}($1)", i - 1)
+                },
+            ),
+        );
+    }
+    let mut declared = base.clone();
+    declared.modules.clear();
+    declared.tables.get_mut(&name).unwrap().row_policies.clear();
+    let changes = run(&base, &declared, &[]);
+    assert_eq!(changes.changes.len(), 9);
+    assert!(matches!(
+        changes.changes[0].change,
+        Change::Policy(PolicyChange::DropPolicy { .. })
+    ));
+    let modules = changes.changes[1..]
+        .iter()
+        .map(|p| {
+            if let Change::Module(ModuleChange::DropModule { id, .. }) = &p.change {
+                id.clone()
+            } else {
+                panic!("unexpected {:?}", p.change)
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        modules,
+        (0..8)
+            .rev()
+            .map(|i| format!("app.f{i}(integer)").parse().unwrap())
+            .collect::<Vec<ModuleId>>()
+    );
+}
+
+/// Reproduces the real flow: the base side's identity file is the one from
+/// that version, and the declared side's is the resolved result.
+fn run(base: &Schema, declared: &Schema, intents: &[Intent]) -> ChangeSet {
+    run_with(&MinimalDialect, base, declared, intents)
+}
+
+/// [`run`], against a caller-chosen dialect — for the one shape whose
+/// ordering answer differs by dialect: whether an index shares the
+/// schema's relation namespace with tables at all
+/// (`Dialect::indexes_share_namespace_with_tables`, issue #176).
+fn run_with(
+    dialect: &(impl Dialect + ?Sized),
+    base: &Schema,
+    declared: &Schema,
+    intents: &[Intent],
+) -> ChangeSet {
+    let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+        .unwrap()
+        .ids;
+    diff(
+        Side {
+            schema: base,
+            ids: &base_ids,
+        },
+        Side {
+            schema: declared,
+            ids: &declared_ids,
+        },
+        dialect,
+        &Hints::default(),
+    )
+    .unwrap()
+    .changes()
+    .clone()
+}
+
+/// `MinimalDialect`, except that `int` and `integer` are one type, as
+/// they are to PostgreSQL.
+struct Aliases;
+
+impl Dialect for Aliases {
+    fn name(&self) -> &'static str {
+        "aliases"
+    }
+    fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
+        MinimalDialect.quote_ident(ident)
+    }
+    fn intermediate_tables(
+        &self,
+        change: &Change,
+        strategy: pbps_model::Strategy,
+    ) -> Result<Vec<pbps_model::TableName>, pbps_dialect::DialectError> {
+        MinimalDialect.intermediate_tables(change, strategy)
+    }
+    fn normalize_type(
+        &self,
+        ty: &pbps_model::ColumnType,
+    ) -> Result<pbps_model::ColumnType, pbps_dialect::DialectError> {
+        let mut ty = ty.clone();
+        if ty.base == "integer" {
+            ty.base = "int".into();
+        }
+        Ok(ty)
+    }
+    fn type_change_risk(
+        &self,
+        from: &pbps_model::ColumnType,
+        to: &pbps_model::ColumnType,
+    ) -> pbps_dialect::TypeChangeRisk {
+        MinimalDialect.type_change_risk(from, to)
+    }
+    fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+        MinimalDialect.fold_ident(ident)
+    }
+    fn lexicon(&self) -> pbps_dialect::Lexicon {
+        MinimalDialect.lexicon()
+    }
+    fn validate_table(
+        &self,
+        name: &pbps_model::TableName,
+        table: &Table,
+    ) -> Vec<pbps_dialect::DialectError> {
+        MinimalDialect.validate_table(name, table)
+    }
+    fn transaction_framing(
+        &self,
+        zone: &pbps_model::SessionZone,
+    ) -> pbps_dialect::TransactionFraming {
+        MinimalDialect.transaction_framing(zone)
+    }
+    fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+        MinimalDialect.probe_framing()
+    }
+}
+
+/// `MinimalDialect` under PostgreSQL's name, for the shapes only that
+/// dialect plans: a package's lifecycle (DEC-2447.12).
+struct Postgres;
+
+impl Dialect for Postgres {
+    fn name(&self) -> &'static str {
+        "postgres"
+    }
+    /// PostgreSQL reads a name inside a string literal too (`'app.docs'::regconfig`).
+    fn generation_may_call(&self, text: &str, name: &str) -> bool {
+        self.may_name(text, name)
+            || text
+                .split('\'')
+                .skip(1)
+                .step_by(2)
+                .any(|literal| literal.split('.').any(|part| part == name))
+    }
+    fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
+        MinimalDialect.quote_ident(ident)
+    }
+    fn intermediate_tables(
+        &self,
+        change: &Change,
+        strategy: pbps_model::Strategy,
+    ) -> Result<Vec<pbps_model::TableName>, pbps_dialect::DialectError> {
+        MinimalDialect.intermediate_tables(change, strategy)
+    }
+    fn normalize_type(
+        &self,
+        ty: &pbps_model::ColumnType,
+    ) -> Result<pbps_model::ColumnType, pbps_dialect::DialectError> {
+        MinimalDialect.normalize_type(ty)
+    }
+    fn type_change_risk(
+        &self,
+        from: &pbps_model::ColumnType,
+        to: &pbps_model::ColumnType,
+    ) -> pbps_dialect::TypeChangeRisk {
+        MinimalDialect.type_change_risk(from, to)
+    }
+    fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+        MinimalDialect.fold_ident(ident)
+    }
+    fn lexicon(&self) -> pbps_dialect::Lexicon {
+        MinimalDialect.lexicon()
+    }
+    fn validate_table(
+        &self,
+        name: &pbps_model::TableName,
+        table: &Table,
+    ) -> Vec<pbps_dialect::DialectError> {
+        MinimalDialect.validate_table(name, table)
+    }
+    fn transaction_framing(
+        &self,
+        zone: &pbps_model::SessionZone,
+    ) -> pbps_dialect::TransactionFraming {
+        MinimalDialect.transaction_framing(zone)
+    }
+    fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+        MinimalDialect.probe_framing()
+    }
+}
+
+/// A package's create, update and move come before a table of the plan in
+/// their shared class, whatever the identities the run happened to mint: a
+/// column of a type the package provides needs it first, and a tie left to
+/// a random uid would put the table ahead of it half the time
+/// (DEC-2447.12).
+#[test]
+fn a_packages_create_comes_before_a_table_of_the_same_class_every_time() {
+    let mut declared = schema_of("app.mail", table(&[("who", Column::new(ty("ext.citext")))]));
+    declared.extensions.insert(
+        "citext".into(),
+        pbps_model::Extension {
+            schema: "ext".into(),
+            version: "1.6".into(),
+        },
+    );
+    for _ in 0..40 {
+        let plan = run_with(&Postgres, &Schema::default(), &declared, &[]);
+        let position = |wanted: fn(&Change) -> bool| {
+            plan.changes
+                .iter()
+                .position(|p| wanted(&p.change))
+                .expect("the plan holds it")
+        };
+        let package = position(|c| {
+            matches!(
+                c,
+                Change::Extension(ExtensionChange::CreateExtension { .. })
+            )
+        });
+        let table = position(|c| matches!(c, Change::Table(TableChange::CreateTable { .. })));
+        assert!(package < table, "{:#?}", plan.changes);
+    }
+}
+
+/// An index key naming an operator class of a package waits for the plan's
+/// create of that package, as a column of its type does, whatever the
+/// identities the run happened to mint (DEC-2447.14). Each key of a new
+/// table is the same, and a key naming an engine class draws no such edge.
+#[test]
+fn an_index_naming_a_package_class_waits_for_the_packages_create_every_time() {
+    use pbps_model::{Index, IndexColumn, IndexKey, IndexMethod, OpClassRef};
+    let indexed = |class: OpClassRef| {
+        let mut t = table(&[("body", Column::new(ty("text")))]);
+        t.indexes.insert(
+            "docs_trgm".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    key: IndexKey::Column("body".into()),
+                    descending: false,
+                    opclass: Some(class),
+                    collation: None,
+                    opclass_parameters: Default::default(),
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: IndexMethod::Gin,
+                storage_parameters: Default::default(),
+                filegroup: None,
+            },
+        );
+        t
+    };
+    let base = schema_of("app.docs", table(&[("body", Column::new(ty("text")))]));
+    let mut declared = schema_of(
+        "app.docs",
+        indexed(OpClassRef::in_schema("ext", "gin_trgm_ops")),
+    );
+    declared.extensions.insert(
+        "pg_trgm".into(),
+        pbps_model::Extension {
+            schema: "ext".into(),
+            version: "1.6".into(),
+        },
+    );
+    for _ in 0..40 {
+        let plan = run_with(&Postgres, &base, &declared, &[]);
+        let position = |wanted: fn(&Change) -> bool| {
+            plan.changes
+                .iter()
+                .position(|p| wanted(&p.change))
+                .expect("the plan holds it")
+        };
+        let package = position(|c| {
+            matches!(
+                c,
+                Change::Extension(ExtensionChange::CreateExtension { .. })
+            )
+        });
+        let index = position(|c| matches!(c, Change::Index(IndexChange::AddIndex { .. })));
+        assert!(package < index, "{:#?}", plan.changes);
+    }
+    // Negative: the same index over an engine class asks nothing of a package,
+    // so the plan holds no package change and the index is still added.
+    let mut engine = schema_of("app.docs", indexed(OpClassRef::bare("jsonb_path_ops")));
+    engine.extensions = Default::default();
+    let plan = run_with(&Postgres, &base, &engine, &[]);
+    assert!(
+        plan.changes
+            .iter()
+            .any(|p| matches!(p.change, Change::Index(IndexChange::AddIndex { .. })))
+    );
+    assert!(!plan.changes.iter().any(|p| matches!(
+        p.change,
+        Change::Extension(ExtensionChange::CreateExtension { .. })
+    )));
+}
+
+/// A configuration that maps a dictionary a package provides waits for the plan's create
+/// of that package, as a column of the package's type does, whatever the identities the
+/// run happened to mint: both are class 7, and `ADD MAPPING` fails on a dictionary that
+/// does not exist yet (DEC-2728.2). Negative: a configuration over the engine's own
+/// dictionary draws no such edge, so with the same package in the plan it sorts before
+/// it at least once in as many runs.
+#[test]
+fn a_configuration_over_a_package_dictionary_waits_for_the_packages_create_every_time() {
+    use pbps_model::SearchObject;
+    let config = |dictionary: &str| SearchObject::Config {
+        parser: "pg_catalog.\"default\"".parse().unwrap(),
+        mappings: [("word".to_owned(), vec![dictionary.parse().unwrap()])].into(),
+    };
+    let planned = |dictionary: &str| {
+        let mut declared = Schema::default();
+        declared
+            .search
+            .insert("config app.docs".parse().unwrap(), config(dictionary));
+        declared.extensions.insert(
+            "zz_dict".into(),
+            pbps_model::Extension {
+                schema: "zz".into(),
+                version: "1.0".into(),
+            },
+        );
+        let plan = run_with(&Postgres, &Schema::default(), &declared, &[]);
+        let position = |wanted: fn(&Change) -> bool| {
+            plan.changes
+                .iter()
+                .position(|p| wanted(&p.change))
+                .expect("the plan holds it")
+        };
+        (
+            position(|c| {
+                matches!(
+                    c,
+                    Change::Extension(ExtensionChange::CreateExtension { .. })
+                )
+            }),
+            position(|c| matches!(c, Change::Search(SearchChange::CreateSearch { .. }))),
+        )
+    };
+    for _ in 0..40 {
+        let (package, config) = planned("zz.zz_dictionary");
+        assert!(package < config);
+    }
+    assert!(
+        (0..40).any(|_| {
+            let (package, config) = planned("pg_catalog.simple");
+            config < package
+        }),
+        "an engine dictionary has no reason to wait for a package"
+    );
+}
+
+/// The package floor reaches what maps a dictionary that waits for the package, not only
+/// that dictionary: package, then the thesaurus over the package's dictionary, then the
+/// configuration over the thesaurus, whatever the identities the run minted (ready round
+/// 1). Negative: the same chain over an engine dictionary has no package to follow, so
+/// the thesaurus is free to sort before the package in some run.
+#[test]
+fn the_package_floor_reaches_what_maps_a_dictionary_that_waits_for_the_package() {
+    use pbps_model::SearchObject;
+    let planned = |sub: &str| {
+        let mut declared = Schema::default();
+        declared.search.insert(
+            "dictionary app.thes".parse().unwrap(),
+            SearchObject::Dictionary {
+                template: "pg_catalog.thesaurus".parse().unwrap(),
+                options: [
+                    ("dictfile".to_owned(), "words".to_owned()),
+                    ("dictionary".to_owned(), sub.to_owned()),
+                ]
+                .into(),
+            },
+        );
+        declared.search.insert(
+            "config app.docs".parse().unwrap(),
+            SearchObject::Config {
+                parser: "pg_catalog.\"default\"".parse().unwrap(),
+                mappings: [("word".to_owned(), vec!["app.thes".parse().unwrap()])].into(),
+            },
+        );
+        declared.extensions.insert(
+            "zz_dict".into(),
+            pbps_model::Extension {
+                schema: "zz".into(),
+                version: "1.0".into(),
+            },
+        );
+        let plan = run_with(&Postgres, &Schema::default(), &declared, &[]);
+        let position = |wanted: fn(&Change) -> bool| {
+            plan.changes
+                .iter()
+                .position(|p| wanted(&p.change))
+                .expect("the plan holds it")
+        };
+        (
+            position(|c| {
+                matches!(
+                    c,
+                    Change::Extension(ExtensionChange::CreateExtension { .. })
+                )
+            }),
+            position(|c| {
+                matches!(c, Change::Search(SearchChange::CreateSearch { name, .. })
+                    if name.kind == pbps_model::SearchKind::Dictionary)
+            }),
+            position(|c| {
+                matches!(c, Change::Search(SearchChange::CreateSearch { name, .. })
+                    if name.kind == pbps_model::SearchKind::Config)
+            }),
+        )
+    };
+    for _ in 0..40 {
+        let (package, thesaurus, config) = planned("zz.zz_dictionary");
+        assert!(package < thesaurus && thesaurus < config);
+    }
+    assert!(
+        (0..40).any(|_| {
+            let (package, thesaurus, _) = planned("pg_catalog.simple");
+            thesaurus < package
+        }),
+        "an engine dictionary has no reason to wait for a package"
+    );
+}
+
+/// A configuration altered to map a dictionary a package provides waits for the plan's
+/// create of that package, as a created one does, whatever the identities the run happened
+/// to mint (DEC-2728.3): the alteration is ranked behind the packages in the draft, where
+/// its effect edge already puts it.
+#[test]
+fn a_configuration_altered_to_map_a_package_dictionary_waits_for_the_packages_create() {
+    use pbps_model::SearchObject;
+    let config = |dictionary: &str| SearchObject::Config {
+        parser: "pg_catalog.\"default\"".parse().unwrap(),
+        mappings: [("word".to_owned(), vec![dictionary.parse().unwrap()])].into(),
+    };
+    let docs: pbps_model::SearchRef = "config app.docs".parse().unwrap();
+    let mut base = Schema::default();
+    base.search
+        .insert(docs.clone(), config("pg_catalog.simple"));
+    let mut declared = Schema::default();
+    declared
+        .search
+        .insert(docs.clone(), config("zz.zz_dictionary"));
+    declared.extensions.insert(
+        "zz_dict".into(),
+        pbps_model::Extension {
+            schema: "zz".into(),
+            version: "1.0".into(),
+        },
+    );
+    let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    for _ in 0..40 {
+        let declared_ids = crate::resolve(&declared, &base_ids, &[], &ctx())
+            .unwrap()
+            .ids;
+        let plan = diff(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &declared,
+                ids: &declared_ids,
+            },
+            &Postgres,
+            &Hints {
+                target_read: true,
+                search_dependents: [(docs.clone(), Default::default())].into(),
+                ..Hints::default()
+            },
+        )
+        .unwrap();
+        let at = |wanted: fn(&Change) -> bool| {
+            plan.changes()
+                .changes
+                .iter()
+                .position(|p| wanted(&p.change))
+                .expect("the plan holds it")
+        };
+        assert!(
+            at(|c| matches!(
+                c,
+                Change::Extension(ExtensionChange::CreateExtension { .. })
+            )) < at(|c| matches!(c, Change::Search(SearchChange::AlterSearchMapping { .. })))
+        );
+    }
+}
+
+/// A domain whose check names a configuration this plan creates by a literal
+/// (`'app.docs'::regconfig`) is created after it, though the configuration maps a
+/// dictionary and so ranks behind that dictionary: over random identities, every run
+/// puts dictionary, configuration, then domain (ready round 2). A domain over it
+/// follows too. Negative: a domain that names nothing keeps its place, tied with the
+/// configuration, so some run puts it first.
+#[test]
+fn a_domain_naming_a_created_configuration_by_a_literal_is_created_after_it() {
+    use pbps_model::{ManagedType, SearchObject};
+    let planned = |check: &str| {
+        let mut declared = Schema::default();
+        declared.search.insert(
+            "dictionary app.d".parse().unwrap(),
+            SearchObject::Dictionary {
+                template: "pg_catalog.simple".parse().unwrap(),
+                options: Default::default(),
+            },
+        );
+        declared.search.insert(
+            "config app.docs".parse().unwrap(),
+            SearchObject::Config {
+                parser: "pg_catalog.\"default\"".parse().unwrap(),
+                mappings: [("word".to_owned(), vec!["app.d".parse().unwrap()])].into(),
+            },
+        );
+        let domain = |base: &str, check: &str| ManagedType::Domain {
+            base: ty(base),
+            not_null: false,
+            default: None,
+            checks: [("c".into(), check.to_owned())].into(),
+            collation: None,
+        };
+        declared
+            .types
+            .insert("app.over".parse().unwrap(), domain("app.name", "true"));
+        declared
+            .types
+            .insert("app.name".parse().unwrap(), domain("text", check));
+        let plan = run_with(&Postgres, &Schema::default(), &declared, &[]);
+        let position = |wanted: &dyn Fn(&Change) -> bool| {
+            plan.changes
+                .iter()
+                .position(|p| wanted(&p.change))
+                .expect("the plan holds it")
+        };
+        (
+            position(&|c| {
+                matches!(c, Change::Search(SearchChange::CreateSearch { name, .. })
+                if name.kind == pbps_model::SearchKind::Config)
+            }),
+            position(&|c| {
+                matches!(c, Change::Type(TypeChange::CreateType { name, .. })
+                if name.name() == "name")
+            }),
+            position(&|c| {
+                matches!(c, Change::Type(TypeChange::CreateType { name, .. })
+                if name.name() == "over")
+            }),
+        )
+    };
+    for _ in 0..40 {
+        let (config, name, over) = planned("to_tsvector('app.docs'::regconfig, VALUE) IS NOT NULL");
+        assert!(config < name && name < over, "{config} {name} {over}");
+    }
+    assert!(
+        (0..40).any(|_| {
+            let (config, name, _) = planned("VALUE <> ''");
+            name < config
+        }),
+        "a domain that names no configuration has no reason to wait for one"
+    );
+}
+
+/// A reference to a type a package provides waits for the plan's create or
+/// move of that package, through the same requirement a managed type's
+/// create gives, so it holds for a domain over it, a new table's column and
+/// a column added to a standing table alike, and never by the luck of a
+/// uid: a domain over `moved.citext` named the destination before the move
+/// made it (#2696 ready round).
+#[test]
+fn a_reference_to_a_package_provided_type_waits_for_its_create_or_move() {
+    let package = |schema: &str| pbps_model::Extension {
+        schema: schema.into(),
+        version: "1.6".into(),
+    };
+    let domain = |base: &str| pbps_model::ManagedType::Domain {
+        base: ty(base),
+        not_null: false,
+        default: None,
+        checks: Default::default(),
+        collation: None,
+    };
+    let planned = |base: &Schema, declared: &Schema, moves: bool| {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(declared, &base_ids, &[], &ctx())
+            .unwrap()
+            .ids;
+        let mut hints = Hints::default();
+        if moves {
+            hints
+                .extension_moves
+                .insert("citext".into(), Default::default());
+        }
+        diff(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &Postgres,
+            &hints,
+        )
+        .unwrap()
+        .changes()
+        .clone()
+    };
+    let position = |plan: &ChangeSet, wanted: fn(&Change) -> bool| {
+        plan.changes
+            .iter()
+            .position(|p| wanted(&p.change))
+            .unwrap_or_else(|| panic!("the plan holds it: {plan:#?}"))
+    };
+    let is_package = |c: &Change| {
+        matches!(
+            c,
+            Change::Extension(ExtensionChange::CreateExtension { .. })
+                | Change::Extension(ExtensionChange::SetExtensionSchema { .. })
+        )
+    };
+    let is_domain = |c: &Change| matches!(c, Change::Type(TypeChange::CreateType { .. }));
+    let is_table = |c: &Change| matches!(c, Change::Table(TableChange::CreateTable { .. }));
+    let is_column = |c: &Change| matches!(c, Change::Column(ColumnChange::AddColumn { .. }));
+    // Create: a new package and a domain over its type; and a move of a
+    // standing package with a domain, a new table and an added column over
+    // the destination's type.
+    let mut created = schema_of("app.mail", table(&[("id", Column::new(ty("int")))]));
+    created.extensions.insert("citext".into(), package("ext"));
+    created
+        .types
+        .insert("app.d".parse().unwrap(), domain("ext.citext"));
+    let mut standing = schema_of("app.mail", table(&[("id", Column::new(ty("int")))]));
+    standing.extensions.insert("citext".into(), package("ext"));
+    let mut moved = schema_of(
+        "app.mail",
+        table(&[
+            ("id", Column::new(ty("int"))),
+            ("who", Column::new(ty("moved.citext"))),
+        ]),
+    );
+    moved.tables.insert(
+        "app.note".parse().unwrap(),
+        table(&[("t", Column::new(ty("moved.citext")))]),
+    );
+    moved.extensions.insert("citext".into(), package("moved"));
+    moved
+        .types
+        .insert("app.d".parse().unwrap(), domain("moved.citext"));
+    for _ in 0..40 {
+        let plan = planned(&Schema::default(), &created, false);
+        assert!(
+            position(&plan, is_package) < position(&plan, is_domain),
+            "{plan:#?}"
+        );
+        let plan = planned(&standing, &moved, true);
+        let package = position(&plan, is_package);
+        assert!(
+            matches!(
+                plan.changes[package].change,
+                Change::Extension(ExtensionChange::SetExtensionSchema { .. })
+            ),
+            "{plan:#?}"
+        );
+        for (what, wanted) in [
+            ("domain", is_domain as fn(&Change) -> bool),
+            ("table", is_table),
+            ("column", is_column),
+        ] {
+            assert!(package < position(&plan, wanted), "{what}: {plan:#?}");
+        }
+    }
+    // Negative: a type in a schema no package stands in is not a package's,
+    // so the domain over it is ordered by its class alone and adds no edge
+    // (the plan is still produced).
+    let mut other = schema_of("app.mail", table(&[("id", Column::new(ty("int")))]));
+    other.extensions.insert("citext".into(), package("ext"));
+    other
+        .types
+        .insert("app.d".parse().unwrap(), domain("elsewhere.t"));
+    assert!(
+        planned(&Schema::default(), &other, false)
+            .changes
+            .iter()
+            .any(|p| is_domain(&p.change))
+    );
+}
+
+/// The requirement itself, apart from the draft's rank: the effects of a
+/// domain over a package's type say the package's move comes first, so the
+/// order verifier refuses the plan with the two swapped and accepts it as
+/// planned (the verifier is the check the draft's rank has to satisfy).
+#[test]
+fn the_effects_of_a_domain_over_a_moved_type_require_the_move_first() {
+    let package = |schema: &str| pbps_model::Extension {
+        schema: schema.into(),
+        version: "1.6".into(),
+    };
+    let mut standing = schema_of("app.mail", table(&[("id", Column::new(ty("int")))]));
+    standing.extensions.insert("citext".into(), package("ext"));
+    let mut moved = standing.clone();
+    moved.extensions.insert("citext".into(), package("moved"));
+    moved.types.insert(
+        "app.d".parse().unwrap(),
+        pbps_model::ManagedType::Domain {
+            base: ty("moved.citext"),
+            not_null: false,
+            default: None,
+            checks: Default::default(),
+            collation: None,
+        },
+    );
+    let base_ids = crate::resolve(&standing, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let declared_ids = crate::resolve(&moved, &base_ids, &[], &ctx()).unwrap().ids;
+    let mut hints = Hints::default();
+    hints
+        .extension_moves
+        .insert("citext".into(), Default::default());
+    let sides = || {
+        (
+            Side {
+                schema: &standing,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &moved,
+                ids: &declared_ids,
+            },
+        )
+    };
+    let (base, declared) = sides();
+    let planned = diff(base, declared, &Postgres, &hints)
+        .unwrap()
+        .changes()
+        .clone();
+    let at = |plan: &ChangeSet, wanted: fn(&Change) -> bool| {
+        plan.changes.iter().position(|p| wanted(&p.change)).unwrap()
+    };
+    let package_at = at(&planned, |c| {
+        matches!(
+            c,
+            Change::Extension(ExtensionChange::SetExtensionSchema { .. })
+        )
+    });
+    let domain_at = at(&planned, |c| {
+        matches!(c, Change::Type(TypeChange::CreateType { .. }))
+    });
+    assert!(package_at < domain_at);
+    let observe = |plan: &ChangeSet| {
+        let (base, declared) = sides();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::order::shadow::observe_plan(base, declared, &Postgres, &hints, plan);
+        }))
+    };
+    assert!(observe(&planned).is_ok());
+    let mut swapped = planned.clone();
+    swapped.changes.swap(package_at, domain_at);
+    let refused = observe(&swapped).expect_err("the swapped order contradicts the effects");
+    let said = refused
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        said.contains("effects contradict") && said.contains("SetExtensionSchema"),
+        "{said}"
+    );
+}
+
+/// A dialect whose collation changes take every dependent down, and whose
+/// nullability changes take down the filtered indexes, and on tightening
+/// the indexes and unique constraints over the column, as SQL Server's do
+/// (#1175, #1363). Everything else is `MinimalDialect`'s, so a type change
+/// alone rebuilds nothing.
+struct Recollates;
+
+impl Dialect for Recollates {
+    fn name(&self) -> &'static str {
+        "recollates"
+    }
+    fn recollate_dependents(&self) -> pbps_dialect::RetypeDependents {
+        pbps_dialect::RetypeDependents {
+            keys_and_indexes: true,
+            checks: true,
+            filtered_indexes: true,
+            foreign_keys: true,
+        }
+    }
+    fn nullability_dependents(&self, to_nullable: bool) -> pbps_dialect::RetypeDependents {
+        pbps_dialect::RetypeDependents {
+            keys_and_indexes: !to_nullable,
+            checks: false,
+            filtered_indexes: true,
+            foreign_keys: false,
+        }
+    }
+    fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
+        MinimalDialect.quote_ident(ident)
+    }
+    fn intermediate_tables(
+        &self,
+        change: &Change,
+        strategy: pbps_model::Strategy,
+    ) -> Result<Vec<pbps_model::TableName>, pbps_dialect::DialectError> {
+        MinimalDialect.intermediate_tables(change, strategy)
+    }
+    fn normalize_type(
+        &self,
+        ty: &pbps_model::ColumnType,
+    ) -> Result<pbps_model::ColumnType, pbps_dialect::DialectError> {
+        MinimalDialect.normalize_type(ty)
+    }
+    fn type_change_risk(
+        &self,
+        from: &pbps_model::ColumnType,
+        to: &pbps_model::ColumnType,
+    ) -> pbps_dialect::TypeChangeRisk {
+        MinimalDialect.type_change_risk(from, to)
+    }
+    fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+        MinimalDialect.fold_ident(ident)
+    }
+    fn lexicon(&self) -> pbps_dialect::Lexicon {
+        MinimalDialect.lexicon()
+    }
+    fn validate_table(
+        &self,
+        name: &pbps_model::TableName,
+        table: &Table,
+    ) -> Vec<pbps_dialect::DialectError> {
+        MinimalDialect.validate_table(name, table)
+    }
+    fn transaction_framing(
+        &self,
+        zone: &pbps_model::SessionZone,
+    ) -> pbps_dialect::TransactionFraming {
+        MinimalDialect.transaction_framing(zone)
+    }
+    fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+        MinimalDialect.probe_framing()
+    }
+}
+
+/// A computed column's expression or persistence change is a drop and an
+/// add, in their classes, with the index over it rebuilt around them; a
+/// read-back's `not_null` is held only where the declaration says it
+/// (#1174, DEC-1174.1).
+#[test]
+fn a_computed_column_change_is_a_drop_and_an_add_around_its_index() {
+    let computed = |expression: &str, persisted: bool, not_null: bool| pbps_model::ComputedColumn {
+        expression: expression.into(),
+        persisted,
+        not_null,
+    };
+    let with = |c: pbps_model::ComputedColumn| {
+        let mut t = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("a", Column::new(ty("int"))),
+        ]);
+        t.computed.insert("c".into(), c);
+        t.indexes.insert(
+            "ix_c".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    key: pbps_model::IndexKey::Column("c".into()),
+                    descending: false,
+                    opclass: None,
+                    collation: None,
+                    opclass_parameters: Default::default(),
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+                filegroup: None,
+            },
+        );
+        schema_of("dbo.t", t)
+    };
+    let base = with(computed("a * 2", true, false));
+    assert_eq!(
+        kinds(&run(&base, &with(computed("a * 3", true, false)), &[])),
+        [
+            "DropIndex",
+            "DropComputedColumn",
+            "AddComputedColumn",
+            "AddIndex"
+        ]
+    );
+    assert_eq!(
+        kinds(&run(&base, &with(computed("a * 2", false, false)), &[])),
+        [
+            "DropIndex",
+            "DropComputedColumn",
+            "AddComputedColumn",
+            "AddIndex"
+        ]
+    );
+    // The read-back says NOT NULL wherever a persisted column is not
+    // nullable; a declaration that leaves it out is the same column.
+    let read_not_null = with(computed("a * 2", true, true));
+    assert!(run(&read_not_null, &base, &[]).changes.is_empty());
+    // A declared one is held to it.
+    assert_eq!(
+        kinds(&run(&base, &read_not_null, &[])),
+        [
+            "DropIndex",
+            "DropComputedColumn",
+            "AddComputedColumn",
+            "AddIndex"
+        ]
+    );
+    // Negative: an unchanged one is no change.
+    assert!(run(&base, &base, &[]).changes.is_empty());
+    // An ordinary column `c` replaced by a computed one, and back, with
+    // the index over `c` unchanged: it comes down and goes back around
+    // the swap (#1174 review).
+    let ordinary = {
+        let mut t = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("a", Column::new(ty("int"))),
+            ("c", Column::new(ty("int"))),
+        ]);
+        t.indexes = with(computed("a * 2", false, false)).tables
+            [&"dbo.t".parse::<TableName>().unwrap()]
+            .indexes
+            .clone();
+        schema_of("dbo.t", t)
+    };
+    let drop_c = [Intent::DropColumn {
+        column: "dbo.t.c".parse().unwrap(),
+        reason: "computed now".parse().unwrap(),
+    }];
+    assert_eq!(
+        kinds(&run(
+            &ordinary,
+            &with(computed("a * 2", false, false)),
+            &drop_c
+        )),
+        ["DropIndex", "DropColumn", "AddComputedColumn", "AddIndex"]
+    );
+    assert_eq!(
+        kinds(&run(&with(computed("a * 2", false, false)), &ordinary, &[])),
+        ["DropIndex", "DropComputedColumn", "AddColumn", "AddIndex"]
+    );
+}
+
+/// A connected SQL Server plan leaves a standing computed column to the
+/// catalog's edges (`Screen::Catalog`, #1460): the text screen folds
+/// case, and refused a retype of `A2` beside a column reading `a2` in a
+/// case-sensitive database. A re-added one has no edge for its new text
+/// and is still screened, and an offline plan screens both.
+#[test]
+fn a_connected_plan_leaves_a_standing_computed_column_to_the_catalog() {
+    let errors_of = |base: &Schema, want: &Schema, screen: Screen| {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let ids = crate::resolve(want, &base_ids, &[], &ctx()).unwrap().ids;
+        rebuilding_by(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: want,
+                ids: &ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+            &BTreeSet::new(),
+            Rebinding::Candidates,
+            screen,
+            None,
+        )
+        .err()
+        .unwrap_or_default()
+    };
+    let shaped = |a: Column, expression: &str| {
+        let mut t = table(&[("id", Column::new(ty("int")).not_null()), ("A2", a)]);
+        t.computed.insert(
+            "c".into(),
+            pbps_model::ComputedColumn {
+                expression: expression.into(),
+                persisted: false,
+                not_null: false,
+            },
+        );
+        schema_of("dbo.t", t)
+    };
+    let base = shaped(Column::new(ty("int")), "a2 * 2");
+    let retyped = shaped(Column::new(ty("bigint")), "a2 * 2");
+    assert!(errors_of(&base, &retyped, Screen::Catalog).is_empty());
+    assert!(matches!(
+        errors_of(&base, &retyped, Screen::Text).as_slice(),
+        [DiffError::ComputedInputChanged { .. }]
+    ));
+
+    let calls = |expression: &str, definition: &str| {
+        with_functions(
+            shaped(Column::new(ty("int")), expression),
+            &[("dbo.f", definition)],
+        )
+    };
+    // Standing while the function it calls is altered.
+    let before = calls("dbo.f(a2)", "one");
+    let altered = calls("dbo.f(a2)", "two");
+    assert!(errors_of(&before, &altered, Screen::Catalog).is_empty());
+    assert!(errors_of(&before, &altered, Screen::Text).iter().any(
+        |e| matches!(e, DiffError::ComputedFunctionChanged { change, .. }
+                if *change == "alters")
+    ));
+    // Re-added around the alter: still the screen's, connected or not.
+    let readded = calls("dbo.f(a2) + 1", "two");
+    for screen in [Screen::Catalog, Screen::Text] {
+        assert!(
+            errors_of(&before, &readded, screen).iter().any(
+                |e| matches!(e, DiffError::ComputedFunctionChanged { change, .. }
+                    if *change == "alters")
+            ),
+            "{screen:?}"
+        );
+    }
+}
+
+/// A plan that renames, drops, retypes or changes the nullability of a
+/// column a standing computed column may read, or alters a module it may
+/// call, is refused by name; one that changes the computed column too is
+/// not, since it is out of the way first (#1174, DEC-1174.1).
+#[test]
+fn a_standing_computed_column_refuses_a_change_to_what_it_reads() {
+    let errors_of = |base: &Schema, want: &Schema, intents: &[Intent]| {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let ids = crate::resolve(want, &base_ids, intents, &ctx())
+            .unwrap()
+            .ids;
+        diff_partial(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: want,
+                ids: &ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .errors
+    };
+    let shaped = |a: Column, expression: &str| {
+        let mut t = table(&[("id", Column::new(ty("int")).not_null()), ("A2", a)]);
+        t.computed.insert(
+            "c".into(),
+            pbps_model::ComputedColumn {
+                expression: expression.into(),
+                persisted: false,
+                not_null: false,
+            },
+        );
+        schema_of("dbo.t", t)
+    };
+    // Named in another case: the engine reads it all the same.
+    let base = shaped(Column::new(ty("int")), "a2 * 2");
+    for (changed, what) in [
+        (Column::new(ty("bigint")), "retypes"),
+        (Column::new(ty("int")).not_null(), "nullability"),
+    ] {
+        let errors = errors_of(&base, &shaped(changed, "a2 * 2"), &[]);
+        assert!(
+            matches!(errors.as_slice(), [DiffError::ComputedInputChanged { column, .. }] if column.raw() == "A2"),
+            "{what}: {errors:?}"
+        );
+    }
+    // Added by this plan, it comes after the input's change: no refusal
+    // (#1174 review).
+    let bare = schema_of(
+        "dbo.t",
+        table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("A2", Column::new(ty("int"))),
+        ]),
+    );
+    let errors = errors_of(&bare, &shaped(Column::new(ty("bigint")), "a2 * 2"), &[]);
+    assert!(errors.is_empty(), "{errors:?}");
+    // Changed together with its expression, it is dropped first and
+    // re-added after: no refusal.
+    let errors = errors_of(&base, &shaped(Column::new(ty("bigint")), "a2 * 3"), &[]);
+    assert!(errors.is_empty(), "{errors:?}");
+    // Negative: a column it does not read, or names only in a literal.
+    let base = shaped(Column::new(ty("int")), "id + len('a2')");
+    let errors = errors_of(
+        &base,
+        &shaped(Column::new(ty("bigint")), "id + len('a2')"),
+        &[],
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+    // A module it may call, altered while it stands.
+    let calls = |definition: &str| {
+        with_functions(
+            shaped(Column::new(ty("int")), "dbo.f(a2)"),
+            &[("dbo.f", definition)],
+        )
+    };
+    let errors = errors_of(&calls("one"), &calls("two"), &[]);
+    assert!(
+        errors.iter().any(|e| matches!(e,
+            DiffError::ComputedFunctionChanged { function, change, .. }
+                if function == "f" && *change == "alters")),
+        "{errors:?}"
+    );
+    // Re-added around the alter, it calls the module when the module
+    // changes: refused too (#1174 review).
+    let errors = errors_of(
+        &calls("one"),
+        &with_functions(
+            shaped(Column::new(ty("int")), "dbo.f(a2) + 1"),
+            &[("dbo.f", "two")],
+        ),
+        &[],
+    );
+    assert!(
+        errors.iter().any(|e| matches!(e,
+            DiffError::ComputedFunctionChanged { change, .. } if *change == "alters")),
+        "{errors:?}"
+    );
+    // Created with its table and the module it calls in one plan: the
+    // module comes after the table, so it is refused.
+    let fresh = Schema::default();
+    let errors = errors_of(&fresh, &calls("one"), &[]);
+    assert!(
+        errors.iter().any(|e| matches!(e,
+            DiffError::ComputedFunctionChanged { change, .. } if *change == "creates")),
+        "{errors:?}"
+    );
+    // Dropped together with the module it calls: no refusal offline. The
+    // order between them is the connected pass's, by the catalog's edges
+    // (DEC-1431.1).
+    let neither = schema_of(
+        "dbo.t",
+        table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("A2", Column::new(ty("int"))),
+        ]),
+    );
+    assert!(errors_of(&calls("one"), &neither, &[]).is_empty());
+    // Nor is such a view's alter refused.
+    let view = |definition: &str| {
+        with_modules(
+            shaped(Column::new(ty("int")), "a2 * 2"),
+            &[("dbo.a2", definition)],
+        )
+    };
+    let errors = errors_of(&view("one"), &view("two"), &[]);
+    assert!(errors.is_empty(), "{errors:?}");
+    // Negative: an altered module it does not name.
+    let plain = shaped(Column::new(ty("int")), "a2 * 2");
+    let errors = errors_of(
+        &with_functions(plain.clone(), &[("dbo.f", "one")]),
+        &with_functions(plain, &[("dbo.f", "two")]),
+        &[],
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+/// A nullability change takes down and puts back what the dialect says
+/// blocks it, alone or inside a type change whose own dependents do not
+/// include them: on tightening the indexes and unique constraints over the
+/// column, and in both directions a filtered index. A check is not one of
+/// them (#1363).
+#[test]
+fn a_nullability_change_rebuilds_what_the_dialect_says_blocks_it() {
+    let index = |column: &str| Index {
+        columns: vec![IndexColumn {
+            key: pbps_model::IndexKey::Column(column.into()),
+            descending: false,
+            opclass: None,
+            collation: None,
+            opclass_parameters: Default::default(),
+        }],
+        include: Vec::new(),
+        unique: false,
+        filter: None,
+        method: Default::default(),
+        storage_parameters: Default::default(),
+        filegroup: None,
+    };
+    let shaped = |nullable: bool, v: &str| {
+        let col = |t: &str| {
+            let c = Column::new(ty(t));
+            if nullable { c } else { c.not_null() }
+        };
+        let mut t = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("k", col("int")),
+            ("u", col("int")),
+            ("c", col("int")),
+            ("v", col(v)),
+            ("other", Column::new(ty("int"))),
+        ]);
+        t.indexes.insert("ix_k".into(), index("k"));
+        t.indexes.insert("ix_v".into(), index("v"));
+        t.indexes.insert("ix_other".into(), index("other"));
+        t.indexes.insert(
+            "ix_filt".into(),
+            Index {
+                filter: Some("other > 0".into()),
+                ..index("id")
+            },
+        );
+        t.unique.insert(
+            "uq_u".into(),
+            UniqueConstraint {
+                columns: vec!["u".into()],
+                storage_parameters: Default::default(),
+                filegroup: None,
+            },
+        );
+        t.checks.insert(
+            "ck_c".into(),
+            CheckConstraint {
+                expression: "c > 0".into(),
+            },
+        );
+        schema_of("dbo.t", t)
+    };
+    let rebuilt = |cs: &ChangeSet| -> Vec<String> {
+        let mut names: Vec<String> = cs
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::Index(IndexChange::DropIndex { name, .. })
+                | Change::Constraint(ConstraintChange::DropUnique { name, .. })
+                | Change::Constraint(ConstraintChange::DropCheck { name, .. }) => {
+                    Some(name.raw().to_owned())
+                }
+                _ => None,
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    // `v` widens from varchar(10) to varchar(20) as it tightens: a type
+    // change the dialect rebuilds nothing for, so its index comes down for
+    // the tightening alone.
+    let (nullable, not_null) = (shaped(true, "varchar(10)"), shaped(false, "varchar(20)"));
+    let cs = run_with(&Recollates, &nullable, &not_null, &[]);
+    // Filters are opaque text, so every filtered index of the table is
+    // rebuilt, as for a type change (DEC-1169.2).
+    assert_eq!(rebuilt(&cs), ["ix_filt", "ix_k", "ix_v", "uq_u"]);
+    let k = kinds(&cs);
+    for kind in ["AddIndex", "AddUnique"] {
+        assert!(k.contains(&kind.to_owned()), "{kind}: {k:?}");
+    }
+    // Relaxing takes down the filtered index alone.
+    let relaxed = shaped(true, "varchar(30)");
+    let cs = run_with(&Recollates, &not_null, &relaxed, &[]);
+    assert_eq!(rebuilt(&cs), ["ix_filt"]);
+    // Negative: a dialect that tightens in place rebuilds nothing.
+    let cs = run(&nullable, &not_null, &[]);
+    assert!(rebuilt(&cs).is_empty(), "{:?}", kinds(&cs));
+}
+
+/// A collation change is the `ALTER COLUMN` a type change is, with both
+/// collations carried and the type restated, and it takes down and puts
+/// back every key, index and check the dialect says blocks it (#1175).
+#[test]
+fn a_collation_change_is_a_column_alter_that_rebuilds_its_dependents() {
+    use pbps_model::Collation;
+    let keyed = |collation: Option<&str>| {
+        let mut code = Column::new(ty("varchar(10)")).not_null();
+        code.collation = collation.map(Collation::new);
+        let mut t = table(&[("id", Column::new(ty("int")).not_null()), ("code", code)]);
+        t.primary_key = Some(PrimaryKey {
+            name: Some("pk_t".into()),
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        });
+        t.unique.insert(
+            "uq_code".into(),
+            UniqueConstraint {
+                columns: vec!["code".into()],
+                storage_parameters: Default::default(),
+                filegroup: None,
+            },
+        );
+        t.checks.insert(
+            "ck_code".into(),
+            CheckConstraint {
+                expression: "code <> ''".into(),
+            },
+        );
+        schema_of("dbo.t", t)
+    };
+    let (base, declared) = (keyed(None), keyed(Some("Latin1_General_CS_AS")));
+    let cs = run_with(&Recollates, &base, &declared, &[]);
+    let alter = cs
+        .changes
+        .iter()
+        .find_map(|p| match &p.change {
+            Change::Column(ColumnChange::AlterColumnType {
+                from,
+                to,
+                from_collation,
+                to_collation,
+                ..
+            }) => Some((
+                from.clone(),
+                to.clone(),
+                from_collation.clone(),
+                to_collation.clone(),
+            )),
+            _ => None,
+        })
+        .expect("an ALTER COLUMN");
+    assert_eq!(alter.0, alter.1, "the type is restated, not changed");
+    assert_eq!(
+        (alter.2, alter.3),
+        (None, Some(Collation::new("latin1_general_cs_as")))
+    );
+    let k = kinds(&cs);
+    for kind in ["DropUnique", "AddUnique", "DropCheck", "AddCheck"] {
+        assert!(k.contains(&kind.to_owned()), "{kind}: {k:?}");
+    }
+    // The key on `id` names no recollated column and stays.
+    assert!(!k.contains(&"SetPrimaryKey".to_owned()), "{k:?}");
+    // Negative: a dialect that needs nothing rebuilt gets the alter alone.
+    assert_eq!(kinds(&run(&base, &declared, &[])), ["AlterColumnType"]);
+    // And an unchanged collation, spelled in another case, is no change.
+    assert!(
+        run_with(
+            &Recollates,
+            &declared,
+            &keyed(Some("LATIN1_general_cs_as")),
+            &[]
+        )
+        .changes
+        .is_empty()
+    );
+}
+
+/// A nullability change restates the column's collation, which an
+/// `ALTER COLUMN` without it would reset to the database default (#1175).
+#[test]
+fn a_nullability_change_restates_the_collation() {
+    use pbps_model::Collation;
+    let with = |nullable: bool| {
+        let mut c = Column::new(ty("varchar(10)"));
+        c.nullable = nullable;
+        c.collation = Some(Collation::new("Latin1_General_CS_AS"));
+        schema_of("dbo.t", table(&[("c", c)]))
+    };
+    let cs = run(&with(true), &with(false), &[]);
+    assert!(
+        matches!(
+            &cs.changes[..],
+            [PlannedChange {
+                change: Change::Column(ColumnChange::AlterColumnNullability {
+                    collation: Some(_),
+                    ..
+                }),
+                ..
+            }]
+        ),
+        "{cs:?}"
+    );
+}
+
+/// A policy that is not btree's or GIN's: one parameter of each verdict,
+/// so the differ's `Rebuild` and `Refuse` arms are exercised before any
+/// method needs them (DEC-2448.1).
+static SYNTHETIC: pbps_model::storage::MethodPolicy = {
+    use pbps_model::storage::{IndexLock, IndexParameter, Kind, ParameterChange};
+    const fn p(name: &'static str, change: ParameterChange) -> IndexParameter {
+        IndexParameter {
+            name,
+            kind: Kind::Int,
+            change,
+            lock: None,
+        }
+    }
+    pbps_model::storage::MethodPolicy {
+        method: IndexMethod::Btree,
+        unique: true,
+        include: true,
+        ordered: true,
+        expression_keys: true,
+        key_types: &[],
+        classes: &[],
+        collation: true,
+        exclusion: true,
+        provider_classes: true,
+        typed_columns: &[],
+        class_families: &[],
+        lock: IndexLock::AccessExclusive,
+        parameters: &[
+            p("altered", ParameterChange::Alter),
+            p("rebuilt", ParameterChange::Rebuild),
+            p("refused", ParameterChange::Refuse),
+        ],
+    }
+};
+
+fn exclusion(key: &str, operator: &str) -> pbps_model::ExclusionConstraint {
+    pbps_model::ExclusionConstraint {
+        method: IndexMethod::Gist,
+        keys: vec![pbps_model::ExclusionKey {
+            key: IndexColumn {
+                key: pbps_model::IndexKey::Expression(key.to_owned()),
+                descending: false,
+                opclass: None,
+                collation: None,
+                opclass_parameters: Default::default(),
+            },
+            operator: pbps_model::OperatorRef::symbol(operator).unwrap(),
+        }],
+        include: Vec::new(),
+        filter: None,
+        storage_parameters: Default::default(),
+        timing: pbps_model::ExclusionTiming::Immediate,
+    }
+}
+
+fn booking(exclusions: &[(&str, pbps_model::ExclusionConstraint)]) -> Schema {
+    let int = || Column::new(ty("integer"));
+    let mut t = table(&[("id", int()), ("a", int()), ("b", int()), ("c", int())]);
+    for (name, x) in exclusions {
+        t.exclude.insert((*name).into(), x.clone());
+    }
+    schema_of("app.booking", t)
+}
+
+/// An exclusion constraint a declaration adds is one change of its own,
+/// `constraint` risk, and nothing else; a standing one that is declared as it
+/// stands plans nothing (DEC-2448.3).
+#[test]
+fn a_declared_exclusion_is_added_by_one_change_and_a_standing_one_plans_nothing() {
+    let base = booking(&[]);
+    let declared = booking(&[("no_overlap", exclusion("int4range(a, b)", "&&"))]);
+    let cs = run(&base, &declared, &[]);
+    let [
+        Change::Constraint(ConstraintChange::SetExclusion {
+            table,
+            name,
+            from: None,
+            to: Some(to),
+        }),
+    ] = cs
+        .changes
+        .iter()
+        .map(|p| &p.change)
+        .collect::<Vec<_>>()
+        .as_slice()
+    else {
+        panic!("{:?}", kinds(&cs));
+    };
+    assert_eq!(
+        (table.raw().to_string(), name.raw()),
+        ("app.booking".into(), "no_overlap")
+    );
+    assert_eq!(to.method, IndexMethod::Gist);
+    assert!(
+        cs.risks().contains(&RiskClass::Constraint),
+        "{:?}",
+        cs.risks()
+    );
+    assert!(
+        !cs.risks().contains(&RiskClass::Destructive),
+        "{:?}",
+        cs.risks()
+    );
+    // Negative: the same constraint on both sides is no change.
+    assert!(run(&declared, &declared, &[]).is_empty());
+}
+
+/// A table the plan creates takes its exclusions in a change after
+/// `CreateTable`, whose payload never carries one: no emitter can create the
+/// table and lose the constraint (DEC-2448.3).
+#[test]
+fn a_new_tables_exclusion_follows_its_create_and_is_not_in_its_payload() {
+    let declared = booking(&[("no_overlap", exclusion("int4range(a, b)", "&&"))]);
+    let cs = run(&Schema::default(), &declared, &[]);
+    let names = kinds(&cs);
+    let create = names.iter().position(|k| k == "CreateTable").unwrap();
+    let exclusion_at = names.iter().position(|k| k == "SetExclusion").unwrap();
+    assert!(create < exclusion_at, "{names:?}");
+    let Change::Table(TableChange::CreateTable { table, .. }) = &cs.changes[create].change else {
+        unreachable!()
+    };
+    assert!(table.exclude.is_empty());
+}
+
+/// Adding an exclusion carries the `constraint` risk, except to a table the
+/// plan creates and writes no row to, which has nothing to check; a created
+/// table that is seeded with rows keeps it (DEC-2448.3).
+#[test]
+fn an_exclusions_constraint_risk_is_excused_only_for_a_table_created_empty() {
+    let x = || [("no_overlap", exclusion("int4range(a, b)", "&&"))];
+    // Standing table: the risk is asked.
+    let standing = run(&booking(&[]), &booking(&x()), &[]);
+    assert!(standing.risks().contains(&RiskClass::Constraint));
+    // A new table, no rows: it is not.
+    let created = run(&Schema::default(), &booking(&x()), &[]);
+    assert!(
+        !created.risks().contains(&RiskClass::Constraint),
+        "{:?}",
+        created.risks()
+    );
+    // A new table that is seeded: the constraint checks those rows.
+    let mut seeded = booking(&x());
+    let table: TableName = "app.booking".parse().unwrap();
+    let t = seeded.tables.get_mut(&table).unwrap();
+    t.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+        filegroup: None,
+    });
+    t.data = Some(pbps_model::TableData {
+        mode: pbps_model::DataMode::Exact,
+        rows: [(
+            pbps_model::RowKey::from("1"),
+            pbps_model::Row(
+                [("a".into(), pbps_model::Value::Int(1))]
+                    .into_iter()
+                    .collect(),
+            ),
+        )]
+        .into_iter()
+        .collect(),
+    });
+    let cs = run(&Schema::default(), &seeded, &[]);
+    let names = kinds(&cs);
+    assert!(names.iter().any(|k| k == "InsertRow"), "{names:?}");
+    assert!(
+        cs.risks().contains(&RiskClass::Constraint),
+        "{:?}",
+        cs.risks()
+    );
+}
+
+/// A retype an enum or a domain rebuild pushes before the table loop runs is
+/// seen by the hazard check as much as the loop's own: the check is asked of
+/// the whole change list, so no pass can hide one, and each states the
+/// constraint's drop and add (DEC-2448.3, DEC-2448.5).
+#[test]
+fn a_rebuild_that_retypes_a_held_column_states_the_constraints_pair() {
+    // How many changes of the constraint `x` the plan holds: its drop and its add
+    // where a rebuilt type retypes a column it holds, none where it does not.
+    let stated = |base: &Schema, declared: &Schema| -> usize {
+        alter_domain(base, declared, &[])
+            .unwrap_or_else(|errors| panic!("{errors:?}"))
+            .changes
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.change,
+                    Change::Constraint(ConstraintChange::SetExclusion { .. })
+                )
+            })
+            .count()
+    };
+    let hold = |mut world: Schema, key: &str| {
+        let t: TableName = "app.t".parse().unwrap();
+        world
+            .tables
+            .get_mut(&t)
+            .unwrap()
+            .exclude
+            .insert("x".into(), exclusion(key, "&&"));
+        world
+    };
+    // Domain: a collation change is the rebuild, which retypes `v`.
+    let mut collated = code(false, None, &[], "text");
+    if let pbps_model::ManagedType::Domain { collation, .. } = &mut collated {
+        *collation = Some("pg_catalog.\"C\"".parse().unwrap());
+    }
+    let before = domain_world(code(false, None, &[], "text"), false, false);
+    let after = domain_world(collated, false, false);
+    assert_eq!(
+        stated(
+            &hold(before.clone(), "int4range(v::int, 1)"),
+            &hold(after.clone(), "int4range(v::int, 1)"),
+        ),
+        2
+    );
+    // Negative: the same rebuild beside an exclusion that holds `id` only.
+    assert_eq!(
+        stated(
+            &hold(before.clone(), "int4range(id, 1)"),
+            &hold(after.clone(), "int4range(id, 1)"),
+        ),
+        0
+    );
+    // Negative: a rebuild with no exclusion at all.
+    assert_eq!(stated(&before, &after), 0);
+    // Enum: removing a label rebuilds the type and retypes `m`.
+    let moods = |labels: &[&str], key: &str| {
+        let mut t = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("m", Column::new(ty("app.mood"))),
+        ]);
+        t.exclude.insert("x".into(), exclusion(key, "&&"));
+        let mut s = schema_of("app.t", t);
+        s.types.insert(
+            "app.mood".parse().unwrap(),
+            pbps_model::ManagedType::Enum {
+                values: labels.iter().map(|v| (*v).into()).collect(),
+            },
+        );
+        s
+    };
+    assert_eq!(
+        stated(
+            &moods(&["a", "b", "c"], "int4range(m::int, 1)"),
+            &moods(&["a", "c"], "int4range(m::int, 1)"),
+        ),
+        2
+    );
+    assert_eq!(
+        stated(
+            &moods(&["a", "b", "c"], "int4range(id, 1)"),
+            &moods(&["a", "c"], "int4range(id, 1)"),
+        ),
+        0
+    );
+}
+
+fn retirement(was: String) -> pbps_model::ExclusionRetirement {
+    pbps_model::ExclusionRetirement {
+        was,
+        reason: "the service enforces it".into(),
+        operator: "leon".into(),
+        dropped_at: "2026-11-15".into(),
+    }
+}
+
+/// Plans `base` to `declared`, with the declared identities `edit`ed after
+/// they resolve (it is handed the table's uid). `Err` is every refusal, as
+/// text.
+fn exclusion_plan_with(
+    base: &Schema,
+    declared: &Schema,
+    edit: impl FnOnce(&mut IdsFile, &pbps_model::Uid),
+) -> Result<ChangeSet, Vec<String>> {
+    let table: TableName = "app.booking".parse().unwrap();
+    let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    // A column the declaration lost is dropped for a stated reason.
+    let dropped: Vec<Intent> = base.tables[&table]
+        .columns
+        .keys()
+        .filter(|c| !declared.tables[&table].columns.contains_key(*c))
+        .map(|c| Intent::DropColumn {
+            column: table.column(c.raw()),
+            reason: "not needed".parse().unwrap(),
+        })
+        .collect();
+    let mut declared_ids = crate::resolve(declared, &base_ids, &dropped, &ctx())
+        .unwrap()
+        .ids;
+    let uid = declared_ids.table_uid(&table).unwrap().clone();
+    edit(&mut declared_ids, &uid);
+    diff(
+        Side {
+            schema: base,
+            ids: &base_ids,
+        },
+        Side {
+            schema: declared,
+            ids: &declared_ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+    )
+    .map(|plan| plan.changes().clone())
+    .map_err(|errs| errs.iter().map(ToString::to_string).collect())
+}
+
+/// [`exclusion_plan_with`], with each of `records` retired as `pbps
+/// drop-exclusion` writes it: for the definition the base holds at the name.
+fn exclusion_plan(
+    base: &Schema,
+    declared: &Schema,
+    records: &[&str],
+) -> Result<ChangeSet, Vec<String>> {
+    let table: TableName = "app.booking".parse().unwrap();
+    exclusion_plan_with(base, declared, |ids, uid| {
+        for name in records {
+            let held = &base.tables[&table].exclude[*name];
+            ids.exclusions
+                .entry(uid.clone())
+                .or_default()
+                .insert((*name).into(), retirement(held.canonical_text()));
+        }
+    })
+}
+
+/// Dropping one needs the retirement of *this* definition; a rename is a drop
+/// and an add and needs it too (DEC-2448.4).
+#[test]
+fn a_dropped_exclusion_needs_a_record_of_that_definition() {
+    let held = booking(&[("no_overlap", exclusion("int4range(a, b)", "&&"))]);
+    let table: TableName = "app.booking".parse().unwrap();
+    // No record: refused, naming the command that records it.
+    let said = exclusion_plan(&held, &booking(&[]), &[]).unwrap_err();
+    assert!(
+        said.len() == 1 && said[0].contains("pbps drop-exclusion app.booking no_overlap --reason"),
+        "{said:?}"
+    );
+    // Recorded: one drop, `destructive`, and no constraint risk.
+    let cs = exclusion_plan(&held, &booking(&[]), &["no_overlap"]).unwrap();
+    let [
+        Change::Constraint(ConstraintChange::SetExclusion {
+            from: Some(_),
+            to: None,
+            ..
+        }),
+    ] = cs
+        .changes
+        .iter()
+        .map(|p| &p.change)
+        .collect::<Vec<_>>()
+        .as_slice()
+    else {
+        panic!("{:?}", kinds(&cs));
+    };
+    assert!(cs.risks().contains(&RiskClass::Destructive));
+    assert!(!cs.risks().contains(&RiskClass::Constraint));
+    // Negative: a record of another definition at the name is no authority.
+    let other = exclusion("int4range(a, b)", "-|-").canonical_text();
+    let said = exclusion_plan_with(&held, &booking(&[]), |ids, uid| {
+        ids.exclusions
+            .entry(uid.clone())
+            .or_default()
+            .insert("no_overlap".into(), retirement(other));
+    });
+    assert!(said.is_err());
+    // Negative: nor is the same record under another table's uid, or at
+    // another name.
+    let was = held.tables[&table].exclude["no_overlap"].canonical_text();
+    let elsewhere = was.clone();
+    let said = exclusion_plan_with(&held, &booking(&[]), |ids, _| {
+        ids.exclusions.insert(
+            "t_zzzzzz".parse().unwrap(),
+            [("no_overlap".into(), retirement(elsewhere))].into(),
+        );
+    });
+    assert!(said.is_err());
+    let said = exclusion_plan_with(&held, &booking(&[]), |ids, uid| {
+        ids.exclusions
+            .entry(uid.clone())
+            .or_default()
+            .insert("another".into(), retirement(was));
+    });
+    assert!(said.is_err());
+    // Renamed: a drop of the old name and an add of the new one, and the
+    // drop needs its record.
+    let renamed = booking(&[("renamed", exclusion("int4range(a, b)", "&&"))]);
+    let said = exclusion_plan(&held, &renamed, &[]).unwrap_err();
+    assert!(
+        said.len() == 1 && said[0].contains("no_overlap"),
+        "{said:?}"
+    );
+    let cs = exclusion_plan(&held, &renamed, &["no_overlap"]).unwrap();
+    assert_eq!(kinds(&cs), ["SetExclusion", "SetExclusion"]);
+    // Unchanged: nothing to refuse and nothing to plan.
+    assert!(exclusion_plan(&held, &held, &[]).unwrap().is_empty());
+}
+
+/// A plan that renames a column the constraint holds (as a plain key or as
+/// payload) and drops the constraint is a valid one: the record `pbps
+/// drop-exclusion` wrote holds the definition as the baseline spells it, so
+/// authority is asked of that, not of the text a rename has rewritten.
+#[test]
+fn a_dropped_exclusion_is_retired_by_its_baseline_definition_across_a_column_rename() {
+    let table: TableName = "app.booking".parse().unwrap();
+    let held = {
+        let mut x = exclusion("", "&&");
+        x.keys[0].key.key = pbps_model::IndexKey::Column("a".into());
+        x.include = vec!["b".into()];
+        x
+    };
+    let base = booking(&[("no_overlap", held.clone())]);
+    // `a` (the key) and `b` (the payload) are both renamed, and the
+    // constraint is gone.
+    let mut declared = booking(&[]);
+    let columns = &mut declared.tables.get_mut(&table).unwrap().columns;
+    for (from, to) in [("a", "a2"), ("b", "b2")] {
+        let column = columns.shift_remove(from).unwrap();
+        columns.insert(to.into(), column);
+    }
+    let plan = |record: Option<String>| {
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let renames: Vec<Intent> = [("a", "a2"), ("b", "b2")]
+            .into_iter()
+            .map(|(from, to)| Intent::RenameColumn {
+                table: table.clone(),
+                from: from.into(),
+                to: to.into(),
+            })
+            .collect();
+        let mut declared_ids = crate::resolve(&declared, &base_ids, &renames, &ctx())
+            .unwrap()
+            .ids;
+        let uid = declared_ids.table_uid(&table).unwrap().clone();
+        if let Some(was) = record {
+            declared_ids
+                .exclusions
+                .entry(uid)
+                .or_default()
+                .insert("no_overlap".into(), retirement(was));
+        }
+        diff(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .map(|plan| plan.changes().clone())
+        .map_err(|errs| errs.iter().map(ToString::to_string).collect::<Vec<_>>())
+    };
+    // Recorded for the baseline's definition: the renames and the drop.
+    let cs = plan(Some(held.canonical_text())).unwrap();
+    assert!(
+        kinds(&cs).iter().filter(|k| **k == "SetExclusion").count() == 1
+            && kinds(&cs).iter().filter(|k| **k == "RenameColumn").count() == 2,
+        "{:?}",
+        kinds(&cs)
+    );
+    // Negative: a record of the definition as the rename spells it is a
+    // record of a different definition, and is no authority.
+    let mut spelled = held.clone();
+    spelled.keys[0].key.key = pbps_model::IndexKey::Column("a2".into());
+    spelled.include = vec!["b2".into()];
+    let said = plan(Some(spelled.canonical_text())).unwrap_err();
+    assert!(
+        said.len() == 1 && said[0].contains("pbps drop-exclusion app.booking no_overlap"),
+        "{said:?}"
+    );
+    // Negative: a record of another definition at the name.
+    let mut other = held.clone();
+    other.keys[0].operator = pbps_model::OperatorRef::symbol("-|-").unwrap();
+    assert!(plan(Some(other.canonical_text())).is_err());
+    // Negative: no record at all.
+    assert!(plan(None).is_err());
+}
+
+/// A changed definition at one name is a replacement, as a drop and an add
+/// that need no reason; only the options changing leaves the constraint
+/// standing (DEC-2448.4).
+#[test]
+fn a_replaced_exclusion_needs_no_record_and_an_option_only_change_keeps_it() {
+    let held = booking(&[("no_overlap", exclusion("int4range(a, b)", "&&"))]);
+    let replaced = booking(&[("no_overlap", exclusion("int4range(a, b)", "-|-"))]);
+    let cs = exclusion_plan(&held, &replaced, &[]).unwrap();
+    let halves: Vec<_> = cs
+        .changes
+        .iter()
+        .map(|p| match &p.change {
+            Change::Constraint(ConstraintChange::SetExclusion { from, to, .. }) => {
+                (from.is_some(), to.is_some())
+            }
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(halves, [(true, false), (false, true)]);
+    assert!(cs.risks().contains(&RiskClass::Destructive));
+    assert!(cs.risks().contains(&RiskClass::Constraint));
+    // Options only: one `ALTER INDEX` on the constraint's index.
+    let mut tuned = replaced.clone();
+    let table: TableName = "app.booking".parse().unwrap();
+    let x = tuned
+        .tables
+        .get_mut(&table)
+        .unwrap()
+        .exclude
+        .get_mut("no_overlap")
+        .unwrap();
+    *x = exclusion("int4range(a, b)", "&&");
+    x.storage_parameters
+        .insert("fillfactor".into(), "70".into());
+    let cs = exclusion_plan(&held, &tuned, &[]).unwrap();
+    let [
+        Change::Index(IndexChange::SetIndexStorageParameters {
+            target: IndexPart::Exclusion(n),
+            set,
+            reset,
+            ..
+        }),
+    ] = cs
+        .changes
+        .iter()
+        .map(|p| &p.change)
+        .collect::<Vec<_>>()
+        .as_slice()
+    else {
+        panic!("{:?}", kinds(&cs));
+    };
+    assert_eq!(n.raw(), "no_overlap");
+    assert_eq!(set.get("fillfactor").map(String::as_str), Some("70"));
+    assert!(reset.is_empty());
+    // Negative: the options and the operator together are a replacement.
+    let mut both = tuned.clone();
+    both.tables
+        .get_mut(&table)
+        .unwrap()
+        .exclude
+        .get_mut("no_overlap")
+        .unwrap()
+        .keys[0]
+        .operator = pbps_model::OperatorRef::symbol("-|-").unwrap();
+    let cs = exclusion_plan(&held, &both, &[]).unwrap();
+    assert_eq!(kinds(&cs), ["SetExclusion", "SetExclusion"]);
+}
+
+/// A parent exclusion that the engine takes: the partition key `a` as a plain key
+/// with `=`, then the overlap.
+fn parent_exclusion() -> pbps_model::ExclusionConstraint {
+    let mut x = exclusion("int4range(b, c)", "&&");
+    x.keys.insert(
+        0,
+        pbps_model::ExclusionKey {
+            key: IndexColumn::column("a"),
+            operator: pbps_model::OperatorRef::symbol("=").unwrap(),
+        },
+    );
+    x
+}
+
+/// `app.booking` partitioned by `a`, holding `parent` and a standing partition that
+/// holds `own` (an own exclusion no declaration can hold yet, so a test builds it).
+fn partitioned_booking(
+    parent: &[(&str, pbps_model::ExclusionConstraint)],
+    own: &[(&str, pbps_model::ExclusionConstraint)],
+) -> Schema {
+    let mut s = booking(parent);
+    let booking_table: TableName = "app.booking".parse().unwrap();
+    s.tables.get_mut(&booking_table).unwrap().partition_by = Some(pbps_model::PartitionBy {
+        external: false,
+        columns: vec!["a".into()],
+        strategy: Default::default(),
+    });
+    let mut leaf = Table {
+        partition_of: Some(pbps_model::PartitionOf {
+            parent: booking_table,
+            bound: pbps_model::PartitionBound::Default,
+            columns: Default::default(),
+        }),
+        ..Default::default()
+    };
+    for (name, x) in own {
+        leaf.exclude.insert((*name).into(), x.clone());
+    }
+    s.tables.insert("app.booking_1".parse().unwrap(), leaf);
+    s
+}
+
+/// `adopts_exclusion` is the engine's rule (measured on 18.6, on `ATTACH` and on a
+/// parent's `ADD` over a standing leaf): method, keys with operators, `INCLUDE` and
+/// the predicate decide; timing, storage parameters and name do not (DEC-2448.6).
+#[test]
+fn an_own_exclusion_is_taken_as_a_clone_by_shape_and_not_by_timing_or_options() {
+    let parent = parent_exclusion();
+    assert!(adopts_exclusion(&parent, &parent));
+    let mut timed = parent.clone();
+    timed.timing = pbps_model::ExclusionTiming::DeferrableDeferred;
+    timed
+        .storage_parameters
+        .insert("fillfactor".into(), "70".into());
+    assert!(adopts_exclusion(&parent, &timed));
+    assert!(adopts_exclusion(&timed, &parent));
+    // Each of the shape's parts, changed, is another constraint.
+    let mut other = parent.clone();
+    other.include = vec!["id".into()];
+    assert!(!adopts_exclusion(&parent, &other));
+    let mut other = parent.clone();
+    other.filter = Some("id > 0".into());
+    assert!(!adopts_exclusion(&parent, &other));
+    let mut other = parent.clone();
+    other.keys.reverse();
+    assert!(!adopts_exclusion(&parent, &other));
+    let mut other = parent.clone();
+    other.keys[1].operator = pbps_model::OperatorRef::symbol("-|-").unwrap();
+    assert!(!adopts_exclusion(&parent, &other));
+    let mut other = parent.clone();
+    other.method = IndexMethod::Btree;
+    assert!(!adopts_exclusion(&parent, &other));
+    let mut other = parent.clone();
+    other.keys.pop();
+    assert!(!adopts_exclusion(&parent, &other));
+}
+
+/// A standing parent takes an exclusion by one change; the engine's key rule and
+/// its adoption of a partition's own are refused by name, an option-only edit is a
+/// replacement (a partitioned index takes no `ALTER INDEX SET`), and a drop needs
+/// its record as any other (DEC-2448.6).
+#[test]
+fn a_standing_parents_exclusion_is_added_replaced_and_dropped_under_the_engines_rules() {
+    let none = partitioned_booking(&[], &[]);
+    let held = partitioned_booking(&[("x", parent_exclusion())], &[]);
+    let cs = exclusion_plan(&none, &held, &[]).unwrap();
+    assert_eq!(kinds(&cs), ["SetExclusion"]);
+    assert!(cs.risks().contains(&RiskClass::Constraint));
+    // Negative: without the partition key as a plain `=` key it is refused by name.
+    for bad in [
+        exclusion("int4range(b, c)", "&&"),
+        {
+            let mut x = parent_exclusion();
+            x.keys[0].operator = pbps_model::OperatorRef::symbol("<>").unwrap();
+            x
+        },
+        {
+            let mut x = parent_exclusion();
+            x.keys[0].key = IndexColumn {
+                key: pbps_model::IndexKey::Expression("a::bigint".into()),
+                ..IndexColumn::column("a")
+            };
+            x
+        },
+    ] {
+        let said = exclusion_plan(&none, &partitioned_booking(&[("x", bad)], &[]), &[])
+            .unwrap_err()
+            .join("\n");
+        assert!(
+            said.contains("without the partition key column `a`"),
+            "{said}"
+        );
+    }
+    // A partition's own of the same shape would be taken as the clone: refused, even
+    // with another timing, and accepted when it differs in shape or is the parent's
+    // alone.
+    let mut own = parent_exclusion();
+    own.timing = pbps_model::ExclusionTiming::DeferrableImmediate;
+    let said = exclusion_plan(
+        &partitioned_booking(&[], &[("mine", own.clone())]),
+        &partitioned_booking(&[("x", parent_exclusion())], &[("mine", own.clone())]),
+        &[],
+    )
+    .unwrap_err()
+    .join("\n");
+    assert!(
+        said.contains("which can take app.booking_1's `mine`"),
+        "{said}"
+    );
+    own.include = vec!["id".into()];
+    assert_eq!(
+        kinds(
+            &exclusion_plan(
+                &partitioned_booking(&[], &[("mine", own.clone())]),
+                &partitioned_booking(&[("x", parent_exclusion())], &[("mine", own)]),
+                &[],
+            )
+            .unwrap()
+        ),
+        ["SetExclusion"]
+    );
+    // An option-only edit is a drop and an add carrying the final options.
+    let mut tuned = parent_exclusion();
+    tuned
+        .storage_parameters
+        .insert("fillfactor".into(), "70".into());
+    let cs = exclusion_plan(
+        &held,
+        &partitioned_booking(&[("x", tuned.clone())], &[]),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(kinds(&cs), ["SetExclusion", "SetExclusion"]);
+    // Negative: on an ordinary table the same edit is the in-place `ALTER INDEX`.
+    let ordinary = |x| booking(&[("x", x)]);
+    let cs = exclusion_plan(&ordinary(parent_exclusion()), &ordinary(tuned), &[]).unwrap();
+    assert_eq!(kinds(&cs), ["SetIndexStorageParameters"]);
+    // A drop needs the retirement record under the parent's uid, as on any table.
+    let said = exclusion_plan(&held, &none, &[]).unwrap_err().join("\n");
+    assert!(
+        said.contains("pbps drop-exclusion app.booking x --reason"),
+        "{said}"
+    );
+    let cs = exclusion_plan(&held, &none, &["x"]).unwrap();
+    assert_eq!(kinds(&cs), ["SetExclusion"]);
+    assert!(cs.risks().contains(&RiskClass::Destructive));
+}
+
+/// The engine's silent loss of a guarantee under a column change is refused
+/// by name: a drop of a key column is allowed only where the same plan drops
+/// the constraint; a retype is allowed and states the constraint's drop and
+/// add beside it (DEC-2448.3, DEC-2448.4, DEC-2448.5).
+#[test]
+fn a_column_drop_under_an_exclusion_is_refused_and_a_retype_states_its_rebuild() {
+    let held = booking(&[("no_overlap", exclusion("int4range(a, b)", "&&"))]);
+    let table: TableName = "app.booking".parse().unwrap();
+    let mut gone = booking(&[]);
+    gone.tables
+        .get_mut(&table)
+        .unwrap()
+        .columns
+        .shift_remove("a");
+    // The column goes and the constraint stays: refused.
+    let mut still = held.clone();
+    still
+        .tables
+        .get_mut(&table)
+        .unwrap()
+        .columns
+        .shift_remove("a");
+    let said = exclusion_plan(&held, &still, &[]).unwrap_err();
+    assert!(
+        said.iter()
+            .any(|m| m.contains("`a`") && m.contains("while the constraint holds it")),
+        "{said:?}"
+    );
+    // The constraint goes with its record: allowed, in one plan.
+    let cs = exclusion_plan(&held, &gone, &["no_overlap"]).unwrap();
+    assert!(
+        kinds(&cs).contains(&"SetExclusion".to_owned()),
+        "{:?}",
+        kinds(&cs)
+    );
+    assert!(
+        kinds(&cs).contains(&"DropColumn".to_owned()),
+        "{:?}",
+        kinds(&cs)
+    );
+    // Negative: both the column and the constraint go, with no record.
+    assert!(exclusion_plan(&held, &gone, &[]).is_err());
+    let drop = |column: &str| {
+        Change::Column(ColumnChange::DropColumn {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: table.column(column),
+        })
+    };
+    let retype = |column: &str| {
+        Change::Column(ColumnChange::AlterColumnType {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: table.column(column),
+            from: ty("integer"),
+            to: ty("bigint"),
+            from_nullable: true,
+            to_nullable: true,
+            from_collation: None,
+            to_collation: None,
+            through_external_partitions: false,
+            using: None,
+        })
+    };
+    // A drop is released by a drop in the plan, and a retype needs none: it is stated.
+    let released = Change::Constraint(ConstraintChange::SetExclusion {
+        table: table.clone(),
+        name: "no_overlap".into(),
+        from: Some(Box::new(exclusion("int4range(a, b)", "&&"))),
+        to: None,
+    });
+    let declared = Some(&held.tables[&table]);
+    let mut errs = Vec::new();
+    let stated = exclusion_hazards(
+        &table,
+        &held.tables[&table],
+        declared,
+        &[drop("a"), released.clone()],
+        &MinimalDialect,
+        &mut errs,
+    );
+    assert!(errs.is_empty() && stated.is_empty(), "{errs:?}");
+    // The drop of the constraint beside the retype is the plan's own statement of it.
+    let stated = exclusion_hazards(
+        &table,
+        &held.tables[&table],
+        declared,
+        &[retype("a"), released],
+        &MinimalDialect,
+        &mut errs,
+    );
+    assert!(errs.is_empty() && stated.is_empty(), "{errs:?} {stated:?}");
+    // A retype alone is stated as the constraint's drop and add, in that order.
+    let stated = exclusion_hazards(
+        &table,
+        &held.tables[&table],
+        declared,
+        &[retype("a")],
+        &MinimalDialect,
+        &mut errs,
+    );
+    assert!(errs.is_empty(), "{errs:?}");
+    assert!(
+        matches!(
+            stated.as_slice(),
+            [
+                Change::Constraint(ConstraintChange::SetExclusion {
+                    from: Some(_),
+                    to: None,
+                    ..
+                }),
+                Change::Constraint(ConstraintChange::SetExclusion {
+                    from: None,
+                    to: Some(_),
+                    ..
+                }),
+            ]
+        ),
+        "{stated:?}"
+    );
+    // Negative: a constraint the declarations no longer hold is the retirement gate's
+    // to refuse, not restated here.
+    let stated = exclusion_hazards(
+        &table,
+        &held.tables[&table],
+        Some(&Table::default()),
+        &[retype("a")],
+        &MinimalDialect,
+        &mut errs,
+    );
+    assert!(errs.is_empty() && stated.is_empty());
+    // Negative: a column the constraint does not hold states nothing.
+    let stated = exclusion_hazards(
+        &table,
+        &held.tables[&table],
+        declared,
+        &[retype("id")],
+        &MinimalDialect,
+        &mut errs,
+    );
+    assert!(errs.is_empty() && stated.is_empty());
+    let mut with_filter = held.tables[&table].clone();
+    with_filter.exclude.get_mut("no_overlap").unwrap().filter = Some("c > 0".into());
+    // A key, the payload and the predicate each hold a column: a drop of it is refused,
+    // a retype of it is stated, and one the constraint does not name is neither.
+    for (held_column, free_column) in [("a", "id"), ("b", "id"), ("c", "id")] {
+        let ask = |change: Change| {
+            let mut errs = Vec::new();
+            let stated = exclusion_hazards(
+                &table,
+                &with_filter,
+                Some(&with_filter),
+                &[change],
+                &MinimalDialect,
+                &mut errs,
+            );
+            (errs, stated)
+        };
+        let (errs, stated) = ask(drop(held_column));
+        assert_eq!(errs.len(), 1, "{held_column}: {errs:?}");
+        assert!(stated.is_empty());
+        assert!(
+            errs[0]
+                .to_string()
+                .contains("while the constraint holds it"),
+            "{errs:?}"
+        );
+        let (errs, stated) = ask(retype(held_column));
+        assert!(errs.is_empty(), "{held_column}: {errs:?}");
+        assert_eq!(stated.len(), 2, "{held_column}: {stated:?}");
+        for free in [drop(free_column), retype(free_column)] {
+            let (errs, stated) = ask(free);
+            assert!(
+                errs.is_empty() && stated.is_empty(),
+                "{free_column}: {errs:?}"
+            );
+        }
+    }
+    // And a table with no exclusion has no hazard at all.
+    let mut errs = Vec::new();
+    let stated = exclusion_hazards(
+        &table,
+        &Table::default(),
+        None,
+        &[drop("a")],
+        &MinimalDialect,
+        &mut errs,
+    );
+    assert!(errs.is_empty() && stated.is_empty());
+}
+
+/// A retype of a column a standing exclusion holds is one plan: the constraint's drop,
+/// the retype, the constraint's add, in that order. A retype of a column the
+/// constraint does not hold, and a retype beside a replacement the plan already states,
+/// add no pair (DEC-2448.5).
+#[test]
+fn a_retype_under_an_exclusion_plans_its_drop_before_and_its_add_after() {
+    let held = booking(&[("no_overlap", exclusion("int4range(a, b)", "&&"))]);
+    let table: TableName = "app.booking".parse().unwrap();
+    let retyped = |column: &str| {
+        let mut declared = held.clone();
+        declared
+            .tables
+            .get_mut(&table)
+            .unwrap()
+            .columns
+            .get_mut(column)
+            .unwrap()
+            .ty = ty("bigint");
+        declared
+    };
+    let cs = exclusion_plan(&held, &retyped("a"), &[]).unwrap();
+    assert_eq!(
+        kinds(&cs),
+        ["SetExclusion", "AlterColumnType", "SetExclusion"],
+        "{:?}",
+        kinds(&cs)
+    );
+    let directions: Vec<(bool, bool)> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::Constraint(ConstraintChange::SetExclusion { from, to, .. }) => {
+                Some((from.is_some(), to.is_some()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(directions, [(true, false), (false, true)]);
+    // Negative: a column the constraint does not hold plans no pair.
+    let cs = exclusion_plan(&held, &retyped("id"), &[]).unwrap();
+    assert_eq!(kinds(&cs), ["AlterColumnType"], "{:?}", kinds(&cs));
+    // Negative: beside a replacement the plan states, the pair is that replacement's.
+    let mut replaced = retyped("a");
+    replaced
+        .tables
+        .get_mut(&table)
+        .unwrap()
+        .exclude
+        .insert("no_overlap".into(), exclusion("int4range(a, b)", "-|-"));
+    let cs = exclusion_plan(&held, &replaced, &[]).unwrap();
+    assert_eq!(
+        kinds(&cs).iter().filter(|k| *k == "SetExclusion").count(),
+        2,
+        "{:?}",
+        kinds(&cs)
+    );
+    // Negative: the constraint gone from the declarations needs its record, retype or not.
+    let mut gone = retyped("a");
+    gone.tables.get_mut(&table).unwrap().exclude.clear();
+    assert!(exclusion_plan(&held, &gone, &[]).is_err());
+}
+
+/// A retype under an exclusion whose storage parameters also change is one rebuild: the
+/// restoring add carries the declared parameters, so no `ALTER INDEX` is left between the
+/// teardown and the restoration to name an index that is not there. The same parameter
+/// change with no rebuild keeps its `ALTER INDEX` (DEC-2448.5).
+#[test]
+fn a_parameter_edit_beside_an_exclusions_rebuild_is_subsumed_by_its_restoration() {
+    let held = booking(&[("no_overlap", exclusion("int4range(a, b)", "&&"))]);
+    let table: TableName = "app.booking".parse().unwrap();
+    let mut tuned = held.clone();
+    tuned
+        .tables
+        .get_mut(&table)
+        .unwrap()
+        .exclude
+        .get_mut("no_overlap")
+        .unwrap()
+        .storage_parameters
+        .insert("fillfactor".into(), "70".into());
+    // Negative: with no rebuild the parameter edit stands alone.
+    let cs = exclusion_plan(&held, &tuned, &[]).unwrap();
+    assert_eq!(
+        kinds(&cs),
+        ["SetIndexStorageParameters"],
+        "{:?}",
+        kinds(&cs)
+    );
+    // The retype rebuilds the constraint; the parameters ride on its add.
+    let mut retyped = tuned.clone();
+    retyped
+        .tables
+        .get_mut(&table)
+        .unwrap()
+        .columns
+        .get_mut("a")
+        .unwrap()
+        .ty = ty("bigint");
+    let cs = exclusion_plan(&held, &retyped, &[]).unwrap();
+    assert_eq!(
+        kinds(&cs),
+        ["SetExclusion", "AlterColumnType", "SetExclusion"],
+        "{:?}",
+        kinds(&cs)
+    );
+    let carried = cs.changes.iter().any(|p| {
+        matches!(&p.change, Change::Constraint(ConstraintChange::SetExclusion { to: Some(x), .. })
+            if x.storage_parameters.get("fillfactor").map(String::as_str) == Some("70"))
+    });
+    assert!(carried, "{:?}", kinds(&cs));
+}
+
+fn parameters_of(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect()
+}
+
+/// A difference in parameters is read through each parameter's verdict:
+/// the worst one decides, and a refused one is named (DEC-2448.1).
+#[test]
+fn a_parameter_difference_follows_the_verdict_of_its_policy_row() {
+    let edit = |was: &[(&str, &str)], now: &[(&str, &str)]| {
+        parameter_edit(&SYNTHETIC, &parameters_of(was), &parameters_of(now))
+    };
+    assert_eq!(edit(&[], &[]), ParameterEdit::Unchanged);
+    assert_eq!(
+        edit(&[("altered", "1")], &[("altered", "1")]),
+        ParameterEdit::Unchanged
+    );
+    assert_eq!(
+        edit(&[], &[("altered", "1")]),
+        ParameterEdit::Alter {
+            set: parameters_of(&[("altered", "1")]),
+            reset: BTreeSet::new()
+        }
+    );
+    // A reset is a change of its parameter too.
+    assert_eq!(edit(&[("rebuilt", "1")], &[]), ParameterEdit::Rebuild);
+    assert_eq!(edit(&[], &[("rebuilt", "2")]), ParameterEdit::Rebuild);
+    // The worst verdict wins, wherever it sits among the others.
+    assert_eq!(
+        edit(&[], &[("altered", "1"), ("rebuilt", "2")]),
+        ParameterEdit::Rebuild
+    );
+    assert_eq!(
+        edit(&[("altered", "1")], &[("rebuilt", "2"), ("refused", "3")]),
+        ParameterEdit::Refuse {
+            parameter: "refused".into()
+        }
+    );
+}
+
+/// Negative: btree and GIN hold only `Alter` parameters, so a change in
+/// any of them is the `ALTER INDEX` it always was, never a rebuild or a
+/// refusal. The old behaviour is the table's content, not a special case.
+#[test]
+fn every_parameter_btree_and_gin_hold_is_altered_in_place() {
+    for method in IndexMethod::ALL {
+        for parameter in method.policy().parameters {
+            // BRIN's `pages_per_range` is the one rebuild (DEC-2449.1).
+            if parameter.change == pbps_model::storage::ParameterChange::Rebuild {
+                let now = parameters_of(&[(parameter.name, "1")]);
+                assert!(matches!(
+                    parameter_edit(method.policy(), &BTreeMap::new(), &now),
+                    ParameterEdit::Rebuild
+                ));
+                continue;
+            }
+            let now = parameters_of(&[(parameter.name, "1")]);
+            assert!(
+                matches!(
+                    parameter_edit(method.policy(), &BTreeMap::new(), &now),
+                    ParameterEdit::Alter { .. }
+                ),
+                "{} {}",
+                method.as_str(),
+                parameter.name
+            );
+        }
+    }
+}
+
+/// A GiST index and a key's collation go through the ordinary index
+/// route, with no new change kind (DEC-2448.2): a parameter-only change is
+/// the `ALTER INDEX` carrying the method, and a collation change or a method
+/// change is the drop and the add.
+#[test]
+fn a_gist_parameter_alters_and_a_collation_or_method_change_replaces_the_index() {
+    let table_with = |method: IndexMethod, collation: Option<&str>, parameters: &[(&str, &str)]| {
+        let mut t = Table::default();
+        t.columns
+            .insert("body".into(), Column::new("text".parse().unwrap()));
+        t.indexes.insert(
+            "ix".into(),
+            Index {
+                columns: vec![pbps_model::IndexColumn {
+                    collation: collation.map(str::to_owned),
+                    ..pbps_model::IndexColumn::column("body")
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method,
+                storage_parameters: parameters_of(parameters),
+                filegroup: None,
+            },
+        );
+        t
+    };
+    let run = |was: &Table, now: &Table| {
+        let mut changes = Vec::new();
+        let mut errs = Vec::new();
+        diff_constraints(&"dbo.t".parse().unwrap(), was, now, &mut changes, &mut errs);
+        assert!(errs.is_empty(), "{errs:?}");
+        changes
+    };
+    let base = table_with(IndexMethod::Gist, None, &[("fillfactor", "70")]);
+    let tuned = table_with(
+        IndexMethod::Gist,
+        None,
+        &[("fillfactor", "80"), ("buffering", "off")],
+    );
+    assert!(matches!(
+        run(&base, &tuned).as_slice(),
+        [Change::Index(IndexChange::SetIndexStorageParameters {
+            method: IndexMethod::Gist,
+            ..
+        })]
+    ));
+    assert!(run(&base, &base).is_empty());
+    let collated = table_with(IndexMethod::Gist, Some("C"), &[("fillfactor", "70")]);
+    assert!(matches!(
+        run(&base, &collated).as_slice(),
+        [Change::Index(IndexChange::DropIndex { .. }), Change::Index(IndexChange::AddIndex { index, .. })]
+            if index.columns[0].collation.as_deref() == Some("C")
+    ));
+    // Negative: the same collation on both sides changes nothing, and a
+    // method change is a replacement, never an `ALTER`.
+    assert!(run(&collated, &collated).is_empty());
+    let btree = table_with(IndexMethod::Btree, None, &[]);
+    assert!(matches!(
+        run(&base, &btree).as_slice(),
+        [
+            Change::Index(IndexChange::DropIndex { .. }),
+            Change::Index(IndexChange::AddIndex { .. })
+        ]
+    ));
+}
+
+/// A key's class or its class's options changing replaces the index, through
+/// the ordinary drop and add and never an `ALTER INDEX`: the engine has no
+/// in-place change of a key's options (measured, `42601`). A difference that
+/// also touches an in-place option is still one replacement carrying every
+/// final option (DEC-2449.2).
+#[test]
+fn a_class_or_a_class_option_change_is_one_replacement_carrying_every_final_option() {
+    let table_with = |class: &str, key: &[(&str, &str)], parameters: &[(&str, &str)]| {
+        let mut t = Table::default();
+        t.columns
+            .insert("n".into(), Column::new("integer".parse().unwrap()));
+        t.indexes.insert(
+            "ix".into(),
+            Index {
+                columns: vec![pbps_model::IndexColumn {
+                    opclass: Some(class.parse().unwrap()),
+                    opclass_parameters: parameters_of(key),
+                    ..pbps_model::IndexColumn::column("n")
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: IndexMethod::Brin,
+                storage_parameters: parameters_of(parameters),
+                filegroup: None,
+            },
+        );
+        t
+    };
+    let run = |was: &Table, now: &Table| {
+        let mut changes = Vec::new();
+        let mut errs = Vec::new();
+        diff_constraints(&"dbo.t".parse().unwrap(), was, now, &mut changes, &mut errs);
+        assert!(errs.is_empty(), "{errs:?}");
+        changes
+    };
+    let base = table_with("int4_minmax_multi_ops", &[("values_per_range", "16")], &[]);
+    assert!(run(&base, &base).is_empty());
+    let option = table_with("int4_minmax_multi_ops", &[("values_per_range", "32")], &[]);
+    let class = table_with("int4_bloom_ops", &[], &[]);
+    let pin = table_with("int4_minmax_multi_ops", &[], &[]);
+    for now in [&option, &class, &pin] {
+        assert!(
+            matches!(
+                run(&base, now).as_slice(),
+                [Change::Index(IndexChange::DropIndex { .. }), Change::Index(IndexChange::AddIndex { index, .. })]
+                    if index.columns == now.indexes["ix"].columns
+            ),
+            "{now:?}"
+        );
+    }
+    // An in-place option beside it adds no `ALTER`: one replacement has it all.
+    let both = table_with(
+        "int4_minmax_multi_ops",
+        &[("values_per_range", "32")],
+        &[("autosummarize", "true")],
+    );
+    assert!(matches!(
+        run(&base, &both).as_slice(),
+        [Change::Index(IndexChange::DropIndex { .. }), Change::Index(IndexChange::AddIndex { index, .. })]
+            if index.storage_parameters.get("autosummarize").map(String::as_str) == Some("true")
+    ));
+    // Negative: the in-place option alone is still the `ALTER`.
+    let only = table_with(
+        "int4_minmax_multi_ops",
+        &[("values_per_range", "16")],
+        &[("autosummarize", "true")],
+    );
+    assert!(matches!(
+        run(&base, &only).as_slice(),
+        [Change::Index(IndexChange::SetIndexStorageParameters { .. })]
+    ));
+}
+
+/// Through the differ itself, under a policy that holds one parameter of
+/// each verdict: `Alter` is the `ALTER INDEX` change, `Rebuild` replaces
+/// the index (its drop and its add, carrying the final parameters), and
+/// `Refuse` is a named error with no change (DEC-2448.1).
+#[test]
+fn the_differ_alters_rebuilds_or_refuses_an_index_by_its_parameters_verdict() {
+    let table_with = |parameters: &[(&str, &str)]| {
+        let mut t = Table::default();
+        t.columns
+            .insert("a".into(), Column::new("int".parse().unwrap()));
+        t.indexes.insert(
+            "ix".into(),
+            Index {
+                columns: vec![pbps_model::IndexColumn::column("a")],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: IndexMethod::Btree,
+                storage_parameters: parameters_of(parameters),
+                filegroup: None,
+            },
+        );
+        t
+    };
+    let run = |now: &[(&str, &str)]| {
+        let mut changes = Vec::new();
+        let mut errs = Vec::new();
+        diff_constraints_by(
+            &"dbo.t".parse().unwrap(),
+            &table_with(&[]),
+            &table_with(now),
+            &mut changes,
+            &mut errs,
+            &|_| &SYNTHETIC,
+        );
+        (changes, errs)
+    };
+    let (changes, errs) = run(&[("altered", "1")]);
+    assert!(errs.is_empty(), "{errs:?}");
+    assert!(
+        matches!(
+            changes.as_slice(),
+            [Change::Index(IndexChange::SetIndexStorageParameters { .. })]
+        ),
+        "{changes:?}"
+    );
+    let (changes, errs) = run(&[("rebuilt", "1")]);
+    assert!(errs.is_empty(), "{errs:?}");
+    assert!(
+        matches!(
+            changes.as_slice(),
+            [Change::Index(IndexChange::DropIndex { .. }), Change::Index(IndexChange::AddIndex { index, .. })]
+                if index.storage_parameters.get("rebuilt").map(String::as_str) == Some("1")
+        ),
+        "{changes:?}"
+    );
+    let (changes, errs) = run(&[("refused", "1")]);
+    assert!(changes.is_empty(), "{changes:?}");
+    let [
+        DiffError::IndexParameterRefused {
+            parameter, method, ..
+        },
+    ] = errs.as_slice()
+    else {
+        panic!("{errs:?}")
+    };
+    assert_eq!((parameter.as_str(), *method), ("refused", "btree"));
+    let message = errs[0].to_string();
+    assert!(
+        message.contains("`refused`") && message.contains("DEC-2448.1"),
+        "{message}"
+    );
+    // Negative: the real table refuses nothing and rebuilds nothing.
+    let mut changes = Vec::new();
+    let mut errs = Vec::new();
+    diff_constraints(
+        &"dbo.t".parse().unwrap(),
+        &table_with(&[]),
+        &table_with(&[("fillfactor", "70")]),
+        &mut changes,
+        &mut errs,
+    );
+    assert!(
+        errs.is_empty()
+            && matches!(
+                changes.as_slice(),
+                [Change::Index(IndexChange::SetIndexStorageParameters { .. })]
+            )
+    );
+}
+
+/// A partitioned parent's index takes no `ALTER INDEX SET`/`RESET` in any
+/// method (42809, #2709), so an option the engine alters in place on an
+/// ordinary table is a rebuild on the parent, for every method, in both
+/// directions; the ordinary table still alters in place (negative), and an
+/// option that is a rebuild anyway stays one (DEC-2449.1).
+#[test]
+fn an_index_option_change_on_a_partitioned_parent_is_a_rebuild_for_every_method() {
+    let table_with = |method: IndexMethod, parameters: &[(&str, &str)], partitioned: bool| {
+        let mut t = Table::default();
+        t.columns
+            .insert("a".into(), Column::new("int".parse().unwrap()));
+        t.indexes.insert(
+            "ix".into(),
+            Index {
+                columns: vec![pbps_model::IndexColumn::column("a")],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method,
+                storage_parameters: parameters_of(parameters),
+                filegroup: None,
+            },
+        );
+        if partitioned {
+            t.partition_by = Some(pbps_model::PartitionBy {
+                external: false,
+                columns: vec!["a".into()],
+                strategy: Default::default(),
+            });
+        }
+        t
+    };
+    let run = |method, was: &[(&str, &str)], now: &[(&str, &str)], partitioned| {
+        let mut changes = Vec::new();
+        let mut errs = Vec::new();
+        diff_constraints(
+            &"app.t".parse().unwrap(),
+            &table_with(method, was, partitioned),
+            &table_with(method, now, partitioned),
+            &mut changes,
+            &mut errs,
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        changes
+    };
+    for (method, name, value) in [
+        (IndexMethod::Btree, "fillfactor", "70"),
+        (IndexMethod::Gin, "fastupdate", "false"),
+        (IndexMethod::Gist, "fillfactor", "70"),
+        (IndexMethod::Brin, "autosummarize", "true"),
+    ] {
+        let now = [(name, value)];
+        // Set, change and reset on the parent are each a drop and an add
+        // that carries the final options.
+        for (was, now) in [(&[][..], &now[..]), (&now[..], &[][..])] {
+            let changes = run(method, was, now, true);
+            assert!(
+                matches!(
+                    changes.as_slice(),
+                    [Change::Index(IndexChange::DropIndex { .. }), Change::Index(IndexChange::AddIndex { index, .. })]
+                        if index.storage_parameters.len() == now.len()
+                ),
+                "{method:?} {name}: {changes:?}"
+            );
+            // Negative: the same edit on an ordinary table alters in place.
+            let changes = run(method, was, now, false);
+            assert!(
+                matches!(
+                    changes.as_slice(),
+                    [Change::Index(IndexChange::SetIndexStorageParameters { .. })]
+                ),
+                "{method:?} {name}: {changes:?}"
+            );
+        }
+        // Negative: nothing changed, nothing planned, partitioned or not.
+        assert!(run(method, &now, &now, true).is_empty());
+    }
+    // BRIN's `pages_per_range` is a rebuild whether the table is partitioned
+    // or not: the native `ALTER` leaves the metapage at the old granularity.
+    for partitioned in [false, true] {
+        let changes = run(
+            IndexMethod::Brin,
+            &[("pages_per_range", "16")],
+            &[("pages_per_range", "4")],
+            partitioned,
+        );
+        assert!(
+            matches!(
+                changes.as_slice(),
+                [
+                    Change::Index(IndexChange::DropIndex { .. }),
+                    Change::Index(IndexChange::AddIndex { .. })
+                ]
+            ),
+            "{partitioned}: {changes:?}"
+        );
+    }
+}
+
+/// A table with a key, a UNIQUE constraint and an index, clustered on
+/// whichever `layout` names (#1178).
+/// An index's, a unique constraint's or a key's parameters alone change
+/// in place, one `SetIndexStorageParameters` each and no rebuild; a part
+/// that changes otherwise is rebuilt with its declared parameters in its
+/// `CREATE` (#1442).
+#[test]
+fn index_parameters_change_in_place_and_ride_a_rebuild() {
+    let with = |ix_params: &[(&str, &str)], pk_params: &[(&str, &str)], descending: bool| {
+        let mut t = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("v", Column::new(ty("int"))),
+        ]);
+        let map = |p: &[(&str, &str)]| {
+            p.iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        t.primary_key = Some(PrimaryKey {
+            name: Some("t_pkey".into()),
+            columns: vec!["id".into()],
+            storage_parameters: map(pk_params),
+            filegroup: None,
+        });
+        t.indexes.insert(
+            "ix_v".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    key: pbps_model::IndexKey::Column("v".into()),
+                    descending,
+                    opclass: None,
+                    collation: None,
+                    opclass_parameters: Default::default(),
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: map(ix_params),
+                filegroup: None,
+            },
+        );
+        schema_of("public.t", t)
+    };
+    let base = with(&[("fillfactor", "70")], &[], false);
+    let cs = run(
+        &base,
+        &with(
+            &[("deduplicate_items", "false")],
+            &[("fillfactor", "80")],
+            false,
+        ),
+        &[],
+    );
+    let shown: Vec<String> = cs
+        .changes
+        .iter()
+        .map(|p| match &p.change {
+            Change::Index(IndexChange::SetIndexStorageParameters {
+                target, set, reset, ..
+            }) => {
+                format!("{target:?} set {set:?} reset {reset:?}")
+            }
+            other => format!("{other:?}"),
+        })
+        .collect();
+    // Their order between them is a tie, and none is needed.
+    let mut shown = shown;
+    shown.sort();
+    assert_eq!(
+        shown,
+        [
+            r#"Index("ix_v") set {"deduplicate_items": "false"} reset {"fillfactor"}"#,
+            r#"PrimaryKey set {"fillfactor": "80"} reset {}"#,
+        ]
+    );
+    // A definition change rebuilds, and the `CREATE` carries them.
+    let cs = run(&base, &with(&[("fillfactor", "70")], &[], true), &[]);
+    let added = cs.changes.iter().find_map(|p| match &p.change {
+        Change::Index(IndexChange::AddIndex { index, .. }) => {
+            Some(index.storage_parameters.clone())
+        }
+        _ => None,
+    });
+    assert_eq!(
+        added,
+        Some([("fillfactor".to_owned(), "70".to_owned())].into())
+    );
+    assert!(!cs.changes.iter().any(|p| matches!(
+        p.change,
+        Change::Index(IndexChange::SetIndexStorageParameters { .. })
+    )));
+    // Negative: the same parameters plan nothing.
+    assert!(run(&base, &base, &[]).changes.is_empty());
+}
+
+/// Tables `public.<name>`, each with an `id` key, and a foreign key per
+/// edge from the first to the second, which need not be declared.
+fn fk_schema(tables: &[&str], edges: &[(&str, &str)]) -> Schema {
+    let mut s = Schema::default();
+    for t in tables {
+        let mut table = table(&[("id", Column::new(ty("int")).not_null())]);
+        table.primary_key = Some(PrimaryKey {
+            name: Some(format!("{t}_pkey").into()),
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        });
+        s.tables
+            .insert(format!("public.{t}").parse().unwrap(), table);
+    }
+    for (k, (from, to)) in edges.iter().enumerate() {
+        let column = format!("r{k}");
+        let table = s
+            .tables
+            .get_mut(&format!("public.{from}").parse::<TableName>().unwrap())
+            .unwrap();
+        table
+            .columns
+            .insert(column.clone().into(), Column::new(ty("int")));
+        table.foreign_keys.insert(
+            format!("fk{k}").into(),
+            pbps_model::ForeignKey {
+                columns: vec![column.into()],
+                references_table: format!("public.{to}").parse().unwrap(),
+                references_columns: vec!["id".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+    }
+    s
+}
+
+fn t(name: &str) -> TableName {
+    format!("public.{name}").parse().unwrap()
+}
+
+/// The closure-and-recursion answer [`ForeignKeyGraph`] replaced (#1792),
+/// kept as the reference it must agree with: each table's component by
+/// mutual reachability, and its depth over the keys that leave it.
+fn reference_graph(
+    schema: &Schema,
+) -> (
+    BTreeMap<TableName, BTreeSet<TableName>>,
+    BTreeMap<TableName, usize>,
+) {
+    let edges = |t: &TableName| -> Vec<TableName> {
+        schema.tables.get(t).map_or_else(Vec::new, |table| {
+            table
+                .foreign_keys
+                .values()
+                .map(|fk| fk.references_table.clone())
+                .filter(|to| to != t && schema.tables.contains_key(to))
+                .collect()
+        })
+    };
+    let mut reach: BTreeMap<TableName, BTreeSet<TableName>> = BTreeMap::new();
+    for t in schema.tables.keys() {
+        let mut seen = BTreeSet::new();
+        let mut stack = edges(t);
+        while let Some(next) = stack.pop() {
+            if seen.insert(next.clone()) {
+                stack.extend(edges(&next));
+            }
+        }
+        reach.insert(t.clone(), seen);
+    }
+    let same =
+        |a: &TableName, b: &TableName| a == b || (reach[a].contains(b) && reach[b].contains(a));
+    fn depth(
+        t: &TableName,
+        schema: &Schema,
+        same: &dyn Fn(&TableName, &TableName) -> bool,
+        memo: &mut BTreeMap<TableName, usize>,
+    ) -> usize {
+        if let Some(d) = memo.get(t) {
+            return *d;
+        }
+        let d = schema.tables.get(t).map_or(0, |table| {
+            table
+                .foreign_keys
+                .values()
+                .filter(|fk| {
+                    fk.references_table != *t
+                        && !(schema.tables.contains_key(&fk.references_table)
+                            && same(&fk.references_table, t))
+                })
+                .map(|fk| 1 + depth(&fk.references_table, schema, same, memo))
+                .max()
+                .unwrap_or(0)
+        });
+        memo.insert(t.clone(), d);
+        d
+    }
+    let mut memo = BTreeMap::new();
+    let mut members = BTreeMap::new();
+    let mut depths = BTreeMap::new();
+    for a in schema.tables.keys() {
+        members.insert(
+            a.clone(),
+            schema
+                .tables
+                .keys()
+                .filter(|b| same(a, b))
+                .cloned()
+                .collect(),
+        );
+        depths.insert(a.clone(), depth(a, schema, &same, &mut memo));
+    }
+    (members, depths)
+}
+
+/// The single pass answers what the closure did, on every graph shape a
+/// few hundred small pseudo-random schemas reach: cycles, self-references,
+/// keys to undeclared tables, several components.
+#[test]
+fn the_linear_foreign_key_graph_agrees_with_the_closure_it_replaced() {
+    let mut seed: u64 = 0x1792;
+    let mut next = |bound: u64| {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) % bound
+    };
+    let names = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
+    for round in 0..400 {
+        let n = 1 + next(names.len() as u64) as usize;
+        let tables = &names[..n];
+        let mut edges = Vec::new();
+        for _ in 0..next(2 * n as u64 + 1) {
+            let from = tables[next(n as u64) as usize];
+            // One key in eight leaves the schema.
+            let to = if next(8) == 0 {
+                "outside"
+            } else {
+                tables[next(n as u64) as usize]
+            };
+            edges.push((from, to));
+        }
+        let schema = fk_schema(tables, &edges);
+        let graph = ForeignKeyGraph::of(&schema);
+        let (members, depths) = reference_graph(&schema);
+        for a in schema.tables.keys() {
+            assert_eq!(
+                graph.depth(a),
+                depths[a],
+                "round {round}, {a}: {edges:?}",
+                a = a.shown()
+            );
+            for b in schema.tables.keys() {
+                assert_eq!(
+                    graph.same_component(a, b),
+                    members[a].contains(b),
+                    "round {round}, {a} and {b}: {edges:?}",
+                    a = a.shown(),
+                    b = b.shown()
+                );
+            }
+        }
+        assert_eq!(graph.deepest(), depths.values().copied().max().unwrap_or(0));
+    }
+}
+
+#[test]
+fn foreign_key_components_and_depths_by_shape() {
+    // A self-reference alone: its own component, depth 0.
+    let g = fk_schema(&["s"], &[("s", "s")]);
+    let graph = ForeignKeyGraph::of(&g);
+    assert!(graph.same_component(&t("s"), &t("s")));
+    assert_eq!(graph.depth(&t("s")), 0);
+
+    // A two-table cycle with a tail into it, and a pair beside it.
+    let g = fk_schema(
+        &["a", "b", "c", "d", "e"],
+        &[("a", "b"), ("b", "a"), ("c", "a"), ("d", "e")],
+    );
+    let graph = ForeignKeyGraph::of(&g);
+    assert!(graph.same_component(&t("a"), &t("b")));
+    assert!(!graph.same_component(&t("a"), &t("c")));
+    assert!(!graph.same_component(&t("d"), &t("e")));
+    assert!(!graph.same_component(&t("a"), &t("d")));
+    // Keys inside the cycle do not count; the tail is one past it.
+    assert_eq!(graph.depth(&t("a")), 0);
+    assert_eq!(graph.depth(&t("b")), 0);
+    assert_eq!(graph.depth(&t("c")), 1);
+    assert_eq!(graph.depth(&t("d")), 1);
+    assert_eq!(graph.deepest(), 1);
+
+    // A key to a table the schema does not declare makes its table 1,
+    // and the undeclared table shares no component, not even its own.
+    let g = fk_schema(&["x"], &[("x", "gone")]);
+    let graph = ForeignKeyGraph::of(&g);
+    assert_eq!(graph.depth(&t("x")), 1);
+    assert_eq!(graph.depth(&t("gone")), 0);
+    assert!(!graph.same_component(&t("gone"), &t("gone")));
+    assert!(!graph.same_component(&t("x"), &t("gone")));
+}
+
+/// A chain of keys as long as a large schema's: every depth, with no
+/// recursion to run out of stack on, and no table's reachable set kept.
+#[test]
+fn a_long_chain_of_keys_gets_every_depth_without_recursing() {
+    let n = 5000;
+    let names: Vec<String> = (0..n).map(|i| format!("t{i:05}")).collect();
+    let tables: Vec<&str> = names.iter().map(String::as_str).collect();
+    let edges: Vec<(&str, &str)> = (1..n).map(|i| (tables[i], tables[i - 1])).collect();
+    let schema = fk_schema(&tables, &edges);
+    let graph = ForeignKeyGraph::of(&schema);
+    for (i, name) in tables.iter().enumerate() {
+        assert_eq!(graph.depth(&t(name)), i);
+    }
+    assert_eq!(graph.deepest(), n - 1);
+    assert!(!graph.same_component(&t(tables[0]), &t(tables[1])));
+}
+
+/// Persistence switches over a cycle with a tail and a separate pair, both
+/// ways: the deeper tables switch first to unlogged and last to logged,
+/// the cycle's keys are dropped around the switches, and a plan with no
+/// switch over the same cyclic schema changes nothing (#1792).
+#[test]
+fn persistence_switches_order_a_cycle_with_a_tail_and_a_separate_pair() {
+    let shape = |unlogged: bool| {
+        let mut s = fk_schema(
+            &["a", "b", "c", "d", "e"],
+            &[("a", "b"), ("b", "a"), ("c", "a"), ("d", "e")],
+        );
+        for table in s.tables.values_mut() {
+            table.unlogged = unlogged;
+        }
+        s
+    };
+    assert!(run(&shape(false), &shape(false), &[]).changes.is_empty());
+    for to_unlogged in [true, false] {
+        let cs = run(&shape(!to_unlogged), &shape(to_unlogged), &[]);
+        let at = |name: &str| {
+            cs.changes
+                .iter()
+                .position(|p| {
+                    matches!(&p.change, Change::TableProperty(TablePropertyChange::SetTablePersistence { table, .. }) if *table == t(name))
+                })
+                .unwrap_or_else(|| panic!("no switch for {name}: {:?}", cs.changes))
+        };
+        for deep in ["c", "d"] {
+            for shallow in ["a", "b", "e"] {
+                assert_eq!(
+                    at(deep) < at(shallow),
+                    to_unlogged,
+                    "{deep} against {shallow}, to unlogged: {to_unlogged}"
+                );
+            }
+        }
+        let first_switch = ["a", "b", "c", "d", "e"].map(at).into_iter().min().unwrap();
+        let last_switch = ["a", "b", "c", "d", "e"].map(at).into_iter().max().unwrap();
+        for (table, key) in [("a", "fk0"), ("b", "fk1")] {
+            let drop = cs.changes.iter().position(|p| {
+                matches!(&p.change, Change::Constraint(ConstraintChange::DropForeignKey { table: tb, name }) if *tb == t(table) && name.raw() == key)
+            });
+            let add = cs.changes.iter().position(|p| {
+                matches!(&p.change, Change::Constraint(ConstraintChange::AddForeignKey { table: tb, name, .. }) if *tb == t(table) && name.raw() == key)
+            });
+            assert!(
+                drop.is_some_and(|d| d < first_switch),
+                "{table}.{key}: {:?}",
+                cs.changes
+            );
+            assert!(
+                add.is_some_and(|a| a > last_switch),
+                "{table}.{key}: {:?}",
+                cs.changes
+            );
+        }
+        // The keys outside the cycle stand through the switches.
+        assert!(!cs.changes.iter().any(|p| matches!(
+            &p.change,
+            Change::Constraint(ConstraintChange::DropForeignKey { name, .. }) if name.raw() == "fk2" || name.raw() == "fk3"
+        )));
+    }
+}
+
+/// A persistence switch is one change, `destructive` to unlogged and
+/// unclassed back; switched together, linked tables go in the order the
+/// engine takes (to unlogged, referencing first; to logged, referenced
+/// first), and a permanent table referencing an unlogged one is refused
+/// (measured on 16 and 18, #1443).
+#[test]
+fn persistence_switches_follow_the_foreign_keys() {
+    let pair = |unlogged: bool| {
+        let mut s = Schema::default();
+        let mut parent = table(&[("id", Column::new(ty("int")).not_null())]);
+        parent.primary_key = Some(PrimaryKey {
+            name: Some("pa_pkey".into()),
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        });
+        parent.unlogged = unlogged;
+        let mut child = table(&[("pa", Column::new(ty("int")))]);
+        child.foreign_keys.insert(
+            "ch_pa".into(),
+            pbps_model::ForeignKey {
+                columns: vec!["pa".into()],
+                references_table: "public.pa".parse().unwrap(),
+                references_columns: vec!["id".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        child.unlogged = unlogged;
+        s.tables.insert("public.pa".parse().unwrap(), parent);
+        s.tables.insert("public.ch".parse().unwrap(), child);
+        s
+    };
+    let order = |from: bool, to: bool| -> Vec<String> {
+        run(&pair(from), &pair(to), &[])
+            .changes
+            .iter()
+            .map(|p| match &p.change {
+                Change::TableProperty(TablePropertyChange::SetTablePersistence {
+                    table,
+                    unlogged,
+                    ..
+                }) => format!("{table} {unlogged}", table = table.shown()),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    };
+    assert_eq!(order(false, true), ["public.ch true", "public.pa true"]);
+    assert_eq!(order(true, false), ["public.pa false", "public.ch false"]);
+    let cs = run(&pair(false), &pair(true), &[]);
+    assert!(
+        cs.changes[0]
+            .risks
+            .contains(&pbps_model::RiskClass::Destructive)
+    );
+    let cs = run(&pair(true), &pair(false), &[]);
+    assert!(cs.changes[0].risks.is_empty(), "{:?}", cs.changes[0].risks);
+    // Negative: a permanent child of an unlogged parent is refused.
+    let mut mixed = pair(false);
+    mixed
+        .tables
+        .get_mut(&"public.pa".parse::<TableName>().unwrap())
+        .unwrap()
+        .unlogged = true;
+    let base_ids = crate::resolve(&pair(false), &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let ids = crate::resolve(&mixed, &base_ids, &[], &ctx()).unwrap().ids;
+    let errors = diff_partial(
+        Side {
+            schema: &pair(false),
+            ids: &base_ids,
+        },
+        Side {
+            schema: &mixed,
+            ids: &ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+    )
+    .errors;
+    assert!(
+        errors.iter().any(|e| matches!(e, DiffError::PermanentReferencesUnlogged { key, .. } if key.raw() == "ch_pa")),
+        "{errors:?}"
+    );
+}
+
+/// A partition tree is created parent first and every partition after
+/// it, whatever the names' order (#1170). A partition is then added under
+/// the standing parent, or dropped with intent and detached from it first
+/// (#1171); any other change to a partitioned table or a partition is
+/// refused by name: its bound, a parent's column, a rename, the parent's
+/// drop. A change to another table, even one referencing the parent, is
+/// not refused.
+/// A standing range-partitioned parent's columns change (#1687): an
+/// addition, a drop, a retype, a rename (a key column's too, which the
+/// key follows), a default and NOT NULL each one change to the parent,
+/// which the engine recurses into every partition. A partition's own
+/// default and NOT NULL follow the parent's change on their column:
+/// - carried through a rename;
+/// - taken with a drop;
+/// - set again after a default change and after a NOT NULL drop, every
+///   partition brought to its declaration;
+/// - left to the parent's tightening.
+///
+/// A key column's drop or retype, and an identity column added, are
+/// refused by name.
+/// A standing parent's indexes change as a table's do (#1688): added,
+/// dropped, and a new name as a drop and an add, the engine recursing
+/// each into every partition. Refused by name: `strategy: online`, a
+/// unique index without a partition-key column, and a new index that
+/// would take a partition's own as its clone (measured on 16 and 18).
+#[test]
+fn a_partitioned_parents_indexes_change_and_a_partitions_own_is_not_taken() {
+    use pbps_model::{PartitionBound, PartitionBy, PartitionOf};
+    let ev: TableName = "app.ev".parse().unwrap();
+    let index = |columns: &[&str], unique: bool, filter: Option<&str>| Index {
+        columns: columns
+            .iter()
+            .map(|c| pbps_model::IndexColumn::column(*c))
+            .collect(),
+        include: Vec::new(),
+        unique,
+        filter: filter.map(Into::into),
+        method: Default::default(),
+        storage_parameters: Default::default(),
+        filegroup: None,
+    };
+    let tree = |parent_indexes: &[(&str, Index)], own: &[(&str, Index)], created: bool| {
+        let mut parent = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("ts", Column::new(ty("date")).not_null()),
+            ("n", Column::new(ty("int"))),
+        ]);
+        parent.partition_by = Some(PartitionBy {
+            external: false,
+            columns: vec!["ts".into()],
+            strategy: Default::default(),
+        });
+        for (name, ix) in parent_indexes {
+            parent.indexes.insert((*name).into(), ix.clone());
+        }
+        let mut s = schema_of("app.ev", parent);
+        let partition = |bound: PartitionBound, own: &[(&str, Index)]| {
+            let mut t = Table {
+                partition_of: Some(PartitionOf {
+                    parent: ev.clone(),
+                    bound,
+                    columns: Default::default(),
+                }),
+                ..Default::default()
+            };
+            for (name, ix) in own {
+                t.indexes.insert((*name).into(), ix.clone());
+            }
+            t
+        };
+        let (standing, new) = if created {
+            (&[][..], own)
+        } else {
+            (own, &[][..])
+        };
+        s.tables.insert(
+            "app.ev_1".parse().unwrap(),
+            partition(PartitionBound::Default, standing),
+        );
+        if created {
+            s.tables.insert(
+                "app.ev_new".parse().unwrap(),
+                partition(
+                    PartitionBound::Range {
+                        from: vec![pbps_model::BoundDatum::Value("2030-01-01".into())],
+                        to: vec![pbps_model::BoundDatum::Value("2031-01-01".into())],
+                    },
+                    new,
+                ),
+            );
+        }
+        s
+    };
+    let planned = |base: &Schema, declared: &Schema, online: bool| {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        // A partition left out is dropped, which takes a reason.
+        let dropped: Vec<Intent> = base
+            .tables
+            .keys()
+            .filter(|t| !declared.tables.contains_key(*t))
+            .map(|t| Intent::DropTable {
+                table: t.clone(),
+                reason: "gone".parse().unwrap(),
+            })
+            .collect();
+        let declared_ids = crate::resolve(declared, &base_ids, &dropped, &ctx())
+            .unwrap()
+            .ids;
+        let mut hints = Hints::default();
+        if online {
+            hints
+                .strategies
+                .insert(ev.clone(), pbps_model::Strategy { online: true });
+        }
+        diff(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &hints,
+        )
+        .map_err(|e| e.iter().map(ToString::to_string).collect::<Vec<_>>())
+    };
+    let outcome = |base: &Schema, declared: &Schema, online: bool| {
+        planned(base, declared, online).map(|cs| kinds(&cs))
+    };
+    let plain = tree(&[], &[], false);
+    let indexed = tree(&[("ev_n", index(&["n"], false, None))], &[], false);
+    let renamed = tree(&[("ev_n2", index(&["n"], false, None))], &[], false);
+    assert_eq!(
+        outcome(&plain, &indexed, false),
+        Ok(vec!["AddIndex".to_owned()])
+    );
+    assert_eq!(
+        outcome(&indexed, &plain, false),
+        Ok(vec!["DropIndex".to_owned()])
+    );
+    assert_eq!(
+        outcome(&indexed, &renamed, false),
+        Ok(vec!["DropIndex".to_owned(), "AddIndex".to_owned()])
+    );
+    let refused = |result: Result<Vec<String>, Vec<String>>, what: &str| {
+        let errors = result.expect_err(what);
+        assert!(errors.iter().any(|e| e.contains(what)), "{errors:?}");
+    };
+    // Online, either way.
+    refused(outcome(&plain, &indexed, true), "with `strategy: online`");
+    refused(outcome(&indexed, &plain, true), "with `strategy: online`");
+    // Unique without the key column; with it, planned.
+    refused(
+        outcome(
+            &plain,
+            &tree(&[("ev_u", index(&["id"], true, None))], &[], false),
+            false,
+        ),
+        "without the partition key column `ts`",
+    );
+    assert!(
+        outcome(
+            &plain,
+            &tree(&[("ev_u", index(&["id", "ts"], true, None))], &[], false),
+            false
+        )
+        .is_ok()
+    );
+    // Adoption: a standing partition's own index, and one created by the
+    // same plan, a key's direction notwithstanding.
+    let own = [("ev_1_n", index(&["n"], false, None))];
+    refused(
+        outcome(
+            &tree(&[], &own, false),
+            &tree(&[("ev_n", index(&["n"], false, None))], &own, false),
+            false,
+        ),
+        "which can take app.ev_1's `ev_1_n`",
+    );
+    let mut descending = index(&["n"], false, None);
+    descending.columns[0].descending = true;
+    refused(
+        outcome(
+            &plain,
+            &tree(
+                &[("ev_n", index(&["n"], false, None))],
+                &[("own", descending)],
+                true,
+            ),
+            false,
+        ),
+        "which can take app.ev_new's `own`",
+    );
+    // An own index this plan adds to a standing partition is built after
+    // its parent's, whatever the names, and stays its own (#1737 review).
+    // A partition whose name sorts before its parent's takes the rule,
+    // not the tie-break, to come second.
+    let renamed = |mut s: Schema, to: &str| {
+        let t = s
+            .tables
+            .remove(&"app.ev_1".parse::<TableName>().unwrap())
+            .unwrap();
+        s.tables.insert(to.parse().unwrap(), t);
+        s
+    };
+    for (partition, partition_index, parent_index) in
+        [("app.ev_1", "ev_1_n", "ev_n"), ("app.aa", "a", "z")]
+    {
+        let both = tree(
+            &[(parent_index, index(&["n"], false, None))],
+            &[(partition_index, index(&["n"], false, None))],
+            false,
+        );
+        let cs = planned(
+            &renamed(plain.clone(), partition),
+            &renamed(both, partition),
+            false,
+        )
+        .expect("planned");
+        let tables: Vec<String> = cs
+            .changes
+            .iter()
+            .map(|p| p.change.table().unwrap().raw().to_string())
+            .collect();
+        assert_eq!(tables, ["app.ev", partition], "{:?}", cs.changes);
+    }
+    // Refused by name: an index change in a plan that drops a partition
+    // under the parent, whose rows the unique probe would still read and
+    // whose shape a detach would check against the parent's indexes as
+    // they stood (#1737 review).
+    let mut without_partition = indexed.clone();
+    without_partition
+        .tables
+        .remove(&"app.ev_1".parse::<TableName>().unwrap());
+    let mut unique_without = tree(&[("ev_u", index(&["id", "ts"], true, None))], &[], false);
+    unique_without
+        .tables
+        .remove(&"app.ev_1".parse::<TableName>().unwrap());
+    let mut plain_without = plain.clone();
+    plain_without
+        .tables
+        .remove(&"app.ev_1".parse::<TableName>().unwrap());
+    refused(
+        outcome(&plain, &unique_without, false),
+        "change the parent and the partitions in separate plans",
+    );
+    refused(
+        outcome(&indexed, &plain_without, false),
+        "change the parent and the partitions in separate plans",
+    );
+    // Negative: the partition dropped alone is planned.
+    assert!(outcome(&indexed, &without_partition, false).is_ok());
+    // A predicate or an expression key is a match whatever its text: the
+    // engine compares what it parses (#1737 review).
+    let mut spaced = index(&["n"], false, None);
+    spaced.columns[0].key = pbps_model::IndexKey::Expression("n + 1".into());
+    let mut packed = spaced.clone();
+    packed.columns[0].key = pbps_model::IndexKey::Expression("n+1".into());
+    for (own_index, parent_index) in [
+        (
+            index(&["n"], false, Some("n>0")),
+            index(&["n"], false, Some("n > 0")),
+        ),
+        (packed, spaced),
+    ] {
+        let own = [("ev_1_x", own_index)];
+        refused(
+            outcome(
+                &tree(&[], &own, false),
+                &tree(&[("ev_x", parent_index)], &own, false),
+                false,
+            ),
+            "which can take app.ev_1's `ev_1_x`",
+        );
+    }
+    // Negative: an own index the plan redefines is dropped before the
+    // parent's is built and added after it, so it is its own.
+    let redefined = planned(
+        &tree(
+            &[],
+            &[("ev_1_x", index(&["n"], false, Some("n > 0")))],
+            false,
+        ),
+        &tree(
+            &[("ev_n", index(&["n"], false, None))],
+            &[("ev_1_x", index(&["n"], false, None))],
+            false,
+        ),
+        false,
+    )
+    .expect("planned");
+    let order: Vec<String> = redefined
+        .changes
+        .iter()
+        .map(|p| {
+            format!(
+                "{} {}",
+                change_in_words(&p.change),
+                p.change.table().unwrap().shown()
+            )
+        })
+        .collect();
+    assert_eq!(
+        order,
+        [
+            "drop index app.ev_1",
+            "add index app.ev",
+            "add index app.ev_1"
+        ],
+        "{order:?}"
+    );
+    // An own index kept across its parent's column rename stands when
+    // the parent's is built: compared as renamed, it is not dropped
+    // (#1737 review).
+    {
+        let own = |column: &str| [("ev_1_n", index(&[column], false, None))];
+        let base = tree(&[], &own("n"), false);
+        let mut declared = tree(&[("ev_n2", index(&["n2"], false, None))], &own("n2"), false);
+        let parent = declared.tables.get_mut(&ev).unwrap();
+        let n = parent.columns.shift_remove("n").unwrap();
+        parent.columns.insert("n2".into(), n);
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let rename = [Intent::RenameColumn {
+            table: ev.clone(),
+            from: "n".into(),
+            to: "n2".into(),
+        }];
+        let declared_ids = crate::resolve(&declared, &base_ids, &rename, &ctx())
+            .unwrap()
+            .ids;
+        let errors = diff(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .expect_err("refused");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.to_string().contains("which can take app.ev_1's `ev_1_n`")),
+            "{errors:?}"
+        );
+    }
+    // Negative: an own index the engine does not adopt, by uniqueness or
+    // by predicate, leaves the parent's planned.
+    for other in [
+        index(&["n", "ts"], true, None),
+        index(&["n"], false, Some("n > 0")),
+    ] {
+        let own = [("ev_1_x", other)];
+        assert_eq!(
+            outcome(
+                &tree(&[], &own, false),
+                &tree(&[("ev_n", index(&["n"], false, None))], &own, false),
+                false,
+            ),
+            Ok(vec!["AddIndex".to_owned()])
+        );
+    }
+}
+/// #1533: a parent whose partitions are external is changed as any
+/// standing parent is. Switching it between declared and external
+/// partitions is never a plan, which records only what its changes do:
+/// the switch is refused with the way to make it. Negatives: a switch to
+/// external with no partition held, one while pbps holds a partition,
+/// and the reverse. A held partition under an external parent never reaches
+/// the differ: `scope` refuses it.
+#[test]
+fn a_parent_with_external_partitions_hands_nothing_over() {
+    use pbps_model::{PartitionBound, PartitionBy, PartitionOf};
+    let ev: TableName = "app.ev".parse().unwrap();
+    let tree = |external: bool, extra: bool, partitions: &[&str]| {
+        let mut s = Schema::default();
+        let mut columns = vec![
+            ("id", Column::new(ty("int")).not_null()),
+            ("ts", Column::new(ty("date")).not_null()),
+        ];
+        if extra {
+            columns.push(("n", Column::new(ty("int"))));
+        }
+        let mut parent = table(&columns);
+        parent.partition_by = Some(PartitionBy {
+            external,
+            columns: vec!["ts".into()],
+            strategy: Default::default(),
+        });
+        s.tables.insert(ev.clone(), parent);
+        for name in partitions {
+            s.tables.insert(
+                name.parse().unwrap(),
+                Table {
+                    partition_of: Some(PartitionOf {
+                        parent: ev.clone(),
+                        bound: PartitionBound::Default,
+                        columns: Default::default(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+        s
+    };
+    let outcome = |base: &Schema, declared: &Schema, intents: &[Intent]| {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+            .unwrap()
+            .ids;
+        diff(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .map(|cs| kinds(&cs))
+        .map_err(|e| e.iter().map(ToString::to_string).collect::<Vec<_>>())
+    };
+    // A column on an external parent: its own change.
+    assert_eq!(
+        outcome(&tree(true, false, &[]), &tree(true, true, &[]), &[]).unwrap(),
+        ["AddColumn"]
+    );
+    // Negative: a parent pbps holds no partition of becomes external by a
+    // baseline, which records it, not by a plan, which would not.
+    let errors =
+        outcome(&tree(false, false, &[]), &tree(true, false, &[]), &[]).expect_err("refused");
+    assert!(
+        errors.iter().any(|e| e.contains(
+            "make its partitions external, which no statement does; record it with `pbps \
+                 baseline --reason …`"
+        )),
+        "{errors:?}"
+    );
+    let drop = Intent::DropTable {
+        table: "app.ev_d".parse().unwrap(),
+        reason: "handed over".parse().unwrap(),
+    };
+    // Negative: external while pbps holds a partition, dropped with intent,
+    // said once, not again for the drop.
+    let errors = outcome(
+        &tree(false, false, &["app.ev_d"]),
+        &tree(true, false, &[]),
+        std::slice::from_ref(&drop),
+    )
+    .expect_err("refused");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0]
+            .matches("make its partitions external while pbps holds app.ev_d")
+            .count(),
+        1,
+        "{errors:?}"
+    );
+    // Negative: external partitions declared by a plan.
+    let errors = outcome(
+        &tree(true, false, &[]),
+        &tree(false, false, &["app.ev_d"]),
+        &[],
+    )
+    .expect_err("refused");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("declare its external partitions")),
+        "{errors:?}"
+    );
+}
+
+/// #1690: a standing parent's rename is planned, a plain `RENAME` its
+/// partitions follow, so their `partition_of.parent` naming the new name
+/// is no change of their partitioning, and the parent's own changes in
+/// the same plan, under its declared name, are its own. Refused by name:
+/// a rename while the plan drops a partition under it. Still refused: a
+/// partition's own rename.
+#[test]
+fn a_partitioned_parent_is_renamed() {
+    use pbps_model::{Index, IndexColumn, PartitionBound, PartitionBy, PartitionOf};
+    let ev: TableName = "app.ev".parse().unwrap();
+    let ev2: TableName = "app.ev2".parse().unwrap();
+    let tree = |parent_name: &TableName, partitions: &[&str]| {
+        let mut s = Schema::default();
+        let mut parent = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("ts", Column::new(ty("date")).not_null()),
+        ]);
+        parent.partition_by = Some(PartitionBy {
+            external: false,
+            columns: vec!["ts".into()],
+            strategy: Default::default(),
+        });
+        s.tables.insert(parent_name.clone(), parent);
+        for (k, name) in partitions.iter().enumerate() {
+            s.tables.insert(
+                name.parse().unwrap(),
+                Table {
+                    partition_of: Some(PartitionOf {
+                        parent: parent_name.clone(),
+                        bound: PartitionBound::Range {
+                            from: vec![pbps_model::BoundDatum::Value(format!("202{k}-01-01"))],
+                            to: vec![pbps_model::BoundDatum::Value(format!("202{}-01-01", k + 1))],
+                        },
+                        columns: Default::default(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+        s
+    };
+    let outcome = |base: &Schema, declared: &Schema, intents: &[Intent]| {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+            .unwrap()
+            .ids;
+        diff(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .map(|cs| kinds(&cs))
+        .map_err(|e| e.iter().map(ToString::to_string).collect::<Vec<_>>())
+    };
+    let rename = |from: &TableName, to: &TableName| Intent::RenameTable {
+        from: from.clone(),
+        to: to.clone(),
+    };
+    let base = tree(&ev, &["app.ev_1", "app.ev_2"]);
+
+    // Alone: the rename, and nothing on the partitions.
+    let renamed = tree(&ev2, &["app.ev_1", "app.ev_2"]);
+    assert_eq!(
+        outcome(&base, &renamed, &[rename(&ev, &ev2)]).unwrap(),
+        ["RenameTable"]
+    );
+    // With an index on the parent under its new name: its own.
+    let mut indexed = renamed.clone();
+    indexed.tables.get_mut(&ev2).unwrap().indexes.insert(
+        "ev2_id".into(),
+        Index {
+            columns: vec![IndexColumn::column("id")],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+            filegroup: None,
+        },
+    );
+    assert_eq!(
+        outcome(&base, &indexed, &[rename(&ev, &ev2)]).unwrap(),
+        ["RenameTable", "AddIndex"]
+    );
+    // Negative: a partition dropped under it in the same plan.
+    let fewer = tree(&ev2, &["app.ev_1"]);
+    let errors = outcome(
+        &base,
+        &fewer,
+        &[
+            rename(&ev, &ev2),
+            Intent::DropTable {
+                table: "app.ev_2".parse().unwrap(),
+                reason: "gone".parse().unwrap(),
+            },
+        ],
+    )
+    .expect_err("refused");
+    assert!(
+        errors.iter().any(|e| e.contains("drops app.ev_2")
+            && e.contains("rename it and change the partitions in separate plans")),
+        "{errors:?}"
+    );
+    // A chain across revisions, `b` to `c` and then `a` to `b`: each
+    // partition's base parent is brought forward once, and `a`'s,
+    // declared under `b`, is not brought forward again (#1751 review).
+    let two = |a: &str, a_1: &str, b: &str, b_1: &str| {
+        let mut s = tree(&a.parse().unwrap(), &[a_1]);
+        s.tables.extend(tree(&b.parse().unwrap(), &[b_1]).tables);
+        s
+    };
+    let (a, b, c): (TableName, TableName, TableName) = (
+        "app.a".parse().unwrap(),
+        "app.b".parse().unwrap(),
+        "app.c".parse().unwrap(),
+    );
+    // Two revisions, resolved in turn, as the ids file records them.
+    let across = |base: &Schema, mid: &Schema, declared: &Schema| {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let mid_ids = crate::resolve(mid, &base_ids, &[rename(&b, &c)], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(declared, &mid_ids, &[rename(&a, &b)], &ctx())
+            .unwrap()
+            .ids;
+        diff(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .map(|cs| kinds(&cs))
+        .map_err(|e| e.iter().map(ToString::to_string).collect::<Vec<_>>())
+    };
+    let base_ab = two("app.a", "app.a_1", "app.b", "app.b_1");
+    let mid = two("app.a", "app.a_1", "app.c", "app.b_1");
+    let chained = across(&base_ab, &mid, &two("app.b", "app.a_1", "app.c", "app.b_1")).unwrap();
+    assert_eq!(chained, ["RenameTable", "RenameTable"]);
+    // Negative: a partition truly moved to another parent across the
+    // chain is still a change of its partitioning.
+    let errors =
+        across(&base_ab, &mid, &two("app.b", "app.b_1", "app.c", "app.a_1")).expect_err("refused");
+    assert!(
+        errors.iter().any(|e| e.contains("change its partitioning")),
+        "{errors:?}"
+    );
+    // Negative: a partition's own rename stays refused.
+    let errors = outcome(
+        &base,
+        &tree(&ev, &["app.ev_1", "app.ev_3"]),
+        &[rename(
+            &"app.ev_2".parse().unwrap(),
+            &"app.ev_3".parse().unwrap(),
+        )],
+    )
+    .expect_err("refused");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("app.ev_2") && e.contains("rename")),
+        "{errors:?}"
+    );
+}
+
+/// A standing parent's keys, checks and foreign keys change as a
+/// table's do (#1689), the engine recursing each into every partition,
+/// and a foreign key may reference it. Refused by name: a key without a
+/// partition-key column, a check under a name a partition holds as its
+/// own, and any of them in a plan that drops a partition under it.
+/// `strategy: online` is no refusal here: only an index honours it.
+#[test]
+fn a_partitioned_parents_keys_checks_and_foreign_keys_change() {
+    use pbps_model::{
+        CheckConstraint, ForeignKey, PartitionBound, PartitionBy, PartitionOf, PrimaryKey,
+        UniqueConstraint,
+    };
+    let ev: TableName = "app.ev".parse().unwrap();
+    let ev_1: TableName = "app.ev_1".parse().unwrap();
+    let check = |e: &str| CheckConstraint {
+        expression: e.into(),
+    };
+    let key = |columns: &[&str]| {
+        columns
+            .iter()
+            .map(|c| ColumnName::from(*c))
+            .collect::<Vec<_>>()
+    };
+    let tree = |edit: &dyn Fn(&mut Table, &mut Table, &mut Schema)| {
+        let mut parent = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("ts", Column::new(ty("date")).not_null()),
+            ("r", Column::new(ty("int"))),
+        ]);
+        parent.partition_by = Some(PartitionBy {
+            external: false,
+            columns: vec!["ts".into()],
+            strategy: Default::default(),
+        });
+        let mut partition = Table {
+            partition_of: Some(PartitionOf {
+                parent: ev.clone(),
+                bound: PartitionBound::Default,
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let mut s = schema_of("app.ref", {
+            let mut t = table(&[("id", Column::new(ty("int")).not_null())]);
+            t.primary_key = Some(PrimaryKey {
+                name: None,
+                columns: key(&["id"]),
+                storage_parameters: Default::default(),
+                filegroup: None,
+            });
+            t
+        });
+        s.tables.insert(
+            "app.child".parse().unwrap(),
+            table(&[
+                ("id", Column::new(ty("int")).not_null()),
+                ("ts", Column::new(ty("date")).not_null()),
+            ]),
+        );
+        edit(&mut parent, &mut partition, &mut s);
+        s.tables.insert(ev.clone(), parent);
+        s.tables.insert(ev_1.clone(), partition);
+        s
+    };
+    let outcome = |base: &Schema, declared: &Schema, online: bool| {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let dropped: Vec<Intent> = base
+            .tables
+            .keys()
+            .filter(|t| !declared.tables.contains_key(*t))
+            .map(|t| Intent::DropTable {
+                table: t.clone(),
+                reason: "gone".parse().unwrap(),
+            })
+            .collect();
+        let declared_ids = crate::resolve(declared, &base_ids, &dropped, &ctx())
+            .unwrap()
+            .ids;
+        let mut hints = Hints::default();
+        if online {
+            hints
+                .strategies
+                .insert(ev.clone(), pbps_model::Strategy { online: true });
+        }
+        diff(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &hints,
+        )
+        .map(|cs| kinds(&cs))
+        .map_err(|e| e.iter().map(ToString::to_string).collect::<Vec<_>>())
+    };
+    let refused = |result: Result<Vec<String>, Vec<String>>, what: &str| {
+        let errors = result.expect_err(what);
+        assert!(errors.iter().any(|e| e.contains(what)), "{errors:?}");
+    };
+    let plain = tree(&|_, _, _| {});
+    let pk = |columns: &'static [&'static str]| {
+        move |p: &mut Table, _: &mut Table, _: &mut Schema| {
+            p.primary_key = Some(PrimaryKey {
+                name: None,
+                columns: key(columns),
+                storage_parameters: Default::default(),
+                filegroup: None,
+            });
+        }
+    };
+    let unique = |columns: &'static [&'static str]| {
+        move |p: &mut Table, _: &mut Table, _: &mut Schema| {
+            p.unique.insert(
+                "ev_u".into(),
+                UniqueConstraint {
+                    columns: key(columns),
+                    storage_parameters: Default::default(),
+                    filegroup: None,
+                },
+            );
+        }
+    };
+    let checked = tree(&|p, _, _| {
+        p.checks.insert("ev_ck".into(), check("r > 0"));
+    });
+    let fk = tree(&|p, _, _| {
+        p.foreign_keys.insert(
+            "ev_r_fk".into(),
+            ForeignKey {
+                columns: key(&["r"]),
+                references_table: "app.ref".parse().unwrap(),
+                references_columns: key(&["id"]),
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+    });
+    // Each added and dropped.
+    for (declared, kind) in [
+        (tree(&pk(&["id", "ts"])), "SetPrimaryKey"),
+        (tree(&unique(&["id", "ts"])), "AddUnique"),
+        (checked.clone(), "AddCheck"),
+        (fk.clone(), "AddForeignKey"),
+    ] {
+        assert_eq!(outcome(&plain, &declared, false), Ok(vec![kind.to_owned()]));
+        assert!(outcome(&declared, &plain, false).is_ok(), "{kind} dropped");
+    }
+    // A foreign key referencing the parent's key.
+    let keyed = tree(&pk(&["id", "ts"]));
+    let referenced = tree(&|p, q, s| {
+        pk(&["id", "ts"])(p, q, s);
+        s.tables
+            .get_mut(&"app.child".parse::<TableName>().unwrap())
+            .unwrap()
+            .foreign_keys
+            .insert(
+                "child_ev_fk".into(),
+                ForeignKey {
+                    columns: key(&["id", "ts"]),
+                    references_table: ev.clone(),
+                    references_columns: key(&["id", "ts"]),
+                    on_delete: Default::default(),
+                    on_update: Default::default(),
+                },
+            );
+    });
+    assert_eq!(
+        outcome(&keyed, &referenced, false),
+        Ok(vec!["AddForeignKey".to_owned()])
+    );
+    // Without the partition key column.
+    refused(
+        outcome(&plain, &tree(&pk(&["id"])), false),
+        "without the partition key column `ts`",
+    );
+    refused(
+        outcome(&plain, &tree(&unique(&["id"])), false),
+        "without the partition key column `ts`",
+    );
+    // A check under a name the partition holds as its own; under another
+    // name, planned.
+    let own = |name: &'static str| {
+        move |_: &mut Table, q: &mut Table, _: &mut Schema| {
+            q.checks.insert(name.into(), check("r > 1"));
+        }
+    };
+    refused(
+        outcome(
+            &tree(&own("ev_ck")),
+            &tree(&|p, q, s| {
+                own("ev_ck")(p, q, s);
+                p.checks.insert("ev_ck".into(), check("r > 0"));
+            }),
+            false,
+        ),
+        "a name app.ev_1 holds as its own check",
+    );
+    assert_eq!(
+        outcome(
+            &tree(&own("ev_1_ck")),
+            &tree(&|p, q, s| {
+                own("ev_1_ck")(p, q, s);
+                p.checks.insert("ev_ck".into(), check("r > 0"));
+            }),
+            false,
+        ),
+        Ok(vec!["AddCheck".to_owned()])
+    );
+    // In a plan that drops a partition under the parent.
+    let mut checked_without = checked.clone();
+    checked_without.tables.remove(&ev_1);
+    refused(
+        outcome(&plain, &checked_without, false),
+        "change the parent and the partitions in separate plans",
+    );
+    // `strategy: online` asks nothing of a check or a key.
+    assert_eq!(
+        outcome(&plain, &checked, true),
+        Ok(vec!["AddCheck".to_owned()])
+    );
+}
+
+#[test]
+fn a_partitioned_parents_columns_change_and_its_partitions_keep_their_own() {
+    use pbps_model::{BoundDatum, PartitionBound, PartitionBy, PartitionColumn, PartitionOf};
+    let parent = || {
+        let mut t = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("ts", Column::new(ty("date")).not_null()),
+            ("n", Column::new(ty("int")).not_null()),
+            ("m", Column::new(ty("int"))),
+        ]);
+        t.partition_by = Some(PartitionBy {
+            external: false,
+            columns: vec!["ts".into()],
+            strategy: Default::default(),
+        });
+        t
+    };
+    let partition = |from: &str, to: &str, own: &[(&str, PartitionColumn)]| Table {
+        partition_of: Some(PartitionOf {
+            parent: "app.ev".parse().unwrap(),
+            bound: PartitionBound::Range {
+                from: vec![BoundDatum::Value(from.into())],
+                to: vec![BoundDatum::Value(to.into())],
+            },
+            columns: own.iter().map(|(c, o)| ((*c).into(), o.clone())).collect(),
+        }),
+        ..Default::default()
+    };
+    let own_default = |d: &str| PartitionColumn {
+        default: Some(d.into()),
+        not_null: false,
+    };
+    let own_not_null = PartitionColumn {
+        default: None,
+        not_null: true,
+    };
+    let tree = |parent: Table, a: &[(&str, PartitionColumn)], b: &[(&str, PartitionColumn)]| {
+        let mut s = schema_of("app.ev", parent);
+        s.tables.insert(
+            "app.a".parse().unwrap(),
+            partition("2024-01-01", "2025-01-01", a),
+        );
+        s.tables.insert(
+            "app.b".parse().unwrap(),
+            partition("2025-01-01", "2026-01-01", b),
+        );
+        s
+    };
+    let base = tree(
+        parent(),
+        &[("m", own_default("7"))],
+        &[("m", own_not_null.clone())],
+    );
+    let outcome = |declared: &Schema, intents: &[Intent]| {
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+            .unwrap()
+            .ids;
+        diff(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+    };
+    let planned = |declared: &Schema, intents: &[Intent]| -> Vec<Change> {
+        outcome(declared, intents)
+            .unwrap_or_else(|e| panic!("refused: {e:?}"))
+            .changes
+            .clone()
+            .into_iter()
+            .map(|p| p.change)
+            .collect()
+    };
+    let refused = |declared: &Schema, intents: &[Intent]| -> Vec<String> {
+        match outcome(declared, intents) {
+            Ok(cs) => panic!("planned {:?}", kinds(&cs)),
+            Err(e) => e.iter().map(ToString::to_string).collect(),
+        }
+    };
+    let ev: TableName = "app.ev".parse().unwrap();
+    let with = |edit: &dyn Fn(&mut Table),
+                a: &[(&str, PartitionColumn)],
+                b: &[(&str, PartitionColumn)]| {
+        let mut p = parent();
+        edit(&mut p);
+        tree(p, a, b)
+    };
+    let keep_a = [("m", own_default("7"))];
+    let keep_b = [("m", own_not_null.clone())];
+
+    // Added: the parent's change alone.
+    let added = planned(
+        &with(
+            &|p| {
+                p.columns.insert("note".into(), Column::new(ty("text")));
+            },
+            &keep_a,
+            &keep_b,
+        ),
+        &[],
+    );
+    assert!(
+        matches!(added.as_slice(), [Change::Column(ColumnChange::AddColumn { name, .. })] if name.raw() == "note"),
+        "{added:?}"
+    );
+    // Retyped: the parent's change alone.
+    let retyped = planned(
+        &with(
+            &|p| {
+                p.columns.get_mut("n").unwrap().ty = ty("bigint");
+            },
+            &keep_a,
+            &keep_b,
+        ),
+        &[],
+    );
+    assert!(
+        matches!(
+            retyped.as_slice(),
+            [Change::Column(ColumnChange::AlterColumnType { .. })]
+        ),
+        "{retyped:?}"
+    );
+    // Dropped with intent: the partitions' own on it go with it.
+    let drop_m = [Intent::DropColumn {
+        column: ColumnRef {
+            table: ev.clone(),
+            name: "m".into(),
+        },
+        reason: "gone".parse().unwrap(),
+    }];
+    let dropped = planned(
+        &with(
+            &|p| {
+                p.columns.shift_remove("m");
+            },
+            &[],
+            &[],
+        ),
+        &drop_m,
+    );
+    assert!(
+        matches!(
+            dropped.as_slice(),
+            [Change::Column(ColumnChange::DropColumn { .. })]
+        ),
+        "{dropped:?}"
+    );
+    // Renamed, the key column too: the key and the partitions' own follow.
+    let renames = [
+        Intent::RenameColumn {
+            table: ev.clone(),
+            from: "m".into(),
+            to: "m2".into(),
+        },
+        Intent::RenameColumn {
+            table: ev.clone(),
+            from: "ts".into(),
+            to: "at".into(),
+        },
+    ];
+    let renamed = planned(
+        &with(
+            &|p| {
+                // In place: a rename keeps the column's position.
+                p.columns = std::mem::take(&mut p.columns)
+                    .into_iter()
+                    .map(|(c, column)| match c.raw() {
+                        "m" => ("m2".into(), column),
+                        "ts" => ("at".into(), column),
+                        _ => (c, column),
+                    })
+                    .collect();
+                p.partition_by = Some(PartitionBy {
+                    external: false,
+                    columns: vec!["at".into()],
+                    strategy: Default::default(),
+                });
+            },
+            &[("m2", own_default("7"))],
+            &[("m2", own_not_null.clone())],
+        ),
+        &renames,
+    );
+    assert!(
+        renamed.len() == 2
+            && renamed
+                .iter()
+                .all(|c| matches!(c, Change::Column(ColumnChange::RenameColumn { .. }))),
+        "{renamed:?}"
+    );
+    // A default set on the parent: its own default set again after it on
+    // `a`; `b` has none, and takes the parent's.
+    let defaulted = planned(
+        &with(
+            &|p| {
+                p.columns.get_mut("m").unwrap().value_source =
+                    pbps_model::ValueSource::Default("1".into());
+            },
+            &keep_a,
+            &keep_b,
+        ),
+        &[],
+    );
+    assert!(
+        matches!(
+            defaulted.as_slice(),
+            [
+                Change::Column(ColumnChange::AlterColumnDefault { .. }),
+                Change::Partition(PartitionChange::SetPartitionDefault { table, to: Some(own), fallback: Some(f), .. }),
+            ] if table.raw().to_string() == "app.a" && own == "7" && f == "1"
+        ),
+        "{defaulted:?}"
+    );
+    // NOT NULL dropped on the parent: every partition brought to its
+    // declaration after it, `a` without one and `b` with its own.
+    let loosened = planned(
+        &with(
+            &|p| {
+                p.columns.get_mut("n").unwrap().nullable = true;
+            },
+            &keep_a,
+            &[("m", own_not_null.clone()), ("n", own_not_null.clone())],
+        ),
+        &[],
+    );
+    assert!(
+        matches!(
+            loosened.first(),
+            Some(Change::Column(ColumnChange::AlterColumnNullability {
+                to_nullable: true,
+                ..
+            }))
+        ),
+        "{loosened:?}"
+    );
+    let set: Vec<(String, bool)> = loosened[1..]
+        .iter()
+        .filter_map(|c| match c {
+            Change::Partition(PartitionChange::SetPartitionNotNull {
+                table,
+                column,
+                not_null,
+                ..
+            }) if column.raw() == "n" => Some((table.raw().to_string(), *not_null)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        set,
+        [("app.a".to_owned(), false), ("app.b".to_owned(), true)],
+        "{loosened:?}"
+    );
+    assert_eq!(loosened.len(), 3, "{loosened:?}");
+    // NOT NULL set on the parent: `b`'s own, which the declaration then
+    // leaves out, is left to it.
+    let tightened = planned(
+        &with(
+            &|p| {
+                p.columns.get_mut("m").unwrap().nullable = false;
+            },
+            &keep_a,
+            &[],
+        ),
+        &[],
+    );
+    assert!(
+        matches!(
+            tightened.as_slice(),
+            [Change::Column(ColumnChange::AlterColumnNullability {
+                to_nullable: false,
+                ..
+            })]
+        ),
+        "{tightened:?}"
+    );
+
+    // Negative: a key column dropped or retyped, and an identity column
+    // added, are refused by name.
+    let drop_ts = [Intent::DropColumn {
+        column: ColumnRef {
+            table: ev.clone(),
+            name: "ts".into(),
+        },
+        reason: "gone".parse().unwrap(),
+    }];
+    let mut no_key = with(
+        &|p| {
+            p.columns.shift_remove("ts");
+        },
+        &keep_a,
+        &keep_b,
+    );
+    no_key.tables.get_mut(&ev).unwrap().partition_by = Some(PartitionBy {
+        external: false,
+        columns: vec!["ts".into()],
+        strategy: Default::default(),
+    });
+    let e = refused(&no_key, &drop_ts);
+    assert!(
+        e.iter()
+            .any(|m| m.contains("which is in its partition key")),
+        "{e:?}"
+    );
+    let e = refused(
+        &with(
+            &|p| {
+                p.columns.get_mut("ts").unwrap().ty = ty("timestamp");
+            },
+            &keep_a,
+            &keep_b,
+        ),
+        &[],
+    );
+    assert!(
+        e.iter()
+            .any(|m| m.contains("which is in its partition key")),
+        "{e:?}"
+    );
+    let e = refused(
+        &with(
+            &|p| {
+                let mut c = Column::new(ty("int")).not_null();
+                c.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
+                    seed: 1,
+                    increment: 1,
+                    options: Default::default(),
+                });
+                p.columns.insert("seq".into(), c);
+            },
+            &keep_a,
+            &keep_b,
+        ),
+        &[],
+    );
+    assert!(
+        e.iter()
+            .any(|m| m.contains("an identity column") && m.contains("#1681")),
+        "{e:?}"
+    );
+
+    // From another base, through revisions: one revision cannot rename
+    // into a name it also drops, so a swap takes two.
+    let from_outcome = |base: &Schema, revisions: &[(&Schema, &[Intent])]| {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let mut declared_ids = base_ids.clone();
+        for (schema, intents) in revisions {
+            declared_ids = crate::resolve(schema, &declared_ids, intents, &ctx())
+                .unwrap()
+                .ids;
+        }
+        let declared = revisions.last().unwrap().0;
+        diff(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .map(|cs| {
+            cs.changes
+                .clone()
+                .into_iter()
+                .map(|p| p.change)
+                .collect::<Vec<_>>()
+        })
+        .map_err(|e| e.iter().map(ToString::to_string).collect::<Vec<_>>())
+    };
+    let from = |base: &Schema, revisions: &[(&Schema, &[Intent])]| {
+        from_outcome(base, revisions).unwrap_or_else(|e| panic!("refused: {e:?}"))
+    };
+    // A name passing from one column to another under a partitioned
+    // parent is planned as a plain table's: the pre-flight, the guard and
+    // the connected passes follow the parent's columns into the
+    // partitions (DEC-1699.1), where the interim plan refused it (#1692).
+    let reuse_planned = |outcome: Result<Vec<Change>, Vec<String>>, from: &str, to: &str| {
+        let changes = outcome.unwrap_or_else(|e| panic!("refused: {e:?}"));
+        assert!(
+            changes.iter().any(|c| matches!(c,
+                Change::Column(ColumnChange::RenameColumn { from: f, to: t, .. }) if f.raw() == from && t.raw() == to)),
+            "{changes:?}"
+        );
+    };
+    // `n` dropped and `m` renamed into its name.
+    let handoff_base = tree(
+        parent(),
+        &[("m", own_default("7")), ("n", own_default("8"))],
+        &[],
+    );
+    let handoff = with(
+        &|p| {
+            p.columns.shift_remove("n");
+            p.columns = std::mem::take(&mut p.columns)
+                .into_iter()
+                .map(|(c, col)| (if c == "m".into() { "n".into() } else { c }, col))
+                .collect();
+        },
+        &[("n", own_default("8"))],
+        &[],
+    );
+    let without_n = with(
+        &|p| {
+            p.columns.shift_remove("n");
+        },
+        &[("m", own_default("7"))],
+        &[],
+    );
+    let handed_off = from_outcome(
+        &handoff_base,
+        &[
+            (
+                &without_n,
+                &[Intent::DropColumn {
+                    column: ColumnRef {
+                        table: ev.clone(),
+                        name: "n".into(),
+                    },
+                    reason: "gone".parse().unwrap(),
+                }],
+            ),
+            (
+                &handoff,
+                &[Intent::RenameColumn {
+                    table: ev.clone(),
+                    from: "m".into(),
+                    to: "n".into(),
+                }],
+            ),
+        ],
+    );
+    reuse_planned(handed_off, "m", "n");
+    // A retype that drops NOT NULL with it: the partitions' NOT NULLs
+    // follow the retype, which carries the parent's change (#1692
+    // review).
+    let retype_loosened = planned(
+        &with(
+            &|p| {
+                let n = p.columns.get_mut("n").unwrap();
+                n.ty = ty("bigint");
+                n.nullable = true;
+            },
+            &keep_a,
+            &[("m", own_not_null.clone()), ("n", own_not_null.clone())],
+        ),
+        &[],
+    );
+    let retype_at = retype_loosened
+        .iter()
+        .position(|c| matches!(c, Change::Column(ColumnChange::AlterColumnType { .. })))
+        .expect("the retype");
+    assert!(
+        retype_loosened
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| matches!(
+                c,
+                Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            ))
+            .all(|(i, _)| i > retype_at)
+            && retype_loosened
+                .iter()
+                .filter(|c| matches!(
+                    c,
+                    Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+                ))
+                .count()
+                == 2,
+        "{retype_loosened:?}"
+    );
+    // A partition created with its own default on a column its parent
+    // adds in the same plan comes after the addition (#1692 review).
+    let mut grown = with(
+        &|p| {
+            p.columns.insert("extra".into(), Column::new(ty("int")));
+        },
+        &keep_a,
+        &keep_b,
+    );
+    grown.tables.insert(
+        "app.c".parse().unwrap(),
+        partition("2026-01-01", "2027-01-01", &[("extra", own_default("5"))]),
+    );
+    let grew = planned(&grown, &[]);
+    let at = |kind: &dyn Fn(&Change) -> bool| grew.iter().position(kind).unwrap();
+    assert!(
+        at(&|c| matches!(c, Change::Column(ColumnChange::AddColumn { .. })))
+            < at(&|c| matches!(c, Change::Table(TableChange::CreateTable { .. }))),
+        "{grew:?}"
+    );
+    // A non-key column dropped and the key column renamed into its name.
+    let spare_base = with(
+        &|p| {
+            p.columns.insert("spare".into(), Column::new(ty("int")));
+        },
+        &keep_a,
+        &keep_b,
+    );
+    let spare = with(
+        &|p| {
+            p.columns = std::mem::take(&mut p.columns)
+                .into_iter()
+                .map(|(c, col)| (if c == "ts".into() { "spare".into() } else { c }, col))
+                .collect();
+            p.partition_by = Some(PartitionBy {
+                external: false,
+                columns: vec!["spare".into()],
+                strategy: Default::default(),
+            });
+        },
+        &keep_a,
+        &keep_b,
+    );
+    let without_spare = with(&|_| {}, &keep_a, &keep_b);
+    let swapped = from_outcome(
+        &spare_base,
+        &[
+            (
+                &without_spare,
+                &[Intent::DropColumn {
+                    column: ColumnRef {
+                        table: ev.clone(),
+                        name: "spare".into(),
+                    },
+                    reason: "gone".parse().unwrap(),
+                }],
+            ),
+            (
+                &spare,
+                &[Intent::RenameColumn {
+                    table: ev.clone(),
+                    from: "ts".into(),
+                    to: "spare".into(),
+                }],
+            ),
+        ],
+    );
+    reuse_planned(swapped, "ts", "spare");
+    // The key column moved out of `ts` and a non-key column into it,
+    // then retyped: the retype is the non-key column's (#1692 review).
+    let rename = |p: &mut Table, from: &str, to: &str| {
+        p.columns = std::mem::take(&mut p.columns)
+            .into_iter()
+            .map(|(c, col)| (if c == from.into() { to.into() } else { c }, col))
+            .collect();
+    };
+    let moved_key = with(
+        &|p| {
+            p.columns.insert("spare".into(), Column::new(ty("int")));
+            rename(p, "ts", "k");
+            p.partition_by = Some(PartitionBy {
+                external: false,
+                columns: vec!["k".into()],
+                strategy: Default::default(),
+            });
+        },
+        &keep_a,
+        &keep_b,
+    );
+    let moved_in = with(
+        &|p| {
+            p.columns.insert("spare".into(), Column::new(ty("int")));
+            rename(p, "ts", "k");
+            rename(p, "spare", "ts");
+            p.columns.get_mut("ts").unwrap().ty = ty("bigint");
+            p.partition_by = Some(PartitionBy {
+                external: false,
+                columns: vec!["k".into()],
+                strategy: Default::default(),
+            });
+        },
+        &keep_a,
+        &keep_b,
+    );
+    let renaming = |from: &str, to: &str| Intent::RenameColumn {
+        table: ev.clone(),
+        from: from.into(),
+        to: to.into(),
+    };
+    // The key's old name passes to another column.
+    let retyped = from_outcome(
+        &spare_base,
+        &[
+            (&moved_key, &[renaming("ts", "k")]),
+            (&moved_in, &[renaming("spare", "ts")]),
+        ],
+    );
+    reuse_planned(retyped, "spare", "ts");
+    // A name renamed away and given to a new column (round 8): the
+    // partition's own NOT NULL probe no longer reads the old column.
+    let renamed_away = with(&|p| rename(p, "n", "n_old"), &keep_a, &keep_b);
+    let readded = with(
+        &|p| {
+            rename(p, "n", "n_old");
+            p.columns.insert("n".into(), Column::new(ty("int")));
+        },
+        &keep_a,
+        &keep_b,
+    );
+    reuse_planned(
+        from_outcome(
+            &with(&|_| {}, &keep_a, &keep_b),
+            &[(&renamed_away, &[renaming("n", "n_old")]), (&readded, &[])],
+        ),
+        "n",
+        "n_old",
+    );
+    // A partition's own index on the renamed column is carried by the
+    // engine's rename, and not dropped and added again (#1692 review).
+    let own_index = |s: &mut Schema, column: &str| {
+        s.tables
+            .get_mut(&"app.a".parse::<TableName>().unwrap())
+            .unwrap()
+            .indexes
+            .insert(
+                "a_m".into(),
+                Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        key: pbps_model::IndexKey::Column(column.into()),
+                        descending: false,
+                        opclass: None,
+                        collation: None,
+                        opclass_parameters: Default::default(),
+                    }],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                    method: Default::default(),
+                    storage_parameters: Default::default(),
+                    filegroup: None,
+                },
+            );
+    };
+    let mut indexed_base = with(&|_| {}, &keep_a, &keep_b);
+    own_index(&mut indexed_base, "m");
+    let mut indexed_renamed = with(
+        &|p| rename(p, "m", "m2"),
+        &[("m2", own_default("7"))],
+        &[("m2", own_not_null.clone())],
+    );
+    own_index(&mut indexed_renamed, "m2");
+    let carried = from(&indexed_base, &[(&indexed_renamed, &[renaming("m", "m2")])]);
+    assert!(
+        matches!(
+            carried.as_slice(),
+            [Change::Column(ColumnChange::RenameColumn { .. })]
+        ),
+        "{carried:?}"
+    );
+    // A partition's own check or index beside its parent's change to the
+    // column it reads: planned, the parent's change first. The pre-flight
+    // takes the parent's retype or rename as the partition's own
+    // (DEC-1699.1), where the interim plan refused it (#1692).
+    let retype_n = |p: &mut Table| p.columns.get_mut("n").unwrap().ty = ty("bigint");
+    let a: TableName = "app.a".parse().unwrap();
+    let reads = |s: &mut Schema, expression: &str| {
+        s.tables.get_mut(&a).unwrap().checks.insert(
+            "a_n".into(),
+            pbps_model::CheckConstraint {
+                expression: expression.into(),
+            },
+        );
+    };
+    let own_unique = |s: &mut Schema, unique: bool| {
+        own_index(s, "n");
+        s.tables
+            .get_mut(&a)
+            .unwrap()
+            .indexes
+            .get_mut("a_m")
+            .unwrap()
+            .unique = unique;
+    };
+    fn index_of<'s>(s: &'s mut Schema, a: &TableName) -> &'s mut pbps_model::Index {
+        s.tables.get_mut(a).unwrap().indexes.get_mut("a_m").unwrap()
+    }
+    let mut checked = with(&retype_n, &keep_a, &keep_b);
+    reads(&mut checked, "n > 0");
+    let mut escaped = with(&retype_n, &keep_a, &keep_b);
+    reads(&mut escaped, r#"U&"\006E" > 0"#);
+    let mut unique = with(&retype_n, &keep_a, &keep_b);
+    own_unique(&mut unique, true);
+    let mut filtered = with(&retype_n, &keep_a, &keep_b);
+    own_unique(&mut filtered, false);
+    index_of(&mut filtered, &a).filter = Some("n > 0".into());
+    let mut expression = with(&retype_n, &keep_a, &keep_b);
+    own_unique(&mut expression, true);
+    index_of(&mut expression, &a).columns[0].key =
+        pbps_model::IndexKey::Expression("(n + 1)".into());
+    let mut renamed_checked = with(
+        &|p| rename(p, "m", "m2"),
+        &[("m2", own_default("7"))],
+        &[("m2", own_not_null.clone())],
+    );
+    reads(&mut renamed_checked, "\"M2\" > 0");
+    let mut defaulted = with(
+        &|p| {
+            p.columns.get_mut("n").unwrap().value_source =
+                pbps_model::ValueSource::Default("5".into())
+        },
+        &keep_a,
+        &keep_b,
+    );
+    own_unique(&mut defaulted, true);
+    let mut loosened = with(
+        &|p| p.columns.get_mut("n").unwrap().nullable = true,
+        &keep_a,
+        &keep_b,
+    );
+    reads(&mut loosened, "n > 0");
+    let rename_m = [renaming("m", "m2")];
+    let parents = |c: &Change| {
+        matches!(
+            c,
+            Change::Column(ColumnChange::AlterColumnType { .. })
+                | Change::Column(ColumnChange::RenameColumn { .. })
+                | Change::Column(ColumnChange::AlterColumnDefault { .. })
+                | Change::Column(ColumnChange::AlterColumnNullability { .. })
+        )
+    };
+    for (what, declared, intents) in [
+        ("a check on the retyped column", &checked, &[][..]),
+        ("an escaped name", &escaped, &[][..]),
+        ("a unique index", &unique, &[][..]),
+        ("a filtered index", &filtered, &[][..]),
+        ("a unique index over an expression", &expression, &[][..]),
+        (
+            "a check on the renamed column",
+            &renamed_checked,
+            &rename_m[..],
+        ),
+        ("a unique index beside a default", &defaulted, &[][..]),
+        ("a check beside a nullability change", &loosened, &[][..]),
+    ] {
+        let changes = planned(declared, intents);
+        let own = changes
+            .iter()
+            .position(|c| {
+                matches!(c, Change::Constraint(ConstraintChange::AddCheck { table, .. }) | Change::Index(IndexChange::AddIndex { table, .. })
+                    if *table == a)
+            })
+            .unwrap_or_else(|| panic!("{what}: {changes:?}"));
+        let parent = changes
+            .iter()
+            .position(parents)
+            .unwrap_or_else(|| panic!("{what}: {changes:?}"));
+        assert!(parent < own, "{what}: {changes:?}");
+    }
+    // A partition dropped while its parent's column tightens: the
+    // pre-flight would count the doomed partition's rows (round 7).
+    let mut dropped_b = with(
+        &|p| p.columns.get_mut("m").unwrap().nullable = false,
+        &[("m", own_default("7"))],
+        &[],
+    );
+    dropped_b
+        .tables
+        .remove(&"app.b".parse::<TableName>().unwrap());
+    let errors = refused(
+        &dropped_b,
+        &[Intent::DropTable {
+            table: "app.b".parse().unwrap(),
+            reason: "gone".parse().unwrap(),
+        }],
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("while this plan attaches, detaches or drops app.b")),
+        "{errors:?}"
+    );
+    // Negative: the partition's own check alone is its change alone.
+    let mut unretyped = with(&|_| {}, &keep_a, &keep_b);
+    reads(&mut unretyped, "n > 0");
+    assert!(
+        matches!(
+            planned(&unretyped, &[]).as_slice(),
+            [Change::Constraint(ConstraintChange::AddCheck { .. })]
+        ),
+        "the check alone"
+    );
+}
+
+#[test]
+fn a_partition_tree_is_created_then_gains_and_loses_partitions_only() {
+    use pbps_model::{BoundDatum, PartitionBound, PartitionBy, PartitionOf};
+    let mut parent = table(&[
+        ("id", Column::new(ty("int")).not_null()),
+        ("ts", Column::new(ty("date")).not_null()),
+    ]);
+    parent.partition_by = Some(PartitionBy {
+        external: false,
+        columns: vec!["ts".into()],
+        strategy: Default::default(),
+    });
+    let partition = |bound: PartitionBound| Table {
+        partition_of: Some(PartitionOf {
+            parent: "app.ev".parse().unwrap(),
+            bound,
+            columns: Default::default(),
+        }),
+        ..Default::default()
+    };
+    let range = |from: &str, to: &str| PartitionBound::Range {
+        from: vec![BoundDatum::Value(from.into())],
+        to: vec![BoundDatum::Value(to.into())],
+    };
+    // `a_old` sorts before its parent by name, and must not be created
+    // before it.
+    let mut tree = schema_of("app.ev", parent.clone());
+    tree.tables.insert(
+        "app.a_old".parse().unwrap(),
+        partition(range("2024-01-01", "2025-01-01")),
+    );
+    tree.tables.insert(
+        "app.z_rest".parse().unwrap(),
+        partition(PartitionBound::Default),
+    );
+    let outcome = |base: &Schema, declared: &Schema, intents: &[Intent]| {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+            .unwrap()
+            .ids;
+        diff(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+    };
+    let refused = |base: &Schema, declared: &Schema, intents: &[Intent]| -> Vec<String> {
+        match outcome(base, declared, intents) {
+            Ok(cs) => panic!("planned {:?}", kinds(&cs)),
+            Err(errors) => errors
+                .iter()
+                .filter(|e| matches!(e, DiffError::PartitionedTableChange { .. }))
+                .map(ToString::to_string)
+                .collect(),
+        }
+    };
+
+    let created = outcome(&Schema::default(), &tree, &[]).expect("a tree is created");
+    let order: Vec<String> = created
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::Table(TableChange::CreateTable { name, .. }) => Some(name.raw().to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order[0], "app.ev", "{order:?}");
+    assert_eq!(order.len(), 3, "{order:?}");
+    // Unchanged, nothing to plan.
+    assert!(outcome(&tree, &tree, &[]).unwrap().changes.is_empty());
+
+    let mut column = tree.clone();
+    column
+        .tables
+        .get_mut(&"app.ev".parse().unwrap())
+        .unwrap()
+        .columns
+        .insert("note".into(), Column::new(ty("int")));
+    let mut bound = tree.clone();
+    bound.tables.insert(
+        "app.a_old".parse().unwrap(),
+        partition(range("2023-01-01", "2025-01-01")),
+    );
+    let mut more = tree.clone();
+    more.tables.insert(
+        "app.m_more".parse().unwrap(),
+        partition(range("2025-01-01", "2026-01-01")),
+    );
+    let mut fewer = tree.clone();
+    fewer
+        .tables
+        .remove(&"app.z_rest".parse::<TableName>().unwrap());
+    let drop = [Intent::DropTable {
+        table: "app.z_rest".parse().unwrap(),
+        reason: "gone".parse().unwrap(),
+    }];
+    // A partition added under the standing parent is its creation.
+    let added = outcome(&tree, &more, &[]).expect("a partition is added");
+    assert_eq!(kinds(&added), ["CreateTable"]);
+    // A partition removed without intent is refused as any table is.
+    let tree_ids = crate::resolve(&tree, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let silent = crate::resolve(&fewer, &tree_ids, &[], &ctx())
+        .expect_err("a drop without intent is refused");
+    assert!(
+        format!("{silent:?}").contains("DropTableNeedsReason"),
+        "{silent:?}"
+    );
+    // A partition dropped with intent is detached from its parent first.
+    let dropped = outcome(&tree, &fewer, &drop).expect("a partition is dropped");
+    assert!(
+        dropped.changes.iter().any(|p| matches!(
+            &p.change,
+            Change::Table(TableChange::DropTable { name, detach_from: Some(parent), .. })
+                if name.raw().to_string() == "app.z_rest" && parent.raw().to_string() == "app.ev"
+        )),
+        "{:?}",
+        dropped.changes
+    );
+    let mut renamed = tree.clone();
+    let moved = renamed
+        .tables
+        .remove(&"app.z_rest".parse::<TableName>().unwrap())
+        .unwrap();
+    renamed.tables.insert("app.z_other".parse().unwrap(), moved);
+    let rename = [Intent::RenameTable {
+        from: "app.z_rest".parse().unwrap(),
+        to: "app.z_other".parse().unwrap(),
+    }];
+    // The whole tree gone: the parent's own drop is still refused.
+    let no_parent = Schema::default();
+    let drop_all = [
+        Intent::DropTable {
+            table: "app.ev".parse().unwrap(),
+            reason: "gone".parse().unwrap(),
+        },
+        Intent::DropTable {
+            table: "app.a_old".parse().unwrap(),
+            reason: "gone".parse().unwrap(),
+        },
+        Intent::DropTable {
+            table: "app.z_rest".parse().unwrap(),
+            reason: "gone".parse().unwrap(),
+        },
+    ];
+    // A parent's column is the parent's change, which the engine
+    // recurses (#1687).
+    assert_eq!(
+        kinds(&outcome(&tree, &column, &[]).expect("a parent's column")),
+        ["AddColumn"]
+    );
+    // The parent's strategy is its partitioning too (#1632).
+    let mut strategy = tree.clone();
+    strategy
+        .tables
+        .get_mut(&"app.ev".parse::<TableName>().unwrap())
+        .unwrap()
+        .partition_by
+        .as_mut()
+        .unwrap()
+        .strategy = pbps_model::PartitionStrategy::List;
+    for (declared, intents, expected) in [
+        (&bound, &[][..], "change its partitioning"),
+        (&strategy, &[][..], "change its partitioning"),
+        (&renamed, &rename[..], "rename table"),
+        (&no_parent, &drop_all[..], "app.ev is a partitioned table"),
+    ] {
+        let found = refused(&tree, declared, intents);
+        assert!(
+            found.iter().any(|e| e.contains(expected)),
+            "{expected}: {found:?}"
+        );
+    }
+
+    // Negative: a new table beside the tree, referencing its parent, is
+    // planned.
+    let mut beside = tree.clone();
+    let mut referencing = table(&[
+        ("ev_id", Column::new(ty("int"))),
+        ("ev_ts", Column::new(ty("date"))),
+    ]);
+    referencing.foreign_keys.insert(
+        "fk_ev".into(),
+        pbps_model::ForeignKey {
+            columns: vec!["ev_id".into(), "ev_ts".into()],
+            references_table: "app.ev".parse().unwrap(),
+            references_columns: vec!["id".into(), "ts".into()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        },
+    );
+    beside.tables.insert("app.r".parse().unwrap(), referencing);
+    let planned = outcome(&tree, &beside, &[]).expect("a referencing table is planned");
+    assert!(
+        kinds(&planned).contains(&"CreateTable".to_owned()),
+        "{:?}",
+        kinds(&planned)
+    );
+}
+
+/// The engine renames a label where a partition bound holds it (measured
+/// on 16 and 18), so a bound that follows a label rename is no change of
+/// the partitioning, whichever strategy bounds it (DEC-2346.1).
+#[test]
+fn a_bound_that_follows_a_label_rename_is_not_a_change_of_partitioning() {
+    use pbps_model::{BoundDatum, ListDatum, PartitionBound, PartitionBy, PartitionOf};
+    let mood = |labels: &[&str]| pbps_model::ManagedType::Enum {
+        values: labels.iter().map(|l| (*l).to_owned()).collect(),
+    };
+    let list = |label: &str| PartitionBound::List {
+        values: [ListDatum::Value(label.into())].into(),
+    };
+    let range = |from: &str, to: &str| PartitionBound::Range {
+        from: vec![BoundDatum::Value(from.into())],
+        to: vec![BoundDatum::Value(to.into())],
+    };
+    for strategy in [
+        pbps_model::PartitionStrategy::List,
+        pbps_model::PartitionStrategy::Range,
+    ] {
+        let bound = |at: &str| match strategy {
+            pbps_model::PartitionStrategy::List => list(at),
+            pbps_model::PartitionStrategy::Range | pbps_model::PartitionStrategy::Hash => {
+                range(at, "z")
+            }
+        };
+        let mut parent = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("m", Column::new(ty("app.mood")).not_null()),
+        ]);
+        parent.partition_by = Some(PartitionBy {
+            external: false,
+            columns: vec!["m".into()],
+            strategy,
+        });
+        let tree = |labels: &[&str], at: &str| {
+            let mut schema = schema_of("app.ev", parent.clone());
+            schema
+                .types
+                .insert("app.mood".parse().unwrap(), mood(labels));
+            schema.tables.insert(
+                "app.ev_one".parse().unwrap(),
+                Table {
+                    partition_of: Some(PartitionOf {
+                        parent: "app.ev".parse().unwrap(),
+                        bound: bound(at),
+                        columns: Default::default(),
+                    }),
+                    ..Default::default()
+                },
+            );
+            schema
+        };
+        let plan = |base: &Schema, declared: &Schema, renames: &[(&str, &str)]| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, &[], &ctx())
+                .unwrap()
+                .ids;
+            let hints = Hints {
+                enum_value_renames: [(
+                    "app.mood".parse().unwrap(),
+                    renames
+                        .iter()
+                        .map(|(from, to)| ((*to).to_owned(), (*from).to_owned()))
+                        .collect(),
+                )]
+                .into(),
+                ..Default::default()
+            };
+            diff(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &hints,
+            )
+        };
+        let base = tree(&["sad", "ok"], "sad");
+        // The rename carries the bound: the plan is the rename alone.
+        let renamed = plan(&base, &tree(&["blue", "ok"], "blue"), &[("sad", "blue")])
+            .expect("the bound follows the label");
+        assert!(
+            matches!(
+                renamed
+                    .changes
+                    .iter()
+                    .map(|p| &p.change)
+                    .collect::<Vec<_>>()[..],
+                [Change::TypeValue(TypeValueChange::RenameEnumValue { .. })]
+            ),
+            "{:?}",
+            renamed.changes
+        );
+        // Negative: the label is renamed and the bound names another.
+        let moved = plan(&base, &tree(&["blue", "ok"], "ok"), &[("sad", "blue")])
+            .expect_err("a bound that did not follow is a change");
+        // Negative: the same bound as before, with no rename behind it.
+        let changed =
+            plan(&base, &tree(&["sad", "ok"], "ok"), &[]).expect_err("a changed bound is a change");
+        for errors in [moved, changed] {
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| matches!(e, DiffError::PartitionedTableChange { .. })
+                        && e.to_string().contains("change its partitioning")),
+                "{errors:?}"
+            );
+        }
+    }
+}
+
+/// The engine renames a label in the rows that hold it (measured on 16 and
+/// 18), so rows that follow a label rename are no change of rows: the
+/// observed key and cells are carried through the plan's renames before
+/// they are compared with the declared ones (DEC-2346.2).
+#[test]
+fn rows_that_follow_a_label_rename_are_no_change_of_rows() {
+    use pbps_model::{DataMode, Row, RowKey, TableData, Value};
+    let mood = |labels: &[&str]| pbps_model::ManagedType::Enum {
+        values: labels.iter().map(|l| (*l).to_owned()).collect(),
+    };
+    let rows = |entries: &[(&str, &str)]| TableData {
+        mode: DataMode::Exact,
+        rows: entries
+            .iter()
+            .map(|(key, next)| {
+                (
+                    RowKey::from(*key),
+                    Row([("next".into(), Value::Text((*next).into()))].into()),
+                )
+            })
+            .collect(),
+    };
+    let world = |labels: &[&str], data: TableData| {
+        let mut t = table(&[
+            ("m", Column::new(ty("app.mood")).not_null()),
+            ("next", Column::new(ty("app.mood"))),
+        ]);
+        t.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["m".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        });
+        t.data = Some(data);
+        let mut schema = schema_of("app.lookup", t);
+        schema
+            .types
+            .insert("app.mood".parse().unwrap(), mood(labels));
+        schema
+    };
+    let plan = |base: &Schema, declared: &Schema, renames: &[(&str, &str)]| {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(declared, &base_ids, &[], &ctx())
+            .unwrap()
+            .ids;
+        let hints = Hints {
+            enum_value_renames: [(
+                "app.mood".parse().unwrap(),
+                renames
+                    .iter()
+                    .map(|(from, to)| ((*to).to_owned(), (*from).to_owned()))
+                    .collect(),
+            )]
+            .into(),
+            ..Default::default()
+        };
+        diff(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &hints,
+        )
+    };
+    let kinds = |plan: &ChangeSet| -> Vec<String> {
+        plan.changes
+            .iter()
+            .map(|p| {
+                format!("{:?}", p.change)
+                    .split([' ', '{'])
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    };
+    let base = world(&["sad", "ok"], rows(&[("sad", "ok"), ("ok", "sad")]));
+    // The rename carries the key and the cell: the plan is the rename.
+    let renamed = plan(
+        &base,
+        &world(&["blue", "ok"], rows(&[("blue", "ok"), ("ok", "blue")])),
+        &[("sad", "blue")],
+    )
+    .expect("the rows follow the label");
+    assert_eq!(kinds(&renamed), ["RenameEnumValue"], "{renamed:?}");
+    // A cell that really changes is one update, from the carried value.
+    let changed = plan(
+        &base,
+        &world(&["blue", "ok"], rows(&[("blue", "ok"), ("ok", "ok")])),
+        &[("sad", "blue")],
+    )
+    .expect("one cell differs");
+    assert_eq!(
+        kinds(&changed),
+        ["RenameEnumValue", "UpdateRow"],
+        "{changed:?}"
+    );
+    let Some(Change::Row(RowChange::UpdateRow { key, columns, .. })) = changed
+        .changes
+        .iter()
+        .map(|p| &p.change)
+        .find(|c| matches!(c, Change::Row(RowChange::UpdateRow { .. })))
+    else {
+        panic!("an update: {changed:?}");
+    };
+    assert_eq!(key.as_str(), "ok");
+    let (before, after) = &columns["next"];
+    assert_eq!(
+        (before, after),
+        (
+            &pbps_model::Cell::Value(Value::Text("blue".into())),
+            &pbps_model::Cell::Value(Value::Text("ok".into()))
+        )
+    );
+    // A chain: `b` becomes `c`, then `a` becomes `b`; both rows follow.
+    let chained = plan(
+        &world(&["a", "b"], rows(&[("a", "b"), ("b", "a")])),
+        &world(&["b", "c"], rows(&[("b", "c"), ("c", "b")])),
+        &[("b", "c"), ("a", "b")],
+    )
+    .expect("a chain of renames");
+    assert!(
+        kinds(&chained).iter().all(|k| k == "RenameEnumValue"),
+        "{chained:?}"
+    );
+    // Without the rename the key is another row: an insert and a delete.
+    let labels = ["sad", "ok", "blue"];
+    let moved = plan(
+        &world(&labels, rows(&[("sad", "ok"), ("ok", "sad")])),
+        &world(&labels, rows(&[("blue", "ok"), ("ok", "sad")])),
+        &[],
+    )
+    .expect("another key");
+    let kinds_without = kinds(&moved);
+    assert!(
+        kinds_without.contains(&"InsertRow".to_owned())
+            && kinds_without.contains(&"DeleteRow".to_owned()),
+        "{kinds_without:?}"
+    );
+    // And a row over a label this plan adds is refused (DEC-2346.2).
+    let errors = plan(
+        &world(&["sad", "ok"], rows(&[("ok", "sad")])),
+        &world(&["sad", "ok", "blue"], rows(&[("ok", "blue")])),
+        &[],
+    )
+    .expect_err("a new label in a cell");
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, DiffError::EnumValueUse { label, .. } if label == "blue")),
+        "{errors:?}"
+    );
+}
+
+/// The move a human allowed reaches the create that moves (#1788): its
+/// bound, read from the declared side's identity file by the
+/// partition's uid. Nothing allowed is `None`, and a create that moves
+/// nothing carries no bound, whatever the file holds.
+#[test]
+fn the_move_a_human_allowed_reaches_the_create_beside_the_default() {
+    use pbps_model::{BoundDatum, PartitionBound, PartitionBy, PartitionOf};
+    let mut parent = table(&[("ts", Column::new(ty("date")).not_null())]);
+    parent.partition_by = Some(PartitionBy {
+        external: false,
+        columns: vec!["ts".into()],
+        strategy: Default::default(),
+    });
+    let partition = |bound: PartitionBound| Table {
+        partition_of: Some(PartitionOf {
+            parent: "app.ev".parse().unwrap(),
+            bound,
+            columns: Default::default(),
+        }),
+        ..Default::default()
+    };
+    let mut base = schema_of("app.ev", parent);
+    let mut declared = base.clone();
+    declared.tables.insert(
+        "app.ev_2025".parse().unwrap(),
+        partition(PartitionBound::Range {
+            from: vec![BoundDatum::Value("2025-01-01".into())],
+            to: vec![BoundDatum::Value("2026-01-01".into())],
+        }),
+    );
+    let bounds = |base: &Schema, declared: &Schema, intents: &[Intent]| {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+            .map(|r| r.ids)
+            .unwrap_or_else(|_| {
+                // The intent is refused for a parent without a DEFAULT;
+                // write the move by hand to see the differ ignore it.
+                let mut ids = crate::resolve(declared, &base_ids, &[], &ctx())
+                    .unwrap()
+                    .ids;
+                let uid = ids
+                    .table_uid(&"app.ev_2025".parse().unwrap())
+                    .unwrap()
+                    .clone();
+                ids.moves.insert(
+                    uid,
+                    pbps_model::Move {
+                        max_rows: 10,
+                        allowed_at: "2026-10-11".into(),
+                        reason: "by hand".into(),
+                        operator: "leon".into(),
+                    },
+                );
+                ids
+            });
+        diff(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .expect("planned")
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::Table(TableChange::CreateTable { moves_at_most, .. }) => Some(*moves_at_most),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+    };
+    let allowed = [Intent::MoveRows {
+        table: "app.ev_2025".parse().unwrap(),
+        max_rows: 10,
+        reason: "no CDC".parse().unwrap(),
+    }];
+    // Negative: no DEFAULT beside it, so nothing moves and no bound is
+    // carried, though the file holds one.
+    assert_eq!(bounds(&base, &declared, &allowed), [None]);
+    for tree in [&mut base, &mut declared] {
+        tree.tables.insert(
+            "app.ev_rest".parse().unwrap(),
+            partition(PartitionBound::Default),
+        );
+    }
+    assert_eq!(bounds(&base, &declared, &allowed), [Some(10)]);
+    // Negative: nothing allowed.
+    assert_eq!(bounds(&base, &declared, &[]), [None]);
+}
+
+/// A range partition added under a standing parent is made beside the
+/// DEFAULT partition the base and the declarations both hold, which the
+/// change names; without one standing on both sides there is none to
+/// move rows out of (#1547, DEC-1547.1).
+#[test]
+fn a_range_added_beside_a_standing_default_names_it() {
+    use pbps_model::{BoundDatum, PartitionBound, PartitionBy, PartitionOf};
+    let mut parent = table(&[
+        ("id", Column::new(ty("int")).not_null()),
+        ("ts", Column::new(ty("date")).not_null()),
+    ]);
+    parent.partition_by = Some(PartitionBy {
+        external: false,
+        columns: vec!["ts".into()],
+        strategy: Default::default(),
+    });
+    let partition = |bound: PartitionBound| Table {
+        partition_of: Some(PartitionOf {
+            parent: "app.ev".parse().unwrap(),
+            bound,
+            columns: Default::default(),
+        }),
+        ..Default::default()
+    };
+    let range = |from: &str, to: &str| {
+        partition(PartitionBound::Range {
+            from: vec![BoundDatum::Value(from.into())],
+            to: vec![BoundDatum::Value(to.into())],
+        })
+    };
+    let bare = schema_of("app.ev", parent);
+    let mut tree = bare.clone();
+    tree.tables.insert(
+        "app.ev_rest".parse().unwrap(),
+        partition(PartitionBound::Default),
+    );
+    let with = |base: &Schema, added: &[(&str, Table)], removed: &[&str]| {
+        let mut declared = base.clone();
+        for (name, t) in added {
+            declared.tables.insert(name.parse().unwrap(), t.clone());
+        }
+        for name in removed {
+            declared.tables.remove(&name.parse::<TableName>().unwrap());
+        }
+        declared
+    };
+    let beside = |base: &Schema, declared: &Schema, intents: &[Intent]| {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+            .unwrap()
+            .ids;
+        let cs = diff(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .expect("planned");
+        cs.changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::Table(TableChange::CreateTable {
+                    name,
+                    beside_default,
+                    ..
+                }) => Some((
+                    name.raw().to_string(),
+                    beside_default.as_ref().map(|name| name.raw().to_string()),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let year = [("app.ev_2025", range("2025-01-01", "2026-01-01"))];
+    assert_eq!(
+        beside(&tree, &with(&tree, &year, &[]), &[]),
+        [("app.ev_2025".to_owned(), Some("app.ev_rest".to_owned()))]
+    );
+    // Negative: no DEFAULT beside it.
+    assert_eq!(
+        beside(&bare, &with(&bare, &year, &[]), &[]),
+        [("app.ev_2025".to_owned(), None)]
+    );
+    // Negative: a DEFAULT made in the same plan starts empty.
+    let both = with(
+        &bare,
+        &[
+            year[0].clone(),
+            ("app.ev_rest", partition(PartitionBound::Default)),
+        ],
+        &[],
+    );
+    assert!(
+        beside(&bare, &both, &[]).iter().all(|(_, d)| d.is_none()),
+        "{:?}",
+        beside(&bare, &both, &[])
+    );
+    // Negative: a DEFAULT the plan drops is gone before the partition is
+    // made.
+    let drop = [Intent::DropTable {
+        table: "app.ev_rest".parse().unwrap(),
+        reason: "gone".parse().unwrap(),
+    }];
+    assert_eq!(
+        beside(&tree, &with(&tree, &year, &["app.ev_rest"]), &drop),
+        [("app.ev_2025".to_owned(), None)]
+    );
+    // Negative: a whole new tree has nothing standing.
+    assert!(
+        beside(&Schema::default(), &with(&tree, &year, &[]), &[])
+            .iter()
+            .all(|(_, d)| d.is_none())
+    );
+}
+
+/// A DEFAULT partition's own NOT NULL, tightened in the plan that moves
+/// rows out of it, follows the create that moves them: under a parent
+/// whose columns change, that create comes at (9, 5), after the
+/// partition alterations it would otherwise follow (#1763 review).
+#[test]
+fn a_default_tightened_in_a_moving_plan_follows_the_move() {
+    use pbps_model::{BoundDatum, PartitionBound, PartitionBy, PartitionColumn, PartitionOf};
+    let mut parent = table(&[
+        ("id", Column::new(ty("int")).not_null()),
+        ("ts", Column::new(ty("date")).not_null()),
+        ("v", Column::new(ty("int"))),
+    ]);
+    parent.partition_by = Some(PartitionBy {
+        external: false,
+        columns: vec!["ts".into()],
+        strategy: Default::default(),
+    });
+    let partition = |bound: PartitionBound, not_null: bool| Table {
+        partition_of: Some(PartitionOf {
+            parent: "app.ev".parse().unwrap(),
+            bound,
+            columns: if not_null {
+                [(
+                    "v".into(),
+                    PartitionColumn {
+                        default: None,
+                        not_null: true,
+                    },
+                )]
+                .into_iter()
+                .collect()
+            } else {
+                Default::default()
+            },
+        }),
+        ..Default::default()
+    };
+    let range = |from: &str, to: &str, not_null: bool| {
+        partition(
+            PartitionBound::Range {
+                from: vec![BoundDatum::Value(from.into())],
+                to: vec![BoundDatum::Value(to.into())],
+            },
+            not_null,
+        )
+    };
+    let mut base = schema_of("app.ev", parent.clone());
+    base.tables.insert(
+        "app.ev_rest".parse().unwrap(),
+        partition(PartitionBound::Default, false),
+    );
+    base.tables.insert(
+        "app.ev_2020".parse().unwrap(),
+        range("2020-01-01", "2021-01-01", false),
+    );
+    let order = |declared: &Schema| -> Vec<String> {
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(declared, &base_ids, &[], &ctx())
+            .unwrap()
+            .ids;
+        diff(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .expect("planned")
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let Change::Table(TableChange::CreateTable { name, .. }) = &p.change {
+                Some(format!("create {name}", name = name.shown()))
+            } else if let Change::Partition(PartitionChange::SetPartitionNotNull {
+                table,
+                not_null,
+                ..
+            }) = &p.change
+            {
+                Some(format!(
+                    "not null {table} {not_null}",
+                    table = table.shown()
+                ))
+            } else if let Change::Column(ColumnChange::AlterColumnDefault { column, .. }) =
+                &p.change
+            {
+                Some(format!("default {}", column.table.shown()))
+            } else {
+                None
+            }
+        })
+        .collect()
+    };
+    let mut declared = base.clone();
+    declared
+        .tables
+        .get_mut(&"app.ev".parse::<TableName>().unwrap())
+        .unwrap()
+        .columns
+        .get_mut("v")
+        .unwrap()
+        .value_source = pbps_model::ValueSource::Default("1".into());
+    declared.tables.insert(
+        "app.ev_rest".parse().unwrap(),
+        partition(PartitionBound::Default, true),
+    );
+    declared.tables.insert(
+        "app.ev_2020".parse().unwrap(),
+        range("2020-01-01", "2021-01-01", true),
+    );
+    declared.tables.insert(
+        "app.ev_2030".parse().unwrap(),
+        range("2030-01-01", "2031-01-01", false),
+    );
+    assert_eq!(
+        order(&declared),
+        [
+            "default app.ev",
+            "not null app.ev_2020 true",
+            "create app.ev_2030",
+            "not null app.ev_rest true",
+        ]
+    );
+    // Negative: with no range added beside it, the DEFAULT's own NOT
+    // NULL keeps its place after its parent's change.
+    declared
+        .tables
+        .remove(&"app.ev_2030".parse::<TableName>().unwrap());
+    assert_eq!(
+        order(&declared),
+        [
+            "default app.ev",
+            "not null app.ev_2020 true",
+            "not null app.ev_rest true",
+        ]
+    );
+}
+
+/// An ordinary table declared as a partition of a standing parent is
+/// attached and keeps its rows (#1545, DEC-1545.1). Its matching key,
+/// foreign key and index become the parent's clones and the parent's
+/// check its inherited copy, so none of them is planned; what it keeps of
+/// its own is brought to the declaration after the attach, a column with
+/// no default taking its parent's back. Its column uids leave the ids
+/// file, and its parent's stay. Every shape the engine would refuse, or
+/// would attach into something the model does not hold, is refused by
+/// name before anything is planned.
+#[test]
+fn an_ordinary_table_declared_as_a_partition_is_attached() {
+    use pbps_model::{BoundDatum, PartitionBound, PartitionBy, PartitionColumn, PartitionOf};
+    let index_on = |column: &str| Index {
+        columns: vec![pbps_model::IndexColumn {
+            key: pbps_model::IndexKey::Column(column.into()),
+            descending: false,
+            opclass: None,
+            collation: None,
+            opclass_parameters: Default::default(),
+        }],
+        include: Vec::new(),
+        unique: false,
+        filter: None,
+        method: Default::default(),
+        storage_parameters: Default::default(),
+        filegroup: None,
+    };
+    let fk = pbps_model::ForeignKey {
+        columns: vec!["n".into()],
+        references_table: "app.r".parse().unwrap(),
+        references_columns: vec!["id".into()],
+        on_delete: pbps_model::ReferentialAction::NoAction,
+        on_update: pbps_model::ReferentialAction::NoAction,
+    };
+    let check = |expression: &str| pbps_model::CheckConstraint {
+        expression: expression.into(),
+    };
+    let key = |name: &str, columns: &[&str]| PrimaryKey {
+        name: Some(name.into()),
+        columns: columns.iter().map(|c| (*c).into()).collect(),
+        storage_parameters: Default::default(),
+        filegroup: None,
+    };
+    let columns = || {
+        table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("ts", Column::new(ty("date")).not_null()),
+            ("n", Column::new(ty("int"))),
+        ])
+    };
+    let mut parent = columns();
+    parent.columns["n"].value_source = pbps_model::ValueSource::Default("0".into());
+    parent.primary_key = Some(key("ev_pk", &["id", "ts"]));
+    parent.checks.insert("ev_n_ck".into(), check("n > 0"));
+    parent.indexes.insert("ev_n".into(), index_on("n"));
+    parent.foreign_keys.insert("ev_n_fk".into(), fk.clone());
+    let unique = |fillfactor: Option<&str>| pbps_model::UniqueConstraint {
+        columns: vec!["n".into(), "ts".into()],
+        storage_parameters: fillfactor
+            .map(|f| ("fillfactor".to_owned(), f.to_owned()))
+            .into_iter()
+            .collect(),
+        filegroup: None,
+    };
+    parent.unique.insert("ev_u".into(), unique(None));
+    parent.partition_by = Some(PartitionBy {
+        external: false,
+        columns: vec!["ts".into()],
+        strategy: Default::default(),
+    });
+    let range = |from: &str, to: &str| PartitionBound::Range {
+        from: vec![BoundDatum::Value(from.into())],
+        to: vec![BoundDatum::Value(to.into())],
+    };
+    let mut tree = schema_of("app.ev", parent);
+    let mut referenced = table(&[("id", Column::new(ty("int")).not_null())]);
+    referenced.primary_key = Some(key("r_pk", &["id"]));
+    tree.tables.insert("app.r".parse().unwrap(), referenced);
+    tree.tables.insert(
+        "app.ev_2025".parse().unwrap(),
+        Table {
+            partition_of: Some(PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound: range("2025-01-01", "2026-01-01"),
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        },
+    );
+    // The table as it stands: the parent's columns in the parent's
+    // order, `n` NOT NULL of its own and without the parent's default,
+    // the parent's key, foreign key, check and index under names of its
+    // own, plus a check and an index of its own.
+    let ordinary = |f: &dyn Fn(&mut Table)| {
+        let mut t = columns();
+        t.columns["n"].nullable = false;
+        t.primary_key = Some(key("t_pk", &["id", "ts"]));
+        t.foreign_keys.insert("t_fk".into(), fk.clone());
+        t.unique.insert("t_u".into(), unique(None));
+        t.checks.insert("ev_n_ck".into(), check("n > 0"));
+        t.checks.insert("t_small".into(), check("n < 100"));
+        t.indexes.insert("t_n".into(), index_on("n"));
+        t.indexes.insert("t_id".into(), index_on("id"));
+        f(&mut t);
+        let mut base = tree.clone();
+        base.tables.insert("app.t".parse().unwrap(), t);
+        base
+    };
+    // Declared as a partition keeping its own check and NOT NULL, and
+    // not its own index.
+    let attached = |bound: PartitionBound| {
+        let mut declared = tree.clone();
+        declared.tables.insert(
+            "app.t".parse().unwrap(),
+            Table {
+                checks: [("t_small".into(), check("n < 100"))].into(),
+                partition_of: Some(PartitionOf {
+                    parent: "app.ev".parse().unwrap(),
+                    bound,
+                    columns: [(
+                        "n".into(),
+                        PartitionColumn {
+                            default: None,
+                            not_null: true,
+                        },
+                    )]
+                    .into(),
+                }),
+                ..Default::default()
+            },
+        );
+        declared
+    };
+    let declared = attached(range("2024-01-01", "2025-01-01"));
+    let outcome = |base: &Schema, declared: &Schema, intents: &[Intent]| {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+            .unwrap()
+            .ids;
+        let cs = diff(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        );
+        (base_ids, declared_ids, cs)
+    };
+    let refused = |base: &Schema, declared: &Schema, intents: &[Intent]| -> Vec<String> {
+        match outcome(base, declared, intents).2 {
+            Ok(cs) => panic!("planned {:?}", kinds(&cs)),
+            Err(errors) => errors.iter().map(ToString::to_string).collect(),
+        }
+    };
+
+    let base = ordinary(&|_| {});
+    // A plain table takes the parent's identity, but even an identical
+    // identity of its own cannot attach portably (DEC-1681.2).
+    let with_identity = |schema: &Schema, tables: &[&str]| {
+        let mut schema = schema.clone();
+        for name in tables {
+            schema
+                .tables
+                .get_mut(&name.parse::<TableName>().unwrap())
+                .unwrap()
+                .columns["id"]
+                .value_source = ValueSource::Identity(pbps_model::Identity {
+                seed: 1,
+                increment: 1,
+                options: Default::default(),
+            });
+        }
+        schema
+    };
+    let identity_base = with_identity(&base, &["app.ev"]);
+    let identity_declared = with_identity(&declared, &["app.ev"]);
+    let plain = outcome(&identity_base, &identity_declared, &[])
+        .2
+        .expect("a plain table attaches under an identity parent");
+    assert_eq!(
+        kinds(&plain),
+        ["DropIndex", "AttachPartition", "SetPartitionDefault"]
+    );
+    for (base, declared) in [
+        (with_identity(&base, &["app.t"]), &declared),
+        (
+            with_identity(&base, &["app.ev", "app.t"]),
+            &identity_declared,
+        ),
+    ] {
+        let errors = refused(&base, declared, &[]);
+        assert!(
+            errors
+                .iter()
+                .any(|m| m.contains("app.t") && m.contains("its column `id` has its own identity")),
+            "{errors:?}"
+        );
+    }
+    let (base_ids, declared_ids, planned) = outcome(&base, &declared, &[]);
+    let planned = planned.expect("an attach is planned");
+    assert_eq!(
+        kinds(&planned),
+        ["DropIndex", "AttachPartition", "SetPartitionDefault"],
+        "{:?}",
+        planned.changes
+    );
+    let Change::Partition(PartitionChange::AttachPartition {
+        table: t,
+        parent: p,
+        bound,
+        shape,
+        ..
+    }) = &planned.changes[1].change
+    else {
+        panic!("{:?}", planned.changes)
+    };
+    assert_eq!(
+        (t.raw().to_string(), p.raw().to_string()),
+        ("app.t".into(), "app.ev".into())
+    );
+    assert_eq!(*bound, range("2024-01-01", "2025-01-01"));
+    assert_eq!(
+        **shape,
+        declared.tables[&"app.t".parse::<TableName>().unwrap()]
+    );
+    assert!(matches!(
+        &planned.changes[0].change,
+        Change::Index(IndexChange::DropIndex { name, .. }) if name.raw() == "t_id"
+    ));
+    assert!(matches!(
+        &planned.changes[2].change,
+        Change::Partition(PartitionChange::SetPartitionDefault { column, from: None, to: None, fallback: Some(f), .. })
+            if column.raw() == "n" && f == "0"
+    ));
+    assert!(planned.changes[1].risks.contains(&RiskClass::Constraint));
+    // The table keeps its uid, its columns' leave, and the parent's stay.
+    let on = |ids: &IdsFile, name: &str| -> Vec<Uid> {
+        ids.columns
+            .iter()
+            .filter(|(_, c)| c.table.raw().to_string() == name)
+            .map(|(u, _)| u.clone())
+            .collect()
+    };
+    assert_eq!(on(&base_ids, "app.t").len(), 3);
+    assert!(on(&declared_ids, "app.t").is_empty());
+    assert_eq!(on(&base_ids, "app.ev"), on(&declared_ids, "app.ev"));
+    assert_eq!(
+        base_ids
+            .tables
+            .iter()
+            .find(|(_, n)| n.raw().to_string() == "app.t")
+            .map(|(u, _)| u),
+        declared_ids
+            .tables
+            .iter()
+            .find(|(_, n)| n.raw().to_string() == "app.t")
+            .map(|(u, _)| u),
+    );
+
+    // A default of its own is kept, and none is asked of the parent.
+    let own_default =
+        ordinary(&|t| t.columns["n"].value_source = pbps_model::ValueSource::Default("7".into()));
+    let mut keeps = declared.clone();
+    keeps
+        .tables
+        .get_mut(&"app.t".parse::<TableName>().unwrap())
+        .unwrap()
+        .partition_of
+        .as_mut()
+        .unwrap()
+        .columns
+        .get_mut("n")
+        .unwrap()
+        .default = Some("7".into());
+    let kept = outcome(&own_default, &keeps, &[])
+        .2
+        .expect("its own default is kept");
+    assert_eq!(kinds(&kept), ["DropIndex", "AttachPartition"]);
+
+    // A key or an index of the parent's under other storage parameters
+    // is adopted all the same, as the engine adopts it.
+    let tuned = ordinary(&|t| {
+        t.unique.insert("t_u".into(), unique(Some("70")));
+        t.indexes.get_mut("t_n").unwrap().storage_parameters =
+            [("fillfactor".to_owned(), "60".to_owned())].into();
+    });
+    let adopted = outcome(&tuned, &declared, &[]).2.expect("adopted");
+    // An index of its own declared under the name of one the attach
+    // would adopt, as another index or the same: the adopted one goes
+    // before the attach, which builds the parent's clone under a name of
+    // the engine's, and the declared one is added after.
+    for definition in [index_on("id"), index_on("n")] {
+        let mut reusing = declared.clone();
+        reusing
+            .tables
+            .get_mut(&"app.t".parse::<TableName>().unwrap())
+            .unwrap()
+            .indexes
+            .insert("t_n".into(), definition);
+        let reclaimed = outcome(&base, &reusing, &[]).2.expect("the name is freed");
+        let order: Vec<String> = reclaimed
+            .changes
+            .iter()
+            .map(|p| match &p.change {
+                Change::Index(IndexChange::DropIndex { name, .. }) => format!(
+                    "drop {name}",
+                    // Preserve raw comparison-label or fixture SQL bytes in test data.
+                    name = name.raw(),
+                ),
+                Change::Index(IndexChange::AddIndex { name, .. }) => format!(
+                    "add {name}",
+                    // Preserve raw comparison-label or fixture SQL bytes in test data.
+                    name = name.raw(),
+                ),
+                other => format!("{other:?}").split(' ').next().unwrap().to_owned(),
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "drop t_id",
+                "drop t_n",
+                "AttachPartition",
+                "SetPartitionDefault",
+                "add t_n"
+            ],
+            "{:?}",
+            reclaimed.changes
+        );
+    }
+    // A BRIN index under class options the parent's differ in is adopted
+    // all the same, measured on 16 and 18 (DEC-2449.2), and the clone
+    // keeps its own. So an own index declared as that one is displaced
+    // before the attach and added after it, as any adopted one is; left
+    // in place it would become the parent's clone and the declared index
+    // would be absent. With no such index on the parent nothing is
+    // adopted, and the own index stays.
+    let brin = |values_per_range: &str| Index {
+        columns: vec![pbps_model::IndexColumn {
+            opclass: Some("int4_minmax_multi_ops".parse().unwrap()),
+            opclass_parameters: [("values_per_range".to_owned(), values_per_range.to_owned())]
+                .into(),
+            ..pbps_model::IndexColumn::column("n")
+        }],
+        method: pbps_model::IndexMethod::Brin,
+        ..index_on("n")
+    };
+    let steps = |base: &Schema, declared: &Schema| -> Vec<String> {
+        outcome(base, declared, &[])
+            .2
+            .expect("planned")
+            .changes
+            .iter()
+            .map(|p| match &p.change {
+                Change::Index(IndexChange::DropIndex { name, .. }) => {
+                    format!("drop {}", name.shown())
+                }
+                Change::Index(IndexChange::AddIndex { name, .. }) => {
+                    format!("add {}", name.shown())
+                }
+                other => format!("{other:?}").split(' ').next().unwrap().to_owned(),
+            })
+            .collect()
+    };
+    let ev: TableName = "app.ev".parse().unwrap();
+    let t: TableName = "app.t".parse().unwrap();
+    let with_brins = |parents: Option<&str>, own: &str| {
+        let mut base = ordinary(&|t| {
+            t.indexes.insert("t_n".into(), brin(own));
+        });
+        let mut declared = declared.clone();
+        declared
+            .tables
+            .get_mut(&t)
+            .unwrap()
+            .indexes
+            .insert("t_n".into(), brin(own));
+        for schema in [&mut base, &mut declared] {
+            let parent = schema.tables.get_mut(&ev).unwrap();
+            parent.indexes.remove("ev_n");
+            if let Some(p) = parents {
+                parent.indexes.insert("ev_n".into(), brin(p));
+            }
+        }
+        (base, declared)
+    };
+    let (base_brin, declared_brin) = with_brins(Some("16"), "32");
+    assert_eq!(
+        steps(&base_brin, &declared_brin),
+        [
+            "drop t_id",
+            "drop t_n",
+            "AttachPartition",
+            "SetPartitionDefault",
+            "add t_n"
+        ],
+        "options the parent's differ in are still an adoption"
+    );
+    let (base_none, declared_none) = with_brins(None, "32");
+    assert_eq!(
+        steps(&base_none, &declared_none),
+        ["drop t_id", "AttachPartition", "SetPartitionDefault"],
+        "no index of the parent's, nothing adopted"
+    );
+    // The attach validates the parent's foreign key over the rows it
+    // brings, so it waits for the rows the plan writes into the table that
+    // key references, and goes before the rows of a table referencing
+    // the parent; its own changes after it (#1642 review).
+    let with_rows = |schema: &Schema| {
+        let mut schema = schema.clone();
+        let rows = |entries: Vec<(&str, Row)>| pbps_model::TableData {
+            mode: pbps_model::DataMode::Ensure,
+            rows: entries
+                .into_iter()
+                .map(|(k, row)| (pbps_model::RowKey::from(k), row))
+                .collect(),
+        };
+        schema
+            .tables
+            .get_mut(&"app.r".parse::<TableName>().unwrap())
+            .unwrap()
+            .data = Some(rows(vec![("7", Row::default())]));
+        let mut q = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("eid", Column::new(ty("int"))),
+            ("ets", Column::new(ty("date"))),
+        ]);
+        q.primary_key = Some(key("q_pk", &["id"]));
+        q.foreign_keys.insert(
+            "q_ev".into(),
+            pbps_model::ForeignKey {
+                columns: vec!["eid".into(), "ets".into()],
+                references_table: "app.ev".parse().unwrap(),
+                references_columns: vec!["id".into(), "ts".into()],
+                on_delete: pbps_model::ReferentialAction::NoAction,
+                on_update: pbps_model::ReferentialAction::NoAction,
+            },
+        );
+        q.data = Some(rows(vec![(
+            "1",
+            [
+                ("eid".into(), Value::Int(1)),
+                ("ets".into(), Value::Text("2024-06-01".into())),
+            ]
+            .into_iter()
+            .collect(),
+        )]));
+        schema.tables.insert("app.q".parse().unwrap(), q);
+        schema
+    };
+    let mut base_with_q = with_rows(&base);
+    for t in ["app.r", "app.q"] {
+        let t = base_with_q
+            .tables
+            .get_mut(&t.parse::<TableName>().unwrap())
+            .unwrap();
+        t.data.as_mut().unwrap().rows.clear();
+    }
+    let waits = outcome(&base_with_q, &with_rows(&declared), &[])
+        .2
+        .expect("attached after the rows");
+    let order: Vec<String> = waits
+        .changes
+        .iter()
+        .map(|p| {
+            if let Change::Row(RowChange::InsertRow { table, .. }) = &p.change {
+                format!("insert {table}", table = table.shown())
+            } else {
+                format!("{:?}", p.change)
+                    .split([' ', '{'])
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            }
+        })
+        .filter(|k| k != "SetDataMode")
+        .collect();
+    assert_eq!(
+        order,
+        [
+            "DropIndex",
+            "insert app.r",
+            "AttachPartition",
+            "insert app.q",
+            "SetPartitionDefault"
+        ],
+        "{:?}",
+        waits.changes
+    );
+    // Negative: with no rows to wait for, it stays with the creates.
+    assert_eq!(
+        kinds(&outcome(&base, &declared, &[]).2.expect("attached")),
+        ["DropIndex", "AttachPartition", "SetPartitionDefault"]
+    );
+
+    // A parent's plain unique index over the columns of the table's
+    // unique constraint or key could take its index: both go before the
+    // attach, and the engine builds the clones (#1642 review).
+    let unique_on = |columns: &[&str]| Index {
+        columns: columns
+            .iter()
+            .map(|c| pbps_model::IndexColumn {
+                key: pbps_model::IndexKey::Column((*c).into()),
+                descending: false,
+                opclass: None,
+                collation: None,
+                opclass_parameters: Default::default(),
+            })
+            .collect(),
+        unique: true,
+        ..index_on("n")
+    };
+    let contested = |schema: &Schema| {
+        let mut schema = schema.clone();
+        let parent = schema
+            .tables
+            .get_mut(&"app.ev".parse::<TableName>().unwrap())
+            .unwrap();
+        parent
+            .indexes
+            .insert("ev_n_ts".into(), unique_on(&["n", "ts"]));
+        parent
+            .indexes
+            .insert("ev_id_ts".into(), unique_on(&["id", "ts"]));
+        schema
+    };
+    let released = outcome(&contested(&base), &contested(&declared), &[])
+        .2
+        .expect("released");
+    let before: Vec<String> = released
+        .changes
+        .iter()
+        .take_while(|p| {
+            !matches!(
+                p.change,
+                Change::Partition(PartitionChange::AttachPartition { .. })
+            )
+        })
+        .map(|p| {
+            if let Change::Constraint(ConstraintChange::DropUnique { name, .. }) = &p.change {
+                format!(
+                    "drop unique {name}",
+                    // Preserve raw comparison-label or fixture SQL bytes in test data.
+                    name = name.raw(),
+                )
+            } else if let Change::Constraint(ConstraintChange::SetPrimaryKey { to: None, .. }) =
+                &p.change
+            {
+                "drop key".to_owned()
+            } else if let Change::Index(IndexChange::DropIndex { name, .. }) = &p.change {
+                format!(
+                    "drop {name}",
+                    // Preserve raw comparison-label or fixture SQL bytes in test data.
+                    name = name.raw(),
+                )
+            } else {
+                format!("{:?}", p.change)
+            }
+        })
+        .collect();
+    assert_eq!(
+        before,
+        ["drop t_id", "drop unique t_u", "drop key"],
+        "{:?}",
+        released.changes
+    );
+    // Negative: with no such index, the key and constraint are adopted.
+    let plain = outcome(&base, &declared, &[]).2.expect("adopted");
+    assert!(
+        !plain.changes.iter().any(|p| matches!(
+            p.change,
+            Change::Constraint(ConstraintChange::DropUnique { .. })
+                | Change::Constraint(ConstraintChange::SetPrimaryKey { to: None, .. })
+        )),
+        "{:?}",
+        plain.changes
+    );
+
+    // An attach that fills the table another attach's parent references
+    // goes first, whatever the names: `app.z` into `app.r`, which `app.ev`
+    // references, before `app.t` into `app.ev` (#1642 review).
+    let r_partitioned = |schema: &Schema| {
+        let mut schema = schema.clone();
+        schema
+            .tables
+            .get_mut(&"app.r".parse::<TableName>().unwrap())
+            .unwrap()
+            .partition_by = Some(PartitionBy {
+            external: false,
+            columns: vec!["id".into()],
+            strategy: Default::default(),
+        });
+        schema
+    };
+    let mut z = table(&[("id", Column::new(ty("int")).not_null())]);
+    z.primary_key = Some(key("z_pk", &["id"]));
+    let mut both_base = r_partitioned(&base);
+    both_base.tables.insert("app.z".parse().unwrap(), z);
+    let mut both_declared = r_partitioned(&declared);
+    both_declared.tables.insert(
+        "app.z".parse().unwrap(),
+        Table {
+            partition_of: Some(PartitionOf {
+                parent: "app.r".parse().unwrap(),
+                bound: PartitionBound::Range {
+                    from: vec![BoundDatum::Value("0".into())],
+                    to: vec![BoundDatum::Value("100".into())],
+                },
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        },
+    );
+    let attaches: Vec<String> = outcome(&both_base, &both_declared, &[])
+        .2
+        .expect("both attached")
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let Change::Partition(PartitionChange::AttachPartition { table, .. }) = &p.change {
+                Some(table.raw().to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(attaches, ["app.z", "app.t"]);
+
+    // The engine's match: a descending index is its parent's all the
+    // same, and of two matches neither is assumed adopted. One is left,
+    // one the declaration does not keep, and the other goes first.
+    let order_of = |cs: &ChangeSet| -> Vec<String> {
+        cs.changes
+            .iter()
+            .filter_map(|p| {
+                if let Change::Index(IndexChange::DropIndex { name, .. }) = &p.change {
+                    Some(format!(
+                        "drop {name}",
+                        // Preserve raw comparison-label or fixture SQL bytes in test data.
+                        name = name.raw(),
+                    ))
+                } else if let Change::Index(IndexChange::AddIndex { name, .. }) = &p.change {
+                    Some(format!(
+                        "add {name}",
+                        // Preserve raw comparison-label or fixture SQL bytes in test data.
+                        name = name.raw(),
+                    ))
+                } else if let Change::Partition(PartitionChange::AttachPartition { .. }) = &p.change
+                {
+                    Some("attach".to_owned())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    let descending = ordinary(&|t| {
+        t.indexes.get_mut("t_n").unwrap().columns[0].descending = true;
+    });
+    let planned = outcome(&descending, &declared, &[]).2.expect("adopted");
+    assert_eq!(order_of(&planned), ["drop t_id", "attach"]);
+    let twice = ordinary(&|t| {
+        t.indexes.insert("a_n".into(), index_on("n"));
+    });
+    let planned = outcome(&twice, &declared, &[]).2.expect("one is left");
+    assert_eq!(order_of(&planned), ["drop t_id", "drop t_n", "attach"]);
+    let mut keeps_a_n = declared.clone();
+    keeps_a_n
+        .tables
+        .get_mut(&"app.t".parse::<TableName>().unwrap())
+        .unwrap()
+        .indexes
+        .insert("a_n".into(), index_on("n"));
+    let planned = outcome(&twice, &keeps_a_n, &[])
+        .2
+        .expect("the other is left");
+    assert_eq!(
+        order_of(&planned),
+        ["drop a_n", "drop t_id", "attach", "add a_n"]
+    );
+
+    // A deprecation is an annotation, not the column's shape.
+    let annotated = ordinary(&|t| t.columns["n"].deprecated = Some("old".into()));
+    outcome(&annotated, &declared, &[])
+        .2
+        .expect("a deprecated column attaches");
+    assert_eq!(
+        kinds(&adopted),
+        ["DropIndex", "AttachPartition", "SetPartitionDefault"]
+    );
+
+    // Negative: every shape the engine refuses, or that would attach
+    // into something the model does not hold, is refused by name.
+    let mut r2 = table(&[
+        ("t_id", Column::new(ty("int"))),
+        ("t_ts", Column::new(ty("date"))),
+    ]);
+    r2.foreign_keys.insert(
+        "r2_t".into(),
+        pbps_model::ForeignKey {
+            columns: vec!["t_id".into(), "t_ts".into()],
+            references_table: "app.t".parse().unwrap(),
+            references_columns: vec!["id".into(), "ts".into()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        },
+    );
+    let mut referencing_base = ordinary(&|_| {});
+    referencing_base
+        .tables
+        .insert("app.r2".parse().unwrap(), r2.clone());
+    let mut referencing_declared = declared.clone();
+    referencing_declared
+        .tables
+        .insert("app.r2".parse().unwrap(), r2);
+    let trigger = (
+        pbps_model::ModuleId::Trigger {
+            on: "app.t".parse().unwrap(),
+            name: "audit".to_owned(),
+        },
+        pbps_model::Module {
+            kind: pbps_model::ModuleKind::Trigger,
+            description: None,
+            definition: "AFTER INSERT AS SELECT 1".to_owned(),
+            options: Default::default(),
+        },
+    );
+    let mut triggered_base = ordinary(&|_| {});
+    triggered_base.modules.extend([trigger.clone()]);
+    let mut triggered = declared.clone();
+    triggered.modules.extend([trigger]);
+    let mut unpartitioned = ordinary(&|_| {});
+    unpartitioned
+        .tables
+        .get_mut(&"app.ev".parse::<TableName>().unwrap())
+        .unwrap()
+        .partition_by = None;
+    let mut renamed = declared.clone();
+    let moved = renamed
+        .tables
+        .remove(&"app.t".parse::<TableName>().unwrap())
+        .unwrap();
+    renamed.tables.insert("app.t2".parse().unwrap(), moved);
+    let rename = [Intent::RenameTable {
+        from: "app.t".parse().unwrap(),
+        to: "app.t2".parse().unwrap(),
+    }];
+    let swap = |t: &mut Table| {
+        let n = t.columns.shift_remove("n").unwrap();
+        t.columns.shift_insert(0, "n".into(), n);
+    };
+    for (base, declared, intents, expected) in [
+        (
+            ordinary(&swap),
+            &declared,
+            &[][..],
+            "its columns are (n, id, ts), and its parent's are (id, ts, n)",
+        ),
+        (
+            ordinary(&|t| {
+                t.columns.insert("extra".into(), Column::new(ty("text")));
+            }),
+            &declared,
+            &[][..],
+            "its columns are (id, ts, n, extra)",
+        ),
+        (
+            ordinary(&|t| t.columns["n"].ty = ty("bigint")),
+            &declared,
+            &[][..],
+            "its column `n` is not its parent's in type",
+        ),
+        (
+            ordinary(&|t| t.columns["id"].nullable = true),
+            &declared,
+            &[][..],
+            "its column `id` is nullable",
+        ),
+        (
+            ordinary(&|t| t.primary_key = Some(key("t_pk", &["id"]))),
+            &declared,
+            &[][..],
+            "its primary key is not its parent's",
+        ),
+        (
+            ordinary(&|t| {
+                t.unique.insert(
+                    "t_u".into(),
+                    pbps_model::UniqueConstraint {
+                        columns: vec!["n".into()],
+                        storage_parameters: Default::default(),
+                        filegroup: None,
+                    },
+                );
+            }),
+            &declared,
+            &[][..],
+            "its unique constraint `t_u` is not its parent's",
+        ),
+        (
+            ordinary(&|t| {
+                t.checks.remove("ev_n_ck");
+            }),
+            &declared,
+            &[][..],
+            "its parent's check `ev_n_ck` is not on it",
+        ),
+        (
+            ordinary(&|t| {
+                t.replica_identity = Some(pbps_model::ReplicaIdentity::Full);
+            }),
+            &declared,
+            &[][..],
+            "replica identity",
+        ),
+        (
+            ordinary(&|t| {
+                t.data = Some(pbps_model::TableData {
+                    mode: pbps_model::DataMode::Exact,
+                    rows: Default::default(),
+                });
+            }),
+            &declared,
+            &[][..],
+            "`data:`",
+        ),
+        (
+            unpartitioned,
+            &declared,
+            &[][..],
+            "is not a partitioned table before this plan",
+        ),
+        (
+            ordinary(&|_| {}),
+            &renamed,
+            &rename[..],
+            "renamed from app.t",
+        ),
+        (
+            referencing_base,
+            &referencing_declared,
+            &[][..],
+            "the foreign key `r2_t` of app.r2 references it",
+        ),
+    ] {
+        let found = refused(&base, declared, intents);
+        assert!(
+            found
+                .iter()
+                .any(|e| e.contains("is attached to app.ev") && e.contains(expected)),
+            "{expected}: {found:?}"
+        );
+    }
+
+    // As the parent's DEFAULT partition, which it does not have yet: the
+    // same attach, with the DEFAULT bound (#1639, DEC-1639.1).
+    let planned = outcome(&base, &attached(PartitionBound::Default), &[])
+        .2
+        .expect("an attach as the DEFAULT partition is planned");
+    assert_eq!(
+        kinds(&planned),
+        ["DropIndex", "AttachPartition", "SetPartitionDefault"],
+        "{:?}",
+        planned.changes
+    );
+    assert!(
+        matches!(
+            &planned.changes[1].change,
+            Change::Partition(PartitionChange::AttachPartition {
+                bound: PartitionBound::Default,
+                ..
+            })
+        ),
+        "{:?}",
+        planned.changes
+    );
+
+    // A trigger on it stays a module of the partition's own through the
+    // attach (DEC-1632.3): planned, with no change to the trigger.
+    let planned = outcome(&triggered_base, &triggered, &[])
+        .2
+        .expect("an attach with a trigger on the table is planned");
+    assert!(
+        planned.changes.iter().any(|c| matches!(
+            c.change,
+            Change::Partition(PartitionChange::AttachPartition { .. })
+        )) && !planned
+            .changes
+            .iter()
+            .any(|c| matches!(c.change, Change::Module(_))),
+        "{:?}",
+        kinds(&planned)
+    );
+
+    // A foreign key the parent's does not match stays the partition's
+    // own through the attach (#1632): kept where it declares it as its
+    // own, dropped where it does not, as an own check is.
+    let cascade = pbps_model::ForeignKey {
+        on_delete: pbps_model::ReferentialAction::Cascade,
+        ..fk.clone()
+    };
+    let cascading = ordinary(&|t| {
+        t.foreign_keys.insert("t_fk".into(), cascade.clone());
+    });
+    let mut keeps = declared.clone();
+    keeps
+        .tables
+        .get_mut(&"app.t".parse::<TableName>().unwrap())
+        .unwrap()
+        .foreign_keys
+        .insert("t_fk".into(), cascade.clone());
+    let planned = outcome(&cascading, &keeps, &[])
+        .2
+        .expect("an attach keeping its own foreign key is planned");
+    assert!(
+        !kinds(&planned)
+            .iter()
+            .any(|k| k == "DropForeignKey" || k == "AddForeignKey"),
+        "{:?}",
+        planned.changes
+    );
+    // `t_fk`, equal to the parent's `ev_n_fk`, becomes its clone and
+    // keeps its name; declared again as its own with another action, it
+    // is dropped before the attach and added after it, or the add would
+    // meet the clone as `already exists` (#1632 review).
+    let mut reused = declared.clone();
+    reused
+        .tables
+        .get_mut(&"app.t".parse::<TableName>().unwrap())
+        .unwrap()
+        .foreign_keys
+        .insert("t_fk".into(), cascade.clone());
+    let planned = outcome(&base, &reused, &[])
+        .2
+        .expect("an attach reusing an adopted name is planned");
+    let at = |f: &dyn Fn(&Change) -> bool| {
+        planned
+            .changes
+            .iter()
+            .position(|c| f(&c.change))
+            .unwrap_or_else(|| panic!("{:?}", planned.changes))
+    };
+    let dropped = at(
+        &|c| matches!(c, Change::Constraint(ConstraintChange::DropForeignKey { name, .. }) if name.raw() == "t_fk"),
+    );
+    let attach = at(&|c| {
+        matches!(
+            c,
+            Change::Partition(PartitionChange::AttachPartition { .. })
+        )
+    });
+    let added = at(
+        &|c| matches!(c, Change::Constraint(ConstraintChange::AddForeignKey { name, .. }) if name.raw() == "t_fk"),
+    );
+    assert!(dropped < attach && attach < added, "{:?}", planned.changes);
+    // Two equal to the parent's: the engine takes one by an order the
+    // model does not hold, so both are dropped before the attach and
+    // the engine clones the parent's; nothing is dropped after it, where
+    // the name could be the clone's (#1632 review).
+    let twins = ordinary(&|t| {
+        t.foreign_keys.insert("t_fk2".into(), fk.clone());
+    });
+    let planned = outcome(&twins, &declared, &[])
+        .2
+        .expect("an attach of twins is planned");
+    let attach = planned
+        .changes
+        .iter()
+        .position(|c| {
+            matches!(
+                c.change,
+                Change::Partition(PartitionChange::AttachPartition { .. })
+            )
+        })
+        .unwrap_or_else(|| panic!("{:?}", planned.changes));
+    let dropped: Vec<(usize, &str)> = planned
+        .changes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| match &c.change {
+            Change::Constraint(ConstraintChange::DropForeignKey { name, .. }) => {
+                Some((i, name.raw()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        dropped.iter().map(|(_, n)| *n).collect::<Vec<_>>(),
+        ["t_fk", "t_fk2"],
+        "{:?}",
+        planned.changes
+    );
+    assert!(
+        dropped.iter().all(|(i, _)| *i < attach),
+        "{:?}",
+        planned.changes
+    );
+    assert!(
+        !planned.changes.iter().any(|c| matches!(
+            c.change,
+            Change::Constraint(ConstraintChange::AddForeignKey { .. })
+        )),
+        "{:?}",
+        planned.changes
+    );
+    // Negative: its name not reused, it is the clone and nothing else.
+    let (_, _, plain) = outcome(&base, &declared, &[]);
+    assert!(!plain.expect("planned").changes.iter().any(|c| matches!(
+        c.change,
+        Change::Constraint(ConstraintChange::DropForeignKey { .. })
+            | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+    )),);
+    let planned = outcome(&cascading, &declared, &[])
+        .2
+        .expect("an attach dropping its own foreign key is planned");
+    assert!(
+        planned.changes.iter().any(|c| matches!(
+            &c.change,
+            Change::Constraint(ConstraintChange::DropForeignKey { table, name }) if table.raw().to_string() == "app.t" && name.raw() == "t_fk"
+        )),
+        "{:?}",
+        planned.changes
+    );
+
+    // In another schema, a default of the parent's text may name another
+    // schema's object: it is the table's own, and the parent's is set
+    // back, under the parent's path.
+    let elsewhere = |schema: &Schema| {
+        let mut moved = schema.clone();
+        let t = moved
+            .tables
+            .remove(&"app.t".parse::<TableName>().unwrap())
+            .unwrap();
+        moved.tables.insert("x.t".parse().unwrap(), t);
+        moved
+    };
+    let other = elsewhere(&ordinary(&|t| {
+        t.columns["n"].value_source = pbps_model::ValueSource::Default("0".into())
+    }));
+    let other_declared = elsewhere(&declared);
+    let set_back = outcome(&other, &other_declared, &[]).2.expect("attached");
+    assert!(
+        set_back.changes.iter().any(|p| matches!(
+            &p.change,
+            Change::Partition(PartitionChange::SetPartitionDefault { table, column, from: Some(f), to: None, .. })
+                if table.raw().to_string() == "x.t" && column.raw() == "n" && f == "0"
+        )),
+        "{:?}",
+        set_back.changes
+    );
+    // Negative: in the parent's schema the same text is the parent's.
+    let same = outcome(
+        &ordinary(&|t| t.columns["n"].value_source = pbps_model::ValueSource::Default("0".into())),
+        &declared,
+        &[],
+    )
+    .2
+    .expect("attached");
+    assert_eq!(kinds(&same), ["DropIndex", "AttachPartition"]);
+    // A check or a generation expression the table spells otherwise than
+    // its parent, as `n>0` beside `n > 0`: offline matched by name and
+    // kind, the texts unseen; connected, compared in the engine's own
+    // spelling of both, which is one text (#1642 review).
+    let connected = |base: &Schema, declared: &Schema, read_back: &Schema| {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(declared, &base_ids, &[], &ctx())
+            .unwrap()
+            .ids;
+        crate::diff_read_back(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+            &BTreeSet::new(),
+            Screen::Text,
+            read_back,
+        )
+    };
+    let respelled = ordinary(&|t| {
+        t.checks.insert("ev_n_ck".into(), check("n>0"));
+    });
+    outcome(&respelled, &declared, &[])
+        .2
+        .expect("offline, matched by name");
+    let mut engine = respelled.clone();
+    for t in ["app.ev", "app.t"] {
+        engine
+            .tables
+            .get_mut(&t.parse::<TableName>().unwrap())
+            .unwrap()
+            .checks
+            .insert("ev_n_ck".into(), check("(n > 0)"));
+    }
+    connected(&respelled, &declared, &engine).expect("one check to the engine");
+    // Negative: a read-back that spells them apart still refuses.
+    let mut apart = engine.clone();
+    apart
+        .tables
+        .get_mut(&"app.t".parse::<TableName>().unwrap())
+        .unwrap()
+        .checks
+        .insert("ev_n_ck".into(), check("(n > 1)"));
+    let e = connected(&respelled, &declared, &apart).expect_err("another check");
+    assert!(
+        e.iter().any(|m| m
+            .to_string()
+            .contains("its parent's check `ev_n_ck` is not on it")),
+        "{e:?}"
+    );
+    // The same for a generation expression, in the parent's schema.
+    let generate = |schema: &Schema, spellings: &[(&str, &str)]| {
+        let mut schema = schema.clone();
+        for (t, expression) in spellings {
+            let mut g = Column::new(ty("int"));
+            g.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
+                expression: (*expression).into(),
+                stored: true,
+            });
+            schema
+                .tables
+                .get_mut(&t.parse::<TableName>().unwrap())
+                .unwrap()
+                .columns
+                .insert("g".into(), g);
+        }
+        schema
+    };
+    let g_respelled = generate(&base, &[("app.ev", "n + 1"), ("app.t", "n+1")]);
+    let g_declared = generate(&declared, &[("app.ev", "n + 1")]);
+    outcome(&g_respelled, &g_declared, &[])
+        .2
+        .expect("offline, matched by kind");
+    let g_engine = generate(&base, &[("app.ev", "(n + 1)"), ("app.t", "(n + 1)")]);
+    connected(&g_respelled, &g_declared, &g_engine).expect("one expression to the engine");
+    // Column names are compared as names: `a, b` then `c` is not `a`
+    // then `b, c`, though both lists join to one text.
+    let names = |schema: &Schema, table: &str, columns: &[&str]| {
+        let mut schema = schema.clone();
+        let t = schema
+            .tables
+            .get_mut(&table.parse::<TableName>().unwrap())
+            .unwrap();
+        for c in columns {
+            t.columns.insert((*c).into(), Column::new(ty("int")));
+        }
+        schema
+    };
+    let e = refused(
+        &names(
+            &names(&base, "app.ev", &["a, b", "c"]),
+            "app.t",
+            &["a", "b, c"],
+        ),
+        &names(&declared, "app.ev", &["a, b", "c"]),
+        &[],
+    );
+    assert!(e.iter().any(|m| m.contains("in that order")), "{e:?}");
+
+    // A generated column: the engine keeps the table's expression, so in
+    // another schema the attach is refused, and in the parent's it plans.
+    let generated = |schema: &Schema, tables: &[&str]| {
+        let mut schema = schema.clone();
+        for t in tables {
+            let mut g = Column::new(ty("int"));
+            g.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
+                expression: "f(n)".into(),
+                stored: true,
+            });
+            schema
+                .tables
+                .get_mut(&t.parse::<TableName>().unwrap())
+                .unwrap()
+                .columns
+                .insert("g".into(), g);
+        }
+        schema
+    };
+    let g_base = generated(&base, &["app.ev", "app.t"]);
+    let g_declared = generated(&declared, &["app.ev"]);
+    let e = refused(&elsewhere(&g_base), &elsewhere(&g_declared), &[]);
+    assert!(
+        e.iter()
+            .any(|m| m.contains("its column `g` is generated, and in another schema")),
+        "{e:?}"
+    );
+    outcome(&g_base, &g_declared, &[])
+        .2
+        .expect("a generated column attaches in its parent's schema");
+    // An expression index kept as its own is dropped before the attach
+    // and built again after, in another schema and in the parent's.
+    let expression = |t: &mut Table| {
+        t.indexes.insert(
+            "t_f".into(),
+            Index {
+                columns: vec![pbps_model::IndexColumn {
+                    key: pbps_model::IndexKey::Expression("f(n)".into()),
+                    descending: false,
+                    opclass: None,
+                    collation: None,
+                    opclass_parameters: Default::default(),
+                }],
+                ..index_on("n")
+            },
+        );
+    };
+    let mut keeps_t_f = declared.clone();
+    expression(
+        keeps_t_f
+            .tables
+            .get_mut(&"app.t".parse::<TableName>().unwrap())
+            .unwrap(),
+    );
+    let with_t_f = ordinary(&|t| expression(t));
+    let rebuilt = outcome(&elsewhere(&with_t_f), &elsewhere(&keeps_t_f), &[])
+        .2
+        .expect("rebuilt");
+    assert_eq!(
+        order_of(&rebuilt),
+        ["drop t_f", "drop t_id", "attach", "add t_f"]
+    );
+    // In the parent's schema too: `f(n)` and the engine's own spelling of
+    // it are not told apart by text.
+    let kept = outcome(&with_t_f, &keeps_t_f, &[]).2.expect("kept");
+    assert_eq!(
+        order_of(&kept),
+        ["drop t_f", "drop t_id", "attach", "add t_f"]
+    );
+
+    // Negative: an ordinary table that stays one keeps its column uids,
+    // and plans nothing.
+    let (_, stay_ids, stays) = outcome(&base, &base, &[]);
+    assert!(stays.expect("nothing changes").changes.is_empty());
+    assert_eq!(on(&stay_ids, "app.t").len(), 3);
+}
+
+/// A detach keeps the partition's clone of its parent's exclusion as an own constraint
+/// under the engine's name (measured on 18.6), which no recipe names yet: a partition of
+/// a parent that holds one is not detached (DEC-2448.6, #2448). Negative: the same detach
+/// of a parent with none is planned.
+#[test]
+fn a_partition_of_a_parent_with_an_exclusion_is_not_detached() {
+    let mut parent = booking(&[])
+        .tables
+        .remove(&"app.booking".parse::<TableName>().unwrap())
+        .unwrap();
+    parent.partition_by = Some(pbps_model::PartitionBy {
+        external: false,
+        columns: vec!["a".into()],
+        strategy: Default::default(),
+    });
+    let partition = Table {
+        partition_of: Some(pbps_model::PartitionOf {
+            parent: "app.booking".parse().unwrap(),
+            bound: pbps_model::PartitionBound::Default,
+            columns: Default::default(),
+        }),
+        ..Default::default()
+    };
+    let declared = Table {
+        partition_by: None,
+        ..parent.clone()
+    };
+    let detach =
+        |parent: &Table| detached_names(parent, &partition, &declared, &MinimalDialect, false);
+    assert!(detach(&parent).is_ok());
+    parent.exclude.insert("x".into(), parent_exclusion());
+    let said = detach(&parent).unwrap_err().join("\n");
+    assert!(
+        said.contains("holds exclusion constraint(s) `x`") && said.contains("#2448"),
+        "{said}"
+    );
+}
+
+/// A partition declared as an ordinary table of its parent's shape is
+/// detached, under the names the declaration gives each of its parent's
+/// objects, and nothing else is planned for it (#1544). Any other shape
+/// is refused by name, and so is a detach and a rename at once. A type in
+/// another spelling, and a foreign key to a table this plan renames
+/// declared under the new name, are still the parent's shape.
+#[test]
+fn a_partition_declared_as_its_parents_shape_is_detached() {
+    use pbps_model::{PartitionBound, PartitionBy, PartitionOf};
+    let mut parent = table(&[
+        ("id", Column::new(ty("int")).not_null()),
+        ("ts", Column::new(ty("date")).not_null()),
+        ("n", Column::new(ty("int"))),
+    ]);
+    parent.primary_key = Some(PrimaryKey {
+        name: Some("ev_pk".into()),
+        columns: vec!["id".into(), "ts".into()],
+        storage_parameters: Default::default(),
+        filegroup: None,
+    });
+    parent.checks.insert(
+        "ev_n_ck".into(),
+        pbps_model::CheckConstraint {
+            expression: "n > 0".into(),
+        },
+    );
+    parent.indexes.insert(
+        "ev_n".into(),
+        Index {
+            columns: vec![pbps_model::IndexColumn {
+                key: pbps_model::IndexKey::Column("n".into()),
+                descending: false,
+                opclass: None,
+                collation: None,
+                opclass_parameters: Default::default(),
+            }],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+            filegroup: None,
+        },
+    );
+    parent.foreign_keys.insert(
+        "ev_n_fk".into(),
+        pbps_model::ForeignKey {
+            columns: vec!["n".into()],
+            references_table: "app.r".parse().unwrap(),
+            references_columns: vec!["id".into()],
+            on_delete: pbps_model::ReferentialAction::NoAction,
+            on_update: pbps_model::ReferentialAction::NoAction,
+        },
+    );
+    parent.partition_by = Some(PartitionBy {
+        external: false,
+        columns: vec!["ts".into()],
+        strategy: Default::default(),
+    });
+    let mut tree = schema_of("app.ev", parent.clone());
+    let mut referenced = table(&[("id", Column::new(ty("int")).not_null())]);
+    referenced.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+        filegroup: None,
+    });
+    tree.tables.insert("app.r".parse().unwrap(), referenced);
+    tree.tables.insert(
+        "app.ev_1".parse().unwrap(),
+        Table {
+            partition_of: Some(PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound: PartitionBound::Default,
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        },
+    );
+    let shape = |f: &dyn Fn(&mut Table)| {
+        let mut t = Table {
+            partition_by: None,
+            ..parent.clone()
+        };
+        t.primary_key.as_mut().unwrap().name = None;
+        let check = t.checks.remove("ev_n_ck").unwrap();
+        t.checks.insert("arch_ck".into(), check);
+        let index = t.indexes.remove("ev_n").unwrap();
+        t.indexes.insert("arch_n".into(), index);
+        f(&mut t);
+        let mut declared = tree.clone();
+        declared.tables.insert("app.ev_1".parse().unwrap(), t);
+        declared
+    };
+    let outcome_in = |declared: &Schema, intents: &[Intent], dialect: &dyn Dialect| {
+        let base_ids = crate::resolve(&tree, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+            .unwrap()
+            .ids;
+        diff(
+            Side {
+                schema: &tree,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            dialect,
+            &Hints::default(),
+        )
+    };
+    let outcome =
+        |declared: &Schema, intents: &[Intent]| outcome_in(declared, intents, &MinimalDialect);
+    let planned = outcome(&shape(&|_| {}), &[]).expect("a detach is planned");
+    assert_eq!(planned.changes.len(), 1, "{:?}", planned.changes);
+    let Change::Partition(PartitionChange::DetachPartition {
+        table: detached,
+        parent: from,
+        names,
+        ..
+    }) = &planned.changes[0].change
+    else {
+        panic!("{:?}", planned.changes)
+    };
+    assert_eq!(detached.raw().to_string(), "app.ev_1");
+    assert_eq!(from.raw().to_string(), "app.ev");
+    let pairs: Vec<(DetachedKind, &str, Option<&str>)> = names
+        .iter()
+        .map(|n| {
+            (
+                n.kind,
+                n.parent.raw(),
+                n.name.as_ref().map(pbps_model::ObjectLocalName::raw),
+            )
+        })
+        .collect();
+    assert_eq!(
+        pairs,
+        [
+            (DetachedKind::PrimaryKey, "ev_pk", None),
+            (DetachedKind::ForeignKey, "ev_n_fk", Some("ev_n_fk")),
+            (DetachedKind::Check, "ev_n_ck", Some("arch_ck")),
+            (DetachedKind::Index, "ev_n", Some("arch_n")),
+        ]
+    );
+
+    // A detach claiming a name a dropped table's index holds runs after
+    // the drop, though the drop's table sorts later by name.
+    let mut handed = shape(&|t| {
+        let index = t.indexes.remove("arch_n").unwrap();
+        t.indexes.insert("old_n".into(), index);
+    });
+    handed
+        .tables
+        .remove(&"app.z_old".parse::<TableName>().unwrap());
+    let mut with_old = tree.clone();
+    let mut old = table(&[("n", Column::new(ty("int")))]);
+    old.indexes
+        .insert("old_n".into(), parent.indexes["ev_n"].clone());
+    with_old.tables.insert("app.z_old".parse().unwrap(), old);
+    let base_ids = crate::resolve(&with_old, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let handed_ids = crate::resolve(
+        &handed,
+        &base_ids,
+        &[Intent::DropTable {
+            table: "app.z_old".parse().unwrap(),
+            reason: "archived".parse().unwrap(),
+        }],
+        &ctx(),
+    )
+    .unwrap()
+    .ids;
+    let planned = diff(
+        Side {
+            schema: &with_old,
+            ids: &base_ids,
+        },
+        Side {
+            schema: &handed,
+            ids: &handed_ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+    )
+    .expect("a detach beside a drop");
+    let kinds: Vec<&str> = planned
+        .changes
+        .iter()
+        .map(|p| match p.change {
+            Change::Partition(PartitionChange::DetachPartition { .. }) => "detach",
+            Change::Table(TableChange::DropTable { .. }) => "drop",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(kinds, ["drop", "detach"], "{:?}", planned.changes);
+
+    // A description is prose, and differs from the parent's freely: a
+    // connected base never holds one.
+    let described = shape(&|t| {
+        t.description = Some("last year's events".into());
+        t.columns["n"].description = Some("a count".into());
+    });
+    let planned = outcome(&described, &[]).expect("a description is not shape");
+    assert!(
+        matches!(
+            planned.changes.as_slice(),
+            [p] if matches!(p.change, Change::Partition(PartitionChange::DetachPartition { .. }))
+        ),
+        "{:?}",
+        planned.changes
+    );
+
+    // A type in another spelling is the parent's type, in a dialect that
+    // spells both alike; one that does not tells them apart.
+    let respelled = shape(&|t| t.columns["id"].ty = ty("integer"));
+    let planned = outcome_in(&respelled, &[], &Aliases).expect("an alias is the same type");
+    assert!(
+        matches!(
+            planned.changes.as_slice(),
+            [p] if matches!(p.change, Change::Partition(PartitionChange::DetachPartition { .. }))
+        ),
+        "{:?}",
+        planned.changes
+    );
+    let errors = outcome(&respelled, &[]).expect_err("two types are refused");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.to_string().contains("its columns are not its parent's")),
+        "{errors:?}"
+    );
+
+    // A foreign key to a table this plan renames is declared under the
+    // new name, and is still the parent's.
+    let mut moved = shape(&|t| {
+        t.foreign_keys.get_mut("ev_n_fk").unwrap().references_table = "app.r2".parse().unwrap();
+    });
+    let rename_r = |s: &mut Schema| {
+        let r = s
+            .tables
+            .remove(&"app.r".parse::<TableName>().unwrap())
+            .unwrap();
+        s.tables.insert("app.r2".parse().unwrap(), r);
+        s.tables
+            .get_mut(&"app.ev".parse::<TableName>().unwrap())
+            .unwrap()
+            .foreign_keys
+            .get_mut("ev_n_fk")
+            .unwrap()
+            .references_table = "app.r2".parse().unwrap();
+    };
+    rename_r(&mut moved);
+    let planned = outcome(
+        &moved,
+        &[Intent::RenameTable {
+            from: "app.r".parse().unwrap(),
+            to: "app.r2".parse().unwrap(),
+        }],
+    )
+    .expect("a detach beside a rename of what it references");
+    let mut kinds: Vec<&str> = planned
+        .changes
+        .iter()
+        .map(|p| match p.change {
+            Change::Partition(PartitionChange::DetachPartition { .. }) => "detach",
+            Change::Table(TableChange::RenameTable { .. }) => "rename",
+            _ => "other",
+        })
+        .collect();
+    kinds.sort_unstable();
+    assert_eq!(kinds, ["detach", "rename"], "{:?}", planned.changes);
+    // Negative: the old name is no longer the parent's reference.
+    let mut stale = shape(&|_| {});
+    rename_r(&mut stale);
+    let errors = outcome(
+        &stale,
+        &[Intent::RenameTable {
+            from: "app.r".parse().unwrap(),
+            to: "app.r2".parse().unwrap(),
+        }],
+    )
+    .expect_err("a key still naming the old table is not the parent's");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.to_string().contains("foreign key `ev_n_fk` is missing")),
+        "{errors:?}"
+    );
+
+    for (declared, expected) in [
+        (
+            shape(&|t| {
+                let n = t.columns.shift_remove("n").unwrap();
+                t.columns.shift_insert(0, "n".into(), n);
+            }),
+            "its columns are not its parent's",
+        ),
+        (
+            shape(&|t| {
+                t.indexes.clear();
+            }),
+            "index `ev_n` is missing",
+        ),
+        (
+            shape(&|t| {
+                t.unique.insert(
+                    "extra".into(),
+                    UniqueConstraint {
+                        columns: vec!["n".into()],
+                        storage_parameters: Default::default(),
+                        filegroup: None,
+                    },
+                );
+            }),
+            "unique constraint `extra` is not its parent's",
+        ),
+        (
+            shape(&|t| {
+                t.data = Some(pbps_model::TableData {
+                    mode: DataMode::Exact,
+                    rows: Default::default(),
+                });
+            }),
+            "neither its parent's nor its own",
+        ),
+    ] {
+        let errors = outcome(&declared, &[]).expect_err(expected);
+        let said: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        assert!(
+            said.iter()
+                .any(|e| e.contains("is detached from app.ev") && e.contains(expected)),
+            "{expected}: {said:?}"
+        );
+    }
+
+    // Negative: a detach and a rename at once is the rename's refusal.
+    let mut renamed = shape(&|_| {});
+    let moved = renamed
+        .tables
+        .remove(&"app.ev_1".parse::<TableName>().unwrap())
+        .unwrap();
+    renamed.tables.insert("app.ev_old".parse().unwrap(), moved);
+    let errors = outcome(
+        &renamed,
+        &[Intent::RenameTable {
+            from: "app.ev_1".parse().unwrap(),
+            to: "app.ev_old".parse().unwrap(),
+        }],
+    )
+    .expect_err("a rename of a partition is refused");
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, DiffError::PartitionedTableChange { .. })),
+        "{errors:?}"
+    );
+}
+
+/// A serial fallback is supplied by the dialect, not by naming a
+/// PostgreSQL sequence in the differ (DEC-2218.1).
+#[test]
+fn an_attached_partition_takes_its_serial_parents_default_unless_it_declares_its_own() {
+    use pbps_model::{
+        Identity, OwnedSequence, PartitionBound, PartitionBy, PartitionColumn, PartitionOf,
+    };
+
+    let plain = table(&[
+        ("id", Column::new(ty("bigint")).not_null()),
+        ("v", Column::new(ty("integer"))),
+    ]);
+    for source in [
+        ValueSource::Default("42".into()),
+        ValueSource::Sequence(OwnedSequence::serial()),
+        ValueSource::Identity(Identity::new(1, 1)),
+    ] {
+        let mut parent = plain.clone();
+        parent.columns["id"].value_source = source.clone();
+        parent.partition_by = Some(PartitionBy {
+            external: false,
+            columns: vec!["v".into()],
+            strategy: Default::default(),
+        });
+        let mut base = schema_of("app.p", parent);
+        // The partition takes the parent's identity; the ordinary table
+        // must have none of its own (DEC-1681.2).
+        base.tables.insert("app.t".parse().unwrap(), plain.clone());
+        let mut declared = base.clone();
+        let partition = Table {
+            partition_of: Some(PartitionOf {
+                parent: "app.p".parse().unwrap(),
+                bound: PartitionBound::Default,
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        };
+        declared.tables.insert("app.t".parse().unwrap(), partition);
+        let planned = run_with(&SerialDefaults, &base, &declared, &[]);
+        let expected = match &source {
+            ValueSource::Default(value) => Some(value.as_str()),
+            ValueSource::Sequence(_) => Some("dialect serial default"),
+            ValueSource::Identity(_) => None,
+            ValueSource::None | ValueSource::Generated(_) => unreachable!("test sources"),
+        };
+        if let Some(expected) = expected {
+            assert_eq!(kinds(&planned), ["AttachPartition", "SetPartitionDefault"]);
+            assert!(matches!(
+                &planned.changes[1].change,
+                Change::Partition(PartitionChange::SetPartitionDefault { to: None, fallback: Some(f), .. }) if f == expected
+            ));
+        } else {
+            assert_eq!(kinds(&planned), ["AttachPartition"]);
+            continue;
+        }
+
+        // An own default is set once; no later fallback overwrites it.
+        declared
+            .tables
+            .get_mut(&"app.t".parse::<TableName>().unwrap())
+            .unwrap()
+            .partition_of
+            .as_mut()
+            .unwrap()
+            .columns
+            .insert(
+                "id".into(),
+                PartitionColumn {
+                    default: Some("7".into()),
+                    not_null: false,
+                },
+            );
+        let own = run_with(&SerialDefaults, &base, &declared, &[]);
+        assert_eq!(kinds(&own), ["AttachPartition", "SetPartitionDefault"]);
+        assert!(matches!(
+            &own.changes[1].change,
+            Change::Partition(PartitionChange::SetPartitionDefault { to: Some(value), .. }) if value == "7"
+        ));
+
+        // Removing that override on a standing partition restores the
+        // same fallback as the attach, including a serial's expression.
+        let mut restored = declared.clone();
+        restored
+            .tables
+            .get_mut(&"app.t".parse::<TableName>().unwrap())
+            .unwrap()
+            .partition_of
+            .as_mut()
+            .unwrap()
+            .columns
+            .clear();
+        let planned = run_with(&SerialDefaults, &declared, &restored, &[]);
+        assert_eq!(kinds(&planned), ["SetPartitionDefault"]);
+        assert!(matches!(
+            &planned.changes[0].change,
+            Change::Partition(PartitionChange::SetPartitionDefault { to: None, fallback: Some(f), .. }) if Some(f.as_str()) == expected
+        ));
+        if let ValueSource::Sequence(sequence) = &source {
+            let mut recorded = declared.clone();
+            recorded
+                .tables
+                .get_mut(&TableName::new("app", "p"))
+                .unwrap()
+                .columns["id"]
+                .value_source = ValueSource::Sequence(OwnedSequence {
+                name: Some("known sequence default".into()),
+                ..sequence.clone()
+            });
+            assert!(run_with(&SerialDefaults, &recorded, &declared, &[]).is_empty());
+            let planned = run_with(&SerialDefaults, &recorded, &restored, &[]);
+            assert!(matches!(&planned.changes[0].change,
+                Change::Partition(PartitionChange::SetPartitionDefault { fallback: Some(f), .. }) if f == "known sequence default"));
+
+            // An ordinary table's own sequence is not an inherited
+            // copy: silently discarding its ownership would lose intent.
+            base.tables
+                .get_mut(&TableName::new("app", "t"))
+                .unwrap()
+                .columns["id"]
+                .value_source = source.clone();
+            let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(&declared, &base_ids, &[], &ctx())
+                .unwrap()
+                .ids;
+            let errors = diff(
+                Side {
+                    schema: &base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: &declared,
+                    ids: &declared_ids,
+                },
+                &SerialDefaults,
+                &Hints::default(),
+            )
+            .unwrap_err();
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| matches!(e, DiffError::AttachedShape { .. })),
+                "{errors:?}"
+            );
+        }
+    }
+}
+
+/// Serial changes recurse into a standing parent's partitions. An own
+/// default follows the recursion, including an override on a new column.
+#[test]
+fn a_standing_parents_serial_changes_restore_its_partitions_own_default() {
+    use pbps_model::{
+        Identity, OwnedSequence, PartitionBound, PartitionBy, PartitionColumn, PartitionOf,
+    };
+
+    let serial = ValueSource::Sequence(OwnedSequence::serial());
+    let retuned = ValueSource::Sequence(OwnedSequence {
+        options: pbps_model::SequenceOptions {
+            max: Some(1000),
+            ..Default::default()
+        },
+        ..OwnedSequence::serial()
+    });
+    let tree = |source: Option<ValueSource>, own: bool, external: bool| {
+        let mut parent = table(&[("v", Column::new(ty("integer")))]);
+        if let Some(source) = source {
+            let mut c = Column::new(ty("bigint")).not_null();
+            c.value_source = source;
+            parent.columns.insert("id".into(), c);
+        }
+        parent.partition_by = Some(PartitionBy {
+            external,
+            columns: vec!["v".into()],
+            strategy: Default::default(),
+        });
+        let mut schema = schema_of("app.p", parent);
+        if !external {
+            schema.tables.insert(
+                "app.a".parse().unwrap(),
+                Table {
+                    partition_of: Some(PartitionOf {
+                        parent: "app.p".parse().unwrap(),
+                        bound: PartitionBound::Default,
+                        columns: if own {
+                            [(
+                                "id".into(),
+                                PartitionColumn {
+                                    default: Some("7".into()),
+                                    not_null: false,
+                                },
+                            )]
+                            .into()
+                        } else {
+                            Default::default()
+                        },
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+        schema
+    };
+    let outcome = |base: &Schema, declared: &Schema, intents: &[Intent]| {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+            .unwrap()
+            .ids;
+        diff(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &SerialDefaults,
+            &Hints::default(),
+        )
+    };
+    for (from, to) in [
+        (None, Some(serial.clone())),
+        (Some(serial.clone()), Some(retuned)),
+        (Some(serial.clone()), Some(ValueSource::None)),
+        (
+            Some(serial.clone()),
+            Some(ValueSource::Default("42".into())),
+        ),
+        (Some(ValueSource::None), Some(serial.clone())),
+        (
+            Some(ValueSource::Default("42".into())),
+            Some(serial.clone()),
+        ),
+        (Some(serial.clone()), None),
+    ] {
+        for external in [false, true] {
+            for own in [false, true] {
+                let base = tree(from.clone(), own && from.is_some(), external);
+                let declared = tree(to.clone(), own && to.is_some(), external);
+                let intents = if to.is_none() {
+                    vec![Intent::DropColumn {
+                        column: "app.p.id".parse().unwrap(),
+                        reason: "retired".parse().unwrap(),
+                    }]
+                } else {
+                    vec![]
+                };
+                let cs = outcome(&base, &declared, &intents)
+                    .unwrap_or_else(|e| panic!("{from:?} -> {to:?}: {e:?}"));
+                let parent = cs
+                    .changes
+                    .iter()
+                    .rposition(|p| p.change.table() == Some(&TableName::new("app", "p")))
+                    .unwrap();
+                let own_step = cs.changes.iter().position(|p| matches!(&p.change, Change::Partition(PartitionChange::SetPartitionDefault { to: Some(d), .. }) if d == "7"));
+                if own && to.is_some() && !external {
+                    assert!(
+                        own_step.is_some_and(|i| i > parent),
+                        "{from:?} -> {to:?}: {cs:?}"
+                    );
+                } else {
+                    assert!(own_step.is_none(), "no override to restore: {cs:?}");
+                }
+                assert!(outcome(&declared, &declared, &[]).unwrap().is_empty());
+            }
+        }
+    }
+    // Neither direction of a serial/identity conversion has uniform
+    // partition inheritance on 16 and 18; name the identity limitation.
+    let identity = ValueSource::Identity(Identity::new(1, 1));
+    for (from, to) in [
+        (serial.clone(), identity.clone()),
+        (identity, serial.clone()),
+    ] {
+        let errors = outcome(
+            &tree(Some(from), false, false),
+            &tree(Some(to), false, false),
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(errors.as_slice(), [DiffError::NumberingChangeOnPartitionedTable { column }] if column == &"app.p.id".parse().unwrap()),
+            "{errors:?}"
+        );
+    }
+    // The existing two-plan rule also covers numbering changes. Exercise
+    // attach, detach and drop separately, without weakening #1692.
+    for transition in ["attach", "detach", "drop"] {
+        let mut base = tree(Some(ValueSource::None), false, false);
+        let mut declared = tree(Some(serial.clone()), false, false);
+        let mut plain = declared.tables[&TableName::new("app", "p")].clone();
+        plain.partition_by = None;
+        let intents = match transition {
+            "attach" => {
+                plain.columns["id"].value_source = ValueSource::None;
+                base.tables.insert(TableName::new("app", "a"), plain);
+                vec![]
+            }
+            "detach" => {
+                declared.tables.insert(TableName::new("app", "a"), plain);
+                vec![]
+            }
+            "drop" => {
+                declared.tables.remove(&TableName::new("app", "a"));
+                vec![Intent::DropTable {
+                    table: TableName::new("app", "a"),
+                    reason: "retired".parse().unwrap(),
+                }]
+            }
+            _ => unreachable!(),
+        };
+        let errors = outcome(&base, &declared, &intents).unwrap_err();
+        assert!(errors.iter().any(|e| matches!(e, DiffError::PartitionedTableChange { what, .. } if what.iter().any(|w| w.contains("separate plans")))), "{transition}: {errors:?}");
+    }
+}
+
+/// Returning opaque text proves that the differ uses the dialect's
+/// answer without constructing SQL or a generated sequence name itself.
+struct SerialDefaults;
+
+impl Dialect for SerialDefaults {
+    fn name(&self) -> &'static str {
+        "serial-defaults"
+    }
+    fn changes_numbering(&self) -> bool {
+        true
+    }
+    fn owned_sequence_default(
+        &self,
+        table: &TableName,
+        column: &str,
+        sequence: &pbps_model::OwnedSequence,
+    ) -> Result<String, pbps_dialect::DialectError> {
+        assert_eq!(table, &TableName::new("app", "p"));
+        assert_eq!(column, "id");
+        Ok(sequence
+            .name
+            .clone()
+            .unwrap_or_else(|| "dialect serial default".into()))
+    }
+    fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
+        MinimalDialect.quote_ident(ident)
+    }
+    fn intermediate_tables(
+        &self,
+        change: &Change,
+        strategy: pbps_model::Strategy,
+    ) -> Result<Vec<pbps_model::TableName>, pbps_dialect::DialectError> {
+        MinimalDialect.intermediate_tables(change, strategy)
+    }
+    fn normalize_type(&self, ty: &ColumnType) -> Result<ColumnType, pbps_dialect::DialectError> {
+        MinimalDialect.normalize_type(ty)
+    }
+    fn type_change_risk(&self, from: &ColumnType, to: &ColumnType) -> pbps_dialect::TypeChangeRisk {
+        MinimalDialect.type_change_risk(from, to)
+    }
+    fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+        MinimalDialect.fold_ident(ident)
+    }
+    fn lexicon(&self) -> pbps_dialect::Lexicon {
+        MinimalDialect.lexicon()
+    }
+    fn validate_table(&self, name: &TableName, table: &Table) -> Vec<pbps_dialect::DialectError> {
+        MinimalDialect.validate_table(name, table)
+    }
+    fn transaction_framing(
+        &self,
+        zone: &pbps_model::SessionZone,
+    ) -> pbps_dialect::TransactionFraming {
+        MinimalDialect.transaction_framing(zone)
+    }
+    fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+        MinimalDialect.probe_framing()
+    }
+}
+
+/// A partition's own column defaults and NOT NULLs (#1578) are created
+/// with it, are changed on a standing partition one column and kind at a
+/// time (#1581), with its parent's default as what it takes back, and
+/// are its detached table's columns: a detach keeps them.
+#[test]
+fn a_partitions_own_column_overrides_are_its_own_through_a_detach() {
+    use pbps_model::{PartitionBound, PartitionBy, PartitionColumn, PartitionOf};
+    let mut parent = table(&[
+        ("ts", Column::new(ty("date")).not_null()),
+        ("n", Column::new(ty("int"))),
+    ]);
+    parent.partition_by = Some(PartitionBy {
+        external: false,
+        columns: vec!["ts".into()],
+        strategy: Default::default(),
+    });
+    let own = |default: &str| Table {
+        partition_of: Some(PartitionOf {
+            parent: "app.ev".parse().unwrap(),
+            bound: PartitionBound::Default,
+            columns: [(
+                "n".into(),
+                PartitionColumn {
+                    default: Some(default.to_owned()),
+                    not_null: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        }),
+        ..Default::default()
+    };
+    let p: TableName = "app.p".parse().unwrap();
+    let mut tree = schema_of("app.ev", parent.clone());
+    tree.tables.insert(p.clone(), own("7"));
+    let outcome = |base: &Schema, declared: &Schema| {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(declared, &base_ids, &[], &ctx())
+            .unwrap()
+            .ids;
+        diff(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+    };
+
+    let created = outcome(&Schema::default(), &tree).expect("a tree is created");
+    assert!(created.changes.iter().any(|c| matches!(
+        &c.change,
+        Change::Table(TableChange::CreateTable { name, table, .. }) if *name == p && **table == own("7")
+    )));
+    assert!(outcome(&tree, &tree).expect("unchanged").changes.is_empty());
+
+    // Changed on a standing partition: the default alone, from its own
+    // to its own.
+    let mut changed = tree.clone();
+    changed.tables.insert(p.clone(), own("8"));
+    let planned = outcome(&tree, &changed).expect("a standing partition's default changes");
+    assert!(
+        matches!(
+            planned.changes.as_slice(),
+            [c] if matches!(&c.change, Change::Partition(PartitionChange::SetPartitionDefault {
+                table, column, from: Some(from), to: Some(to), fallback: None, ..
+            }) if *table == p && column.raw() == "n" && from == "7" && to == "8")
+        ),
+        "{:?}",
+        planned.changes
+    );
+    // Both overrides gone: its parent's again, a default to take back
+    // where the parent has one.
+    let parents = |declared: &mut Schema| {
+        declared
+            .tables
+            .get_mut(&"app.ev".parse::<TableName>().unwrap())
+            .unwrap()
+            .columns
+            .get_mut("n")
+            .unwrap()
+            .value_source = pbps_model::ValueSource::Default("1".into());
+    };
+    let mut was = tree.clone();
+    parents(&mut was);
+    let mut dropped = was.clone();
+    dropped.tables.insert(
+        p.clone(),
+        Table {
+            partition_of: Some(PartitionOf {
+                columns: BTreeMap::new(),
+                ..own("7").partition_of.unwrap()
+            }),
+            ..Default::default()
+        },
+    );
+    let planned = outcome(&was, &dropped).expect("both overrides dropped");
+    let kinds: Vec<&Change> = planned.changes.iter().map(|c| &c.change).collect();
+    assert!(
+        matches!(
+            kinds.as_slice(),
+            [
+                Change::Partition(PartitionChange::SetPartitionNotNull { not_null: false, .. }),
+                Change::Partition(PartitionChange::SetPartitionDefault { from: Some(_), to: None, fallback: Some(f), .. }),
+            ] if f == "1"
+        ),
+        "{kinds:?}"
+    );
+    // The parent's own default is the parent's change, which the engine
+    // recurses into every partition over the partition's own default:
+    // that is set again after it (#1687).
+    let mut parent_default = tree.clone();
+    parents(&mut parent_default);
+    let planned = outcome(&tree, &parent_default).expect("a partitioned parent's default");
+    let kinds: Vec<&Change> = planned.changes.iter().map(|c| &c.change).collect();
+    assert!(
+        matches!(
+            kinds.as_slice(),
+            [
+                Change::Column(ColumnChange::AlterColumnDefault { to: Some(d), .. }),
+                Change::Partition(PartitionChange::SetPartitionDefault { from: Some(a), to: Some(b), fallback: Some(f), .. }),
+            ] if d == "1" && a == "7" && b == "7" && f == "1"
+        ),
+        "{kinds:?}"
+    );
+
+    // Detached: its columns are the parent's with its own default and
+    // NOT NULL.
+    let detached = |n: Column| {
+        let mut t = Table {
+            partition_by: None,
+            ..parent.clone()
+        };
+        t.columns.insert("n".into(), n);
+        let mut declared = tree.clone();
+        declared.tables.insert(p.clone(), t);
+        declared
+    };
+    let mut kept = Column::new(ty("int")).not_null();
+    kept.value_source = pbps_model::ValueSource::Default("7".into());
+    let planned = outcome(&tree, &detached(kept)).expect("a detach");
+    assert!(
+        matches!(
+            planned.changes.as_slice(),
+            [c] if matches!(c.change, Change::Partition(PartitionChange::DetachPartition { .. }))
+        ),
+        "{:?}",
+        planned.changes
+    );
+    // Negative: declared as the parent's, it is not what the detach keeps.
+    let errors: Vec<String> = outcome(&tree, &detached(Column::new(ty("int"))))
+        .expect_err("not the detached shape")
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("its columns are not its parent's")),
+        "{errors:?}"
+    );
+    // The parent's columns changed while a partition is detached or
+    // attached in the same plan: refused by name, with the two-plan
+    // remedy, and not also as a detached shape (#1692 review).
+    let mut kept = Column::new(ty("int")).not_null();
+    kept.value_source = pbps_model::ValueSource::Default("7".into());
+    let grown = |s: &mut Schema| {
+        for t in s.tables.values_mut() {
+            if t.partition_of.is_none() {
+                t.columns.insert("x".into(), Column::new(ty("int")));
+            }
+        }
+    };
+    let mut detached_grown = detached(kept.clone());
+    grown(&mut detached_grown);
+    // Attached as a range: the DEFAULT partition is not attached here.
+    let mut ranged = tree.clone();
+    if let Some(of) = ranged
+        .tables
+        .get_mut(&p)
+        .and_then(|t| t.partition_of.as_mut())
+    {
+        of.bound = PartitionBound::Range {
+            from: vec![pbps_model::BoundDatum::Value("2024-01-01".into())],
+            to: vec![pbps_model::BoundDatum::Value("2025-01-01".into())],
+        };
+    }
+    let mut grown_tree = ranged.clone();
+    grown(&mut grown_tree);
+    for (base, declared) in [
+        (&tree, &detached_grown),
+        (&detached(kept.clone()), &grown_tree),
+    ] {
+        let errors: Vec<String> = outcome(base, declared)
+            .expect_err("columns changed across an attach or a detach")
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            errors.iter().any(|e| e.contains(
+                "while this plan attaches, detaches or drops app.p; change the columns and the \
+                     partitions in separate plans"
+            )) && !errors.iter().any(|e| e.contains("not its parent's")),
+            "{errors:?}"
+        );
+    }
+    // Negative: each half alone is planned.
+    outcome(&ranged, &grown_tree).expect("the parent's column alone");
+    outcome(&detached(kept.clone()), &ranged).expect("the attach alone");
+}
+
+/// A partition's own checks and indexes (#1577) are created with it, are
+/// added, dropped and redefined on a standing partition alone, its
+/// parent's still refused (#1581), and stay under their own names through
+/// a detach, which renames only the
+/// parent's clones: an own one declared otherwise is a change the detach
+/// does not make, and is refused by name.
+#[test]
+fn a_partitions_own_checks_and_indexes_are_its_own_through_a_detach() {
+    use pbps_model::{PartitionBound, PartitionBy, PartitionOf};
+    let index = |column: &str| Index {
+        columns: vec![pbps_model::IndexColumn {
+            key: pbps_model::IndexKey::Column(column.into()),
+            descending: false,
+            opclass: None,
+            collation: None,
+            opclass_parameters: Default::default(),
+        }],
+        include: Vec::new(),
+        unique: false,
+        filter: None,
+        method: Default::default(),
+        storage_parameters: Default::default(),
+        filegroup: None,
+    };
+    let check = |expression: &str| pbps_model::CheckConstraint {
+        expression: expression.into(),
+    };
+    let mut parent = table(&[
+        ("ts", Column::new(ty("date")).not_null()),
+        ("n", Column::new(ty("int"))),
+    ]);
+    parent.indexes.insert("ev_n".into(), index("n"));
+    parent.partition_by = Some(PartitionBy {
+        external: false,
+        columns: vec!["ts".into()],
+        strategy: Default::default(),
+    });
+    let mut own = Table {
+        partition_of: Some(PartitionOf {
+            parent: "app.ev".parse().unwrap(),
+            bound: PartitionBound::Default,
+            columns: Default::default(),
+        }),
+        ..Default::default()
+    };
+    own.checks.insert("p_ck".into(), check("n < 10"));
+    own.indexes.insert("p_ts".into(), index("ts"));
+    let p: TableName = "app.p".parse().unwrap();
+    let mut tree = schema_of("app.ev", parent.clone());
+    tree.tables.insert(p.clone(), own.clone());
+    let outcome = |base: &Schema, declared: &Schema| {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(declared, &base_ids, &[], &ctx())
+            .unwrap()
+            .ids;
+        diff(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+    };
+    let said = |errors: Vec<DiffError>| -> Vec<String> {
+        errors.iter().map(ToString::to_string).collect()
+    };
+
+    // Created with its own, in the one change that creates it.
+    let created = outcome(&Schema::default(), &tree).expect("a tree is created");
+    let made = created
+        .changes
+        .iter()
+        .find_map(|c| match &c.change {
+            Change::Table(TableChange::CreateTable { name, table, .. }) if *name == p => {
+                Some(table)
+            }
+            _ => None,
+        })
+        .expect("the partition is created");
+    assert_eq!(**made, own);
+    assert!(
+        !created.changes.iter().any(|c| matches!(
+            c.change,
+            Change::Constraint(ConstraintChange::AddCheck { .. })
+                | Change::Index(IndexChange::AddIndex { .. })
+        ) && c.change.table() == Some(&p)),
+        "{:?}",
+        created.changes
+    );
+
+    // An own one added, dropped or changed on a standing partition is
+    // planned on the partition alone (#1581).
+    for (edit, expected) in [
+        (
+            &(|t: &mut Table| {
+                t.indexes.insert("p_n".into(), index("n"));
+            }) as &dyn Fn(&mut Table),
+            &["add index"] as &[&str],
+        ),
+        (
+            &|t: &mut Table| {
+                t.checks.clear();
+            },
+            &["drop check"],
+        ),
+        (
+            &|t: &mut Table| {
+                t.indexes.insert("p_ts".into(), index("n"));
+            },
+            &["drop index", "add index"],
+        ),
+    ] {
+        let mut declared = tree.clone();
+        edit(declared.tables.get_mut(&p).unwrap());
+        let planned = outcome(&tree, &declared).expect("planned");
+        let kinds: Vec<String> = planned
+            .changes
+            .iter()
+            .map(|c| {
+                assert_eq!(c.change.table(), Some(&p), "{:?}", c.change);
+                change_in_words(&c.change)
+            })
+            .collect();
+        assert_eq!(kinds, expected, "{:?}", planned.changes);
+    }
+    // Negative: one added to the parent is the parent's change, and one
+    // the partition's own `p_ts` would be adopted into as its clone is
+    // refused by name (#1688, DEC-1688.1).
+    let mut declared = tree.clone();
+    declared
+        .tables
+        .get_mut(&"app.ev".parse::<TableName>().unwrap())
+        .unwrap()
+        .indexes
+        .insert("ev_ts".into(), index("ts"));
+    let errors = said(outcome(&tree, &declared).expect_err("refused"));
+    assert!(
+        errors.iter().any(
+            |e| e.starts_with("app.ev is a partitioned table or a partition")
+                && e.contains(&format!("which can take {p}'s `p_ts`", p = p.shown()))
+        ),
+        "{errors:?}"
+    );
+
+    // Detached: the parent's index renamed to the declared name, its own
+    // left alone under theirs.
+    let shape = |f: &dyn Fn(&mut Table)| {
+        let mut t = Table {
+            partition_by: None,
+            ..parent.clone()
+        };
+        let clone = t.indexes.remove("ev_n").unwrap();
+        t.indexes.insert("arch_n".into(), clone);
+        t.checks.insert("p_ck".into(), check("n < 10"));
+        t.indexes.insert("p_ts".into(), index("ts"));
+        f(&mut t);
+        let mut declared = tree.clone();
+        declared.tables.insert(p.clone(), t);
+        declared
+    };
+    let planned = outcome(&tree, &shape(&|_| {})).expect("a detach");
+    let [planned] = planned.changes.as_slice() else {
+        panic!("{:?}", planned.changes)
+    };
+    let Change::Partition(PartitionChange::DetachPartition { names, .. }) = &planned.change else {
+        panic!("{planned:?}")
+    };
+    let pairs: Vec<(&str, Option<&str>)> = names
+        .iter()
+        .map(|n| {
+            (
+                n.parent.raw(),
+                n.name.as_ref().map(pbps_model::ObjectLocalName::raw),
+            )
+        })
+        .collect();
+    assert_eq!(pairs, [("ev_n", Some("arch_n"))]);
+
+    // Negative: an own one gone, renamed or changed in the declaration.
+    for (edit, expected) in [
+        (
+            &(|t: &mut Table| {
+                t.indexes.remove("p_ts");
+            }) as &dyn Fn(&mut Table),
+            "its own index `p_ts` is not declared as it stands",
+        ),
+        (
+            &|t: &mut Table| {
+                let i = t.indexes.remove("p_ts").unwrap();
+                t.indexes.insert("p_ts2".into(), i);
+            },
+            "its own index `p_ts` is not declared as it stands",
+        ),
+        (
+            &|t: &mut Table| {
+                t.checks.insert("p_ck".into(), check("n < 11"));
+            },
+            "its own check `p_ck` is not declared as it stands",
+        ),
+    ] {
+        let errors = said(outcome(&tree, &shape(edit)).expect_err(expected));
+        assert!(errors.iter().any(|e| e.contains(expected)), "{errors:?}");
+    }
+}
+
+/// A partition's own foreign key is matched through a detach as this
+/// plan leaves it (#1632): the table it references renamed in the same
+/// plan is declared under its new name on the detached table, and the
+/// detach is planned beside the rename. Declared under the old name, or
+/// otherwise changed, it is still refused by name.
+#[test]
+fn a_partitions_own_foreign_key_follows_a_renamed_target_through_a_detach() {
+    use pbps_model::{PartitionBound, PartitionBy, PartitionOf};
+    let fk = |to: &str| pbps_model::ForeignKey {
+        columns: vec!["s".into()],
+        references_table: to.parse().unwrap(),
+        references_columns: vec!["id".into()],
+        on_delete: Default::default(),
+        on_update: Default::default(),
+    };
+    let mut parent = table(&[
+        ("ts", Column::new(ty("date")).not_null()),
+        ("s", Column::new(ty("int"))),
+    ]);
+    parent.partition_by = Some(PartitionBy {
+        external: false,
+        columns: vec!["ts".into()],
+        strategy: Default::default(),
+    });
+    let mut own = Table {
+        partition_of: Some(PartitionOf {
+            parent: "app.ev".parse().unwrap(),
+            bound: PartitionBound::Default,
+            columns: Default::default(),
+        }),
+        ..Default::default()
+    };
+    own.foreign_keys.insert("p_s_fk".into(), fk("app.s"));
+    let mut target = table(&[("id", Column::new(ty("int")).not_null())]);
+    target.primary_key = Some(PrimaryKey {
+        name: Some("s_pk".into()),
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+        filegroup: None,
+    });
+    let p: TableName = "app.p".parse().unwrap();
+    let mut tree = schema_of("app.ev", parent.clone());
+    tree.tables.insert(p.clone(), own);
+    tree.tables.insert("app.s".parse().unwrap(), target.clone());
+    let rename = [Intent::RenameTable {
+        from: "app.s".parse().unwrap(),
+        to: "app.s2".parse().unwrap(),
+    }];
+    let declared = |references: &str| {
+        let mut declared = tree.clone();
+        let moved = declared
+            .tables
+            .remove(&"app.s".parse::<TableName>().unwrap())
+            .unwrap();
+        declared.tables.insert("app.s2".parse().unwrap(), moved);
+        let mut detached = Table {
+            partition_by: None,
+            ..parent.clone()
+        };
+        detached
+            .foreign_keys
+            .insert("p_s_fk".into(), fk(references));
+        declared.tables.insert(p.clone(), detached);
+        declared
+    };
+    let outcome = |declared: &Schema| {
+        let base_ids = crate::resolve(&tree, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(declared, &base_ids, &rename, &ctx())
+            .unwrap()
+            .ids;
+        diff(
+            Side {
+                schema: &tree,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+    };
+    let planned = outcome(&declared("app.s2")).expect("a detach beside the rename");
+    let kinds: Vec<String> = planned
+        .changes
+        .iter()
+        .map(|c| change_in_words(&c.change))
+        .collect();
+    assert!(
+        planned.changes.iter().any(|c| matches!(
+            c.change,
+            Change::Partition(PartitionChange::DetachPartition { .. })
+        )) && planned
+            .changes
+            .iter()
+            .any(|c| matches!(c.change, Change::Table(TableChange::RenameTable { .. })))
+            && !planned.changes.iter().any(|c| matches!(
+                c.change,
+                Change::Constraint(ConstraintChange::DropForeignKey { .. })
+                    | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+            )),
+        "{kinds:?}"
+    );
+    // Negative: declared under the target's old name.
+    let errors: Vec<String> = outcome(&declared("app.s"))
+        .expect_err("refused")
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("its own foreign key `p_s_fk` is not declared as it stands")),
+        "{errors:?}"
+    );
+}
+
+/// A partition with a foreign key of its own is dropped under its
+/// standing parent with drop intent, its foreign key dropped first as a
+/// table's is (#1632 review). Without the intent it is still refused.
+#[test]
+fn a_partition_with_its_own_foreign_key_is_dropped_under_its_parent() {
+    use pbps_model::{PartitionBound, PartitionBy, PartitionOf};
+    let mut parent = table(&[
+        ("ts", Column::new(ty("date")).not_null()),
+        ("s", Column::new(ty("int"))),
+    ]);
+    parent.partition_by = Some(PartitionBy {
+        external: false,
+        columns: vec!["ts".into()],
+        strategy: Default::default(),
+    });
+    let mut own = Table {
+        partition_of: Some(PartitionOf {
+            parent: "app.ev".parse().unwrap(),
+            bound: PartitionBound::Default,
+            columns: Default::default(),
+        }),
+        ..Default::default()
+    };
+    own.foreign_keys.insert(
+        "p_s_fk".into(),
+        pbps_model::ForeignKey {
+            columns: vec!["s".into()],
+            references_table: "app.s".parse().unwrap(),
+            references_columns: vec!["id".into()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        },
+    );
+    let p: TableName = "app.p".parse().unwrap();
+    let mut tree = schema_of("app.ev", parent);
+    tree.tables.insert(p.clone(), own);
+    let declared = schema_of(
+        "app.ev",
+        tree.tables[&"app.ev".parse::<TableName>().unwrap()].clone(),
+    );
+    let outcome = |intents: &[Intent]| {
+        let base_ids = crate::resolve(&tree, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(&declared, &base_ids, intents, &ctx())
+            .unwrap()
+            .ids;
+        diff(
+            Side {
+                schema: &tree,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+    };
+    let planned = outcome(&[Intent::DropTable {
+        table: p.clone(),
+        reason: "gone".parse().unwrap(),
+    }])
+    .expect("the partition is dropped");
+    let kinds: Vec<String> = planned
+        .changes
+        .iter()
+        .map(|c| change_in_words(&c.change))
+        .collect();
+    let at = |f: &dyn Fn(&Change) -> bool| planned.changes.iter().position(|c| f(&c.change));
+    let fk = at(
+        &|c| matches!(c, Change::Constraint(ConstraintChange::DropForeignKey { name, .. }) if name.raw() == "p_s_fk"),
+    );
+    let table =
+        at(&|c| matches!(c, Change::Table(TableChange::DropTable { name, .. }) if *name == p));
+    assert!(
+        matches!((fk, table), (Some(fk), Some(table)) if fk < table),
+        "{kinds:?}"
+    );
+    // Negative: without drop intent, no plan: its identity is refused as
+    // a drop that records no reason.
+    let base_ids = crate::resolve(&tree, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    assert!(crate::resolve(&declared, &base_ids, &[], &ctx()).is_err());
+}
+
+/// An attached table's own foreign key is compared with what the
+/// partition declares as this plan leaves it (#1632): to a table renamed
+/// in the same plan, declared under the new name, it is neither dropped
+/// nor added again. Declared otherwise, it is dropped and added as on any
+/// table.
+#[test]
+fn an_attached_tables_own_foreign_key_follows_a_renamed_target() {
+    use pbps_model::{BoundDatum, PartitionBound, PartitionBy, PartitionOf};
+    let fk = |to: &str, on_delete| pbps_model::ForeignKey {
+        columns: vec!["s".into()],
+        references_table: to.parse().unwrap(),
+        references_columns: vec!["id".into()],
+        on_delete,
+        on_update: Default::default(),
+    };
+    let columns = || {
+        table(&[
+            ("ts", Column::new(ty("date")).not_null()),
+            ("s", Column::new(ty("int"))),
+        ])
+    };
+    let mut parent = columns();
+    parent.partition_by = Some(PartitionBy {
+        external: false,
+        columns: vec!["ts".into()],
+        strategy: Default::default(),
+    });
+    let mut target = table(&[("id", Column::new(ty("int")).not_null())]);
+    target.primary_key = Some(PrimaryKey {
+        name: Some("s_pk".into()),
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+        filegroup: None,
+    });
+    let t: TableName = "app.t".parse().unwrap();
+    let mut base = schema_of("app.ev", parent);
+    base.tables.insert("app.s".parse().unwrap(), target);
+    let mut ordinary = columns();
+    ordinary
+        .foreign_keys
+        .insert("t_s_fk".into(), fk("app.s", Default::default()));
+    base.tables.insert(t.clone(), ordinary);
+    let rename = [Intent::RenameTable {
+        from: "app.s".parse().unwrap(),
+        to: "app.s2".parse().unwrap(),
+    }];
+    let declared = |references: &str, on_delete| {
+        let mut declared = base.clone();
+        let moved = declared
+            .tables
+            .remove(&"app.s".parse::<TableName>().unwrap())
+            .unwrap();
+        declared.tables.insert("app.s2".parse().unwrap(), moved);
+        let mut partition = Table {
+            partition_of: Some(PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound: PartitionBound::Range {
+                    from: vec![BoundDatum::Value("2025-01-01".into())],
+                    to: vec![BoundDatum::Value("2026-01-01".into())],
+                },
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        };
+        partition
+            .foreign_keys
+            .insert("t_s_fk".into(), fk(references, on_delete));
+        declared.tables.insert(t.clone(), partition);
+        declared
+    };
+    let fk_changes = |declared: &Schema| -> Vec<String> {
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(declared, &base_ids, &rename, &ctx())
+            .unwrap()
+            .ids;
+        let planned = diff(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .expect("an attach beside the rename");
+        assert!(
+            planned.changes.iter().any(|c| matches!(
+                c.change,
+                Change::Partition(PartitionChange::AttachPartition { .. })
+            )),
+            "{:?}",
+            planned.changes
+        );
+        planned
+            .changes
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.change,
+                    Change::Constraint(ConstraintChange::DropForeignKey { .. })
+                        | Change::Constraint(ConstraintChange::AddForeignKey { .. })
+                )
+            })
+            .map(|c| change_in_words(&c.change))
+            .collect()
+    };
+    assert!(
+        fk_changes(&declared("app.s2", Default::default())).is_empty(),
+        "kept as it stands"
+    );
+    // Negative: declared with another action, it is dropped and added.
+    assert_eq!(
+        fk_changes(&declared("app.s2", pbps_model::ReferentialAction::Cascade)).len(),
+        2
+    );
+}
+
+/// A partition's persistence and storage parameters (#1580) are created
+/// with it, in the one change that creates it; changed on a standing
+/// partition alone (#1581), a switch to unlogged under a permanent
+/// table's key refused as a creation is; and a detach keeps them,
+/// so the table it leaves is declared with them or the plan is refused.
+#[test]
+fn a_partitions_own_persistence_and_storage_are_its_own_through_a_detach() {
+    use pbps_model::{PartitionBound, PartitionBy, PartitionOf};
+    let mut parent = table(&[("ts", Column::new(ty("date")).not_null())]);
+    parent.partition_by = Some(PartitionBy {
+        external: false,
+        columns: vec!["ts".into()],
+        strategy: Default::default(),
+    });
+    let own = Table {
+        partition_of: Some(PartitionOf {
+            parent: "app.ev".parse().unwrap(),
+            bound: PartitionBound::Default,
+            columns: Default::default(),
+        }),
+        unlogged: true,
+        storage_parameters: [("fillfactor".to_owned(), "70".to_owned())].into(),
+        ..Default::default()
+    };
+    let p: TableName = "app.p".parse().unwrap();
+    let mut tree = schema_of("app.ev", parent.clone());
+    tree.tables.insert(p.clone(), own.clone());
+    let outcome = |base: &Schema, declared: &Schema| {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(declared, &base_ids, &[], &ctx())
+            .unwrap()
+            .ids;
+        diff(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+    };
+    let said = |errors: Vec<DiffError>| -> Vec<String> {
+        errors.iter().map(ToString::to_string).collect()
+    };
+
+    let created = outcome(&Schema::default(), &tree).expect("a tree is created");
+    let made = created
+        .changes
+        .iter()
+        .find_map(|c| match &c.change {
+            Change::Table(TableChange::CreateTable { name, table, .. }) if *name == p => {
+                Some(table)
+            }
+            _ => None,
+        })
+        .expect("the partition is created");
+    assert_eq!(**made, own);
+    assert!(
+        !created.changes.iter().any(|c| matches!(
+            c.change,
+            Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+                | Change::TableProperty(TablePropertyChange::SetStorageParameters { .. })
+        )),
+        "{:?}",
+        created.changes
+    );
+
+    // A permanent table's key to the parent reaches the unlogged
+    // partition, which the engine does not refuse: refused here, created
+    // with the tree or added under a standing one (#1580 review).
+    let r: TableName = "app.r".parse().unwrap();
+    let referencing = |unlogged: bool| {
+        let mut t = table(&[("ts", Column::new(ty("date")))]);
+        t.foreign_keys.insert(
+            "r_ev".into(),
+            ForeignKey {
+                columns: vec!["ts".into()],
+                references_table: "app.ev".parse().unwrap(),
+                references_columns: vec!["ts".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        t.unlogged = unlogged;
+        t
+    };
+    let mut keyed = tree.clone();
+    keyed.tables.insert(r.clone(), referencing(false));
+    let mut standing = keyed.clone();
+    standing.tables.remove(&p);
+    for base in [Schema::default(), standing] {
+        let errors = outcome(&base, &keyed).expect_err("refused");
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                DiffError::PermanentReferencesUnloggedPartition { table, partition, .. }
+                    if *table == r && *partition == p
+            )),
+            "{errors:?}"
+        );
+    }
+    // Negative: an unlogged referencing table, or a permanent partition.
+    let mut unlogged_ref = tree.clone();
+    unlogged_ref.tables.insert(r.clone(), referencing(true));
+    outcome(&Schema::default(), &unlogged_ref).expect("an unlogged table may reference it");
+    let mut permanent = keyed.clone();
+    permanent.tables.get_mut(&p).unwrap().unlogged = false;
+    outcome(&Schema::default(), &permanent).expect("every partition permanent");
+    // And switched to unlogged on a standing partition (#1581).
+    let errors = outcome(&permanent, &keyed).expect_err("refused");
+    assert!(
+        errors.iter().any(|e| matches!(
+            e,
+            DiffError::PermanentReferencesUnloggedPartition { table, partition, .. }
+                if *table == r && *partition == p
+        )),
+        "{errors:?}"
+    );
+
+    // Changed on a standing partition: planned on it alone (#1581).
+    for (edit, expected) in [
+        (
+            &(|t: &mut Table| t.unlogged = false) as &dyn Fn(&mut Table),
+            "set table persistence",
+        ),
+        (
+            &|t: &mut Table| {
+                t.storage_parameters
+                    .insert("fillfactor".into(), "80".into());
+            },
+            "set storage parameters",
+        ),
+    ] {
+        let mut declared = tree.clone();
+        edit(declared.tables.get_mut(&p).unwrap());
+        let planned = outcome(&tree, &declared).expect("planned");
+        assert!(
+            matches!(
+                planned.changes.as_slice(),
+                [c] if c.change.table() == Some(&p) && change_in_words(&c.change) == expected
+            ),
+            "{:?}",
+            planned.changes
+        );
+    }
+
+    // Detached and declared with them: the detach alone.
+    let detached = |unlogged: bool| {
+        let mut declared = tree.clone();
+        declared.tables.insert(
+            p.clone(),
+            Table {
+                partition_by: None,
+                unlogged,
+                storage_parameters: own.storage_parameters.clone(),
+                ..parent.clone()
+            },
+        );
+        declared
+    };
+    let planned = outcome(&tree, &detached(true)).expect("a detach");
+    assert!(
+        matches!(
+            planned.changes.as_slice(),
+            [c] if matches!(c.change, Change::Partition(PartitionChange::DetachPartition { .. }))
+        ),
+        "{:?}",
+        planned.changes
+    );
+    // Negative: declared permanent, which the detach does not make it.
+    let errors = said(outcome(&tree, &detached(false)).expect_err("refused"));
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("app.p is detached") && e.contains("nor its own")),
+        "{errors:?}"
+    );
+}
+
+/// A table with `system_time` is created whole, and every change to it
+/// is refused by name until #1177: a column added, its period or history
+/// changed (which no change would carry, and would otherwise plan nothing
+/// and record the declaration as applied), the table dropped or renamed.
+/// A change to another table, even one referencing it, is not refused.
+#[test]
+fn a_table_with_system_time_is_created_but_never_changed() {
+    let versioned = |retention: Option<&str>| {
+        let mut t = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("vf", Column::new(ty("datetime2")).not_null()),
+            ("vt", Column::new(ty("datetime2")).not_null()),
+        ]);
+        t.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        });
+        t.system_time = Some(pbps_model::SystemTime {
+            start: "vf".into(),
+            end: "vt".into(),
+            hidden: false,
+            versioning: Some(pbps_model::SystemVersioning {
+                history: "app.t_history".parse().unwrap(),
+                retention: retention.map(|r| r.parse().unwrap()),
+            }),
+        });
+        t
+    };
+    let outcome = |base: &Schema, declared: &Schema, intents: &[Intent]| {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+            .unwrap()
+            .ids;
+        diff(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+    };
+    let refused = |base: &Schema, declared: &Schema, intents: &[Intent]| -> Vec<String> {
+        match outcome(base, declared, intents) {
+            Ok(cs) => panic!("planned {:?}", kinds(&cs)),
+            Err(errors) => errors
+                .iter()
+                .filter(|e| matches!(e, DiffError::TemporalTableChange { .. }))
+                .map(ToString::to_string)
+                .collect(),
+        }
+    };
+    let base = schema_of("app.t", versioned(None));
+
+    // Created whole, in one change.
+    let created = outcome(&Schema::default(), &base, &[]).expect("a create is planned");
+    assert_eq!(kinds(&created), ["CreateTable"]);
+    // With the foreign keys the differ splits out of its `CREATE`, which
+    // are the creation too (#1501 review).
+    let mut keyed = base.clone();
+    keyed.tables.insert(
+        "app.parent".parse().unwrap(),
+        table(&[("id", Column::new(ty("int")).not_null())]),
+    );
+    keyed
+        .tables
+        .get_mut(&"app.t".parse().unwrap())
+        .unwrap()
+        .foreign_keys
+        .insert(
+            "fk_t_parent".into(),
+            pbps_model::ForeignKey {
+                columns: vec!["id".into()],
+                references_table: "app.parent".parse().unwrap(),
+                references_columns: vec!["id".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+    let created = outcome(&Schema::default(), &keyed, &[]).expect("a keyed create is planned");
+    assert!(
+        kinds(&created).contains(&"AddForeignKey".to_owned()),
+        "{:?}",
+        kinds(&created)
+    );
+    // And under the name of an ordinary table an earlier revision of the
+    // same plan dropped: the new table has a uid of its own.
+    let mut ordinary = keyed.clone();
+    ordinary.tables.insert(
+        "app.t".parse().unwrap(),
+        table(&[("id", Column::new(ty("int")).not_null())]),
+    );
+    let mut vacated = keyed.clone();
+    vacated
+        .tables
+        .remove(&"app.t".parse::<TableName>().unwrap());
+    let base_ids = crate::resolve(&ordinary, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let between = crate::resolve(
+        &vacated,
+        &base_ids,
+        &[Intent::DropTable {
+            table: "app.t".parse().unwrap(),
+            reason: "replaced".parse().unwrap(),
+        }],
+        &ctx(),
+    )
+    .unwrap()
+    .ids;
+    let reused_ids = crate::resolve(&keyed, &between, &[], &ctx()).unwrap().ids;
+    let reused = diff(
+        Side {
+            schema: &ordinary,
+            ids: &base_ids,
+        },
+        Side {
+            schema: &keyed,
+            ids: &reused_ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+    )
+    .expect("a create under a name an earlier revision dropped is planned");
+    assert!(
+        kinds(&reused).contains(&"DropTable".to_owned())
+            && kinds(&reused).contains(&"AddForeignKey".to_owned()),
+        "{:?}",
+        kinds(&reused)
+    );
+    // Negative: a temporal table dropped and created again under its own
+    // name is still a drop of a temporal table.
+    let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let between = crate::resolve(
+        &Schema::default(),
+        &base_ids,
+        &[Intent::DropTable {
+            table: "app.t".parse().unwrap(),
+            reason: "replaced".parse().unwrap(),
+        }],
+        &ctx(),
+    )
+    .unwrap()
+    .ids;
+    let again_ids = crate::resolve(&base, &between, &[], &ctx()).unwrap().ids;
+    let errors = diff(
+        Side {
+            schema: &base,
+            ids: &base_ids,
+        },
+        Side {
+            schema: &base,
+            ids: &again_ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+    )
+    .expect_err("a temporal table dropped and recreated is refused");
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, DiffError::TemporalTableChange { .. })),
+        "{errors:?}"
+    );
+    // Unchanged, nothing to plan.
+    assert!(outcome(&base, &base, &[]).unwrap().changes.is_empty());
+
+    let mut added = base.clone();
+    added
+        .tables
+        .get_mut(&"app.t".parse().unwrap())
+        .unwrap()
+        .columns
+        .insert("note".into(), Column::new(ty("int")).not_null());
+    let retained = schema_of("app.t", versioned(Some("6 months")));
+    let mut renamed_history = base.clone();
+    renamed_history
+        .tables
+        .get_mut(&"app.t".parse().unwrap())
+        .unwrap()
+        .system_time
+        .as_mut()
+        .unwrap()
+        .versioning
+        .as_mut()
+        .unwrap()
+        .history = "app.t_audit".parse().unwrap();
+    let renamed = schema_of("app.u", versioned(None));
+    for (what, declared, intents) in [
+        ("a NOT NULL column added", &added, vec![]),
+        ("its retention", &retained, vec![]),
+        ("its history renamed", &renamed_history, vec![]),
+        (
+            "the table dropped",
+            &Schema::default(),
+            vec![Intent::DropTable {
+                table: "app.t".parse().unwrap(),
+                reason: "retired".parse().unwrap(),
+            }],
+        ),
+        (
+            "the table renamed",
+            &renamed,
+            vec![Intent::RenameTable {
+                from: "app.t".parse().unwrap(),
+                to: "app.u".parse().unwrap(),
+            }],
+        ),
+    ] {
+        let errors = refused(&base, declared, &intents);
+        assert!(
+            !errors.is_empty()
+                && errors
+                    .iter()
+                    .all(|e| e.contains("the only change pbps makes")),
+            "{what}: {errors:?}"
+        );
+    }
+    // A nullable column is the one change it takes (#1177), with or
+    // without a default; the refusal names every other change it meets.
+    for column in [
+        Column::new(ty("int")),
+        Column {
+            value_source: ValueSource::Default("5".into()),
+            ..Column::new(ty("int"))
+        },
+    ] {
+        let mut grown = base.clone();
+        grown
+            .tables
+            .get_mut(&"app.t".parse().unwrap())
+            .unwrap()
+            .columns
+            .insert("note".into(), column);
+        let cs = outcome(&base, &grown, &[]).expect("a nullable column is added");
+        assert_eq!(kinds(&cs), ["AddColumn"]);
+    }
+    let mut mixed = retained.clone();
+    let t = mixed.tables.get_mut(&"app.t".parse().unwrap()).unwrap();
+    t.columns.insert("note".into(), Column::new(ty("int")));
+    t.columns
+        .insert("must".into(), Column::new(ty("int")).not_null());
+    t.columns
+        .insert("also".into(), Column::new(ty("int")).not_null());
+    let errors = refused(&base, &mixed, &[]);
+    assert!(
+        errors.len() == 1
+            && errors[0].contains("would also change its `system_time`, add a NOT NULL column.")
+            && !errors[0].contains("NOT NULL column, add a NOT NULL"),
+        "{errors:?}"
+    );
+    // Negative: an ordinary table referencing it changes freely.
+    let mut referencing = base.clone();
+    let mut other = table(&[("t_id", Column::new(ty("int")))]);
+    other.foreign_keys.insert(
+        "fk_other_t".into(),
+        pbps_model::ForeignKey {
+            columns: vec!["t_id".into()],
+            references_table: "app.t".parse().unwrap(),
+            references_columns: vec!["id".into()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        },
+    );
+    referencing
+        .tables
+        .insert("app.other".parse().unwrap(), other);
+    let cs = outcome(&base, &referencing, &[]).expect("another table is not refused");
+    assert!(
+        kinds(&cs).contains(&"CreateTable".to_owned()),
+        "{:?}",
+        kinds(&cs)
+    );
+}
+
+/// Tables referencing each other in a cycle have no order to switch in:
+/// whichever goes first breaks the other's key. The keys inside the
+/// cycle are dropped before the switches and added back after, and the
+/// tables outside it keep their order (#1488 review).
+#[test]
+fn a_foreign_key_cycle_is_unlinked_around_its_persistence_switch() {
+    let fk = |to: &str, column: &str| pbps_model::ForeignKey {
+        columns: vec![column.into()],
+        references_table: to.parse().unwrap(),
+        references_columns: vec!["id".into()],
+        on_delete: Default::default(),
+        on_update: Default::default(),
+    };
+    let cycle = |unlogged: bool| {
+        let mut s = Schema::default();
+        for (name, other) in [("public.a", "public.b"), ("public.b", "public.a")] {
+            let mut t = table(&[
+                ("id", Column::new(ty("int")).not_null()),
+                ("other", Column::new(ty("int"))),
+            ]);
+            t.primary_key = Some(PrimaryKey {
+                name: None,
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+                filegroup: None,
+            });
+            t.foreign_keys
+                .insert(format!("{}_other", &name[7..]).into(), fk(other, "other"));
+            t.unlogged = unlogged;
+            s.tables.insert(name.parse().unwrap(), t);
+        }
+        s
+    };
+    let cs = run(&cycle(false), &cycle(true), &[]);
+    let at = |pred: &dyn Fn(&Change) -> bool| -> Vec<usize> {
+        cs.changes
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| pred(&p.change))
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let drops = at(&|c| {
+        matches!(
+            c,
+            Change::Constraint(ConstraintChange::DropForeignKey { .. })
+        )
+    });
+    let switches = at(&|c| {
+        matches!(
+            c,
+            Change::TableProperty(TablePropertyChange::SetTablePersistence { .. })
+        )
+    });
+    let adds = at(&|c| {
+        matches!(
+            c,
+            Change::Constraint(ConstraintChange::AddForeignKey { .. })
+        )
+    });
+    assert_eq!(
+        (drops.len(), switches.len(), adds.len()),
+        (2, 2, 2),
+        "{:?}",
+        kinds(&cs)
+    );
+    assert!(
+        drops.iter().max() < switches.iter().min(),
+        "{:?}",
+        kinds(&cs)
+    );
+    assert!(
+        switches.iter().max() < adds.iter().min(),
+        "{:?}",
+        kinds(&cs)
+    );
+    // Negative: a chain, not a cycle, keeps its keys and its order.
+    let chain = |unlogged: bool| {
+        let mut s = cycle(unlogged);
+        s.tables
+            .get_mut(&"public.a".parse::<TableName>().unwrap())
+            .unwrap()
+            .foreign_keys
+            .clear();
+        s
+    };
+    let cs = run(&chain(false), &chain(true), &[]);
+    assert!(
+        !cs.changes.iter().any(|p| matches!(
+            p.change,
+            Change::Constraint(ConstraintChange::DropForeignKey { .. })
+        )),
+        "{:?}",
+        kinds(&cs)
+    );
+}
+
+/// One change per table, setting what differs and resetting what the
+/// declaration drops; a parameter left alone is not restated, and an
+/// unchanged set plans nothing (#1441).
+#[test]
+fn storage_parameters_set_what_differs_and_reset_what_goes() {
+    let with = |pairs: &[(&str, &str)]| {
+        let mut t = table(&[("id", Column::new(ty("int")).not_null())]);
+        t.storage_parameters = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        schema_of("public.t", t)
+    };
+    let base = with(&[
+        ("fillfactor", "70"),
+        ("autovacuum_enabled", "false"),
+        ("parallel_workers", "2"),
+    ]);
+    let cs = run(
+        &base,
+        &with(&[
+            ("fillfactor", "80"),
+            ("parallel_workers", "2"),
+            ("vacuum_truncate", "false"),
+        ]),
+        &[],
+    );
+    let [p] = cs.changes.as_slice() else {
+        panic!("{cs:#?}");
+    };
+    let Change::TableProperty(TablePropertyChange::SetStorageParameters { set, reset, .. }) =
+        &p.change
+    else {
+        panic!("{cs:#?}");
+    };
+    assert_eq!(
+        set.iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect::<Vec<_>>(),
+        [("fillfactor", "80"), ("vacuum_truncate", "false")]
+    );
+    assert_eq!(
+        reset.iter().map(String::as_str).collect::<Vec<_>>(),
+        ["autovacuum_enabled"]
+    );
+    // Negative: the same parameters plan nothing.
+    assert!(run(&base, &base, &[]).changes.is_empty());
+}
+
+/// `public.t` with unique indexes `ix_code` over a NOT NULL column and
+/// `ix_v` over a nullable one, and the given identity.
+fn identified_by(identity: Option<pbps_model::ReplicaIdentity>) -> Table {
+    let unique_on = |column: &str| Index {
+        columns: vec![IndexColumn {
+            key: pbps_model::IndexKey::Column(column.into()),
+            descending: false,
+            opclass: None,
+            collation: None,
+            opclass_parameters: Default::default(),
+        }],
+        include: Vec::new(),
+        unique: true,
+        filter: None,
+        method: Default::default(),
+        storage_parameters: Default::default(),
+        filegroup: None,
+    };
+    let mut t = table(&[
+        ("id", Column::new(ty("int")).not_null()),
+        ("code", Column::new(ty("int")).not_null()),
+        ("v", Column::new(ty("int"))),
+    ]);
+    t.indexes.insert("ix_code".into(), unique_on("code"));
+    t.indexes.insert("ix_v".into(), unique_on("v"));
+    t.replica_identity = identity;
+    t
+}
+
+/// The order of a plan's replica identity against its index changes, by
+/// the rule of DEC-1444.1: first, at (0, 1), where the table can take
+/// the target as it stands, which is before the old identity's index is
+/// dropped; last in class 13 where the plan adds the index it names, new
+/// or rebuilt, or makes its columns NOT NULL. Unchanged and not rebuilt,
+/// it is not planned at all.
+#[test]
+fn a_replica_identity_is_set_before_its_old_index_goes_and_after_its_new_one_comes() {
+    use pbps_model::ReplicaIdentity as R;
+    let shown = |cs: &ChangeSet| -> Vec<String> {
+        cs.changes
+            .iter()
+            .map(|p| match &p.change {
+                Change::TableProperty(TablePropertyChange::SetReplicaIdentity {
+                    table,
+                    to,
+                    ..
+                }) => format!(
+                    "identity {table} {}",
+                    to.as_ref()
+                        .map_or("default".to_owned(), |identity| identity.raw().to_string()),
+                    table = table.shown()
+                ),
+                Change::Index(IndexChange::AddIndex { name, .. }) => format!(
+                    "add {name}",
+                    // Preserve raw comparison-label or fixture SQL bytes in test data.
+                    name = name.raw(),
+                ),
+                Change::Index(IndexChange::DropIndex { name, .. }) => format!(
+                    "drop {name}",
+                    // Preserve raw comparison-label or fixture SQL bytes in test data.
+                    name = name.raw(),
+                ),
+                Change::Column(ColumnChange::AlterColumnNullability { column, .. }) => {
+                    format!("tighten {}", column.name.shown())
+                }
+                other => format!("{other:?}"),
+            })
+            .collect()
+    };
+    let plan = |was: Table, now: Table| {
+        shown(&run(
+            &schema_of("public.t", was),
+            &schema_of("public.t", now),
+            &[],
+        ))
+    };
+
+    // The old identity's index is dropped: the identity moves first.
+    let mut gone = identified_by(Some(R::Full));
+    gone.indexes.remove("ix_code");
+    assert_eq!(
+        plan(identified_by(Some(R::Index("ix_code".into()))), gone),
+        ["identity public.t full", "drop ix_code"]
+    );
+
+    // Its index rebuilt: FULL first, which the table can always take,
+    // so no read between the drop and the add finds it identifying no
+    // row; then dropped, added, and the identity set again (#1467
+    // review).
+    let mut rebuilt = identified_by(Some(R::Index("ix_code".into())));
+    rebuilt.indexes.get_mut("ix_code").unwrap().columns[0].descending = true;
+    assert_eq!(
+        plan(identified_by(Some(R::Index("ix_code".into()))), rebuilt),
+        [
+            "identity public.t full",
+            "drop ix_code",
+            "add ix_code",
+            "identity public.t {index: ix_code}"
+        ]
+    );
+
+    // A new index, and one over a column this plan makes NOT NULL: after.
+    let mut new = identified_by(Some(R::Index("ix_new".into())));
+    new.indexes
+        .insert("ix_new".into(), new.indexes["ix_code"].clone());
+    assert_eq!(
+        plan(identified_by(None), new),
+        ["add ix_new", "identity public.t {index: ix_new}"]
+    );
+    let mut tightened = identified_by(Some(R::Index("ix_v".into())));
+    tightened.columns.get_mut("v").unwrap().nullable = false;
+    assert_eq!(
+        plan(identified_by(None), tightened),
+        ["tighten v", "identity public.t {index: ix_v}"]
+    );
+
+    // Negative: unchanged and not rebuilt, nothing is planned; a change
+    // elsewhere in the table does not restate it.
+    let mut elsewhere = identified_by(Some(R::Index("ix_code".into())));
+    elsewhere.indexes.get_mut("ix_v").unwrap().columns[0].descending = true;
+    assert_eq!(
+        plan(identified_by(Some(R::Index("ix_code".into()))), elsewhere),
+        ["drop ix_v", "add ix_v"]
+    );
+    assert!(plan(identified_by(Some(R::Full)), identified_by(Some(R::Full))).is_empty());
+}
+
+fn clustered_on(layout: Option<pbps_model::Clustered>) -> Table {
+    let mut t = table(&[
+        ("id", Column::new(ty("int")).not_null()),
+        ("code", Column::new(ty("int")).not_null()),
+        ("v", Column::new(ty("int"))),
+    ]);
+    t.primary_key = Some(PrimaryKey {
+        name: Some("pk_t".into()),
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+        filegroup: None,
+    });
+    t.unique.insert(
+        "uq_code".into(),
+        UniqueConstraint {
+            columns: vec!["code".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        },
+    );
+    t.indexes.insert(
+        "ix_v".into(),
+        Index {
+            columns: vec![IndexColumn {
+                key: pbps_model::IndexKey::Column("v".into()),
+                descending: false,
+                opclass: None,
+                collation: None,
+                opclass_parameters: Default::default(),
+            }],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+            filegroup: None,
+        },
+    );
+    t.clustered = layout;
+    t
+}
+
+/// Moving the clustered index rebuilds the object that gives it up and
+/// the one that takes it, each with its new layout, and nothing else;
+/// the new clustered index is built before any other addition, so the
+/// key re-added nonclustered is not built twice.
+#[test]
+fn a_layout_change_rebuilds_exactly_the_two_objects_it_moves_between() {
+    use pbps_model::Clustered;
+    let cs = run(
+        &schema_of("dbo.t", clustered_on(None)),
+        &schema_of("dbo.t", clustered_on(Some(Clustered::Index("ix_v".into())))),
+        &[],
+    );
+    let shown: Vec<String> = cs
+        .changes
+        .iter()
+        .map(|p| match &p.change {
+            Change::Constraint(ConstraintChange::SetPrimaryKey {
+                from,
+                to,
+                nonclustered,
+                ..
+            }) => format!(
+                "pk {}->{} nonclustered={nonclustered}",
+                from.is_some(),
+                to.is_some()
+            ),
+            Change::Index(IndexChange::AddIndex {
+                name, clustered, ..
+            }) => format!(
+                "add {name} clustered={clustered}",
+                // Preserve raw comparison-label or fixture SQL bytes in test data.
+                name = name.raw(),
+            ),
+            Change::Index(IndexChange::DropIndex { name, .. }) => format!(
+                "drop {name}",
+                // Preserve raw comparison-label or fixture SQL bytes in test data.
+                name = name.raw(),
+            ),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            "drop ix_v",
+            "pk true->false nonclustered=false",
+            "add ix_v clustered=true",
+            "pk false->true nonclustered=true",
+        ]
+    );
+
+    // And back: the key takes it again, and the index is rebuilt plain —
+    // after the key, although `AddIndex` sorts ahead of `SetPrimaryKey`
+    // everywhere else in the addition class.
+    let cs = run(
+        &schema_of("dbo.t", clustered_on(Some(Clustered::Index("ix_v".into())))),
+        &schema_of("dbo.t", clustered_on(None)),
+        &[],
+    );
+    let key = cs.changes.iter().position(|p| {
+        matches!(
+            &p.change,
+            Change::Constraint(ConstraintChange::SetPrimaryKey {
+                to: Some(_),
+                nonclustered: false,
+                ..
+            })
+        )
+    });
+    let index = cs.changes.iter().position(|p| {
+        matches!(
+            &p.change,
+            Change::Index(IndexChange::AddIndex {
+                clustered: false,
+                ..
+            })
+        )
+    });
+    assert!(
+        matches!((key, index), (Some(k), Some(i)) if k < i),
+        "{cs:?}"
+    );
+    assert!(!kinds(&cs).iter().any(|k| k.contains("Unique")), "{cs:?}");
+
+    // Negative: an unchanged layout is no change at all.
+    for layout in [
+        None,
+        Some(Clustered::Heap),
+        Some(Clustered::Unique("uq_code".into())),
+    ] {
+        let t = schema_of("dbo.t", clustered_on(layout.clone()));
+        assert!(run(&t, &t, &[]).changes.is_empty(), "{layout:?}");
+    }
+}
+
+#[test]
+fn a_unique_layout_change_rebuilds_only_that_unique_in_both_directions() {
+    use pbps_model::Clustered;
+    let heap = schema_of("dbo.t", clustered_on(Some(Clustered::Heap)));
+    let clustered = schema_of(
+        "dbo.t",
+        clustered_on(Some(Clustered::Unique("uq_code".into()))),
+    );
+    for (base, declared, takes_clustered) in [(&heap, &clustered, true), (&clustered, &heap, false)]
+    {
+        let cs = run(base, declared, &[]);
+        let changes: Vec<_> = cs.changes.iter().map(|p| &p.change).collect();
+        assert_eq!(
+            changes,
+            [
+                &Change::Constraint(ConstraintChange::DropUnique {
+                    table: "dbo.t".parse().unwrap(),
+                    name: "uq_code".into(),
+                }),
+                &Change::Constraint(ConstraintChange::AddUnique {
+                    table: "dbo.t".parse().unwrap(),
+                    name: "uq_code".into(),
+                    constraint: declared.tables[&"dbo.t".parse().unwrap()].unique["uq_code"]
+                        .clone(),
+                    clustered: takes_clustered,
+                }),
+            ]
+        );
+        assert!(run(declared, declared, &[]).changes.is_empty());
+    }
+}
+
+/// A key that is only dropped claims no layout, whatever the declaration
+/// says about the table: `nonclustered` describes the key a change adds.
+/// PostgreSQL's emitter refuses a change that claims one, so a drop that
+/// did would stop every plan giving up a key there.
+#[test]
+fn a_key_that_is_only_dropped_claims_no_layout() {
+    let base = clustered_on(None);
+    let mut declared = base.clone();
+    declared.primary_key = None;
+    let cs = run(
+        &schema_of("dbo.t", base),
+        &schema_of("dbo.t", declared),
+        &[],
+    );
+    assert!(
+        cs.changes.iter().any(|p| matches!(
+            &p.change,
+            Change::Constraint(ConstraintChange::SetPrimaryKey {
+                to: None,
+                nonclustered: false,
+                ..
+            })
+        )),
+        "{cs:?}"
+    );
+    assert!(
+        !cs.changes.iter().any(|p| matches!(
+            &p.change,
+            Change::Constraint(ConstraintChange::SetPrimaryKey {
+                nonclustered: true,
+                ..
+            })
+        )),
+        "{cs:?}"
+    );
+}
+
+/// A key that stays but becomes nonclustered is still a different
+/// index, so the foreign keys bound to it are dropped and re-added
+/// around it, as they are for any replaced key.
+#[test]
+fn a_key_moved_to_the_heap_takes_its_foreign_keys_through_the_rebuild() {
+    let mut base = schema_of("dbo.t", clustered_on(None));
+    let mut child = table(&[
+        ("id", Column::new(ty("int")).not_null()),
+        ("t_id", Column::new(ty("int"))),
+    ]);
+    child.foreign_keys.insert(
+        "fk_child_t".into(),
+        ForeignKey {
+            columns: vec!["t_id".into()],
+            references_table: "dbo.t".parse().unwrap(),
+            references_columns: vec!["id".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    base.tables.insert("dbo.child".parse().unwrap(), child);
+    let mut declared = base.clone();
+    declared
+        .tables
+        .get_mut(&"dbo.t".parse::<TableName>().unwrap())
+        .unwrap()
+        .clustered = Some(pbps_model::Clustered::Heap);
+    let k = kinds(&run(&base, &declared, &[]));
+    assert_eq!(
+        k,
+        [
+            "DropForeignKey",
+            "SetPrimaryKey",
+            "SetPrimaryKey",
+            "AddForeignKey"
+        ]
+    );
+}
+
+/// A renamed clustered index is a drop and an add under the new name,
+/// and the selector written with the new name makes the new one the
+/// clustered one; the key, nonclustered on both sides, is not touched.
+#[test]
+fn a_renamed_clustered_index_is_rebuilt_clustered_under_its_new_name() {
+    use pbps_model::Clustered;
+    let base = clustered_on(Some(Clustered::Index("ix_v".into())));
+    let mut declared = base.clone();
+    let index = declared.indexes.remove("ix_v").unwrap();
+    declared.indexes.insert("cx_v".into(), index);
+    declared.clustered = Some(Clustered::Index("cx_v".into()));
+    let cs = run(
+        &schema_of("dbo.t", base),
+        &schema_of("dbo.t", declared),
+        &[],
+    );
+    let shown: Vec<String> = cs
+        .changes
+        .iter()
+        .map(|p| match &p.change {
+            Change::Index(IndexChange::AddIndex {
+                name, clustered, ..
+            }) => format!(
+                "add {name} clustered={clustered}",
+                // Preserve raw comparison-label or fixture SQL bytes in test data.
+                name = name.raw(),
+            ),
+            Change::Index(IndexChange::DropIndex { name, .. }) => format!(
+                "drop {name}",
+                // Preserve raw comparison-label or fixture SQL bytes in test data.
+                name = name.raw(),
+            ),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(shown, ["drop ix_v", "add cx_v clustered=true"]);
+}
+
+/// A key that references itself goes through its own rebuild: the
+/// foreign key is dropped before the key and re-added after it.
+#[test]
+fn a_self_referencing_key_rebuilt_for_its_layout_keeps_its_foreign_key() {
+    let mut t = clustered_on(None);
+    t.columns.insert("parent".into(), Column::new(ty("int")));
+    t.foreign_keys.insert(
+        "fk_t_parent".into(),
+        ForeignKey {
+            columns: vec!["parent".into()],
+            references_table: "dbo.t".parse().unwrap(),
+            references_columns: vec!["id".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    let mut heap = t.clone();
+    heap.clustered = Some(pbps_model::Clustered::Heap);
+    let k = kinds(&run(&schema_of("dbo.t", t), &schema_of("dbo.t", heap), &[]));
+    assert_eq!(
+        k,
+        [
+            "DropForeignKey",
+            "SetPrimaryKey",
+            "SetPrimaryKey",
+            "AddForeignKey"
+        ]
+    );
+}
+
+/// Why a comparison against a live database has to identify the live side
+/// by what is there (`crate::observed_ids`), not by the mapping the
+/// declarations carry.
+///
+/// Matching is by uid. Handing both sides the same identity file makes
+/// every uid present on both, so a table one side does not hold is not an
+/// addition — it is a pair whose model lookup fails, and the loop skips it.
+/// The two findings that matter most (something the plan failed to create,
+/// something a hand added) are exactly the two that vanish. `plan --dev`
+/// and the drift check both depend on this.
+#[test]
+fn a_shared_identity_file_hides_what_one_side_is_missing() {
+    let declared = schema_of("dbo.t", table(&[("id", Column::new(ty("int")))]));
+    let ids = crate::resolve(&declared, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    // The engine built nothing at all.
+    let engine = Schema::default();
+
+    let shared = diff(
+        Side {
+            schema: &engine,
+            ids: &ids,
+        },
+        Side {
+            schema: &declared,
+            ids: &ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+    )
+    .unwrap();
+    assert!(
+        shared.changes.is_empty(),
+        "the trap this test exists for has moved: {:?}",
+        kinds(&shared)
+    );
+
+    let observed = crate::observed_ids(&engine, &ids);
+    let honest = diff(
+        Side {
+            schema: &engine,
+            ids: &observed,
+        },
+        Side {
+            schema: &declared,
+            ids: &ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+    )
+    .unwrap();
+    assert_eq!(kinds(&honest), vec!["CreateTable"]);
+}
+
+// ---- Reference data (ADR-0004) ----
+
+fn lookup(mode: DataMode, rows: &[(&str, &str)]) -> Table {
+    let mut t = table(&[
+        ("code", Column::new(ty("varchar(20)")).not_null()),
+        ("label", Column::new(ty("nvarchar(50)"))),
+    ]);
+    t.primary_key = Some(pbps_model::PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+        storage_parameters: Default::default(),
+        filegroup: None,
+    });
+    t.data = Some(pbps_model::TableData {
+        mode,
+        rows: rows
+            .iter()
+            .map(|(k, label)| {
+                (
+                    pbps_model::RowKey::from(*k),
+                    [("label".into(), Value::Text((*label).to_owned()))]
+                        .into_iter()
+                        .collect::<Row>(),
+                )
+            })
+            .collect(),
+    });
+    t
+}
+
+/// A tightening of a table whose rows this plan writes or deletes runs
+/// after them, since they may be what fills or removes its NULLs, and a
+/// tightening folded into a retype comes out of it to do so. A table
+/// without row changes keeps its tightening among the column alterations,
+/// whatever another table's rows do (#1367).
+#[test]
+#[allow(clippy::wildcard_enum_match_arm)]
+fn a_tightening_runs_after_the_rows_of_its_table() {
+    let required = |mut t: Table, ty_: &str| {
+        let label = t.columns.get_mut("label").expect("the lookup's label");
+        label.ty = ty(ty_);
+        label.nullable = false;
+        t
+    };
+    let order = |cs: &ChangeSet| -> Vec<String> {
+        cs.changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::Column(ColumnChange::AlterColumnNullability { column, .. }) => {
+                    Some(format!("tighten {}", column.table.shown()))
+                }
+                Change::Column(ColumnChange::AlterColumnType {
+                    column,
+                    to_nullable,
+                    ..
+                }) => Some(format!(
+                    "retype {} nullable={to_nullable}",
+                    column.table.shown()
+                )),
+                Change::Row(RowChange::UpdateRow { table, .. }) => {
+                    Some(format!("update {table}", table = table.shown()))
+                }
+                Change::Row(RowChange::DeleteRow { table, .. }) => {
+                    Some(format!("delete {table}", table = table.shown()))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    // An update fills the NULL: the tightening follows it.
+    let base = schema_of("dbo.s", lookup(DataMode::Ensure, &[("a", "x")]));
+    let filled = schema_of(
+        "dbo.s",
+        required(lookup(DataMode::Ensure, &[("a", "y")]), "nvarchar(50)"),
+    );
+    assert_eq!(
+        order(&run(&base, &filled, &[])),
+        ["update dbo.s", "tighten dbo.s"]
+    );
+    // An exact table deletes the row that held it: after the delete.
+    let base = schema_of("dbo.s", lookup(DataMode::Exact, &[("a", "x"), ("b", "y")]));
+    let removed = schema_of(
+        "dbo.s",
+        required(lookup(DataMode::Exact, &[("a", "x")]), "nvarchar(50)"),
+    );
+    assert_eq!(
+        order(&run(&base, &removed, &[])),
+        ["delete dbo.s", "tighten dbo.s"]
+    );
+    // Folded into a retype, the tightening comes out of it and follows the
+    // rows; the retype keeps the column nullable.
+    let widened = schema_of(
+        "dbo.s",
+        required(lookup(DataMode::Ensure, &[("a", "y")]), "nvarchar(80)"),
+    );
+    let base = schema_of("dbo.s", lookup(DataMode::Ensure, &[("a", "x")]));
+    assert_eq!(
+        order(&run(&base, &widened, &[])),
+        [
+            "retype dbo.s nullable=true",
+            "update dbo.s",
+            "tighten dbo.s"
+        ]
+    );
+    // Negative: another table's rows move nothing. `dbo.s` writes no row,
+    // so its tightening stays in class 9, ahead of `dbo.o`'s update, and a
+    // retype keeps its tightening folded in.
+    let pair = |s: Table, o: Table| {
+        let mut schema = schema_of("dbo.s", s);
+        schema.tables.insert("dbo.o".parse().unwrap(), o);
+        schema
+    };
+    let base = pair(
+        lookup(DataMode::Ensure, &[("a", "x")]),
+        lookup(DataMode::Ensure, &[("a", "x")]),
+    );
+    let declared = pair(
+        required(lookup(DataMode::Ensure, &[("a", "x")]), "nvarchar(50)"),
+        lookup(DataMode::Ensure, &[("a", "y")]),
+    );
+    assert_eq!(
+        order(&run(&base, &declared, &[])),
+        ["tighten dbo.s", "update dbo.o"]
+    );
+    let declared = pair(
+        required(lookup(DataMode::Ensure, &[("a", "x")]), "nvarchar(80)"),
+        lookup(DataMode::Ensure, &[("a", "y")]),
+    );
+    assert_eq!(
+        order(&run(&base, &declared, &[])),
+        ["retype dbo.s nullable=false", "update dbo.o"]
+    );
+}
+
+/// A column whose tightening was split out of its retype carries two
+/// changes, and the dependents both bring down are rebuilt: the check a
+/// collation change takes down, and the unique key a tightening does
+/// (#1363, #1367).
+#[test]
+fn a_split_tightening_keeps_the_dependents_of_its_retype() {
+    let shaped = |collation: Option<&str>, nullable: bool, label: &str| {
+        let mut t = lookup(DataMode::Ensure, &[("a", label)]);
+        let column = t.columns.get_mut("label").expect("the lookup's label");
+        column.collation = collation.map(pbps_model::Collation::new);
+        column.nullable = nullable;
+        t.unique.insert(
+            "uq_label".into(),
+            UniqueConstraint {
+                columns: vec!["label".into()],
+                storage_parameters: Default::default(),
+                filegroup: None,
+            },
+        );
+        t.checks.insert(
+            "ck_label".into(),
+            CheckConstraint {
+                expression: "label <> ''".into(),
+            },
+        );
+        schema_of("dbo.s", t)
+    };
+    let base = shaped(None, true, "x");
+    let declared = shaped(Some("Latin1_General_CS_AS"), false, "y");
+    let k = kinds(&run_with(&Recollates, &base, &declared, &[]));
+    for kind in [
+        "AlterColumnType",
+        "AlterColumnNullability",
+        "DropCheck",
+        "AddCheck",
+        "DropUnique",
+        "AddUnique",
+    ] {
+        assert!(k.contains(&kind.to_owned()), "{kind}: {k:?}");
+    }
+}
+
+/// Changes tied on class, rank and subject are ordered by their `Debug`
+/// text, not by the order the differ produced them in.
+///
+/// Ten columns of one table are widened and ten others become nullable.
+/// Both kinds tie on class, rank and table. The differ walks the columns
+/// by uid, which is random, so it interleaves the two kinds. Only the
+/// `Debug` tiebreak puts every `AlterColumnNullability` before every
+/// `AlterColumnType`; the walk gives that order in one run in C(20, 10).
+/// The key is now computed once per change (#1908) and must give this
+/// same order.
+#[test]
+fn changes_tied_on_class_and_table_are_ordered_by_their_debug_text() {
+    let shape = |changed: bool| {
+        let mut columns: Vec<(String, Column)> = Vec::new();
+        for i in 0..10 {
+            let widened = Column::new(ty(if changed { "bigint" } else { "int" }));
+            columns.push((format!("w{i:02}"), widened));
+            let mut loosened = Column::new(ty("int"));
+            loosened.nullable = changed;
+            columns.push((format!("n{i:02}"), loosened));
+        }
+        let columns: Vec<(&str, Column)> = columns
+            .iter()
+            .map(|(n, c)| (n.as_str(), c.clone()))
+            .collect();
+        schema_of("dbo.t", table(&columns))
+    };
+    let changes: Vec<String> = run(&shape(false), &shape(true), &[])
+        .changes
+        .iter()
+        .map(|p| format!("{:?}", p.change))
+        .collect();
+    assert_eq!(changes.len(), 20, "{changes:?}");
+    let kinds: Vec<&str> = changes
+        .iter()
+        .map(|c| c.split_once(' ').map_or(c.as_str(), |(kind, _)| kind))
+        .collect();
+    assert_eq!(kinds[..10], ["AlterColumnNullability"; 10], "{changes:?}");
+    assert_eq!(kinds[10..], ["AlterColumnType"; 10], "{changes:?}");
+    let mut by_debug = changes.clone();
+    by_debug.sort();
+    assert_eq!(changes, by_debug);
+}
+
+/// `MinimalDialect` where descriptions are comments, as PostgreSQL's are.
+#[derive(Debug, Clone, Copy, Default)]
+struct HoldsDescriptions;
+
+impl Dialect for HoldsDescriptions {
+    fn name(&self) -> &'static str {
+        "holds-descriptions"
+    }
+    fn holds_descriptions(&self) -> bool {
+        true
+    }
+    fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
+        MinimalDialect.quote_ident(ident)
+    }
+    fn intermediate_tables(
+        &self,
+        change: &Change,
+        strategy: pbps_model::Strategy,
+    ) -> Result<Vec<pbps_model::TableName>, pbps_dialect::DialectError> {
+        MinimalDialect.intermediate_tables(change, strategy)
+    }
+    fn normalize_type(
+        &self,
+        ty: &pbps_model::ColumnType,
+    ) -> Result<pbps_model::ColumnType, pbps_dialect::DialectError> {
+        MinimalDialect.normalize_type(ty)
+    }
+    fn type_change_risk(
+        &self,
+        from: &pbps_model::ColumnType,
+        to: &pbps_model::ColumnType,
+    ) -> pbps_dialect::TypeChangeRisk {
+        MinimalDialect.type_change_risk(from, to)
+    }
+    fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+        MinimalDialect.fold_ident(ident)
+    }
+    fn lexicon(&self) -> pbps_dialect::Lexicon {
+        MinimalDialect.lexicon()
+    }
+    fn validate_table(
+        &self,
+        name: &pbps_model::TableName,
+        table: &Table,
+    ) -> Vec<pbps_dialect::DialectError> {
+        MinimalDialect.validate_table(name, table)
+    }
+    fn transaction_framing(
+        &self,
+        zone: &pbps_model::SessionZone,
+    ) -> pbps_dialect::TransactionFraming {
+        MinimalDialect.transaction_framing(zone)
+    }
+    fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+        MinimalDialect.probe_framing()
+    }
+}
+
+/// The tie-break text decides across families: a column's deprecation, a
+/// table's comment and storage parameters and an index's storage parameters,
+/// all one table's and all in one class and rank, come out in the alphabetical
+/// order of their kinds, not grouped by what they belong to (#2790). Three
+/// families, so a `Debug` that names the family first (`Column(`, `Index(`,
+/// `TableProperty(`) would put the index's parameters before the comment.
+#[test]
+fn metadata_changes_tied_on_class_and_table_are_ordered_by_kind_across_families() {
+    let with = |fillfactor: &str, described: bool| {
+        let mut t = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("v", Column::new(ty("int"))),
+        ]);
+        t.indexes.insert(
+            "ix_v".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    key: pbps_model::IndexKey::Column("v".into()),
+                    descending: false,
+                    opclass: None,
+                    collation: None,
+                    opclass_parameters: Default::default(),
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: [("fillfactor".to_owned(), fillfactor.to_owned())]
+                    .into_iter()
+                    .collect(),
+                filegroup: None,
+            },
+        );
+        t.storage_parameters = [("fillfactor".to_owned(), fillfactor.to_owned())]
+            .into_iter()
+            .collect();
+        if described {
+            t.description = Some("a table".into());
+            t.columns["v"].deprecated = Some("old".into());
+        }
+        schema_of("public.t", t)
+    };
+    let planned = run_with(
+        &HoldsDescriptions,
+        &with("70", false),
+        &with("80", true),
+        &[],
+    );
+    let changed = kinds(&planned);
+    assert_eq!(
+        changed,
+        [
+            "SetColumnDeprecated",
+            "SetComment",
+            "SetIndexStorageParameters",
+            "SetStorageParameters"
+        ],
+        "{:?}",
+        planned.changes
+    );
+    // Negative: not the order a grouping by family would give, so the test
+    // cannot pass by accident.
+    assert_ne!(
+        changed,
+        [
+            "SetColumnDeprecated",
+            "SetIndexStorageParameters",
+            "SetComment",
+            "SetStorageParameters"
+        ]
+    );
+}
+
+/// `change_in_words` reads the kind's own name, for one kind of every family (the list
+/// is held to the families the fixtures have kinds of),
+/// so a refusal says `drop check` and not the family's name (#2790).
+#[test]
+fn a_kind_is_put_in_words_by_its_own_name_in_every_family() {
+    fn plan_files(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                plan_files(&path, found);
+            } else if path.extension().is_some_and(|e| e == "json") {
+                found.push(path);
+            }
+        }
+    }
+    fn objects(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
+        if let serde_json::Value::Object(map) = value {
+            if map.get("op").is_some_and(serde_json::Value::is_string) {
+                out.push(value.clone());
+            } else {
+                map.values().for_each(|v| objects(v, out));
+            }
+        } else if let serde_json::Value::Array(items) = value {
+            items.iter().for_each(|v| objects(v, out));
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut files = Vec::new();
+    for place in [
+        "pbps-cli/tests/fixtures/name-compatibility",
+        "pbps-model/tests/fixtures",
+        "pbps-model/tests/support",
+    ] {
+        plan_files(&root.join(place), &mut files);
+    }
+    let mut by_op: std::collections::BTreeMap<String, Change> = Default::default();
+    for file in files {
+        let Ok(value) = serde_json::from_str(&std::fs::read_to_string(file).unwrap()) else {
+            continue;
+        };
+        let mut found = Vec::new();
+        objects(&value, &mut found);
+        for object in found {
+            let op = object["op"].as_str().unwrap().to_owned();
+            if let Ok(planned) = serde_json::from_value::<pbps_model::PlannedChange>(object) {
+                by_op.entry(op).or_insert(planned.change);
+            }
+        }
+    }
+    // One kind of each family, in `ChangeFamily` order.
+    let expected = [
+        ("create_table", "create table"),
+        ("set_replica_identity", "set replica identity"),
+        ("detach_partition", "detach partition"),
+        ("drop_column", "drop column"),
+        ("drop_check", "drop check"),
+        ("drop_index", "drop index"),
+        ("drop_policy", "drop policy"),
+        ("set_data_mode", "set data mode"),
+        ("drop_module", "drop module"),
+        ("revoke", "revoke"),
+        ("alter_domain", "alter domain"),
+        ("drop_role", "drop role"),
+        ("rename_type", "rename type"),
+        ("drop_extension", "drop extension"),
+        ("drop_search", "drop search"),
+    ];
+    let mut families = std::collections::BTreeSet::new();
+    for (op, words) in expected {
+        let change = by_op
+            .get(op)
+            .unwrap_or_else(|| panic!("no fixture holds a `{op}` that decodes as a change: add one, or a kind stopped decoding"));
+        assert_eq!(change_in_words(change), words, "{op}");
+        families.insert(change.family());
+    }
+    // Every family the fixtures hold a kind of is one of those above, so a family
+    // added later fails here until a kind of it is listed; the fixtures hold every
+    // kind (`part-effects.json` is the corpus of all of them).
+    let held: std::collections::BTreeSet<_> = by_op.values().map(Change::family).collect();
+    assert_eq!(held, families, "one kind of every family");
+    // Negative: the words are the kind's, so two kinds of one family differ.
+    assert_ne!(
+        change_in_words(&by_op["drop_check"]),
+        change_in_words(&by_op["add_check"])
+    );
+}
+
+fn row_ops(cs: &ChangeSet) -> Vec<String> {
+    cs.changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::Row(RowChange::InsertRow { key, .. }) => Some(format!("insert {key}")),
+            Change::Row(RowChange::UpdateRow { key, columns, .. }) => Some(format!(
+                "update {key} [{}]",
+                columns.keys().cloned().collect::<Vec<_>>().join(",")
+            )),
+            Change::Row(RowChange::DeleteRow { key, cause, .. }) => {
+                Some(format!("delete {key} {cause:?}"))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_declared_row_that_is_not_there_is_inserted() {
+    let base = schema_of("dbo.s", lookup(DataMode::Exact, &[]));
+    let declared = schema_of("dbo.s", lookup(DataMode::Exact, &[("new", "New")]));
+    assert_eq!(row_ops(&run(&base, &declared, &[])), ["insert new"]);
+}
+
+#[test]
+fn only_the_columns_that_differ_reach_the_update() {
+    let base = schema_of(
+        "dbo.s",
+        lookup(DataMode::Exact, &[("new", "New"), ("shipped", "Shipped")]),
+    );
+    let declared = schema_of(
+        "dbo.s",
+        lookup(
+            DataMode::Exact,
+            &[("new", "Opened"), ("shipped", "Shipped")],
+        ),
+    );
+    // `shipped` is untouched, and `new` restates only `label`: an UPDATE
+    // that also set the columns which agree would overwrite values nobody
+    // asked to change.
+    assert_eq!(row_ops(&run(&base, &declared, &[])), ["update new [label]"]);
+}
+
+/// The cells the plan leaves alone travel beside the changed ones, with
+/// their base types, so the emitter can hold the whole declared row —
+/// never restate it (DECISIONS 136). A column the row omits is carried as
+/// the default it resolves to.
+#[test]
+fn an_update_carries_the_cells_it_leaves_alone() {
+    let mut base_t = lookup(DataMode::Exact, &[("new", "New")]);
+    base_t
+        .columns
+        .insert("note".into(), Column::new(ty("nvarchar(50)")));
+    let mut sort = Column::new(ty("int"));
+    sort.value_source = pbps_model::ValueSource::Default("(0)".to_owned());
+    base_t.columns.insert("sort".into(), sort);
+    // The engine's own: never read back, so never a cell to hold the
+    // row to (DECISIONS 94) — holding it to NULL would refuse every
+    // update on the table.
+    let mut seq = Column::new(ty("int")).not_null();
+    seq.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
+        seed: 1,
+        increment: 1,
+        options: Default::default(),
+    });
+    base_t.columns.insert("seq".into(), seq);
+    base_t
+        .data
+        .as_mut()
+        .unwrap()
+        .rows
+        .get_mut(&pbps_model::RowKey::from("new"))
+        .unwrap()
+        .0
+        .insert("note".into(), Value::Text("kept".to_owned()));
+    let mut declared_t = base_t.clone();
+    declared_t
+        .data
+        .as_mut()
+        .unwrap()
+        .rows
+        .get_mut(&pbps_model::RowKey::from("new"))
+        .unwrap()
+        .0
+        .insert("label".into(), Value::Text("Opened".to_owned()));
+
+    let cs = run(
+        &schema_of("dbo.s", base_t),
+        &schema_of("dbo.s", declared_t),
+        &[],
+    );
+    let Some(Change::Row(RowChange::UpdateRow {
+        columns,
+        unchanged,
+        types,
+        ..
+    })) = cs
+        .changes
+        .iter()
+        .map(|p| &p.change)
+        .find(|c| matches!(c, Change::Row(RowChange::UpdateRow { .. })))
+    else {
+        panic!("{:?}", row_ops(&cs));
+    };
+    assert_eq!(
+        columns.keys().cloned().collect::<Vec<_>>(),
+        [pbps_model::ColumnName::from("label")]
+    );
+    assert_eq!(
+        unchanged.iter().collect::<Vec<_>>(),
+        [
+            (
+                &ColumnName::from("note"),
+                &Cell::Value(Value::Text("kept".to_owned()))
+            ),
+            (&ColumnName::from("sort"), &Cell::Default("(0)".to_owned())),
+        ]
+    );
+    // The key is neither: it lives in the map key, not in the row. Nor
+    // is the identity column.
+    assert_eq!(
+        types.keys().cloned().collect::<Vec<_>>(),
+        [
+            pbps_model::ColumnName::from("label"),
+            pbps_model::ColumnName::from("note"),
+            pbps_model::ColumnName::from("sort")
+        ]
+    );
+    assert!(!unchanged.contains_key("seq"), "{unchanged:?}");
+}
+
+/// A cell needs two types when the same plan changes the column under it.
+/// `types` is what the *recorded* state holds — the emitter's
+/// precondition — and it carries a column only where this plan leaves its
+/// type alone: a column the base lacks has no recorded cell at all, and a
+/// column this plan retypes has one the engine has since converted out of
+/// the spelling that was recorded (146).
+/// `after_types` is what the column will be once this plan's `AddColumn`
+/// and `AlterColumnType` have run, which is what the write is held to
+/// afterwards; carrying only the first left an added cell held by nothing,
+/// so a trigger could rewrite it and be recorded as the plan's own result
+/// (DECISIONS 140).
+#[test]
+fn an_update_carries_the_type_each_cell_will_have_as_well_as_the_one_it_had() {
+    let base_t = lookup(DataMode::Exact, &[("new", "New")]);
+    let mut declared_t = base_t.clone();
+    // Added and populated in this same revision.
+    declared_t
+        .columns
+        .insert("note".into(), Column::new(ty("nvarchar(50)")));
+    // Retyped in this same revision, and its cell left alone.
+    declared_t
+        .columns
+        .insert("label".into(), Column::new(ty("nvarchar(80)")));
+    let row = declared_t
+        .data
+        .as_mut()
+        .unwrap()
+        .rows
+        .get_mut(&pbps_model::RowKey::from("new"))
+        .unwrap();
+    row.0.insert("note".into(), Value::Text("fresh".to_owned()));
+
+    let cs = run(
+        &schema_of("dbo.s", base_t),
+        &schema_of("dbo.s", declared_t),
+        &[],
+    );
+    let Some(Change::Row(RowChange::UpdateRow {
+        types, after_types, ..
+    })) = cs
+        .changes
+        .iter()
+        .map(|p| &p.change)
+        .find(|c| matches!(c, Change::Row(RowChange::UpdateRow { .. })))
+    else {
+        panic!("{:?}", row_ops(&cs));
+    };
+    // `note` is held by nothing before the write: the base has no such
+    // column, so there is no recorded cell to hold the row to. `label`
+    // is — under the type its recorded text was *read* in, paired with
+    // the type below, which is what lets the emitter ask the engine for
+    // the conversion instead of spelling it (DECISIONS 149, where 146
+    // carried neither and held nothing).
+    assert_eq!(
+        types.keys().cloned().collect::<Vec<_>>(),
+        [pbps_model::ColumnName::from("label")]
+    );
+    assert_eq!(types["label"], ty("nvarchar(50)"));
+    // Both the added column and the retyped one carry what they will be;
+    // a column neither added nor retyped carries nothing here, and the
+    // emitter falls back to `types`.
+    assert_eq!(
+        after_types.keys().cloned().collect::<Vec<_>>(),
+        [
+            pbps_model::ColumnName::from("label"),
+            pbps_model::ColumnName::from("note")
+        ]
+    );
+    assert_eq!(after_types["label"], ty("nvarchar(80)"));
+    assert_eq!(after_types["note"], ty("nvarchar(50)"));
+}
+
+#[test]
+fn exact_deletes_a_row_the_declaration_dropped() {
+    let base = schema_of(
+        "dbo.s",
+        lookup(DataMode::Exact, &[("new", "New"), ("old", "Old")]),
+    );
+    let declared = schema_of("dbo.s", lookup(DataMode::Exact, &[("new", "New")]));
+    assert_eq!(
+        row_ops(&run(&base, &declared, &[])),
+        ["delete old Undeclared"]
+    );
+}
+
+/// The promise `ensure` makes, and the reason the mode exists at all: the
+/// application writes to this table too, and pbps must not remove what it
+/// put there.
+#[test]
+fn ensure_never_deletes() {
+    let base = schema_of(
+        "dbo.s",
+        lookup(DataMode::Ensure, &[("new", "New"), ("old", "Old")]),
+    );
+    let declared = schema_of("dbo.s", lookup(DataMode::Ensure, &[("new", "New")]));
+    assert!(row_ops(&run(&base, &declared, &[])).is_empty());
+}
+
+/// Removing the *declaration* must never delete the rows. Reading a removed
+/// block as "delete them all" would make deleting a file destroy data.
+#[test]
+fn removing_the_block_deletes_nothing() {
+    let base = schema_of("dbo.s", lookup(DataMode::Exact, &[("new", "New")]));
+    let mut without = lookup(DataMode::Exact, &[]);
+    without.data = None;
+    let declared = schema_of("dbo.s", without);
+    let cs = run(&base, &declared, &[]);
+    assert!(row_ops(&cs).is_empty(), "{:?}", row_ops(&cs));
+    // It is still reported, so the recorded state stops claiming a mode the
+    // file no longer declares.
+    assert!(cs.changes.iter().any(|p| matches!(
+        &p.change,
+        Change::Row(RowChange::SetDataMode { to: None, .. })
+    )));
+}
+
+#[test]
+fn identical_rows_produce_no_change() {
+    let base = schema_of("dbo.s", lookup(DataMode::Exact, &[("new", "New")]));
+    let declared = schema_of("dbo.s", lookup(DataMode::Exact, &[("new", "New")]));
+    assert!(run(&base, &declared, &[]).changes.is_empty());
+}
+
+/// An omitted column and an explicit `null` are two spellings of one row.
+/// Comparing them unequal would put an UPDATE that changes nothing into
+/// every plan, for ever.
+#[test]
+fn an_omitted_column_equals_an_explicit_null() {
+    let mut base_t = lookup(DataMode::Exact, &[("new", "x")]);
+    base_t.data.as_mut().unwrap().rows = [(pbps_model::RowKey::from("new"), Row::default())]
+        .into_iter()
+        .collect();
+    let mut declared_t = lookup(DataMode::Exact, &[("new", "x")]);
+    declared_t.data.as_mut().unwrap().rows = [(
+        pbps_model::RowKey::from("new"),
+        [("label".into(), Value::Null)].into_iter().collect::<Row>(),
+    )]
+    .into_iter()
+    .collect();
+    assert!(
+        run(
+            &schema_of("dbo.s", base_t),
+            &schema_of("dbo.s", declared_t),
+            &[]
+        )
+        .changes
+        .is_empty()
+    );
+}
+
+#[test]
+fn a_new_table_gets_its_rows_after_the_create() {
+    let declared = schema_of("dbo.s", lookup(DataMode::Exact, &[("new", "New")]));
+    let cs = run(&Schema::default(), &declared, &[]);
+    let k = kinds(&cs);
+    let create = k.iter().position(|c| c == "CreateTable").unwrap();
+    let insert = k.iter().position(|c| c == "InsertRow").unwrap();
+    assert!(create < insert, "{k:?}");
+}
+
+/// The bug this ordering exists to prevent, one level down from the foreign
+/// key between two new tables that a live test had to find: `sub` points at
+/// `status`, so `status`'s rows have to be in before `sub`'s go in — and out
+/// after `sub`'s come out.
+#[test]
+fn rows_follow_the_foreign_keys_between_their_tables() {
+    let status = lookup(DataMode::Exact, &[("new", "New")]);
+    let mut sub = lookup(DataMode::Exact, &[("a", "A")]);
+    sub.columns
+        .insert("parent".into(), Column::new(ty("varchar(20)")).not_null());
+    sub.foreign_keys.insert(
+        "fk_sub_status".into(),
+        pbps_model::ForeignKey {
+            columns: vec!["parent".into()],
+            references_table: "dbo.status".parse().unwrap(),
+            references_columns: vec!["code".into()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        },
+    );
+
+    let mut empty_status = status.clone();
+    empty_status.data.as_mut().unwrap().rows.clear();
+    let mut empty_sub = sub.clone();
+    empty_sub.data.as_mut().unwrap().rows.clear();
+
+    let mut base = Schema::default();
+    base.tables
+        .insert("dbo.status".parse().unwrap(), empty_status);
+    base.tables.insert("dbo.sub".parse().unwrap(), empty_sub);
+    let mut declared = Schema::default();
+    declared
+        .tables
+        .insert("dbo.status".parse().unwrap(), status.clone());
+    declared
+        .tables
+        .insert("dbo.sub".parse().unwrap(), sub.clone());
+
+    let cs = run(&base, &declared, &[]);
+    let inserts: Vec<&TableName> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::Row(RowChange::InsertRow { table, .. }) => Some(table),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        inserts
+            .iter()
+            .map(|name| name.raw().to_string())
+            .collect::<Vec<_>>(),
+        ["dbo.status", "dbo.sub"],
+        "the referenced table's rows must go in first"
+    );
+
+    // And the mirror image: taking them out runs the other way round.
+    let cs = run(&declared, &base, &[]);
+    let deletes: Vec<String> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::Row(RowChange::DeleteRow { table, .. }) => Some(table.raw().to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deletes, ["dbo.sub", "dbo.status"]);
+}
+
+/// The second review's first P1. An existing row that stops writing a
+/// column with a default is asking for the default, and the UPDATE has to
+/// say so: `= NULL` fails a NOT NULL column and stores NULL in a nullable
+/// one.
+#[test]
+fn dropping_a_written_value_in_favour_of_the_default_updates_to_default() {
+    let mut base_t = lookup(DataMode::Exact, &[("new", "x")]);
+    base_t.columns.get_mut("label").unwrap().value_source =
+        pbps_model::ValueSource::Default("''".to_owned());
+    let mut declared_t = base_t.clone();
+    declared_t.data.as_mut().unwrap().rows = [(pbps_model::RowKey::from("new"), Row::default())]
+        .into_iter()
+        .collect();
+    let cs = run(
+        &schema_of("dbo.s", base_t),
+        &schema_of("dbo.s", declared_t),
+        &[],
+    );
+    let Change::Row(RowChange::UpdateRow { columns, .. }) = &cs.changes[0].change else {
+        panic!("{:?}", kinds(&cs));
+    };
+    assert_eq!(
+        columns["label"],
+        (
+            pbps_model::Cell::Value(Value::Text("x".to_owned())),
+            pbps_model::Cell::Default("''".to_owned())
+        )
+    );
+}
+
+/// The engine respells every expression it stores — measured on SQL
+/// Server, `n > 0 AND label <> 'none'` comes back `([n]>(0) AND
+/// [label]<>'none')` and `GETDATE()` as `getdate()` — so a differ that
+/// compared the declaration against the read-back restated an unchanged
+/// check and rebuilt an unchanged filtered index on every connected plan.
+/// With the declared texts recorded and laid over the read-back, an
+/// unchanged declaration plans nothing, a changed one plans the change,
+/// and an object nothing was recorded for is compared as it always was
+/// (ADR-0013 §4, DECISIONS 207–208).
+#[test]
+fn a_declared_expression_the_engine_respelled_is_not_restated_when_unchanged() {
+    let declared_t = {
+        let mut t = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("n", Column::new(ty("int"))),
+            ("d", Column::new(ty("date"))),
+        ]);
+        t.columns.get_mut("n").unwrap().value_source =
+            pbps_model::ValueSource::Default("0".to_owned());
+        t.columns.get_mut("d").unwrap().value_source =
+            pbps_model::ValueSource::Default("GETDATE()".to_owned());
+        t.checks.insert(
+            "ck_n".into(),
+            pbps_model::CheckConstraint {
+                expression: "n > 0 AND n < 10".to_owned(),
+            },
+        );
+        t.indexes.insert(
+            "ix_n".into(),
+            pbps_model::Index {
+                columns: vec![pbps_model::IndexColumn {
+                    key: pbps_model::IndexKey::Column("n".into()),
+                    descending: false,
+                    opclass: None,
+                    collation: None,
+                    opclass_parameters: Default::default(),
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: Some("n > 0".to_owned()),
+                method: Default::default(),
+                storage_parameters: Default::default(),
+                filegroup: None,
+            },
+        );
+        t
+    };
+    let read_back_t = {
+        let mut t = declared_t.clone();
+        t.columns.get_mut("n").unwrap().value_source =
+            pbps_model::ValueSource::Default("(0)".to_owned());
+        t.columns.get_mut("d").unwrap().value_source =
+            pbps_model::ValueSource::Default("getdate()".to_owned());
+        t.checks.get_mut("ck_n").unwrap().expression = "[n]>(0) AND [n]<(10)".to_owned();
+        t.indexes.get_mut("ix_n").unwrap().filter = Some("[n]>(0)".to_owned());
+        t
+    };
+    let declared = schema_of("dbo.t", declared_t.clone());
+    let read_back = schema_of("dbo.t", read_back_t);
+
+    // Compared against the read-back, as before the record existed: the
+    // restatement, with its drop-and-add of the check and the index.
+    let restated = kinds(&run(&read_back, &declared, &[]));
+    assert!(
+        restated.contains(&"AlterColumnDefault".to_owned()),
+        "{restated:?}"
+    );
+    assert!(restated.contains(&"DropIndex".to_owned()), "{restated:?}");
+
+    // Compared against what was declared when it was written: nothing.
+    let recorded = pbps_model::Declared::from_schema(&declared);
+    let base = recorded.overlay(&read_back);
+    assert!(run(&base, &declared, &[]).changes.is_empty());
+
+    // A changed declaration is still a change — of that expression only.
+    let mut edited = declared.clone();
+    edited
+        .tables
+        .get_mut(&"dbo.t".parse().unwrap())
+        .unwrap()
+        .checks
+        .get_mut("ck_n")
+        .unwrap()
+        .expression = "n > 1 AND n < 10".to_owned();
+    assert_eq!(kinds(&run(&base, &edited, &[])), ["DropCheck", "AddCheck"]);
+}
+
+/// Each side resolves against its own table: a column that *gains* a
+/// default in this plan holds NULL in every existing row (adding a default
+/// does not backfill), and the declaration says the row should hold the
+/// default — so that is an UPDATE, and the right one.
+#[test]
+fn a_column_gaining_a_default_updates_omitted_rows_to_it() {
+    let base_t = {
+        let mut t = lookup(DataMode::Exact, &[("new", "x")]);
+        t.data.as_mut().unwrap().rows = [(pbps_model::RowKey::from("new"), Row::default())]
+            .into_iter()
+            .collect();
+        t
+    };
+    let mut declared_t = base_t.clone();
+    declared_t.columns.get_mut("label").unwrap().value_source =
+        pbps_model::ValueSource::Default("''".to_owned());
+    let cs = run(
+        &schema_of("dbo.s", base_t),
+        &schema_of("dbo.s", declared_t),
+        &[],
+    );
+    assert_eq!(row_ops(&cs), ["update new [label]"]);
+    // And it runs after the default exists.
+    let k = kinds(&cs);
+    let alter = k.iter().position(|c| c == "AlterColumnDefault").unwrap();
+    let update = k.iter().position(|c| c == "UpdateRow").unwrap();
+    assert!(alter < update, "{k:?}");
+}
+
+/// The negative case: two omissions on a column with a default are the
+/// same statement, and must not produce an UPDATE on every plan.
+#[test]
+fn two_omissions_of_a_defaulted_column_are_equal() {
+    let mut t = lookup(DataMode::Exact, &[("new", "x")]);
+    t.columns.get_mut("label").unwrap().value_source =
+        pbps_model::ValueSource::Default("''".to_owned());
+    t.data.as_mut().unwrap().rows = [(pbps_model::RowKey::from("new"), Row::default())]
+        .into_iter()
+        .collect();
+    assert!(
+        run(&schema_of("dbo.s", t.clone()), &schema_of("dbo.s", t), &[])
+            .changes
+            .is_empty()
+    );
+}
+
+fn rename_column(from: &str, to: &str) -> Intent {
+    Intent::RenameColumn {
+        table: "dbo.s".parse().unwrap(),
+        from: from.into(),
+        to: to.into(),
+    }
+}
+
+/// The second review's second round. The key lives in the map key, not in
+/// either row, so a default added to the key column has nothing to compare
+/// against — reading it through the omission rule produced
+/// `SET [code] = DEFAULT` for every row, which for a GUID default rewrites
+/// every identity.
+#[test]
+fn a_default_on_the_key_column_never_updates_the_key() {
+    let base_t = lookup(DataMode::Exact, &[("new", "New")]);
+    let mut declared_t = base_t.clone();
+    declared_t.columns.get_mut("code").unwrap().value_source =
+        pbps_model::ValueSource::Default("NEWID()".to_owned());
+    let cs = run(
+        &schema_of("dbo.s", base_t),
+        &schema_of("dbo.s", declared_t),
+        &[],
+    );
+    assert!(row_ops(&cs).is_empty(), "{:?}", row_ops(&cs));
+    // The negative case: the default itself is still a change.
+    assert!(
+        kinds(&cs).contains(&"AlterColumnDefault".to_owned()),
+        "{:?}",
+        kinds(&cs)
+    );
+}
+
+/// An omitted column means *the* default — and when the default changes,
+/// so does what the row should hold. `ALTER` does not backfill, so the
+/// plan has to restate it, and two undifferentiated "default" cells would
+/// have compared equal.
+#[test]
+fn a_changed_default_restates_the_rows_that_omit_the_column() {
+    let mut base_t = lookup(DataMode::Exact, &[("new", "x")]);
+    base_t.columns.get_mut("label").unwrap().value_source =
+        pbps_model::ValueSource::Default("'a'".to_owned());
+    base_t.data.as_mut().unwrap().rows = [(pbps_model::RowKey::from("new"), Row::default())]
+        .into_iter()
+        .collect();
+    let mut declared_t = base_t.clone();
+    declared_t.columns.get_mut("label").unwrap().value_source =
+        pbps_model::ValueSource::Default("'b'".to_owned());
+
+    let cs = run(
+        &schema_of("dbo.s", base_t),
+        &schema_of("dbo.s", declared_t),
+        &[],
+    );
+    let Some(Change::Row(RowChange::UpdateRow { columns, .. })) = cs
+        .changes
+        .iter()
+        .map(|p| &p.change)
+        .find(|c| matches!(c, Change::Row(RowChange::UpdateRow { .. })))
+    else {
+        panic!("{:?}", kinds(&cs));
+    };
+    assert_eq!(
+        columns["label"],
+        (
+            pbps_model::Cell::Default("'a'".to_owned()),
+            pbps_model::Cell::Default("'b'".to_owned())
+        )
+    );
+    // And after the new default exists.
+    let k = kinds(&cs);
+    let alter = k.iter().position(|c| c == "AlterColumnDefault").unwrap();
+    let update = k.iter().position(|c| c == "UpdateRow").unwrap();
+    assert!(alter < update, "{k:?}");
+}
+
+/// A renamed column keeps its values. Looking the base row up by the new
+/// name found nothing, and restated every row behind the `data-update`
+/// gate for a change that was not one.
+#[test]
+fn a_renamed_column_with_unchanged_values_is_not_an_update() {
+    let base_t = lookup(DataMode::Exact, &[("new", "New")]);
+    let mut declared_t = base_t.clone();
+    let label = declared_t.columns.shift_remove("label").unwrap();
+    declared_t.columns.insert("caption".into(), label);
+    declared_t.data.as_mut().unwrap().rows = [(
+        pbps_model::RowKey::from("new"),
+        [("caption".into(), Value::Text("New".to_owned()))]
+            .into_iter()
+            .collect::<Row>(),
+    )]
+    .into_iter()
+    .collect();
+
+    let cs = run(
+        &schema_of("dbo.s", base_t),
+        &schema_of("dbo.s", declared_t),
+        &[rename_column("label", "caption")],
+    );
+    assert!(row_ops(&cs).is_empty(), "{:?}", row_ops(&cs));
+    assert!(
+        kinds(&cs).contains(&"RenameColumn".to_owned()),
+        "{:?}",
+        kinds(&cs)
+    );
+}
+
+#[test]
+fn absent_baseline_key_is_restored_with_exact_row_changes() {
+    let mut base_t = lookup(DataMode::Exact, &[("new", "Old"), ("gone", "Gone")]);
+    base_t.primary_key = None;
+    let declared_t = lookup(DataMode::Exact, &[("new", "New"), ("added", "Added")]);
+    let cs = run(
+        &schema_of("dbo.s", base_t),
+        &schema_of("dbo.s", declared_t),
+        &[],
+    );
+    for kind in ["SetPrimaryKey", "UpdateRow", "InsertRow", "DeleteRow"] {
+        assert!(kinds(&cs).contains(&kind.to_owned()), "{:?}", kinds(&cs));
+    }
+}
+
+#[test]
+fn an_added_key_column_cannot_match_retained_baseline_rows() {
+    let mut base = lookup(DataMode::Exact, &[("new", "Old")]);
+    base.primary_key = None;
+    let mut declared = lookup(DataMode::Exact, &[("new", "New")]);
+    declared
+        .columns
+        .insert("new_code".into(), declared.columns["code"].clone());
+    declared.primary_key.as_mut().unwrap().columns = vec!["new_code".into()];
+    let name: TableName = "dbo.s".parse().unwrap();
+    let mut changes = vec![Change::Constraint(ConstraintChange::SetPrimaryKey {
+        table: name.clone(),
+        from: None,
+        to: declared.primary_key.clone(),
+        nonclustered: false,
+    })];
+    let mut errors = Vec::new();
+    let mapping = [
+        ("code".into(), "code".into()),
+        ("label".into(), "label".into()),
+    ]
+    .into();
+    diff_data(&name, &base, &declared, &mapping, &mut changes, &mut errors);
+    assert_eq!(
+        errors,
+        vec![DiffError::DataBaselineKeyOnNewColumn {
+            table: name,
+            column: "new_code".into(),
+        }]
+    );
+    // The baseline had no key, so nothing moved: the diagnostic must not
+    // say it did, nor advise a rename that has nothing to rename (#808).
+    let message = errors[0].to_string();
+    assert!(!message.contains("moved"), "{message}");
+    assert!(!message.contains("rename"), "{message}");
+    assert!(message.contains("`new_code`"), "{message}");
+    assert_eq!(changes.len(), 1, "{changes:?}");
+}
+
+#[test]
+fn composite_baseline_key_reports_its_columns_without_moved_key_advice() {
+    let declared = lookup(DataMode::Exact, &[("new", "New")]);
+    let mut base = declared.clone();
+    base.primary_key
+        .as_mut()
+        .unwrap()
+        .columns
+        .push("label".into());
+    let mut changes = Vec::new();
+    let mut errors = Vec::new();
+    let mapping = [
+        ("code".into(), "code".into()),
+        ("label".into(), "label".into()),
+    ]
+    .into();
+    diff_data(
+        &"dbo.s".parse().unwrap(),
+        &base,
+        &declared,
+        &mapping,
+        &mut changes,
+        &mut errors,
+    );
+    assert_eq!(
+        errors,
+        vec![DiffError::DataBaselineKeyNotSingle {
+            table: "dbo.s".parse().unwrap(),
+            columns: vec!["code".into(), "label".into()],
+        }]
+    );
+    let message = errors[0].to_string();
+    assert!(
+        message.contains("2 columns") && message.contains("single-column"),
+        "{message}"
+    );
+    assert!(!message.contains("Remove the block"), "{message}");
+    assert!(changes.is_empty());
+}
+
+#[test]
+fn absent_baseline_key_without_restoration_is_refused_accurately() {
+    let declared = lookup(DataMode::Exact, &[("new", "New")]);
+    let mut base = declared.clone();
+    base.primary_key = None;
+    let mut changes = Vec::new();
+    let mut errors = Vec::new();
+    diff_data(
+        &"dbo.s".parse().unwrap(),
+        &base,
+        &declared,
+        &BTreeMap::new(),
+        &mut changes,
+        &mut errors,
+    );
+    assert_eq!(
+        errors,
+        vec![DiffError::DataBaselineKeyAbsent {
+            table: "dbo.s".parse().unwrap()
+        }]
+    );
+    assert!(changes.is_empty());
+}
+
+/// The row keys on each side are values of that side's key column. When
+/// the key moves to a *different* column the two key sets have nothing in
+/// common, and matching them by text would update and delete the wrong
+/// rows — so it is refused, not guessed.
+#[test]
+fn moving_the_primary_key_to_another_column_is_refused() {
+    let base_t = lookup(DataMode::Exact, &[("new", "New")]);
+    let mut declared_t = base_t.clone();
+    declared_t.primary_key = Some(pbps_model::PrimaryKey {
+        name: None,
+        columns: vec!["label".into()],
+        storage_parameters: Default::default(),
+        filegroup: None,
+    });
+    // The rows now key on `label`, and say nothing about `code`.
+    declared_t.columns.get_mut("code").unwrap().nullable = true;
+    declared_t.data.as_mut().unwrap().rows = [(pbps_model::RowKey::from("New"), Row::default())]
+        .into_iter()
+        .collect();
+
+    let base = schema_of("dbo.s", base_t);
+    let declared = schema_of("dbo.s", declared_t);
+    let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let declared_ids = crate::resolve(&declared, &base_ids, &[], &ctx())
+        .unwrap()
+        .ids;
+    let d = diff_partial(
+        Side {
+            schema: &base,
+            ids: &base_ids,
+        },
+        Side {
+            schema: &declared,
+            ids: &declared_ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+    );
+    assert!(
+        d.errors
+            .iter()
+            .any(|e| matches!(e, DiffError::DataKeyColumnChanged { .. })),
+        "{:?}",
+        d.errors
+    );
+    assert!(row_ops(&d.changes).is_empty(), "{:?}", row_ops(&d.changes));
+}
+
+/// The negative case for the refusal: *renaming* the key column is the
+/// same column by uid, the values did not move, and the row changes simply
+/// use the new name.
+#[test]
+fn renaming_the_primary_key_column_keeps_the_rows_matched() {
+    let base_t = lookup(DataMode::Exact, &[("new", "New")]);
+    let mut declared_t = base_t.clone();
+    let code = declared_t.columns.shift_remove("code").unwrap();
+    declared_t.columns.insert("kode".into(), code);
+    declared_t.primary_key = Some(pbps_model::PrimaryKey {
+        name: None,
+        columns: vec!["kode".into()],
+        storage_parameters: Default::default(),
+        filegroup: None,
+    });
+    declared_t.data.as_mut().unwrap().rows = [(
+        pbps_model::RowKey::from("new"),
+        [("label".into(), Value::Text("Renamed".to_owned()))]
+            .into_iter()
+            .collect::<Row>(),
+    )]
+    .into_iter()
+    .collect();
+
+    let cs = run(
+        &schema_of("dbo.s", base_t),
+        &schema_of("dbo.s", declared_t),
+        &[rename_column("code", "kode")],
+    );
+    assert_eq!(row_ops(&cs), ["update new [label]"]);
+    let Some(Change::Row(RowChange::UpdateRow { key_column, .. })) = cs
+        .changes
+        .iter()
+        .map(|p| &p.change)
+        .find(|c| matches!(c, Change::Row(RowChange::UpdateRow { .. })))
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        key_column,
+        &pbps_model::ColumnName::from("kode"),
+        "the statement runs after the rename"
+    );
+}
+
+/// The third review's P1. A parent row leaves an `exact` table while a
+/// child row moves its foreign key to another parent. Deleting first is
+/// wrong both ways the engine can go: `NO ACTION` refuses a delete the
+/// child still points at, and `ON DELETE CASCADE` takes the child with it —
+/// silently, with the later update then touching zero rows and the dev
+/// rehearsal, which compares structure only, calling that convergence.
+#[test]
+fn a_child_row_moves_away_before_its_former_parent_is_deleted() {
+    let parent = lookup(DataMode::Exact, &[("p1", "P1"), ("p2", "P2")]);
+    let mut child = lookup(DataMode::Exact, &[("c", "C")]);
+    child
+        .columns
+        .insert("parent".into(), Column::new(ty("varchar(20)")).not_null());
+    child.foreign_keys.insert(
+        "fk_child_parent".into(),
+        pbps_model::ForeignKey {
+            columns: vec!["parent".into()],
+            references_table: "dbo.parent".parse().unwrap(),
+            references_columns: vec!["code".into()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        },
+    );
+    let pointing_at = |p: &str| -> Table {
+        let mut t = child.clone();
+        t.data.as_mut().unwrap().rows = [(
+            pbps_model::RowKey::from("c"),
+            [
+                ("label".into(), Value::Text("C".to_owned())),
+                ("parent".into(), Value::Text(p.to_owned())),
+            ]
+            .into_iter()
+            .collect::<Row>(),
+        )]
+        .into_iter()
+        .collect();
+        t
+    };
+
+    let mut base = Schema::default();
+    base.tables
+        .insert("dbo.parent".parse().unwrap(), parent.clone());
+    base.tables
+        .insert("dbo.child".parse().unwrap(), pointing_at("p1"));
+    let mut declared = Schema::default();
+    declared.tables.insert(
+        "dbo.parent".parse().unwrap(),
+        lookup(DataMode::Exact, &[("p2", "P2")]),
+    );
+    declared
+        .tables
+        .insert("dbo.child".parse().unwrap(), pointing_at("p2"));
+
+    let cs = run(&base, &declared, &[]);
+    let k = kinds(&cs);
+    let update = k
+        .iter()
+        .position(|c| c == "UpdateRow")
+        .unwrap_or_else(|| panic!("{k:?}"));
+    let delete = k
+        .iter()
+        .position(|c| c == "DeleteRow")
+        .unwrap_or_else(|| panic!("{k:?}"));
+    assert!(update < delete, "{k:?}");
+}
+
+/// The row a delete removes travels with it: `apply` checks the baseline
+/// and then runs, and a row rewritten in between is not the row the
+/// reviewer approved (DECISIONS 143).
+#[test]
+fn a_deleted_row_carries_the_cells_and_types_the_baseline_recorded() {
+    let base = schema_of("dbo.s", lookup(DataMode::Exact, &[("old", "Old")]));
+    let declared = schema_of("dbo.s", lookup(DataMode::Exact, &[]));
+    let cs = run(&base, &declared, &[]);
+    let delete = cs
+        .changes
+        .iter()
+        .find_map(|p| match &p.change {
+            Change::Row(RowChange::DeleteRow { row, types, .. }) => Some((row, types)),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{:?}", kinds(&cs)));
+    assert_eq!(
+        delete.0.get("label"),
+        Some(&pbps_model::Cell::Value(Value::Text("Old".to_owned())))
+    );
+    // The key is the delete's own key, not a cell; the type is the base's,
+    // so the predicate compares each cell the way the read-back rendered
+    // it.
+    assert!(!delete.0.contains_key("code"), "{:?}", delete.0);
+    assert_eq!(delete.1.get("label"), Some(&ty("nvarchar(50)")));
+}
+
+/// Every column change sorts before the row changes, so the delete's
+/// predicate has to name the columns as the table has them by then: the
+/// new name for one this plan renames, and nothing at all for one it
+/// drops — a predicate on a column that no longer exists fails an
+/// otherwise valid apply (DECISIONS 143).
+#[test]
+fn a_delete_names_the_columns_the_table_has_when_it_runs() {
+    let with_label = |label: &str, extra: Option<&str>| {
+        let mut t = lookup(DataMode::Exact, &[]);
+        let held = t.columns.shift_remove("label").expect("the lookup's label");
+        t.columns.insert(label.into(), held);
+        if let Some(extra) = extra {
+            t.columns
+                .insert(extra.into(), Column::new(ty("nvarchar(50)")));
+        }
+        t
+    };
+    let mut base_table = with_label("label", Some("note"));
+    base_table.data = Some(pbps_model::TableData {
+        mode: DataMode::Exact,
+        rows: [(
+            pbps_model::RowKey::from("old"),
+            [
+                ("label".into(), Value::Text("Old".to_owned())),
+                ("note".into(), Value::Text("dropped".to_owned())),
+            ]
+            .into_iter()
+            .collect::<Row>(),
+        )]
+        .into_iter()
+        .collect(),
+    });
+    let base = schema_of("dbo.s", base_table);
+    let declared = schema_of("dbo.s", with_label("caption", None));
+    let intents = vec![
+        Intent::RenameColumn {
+            table: "dbo.s".parse().unwrap(),
+            from: "label".into(),
+            to: "caption".into(),
+        },
+        Intent::DropColumn {
+            column: "dbo.s.note".parse().unwrap(),
+            reason: "gone".parse().unwrap(),
+        },
+    ];
+    let cs = run(&base, &declared, &intents);
+    let (row, types, dropped) = cs
+        .changes
+        .iter()
+        .find_map(|p| match &p.change {
+            Change::Row(RowChange::DeleteRow {
+                row,
+                types,
+                dropped,
+                ..
+            }) => Some((row, types, dropped)),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{:?}", kinds(&cs)));
+    assert_eq!(
+        row.get("caption"),
+        Some(&pbps_model::Cell::Value(Value::Text("Old".to_owned()))),
+        "{row:?}"
+    );
+    assert!(!row.contains_key("label"), "{row:?}");
+    assert!(!row.contains_key("note"), "{row:?}");
+    assert_eq!(
+        dropped.get("note"),
+        Some(&pbps_model::Cell::Value(Value::Text("dropped".to_owned()))),
+        "the dropped cell remains visible to the reviewer: {row:?}"
+    );
+    assert!(
+        !types.contains_key("note"),
+        "a dropped column cannot be held: {types:?}"
+    );
+    assert!(
+        types.contains_key("caption"),
+        "the renamed survivor is still held: {types:?}"
+    );
+    assert!(
+        !row.contains_key("code"),
+        "the primary key is carried separately: {row:?}"
+    );
+}
+
+#[test]
+fn a_replaced_column_keeps_its_deleted_rows_baseline_cell() {
+    let base = schema_of("dbo.s", lookup(DataMode::Exact, &[("old", "Old")]));
+    let declared = schema_of("dbo.s", lookup(DataMode::Exact, &[]));
+    let mut intermediate = declared.clone();
+    intermediate
+        .tables
+        .get_mut(&"dbo.s".parse().unwrap())
+        .unwrap()
+        .columns
+        .shift_remove("label");
+    let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let intermediate_ids = crate::resolve(
+        &intermediate,
+        &base_ids,
+        &[Intent::DropColumn {
+            column: "dbo.s.label".parse().unwrap(),
+            reason: "replace".parse().unwrap(),
+        }],
+        &ctx(),
+    )
+    .unwrap()
+    .ids;
+    let declared_ids = crate::resolve(&declared, &intermediate_ids, &[], &ctx())
+        .unwrap()
+        .ids;
+    let cs = diff(
+        Side {
+            schema: &base,
+            ids: &base_ids,
+        },
+        Side {
+            schema: &declared,
+            ids: &declared_ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+    )
+    .unwrap();
+    assert!(cs.changes.iter().any(
+        |p| matches!(&p.change, Change::Column(ColumnChange::DropColumn { column, .. }) if column.name == "label".into())
+    ));
+    assert!(
+        cs.changes.iter().any(
+            |p| matches!(&p.change, Change::Column(ColumnChange::AddColumn { name, .. }) if name.raw() == "label")
+        )
+    );
+    let (row, types, dropped) = cs
+        .changes
+        .iter()
+        .find_map(|p| match &p.change {
+            Change::Row(RowChange::DeleteRow {
+                row,
+                types,
+                dropped,
+                ..
+            }) => Some((row, types, dropped)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        dropped.get("label"),
+        Some(&pbps_model::Cell::Value(Value::Text("Old".into())))
+    );
+    assert!(!types.contains_key("label"));
+    assert!(!row.contains_key("label"));
+}
+
+/// #402: an `exact` table whose declaration drops some columns and all of
+/// its rows, wide and long enough that a per-column scan of the surviving
+/// names per deleted row was the planning cost. Every deleted row still
+/// carries its dropped cells for the reviewer, and no surviving column's
+/// cell is ever moved into that reviewer-only map — the negative case the
+/// one-set-per-table answer must not break (DECISIONS 442).
+#[test]
+fn every_deleted_row_of_a_wide_table_splits_dropped_and_surviving_cells() {
+    const SURVIVING: usize = 40;
+    const DROPPED: usize = 5;
+    const ROWS: usize = 400;
+    let mut base_table = lookup(DataMode::Exact, &[]);
+    for i in 0..SURVIVING {
+        base_table
+            .columns
+            .insert(format!("keep{i}").into(), Column::new(ty("nvarchar(50)")));
+    }
+    for i in 0..DROPPED {
+        base_table
+            .columns
+            .insert(format!("gone{i}").into(), Column::new(ty("nvarchar(50)")));
+    }
+    let rows = &mut base_table.data.as_mut().unwrap().rows;
+    for r in 0..ROWS {
+        let mut row = Row::default();
+        for i in 0..SURVIVING {
+            row.0
+                .insert(format!("keep{i}").into(), Value::Text(format!("k{r}")));
+        }
+        for i in 0..DROPPED {
+            row.0
+                .insert(format!("gone{i}").into(), Value::Text(format!("g{r}")));
+        }
+        rows.insert(pbps_model::RowKey::from(format!("row{r}").as_str()), row);
+    }
+    let base = schema_of("dbo.s", base_table.clone());
+    let mut declared_table = base_table;
+    declared_table.data.as_mut().unwrap().rows.clear();
+    for i in 0..DROPPED {
+        declared_table
+            .columns
+            .shift_remove(format!("gone{i}").as_str());
+    }
+    let declared = schema_of("dbo.s", declared_table);
+    let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let drops: Vec<Intent> = (0..DROPPED)
+        .map(|i| Intent::DropColumn {
+            column: format!("dbo.s.gone{i}").parse().unwrap(),
+            reason: "gone".parse().unwrap(),
+        })
+        .collect();
+    let declared_ids = crate::resolve(&declared, &base_ids, &drops, &ctx())
+        .unwrap()
+        .ids;
+    let cs = diff(
+        Side {
+            schema: &base,
+            ids: &base_ids,
+        },
+        Side {
+            schema: &declared,
+            ids: &declared_ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+    )
+    .unwrap();
+
+    let mut deleted = 0;
+    for p in &cs.changes {
+        let Change::Row(RowChange::DeleteRow { row, dropped, .. }) = &p.change else {
+            continue;
+        };
+        deleted += 1;
+        let gone: Vec<&str> = dropped.keys().map(pbps_model::ColumnName::raw).collect();
+        let mut expected: Vec<String> = (0..DROPPED).map(|i| format!("gone{i}")).collect();
+        expected.sort();
+        assert_eq!(
+            gone,
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        for i in 0..SURVIVING {
+            let keep = format!("keep{i}");
+            assert!(
+                !dropped.contains_key(keep.as_str()),
+                "{keep} moved to the reviewer map"
+            );
+            assert!(
+                row.contains_key(keep.as_str()),
+                "{keep} missing from the predicate"
+            );
+        }
+    }
+    assert_eq!(deleted, ROWS);
+}
+
+#[test]
+fn a_historical_drop_then_rename_can_reuse_a_baseline_cell_name() {
+    let mut base_table = lookup(DataMode::Exact, &[("old", "surviving")]);
+    base_table
+        .columns
+        .insert("note".into(), Column::new(ty("nvarchar(50)")));
+    base_table
+        .data
+        .as_mut()
+        .unwrap()
+        .rows
+        .get_mut(&pbps_model::RowKey::from("old"))
+        .unwrap()
+        .0
+        .insert("note".into(), Value::Text("dropped".into()));
+    let base = schema_of("dbo.s", base_table);
+    let intermediate = schema_of("dbo.s", lookup(DataMode::Exact, &[]));
+    let mut declared_table = lookup(DataMode::Exact, &[]);
+    let label = declared_table.columns.shift_remove("label").unwrap();
+    declared_table.columns.insert("note".into(), label);
+    let declared = schema_of("dbo.s", declared_table);
+    let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let intermediate_ids = crate::resolve(
+        &intermediate,
+        &base_ids,
+        &[Intent::DropColumn {
+            column: "dbo.s.note".parse().unwrap(),
+            reason: "gone".parse().unwrap(),
+        }],
+        &ctx(),
+    )
+    .unwrap()
+    .ids;
+    let declared_ids = crate::resolve(
+        &declared,
+        &intermediate_ids,
+        &[Intent::RenameColumn {
+            table: "dbo.s".parse().unwrap(),
+            from: "label".into(),
+            to: "note".into(),
+        }],
+        &ctx(),
+    )
+    .unwrap()
+    .ids;
+    let cs = diff(
+        Side {
+            schema: &base,
+            ids: &base_ids,
+        },
+        Side {
+            schema: &declared,
+            ids: &declared_ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+    )
+    .unwrap();
+    let (row, types, dropped) = cs
+        .changes
+        .iter()
+        .find_map(|p| match &p.change {
+            Change::Row(RowChange::DeleteRow {
+                row,
+                types,
+                dropped,
+                ..
+            }) => Some((row, types, dropped)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        row.get("note"),
+        Some(&pbps_model::Cell::Value(Value::Text("surviving".into())))
+    );
+    assert!(types.contains_key("note"));
+    assert_eq!(
+        dropped.get("note"),
+        Some(&pbps_model::Cell::Value(Value::Text("dropped".into())))
+    );
+}
+
+/// The same two revisions, and the order the engine needs.
+///
+/// `order_key` puts `RenameColumn` at 3 and `DropColumn` at 5, so the plan
+/// reached the engine with the rename first — into a name the doomed
+/// column still held. **Measured** on the pinned images: SQL Server 2025
+/// answers `sp_rename` with `Msg 15335, The new name 'note' is already in
+/// use as a COLUMN name and would cause a duplicate that is not
+/// permitted`, and PostgreSQL 18.6 answers `ALTER TABLE s RENAME COLUMN
+/// label TO note` with `column "note" of relation "s" already exists`.
+/// Both take the two statements in the other order.
+///
+/// The drop that frees the name moves, and only that one: a rename into a
+/// name nothing in this plan gives up is still refused outright rather
+/// than implicitly dropped, which is
+/// `a_single_revision_cannot_rename_into_an_occupied_baseline_name`.
+#[test]
+fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
+    let mut base_table = lookup(DataMode::Exact, &[("old", "surviving")]);
+    base_table
+        .columns
+        .insert("note".into(), Column::new(ty("nvarchar(50)")));
+    base_table
+        .data
+        .as_mut()
+        .unwrap()
+        .rows
+        .get_mut(&pbps_model::RowKey::from("old"))
+        .unwrap()
+        .0
+        .insert("note".into(), Value::Text("dropped".into()));
+    let base = schema_of("dbo.s", base_table);
+    let intermediate = schema_of("dbo.s", lookup(DataMode::Exact, &[]));
+    let mut declared_table = lookup(DataMode::Exact, &[]);
+    let label = declared_table.columns.shift_remove("label").unwrap();
+    declared_table.columns.insert("note".into(), label);
+    let declared = schema_of("dbo.s", declared_table);
+    let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let intermediate_ids = crate::resolve(
+        &intermediate,
+        &base_ids,
+        &[Intent::DropColumn {
+            column: "dbo.s.note".parse().unwrap(),
+            reason: "gone".parse().unwrap(),
+        }],
+        &ctx(),
+    )
+    .unwrap()
+    .ids;
+    let declared_ids = crate::resolve(
+        &declared,
+        &intermediate_ids,
+        &[Intent::RenameColumn {
+            table: "dbo.s".parse().unwrap(),
+            from: "label".into(),
+            to: "note".into(),
+        }],
+        &ctx(),
+    )
+    .unwrap()
+    .ids;
+    let cs = diff(
+        Side {
+            schema: &base,
+            ids: &base_ids,
+        },
+        Side {
+            schema: &declared,
+            ids: &declared_ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+    )
+    .unwrap();
+    let at = |f: fn(&Change) -> bool| {
+        cs.changes
+            .iter()
+            .position(|p| f(&p.change))
+            .unwrap_or_else(|| panic!("{:?}", kinds(&cs)))
+    };
+    let drop_at = at(
+        |c| matches!(c, Change::Column(ColumnChange::DropColumn { column, .. }) if column.name == "note".into()),
+    );
+    let rename_at = at(
+        |c| matches!(c, Change::Column(ColumnChange::RenameColumn { to, .. }) if to.raw() == "note"),
+    );
+    assert!(
+        drop_at < rename_at,
+        "the drop must free the name first: {:?}",
+        kinds(&cs)
+    );
+}
+
+/// And where the two names are one name only to the database.
+///
+/// `fold_ident` is the dialect's answer to "are these one name", and on
+/// SQL Server it is the identity — because the answer there belongs to the
+/// *database's* collation, which a plan computed offline does not have.
+/// **Measured** on the pinned image, each in a database of the named
+/// collation:
+///
+/// ```text
+/// SQL_Latin1_General_CP1_CI_AS   note vs Note  ->  one name, Msg 15335
+/// SQL_Latin1_General_CP1_CI_AI   café vs cafe  ->  one name, Msg 15335
+/// Latin1_General_CS_AS           note vs Note  ->  two names, both kept
+/// ```
+///
+/// Case here; the accent case is the same fixture with the same answer,
+/// and width and kana sensitivity are two more flags on the same collation
+/// name. The ordering does not fold at all — see
+/// `every_column_drop_on_a_renamed_columns_table_runs_first` for the rule
+/// that makes all of them one case.
+#[test]
+fn a_dropped_columns_name_is_free_before_a_rename_that_differs_only_by_case() {
+    let mut base_table = lookup(DataMode::Exact, &[("old", "surviving")]);
+    base_table
+        .columns
+        .insert("note".into(), Column::new(ty("nvarchar(50)")));
+    base_table
+        .data
+        .as_mut()
+        .unwrap()
+        .rows
+        .get_mut(&pbps_model::RowKey::from("old"))
+        .unwrap()
+        .0
+        .insert("note".into(), Value::Text("dropped".into()));
+    let base = schema_of("dbo.s", base_table);
+    let intermediate = schema_of("dbo.s", lookup(DataMode::Exact, &[]));
+    let mut declared_table = lookup(DataMode::Exact, &[]);
+    let label = declared_table.columns.shift_remove("label").unwrap();
+    declared_table.columns.insert("Note".into(), label);
+    let declared = schema_of("dbo.s", declared_table);
+    let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let intermediate_ids = crate::resolve(
+        &intermediate,
+        &base_ids,
+        &[Intent::DropColumn {
+            column: "dbo.s.note".parse().unwrap(),
+            reason: "gone".parse().unwrap(),
+        }],
+        &ctx(),
+    )
+    .unwrap()
+    .ids;
+    let declared_ids = crate::resolve(
+        &declared,
+        &intermediate_ids,
+        &[Intent::RenameColumn {
+            table: "dbo.s".parse().unwrap(),
+            from: "label".into(),
+            to: "Note".into(),
+        }],
+        &ctx(),
+    )
+    .unwrap()
+    .ids;
+    let cs = diff(
+        Side {
+            schema: &base,
+            ids: &base_ids,
+        },
+        Side {
+            schema: &declared,
+            ids: &declared_ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+    )
+    .unwrap();
+    let at = |f: fn(&Change) -> bool| {
+        cs.changes
+            .iter()
+            .position(|p| f(&p.change))
+            .unwrap_or_else(|| panic!("{:?}", kinds(&cs)))
+    };
+    let drop_at = at(
+        |c| matches!(c, Change::Column(ColumnChange::DropColumn { column, .. }) if column.name == "note".into()),
+    );
+    let rename_at = at(
+        |c| matches!(c, Change::Column(ColumnChange::RenameColumn { to, .. }) if to.raw() == "Note"),
+    );
+    assert!(
+        drop_at < rename_at,
+        "the engine reads one name where the model reads two: {:?}",
+        kinds(&cs)
+    );
+}
+
+/// The rule the two cases above are instances of, stated where it can be
+/// broken: on a table this plan renames a column of, **every** column drop
+/// runs first — including one whose name nothing claims.
+///
+/// Narrowing it to a name comparison is what the two cases above each
+/// refuted in turn, one collation further out every time. Which spellings
+/// are one column name is the target database's to say, and a plan is
+/// computed offline (SPEC 7.3), so the only question that is true under
+/// every collation is "same table". The over-match is free: nothing
+/// between the drop's old class and its new one can notice, because a
+/// `Revoke` names no column and a column this plan drops is never a
+/// rename's source.
+#[test]
+fn every_column_drop_on_a_renamed_columns_table_runs_first() {
+    let base = schema_of(
+        "dbo.t",
+        table(&[
+            ("old", Column::new(ty("int"))),
+            ("unrelated", Column::new(ty("int"))),
+        ]),
+    );
+    let declared = schema_of("dbo.t", table(&[("new", Column::new(ty("int")))]));
+    let cs = run(
+        &base,
+        &declared,
+        &[
+            Intent::RenameColumn {
+                table: "dbo.t".parse().unwrap(),
+                from: "old".into(),
+                to: "new".into(),
+            },
+            Intent::DropColumn {
+                column: "dbo.t.unrelated".parse().unwrap(),
+                reason: "no longer in use".parse().unwrap(),
+            },
+        ],
+    );
+    assert_eq!(
+        kinds(&cs),
+        ["DropColumn", "RenameColumn"],
+        "`unrelated` claims nothing `new` wants, and still goes first: {cs:?}"
+    );
+
+    // And a drop on *another* table stays where it was: the rename can
+    // collide with a column of its own table and no other.
+    let mut base = base;
+    base.tables.insert(
+        "dbo.other".parse().unwrap(),
+        table(&[("gone", Column::new(ty("int")))]),
+    );
+    let mut declared = declared;
+    declared
+        .tables
+        .insert("dbo.other".parse().unwrap(), table(&[]));
+    let cs = run(
+        &base,
+        &declared,
+        &[
+            Intent::RenameColumn {
+                table: "dbo.t".parse().unwrap(),
+                from: "old".into(),
+                to: "new".into(),
+            },
+            Intent::DropColumn {
+                column: "dbo.t.unrelated".parse().unwrap(),
+                reason: "no longer in use".parse().unwrap(),
+            },
+            Intent::DropColumn {
+                column: "dbo.other.gone".parse().unwrap(),
+                reason: "no longer in use".parse().unwrap(),
+            },
+        ],
+    );
+    assert_eq!(
+        kinds(&cs),
+        ["DropColumn", "RenameColumn", "DropColumn"],
+        "only the renamed table's own drops move: {cs:?}"
+    );
+}
+
+#[test]
+fn a_single_revision_cannot_rename_into_an_occupied_baseline_name() {
+    let mut base_table = lookup(DataMode::Exact, &[("old", "surviving")]);
+    base_table
+        .columns
+        .insert("note".into(), Column::new(ty("nvarchar(50)")));
+    base_table
+        .data
+        .as_mut()
+        .unwrap()
+        .rows
+        .get_mut(&pbps_model::RowKey::from("old"))
+        .unwrap()
+        .0
+        .insert("note".into(), Value::Text("dropped".into()));
+    let base = schema_of("dbo.s", base_table);
+    let mut declared_table = lookup(DataMode::Exact, &[]);
+    let label = declared_table.columns.shift_remove("label").unwrap();
+    declared_table.columns.insert("note".into(), label);
+    let declared = schema_of("dbo.s", declared_table);
+    let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let errors = crate::resolve(
+        &declared,
+        &base_ids,
+        &[
+            Intent::DropColumn {
+                column: "dbo.s.note".parse().unwrap(),
+                reason: "gone".parse().unwrap(),
+            },
+            Intent::RenameColumn {
+                table: "dbo.s".parse().unwrap(),
+                from: "label".into(),
+                to: "note".into(),
+            },
+        ],
+        &ctx(),
+    )
+    .unwrap_err();
+    assert!(errors.iter().any(|error| matches!(error, crate::Blocker::RenameTargetExists { target } if target == "dbo.s.note")), "{errors:?}");
+}
+
+/// Two revisions resolved in turn, one dropping `app.target` and the next
+/// renaming `app.old` into its name, then diffed from the undeployed
+/// baseline as a plan that carries both (#536).
+fn a_dropped_tables_name_reused_by_a_later_rename(
+    dialect: &(impl Dialect + ?Sized),
+    base: &Schema,
+    intermediate: &Schema,
+    declared: &Schema,
+) -> ChangeSet {
+    let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let intermediate_ids = crate::resolve(
+        intermediate,
+        &base_ids,
+        &[Intent::DropTable {
+            table: "app.target".parse().unwrap(),
+            reason: "gone".parse().unwrap(),
+        }],
+        &ctx(),
+    )
+    .unwrap()
+    .ids;
+    let declared_ids = crate::resolve(
+        declared,
+        &intermediate_ids,
+        &[Intent::RenameTable {
+            from: "app.old".parse().unwrap(),
+            to: "app.target".parse().unwrap(),
+        }],
+        &ctx(),
+    )
+    .unwrap()
+    .ids;
+    diff_with(
+        Side {
+            schema: base,
+            ids: &base_ids,
+        },
+        Side {
+            schema: declared,
+            ids: &declared_ids,
+        },
+        dialect,
+    )
+}
+
+fn diff_with(base: Side<'_>, declared: Side<'_>, dialect: &(impl Dialect + ?Sized)) -> ChangeSet {
+    diff(base, declared, dialect, &Hints::default())
+        .unwrap()
+        .changes()
+        .clone()
+}
+
+/// DEC-981.3, the other two release paths: a table rename vacating a name
+/// a later rename claims in another case, and a check drop freeing a name
+/// a rename claims in another case. Each goes first.
+#[test]
+fn every_release_path_orders_a_claim_spelled_differently_in_case() {
+    let t = |n: &str| table(&[(n, Column::new(ty("int")))]);
+    let tables = |list: &[(&str, &str)]| {
+        let mut s = Schema::default();
+        for (name, column) in list {
+            s.tables.insert(name.parse().unwrap(), t(column));
+        }
+        s
+    };
+    let renames = |cs: &ChangeSet| -> Vec<String> {
+        cs.changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::Table(TableChange::RenameTable { from, to, .. }) => Some(format!(
+                    "{from} -> {to}",
+                    from = from.shown(),
+                    to = to.shown()
+                )),
+                Change::Constraint(ConstraintChange::DropCheck { name, .. }) => Some(format!(
+                    "drop check {name}",
+                    // Preserve raw comparison-label or fixture SQL bytes in test data.
+                    name = name.raw(),
+                )),
+                _ => None,
+            })
+            .collect()
+    };
+    // `app.b -> app.c`, then `app.a -> app.B`: `a` sorts first by name.
+    let cs = across_revisions(
+        &tables(&[("app.a", "ay"), ("app.b", "bee")]),
+        &[
+            (
+                tables(&[("app.a", "ay"), ("app.c", "bee")]),
+                vec![Intent::RenameTable {
+                    from: "app.b".parse().unwrap(),
+                    to: "app.c".parse().unwrap(),
+                }],
+            ),
+            (
+                tables(&[("app.B", "ay"), ("app.c", "bee")]),
+                vec![Intent::RenameTable {
+                    from: "app.a".parse().unwrap(),
+                    to: "app.B".parse().unwrap(),
+                }],
+            ),
+        ],
+    );
+    assert_eq!(renames(&cs), ["app.b -> app.c", "app.a -> app.B"], "{cs:?}");
+
+    // A check `Target` on another table, dropped, and `app.old` renamed to
+    // `app.target` (constraints share the namespace here).
+    let old_t = table(&[("id", Column::new(ty("int")))]);
+    let mut other = table(&[("n", Column::new(ty("int")))]);
+    other.checks.insert(
+        "Target".into(),
+        pbps_model::schema::CheckConstraint {
+            expression: "n > 0".into(),
+        },
+    );
+    let base = two_tables(("app.old", old_t.clone()), ("app.other", other));
+    let declared = two_tables(
+        ("app.target", old_t),
+        ("app.other", table(&[("n", Column::new(ty("int")))])),
+    );
+    let cs = run(
+        &base,
+        &declared,
+        &[Intent::RenameTable {
+            from: "app.old".parse().unwrap(),
+            to: "app.target".parse().unwrap(),
+        }],
+    );
+    assert_eq!(
+        renames(&cs),
+        ["drop check Target", "app.old -> app.target"],
+        "{cs:?}"
+    );
+}
+
+/// DEC-981.3: dropping `app.Target` and renaming `app.old` to
+/// `app.target` across skipped revisions is one name to a case-insensitive
+/// collation, so the drop goes first there too (`sp_rename` is Msg 15335
+/// otherwise). On a case-sensitive database the extra order is harmless.
+#[test]
+fn a_dropped_table_frees_a_name_spelled_differently_in_case() {
+    let t = |n: &str| table(&[(n, Column::new(ty("int")))]);
+    let tables = |list: &[(&str, &str)]| {
+        let mut s = Schema::default();
+        for (name, column) in list {
+            s.tables.insert(name.parse().unwrap(), t(column));
+        }
+        s
+    };
+    let order = |cs: &ChangeSet| -> Vec<String> {
+        cs.changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::Table(TableChange::DropTable { name, .. }) => {
+                    Some(format!("drop {name}", name = name.shown()))
+                }
+                Change::Table(TableChange::RenameTable { from, to, .. }) => Some(format!(
+                    "{from} -> {to}",
+                    from = from.shown(),
+                    to = to.shown()
+                )),
+                _ => None,
+            })
+            .collect()
+    };
+    let cs = across_revisions(
+        &tables(&[("app.Target", "doomed"), ("app.old", "kept")]),
+        &[
+            (
+                tables(&[("app.old", "kept")]),
+                vec![Intent::DropTable {
+                    table: "app.Target".parse().unwrap(),
+                    reason: "gone".parse().unwrap(),
+                }],
+            ),
+            (
+                tables(&[("app.target", "kept")]),
+                vec![Intent::RenameTable {
+                    from: "app.old".parse().unwrap(),
+                    to: "app.target".parse().unwrap(),
+                }],
+            ),
+        ],
+    );
+    assert_eq!(
+        order(&cs),
+        ["drop app.Target", "app.old -> app.target"],
+        "{cs:?}"
+    );
+}
+
+/// Measured on both engines, the rename is refused while the doomed table
+/// still holds the name: Msg 15335 on SQL Server, `42P07` on PostgreSQL.
+/// So the drop moves ahead of it, on a dialect where nothing else shares
+/// the namespace as well as on one where indexes do.
+/// #981's original case: `s1.old` carries a check `c` into `s2` while the
+/// plan drops the table `s2.c`. A dropped table releases its own name
+/// (DEC-536.1), so the drop runs before the move that claims it; before
+/// that, `DropTable` was class 6 and the transfer was refused.
+#[test]
+fn a_dropped_table_frees_a_name_a_moved_table_carries_in() {
+    let mut moving = table(&[("n", Column::new(ty("int")))]);
+    moving.checks.insert(
+        "c".into(),
+        pbps_model::schema::CheckConstraint {
+            expression: "n > 0".into(),
+        },
+    );
+    let base = two_tables(
+        ("s1.old", moving.clone()),
+        ("s2.c", table(&[("id", Column::new(ty("int")))])),
+    );
+    let declared = schema_of("s2.new", moving);
+    let cs = run(
+        &base,
+        &declared,
+        &[
+            Intent::RenameTable {
+                from: "s1.old".parse().unwrap(),
+                to: "s2.new".parse().unwrap(),
+            },
+            Intent::DropTable {
+                table: "s2.c".parse().unwrap(),
+                reason: "gone".parse().unwrap(),
+            },
+        ],
+    );
+    assert_eq!(kinds(&cs), ["DropTable", "RenameTable"], "{cs:?}");
+}
+
+/// A move to another schema takes the constraints it carries out of the
+/// source schema, so a rename into one of their names there runs after
+/// it, under the exact spelling and under one differing only in case
+/// (review of #1346). `a` sorts first by name, so without the link the
+/// rename into `c` ran while the check still held it.
+#[test]
+fn a_rename_into_a_name_a_moved_table_carries_away_runs_after_the_move() {
+    let mut moving = table(&[("n", Column::new(ty("int")))]);
+    moving.checks.insert(
+        "c".into(),
+        pbps_model::schema::CheckConstraint {
+            expression: "n > 0".into(),
+        },
+    );
+    let other = table(&[("id", Column::new(ty("int")))]);
+    let base = two_tables(("s1.old", moving.clone()), ("s1.a", other.clone()));
+    for into in ["s1.c", "s1.C"] {
+        let declared = two_tables(("s2.new", moving.clone()), (into, other.clone()));
+        let cs = run(
+            &base,
+            &declared,
+            &[
+                Intent::RenameTable {
+                    from: "s1.old".parse().unwrap(),
+                    to: "s2.new".parse().unwrap(),
+                },
+                Intent::RenameTable {
+                    from: "s1.a".parse().unwrap(),
+                    to: into.parse().unwrap(),
+                },
+            ],
+        );
+        let order: Vec<String> = cs
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::Table(TableChange::RenameTable { from, .. }) => {
+                    Some(from.raw().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, ["s1.old", "s1.a"], "{into}: {cs:?}");
+    }
+}
+
+/// A generated default constraint leaves the source schema with its
+/// table too, so a rename into its name there runs after the move
+/// (review of #1346). A table without a default releases no such name.
+#[test]
+fn a_rename_into_a_moved_tables_generated_default_name_runs_after_the_move() {
+    let other = table(&[("id", Column::new(ty("int")))]);
+    let order = |moving: &Table| -> Vec<String> {
+        let base = two_tables(("s1.old", moving.clone()), ("s1.a", other.clone()));
+        let declared = two_tables(("s2.new", moving.clone()), ("s1.df_old_x", other.clone()));
+        run_with(
+            &NamesItsDefaults,
+            &base,
+            &declared,
+            &[
+                Intent::RenameTable {
+                    from: "s1.old".parse().unwrap(),
+                    to: "s2.new".parse().unwrap(),
+                },
+                Intent::RenameTable {
+                    from: "s1.a".parse().unwrap(),
+                    to: "s1.df_old_x".parse().unwrap(),
+                },
+            ],
+        )
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::Table(TableChange::RenameTable { from, .. }) => Some(from.raw().to_string()),
+            _ => None,
+        })
+        .collect()
+    };
+    let mut x = Column::new(ty("int"));
+    x.value_source = pbps_model::ValueSource::Default("0".into());
+    assert_eq!(order(&table(&[("x", x)])), ["s1.old", "s1.a"]);
+    // Nothing frees the name here, so the name order stands.
+    assert_eq!(
+        order(&table(&[("x", Column::new(ty("int")))])),
+        ["s1.a", "s1.old"]
+    );
+}
+
+/// A generated default name is one of the alternatives the table may
+/// hold, so its edge is weak. `a.new` moves to `z.df_old_x` and `z.old`
+/// takes `a.new`: the real edge puts `a.new`'s move first. `z.old`'s
+/// default may hold `z.df_old_x`, or an alternative, in which case the
+/// plan is valid; the generated edge would close a cycle, and it is the
+/// one that gives way (review of #1346).
+#[test]
+fn a_generated_default_name_never_displaces_a_real_release_edge() {
+    let mut x = Column::new(ty("int"));
+    x.value_source = pbps_model::ValueSource::Default("0".into());
+    let old = table(&[("id", Column::new(ty("int"))), ("x", x)]);
+    let other = table(&[("id", Column::new(ty("int")))]);
+    // Two revisions, skipped: `a.new` leaves first, then `z.old` takes it.
+    let base = two_tables(("z.old", old.clone()), ("a.new", other.clone()));
+    let cs = across_revisions_with(
+        &NamesItsDefaults,
+        &base,
+        &[
+            (
+                two_tables(("z.old", old.clone()), ("z.df_old_x", other.clone())),
+                vec![Intent::RenameTable {
+                    from: "a.new".parse().unwrap(),
+                    to: "z.df_old_x".parse().unwrap(),
+                }],
+            ),
+            (
+                two_tables(("a.new", old), ("z.df_old_x", other)),
+                vec![Intent::RenameTable {
+                    from: "z.old".parse().unwrap(),
+                    to: "a.new".parse().unwrap(),
+                }],
+            ),
+        ],
+    );
+    let order: Vec<String> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::Table(TableChange::RenameTable { from, .. }) => Some(from.raw().to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order, ["a.new", "z.old"], "{cs:?}");
+
+    // Nor a case-folded one: `a.other` leaves, then `z.old` takes
+    // `a.Other`, one name to a case-insensitive collation. That edge
+    // outranks the generated name's, whichever was found first.
+    let other = table(&[("id", Column::new(ty("int")))]);
+    let mut x = Column::new(ty("int"));
+    x.value_source = pbps_model::ValueSource::Default("0".into());
+    let old = table(&[("id", Column::new(ty("int"))), ("x", x)]);
+    let cs = across_revisions_with(
+        &NamesItsDefaults,
+        &two_tables(("z.old", old.clone()), ("a.other", other.clone())),
+        &[
+            (
+                two_tables(("z.old", old.clone()), ("z.df_old_x", other.clone())),
+                vec![Intent::RenameTable {
+                    from: "a.other".parse().unwrap(),
+                    to: "z.df_old_x".parse().unwrap(),
+                }],
+            ),
+            (
+                two_tables(("a.Other", old), ("z.df_old_x", other)),
+                vec![Intent::RenameTable {
+                    from: "z.old".parse().unwrap(),
+                    to: "a.Other".parse().unwrap(),
+                }],
+            ),
+        ],
+    );
+    let order: Vec<String> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::Table(TableChange::RenameTable { from, .. }) => Some(from.raw().to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order, ["a.other", "z.old"], "{cs:?}");
+}
+
+/// A rename within its schema renames its generated defaults too, so it
+/// releases the old table name's and claims the new one's (review of
+/// #1346). `dbo.a` into `dbo.df_old_x` waits for `dbo.old`'s rename, and
+/// `dbo.b`'s rename to `dbo.c` waits for `dbo.df_c_x` to leave. Without a
+/// default neither name is involved, and the name order stands.
+#[test]
+fn a_rename_in_its_schema_releases_and_claims_generated_default_names() {
+    let other = table(&[("id", Column::new(ty("int")))]);
+    let mut x = Column::new(ty("int"));
+    x.value_source = pbps_model::ValueSource::Default("0".into());
+    let defaulted = table(&[("id", Column::new(ty("int"))), ("x", x)]);
+    let plain = table(&[
+        ("id", Column::new(ty("int"))),
+        ("x", Column::new(ty("int"))),
+    ]);
+    let order = |moving: &Table, from: &str, to: &str, other_from: &str, other_to: &str| {
+        let cs = run_with(
+            &NamesItsDefaults,
+            &two_tables((from, moving.clone()), (other_from, other.clone())),
+            &two_tables((to, moving.clone()), (other_to, other.clone())),
+            &[
+                Intent::RenameTable {
+                    from: from.parse().unwrap(),
+                    to: to.parse().unwrap(),
+                },
+                Intent::RenameTable {
+                    from: other_from.parse().unwrap(),
+                    to: other_to.parse().unwrap(),
+                },
+            ],
+        );
+        cs.changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::Table(TableChange::RenameTable { from, .. }) => {
+                    Some(from.raw().to_string())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    // Released: `df_old_x` leaves with `dbo.old`'s rename.
+    assert_eq!(
+        order(&defaulted, "dbo.old", "dbo.new", "dbo.a", "dbo.df_old_x"),
+        ["dbo.old", "dbo.a"]
+    );
+    assert_eq!(
+        order(&plain, "dbo.old", "dbo.new", "dbo.a", "dbo.df_old_x"),
+        ["dbo.a", "dbo.old"]
+    );
+    // Claimed: `dbo.b -> dbo.c` names its default `df_c_x`.
+    assert_eq!(
+        order(&defaulted, "dbo.b", "dbo.c", "dbo.df_c_x", "dbo.z"),
+        ["dbo.df_c_x", "dbo.b"]
+    );
+    assert_eq!(
+        order(&plain, "dbo.b", "dbo.c", "dbo.df_c_x", "dbo.z"),
+        ["dbo.b", "dbo.df_c_x"]
+    );
+}
+
+/// A check the plan drops is gone before its table moves, so the move
+/// does not release its name: `z.old`'s check `c` is dropped, `a.x` moves
+/// to `z.c`, and `z.old` then takes `a.x`. Only `a.x`'s move freeing its
+/// own name orders the two (review of #1346).
+#[test]
+fn a_dropped_check_neither_leaves_nor_arrives_with_its_tables_move() {
+    let other = table(&[("id", Column::new(ty("int")))]);
+    let mut old = table(&[("id", Column::new(ty("int")))]);
+    old.checks.insert(
+        "c".into(),
+        pbps_model::schema::CheckConstraint {
+            expression: "id > 0".into(),
+        },
+    );
+    let plain_old = table(&[("id", Column::new(ty("int")))]);
+    let cs = across_revisions(
+        &two_tables(("z.old", old.clone()), ("a.x", other.clone())),
+        &[
+            (
+                two_tables(("z.old", old), ("z.c", other.clone())),
+                vec![Intent::RenameTable {
+                    from: "a.x".parse().unwrap(),
+                    to: "z.c".parse().unwrap(),
+                }],
+            ),
+            (
+                two_tables(("a.x", plain_old), ("z.c", other)),
+                vec![Intent::RenameTable {
+                    from: "z.old".parse().unwrap(),
+                    to: "a.x".parse().unwrap(),
+                }],
+            ),
+        ],
+    );
+    let order: Vec<String> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::Table(TableChange::RenameTable { from, .. }) => Some(from.raw().to_string()),
+            Change::Constraint(ConstraintChange::DropCheck { name, .. }) => Some(format!(
+                "drop {name}",
+                // Preserve raw comparison-label or fixture SQL bytes in test data.
+                name = name.raw(),
+            )),
+            _ => None,
+        })
+        .collect();
+    let at = |what: &str| order.iter().position(|o| o == what).unwrap();
+    assert!(at("drop c") < at("a.x"), "{order:?}");
+    assert!(at("a.x") < at("z.old"), "{order:?}");
+
+    // Nor does it claim the name in the destination: `z.old` drops `c`
+    // and moves to `z2.x`, then `z2.c` takes `z.old` (review of #1346).
+    let mut old = table(&[("id", Column::new(ty("int")))]);
+    old.checks.insert(
+        "c".into(),
+        pbps_model::schema::CheckConstraint {
+            expression: "id > 0".into(),
+        },
+    );
+    let other = table(&[("id", Column::new(ty("int")))]);
+    let plain_old = table(&[("id", Column::new(ty("int")))]);
+    let cs = across_revisions(
+        &two_tables(("z.old", old), ("z2.c", other.clone())),
+        &[
+            (
+                two_tables(("z2.x", plain_old.clone()), ("z2.c", other.clone())),
+                vec![Intent::RenameTable {
+                    from: "z.old".parse().unwrap(),
+                    to: "z2.x".parse().unwrap(),
+                }],
+            ),
+            (
+                two_tables(("z2.x", plain_old), ("z.old", other)),
+                vec![Intent::RenameTable {
+                    from: "z2.c".parse().unwrap(),
+                    to: "z.old".parse().unwrap(),
+                }],
+            ),
+        ],
+    );
+    let order: Vec<String> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::Table(TableChange::RenameTable { from, .. }) => Some(from.raw().to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order, ["z.old", "z2.c"], "{cs:?}");
+}
+
+#[test]
+fn a_dropped_tables_name_is_free_before_a_later_rename_reuses_it() {
+    let old_t = table(&[("id", Column::new(ty("int")))]);
+    let target_t = table(&[("n", Column::new(ty("varchar(10)")))]);
+    let base = two_tables(("app.old", old_t.clone()), ("app.target", target_t));
+    let intermediate = schema_of("app.old", old_t.clone());
+    let declared = schema_of("app.target", old_t);
+    for dialect in [&MinimalDialect as &dyn Dialect, &SharesIndexNamespace] {
+        let cs = a_dropped_tables_name_reused_by_a_later_rename(
+            dialect,
+            &base,
+            &intermediate,
+            &declared,
+        );
+        assert_eq!(
+            kinds(&cs),
+            ["DropTable", "RenameTable"],
+            "{}: the drop must free the name first: {cs:?}",
+            dialect.name()
+        );
+    }
+}
+
+/// The doomed table cannot go while another table's key still names it,
+/// and its own keys are dropped first as they always are. Both move with
+/// it. Its own key keeps the doomed table's address: the rename would
+/// otherwise rekey it onto the renamed table, which never had it.
+#[test]
+fn the_keys_around_a_reused_tables_drop_move_ahead_of_it() {
+    let old_t = table(&[("id", Column::new(ty("int")).not_null())]);
+    let mut target_t = table(&[
+        ("id", Column::new(ty("int")).not_null()),
+        ("parent_id", Column::new(ty("int"))),
+    ]);
+    target_t.foreign_keys.insert(
+        "fk_target_parent".into(),
+        fk(&["parent_id"], "app.parent", &["id"]),
+    );
+    let parent = table(&[("id", Column::new(ty("int")).not_null())]);
+    let mut child = table(&[("target_id", Column::new(ty("int")))]);
+    child.foreign_keys.insert(
+        "fk_child_target".into(),
+        fk(&["target_id"], "app.target", &["id"]),
+    );
+    let bare_child = table(&[("target_id", Column::new(ty("int")))]);
+
+    let mut base = two_tables(("app.old", old_t.clone()), ("app.target", target_t));
+    base.tables
+        .insert("app.parent".parse().unwrap(), parent.clone());
+    base.tables.insert("app.child".parse().unwrap(), child);
+    let mut intermediate = two_tables(("app.old", old_t.clone()), ("app.parent", parent));
+    intermediate
+        .tables
+        .insert("app.child".parse().unwrap(), bare_child);
+    let mut declared = intermediate.clone();
+    let renamed = declared
+        .tables
+        .remove(&"app.old".parse::<TableName>().unwrap())
+        .unwrap();
+    declared
+        .tables
+        .insert("app.target".parse().unwrap(), renamed);
+
+    let cs = a_dropped_tables_name_reused_by_a_later_rename(
+        &MinimalDialect,
+        &base,
+        &intermediate,
+        &declared,
+    );
+    let at = |f: &dyn Fn(&Change) -> bool| {
+        cs.changes
+            .iter()
+            .position(|p| f(&p.change))
+            .unwrap_or_else(|| panic!("{:?}", cs.changes))
+    };
+    let child_key = at(&|c| {
+        matches!(c, Change::Constraint(ConstraintChange::DropForeignKey { table, name })
+            if table.raw().to_string() == "app.child" && name.raw() == "fk_child_target")
+    });
+    let own_key = at(&|c| {
+        matches!(c, Change::Constraint(ConstraintChange::DropForeignKey { table, name })
+            if table.raw().to_string() == "app.target" && name.raw() == "fk_target_parent")
+    });
+    let drop = at(&|c| matches!(c, Change::Table(TableChange::DropTable { .. })));
+    let rename = at(&|c| matches!(c, Change::Table(TableChange::RenameTable { .. })));
+    assert!(child_key < drop, "{:?}", cs.changes);
+    assert!(own_key < drop, "{:?}", cs.changes);
+    assert!(drop < rename, "{:?}", cs.changes);
+}
+
+/// A key that reads the same by name in the first and last revision can
+/// point at two tables: `child`'s key referenced the doomed `target`, is
+/// dropped with it, and a later revision re-adds it under the same name to
+/// the table renamed into `target`. Compared by name alone, nothing
+/// changed, and the standing key would block the drop. It is dropped
+/// ahead of the doomed table and added back after the rename.
+#[test]
+fn a_key_to_a_reused_name_is_rebound_to_its_new_occupant() {
+    let keyed = || table(&[("id", Column::new(ty("int")).not_null())]);
+    let mut child = table(&[("target_id", Column::new(ty("int")))]);
+    child.foreign_keys.insert(
+        "fk_child_target".into(),
+        fk(&["target_id"], "app.target", &["id"]),
+    );
+    let bare_child = table(&[("target_id", Column::new(ty("int")))]);
+
+    let mut base = two_tables(("app.old", keyed()), ("app.target", keyed()));
+    base.tables
+        .insert("app.child".parse().unwrap(), child.clone());
+    let intermediate = two_tables(("app.old", keyed()), ("app.child", bare_child));
+    let declared = two_tables(("app.target", keyed()), ("app.child", child));
+
+    let cs = a_dropped_tables_name_reused_by_a_later_rename(
+        &MinimalDialect,
+        &base,
+        &intermediate,
+        &declared,
+    );
+    let at = |f: &dyn Fn(&Change) -> bool| {
+        cs.changes
+            .iter()
+            .position(|p| f(&p.change))
+            .unwrap_or_else(|| panic!("{:?}", cs.changes))
+    };
+    let drop_key = at(
+        &|c| matches!(c, Change::Constraint(ConstraintChange::DropForeignKey { name, .. }) if name.raw() == "fk_child_target"),
+    );
+    let drop = at(&|c| matches!(c, Change::Table(TableChange::DropTable { .. })));
+    let rename = at(&|c| matches!(c, Change::Table(TableChange::RenameTable { .. })));
+    let add_key = at(
+        &|c| matches!(c, Change::Constraint(ConstraintChange::AddForeignKey { name, .. }) if name.raw() == "fk_child_target"),
+    );
+    assert!(
+        drop_key < drop && drop < rename && rename < add_key,
+        "{:?}",
+        cs.changes
+    );
+
+    // A key whose table keeps its identity is left alone.
+    let mut kept = base.clone();
+    kept.tables.remove(&"app.old".parse::<TableName>().unwrap());
+    let cs = run(&kept, &kept, &[]);
+    assert!(cs.changes.is_empty(), "{:?}", cs.changes);
+}
+
+/// The same, where the doomed table has a key of that name too — a key
+/// name is the table's own on PostgreSQL — and the renamed table's key
+/// pointed at the doomed one. Two identical drops at one address are two
+/// keys, and the renamed table's still has to go and come back.
+#[test]
+fn a_rebound_key_is_not_mistaken_for_the_doomed_tables_key_of_its_name() {
+    let keyed = || table(&[("id", Column::new(ty("int")).not_null())]);
+    let mut old = table(&[
+        ("id", Column::new(ty("int")).not_null()),
+        ("target_id", Column::new(ty("int"))),
+    ]);
+    old.foreign_keys
+        .insert("fk".into(), fk(&["target_id"], "app.target", &["id"]));
+    let mut target = table(&[
+        ("id", Column::new(ty("int")).not_null()),
+        ("parent_id", Column::new(ty("int"))),
+    ]);
+    target
+        .foreign_keys
+        .insert("fk".into(), fk(&["parent_id"], "app.parent", &["id"]));
+    let mut base = two_tables(("app.old", old.clone()), ("app.target", target));
+    base.tables.insert("app.parent".parse().unwrap(), keyed());
+    let mut bare = old.clone();
+    bare.foreign_keys.clear();
+    let intermediate = two_tables(("app.old", bare), ("app.parent", keyed()));
+    // The renamed table's key now points at itself, under its new name.
+    let declared = two_tables(("app.target", old), ("app.parent", keyed()));
+
+    let cs = a_dropped_tables_name_reused_by_a_later_rename(
+        &SharesIndexNamespace,
+        &base,
+        &intermediate,
+        &declared,
+    );
+    let drops: Vec<usize> = cs
+        .changes
+        .iter()
+        .enumerate()
+        .filter(
+            |(_, p)| matches!(&p.change, Change::Constraint(ConstraintChange::DropForeignKey { name, .. }) if name.raw() == "fk"),
+        )
+        .map(|(i, _)| i)
+        .collect();
+    let at = |f: &dyn Fn(&Change) -> bool| {
+        cs.changes
+            .iter()
+            .position(|p| f(&p.change))
+            .unwrap_or_else(|| panic!("{:?}", cs.changes))
+    };
+    let drop = at(&|c| matches!(c, Change::Table(TableChange::DropTable { .. })));
+    let rename = at(&|c| matches!(c, Change::Table(TableChange::RenameTable { .. })));
+    let add = at(
+        &|c| matches!(c, Change::Constraint(ConstraintChange::AddForeignKey { name, .. }) if name.raw() == "fk"),
+    );
+    assert_eq!(drops.len(), 2, "{:?}", cs.changes);
+    // One at each table's address as it stands when it runs: the doomed
+    // table's, and the renamed table's source.
+    let addresses: BTreeSet<String> = drops
+        .iter()
+        .filter_map(|d| {
+            cs.changes[*d]
+                .change
+                .table()
+                .map(|name| name.raw().to_string())
+        })
+        .collect();
+    assert_eq!(
+        addresses,
+        BTreeSet::from(["app.old".to_owned(), "app.target".to_owned()]),
+        "{:?}",
+        cs.changes
+    );
+    assert!(drops.iter().all(|d| *d < drop), "{:?}", cs.changes);
+    assert!(drop < rename && rename < add, "{:?}", cs.changes);
+}
+
+/// A key on another table this plan drops, pointing at the doomed one, is
+/// that table's own key and is dropped separately like any other; it
+/// still has to go before the doomed table does, and the other table's
+/// drop keeps its class.
+#[test]
+fn another_dropped_tables_key_to_the_reused_name_goes_first() {
+    let keyed = || table(&[("id", Column::new(ty("int")).not_null())]);
+    let mut other = table(&[("target_id", Column::new(ty("int")))]);
+    other.foreign_keys.insert(
+        "fk_other_target".into(),
+        fk(&["target_id"], "app.target", &["id"]),
+    );
+    let mut base = two_tables(("app.old", keyed()), ("app.target", keyed()));
+    base.tables.insert("app.other".parse().unwrap(), other);
+    let intermediate = schema_of("app.old", keyed());
+    let declared = schema_of("app.target", keyed());
+    let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let intermediate_ids = crate::resolve(
+        &intermediate,
+        &base_ids,
+        &[
+            Intent::DropTable {
+                table: "app.target".parse().unwrap(),
+                reason: "gone".parse().unwrap(),
+            },
+            Intent::DropTable {
+                table: "app.other".parse().unwrap(),
+                reason: "gone".parse().unwrap(),
+            },
+        ],
+        &ctx(),
+    )
+    .unwrap()
+    .ids;
+    let declared_ids = crate::resolve(
+        &declared,
+        &intermediate_ids,
+        &[Intent::RenameTable {
+            from: "app.old".parse().unwrap(),
+            to: "app.target".parse().unwrap(),
+        }],
+        &ctx(),
+    )
+    .unwrap()
+    .ids;
+    let cs = diff_with(
+        Side {
+            schema: &base,
+            ids: &base_ids,
+        },
+        Side {
+            schema: &declared,
+            ids: &declared_ids,
+        },
+        &MinimalDialect,
+    );
+    let at = |f: &dyn Fn(&Change) -> bool| {
+        cs.changes
+            .iter()
+            .position(|p| f(&p.change))
+            .unwrap_or_else(|| panic!("{:?}", cs.changes))
+    };
+    let key = at(&|c| {
+        matches!(c, Change::Constraint(ConstraintChange::DropForeignKey { table, name })
+            if table.raw().to_string() == "app.other" && name.raw() == "fk_other_target")
+    });
+    let target = at(
+        &|c| matches!(c, Change::Table(TableChange::DropTable { name, .. }) if name.raw().to_string() == "app.target"),
+    );
+    let rename = at(&|c| matches!(c, Change::Table(TableChange::RenameTable { .. })));
+    let other = at(
+        &|c| matches!(c, Change::Table(TableChange::DropTable { name, .. }) if name.raw().to_string() == "app.other"),
+    );
+    assert!(
+        key < target && target < rename && rename < other,
+        "{:?}",
+        cs.changes
+    );
+}
+
+/// DEC-981.3: under a case-insensitive collation `b -> c` then `a -> B` is
+/// a chain, because the engine reads `B` as held by `b`. The fold only
+/// orders: `a -> B` beside `b -> A` is a valid pair on a case-sensitive
+/// database, and a cycle closed through the fold is not reported.
+#[test]
+fn a_column_rename_chain_linked_only_by_case_still_orders() {
+    let cols = |c: &[(&str, &str)]| {
+        schema_of(
+            "dbo.t",
+            table(
+                &c.iter()
+                    .map(|(n, t)| (*n, Column::new(ty(t))))
+                    .collect::<Vec<_>>(),
+            ),
+        )
+    };
+    let rename = |from: &str, to: &str| Intent::RenameColumn {
+        table: "dbo.t".parse().unwrap(),
+        from: from.into(),
+        to: to.into(),
+    };
+    let order = |cs: &ChangeSet| -> Vec<String> {
+        cs.changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::Column(ColumnChange::RenameColumn { from, to, .. }) => Some(format!(
+                    "{from} -> {to}",
+                    from = from.shown(),
+                    to = to.shown(),
+                )),
+                _ => None,
+            })
+            .collect()
+    };
+    // Fresh uids each time: without the link the order was theirs.
+    for _ in 0..32 {
+        let cs = across_revisions(
+            &cols(&[("a", "int"), ("b", "bigint")]),
+            &[
+                (
+                    cols(&[("a", "int"), ("c", "bigint")]),
+                    vec![rename("b", "c")],
+                ),
+                (
+                    cols(&[("B", "int"), ("c", "bigint")]),
+                    vec![rename("a", "B")],
+                ),
+            ],
+        );
+        assert_eq!(order(&cs), ["b -> c", "a -> B"], "{cs:?}");
+    }
+
+    // `a -> B` and `b -> A`: a cycle only through the fold. Both renames
+    // are planned, and no cycle is reported.
+    let diffed = revisions_diffed(
+        &cols(&[("a", "int"), ("b", "bigint")]),
+        &[
+            (
+                cols(&[("x", "int"), ("b", "bigint")]),
+                vec![rename("a", "x")],
+            ),
+            (
+                cols(&[("x", "int"), ("A", "bigint")]),
+                vec![rename("b", "A")],
+            ),
+            (
+                cols(&[("B", "int"), ("A", "bigint")]),
+                vec![rename("x", "B")],
+            ),
+        ],
+    );
+    assert!(diffed.errors.is_empty(), "{:?}", diffed.errors);
+    assert_eq!(order(&diffed.changes).len(), 2, "{:?}", diffed.changes);
+
+    // `a -> B`, `b -> c`, `c -> A`: a cycle only through two folded
+    // links, around the exact one that `b -> c` waits on `c -> A`. The
+    // link that would close the cycle is dropped, and the exact one keeps
+    // its order.
+    for _ in 0..32 {
+        let diffed = revisions_diffed(
+            &cols(&[("a", "int"), ("b", "bigint"), ("c", "smallint")]),
+            &[
+                (
+                    cols(&[("a", "int"), ("b", "bigint"), ("A", "smallint")]),
+                    vec![rename("c", "A")],
+                ),
+                (
+                    cols(&[("a", "int"), ("c", "bigint"), ("A", "smallint")]),
+                    vec![rename("b", "c")],
+                ),
+                (
+                    cols(&[("B", "int"), ("c", "bigint"), ("A", "smallint")]),
+                    vec![rename("a", "B")],
+                ),
+            ],
+        );
+        assert!(diffed.errors.is_empty(), "{:?}", diffed.errors);
+        let order = order(&diffed.changes);
+        let at = |r: &str| order.iter().position(|o| o == r).unwrap();
+        assert!(at("c -> A") < at("b -> c"), "{order:?}");
+    }
+}
+
+/// Revisions resolved in turn from `base`, each with its own intents,
+/// then diffed from the undeployed baseline.
+/// A chain longer than a byte counts: each link keeps its own rank, so a
+/// rename never runs before the one that vacates its target.
+#[test]
+fn a_column_rename_chain_longer_than_a_byte_keeps_every_link_in_order() {
+    const LINKS: usize = 300;
+    let cols = |names: &[String]| {
+        schema_of(
+            "dbo.t",
+            table(
+                &names
+                    .iter()
+                    .map(|n| (n.as_str(), Column::new(ty("int"))))
+                    .collect::<Vec<_>>(),
+            ),
+        )
+    };
+    let name = |i: usize| format!("c{i:03}");
+    // Baseline `c000`..`c299`. Revision k renames `c(299-k)` to
+    // `c(300-k)`, the name the revision before it vacated.
+    let mut names: Vec<String> = (0..LINKS).map(name).collect();
+    let base = cols(&names);
+    let mut revisions = Vec::new();
+    for k in 0..LINKS {
+        let from = LINKS - 1 - k;
+        names[from] = name(from + 1);
+        revisions.push((
+            cols(&names),
+            vec![Intent::RenameColumn {
+                table: "dbo.t".parse().unwrap(),
+                from: name(from).into(),
+                to: name(from + 1).into(),
+            }],
+        ));
+    }
+    let cs = across_revisions(&base, &revisions);
+    let order: Vec<String> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::Column(ColumnChange::RenameColumn { from, .. }) => Some(from.raw().to_owned()),
+            _ => None,
+        })
+        .collect();
+    let expected: Vec<String> = (0..LINKS).rev().map(name).collect();
+    assert_eq!(order, expected);
+}
+
+/// The base schema and every revision resolved in turn, without the
+/// diff: for a case whose diff reports an error rather than a plan.
+fn revisions_diffed(base: &Schema, revisions: &[(Schema, Vec<Intent>)]) -> Diffed {
+    let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let mut ids = base_ids.clone();
+    for (schema, intents) in revisions {
+        ids = crate::resolve(schema, &ids, intents, &ctx()).unwrap().ids;
+    }
+    diff_partial_rebuilding(
+        Side {
+            schema: base,
+            ids: &base_ids,
+        },
+        Side {
+            schema: &revisions.last().unwrap().0,
+            ids: &ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+        &BTreeSet::new(),
+        Rebinding::Candidates,
+        Screen::Text,
+        None,
+    )
+}
+
+/// #541: a column rename into a name another rename of the same table
+/// vacates runs after it. Two minted uids used to decide, and `a -> b`
+/// ran while `b` still stood — `Msg 15335` on SQL Server and `column "b"
+/// of relation "t" already exists` on PostgreSQL.
+#[test]
+fn a_column_rename_into_a_name_another_rename_vacates_runs_after_it() {
+    let cols = |c: &[(&str, &str)]| {
+        schema_of(
+            "dbo.t",
+            table(
+                &c.iter()
+                    .map(|(n, t)| (*n, Column::new(ty(t))))
+                    .collect::<Vec<_>>(),
+            ),
+        )
+    };
+    let rename = |from: &str, to: &str| Intent::RenameColumn {
+        table: "dbo.t".parse().unwrap(),
+        from: from.into(),
+        to: to.into(),
+    };
+    let order = |cs: &ChangeSet| -> Vec<String> {
+        cs.changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::Column(ColumnChange::RenameColumn { from, to, .. }) => Some(format!(
+                    "{from} -> {to}",
+                    from = from.shown(),
+                    to = to.shown(),
+                )),
+                _ => None,
+            })
+            .collect()
+    };
+    // Resolved afresh each time: the uids are minted, so without the
+    // chain order the renames came out in either order, and one
+    // resolution alone would pass half the time for the wrong reason.
+    for _ in 0..32 {
+        let cs = across_revisions(
+            &cols(&[("a", "int"), ("b", "bigint")]),
+            &[
+                (
+                    cols(&[("a", "int"), ("c", "bigint")]),
+                    vec![rename("b", "c")],
+                ),
+                (
+                    cols(&[("b", "int"), ("c", "bigint")]),
+                    vec![rename("a", "b")],
+                ),
+            ],
+        );
+        assert_eq!(order(&cs), ["b -> c", "a -> b"], "{cs:?}");
+
+        // Three links: the far end first, whatever the uids say.
+        let cs = across_revisions(
+            &cols(&[("a", "int"), ("b", "bigint"), ("c", "text")]),
+            &[
+                (
+                    cols(&[("a", "int"), ("b", "bigint"), ("d", "text")]),
+                    vec![rename("c", "d")],
+                ),
+                (
+                    cols(&[("a", "int"), ("c", "bigint"), ("d", "text")]),
+                    vec![rename("b", "c")],
+                ),
+                (
+                    cols(&[("b", "int"), ("c", "bigint"), ("d", "text")]),
+                    vec![rename("a", "b")],
+                ),
+            ],
+        );
+        assert_eq!(order(&cs), ["c -> d", "b -> c", "a -> b"], "{cs:?}");
+    }
+
+    // Two columns trading names through a third across three revisions:
+    // `resolve` accepts every step, and no order of the net renames runs.
+    // The plan says so instead of emitting one.
+    let diffed = revisions_diffed(
+        &cols(&[("a", "int"), ("b", "bigint")]),
+        &[
+            (
+                cols(&[("c", "int"), ("b", "bigint")]),
+                vec![rename("a", "c")],
+            ),
+            (
+                cols(&[("c", "int"), ("a", "bigint")]),
+                vec![rename("b", "a")],
+            ),
+            (
+                cols(&[("b", "int"), ("a", "bigint")]),
+                vec![rename("c", "b")],
+            ),
+        ],
+    );
+    assert!(
+        diffed.errors.iter().any(|e| matches!(e,
+            DiffError::ColumnRenameCycle { table, columns }
+                if table.raw().to_string() == "dbo.t"
+                    && columns == &BTreeSet::from([ColumnName::from("a"), ColumnName::from("b")]))),
+        "{:?}",
+        diffed.errors
+    );
+}
+
+fn across_revisions(base: &Schema, revisions: &[(Schema, Vec<Intent>)]) -> ChangeSet {
+    across_revisions_with(&MinimalDialect, base, revisions)
+}
+
+/// [`across_revisions`], against a caller-chosen dialect.
+fn across_revisions_with(
+    dialect: &(impl Dialect + ?Sized),
+    base: &Schema,
+    revisions: &[(Schema, Vec<Intent>)],
+) -> ChangeSet {
+    let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let mut ids = base_ids.clone();
+    for (schema, intents) in revisions {
+        ids = crate::resolve(schema, &ids, intents, &ctx()).unwrap().ids;
+    }
+    diff_with(
+        Side {
+            schema: base,
+            ids: &base_ids,
+        },
+        Side {
+            schema: &revisions.last().unwrap().0,
+            ids: &ids,
+        },
+        dialect,
+    )
+}
+
+/// A rename releases its source name as it runs, so a later revision's
+/// rename into that name runs after it. `y` sorts before `z`, so without
+/// the edge the alphabet ran `y -> z` while `z` still stood.
+#[test]
+fn a_rename_into_a_name_another_rename_vacates_runs_after_it() {
+    let t = |n: &str| table(&[(n, Column::new(ty("int")))]);
+    let rename = |from: &str, to: &str| Intent::RenameTable {
+        from: from.parse().unwrap(),
+        to: to.parse().unwrap(),
+    };
+    let schema = |tables: &[(&str, &str)]| {
+        let mut s = Schema::default();
+        for (name, column) in tables {
+            s.tables.insert(name.parse().unwrap(), t(column));
+        }
+        s
+    };
+    let order = |cs: &ChangeSet| -> Vec<String> {
+        cs.changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::Table(TableChange::DropTable { name, .. }) => {
+                    Some(format!("drop {name}", name = name.shown()))
+                }
+                Change::Table(TableChange::RenameTable { from, to, .. }) => Some(format!(
+                    "{from} -> {to}",
+                    from = from.shown(),
+                    to = to.shown()
+                )),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // With a drop at the head of the chain.
+    let cs = across_revisions(
+        &schema(&[("app.a", "doomed"), ("app.z", "zed"), ("app.y", "why")]),
+        &[
+            (
+                schema(&[("app.z", "zed"), ("app.y", "why")]),
+                vec![Intent::DropTable {
+                    table: "app.a".parse().unwrap(),
+                    reason: "gone".parse().unwrap(),
+                }],
+            ),
+            (
+                schema(&[("app.a", "zed"), ("app.y", "why")]),
+                vec![rename("app.z", "app.a")],
+            ),
+            (
+                schema(&[("app.a", "zed"), ("app.z", "why")]),
+                vec![rename("app.y", "app.z")],
+            ),
+        ],
+    );
+    assert_eq!(
+        order(&cs),
+        ["drop app.a", "app.z -> app.a", "app.y -> app.z"],
+        "{cs:?}"
+    );
+
+    // And without one: a chain of renames alone.
+    let cs = across_revisions(
+        &schema(&[("app.z", "zed"), ("app.y", "why")]),
+        &[
+            (
+                schema(&[("app.a", "zed"), ("app.y", "why")]),
+                vec![rename("app.z", "app.a")],
+            ),
+            (
+                schema(&[("app.a", "zed"), ("app.z", "why")]),
+                vec![rename("app.y", "app.z")],
+            ),
+        ],
+    );
+    assert_eq!(order(&cs), ["app.z -> app.a", "app.y -> app.z"], "{cs:?}");
+
+    // Across schemas: a move passes through its source name in the
+    // destination schema, so `s1.z -> s2.a` holds `s2.z` for a moment,
+    // and `s1.y -> s2.z` waits for it.
+    let cs = across_revisions(
+        &schema(&[("s1.z", "zed"), ("s1.y", "why")]),
+        &[
+            (
+                schema(&[("s2.a", "zed"), ("s1.y", "why")]),
+                vec![rename("s1.z", "s2.a")],
+            ),
+            (
+                schema(&[("s2.a", "zed"), ("s2.z", "why")]),
+                vec![rename("s1.y", "s2.z")],
+            ),
+        ],
+    );
+    assert_eq!(order(&cs), ["s1.z -> s2.a", "s1.y -> s2.z"], "{cs:?}");
+}
+
+/// #1966: table renames that each wait for a name another still holds
+/// are refused by name, as a column cycle is (DEC-541.1). Before this the
+/// differ planned them, and an offline plan wrote a script no engine runs.
+/// A chain, a cross-schema move nothing else waits on, and a pair equal
+/// only after case folding are not cycles here.
+#[test]
+fn a_table_rename_cycle_is_refused_by_name() {
+    let t = |n: &str| table(&[(n, Column::new(ty("int")))]);
+    let rename = |from: &str, to: &str| Intent::RenameTable {
+        from: from.parse().unwrap(),
+        to: to.parse().unwrap(),
+    };
+    let schema = |tables: &[(&str, &str)]| {
+        let mut s = Schema::default();
+        for (name, column) in tables {
+            s.tables.insert(name.parse().unwrap(), t(column));
+        }
+        s
+    };
+    let cycles = |diffed: &Diffed| -> Vec<BTreeSet<String>> {
+        diffed
+            .errors
+            .iter()
+            .filter_map(|e| match e {
+                DiffError::TableRenameCycle { renames } => Some(
+                    renames
+                        .iter()
+                        .map(|(from, to)| {
+                            format!("{from} -> {to}", from = from.shown(), to = to.shown())
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect()
+    };
+    let set = |renames: &[&str]| -> BTreeSet<String> {
+        renames.iter().map(|r| (*r).to_owned()).collect()
+    };
+
+    // Two tables trading names through a third, across three revisions.
+    let swap = revisions_diffed(
+        &schema(&[("app.a", "ay"), ("app.b", "bee")]),
+        &[
+            (
+                schema(&[("app.c", "ay"), ("app.b", "bee")]),
+                vec![rename("app.a", "app.c")],
+            ),
+            (
+                schema(&[("app.c", "ay"), ("app.a", "bee")]),
+                vec![rename("app.b", "app.a")],
+            ),
+            (
+                schema(&[("app.b", "ay"), ("app.a", "bee")]),
+                vec![rename("app.c", "app.b")],
+            ),
+        ],
+    );
+    assert_eq!(
+        cycles(&swap),
+        [set(&["app.a -> app.b", "app.b -> app.a"])],
+        "{:?}",
+        swap.errors
+    );
+    let message = swap.errors[0].to_string();
+    assert!(message.contains("`app.a -> app.b`"), "{message}");
+    assert!(message.contains("separate deployments"), "{message}");
+    assert!(message.contains("temporary name"), "{message}");
+
+    // Three tables rotating names.
+    let rotation = revisions_diffed(
+        &schema(&[("app.a", "ay"), ("app.b", "bee"), ("app.c", "cee")]),
+        &[
+            (
+                schema(&[("app.t", "ay"), ("app.b", "bee"), ("app.c", "cee")]),
+                vec![rename("app.a", "app.t")],
+            ),
+            (
+                schema(&[("app.t", "ay"), ("app.b", "bee"), ("app.a", "cee")]),
+                vec![rename("app.c", "app.a")],
+            ),
+            (
+                schema(&[("app.t", "ay"), ("app.c", "bee"), ("app.a", "cee")]),
+                vec![rename("app.b", "app.c")],
+            ),
+            (
+                schema(&[("app.b", "ay"), ("app.c", "bee"), ("app.a", "cee")]),
+                vec![rename("app.t", "app.b")],
+            ),
+        ],
+    );
+    assert_eq!(
+        cycles(&rotation),
+        [set(&["app.a -> app.b", "app.b -> app.c", "app.c -> app.a"])],
+        "{:?}",
+        rotation.errors
+    );
+
+    // One name trading schemas: each move lands on the other's name.
+    let across = revisions_diffed(
+        &schema(&[("s1.b", "one"), ("s2.b", "two")]),
+        &[
+            (
+                schema(&[("s1.t", "one"), ("s2.b", "two")]),
+                vec![rename("s1.b", "s1.t")],
+            ),
+            (
+                schema(&[("s1.t", "one"), ("s1.b", "two")]),
+                vec![rename("s2.b", "s1.b")],
+            ),
+            (
+                schema(&[("s2.b", "one"), ("s1.b", "two")]),
+                vec![rename("s1.t", "s2.b")],
+            ),
+        ],
+    );
+    assert_eq!(
+        cycles(&across),
+        [set(&["s1.b -> s2.b", "s2.b -> s1.b"])],
+        "{:?}",
+        across.errors
+    );
+
+    // A cycle through intermediate names alone, in one revision: each
+    // move passes through its old name in the other's schema, which the
+    // other still holds. No final name is shared.
+    let intermediate = revisions_diffed(
+        &schema(&[("s1.a", "one"), ("s2.a", "two")]),
+        &[(
+            schema(&[("s2.b", "one"), ("s1.c", "two")]),
+            vec![rename("s1.a", "s2.b"), rename("s2.a", "s1.c")],
+        )],
+    );
+    assert_eq!(
+        cycles(&intermediate),
+        [set(&["s1.a -> s2.b", "s2.a -> s1.c"])],
+        "{:?}",
+        intermediate.errors
+    );
+
+    // Negatives. A chain has an order: the far end first.
+    let chain = revisions_diffed(
+        &schema(&[("app.a", "ay"), ("app.b", "bee")]),
+        &[
+            (
+                schema(&[("app.a", "ay"), ("app.c", "bee")]),
+                vec![rename("app.b", "app.c")],
+            ),
+            (
+                schema(&[("app.b", "ay"), ("app.c", "bee")]),
+                vec![rename("app.a", "app.b")],
+            ),
+        ],
+    );
+    assert!(chain.errors.is_empty(), "{:?}", chain.errors);
+    // A move across schemas whose intermediate name nothing else holds.
+    let alone = revisions_diffed(
+        &schema(&[("s1.a", "one"), ("s2.x", "two")]),
+        &[(
+            schema(&[("s2.b", "one"), ("s2.x", "two")]),
+            vec![rename("s1.a", "s2.b")],
+        )],
+    );
+    assert!(alone.errors.is_empty(), "{:?}", alone.errors);
+    // Names equal only after case folding: a case-sensitive database
+    // takes both renames in either order, and a case-insensitive one is
+    // the connected plan's to refuse (DEC-1366.3).
+    let folded = revisions_diffed(
+        &schema(&[("app.a", "ay"), ("app.b", "bee")]),
+        &[(
+            schema(&[("app.B", "ay"), ("app.A", "bee")]),
+            vec![rename("app.a", "app.B"), rename("app.b", "app.A")],
+        )],
+    );
+    assert!(cycles(&folded).is_empty(), "{:?}", folded.errors);
+}
+
+/// #1971: a long chain of table renames plans in time. Nearly every
+/// rename of a chain waits for the next, and a pairwise search for cycles
+/// over them was cubic in their number. A chain has no cycle, so nothing
+/// is refused, and the far end still goes first.
+#[test]
+fn a_long_rename_chain_is_searched_for_cycles_in_linear_time() {
+    const N: usize = 5000;
+    let name = |k: usize| format!("app.t{k}");
+    let schema = |range: std::ops::Range<usize>, shift: usize| {
+        let mut s = Schema::default();
+        for k in range {
+            // Each table keeps its own column, so it is one table moving.
+            let column = format!("c{}", k + shift);
+            s.tables.insert(
+                name(k).parse().unwrap(),
+                table(&[(&column, Column::new(ty("int")))]),
+            );
+        }
+        s
+    };
+    // One revision cannot rename into a name its baseline still holds,
+    // so a chain builds up over revisions (DEC-536.1). The identities
+    // those revisions leave are written directly: each table renamed to
+    // the name the one before it has just left.
+    let base = schema(1..N + 1, 0);
+    let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let mut ids = base_ids.clone();
+    for k in 1..=N {
+        ids.rename_table(&name(k).parse().unwrap(), &name(k - 1).parse().unwrap());
+    }
+    let desired = schema(0..N, 1);
+    let started = std::time::Instant::now();
+    let chain = diff_partial_rebuilding(
+        Side {
+            schema: &base,
+            ids: &base_ids,
+        },
+        Side {
+            schema: &desired,
+            ids: &ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+        &BTreeSet::new(),
+        Rebinding::Candidates,
+        Screen::Text,
+        None,
+    );
+    let took = started.elapsed();
+    assert!(chain.errors.is_empty(), "{:?}", chain.errors);
+    let steps: Vec<String> = chain
+        .changes
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::Table(TableChange::RenameTable { from, to, .. }) => Some(format!(
+                "{from} -> {to}",
+                from = from.shown(),
+                to = to.shown()
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(steps.len(), N);
+    assert_eq!(steps[0], "app.t1 -> app.t0");
+    assert_eq!(steps[N - 1], format!("app.t{N} -> app.t{}", N - 1));
+    eprintln!("{N} chained renames planned in {took:?}");
+    assert!(
+        took < std::time::Duration::from_secs(60),
+        "{N} chained renames took {took:?}"
+    );
+}
+
+/// DEC-1118.1: a trigger keyed by a name that passes to another table is
+/// two triggers under one id. The doomed table's goes first; the one
+/// declared on the new occupant is created after the rename. Compared by
+/// id alone, nothing changed, and the occupant never got its trigger.
+#[test]
+fn a_trigger_on_a_name_that_changes_hands_is_dropped_and_created() {
+    let keyed = || table(&[("id", Column::new(ty("int")).not_null())]);
+    let trigger = || {
+        (
+            pbps_model::ModuleId::Trigger {
+                on: "app.target".parse().unwrap(),
+                name: "audit".to_owned(),
+            },
+            pbps_model::Module {
+                kind: pbps_model::ModuleKind::Trigger,
+                description: None,
+                definition: "AFTER INSERT AS SELECT 1".to_owned(),
+                options: Default::default(),
+            },
+        )
+    };
+    let mut base = two_tables(("app.old", keyed()), ("app.target", keyed()));
+    base.modules.extend([trigger()]);
+    let intermediate = schema_of("app.old", keyed());
+    let mut declared = schema_of("app.target", keyed());
+    declared.modules.extend([trigger()]);
+
+    let cs = a_dropped_tables_name_reused_by_a_later_rename(
+        &MinimalDialect,
+        &base,
+        &intermediate,
+        &declared,
+    );
+    let at = |f: &dyn Fn(&Change) -> bool| {
+        cs.changes
+            .iter()
+            .position(|p| f(&p.change))
+            .unwrap_or_else(|| panic!("{:?}", cs.changes))
+    };
+    let dropped = at(&|c| matches!(c, Change::Module(ModuleChange::DropModule { .. })));
+    let table_dropped = at(&|c| matches!(c, Change::Table(TableChange::DropTable { .. })));
+    let rename = at(&|c| matches!(c, Change::Table(TableChange::RenameTable { .. })));
+    let created = at(&|c| matches!(c, Change::Module(ModuleChange::CreateModule { .. })));
+    assert!(
+        dropped < table_dropped && rename < created,
+        "{:?}",
+        cs.changes
+    );
+
+    // The same trigger on a table that keeps its identity is untouched.
+    let cs = run(&declared, &declared, &[]);
+    assert!(cs.changes.is_empty(), "{:?}", cs.changes);
+}
+
+fn assert_trigger_restoration_identity(case: &str) {
+    let id = ModuleId::Trigger {
+        on: "app.target".parse().unwrap(),
+        name: "audit".into(),
+    };
+    let module = Module {
+        kind: pbps_model::ModuleKind::Trigger,
+        definition: "AFTER INSERT AS SELECT 1".into(),
+        description: None,
+        options: Default::default(),
+    };
+    let mut before = two_tables(
+        ("app.target", Table::default()),
+        ("app.other", Table::default()),
+    );
+    before.modules.insert(id.clone(), module.clone());
+    let old_owner: Uid = "t_aaaaaa".parse().unwrap();
+    let other_owner: Uid = "t_bbbbbb".parse().unwrap();
+    let new_owner: Uid = "t_cccccc".parse().unwrap();
+    let old = IdsFile {
+        tables: [
+            (old_owner.clone(), "app.target".parse().unwrap()),
+            (other_owner.clone(), "app.other".parse().unwrap()),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let mut after = before.clone();
+    let mut new = old.clone();
+    let handoff = match case {
+        "drop" => {
+            new.tables.remove(&old_owner);
+            new.tables.insert(new_owner, "app.target".parse().unwrap());
+            true
+        }
+        "rename-away" => {
+            new.tables.insert(old_owner, "app.retired".parse().unwrap());
+            new.tables.insert(new_owner, "app.target".parse().unwrap());
+            after
+                .tables
+                .insert("app.retired".parse().unwrap(), Table::default());
+            true
+        }
+        "retained" => false,
+        "unrelated-handoff" => {
+            new.tables.remove(&other_owner);
+            new.tables.insert(new_owner, "app.other".parse().unwrap());
+            false
+        }
+        _ => unreachable!(),
+    };
+    let base = Side {
+        schema: &before,
+        ids: &old,
+    };
+    let declared = Side {
+        schema: &after,
+        ids: &new,
+    };
+    let mut changes = Vec::new();
+    diff_modules(
+        &before,
+        &after,
+        &names_changing_hands(base, declared),
+        &MinimalDialect,
+        &mut changes,
+    );
+    let physical = vec![
+        Change::Module(ModuleChange::DropModule {
+            id: id.clone(),
+            kind: module.kind,
+        }),
+        Change::Module(ModuleChange::CreateModule {
+            id,
+            module: Box::new(module),
+        }),
+    ];
+    if handoff {
+        assert_eq!(
+            changes, physical,
+            "{case}: the old trigger goes before the new one"
+        );
+    } else {
+        assert!(changes.is_empty(), "{case}: {changes:?}");
+    }
+    let unchanged = restoration_comparison(base, declared, &MinimalDialect);
+    for change in &physical {
+        assert_eq!(unchanged(change, None), !handoff, "{case}: {change:?}");
+    }
+}
+
+#[test]
+fn a_dropped_tables_replacement_trigger_is_not_an_unchanged_restoration() {
+    assert_trigger_restoration_identity("drop");
+}
+
+#[test]
+fn a_renamed_away_tables_replacement_trigger_is_not_an_unchanged_restoration() {
+    assert_trigger_restoration_identity("rename-away");
+}
+
+#[test]
+fn a_retained_tables_trigger_keeps_its_restoration_exemption() {
+    assert_trigger_restoration_identity("retained");
+    assert_trigger_restoration_identity("unrelated-handoff");
+}
+
+/// DEC-1118.1: a grant keyed by a name that passes to another table is
+/// compared as the occupant's. The doomed table's grants go with it; the
+/// occupant keeps what it held under its old name, gains what is declared
+/// and loses what is not. The last was skipped: the name read as a
+/// dropped object, whose grants nothing revokes.
+#[test]
+fn grants_on_a_name_that_changes_hands_are_compared_as_the_occupants() {
+    use pbps_model::{GrantTarget, Permission, Role};
+    let keyed = || table(&[("id", Column::new(ty("int")).not_null())]);
+    let role = |grants: &[(&str, Permission)]| {
+        let mut r = Role::default();
+        for (target, permission) in grants {
+            r.grants
+                .entry(target.parse::<GrantTarget>().unwrap())
+                .or_default()
+                .insert(*permission);
+        }
+        r
+    };
+    let with_role = |mut s: Schema, r: Role| {
+        s.roles.insert("app_reader".to_owned().into(), r);
+        s
+    };
+    let base = with_role(
+        two_tables(("app.old", keyed()), ("app.target", keyed())),
+        role(&[
+            ("app.target", Permission::Select),
+            ("app.old", Permission::Insert),
+        ]),
+    );
+    let intermediate = with_role(
+        schema_of("app.old", keyed()),
+        role(&[("app.old", Permission::Insert)]),
+    );
+    let declared = with_role(
+        schema_of("app.target", keyed()),
+        role(&[("app.target", Permission::Select)]),
+    );
+
+    let cs = a_dropped_tables_name_reused_by_a_later_rename(
+        &MinimalDialect,
+        &base,
+        &intermediate,
+        &declared,
+    );
+    let grants: BTreeSet<String> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::Permission(GrantChange::Grant {
+                target,
+                permissions,
+                ..
+            }) => Some(format!("grant {} {permissions:?}", target.raw())),
+            Change::Permission(GrantChange::Revoke {
+                target,
+                permissions,
+                ..
+            }) => Some(format!("revoke {} {permissions:?}", target.raw())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        grants,
+        BTreeSet::from([
+            "grant app.target {Select}".to_owned(),
+            "revoke app.target {Insert}".to_owned(),
+        ]),
+        "{:?}",
+        cs.changes
+    );
+}
+
+/// Only a drop whose name a rename claims moves. Another table's drop
+/// keeps its class, after the renames.
+#[test]
+fn a_dropped_table_nothing_renames_into_stays_after_the_renames() {
+    let old_t = table(&[("id", Column::new(ty("int")))]);
+    let base = two_tables(("app.old", old_t.clone()), ("app.gone", old_t.clone()));
+    let declared = schema_of("app.new", old_t);
+    let cs = run(
+        &base,
+        &declared,
+        &[
+            Intent::DropTable {
+                table: "app.gone".parse().unwrap(),
+                reason: "gone".parse().unwrap(),
+            },
+            Intent::RenameTable {
+                from: "app.old".parse().unwrap(),
+                to: "app.new".parse().unwrap(),
+            },
+        ],
+    );
+    assert_eq!(kinds(&cs), ["RenameTable", "DropTable"], "{cs:?}");
+}
+
+/// And a name still held by a surviving table is refused, not implicitly
+/// freed: only a drop some revision recorded can release it.
+#[test]
+fn a_rename_into_a_surviving_tables_name_is_refused() {
+    let old_t = table(&[("id", Column::new(ty("int")))]);
+    let base = two_tables(("app.old", old_t.clone()), ("app.target", old_t.clone()));
+    let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let declared = schema_of("app.target", old_t);
+    let errors = crate::resolve(
+        &declared,
+        &base_ids,
+        &[Intent::RenameTable {
+            from: "app.old".parse().unwrap(),
+            to: "app.target".parse().unwrap(),
+        }],
+        &ctx(),
+    )
+    .unwrap_err();
+    assert!(
+        errors.iter().any(|error| matches!(error,
+            crate::Blocker::RenameTargetExists { target } if target == "app.target")),
+        "{errors:?}"
+    );
+}
+
+/// And the same for a delete: `AlterColumnType` sorts before the row
+/// changes, so a cell whose column this plan retypes carries both types —
+/// the one its recorded text was read in and the one the column has when
+/// the `DELETE` runs. Together they are a predicate the engine can
+/// answer; either alone compares two spellings of one value, which is
+/// why 146 carried neither and left the row held by its key alone
+/// (DECISIONS 149).
+#[test]
+fn a_delete_holds_a_retyped_cell_by_both_of_its_types() {
+    let base = schema_of("dbo.s", lookup(DataMode::Exact, &[("old", "Old")]));
+    let mut declared_t = lookup(DataMode::Exact, &[]);
+    declared_t
+        .columns
+        .insert("label".into(), Column::new(ty("varchar(50)")));
+    let declared = schema_of("dbo.s", declared_t);
+
+    let cs = run(&base, &declared, &[]);
+    let (row, types, after_types) = cs
+        .changes
+        .iter()
+        .find_map(|p| match &p.change {
+            Change::Row(RowChange::DeleteRow {
+                row,
+                types,
+                after_types,
+                ..
+            }) => Some((row, types, after_types)),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{:?}", kinds(&cs)));
+    assert!(row.contains_key("label"), "{row:?}");
+    assert_eq!(types["label"], ty("nvarchar(50)"), "{types:?}");
+    assert_eq!(after_types["label"], ty("varchar(50)"), "{after_types:?}");
+}
+
+/// A row write carries its key's type, the declared one the `WHERE`
+/// meets once any retype has run, so the emitter can find the row by the
+/// engine's own `=` without the session's path (DEC-1564.2). The key is
+/// not a cell: it stays out of `types`, which holds the row's cells.
+#[test]
+fn a_row_write_carries_its_keys_declared_type_and_not_as_a_cell() {
+    let base = schema_of(
+        "dbo.s",
+        lookup(DataMode::Exact, &[("old", "Old"), ("kept", "Before")]),
+    );
+    let mut declared_t = lookup(DataMode::Exact, &[("kept", "After")]);
+    declared_t
+        .columns
+        .insert("code".into(), Column::new(ty("varchar(40)")).not_null());
+    let declared = schema_of("dbo.s", declared_t);
+
+    let cs = run(&base, &declared, &[]);
+    let mut seen = 0;
+    for p in &cs.changes {
+        let (key_type, types) = match &p.change {
+            Change::Row(RowChange::UpdateRow {
+                key_type, types, ..
+            })
+            | Change::Row(RowChange::DeleteRow {
+                key_type, types, ..
+            }) => (key_type, types),
+            _ => continue,
+        };
+        seen += 1;
+        assert_eq!(
+            key_type.as_ref(),
+            Some(&ty("varchar(40)")),
+            "{:?}",
+            kinds(&cs)
+        );
+        assert!(!types.contains_key("code"), "{types:?}");
+    }
+    assert_eq!(seen, 2, "an update and a delete: {:?}", kinds(&cs));
+}
+
+/// And the far more common case, which must stay a single type: a column
+/// nobody retyped goes in `types` and nowhere else, so the emitter
+/// compares the recorded text against the column and asks the engine for
+/// no conversion at all.
+#[test]
+fn a_delete_carries_one_type_for_a_column_this_plan_leaves_alone() {
+    let base = schema_of("dbo.s", lookup(DataMode::Exact, &[("old", "Old")]));
+    let declared = schema_of("dbo.s", lookup(DataMode::Exact, &[]));
+
+    let cs = run(&base, &declared, &[]);
+    let (types, after_types) = cs
+        .changes
+        .iter()
+        .find_map(|p| match &p.change {
+            Change::Row(RowChange::DeleteRow {
+                types, after_types, ..
+            }) => Some((types, after_types)),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{:?}", kinds(&cs)));
+    assert_eq!(types["label"], ty("nvarchar(50)"), "{types:?}");
+    assert!(after_types.is_empty(), "{after_types:?}");
+}
+
+/// A `data:` block whose rows have no identity is refused, not silently
+/// dropped from the plan.
+#[test]
+fn a_data_block_without_a_single_column_key_is_an_error() {
+    let mut t = lookup(DataMode::Exact, &[("new", "New")]);
+    t.primary_key = None;
+    let declared = schema_of("dbo.s", t.clone());
+    let base_ids = crate::resolve(&declared, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let d = diff_partial(
+        Side {
+            schema: &Schema::default(),
+            ids: &IdsFile::default(),
+        },
+        Side {
+            schema: &declared,
+            ids: &base_ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+    );
+    assert!(
+        d.errors
+            .iter()
+            .any(|e| matches!(e, DiffError::DataWithoutKey { .. })),
+        "{:?}",
+        d.errors
+    );
+}
+
+fn kinds(cs: &ChangeSet) -> Vec<String> {
+    cs.changes
+        .iter()
+        .map(|p| {
+            format!("{:?}", p.change)
+                .split_whitespace()
+                .next()
+                .unwrap_or("?")
+                .trim_end_matches('{')
+                .trim()
+                .to_string()
+        })
+        .collect()
+}
+
+/// Found by the live convergence test: a new table's FK referenced another
+/// new table, and whether the referenced CREATE ran first depended on the
+/// random uid order. The FK must always come out as its own change, after
+/// every CreateTable — from either direction of the reference.
+#[test]
+fn a_foreign_key_between_two_new_tables_sorts_after_both_creates() {
+    // Run it both ways round: customer -> region and region2 -> aaa. With
+    // the bug, one of the two directions fails depending on name order.
+    for (referencing, referenced) in [("dbo.customer", "dbo.region"), ("dbo.aaa", "dbo.zzz")] {
+        let mut fk_table = table(&[("other_id", Column::new(ty("int")))]);
+        fk_table.foreign_keys.insert(
+            "fk_link".into(),
+            pbps_model::ForeignKey {
+                columns: vec!["other_id".into()],
+                references_table: referenced.parse().unwrap(),
+                references_columns: vec!["id".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        let mut declared = schema_of(referencing, fk_table);
+        declared.tables.insert(
+            referenced.parse().unwrap(),
+            table(&[("id", Column::new(ty("int")).not_null())]),
+        );
+
+        let cs = run(&Schema::default(), &declared, &[]);
+        let ks = kinds(&cs);
+        assert_eq!(
+            ks,
+            ["CreateTable", "CreateTable", "AddForeignKey"],
+            "{referencing} -> {referenced}: {ks:?}"
+        );
+        // And the CreateTable no longer smuggles the FK along.
+        assert!(
+            cs.changes.iter().all(|p| match &p.change {
+                Change::Table(TableChange::CreateTable { table, .. }) =>
+                    table.foreign_keys.is_empty(),
+                _ => true,
+            }),
+            "the FK must not also ride inside the CREATE"
+        );
+    }
+}
+
+/// The mirror image: dropping two tables that reference each other must
+/// shed the foreign keys before either DROP TABLE runs.
+#[test]
+fn foreign_keys_of_dropped_tables_are_dropped_before_the_tables() {
+    let mut fk_table = table(&[("other_id", Column::new(ty("int")))]);
+    fk_table.foreign_keys.insert(
+        "fk_link".into(),
+        pbps_model::ForeignKey {
+            columns: vec!["other_id".into()],
+            references_table: "dbo.zzz".parse().unwrap(),
+            references_columns: vec!["id".into()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        },
+    );
+    let mut base = schema_of("dbo.aaa", fk_table);
+    base.tables.insert(
+        "dbo.zzz".parse().unwrap(),
+        table(&[("id", Column::new(ty("int")).not_null())]),
+    );
+
+    let intents = [
+        Intent::DropTable {
+            table: "dbo.aaa".parse().unwrap(),
+            reason: "test".parse().unwrap(),
+        },
+        Intent::DropTable {
+            table: "dbo.zzz".parse().unwrap(),
+            reason: "test".parse().unwrap(),
+        },
+    ];
+    let cs = run(&base, &Schema::default(), &intents);
+    assert_eq!(
+        kinds(&cs),
+        ["DropForeignKey", "DropTable", "DropTable"],
+        "{:?}",
+        kinds(&cs)
+    );
+}
+
+/// A table name that is still declared is still that table: `resolve`
+/// binds a name on both sides to the uid it already has, so no intent can
+/// retire a uid and hand its name to a new object in one revision.
+///
+/// Pinned because a caller depends on it. `refuse_unplanned_movement`
+/// pairs the baseline read with the read-back **by name**, and a plan that
+/// could drop `dbo.t` and put a different `dbo.t` back would make that
+/// pairing compare two unrelated tables with no change of the plan naming
+/// the difference — every such apply refused. The guard needs no case for
+/// it because this rule makes it unrepresentable, which is the better half
+/// of that trade; if this test ever fails, that guard is what to revisit
+/// (DECISIONS 170).
+#[test]
+fn a_declared_name_cannot_be_dropped_and_reoccupied_in_one_revision() {
+    let base = schema_of("dbo.t", table(&[("a", Column::new(ty("int")))]));
+    let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+
+    // Declared again under its own name, with drop intent: the intent is
+    // unused, because the name still resolves to the uid it had.
+    let replaced = schema_of("dbo.t", table(&[("a", Column::new(ty("int")))]));
+    let blockers = crate::resolve(
+        &replaced,
+        &base_ids,
+        &[Intent::DropTable {
+            table: "dbo.t".parse().unwrap(),
+            reason: "replaced".parse().unwrap(),
+        }],
+        &ctx(),
+    )
+    .expect_err("a declared name cannot also be dropped");
+    assert!(
+        blockers
+            .iter()
+            .any(|b| matches!(b, crate::Blocker::UnusedIntent { .. })),
+        "{blockers:?}"
+    );
+
+    // And the same for handing the name to another table by rename.
+    let mut two = schema_of("dbo.t", table(&[("a", Column::new(ty("int")))]));
+    two.tables.insert(
+        "dbo.a".parse().unwrap(),
+        table(&[("a", Column::new(ty("int")))]),
+    );
+    let two_ids = crate::resolve(&two, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let blockers = crate::resolve(
+        &replaced,
+        &two_ids,
+        &[
+            Intent::DropTable {
+                table: "dbo.t".parse().unwrap(),
+                reason: "replaced".parse().unwrap(),
+            },
+            Intent::RenameTable {
+                from: "dbo.a".parse().unwrap(),
+                to: "dbo.t".parse().unwrap(),
+            },
+        ],
+        &ctx(),
+    )
+    .expect_err("a rename cannot take an occupied name either");
+    assert!(
+        blockers.iter().any(|b| matches!(
+            b,
+            crate::Blocker::RenameTargetExists { target } if target == "dbo.t"
+        )),
+        "{blockers:?}"
+    );
+}
+
+/// A declaration that gives up a primary key and relaxes the column it
+/// held produces a plan that runs the key's drop first, because neither
+/// engine will relax a column a key still names.
+///
+/// Measured, both refuse: PostgreSQL answers `42P16`, "column \"id\" is in
+/// a primary key", and SQL Server answers 5074 with 4922 behind it. The
+/// plan was valid, reviewed and unapplicable — the shape this ordering
+/// exists to prevent.
+///
+/// The same class also puts the drop ahead of `DropColumn` at 5, which is
+/// the other half: SQL Server refuses to drop a column its key names, with
+/// the same 5074.
+#[test]
+fn a_key_is_dropped_before_the_column_it_held_is_relaxed() {
+    let mut base_t = table(&[("id", Column::new(ty("int")).not_null())]);
+    base_t.primary_key = Some(pbps_model::PrimaryKey {
+        name: Some("pk_t".into()),
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+        filegroup: None,
+    });
+    let base = schema_of("dbo.t", base_t);
+    let declared = schema_of("dbo.t", table(&[("id", Column::new(ty("int")))]));
+
+    let cs = run(&base, &declared, &[]);
+    // The kinds are compared, not the families: both of these are one family
+    // apart from each other, but a key and a unique are one family too.
+    let order: Vec<&Change> = cs.changes.iter().map(|p| &p.change).collect();
+    let key = Change::Constraint(ConstraintChange::SetPrimaryKey {
+        table: "dbo.t".parse().unwrap(),
+        from: None,
+        to: None,
+        nonclustered: false,
+    });
+    let nullable = Change::Column(ColumnChange::AlterColumnNullability {
+        uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+        column: pbps_model::ColumnRef {
+            table: "dbo.t".parse().unwrap(),
+            name: "id".into(),
+        },
+        ty: ty("int"),
+        to_nullable: true,
+        through_external_partitions: false,
+        collation: None,
+    });
+    assert!(
+        order.len() == 2 && order[0].same_kind(&key) && order[1].same_kind(&nullable),
+        "the key has to go first: {:#?}",
+        cs.changes
+    );
+}
+
+/// A column with a default and a new type is three phases, one rank each:
+/// the old default out, the type changed, the new default in.
+///
+/// Both kinds are class 9, so the tiebreaker decided the order, and the
+/// tiebreaker is the change's rendering — which puts `AlterColumnDefault`
+/// ahead of `AlterColumnType` by the alphabet and nothing else. Each end of
+/// that is refused by an engine, and both are measured:
+///
+/// - the new default first: `SET DEFAULT 'abc'` on an `integer` column is
+///   "invalid input syntax for type integer" on PostgreSQL;
+/// - the type first: `ALTER COLUMN n bigint` is refused by SQL Server while
+///   a default constraint stands on the column — 5074, with 4922 behind it.
+///   The nullability form of the same statement is *accepted*, so the
+///   dependency belongs to the type change and not to `ALTER COLUMN`.
+///
+/// So a replaced default on a retyped column is split into its two halves
+/// (`diff_columns`), and the three ranks put the type between them.
+#[test]
+fn a_retyped_column_drops_its_old_default_changes_type_then_takes_the_new_one() {
+    let with = |t: &str, d: &str| Column {
+        value_source: ValueSource::Default(d.to_owned()),
+        ..Column::new(ty(t))
+    };
+    let base = schema_of("dbo.t", table(&[("n", with("int", "0"))]));
+    let declared = schema_of("dbo.t", table(&[("n", with("nvarchar(10)", "'abc'"))]));
+    let cs = run(&base, &declared, &[]);
+    let at = |f: fn(&Change) -> bool| {
+        cs.changes
+            .iter()
+            .position(|p| f(&p.change))
+            .unwrap_or_else(|| panic!("not planned: {:#?}", cs.changes))
+    };
+    let out = at(|c| {
+        matches!(
+            c,
+            Change::Column(ColumnChange::AlterColumnDefault { to: None, .. })
+        )
+    });
+    let retype = at(|c| matches!(c, Change::Column(ColumnChange::AlterColumnType { .. })));
+    let into = at(|c| {
+        matches!(
+            c,
+            Change::Column(ColumnChange::AlterColumnDefault { to: Some(_), .. })
+        )
+    });
+    assert!(
+        out < retype && retype < into,
+        "out {out}, retype {retype}, into {into}: {:#?}",
+        cs.changes
+    );
+}
+
+/// The negative half: a default replaced on a column that keeps its type
+/// stays one change. Nothing has to run between the halves, `SET DEFAULT`
+/// replaces on PostgreSQL, and SQL Server's emitter already drops and adds
+/// inside its own statement — so splitting would put two lines at opposite
+/// ends of a plan where one says it better.
+#[test]
+fn a_default_replaced_without_a_retype_stays_one_change() {
+    let with = |t: &str, d: &str| Column {
+        value_source: ValueSource::Default(d.to_owned()),
+        ..Column::new(ty(t))
+    };
+    let base = schema_of("dbo.t", table(&[("n", with("int", "0"))]));
+    let declared = schema_of("dbo.t", table(&[("n", with("int", "1"))]));
+    let cs = run(&base, &declared, &[]);
+    assert_eq!(
+        cs.changes.len(),
+        1,
+        "one change, not two: {:#?}",
+        cs.changes
+    );
+    assert!(
+        matches!(
+            cs.changes[0].change,
+            Change::Column(ColumnChange::AlterColumnDefault {
+                from: Some(_),
+                to: Some(_),
+                ..
+            })
+        ),
+        "{:#?}",
+        cs.changes
+    );
+}
+
+/// A key that is **replaced** is two changes, and they go to opposite ends
+/// of the plan: the old one's drop with the constraint drops, the new
+/// one's add after every column its shape may name.
+///
+/// One change cannot do it. The add may name a column this same plan is
+/// still adding at class 8 — so a replacement could not simply join the
+/// drops — and the drop has to precede every column change a standing key
+/// blocks. The halves need opposite classes, so they are separate changes;
+/// both emitters already emitted the two statements independently, and
+/// only their positions move.
+#[test]
+fn a_replaced_key_is_dropped_before_its_old_columns_and_added_after_its_new_ones() {
+    let mut base_t = table(&[("id", Column::new(ty("int")).not_null())]);
+    base_t.primary_key = Some(pbps_model::PrimaryKey {
+        name: Some("pk_t".into()),
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+        filegroup: None,
+    });
+    let base = schema_of("dbo.t", base_t);
+    // The declaration replaces the key, adds the column the new key names,
+    // and relaxes the column the old key held — every dependency in one
+    // plan.
+    let mut declared_t = table(&[
+        ("id", Column::new(ty("int"))),
+        ("other", Column::new(ty("int")).not_null()),
+    ]);
+    declared_t.primary_key = Some(pbps_model::PrimaryKey {
+        name: Some("pk_t".into()),
+        columns: vec!["other".into()],
+        storage_parameters: Default::default(),
+        filegroup: None,
+    });
+    let declared = schema_of("dbo.t", declared_t);
+
+    let cs = run(&base, &declared, &[]);
+    let at = |f: fn(&Change) -> bool| {
+        cs.changes
+            .iter()
+            .position(|p| f(&p.change))
+            .unwrap_or_else(|| panic!("not planned: {:#?}", cs.changes))
+    };
+    let drop = at(|c| {
+        matches!(
+            c,
+            Change::Constraint(ConstraintChange::SetPrimaryKey { to: None, .. })
+        )
+    });
+    let relaxed = at(|c| {
+        matches!(
+            c,
+            Change::Column(ColumnChange::AlterColumnNullability { .. })
+        )
+    });
+    let added = at(|c| matches!(c, Change::Column(ColumnChange::AddColumn { .. })));
+    let add = at(|c| {
+        matches!(
+            c,
+            Change::Constraint(ConstraintChange::SetPrimaryKey { from: None, .. })
+        )
+    });
+    assert!(
+        drop < relaxed && added < add,
+        "drop {drop}, relaxed {relaxed}, added {added}, add {add}: {:#?}",
+        cs.changes
+    );
+}
+
+/// A plan that renames a table **and** drops one of its columns names the
+/// column's table as the declaration does, because by the time the drop
+/// runs the rename has already happened.
+///
+/// `order_key` puts `RenameTable` at 1 and `DropColumn` at 5, so the
+/// statements are emitted in that order. Built from the base side's
+/// `ColumnRef` — which every sibling change in that loop is not — the plan
+/// read `sp_rename 'dbo.customers', 'clients'` and then
+/// `ALTER TABLE [dbo].[customers] DROP COLUMN [doomed]`, which the engine
+/// refuses with `Invalid object name`. A valid, reviewed plan, refused.
+///
+/// The column's *own* name stays the base one: a column this plan drops is
+/// absent from the declarations, so nothing renames it and the database
+/// still knows it by that name.
+#[test]
+fn a_dropped_column_names_the_table_the_rename_has_already_produced() {
+    let base = schema_of(
+        "dbo.customers",
+        table(&[
+            ("id", Column::new(ty("int"))),
+            ("doomed", Column::new(ty("int"))),
+        ]),
+    );
+    let declared = schema_of("dbo.clients", table(&[("id", Column::new(ty("int")))]));
+    let cs = run(
+        &base,
+        &declared,
+        &[
+            Intent::RenameTable {
+                from: "dbo.customers".parse().unwrap(),
+                to: "dbo.clients".parse().unwrap(),
+            },
+            // Spelled with the *declared* table: `resolve_columns`
+            // iterates the declarations, and the table rename is already
+            // applied to the ids by the time it runs. Which is the same
+            // reason the change below must carry that name.
+            Intent::DropColumn {
+                column: "dbo.clients.doomed".parse().unwrap(),
+                reason: "no longer used".parse().unwrap(),
+            },
+        ],
+    );
+
+    let Some(Change::Column(ColumnChange::DropColumn { column, .. })) = cs
+        .changes
+        .iter()
+        .map(|c| &c.change)
+        .find(|c| matches!(c, Change::Column(ColumnChange::DropColumn { .. })))
+    else {
+        panic!("no DropColumn in {cs:?}");
+    };
+    assert_eq!(
+        column.table,
+        "dbo.clients".parse::<TableName>().unwrap(),
+        "the drop must name the table the rename has already produced"
+    );
+    assert_eq!(
+        column.name,
+        "doomed".into(),
+        "the column itself is not renamed"
+    );
+
+    // And the rename really does sort first, which is what makes the name
+    // above the only correct one — the assertion is worthless if the
+    // ordering ever reverses.
+    let kinds: Vec<&str> = cs
+        .changes
+        .iter()
+        .map(|c| match &c.change {
+            Change::Table(TableChange::RenameTable { .. }) => "RenameTable",
+            Change::Column(ColumnChange::DropColumn { .. }) => "DropColumn",
+            _ => "other",
+        })
+        .collect();
+    // Each position is unwrapped before they are compared. Left as
+    // `Option`s, a plan that stopped emitting the rename would satisfy
+    // `None < Some(_)` and pass — the absent rename is the very failure
+    // this is here to catch, so it must not be the one shape that slips
+    // through.
+    let Some(rename) = kinds.iter().position(|k| *k == "RenameTable") else {
+        panic!("no RenameTable in {kinds:?}");
+    };
+    let Some(drop) = kinds.iter().position(|k| *k == "DropColumn") else {
+        panic!("no DropColumn in {kinds:?}");
+    };
+    assert!(rename < drop, "{kinds:?}");
+}
+
+/// A table renamed beside a column of its own: the plan's kinds, in order.
+///
+/// The column rename is spelled with the table's **declared** name because
+/// `resolve_columns` iterates the declared schema, which is the whole
+/// reason the two changes are sorted against two different names for one
+/// table.
+fn rename_pair(from: &str, to: &str) -> Vec<String> {
+    let base = schema_of(
+        from,
+        table(&[
+            ("id", Column::new(ty("int"))),
+            ("old", Column::new(ty("int"))),
+        ]),
+    );
+    let declared = schema_of(
+        to,
+        table(&[
+            ("id", Column::new(ty("int"))),
+            ("new", Column::new(ty("int"))),
+        ]),
+    );
+    let cs = run(
+        &base,
+        &declared,
+        &[
+            Intent::RenameTable {
+                from: from.parse().unwrap(),
+                to: to.parse().unwrap(),
+            },
+            Intent::RenameColumn {
+                table: to.parse().unwrap(),
+                from: "old".into(),
+                to: "new".into(),
+            },
+        ],
+    );
+    kinds(&cs)
+}
+
+/// A column rename runs after the rename of the table it names, even when
+/// the table's new name sorts before its old one.
+///
+/// `RenameTable` answers `subject()` with its **`from`** — the old name —
+/// while `RenameColumn` carries the declared, post-rename table. Sharing
+/// one ordering class, the two were separated by that tiebreaker, so the
+/// alphabet decided: `"dbo.clients" < "dbo.customers"` put the column
+/// rename first and the plan emitted
+/// `sp_rename 'dbo.clients.old', 'new', 'COLUMN'` against a table that did
+/// not exist yet. A valid, reviewed plan the engine refuses.
+#[test]
+fn a_column_rename_follows_its_table_rename_though_the_new_name_sorts_first() {
+    assert_eq!(
+        rename_pair("dbo.customers", "dbo.clients"),
+        ["RenameTable", "RenameColumn"],
+        "the column rename must name a table that already exists"
+    );
+}
+
+/// The same pair with the names the other way round, where the tiebreaker
+/// happened to give the right answer already.
+///
+/// This is the case that passed before the fix, and it is here so the fix
+/// is not read as a coincidence of names: the order must come from the
+/// dependency, not from which spelling sorts lower.
+#[test]
+fn a_column_rename_follows_its_table_rename_though_the_old_name_sorts_first() {
+    assert_eq!(
+        rename_pair("dbo.clients", "dbo.customers"),
+        ["RenameTable", "RenameColumn"],
+        "the order must not depend on the alphabet"
+    );
+}
+
+#[test]
+fn identical_schemas_produce_no_changes() {
+    let s = schema_of("dbo.t", table(&[("a", Column::new(ty("int")))]));
+    assert!(run(&s, &s, &[]).is_empty());
+}
+
+#[test]
+fn widening_a_type_carries_no_risk() {
+    let base = schema_of("dbo.t", table(&[("a", Column::new(ty("nvarchar(50)")))]));
+    let want = schema_of("dbo.t", table(&[("a", Column::new(ty("nvarchar(100)")))]));
+    let cs = run(&base, &want, &[]);
+
+    assert_eq!(cs.changes.len(), 1);
+    assert!(cs.risks().is_empty(), "widening a length needs no approval");
+}
+
+#[test]
+fn narrowing_a_type_requires_approval() {
+    let base = schema_of("dbo.t", table(&[("a", Column::new(ty("nvarchar(100)")))]));
+    let want = schema_of("dbo.t", table(&[("a", Column::new(ty("nvarchar(50)")))]));
+    let cs = run(&base, &want, &[]);
+
+    assert!(cs.risks().contains(&RiskClass::Narrowing));
+    assert_eq!(
+        cs.unapproved_risks(&Default::default()),
+        [RiskClass::Narrowing].into_iter().collect()
+    );
+}
+
+/// A case difference is not a change, or retyping a type would produce a
+/// phantom diff every time.
+#[test]
+fn type_case_difference_is_not_a_change() {
+    let base = schema_of("dbo.t", table(&[("a", Column::new(ty("NVARCHAR(100)")))]));
+    let want = schema_of("dbo.t", table(&[("a", Column::new(ty("nvarchar(100)")))]));
+    assert!(run(&base, &want, &[]).is_empty());
+}
+
+#[test]
+fn tightening_nullability_requires_approval() {
+    let base = schema_of("dbo.t", table(&[("a", Column::new(ty("int")))]));
+    let want = schema_of("dbo.t", table(&[("a", Column::new(ty("int")).not_null())]));
+    let cs = run(&base, &want, &[]);
+
+    assert!(cs.risks().contains(&RiskClass::NotNull));
+}
+
+#[test]
+fn loosening_nullability_is_safe() {
+    let base = schema_of("dbo.t", table(&[("a", Column::new(ty("int")).not_null())]));
+    let want = schema_of("dbo.t", table(&[("a", Column::new(ty("int")))]));
+    assert!(run(&base, &want, &[]).risks().is_empty());
+}
+
+#[test]
+fn dropping_a_column_is_destructive() {
+    let base = schema_of(
+        "dbo.t",
+        table(&[("a", Column::new(ty("int"))), ("b", Column::new(ty("int")))]),
+    );
+    let want = schema_of("dbo.t", table(&[("a", Column::new(ty("int")))]));
+    let intents = vec![Intent::DropColumn {
+        column: "dbo.t.b".parse().unwrap(),
+        reason: "no longer in use".parse().unwrap(),
+    }];
+    let cs = run(&base, &want, &intents);
+
+    assert_eq!(kinds(&cs), ["DropColumn"]);
+    assert!(cs.risks().contains(&RiskClass::Destructive));
+}
+
+/// A rename must produce exactly one RenameColumn, never an add and a drop
+/// alongside it.
+#[test]
+fn renaming_produces_exactly_one_change() {
+    let base = schema_of("dbo.t", table(&[("old", Column::new(ty("int")))]));
+    let want = schema_of("dbo.t", table(&[("new", Column::new(ty("int")))]));
+    let intents = vec![Intent::RenameColumn {
+        table: "dbo.t".parse().unwrap(),
+        from: "old".into(),
+        to: "new".into(),
+    }];
+    let cs = run(&base, &want, &intents);
+
+    assert_eq!(kinds(&cs), ["RenameColumn"]);
+    assert!(cs.risks().contains(&RiskClass::Rename));
+}
+
+/// A rename plus a type change: with identity mapped correctly, the type
+/// comparison must be against the old column.
+#[test]
+fn rename_and_retype_are_both_detected() {
+    let base = schema_of("dbo.t", table(&[("old", Column::new(ty("nvarchar(100)")))]));
+    let want = schema_of("dbo.t", table(&[("new", Column::new(ty("nvarchar(50)")))]));
+    let intents = vec![Intent::RenameColumn {
+        table: "dbo.t".parse().unwrap(),
+        from: "old".into(),
+        to: "new".into(),
+    }];
+    let cs = run(&base, &want, &intents);
+
+    assert_eq!(kinds(&cs), ["RenameColumn", "AlterColumnType"]);
+    assert!(cs.risks().contains(&RiskClass::Narrowing));
+}
+
+/// A new table's columns ride along in CreateTable; no per-column AddColumn
+/// should be emitted as well.
+#[test]
+fn new_table_does_not_also_emit_add_column() {
+    let base = Schema::default();
+    let want = schema_of(
+        "dbo.t",
+        table(&[("a", Column::new(ty("int"))), ("b", Column::new(ty("int")))]),
+    );
+    assert_eq!(kinds(&run(&base, &want, &[])), ["CreateTable"]);
+}
+
+#[test]
+fn changed_index_becomes_drop_then_add() {
+    let ix = |c: &str| Index {
+        columns: vec![IndexColumn {
+            key: pbps_model::IndexKey::Column(c.into()),
+            descending: false,
+            opclass: None,
+            collation: None,
+            opclass_parameters: Default::default(),
+        }],
+        include: vec![],
+        unique: false,
+        filter: None,
+        method: Default::default(),
+        storage_parameters: Default::default(),
+        filegroup: None,
+    };
+    let mut base_t = table(&[("a", Column::new(ty("int"))), ("b", Column::new(ty("int")))]);
+    base_t.indexes.insert("ix_t".into(), ix("a"));
+    let mut want_t = base_t.clone();
+    want_t.indexes.insert("ix_t".into(), ix("b"));
+
+    let cs = run(
+        &schema_of("dbo.t", base_t),
+        &schema_of("dbo.t", want_t),
+        &[],
+    );
+    assert_eq!(kinds(&cs), ["DropIndex", "AddIndex"]);
+}
+
+/// The order has to be safely executable: renames first, dropping constraints
+/// before dropping columns, adding constraints last.
+/// A schema of two tables, for the foreign-key ordering cases below.
+fn two_tables(a: (&str, Table), b: (&str, Table)) -> Schema {
+    let mut s = Schema::default();
+    s.tables.insert(a.0.parse().unwrap(), a.1);
+    s.tables.insert(b.0.parse().unwrap(), b.1);
+    s
+}
+
+/// A table with one `sku` column, plus whatever the caller adds.
+fn sku_table() -> Table {
+    table(&[
+        ("id", Column::new(ty("int"))),
+        ("sku", Column::new(ty("int"))),
+    ])
+}
+
+fn unique(columns: &[&str]) -> UniqueConstraint {
+    UniqueConstraint {
+        columns: columns.iter().map(|c| (*c).into()).collect(),
+        storage_parameters: Default::default(),
+        filegroup: None,
+    }
+}
+
+fn fk(columns: &[&str], to: &str, to_columns: &[&str]) -> ForeignKey {
+    ForeignKey {
+        columns: columns.iter().map(|c| (*c).into()).collect(),
+        references_table: to.parse().unwrap(),
+        references_columns: to_columns.iter().map(|c| (*c).into()).collect(),
+        on_delete: ReferentialAction::default(),
+        on_update: ReferentialAction::default(),
+    }
+}
+
+#[test]
+fn replacing_a_referenced_key_surrounds_it_with_visible_foreign_key_changes() {
+    for kind in ["index", "unique", "primary"] {
+        let mut parent = sku_table();
+        if kind == "primary" {
+            parent.primary_key = Some(PrimaryKey {
+                name: Some("old_key".into()),
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+                filegroup: None,
+            });
+        } else if kind == "index" {
+            parent.indexes.insert(
+                "old_key".into(),
+                pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        key: pbps_model::IndexKey::Column("id".into()),
+                        descending: false,
+                        opclass: None,
+                        collation: None,
+                        opclass_parameters: Default::default(),
+                    }],
+                    include: vec![],
+                    unique: true,
+                    filter: None,
+                    method: Default::default(),
+                    storage_parameters: Default::default(),
+                    filegroup: None,
+                },
+            );
+        } else {
+            parent.unique.insert("old_key".into(), unique(&["id"]));
+        }
+        parent.unique.insert("unrelated".into(), unique(&["sku"]));
+        let mut child = sku_table();
+        child
+            .foreign_keys
+            .insert("fk_kept".into(), fk(&["id"], "dbo.parent", &["id"]));
+        child
+            .foreign_keys
+            .insert("fk_other".into(), fk(&["sku"], "dbo.parent", &["sku"]));
+        let base = two_tables(("dbo.parent", parent), ("dbo.child", child));
+        assert!(run(&base, &base, &[]).is_empty());
+        let mut declared = base.clone();
+        let parent = declared
+            .tables
+            .get_mut(&"dbo.parent".parse().unwrap())
+            .unwrap();
+        if kind == "primary" {
+            parent.primary_key.as_mut().unwrap().name = Some("new_key".into());
+        } else if kind == "index" {
+            let index = parent.indexes.remove("old_key").unwrap();
+            parent.indexes.insert("new_key".into(), index);
+        } else {
+            let key = parent.unique.remove("old_key").unwrap();
+            parent.unique.insert("new_key".into(), key);
+        }
+        let cs = run(&base, &declared, &[]);
+        assert_eq!(
+            kinds(&cs),
+            if kind == "primary" {
+                vec![
+                    "DropForeignKey",
+                    "SetPrimaryKey",
+                    "SetPrimaryKey",
+                    "AddForeignKey",
+                ]
+            } else if kind == "index" {
+                vec!["DropForeignKey", "DropIndex", "AddIndex", "AddForeignKey"]
+            } else {
+                vec!["DropForeignKey", "DropUnique", "AddUnique", "AddForeignKey"]
+            },
+            "{cs:?}"
+        );
+        assert!(
+            matches!(&cs.changes[0].change, Change::Constraint(ConstraintChange::DropForeignKey {name, ..}) if name.raw() == "fk_kept")
+        );
+        assert!(
+            matches!(&cs.changes[3].change, Change::Constraint(ConstraintChange::AddForeignKey {name, constraint, ..})
+            if name.raw() == "fk_kept" && **constraint == base.tables[&"dbo.child".parse().unwrap()].foreign_keys["fk_kept"])
+        );
+        assert_eq!(cs.changes[0].risks, cs.changes[0].change.intrinsic_risks());
+        assert!(
+            cs.changes[3]
+                .change
+                .intrinsic_risks()
+                .contains(&pbps_model::RiskClass::Constraint)
+        );
+
+        // An explicit FK removal must not be duplicated or recreated.
+        declared
+            .tables
+            .get_mut(&"dbo.child".parse().unwrap())
+            .unwrap()
+            .foreign_keys
+            .remove("fk_kept");
+        let removed = run(&base, &declared, &[]);
+        assert_eq!(
+            removed
+                .changes
+                .iter()
+                .filter(|p| matches!(
+                    p.change,
+                    Change::Constraint(ConstraintChange::DropForeignKey { .. })
+                ))
+                .count(),
+            1
+        );
+        assert!(!removed.changes.iter().any(|p| matches!(
+            p.change,
+            Change::Constraint(ConstraintChange::AddForeignKey { .. })
+        )));
+    }
+}
+
+#[test]
+fn replacing_indexes_that_cannot_back_foreign_keys_keeps_the_foreign_keys() {
+    for (unique, filter) in [(false, None), (true, Some("id > 0"))] {
+        let mut parent = sku_table();
+        parent.primary_key = Some(PrimaryKey {
+            name: Some("parent_pk".into()),
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        });
+        parent.indexes.insert(
+            "old_index".into(),
+            pbps_model::Index {
+                columns: vec![pbps_model::IndexColumn {
+                    key: pbps_model::IndexKey::Column("id".into()),
+                    descending: false,
+                    opclass: None,
+                    collation: None,
+                    opclass_parameters: Default::default(),
+                }],
+                include: vec![],
+                unique,
+                filter: filter.map(str::to_owned),
+                method: Default::default(),
+                storage_parameters: Default::default(),
+                filegroup: None,
+            },
+        );
+        let mut child = sku_table();
+        child
+            .foreign_keys
+            .insert("child_fk".into(), fk(&["id"], "dbo.parent", &["id"]));
+        let base = two_tables(("dbo.parent", parent), ("dbo.child", child));
+        let mut declared = base.clone();
+        let parent = declared
+            .tables
+            .get_mut(&"dbo.parent".parse().unwrap())
+            .unwrap();
+        let index = parent.indexes.remove("old_index").unwrap();
+        parent.indexes.insert("new_index".into(), index);
+        let cs = run(&base, &declared, &[]);
+        assert_eq!(kinds(&cs), vec!["DropIndex", "AddIndex"], "{cs:?}");
+    }
+}
+
+#[test]
+fn composite_and_self_references_follow_table_and_column_identity_during_key_replacement() {
+    let mut parent = sku_table();
+    parent
+        .unique
+        .insert("old_key".into(), unique(&["id", "sku"]));
+    parent.foreign_keys.insert(
+        "self_fk".into(),
+        fk(&["id", "sku"], "dbo.parent", &["id", "sku"]),
+    );
+    let mut child = sku_table();
+    child.foreign_keys.insert(
+        "child_fk".into(),
+        fk(&["id", "sku"], "dbo.parent", &["sku", "id"]),
+    );
+    let base = two_tables(("dbo.parent", parent), ("dbo.child", child));
+    let intents = [
+        Intent::RenameTable {
+            from: "dbo.parent".parse().unwrap(),
+            to: "dbo.parent_new".parse().unwrap(),
+        },
+        Intent::RenameTable {
+            from: "dbo.child".parse().unwrap(),
+            to: "dbo.child_new".parse().unwrap(),
+        },
+        Intent::RenameColumn {
+            table: "dbo.parent_new".parse().unwrap(),
+            from: "id".into(),
+            to: "code".into(),
+        },
+    ];
+    for replace in [false, true] {
+        let mut parent = base.tables[&"dbo.parent".parse().unwrap()].clone();
+        let column = parent.columns.shift_remove("id").unwrap();
+        parent.columns.insert("code".into(), column);
+        parent.unique.clear();
+        parent.unique.insert(
+            if replace { "new_key" } else { "old_key" }.into(),
+            unique(&["code", "sku"]),
+        );
+        parent.foreign_keys.insert(
+            "self_fk".into(),
+            fk(&["code", "sku"], "dbo.parent_new", &["code", "sku"]),
+        );
+        let mut child = base.tables[&"dbo.child".parse().unwrap()].clone();
+        child.foreign_keys.insert(
+            "child_fk".into(),
+            fk(&["id", "sku"], "dbo.parent_new", &["sku", "code"]),
+        );
+        let declared = two_tables(("dbo.parent_new", parent), ("dbo.child_new", child));
+        let cs = run(&base, &declared, &intents);
+        let drops: Vec<_> = cs
+            .changes
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                matches!(
+                    p.change,
+                    Change::Constraint(ConstraintChange::DropForeignKey { .. })
+                )
+            })
+            .collect();
+        let adds: Vec<_> = cs
+            .changes
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                matches!(
+                    p.change,
+                    Change::Constraint(ConstraintChange::AddForeignKey { .. })
+                )
+            })
+            .collect();
+        assert_eq!(drops.len(), if replace { 2 } else { 0 }, "{cs:?}");
+        assert_eq!(adds.len(), drops.len());
+        if replace {
+            let key_drop = cs
+                .changes
+                .iter()
+                .position(|p| {
+                    matches!(
+                        p.change,
+                        Change::Constraint(ConstraintChange::DropUnique { .. })
+                    )
+                })
+                .unwrap();
+            let key_add = cs
+                .changes
+                .iter()
+                .position(|p| {
+                    matches!(
+                        p.change,
+                        Change::Constraint(ConstraintChange::AddUnique { .. })
+                    )
+                })
+                .unwrap();
+            assert!(drops.iter().all(|(i, _)| *i < key_drop));
+            for (i, p) in adds {
+                assert!(i > key_add);
+                let Change::Constraint(ConstraintChange::AddForeignKey {
+                    table,
+                    name,
+                    constraint,
+                }) = &p.change
+                else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    constraint.as_ref(),
+                    &declared.tables[table].foreign_keys[name]
+                );
+            }
+        }
+    }
+}
+
+/// A foreign key is added after the key it references, even when the
+/// referencing table's name sorts first.
+///
+/// Both changes are in the addition class and both took
+/// `dependency_rank` 0, so `subject()` — the table name — decided:
+/// `"dbo.order_line" < "dbo.product"` put the foreign key first, and the
+/// engine refused it with 1776, "There are no primary or candidate keys in
+/// the referenced table ... that match the referencing column list"
+/// (measured on the pinned image).
+#[test]
+fn a_foreign_key_is_added_after_the_key_it_references() {
+    let base = two_tables(
+        ("dbo.product", sku_table()),
+        ("dbo.order_line", sku_table()),
+    );
+
+    let mut product = sku_table();
+    product
+        .unique
+        .insert("uq_product_sku".into(), unique(&["sku"]));
+    let mut order_line = sku_table();
+    order_line.foreign_keys.insert(
+        "fk_ol_product".into(),
+        fk(&["sku"], "dbo.product", &["sku"]),
+    );
+    let declared = two_tables(("dbo.product", product), ("dbo.order_line", order_line));
+
+    assert_eq!(
+        kinds(&run(&base, &declared, &[])),
+        ["AddUnique", "AddForeignKey"],
+        "the key must exist before the foreign key names it"
+    );
+}
+
+/// #1633: `RESTRICT` is not `NO ACTION`, so a key changed from one to the
+/// other, on delete or on update, is dropped and added again, as any
+/// changed key is. An identical `RESTRICT` key is no change.
+#[test]
+fn a_restrict_action_is_not_equated_with_no_action() {
+    use pbps_model::ReferentialAction::{NoAction, Restrict};
+    let keyed = |on_delete, on_update| {
+        let mut product = sku_table();
+        product
+            .unique
+            .insert("uq_product_sku".into(), unique(&["sku"]));
+        let mut order_line = sku_table();
+        let mut key = fk(&["sku"], "dbo.product", &["sku"]);
+        key.on_delete = on_delete;
+        key.on_update = on_update;
+        order_line.foreign_keys.insert("fk_ol_product".into(), key);
+        two_tables(("dbo.product", product), ("dbo.order_line", order_line))
+    };
+    let plain = keyed(NoAction, NoAction);
+    for changed in [keyed(Restrict, NoAction), keyed(NoAction, Restrict)] {
+        assert_eq!(
+            kinds(&run(&plain, &changed, &[])),
+            ["DropForeignKey", "AddForeignKey"]
+        );
+        assert_eq!(
+            kinds(&run(&changed, &plain, &[])),
+            ["DropForeignKey", "AddForeignKey"]
+        );
+    }
+    // Negative: the same `RESTRICT` key on both sides.
+    let held = keyed(Restrict, Restrict);
+    assert!(run(&held, &keyed(Restrict, Restrict), &[]).is_empty());
+}
+
+/// A unique **index** is a supplier too. Measured: SQL Server accepts a
+/// foreign key referencing a plain `CREATE UNIQUE INDEX`, with no `UNIQUE`
+/// constraint anywhere — so ranking only the constraint pair would leave
+/// this half of it broken.
+#[test]
+fn a_foreign_key_is_added_after_the_unique_index_it_references() {
+    let base = two_tables(
+        ("dbo.product", sku_table()),
+        ("dbo.order_line", sku_table()),
+    );
+
+    let mut product = sku_table();
+    product.indexes.insert(
+        "ux_product_sku".into(),
+        Index {
+            columns: vec![IndexColumn {
+                key: pbps_model::IndexKey::Column("sku".into()),
+                descending: false,
+                opclass: None,
+                collation: None,
+                opclass_parameters: Default::default(),
+            }],
+            include: vec![],
+            unique: true,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+            filegroup: None,
+        },
+    );
+    let mut order_line = sku_table();
+    order_line.foreign_keys.insert(
+        "fk_ol_product".into(),
+        fk(&["sku"], "dbo.product", &["sku"]),
+    );
+    let declared = two_tables(("dbo.product", product), ("dbo.order_line", order_line));
+
+    assert_eq!(
+        kinds(&run(&base, &declared, &[])),
+        ["AddIndex", "AddForeignKey"],
+        "a unique index is a candidate key, so it must come first too"
+    );
+}
+
+/// The mirror: a foreign key is dropped before the key it references.
+///
+/// Names chosen so the alphabet gives the wrong answer —
+/// `"dbo.customer" < "dbo.order_x"` — which is what put the `DropUnique`
+/// first. Measured, the engine refuses that with 3727 (and 3723 for the
+/// index form): the constraint is being referenced by the foreign key.
+#[test]
+fn a_foreign_key_is_dropped_before_the_key_it_references() {
+    let mut customer = sku_table();
+    customer
+        .unique
+        .insert("uq_customer_sku".into(), unique(&["sku"]));
+    let mut order_x = sku_table();
+    order_x.foreign_keys.insert(
+        "fk_ox_customer".into(),
+        fk(&["sku"], "dbo.customer", &["sku"]),
+    );
+    let base = two_tables(("dbo.customer", customer), ("dbo.order_x", order_x));
+
+    let declared = two_tables(("dbo.customer", sku_table()), ("dbo.order_x", sku_table()));
+
+    assert_eq!(
+        kinds(&run(&base, &declared, &[])),
+        ["DropForeignKey", "DropUnique"],
+        "the referencing constraint must go before the key it holds down"
+    );
+}
+
+/// A check constraint has no such relation, and must not be dragged around
+/// by the rank that orders the foreign keys.
+///
+/// The negative case: with the foreign key ranked, everything else in the
+/// class has to keep the tiebreaker it had, or the rank has quietly become
+/// a reordering of changes that never depended on each other.
+#[test]
+fn a_check_constraint_keeps_the_order_its_name_gives_it() {
+    let base = two_tables(("dbo.aaa", sku_table()), ("dbo.zzz", sku_table()));
+
+    let mut aaa = sku_table();
+    aaa.checks.insert(
+        "ck_aaa".into(),
+        CheckConstraint {
+            expression: "sku > 0".into(),
+        },
+    );
+    let mut zzz = sku_table();
+    zzz.checks.insert(
+        "ck_zzz".into(),
+        CheckConstraint {
+            expression: "sku > 0".into(),
+        },
+    );
+    let declared = two_tables(("dbo.aaa", aaa), ("dbo.zzz", zzz));
+
+    let cs = run(&base, &declared, &[]);
+    let tables: Vec<String> = cs.changes.iter().map(|p| p.change.subject()).collect();
+    assert_eq!(
+        tables,
+        ["dbo.aaa", "dbo.zzz"],
+        "two unrelated checks keep the table-name tiebreaker"
+    );
+}
+
+/// A column rename does not restate the primary key that names it.
+///
+/// `diff_constraints` compares column *lists*, and the base side's are the
+/// pre-rename names, so renaming a key column made `pk_differs` true and
+/// the plan carried a `SetPrimaryKey` beside the rename. The emitter
+/// renders that as `DROP CONSTRAINT` + `ADD PRIMARY KEY`, which the engine
+/// refuses outright when a foreign key references the key (3727,
+/// measured), adds `Constraint` risk to a plan approved as a rename, and
+/// re-mints the name the engine invented for an unnamed key — the very
+/// churn the unnamed-match rule above `pk_differs` exists to prevent.
+///
+/// Measured: `sp_rename` on a key column is accepted and the primary key
+/// follows it, keeping its invented name.
+#[test]
+fn renaming_a_key_column_does_not_restate_the_primary_key() {
+    let mut base_t = sku_table();
+    base_t.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+        filegroup: None,
+    });
+    let mut want_t = table(&[
+        ("cust_id", Column::new(ty("int"))),
+        ("sku", Column::new(ty("int"))),
+    ]);
+    want_t.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["cust_id".into()],
+        storage_parameters: Default::default(),
+        filegroup: None,
+    });
+
+    let cs = run(
+        &schema_of("dbo.t", base_t),
+        &schema_of("dbo.t", want_t),
+        &[Intent::RenameColumn {
+            table: "dbo.t".parse().unwrap(),
+            from: "id".into(),
+            to: "cust_id".into(),
+        }],
+    );
+    assert_eq!(kinds(&cs), ["RenameColumn"], "{cs:?}");
+}
+
+/// The same for an index and a unique constraint, and the risk the plan
+/// carries is the point: `DropIndex` is `Destructive`, so a rename-only
+/// revision demanded `--allow destructive` at the gate for a change the
+/// user never asked for.
+///
+/// Measured: a column rename is accepted and the index — key and
+/// `INCLUDE` alike — and the unique constraint follow it.
+#[test]
+fn renaming_an_indexed_column_does_not_restate_the_index() {
+    let mut base_t = table(&[
+        ("id", Column::new(ty("int"))),
+        ("old", Column::new(ty("int"))),
+        ("note", Column::new(ty("int"))),
+    ]);
+    base_t.indexes.insert(
+        "ix_t_old".into(),
+        Index {
+            columns: vec![IndexColumn {
+                key: pbps_model::IndexKey::Column("old".into()),
+                descending: false,
+                opclass: None,
+                collation: None,
+                opclass_parameters: Default::default(),
+            }],
+            include: vec!["note".into()],
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+            filegroup: None,
+        },
+    );
+    base_t.unique.insert("uq_t_old".into(), unique(&["old"]));
+
+    let mut want_t = table(&[
+        ("id", Column::new(ty("int"))),
+        ("new", Column::new(ty("int"))),
+        ("note", Column::new(ty("int"))),
+    ]);
+    want_t.indexes.insert(
+        "ix_t_old".into(),
+        Index {
+            columns: vec![IndexColumn {
+                key: pbps_model::IndexKey::Column("new".into()),
+                descending: false,
+                opclass: None,
+                collation: None,
+                opclass_parameters: Default::default(),
+            }],
+            include: vec!["note".into()],
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+            filegroup: None,
+        },
+    );
+    want_t.unique.insert("uq_t_old".into(), unique(&["new"]));
+
+    let cs = run(
+        &schema_of("dbo.t", base_t),
+        &schema_of("dbo.t", want_t),
+        &[Intent::RenameColumn {
+            table: "dbo.t".parse().unwrap(),
+            from: "old".into(),
+            to: "new".into(),
+        }],
+    );
+    assert_eq!(kinds(&cs), ["RenameColumn"], "{cs:?}");
+    let risks: Vec<RiskClass> = cs.changes.iter().flat_map(|p| p.risks.clone()).collect();
+    assert_eq!(
+        risks,
+        [RiskClass::Rename],
+        "a rename-only revision must not ask for --allow destructive"
+    );
+}
+
+/// A **table** rename does it one level out: `references_table` changes on
+/// every child, so tables the revision never mentions got a foreign key
+/// dropped and re-added.
+///
+/// Measured: `sp_rename` of a table carries the child foreign keys — the
+/// child reports the new name immediately after.
+#[test]
+fn renaming_a_table_does_not_restate_the_foreign_keys_that_reference_it() {
+    let mut child = sku_table();
+    child
+        .foreign_keys
+        .insert("fk_c".into(), fk(&["sku"], "dbo.parent", &["sku"]));
+    let mut parent = sku_table();
+    parent.unique.insert("uq_p".into(), unique(&["sku"]));
+    let base = two_tables(("dbo.parent", parent.clone()), ("dbo.child", child));
+
+    let mut child2 = sku_table();
+    child2
+        .foreign_keys
+        .insert("fk_c".into(), fk(&["sku"], "dbo.ancestor", &["sku"]));
+    let declared = two_tables(("dbo.ancestor", parent), ("dbo.child", child2));
+
+    let cs = run(
+        &base,
+        &declared,
+        &[Intent::RenameTable {
+            from: "dbo.parent".parse().unwrap(),
+            to: "dbo.ancestor".parse().unwrap(),
+        }],
+    );
+    assert_eq!(kinds(&cs), ["RenameTable"], "{cs:?}");
+}
+
+/// The negative case: a genuine change of membership still produces the
+/// restatement, and a check constraint whose expression names the renamed
+/// column still produces one too.
+///
+/// The rebased comparison must suppress only the spelling. A check's
+/// expression is opaque text this tool never rewrites, and measured, the
+/// engine refuses `sp_rename` on a column a check names at all (15336), so
+/// its drop and re-add is the only way the rename can happen — not churn.
+#[test]
+fn a_real_membership_change_and_a_check_still_restate_themselves() {
+    let mut base_t = table(&[
+        ("id", Column::new(ty("int"))),
+        ("old", Column::new(ty("int"))),
+        ("other", Column::new(ty("int"))),
+    ]);
+    base_t.unique.insert("uq_t".into(), unique(&["old"]));
+    base_t.checks.insert(
+        "ck_t".into(),
+        CheckConstraint {
+            expression: "old > 0".into(),
+        },
+    );
+
+    let mut want_t = table(&[
+        ("id", Column::new(ty("int"))),
+        ("new", Column::new(ty("int"))),
+        ("other", Column::new(ty("int"))),
+    ]);
+    // The unique now covers a second column: a real change, not a spelling.
+    want_t
+        .unique
+        .insert("uq_t".into(), unique(&["new", "other"]));
+    want_t.checks.insert(
+        "ck_t".into(),
+        CheckConstraint {
+            expression: "new > 0".into(),
+        },
+    );
+
+    let cs = run(
+        &schema_of("dbo.t", base_t),
+        &schema_of("dbo.t", want_t),
+        &[Intent::RenameColumn {
+            table: "dbo.t".parse().unwrap(),
+            from: "old".into(),
+            to: "new".into(),
+        }],
+    );
+    assert_eq!(
+        kinds(&cs),
+        [
+            "DropCheck",
+            "DropUnique",
+            "RenameColumn",
+            "AddCheck",
+            "AddUnique"
+        ],
+        "{cs:?}"
+    );
+}
+
+/// A check constraint is dropped **before** the rename it blocks.
+///
+/// `sp_rename` on a column a check names is refused outright — 15336,
+/// `the object participates in enforced dependencies` (measured) — so the
+/// drop and re-add #123 leaves in place is not enough on its own: it has
+/// to happen in that order. With `DropCheck` after `RenameColumn` the plan
+/// renamed first and the engine refused the statement, which is a valid,
+/// reviewed plan refused.
+///
+/// The re-add stays where it was, in the constraint class after the
+/// renames, which is where the new expression can be written.
+#[test]
+fn a_check_is_dropped_before_the_rename_it_blocks() {
+    let mut base_t = table(&[
+        ("id", Column::new(ty("int"))),
+        ("old", Column::new(ty("int"))),
+    ]);
+    base_t.checks.insert(
+        "ck_t".into(),
+        CheckConstraint {
+            expression: "old > 0".into(),
+        },
+    );
+    let mut want_t = table(&[
+        ("id", Column::new(ty("int"))),
+        ("new", Column::new(ty("int"))),
+    ]);
+    want_t.checks.insert(
+        "ck_t".into(),
+        CheckConstraint {
+            expression: "new > 0".into(),
+        },
+    );
+
+    let cs = run(
+        &schema_of("dbo.t", base_t),
+        &schema_of("dbo.t", want_t),
+        &[Intent::RenameColumn {
+            table: "dbo.t".parse().unwrap(),
+            from: "old".into(),
+            to: "new".into(),
+        }],
+    );
+    assert_eq!(
+        kinds(&cs),
+        ["DropCheck", "RenameColumn", "AddCheck"],
+        "the check has to be gone before the engine will rename the column"
+    );
+}
+
+/// The same for a filtered index, which the engine refuses with 5074,
+/// `the index is dependent on column`, and 4922 behind it, `one or more
+/// objects access this column`. A driver sees the first, `TRY`/`CATCH` the
+/// last; both are the same refusal.
+///
+/// The predicate is opaque text this tool never rewrites, so the two sides
+/// differ on it and the drop-and-add is real; only its order was wrong.
+#[test]
+fn a_filtered_index_is_dropped_before_the_rename_it_blocks() {
+    let ix = |column: &str| Index {
+        columns: vec![IndexColumn {
+            key: pbps_model::IndexKey::Column(column.into()),
+            descending: false,
+            opclass: None,
+            collation: None,
+            opclass_parameters: Default::default(),
+        }],
+        include: vec![],
+        unique: false,
+        filter: Some(format!("[{column}] IS NOT NULL")),
+        method: Default::default(),
+        storage_parameters: Default::default(),
+        filegroup: None,
+    };
+    let mut base_t = table(&[
+        ("id", Column::new(ty("int"))),
+        ("old", Column::new(ty("int"))),
+    ]);
+    base_t.indexes.insert("ix_t".into(), ix("old"));
+    let mut want_t = table(&[
+        ("id", Column::new(ty("int"))),
+        ("new", Column::new(ty("int"))),
+    ]);
+    want_t.indexes.insert("ix_t".into(), ix("new"));
+
+    let cs = run(
+        &schema_of("dbo.t", base_t),
+        &schema_of("dbo.t", want_t),
+        &[Intent::RenameColumn {
+            table: "dbo.t".parse().unwrap(),
+            from: "old".into(),
+            to: "new".into(),
+        }],
+    );
+    assert_eq!(
+        kinds(&cs),
+        ["DropIndex", "RenameColumn", "AddIndex"],
+        "the filtered index has to be gone before the rename"
+    );
+}
+
+/// And the drops still come *after* the table rename, because they name
+/// the table: measured, a table rename is not blocked by either a check or
+/// a filtered index, so there is nothing to gain by moving them ahead of
+/// it — and a drop emitted before `sp_rename` would name a table that no
+/// longer exists, which is the shape #118 fixed.
+#[test]
+fn the_drops_that_unblock_a_rename_still_follow_the_table_rename() {
+    let mut base_t = table(&[
+        ("id", Column::new(ty("int"))),
+        ("old", Column::new(ty("int"))),
+    ]);
+    base_t.checks.insert(
+        "ck_t".into(),
+        CheckConstraint {
+            expression: "old > 0".into(),
+        },
+    );
+    let mut want_t = table(&[
+        ("id", Column::new(ty("int"))),
+        ("new", Column::new(ty("int"))),
+    ]);
+    want_t.checks.insert(
+        "ck_t".into(),
+        CheckConstraint {
+            expression: "new > 0".into(),
+        },
+    );
+
+    let cs = run(
+        &schema_of("dbo.customers", base_t),
+        &schema_of("dbo.clients", want_t),
+        &[
+            Intent::RenameTable {
+                from: "dbo.customers".parse().unwrap(),
+                to: "dbo.clients".parse().unwrap(),
+            },
+            Intent::RenameColumn {
+                table: "dbo.clients".parse().unwrap(),
+                from: "old".into(),
+                to: "new".into(),
+            },
+        ],
+    );
+    assert_eq!(
+        kinds(&cs),
+        ["RenameTable", "DropCheck", "RenameColumn", "AddCheck"],
+        "the drop names the table, so it follows the rename that gives it \
+             that name"
+    );
+}
+
+/// A dialect that keeps an index in the schema's relation namespace —
+/// PostgreSQL's answer (issue #176). Everything else is `MinimalDialect`'s,
+/// so what a test using it shows is exactly the difference this one
+/// capability makes to the plan's statement order.
+#[derive(Debug, Clone, Copy, Default)]
+struct SharesIndexNamespace;
+
+impl Dialect for SharesIndexNamespace {
+    fn name(&self) -> &'static str {
+        "shares-index-namespace"
+    }
+    fn indexes_share_namespace_with_tables(&self) -> bool {
+        true
+    }
+    fn constraints_share_namespace_with_tables(&self) -> bool {
+        false
+    }
+    fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
+        MinimalDialect.quote_ident(ident)
+    }
+    fn intermediate_tables(
+        &self,
+        change: &Change,
+        strategy: pbps_model::Strategy,
+    ) -> Result<Vec<pbps_model::TableName>, pbps_dialect::DialectError> {
+        MinimalDialect.intermediate_tables(change, strategy)
+    }
+    fn normalize_type(
+        &self,
+        ty: &pbps_model::ColumnType,
+    ) -> Result<pbps_model::ColumnType, pbps_dialect::DialectError> {
+        MinimalDialect.normalize_type(ty)
+    }
+    fn type_change_risk(
+        &self,
+        from: &pbps_model::ColumnType,
+        to: &pbps_model::ColumnType,
+    ) -> pbps_dialect::TypeChangeRisk {
+        MinimalDialect.type_change_risk(from, to)
+    }
+    fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+        MinimalDialect.fold_ident(ident)
+    }
+    fn lexicon(&self) -> pbps_dialect::Lexicon {
+        MinimalDialect.lexicon()
+    }
+    fn validate_table(
+        &self,
+        name: &pbps_model::TableName,
+        table: &Table,
+    ) -> Vec<pbps_dialect::DialectError> {
+        MinimalDialect.validate_table(name, table)
+    }
+    fn transaction_framing(
+        &self,
+        zone: &pbps_model::SessionZone,
+    ) -> pbps_dialect::TransactionFraming {
+        MinimalDialect.transaction_framing(zone)
+    }
+    fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+        MinimalDialect.probe_framing()
+    }
+}
+
+/// A dialect where constraints share the schema's namespace and a column
+/// default's constraint is named by the engine, `df_<table>_<column>`:
+/// SQL Server's shape, without its digests. Everything else is
+/// `MinimalDialect`'s.
+#[derive(Debug, Clone, Copy, Default)]
+struct NamesItsDefaults;
+
+impl Dialect for NamesItsDefaults {
+    fn name(&self) -> &'static str {
+        "names-its-defaults"
+    }
+    fn indexes_share_namespace_with_tables(&self) -> bool {
+        false
+    }
+    fn constraints_share_namespace_with_tables(&self) -> bool {
+        true
+    }
+    fn generated_constraint_names(
+        &self,
+        name: &TableName,
+        table: &Table,
+    ) -> Vec<pbps_model::ObjectLocalName> {
+        table
+            .columns
+            .iter()
+            .filter(|(_, c)| match &c.value_source {
+                ValueSource::Default(_) => true,
+                ValueSource::None
+                | ValueSource::Identity(_)
+                | ValueSource::Sequence(_)
+                | ValueSource::Generated(_) => false,
+            })
+            .map(|(column, _)| {
+                format!("df_{}_{column}", name.name, column = column.shown(),).into()
+            })
+            .collect()
+    }
+    fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
+        MinimalDialect.quote_ident(ident)
+    }
+    fn intermediate_tables(
+        &self,
+        change: &Change,
+        strategy: pbps_model::Strategy,
+    ) -> Result<Vec<pbps_model::TableName>, pbps_dialect::DialectError> {
+        MinimalDialect.intermediate_tables(change, strategy)
+    }
+    fn normalize_type(
+        &self,
+        ty: &pbps_model::ColumnType,
+    ) -> Result<pbps_model::ColumnType, pbps_dialect::DialectError> {
+        MinimalDialect.normalize_type(ty)
+    }
+    fn type_change_risk(
+        &self,
+        from: &pbps_model::ColumnType,
+        to: &pbps_model::ColumnType,
+    ) -> pbps_dialect::TypeChangeRisk {
+        MinimalDialect.type_change_risk(from, to)
+    }
+    fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+        MinimalDialect.fold_ident(ident)
+    }
+    fn lexicon(&self) -> pbps_dialect::Lexicon {
+        MinimalDialect.lexicon()
+    }
+    fn validate_table(
+        &self,
+        name: &pbps_model::TableName,
+        table: &Table,
+    ) -> Vec<pbps_dialect::DialectError> {
+        MinimalDialect.validate_table(name, table)
+    }
+    fn transaction_framing(
+        &self,
+        zone: &pbps_model::SessionZone,
+    ) -> pbps_dialect::TransactionFraming {
+        MinimalDialect.transaction_framing(zone)
+    }
+    fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+        MinimalDialect.probe_framing()
+    }
+}
+
+/// The finding from round 3 of #462 (issue #176): a table renamed onto a
+/// name a *different* table's dropped index vacates in the same plan is a
+/// declaration whose final schema `check_index_names` sees no collision
+/// in at all — and until this test, the plan sorter put `RenameTable`
+/// (class 1) ahead of `DropIndex` (class 2) regardless, so the emitted
+/// `ALTER TABLE ... RENAME TO "target"` ran while `app.other`'s index
+/// `target` still existed.
+///
+/// Measured end to end on PostgreSQL 18.6: bootstrap `app.old` and
+/// `app.other` (with its index `target`), then plan renaming `app.old` to
+/// `app.target` while dropping that index — the live apply failed with
+/// `42P07: relation "target" already exists` before this fix, and
+/// succeeds after it, in the order this test pins.
+///
+/// On SQL Server an index name is scoped to its own table
+/// (`indexes_share_namespace_with_tables` is `false`), so the same plan
+/// never collides there and the drop stays in its ordinary class-2 place
+/// — `MinimalDialect` is that answer, and the second assertion pins it.
+#[test]
+fn a_drop_that_frees_a_renamed_targets_name_precedes_the_rename_where_indexes_share_it() {
+    let old_t = table(&[("id", Column::new(ty("int")))]);
+    let mut other_base = table(&[("n", Column::new(ty("int")))]);
+    other_base.indexes.insert(
+        "target".into(),
+        Index {
+            columns: vec![IndexColumn {
+                key: pbps_model::IndexKey::Column("n".into()),
+                descending: false,
+                opclass: None,
+                collation: None,
+                opclass_parameters: Default::default(),
+            }],
+            include: vec![],
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+            filegroup: None,
+        },
+    );
+    let base = two_tables(("app.old", old_t.clone()), ("app.other", other_base));
+
+    let target_t = old_t;
+    let other_declared = table(&[("n", Column::new(ty("int")))]);
+    let declared = two_tables(("app.target", target_t), ("app.other", other_declared));
+
+    let intents = [Intent::RenameTable {
+        from: "app.old".parse().unwrap(),
+        to: "app.target".parse().unwrap(),
+    }];
+
+    let cs = run_with(&SharesIndexNamespace, &base, &declared, &intents);
+    assert_eq!(
+        kinds(&cs),
+        ["DropIndex", "RenameTable"],
+        "the index has to be gone before the engine will let the rename claim its name: {cs:?}"
+    );
+
+    let cs = run_with(&MinimalDialect, &base, &declared, &intents);
+    assert_eq!(
+        kinds(&cs),
+        ["RenameTable", "DropIndex"],
+        "an index name is only unique per table on SQL Server, so nothing moves: {cs:?}"
+    );
+}
+
+/// Review of #969: on SQL Server a check or foreign key is a schema object
+/// beside the tables (DEC-496.1), so dropping one frees its name for a
+/// table renamed onto it, and the drop has to run first. Measured on
+/// 17.0.4075.5: `sp_rename 'dbo.old', 'c'` is refused (Msg 15335) while
+/// another table still has a check `c`, and succeeds once it is dropped.
+/// On PostgreSQL a check name is the table's own, and nothing moves.
+#[test]
+fn a_dropped_constraint_that_frees_a_renamed_targets_name_precedes_the_rename_where_constraints_share_it()
+ {
+    let old_t = table(&[("id", Column::new(ty("int")))]);
+    let mut other_base = table(&[("n", Column::new(ty("int")))]);
+    other_base.checks.insert(
+        "target".into(),
+        pbps_model::schema::CheckConstraint {
+            expression: "n > 0".into(),
+        },
+    );
+    let base = two_tables(("app.old", old_t.clone()), ("app.other", other_base));
+    let declared = two_tables(
+        ("app.target", old_t),
+        ("app.other", table(&[("n", Column::new(ty("int")))])),
+    );
+    let intents = [Intent::RenameTable {
+        from: "app.old".parse().unwrap(),
+        to: "app.target".parse().unwrap(),
+    }];
+
+    let cs = run_with(&MinimalDialect, &base, &declared, &intents);
+    assert_eq!(
+        kinds(&cs),
+        ["DropCheck", "RenameTable"],
+        "the check has to be gone before the engine lets the rename take its name: {cs:?}"
+    );
+
+    let cs = run_with(&SharesIndexNamespace, &base, &declared, &intents);
+    assert_eq!(
+        kinds(&cs),
+        ["RenameTable", "DropCheck"],
+        "a check name is the table's own on PostgreSQL, so nothing moves: {cs:?}"
+    );
+}
+
+/// Review of #969: a table moved to another schema carries its constraints
+/// (SQL Server) or indexes (PostgreSQL) there, and a name another object
+/// holds in the destination refuses the whole move. Measured on
+/// 17.0.4075.5: `ALTER SCHEMA s2 TRANSFER s1.old` is refused (Msg 15530)
+/// while `old` has a check `c` and `s2.c` is a table. One the plan drops
+/// anyway goes first, addressed by the source name. A rename within one
+/// schema carries nothing, and its drop stays after it under the declared
+/// name.
+#[test]
+fn a_moved_tables_dropped_constraint_or_index_runs_before_the_transfer() {
+    let mut old_t = table(&[("id", Column::new(ty("int")))]);
+    old_t.checks.insert(
+        "c".into(),
+        pbps_model::schema::CheckConstraint {
+            expression: "id > 0".into(),
+        },
+    );
+    old_t.indexes.insert(
+        "ix".into(),
+        Index {
+            columns: vec![IndexColumn {
+                key: pbps_model::IndexKey::Column("id".into()),
+                descending: false,
+                opclass: None,
+                collation: None,
+                opclass_parameters: Default::default(),
+            }],
+            include: vec![],
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+            filegroup: None,
+        },
+    );
+    let bare = table(&[("id", Column::new(ty("int")))]);
+    let base = two_tables(("s1.old", old_t), ("s2.c", bare.clone()));
+    let declared = two_tables(("s2.new", bare.clone()), ("s2.c", bare.clone()));
+    let moved = [Intent::RenameTable {
+        from: "s1.old".parse().unwrap(),
+        to: "s2.new".parse().unwrap(),
+    }];
+    let first_before_rename = |cs: &ChangeSet, kind: &str| {
+        let at = |k: &str| kinds(cs).iter().position(|x| x == k).unwrap();
+        assert!(at(kind) < at("RenameTable"), "{kind} first: {cs:?}");
+        let table = cs.changes[at(kind)].change.table().unwrap().clone();
+        assert_eq!(
+            table,
+            "s1.old".parse().unwrap(),
+            "by the source name: {cs:?}"
+        );
+    };
+
+    let cs = run_with(&MinimalDialect, &base, &declared, &moved);
+    first_before_rename(&cs, "DropCheck");
+    let cs = run_with(&SharesIndexNamespace, &base, &declared, &moved);
+    first_before_rename(&cs, "DropIndex");
+
+    // Within one schema nothing is carried, and nothing moves.
+    let base = two_tables(
+        ("s1.old", {
+            let mut t = bare.clone();
+            t.checks.insert(
+                "c".into(),
+                pbps_model::schema::CheckConstraint {
+                    expression: "id > 0".into(),
+                },
+            );
+            t
+        }),
+        ("s2.c", bare.clone()),
+    );
+    let declared = two_tables(("s1.new", bare.clone()), ("s2.c", bare));
+    let cs = run_with(
+        &MinimalDialect,
+        &base,
+        &declared,
+        &[Intent::RenameTable {
+            from: "s1.old".parse().unwrap(),
+            to: "s1.new".parse().unwrap(),
+        }],
+    );
+    assert_eq!(kinds(&cs), ["RenameTable", "DropCheck"], "{cs:?}");
+}
+
+/// Review of #969: the move carries a check the table keeps into its
+/// destination, where the plan drops another table's check of that name.
+/// That drop has to go first, and it is addressed as it is.
+#[test]
+fn a_destination_constraint_a_moved_table_would_collide_with_is_dropped_first() {
+    let check = || pbps_model::schema::CheckConstraint {
+        expression: "id > 0".into(),
+    };
+    let mut old_t = table(&[("id", Column::new(ty("int")))]);
+    old_t.checks.insert("c".into(), check());
+    let mut other = table(&[("id", Column::new(ty("int")))]);
+    other.checks.insert("c".into(), check());
+    let base = two_tables(("s1.old", old_t.clone()), ("s2.other", other));
+    let declared = two_tables(
+        ("s2.new", old_t),
+        ("s2.other", table(&[("id", Column::new(ty("int")))])),
+    );
+    let cs = run_with(
+        &MinimalDialect,
+        &base,
+        &declared,
+        &[Intent::RenameTable {
+            from: "s1.old".parse().unwrap(),
+            to: "s2.new".parse().unwrap(),
+        }],
+    );
+    assert_eq!(kinds(&cs), ["DropCheck", "RenameTable"], "{cs:?}");
+    assert_eq!(
+        cs.changes[0].change.table().unwrap().clone(),
+        "s2.other".parse().unwrap(),
+        "{cs:?}"
+    );
+}
+
+/// #975: a rename carries the columns that have a default when it runs, by
+/// the names they have then, so the emitter can move each generated default
+/// with its table. A column the same plan renames is listed by its old name,
+/// since the table's rename runs first.
+#[test]
+fn a_table_rename_lists_the_columns_that_carry_a_default_by_their_names_then() {
+    let mut with_default = Column::new(ty("int"));
+    with_default.value_source = pbps_model::ValueSource::Default("0".into());
+    let base = two_tables(
+        (
+            "app.old",
+            table(&[("a", with_default.clone()), ("b", Column::new(ty("int")))]),
+        ),
+        ("app.other", table(&[("n", Column::new(ty("int")))])),
+    );
+    let declared = two_tables(
+        (
+            "app.new",
+            table(&[("a", with_default), ("b", Column::new(ty("int")))]),
+        ),
+        ("app.other", table(&[("n", Column::new(ty("int")))])),
+    );
+    let cs = run_with(
+        &MinimalDialect,
+        &base,
+        &declared,
+        &[Intent::RenameTable {
+            from: "app.old".parse().unwrap(),
+            to: "app.new".parse().unwrap(),
+        }],
+    );
+    let Change::Table(TableChange::RenameTable { defaults, .. }) = &cs.changes[0].change else {
+        panic!("{cs:?}");
+    };
+    assert_eq!(defaults, &[pbps_model::ColumnName::from("a").to_owned()]);
+}
+
+/// A column rename in a plan that also renames its table names the old
+/// table, so the emitter can find a generated default the table rename
+/// had to leave under the old table's name (#975). Without a table rename
+/// it names none.
+#[test]
+fn a_column_rename_names_the_old_table_only_when_the_table_is_renamed_too() {
+    let other = ("app.other", table(&[("n", Column::new(ty("int")))]));
+    let base = two_tables(
+        ("app.old", table(&[("a", Column::new(ty("int")))])),
+        other.clone(),
+    );
+    let renamed = |t: &str| two_tables((t, table(&[("b", Column::new(ty("int")))])), other.clone());
+    let column = |t: &str| Intent::RenameColumn {
+        table: t.parse().unwrap(),
+        from: "a".into(),
+        to: "b".into(),
+    };
+    let table_was = |cs: &ChangeSet| {
+        cs.changes
+            .iter()
+            .find_map(|p| match &p.change {
+                Change::Column(ColumnChange::RenameColumn { table_was, .. }) => {
+                    Some(table_was.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{cs:?}"))
+    };
+
+    let both = run_with(
+        &MinimalDialect,
+        &base,
+        &renamed("app.new"),
+        &[
+            Intent::RenameTable {
+                from: "app.old".parse().unwrap(),
+                to: "app.new".parse().unwrap(),
+            },
+            column("app.new"),
+        ],
+    );
+    assert_eq!(table_was(&both), Some("app.old".parse().unwrap()));
+
+    let alone = run_with(
+        &MinimalDialect,
+        &base,
+        &renamed("app.old"),
+        &[column("app.old")],
+    );
+    assert_eq!(table_was(&alone), None);
+}
+
+/// The same for a foreign key, the other constraint no index backs.
+#[test]
+fn a_dropped_foreign_key_that_frees_a_renamed_targets_name_precedes_the_rename() {
+    let old_t = table(&[("id", Column::new(ty("int")))]);
+    let parent = table(&[("id", Column::new(ty("int")))]);
+    let mut child = table(&[("pid", Column::new(ty("int")))]);
+    child.foreign_keys.insert(
+        "target".into(),
+        pbps_model::schema::ForeignKey {
+            columns: vec!["pid".into()],
+            references_table: "app.parent".parse().unwrap(),
+            references_columns: vec!["id".into()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        },
+    );
+    let mut base = two_tables(("app.old", old_t.clone()), ("app.child", child));
+    base.tables
+        .insert("app.parent".parse().unwrap(), parent.clone());
+    let mut declared = two_tables(
+        ("app.target", old_t),
+        ("app.child", table(&[("pid", Column::new(ty("int")))])),
+    );
+    declared
+        .tables
+        .insert("app.parent".parse().unwrap(), parent);
+
+    let cs = run_with(
+        &MinimalDialect,
+        &base,
+        &declared,
+        &[Intent::RenameTable {
+            from: "app.old".parse().unwrap(),
+            to: "app.target".parse().unwrap(),
+        }],
+    );
+    assert_eq!(kinds(&cs), ["DropForeignKey", "RenameTable"], "{cs:?}");
+}
+
+/// The same shape for a named unique constraint, which is backed by an
+/// index of that name (the review-widened half of #176): dropping it
+/// frees the relation name just as dropping a plain index does.
+#[test]
+fn a_dropped_unique_constraint_that_frees_a_renamed_targets_name_precedes_the_rename() {
+    let old_t = table(&[("id", Column::new(ty("int")))]);
+    let mut other_base = table(&[("n", Column::new(ty("int")))]);
+    other_base.unique.insert("target".into(), unique(&["n"]));
+    let base = two_tables(("app.old", old_t.clone()), ("app.other", other_base));
+
+    let declared = two_tables(
+        ("app.target", old_t),
+        ("app.other", table(&[("n", Column::new(ty("int")))])),
+    );
+
+    let cs = run_with(
+        &SharesIndexNamespace,
+        &base,
+        &declared,
+        &[Intent::RenameTable {
+            from: "app.old".parse().unwrap(),
+            to: "app.target".parse().unwrap(),
+        }],
+    );
+    assert_eq!(kinds(&cs), ["DropUnique", "RenameTable"], "{cs:?}");
+}
+
+/// The same, where the key on the freeing constraint belongs to a table
+/// this plan drops. The dropped table's own key drop still has to precede
+/// the unique it references, under the dropped table's name.
+#[test]
+fn a_dropped_tables_key_to_a_freeing_unique_precedes_it() {
+    let old_t = table(&[("id", Column::new(ty("int")))]);
+    let mut other_base = table(&[("n", Column::new(ty("int")))]);
+    other_base.unique.insert("target".into(), unique(&["n"]));
+    let mut child = table(&[("other_n", Column::new(ty("int")))]);
+    child.foreign_keys.insert(
+        "fk_child_other".into(),
+        fk(&["other_n"], "app.other", &["n"]),
+    );
+    let mut base = two_tables(("app.old", old_t.clone()), ("app.other", other_base));
+    base.tables.insert("app.child".parse().unwrap(), child);
+
+    let declared = two_tables(
+        ("app.target", old_t),
+        ("app.other", table(&[("n", Column::new(ty("int")))])),
+    );
+
+    let cs = run_with(
+        &SharesIndexNamespace,
+        &base,
+        &declared,
+        &[
+            Intent::RenameTable {
+                from: "app.old".parse().unwrap(),
+                to: "app.target".parse().unwrap(),
+            },
+            Intent::DropTable {
+                table: "app.child".parse().unwrap(),
+                reason: "gone".parse().unwrap(),
+            },
+        ],
+    );
+    let at = |f: &dyn Fn(&Change) -> bool| {
+        cs.changes
+            .iter()
+            .position(|p| f(&p.change))
+            .unwrap_or_else(|| panic!("{:?}", cs.changes))
+    };
+    let key = at(&|c| {
+        matches!(c, Change::Constraint(ConstraintChange::DropForeignKey { table, name })
+            if table.raw().to_string() == "app.child" && name.raw() == "fk_child_other")
+    });
+    let unique = at(&|c| matches!(c, Change::Constraint(ConstraintChange::DropUnique { .. })));
+    let rename = at(&|c| matches!(c, Change::Table(TableChange::RenameTable { .. })));
+    assert!(key < unique && unique < rename, "{:?}", cs.changes);
+}
+
+/// Finding 1 from PR #462's round-2 review: the guard used to disable all
+/// reordering the moment *any* `DropForeignKey` was anywhere in the plan
+/// — even one that itself depends on the very constraint a freeing drop
+/// is about to lift, which left this exact plan refused. Measured on
+/// `pbps-test-pg-cw`: dropping `fk_c` (which references `app.other.n`,
+/// the column `target` constrains) before `target`, before the rename,
+/// is what PostgreSQL actually needs — and takes.
+#[test]
+fn a_foreign_key_drop_moves_with_the_freeing_drop_it_depends_on() {
+    let old_t = table(&[("id", Column::new(ty("int")))]);
+    let mut other_base = table(&[("n", Column::new(ty("int")))]);
+    other_base.unique.insert("target".into(), unique(&["n"]));
+    let mut child_base = table(&[("n", Column::new(ty("int")))]);
+    child_base
+        .foreign_keys
+        .insert("fk_c".into(), fk(&["n"], "app.other", &["n"]));
+    let mut base = two_tables(("app.old", old_t.clone()), ("app.other", other_base));
+    base.tables.insert("app.child".parse().unwrap(), child_base);
+
+    let mut declared = two_tables(
+        ("app.target", old_t),
+        ("app.other", table(&[("n", Column::new(ty("int")))])),
+    );
+    declared.tables.insert(
+        "app.child".parse().unwrap(),
+        table(&[("n", Column::new(ty("int")))]),
+    );
+
+    let cs = run_with(
+        &SharesIndexNamespace,
+        &base,
+        &declared,
+        &[Intent::RenameTable {
+            from: "app.old".parse().unwrap(),
+            to: "app.target".parse().unwrap(),
+        }],
+    );
+    assert_eq!(
+        kinds(&cs),
+        ["DropForeignKey", "DropUnique", "RenameTable"],
+        "the foreign key has to go before the constraint it depends on, \
+             which has to go before the rename that claims its name: {cs:?}"
+    );
+}
+
+/// An unrelated FK stays after its owner's rename without pinning the
+/// other table's freeing unique drop (issue #467).
+#[test]
+fn an_unrelated_foreign_key_keeps_its_owner_name_without_blocking_other_drops() {
+    let mut old_t = table(&[
+        ("id", Column::new(ty("int"))),
+        ("parent_id", Column::new(ty("int"))),
+    ]);
+    old_t.foreign_keys.insert(
+        "fk_old_parent".into(),
+        fk(&["parent_id"], "app.parent", &["id"]),
+    );
+    let mut other_base = table(&[("n", Column::new(ty("int")))]);
+    other_base.unique.insert("target".into(), unique(&["n"]));
+    let mut base = two_tables(("app.old", old_t.clone()), ("app.other", other_base));
+    base.tables.insert(
+        "app.parent".parse().unwrap(),
+        table(&[("id", Column::new(ty("int")))]),
+    );
+
+    let target_t = table(&[
+        ("id", Column::new(ty("int"))),
+        ("parent_id", Column::new(ty("int"))),
+    ]);
+    let mut declared = two_tables(
+        ("app.target", target_t),
+        ("app.other", table(&[("n", Column::new(ty("int")))])),
+    );
+    declared.tables.insert(
+        "app.parent".parse().unwrap(),
+        table(&[("id", Column::new(ty("int")))]),
+    );
+
+    let cs = run_with(
+        &SharesIndexNamespace,
+        &base,
+        &declared,
+        &[Intent::RenameTable {
+            from: "app.old".parse().unwrap(),
+            to: "app.target".parse().unwrap(),
+        }],
+    );
+    assert_eq!(
+        kinds(&cs),
+        ["DropUnique", "RenameTable", "DropForeignKey"],
+        "only a referencing FK must precede the freeing key: {cs:?}"
+    );
+}
+
+/// Finding 2 from PR #462's round-2 review, the review-widened half of
+/// #176: `pbps-pg`'s `emit.rs` renders `DropIndex` as
+/// `DROP INDEX <schema>.<name>` — it never names the table at all, so it
+/// can move ahead of a rename even when it is *that very table's own*
+/// index being dropped. The
+/// guard used to exclude any drop whose own table was a rename target,
+/// which is right for `DropUnique`/the primary-key drop (both need
+/// `ALTER TABLE`) but was wrong for `DropIndex`, and left this plan
+/// refused. Measured on `pbps-test-pg-cw`: `app.old` owns a plain index
+/// literally named `target` and renames to `app.target` in the same
+/// plan; the drop has to run first regardless of whose index it is.
+#[test]
+fn a_table_can_free_its_own_renamed_targets_name_by_dropping_its_own_index() {
+    let mut old_t = table(&[("id", Column::new(ty("int")))]);
+    old_t.indexes.insert(
+        "target".into(),
+        Index {
+            columns: vec![IndexColumn {
+                key: pbps_model::IndexKey::Column("id".into()),
+                descending: false,
+                opclass: None,
+                collation: None,
+                opclass_parameters: Default::default(),
+            }],
+            include: vec![],
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+            filegroup: None,
+        },
+    );
+    let base = schema_of("app.old", old_t);
+    let declared = schema_of("app.target", table(&[("id", Column::new(ty("int")))]));
+
+    let cs = run_with(
+        &SharesIndexNamespace,
+        &base,
+        &declared,
+        &[Intent::RenameTable {
+            from: "app.old".parse().unwrap(),
+            to: "app.target".parse().unwrap(),
+        }],
+    );
+    assert_eq!(
+        kinds(&cs),
+        ["DropIndex", "RenameTable"],
+        "dropping an index never needs the table's current name, so it \
+             can free even its own table's name: {cs:?}"
+    );
+}
+
+/// Round-3 review finding: `pbps-pg`'s `emit.rs::rename_table` runs a
+/// cross-schema rename as two statements, not one — `ALTER TABLE s1.old
+/// SET SCHEMA s2;` lands the table at the *intermediate* name `s2.old`
+/// first, and only `ALTER TABLE s2.old RENAME TO target;` after that
+/// gives it its declared name `s2.target`. The name set the guard used
+/// to check only ever held the second name. Measured on
+/// `pbps-test-pg-cw`: `s2.sibling`, an unrelated table, owns a plain
+/// index literally named `old`; the first statement collides with it —
+/// `relation "old" already exists in schema "s2"` — even though the
+/// plan's *final* declared schema has no collision at all, and dropping
+/// that index first is what the engine actually needs.
+#[test]
+fn a_cross_schema_rename_also_frees_the_schema_it_passes_through() {
+    let old_t = table(&[("id", Column::new(ty("int")))]);
+    let mut sibling_base = table(&[("n", Column::new(ty("int")))]);
+    sibling_base.indexes.insert(
+        "old".into(),
+        Index {
+            columns: vec![IndexColumn {
+                key: pbps_model::IndexKey::Column("n".into()),
+                descending: false,
+                opclass: None,
+                collation: None,
+                opclass_parameters: Default::default(),
+            }],
+            include: vec![],
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+            filegroup: None,
+        },
+    );
+    let base = two_tables(("s1.old", old_t.clone()), ("s2.sibling", sibling_base));
+
+    let declared = two_tables(
+        ("s2.target", old_t),
+        ("s2.sibling", table(&[("n", Column::new(ty("int")))])),
+    );
+
+    let cs = run_with(
+        &SharesIndexNamespace,
+        &base,
+        &declared,
+        &[Intent::RenameTable {
+            from: "s1.old".parse().unwrap(),
+            to: "s2.target".parse().unwrap(),
+        }],
+    );
+    assert_eq!(
+        kinds(&cs),
+        ["DropIndex", "RenameTable"],
+        "the index has to be gone before the cross-schema rename's first \
+             statement claims the intermediate name it collides with: {cs:?}"
+    );
+}
+
+/// Moving a filtered index drop ahead of its own cross-schema rename
+/// must update the typed address, including the recorded filter removal.
+#[test]
+fn a_cross_schema_renames_own_index_uses_its_source_address_before_the_rename() {
+    let mut old_t = table(&[("id", Column::new(ty("int")))]);
+    old_t.indexes.insert(
+        "target".into(),
+        Index {
+            columns: vec![IndexColumn {
+                key: pbps_model::IndexKey::Column("id".into()),
+                descending: false,
+                opclass: None,
+                collation: None,
+                opclass_parameters: Default::default(),
+            }],
+            include: vec![],
+            unique: false,
+            filter: Some("id > 0".into()),
+            method: Default::default(),
+            storage_parameters: Default::default(),
+            filegroup: None,
+        },
+    );
+    let base = schema_of("s1.old", old_t);
+    let declared = schema_of("s2.target", table(&[("id", Column::new(ty("int")))]));
+
+    let cs = run_with(
+        &SharesIndexNamespace,
+        &base,
+        &declared,
+        &[Intent::RenameTable {
+            from: "s1.old".parse().unwrap(),
+            to: "s2.target".parse().unwrap(),
+        }],
+    );
+    assert_eq!(
+        kinds(&cs),
+        ["DropIndex", "RenameTable"],
+        "the drop must precede SET SCHEMA and carry its source address: {cs:?}"
+    );
+    assert!(
+        matches!(&cs.changes[0].change, Change::Index(IndexChange::DropIndex { table, .. }) if table.raw().to_string() == "s1.old")
+    );
+    let mut recorded = pbps_model::Declared::from_schema(&base);
+    recorded.advance(&cs);
+    assert!(recorded.expressions.filters.is_empty(), "{recorded:?}");
+}
+
+#[test]
+fn a_referencing_foreign_key_uses_its_source_name_before_freeing_its_rename() {
+    let mut owner = table(&[("id", Column::new(ty("int")))]);
+    owner.unique.insert("target".into(), unique(&["id"]));
+    let mut child = table(&[("id", Column::new(ty("int")))]);
+    child
+        .foreign_keys
+        .insert("fk_child".into(), fk(&["id"], "app.owner", &["id"]));
+    let base = two_tables(("app.owner", owner), ("app.old", child));
+    let declared = two_tables(
+        ("app.owner", table(&[("id", Column::new(ty("int")))])),
+        ("app.target", table(&[("id", Column::new(ty("int")))])),
+    );
+    let cs = run_with(
+        &SharesIndexNamespace,
+        &base,
+        &declared,
+        &[Intent::RenameTable {
+            from: "app.old".parse().unwrap(),
+            to: "app.target".parse().unwrap(),
+        }],
+    );
+    assert_eq!(kinds(&cs), ["DropForeignKey", "DropUnique", "RenameTable"]);
+    assert!(
+        matches!(&cs.changes[0].change, Change::Constraint(ConstraintChange::DropForeignKey { table, .. }) if table.raw().to_string() == "app.old")
+    );
+}
+
+#[test]
+fn a_freeing_constraint_drop_runs_between_its_owner_and_claimant_renames() {
+    for primary in [false, true] {
+        let mut owner = table(&[("id", Column::new(ty("int")).not_null())]);
+        if primary {
+            owner.primary_key = Some(PrimaryKey {
+                name: Some("target".into()),
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+                filegroup: None,
+            });
+        } else {
+            owner.unique.insert("target".into(), unique(&["id"]));
+        }
+        let base = two_tables(
+            ("app.owner_old", owner),
+            ("app.claimant_old", table(&[("id", Column::new(ty("int")))])),
+        );
+        let declared = two_tables(
+            (
+                "app.owner_new",
+                table(&[("id", Column::new(ty("int")).not_null())]),
+            ),
+            ("app.target", table(&[("id", Column::new(ty("int")))])),
+        );
+        let cs = run_with(
+            &SharesIndexNamespace,
+            &base,
+            &declared,
+            &[
+                Intent::RenameTable {
+                    from: "app.owner_old".parse().unwrap(),
+                    to: "app.owner_new".parse().unwrap(),
+                },
+                Intent::RenameTable {
+                    from: "app.claimant_old".parse().unwrap(),
+                    to: "app.target".parse().unwrap(),
+                },
+            ],
+        );
+        assert_eq!(
+            kinds(&cs),
+            [
+                "RenameTable",
+                if primary {
+                    "SetPrimaryKey"
+                } else {
+                    "DropUnique"
+                },
+                "RenameTable"
+            ],
+            "{cs:?}"
+        );
+        assert!(
+            matches!(&cs.changes[0].change, Change::Table(TableChange::RenameTable { to, .. }) if to.raw().to_string() == "app.owner_new")
+        );
+        assert_eq!(
+            cs.changes[1].change.table().unwrap().raw().to_string(),
+            "app.owner_new"
+        );
+    }
+}
+
+#[test]
+fn a_foreign_key_on_other_columns_does_not_move_with_a_freeing_key() {
+    let mut owner = table(&[
+        ("id", Column::new(ty("int"))),
+        ("other", Column::new(ty("int"))),
+    ]);
+    owner.unique.insert("target".into(), unique(&["id"]));
+    owner.unique.insert("other_key".into(), unique(&["other"]));
+    let mut child = table(&[("id", Column::new(ty("int")))]);
+    child
+        .foreign_keys
+        .insert("fk_child".into(), fk(&["id"], "app.owner", &["other"]));
+    let base = two_tables(("app.owner", owner.clone()), ("app.old", child));
+    owner.unique.remove("target");
+    let declared = two_tables(
+        ("app.owner", owner),
+        ("app.target", table(&[("id", Column::new(ty("int")))])),
+    );
+    let cs = run_with(
+        &SharesIndexNamespace,
+        &base,
+        &declared,
+        &[Intent::RenameTable {
+            from: "app.old".parse().unwrap(),
+            to: "app.target".parse().unwrap(),
+        }],
+    );
+    assert_eq!(
+        kinds(&cs),
+        ["DropUnique", "RenameTable", "DropForeignKey"],
+        "{cs:?}"
+    );
+    assert_eq!(
+        cs.changes[2].change.table().unwrap().raw().to_string(),
+        "app.target"
+    );
+}
+
+#[test]
+fn mutually_blocking_owner_preferences_use_an_executable_source_address() {
+    let mut a = table(&[("id", Column::new(ty("int")))]);
+    a.unique.insert("new_b".into(), unique(&["id"]));
+    let mut b = table(&[("id", Column::new(ty("int")))]);
+    b.unique.insert("new_a".into(), unique(&["id"]));
+    let base = two_tables(("app.old_a", a), ("app.old_b", b));
+    let declared = two_tables(
+        ("app.new_a", table(&[("id", Column::new(ty("int")))])),
+        ("app.new_b", table(&[("id", Column::new(ty("int")))])),
+    );
+    let cs = run_with(
+        &SharesIndexNamespace,
+        &base,
+        &declared,
+        &[
+            Intent::RenameTable {
+                from: "app.old_a".parse().unwrap(),
+                to: "app.new_a".parse().unwrap(),
+            },
+            Intent::RenameTable {
+                from: "app.old_b".parse().unwrap(),
+                to: "app.new_b".parse().unwrap(),
+            },
+        ],
+    );
+    assert_eq!(
+        kinds(&cs),
+        ["DropUnique", "RenameTable", "DropUnique", "RenameTable"],
+        "{cs:?}"
+    );
+    assert!(
+        cs.changes[0]
+            .change
+            .table()
+            .unwrap()
+            .name
+            .starts_with("old_")
+    );
+    assert!(
+        cs.changes[2]
+            .change
+            .table()
+            .unwrap()
+            .name
+            .starts_with("new_")
+    );
+}
+
+#[test]
+fn changes_are_ordered_for_execution() {
+    let mut base_t = table(&[
+        ("old", Column::new(ty("int"))),
+        ("doomed", Column::new(ty("int"))),
+    ]);
+    base_t.indexes.insert(
+        "ix_doomed".into(),
+        Index {
+            columns: vec![IndexColumn {
+                key: pbps_model::IndexKey::Column("doomed".into()),
+                descending: false,
+                opclass: None,
+                collation: None,
+                opclass_parameters: Default::default(),
+            }],
+            include: vec![],
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+            filegroup: None,
+        },
+    );
+    let want_t = table(&[("new", Column::new(ty("int")))]);
+
+    let intents = vec![
+        Intent::RenameColumn {
+            table: "dbo.t".parse().unwrap(),
+            from: "old".into(),
+            to: "new".into(),
+        },
+        Intent::DropColumn {
+            column: "dbo.t.doomed".parse().unwrap(),
+            reason: "no longer in use".parse().unwrap(),
+        },
+    ];
+    let cs = run(
+        &schema_of("dbo.t", base_t),
+        &schema_of("dbo.t", want_t),
+        &intents,
+    );
+
+    assert_eq!(
+        kinds(&cs),
+        ["DropIndex", "DropColumn", "RenameColumn"],
+        "an index must be dropped before the column it references, and a \
+             column drop before the rename of a column of its own table — \
+             `doomed` claims nothing `new` wants here, and moves anyway, \
+             because which spellings are one name is the target database's \
+             collation to say and not this plan's (DECISIONS 474)"
+    );
+}
+
+/// description affects documentation, not structure, so Phase 1 deliberately
+/// produces no change for it.
+#[test]
+fn description_change_is_not_a_structural_change() {
+    let base = schema_of("dbo.t", table(&[("a", Column::new(ty("int")))]));
+    let mut c = Column::new(ty("int"));
+    c.description = Some("Customer identifier".into());
+    let want = schema_of("dbo.t", table(&[("a", c)]));
+    assert!(run(&base, &want, &[]).is_empty());
+}
+
+#[test]
+fn deprecating_a_column_is_a_change_but_not_a_risk() {
+    let base = schema_of("dbo.t", table(&[("a", Column::new(ty("int")))]));
+    let mut c = Column::new(ty("int"));
+    c.deprecated = Some("superseded by email".into());
+    let want = schema_of("dbo.t", table(&[("a", c)]));
+    let cs = run(&base, &want, &[]);
+
+    assert_eq!(kinds(&cs), ["SetColumnDeprecated"]);
+    assert!(cs.risks().is_empty());
+}
+
+/// A `serial`'s sequence added, removed or changed on a kept column, a
+/// kept `serial` retyped, and a `serial` added to an `UNLOGGED` table are
+/// each refused by name; a rename that leaves the sequence's generated
+/// name behind is not a change, nor is a `serial` added to a logged table
+/// (#1631, DEC-1631.1).
+#[test]
+fn a_serials_sequence_change_is_refused_and_a_rename_is_not_one() {
+    let serial = |ty_: &str, start: i64| {
+        let mut c = Column::new(ty(ty_)).not_null();
+        c.value_source = pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
+            start,
+            increment: 1,
+            name: None,
+            options: Default::default(),
+        });
+        c
+    };
+    let errors = |base: &Schema, want: &Schema, intents: &[Intent]| {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(want, &base_ids, intents, &ctx())
+            .unwrap()
+            .ids;
+        match diff(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: want,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        ) {
+            Ok(_) => Vec::new(),
+            Err(errs) => errs,
+        }
+    };
+    let refused = |errs: Vec<DiffError>| {
+        matches!(
+            errs.as_slice(),
+            [DiffError::SequenceChangeUnsupported { .. }]
+        )
+    };
+    let base = schema_of("app.t", table(&[("id", serial("integer", 1))]));
+    for (why, want) in [
+        (
+            "start",
+            schema_of("app.t", table(&[("id", serial("integer", 5))])),
+        ),
+        (
+            "retype",
+            schema_of("app.t", table(&[("id", serial("bigint", 1))])),
+        ),
+        (
+            "removed",
+            schema_of(
+                "app.t",
+                table(&[("id", Column::new(ty("integer")).not_null())]),
+            ),
+        ),
+    ] {
+        assert!(refused(errors(&base, &want, &[])), "{why}");
+    }
+    let plain = schema_of(
+        "app.t",
+        table(&[("id", Column::new(ty("integer")).not_null())]),
+    );
+    assert!(refused(errors(&plain, &base, &[])), "added");
+
+    // The negative cases.
+    assert!(errors(&base, &base, &[]).is_empty());
+    let renamed = schema_of("app.t", table(&[("n", serial("integer", 1))]));
+    let rename = [Intent::RenameColumn {
+        table: "app.t".parse().unwrap(),
+        from: "id".into(),
+        to: "n".into(),
+    }];
+    assert!(errors(&base, &renamed, &rename).is_empty());
+    let mut grown = table(&[("id", serial("integer", 1)), ("n", serial("integer", 1))]);
+    let logged = schema_of("app.t", grown.clone());
+    assert!(errors(&base, &logged, &[]).is_empty());
+    grown.unlogged = true;
+    let mut unlogged_base = table(&[("id", serial("integer", 1))]);
+    unlogged_base.unlogged = true;
+    assert!(refused(errors(
+        &schema_of("app.t", unlogged_base),
+        &schema_of("app.t", grown),
+        &[]
+    )));
+}
+
+/// IDENTITY cannot be modified with ALTER, so it must be blocked explicitly
+/// rather than emitting invalid SQL.
+#[test]
+fn identity_change_is_rejected() {
+    let base = schema_of("dbo.t", table(&[("a", Column::new(ty("int")))]));
+    let mut c = Column::new(ty("int"));
+    c.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
+        seed: 1,
+        increment: 1,
+        options: Default::default(),
+    });
+    let want = schema_of("dbo.t", table(&[("a", c)]));
+
+    let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let declared_ids = crate::resolve(&want, &base_ids, &[], &ctx()).unwrap().ids;
+    let err = diff(
+        Side {
+            schema: &base,
+            ids: &base_ids,
+        },
+        Side {
+            schema: &want,
+            ids: &declared_ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err[0],
+        DiffError::IdentityChangeUnsupported { .. }
+    ));
+}
+
+/// The expressible half of the same comparison survives. `diff` accumulates
+/// every change it can phrase and only then checks for errors, so returning
+/// Columns added to one table are added in the order they are declared,
+/// which is the order the engine leaves them in, whatever their names and
+/// whatever uids they are minted: before, the uid in each change's
+/// rendering broke the tie, so the table's column order changed from one
+/// plan to the next (#2080). Minted afresh each time, as `plan` mints a
+/// new column's uid.
+#[test]
+fn columns_added_to_one_table_follow_their_declared_order() {
+    let bare = schema_of("app.t", table(&[("id", Column::new(ty("int")))]));
+    let added = schema_of(
+        "app.t",
+        table(&[
+            ("id", Column::new(ty("int"))),
+            ("z", Column::new(ty("int"))),
+            ("m", Column::new(ty("int"))),
+            ("a", Column::new(ty("int"))),
+        ]),
+    );
+    let from_ids = crate::resolve(&bare, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    for _ in 0..16 {
+        let to_ids = crate::resolve(&added, &from_ids, &[], &ctx()).unwrap().ids;
+        let order: Vec<String> = diff_partial(
+            Side {
+                schema: &bare,
+                ids: &from_ids,
+            },
+            Side {
+                schema: &added,
+                ids: &to_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let Change::Column(ColumnChange::AddColumn { name, .. }) = &p.change {
+                Some(name.raw().to_owned())
+            } else {
+                None
+            }
+        })
+        .collect();
+        assert_eq!(order, ["z", "m", "a"]);
+    }
+}
+
+/// A generated column is added after, and dropped before, the ordinary
+/// columns of the same plan: the engine refuses an expression over a
+/// column not added yet, and refuses to drop a column a generated column
+/// still reads (DEC-1168.1). Each half names its columns so that name
+/// order alone would get it wrong.
+#[test]
+fn a_generated_column_is_added_after_and_dropped_before_its_inputs() {
+    let generated_over = |input: &str| {
+        let mut c = Column::new(ty("int"));
+        c.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
+            expression: format!("{input} * 2"),
+            stored: true,
+        });
+        c
+    };
+    let bare = schema_of("app.t", table(&[("id", Column::new(ty("int")))]));
+    let with = |generated: &str, input: &str| {
+        schema_of(
+            "app.t",
+            table(&[
+                ("id", Column::new(ty("int"))),
+                (input, Column::new(ty("int"))),
+                (generated, generated_over(input)),
+            ]),
+        )
+    };
+    let order = |from: &Schema, to: &Schema, intents: &[pbps_model::Intent]| {
+        let from_ids = crate::resolve(from, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let to_ids = crate::resolve(to, &from_ids, intents, &ctx()).unwrap().ids;
+        diff_partial(
+            Side {
+                schema: from,
+                ids: &from_ids,
+            },
+            Side {
+                schema: to,
+                ids: &to_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let Change::Column(ColumnChange::AddColumn { name, .. }) = &p.change {
+                Some(format!("+{name}", name = name.shown(),))
+            } else if let Change::Column(ColumnChange::DropColumn { column, .. }) = &p.change {
+                Some(format!("-{}", column.name.shown()))
+            } else if let Change::Column(ColumnChange::AlterColumnType { column, .. }) = &p.change {
+                Some(format!("~{}", column.name.shown()))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+    };
+    // `a0` sorts before `b` by name, and is added after it.
+    assert_eq!(order(&bare, &with("a0", "b"), &[]), ["+b", "+a0"]);
+    // And after a retype of an input it reads, which the engine refuses
+    // once the generated column stands.
+    let narrow = schema_of(
+        "app.t",
+        table(&[
+            ("id", Column::new(ty("int"))),
+            ("b", Column::new(ty("smallint"))),
+        ]),
+    );
+    assert_eq!(order(&narrow, &with("a0", "b"), &[]), ["~b", "+a0"]);
+    // `zz` sorts after `a` by name, and is dropped before it.
+    let t: TableName = "app.t".parse().unwrap();
+    let drops = ["a", "zz"].map(|c| pbps_model::Intent::DropColumn {
+        column: t.column(c),
+        reason: "gone".parse().unwrap(),
+    });
+    assert_eq!(order(&with("zz", "a"), &bare, &drops), ["-zz", "-a"]);
+    // And when the same plan renames the table, so each `DropColumn`
+    // names it under the declared name: found by uid, not by name.
+    let renamed = schema_of("app.u", table(&[("id", Column::new(ty("int")))]));
+    let mut intents = vec![pbps_model::Intent::RenameTable {
+        from: t.clone(),
+        to: "app.u".parse().unwrap(),
+    }];
+    let u: TableName = "app.u".parse().unwrap();
+    intents.extend(["a", "zz"].map(|c| pbps_model::Intent::DropColumn {
+        column: u.column(c),
+        reason: "gone".parse().unwrap(),
+    }));
+    assert_eq!(order(&with("zz", "a"), &renamed, &intents), ["-zz", "-a"]);
+    // And when the same plan renames another column of the table, which
+    // brings every drop of it into the rename's class.
+    let mut both = with("zz", "a");
+    both.tables
+        .get_mut(&t)
+        .unwrap()
+        .columns
+        .insert("x".into(), Column::new(ty("int")));
+    let kept = schema_of(
+        "app.t",
+        table(&[
+            ("id", Column::new(ty("int"))),
+            ("y", Column::new(ty("int"))),
+        ]),
+    );
+    let mut intents = vec![pbps_model::Intent::RenameColumn {
+        table: t.clone(),
+        from: "x".into(),
+        to: "y".into(),
+    }];
+    intents.extend(drops.clone());
+    // Uids are drawn fresh on every resolve, and they are what breaks a
+    // tie in the class, so one draw can land right by chance.
+    for _ in 0..32 {
+        assert_eq!(order(&both, &kept, &intents), ["-zz", "-a"]);
+    }
+}
+
+/// A recomputed generated column is checked against its nullability as it
+/// stands: a relaxation goes before the new expression and a tightening
+/// after it, whatever the names say (DEC-1168.1).
+#[test]
+fn a_generated_columns_nullability_relaxes_before_and_tightens_after_its_expression() {
+    let generated_as = |type_: &str, expression: &str, nullable: bool| {
+        let mut c = Column::new(ty(type_));
+        c.nullable = nullable;
+        c.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
+            expression: expression.into(),
+            stored: true,
+        });
+        c
+    };
+    let generated = |expression: &str, nullable: bool| generated_as("int", expression, nullable);
+    let order = |from: Column, to: Column| {
+        let base = schema_of(
+            "app.t",
+            table(&[("a", Column::new(ty("int"))), ("g", from)]),
+        );
+        let want = schema_of("app.t", table(&[("a", Column::new(ty("int"))), ("g", to)]));
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let ids = crate::resolve(&want, &base_ids, &[], &ctx()).unwrap().ids;
+        diff_partial(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &want,
+                ids: &ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .changes
+        .changes
+        .iter()
+        .map(|p| match &p.change {
+            Change::Column(ColumnChange::AlterColumnExpression { .. }) => "expression",
+            Change::Column(ColumnChange::AlterColumnNullability {
+                to_nullable: true, ..
+            }) => "relax",
+            Change::Column(ColumnChange::AlterColumnNullability {
+                to_nullable: false, ..
+            }) => "tighten",
+            Change::Column(ColumnChange::AlterColumnType {
+                to_nullable: true, ..
+            }) => "retype",
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        order(generated("coalesce(a, 0)", false), generated("a", true)),
+        ["relax", "expression"]
+    );
+    assert_eq!(
+        order(generated("a", true), generated("coalesce(a, 0)", false)),
+        ["expression", "tighten"]
+    );
+    // Retyped as well: the type change would carry the tightening, and
+    // leaves it to a step after the new expression instead.
+    assert_eq!(
+        order(
+            generated("a", true),
+            generated_as("bigint", "coalesce(a, 0)", false)
+        ),
+        ["retype", "expression", "tighten"]
+    );
+}
+
+/// A generated column's expression changes in place, as one typed change
+/// that carries both texts; a column that becomes or stops being
+/// generated, or changes kind, has no in-place form and is refused by name
+/// (DEC-1168.1). An ordinary default beside it is a default change.
+#[test]
+fn a_generated_expression_changes_in_place_and_nothing_else_about_generation_does() {
+    let generated = |expression: &str, stored: bool| {
+        let mut c = Column::new(ty("int"));
+        c.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
+            expression: expression.into(),
+            stored,
+        });
+        c
+    };
+    let diff_of = |from: Column, to: Column| {
+        let base = schema_of("app.t", table(&[("b", from)]));
+        let want = schema_of("app.t", table(&[("b", to)]));
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let ids = crate::resolve(&want, &base_ids, &[], &ctx()).unwrap().ids;
+        diff_partial(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &want,
+                ids: &ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+    };
+    let changed = diff_of(generated("a * 2", true), generated("a * 3", true));
+    assert!(changed.errors.is_empty(), "{:?}", changed.errors);
+    assert!(
+        matches!(
+            changed.changes.changes.as_slice(),
+            [p] if matches!(&p.change, Change::Column(ColumnChange::AlterColumnExpression { from, to, .. }) if from == "a * 2" && to == "a * 3")
+        ),
+        "{:?}",
+        changed.changes
+    );
+    assert!(
+        diff_of(generated("a * 2", true), generated("a * 2", true))
+            .changes
+            .changes
+            .is_empty()
+    );
+    for (from, to) in [
+        (Column::new(ty("int")), generated("a * 2", true)),
+        (generated("a * 2", true), Column::new(ty("int"))),
+        (generated("a * 2", true), generated("a * 2", false)),
+    ] {
+        let refused = diff_of(from, to);
+        assert!(
+            matches!(
+                refused.errors.as_slice(),
+                [DiffError::GenerationChangeUnsupported { .. }]
+            ),
+            "{:?}",
+            refused.errors
+        );
+    }
+    // Negative: a default is not a generation, and changes as a default.
+    let mut with_default = Column::new(ty("int"));
+    with_default.value_source = pbps_model::ValueSource::Default("7".into());
+    let defaulted = diff_of(Column::new(ty("int")), with_default);
+    assert_eq!(kinds(&defaulted.changes), ["AlterColumnDefault"]);
+}
+
+/// `Err(errs)` threw away work it had already done — and `verify`, whose
+/// job is to *report* differences rather than approve them, showed only the
+/// identity error. The nullability drift beside it went missing from the
+/// count, the human report and the `on_drift` hook's payload alike.
+#[test]
+fn an_unexpressible_difference_does_not_hide_the_expressible_ones() {
+    let base = schema_of(
+        "dbo.t",
+        table(&[("a", Column::new(ty("int"))), ("b", Column::new(ty("int")))]),
+    );
+    let mut identity_changed = Column::new(ty("int"));
+    identity_changed.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
+        seed: 1,
+        increment: 1,
+        options: Default::default(),
+    });
+    let mut not_null = Column::new(ty("int"));
+    not_null.nullable = false;
+    let want = schema_of("dbo.t", table(&[("a", identity_changed), ("b", not_null)]));
+
+    let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let declared_ids = crate::resolve(&want, &base_ids, &[], &ctx()).unwrap().ids;
+    let sides = || {
+        (
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &want,
+                ids: &declared_ids,
+            },
+        )
+    };
+
+    let (b, d) = sides();
+    let partial = diff_partial(b, d, &MinimalDialect, &Hints::default());
+    assert!(matches!(
+        partial.errors.as_slice(),
+        [DiffError::IdentityChangeUnsupported { .. }]
+    ));
+    assert_eq!(
+        kinds(&partial.changes),
+        ["AlterColumnNullability"],
+        "the change the differ could phrase was dropped: {:?}",
+        partial.changes
+    );
+
+    // And `diff` still refuses outright, because a plan that cannot express
+    // every difference must not be applied at all. The two callers ask
+    // different questions and this is the one place that says so.
+    let (b, d) = sides();
+    assert!(diff(b, d, &MinimalDialect, &Hints::default()).is_err());
+}
+
+/// A jump-version deploy: the entire reason uid matching exists.
+///
+/// Prod sits at v1 while the declarations have moved on to v3, with a rename
+/// somewhere in between. That intent left the working tree long ago — but both
+/// identity files still record the same uid, so the rename is still detected,
+/// in one step, with no need to walk the v1→v2→v3 chain of names.
+#[test]
+fn a_rename_is_detected_across_many_versions() {
+    let v1 = schema_of(
+        "dbo.t",
+        table(&[("customer_name", Column::new(ty("nvarchar(50)")))]),
+    );
+    let v1_ids = crate::resolve(&v1, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+
+    // v2: the rename. The intent exists only in this version.
+    let v2 = schema_of(
+        "dbo.t",
+        table(&[("full_name", Column::new(ty("nvarchar(50)")))]),
+    );
+    let v2_ids = crate::resolve(
+        &v2,
+        &v1_ids,
+        &[Intent::RenameColumn {
+            table: "dbo.t".parse().unwrap(),
+            from: "customer_name".into(),
+            to: "full_name".into(),
+        }],
+        &ctx(),
+    )
+    .unwrap()
+    .ids;
+
+    // v3: just a longer column. No intent at all.
+    let v3 = schema_of(
+        "dbo.t",
+        table(&[("full_name", Column::new(ty("nvarchar(200)")))]),
+    );
+    let v3_ids = crate::resolve(&v3, &v2_ids, &[], &ctx()).unwrap().ids;
+
+    // Apply v3 to an environment stuck at v1, supplying no intent.
+    let cs = diff(
+        Side {
+            schema: &v1,
+            ids: &v1_ids,
+        },
+        Side {
+            schema: &v3,
+            ids: &v3_ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kinds(&cs),
+        ["RenameColumn", "AlterColumnType"],
+        "across versions a rename must still read as a rename, not a drop plus an add"
+    );
+    assert!(
+        !cs.risks().contains(&RiskClass::Destructive),
+        "this must never turn into a data-losing plan"
+    );
+}
+
+/// Identical input must produce a plan in the same order, or the plan's
+/// checksum would be unstable.
+#[test]
+fn output_is_deterministic() {
+    let base = schema_of(
+        "dbo.t",
+        table(&[("a", Column::new(ty("int"))), ("b", Column::new(ty("int")))]),
+    );
+    let want = schema_of(
+        "dbo.t",
+        table(&[
+            ("a", Column::new(ty("bigint"))),
+            ("b", Column::new(ty("bigint"))),
+            ("c", Column::new(ty("int"))),
+        ]),
+    );
+    let first = run(&base, &want, &[]);
+    for _ in 0..10 {
+        let again = run(&base, &want, &[]);
+        assert_eq!(
+            kinds(&first),
+            kinds(&again),
+            "identical input should produce the plan in the same order"
+        );
+    }
+    let _ = Uid::generate(pbps_model::UidKind::Column);
+}
+
+// ---- modules (ADR-0002) ----
+
+fn a_module(kind: pbps_model::ModuleKind, definition: &str) -> pbps_model::Module {
+    pbps_model::Module {
+        kind,
+        description: None,
+        definition: definition.to_owned(),
+        options: Default::default(),
+    }
+}
+
+fn with_functions(mut schema: Schema, specs: &[(&str, &str)]) -> Schema {
+    for (name, definition) in specs {
+        schema.modules.insert(
+            name.parse().unwrap(),
+            a_module(pbps_model::ModuleKind::Function, definition),
+        );
+    }
+    schema
+}
+
+fn with_modules(mut schema: Schema, specs: &[(&str, &str)]) -> Schema {
+    for (name, definition) in specs {
+        schema.modules.insert(
+            name.parse().unwrap(),
+            a_module(pbps_model::ModuleKind::View, definition),
+        );
+    }
+    schema
+}
+
+/// Modules are matched by name and carry no identity, so `run`'s uid
+/// machinery is bypassed: this calls the differ directly with the same ids
+/// on both sides.
+fn module_diff(base: &Schema, declared: &Schema) -> ChangeSet {
+    let ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    diff(
+        Side {
+            schema: base,
+            ids: &ids,
+        },
+        Side {
+            schema: declared,
+            ids: &ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+    )
+    .unwrap()
+    .changes()
+    .clone()
+}
+
+#[test]
+fn a_new_module_is_created_and_a_removed_one_dropped() {
+    let base = Schema::default();
+    let declared = with_modules(Schema::default(), &[("dbo.v", "SELECT 1")]);
+    assert_eq!(kinds(&module_diff(&base, &declared)), ["CreateModule"]);
+
+    let dropped = module_diff(&declared, &base);
+    assert_eq!(kinds(&dropped), ["DropModule"]);
+    // What a dropped module destroys is the validity of its dependents, so
+    // it faces the gate — with no tombstone and no reason, because git
+    // holds the definition it had.
+    assert!(dropped.risks().contains(&RiskClass::Destructive));
+}
+
+/// Layout is not a change. Re-stating every view on every deploy would
+/// train reviewers to skim the plan, which is the one thing a plan must not
+/// invite.
+#[test]
+fn a_reindented_definition_is_not_a_change() {
+    let base = with_modules(Schema::default(), &[("dbo.v", "SELECT a, b FROM t")]);
+    let declared = with_modules(
+        Schema::default(),
+        &[("dbo.v", "SELECT a,\n       b\nFROM t")],
+    );
+    assert!(module_diff(&base, &declared).is_empty());
+}
+
+#[test]
+fn a_changed_definition_is_restated_in_full() {
+    let base = with_modules(Schema::default(), &[("dbo.v", "SELECT a FROM t")]);
+    let declared = with_modules(Schema::default(), &[("dbo.v", "SELECT a, b FROM t")]);
+    let cs = module_diff(&base, &declared);
+    assert_eq!(kinds(&cs), ["AlterModule"]);
+    // CREATE OR ALTER preserves the permissions granted on the object, so
+    // an alteration must never be planned as drop + create.
+    assert!(cs.risks().is_empty());
+}
+
+/// `CREATE OR ALTER` cannot turn a view into a procedure. Planning that as
+/// an alteration would fail at the statement, halfway through an apply.
+#[test]
+fn a_changed_kind_becomes_drop_plus_create() {
+    let base = with_modules(Schema::default(), &[("dbo.thing", "SELECT 1")]);
+    let mut declared = Schema::default();
+    declared.modules.insert(
+        "dbo.thing".parse().unwrap(),
+        a_module(pbps_model::ModuleKind::Procedure, "AS SELECT 1"),
+    );
+    assert_eq!(
+        kinds(&module_diff(&base, &declared)),
+        ["DropModule", "CreateModule"]
+    );
+}
+
+/// A trigger moved to another table needs no case of its own: its table is
+/// part of its identity (ADR-0009 §1), so the move is one key gone and one
+/// key new — which is the drop and the create, in that order, from the two
+/// ordinary loops.
+#[test]
+fn a_trigger_moved_to_another_table_is_a_drop_and_a_create() {
+    let trigger = |table: &str| {
+        let mut schema = Schema::default();
+        schema.modules.insert(
+            pbps_model::ModuleId::Trigger {
+                on: table.parse().unwrap(),
+                name: "audit".to_owned(),
+            },
+            a_module(pbps_model::ModuleKind::Trigger, "AFTER INSERT AS SELECT 1"),
+        );
+        schema
+    };
+    let cs = module_diff(&trigger("dbo.orders"), &trigger("dbo.customers"));
+    assert_eq!(kinds(&cs), ["DropModule", "CreateModule"]);
+    let subjects: Vec<String> = cs.changes.iter().map(|p| p.change.subject()).collect();
+    assert_eq!(subjects, ["dbo.orders.audit", "dbo.customers.audit"]);
+
+    // The same trigger on the same table is still an alteration, not a
+    // replacement: nothing about its identity moved.
+    let mut same = trigger("dbo.orders");
+    for m in same.modules.values_mut() {
+        m.definition = "AFTER UPDATE AS SELECT 1".to_owned();
+    }
+    assert_eq!(
+        kinds(&module_diff(&trigger("dbo.orders"), &same)),
+        ["AlterModule"]
+    );
+}
+
+/// Two overloads of one function are two objects: a plan that adds the
+/// second must not read as an alteration of the first.
+#[test]
+fn a_second_overload_is_a_create_and_not_an_alteration() {
+    let routine = |spec: &str, body: &str| {
+        let mut schema = Schema::default();
+        schema.modules.insert(
+            spec.parse().unwrap(),
+            a_module(pbps_model::ModuleKind::Function, body),
+        );
+        schema
+    };
+    let mut both = routine("app.f(integer)", "AS 1");
+    both.modules.extend(routine("app.f(text)", "AS 2").modules);
+    let cs = module_diff(&routine("app.f(integer)", "AS 1"), &both);
+    assert_eq!(kinds(&cs), ["CreateModule"]);
+    assert_eq!(cs.changes[0].change.subject(), "app.f(text)");
+}
+
+/// A view over a view has to be created second and dropped first, or the
+/// statement fails. The scan of the definition text is what produces the
+/// order; §8.2's "never parse" is about comparison, not about this.
+#[test]
+fn modules_are_ordered_by_what_they_reference() {
+    let declared = with_modules(
+        Schema::default(),
+        &[
+            ("dbo.top", "SELECT * FROM dbo.middle"),
+            ("dbo.middle", "SELECT * FROM dbo.base"),
+            ("dbo.base", "SELECT 1"),
+        ],
+    );
+    let created: Vec<String> = module_diff(&Schema::default(), &declared)
+        .changes
+        .iter()
+        .map(|p| p.change.subject())
+        .collect();
+    assert_eq!(created, ["dbo.base", "dbo.middle", "dbo.top"]);
+
+    let dropped: Vec<String> = module_diff(&declared, &Schema::default())
+        .changes
+        .iter()
+        .map(|p| p.change.subject())
+        .collect();
+    assert_eq!(dropped, ["dbo.top", "dbo.middle", "dbo.base"]);
+}
+
+/// A module that is going must go before the table changes: a SCHEMABINDING
+/// view blocks a rename of the column it binds. And one that is arriving
+/// must come after them, or it selects a column that does not exist yet.
+#[test]
+fn modules_bracket_the_table_changes() {
+    let base = with_modules(
+        schema_of("dbo.t", table(&[("a", Column::new(ty("int")))])),
+        &[("dbo.going", "SELECT a FROM dbo.t")],
+    );
+    let declared = with_modules(
+        schema_of(
+            "dbo.t",
+            table(&[("a", Column::new(ty("int"))), ("b", Column::new(ty("int")))]),
+        ),
+        &[("dbo.arriving", "SELECT a, b FROM dbo.t")],
+    );
+    let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let declared_ids = crate::resolve(&declared, &base_ids, &[], &ctx())
+        .unwrap()
+        .ids;
+    let cs = diff(
+        Side {
+            schema: &base,
+            ids: &base_ids,
+        },
+        Side {
+            schema: &declared,
+            ids: &declared_ids,
+        },
+        &MinimalDialect,
+        &Hints::default(),
+    )
+    .unwrap();
+    assert_eq!(kinds(&cs), ["DropModule", "AddColumn", "CreateModule"]);
+}
+
+// ---- roles (ADR-0005) ----
+
+mod roles {
+    use super::*;
+    use pbps_model::ColumnChange;
+    use pbps_model::GrantChange;
+    use pbps_model::ModuleChange;
+    use pbps_model::PartitionChange;
+    use pbps_model::RoleChange;
+    use pbps_model::TableChange;
+    use pbps_model::{GrantTarget, Permission, Role};
+
+    fn role(grants: &[(&str, &[Permission])]) -> Role {
+        let mut r = Role::default();
+        for (target, perms) in grants {
+            r.grants.insert(
+                target.parse::<GrantTarget>().unwrap(),
+                perms.iter().copied().collect(),
+            );
+        }
+        r
+    }
+
+    #[test]
+    fn a_new_serial_regrants_an_unchanged_table_marker_after_the_column() {
+        let mut base = side(&[(
+            "r_aaaaaa",
+            "writer",
+            role(&[(
+                "dbo.customer",
+                &[Permission::Insert, Permission::SerialSequences],
+            )]),
+        )]);
+        base.0
+            .tables
+            .get_mut(&"dbo.customer".parse().unwrap())
+            .unwrap()
+            .columns["id"]
+            .value_source = ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+        let mut declared = base.clone();
+        let mut column = Column::new(ty("int")).not_null();
+        column.value_source = ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+        declared
+            .0
+            .tables
+            .get_mut(&"dbo.customer".parse().unwrap())
+            .unwrap()
+            .columns
+            .insert("other".into(), column);
+        declared.1.columns.insert(
+            "c_bbbbbb".parse().unwrap(),
+            "dbo.customer.other".parse().unwrap(),
+        );
+        let changes = diff(
+            Side {
+                schema: &base.0,
+                ids: &base.1,
+            },
+            Side {
+                schema: &declared.0,
+                ids: &declared.1,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            changes.changes[0].change,
+            Change::Column(ColumnChange::AddColumn { .. })
+        ));
+        assert_eq!(changes.changes.len(), 2);
+        assert!(
+            matches!(&changes.changes[1].change, Change::Permission(GrantChange::Grant { role, permissions, .. })
+            if role.raw() == "writer" && *permissions == BTreeSet::from([Permission::SerialSequences]))
+        );
+        let unchanged = diff(
+            Side {
+                schema: &base.0,
+                ids: &base.1,
+            },
+            Side {
+                schema: &base.0,
+                ids: &base.1,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap();
+        assert!(unchanged.is_empty());
+        declared
+            .0
+            .tables
+            .get_mut(&"dbo.customer".parse().unwrap())
+            .unwrap()
+            .columns["other"]
+            .value_source = ValueSource::None;
+        assert_eq!(
+            kinds(&base, &declared).len(),
+            1,
+            "an ordinary column regrants nothing"
+        );
+    }
+
+    #[test]
+    fn converting_a_column_to_serial_regrants_only_the_declared_holders() {
+        let mut base = side(&[(
+            "r_aaaaaa",
+            "writer",
+            role(&[(
+                "dbo.customer",
+                &[Permission::Insert, Permission::SerialSequences],
+            )]),
+        )]);
+        // The standing marker is backed by an existing serial; the
+        // declared side also holds the source installed by the change.
+        let mut existing = Column::new(ty("int"));
+        existing.value_source = ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+        base.0
+            .tables
+            .get_mut(&"dbo.customer".parse().unwrap())
+            .unwrap()
+            .columns
+            .insert("existing".into(), existing);
+        let mut declared = base.clone();
+        declared
+            .0
+            .tables
+            .get_mut(&"dbo.customer".parse().unwrap())
+            .unwrap()
+            .columns["id"]
+            .value_source = ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+        for from in [
+            ValueSource::None,
+            ValueSource::Identity(pbps_model::Identity::new(1, 1)),
+            ValueSource::Sequence(pbps_model::OwnedSequence::serial()),
+        ] {
+            base.0
+                .tables
+                .get_mut(&"dbo.customer".parse().unwrap())
+                .unwrap()
+                .columns["id"]
+                .value_source = from.clone();
+            let creates = !matches!(from, ValueSource::Sequence(_));
+            let mut changes = vec![Change::Column(ColumnChange::AlterColumnNumbering {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: "dbo.customer.id".parse().unwrap(),
+                ty: ty("int"),
+                from,
+                to: ValueSource::Sequence(pbps_model::OwnedSequence::serial()),
+            })];
+            diff_roles(
+                Side {
+                    schema: &base.0,
+                    ids: &base.1,
+                },
+                Side {
+                    schema: &declared.0,
+                    ids: &declared.1,
+                },
+                &ClusterRoles,
+                &mut changes,
+            );
+            assert_eq!(changes.len(), if creates { 2 } else { 1 });
+        }
+    }
+
+    fn serial_side(grants: &[(&str, &[Permission])]) -> (Schema, IdsFile) {
+        let mut s = side(&[("r_aaaaaa", "writer", role(grants))]);
+        s.0.tables
+            .get_mut(&"dbo.customer".parse().unwrap())
+            .unwrap()
+            .columns["id"]
+            .value_source = ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+        s
+    }
+
+    #[test]
+    fn partition_markers_regrant_new_root_serials_and_compare_the_effective_union() {
+        let mut base = serial_side(&[]);
+        let parent: TableName = "dbo.customer".parse().unwrap();
+        base.0.tables.get_mut(&parent).unwrap().partition_by = Some(pbps_model::PartitionBy {
+            strategy: Default::default(),
+            columns: vec!["id".into()],
+            external: false,
+        });
+        for (uid, name, parent_name) in [
+            ("t_bbbbbb", "dbo.p1", "dbo.customer"),
+            ("t_cccccc", "dbo.p2", "dbo.p1"),
+        ] {
+            base.0.tables.insert(
+                name.parse().unwrap(),
+                Table {
+                    partition_of: Some(pbps_model::PartitionOf {
+                        parent: parent_name.parse().unwrap(),
+                        bound: pbps_model::PartitionBound::Default,
+                        columns: Default::default(),
+                    }),
+                    ..Default::default()
+                },
+            );
+            base.1
+                .tables
+                .insert(uid.parse().unwrap(), name.parse().unwrap());
+        }
+        base.0
+            .roles
+            .insert("writer".into(), role(&[("dbo.p2", &[Permission::Insert])]));
+        pbps_model::role::implied_serial_grants(&mut base.0);
+        for shape in ["unchanged", "add", "convert", "drop", "rename"] {
+            let mut declared = base.clone();
+            let mut changes = Vec::new();
+            if shape == "add" {
+                let mut column = Column::new(ty("int"));
+                column.value_source = ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+                declared
+                    .0
+                    .tables
+                    .get_mut(&parent)
+                    .unwrap()
+                    .columns
+                    .insert("other".into(), column.clone());
+                changes.push(Change::Column(ColumnChange::AddColumn {
+                    uid: "c_bbbbbb".parse().unwrap(),
+                    table: parent.clone(),
+                    name: "other".into(),
+                    column: Box::new(column),
+                }));
+            } else if shape == "convert" {
+                base.0.tables.get_mut(&parent).unwrap().columns["id"].value_source =
+                    ValueSource::None;
+                changes.push(Change::Column(ColumnChange::AlterColumnNumbering {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    column: parent.column("id"),
+                    ty: ty("int"),
+                    from: ValueSource::None,
+                    to: ValueSource::Sequence(pbps_model::OwnedSequence::serial()),
+                }));
+            } else if shape == "drop" {
+                declared.0.tables.get_mut(&parent).unwrap().columns.clear();
+                declared.1.columns.clear();
+            } else if shape == "rename" {
+                let renamed: TableName = "dbo.renamed".parse().unwrap();
+                let table = declared.0.tables.remove(&parent).unwrap();
+                declared.0.tables.insert(renamed.clone(), table);
+                declared
+                    .1
+                    .tables
+                    .insert("t_aaaaaa".parse().unwrap(), renamed.clone());
+                declared
+                    .1
+                    .columns
+                    .insert("c_aaaaaa".parse().unwrap(), renamed.column("id"));
+                declared
+                    .0
+                    .tables
+                    .get_mut(&"dbo.p1".parse().unwrap())
+                    .unwrap()
+                    .partition_of
+                    .as_mut()
+                    .unwrap()
+                    .parent = renamed;
+            }
+            diff_roles(
+                Side {
+                    schema: &base.0,
+                    ids: &base.1,
+                },
+                Side {
+                    schema: &declared.0,
+                    ids: &declared.1,
+                },
+                &ClusterRoles,
+                &mut changes,
+            );
+            let grants: Vec<_> = changes
+                .iter()
+                .filter(|c| matches!(c, Change::Permission(GrantChange::Grant { .. })))
+                .collect();
+            assert_eq!(
+                grants.len(),
+                usize::from(matches!(shape, "add" | "convert")),
+                "{shape}: {changes:?}"
+            );
+            for grant in grants {
+                assert!(
+                    matches!(grant, Change::Permission(GrantChange::Grant { target, permissions, .. }) if *target == "dbo.p2".parse().unwrap() && *permissions == [Permission::SerialSequences].into()),
+                    "{grant:?}"
+                );
+            }
+            assert!(
+                !changes
+                    .iter()
+                    .any(|c| matches!(c, Change::Permission(GrantChange::Revoke { .. }))),
+                "{shape}: {changes:?}"
+            );
+            // Restore the base changed for the conversion case.
+            base.0.tables.get_mut(&parent).unwrap().columns["id"].value_source =
+                ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+        }
+        // Explicit USAGE on the root and INSERT on a partition describe
+        // one ACL; removing either source must preserve the other.
+        for keep_insert in [false, true] {
+            let mut declared = base.clone();
+            declared.0.roles.insert(
+                "writer".into(),
+                if keep_insert {
+                    role(&[("dbo.p1", &[Permission::Insert])])
+                } else {
+                    role(&[("sequence::dbo.customer.id", &[Permission::Usage])])
+                },
+            );
+            pbps_model::role::implied_serial_grants(&mut declared.0);
+            let mut changes = Vec::new();
+            diff_roles(
+                Side {
+                    schema: &base.0,
+                    ids: &base.1,
+                },
+                Side {
+                    schema: &declared.0,
+                    ids: &declared.1,
+                },
+                &ClusterRoles,
+                &mut changes,
+            );
+            assert!(
+                !changes.iter().any(|c| matches!(
+                    c,
+                    Change::Permission(GrantChange::Revoke {
+                        target: GrantTarget::Sequence(_),
+                        ..
+                    })
+                )),
+                "{changes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn detach_leaves_inherited_sequence_usage_explicit_and_attach_gains_the_marker() {
+        let mut partition = serial_side(&[("dbo.p1", &[Permission::Insert])]);
+        let parent: TableName = "dbo.customer".parse().unwrap();
+        partition.0.tables.get_mut(&parent).unwrap().partition_by = Some(pbps_model::PartitionBy {
+            strategy: Default::default(),
+            columns: vec!["id".into()],
+            external: false,
+        });
+        partition.0.tables.insert(
+            "dbo.p1".parse().unwrap(),
+            Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: parent.clone(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: [(
+                        "id".into(),
+                        pbps_model::PartitionColumn {
+                            default: Some("0".into()),
+                            not_null: false,
+                        },
+                    )]
+                    .into(),
+                }),
+                ..Default::default()
+            },
+        );
+        partition
+            .1
+            .tables
+            .insert("t_bbbbbb".parse().unwrap(), "dbo.p1".parse().unwrap());
+        pbps_model::role::implied_serial_grants(&mut partition.0);
+        let mut detached = partition.clone();
+        let mut column = detached.0.tables[&parent].columns["id"].clone();
+        column.value_source = ValueSource::Default("0".into());
+        detached.0.tables.insert(
+            "dbo.p1".parse().unwrap(),
+            Table {
+                columns: [("id".into(), column)].into(),
+                ..Default::default()
+            },
+        );
+        detached
+            .1
+            .columns
+            .insert("c_bbbbbb".parse().unwrap(), "dbo.p1.id".parse().unwrap());
+        detached
+            .0
+            .roles
+            .insert("writer".into(), role(&[("dbo.p1", &[Permission::Insert])]));
+        for removed_role in [false, true] {
+            let mut declared = detached.clone();
+            if removed_role {
+                declared.0.roles.clear();
+                declared.1.roles.clear();
+            }
+            let changes = diff(
+                Side {
+                    schema: &partition.0,
+                    ids: &partition.1,
+                },
+                Side {
+                    schema: &declared.0,
+                    ids: &declared.1,
+                },
+                &ClusterRoles,
+                &Hints::default(),
+            )
+            .unwrap();
+            assert!(
+                changes.changes.iter().any(|p| matches!(
+                    p.change,
+                    Change::Partition(PartitionChange::DetachPartition { .. })
+                )),
+                "{changes:?}"
+            );
+            assert!(
+                !changes.changes.iter().any(|p| matches!(
+                    &p.change,
+                    Change::Permission(GrantChange::Revoke {
+                        target: GrantTarget::Sequence(_),
+                        ..
+                    })
+                )),
+                "{changes:?}"
+            );
+        }
+        let changes = diff(
+            Side {
+                schema: &detached.0,
+                ids: &detached.1,
+            },
+            Side {
+                schema: &partition.0,
+                ids: &partition.1,
+            },
+            &ClusterRoles,
+            &Hints::default(),
+        )
+        .unwrap();
+        let attach = changes
+            .changes
+            .iter()
+            .position(|p| {
+                matches!(
+                    p.change,
+                    Change::Partition(PartitionChange::AttachPartition { .. })
+                )
+            })
+            .unwrap();
+        let grant = changes.changes.iter().position(|p| matches!(&p.change, Change::Permission(GrantChange::Grant { target, permissions, .. }) if *target == "dbo.p1".parse().unwrap() && *permissions == [Permission::SerialSequences].into())).unwrap();
+        assert!(attach < grant, "{changes:?}");
+        assert!(
+            !changes
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, Change::Permission(GrantChange::Revoke { .. }))),
+            "{changes:?}"
+        );
+    }
+
+    #[test]
+    fn sequence_usage_is_revoked_only_after_both_sources_are_removed() {
+        use Permission::{Insert, SerialSequences, Usage};
+        let cases = [
+            (
+                vec![
+                    ("dbo.customer", vec![Insert, SerialSequences]),
+                    ("sequence::dbo.customer.id", vec![Usage]),
+                ],
+                vec![("dbo.customer", vec![Insert, SerialSequences])],
+                false,
+            ),
+            (
+                vec![("dbo.customer", vec![Insert, SerialSequences])],
+                vec![("sequence::dbo.customer.id", vec![Usage])],
+                false,
+            ),
+            (
+                vec![("sequence::dbo.customer.id", vec![Usage])],
+                vec![("dbo.customer", vec![Insert, SerialSequences])],
+                false,
+            ),
+            (
+                vec![("sequence::dbo.customer.id", vec![Usage])],
+                vec![],
+                true,
+            ),
+            (
+                vec![("dbo.customer", vec![Insert, SerialSequences])],
+                vec![],
+                true,
+            ),
+        ];
+        for (before, after, revoked) in cases {
+            fn as_refs<'a>(
+                v: &'a [(&'a str, Vec<Permission>)],
+            ) -> Vec<(&'a str, &'a [Permission])> {
+                v.iter().map(|(t, p)| (*t, p.as_slice())).collect()
+            }
+            let base = serial_side(&as_refs(&before));
+            let declared = serial_side(&as_refs(&after));
+            let mut changes = Vec::new();
+            diff_roles(
+                Side {
+                    schema: &base.0,
+                    ids: &base.1,
+                },
+                Side {
+                    schema: &declared.0,
+                    ids: &declared.1,
+                },
+                &ClusterRoles,
+                &mut changes,
+            );
+            assert_eq!(changes.iter().any(|c| matches!(c, Change::Permission(GrantChange::Revoke { target: GrantTarget::Sequence(_), permissions, .. }) if permissions.contains(&Usage))), revoked, "{before:?} -> {after:?}: {changes:?}");
+            assert!(!changes.iter().any(|c| matches!(c, Change::Permission(GrantChange::Revoke { permissions, .. }) if permissions.contains(&SerialSequences))));
+        }
+    }
+
+    #[test]
+    fn sequence_grants_follow_table_and_column_identity_without_permission_changes() {
+        let base = serial_side(&[(
+            "sequence::dbo.customer.id",
+            &[Permission::Usage, Permission::Select],
+        )]);
+        let mut declared = base.clone();
+        let mut table = declared
+            .0
+            .tables
+            .remove(&"dbo.customer".parse().unwrap())
+            .unwrap();
+        let column = table.columns.shift_remove("id").unwrap();
+        table.columns.insert("renamed".into(), column);
+        declared
+            .0
+            .tables
+            .insert("dbo.moved".parse().unwrap(), table);
+        *declared.1.tables.values_mut().next().unwrap() = "dbo.moved".parse().unwrap();
+        *declared.1.columns.values_mut().next().unwrap() = "dbo.moved.renamed".parse().unwrap();
+        declared.0.roles.insert(
+            "writer".into(),
+            role(&[(
+                "sequence::dbo.moved.renamed",
+                &[Permission::Usage, Permission::Select],
+            )]),
+        );
+        let mut changes = Vec::new();
+        diff_roles(
+            Side {
+                schema: &base.0,
+                ids: &base.1,
+            },
+            Side {
+                schema: &declared.0,
+                ids: &declared.1,
+            },
+            &ClusterRoles,
+            &mut changes,
+        );
+        assert!(changes.is_empty(), "{changes:?}");
+        declared.0.roles.get_mut("writer").unwrap().grants.clear();
+        diff_roles(
+            Side {
+                schema: &base.0,
+                ids: &base.1,
+            },
+            Side {
+                schema: &declared.0,
+                ids: &declared.1,
+            },
+            &ClusterRoles,
+            &mut changes,
+        );
+        assert!(
+            matches!(&changes[0], Change::Permission(GrantChange::Revoke { target, .. }) if *target == "sequence::dbo.moved.renamed".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn sequence_grants_follow_the_surviving_table_into_a_retired_tables_name() {
+        let mut base = serial_side(&[("sequence::dbo.incoming.id", &[Permission::Usage])]);
+        let column_table = base.0.tables[&"dbo.customer".parse().unwrap()].clone();
+        base.0
+            .tables
+            .insert("dbo.incoming".parse().unwrap(), column_table);
+        base.1
+            .tables
+            .insert("t_bbbbbb".parse().unwrap(), "dbo.incoming".parse().unwrap());
+        base.1.columns.insert(
+            "c_bbbbbb".parse().unwrap(),
+            "dbo.incoming.id".parse().unwrap(),
+        );
+        let mut declared = serial_side(&[("sequence::dbo.customer.id", &[Permission::Usage])]);
+        declared.1.tables.clear();
+        declared
+            .1
+            .tables
+            .insert("t_bbbbbb".parse().unwrap(), "dbo.customer".parse().unwrap());
+        declared.1.columns.clear();
+        declared.1.columns.insert(
+            "c_bbbbbb".parse().unwrap(),
+            "dbo.customer.id".parse().unwrap(),
+        );
+        for removed_role in [false, true] {
+            let mut declared = declared.clone();
+            if removed_role {
+                declared.0.roles.clear();
+                declared.1.roles.clear();
+            }
+            let mut changes = vec![
+                Change::Table(TableChange::DropTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: "dbo.customer".parse().unwrap(),
+                    detach_from: None,
+                }),
+                Change::Table(TableChange::RenameTable {
+                    uid: "t_bbbbbb".parse().unwrap(),
+                    from: "dbo.incoming".parse().unwrap(),
+                    to: "dbo.customer".parse().unwrap(),
+                    defaults: Vec::new(),
+                }),
+            ];
+            diff_roles(
+                Side {
+                    schema: &base.0,
+                    ids: &base.1,
+                },
+                Side {
+                    schema: &declared.0,
+                    ids: &declared.1,
+                },
+                &ClusterRoles,
+                &mut changes,
+            );
+            assert_eq!(
+                changes.len(),
+                if removed_role { 3 } else { 2 },
+                "{changes:?}"
+            );
+            if removed_role {
+                assert!(
+                    matches!(changes.last().unwrap(), Change::Permission(GrantChange::Revoke { target, permissions, .. }) if *target == "sequence::dbo.customer.id".parse().unwrap() && *permissions == [Permission::Usage].into())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_serial_conversion_takes_its_explicit_and_implied_grants_without_revokes() {
+        for source in [
+            ValueSource::None,
+            ValueSource::Default("7".into()),
+            ValueSource::Identity(pbps_model::Identity::new(1, 1)),
+        ] {
+            for implied in [false, true] {
+                for removed_role in [false, true] {
+                    for renamed in [false, true] {
+                        let grants = if implied {
+                            vec![(
+                                "dbo.customer",
+                                vec![Permission::Insert, Permission::SerialSequences],
+                            )]
+                        } else {
+                            vec![(
+                                "sequence::dbo.customer.id",
+                                vec![Permission::Usage, Permission::Select, Permission::Update],
+                            )]
+                        };
+                        let grants: Vec<_> = grants
+                            .iter()
+                            .map(|(target, rights)| (*target, rights.as_slice()))
+                            .collect();
+                        let mut base = serial_side(&grants);
+                        let mut other = Column::new(ty("int"));
+                        other.value_source =
+                            ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+                        base.0
+                            .tables
+                            .get_mut(&"dbo.customer".parse().unwrap())
+                            .unwrap()
+                            .columns
+                            .insert("other".into(), other);
+                        base.1.columns.insert(
+                            "c_bbbbbb".parse().unwrap(),
+                            "dbo.customer.other".parse().unwrap(),
+                        );
+                        let mut declared = base.clone();
+                        declared
+                            .0
+                            .tables
+                            .get_mut(&"dbo.customer".parse().unwrap())
+                            .unwrap()
+                            .columns["id"]
+                            .value_source = source.clone();
+                        let target = if renamed {
+                            let mut table = declared
+                                .0
+                                .tables
+                                .remove(&"dbo.customer".parse().unwrap())
+                                .unwrap();
+                            let column = table.columns.shift_remove("id").unwrap();
+                            table.columns.insert("converted".into(), column);
+                            declared
+                                .0
+                                .tables
+                                .insert("dbo.moved".parse().unwrap(), table);
+                            declared
+                                .1
+                                .tables
+                                .insert("t_aaaaaa".parse().unwrap(), "dbo.moved".parse().unwrap());
+                            declared.1.columns.insert(
+                                "c_aaaaaa".parse().unwrap(),
+                                "dbo.moved.converted".parse().unwrap(),
+                            );
+                            declared.1.columns.insert(
+                                "c_bbbbbb".parse().unwrap(),
+                                "dbo.moved.other".parse().unwrap(),
+                            );
+                            "sequence::dbo.moved.converted"
+                        } else {
+                            "sequence::dbo.customer.id"
+                        };
+                        if removed_role {
+                            declared.0.roles.clear();
+                            declared.1.roles.clear();
+                        } else {
+                            declared.0.roles.insert(
+                                "writer".into(),
+                                if implied {
+                                    role(&[(
+                                        if renamed { "dbo.moved" } else { "dbo.customer" },
+                                        &[Permission::Insert, Permission::SerialSequences],
+                                    )])
+                                } else {
+                                    Role::default()
+                                },
+                            );
+                        }
+                        let changes = diff(
+                            Side {
+                                schema: &base.0,
+                                ids: &base.1,
+                            },
+                            Side {
+                                schema: &declared.0,
+                                ids: &declared.1,
+                            },
+                            &ClusterRoles,
+                            &Hints::default(),
+                        )
+                        .unwrap();
+                        assert!(
+                            changes.changes.iter().any(|p| matches!(
+                                p.change,
+                                Change::Column(ColumnChange::AlterColumnNumbering { .. })
+                            )),
+                            "{changes:?}"
+                        );
+                        assert!(!changes.changes.iter().any(|p| matches!(&p.change,
+                            Change::Permission(GrantChange::Revoke { target: revoked, .. }) if *revoked == target.parse::<GrantTarget>().unwrap())),
+                            "source={source:?}, implied={implied}, removed role={removed_role}, renamed={renamed}: {changes:?}");
+                        // An unrelated serial survives the conversion. Its
+                        // permissions still need revoking with the role.
+                        let other = if renamed {
+                            "sequence::dbo.moved.other"
+                        } else {
+                            "sequence::dbo.customer.other"
+                        };
+                        assert_eq!(changes.changes.iter().any(|p| matches!(&p.change,
+                            Change::Permission(GrantChange::Revoke { target, permissions, .. }) if *target == other.parse::<GrantTarget>().unwrap() && permissions.contains(&Permission::Usage))), implied && removed_role, "{changes:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_surviving_serial_still_revokes_removed_explicit_grants() {
+        let rights = [Permission::Usage, Permission::Select, Permission::Update];
+        let base = serial_side(&[("sequence::dbo.customer.id", &rights)]);
+        let mut declared = base.clone();
+        declared.0.roles.get_mut("writer").unwrap().grants.clear();
+        let changes = diff(
+            Side {
+                schema: &base.0,
+                ids: &base.1,
+            },
+            Side {
+                schema: &declared.0,
+                ids: &declared.1,
+            },
+            &ClusterRoles,
+            &Hints::default(),
+        )
+        .unwrap();
+        assert_eq!(changes.changes.len(), 1, "{changes:?}");
+        assert!(
+            matches!(&changes.changes[0].change, Change::Permission(GrantChange::Revoke { target, permissions, .. })
+            if *target == "sequence::dbo.customer.id".parse().unwrap() && *permissions == rights.into())
+        );
+    }
+
+    #[test]
+    fn retuning_a_serial_keeps_explicit_and_implied_sequence_grants() {
+        for grants in [
+            vec![(
+                "sequence::dbo.customer.id",
+                vec![Permission::Usage, Permission::Select, Permission::Update],
+            )],
+            vec![(
+                "dbo.customer",
+                vec![Permission::Insert, Permission::SerialSequences],
+            )],
+        ] {
+            let grants: Vec<_> = grants
+                .iter()
+                .map(|(target, rights)| (*target, rights.as_slice()))
+                .collect();
+            let mut base = serial_side(&grants);
+            if let ValueSource::Sequence(sequence) = &mut base
+                .0
+                .tables
+                .get_mut(&"dbo.customer".parse().unwrap())
+                .unwrap()
+                .columns["id"]
+                .value_source
+            {
+                sequence.name = Some("old_sequence".into());
+            }
+            let mut declared = base.clone();
+            if let ValueSource::Sequence(sequence) = &mut declared
+                .0
+                .tables
+                .get_mut(&"dbo.customer".parse().unwrap())
+                .unwrap()
+                .columns["id"]
+                .value_source
+            {
+                sequence.start = 5;
+                sequence.name = Some("renamed_sequence".into());
+            }
+            let changes = diff(
+                Side {
+                    schema: &base.0,
+                    ids: &base.1,
+                },
+                Side {
+                    schema: &declared.0,
+                    ids: &declared.1,
+                },
+                &ClusterRoles,
+                &Hints::default(),
+            )
+            .unwrap();
+            assert_eq!(changes.changes.len(), 1, "{changes:?}");
+            assert!(matches!(
+                changes.changes[0].change,
+                Change::Column(ColumnChange::AlterColumnNumbering {
+                    from: ValueSource::Sequence(_),
+                    to: ValueSource::Sequence(_),
+                    ..
+                })
+            ));
+            assert!(
+                changes.changes.iter().all(|p| p.change.grant().is_none()),
+                "{changes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sequence_grants_follow_column_creation_and_are_reapplied_after_recreation() {
+        let desired = serial_side(&[(
+            "sequence::dbo.customer.id",
+            &[Permission::Usage, Permission::Select, Permission::Update],
+        )]);
+        for shape in ["new table", "add", "convert", "readd", "unchanged"] {
+            let mut base = desired.clone();
+            if shape == "new table" {
+                base.0.tables.clear();
+                base.1.tables.clear();
+                base.1.columns.clear();
+                base.0.roles.clear();
+                base.1.roles.clear();
+            } else if shape == "add" {
+                base.0
+                    .tables
+                    .get_mut(&"dbo.customer".parse().unwrap())
+                    .unwrap()
+                    .columns
+                    .clear();
+                base.1.columns.clear();
+                base.0.roles.get_mut("writer").unwrap().grants.clear();
+            } else if shape == "convert" {
+                base.0
+                    .tables
+                    .get_mut(&"dbo.customer".parse().unwrap())
+                    .unwrap()
+                    .columns["id"]
+                    .value_source = ValueSource::None;
+                base.0.roles.get_mut("writer").unwrap().grants.clear();
+            }
+            let mut declared = desired.clone();
+            if shape == "readd" {
+                declared.1.columns.clear();
+                declared.1.columns.insert(
+                    "c_bbbbbb".parse().unwrap(),
+                    "dbo.customer.id".parse().unwrap(),
+                );
+            }
+            // The ordinary ordering engine sees the same Grant target; no
+            // sequence-specific sort class or pass participates.
+            let changes = diff(
+                Side {
+                    schema: &base.0,
+                    ids: &base.1,
+                },
+                Side {
+                    schema: &declared.0,
+                    ids: &declared.1,
+                },
+                &ClusterRoles,
+                &Hints::default(),
+            )
+            .unwrap();
+            let grant = changes.changes.iter().position(|p| {
+                matches!(
+                    p.change,
+                    Change::Permission(GrantChange::Grant {
+                        target: GrantTarget::Sequence(_),
+                        ..
+                    })
+                )
+            });
+            if shape == "unchanged" {
+                assert!(grant.is_none());
+                continue;
+            }
+            let grant = grant.expect(shape);
+            assert!(grant > 0, "{shape}: {changes:?}");
+            assert!(
+                changes.changes[..grant].iter().any(|p| matches!(
+                    p.change,
+                    Change::Table(TableChange::CreateTable { .. })
+                        | Change::Column(ColumnChange::AddColumn { .. })
+                        | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+                )),
+                "{shape}: {changes:?}"
+            );
+            assert!(
+                matches!(&changes.changes[grant].change, Change::Permission(GrantChange::Grant { permissions, .. }) if *permissions == [Permission::Usage, Permission::Select, Permission::Update].into())
+            );
+        }
+        // Even equal textual grants need to be reapplied when an engine
+        // recreates the sequence during a numbering conversion.
+        let mut changes = vec![Change::Column(ColumnChange::AlterColumnNumbering {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: "dbo.customer.id".parse().unwrap(),
+            ty: ty("int"),
+            from: ValueSource::None,
+            to: ValueSource::Sequence(pbps_model::OwnedSequence::serial()),
+        })];
+        diff_roles(
+            Side {
+                schema: &desired.0,
+                ids: &desired.1,
+            },
+            Side {
+                schema: &desired.0,
+                ids: &desired.1,
+            },
+            &ClusterRoles,
+            &mut changes,
+        );
+        assert!(
+            matches!(changes.last().unwrap(), Change::Permission(GrantChange::Grant { target: GrantTarget::Sequence(_), permissions, .. }) if permissions.len() == 3)
+        );
+    }
+
+    /// One table `dbo.customer` (uid t_aaaaaa) on both sides, plus the
+    /// roles given, with `r_` uids minted from the name list.
+    fn side(roles: &[(&str, &str, Role)]) -> (Schema, IdsFile) {
+        let mut s = Schema::default();
+        let mut t = Table::default();
+        t.columns
+            .insert("id".into(), Column::new("int".parse().unwrap()));
+        s.tables.insert("dbo.customer".parse().unwrap(), t);
+        let mut ids = IdsFile::default();
+        ids.tables
+            .insert("t_aaaaaa".parse().unwrap(), "dbo.customer".parse().unwrap());
+        ids.columns.insert(
+            "c_aaaaaa".parse().unwrap(),
+            "dbo.customer.id".parse().unwrap(),
+        );
+        for (uid, name, role) in roles {
+            ids.roles
+                .insert(uid.parse().unwrap(), (*name).to_owned().into());
+            s.roles.insert((*name).to_owned().into(), role.clone());
+        }
+        (s, ids)
+    }
+
+    fn kinds(base: &(Schema, IdsFile), declared: &(Schema, IdsFile)) -> Vec<String> {
+        diff(
+            Side {
+                schema: &base.0,
+                ids: &base.1,
+            },
+            Side {
+                schema: &declared.0,
+                ids: &declared.1,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap()
+        .changes
+        .iter()
+        .map(|p| crate::schema_diff::tests::roles::describe(&p.change))
+        .collect()
+    }
+
+    /// A dialect whose roles are the *cluster's*, not the database's —
+    /// PostgreSQL's answer (ADR-0010 §3, DECISIONS 211). Numbering changes
+    /// are admitted for serial grant ordering; other answers delegate to
+    /// `MinimalDialect`.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct ClusterRoles;
+
+    impl pbps_dialect::Dialect for ClusterRoles {
+        fn name(&self) -> &'static str {
+            "cluster-roles"
+        }
+        fn changes_numbering(&self) -> bool {
+            true
+        }
+        fn manages_roles(&self) -> bool {
+            false
+        }
+        fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
+            MinimalDialect.quote_ident(ident)
+        }
+        fn intermediate_tables(
+            &self,
+            change: &Change,
+            strategy: pbps_model::Strategy,
+        ) -> Result<Vec<pbps_model::TableName>, pbps_dialect::DialectError> {
+            MinimalDialect.intermediate_tables(change, strategy)
+        }
+        fn normalize_type(
+            &self,
+            ty: &pbps_model::ColumnType,
+        ) -> Result<pbps_model::ColumnType, pbps_dialect::DialectError> {
+            MinimalDialect.normalize_type(ty)
+        }
+        fn type_change_risk(
+            &self,
+            from: &pbps_model::ColumnType,
+            to: &pbps_model::ColumnType,
+        ) -> pbps_dialect::TypeChangeRisk {
+            MinimalDialect.type_change_risk(from, to)
+        }
+        fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+            MinimalDialect.fold_ident(ident)
+        }
+        fn lexicon(&self) -> pbps_dialect::Lexicon {
+            MinimalDialect.lexicon()
+        }
+        fn validate_table(
+            &self,
+            name: &pbps_model::TableName,
+            table: &Table,
+        ) -> Vec<pbps_dialect::DialectError> {
+            MinimalDialect.validate_table(name, table)
+        }
+        fn transaction_framing(
+            &self,
+            zone: &pbps_model::SessionZone,
+        ) -> pbps_dialect::TransactionFraming {
+            MinimalDialect.transaction_framing(zone)
+        }
+        fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+            MinimalDialect.probe_framing()
+        }
+    }
+
+    fn kinds_on(
+        dialect: &(impl pbps_dialect::Dialect + ?Sized),
+        base: &(Schema, IdsFile),
+        declared: &(Schema, IdsFile),
+    ) -> Vec<String> {
+        diff(
+            Side {
+                schema: &base.0,
+                ids: &base.1,
+            },
+            Side {
+                schema: &declared.0,
+                ids: &declared.1,
+            },
+            dialect,
+            &Hints::default(),
+        )
+        .unwrap()
+        .changes
+        .iter()
+        .map(|p| describe(&p.change))
+        .collect()
+    }
+
+    /// The grants are managed either way; the *principal* is not. A plan
+    /// that carried a `CreateRole` here would refuse the only way a role
+    /// ever comes under management on such an engine — a DBA creates it in
+    /// the cluster and the project then declares it.
+    #[test]
+    fn a_declared_role_is_granted_without_being_created_where_the_cluster_owns_it() {
+        let base = side(&[]);
+        let declared = side(&[(
+            "r_aaaaaa",
+            "app_reader",
+            role(&[("dbo.customer", &[Permission::Select])]),
+        )]);
+        assert_eq!(
+            kinds_on(&ClusterRoles, &base, &declared),
+            ["grant app_reader dbo.customer select"]
+        );
+        // The same declaration on an engine that owns its roles creates
+        // it, which is what says this test is about the capability and not
+        // about the fixture.
+        assert_eq!(
+            kinds_on(&MinimalDialect, &base, &declared),
+            ["create app_reader", "grant app_reader dbo.customer select"]
+        );
+    }
+
+    /// `drop-role` revokes and unmanages. A plan that said "drop role" and
+    /// ran nothing would leave a principal still holding every permission
+    /// pbps was managing; one that really dropped it would reach every
+    /// other database in the cluster.
+    #[test]
+    fn a_dropped_role_has_its_grants_revoked_and_the_principal_left_standing() {
+        let base = side(&[(
+            "r_aaaaaa",
+            "app_reader",
+            role(&[
+                ("dbo.customer", &[Permission::Select, Permission::Insert]),
+                ("schema::dbo", &[Permission::Usage]),
+            ]),
+        )]);
+        let declared = side(&[]);
+        assert_eq!(
+            kinds_on(&ClusterRoles, &base, &declared),
+            [
+                "revoke app_reader dbo.customer select+insert",
+                "revoke app_reader schema::dbo usage",
+            ]
+        );
+        assert_eq!(
+            kinds_on(&MinimalDialect, &base, &declared),
+            ["drop app_reader"]
+        );
+    }
+
+    /// A revoke on an object the same plan drops would fail on an object
+    /// that is gone — the rule the per-target comparison already applies,
+    /// on the path that does not go through it.
+    #[test]
+    fn a_dropped_roles_grant_on_a_dropped_object_is_not_revoked() {
+        let base = side(&[(
+            "r_aaaaaa",
+            "app_reader",
+            role(&[("dbo.customer", &[Permission::Select])]),
+        )]);
+        let mut declared = side(&[]);
+        declared.0.tables.clear();
+        declared.1.tables.clear();
+        declared.1.columns.clear();
+        let k = kinds_on(&ClusterRoles, &base, &declared);
+        assert!(
+            !k.iter().any(|c| c.starts_with("revoke")),
+            "the DROP TABLE takes the permission with it: {k:?}"
+        );
+    }
+
+    /// A rename is a rename a human performed in the cluster, and an ACL
+    /// entry holds the role's oid rather than its name — so every grant
+    /// followed it, and the plan has nothing to re-grant.
+    #[test]
+    fn a_renamed_role_is_not_renamed_again_where_the_cluster_owns_the_principal() {
+        let base = side(&[(
+            "r_aaaaaa",
+            "old_name",
+            role(&[("dbo.customer", &[Permission::Select])]),
+        )]);
+        let declared = side(&[(
+            "r_aaaaaa",
+            "new_name",
+            role(&[("dbo.customer", &[Permission::Select])]),
+        )]);
+        assert!(kinds_on(&ClusterRoles, &base, &declared).is_empty());
+        assert_eq!(
+            kinds_on(&MinimalDialect, &base, &declared),
+            ["rename old_name->new_name"]
+        );
+    }
+
+    fn describe(c: &Change) -> String {
+        match c {
+            Change::Role(RoleChange::CreateRole { name, .. }) => format!(
+                "create {name}",
+                // Preserve the original spelling in this SQL or comparison fixture.
+                name = name.raw(),
+            ),
+            Change::Role(RoleChange::DropRole { name, .. }) => format!(
+                "drop {name}",
+                // Preserve the original spelling in this SQL or comparison fixture.
+                name = name.raw(),
+            ),
+            Change::Role(RoleChange::RenameRole { from, to, .. }) => format!(
+                "rename {from}->{to}",
+                // Preserve the original spelling in this SQL or comparison fixture.
+                from = from.raw(),
+                // Preserve the original spelling in this SQL or comparison fixture.
+                to = to.raw(),
+            ),
+            Change::Permission(GrantChange::Grant {
+                role,
+                target,
+                permissions,
+            }) => format!(
+                "grant {role} {target} {}",
+                permissions
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join("+"),
+                // Preserve the original spelling in this SQL or comparison fixture.
+                role = role.raw(),
+                target = target.raw(),
+            ),
+            Change::Permission(GrantChange::Revoke {
+                role,
+                target,
+                permissions,
+            }) => format!(
+                "revoke {role} {target} {}",
+                permissions
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join("+"),
+                // Preserve the original spelling in this SQL or comparison fixture.
+                role = role.raw(),
+                target = target.raw(),
+            ),
+            other => format!("{:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn a_new_role_is_created_and_then_granted_and_nothing_is_gated() {
+        let base = side(&[]);
+        let declared = side(&[(
+            "r_aaaaaa",
+            "app_reader",
+            role(&[("dbo.customer", &[Permission::Select, Permission::Insert])]),
+        )]);
+        let k = kinds(&base, &declared);
+        assert_eq!(
+            k,
+            [
+                "create app_reader",
+                "grant app_reader dbo.customer select+insert"
+            ]
+        );
+        let cs = diff(
+            Side {
+                schema: &base.0,
+                ids: &base.1,
+            },
+            Side {
+                schema: &declared.0,
+                ids: &declared.1,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap();
+        assert!(cs.risks().contains(&RiskClass::GrantWiden));
+        assert!(cs.unapproved_risks(&Default::default()).is_empty());
+    }
+
+    /// Only the difference: restating what the role already holds would
+    /// claim a widening that is not one, and dropping a permission is a
+    /// revoke behind the gate.
+    #[test]
+    fn grants_are_compared_per_target_and_only_the_difference_is_emitted() {
+        let base = side(&[(
+            "r_aaaaaa",
+            "app_reader",
+            role(&[
+                ("dbo.customer", &[Permission::Select, Permission::Insert]),
+                ("schema::app", &[Permission::Execute]),
+            ]),
+        )]);
+        let declared = side(&[(
+            "r_aaaaaa",
+            "app_reader",
+            role(&[
+                ("dbo.customer", &[Permission::Select, Permission::Update]),
+                ("schema::app", &[Permission::Execute]),
+            ]),
+        )]);
+        let k = kinds(&base, &declared);
+        assert_eq!(
+            k,
+            [
+                "revoke app_reader dbo.customer insert",
+                "grant app_reader dbo.customer update"
+            ]
+        );
+        let cs = diff(
+            Side {
+                schema: &base.0,
+                ids: &base.1,
+            },
+            Side {
+                schema: &declared.0,
+                ids: &declared.1,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            cs.unapproved_risks(&Default::default()),
+            [RiskClass::Revoke].into_iter().collect()
+        );
+        // The negative case: identical grants are no change at all.
+        assert!(kinds(&base, &base).is_empty());
+    }
+
+    #[test]
+    fn a_role_matched_by_uid_under_a_new_name_is_renamed_in_place() {
+        let base = side(&[(
+            "r_aaaaaa",
+            "reader",
+            role(&[("dbo.customer", &[Permission::Select])]),
+        )]);
+        let declared = side(&[(
+            "r_aaaaaa",
+            "app_reader",
+            role(&[("dbo.customer", &[Permission::Select])]),
+        )]);
+        assert_eq!(kinds(&base, &declared), ["rename reader->app_reader"]);
+    }
+
+    #[test]
+    fn a_role_gone_from_the_ids_is_dropped_behind_the_revoke_gate() {
+        let base = side(&[(
+            "r_aaaaaa",
+            "legacy",
+            role(&[("dbo.customer", &[Permission::Select])]),
+        )]);
+        let declared = side(&[]);
+        assert_eq!(kinds(&base, &declared), ["drop legacy"]);
+        let cs = diff(
+            Side {
+                schema: &base.0,
+                ids: &base.1,
+            },
+            Side {
+                schema: &declared.0,
+                ids: &declared.1,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap();
+        assert!(cs.risks().contains(&RiskClass::Revoke));
+    }
+
+    /// A grant follows its object through `sp_rename`, so a renamed table
+    /// must not come out as a revoke on the old name and a grant on the
+    /// new one.
+    #[test]
+    fn a_grant_on_a_renamed_table_is_not_revoked_and_regranted() {
+        let base = side(&[(
+            "r_aaaaaa",
+            "r",
+            role(&[("dbo.customer", &[Permission::Select])]),
+        )]);
+        let mut declared = side(&[(
+            "r_aaaaaa",
+            "r",
+            role(&[("dbo.client", &[Permission::Select])]),
+        )]);
+        let t = declared
+            .0
+            .tables
+            .remove(&"dbo.customer".parse().unwrap())
+            .unwrap();
+        declared.0.tables.insert("dbo.client".parse().unwrap(), t);
+        declared.1.rename_table(
+            &"dbo.customer".parse().unwrap(),
+            &"dbo.client".parse().unwrap(),
+        );
+        let k = kinds(&base, &declared);
+        assert!(
+            k.iter()
+                .all(|c| !c.starts_with("grant") && !c.starts_with("revoke")),
+            "{k:?}"
+        );
+    }
+
+    /// The drop takes the permission with it; a `REVOKE` after it would
+    /// fail on an object that is gone.
+    #[test]
+    fn a_grant_on_a_table_this_plan_drops_is_not_revoked() {
+        let base = side(&[(
+            "r_aaaaaa",
+            "r",
+            role(&[("dbo.customer", &[Permission::Select])]),
+        )]);
+        let mut declared = side(&[("r_aaaaaa", "r", role(&[]))]);
+        declared.0.tables.clear();
+        declared.1.tables.clear();
+        declared.1.columns.clear();
+        let k = kinds(&base, &declared);
+        assert!(k.iter().all(|c| !c.starts_with("revoke")), "{k:?}");
+    }
+
+    /// Where routines overload, a drop takes the grants of the one routine
+    /// it names and no other (ADR-0009 §1). Matching by name read the
+    /// sibling's grant as gone with the drop, and left the role holding a
+    /// permission the plan declared removed.
+    #[test]
+    fn a_dropped_overload_takes_only_its_own_grants() {
+        let routine = |id: &str, body: &str| {
+            (
+                id.parse::<ModuleId>().unwrap(),
+                pbps_model::Module {
+                    kind: pbps_model::ModuleKind::Function,
+                    description: None,
+                    definition: body.to_owned(),
+                    options: Default::default(),
+                },
+            )
+        };
+        let mut base = side(&[(
+            "r_aaaaaa",
+            "r",
+            role(&[
+                ("dbo.f(integer)", &[Permission::Execute]),
+                ("dbo.f(text)", &[Permission::Execute]),
+            ]),
+        )]);
+        base.0.modules.extend([
+            routine("dbo.f(integer)", "RETURN 1"),
+            routine("dbo.f(text)", "RETURN 'a'"),
+        ]);
+        // `dbo.f(integer)` is dropped; `dbo.f(text)` stays, and its grant
+        // is declared gone.
+        let mut declared = side(&[("r_aaaaaa", "r", role(&[]))]);
+        declared
+            .0
+            .modules
+            .extend([routine("dbo.f(text)", "RETURN 'a'")]);
+        let cs = diff(
+            Side {
+                schema: &base.0,
+                ids: &base.1,
+            },
+            Side {
+                schema: &declared.0,
+                ids: &declared.1,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap();
+        let revoked: Vec<String> = cs
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::Permission(GrantChange::Revoke { target, .. }) => {
+                    Some(target.raw().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(revoked, ["dbo.f(text)"], "{:?}", kinds(&base, &declared));
+        assert!(
+            cs.changes.iter().any(|p| matches!(
+                &p.change,
+                Change::Module(ModuleChange::DropModule { id, .. }) if id.raw().to_string() == "dbo.f(integer)"
+            )),
+            "{:?}",
+            kinds(&base, &declared)
+        );
+    }
+
+    /// The drop takes the permission with it, and the CREATE that follows
+    /// makes a bare object: every declared permission on it is a GRANT
+    /// again, even though the two grant sets read the same.
+    #[test]
+    fn a_grant_on_a_table_this_plan_drops_and_recreates_is_granted_again() {
+        let grants = role(&[("dbo.customer", &[Permission::Select])]);
+        let base = side(&[("r_aaaaaa", "r", grants.clone())]);
+        // The same name under a new identity: a drop and a create.
+        let mut declared = side(&[("r_aaaaaa", "r", grants)]);
+        declared.1.tables.clear();
+        declared.1.columns.clear();
+        declared
+            .1
+            .tables
+            .insert("t_bbbbbb".parse().unwrap(), "dbo.customer".parse().unwrap());
+        declared.1.columns.insert(
+            "c_bbbbbb".parse().unwrap(),
+            "dbo.customer.id".parse().unwrap(),
+        );
+        let cs = diff(
+            Side {
+                schema: &base.0,
+                ids: &base.1,
+            },
+            Side {
+                schema: &declared.0,
+                ids: &declared.1,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap();
+        let at = |pred: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| pred(&p.change));
+        let drop =
+            at(&|c| matches!(c, Change::Table(TableChange::DropTable { .. }))).expect("a drop");
+        let create =
+            at(&|c| matches!(c, Change::Table(TableChange::CreateTable { .. }))).expect("a create");
+        let grant = at(&|c| matches!(c, Change::Permission(GrantChange::Grant { .. })))
+            .expect("the grant again");
+        assert!(
+            at(&|c| matches!(c, Change::Permission(GrantChange::Revoke { .. }))).is_none(),
+            "{:?}",
+            kinds(&base, &declared)
+        );
+        // And the grant comes after the create, which comes after the drop.
+        assert!(drop < create && create < grant, "{drop} {create} {grant}");
+    }
+
+    /// A dialect whose `AlterModule` rebuilds the object, PostgreSQL's
+    /// answer (ADR-0009 §3, #248). Everything else is `MinimalDialect`'s,
+    /// the same isolation `ClusterRoles` gives `manages_roles` above.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct Rebuilds;
+
+    impl pbps_dialect::Dialect for Rebuilds {
+        fn name(&self) -> &'static str {
+            "rebuilds-modules"
+        }
+        fn rebuilds_modules(&self) -> bool {
+            true
+        }
+        fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
+            MinimalDialect.quote_ident(ident)
+        }
+        fn intermediate_tables(
+            &self,
+            change: &Change,
+            strategy: pbps_model::Strategy,
+        ) -> Result<Vec<pbps_model::TableName>, pbps_dialect::DialectError> {
+            MinimalDialect.intermediate_tables(change, strategy)
+        }
+        fn normalize_type(
+            &self,
+            ty: &pbps_model::ColumnType,
+        ) -> Result<pbps_model::ColumnType, pbps_dialect::DialectError> {
+            MinimalDialect.normalize_type(ty)
+        }
+        fn type_change_risk(
+            &self,
+            from: &pbps_model::ColumnType,
+            to: &pbps_model::ColumnType,
+        ) -> pbps_dialect::TypeChangeRisk {
+            MinimalDialect.type_change_risk(from, to)
+        }
+        fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+            MinimalDialect.fold_ident(ident)
+        }
+        fn lexicon(&self) -> pbps_dialect::Lexicon {
+            MinimalDialect.lexicon()
+        }
+        fn validate_table(
+            &self,
+            name: &pbps_model::TableName,
+            table: &Table,
+        ) -> Vec<pbps_dialect::DialectError> {
+            MinimalDialect.validate_table(name, table)
+        }
+        fn transaction_framing(
+            &self,
+            zone: &pbps_model::SessionZone,
+        ) -> pbps_dialect::TransactionFraming {
+            MinimalDialect.transaction_framing(zone)
+        }
+        fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+            MinimalDialect.probe_framing()
+        }
+    }
+
+    /// #314: a module the declarations did not change, handed back to be
+    /// rebuilt because a connected read found it depends on one that is
+    /// rebuilt, is rebuilt with its grant restated — the same as one the
+    /// declarations edited. An id the plan already changes, or one the
+    /// declarations do not have, is not rebuilt a second time or at all.
+    #[test]
+    fn a_module_handed_back_to_be_rebuilt_is_rebuilt_with_its_grant() {
+        let grants = role(&[("app.v", &[Permission::Select])]);
+        let mut base = side(&[("r_aaaaaa", "app_reader", grants.clone())]);
+        let mut declared = side(&[("r_aaaaaa", "app_reader", grants)]);
+        for s in [&mut base.0, &mut declared.0] {
+            s.modules.insert(
+                "app.v".parse().unwrap(),
+                a_module(pbps_model::ModuleKind::View, "SELECT a FROM app.t"),
+            );
+        }
+        let run = |also: &[&str]| {
+            diff_rebuilding(
+                Side {
+                    schema: &base.0,
+                    ids: &base.1,
+                },
+                Side {
+                    schema: &declared.0,
+                    ids: &declared.1,
+                },
+                &Rebuilds,
+                &Hints::default(),
+                &also.iter().map(|s| s.parse().unwrap()).collect(),
+            )
+            .unwrap()
+        };
+        let count = |cs: &ChangeSet, pred: &dyn Fn(&Change) -> bool| {
+            cs.changes.iter().filter(|p| pred(&p.change)).count()
+        };
+
+        let rebuilt = run(&["app.v"]);
+        assert_eq!(
+            count(&rebuilt, &|c| matches!(
+                c,
+                Change::Module(ModuleChange::AlterModule { .. })
+            )),
+            1
+        );
+        assert_eq!(
+            count(&rebuilt, &|c| matches!(
+                c,
+                Change::Permission(GrantChange::Grant { .. })
+            )),
+            1
+        );
+
+        // Nothing handed back: nothing changes.
+        assert!(run(&[]).changes.is_empty());
+        // Not declared: nothing to rebuild it from.
+        assert!(run(&["app.gone"]).changes.is_empty());
+    }
+
+    /// The whole point of #248: a module rebuild takes the object's ACL
+    /// with it on this engine, so a role's grant that neither side's
+    /// declaration changed is still gone afterwards unless the plan
+    /// restates it. `diff_roles` treats the `AlterModule` as a drop only
+    /// when the dialect says the engine rebuilds modules — on one that
+    /// does not (SQL Server's `CREATE OR ALTER`), restating an unchanged
+    /// grant would be noise nobody asked for, since nothing there took it
+    /// away.
+    #[test]
+    fn a_rebuilding_dialect_restates_an_unchanged_grant_after_the_alter() {
+        let grants = role(&[("app.v", &[Permission::Select])]);
+        let mut base = side(&[("r_aaaaaa", "app_reader", grants.clone())]);
+        base.0.modules.insert(
+            "app.v".parse().unwrap(),
+            a_module(pbps_model::ModuleKind::View, "SELECT a FROM app.t"),
+        );
+        let mut declared = side(&[("r_aaaaaa", "app_reader", grants)]);
+        declared.0.modules.insert(
+            "app.v".parse().unwrap(),
+            a_module(pbps_model::ModuleKind::View, "SELECT a, b FROM app.t"),
+        );
+
+        let run = |dialect: &dyn pbps_dialect::Dialect| {
+            diff(
+                Side {
+                    schema: &base.0,
+                    ids: &base.1,
+                },
+                Side {
+                    schema: &declared.0,
+                    ids: &declared.1,
+                },
+                dialect,
+                &Hints::default(),
+            )
+            .unwrap()
+        };
+
+        let rebuilt = run(&Rebuilds);
+        let at = |cs: &ChangeSet, pred: &dyn Fn(&Change) -> bool| {
+            cs.changes.iter().position(|p| pred(&p.change))
+        };
+        let alter = at(&rebuilt, &|c| {
+            matches!(c, Change::Module(ModuleChange::AlterModule { .. }))
+        })
+        .expect("the alter");
+        let grant = at(&rebuilt, &|c| {
+            matches!(c, Change::Permission(GrantChange::Grant { .. }))
+        })
+        .expect("the grant again");
+        assert!(
+            alter < grant,
+            "the grant must sort after the rebuild it restores"
+        );
+        match &rebuilt.changes[grant].change {
+            Change::Permission(GrantChange::Grant {
+                role,
+                target,
+                permissions,
+            }) => {
+                assert_eq!(role.raw(), "app_reader");
+                assert_eq!(target.raw().to_string(), "app.v");
+                assert_eq!(permissions, &[Permission::Select].into_iter().collect());
+            }
+            other => panic!("expected a grant, got {other:?}"),
+        }
+
+        // The engine whose `AlterModule` does not rebuild the object
+        // restates nothing: the grant was never taken away, so writing it
+        // again would be a change nobody declared.
+        let altered = run(&MinimalDialect);
+        assert!(
+            at(&altered, &|c| matches!(
+                c,
+                Change::Permission(GrantChange::Grant { .. })
+            ))
+            .is_none(),
+            "CREATE OR ALTER preserves the grant; restating it here is noise"
+        );
+    }
+
+    /// A revoke still follows the column renames, though the constraint
+    /// drops it used to share an ordering class with have moved ahead of
+    /// them.
+    ///
+    /// The drops moved because the engine refuses a rename while a check
+    /// or a filtered index names the column. A revoke has the opposite
+    /// need — it names the object as the renames leave it — so it could
+    /// not travel with them and took a class of its own. This is the
+    /// negative case for that split: nothing about the move may drag the
+    /// revoke forward with it.
+    #[test]
+    fn a_revoke_stays_behind_the_renames_the_drops_moved_ahead_of() {
+        let base = side(&[(
+            "r_aaaaaa",
+            "app",
+            role(&[("dbo.customer", &[Permission::Insert])]),
+        )]);
+        let mut declared = side(&[("r_aaaaaa", "app", role(&[]))]);
+        // And a column of that table is renamed in the same plan.
+        let t = declared
+            .0
+            .tables
+            .get_mut(&"dbo.customer".parse::<TableName>().unwrap())
+            .unwrap();
+        t.columns.clear();
+        t.columns
+            .insert("row_id".into(), Column::new("int".parse().unwrap()));
+        declared.1.columns.insert(
+            "c_aaaaaa".parse().unwrap(),
+            "dbo.customer.row_id".parse().unwrap(),
+        );
+
+        // `describe` names the role changes; a column rename falls to its
+        // discriminant, which is all this test needs from it.
+        let k = kinds(&base, &declared);
+        let at = |s: &str| {
+            k.iter()
+                .position(|c| c.starts_with(s))
+                .unwrap_or_else(|| panic!("{s} in {k:?}"))
+        };
+        assert!(at("Discriminant") < at("revoke"), "{k:?}");
+    }
+
+    /// The ordering: a revoke after the renames it may depend on, a grant
+    /// after every object exists and after the role does.
+    #[test]
+    fn role_changes_sort_where_their_statements_can_run() {
+        let base = side(&[(
+            "r_aaaaaa",
+            "old",
+            role(&[("dbo.customer", &[Permission::Insert])]),
+        )]);
+        let mut declared = side(&[
+            (
+                "r_aaaaaa",
+                "renamed",
+                role(&[("dbo.customer", &[Permission::Select])]),
+            ),
+            (
+                "r_bbbbbb",
+                "fresh",
+                role(&[("dbo.customer", &[Permission::Select])]),
+            ),
+        ]);
+        let mut t = Table::default();
+        t.columns
+            .insert("id".into(), Column::new("int".parse().unwrap()));
+        declared.0.tables.insert("dbo.extra".parse().unwrap(), t);
+        declared
+            .1
+            .tables
+            .insert("t_bbbbbb".parse().unwrap(), "dbo.extra".parse().unwrap());
+        let k = kinds(&base, &declared);
+        let at = |s: &str| {
+            k.iter()
+                .position(|c| c.starts_with(s))
+                .unwrap_or_else(|| panic!("{s} in {k:?}"))
+        };
+        assert!(at("rename") < at("revoke"), "{k:?}");
+        assert!(at("revoke") < at("create fresh"), "{k:?}");
+        assert!(at("create fresh") < at("grant fresh"), "{k:?}");
+        // CreateTable is a discriminant string here; it must precede grants.
+        let create_table = k
+            .iter()
+            .position(|c| c.starts_with("Discriminant"))
+            .unwrap();
+        assert!(create_table < at("grant"), "{k:?}");
+    }
+}
+
+/// `PUBLIC` execution on a routine this plan creates (issue #318,
+/// ADR-0010 §5).
+mod public_execution {
+    use super::*;
+    use pbps_model::GrantChange;
+    use pbps_model::ModuleChange;
+
+    /// PostgreSQL's two answers, on a dialect that is otherwise
+    /// `MinimalDialect` — the same isolation `Rebuilds` gives
+    /// `rebuilds_modules` in `roles` above.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct PublicExecutes;
+
+    impl pbps_dialect::Dialect for PublicExecutes {
+        fn name(&self) -> &'static str {
+            "public-executes"
+        }
+        fn rebuilds_modules(&self) -> bool {
+            true
+        }
+        fn creates_public_executable_routines(&self) -> bool {
+            true
+        }
+        fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
+            MinimalDialect.quote_ident(ident)
+        }
+        fn intermediate_tables(
+            &self,
+            change: &Change,
+            strategy: pbps_model::Strategy,
+        ) -> Result<Vec<pbps_model::TableName>, pbps_dialect::DialectError> {
+            MinimalDialect.intermediate_tables(change, strategy)
+        }
+        fn normalize_type(
+            &self,
+            ty: &ColumnType,
+        ) -> Result<ColumnType, pbps_dialect::DialectError> {
+            MinimalDialect.normalize_type(ty)
+        }
+        fn type_change_risk(
+            &self,
+            from: &ColumnType,
+            to: &ColumnType,
+        ) -> pbps_dialect::TypeChangeRisk {
+            MinimalDialect.type_change_risk(from, to)
+        }
+        fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+            MinimalDialect.fold_ident(ident)
+        }
+        fn lexicon(&self) -> pbps_dialect::Lexicon {
+            MinimalDialect.lexicon()
+        }
+        fn validate_table(
+            &self,
+            name: &TableName,
+            table: &Table,
+        ) -> Vec<pbps_dialect::DialectError> {
+            MinimalDialect.validate_table(name, table)
+        }
+        fn transaction_framing(
+            &self,
+            zone: &pbps_model::SessionZone,
+        ) -> pbps_dialect::TransactionFraming {
+            MinimalDialect.transaction_framing(zone)
+        }
+        fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+            MinimalDialect.probe_framing()
+        }
+        fn overloads(&self, kind: pbps_model::ModuleKind) -> bool {
+            matches!(
+                kind,
+                pbps_model::ModuleKind::Function | pbps_model::ModuleKind::Procedure
+            )
+        }
+    }
+
+    fn schema_with(specs: &[(&str, pbps_model::ModuleKind, &str)]) -> Schema {
+        let mut s = Schema::default();
+        for (id, kind, definition) in specs {
+            s.modules
+                .insert(id.parse().unwrap(), a_module(*kind, definition));
+        }
+        s
+    }
+
+    fn run(
+        dialect: &(impl Dialect + ?Sized),
+        base: &Schema,
+        declared: &Schema,
+        hints: &Hints,
+    ) -> ChangeSet {
+        let ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        diff(
+            Side {
+                schema: base,
+                ids: &ids,
+            },
+            Side {
+                schema: declared,
+                ids: &ids,
+            },
+            dialect,
+            hints,
+        )
+        .unwrap()
+        .changes()
+        .clone()
+    }
+
+    fn decided(cs: &ChangeSet) -> Vec<(String, PublicAccess, RoutineOrigin)> {
+        cs.changes
+            .iter()
+            .filter_map(|p| {
+                if let Change::Permission(GrantChange::PublicExecution {
+                    routine,
+                    access,
+                    origin,
+                }) = &p.change
+                {
+                    Some((routine.raw().to_string(), *access, *origin))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn closed(cs: &ChangeSet) -> Vec<(String, RoutineOrigin)> {
+        decided(cs)
+            .into_iter()
+            .filter(|(_, access, _)| *access == PublicAccess::Revoked)
+            .map(|(routine, _, origin)| (routine, origin))
+            .collect()
+    }
+
+    /// The whole of #318: a routine the plan creates must not be left
+    /// holding the engine's default, and the revoke that takes it away is
+    /// a change in the plan — not something the applier does afterwards,
+    /// which would be outside the checksum a human approved.
+    #[test]
+    fn a_created_routine_is_closed_to_public_in_the_plan() {
+        let declared = schema_with(&[(
+            "app.f(integer)",
+            pbps_model::ModuleKind::Function,
+            "RETURNS integer AS $$ SELECT 1 $$ LANGUAGE sql",
+        )]);
+        let cs = run(
+            &PublicExecutes,
+            &Schema::default(),
+            &declared,
+            &Hints::default(),
+        );
+        assert_eq!(
+            closed(&cs),
+            [("app.f(integer)".to_owned(), RoutineOrigin::Created)],
+            "{:?}",
+            kinds(&cs)
+        );
+        // And after the create, or it names an object that is not there.
+        let k = kinds(&cs);
+        let at = |name: &str| k.iter().position(|c| c == name).unwrap();
+        assert!(at("CreateModule") < at("PublicExecution"), "{k:?}");
+        // A routine nobody could execute a statement earlier loses
+        // nothing, so the gate is not asked: `--allow revoke` in front of
+        // every plan that declares a function is friction without safety.
+        assert!(cs.risks().is_empty(), "{:?}", cs.risks());
+    }
+
+    /// #687: each routine's `PUBLIC` decision is the statement right after
+    /// its own `CREATE`, not one after every module. In the autocommit
+    /// script `--sql` renders, anything between them is a window in which
+    /// the whole cluster can execute the new routine. Three routines, so a
+    /// placement after all modules, or one ordered by name alone, puts
+    /// another routine's `CREATE` in between.
+    #[test]
+    fn each_routine_is_closed_to_public_in_the_statement_after_its_create() {
+        let body = "RETURNS integer AS $$ SELECT 1 $$ LANGUAGE sql";
+        // `b` calls `a`, so `b` has a later create rank than its peers: its
+        // decision must follow its own rank, not sort at rank 0 ahead of
+        // the `CREATE` it settles.
+        let calls_a = "RETURNS integer AS $$ SELECT app.a(1) $$ LANGUAGE sql";
+        let declared = schema_with(&[
+            ("app.a(integer)", pbps_model::ModuleKind::Function, body),
+            ("app.b(integer)", pbps_model::ModuleKind::Function, calls_a),
+            ("app.c(integer)", pbps_model::ModuleKind::Function, body),
+        ]);
+        let cs = run(
+            &PublicExecutes,
+            &Schema::default(),
+            &declared,
+            &Hints::default(),
+        );
+        let mut closed = 0;
+        for (at, planned) in cs.changes.iter().enumerate() {
+            if let Change::Permission(GrantChange::PublicExecution { routine, .. }) =
+                &planned.change
+            {
+                closed += 1;
+                let before = at.checked_sub(1).map(|i| &cs.changes[i].change);
+                assert!(
+                    matches!(
+                        before,
+                        Some(Change::Module(ModuleChange::CreateModule { id: ModuleId::Routine(r), .. })) if r == routine
+                    ),
+                    "{} is not settled right after its own CREATE: {:?}",
+                    routine.shown(),
+                    kinds(&cs)
+                );
+            }
+        }
+        assert_eq!(closed, 3, "{:?}", kinds(&cs));
+    }
+
+    /// The opt-out the user writes. One line in the declaration, so the
+    /// decision goes through the merge request and into the checksum.
+    #[test]
+    fn a_declaration_that_asks_for_public_execution_keeps_it() {
+        let declared = schema_with(&[(
+            "app.f(integer)",
+            pbps_model::ModuleKind::Function,
+            "RETURNS integer AS $$ SELECT 1 $$ LANGUAGE sql",
+        )]);
+        let mut hints = Hints::default();
+        hints
+            .public_execute
+            .insert("app.f(integer)".parse().unwrap());
+        let cs = run(&PublicExecutes, &Schema::default(), &declared, &hints);
+        assert!(closed(&cs).is_empty(), "{:?}", kinds(&cs));
+        // Said out loud, not by silence. A plan that carried nothing here
+        // could not be told from one with no opinion, and the connected
+        // rebuild guard has to tell those apart — see the rebuild case
+        // below. It widens, and says so.
+        assert_eq!(
+            decided(&cs),
+            [(
+                "app.f(integer)".to_owned(),
+                PublicAccess::Kept,
+                RoutineOrigin::Created
+            )],
+            "{:?}",
+            kinds(&cs)
+        );
+        assert!(
+            cs.risks().contains(&RiskClass::GrantWiden),
+            "{:?}",
+            cs.risks()
+        );
+        // And it is the *signature* that opts in, not the name: the other
+        // overload is still closed.
+        let both = schema_with(&[
+            (
+                "app.f(integer)",
+                pbps_model::ModuleKind::Function,
+                "RETURNS integer AS $$ SELECT 1 $$ LANGUAGE sql",
+            ),
+            (
+                "app.f(text)",
+                pbps_model::ModuleKind::Function,
+                "RETURNS integer AS $$ SELECT 2 $$ LANGUAGE sql",
+            ),
+        ]);
+        let cs = run(&PublicExecutes, &Schema::default(), &both, &hints);
+        assert_eq!(
+            closed(&cs),
+            [("app.f(text)".to_owned(), RoutineOrigin::Created)],
+            "{:?}",
+            kinds(&cs)
+        );
+    }
+
+    /// A rebuild is the risky half and says so. The `CREATE` inside it
+    /// restores the engine default, and whether anybody was relying on
+    /// that default is not in the declarations — so the gate is asked,
+    /// which is exactly what it is not asked for a fresh routine.
+    #[test]
+    fn a_rebuilt_routine_faces_the_gate_and_a_fresh_one_does_not() {
+        let base = schema_with(&[(
+            "app.f(integer)",
+            pbps_model::ModuleKind::Function,
+            "RETURNS integer AS $$ SELECT 1 $$ LANGUAGE sql",
+        )]);
+        let declared = schema_with(&[(
+            "app.f(integer)",
+            pbps_model::ModuleKind::Function,
+            "RETURNS integer AS $$ SELECT 2 $$ LANGUAGE sql",
+        )]);
+        let cs = run(&PublicExecutes, &base, &declared, &Hints::default());
+        assert_eq!(
+            closed(&cs),
+            [("app.f(integer)".to_owned(), RoutineOrigin::Rebuilt)],
+            "{:?}",
+            kinds(&cs)
+        );
+        assert!(cs.risks().contains(&RiskClass::Revoke), "{:?}", cs.risks());
+    }
+
+    /// The case a plan that only ever *revoked* got wrong: a routine
+    /// somebody closed, whose declaration now asks for the default back,
+    /// and whose definition changed in the same revision.
+    ///
+    /// On this engine the rebuild's `CREATE` restores the default by
+    /// itself, so there is no statement to write — and a plan that
+    /// therefore said nothing could not be told from one with no opinion.
+    /// `crate::pbps_pg::modules::before_a_rebuild` refuses a missing
+    /// default it finds no recorded intent for, so silence here refused a
+    /// valid rebuild for the very state it had been asked to reach.
+    #[test]
+    fn an_opted_in_rebuild_records_the_decision_rather_than_staying_silent() {
+        let base = schema_with(&[(
+            "app.f(integer)",
+            pbps_model::ModuleKind::Function,
+            "RETURNS integer AS $$ SELECT 1 $$ LANGUAGE sql",
+        )]);
+        let declared = schema_with(&[(
+            "app.f(integer)",
+            pbps_model::ModuleKind::Function,
+            "RETURNS integer AS $$ SELECT 2 $$ LANGUAGE sql",
+        )]);
+        let mut hints = Hints::default();
+        hints
+            .public_execute
+            .insert("app.f(integer)".parse().unwrap());
+        let cs = run(&PublicExecutes, &base, &declared, &hints);
+        assert_eq!(
+            decided(&cs),
+            [(
+                "app.f(integer)".to_owned(),
+                PublicAccess::Kept,
+                RoutineOrigin::Rebuilt
+            )],
+            "{:?}",
+            kinds(&cs)
+        );
+        // Nothing is taken away, so the revoke gate is not asked — but
+        // the routine stays open to every principal, and that is
+        // labelled.
+        assert!(!cs.risks().contains(&RiskClass::Revoke), "{:?}", cs.risks());
+        assert!(
+            cs.risks().contains(&RiskClass::GrantWiden),
+            "{:?}",
+            cs.risks()
+        );
+    }
+
+    /// A view has no `EXECUTE` and a trigger is invoked by nobody, so
+    /// neither is ever named by one of these.
+    #[test]
+    fn only_a_routine_is_closed_to_public() {
+        let declared = schema_with(&[
+            ("app.v", pbps_model::ModuleKind::View, "SELECT 1"),
+            (
+                "app.t.tr",
+                pbps_model::ModuleKind::Trigger,
+                "AFTER INSERT AS SELECT 1",
+            ),
+        ]);
+        let cs = run(
+            &PublicExecutes,
+            &Schema::default(),
+            &declared,
+            &Hints::default(),
+        );
+        assert!(decided(&cs).is_empty(), "{:?}", kinds(&cs));
+    }
+
+    /// An engine whose `CREATE` grants nobody `EXECUTE` gets none of
+    /// this. Emitting the revoke there would take access away from SQL
+    /// Server's real `public` role that nothing in the project granted.
+    #[test]
+    fn an_engine_without_the_default_is_left_alone() {
+        let declared = schema_with(&[(
+            "app.f(integer)",
+            pbps_model::ModuleKind::Function,
+            "RETURNS integer AS $$ SELECT 1 $$ LANGUAGE sql",
+        )]);
+        let cs = run(
+            &MinimalDialect,
+            &Schema::default(),
+            &declared,
+            &Hints::default(),
+        );
+        assert!(decided(&cs).is_empty(), "{:?}", kinds(&cs));
+    }
+}
+
+/// A declaration that leaves the primary key unnamed matches whatever
+/// name the engine invented; only a named declaration, or different
+/// columns, is a change.
+#[test]
+fn an_unnamed_declared_primary_key_matches_any_stored_name() {
+    let mut base_t = Table::default();
+    base_t
+        .columns
+        .insert("id".into(), Column::new("int".parse().unwrap()));
+    base_t.primary_key = Some(pbps_model::PrimaryKey {
+        name: Some("PK__t__357D4CF8312E0151".into()),
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+        filegroup: None,
+    });
+    let mut declared_t = base_t.clone();
+    declared_t.primary_key = Some(pbps_model::PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+        filegroup: None,
+    });
+    let mut changes = Vec::new();
+    diff_constraints(
+        &"dbo.t".parse().unwrap(),
+        &base_t,
+        &declared_t,
+        &mut changes,
+        &mut Vec::new(),
+    );
+    assert!(changes.is_empty(), "{changes:?}");
+
+    // The negative cases: other columns, or a name of its own.
+    declared_t.primary_key = Some(pbps_model::PrimaryKey {
+        name: None,
+        columns: vec!["other".into()],
+        storage_parameters: Default::default(),
+        filegroup: None,
+    });
+    let mut changes = Vec::new();
+    diff_constraints(
+        &"dbo.t".parse().unwrap(),
+        &base_t,
+        &declared_t,
+        &mut changes,
+        &mut Vec::new(),
+    );
+    assert!(
+        matches!(
+            changes.as_slice(),
+            [
+                Change::Constraint(ConstraintChange::SetPrimaryKey { to: None, .. }),
+                Change::Constraint(ConstraintChange::SetPrimaryKey { from: None, .. })
+            ]
+        ),
+        "a replaced key is its drop and its add: {changes:?}"
+    );
+    declared_t.primary_key = Some(pbps_model::PrimaryKey {
+        name: Some("pk_t".into()),
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+        filegroup: None,
+    });
+    let mut changes = Vec::new();
+    diff_constraints(
+        &"dbo.t".parse().unwrap(),
+        &base_t,
+        &declared_t,
+        &mut changes,
+        &mut Vec::new(),
+    );
+    assert!(
+        matches!(
+            changes.as_slice(),
+            [
+                Change::Constraint(ConstraintChange::SetPrimaryKey { to: None, .. }),
+                Change::Constraint(ConstraintChange::SetPrimaryKey { from: None, .. })
+            ]
+        ),
+        "a named key is compared in full: {changes:?}"
+    );
+}
+
+/// A role that holds another dropped role has to be dropped first: its
+/// membership cleanup names a principal the other drop would have taken
+/// away, and the engine refuses that by name.
+#[test]
+fn a_role_holding_another_dropped_role_is_dropped_before_it() {
+    use pbps_model::RoleChange;
+    use pbps_model::{Change, PlannedChange};
+    let drop = |name: &str, members: &[&str]| {
+        PlannedChange::new(Change::Role(RoleChange::DropRole {
+            uid: "r_aaaaaa".parse().unwrap(),
+            name: name.to_owned().into(),
+            members: members.iter().map(|m| (*m).into()).collect(),
+        }))
+    };
+    // `a` is a member of `z`, and `z` of `top`: the name tiebreaker alone
+    // would emit them a, top, z — every one of them wrong.
+    let planned = vec![drop("a", &[]), drop("z", &["a"]), drop("top", &["z"])];
+    let depth = super::member_depth(&planned);
+    assert_eq!(depth["top"], 0);
+    assert_eq!(depth["z"], 1);
+    assert_eq!(depth["a"], 2);
+
+    // A member that is not itself dropped is nobody's rank, and a plan
+    // whose roles hold none of each other keeps the order it had.
+    let flat = vec![drop("a", &["some_user"]), drop("z", &[])];
+    let depth = super::member_depth(&flat);
+    assert_eq!(depth["a"], 0);
+    assert_eq!(depth["z"], 0);
+    assert!(!depth.contains_key("some_user"));
+}
+
+/// The differ never sees a dropped role's members — `plan --db` writes
+/// them in afterwards — so the parent-first order has to be applied again
+/// once they are known, over the slots the drops already occupy, with
+/// everything else where it was (DECISIONS 139).
+#[test]
+fn role_drops_are_reordered_parent_first_once_their_members_are_known() {
+    use pbps_model::RoleChange;
+    use pbps_model::TableChange;
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+    let drop = |name: &str, members: &[&str]| {
+        PlannedChange::new(Change::Role(RoleChange::DropRole {
+            uid: "r_aaaaaa".parse().unwrap(),
+            name: name.to_owned().into(),
+            members: members.iter().map(|m| (*m).into()).collect(),
+        }))
+    };
+    let other = PlannedChange::new(Change::Table(TableChange::DropTable {
+        uid: "t_aaaaaa".parse().unwrap(),
+        name: TableName::new("dbo", "gone"),
+        detach_from: None,
+    }));
+    // As the differ left them: name order, with a table drop in between.
+    let mut cs = ChangeSet {
+        changes: vec![
+            drop("a", &["some_user"]),
+            other.clone(),
+            drop("top", &["z"]),
+            drop("z", &["a"]),
+        ],
+    };
+    let mut legacy = cs.clone();
+    crate::order::roles::legacy::legacy_order(&mut legacy);
+    cs = crate::order::role_drops(crate::order::propose(cs))
+        .unwrap()
+        .changes()
+        .clone();
+    assert_eq!(cs, legacy);
+    assert_eq!(
+        crate::order::roles::legacy::checksum(&cs),
+        crate::order::roles::legacy::checksum(&legacy)
+    );
+    let names: Vec<String> = cs
+        .changes
+        .iter()
+        .map(|p| match &p.change {
+            Change::Role(RoleChange::DropRole { name, .. }) => name.raw().to_owned(),
+            _ => "table".to_owned(),
+        })
+        .collect();
+    assert_eq!(names, ["top", "table", "z", "a"]);
+
+    // Nothing holding anything: untouched.
+    let mut flat = ChangeSet {
+        changes: vec![drop("a", &[]), other, drop("z", &["some_user"])],
+    };
+    let before = format!("{:?}", flat.changes);
+    let mut legacy = flat.clone();
+    crate::order::roles::legacy::legacy_order(&mut legacy);
+    flat = crate::order::role_drops(crate::order::propose(flat))
+        .unwrap()
+        .changes()
+        .clone();
+    assert_eq!(flat, legacy);
+    assert_eq!(format!("{:?}", flat.changes), before);
+}
+
+#[test]
+fn restoration_comparison_uses_each_parts_differ_equivalence() {
+    use pbps_model::{
+        CheckConstraint, Column, ColumnType, ComputedColumn, ForeignKey, Index, IndexColumn,
+        IndexKey, Part, PrimaryKey, ReferentialAction, Table, TableName, Uid, UniqueConstraint,
+    };
+    let table: TableName = "app.t".parse().unwrap();
+    let parent: TableName = "app.parent".parse().unwrap();
+    let renamed: TableName = "app.renamed".parse().unwrap();
+    let owner: Uid = "t_aaaaaa".parse().unwrap();
+    let reference: Uid = "t_bbbbbb".parse().unwrap();
+    let key = || IndexColumn {
+        key: IndexKey::Column("old".into()),
+        descending: false,
+        opclass: None,
+        collation: None,
+        opclass_parameters: Default::default(),
+    };
+    for kind in [
+        Part::Computed,
+        Part::PrimaryKey,
+        Part::Unique,
+        Part::Check,
+        Part::ForeignKey,
+        Part::Index,
+    ] {
+        let mut shape = Table::default();
+        for column in ["old", "other"] {
+            let mut spec = Column::new(ColumnType::simple("integer"));
+            spec.nullable = false;
+            shape.columns.insert(column.into(), spec);
+        }
+        match kind {
+            Part::Computed => {
+                shape.computed.insert(
+                    "derived".into(),
+                    ComputedColumn {
+                        expression: "old + 1".into(),
+                        persisted: true,
+                        not_null: true,
+                    },
+                );
+            }
+            Part::PrimaryKey => {
+                shape.primary_key = Some(PrimaryKey {
+                    name: Some("PK__generated".into()),
+                    columns: vec!["old".into()],
+                    storage_parameters: Default::default(),
+                    filegroup: None,
+                })
+            }
+            Part::Unique => {
+                shape.unique.insert(
+                    "uq".into(),
+                    UniqueConstraint {
+                        columns: vec!["old".into()],
+                        storage_parameters: Default::default(),
+                        filegroup: None,
+                    },
+                );
+            }
+            Part::Check => {
+                shape.checks.insert(
+                    "ck".into(),
+                    CheckConstraint {
+                        expression: "old > 0".into(),
+                    },
+                );
+            }
+            Part::ForeignKey => {
+                shape.foreign_keys.insert(
+                    "fk".into(),
+                    ForeignKey {
+                        columns: vec!["old".into()],
+                        references_table: parent.clone(),
+                        references_columns: vec!["old".into()],
+                        on_delete: Default::default(),
+                        on_update: Default::default(),
+                    },
+                );
+            }
+            Part::Index => {
+                shape.indexes.insert(
+                    "ix".into(),
+                    Index {
+                        columns: vec![key()],
+                        include: vec![],
+                        unique: true,
+                        filter: None,
+                        method: Default::default(),
+                        storage_parameters: Default::default(),
+                        filegroup: None,
+                    },
+                );
+            }
+            Part::Policy | Part::Exclusion => unreachable!(),
+        }
+        let mut referenced = Table {
+            columns: shape.columns.clone(),
+            ..Default::default()
+        };
+        referenced.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["old".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        });
+        let before = Schema {
+            tables: [(table.clone(), shape.clone()), (parent.clone(), referenced)].into(),
+            ..Default::default()
+        };
+        let old = IdsFile {
+            tables: [
+                (owner.clone(), table.clone()),
+                (reference.clone(), parent.clone()),
+            ]
+            .into(),
+            columns: [
+                ("c_aaaaaa".parse().unwrap(), table.column("old")),
+                ("c_bbbbbb".parse().unwrap(), table.column("other")),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let mut canonical = before.clone();
+        let mut new = old.clone();
+        let after = canonical.tables.get_mut(&table).unwrap();
+        match kind {
+            // The catalog infers NOT NULL; its absence in YAML is not a change.
+            Part::Computed => after.computed.get_mut("derived").unwrap().not_null = false,
+            // The declaration leaves a generated constraint name to the engine.
+            Part::PrimaryKey => after.primary_key.as_mut().unwrap().name = None,
+            // Parameter-only edits keep the same unique restriction.
+            Part::Unique => {
+                after
+                    .unique
+                    .get_mut("uq")
+                    .unwrap()
+                    .storage_parameters
+                    .insert("fillfactor".into(), "80".into());
+            }
+            Part::Index => {
+                after
+                    .indexes
+                    .get_mut("ix")
+                    .unwrap()
+                    .storage_parameters
+                    .insert("fillfactor".into(), "80".into());
+            }
+            // Rename remapping belongs to the differ, including referenced UIDs.
+            Part::ForeignKey => {
+                after.foreign_keys.get_mut("fk").unwrap().references_table = renamed.clone();
+                let shape = canonical.tables.remove(&parent).unwrap();
+                canonical.tables.insert(renamed.clone(), shape);
+                new.tables.insert(reference.clone(), renamed.clone());
+            }
+            Part::Check => {}
+            Part::Policy | Part::Exclusion => unreachable!(),
+        }
+        for changed in [false, true] {
+            let mut desired = canonical.clone();
+            let after = desired.tables.get_mut(&table).unwrap();
+            if changed {
+                match kind {
+                    Part::Computed => {
+                        after.computed.get_mut("derived").unwrap().expression = "other + 1".into()
+                    }
+                    Part::PrimaryKey => {
+                        after.primary_key.as_mut().unwrap().columns = vec!["other".into()]
+                    }
+                    Part::Unique => {
+                        after.unique.get_mut("uq").unwrap().columns = vec!["other".into()]
+                    }
+                    Part::Check => {
+                        after.checks.get_mut("ck").unwrap().expression = "old > 10".into()
+                    }
+                    Part::ForeignKey => {
+                        after.foreign_keys.get_mut("fk").unwrap().on_delete =
+                            ReferentialAction::Cascade
+                    }
+                    Part::Index => {
+                        after.indexes.get_mut("ix").unwrap().columns[0].key =
+                            IndexKey::Column("other".into())
+                    }
+                    Part::Policy | Part::Exclusion => unreachable!(),
+                }
+            }
+            let restoration = match kind {
+                Part::Computed => Change::Column(ColumnChange::DropComputedColumn {
+                    table: table.clone(),
+                    name: "derived".into(),
+                    computed: shape.computed["derived"].clone(),
+                }),
+                Part::PrimaryKey => Change::Constraint(ConstraintChange::SetPrimaryKey {
+                    table: table.clone(),
+                    from: None,
+                    to: after.primary_key.clone(),
+                    nonclustered: !after.primary_key_is_clustered(),
+                }),
+                Part::Unique => Change::Constraint(ConstraintChange::AddUnique {
+                    table: table.clone(),
+                    name: "uq".into(),
+                    constraint: after.unique["uq"].clone(),
+                    clustered: after.unique_is_clustered("uq"),
+                }),
+                // The physical rebuild can carry the engine's expression spelling.
+                Part::Check => Change::Constraint(ConstraintChange::AddCheck {
+                    table: table.clone(),
+                    name: "ck".into(),
+                    constraint: CheckConstraint {
+                        expression: if changed { "old > 10" } else { "((old)>(0))" }.into(),
+                    },
+                }),
+                Part::ForeignKey => Change::Constraint(ConstraintChange::AddForeignKey {
+                    table: table.clone(),
+                    name: "fk".into(),
+                    constraint: Box::new(after.foreign_keys["fk"].clone()),
+                }),
+                Part::Index => Change::Index(IndexChange::AddIndex {
+                    table: table.clone(),
+                    name: "ix".into(),
+                    index: Box::new(after.indexes["ix"].clone()),
+                    clustered: after.index_is_clustered("ix"),
+                }),
+                Part::Policy | Part::Exclusion => unreachable!(),
+            };
+            let compare = restoration_comparison(
+                Side {
+                    schema: &before,
+                    ids: &old,
+                },
+                Side {
+                    schema: &desired,
+                    ids: &new,
+                },
+                &MinimalDialect,
+            );
+            assert_eq!(
+                compare(&restoration, Some(&owner)),
+                !changed,
+                "{kind:?}, changed={changed}"
+            );
+            assert!(!compare(&restoration, None), "a part needs its owner");
+            let absent = IdsFile::default();
+            let unavailable = restoration_comparison(
+                Side {
+                    schema: &before,
+                    ids: &absent,
+                },
+                Side {
+                    schema: &desired,
+                    ids: &new,
+                },
+                &MinimalDialect,
+            );
+            assert!(!unavailable(&restoration, Some(&owner)));
+        }
+    }
+}
+
+#[test]
+fn module_decisions_preserve_the_differs_normalization_and_rebuild_boundary() {
+    let before = Module {
+        kind: pbps_model::ModuleKind::View,
+        definition: "CREATE VIEW app.v AS SELECT 1".into(),
+        description: None,
+        options: Default::default(),
+    };
+    let id: ModuleId = "app.v".parse().unwrap();
+    for case in ["description", "formatting", "body", "options", "kind"] {
+        let mut after = before.clone();
+        let expected = match case {
+            "description" => {
+                after.description = Some("report".into());
+                ModuleDelta::Unchanged
+            }
+            "formatting" => {
+                after.definition = "CREATE VIEW app.v AS\r\n SELECT 1\n".into();
+                ModuleDelta::Unchanged
+            }
+            "body" => {
+                after.definition = "CREATE VIEW app.v AS SELECT 2".into();
+                ModuleDelta::Alter
+            }
+            "options" => {
+                after.options.schemabinding = true;
+                ModuleDelta::Alter
+            }
+            "kind" => {
+                after.kind = pbps_model::ModuleKind::Procedure;
+                ModuleDelta::Rebuild
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            module_delta(&before, &after, &MinimalDialect),
+            expected,
+            "{case}"
+        );
+        let base = Schema {
+            modules: [(id.clone(), before.clone())].into(),
+            ..Default::default()
+        };
+        let declared = Schema {
+            modules: [(id.clone(), after.clone())].into(),
+            ..Default::default()
+        };
+        let mut changes = Vec::new();
+        diff_modules(
+            &base,
+            &declared,
+            &BTreeSet::new(),
+            &MinimalDialect,
+            &mut changes,
+        );
+        assert_eq!(
+            changes.len(),
+            match expected {
+                ModuleDelta::Unchanged => 0,
+                ModuleDelta::Alter => 1,
+                ModuleDelta::Rebuild => 2,
+            },
+            "{case}"
+        );
+        let ids = IdsFile::default();
+        let compare = restoration_comparison(
+            Side {
+                schema: &base,
+                ids: &ids,
+            },
+            Side {
+                schema: &declared,
+                ids: &ids,
+            },
+            &MinimalDialect,
+        );
+        let drop = Change::Module(ModuleChange::DropModule {
+            id: id.clone(),
+            kind: before.kind,
+        });
+        let create = Change::Module(ModuleChange::CreateModule {
+            id: id.clone(),
+            module: Box::new(after),
+        });
+        for change in [&drop, &create] {
+            assert_eq!(
+                compare(change, None),
+                expected == ModuleDelta::Unchanged,
+                "{case}"
+            );
+        }
+        let missing = Schema::default();
+        let unavailable = restoration_comparison(
+            Side {
+                schema: &base,
+                ids: &ids,
+            },
+            Side {
+                schema: &missing,
+                ids: &ids,
+            },
+            &MinimalDialect,
+        );
+        assert!(!unavailable(&drop, None));
+    }
+}
+
+#[test]
+fn default_decisions_compare_the_declared_opaque_expression_and_its_absence() {
+    for (before, after, different) in [
+        (None, None, false),
+        (Some("app.f()"), Some("app.f()"), false),
+        (None, Some("app.f()"), true),
+        (Some("app.f()"), None, true),
+        (Some("app.f()"), Some("app.f() + 1"), true),
+    ] {
+        let before = before.map(str::to_owned);
+        let after = after.map(str::to_owned);
+        assert_eq!(defaults_differ(before.as_ref(), after.as_ref()), different);
+    }
+}
+
+#[test]
+fn restoration_comparison_distinguishes_unchanged_defaults_from_edits_and_missing_identity() {
+    use pbps_model::{PartitionBound, PartitionColumn, PartitionOf};
+    let parent: TableName = "app.parent".parse().unwrap();
+    let name: TableName = "app.t".parse().unwrap();
+    let owner: Uid = "t_aaaaaa".parse().unwrap();
+    let column: Uid = "c_aaaaaa".parse().unwrap();
+    for partition in [false, true] {
+        let mut spec = Column::new(ty("int"));
+        spec.value_source = ValueSource::Default("app.f()".into());
+        let shape = table(&[("old", spec)]);
+        let mut before = schema_of("app.t", shape.clone());
+        if partition {
+            before.tables.insert(parent.clone(), shape);
+            before.tables.insert(
+                name.clone(),
+                Table {
+                    partition_of: Some(PartitionOf {
+                        parent: parent.clone(),
+                        bound: PartitionBound::Default,
+                        columns: [(
+                            "old".into(),
+                            PartitionColumn {
+                                default: Some("app.f()".into()),
+                                not_null: false,
+                            },
+                        )]
+                        .into(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+        let ids = IdsFile {
+            tables: [
+                (owner.clone(), name.clone()),
+                ("t_bbbbbb".parse().unwrap(), parent.clone()),
+            ]
+            .into(),
+            columns: [(
+                column.clone(),
+                if partition {
+                    parent.column("old")
+                } else {
+                    name.column("old")
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        for changed in [false, true] {
+            let mut after = before.clone();
+            let desired = if changed { "app.f() + 1" } else { "app.f()" };
+            let shape = after.tables.get_mut(&name).unwrap();
+            if partition {
+                shape
+                    .partition_of
+                    .as_mut()
+                    .unwrap()
+                    .columns
+                    .get_mut("old")
+                    .unwrap()
+                    .default = Some(desired.into());
+            } else {
+                shape.columns.get_mut("old").unwrap().value_source =
+                    ValueSource::Default(desired.into());
+            }
+            let compare = restoration_comparison(
+                Side {
+                    schema: &before,
+                    ids: &ids,
+                },
+                Side {
+                    schema: &after,
+                    ids: &ids,
+                },
+                &MinimalDialect,
+            );
+            for (from, to) in [(Some("app.f()".into()), None), (None, Some(desired.into()))] {
+                let change = if partition {
+                    Change::Partition(PartitionChange::SetPartitionDefault {
+                        uid: owner.clone(),
+                        table: name.clone(),
+                        parent: parent.clone(),
+                        column: "old".into(),
+                        from,
+                        to,
+                        fallback: Some("app.f()".into()),
+                    })
+                } else {
+                    Change::Column(ColumnChange::AlterColumnDefault {
+                        uid: column.clone(),
+                        column: name.column("old"),
+                        from,
+                        to,
+                    })
+                };
+                assert_eq!(
+                    compare(&change, Some(&owner)),
+                    !changed,
+                    "partition={partition}, changed={changed}"
+                );
+                let absent = IdsFile::default();
+                let unavailable = restoration_comparison(
+                    Side {
+                        schema: &before,
+                        ids: &absent,
+                    },
+                    Side {
+                        schema: &after,
+                        ids: &ids,
+                    },
+                    &MinimalDialect,
+                );
+                assert!(!unavailable(&change, Some(&owner)));
+            }
+            let unrelated = Change::Column(ColumnChange::SetColumnDeprecated {
+                uid: column.clone(),
+                column: name.column("old"),
+                reason: None,
+            });
+            assert!(!compare(&unrelated, Some(&owner)));
+        }
+    }
+}
+
+fn partition_default_after_name_reuse(default: &str, unchanged: bool) {
+    use pbps_model::{PartitionBound, PartitionColumn, PartitionOf};
+    let parent: TableName = "app.parent".parse().unwrap();
+    let leaf: TableName = "app.leaf".parse().unwrap();
+    let owner: Uid = "t_aaaaaa".parse().unwrap();
+    let child: Uid = "t_bbbbbb".parse().unwrap();
+    let survives: Uid = "c_aaaaaa".parse().unwrap();
+    let drops: Uid = "c_bbbbbb".parse().unwrap();
+    let own = |value: &str| PartitionColumn {
+        default: Some(value.into()),
+        not_null: false,
+    };
+    let mut before = schema_of(
+        "app.parent",
+        table(&[("m", Column::new(ty("int"))), ("n", Column::new(ty("int")))]),
+    );
+    before.tables.insert(
+        leaf.clone(),
+        Table {
+            partition_of: Some(PartitionOf {
+                parent: parent.clone(),
+                bound: PartitionBound::Default,
+                columns: [("m".into(), own("7")), ("n".into(), own("8"))].into(),
+            }),
+            ..Default::default()
+        },
+    );
+    let old_ids = IdsFile {
+        tables: [(owner, parent.clone()), (child.clone(), leaf.clone())].into(),
+        columns: [
+            (survives.clone(), parent.column("m")),
+            (drops.clone(), parent.column("n")),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let mut after = before.clone();
+    after
+        .tables
+        .get_mut(&parent)
+        .unwrap()
+        .columns
+        .shift_remove("m");
+    after
+        .tables
+        .get_mut(&leaf)
+        .unwrap()
+        .partition_of
+        .as_mut()
+        .unwrap()
+        .columns = [("n".into(), own(default))].into();
+    let mut ids = old_ids.clone();
+    ids.columns.remove(&drops);
+    ids.columns.insert(survives, parent.column("n"));
+    let base = Side {
+        schema: &before,
+        ids: &old_ids,
+    };
+    let declared = Side {
+        schema: &after,
+        ids: &ids,
+    };
+    let compare = restoration_comparison(base, declared, &MinimalDialect);
+    let restoration = Change::Partition(PartitionChange::SetPartitionDefault {
+        uid: child.clone(),
+        table: leaf.clone(),
+        parent,
+        column: "n".into(),
+        from: None,
+        to: Some(default.into()),
+        fallback: None,
+    });
+    assert_eq!(compare(&restoration, Some(&child)), unchanged);
+    // The callback must make the same logical decision as ordinary planning.
+    let mut changes = Vec::new();
+    let mut errors = Vec::new();
+    let index = Indexes {
+        base: old_ids.index(),
+        declared: ids.index(),
+    };
+    diff_partition_columns(
+        &child,
+        &leaf,
+        &before.tables[&leaf],
+        &after.tables[&leaf],
+        base,
+        declared,
+        &index,
+        &MinimalDialect,
+        &mut changes,
+        &mut errors,
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(
+        changes.iter().any(
+            |c| matches!(c, Change::Partition(PartitionChange::SetPartitionDefault { column, .. }) if column.raw() == "n")
+        ),
+        !unchanged
+    );
+}
+
+#[test]
+fn an_unchanged_partition_default_follows_the_surviving_uid_into_a_dropped_name() {
+    partition_default_after_name_reuse("7", true);
+}
+
+#[test]
+fn a_changed_partition_default_cannot_hide_behind_the_dropped_columns_value() {
+    partition_default_after_name_reuse("8", false);
+}
