@@ -22,6 +22,9 @@ const REASON_FLAGS: [&str; 6] = [
 /// test, so the name is changed in one place and the test names the rest.
 const DROP_EXTENSION_FLAG: &str = "--drop-extension";
 
+/// The batch spelling of a text search rename, tied to [`crate::report::RENAME_SEARCH`] the same way.
+const RENAME_SEARCH_FLAG: &str = "--rename-search";
+
 /// The batch spelling of `pbps drop-search`, tied to [`crate::report::DROP_SEARCH`] the same way.
 const DROP_SEARCH_FLAG: &str = "--drop-search";
 
@@ -40,6 +43,10 @@ pub struct BatchArgs {
     /// Rename a declared type
     #[arg(long, num_args = 2, action = ArgAction::Append, value_names = ["FROM", "TO"])]
     rename_type: Vec<String>,
+    /// Rename a text search configuration or dictionary within its schema, both named
+    /// `config app.docs` or `dictionary app.words`, of one kind
+    #[arg(long, num_args = 2, action = ArgAction::Append, value_names = ["FROM", "TO"])]
+    rename_search: Vec<String>,
     /// Drop a declared type with its own nonblank audit reason
     #[arg(long, num_args = 2, action = ArgAction::Append, value_names = ["TYPE", "REASON"])]
     drop_type: Vec<String>,
@@ -95,6 +102,7 @@ impl BatchArgs {
             ("--rename-table", &self.rename_table),
             ("--rename-role", &self.rename_role),
             ("--rename-type", &self.rename_type),
+            (RENAME_SEARCH_FLAG, &self.rename_search),
             ("--drop-type", &self.drop_type),
             ("--drop", &self.drop),
             ("--drop-table", &self.drop_table),
@@ -181,6 +189,19 @@ fn parse_pair(flag: &str, first: &str, second: &str) -> anyhow::Result<Intent> {
             name: first.to_owned().into(),
             reason: second.parse()?,
         },
+        // Search identity is never inferred, and the engine's rename keeps the kind: a pair of
+        // two kinds is no rename, so it is refused here by both names (DEC-2728.5).
+        RENAME_SEARCH_FLAG => {
+            let from: pbps_model::SearchRef = first.parse().map_err(anyhow::Error::msg)?;
+            let to: pbps_model::SearchRef = second.parse().map_err(anyhow::Error::msg)?;
+            ensure!(
+                from.kind == to.kind,
+                "a rename keeps the kind: {} cannot become {}",
+                from.shown(),
+                to.shown()
+            );
+            Intent::RenameSearch { from, to }
+        }
         DROP_SEARCH_FLAG => Intent::DropSearch {
             name: first.parse().map_err(anyhow::Error::msg)?,
             reason: second.parse()?,
@@ -422,6 +443,43 @@ mod tests {
                 || said.contains("pbps drop-search \"config app.docs\" --reason"),
             "{said}"
         );
+    }
+
+    /// `--rename-search` reads two names of one kind. Negatives: a pair of two kinds, an
+    /// unprefixed name and a missing value are refused; the report spells the flag the same way.
+    #[test]
+    fn a_search_rename_batch_pair_keeps_one_kind() {
+        let parsed = parse_pair(RENAME_SEARCH_FLAG, "config app.old", "config app.new").unwrap();
+        assert_eq!(
+            parsed,
+            Intent::RenameSearch {
+                from: "config app.old".parse().unwrap(),
+                to: "config app.new".parse().unwrap(),
+            }
+        );
+        for (from, to) in [
+            ("config app.old", "dictionary app.new"),
+            ("app.old", "config app.new"),
+            ("config app.old", "app.new"),
+        ] {
+            assert!(
+                parse_pair(RENAME_SEARCH_FLAG, from, to).is_err(),
+                "{from} {to}"
+            );
+        }
+        assert_eq!(
+            RENAME_SEARCH_FLAG,
+            format!("--{}", crate::report::RENAME_SEARCH)
+        );
+        let flag = crate::report::blockers_with_intents(
+            &[pbps_diff::Blocker::DropSearchNeedsReason {
+                name: "config app.docs".parse().unwrap(),
+            }],
+            std::slice::from_ref(&parsed),
+        );
+        assert!(flag.contains("--rename-search"), "{flag}");
+        let incomplete = crate::Cli::try_parse_from(["pbps", "intent", "--rename-search", "a"]);
+        assert!(incomplete.is_err());
     }
 
     /// The command's name lives in one constant. The batch flag, the single

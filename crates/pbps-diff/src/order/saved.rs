@@ -653,6 +653,36 @@ pub fn validate_saved_plan(
             {
                 return Err(AdmissionError::from_error(error));
             }
+        } else if let pbps_model::Change::Search(pbps_model::SearchChange::RenameSearch {
+            uid,
+            from,
+            to,
+            definition,
+        }) = &step.change
+        {
+            // A rename keeps the kind and the schema and ends at the name the plan's identity
+            // mapping gives the object, so a hand-edited plan cannot move one object onto
+            // another's name or out of its schema (DEC-2728.5).
+            if uid.kind() != pbps_model::UidKind::Search
+                || plan.ids.search.get(uid) != Some(to)
+                || from == to
+                || from.kind != to.kind
+                || to.kind != definition.kind()
+                || from.name.schema() != to.name.schema()
+            {
+                refuse!(
+                    "text search rename of {} to {} disagrees with the identity mapping",
+                    from.shown(),
+                    to.shown()
+                );
+            }
+            if let Some(error) = dialect
+                .validate_search(to, definition, &pbps_model::Schema::default())
+                .into_iter()
+                .next()
+            {
+                return Err(AdmissionError::from_error(error));
+            }
         } else if let pbps_model::Change::Search(pbps_model::SearchChange::DropSearch {
             uid,
             name,

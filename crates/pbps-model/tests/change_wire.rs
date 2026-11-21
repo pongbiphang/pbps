@@ -30,6 +30,7 @@ const OPS: &[&str] = &[
     "drop_search",
     "alter_search_mapping",
     "alter_search_dictionary",
+    "rename_search",
     "create_extension",
     "drop_extension",
     "update_extension",
@@ -165,6 +166,11 @@ const ACCEPTED: &[(&str, &str, &str)] = &[
         r"alter_search_dictionary",
         r#"{"op":"alter_search_dictionary","uid":"s_aaaaaa","name":"dictionary app.words","before":{"kind":"dictionary","template":"pg_catalog.simple","options":{}},"after":{"kind":"dictionary","template":"pg_catalog.simple","options":{"stopwords":"english"}}}"#,
         r#"{"op":"alter_search_dictionary","uid":"s_aaaaaa","name":"dictionary app.words","before":{"kind":"dictionary","template":"pg_catalog.simple","options":{}},"after":{"kind":"dictionary","template":"pg_catalog.simple","options":{"stopwords":"english"}}}"#,
+    ),
+    (
+        r"rename_search",
+        r#"{"op":"rename_search","uid":"s_aaaaaa","from":"config app.docs","to":"config app.articles","definition":{"kind":"config","parser":"pg_catalog.\"default\"","mappings":{"asciiword":["app.words"]}}}"#,
+        r#"{"op":"rename_search","uid":"s_aaaaaa","from":"config app.docs","to":"config app.articles","definition":{"kind":"config","parser":"pg_catalog.default","mappings":{"asciiword":["app.words"]}}}"#,
     ),
 ];
 

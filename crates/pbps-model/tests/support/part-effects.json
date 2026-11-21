@@ -802,6 +802,24 @@
     }
   },
   {
+    "name": "RenameSearch",
+    "change": {
+      "op": "rename_search",
+      "uid": "s_aaaaaa",
+      "from": "config app.docs",
+      "to": "config app.articles",
+      "definition": {
+        "kind": "config",
+        "parser": "pg_catalog.\"default\"",
+        "mappings": {
+          "asciiword": [
+            "app.words"
+          ]
+        }
+      }
+    }
+  },
+  {
     "name": "DropSearch",
     "change": {
       "op": "drop_search",

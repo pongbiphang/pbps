@@ -1,8 +1,9 @@
 //! Text search configuration and dictionary declaration files (#2728, DEC-2728.1).
 
+use std::fmt::Write as _;
 use std::path::Path;
 
-use pbps_model::{SearchKind, SearchName, SearchObject, SearchRef, TypeRef};
+use pbps_model::{Intent, SearchKind, SearchName, SearchObject, SearchRef, TypeRef};
 
 use crate::{
     LoadError,
@@ -14,6 +15,9 @@ use crate::{
 pub struct LoadedSearch {
     pub name: SearchRef,
     pub definition: SearchObject,
+    /// The one-shot `renamed_from:` annotation, of the file's own kind. It becomes
+    /// `Intent::RenameSearch` and does not enter the model (DEC-2728.5).
+    pub renamed_from: Option<SearchRef>,
 }
 
 fn reference<T: std::str::FromStr<Err = pbps_model::TypeParseError>>(
@@ -22,6 +26,17 @@ fn reference<T: std::str::FromStr<Err = pbps_model::TypeParseError>>(
 ) -> Result<T, String> {
     text.parse::<T>()
         .map_err(|e| format!("{what} `{}`: {e}", pbps_model::escape::Escaped(text)))
+}
+
+/// Reads `renamed_from:` as a name of the file's own kind. A name of the other kind has
+/// no spelling: the engine's rename never changes the kind.
+fn renamed_from(
+    kind: SearchKind,
+    text: Option<&str>,
+    what: &str,
+) -> Result<Option<SearchRef>, String> {
+    text.map(|text| reference::<SearchName>(text, what).map(|name| SearchRef::new(kind, name)))
+        .transpose()
 }
 
 /// Loads a `text_search_config:` or `text_search_dictionary:` file. Which of the
@@ -41,6 +56,12 @@ pub fn load_search_str(path: &Path, text: &str) -> Result<LoadedSearch, Vec<Load
                 serde_saphyr::from_str(text).map_err(|e| fail(e.to_string()))?;
             let name: SearchName =
                 reference(&dto.text_search_config, "text search configuration").map_err(fail)?;
+            let renamed_from = renamed_from(
+                SearchKind::Config,
+                dto.renamed_from.as_deref(),
+                "renamed_from of text search configuration",
+            )
+            .map_err(fail)?;
             let parser: TypeRef = reference(&dto.parser, "parser").map_err(fail)?;
             let mut mappings = std::collections::BTreeMap::new();
             for (alias, dictionaries) in dto.mappings {
@@ -61,6 +82,7 @@ pub fn load_search_str(path: &Path, text: &str) -> Result<LoadedSearch, Vec<Load
             Ok(LoadedSearch {
                 name: SearchRef::new(SearchKind::Config, name),
                 definition: SearchObject::Config { parser, mappings },
+                renamed_from,
             })
         }
         (None, Some(_)) => {
@@ -68,6 +90,12 @@ pub fn load_search_str(path: &Path, text: &str) -> Result<LoadedSearch, Vec<Load
                 serde_saphyr::from_str(text).map_err(|e| fail(e.to_string()))?;
             let name: SearchName =
                 reference(&dto.text_search_dictionary, "text search dictionary").map_err(fail)?;
+            let renamed_from = renamed_from(
+                SearchKind::Dictionary,
+                dto.renamed_from.as_deref(),
+                "renamed_from of text search dictionary",
+            )
+            .map_err(fail)?;
             let template: TypeRef = reference(&dto.template, "template").map_err(fail)?;
             let definition = SearchObject::Dictionary {
                 template,
@@ -87,6 +115,7 @@ pub fn load_search_str(path: &Path, text: &str) -> Result<LoadedSearch, Vec<Load
             Ok(LoadedSearch {
                 name: SearchRef::new(SearchKind::Dictionary, name),
                 definition,
+                renamed_from,
             })
         }
         _ => Err(fail(
@@ -97,13 +126,26 @@ pub fn load_search_str(path: &Path, text: &str) -> Result<LoadedSearch, Vec<Load
     }
 }
 
-/// The declaration file text of one object: what [`load_search_str`] reads back.
-pub fn render_search(name: &SearchRef, definition: &SearchObject) -> String {
+/// The declaration file text of one object: what [`load_search_str`] reads back. A rename
+/// still pending in `pending` is written as `renamed_from:`; one the identity file already
+/// holds is not passed, so `fmt` strips it (DEC-2728.5).
+pub fn render_search(name: &SearchRef, definition: &SearchObject, pending: &[Intent]) -> String {
     let mut out = format!(
         "{}: {}\n",
         name.kind.key(),
         scalar(&name.name.raw().to_string())
     );
+    for intent in pending {
+        if let Intent::RenameSearch { from, to } = intent
+            && to == name
+        {
+            let _ = writeln!(
+                out,
+                "renamed_from: {}",
+                scalar(&from.name.raw().to_string())
+            );
+        }
+    }
     match definition {
         SearchObject::Config { parser, mappings } => {
             out.push_str(&format!("parser: {}\n", scalar(&parser.raw().to_string())));
@@ -161,13 +203,16 @@ mod tests {
                           options:\n  language: english\n  stopwords: english\n";
         let loaded = config(dictionary);
         assert_eq!(loaded.name.kind, SearchKind::Dictionary);
-        assert_eq!(render_search(&loaded.name, &loaded.definition), dictionary);
+        assert_eq!(
+            render_search(&loaded.name, &loaded.definition, &[]),
+            dictionary
+        );
 
         let configuration = "text_search_config: app.docs\nparser: pg_catalog.\"default\"\n\
                              mappings:\n  asciiword: [app.d1, pg_catalog.simple]\n  email: [pg_catalog.simple]\n";
         let loaded = config(configuration);
         assert_eq!(loaded.name.kind, SearchKind::Config);
-        let rendered = render_search(&loaded.name, &loaded.definition);
+        let rendered = render_search(&loaded.name, &loaded.definition, &[]);
         assert_eq!(config(&rendered), loaded);
 
         // Values that other scalars would swallow stay text.
@@ -182,7 +227,7 @@ mod tests {
             .into(),
         };
         let name = SearchRef::new(SearchKind::Dictionary, "app.\"Odd Name\"".parse().unwrap());
-        let rendered = render_search(&name, &odd);
+        let rendered = render_search(&name, &odd, &[]);
         let back = config(&rendered);
         assert_eq!((back.name, back.definition), (name, odd), "{rendered}");
         // An empty configuration is legal and round trips.
@@ -191,7 +236,7 @@ mod tests {
             mappings: Default::default(),
         };
         let name = SearchRef::new(SearchKind::Config, "app.empty".parse().unwrap());
-        assert_eq!(config(&render_search(&name, &empty)).definition, empty);
+        assert_eq!(config(&render_search(&name, &empty, &[])).definition, empty);
     }
 
     /// A name that starts with an underscore is a text search name like any other: declared,
@@ -202,7 +247,7 @@ mod tests {
                     mappings:\n  word: [app._words]\n";
         let loaded = config(text);
         assert_eq!(loaded.name.name.name(), "_docs");
-        let rendered = render_search(&loaded.name, &loaded.definition);
+        let rendered = render_search(&loaded.name, &loaded.definition, &[]);
         assert!(
             rendered.contains("app._docs") && rendered.contains("[app._words]"),
             "{rendered}"
@@ -215,7 +260,7 @@ mod tests {
     }
 
     /// Negatives: no leading kind, both, an unqualified or malformed name, an empty
-    /// mapping, an unknown key (a rename is not part of this first slice).
+    /// mapping, a malformed `renamed_from`, an unknown key.
     #[test]
     fn a_text_search_file_that_cannot_be_read_is_refused_by_name() {
         for (text, expected) in [
@@ -233,7 +278,15 @@ mod tests {
                 "lists no dictionary",
             ),
             (
-                "text_search_config: app.c\nparser: pg_catalog.\"default\"\nrenamed_from: app.old\n",
+                "text_search_config: app.c\nparser: pg_catalog.\"default\"\nrenamed_from: old\n",
+                "renamed_from",
+            ),
+            (
+                "text_search_dictionary: app.d\ntemplate: pg_catalog.simple\nrenamed_from: ''\n",
+                "renamed_from",
+            ),
+            (
+                "text_search_config: app.c\nparser: pg_catalog.\"default\"\nrenamed_from: config app.old\n",
                 "renamed_from",
             ),
             ("text_search_dictionary: app.d\n", "template"),
@@ -244,6 +297,60 @@ mod tests {
         ] {
             let said = refusal(text);
             assert!(said.contains(expected), "{text:?}: {said}");
+        }
+    }
+
+    /// `renamed_from:` is read as a name of the file's own kind, so the same text means
+    /// `config app.old` in a configuration file and `dictionary app.old` in a dictionary
+    /// file, and it writes back while pending (DEC-2728.5). Negatives: no annotation is no
+    /// rename, and one still pending is the only thing `render_search` writes.
+    #[test]
+    fn renamed_from_takes_the_kind_of_its_own_file_and_renders_while_pending() {
+        let configuration = config(
+            "text_search_config: app.c\nparser: pg_catalog.\"default\"\nrenamed_from: app.old\n",
+        );
+        assert_eq!(
+            configuration.renamed_from,
+            Some(SearchRef::new(
+                SearchKind::Config,
+                "app.old".parse().unwrap()
+            ))
+        );
+        let dictionary = config(
+            "text_search_dictionary: app.d\ntemplate: pg_catalog.simple\nrenamed_from: app.old\n",
+        );
+        assert_eq!(
+            dictionary.renamed_from,
+            Some(SearchRef::new(
+                SearchKind::Dictionary,
+                "app.old".parse().unwrap()
+            ))
+        );
+        assert_eq!(
+            config("text_search_dictionary: app.d\ntemplate: pg_catalog.simple\n").renamed_from,
+            None
+        );
+
+        let pending = [Intent::RenameSearch {
+            from: dictionary.renamed_from.clone().unwrap(),
+            to: dictionary.name.clone(),
+        }];
+        let kept = render_search(&dictionary.name, &dictionary.definition, &pending);
+        assert_eq!(
+            kept,
+            "text_search_dictionary: app.d\nrenamed_from: app.old\ntemplate: pg_catalog.simple\n"
+        );
+        assert_eq!(config(&kept), dictionary);
+        // Absorbed (not passed) or aimed at another object: nothing is written.
+        let other = [Intent::RenameSearch {
+            from: dictionary.renamed_from.clone().unwrap(),
+            to: SearchRef::new(SearchKind::Dictionary, "app.other".parse().unwrap()),
+        }];
+        for pending in [&[][..], &other[..]] {
+            assert!(
+                !render_search(&dictionary.name, &dictionary.definition, pending)
+                    .contains("renamed_from")
+            );
         }
     }
 

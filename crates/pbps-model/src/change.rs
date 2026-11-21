@@ -376,6 +376,17 @@ pub enum SearchChange {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         opaque: Vec<String>,
     },
+    /// `ALTER TEXT SEARCH ... RENAME TO` of an object a recorded `renamed_from` moves
+    /// within its schema (DEC-2728.5). The object keeps its uid, its oid and what the
+    /// catalog holds about it; the payload is the definition that stands when the rename
+    /// runs, as `RenameType`'s is, so the saved-plan admission can validate `to` and
+    /// the checksum pins what was compared.
+    RenameSearch {
+        uid: Uid,
+        from: crate::SearchRef,
+        to: crate::SearchRef,
+        definition: Box<crate::SearchObject>,
+    },
 }
 
 impl SearchChange {
@@ -388,6 +399,7 @@ impl SearchChange {
             Self::AlterSearchMapping { after, .. } | Self::AlterSearchDictionary { after, .. } => {
                 Some(after)
             }
+            Self::RenameSearch { definition, .. } => Some(definition),
             Self::DropSearch { .. } => None,
         }
     }
@@ -2009,6 +2021,7 @@ impl Change {
             | Change::Type(TypeChange::CreateType { name, .. })
             | Change::Type(TypeChange::DropType { name, .. }) => name.raw().to_string(),
             Change::Type(TypeChange::RenameType { from, .. }) => from.raw().to_string(),
+            Change::Search(SearchChange::RenameSearch { from, .. }) => from.raw().to_string(),
             Change::Search(SearchChange::CreateSearch { name, .. })
             | Change::Search(SearchChange::AlterSearchMapping { name, .. })
             | Change::Search(SearchChange::AlterSearchDictionary { name, .. })
@@ -3259,7 +3272,7 @@ Change::Partition(PartitionChange::CopyTableRows(_)) | Change::Partition(Partiti
             // rename and not drop + add — but the old name is gone the same
             // way a table's is, and `IS_ROLEMEMBER('old')` in a module or an
             // application breaks on the spot. Same gate as the other renames.
-            Change::TypeValue(TypeValueChange::RenameEnumValue { .. }) | Change::Type(TypeChange::RenameType { .. }) | Change::Table(TableChange::RenameTable { .. }) | Change::Column(ColumnChange::RenameColumn { .. }) | Change::Role(RoleChange::RenameRole { .. }) => {
+            Change::TypeValue(TypeValueChange::RenameEnumValue { .. }) | Change::Type(TypeChange::RenameType { .. }) | Change::Search(SearchChange::RenameSearch { .. }) | Change::Table(TableChange::RenameTable { .. }) | Change::Column(ColumnChange::RenameColumn { .. }) | Change::Role(RoleChange::RenameRole { .. }) => {
                 r.insert(RiskClass::Rename);
             }
             Change::TypeValue(TypeValueChange::EnumRebuild { .. }) => {
@@ -3739,6 +3752,46 @@ mod tests {
         });
         assert_eq!(change.subject(), format!("app.{part}"));
         assert_ne!(change.subject(), r"app.a\nb\c\u{200b}");
+    }
+
+    /// A text search rename is gated as a rename, is named by its old spelling and carries the
+    /// definition that stands, so a plan's checksum pins what was compared (DEC-2728.5).
+    /// Negatives: an in-place alteration with nothing opaque is ungated, and a create is
+    /// named by its own name.
+    #[test]
+    fn a_search_rename_is_gated_as_a_rename_and_named_by_its_old_spelling() {
+        let definition = Box::new(crate::SearchObject::Dictionary {
+            template: "pg_catalog.simple".parse().unwrap(),
+            options: BTreeMap::new(),
+        });
+        let rename = SearchChange::RenameSearch {
+            uid: "s_aaaaaa".parse().unwrap(),
+            from: "dictionary app.words".parse().unwrap(),
+            to: "dictionary app.terms".parse().unwrap(),
+            definition: definition.clone(),
+        };
+        assert_eq!(rename.result(), Some(&*definition));
+        let rename = Change::Search(rename);
+        assert_eq!(rename.subject(), "dictionary app.words");
+        assert_eq!(
+            PlannedChange::new(rename).risks,
+            BTreeSet::from([RiskClass::Rename])
+        );
+        let alter = Change::Search(SearchChange::AlterSearchDictionary {
+            uid: "s_aaaaaa".parse().unwrap(),
+            name: "dictionary app.words".parse().unwrap(),
+            before: definition.clone(),
+            after: definition.clone(),
+            opaque: Vec::new(),
+        });
+        assert!(PlannedChange::new(alter).risks.is_empty());
+        let create = Change::Search(SearchChange::CreateSearch {
+            uid: "s_bbbbbb".parse().unwrap(),
+            name: "dictionary app.terms".parse().unwrap(),
+            definition,
+            unresolved: Vec::new(),
+        });
+        assert_eq!(create.subject(), "dictionary app.terms");
     }
 
     /// A part the plan creates again takes its parameters in its `CREATE`,

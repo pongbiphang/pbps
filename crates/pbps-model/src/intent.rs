@@ -88,6 +88,13 @@ pub enum Intent {
         name: crate::SearchRef,
         reason: Reason,
     },
+    /// Rename a text search configuration or dictionary (`ALTER TEXT SEARCH ... RENAME TO`)
+    /// within its schema. Both names are of one kind: the file that carries the intent
+    /// names its own kind, and the object keeps its uid (DEC-2728.5).
+    RenameSearch {
+        from: crate::SearchRef,
+        to: crate::SearchRef,
+    },
     /// Drop an exclusion constraint. It has no identity of its own, so the
     /// table and the constraint's name say which, and the record this becomes
     /// is what lets a plan drop it (DEC-2448.4). "Why was this guarantee given
@@ -121,7 +128,8 @@ impl Intent {
             | Intent::RenameRole { .. }
             | Intent::DropRole { .. }
             | Intent::DropExtension { .. }
-            | Intent::DropSearch { .. } => false,
+            | Intent::DropSearch { .. }
+            | Intent::RenameSearch { .. } => false,
         }
     }
 }

@@ -410,6 +410,12 @@ fn collect_files(
                     path.clone(),
                 );
                 seen_search.insert(s.name.clone(), path);
+                if let Some(from) = s.renamed_from {
+                    loaded.intents.push(Intent::RenameSearch {
+                        from,
+                        to: s.name.clone(),
+                    });
+                }
                 loaded.schema.search.insert(s.name, s.definition);
                 continue;
             }
@@ -1023,6 +1029,28 @@ indexes:
                 to: "dbo.client".parse().unwrap(),
             }]
         );
+    }
+
+    /// A text search file's `renamed_from:` becomes the intent of its own kind and stays out
+    /// of the model (DEC-2728.5). Negative: a file without one records none.
+    #[test]
+    fn a_text_search_rename_is_intent_of_the_files_own_kind() {
+        let files = |text: &str| {
+            load_schema_files(&[(std::path::PathBuf::from("d.yml"), text.to_owned())]).unwrap()
+        };
+        let loaded = files(
+            "text_search_dictionary: app.new\ntemplate: pg_catalog.simple\nrenamed_from: app.old\n",
+        );
+        assert_eq!(
+            loaded.intents,
+            vec![Intent::RenameSearch {
+                from: "dictionary app.old".parse().unwrap(),
+                to: "dictionary app.new".parse().unwrap(),
+            }]
+        );
+        assert_eq!(loaded.schema.search.len(), 1);
+        let plain = files("text_search_dictionary: app.new\ntemplate: pg_catalog.simple\n");
+        assert!(plain.intents.is_empty());
     }
 
     // ---- negative cases ----

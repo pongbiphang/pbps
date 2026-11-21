@@ -601,6 +601,10 @@ fn renamed_from(loaded: &Loaded, kind: UidKind, name: &str) -> Option<String> {
             && kind == UidKind::Type
         {
             (from.raw().to_string(), to.raw().to_string())
+        } else if let Intent::RenameSearch { from, to } = intent
+            && kind == UidKind::Search
+        {
+            (from.raw().to_string(), to.raw().to_string())
         } else {
             return None;
         };

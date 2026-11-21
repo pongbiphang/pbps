@@ -584,6 +584,16 @@ mod effects_of_each_kind {
                     opaque: Vec::new(),
                 }),
             ),
+            // A rename rewrites the object at its final name (DEC-2728.5).
+            (
+                "RenameSearch",
+                Change::Search(SearchChange::RenameSearch {
+                    uid: uid(UidKind::Search, "words"),
+                    from: search_ref("dictionary app.words"),
+                    to: search_ref("dictionary app.terms"),
+                    definition: Box::new(words_object()),
+                }),
+            ),
             // A dictionary leaves only after the configuration that maps it.
             (
                 "DropSearch",

@@ -4610,10 +4610,26 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
                     absorbed,
                 )
             }
-            // A text search object carries no rename intent in this part (#2728), nor does
-            // a sequence (#2721): a rename is recorded intent with the part that adds it.
+            // A text search object's `renamed_from:` is partitioned as a type's is: kept
+            // while pending, stripped once the identity file holds it (DEC-2728.5). A
+            // sequence carries none (#2721): a rename is recorded intent with the part
+            // that adds it.
             pbps_load::LoadedFile::Search(s) => {
-                (pbps_load::render_search(&s.name, &s.definition), Vec::new())
+                let intents = s.renamed_from.into_iter().map(|from| Intent::RenameSearch {
+                    from,
+                    to: s.name.clone(),
+                });
+                let (pending, absorbed): (Vec<Intent>, Vec<Intent>) = intents.partition(|intent| {
+                    !pbps_diff::intent_is_absorbed(
+                        intent,
+                        &ids,
+                        RenameSource::of(intent, &declared),
+                    )
+                });
+                (
+                    pbps_load::render_search(&s.name, &s.definition, &pending),
+                    absorbed,
+                )
             }
             pbps_load::LoadedFile::Sequence(s) => (
                 pbps_load::render_sequence(&s.name, &s.definition),

@@ -685,6 +685,7 @@ Change::Partition(PartitionChange::RebuildPartitionedTable(_)) | Change::Index(I
             | Change::Search(SearchChange::CreateSearch { .. })
             | Change::Search(SearchChange::AlterSearchMapping { .. })
             | Change::Search(SearchChange::AlterSearchDictionary { .. })
+            | Change::Search(SearchChange::RenameSearch { .. })
             | Change::Search(SearchChange::DropSearch { .. })
             // A package's members are new to the target and no standing
             // object's fingerprint reads them until a declaration does

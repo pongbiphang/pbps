@@ -105,6 +105,7 @@ pub(super) fn search(change: &SearchChange) -> Sql {
         SearchChange::CreateSearch { .. }
         | SearchChange::AlterSearchMapping { .. }
         | SearchChange::AlterSearchDictionary { .. }
+        | SearchChange::RenameSearch { .. }
         | SearchChange::DropSearch { .. } => Err(unsupported(
             "declared text search configurations and dictionaries",
         )),

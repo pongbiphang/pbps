@@ -31,6 +31,8 @@ use pbps_model::{Change, ChangeSet, DriftReport, Intent, RiskClass, TableName};
 /// place the name lives, so a rename is a one-line change (DEC-2447.9).
 pub(crate) const DROP_EXTENSION: &str = "drop-extension";
 pub(crate) const DROP_SEARCH: &str = "drop-search";
+/// The batch spelling of a text search rename (DEC-2728.5).
+pub(crate) const RENAME_SEARCH: &str = "rename-search";
 
 /// The command that retires an exclusion constraint (DEC-2448.4). It has no
 /// batch spelling: its target is a table and a name, which the batch's pairs
@@ -80,6 +82,9 @@ pub fn intent(i: &Intent) -> String {
         }
         Intent::DropExtension { name, reason } => {
             format!("drop extension {} (reason: {reason})", name.shown())
+        }
+        Intent::RenameSearch { from, to } => {
+            format!("rename {} -> {}", from.shown(), to.shown())
         }
         Intent::DropSearch { name, reason } => {
             format!("drop {} (reason: {reason})", name.shown())
@@ -233,6 +238,12 @@ fn supplied_flag(intent: &Intent) -> Option<String> {
             name.raw(),
             reason.as_ref(),
             "why",
+        ),
+        Intent::RenameSearch { from, to } => pair_flag(
+            &format!("--{RENAME_SEARCH}"),
+            &from.raw().to_string(),
+            &to.raw().to_string(),
+            "new name",
         ),
         Intent::DropSearch { name, reason } => pair_flag(
             &format!("--{DROP_SEARCH}"),
@@ -1021,7 +1032,8 @@ fn one_blocker(b: &Blocker) -> String {
         ),
         Blocker::DropSearchNeedsReason { name } => format!(
             "  {name} disappeared from the declarations, but a drop must record why — an \
-             index or generated column that names it by a string literal must go first\n\n    \
+             index or generated column that names it by a string literal must go first. If it \
+             was renamed, say so with `renamed_from:` in the new declaration instead\n\n    \
              pbps {DROP_SEARCH} {argument} --reason {why}\n",
             argument = shell_arg(&name.raw().to_string()).unwrap_or_else(|| placeholder("object")),
             name = name.shown(),
@@ -1809,6 +1821,22 @@ pub fn describe(c: &Change) -> String {
                 name.shown(),
                 changed_parts(before, after),
                 server_files_note(after)
+            )
+        }
+        // The engine keeps the object's oid, so every parsed dependent follows. What names it
+        // by text does not, and the catalog cannot see that text, so the line says so
+        // instead of guessing (DEC-2728.5).
+        Change::Search(SearchChange::RenameSearch { from, to, .. }) => {
+            let word = match from.kind {
+                pbps_model::SearchKind::Config => "config",
+                pbps_model::SearchKind::Dictionary => "dictionary",
+            };
+            format!(
+                "~ rename {word} {} -> {} (text that names {} is not followed: a function \
+                 body, a `default_text_search_config` setting, an application)",
+                from.name.shown(),
+                to.name.shown(),
+                from.name.shown()
             )
         }
         Change::Search(SearchChange::DropSearch { name, .. }) => format!("- drop {}", name.shown()),
@@ -3920,6 +3948,80 @@ mod search_alteration_tests {
              function app.f(text), whose body the catalog cannot read))"
         );
         assert!(!line("dictionary app.solo", was, now, Vec::new()).contains("vouch"));
+    }
+
+    /// A rename's plan line names both spellings and says what it does not follow: what names
+    /// the object by text is invisible to the catalog, so the line states the limit instead of
+    /// guessing (DEC-2728.5). The intent and the batch flag speak the same words. Negative: a
+    /// drop's line is not a rename's, and a drop intent offers no rename flag.
+    #[test]
+    fn a_rename_says_what_it_does_not_follow_and_the_intent_has_its_flag() {
+        let change = |from: &str, to: &str, definition| {
+            Change::Search(SearchChange::RenameSearch {
+                uid: "s_aaaaaa".parse().unwrap(),
+                from: from.parse().unwrap(),
+                to: to.parse().unwrap(),
+                definition: Box::new(definition),
+            })
+        };
+        let said = describe(&change(
+            "config app.old",
+            "config app.new",
+            config(&[("word", "app.a")]),
+        ));
+        assert!(
+            said.starts_with(
+                "~ rename config app.old -> app.new (text that names app.old is not followed"
+            ),
+            "{said}"
+        );
+        assert!(said.contains("default_text_search_config"), "{said}");
+        let said = describe(&change(
+            "dictionary app.old",
+            "dictionary app.new",
+            dictionary(&[]),
+        ));
+        assert!(
+            said.starts_with("~ rename dictionary app.old -> app.new"),
+            "{said}"
+        );
+        let drop = Change::Search(SearchChange::DropSearch {
+            uid: "s_aaaaaa".parse().unwrap(),
+            name: "config app.old".parse().unwrap(),
+            definition: Box::new(config(&[])),
+        });
+        assert_eq!(
+            describe(&drop),
+            "- drop text search configuration `app.old`"
+        );
+
+        let intent_of = Intent::RenameSearch {
+            from: "config app.old".parse().unwrap(),
+            to: "config app.new".parse().unwrap(),
+        };
+        assert_eq!(
+            intent(&intent_of),
+            "rename text search configuration `app.old` -> text search configuration `app.new`"
+        );
+        assert!(
+            supplied_flag(&intent_of)
+                .unwrap()
+                .starts_with("--rename-search ")
+        );
+        let drop_intent = Intent::DropSearch {
+            name: "config app.old".parse().unwrap(),
+            reason: "gone".parse().unwrap(),
+        };
+        assert!(
+            !supplied_flag(&drop_intent)
+                .unwrap()
+                .contains("--rename-search")
+        );
+        // A drop's remedy points at the rename that avoids it.
+        let said = blockers(&[Blocker::DropSearchNeedsReason {
+            name: "config app.old".parse().unwrap(),
+        }]);
+        assert!(said.contains("renamed_from:"), "{said}");
     }
 }
 

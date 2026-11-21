@@ -574,3 +574,77 @@ fn an_object_a_plan_alters_in_place_is_recorded_as_the_database_holds_it() {
     let not_run = table("int").as_recorded_after_apply(&previous, &altering, &ids);
     assert_eq!(not_run.search[&name], previous.search[&name]);
 }
+
+/// A plan that renames the dictionary `from` to `to`, as the differ plans it.
+fn renaming(from: &str, to: &str) -> ChangeSet {
+    let parse = |name: &str| SearchRef::new(SearchKind::Dictionary, name.parse().unwrap());
+    ChangeSet {
+        changes: vec![PlannedChange::new(Change::Search(
+            SearchChange::RenameSearch {
+                uid: Uid::generate(UidKind::Search),
+                from: parse(from),
+                to: parse(to),
+                definition: Box::new(text_search(from, 0).search.into_values().next().unwrap()),
+            },
+        ))],
+    }
+}
+
+/// A rename moves a name and nothing else, so the record the object had under its old name is
+/// the one it keeps under the new one, even where the read-back says otherwise (DEC-2728.5).
+/// Negatives: a name no rename reached takes the read-back as before, and the carry is only
+/// for the rename's own target.
+#[test]
+fn a_renamed_object_keeps_the_definition_it_was_recorded_with() {
+    // Recorded as variant 0 under the old name; the database holds variant 1 under the new one.
+    let previous = merged(text_search("app.old", 0), text_search("app.other", 0));
+    let read_back = merged(text_search("app.new", 1), text_search("app.other", 1));
+    let ids = live(&["app.new", "app.other"]);
+    let recorded =
+        read_back
+            .clone()
+            .as_recorded_after_apply(&previous, &renaming("app.old", "app.new"), &ids);
+    assert_eq!(
+        recorded.search[&SearchRef::new(SearchKind::Dictionary, "app.new".parse().unwrap())],
+        text_search("app.new", 0)
+            .search
+            .into_values()
+            .next()
+            .unwrap()
+    );
+    // `app.other` is no rename's target: its own record stands.
+    assert_eq!(
+        recorded.search[&SearchRef::new(SearchKind::Dictionary, "app.other".parse().unwrap())],
+        text_search("app.other", 0)
+            .search
+            .into_values()
+            .next()
+            .unwrap()
+    );
+    // Without the rename in the plan the new name has no record, and the read-back is taken.
+    let unrecorded = read_back
+        .clone()
+        .as_recorded_after_apply(&previous, &nothing_planned(), &ids);
+    assert_eq!(
+        unrecorded.search[&SearchRef::new(SearchKind::Dictionary, "app.new".parse().unwrap())],
+        text_search("app.new", 1)
+            .search
+            .into_values()
+            .next()
+            .unwrap()
+    );
+}
+
+/// At a staged checkpoint the identities may still hold the old name, where the previous
+/// record answers directly; the old name is then recorded as it was.
+#[test]
+fn a_rename_that_has_not_run_records_the_object_under_its_old_name() {
+    let previous = text_search("app.old", 0);
+    let read_back = text_search("app.old", 1);
+    let recorded = read_back.as_recorded_after_apply(
+        &previous,
+        &renaming("app.old", "app.new"),
+        &live(&["app.old"]),
+    );
+    assert_eq!(recorded.search, previous.search);
+}

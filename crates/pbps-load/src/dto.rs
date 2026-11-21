@@ -1801,6 +1801,12 @@ mod tests {
 #[serde(deny_unknown_fields)]
 pub struct SearchConfigDto {
     pub text_search_config: String,
+    /// One-shot intent, as for [`DomainTypeDto::renamed_from`]: this object was called
+    /// this, in the same schema, before. The name is of the file's own kind, so
+    /// `text_search_config: app.new` with `renamed_from: app.old` means `config app.old`
+    /// (DEC-2728.5).
+    #[serde(default)]
+    pub renamed_from: Option<String>,
     /// The parser, qualified by its schema. Only the built-in one,
     /// `pg_catalog."default"`, is held.
     pub parser: String,
@@ -1815,6 +1821,9 @@ pub struct SearchConfigDto {
 #[serde(deny_unknown_fields)]
 pub struct SearchDictionaryDto {
     pub text_search_dictionary: String,
+    /// One-shot intent, as for [`SearchConfigDto::renamed_from`].
+    #[serde(default)]
+    pub renamed_from: Option<String>,
     /// The template, qualified by its schema. Only the built-in ones are held.
     pub template: String,
     /// The template's options, verbatim. A file-backed dictionary's file name is

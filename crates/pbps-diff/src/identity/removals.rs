@@ -156,6 +156,18 @@ pub fn inventory(
             Some((from.clone(), to.clone()))
         }),
     );
+    // Without this a rename the declarations record would read as the object's removal and
+    // raise `DropSearchNeedsReason` for a name that is only moving (DEC-2728.5).
+    project_pending_renames(
+        &mut names.search,
+        schema.search.keys().cloned().collect(),
+        intents.iter().filter_map(|i| {
+            let Intent::RenameSearch { from, to } = i else {
+                return None;
+            };
+            Some((from.clone(), to.clone()))
+        }),
+    );
     let mut removed_tables = std::collections::BTreeSet::new();
     let mut removed = Vec::new();
     for (uid, name) in &recorded.tables {
@@ -285,9 +297,15 @@ pub fn inventory(
             });
         }
     }
-    // Immutable by name like a package: there is no rename to project yet.
+    // The name a pending rename gives it is the one the declarations must hold; an
+    // object nothing names any more is a removal, as for a type.
     for (uid, name) in &recorded.search {
-        if recorded_schema.search.contains_key(name) && !names.search.contains_key(uid) {
+        if recorded_schema.search.contains_key(name)
+            && !names
+                .search
+                .get(uid)
+                .is_some_and(|name| schema.search.contains_key(name))
+        {
             removed.push(Removal::Search {
                 uid: uid.clone(),
                 name: name.clone(),

@@ -249,6 +249,23 @@ impl NameOnly {
                 }
             })
             .collect();
+        // A rename moves an object's name and nothing else, so the record it had under the
+        // old name is the one it keeps under the new one (DEC-2728.5). Without this the
+        // new name has no record and the read-back would be recorded in its place. At a
+        // staged checkpoint the identities may still hold the old name, which `previous`
+        // answers directly, so the carry is only for the name the rename has reached.
+        let renamed: BTreeMap<&SearchRef, &SearchRef> = applied
+            .changes
+            .iter()
+            .filter_map(|planned| {
+                if let Change::Search(SearchChange::RenameSearch { from, to, .. }) = &planned.change
+                {
+                    Some((to, from))
+                } else {
+                    None
+                }
+            })
+            .collect();
         let search = live
             .search
             .values()
@@ -256,7 +273,10 @@ impl NameOnly {
                 let object = if made.contains(name) {
                     read.get(name).or_else(|| previous.get(name))
                 } else {
-                    previous.get(name).or_else(|| read.get(name))
+                    previous
+                        .get(name)
+                        .or_else(|| renamed.get(name).and_then(|from| previous.get(*from)))
+                        .or_else(|| read.get(name))
                 };
                 object.map(|object| (name.clone(), object.clone()))
             })
