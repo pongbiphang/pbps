@@ -7,8 +7,9 @@
 //! and none of them names a driver type or a `Conn`: the wiring (item 7) runs
 //! them on a blocking thread behind the trait of `pbps_db::engine`.
 //!
-//! This part holds the state table and the write path: [`ensure_tables`],
-//! [`is_initialized`], [`record`] and [`prune`]. The reads, the lock and the
+//! This part holds the state table, the write path ([`ensure_tables`],
+//! [`is_initialized`], [`record`], [`prune`]) and the reads ([`latest`], [`entry`],
+//! [`deployed_revision`], [`has_applied_plan`], [`timeline`]). The lock and the
 //! integrity check are later parts of the same item and add to the same list
 //! of tables ([`ddl::RECIPE`]); nothing here is written for one table only.
 //!
@@ -33,10 +34,13 @@
 
 mod busy;
 mod ddl;
+mod read;
+mod rows;
 mod write;
 
 pub use busy::BUSY_WAIT;
 pub use ddl::{ensure_tables, is_initialized};
+pub use read::{deployed_revision, entry, has_applied_plan, latest, timeline};
 pub use write::{prune, record};
 
 /// The state table as the statements spell it. See the module header on `main.`.

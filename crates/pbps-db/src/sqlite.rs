@@ -191,6 +191,33 @@ impl Record {
             )),
         }
     }
+
+    /// Text, or `None` for NULL. Any other type, and a column that is not there,
+    /// are errors: a nullable column is the one place NULL is an answer, and a
+    /// value of another type must not read as its absence.
+    pub fn optional_text(&self, index: usize) -> Result<Option<&str>, DbError> {
+        match self.column(index)? {
+            Value::Null => Ok(None),
+            Value::Text(s) => Ok(Some(s)),
+            value @ (Value::Integer(_) | Value::Real(_) | Value::Blob(_)) => Err(DbError::BadRow(
+                format!("column {index} is {}, expected text or NULL", value.kind()),
+            )),
+        }
+    }
+
+    /// An integer, or `None` for NULL; see [`Record::optional_text`].
+    pub fn optional_integer(&self, index: usize) -> Result<Option<i64>, DbError> {
+        match self.column(index)? {
+            Value::Null => Ok(None),
+            Value::Integer(n) => Ok(Some(*n)),
+            value @ (Value::Real(_) | Value::Text(_) | Value::Blob(_)) => {
+                Err(DbError::BadRow(format!(
+                    "column {index} is {}, expected an integer or NULL",
+                    value.kind()
+                )))
+            }
+        }
+    }
 }
 
 /// An open SQLite database, with foreign keys enforced.
@@ -811,6 +838,39 @@ mod tests {
         match c.query("SELECT CAST(x'ff' AS TEXT)", &[]) {
             Err(DbError::BadRow(message)) => assert!(message.contains("UTF-8"), "{message}"),
             other => panic!("expected a refusal of text that is not UTF-8, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn optional_columns_read_null_as_absent_and_nothing_else_as_absent() {
+        let c = Connection::open_in_memory().expect("open");
+        let rows = c
+            .query("SELECT NULL, 'a', 7, 1.5, x'00', '' ", &[])
+            .expect("select");
+        let row = &rows[0];
+        assert_eq!(row.optional_text(0).expect("null"), None);
+        assert_eq!(row.optional_text(1).expect("text"), Some("a"));
+        assert_eq!(
+            row.optional_text(5).expect("empty"),
+            Some(""),
+            "empty is not NULL"
+        );
+        assert_eq!(row.optional_integer(0).expect("null"), None);
+        assert_eq!(row.optional_integer(2).expect("integer"), Some(7));
+        // Negative cases: another type and an absent column are errors, never `None`.
+        for (result, wanted) in [
+            (row.optional_text(2).map(drop), "an integer"),
+            (row.optional_text(3).map(drop), "a real"),
+            (row.optional_text(4).map(drop), "a blob"),
+            (row.optional_integer(1).map(drop), "text"),
+            (row.optional_integer(3).map(drop), "a real"),
+            (row.optional_text(9).map(drop), "out of range"),
+            (row.optional_integer(9).map(drop), "out of range"),
+        ] {
+            match result {
+                Err(DbError::BadRow(message)) => assert!(message.contains(wanted), "{message}"),
+                other => panic!("expected a row-shape error mentioning {wanted}, got {other:?}"),
+            }
         }
     }
 
