@@ -168,38 +168,14 @@ enum Attempt {
 /// The file `main` was opened from, as SQLite names it, or `None` for a database
 /// with none.
 ///
-/// Asked for as bytes (in hexadecimal, which every row accessor can carry): a
-/// file name on Unix need not be UTF-8, the connection opens such a file, and a
-/// name read as text would be refused. `Err(why)` is a name this platform
+/// Asked for as bytes: a file name on Unix need not be UTF-8, the connection
+/// opens such a file, and a name read as text would be refused. Asked of the
+/// statement and not of `pragma_database_list` in a `SELECT`, which a table of
+/// that name in any schema would answer in place of, with the file it names
+/// (see [`Connection::main_database_file`]). `Err(why)` is a name this platform
 /// cannot turn back into a path, which leaves the row alone.
 fn database_file(c: &Connection) -> Result<Result<Option<PathBuf>, RowOnly>, DbError> {
-    let rows = c.query(
-        "SELECT hex(CAST(file AS BLOB)) FROM pragma_database_list WHERE name = 'main'",
-        &[],
-    )?;
-    let Some(row) = rows.first() else {
-        return Err(DbError::BadRow(
-            "`pragma_database_list` does not list `main`".into(),
-        ));
-    };
-    let hex = row.text(0)?.as_bytes();
-    let digit = |b: u8| {
-        char::from(b)
-            .to_digit(16)
-            .and_then(|d| u8::try_from(d).ok())
-    };
-    let bytes: Option<Vec<u8>> = hex
-        .chunks(2)
-        .map(|pair| match pair {
-            [high, low] => Some(digit(*high)? << 4 | digit(*low)?),
-            _ => None,
-        })
-        .collect();
-    let Some(bytes) = bytes else {
-        return Err(DbError::BadRow(
-            "`hex()` of the database's file name is not hexadecimal".into(),
-        ));
-    };
+    let bytes = c.main_database_file()?;
     if bytes.is_empty() {
         return Ok(Ok(None));
     }

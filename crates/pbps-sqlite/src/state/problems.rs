@@ -24,6 +24,7 @@
 //! A read: it creates nothing and writes nothing. Under [`busy::waiting`], like
 //! every function of the state layer.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use pbps_db::DbError;
@@ -98,6 +99,23 @@ pub(super) fn stranger(name: &str, kind: &str) -> String {
     )
 }
 
+/// A table name as the argument of a pragma statement, which takes no bound
+/// parameter. [`ident::quote`] refuses the empty name, which SQLite accepts for
+/// a table and the pragma reads (measured), so it is written out here: a table
+/// of that name must not hide a key. A NUL ends the statement, so a name with
+/// one is an error and never a question about some other table.
+fn pragma_name(name: &str) -> Result<String, DbError> {
+    if name.is_empty() {
+        return Ok("\"\"".to_owned());
+    }
+    ident::quote(name).map_err(|_| {
+        DbError::BadRow(format!(
+            "the table name `{}` cannot be written into a statement",
+            Escaped(name)
+        ))
+    })
+}
+
 fn problems(c: &Connection) -> Result<Vec<String>, DbError> {
     let names: Vec<&str> = RECIPE.iter().map(|r| r.name).collect();
     let slots = (1..=names.len())
@@ -144,23 +162,37 @@ fn problems(c: &Connection) -> Result<Vec<String>, DbError> {
     // pragma does not load a virtual table's module, so a table of a module this
     // library lacks answers with no keys and does not fail the question on an
     // application's file (measured, and a test keeps it so).
-    // The pragma is asked of `main` by name: unqualified, a `TEMP` table of the
-    // child's name would answer in its place, with no key.
-    let referring = c.query(
-        &format!(
-            "SELECT DISTINCT m.name, f.\"table\" FROM main.sqlite_schema AS m, \
-             pragma_foreign_key_list(m.name, 'main') AS f \
-             WHERE m.type = 'table' \
-             AND f.\"table\" COLLATE NOCASE IN ({slots}) ORDER BY m.name, f.\"table\""
-        ),
-        &params,
+    //
+    // The statement form, once per table, and not `pragma_foreign_key_list(...)`
+    // in a `SELECT`: a `FROM` name is an ordinary table first, so an application
+    // table named `pragma_foreign_key_list` (in `main`, `temp` or an attached
+    // file) makes the table-valued form fail, and with it every gated operation
+    // on a genuine ledger. No object an application can create changes what the
+    // statement form returns. It is asked of `main` by name: unqualified, a
+    // `TEMP` table of the child's name would answer in its place, with no key.
+    let children = c.query(
+        "SELECT name FROM main.sqlite_schema WHERE type = 'table' ORDER BY name",
+        &[],
     )?;
-    for row in &referring {
-        found.push(format!(
-            "`{}` has a foreign key onto `{}`, so a delete there would delete or refuse its rows",
-            Escaped(row.text(0)?),
-            Escaped(row.text(1)?)
-        ));
+    for child in &children {
+        let child = child.text(0)?;
+        let mut onto = BTreeSet::new();
+        for key in c.query(
+            &format!("PRAGMA main.foreign_key_list({})", pragma_name(child)?),
+            &[],
+        )? {
+            let parent = key.text(2)?;
+            if RECIPE.iter().any(|r| ident::same(r.name, parent)) {
+                onto.insert(parent.to_owned());
+            }
+        }
+        for parent in onto {
+            found.push(format!(
+                "`{}` has a foreign key onto `{}`, so a delete there would delete or refuse its rows",
+                Escaped(child),
+                Escaped(&parent)
+            ));
+        }
     }
     Ok(found)
 }

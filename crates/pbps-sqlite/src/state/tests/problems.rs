@@ -557,3 +557,96 @@ fn a_foreign_key_is_found_though_a_temp_table_shadows_the_referring_table() {
     .expect("only the temp table has a key");
     assert!(crate::state::ledger_problems(c).expect("read").is_empty());
 }
+
+/// Where an application can put a table that the engine's table-valued pragma
+/// function shares a name with: the file, the connection's own `temp`, and an
+/// attached file. An object of another kind takes the name just as well.
+const PRAGMA_NAMESAKES: [&str; 5] = [
+    "CREATE TABLE main.pragma_foreign_key_list (a, b)",
+    "CREATE TEMP TABLE pragma_foreign_key_list (a, b)",
+    "ATTACH ':memory:' AS other; CREATE TABLE other.pragma_foreign_key_list (a, b)",
+    "CREATE VIEW main.pragma_foreign_key_list AS SELECT 1 AS a",
+    "CREATE TABLE main.pragma_foreign_key_list \
+     (id, seq, \"table\", \"from\", \"to\", on_update, on_delete, match)",
+];
+
+/// A genuine ledger is not refused for an unrelated table of the pragma
+/// function's name, and every gated operation works beside it.
+#[test]
+fn a_table_named_like_the_foreign_key_pragma_does_not_refuse_a_genuine_ledger() {
+    for setup in PRAGMA_NAMESAKES {
+        let mut fresh = Fresh::memory();
+        let c = fresh.connection();
+        c.execute_batch(setup).expect("a namesake");
+        assert!(ledger_problems(c).expect("asked").is_empty(), "{setup}");
+        ensure_tables(c).expect("created");
+        assert!(ledger_problems(c).expect("asked").is_empty(), "{setup}");
+        record(c, &snapshot(StateKind::Apply, "op")).expect("recorded");
+        assert!(environment_identity(c).expect("read").is_some(), "{setup}");
+        assert!(
+            !unlock(c).expect("unlocked"),
+            "{setup}: no lock row is held"
+        );
+    }
+}
+
+/// The negative: asking by the statement did not make the check blind. A key
+/// onto a ledger table is found with the namesake present, whichever the
+/// referring table's spelling of the ledger table's name.
+#[test]
+fn a_foreign_key_onto_the_ledger_is_found_beside_a_table_named_like_the_pragma() {
+    for setup in PRAGMA_NAMESAKES {
+        let mut fresh = Fresh::memory();
+        let c = fresh.connection();
+        ensure_tables(c).expect("created");
+        c.execute_batch(setup).expect("a namesake");
+        c.execute_batch(
+            "CREATE TABLE audit (state_id INTEGER REFERENCES __PBPS_STATE (id) ON DELETE CASCADE)",
+        )
+        .expect("a child");
+        let found = ledger_problems(c).expect("asked");
+        assert_eq!(found.len(), 1, "{setup}: {found:?}");
+        assert!(
+            found[0].contains("`audit` has a foreign key onto `__PBPS_STATE`"),
+            "{found:?}"
+        );
+        // The same key from every column of one child is one line, in the order
+        // the tables are named.
+        c.execute_batch(
+            "DROP TABLE audit;
+             CREATE TABLE b_child (x INTEGER REFERENCES __pbps_state (id), y INTEGER REFERENCES __pbps_state (id));
+             CREATE TABLE a_child (x INTEGER REFERENCES __pbps_lock (id));",
+        )
+        .expect("two children");
+        let found = ledger_problems(c).expect("asked");
+        assert_eq!(found.len(), 2, "{setup}: {found:?}");
+        assert!(found[0].starts_with("`a_child`"), "{found:?}");
+        assert!(found[1].starts_with("`b_child`"), "{found:?}");
+    }
+}
+
+/// A table whose name is empty, or holds a quote, is asked about as itself: the
+/// statement takes no parameter, so the name is written into it.
+#[test]
+fn a_key_is_found_on_a_table_with_an_empty_or_quoted_name() {
+    let mut fresh = Fresh::memory();
+    let c = fresh.connection();
+    ensure_tables(c).expect("created");
+    c.execute_batch(
+        "CREATE TABLE \"\" (x INTEGER REFERENCES __pbps_state (id));
+         CREATE TABLE \"a\"\"b'c\" (x INTEGER REFERENCES __pbps_lock (id));
+         CREATE TABLE plain (x INTEGER);",
+    )
+    .expect("children");
+    let found = ledger_problems(c).expect("asked");
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(found[0].starts_with("`` has a foreign key"), "{found:?}");
+    assert!(
+        found[1].starts_with("`a\"b'c` has a foreign key onto `__pbps_lock`"),
+        "{found:?}"
+    );
+    // Negative: with the keys gone, the same names are no problem.
+    c.execute_batch("DROP TABLE \"\"; DROP TABLE \"a\"\"b'c\"")
+        .expect("dropped");
+    assert!(ledger_problems(c).expect("asked").is_empty());
+}

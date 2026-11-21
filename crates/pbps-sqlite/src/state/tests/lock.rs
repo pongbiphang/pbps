@@ -683,3 +683,44 @@ fn release_refuses_a_view_in_the_locks_name_and_runs_no_trigger() {
         "the trigger did not run"
     );
 }
+
+/// A table named like the table-valued pragma that lists the databases must not
+/// say where the lock's sidecar is: the file is the one the connection opened.
+/// Read through that table the file would be whatever the table says, and the
+/// run would lock a path of the application's choosing.
+#[test]
+fn a_table_named_like_the_database_list_pragma_does_not_choose_the_sidecar() {
+    for setup in [
+        "CREATE TABLE main.pragma_database_list (name, file); \
+         INSERT INTO main.pragma_database_list VALUES ('main', '/no/such/directory/elsewhere.db')",
+        "CREATE TEMP TABLE pragma_database_list (name, file); \
+         INSERT INTO pragma_database_list VALUES ('main', '/no/such/directory/elsewhere.db')",
+        "ATTACH ':memory:' AS other; CREATE TABLE other.pragma_database_list (name, file); \
+         INSERT INTO other.pragma_database_list VALUES ('main', '/no/such/directory/elsewhere.db')",
+        "CREATE VIEW main.pragma_database_list AS SELECT 1 AS name",
+    ] {
+        let fresh = Fresh::file();
+        let c = open(fresh.path());
+        c.execute_batch(setup).expect("a namesake");
+        let taken = lock(&c, "op [pid 1]").expect("locked");
+        assert_eq!(taken.guard.proof(), &Proof::File, "{setup}");
+        let real = std::fs::canonicalize(fresh.path()).expect("the real path");
+        assert!(sidecar_path(&real).exists(), "{setup}");
+        assert!(release(&c, taken.guard).expect("released"), "{setup}");
+    }
+}
+
+/// The negative: a database with no file has none to lock, whatever a namesake
+/// table says its file is.
+#[test]
+fn a_namesake_of_the_database_list_pragma_does_not_give_a_memory_database_a_file() {
+    let mut fresh = Fresh::memory();
+    let c = fresh.connection();
+    c.execute_batch(
+        "CREATE TABLE pragma_database_list (name, file); \
+         INSERT INTO pragma_database_list VALUES ('main', '/no/such/directory/elsewhere.db')",
+    )
+    .expect("a namesake");
+    let taken = lock(c, "op [pid 1]").expect("row only");
+    assert_eq!(taken.guard.proof(), &Proof::RowOnly(RowOnly::NoFile));
+}
