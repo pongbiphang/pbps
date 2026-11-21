@@ -1174,37 +1174,10 @@ pub fn touched(names: &PlanNames<'_>) -> (usize, usize) {
 ///
 /// `Change::roles` answers with both ends of a rename, which is the right
 /// answer for "did this plan touch that role" and the wrong one for counting:
-/// collected as they come, one renamed role is two.
-// Exhaustive rather than a wildcard, for the reason `Change::roles` gives: a
-// change added later that names a role has to be classified here, or the
-// summary stops counting it.
+/// collected as they come, one renamed role is two. The name the change
+/// carries is the first it answers with, so only that one is taken.
 fn role_of(change: &Change) -> Option<&pbps_model::RoleName> {
-    match change {
-Change::Partition(PartitionChange::RebuildPartitionedTable(_)) | Change::Index(IndexChange::BuildPartitionedIndex(_)) | Change::Partition(PartitionChange::CopyTableRows(_)) | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => None,
-        Change::TypeValue(_) | Change::Type(_) | Change::Search(_) | Change::Extension(_) => None,
-        Change::Role(RoleChange::CreateRole { name, .. })
-        | Change::Role(RoleChange::DropRole { name, .. })
-        | Change::Permission(GrantChange::Grant { role: name, .. })
-        | Change::Permission(GrantChange::Revoke { role: name, .. }) => Some(name),
-        Change::Role(RoleChange::RenameRole { from, .. }) => Some(from),
-        Change::Table(_)
-        | Change::Partition(PartitionChange::DetachPartition { .. })
-        | Change::Partition(PartitionChange::AttachPartition { .. })
-        | Change::Column(_)
-        | Change::TableProperty(_)
-        | Change::Constraint(_)
-        | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-        | Change::Partition(PartitionChange::SetPartitionDefault { .. })
-        | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
-        | Change::Policy(_)
-        | Change::Index(IndexChange::AddIndex { .. })
-        | Change::Index(IndexChange::DropIndex { .. })
-        | Change::Row(_)
-        | Change::Module(_)
-        // `PUBLIC` is not a role the summary can count: no declaration, ids
-        // file or pull ever names it (ADR-0010 §5).
-        | Change::Permission(GrantChange::PublicExecution { .. }) => None,
-    }
+    change.roles().next()
 }
 
 /// "3 table(s)", "2 module(s)", or both — never a count of one naming the
@@ -3948,3 +3921,143 @@ mod search_alteration_tests {
         assert!(!line("dictionary app.solo", was, now, Vec::new()).contains("vouch"));
     }
 }
+
+// One change of every kind, the corpus `pbps-model` keeps complete
+// (`the_equivalence_corpus_covers_every_change_kind`).
+#[cfg(test)]
+#[path = "../../pbps-model/tests/support/part_effect_cases.rs"]
+mod change_kinds;
+
+#[cfg(test)]
+mod role_of_tests {
+    use super::*;
+    use pbps_model::{GrantTarget, Permission, Uid, UidKind};
+
+    /// The kinds that carry a role's name, as the corpus names them.
+    const NAMING_A_ROLE: [&str; 5] = ["CreateRole", "DropRole", "RenameRole", "Grant", "Revoke"];
+
+    /// Negative for every other kind, `PublicExecution` among them: `PUBLIC`
+    /// is not a role the summary counts (ADR-0010 §5).
+    #[test]
+    fn only_a_role_change_or_a_roles_grant_answers_with_a_role() {
+        let cases = change_kinds::cases();
+        assert!(cases.iter().any(|(name, _)| name == "PublicExecution"));
+        for (name, change) in cases {
+            let kind = name.split('/').next().unwrap();
+            assert_eq!(
+                role_of(&change).is_some(),
+                NAMING_A_ROLE.contains(&kind),
+                "{name}"
+            );
+        }
+    }
+
+    /// The corpus renames a role onto its own name, which cannot tell the two
+    /// ends apart; this one can.
+    #[test]
+    fn a_rename_answers_with_the_old_name_and_never_the_new_one() {
+        let rename = Change::Role(RoleChange::RenameRole {
+            uid: Uid::derived(UidKind::Role, "a", 0),
+            from: "a".into(),
+            to: "b".into(),
+        });
+        assert_eq!(role_of(&rename), Some(&"a".into()));
+        assert_eq!(rename.roles().count(), 2);
+    }
+
+    #[test]
+    fn a_grant_or_a_revoke_answers_with_its_grantee_whatever_the_target() {
+        for target in [
+            GrantTarget::Schema("app".into()),
+            GrantTarget::Object("app.t".parse().unwrap()),
+        ] {
+            let permissions: std::collections::BTreeSet<_> = [Permission::Usage].into();
+            let grant = Change::Permission(GrantChange::Grant {
+                role: "reader".into(),
+                target: target.clone(),
+                permissions: permissions.clone(),
+            });
+            let revoke = Change::Permission(GrantChange::Revoke {
+                role: "writer".into(),
+                target,
+                permissions,
+            });
+            assert_eq!(role_of(&grant), Some(&"reader".into()));
+            assert_eq!(role_of(&revoke), Some(&"writer".into()));
+        }
+    }
+}
+
+// ORACLE-2997-BEGIN
+#[cfg(test)]
+mod role_of_listing_oracle {
+    use super::*;
+    use pbps_model::{GrantTarget, Permission, Uid, UidKind};
+
+    fn listed(change: &Change) -> Option<&pbps_model::RoleName> {
+        match change {
+    Change::Partition(PartitionChange::RebuildPartitionedTable(_)) | Change::Index(IndexChange::BuildPartitionedIndex(_)) | Change::Partition(PartitionChange::CopyTableRows(_)) | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => None,
+            Change::TypeValue(_) | Change::Type(_) | Change::Search(_) | Change::Extension(_) => None,
+            Change::Role(RoleChange::CreateRole { name, .. })
+            | Change::Role(RoleChange::DropRole { name, .. })
+            | Change::Permission(GrantChange::Grant { role: name, .. })
+            | Change::Permission(GrantChange::Revoke { role: name, .. }) => Some(name),
+            Change::Role(RoleChange::RenameRole { from, .. }) => Some(from),
+            Change::Table(_)
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Column(_)
+            | Change::TableProperty(_)
+            | Change::Constraint(_)
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(_)
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(_)
+            | Change::Module(_)
+            // `PUBLIC` is not a role the summary can count: no declaration, ids
+            // file or pull ever names it (ADR-0010 §5).
+            | Change::Permission(GrantChange::PublicExecution { .. }) => None,
+        }
+    }
+
+    #[test]
+    fn the_projection_answers_as_the_listing_did_for_every_kind() {
+        let permissions: std::collections::BTreeSet<_> = [Permission::Usage].into();
+        let extras = [
+            (
+                "RenameRole/two-names".to_owned(),
+                Change::Role(RoleChange::RenameRole {
+                    uid: Uid::derived(UidKind::Role, "a", 0),
+                    from: "a".into(),
+                    to: "b".into(),
+                }),
+            ),
+            (
+                "Grant/schema".to_owned(),
+                Change::Permission(GrantChange::Grant {
+                    role: "reader".into(),
+                    target: GrantTarget::Schema("app".into()),
+                    permissions: permissions.clone(),
+                }),
+            ),
+            (
+                "Revoke/schema".to_owned(),
+                Change::Permission(GrantChange::Revoke {
+                    role: "writer".into(),
+                    target: GrantTarget::Schema("app".into()),
+                    permissions,
+                }),
+            ),
+        ];
+        let mut seen = 0;
+        for (name, change) in change_kinds::cases().into_iter().chain(extras) {
+            assert_eq!(role_of(&change), listed(&change), "{name}");
+            seen += 1;
+        }
+        assert!(seen > 100, "{seen}");
+    }
+}
+// ORACLE-2997-END
