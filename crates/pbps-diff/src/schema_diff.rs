@@ -1088,6 +1088,143 @@ pub(crate) fn diff_partial_rebuilding(
     errs.extend(extension_move_errors);
     changes.extend(diff_search(base, declared, hints, &mut errs));
 
+    let types = diff_types(
+        base,
+        declared,
+        dialect,
+        &rebuilt_domains.uids,
+        &mut changes,
+        &mut errs,
+    );
+
+    let (
+        TableFacts {
+            index,
+            renames,
+            standing,
+        },
+        changes_out,
+        errs_out,
+    ) = diff_tables(base, declared, dialect, types, read_back, changes, errs);
+    changes = changes_out;
+    errs = errs_out;
+    let base_tables = &base.ids.tables;
+    let declared_tables = &declared.ids.tables;
+
+    split_tightenings_from_retypes(&mut changes);
+    clear_external_partitions_after_loosening(declared.schema, &mut changes);
+    crate::enum_labels::rebuild_defaults(base, declared, &mut changes);
+    recreate_retyped_dependents(base, declared, &renames, dialect, &mut changes);
+    recreate_referenced_foreign_keys(base, declared, &renames, &mut changes);
+    rebind_foreign_keys_to_a_new_occupant(base, declared, &mut changes);
+    unlink_cycles_around_persistence_switches(declared.schema, &mut changes);
+    // After every pass that drops and re-adds an index: each re-add of the
+    // identity's index loses the identity, and is followed by it again.
+    let early_identity = diff_replica_identity(
+        base.schema,
+        declared.schema,
+        declared_tables,
+        base_tables,
+        &mut changes,
+    );
+
+    diff_modules(
+        base.schema,
+        declared.schema,
+        &names_changing_hands(base, declared),
+        dialect,
+        &mut changes,
+    );
+    refuse_computed_dependencies(
+        base.schema,
+        declared.schema,
+        dialect,
+        screen,
+        &changes,
+        &mut errs,
+    );
+    refuse_temporal_changes(base, declared, &changes, &mut errs);
+    refuse_unjoinable_foreign_keys(declared.schema, dialect, &changes, &mut errs);
+    refuse_rows_referencing_late_inserts(declared, &changes, &mut errs);
+    refuse_partition_changes(base, declared, &index, hints, dialect, &changes, &mut errs);
+    changes = rebind_modules(base, declared, dialect, hints, also, rebinding, changes);
+    diff_roles(base, declared, dialect, &mut changes);
+    revoke_public_execution(base.schema, dialect, hints, &mut changes);
+
+    // The ordering and risk pass below runs whether or not there are errors:
+    // it is pure computation over the changes already built, and a caller that
+    // is going to *report* the partial set needs it sorted and classified
+    // exactly as a plan would be.
+    // After every pass that rebuilds an index: its `CREATE` carries the
+    // declared parameters (#1483 review).
+    // Every change is in: whichever pass produced a retype or a drop of a held
+    // column is seen, not only the table loop's.
+    for (table, held) in &standing {
+        let stated = exclusion_hazards(
+            table,
+            held,
+            declared.schema.tables.get(table),
+            changes.iter().filter(|c| c.table() == Some(table)),
+            dialect,
+            &mut errs,
+        );
+        changes.extend(stated);
+    }
+    // Descriptions are comments only where the engine holds them; elsewhere they stay the
+    // free text they were (#2729).
+    if dialect.holds_descriptions() {
+        let comments = crate::comments::changes(base, declared, &changes);
+        changes.extend(comments);
+    }
+    crate::order::drop_parameter_changes_of_rebuilt_indexes(&mut changes, |c| c);
+    let mut planned: Vec<PlannedChange> = changes.into_iter().map(PlannedChange::new).collect();
+    for p in &mut planned {
+        // Attached here, not looked up at emit time: the plan file is the
+        // artifact the deployment gate reviews, and a hint resolved later
+        // against a YAML file the deployment host may not have is a hint
+        // nobody read (ADR-0003).
+        if let Some(strategy) = p.change.table().and_then(|t| hints.strategies.get(t)) {
+            p.strategy = *strategy;
+        }
+    }
+
+    crate::row_defaults::catalog(&mut planned, base, declared, &hints.row_guard_defaults);
+
+    let (facts, mut planned, errs) = sort_facts(
+        planned,
+        base,
+        declared,
+        dialect,
+        module_deps,
+        index,
+        early_identity,
+        errs,
+    );
+    // Cached: `sort_by_key` computed this key, `Debug` text and all, on both
+    // sides of every comparison, a third of a 4,000-table plan's CPU
+    // (#1908). The cache keeps equal keys in their original order, as the
+    // stable sort did, so the order is the same.
+    crate::order::normalization::sort_draft(&mut planned, |p| facts.key(p));
+    finish_sort(planned, base, declared, dialect, renames, errs)
+}
+
+/// The types phase of `diff_partial_rebuilding`: refusals for types that no
+/// identity file records, then drop, alter and rename of the recorded ones, the
+/// creates, and the refusals for rename cycles and for retained identities
+/// whose declaration is gone.
+///
+/// It pushes into the caller's lists instead of returning its own, because the
+/// order of `errors` is part of the result and the passes that follow read
+/// `changes` as the earlier phases left it. It returns the resolver the tables
+/// phase reads.
+fn diff_types<'a>(
+    base: Side<'a>,
+    declared: Side<'a>,
+    dialect: &(impl Dialect + ?Sized),
+    rebuilt_domain_uids: &BTreeMap<Uid, crate::domain_rebuild::Why>,
+    changes: &mut Vec<Change>,
+    errs: &mut Vec<DiffError>,
+) -> TypeResolver<'a> {
     // Definitions match by recorded identity. A rename is never inferred
     // from equal definitions or a pair of disappearing/appearing names.
     let types = TypeResolver::new(base.ids, declared.ids);
@@ -1172,7 +1309,7 @@ pub(crate) fn diff_partial_rebuilding(
                 // above and plans nothing (DEC-1635.8).
                 let comparable = &old_schema.types[name];
                 let alters = refused.is_empty()
-                    && !rebuilt_domains.uids.contains_key(uid)
+                    && !rebuilt_domain_uids.contains_key(uid)
                     && matches!(
                         (comparable, new),
                         (
@@ -1263,7 +1400,40 @@ pub(crate) fn diff_partial_rebuilding(
             });
         }
     }
+    types
+}
 
+/// What the tables phase leaves for the passes after it.
+struct TableFacts<'a> {
+    /// Both identity files, indexed: the partition refusals and the sort facts read it.
+    index: Indexes<'a>,
+    /// The table and column renames of this plan: the dependents of a retyped
+    /// column, the foreign keys onto a renamed table and the rename order read them.
+    renames: Renames,
+    /// The base tables that hold an exclusion, as this plan's renames leave
+    /// them: the exclusion hazards read them.
+    standing: BTreeMap<TableName, Table>,
+}
+
+/// The tables phase of `diff_partial_rebuilding`: the tables only the base
+/// holds are dropped, the tables only the declarations hold are created, and
+/// each table both sides hold is renamed, compared and attached or detached.
+///
+/// It takes the lists of `changes` and `errs` built so far and hands them back,
+/// not lists of its own to append afterwards: the order of both is part of the
+/// result, and the loop over the surviving tables reads `changes` as `&changes`
+/// and lends both as `&mut changes` and `&mut errs`, which a `&mut Vec`
+/// parameter would not allow. It takes the resolver by value, as no pass after
+/// it reads it. It returns the facts the passes after it read.
+fn diff_tables<'a>(
+    base: Side<'a>,
+    declared: Side<'a>,
+    dialect: &(impl Dialect + ?Sized),
+    types: TypeResolver<'_>,
+    read_back: Option<&Schema>,
+    mut changes: Vec<Change>,
+    mut errs: Vec<DiffError>,
+) -> (TableFacts<'a>, Vec<Change>, Vec<DiffError>) {
     let base_tables = &base.ids.tables;
     let declared_tables = &declared.ids.tables;
     let index = Indexes {
@@ -1827,43 +1997,34 @@ pub(crate) fn diff_partial_rebuilding(
             &mut errs,
         );
     }
+    (
+        TableFacts {
+            index,
+            renames,
+            standing,
+        },
+        changes,
+        errs,
+    )
+}
 
-    split_tightenings_from_retypes(&mut changes);
-    clear_external_partitions_after_loosening(declared.schema, &mut changes);
-    crate::enum_labels::rebuild_defaults(base, declared, &mut changes);
-    recreate_retyped_dependents(base, declared, &renames, dialect, &mut changes);
-    recreate_referenced_foreign_keys(base, declared, &renames, &mut changes);
-    rebind_foreign_keys_to_a_new_occupant(base, declared, &mut changes);
-    unlink_cycles_around_persistence_switches(declared.schema, &mut changes);
-    // After every pass that drops and re-adds an index: each re-add of the
-    // identity's index loses the identity, and is followed by it again.
-    let early_identity = diff_replica_identity(
-        base.schema,
-        declared.schema,
-        declared_tables,
-        base_tables,
-        &mut changes,
-    );
-
-    diff_modules(
-        base.schema,
-        declared.schema,
-        &names_changing_hands(base, declared),
-        dialect,
-        &mut changes,
-    );
-    refuse_computed_dependencies(
-        base.schema,
-        declared.schema,
-        dialect,
-        screen,
-        &changes,
-        &mut errs,
-    );
-    refuse_temporal_changes(base, declared, &changes, &mut errs);
-    refuse_unjoinable_foreign_keys(declared.schema, dialect, &changes, &mut errs);
-    refuse_rows_referencing_late_inserts(declared, &changes, &mut errs);
-    refuse_partition_changes(base, declared, &index, hints, dialect, &changes, &mut errs);
+/// The module rebinding phase of `diff_partial_rebuilding`: the modules the
+/// dialect, the caller or an enum's dependents ask to have rebuilt around the
+/// plan's changes, and the modules a schema-bound teardown takes down.
+///
+/// It takes the list of `changes` built so far and hands it back rebuilt, not a
+/// list of its own to append afterwards: it rewrites entries already in the
+/// list, and `diff_roles`, the exclusion hazards and the sort read the list as
+/// this phase leaves it. Moving the list in and out keeps its order.
+fn rebind_modules(
+    base: Side<'_>,
+    declared: Side<'_>,
+    dialect: &(impl Dialect + ?Sized),
+    hints: &Hints,
+    also: &BTreeSet<ModuleId>,
+    rebinding: Rebinding,
+    mut changes: Vec<Change>,
+) -> Vec<Change> {
     // A module declaration can stay byte-for-byte identical while a new
     // overload or shadow changes what it should bind to. Ask the dialect
     // before sorting, rather than appending unreviewed SQL at apply time.
@@ -2006,48 +2167,18 @@ pub(crate) fn diff_partial_rebuilding(
             module: Box::new(module.clone()),
         }));
     }
-    diff_roles(base, declared, dialect, &mut changes);
-    revoke_public_execution(base.schema, dialect, hints, &mut changes);
+    changes
+}
 
-    // The ordering and risk pass below runs whether or not there are errors:
-    // it is pure computation over the changes already built, and a caller that
-    // is going to *report* the partial set needs it sorted and classified
-    // exactly as a plan would be.
-    // After every pass that rebuilds an index: its `CREATE` carries the
-    // declared parameters (#1483 review).
-    // Every change is in: whichever pass produced a retype or a drop of a held
-    // column is seen, not only the table loop's.
-    for (table, held) in &standing {
-        let stated = exclusion_hazards(
-            table,
-            held,
-            declared.schema.tables.get(table),
-            changes.iter().filter(|c| c.table() == Some(table)),
-            dialect,
-            &mut errs,
-        );
-        changes.extend(stated);
-    }
-    // Descriptions are comments only where the engine holds them; elsewhere they stay the
-    // free text they were (#2729).
-    if dialect.holds_descriptions() {
-        let comments = crate::comments::changes(base, declared, &changes);
-        changes.extend(comments);
-    }
-    crate::order::drop_parameter_changes_of_rebuilt_indexes(&mut changes, |c| c);
-    let mut planned: Vec<PlannedChange> = changes.into_iter().map(PlannedChange::new).collect();
-    for p in &mut planned {
-        // Attached here, not looked up at emit time: the plan file is the
-        // artifact the deployment gate reviews, and a hint resolved later
-        // against a YAML file the deployment host may not have is a hint
-        // nobody read (ADR-0003).
-        if let Some(strategy) = p.change.table().and_then(|t| hints.strategies.get(t)) {
-            p.strategy = *strategy;
-        }
-    }
-
-    crate::row_defaults::catalog(&mut planned, base, declared, &hints.row_guard_defaults);
-
+/// The creation and the drop rank of each module among the modules, by their
+/// dependencies: `dependency_rank` reads them for the module changes.
+#[allow(clippy::needless_borrow)] // The block moved as it was; its borrows were of an owned local.
+fn module_ranks(
+    base: Side<'_>,
+    declared: Side<'_>,
+    dialect: &(impl Dialect + ?Sized),
+    module_deps: &pbps_model::module::ModuleDeps,
+) -> (BTreeMap<ModuleId, usize>, BTreeMap<ModuleId, usize>) {
     // Modules are ordered among themselves by dependency: a view over a view
     // has to be created second, and dropped first (ADR-0002).
     // Lexed by the dialect: where a literal ends is the engine's rule, and an
@@ -2072,18 +2203,16 @@ pub(crate) fn diff_partial_rebuilding(
         &module_deps,
         &lexis,
     ));
-    // The tiebreaker within an ordering class is the table name, then the
-    // change's rendering. Debug output alone would sort by uid, which is random
-    // at mint time — the plan would be correct but differently ordered per
-    // project, and a reviewer diffing two plan.sql files would see noise.
-    //
-    // `subject()` does not speak for one side consistently: `RenameTable` and
-    // `RenameRole` answer with the name the object is losing, everything else
-    // with the name it will have. Two changes to one object are therefore
-    // sorted against two different spellings of it, and the alphabet — not the
-    // dependency — decides which wins. Anything with a real order between them
-    // belongs in ordering classes or explicit dependency edges; this
-    // tiebreaker cannot express it.
+    (create_rank, drop_rank)
+}
+
+/// The parents this plan attaches partitions to, and the rank of the tables that
+/// receive rows or attaches: `late_attach_ranks` reads both, `dependency_rank`
+/// the rank.
+fn attach_parents_and_data_rank(
+    planned: &[PlannedChange],
+    declared: Side<'_>,
+) -> (BTreeMap<TableName, TableName>, BTreeMap<TableName, usize>) {
     // Rows follow the foreign keys among the tables that declare them. The
     // declared side is the right one to read: a row being inserted is going
     // into the schema as it will be, not as it was.
@@ -2122,8 +2251,12 @@ pub(crate) fn diff_partial_rebuilding(
                 .collect(),
         )
     });
-    // Roles that are dropped together are ordered parent before member.
-    let role_rank = member_depth(&planned);
+    (attach_parents, data_rank)
+}
+
+/// The tables a `RenameColumn` of this plan claims a column name on:
+/// `frees_a_renamed_column` reads it to find the drop that frees a name.
+fn column_name_claims(planned: &[PlannedChange]) -> BTreeSet<TableName> {
     // The tables a `RenameColumn` in this plan claims a column name on. Both
     // this and the drops below carry `declared_table_name` (`diff_columns`),
     // so the two spellings meet.
@@ -2191,49 +2324,16 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::Permission(_) => None,
         })
         .collect();
-    // Whether this drop can be what frees a name a `RenameColumn` above is
-    // waiting for. A column drop and nothing else: no other change gives up a
-    // column name.
-    let frees_a_renamed_column = |c: &Change| -> bool {
-        match c {
-            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
-            | Change::Index(IndexChange::BuildPartitionedIndex(_))
-            | Change::Partition(PartitionChange::CopyTableRows(_))
-            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => false,
-            Change::Column(ColumnChange::DropColumn { column, .. }) => {
-                tables_claiming_a_column_name.contains(&column.table)
-            }
-            Change::Table(_)
-            | Change::Partition(PartitionChange::DetachPartition { .. })
-            | Change::Partition(PartitionChange::AttachPartition { .. })
-            | Change::Column(ColumnChange::AddColumn { .. })
-            | Change::Column(ColumnChange::RenameColumn { .. })
-            | Change::Column(ColumnChange::AlterColumnType { .. })
-            | Change::Column(ColumnChange::AlterColumnNullability { .. })
-            | Change::Column(ColumnChange::AlterColumnDefault { .. })
-            | Change::Column(ColumnChange::AlterColumnExpression { .. })
-            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
-            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
-            | Change::TableProperty(_)
-            | Change::Constraint(_)
-            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
-            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
-            | Change::Policy(_)
-            | Change::Index(IndexChange::AddIndex { .. })
-            | Change::Column(ColumnChange::AddComputedColumn { .. })
-            | Change::Column(ColumnChange::DropComputedColumn { .. })
-            | Change::Index(IndexChange::DropIndex { .. })
-            | Change::Row(_)
-            | Change::Module(_)
-            | Change::TypeValue(_)
-            | Change::Role(_)
-            | Change::Type(_)
-            | Change::Search(_)
-            | Change::Extension(_)
-            | Change::Permission(_) => false,
-        }
-    };
+    tables_claiming_a_column_name
+}
+
+/// How many renames each `RenameColumn` waits on, which ranks it within its class.
+/// It pushes the refusals for cycles of renames into `errs` in place: the
+/// order of `errors` is part of the result.
+fn rename_chain_depths(
+    planned: &[PlannedChange],
+    errs: &mut Vec<DiffError>,
+) -> BTreeMap<Rename, usize> {
     // A column rename into a name another rename of the same table vacates
     // runs after it: skipped revisions that rename `b` to `c` and then `a` to
     // `b` leave a chain the uids would otherwise order, and `a -> b` while `b`
@@ -2274,7 +2374,6 @@ pub(crate) fn diff_partial_rebuilding(
     // every exact one and only where it closes no cycle: on a case-sensitive
     // database `a -> B` beside `b -> A` is a valid pair, not a swap, and a
     // folded link must not hide an exact one it would loop through.
-    type Rename = (TableName, ColumnName);
     let mut waits: BTreeMap<&Rename, BTreeSet<&Rename>> = vacates
         .iter()
         .map(|(rename, to)| {
@@ -2282,23 +2381,6 @@ pub(crate) fn diff_partial_rebuilding(
             (rename, exact.map(|(k, _)| k).into_iter().collect())
         })
         .collect();
-    fn reaches<'a>(
-        waits: &BTreeMap<&'a Rename, BTreeSet<&'a Rename>>,
-        from: &'a Rename,
-        to: &Rename,
-    ) -> bool {
-        let mut seen = BTreeSet::new();
-        let mut stack = vec![from];
-        while let Some(at) = stack.pop() {
-            if at == to {
-                return true;
-            }
-            if seen.insert(at) {
-                stack.extend(waits.get(at).into_iter().flatten().copied());
-            }
-        }
-        false
-    }
     for (rename, to) in &vacates {
         let folded = crate::order::rename_order::case_folded(to.raw());
         for vacating in vacates.keys() {
@@ -2318,29 +2400,6 @@ pub(crate) fn diff_partial_rebuilding(
     // Its depth is the longest run of renames it waits on; the chain's far
     // end, whose target is free, goes first. A rename on an exact cycle is
     // refused below, so its depth is only cut short, never relied on.
-    fn depth<'a>(
-        waits: &BTreeMap<&'a Rename, BTreeSet<&'a Rename>>,
-        at: &'a Rename,
-        open: &mut BTreeSet<&'a Rename>,
-        memo: &mut BTreeMap<&'a Rename, usize>,
-    ) -> usize {
-        if let Some(&d) = memo.get(at) {
-            return d;
-        }
-        if !open.insert(at) {
-            return 0;
-        }
-        let d = waits
-            .get(at)
-            .into_iter()
-            .flatten()
-            .map(|&next| 1 + depth(waits, next, open, memo))
-            .max()
-            .unwrap_or(0);
-        open.remove(at);
-        memo.insert(at, d);
-        d
-    }
     let mut memo = BTreeMap::new();
     let chain_depth: BTreeMap<Rename, usize> = vacates
         .keys()
@@ -2354,9 +2413,56 @@ pub(crate) fn diff_partial_rebuilding(
     for (table, columns) in cycles {
         errs.push(DiffError::ColumnRenameCycle { table, columns });
     }
-    // The class, and a rank inside it, so a change can sit between two
-    // classes without a new ordinal shifting every one below it — the cost
-    // `order_key`'s own doc names.
+    chain_depth
+}
+
+type Rename = (TableName, ColumnName);
+
+fn reaches<'a>(
+    waits: &BTreeMap<&'a Rename, BTreeSet<&'a Rename>>,
+    from: &'a Rename,
+    to: &Rename,
+) -> bool {
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![from];
+    while let Some(at) = stack.pop() {
+        if at == to {
+            return true;
+        }
+        if seen.insert(at) {
+            stack.extend(waits.get(at).into_iter().flatten().copied());
+        }
+    }
+    false
+}
+
+fn depth<'a>(
+    waits: &BTreeMap<&'a Rename, BTreeSet<&'a Rename>>,
+    at: &'a Rename,
+    open: &mut BTreeSet<&'a Rename>,
+    memo: &mut BTreeMap<&'a Rename, usize>,
+) -> usize {
+    if let Some(&d) = memo.get(at) {
+        return d;
+    }
+    if !open.insert(at) {
+        return 0;
+    }
+    let d = waits
+        .get(at)
+        .into_iter()
+        .flatten()
+        .map(|&next| 1 + depth(waits, next, open, memo))
+        .max()
+        .unwrap_or(0);
+    open.remove(at);
+    memo.insert(at, d);
+    d
+}
+
+/// The uids of the base's generated columns, whose drops `sort_class` puts first
+/// in their class.
+fn generated_columns_in_base(base: Side<'_>, index: &Indexes<'_>) -> BTreeSet<pbps_model::Uid> {
     // The base's generated columns, whose drops go first in their class: an
     // input column cannot be dropped while a generated column still reads it
     // (DEC-1168.1). By uid, not by name: a `DropColumn` names the column
@@ -2380,14 +2486,21 @@ pub(crate) fn diff_partial_rebuilding(
                 .filter_map(|(column, _)| index.base.column_uid(&name.column(column)).cloned())
         })
         .collect();
+    generated_in_base
+}
+
+/// The tables this plan writes rows into or deletes rows from: `late_attach` and
+/// `sort_class` read it.
+fn row_change_tables(planned: &[PlannedChange]) -> BTreeSet<TableName> {
     let row_tables: BTreeSet<TableName> = planned
         .iter()
         .filter_map(|p| row_table(&p.change).cloned())
         .collect();
-    let identified = identities_put_on(planned.iter().map(|p| &p.change));
-    let inserted = tables_with_inserts(planned.iter().map(|p| &p.change));
-    let late = numbering_after_deletes(planned.iter().map(|p| &p.change));
-    let installed = numbering_put_on(planned.iter().map(|p| &p.change));
+    row_tables
+}
+
+/// The columns this plan tightens or retypes: `sequence_release_ranks` reads them.
+fn columns_held_back(planned: &[PlannedChange]) -> BTreeSet<ColumnRef> {
     // A column this plan tightens or retypes: a conversion to an identity
     // waits for both, since the identity is made `NOT NULL`-only and in the
     // column's type at the time (#1930 review).
@@ -2407,6 +2520,15 @@ pub(crate) fn diff_partial_rebuilding(
             }
         })
         .collect();
+    held_back
+}
+
+/// The identity columns whose sequence bounds are retuned before their retype:
+/// `sort_class` puts their numbering change first in its class.
+fn columns_whose_bounds_go_first(
+    planned: &[PlannedChange],
+    dialect: &(impl Dialect + ?Sized),
+) -> BTreeSet<ColumnRef> {
     // A kept identity on a column this plan narrows: its sequence is
     // retuned before the retype (#2013 review, DEC-1921.1). The engine moves
     // an identity's sequence with its column, and measured on 16 and 18 it
@@ -2445,11 +2567,34 @@ pub(crate) fn diff_partial_rebuilding(
         })
         .cloned()
         .collect();
+    bounds_first
+}
+
+/// How deep each owned-sequence release sits in its chain of renames, which
+/// `sort_class` ranks it by. It pushes the refusals for cycles into `errs` in
+/// place: the order of `errors` is part of the result.
+#[allow(clippy::needless_borrow)] // The block moved as it was; its borrows were of an owned local.
+fn sequence_release_ranks(
+    planned: &[PlannedChange],
+    held_back: &BTreeSet<ColumnRef>,
+    errs: &mut Vec<DiffError>,
+) -> BTreeMap<ColumnRef, usize> {
     let (early_release, sequence_cycles) =
         sequence_release_depths(planned.iter().map(|p| &p.change), &held_back);
     for renames in sequence_cycles {
         errs.push(DiffError::SequenceRenameCycle { renames });
     }
+    early_release
+}
+
+/// The attached partitions that wait among the row changes, with the rank of
+/// their parent: `sort_class` and the sort key read it.
+fn late_attach_ranks(
+    declared: Side<'_>,
+    attach_parents: &BTreeMap<TableName, TableName>,
+    row_tables: &BTreeSet<TableName>,
+    data_rank: &BTreeMap<TableName, usize>,
+) -> BTreeMap<TableName, isize> {
     // An attach validates its parent's foreign keys over the rows it brings,
     // as `ADD FOREIGN KEY` does, so one whose parent references a table this
     // plan writes rows into, or attaches a table to, waits for them: among
@@ -2475,23 +2620,15 @@ pub(crate) fn diff_partial_rebuilding(
             )
         })
         .collect();
-    let follows_late_attach = |c: &Change| -> bool {
-        if let Change::Partition(PartitionChange::SetPartitionDefault { table, .. })
-        | Change::Partition(PartitionChange::SetPartitionNotNull { table, .. })
-        | Change::TableProperty(TablePropertyChange::SetTablePersistence { table, .. })
-        | Change::TableProperty(TablePropertyChange::SetStorageParameters { table, .. })
-        | Change::Index(IndexChange::SetIndexStorageParameters { table, .. }) = c
-        {
-            late_attach.contains_key(table)
-        } else {
-            false
-        }
-    };
-    // A function a computed column calls is dropped after the column, by a
-    // connected plan's pass over the catalog's own edges
-    // (`order_computed_by_edges`, DEC-1431.1). An offline plan is never
-    // applied, and a text scan here took one function for another (#1174
-    // review), so the differ moves nothing for it.
+    late_attach
+}
+
+/// The foreign-key graph a persistence switch is ordered by in `sort_class`, none
+/// when the plan has no switch, and the depth of its deepest table.
+fn persistence_fk_graph<'a>(
+    planned: &[PlannedChange],
+    declared: Side<'a>,
+) -> (Option<ForeignKeyGraph<'a>>, usize) {
     // How deep each declared table sits in the foreign-key graph: 0 for one
     // that references no other, else one more than the deepest it does.
     // Switched to logged, the referenced table goes first, so by depth;
@@ -2511,6 +2648,12 @@ pub(crate) fn diff_partial_rebuilding(
         })
         .then(|| ForeignKeyGraph::of(declared.schema));
     let deepest = fk_graph.as_ref().map_or(0, ForeignKeyGraph::deepest);
+    (fk_graph, deepest)
+}
+
+/// The columns of a parent whose default, numbering source or NULL-ness this plan
+/// changes: `follows_its_parent` reads it.
+fn parent_columns_moved(planned: &[PlannedChange]) -> BTreeSet<(TableName, ColumnName)> {
     // A parent's column default, numbering source or NULL-ness this plan
     // changes, which the engine recurses into every partition: its own on that
     // column is set after it, or the parent's would overwrite it (#1687).
@@ -2537,6 +2680,15 @@ pub(crate) fn diff_partial_rebuilding(
             }
         })
         .collect();
+    parent_moved
+}
+
+/// The partitioned parents whose columns this plan changes: `sort_class` creates
+/// their partitions after those changes.
+fn parents_with_column_changes(
+    planned: &[PlannedChange],
+    declared: Side<'_>,
+) -> BTreeSet<TableName> {
     // The parents whose columns this plan changes (#1687).
     let parent_columns_change: BTreeSet<TableName> = planned
         .iter()
@@ -2551,6 +2703,12 @@ pub(crate) fn diff_partial_rebuilding(
         })
         .cloned()
         .collect();
+    parent_columns_change
+}
+
+/// The DEFAULT partitions a create of this plan moves rows out of: `sort_class`
+/// orders their NOT NULL after those creates.
+fn defaults_moved_out_of(planned: &[PlannedChange]) -> BTreeSet<TableName> {
     // The DEFAULT partitions a create in this plan moves rows out of (#1547).
     let moved_out_of: BTreeSet<TableName> = planned
         .iter()
@@ -2566,19 +2724,20 @@ pub(crate) fn diff_partial_rebuilding(
             }
         })
         .collect();
-    let follows_its_parent = |c: &Change| -> bool {
-        let (Change::Partition(PartitionChange::SetPartitionDefault { table, column, .. })
-        | Change::Partition(PartitionChange::SetPartitionNotNull { table, column, .. })) = c
-        else {
-            return false;
-        };
-        declared
-            .schema
-            .tables
-            .get(table)
-            .and_then(|t| t.partition_of.as_ref())
-            .is_some_and(|of| parent_moved.contains(&(of.parent.clone(), column.clone())))
-    };
+    moved_out_of
+}
+
+/// How deep each type sits in its chain of base domains, in the declarations and
+/// in the base: `dependency_rank` reads them. It pushes the refusal for a cycle
+/// into `errs` in place: the order of `errors` is part of the result.
+fn domain_type_ranks(
+    base: Side<'_>,
+    declared: Side<'_>,
+    errs: &mut Vec<DiffError>,
+) -> (
+    BTreeMap<pbps_model::TypeRef, isize>,
+    BTreeMap<pbps_model::TypeRef, isize>,
+) {
     let mut type_rank = BTreeMap::new();
     let mut drop_type_rank = BTreeMap::new();
     for (schema, ranks) in [
@@ -2604,7 +2763,355 @@ pub(crate) fn diff_partial_rebuilding(
             ranks.insert(name.clone(), seen.len() as isize);
         }
     }
-    let sort_class = |c: &Change| -> (u8, usize) {
+    (type_rank, drop_type_rank)
+}
+
+/// The rank behind the last package change of the plan: the search ranks start
+/// from it, and the sort key adds it to the rank of a created domain.
+fn package_floor_of(
+    planned: &[PlannedChange],
+    extension_rank: &BTreeMap<pbps_model::Uid, isize>,
+) -> isize {
+    // A domain this plan creates may be built on a type a package of this plan
+    // provides, created or moved here (the effects say so: its base needs the
+    // package's change). The draft is what orders two changes of one class, and
+    // the effects only check it, so the creation ranks behind the last package
+    // change instead of tying with it, where the subject decided (#2696 ready
+    // round, DEC-2447.12).
+    let package_floor: isize = planned
+        .iter()
+        .filter_map(|p| {
+            if let Change::Extension(ExtensionChange::CreateExtension { uid, .. })
+            | Change::Extension(ExtensionChange::UpdateExtension { uid, .. }) = &p.change
+            {
+                Some(extension_rank.get(uid).copied().unwrap_or(0) + 1)
+            } else if let Change::Extension(ExtensionChange::SetExtensionSchema { uid, .. }) =
+                &p.change
+            {
+                Some(extension_rank.get(uid).copied().unwrap_or(0) + 2)
+            } else {
+                None
+            }
+        })
+        .max()
+        .unwrap_or(0);
+    package_floor
+}
+
+fn built_domain(c: &Change) -> Option<&pbps_model::ManagedType> {
+    let definition = if let Change::Type(TypeChange::CreateType { definition, .. })
+    | Change::TypeValue(TypeValueChange::EnumRebuild {
+        step: pbps_model::EnumRebuildStep::Create { definition, .. },
+        ..
+    }) = c
+    {
+        definition.as_ref()
+    } else {
+        return None;
+    };
+    matches!(definition, pbps_model::ManagedType::Domain { .. }).then_some(definition)
+}
+
+/// The search objects this plan creates, and those it alters in place: the search
+/// ranks and the domain floor read them.
+fn searches_in_the_plan(
+    planned: &[PlannedChange],
+) -> (
+    BTreeSet<&pbps_model::SearchRef>,
+    BTreeSet<&pbps_model::SearchRef>,
+) {
+    // A dictionary is created before the configuration that maps it, and the configuration
+    // dropped before the dictionary (DEC-2728.2): the depth of the references among the
+    // objects the plan holds on each side. An object created here that maps a dictionary a
+    // package may provide starts behind the packages of this plan (the effects:
+    // `package_input`), and what maps it sits one rank behind that, so the floor is composed
+    // into the depth, not added to the sort key afterwards.
+    let created_search: BTreeSet<&pbps_model::SearchRef> = planned
+        .iter()
+        .filter_map(|p| {
+            if let Change::Search(SearchChange::CreateSearch { name, .. }) = &p.change {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    // One altered in place maps what it now maps, so it waits for the packages as a create does.
+    let altered_search: BTreeSet<&pbps_model::SearchRef> = planned
+        .iter()
+        .filter_map(|p| {
+            if let Change::Search(
+                SearchChange::AlterSearchMapping { name, .. }
+                | SearchChange::AlterSearchDictionary { name, .. },
+            ) = &p.change
+            {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    (created_search, altered_search)
+}
+
+/// The depth of each search object among the references on each side, for the
+/// declarations and for the base: the sort key ranks the search changes by them.
+fn search_ranks(
+    base: Side<'_>,
+    declared: Side<'_>,
+    package_floor: isize,
+    created_search: &BTreeSet<&pbps_model::SearchRef>,
+    altered_search: &BTreeSet<&pbps_model::SearchRef>,
+) -> (
+    BTreeMap<pbps_model::SearchRef, isize>,
+    BTreeMap<pbps_model::SearchRef, isize>,
+) {
+    let search_depths = |schema: &Schema, floor: isize| -> BTreeMap<pbps_model::SearchRef, isize> {
+        let start = |name: &pbps_model::SearchRef, object: &pbps_model::SearchObject| {
+            if floor > 0
+                && (created_search.contains(name) || altered_search.contains(name))
+                && object.dictionaries().iter().any(|d| {
+                    d.name.schema() != "pg_catalog" && declared.ids.search_uid(d).is_none()
+                })
+            {
+                floor
+            } else {
+                0
+            }
+        };
+        schema
+            .search
+            .keys()
+            .map(|name| {
+                (
+                    name.clone(),
+                    search_depth(schema, name, &start, &mut BTreeSet::new()),
+                )
+            })
+            .collect()
+    };
+    let (search_rank, drop_search_rank) = (
+        search_depths(declared.schema, package_floor),
+        search_depths(base.schema, 0),
+    );
+    (search_rank, drop_search_rank)
+}
+
+/// The rank the created domains that name a created search object sort behind, 0
+/// for a plan whose domains name none: the sort key adds it to their rank.
+#[allow(clippy::let_and_return)] // The block moved as it was; it ends in the binding it returns.
+fn domain_floor_behind_searches(
+    planned: &[PlannedChange],
+    dialect: &(impl Dialect + ?Sized),
+    created_search: &BTreeSet<&pbps_model::SearchRef>,
+    search_rank: &BTreeMap<pbps_model::SearchRef, isize>,
+) -> isize {
+    // A domain's check or default may name a configuration this plan creates by a literal
+    // (`'app.docs'::regconfig`), which the engine resolves when the domain is created: the
+    // same literal scan the scratch order uses (`may_call`). The two share a class, so the
+    // domains rank behind every created search object, all of them together, which keeps the
+    // order among them (a chain of domains is ranked by its bases). A plan whose domains name
+    // none leaves them where they were.
+    let names_a_search = planned
+        .iter()
+        .filter_map(|p| built_domain(&p.change))
+        .any(|domain| {
+            let pbps_model::ManagedType::Domain {
+                default, checks, ..
+            } = domain
+            else {
+                return false;
+            };
+            created_search.iter().any(|created| {
+                default
+                    .iter()
+                    .chain(checks.values())
+                    .any(|text| dialect.generation_may_call(text, created.name.name()))
+            })
+        });
+    let domain_floor = if names_a_search {
+        1 + created_search
+            .iter()
+            .filter_map(|created| search_rank.get(*created))
+            .max()
+            .copied()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    domain_floor
+}
+
+/// What the sort of `diff_partial_rebuilding` reads, built once by `sort_facts` before
+/// the sort takes the plan mutably. Every field is owned: a fact that borrows
+/// `planned` is only an input to another fact and cannot be kept here.
+struct SortFacts<'a> {
+    /// The tables a `RenameColumn` of this plan claims a column name on: `frees_a_renamed_column` reads it.
+    tables_claiming_a_column_name: BTreeSet<TableName>,
+    /// The uids of the base's generated columns: `class` puts their drops first in their class.
+    generated_in_base: BTreeSet<pbps_model::Uid>,
+    /// The tables this plan writes rows into or deletes rows from: `class` orders the tightening and the numbering of their columns after the rows.
+    row_tables: BTreeSet<TableName>,
+    /// The columns this plan puts an identity on: `class` leaves the tightening of one ahead of the inserts of a table that deletes no rows.
+    identified: BTreeSet<ColumnRef>,
+    /// The tables this plan inserts rows into: `class` reads it with `late`.
+    inserted: BTreeSet<TableName>,
+    /// The tables a plan puts a numbering source on and both deletes and inserts rows of: `class` orders their inserts after the source.
+    late: BTreeSet<TableName>,
+    /// The columns this plan puts a numbering source on: `class` orders them after the deletes.
+    installed: BTreeSet<ColumnRef>,
+    /// The identity columns whose sequence bounds are retuned before their retype: `class` puts their numbering change first.
+    bounds_first: BTreeSet<ColumnRef>,
+    /// How deep each owned-sequence release sits in its chain of renames: `class` ranks it by that.
+    early_release: BTreeMap<ColumnRef, usize>,
+    /// The attached partitions that wait among the row changes, with the rank of their parent: `class` and `key` read it.
+    late_attach: BTreeMap<TableName, isize>,
+    /// The foreign-key graph a persistence switch is ordered by, none without a switch: `class` reads it.
+    fk_graph: Option<ForeignKeyGraph<'a>>,
+    /// The depth of the deepest table of `fk_graph`: `class` reads it for a switch to unlogged.
+    deepest: usize,
+    /// The columns of a parent whose default, numbering source or NULL-ness this plan changes: `follows_its_parent` reads it.
+    parent_moved: BTreeSet<(TableName, ColumnName)>,
+    /// The partitioned parents whose columns this plan changes: `class` creates their partitions after those changes.
+    parent_columns_change: BTreeSet<TableName>,
+    /// The DEFAULT partitions a create of this plan moves rows out of: `class` orders their NOT NULL after those creates.
+    moved_out_of: BTreeSet<TableName>,
+    /// The replica identities whose target stands before the plan: `class` sets them first.
+    early_identity: BTreeSet<(Uid, Option<ReplicaIdentity>)>,
+    /// How many renames each `RenameColumn` waits on: `class` ranks it by that.
+    chain_depth: BTreeMap<Rename, usize>,
+    /// The declarations: `follows_its_parent`, `class` and `key` read the partitioning and the column order of their tables.
+    declared: Side<'a>,
+    /// The creation rank of each module among the modules: `key` ranks the module creates by it.
+    create_rank: BTreeMap<ModuleId, usize>,
+    /// The drop rank of each module among the modules: `key` ranks the module drops by it.
+    drop_rank: BTreeMap<ModuleId, usize>,
+    /// The rank of the tables that receive rows or attaches: `key` ranks their changes by it.
+    data_rank: BTreeMap<TableName, usize>,
+    /// How deep each role sits among the roles dropped together: `key` drops a parent before its members.
+    role_rank: BTreeMap<pbps_model::RoleName, usize>,
+    /// How deep each type sits in its chain of base domains, in the declarations: `key` ranks the type changes by it.
+    type_rank: BTreeMap<pbps_model::TypeRef, isize>,
+    /// How deep each type sits in its chain of base domains, in the base: `key` ranks the type drops by it.
+    drop_type_rank: BTreeMap<pbps_model::TypeRef, isize>,
+    /// The depth of each package change among the packages it requires: `key` ranks the extension changes by it.
+    extension_rank: BTreeMap<pbps_model::Uid, isize>,
+    /// The depth of each search object among the references in the declarations: `key` ranks the search changes by it.
+    search_rank: BTreeMap<pbps_model::SearchRef, isize>,
+    /// The depth of each search object among the references in the base: `key` ranks the search drops by it.
+    drop_search_rank: BTreeMap<pbps_model::SearchRef, isize>,
+    /// The rank behind the last package change of the plan: `key` adds it to the rank of a created domain.
+    package_floor: isize,
+    /// The rank the created domains that name a created search object sort behind: `key` adds it to their rank.
+    domain_floor: isize,
+}
+
+impl SortFacts<'_> {
+    /// Whether `c` is the drop that frees a column name a `RenameColumn` of this plan claims:
+    /// `class` asks it of every change.
+    // Whether this drop can be what frees a name a `RenameColumn` above is
+    // waiting for. A column drop and nothing else: no other change gives up a
+    // column name.
+    fn frees_a_renamed_column(&self, c: &Change) -> bool {
+        match c {
+            Change::Partition(PartitionChange::RebuildPartitionedTable(_))
+            | Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(PartitionChange::CopyTableRows(_))
+            | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => false,
+            Change::Column(ColumnChange::DropColumn { column, .. }) => {
+                self.tables_claiming_a_column_name.contains(&column.table)
+            }
+            Change::Table(_)
+            | Change::Partition(PartitionChange::DetachPartition { .. })
+            | Change::Partition(PartitionChange::AttachPartition { .. })
+            | Change::Column(ColumnChange::AddColumn { .. })
+            | Change::Column(ColumnChange::RenameColumn { .. })
+            | Change::Column(ColumnChange::AlterColumnType { .. })
+            | Change::Column(ColumnChange::AlterColumnNullability { .. })
+            | Change::Column(ColumnChange::AlterColumnDefault { .. })
+            | Change::Column(ColumnChange::AlterColumnExpression { .. })
+            | Change::Column(ColumnChange::AlterColumnNumbering { .. })
+            | Change::Column(ColumnChange::SetColumnDeprecated { .. })
+            | Change::TableProperty(_)
+            | Change::Constraint(_)
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::Partition(PartitionChange::SetPartitionDefault { .. })
+            | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
+            | Change::Policy(_)
+            | Change::Index(IndexChange::AddIndex { .. })
+            | Change::Column(ColumnChange::AddComputedColumn { .. })
+            | Change::Column(ColumnChange::DropComputedColumn { .. })
+            | Change::Index(IndexChange::DropIndex { .. })
+            | Change::Row(_)
+            | Change::Module(_)
+            | Change::TypeValue(_)
+            | Change::Role(_)
+            | Change::Type(_)
+            | Change::Search(_)
+            | Change::Extension(_)
+            | Change::Permission(_) => false,
+        }
+    }
+
+    /// Whether `c` is a setting on a partition that waits among the row changes: `class` asks it.
+    fn follows_late_attach(&self, c: &Change) -> bool {
+        if let Change::Partition(PartitionChange::SetPartitionDefault { table, .. })
+        | Change::Partition(PartitionChange::SetPartitionNotNull { table, .. })
+        | Change::TableProperty(TablePropertyChange::SetTablePersistence { table, .. })
+        | Change::TableProperty(TablePropertyChange::SetStorageParameters { table, .. })
+        | Change::Index(IndexChange::SetIndexStorageParameters { table, .. }) = c
+        {
+            self.late_attach.contains_key(table)
+        } else {
+            false
+        }
+    }
+
+    /// Whether `c` sets a partition's default or NOT NULL on a column its parent's change moves:
+    /// `class` asks it.
+    fn follows_its_parent(&self, c: &Change) -> bool {
+        let Self {
+            declared,
+            parent_moved,
+            ..
+        } = self;
+        let (Change::Partition(PartitionChange::SetPartitionDefault { table, column, .. })
+        | Change::Partition(PartitionChange::SetPartitionNotNull { table, column, .. })) = c
+        else {
+            return false;
+        };
+        declared
+            .schema
+            .tables
+            .get(table)
+            .and_then(|t| t.partition_of.as_ref())
+            .is_some_and(|of| parent_moved.contains(&(of.parent.clone(), column.clone())))
+    }
+
+    /// The ordering class of `c` and a rank inside it: the first two parts of the sort key.
+    // The class, and a rank inside it, so a change can sit between two
+    // classes without a new ordinal shifting every one below it — the cost
+    // `order_key`'s own doc names.
+    fn class(&self, c: &Change) -> (u8, usize) {
+        let Self {
+            generated_in_base,
+            row_tables,
+            identified,
+            inserted,
+            late,
+            installed,
+            bounds_first,
+            early_release,
+            late_attach,
+            fk_graph,
+            deepest,
+            parent_columns_change,
+            moved_out_of,
+            early_identity,
+            chain_depth,
+            declared,
+            ..
+        } = self;
         if matches!(
             c,
             Change::Type(TypeChange::CreateType { .. })
@@ -2651,7 +3158,7 @@ pub(crate) fn diff_partial_rebuilding(
         {
             return (ROW_DELETIONS - 1, 1);
         }
-        if follows_late_attach(c) {
+        if self.follows_late_attach(c) {
             return (ROW_DELETIONS - 1, 2);
         }
         // A DEFAULT partition's own NOT NULL, tightened in a plan that moves
@@ -2669,7 +3176,7 @@ pub(crate) fn diff_partial_rebuilding(
         {
             return (COLUMN_ALTERATIONS, 6);
         }
-        if follows_its_parent(c) {
+        if self.follows_its_parent(c) {
             return (COLUMN_ALTERATIONS, 4);
         }
         if let Change::TableProperty(TablePropertyChange::SetTablePersistence {
@@ -2758,7 +3265,7 @@ pub(crate) fn diff_partial_rebuilding(
         // column never reads another, and nothing in class 9 needs one that is
         // new, so one layer each way is the whole order (DEC-1168.1).
         let drops_generated = matches!(c, Change::Column(ColumnChange::DropColumn { uid, .. }) if generated_in_base.contains(uid));
-        if frees_a_renamed_column(c) {
+        if self.frees_a_renamed_column(c) {
             // The layer holds here too: every drop of a table that renames a
             // column comes to this class, the generated one and its input
             // alike, so the generated one keeps its place ahead.
@@ -2867,147 +3374,29 @@ pub(crate) fn diff_partial_rebuilding(
         } else {
             (order_key(c), 1)
         }
-    };
-    // Cached: `sort_by_key` computed this key, `Debug` text and all, on both
-    // sides of every comparison, a third of a 4,000-table plan's CPU
-    // (#1908). The cache keeps equal keys in their original order, as the
-    // stable sort did, so the order is the same.
-    let extension_rank = crate::extensions::depths(planned.iter().map(|p| &p.change));
-    // A domain this plan creates may be built on a type a package of this plan
-    // provides, created or moved here (the effects say so: its base needs the
-    // package's change). The draft is what orders two changes of one class, and
-    // the effects only check it, so the creation ranks behind the last package
-    // change instead of tying with it, where the subject decided (#2696 ready
-    // round, DEC-2447.12).
-    fn built_domain(c: &Change) -> Option<&pbps_model::ManagedType> {
-        let definition = if let Change::Type(TypeChange::CreateType { definition, .. })
-        | Change::TypeValue(TypeValueChange::EnumRebuild {
-            step: pbps_model::EnumRebuildStep::Create { definition, .. },
-            ..
-        }) = c
-        {
-            definition.as_ref()
-        } else {
-            return None;
-        };
-        matches!(definition, pbps_model::ManagedType::Domain { .. }).then_some(definition)
     }
-    let package_floor: isize = planned
-        .iter()
-        .filter_map(|p| {
-            if let Change::Extension(ExtensionChange::CreateExtension { uid, .. })
-            | Change::Extension(ExtensionChange::UpdateExtension { uid, .. }) = &p.change
-            {
-                Some(extension_rank.get(uid).copied().unwrap_or(0) + 1)
-            } else if let Change::Extension(ExtensionChange::SetExtensionSchema { uid, .. }) =
-                &p.change
-            {
-                Some(extension_rank.get(uid).copied().unwrap_or(0) + 2)
-            } else {
-                None
-            }
-        })
-        .max()
-        .unwrap_or(0);
-    // A dictionary is created before the configuration that maps it, and the configuration
-    // dropped before the dictionary (DEC-2728.2): the depth of the references among the
-    // objects the plan holds on each side. An object created here that maps a dictionary a
-    // package may provide starts behind the packages of this plan (the effects:
-    // `package_input`), and what maps it sits one rank behind that, so the floor is composed
-    // into the depth, not added to the sort key afterwards.
-    let created_search: BTreeSet<&pbps_model::SearchRef> = planned
-        .iter()
-        .filter_map(|p| {
-            if let Change::Search(SearchChange::CreateSearch { name, .. }) = &p.change {
-                Some(name)
-            } else {
-                None
-            }
-        })
-        .collect();
-    // One altered in place maps what it now maps, so it waits for the packages as a create does.
-    let altered_search: BTreeSet<&pbps_model::SearchRef> = planned
-        .iter()
-        .filter_map(|p| {
-            if let Change::Search(
-                SearchChange::AlterSearchMapping { name, .. }
-                | SearchChange::AlterSearchDictionary { name, .. },
-            ) = &p.change
-            {
-                Some(name)
-            } else {
-                None
-            }
-        })
-        .collect();
-    let search_depths = |schema: &Schema, floor: isize| -> BTreeMap<pbps_model::SearchRef, isize> {
-        let start = |name: &pbps_model::SearchRef, object: &pbps_model::SearchObject| {
-            if floor > 0
-                && (created_search.contains(name) || altered_search.contains(name))
-                && object.dictionaries().iter().any(|d| {
-                    d.name.schema() != "pg_catalog" && declared.ids.search_uid(d).is_none()
-                })
-            {
-                floor
-            } else {
-                0
-            }
-        };
-        schema
-            .search
-            .keys()
-            .map(|name| {
-                (
-                    name.clone(),
-                    search_depth(schema, name, &start, &mut BTreeSet::new()),
-                )
-            })
-            .collect()
-    };
-    let (search_rank, drop_search_rank) = (
-        search_depths(declared.schema, package_floor),
-        search_depths(base.schema, 0),
-    );
-    // A domain's check or default may name a configuration this plan creates by a literal
-    // (`'app.docs'::regconfig`), which the engine resolves when the domain is created: the
-    // same literal scan the scratch order uses (`may_call`). The two share a class, so the
-    // domains rank behind every created search object, all of them together, which keeps the
-    // order among them (a chain of domains is ranked by its bases). A plan whose domains name
-    // none leaves them where they were.
-    let names_a_search = planned
-        .iter()
-        .filter_map(|p| built_domain(&p.change))
-        .any(|domain| {
-            let pbps_model::ManagedType::Domain {
-                default, checks, ..
-            } = domain
-            else {
-                return false;
-            };
-            created_search.iter().any(|created| {
-                default
-                    .iter()
-                    .chain(checks.values())
-                    .any(|text| dialect.generation_may_call(text, created.name.name()))
-            })
-        });
-    let domain_floor = if names_a_search {
-        1 + created_search
-            .iter()
-            .filter_map(|created| search_rank.get(*created))
-            .max()
-            .copied()
-            .unwrap_or(0)
-    } else {
-        0
-    };
-    crate::order::normalization::sort_draft(&mut planned, |p| {
-        let (class, within) = sort_class(&p.change);
+
+    /// The sort key of `p`: its class, a rank among the dependencies of its kind, then the
+    /// tiebreakers. `sort_draft` calls it once per change.
+    // The tiebreaker within an ordering class is the table name, then the
+    // change's rendering. Debug output alone would sort by uid, which is random
+    // at mint time — the plan would be correct but differently ordered per
+    // project, and a reviewer diffing two plan.sql files would see noise.
+    //
+    // `subject()` does not speak for one side consistently: `RenameTable` and
+    // `RenameRole` answer with the name the object is losing, everything else
+    // with the name it will have. Two changes to one object are therefore
+    // sorted against two different spellings of it, and the alphabet — not the
+    // dependency — decides which wins. Anything with a real order between them
+    // belongs in ordering classes or explicit dependency edges; this
+    // tiebreaker cannot express it.
+    fn key(&self, p: &PlannedChange) -> (u8, usize, isize, String, usize, String) {
+        let (class, within) = self.class(&p.change);
         (
             class,
             within,
             if let Change::Partition(PartitionChange::AttachPartition { table, .. }) = &p.change
-                && let Some(rank) = late_attach.get(table)
+                && let Some(rank) = self.late_attach.get(table)
             {
                 *rank
             } else if let Change::Extension(ExtensionChange::CreateExtension { uid, .. })
@@ -3016,7 +3405,7 @@ pub(crate) fn diff_partial_rebuilding(
             {
                 // Behind the packages of this plan it requires, or that require
                 // it for a drop (DEC-2447.6, DEC-2447.8).
-                extension_rank.get(uid).copied().unwrap_or(0)
+                self.extension_rank.get(uid).copied().unwrap_or(0)
             } else if let Change::Search(
                 SearchChange::CreateSearch { name, .. }
                 | SearchChange::AlterSearchMapping { name, .. }
@@ -3024,27 +3413,27 @@ pub(crate) fn diff_partial_rebuilding(
             ) = &p.change
             {
                 // Behind the packages and the dictionaries of this plan it maps.
-                search_rank.get(name).copied().unwrap_or(0)
+                self.search_rank.get(name).copied().unwrap_or(0)
             } else if let Change::Search(SearchChange::DropSearch { name, .. }) = &p.change {
-                -drop_search_rank.get(name).copied().unwrap_or(0)
+                -self.drop_search_rank.get(name).copied().unwrap_or(0)
             } else if let Change::Extension(ExtensionChange::SetExtensionSchema { uid, .. }) =
                 &p.change
             {
                 // One rank behind the package's own update, whose result the
                 // move starts from: the two rewrite one package, and the draft
                 // is what orders two writes (DEC-2447.11).
-                extension_rank.get(uid).copied().unwrap_or(0) + 1
+                self.extension_rank.get(uid).copied().unwrap_or(0) + 1
             } else {
                 dependency_rank(
                     &p.change,
-                    &create_rank,
-                    &drop_rank,
-                    &data_rank,
-                    &role_rank,
-                    &type_rank,
-                    &drop_type_rank,
+                    &self.create_rank,
+                    &self.drop_rank,
+                    &self.data_rank,
+                    &self.role_rank,
+                    &self.type_rank,
+                    &self.drop_type_rank,
                 ) + if built_domain(&p.change).is_some() {
-                    package_floor.max(domain_floor)
+                    self.package_floor.max(self.domain_floor)
                 } else {
                     0
                 }
@@ -3056,7 +3445,7 @@ pub(crate) fn diff_partial_rebuilding(
             // to the rendering below, the column's random uid decided it
             // (#2080).
             if let Change::Column(ColumnChange::AddColumn { table, name, .. }) = &p.change {
-                declared
+                self.declared
                     .schema
                     .tables
                     .get(table)
@@ -3067,7 +3456,110 @@ pub(crate) fn diff_partial_rebuilding(
             },
             tie_break_text(&p.change),
         )
-    });
+    }
+}
+
+/// The facts the sort reads, computed in the order the passes ran before the split:
+/// the three that push into `errs` are `rename_chain_depths`, `sequence_release_ranks`
+/// and `domain_type_ranks`, in that order. The plan and the list go in by value and
+/// come back, because the sort and the finish go on with them.
+#[allow(clippy::too_many_arguments)] // Each fact reads one of these; the parent function is allowed the same.
+fn sort_facts<'a>(
+    planned: Vec<PlannedChange>,
+    base: Side<'a>,
+    declared: Side<'a>,
+    dialect: &(impl Dialect + ?Sized),
+    module_deps: pbps_model::module::ModuleDeps,
+    index: Indexes<'a>,
+    early_identity: BTreeSet<(Uid, Option<ReplicaIdentity>)>,
+    mut errs: Vec<DiffError>,
+) -> (SortFacts<'a>, Vec<PlannedChange>, Vec<DiffError>) {
+    let (create_rank, drop_rank) = module_ranks(base, declared, dialect, &module_deps);
+    let (attach_parents, data_rank) = attach_parents_and_data_rank(&planned, declared);
+    // Roles that are dropped together are ordered parent before member.
+    let role_rank = member_depth(&planned);
+    let tables_claiming_a_column_name = column_name_claims(&planned);
+    let chain_depth = rename_chain_depths(&planned, &mut errs);
+    let generated_in_base = generated_columns_in_base(base, &index);
+    let row_tables = row_change_tables(&planned);
+    let identified = identities_put_on(planned.iter().map(|p| &p.change));
+    let inserted = tables_with_inserts(planned.iter().map(|p| &p.change));
+    let late = numbering_after_deletes(planned.iter().map(|p| &p.change));
+    let installed = numbering_put_on(planned.iter().map(|p| &p.change));
+    let held_back = columns_held_back(&planned);
+    let bounds_first = columns_whose_bounds_go_first(&planned, dialect);
+    let early_release = sequence_release_ranks(&planned, &held_back, &mut errs);
+    let late_attach = late_attach_ranks(declared, &attach_parents, &row_tables, &data_rank);
+    // A function a computed column calls is dropped after the column, by a
+    // connected plan's pass over the catalog's own edges
+    // (`order_computed_by_edges`, DEC-1431.1). An offline plan is never
+    // applied, and a text scan here took one function for another (#1174
+    // review), so the differ moves nothing for it.
+    let (fk_graph, deepest) = persistence_fk_graph(&planned, declared);
+    let parent_moved = parent_columns_moved(&planned);
+    let parent_columns_change = parents_with_column_changes(&planned, declared);
+    let moved_out_of = defaults_moved_out_of(&planned);
+    let (type_rank, drop_type_rank) = domain_type_ranks(base, declared, &mut errs);
+    let extension_rank = crate::extensions::depths(planned.iter().map(|p| &p.change));
+    let package_floor = package_floor_of(&planned, &extension_rank);
+    let (created_search, altered_search) = searches_in_the_plan(&planned);
+    let (search_rank, drop_search_rank) = search_ranks(
+        base,
+        declared,
+        package_floor,
+        &created_search,
+        &altered_search,
+    );
+    let domain_floor =
+        domain_floor_behind_searches(&planned, dialect, &created_search, &search_rank);
+    (
+        SortFacts {
+            tables_claiming_a_column_name,
+            generated_in_base,
+            row_tables,
+            identified,
+            inserted,
+            late,
+            installed,
+            bounds_first,
+            early_release,
+            late_attach,
+            fk_graph,
+            deepest,
+            parent_moved,
+            parent_columns_change,
+            moved_out_of,
+            early_identity,
+            chain_depth,
+            declared,
+            create_rank,
+            drop_rank,
+            data_rank,
+            role_rank,
+            type_rank,
+            drop_type_rank,
+            extension_rank,
+            search_rank,
+            drop_search_rank,
+            package_floor,
+            domain_floor,
+        },
+        planned,
+        errs,
+    )
+}
+
+/// What `diff_partial_rebuilding` does after the sort: the rename order and the
+/// last-column order, the drop requirements, the risks and the unsafe label uses.
+/// It pushes into `errs` in place: the order of `errors` is part of the result.
+fn finish_sort(
+    mut planned: Vec<PlannedChange>,
+    base: Side<'_>,
+    declared: Side<'_>,
+    dialect: &(impl Dialect + ?Sized),
+    renames: Renames,
+    mut errs: Vec<DiffError>,
+) -> Diffed {
     for cycle in crate::order::rename_order::order(&mut planned, base, &renames, dialect) {
         errs.push(DiffError::TableRenameCycle { renames: cycle });
     }
