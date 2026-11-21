@@ -279,7 +279,13 @@ pub fn render(file: &TreeFile) -> String {
             ));
         }
         if !t.partition_exclusions.is_empty() {
-            top.push(section("partition_exclusions", &t.partition_exclusions));
+            let keyed: Vec<_> = flat_partition_exclusions(&t.partition_exclusions)
+                .map(|(child, name, r)| (partition_exclusion_key(child, name), r))
+                .collect();
+            top.push(section_keyed(
+                "partition_exclusions",
+                keyed.iter().map(|(key, r)| (key.as_str(), *r)),
+            ));
         }
     }
     format!("{{\n{}\n}}\n", top.join(",\n"))
@@ -366,7 +372,7 @@ struct Raw {
     conversions: Option<Section<Conversion>>,
     rebuilds: Option<Section<Rebuild>>,
     exclusions: Option<Section<ExclusionRetirement>>,
-    partition_exclusions: Option<Section<BTreeMap<String, ExclusionRetirement>>>,
+    partition_exclusions: Option<Section<ExclusionRetirement>>,
 }
 
 fn malformed(path: &str, message: impl Into<String>) -> TreeError {
@@ -489,6 +495,65 @@ fn by_name<V>(
         .collect()
 }
 
+/// One line per (child, constraint) of a `partition_exclusions` section, so two
+/// independent retirements on one child sit on different lines and a text merge
+/// keeps both (DEC-2448.7). The key is the child's uid, a `/`, then the name as
+/// [`name_key`] writes it; a uid holds no `/`, so the first one splits them.
+fn partition_exclusion_key(child: &Uid, name: &str) -> String {
+    format!("{child}/{}", name_key(name))
+}
+
+/// A table's partition retirements, one (child, name, record) at a time.
+pub(crate) fn flat_partition_exclusions(
+    all: &PartitionExclusions,
+) -> impl Iterator<Item = (&Uid, &str, &ExclusionRetirement)> {
+    all.iter()
+        .flat_map(|(child, named)| named.iter().map(move |(name, r)| (child, name.as_str(), r)))
+}
+
+/// The reverse of [`flat_partition_exclusions`]: entries grouped by child, in
+/// the child's order and then the name's.
+pub(crate) fn group_partition_exclusions(
+    flat: impl IntoIterator<Item = ((Uid, String), ExclusionRetirement)>,
+) -> PartitionExclusions {
+    let mut grouped: BTreeMap<Uid, BTreeMap<String, ExclusionRetirement>> = BTreeMap::new();
+    for ((child, name), r) in flat {
+        grouped.entry(child).or_default().insert(name, r);
+    }
+    grouped.into_iter().collect()
+}
+
+/// Unwraps a `partition_exclusions` section, which is keyed by a child's uid
+/// and a name together, with the checks [`by_name`] makes of the sentinel and of
+/// duplicates, and the uid reader's of the child's uid.
+fn by_child_and_name(
+    path: &str,
+    name: &'static str,
+    section: Option<Section<ExclusionRetirement>>,
+) -> Result<PartitionExclusions, TreeError> {
+    // A uid starts with a kind letter, so `by_name` leaves a whole key alone
+    // (it refuses only a key starting with `_`) and the split is this one's.
+    let flat = by_name(path, name, section)?
+        .into_iter()
+        .map(|(key, r)| {
+            let (child, rest) = key
+                .split_once('/')
+                .ok_or_else(|| malformed(path, format!("`{key}` is not `<uid>/<name>`")))?;
+            let child: Uid = child
+                .parse()
+                .map_err(|e| malformed(path, format!("`{key}`: {e}")))?;
+            if child.kind() != UidKind::Table {
+                return Err(TreeError::KindMismatch {
+                    path: path.to_owned(),
+                    uid: child,
+                });
+            }
+            Ok(((child, key_name(path, name, rest.to_owned())?), r))
+        })
+        .collect::<Result<Vec<_>, TreeError>>()?;
+    Ok(group_partition_exclusions(flat))
+}
+
 /// What an entry of the identity tree must be, said the same way by every reader
 /// (the working tree, a revision, git's index): a regular file named `*.json`.
 /// `parse` does not look at names, so each reader asks this first, and a
@@ -534,12 +599,10 @@ pub fn parse(path: &str, text: &str) -> Result<TreeFile, TreeError> {
             conversions: keyed(path, "conversions", raw.conversions, UidKind::Column, false)?,
             rebuilds: keyed(path, "rebuilds", raw.rebuilds, UidKind::Table, false)?,
             exclusions: by_name(path, "exclusions", raw.exclusions)?,
-            partition_exclusions: keyed(
+            partition_exclusions: by_child_and_name(
                 path,
                 "partition_exclusions",
                 raw.partition_exclusions,
-                UidKind::Table,
-                false,
             )?,
         })
     } else {
