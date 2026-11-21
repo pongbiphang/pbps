@@ -219,6 +219,13 @@ pub(crate) fn writable_within(c: &Connection, wait: Duration) -> Result<(), DbEr
             "ROLLBACK TO pbps_probe; RELEASE pbps_probe"
         });
         match (tried, undone) {
+            // The probe's table needs a page, and a database at its page limit
+            // with none free refuses that page, not the write: a plan that only
+            // renames, or writes where there is room, still commits there
+            // (measured). So it is no answer to this question, and the plan is
+            // not refused for it. In a write-protected directory the journal
+            // fails first (measured), so that refusal is not lost.
+            (Err(error), Ok(())) if is_full(&error) => Ok(()),
             (Err(error), _) => Err(unwritable(error, wait)),
             (Ok(()), Err(error)) => Err(explained(error, wait)),
             (Ok(()), Ok(())) => Ok(()),
@@ -233,6 +240,17 @@ fn probe_name(c: &Connection) -> Result<String, DbError> {
         Some(row) => Ok(format!("__pbps_probe_{}", row.text(0)?)),
         None => Err(DbError::BadRow("`randomblob` returned no row".into())),
     }
+}
+
+/// The primary result code of a write that needed a page the database may not
+/// grow by (`SQLITE_FULL`).
+const FULL: u32 = 13;
+
+fn is_full(error: &DbError) -> bool {
+    error
+        .server_error_code()
+        .and_then(|code| code.parse::<u32>().ok())
+        .is_some_and(|code| code & 0xff == FULL)
 }
 
 /// The primary result code of a write refused because the database is read-only,

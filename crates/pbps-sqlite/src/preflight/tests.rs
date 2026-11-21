@@ -219,6 +219,72 @@ fn inside_a_callers_transaction_only_the_probes_savepoint_is_undone() {
     assert!(!c.in_transaction());
 }
 
+/// A database at its page limit with no free page: two tables, capped where it
+/// stands.
+fn fill_to_the_limit(c: &Connection) {
+    c.execute_batch("CREATE TABLE app(a); CREATE TABLE other(b); INSERT INTO other VALUES (1)")
+        .expect("data");
+    let integer = |sql: &str| {
+        c.query(sql, &[]).expect("query")[0]
+            .integer(0)
+            .expect("integer")
+    };
+    let pages = integer("PRAGMA page_count");
+    assert_eq!(integer("PRAGMA freelist_count"), 0);
+    assert_eq!(
+        integer(&format!("PRAGMA max_page_count = {pages}")),
+        pages,
+        "capped where it stands"
+    );
+    let full = c
+        .execute_batch("CREATE TABLE one_more(x)")
+        .expect_err("no page for another table");
+    assert_eq!(full.server_error_code().as_deref(), Some("13"));
+}
+
+#[test]
+fn a_database_at_its_page_limit_is_not_called_unwritable() {
+    let mut fresh = Fresh::file();
+    let c = fresh.connection();
+    fill_to_the_limit(c);
+    writable(c).expect("the probe's page is not the plan's");
+    assert!(!c.in_transaction(), "nothing left open");
+    assert_eq!(
+        c.query("SELECT count(*) FROM sqlite_schema", &[])
+            .expect("query")[0]
+            .integer(0)
+            .expect("integer"),
+        2,
+        "the probe left nothing"
+    );
+    let apply = before_apply(c, &plan([]), Version::new(3, 54, 1), Stage::Apply).expect("asked");
+    assert!(apply.problems.is_empty(), "{apply:?}");
+    // What a plan may do there without a new page still commits.
+    c.execute_batch("ALTER TABLE app RENAME TO renamed; INSERT INTO other VALUES (2)")
+        .expect("a rename and a row where there is room");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_full_database_in_a_write_protected_directory_is_still_refused() {
+    // Negative: letting the page limit pass does not let the directory pass.
+    let mut fresh = Fresh::file();
+    fill_to_the_limit(fresh.connection());
+    let dir = fresh.path().parent().expect("a directory").to_path_buf();
+    if !protect(&dir) {
+        unprotect(&dir);
+        eprintln!("skipped: this process ignores directory permissions, so nothing is protected");
+        return;
+    }
+    let refused = writable(fresh.connection());
+    unprotect(&dir);
+    let refused = refused.expect_err("the journal cannot be made");
+    let DbError::Refused(message) = &refused else {
+        panic!("expected a refusal: {refused:?}");
+    };
+    assert!(message.contains("write-protected"), "{message}");
+}
+
 #[test]
 fn a_database_another_connection_is_writing_is_busy_and_not_unwritable() {
     let mut fresh = Fresh::file();
