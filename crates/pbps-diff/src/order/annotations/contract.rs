@@ -1,6 +1,7 @@
 //! Transient annotation identities, reprojected at each existing settlement.
 use std::sync::Arc;
 
+use super::super::edges::{Baseline, Because, Checks, graph};
 use super::*;
 use pbps_model::ColumnChange;
 use pbps_model::IndexChange;
@@ -12,6 +13,7 @@ use pbps_model::TypeChange;
 use pbps_model::TypeValueChange;
 use pbps_model::diagnostic::Declaration;
 use pbps_model::object_ref::{BoundRoot, Registry};
+use pbps_model::operation::effects;
 use pbps_model::operation::symbolic::Attribute;
 use pbps_model::operation::{
     ColumnKey, ModuleEdits, ObjectKey, Operations, Origin, Owners, PartKey, PlanOwners, Snapshot,
@@ -21,6 +23,10 @@ use pbps_model::plan_names::{At, PlanNames};
 use pbps_model::{IdsFile, Schema, Table, Uid};
 
 type Ref = ObjectRef<BoundRoot>;
+
+/// The edges a pass settles by, and the lines each annotation edge came from,
+/// spelled and by the pair the edge orders.
+pub(crate) type Settling = (Vec<Constraint>, BTreeMap<(usize, usize), BTreeSet<String>>);
 
 #[derive(Debug, Clone)]
 struct Side {
@@ -49,7 +55,10 @@ pub struct Contract {
     after: Arc<Side>,
     base: Vec<Annotation<BoundRoot>>,
     goal: Vec<Annotation<BoundRoot>>,
-    labels: BTreeMap<Ref, String>,
+    /// How each side spelled the references of its lines. One identity can
+    /// carry two spellings (a rename), so the sides are kept apart.
+    base_labels: BTreeMap<Ref, String>,
+    goal_labels: BTreeMap<Ref, String>,
     demanded: BTreeMap<Root, BTreeSet<ObjectRef>>,
     creation: BTreeMap<pbps_model::operation::Source, (BTreeSet<ObjectRef>, Creation)>,
     pub(crate) extended: bool,
@@ -157,8 +166,11 @@ impl Contract {
             before.ids,
             after.ids,
         );
-        let mut labels = BTreeMap::new();
-        let mut bind = |snapshot: Snapshot<'_>, dependencies: &ObjectDeps, spelling| {
+        let (mut base_labels, mut goal_labels) = (BTreeMap::new(), BTreeMap::new());
+        let bind = |snapshot: Snapshot<'_>,
+                    dependencies: &ObjectDeps,
+                    spelling,
+                    labels: &mut BTreeMap<Ref, String>| {
             let registry = Registry::new(snapshot.schema);
             let problems = registry.validate(dependencies, Some((&owners, spelling)));
             if !problems.is_empty() {
@@ -200,8 +212,8 @@ impl Contract {
                 demanded.entry(root).or_default().insert(reference.clone());
             }
         }
-        let base_edges = bind(before, base, Spelling::Base)?;
-        let goal_edges = bind(after, goal, Spelling::Final)?;
+        let base_edges = bind(before, base, Spelling::Base, &mut base_labels)?;
+        let goal_edges = bind(after, goal, Spelling::Final, &mut goal_labels)?;
         let legacy = |r: &ObjectRef| {
             matches!(
                 r,
@@ -320,7 +332,8 @@ impl Contract {
             after: Arc::new(Side::of(after, &owners, Spelling::Final)?),
             base: base_edges,
             goal: goal_edges,
-            labels,
+            base_labels,
+            goal_labels,
             demanded,
             extended,
             deferred: Vec::new(),
@@ -366,6 +379,24 @@ impl Contract {
         &self,
         plan: &super::super::PlanningPlan<S>,
     ) -> Result<Vec<Constraint>, String> {
+        self.edges(plan, false).map(|(edges, _)| edges)
+    }
+
+    /// What a pass settles by: the annotation edges and the creation facts the
+    /// plan's effects state, so a line that contradicts a fact is a cycle like
+    /// any other (DEC-2469.10); and the line each annotation edge came from.
+    pub(crate) fn settling<S>(
+        &self,
+        plan: &super::super::PlanningPlan<S>,
+    ) -> Result<Settling, String> {
+        self.edges(plan, true)
+    }
+
+    fn edges<S>(
+        &self,
+        plan: &super::super::PlanningPlan<S>,
+        facts: bool,
+    ) -> Result<Settling, String> {
         // Snapshot names follow logical sources; retained operations separately
         // carry their immutable input address versions (DEC-2296.9).
         let mut logical = self.logical.changes.clone();
@@ -434,11 +465,12 @@ impl Contract {
                 );
             }
         }
-        for reference in self
+        for (labels, reference) in self
             .base
             .iter()
-            .chain(&self.goal)
-            .flat_map(|a| [&a.owner, &a.provider])
+            .map(|a| (&self.base_labels, a))
+            .chain(self.goal.iter().map(|a| (&self.goal_labels, a)))
+            .flat_map(|(labels, a)| [(labels, &a.owner), (labels, &a.provider)])
         {
             if let BoundRoot::InheritedColumn { column, .. } = &reference.root
                 && let Some(attributes) = changed.get(column)
@@ -456,7 +488,7 @@ impl Contract {
             {
                 return Err(format!(
                     "cannot project `{}`: recursive engine boundary metadata is required",
-                    self.labels[reference]
+                    labels[reference]
                 ));
             }
         }
@@ -489,7 +521,7 @@ impl Contract {
                 &installers,
             )?;
         }
-        index.project(&self.base, &self.goal).map_err(|error| {
+        let (mut edges, origins) = index.project_from(&self.base, &self.goal).map_err(|error| {
             let (number, reason) = match error {
                 ProjectionError::Missing(n) => (n, "an endpoint has no installation boundary or recorded baseline presence"),
                 ProjectionError::InternalCycle(n) => (n, "an internal creation cycle: the indivisible owner's contained surface requires the owner first"),
@@ -509,8 +541,94 @@ impl Contract {
                 })
             } else { None };
             let context=inline.map_or_else(String::new,|why|format!("; {why}"));
-            format!("cannot project annotation `{}` depends on `{}`: {reason}{context}", self.labels[&annotation.owner], self.labels[&annotation.provider])
-        })
+            format!("cannot project {}: {reason}{context}", self.spell(annotation, false))
+        })?;
+        if facts {
+            edges.extend(self.creations(&operations, &owners)?);
+        }
+        let lines = origins
+            .into_iter()
+            .map(|(pair, from)| {
+                let spelt = from.into_iter().map(|(reverse, number)| {
+                    self.spell(
+                        &if reverse { &self.base } else { &self.goal }[number],
+                        reverse,
+                    )
+                });
+                (pair, spelt.collect())
+            })
+            .collect();
+        Ok((edges, lines))
+    }
+
+    /// The `Creates` edges of the plan's own effects, over the logical
+    /// timeline `constraints` already holds. The differ keeps these facts in
+    /// its sort class and rank, which no line can contradict by making a
+    /// cycle; stated as edges they meet the user's lines in one search.
+    fn creations(
+        &self,
+        operations: &Operations,
+        owners: &PlanOwners,
+    ) -> Result<Vec<Constraint>, String> {
+        let before = Snapshot {
+            schema: &self.before.schema,
+            ids: &self.before.ids,
+        };
+        let after = Snapshot {
+            schema: &self.after.schema,
+            ids: &self.after.ids,
+        };
+        // A step whose effects cannot be read is an error, not an empty set:
+        // its facts would vanish and a line that reverses one would be
+        // followed. The debug check keeps such a step in `unowned` and says
+        // so; here it refuses the annotated plan and names the step. The
+        // owners of every step were already read by `defines` above, and a
+        // rebuild root is expanded before any pass settles, so a plan the
+        // differ emits does not reach this (DEC-2469.10).
+        let fx: Vec<_> = operations
+            .as_slice()
+            .iter()
+            .map(|op| {
+                effects(op, owners, before, after).map_err(|why| {
+                    format!(
+                        "the creation facts of step `{}` cannot be read: {why}",
+                        pbps_model::Text::from(op.change().subject()).shown()
+                    )
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let graph = graph(
+            operations.as_slice(),
+            &fx,
+            &Baseline::of(before, owners),
+            &Default::default(),
+            Checks::ALL,
+        );
+        Ok(graph
+            .edges
+            .into_iter()
+            .filter(|edge| matches!(edge.because, Because::Creates(_)))
+            .map(|edge| Constraint {
+                before: edge.before,
+                after: edge.after,
+                source: Source::Effect,
+                reason: OrderReason::Structural,
+            })
+            .collect())
+    }
+
+    /// A line as the user wrote it: the one speller of the projection error
+    /// and of the cycle text that names the line.
+    fn spell(&self, annotation: &Annotation<BoundRoot>, baseline: bool) -> String {
+        let labels = if baseline {
+            &self.base_labels
+        } else {
+            &self.goal_labels
+        };
+        format!(
+            "annotation `{}` depends on `{}`",
+            labels[&annotation.owner], labels[&annotation.provider]
+        )
     }
 
     fn record(

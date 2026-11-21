@@ -1569,8 +1569,16 @@ impl Cx<'_> {
                 self.exists(ObjectKey::Table(owner.clone()));
                 self.requires(Requirement::Reads(ObjectKey::Table(owner)));
             }
-            Change::Module(ModuleChange::CreateModule { .. })
-            | Change::Module(ModuleChange::DropModule { .. }) => {}
+            // A trigger needs its table first. A trigger on a view finds no
+            // table of that name and states nothing; the view is text-derived.
+            Change::Module(ModuleChange::CreateModule { id, .. }) => {
+                if let Some(on) = id.attached_to()
+                    && let Ok(owner) = self.table(on)
+                {
+                    self.exists(ObjectKey::Table(owner));
+                }
+            }
+            Change::Module(ModuleChange::DropModule { .. }) => {}
             Change::Module(ModuleChange::AlterModule { id, .. }) => {
                 if matches!(op.modules, super::ModuleEdits::InPlace) {
                     let key = ObjectKey::Module(id.clone());

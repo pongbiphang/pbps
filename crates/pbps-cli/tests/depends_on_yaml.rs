@@ -1175,3 +1175,475 @@ fn a_review_example_the_scan_already_orders_keeps_that_order_with_one_line() {
         assert_eq!(edges, 1, "{name} with the line");
     }
 }
+
+// ---------------------------------------------------------------------------
+// A line that contradicts a creation fact is refused (#2469 F, DEC-2469.10).
+//
+// A creation fact is something a step needs to exist first: a table's type, a
+// partition's parent, a trigger's table. The differ holds most of them in its
+// sort class and rank, where no line can make a cycle, so a line that reversed
+// one used to write a plan the engine would refuse. They are edges now, beside
+// the lines, and the cycle is refused naming the line.
+
+use pbps_model::object_ref::{ObjectRef, Root, Selector};
+use pbps_model::operation::PartKey;
+
+/// What the suite holds for a kind of provider a line can name.
+enum Fact {
+    /// These cases reverse a fact of the kind.
+    Cases(&'static [&'static str]),
+    /// No line can, or the fact is not an edge, for this reason.
+    NoCase(&'static str),
+}
+
+/// Every kind of reference a line can name as the provider, each with the
+/// cases that contradict a creation fact through it, or the reason it has
+/// none. An exhaustive match with no wildcard: a new kind of reference does
+/// not compile until it is placed here.
+fn fact_of(provider: &ObjectRef) -> Fact {
+    match &provider.part {
+        Selector::Whole => match &provider.root {
+            Root::Table(_) => Fact::Cases(&[
+                "enum-under-column",
+                "domain-under-column",
+                "partition-under-parent",
+            ]),
+            Root::Column(_) => Fact::Cases(&["own-column-pg", "own-column-ms"]),
+            Root::Type(_) => Fact::Cases(&["domain-over-domain", "enum-under-domain"]),
+            // A view over a view and a table under the view that reads it are
+            // text-derived: a line may displace them (decision 8.3 = A).
+            Root::Module(_) => Fact::Cases(&["trigger-before-table-pg", "trigger-before-table-ms"]),
+            Root::Role(_) => {
+                Fact::NoCase("a PostgreSQL role is provisioned outside the plan: no step to order")
+            }
+        },
+        Selector::Default => Fact::Cases(&["own-default-pg", "own-default-ms"]),
+        Selector::Generation => Fact::Cases(&["own-generation-pg"]),
+        Selector::Sequence => Fact::Cases(&["own-sequence-pg"]),
+        Selector::NotNull => Fact::Cases(&["own-not-null-pg", "own-not-null-ms"]),
+        Selector::Part(part) => match part {
+            PartKey::PrimaryKey => Fact::Cases(&["own-primary-key-pg", "own-primary-key-ms"]),
+            PartKey::Unique(_) => Fact::Cases(&["own-unique-pg", "own-unique-ms"]),
+            PartKey::ForeignKey(_) => Fact::NoCase(
+                "a foreign key is its own step after both tables, so no line reverses it (2e)",
+            ),
+            PartKey::Check(_) => Fact::Cases(&["own-check-pg", "own-check-ms"]),
+            PartKey::Exclusion(_) => Fact::Cases(&["exclusion-before-table-pg"]),
+            PartKey::Policy(_) => Fact::Cases(&["own-policy-pg"]),
+            PartKey::RowSecurity => Fact::Cases(&["own-row-security-pg"]),
+            PartKey::Index(_) => {
+                Fact::Cases(&["own-index-pg", "own-index-ms", "own-view-index-ms"])
+            }
+            PartKey::Computed(_) => Fact::Cases(&["own-computed-ms"]),
+        },
+    }
+}
+
+/// One reference per arm of [`fact_of`], so each arm is read.
+const KINDS: &[&str] = &[
+    "table::app.t",
+    "column::app.t.x",
+    "type::app.d",
+    "module::app.v",
+    "role::app.r",
+    "default::app.t.x",
+    "generation::app.t.x",
+    "sequence::app.t.id",
+    "not_null::app.t.x",
+    "primary_key::app.t",
+    "unique::app.t.u",
+    "foreign_key::app.t.fk",
+    "check::app.t.c",
+    "exclusion::app.t.e",
+    "policy::app.t.p",
+    "row_security::app.t",
+    "index::app.t.ix",
+    "object::{\"root\":{\"table\":\"dbo.t\"},\"part\":{\"computed\":\"x\"}}",
+];
+
+/// A project whose one `depends_on:` line reverses a creation fact.
+struct Contradiction {
+    name: &'static str,
+    dialect: &'static str,
+    /// The files, with `{dep}` where the owner's file takes the line.
+    files: Vec<(&'static str, String)>,
+    owner_file: &'static str,
+    /// The line as YAML, and as the refusal spells it.
+    yaml: String,
+    owner: &'static str,
+    provider: &'static str,
+    /// The members the refusal names, where a case pins them.
+    members: Option<&'static str>,
+}
+
+fn tbl(schema: &str, cols: &str, rest: &str) -> String {
+    format!(
+        "table: {schema}.t\n{{dep}}columns:\n  id: {{type: int, nullable: false}}\n{cols}{rest}"
+    )
+}
+
+/// A table whose own part `provider` the line puts before the table.
+fn own(
+    name: &'static str,
+    dialect: &'static str,
+    schema: &str,
+    cols: &str,
+    rest: &str,
+    provider: &'static str,
+) -> Contradiction {
+    Contradiction {
+        name,
+        dialect,
+        files: vec![("t.yml", tbl(schema, cols, rest))],
+        owner_file: "t.yml",
+        yaml: format!("depends_on:\n  \"table::{schema}.t\": [\"{provider}\"]\n"),
+        owner: if schema == "app" {
+            "table::app.t"
+        } else {
+            "table::dbo.t"
+        },
+        provider,
+        members: None,
+    }
+}
+
+fn contradictions() -> Vec<Contradiction> {
+    const X: &str = "  x: {type: int}\n";
+    let mut cases = vec![
+        // Typed facts the differ holds by class and rank (2b).
+        Contradiction {
+            name: "domain-over-domain",
+            dialect: "postgres",
+            files: vec![
+                (
+                    "p.yml",
+                    "domain: app.positive\n{dep}type: int\nchecks:\n  c: \"VALUE > 0\"\n".into(),
+                ),
+                ("v.yml", "domain: app.value\ntype: app.positive\n".into()),
+            ],
+            owner_file: "p.yml",
+            yaml: "depends_on: [\"type::app.value\"]\n".into(),
+            owner: "type::app.positive",
+            provider: "type::app.value",
+            members: None,
+        },
+        Contradiction {
+            name: "enum-under-domain",
+            dialect: "postgres",
+            files: vec![
+                ("d.yml", "domain: app.d\ntype: app.mood\n".into()),
+                ("m.yml", "enum: app.mood\n{dep}values: [a, b]\n".into()),
+            ],
+            owner_file: "m.yml",
+            yaml: "depends_on: [\"type::app.d\"]\n".into(),
+            owner: "type::app.mood",
+            provider: "type::app.d",
+            members: None,
+        },
+        Contradiction {
+            name: "enum-under-column",
+            dialect: "postgres",
+            files: vec![
+                ("m.yml", "enum: app.mood\n{dep}values: [a, b]\n".into()),
+                ("t.yml", "table: app.t\ncolumns:\n  id: {type: int, nullable: false}\n  m: {type: app.mood}\n".into()),
+            ],
+            owner_file: "m.yml",
+            yaml: "depends_on: [\"table::app.t\"]\n".into(),
+            owner: "type::app.mood",
+            provider: "table::app.t",
+            members: None,
+        },
+        Contradiction {
+            name: "domain-under-column",
+            dialect: "postgres",
+            files: vec![
+                ("d.yml", "domain: app.d\n{dep}type: int\n".into()),
+                ("t.yml", "table: app.t\ncolumns:\n  id: {type: int, nullable: false}\n  m: {type: app.d}\n".into()),
+            ],
+            owner_file: "d.yml",
+            yaml: "depends_on: [\"table::app.t\"]\n".into(),
+            owner: "type::app.d",
+            provider: "table::app.t",
+            members: None,
+        },
+        // Typed facts the check did not even report (2c).
+        own(
+            "exclusion-before-table-pg",
+            "postgres",
+            "app",
+            X,
+            "exclude:\n  e:\n    method: btree\n    keys:\n      - {column: x, operator: \"=\"}\n",
+            "exclusion::app.t.e",
+        ),
+        Contradiction {
+            name: "partition-under-parent",
+            dialect: "postgres",
+            files: vec![(
+                "p.yml",
+                "table: app.p\n{dep}columns:\n  id: {type: int, nullable: false}\n  ts: {type: int, nullable: false}\npartition_by: [ts]\npartitions:\n  c1: {from: [\"0\"], to: [\"10\"]}\n".into(),
+            )],
+            owner_file: "p.yml",
+            yaml: "depends_on:\n  \"table::app.p\": [\"table::app.c1\"]\n".into(),
+            owner: "table::app.p",
+            provider: "table::app.c1",
+            members: None,
+        },
+        Contradiction {
+            name: "trigger-before-table-pg",
+            dialect: "postgres",
+            files: vec![
+                ("t.yml", tbl("app", X, "")),
+                (
+                    "tf.yml",
+                    "function: app.tf()\ndefinition: |-\n  () RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$\n".into(),
+                ),
+                (
+                    "trg.yml",
+                    "trigger: app.trg\non: app.t\ndefinition: |-\n  BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.tf()\n".into(),
+                ),
+            ],
+            owner_file: "t.yml",
+            yaml: "depends_on: [\"module::app.t.trg\"]\n".into(),
+            owner: "table::app.t",
+            provider: "module::app.t.trg",
+            members: Some("`app.t`, `app.t.trg`"),
+        },
+        Contradiction {
+            name: "trigger-before-table-ms",
+            dialect: "mssql",
+            files: vec![
+                ("t.yml", tbl("dbo", X, "")),
+                (
+                    "trg.yml",
+                    "trigger: dbo.trg\non: dbo.t\ndefinition: |-\n  AFTER INSERT AS SELECT 1\n".into(),
+                ),
+            ],
+            owner_file: "t.yml",
+            yaml: "depends_on: [\"module::dbo.t.trg\"]\n".into(),
+            owner: "table::dbo.t",
+            provider: "module::dbo.t.trg",
+            members: Some("`dbo.t`, `dbo.t.trg`"),
+        },
+        // A table's own parts (2a), which the CREATE TABLE group refused
+        // already and which now name the line too.
+        own("own-index-pg", "postgres", "app", X, "indexes:\n  ix: {columns: [x]}\n", "index::app.t.ix"),
+        own("own-check-pg", "postgres", "app", X, "checks:\n  c: \"x > 0\"\n", "check::app.t.c"),
+        own("own-unique-pg", "postgres", "app", X, "unique:\n  u: {columns: [x]}\n", "unique::app.t.u"),
+        own("own-primary-key-pg", "postgres", "app", X, "primary_key: [id]\n", "primary_key::app.t"),
+        own("own-default-pg", "postgres", "app", "  x: {type: int, default: \"0\"}\n", "", "default::app.t.x"),
+        own("own-not-null-pg", "postgres", "app", "  x: {type: int, nullable: false}\n", "", "not_null::app.t.x"),
+        own("own-generation-pg", "postgres", "app", "  x: {type: int, generated: {expression: \"id + 1\", stored: true}}\n", "", "generation::app.t.x"),
+        own("own-column-pg", "postgres", "app", X, "", "column::app.t.x"),
+        own("own-policy-pg", "postgres", "app", X, "row_security: {enabled: true}\nrow_policies:\n  p: {using: \"true\"}\n", "policy::app.t.p"),
+        own("own-row-security-pg", "postgres", "app", X, "row_security: {enabled: true}\n", "row_security::app.t"),
+        own("own-index-ms", "mssql", "dbo", X, "indexes:\n  ix: {columns: [x]}\n", "index::dbo.t.ix"),
+        own("own-check-ms", "mssql", "dbo", X, "checks:\n  c: \"x > 0\"\n", "check::dbo.t.c"),
+        own("own-unique-ms", "mssql", "dbo", X, "unique:\n  u: {columns: [x]}\n", "unique::dbo.t.u"),
+        own("own-primary-key-ms", "mssql", "dbo", X, "primary_key: [id]\n", "primary_key::dbo.t"),
+        own("own-default-ms", "mssql", "dbo", "  x: {type: int, default: \"0\"}\n", "", "default::dbo.t.x"),
+        own("own-not-null-ms", "mssql", "dbo", "  x: {type: int, nullable: false}\n", "", "not_null::dbo.t.x"),
+        own("own-column-ms", "mssql", "dbo", X, "", "column::dbo.t.x"),
+    ];
+    // A computed column has no short prefix, only the structured spelling.
+    cases.push(Contradiction {
+        name: "own-computed-ms",
+        dialect: "mssql",
+        files: vec![(
+            "t.yml",
+            "table: dbo.t\n{dep}columns:\n  id: {type: int, nullable: false}\ncomputed:\n  x: {expression: \"id + 1\", persisted: true}\n".into(),
+        )],
+        owner_file: "t.yml",
+        yaml: "depends_on:\n  \"table::dbo.t\": ['object::{\"root\":{\"table\":\"dbo.t\"},\"part\":{\"computed\":\"x\"}}']\n".into(),
+        owner: "table::dbo.t",
+        provider: "object::{\"root\":{\"table\":\"dbo.t\"},\"part\":{\"computed\":\"x\"}}",
+        members: None,
+    });
+    cases.push(Contradiction {
+        name: "own-sequence-pg",
+        dialect: "postgres",
+        files: vec![(
+            "t.yml",
+            "table: app.t\n{dep}columns:\n  id: {type: serial}\n".into(),
+        )],
+        owner_file: "t.yml",
+        yaml: "depends_on:\n  \"table::app.t\": [\"sequence::app.t.id\"]\n".into(),
+        owner: "table::app.t",
+        provider: "sequence::app.t.id",
+        members: None,
+    });
+    cases.push(Contradiction {
+        name: "own-view-index-ms",
+        dialect: "mssql",
+        files: vec![
+            ("t.yml", "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n".into()),
+            (
+                "v.yml",
+                "view: dbo.v\nschemabinding: true\n{dep}indexes:\n  ix: {unique: true, columns: [id]}\nclustered: ix\ndefinition: |-\n  SELECT id FROM dbo.t\n".into(),
+            ),
+        ],
+        owner_file: "v.yml",
+        yaml: "depends_on:\n  \"module::dbo.v\": [\"index::module::dbo.v.ix\"]\n".into(),
+        owner: "module::dbo.v",
+        provider: "index::module::dbo.v.ix",
+        members: None,
+    });
+    cases
+}
+
+impl Contradiction {
+    fn at(&self, annotated: bool) -> Project {
+        let p = Project::new(self.dialect);
+        for (name, body) in &self.files {
+            let line = if annotated && *name == self.owner_file {
+                self.yaml.as_str()
+            } else {
+                ""
+            };
+            p.file(name, &body.replace("{dep}", line));
+        }
+        p
+    }
+
+    /// The line as the refusal names it, spelt as the projection error does.
+    fn line(&self) -> String {
+        format!("annotation `{}` depends on `{}`", self.owner, self.provider)
+    }
+}
+
+#[test]
+fn a_line_that_contradicts_a_creation_fact_is_refused_naming_the_line() {
+    let failures: Vec<String> = contradictions()
+        .iter()
+        .filter_map(|case| {
+            let name = case.name;
+            // Negative: the project without the line plans.
+            if let Err(why) = case.at(false).plan() {
+                return Some(format!("{name}: refused without the line: {why}"));
+            }
+            let p = case.at(true);
+            let out = p.root.join("plan.json");
+            let (code, text) = p.said(&["plan", "--out", out.to_str().unwrap()]);
+            // A refusal, not a panic of a debug build (101) and not a plan (0).
+            if code != Some(1) {
+                return Some(format!("{name}: exit {code:?}, not a refusal: {text}"));
+            }
+            if !text.contains("these steps wait on one another")
+                && !text.contains("cannot project annotation")
+            {
+                return Some(format!("{name}: refused, but not as a cycle: {text}"));
+            }
+            // The cycle names its members: a step printed as `#<n>` is not a
+            // name (acceptance 3 of #2469).
+            if let Some(members) = text
+                .split("wait on one another: ")
+                .nth(1)
+                .and_then(|rest| rest.split("; because").next())
+                && members.split(", ").any(|m| {
+                    m.strip_prefix('#')
+                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                })
+            {
+                return Some(format!("{name}: a member is a placeholder: {members}"));
+            }
+            if let Some(members) = case.members
+                && !text.contains(&format!("wait on one another: {members}; because"))
+            {
+                return Some(format!("{name}: members are not `{members}`: {text}"));
+            }
+            (!text.contains(&case.line())).then(|| {
+                format!(
+                    "{name}: the refusal does not name the line `{}`: {text}",
+                    case.line()
+                )
+            })
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn every_kind_of_reference_has_a_case_or_a_reason() {
+    let cases = contradictions();
+    let known: Vec<&str> = cases.iter().map(|c| c.name).collect();
+    let mut named = std::collections::BTreeSet::new();
+    for kind in KINDS {
+        let reference: ObjectRef = kind.parse().unwrap_or_else(|e| panic!("{kind}: {e}"));
+        match fact_of(&reference) {
+            Fact::Cases(names) => {
+                assert!(!names.is_empty(), "{kind} names no case");
+                for name in names {
+                    assert!(known.contains(name), "{kind}: no case `{name}`");
+                    named.insert(*name);
+                }
+            }
+            Fact::NoCase(reason) => assert!(!reason.is_empty(), "{kind} has no reason"),
+        }
+    }
+    // Each case answers to the kind of its provider, and each kind a case
+    // names is read above: no case hangs outside the list.
+    for case in &cases {
+        let provider: ObjectRef = case.provider.parse().unwrap();
+        let Fact::Cases(names) = fact_of(&provider) else {
+            panic!("{}: its provider's kind has no case", case.name);
+        };
+        assert!(
+            names.contains(&case.name),
+            "{}: not listed for `{}`",
+            case.name,
+            case.provider
+        );
+        assert!(
+            named.contains(case.name),
+            "{}: no kind in KINDS reaches it",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn a_line_that_agrees_with_a_creation_fact_is_accepted_and_orders_as_before() {
+    // The trigger follows its table in the plan; a line that says so is
+    // redundant, and the plan is the one without it.
+    let trigger = &contradictions()
+        .into_iter()
+        .find(|c| c.name == "trigger-before-table-pg")
+        .unwrap();
+    let plain = trigger.at(false).plan().unwrap().0;
+    let agreeing = trigger.at(false);
+    agreeing.file(
+        "trg.yml",
+        "trigger: app.trg\non: app.t\ndepends_on: [\"table::app.t\"]\ndefinition: |-\n  BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.tf()\n",
+    );
+    let (steps, edges) = agreeing.plan().unwrap();
+    assert_eq!(steps, plain);
+    assert_eq!(edges, 1);
+    // The type likewise follows what it is over.
+    let types = &contradictions()
+        .into_iter()
+        .find(|c| c.name == "domain-over-domain")
+        .unwrap();
+    let plain = types.at(false).plan().unwrap().0;
+    let agreeing = types.at(false);
+    agreeing.file(
+        "v.yml",
+        "domain: app.value\ndepends_on: [\"type::app.positive\"]\ntype: app.positive\n",
+    );
+    assert_eq!(agreeing.plan().unwrap().0, plain);
+}
+
+#[test]
+fn a_line_that_reverses_a_text_derived_fact_is_followed_on_purpose() {
+    // A view over a view is read from the text, which a line may displace
+    // (decision 8.3 = A); the creation facts above are not.
+    let p = Project::new("postgres");
+    p.file("w.yml", "view: app.w\ndefinition: SELECT 1 AS n\n");
+    p.file("v.yml", "view: app.v\ndefinition: SELECT n FROM app.w\n");
+    let plain = p.plan().unwrap().0;
+    assert_eq!(plain, ["create_module app.w", "create_module app.v"]);
+    p.file(
+        "w.yml",
+        "view: app.w\ndepends_on: [\"app.v\"]\ndefinition: SELECT 1 AS n\n",
+    );
+    let (steps, _) = p.plan().unwrap();
+    assert_eq!(steps, ["create_module app.v", "create_module app.w"]);
+}

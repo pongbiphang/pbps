@@ -22,6 +22,9 @@ pub struct Annotation<R> {
     pub provider: ObjectRef<R>,
 }
 
+/// The annotations an edge came from, by the pair it orders.
+pub type Lines = BTreeMap<(usize, usize), BTreeSet<(bool, usize)>>;
+
 #[derive(Debug, Clone, Default)]
 pub struct Boundary {
     pub installs: BTreeSet<usize>,
@@ -69,7 +72,20 @@ impl<R: Ord + Clone> Index<R> {
         base: &[Annotation<R>],
         goal: &[Annotation<R>],
     ) -> Result<Vec<Constraint>, ProjectionError> {
+        self.project_from(base, goal).map(|(edges, _)| edges)
+    }
+
+    /// [`Index::project`], and for each edge the annotations it came from:
+    /// `(true, n)` is the baseline's `n`th, `(false, n)` the goal's. The edge
+    /// alone drops this, and a refused cycle could not name what the user
+    /// wrote.
+    pub fn project_from(
+        &self,
+        base: &[Annotation<R>],
+        goal: &[Annotation<R>],
+    ) -> Result<(Vec<Constraint>, Lines), ProjectionError> {
         let mut edges = BTreeSet::new();
+        let mut lines = Lines::new();
         for (reverse, annotations) in [(true, base), (false, goal)] {
             for (number, annotation) in annotations.iter().enumerate() {
                 let owner = self.boundaries.get(&annotation.owner);
@@ -119,12 +135,16 @@ impl<R: Ord + Clone> Index<R> {
                                 source: Source::Annotation,
                                 reason: OrderReason::Structural,
                             });
+                            lines
+                                .entry((before, after))
+                                .or_default()
+                                .insert((reverse, number));
                         }
                     }
                 }
             }
         }
-        Ok(edges.into_iter().collect())
+        Ok((edges.into_iter().collect(), lines))
     }
 }
 

@@ -19,9 +19,11 @@
 //! PostgreSQL handovers of an identity sequence's or detached clone's name
 //! (DEC-1986.1, DEC-1558.1), and baseline binding releases (DEC-2228.1).
 //! Generated-input releases also carry delayed inserts and their effect
-//! consumers within the existing settlement (DEC-2174.1). Other callers,
-//! including computed-column releases, settle only their stated constraints
-//! (DEC-1956.3). The resolver combines the effects,
+//! consumers within the existing settlement (DEC-2174.1). A plan with an
+//! extended annotation also settles by the creation edges of its own steps
+//! beside its lines, so a line that reverses a fact is a cycle (DEC-2469.10).
+//! Other callers, including computed-column releases, settle only their
+//! stated constraints (DEC-1956.3). The resolver combines the effects,
 //! name slots and its evidence (DEC-1968.2).
 
 #![cfg_attr(
