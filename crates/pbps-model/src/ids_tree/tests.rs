@@ -431,7 +431,7 @@ fn a_partitions_exclusion_retirement_sits_in_its_parents_file_and_round_trips() 
     let (ids, p) = sample();
     let t = split(&ids, &p).unwrap();
     assert!(t["app/events.json"].contains("\"partition_exclusions\""));
-    assert!(t["app/events.json"].contains("\"t_bbbbb1\": {\"no_overlap\""));
+    assert!(t["app/events.json"].contains("\"t_bbbbb1/no_overlap\": {"));
     assert!(!t["app/events.json"].contains("\"exclusions\":"));
     assert!(!t["dbo/customer.json"].contains("partition_exclusions"));
     assert_eq!(assemble(&t).unwrap(), ids);
@@ -446,8 +446,8 @@ fn a_partitions_exclusion_retirement_outside_its_parents_partitions_is_refused()
     let t = tree();
     let stray = edit(
         &t["app/events.json"],
-        "\"t_bbbbb1\": {\"no_overlap\"",
-        "\"t_aaaaaa\": {\"no_overlap\"",
+        "\"t_bbbbb1/no_overlap\": {",
+        "\"t_aaaaaa/no_overlap\": {",
     );
     assert!(matches!(
         refuses("app/events.json", stray),
@@ -458,8 +458,8 @@ fn a_partitions_exclusion_retirement_outside_its_parents_partitions_is_refused()
     ));
     let retired = edit(
         &t["app/events.json"],
-        "\"t_bbbbb1\": {\"no_overlap\"",
-        "\"t_bbbbb2\": {\"no_overlap\"",
+        "\"t_bbbbb1/no_overlap\": {",
+        "\"t_bbbbb2/no_overlap\": {",
     );
     assert!(matches!(
         refuses("app/events.json", retired),
@@ -481,8 +481,8 @@ fn a_partitions_exclusion_retirement_with_a_blank_name_is_refused_like_a_tables(
     let t = tree();
     let blank = edit(
         &t["app/events.json"],
-        "\"t_bbbbb1\": {\"no_overlap\"",
-        "\"t_bbbbb1\": {\"\"",
+        "\"t_bbbbb1/no_overlap\": {",
+        "\"t_bbbbb1/\": {",
     );
     assert!(matches!(
         refuses("app/events.json", blank),
@@ -491,6 +491,51 @@ fn a_partitions_exclusion_retirement_with_a_blank_name_is_refused_like_a_tables(
     // Negative: a valid name is read as it was.
     let (ids, p) = sample();
     assert_eq!(assemble(&split(&ids, &p).unwrap()).unwrap(), ids);
+}
+
+#[test]
+fn a_partitions_retirements_sit_one_to_a_line_so_a_text_merge_keeps_both() {
+    // Two constraints of one child are two lines, not one nested object, or a git
+    // merge of two branches that each retire one would conflict on the shared line.
+    // A name that starts with `_` is written as a name section writes it.
+    let (mut ids, p) = sample();
+    let record = ids.exclusions[&uid("t_bbbbb1")]["no_overlap"].clone();
+    for name in ["another", "_hidden"] {
+        ids.exclusions
+            .get_mut(&uid("t_bbbbb1"))
+            .unwrap()
+            .insert(ObjectLocalName::new(name), record.clone());
+    }
+    let t = split(&ids, &p).unwrap();
+    let events = &t["app/events.json"];
+    for key in [
+        "t_bbbbb1/another",
+        "t_bbbbb1/no_overlap",
+        "t_bbbbb1/__hidden",
+    ] {
+        let lines = events
+            .lines()
+            .filter(|l| l.trim_start().starts_with(&format!("\"{key}\": {{")))
+            .count();
+        assert_eq!(lines, 1, "{key}");
+    }
+    assert_eq!(assemble(&t).unwrap(), ids);
+    // Negative: a key with no `/`, one whose uid is no table's, and one that
+    // starts with a single `_` are refused rather than guessed at.
+    for bad in ["t_bbbbb1", "c_aaaaa1/no_overlap", "t_bbbbb1/_hidden"] {
+        let broken = edit(
+            &t["app/events.json"],
+            "\"t_bbbbb1/another\": {",
+            &format!("\"{bad}\": {{"),
+        );
+        assert!(
+            matches!(
+                refuses("app/events.json", broken),
+                TreeError::Malformed { .. } | TreeError::KindMismatch { .. }
+            ),
+            "{bad}"
+        );
+    }
 }
 
 #[test]
