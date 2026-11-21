@@ -28,6 +28,8 @@ use pbps_model::StateSnapshot;
 
 use crate::DbError;
 
+pub mod flow;
+
 /// The tool's own two tables, by the names SPEC §8.1 gives them. They are
 /// excluded from the managed set by the catalog queries, so the tool never
 /// plans changes to itself.
