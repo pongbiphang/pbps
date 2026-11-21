@@ -385,6 +385,44 @@ impl Connection {
         Ok(out)
     }
 
+    /// The bytes of the file `main` was opened from, empty for a database with
+    /// none (in memory, or a temporary one).
+    ///
+    /// Asked of the statement `PRAGMA database_list` and not of the
+    /// table-valued `pragma_database_list`: a table of that name in any schema
+    /// takes the table-valued form's place, with whatever rows it holds
+    /// (measured), and no object does that to the statement. The bytes are
+    /// returned as stored because a file name on Unix need not be UTF-8, which
+    /// [`Connection::query`] refuses in a text value.
+    pub fn main_database_file(&self) -> Result<Vec<u8>, DbError> {
+        let mut statement = self
+            .inner
+            .prepare("PRAGMA database_list")
+            .map_err(driver_error)?;
+        let mut rows = statement.query([]).map_err(driver_error)?;
+        while let Some(row) = rows.next().map_err(driver_error)? {
+            let name = match row.get_ref(1).map_err(driver_error)? {
+                ValueRef::Text(name) => name,
+                ValueRef::Null | ValueRef::Integer(_) | ValueRef::Real(_) | ValueRef::Blob(_) => {
+                    return Err(DbError::BadRow("a database's name is not text".into()));
+                }
+            };
+            if name != b"main" {
+                continue;
+            }
+            return match row.get_ref(2).map_err(driver_error)? {
+                ValueRef::Text(file) => Ok(file.to_vec()),
+                ValueRef::Null => Ok(Vec::new()),
+                ValueRef::Integer(_) | ValueRef::Real(_) | ValueRef::Blob(_) => Err(
+                    DbError::BadRow("the database's file name is not text".into()),
+                ),
+            };
+        }
+        Err(DbError::BadRow(
+            "`PRAGMA database_list` does not list `main`".into(),
+        ))
+    }
+
     /// Runs `work` in a transaction: commit if it returns `Ok`, roll back and
     /// return its error if not.
     ///

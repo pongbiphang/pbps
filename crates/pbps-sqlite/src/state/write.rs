@@ -10,6 +10,7 @@ use pbps_model::StateSnapshot;
 
 use super::busy::{self, BUSY_WAIT};
 use super::ddl::{ensure_tables_within, is_initialized};
+use super::problems::refuse_untrusted;
 use super::{OPERATOR_CHARS, REASON_CHARS, STATE_TABLE};
 
 /// The widths of the other bounded columns, in characters, as the recipe's
@@ -80,7 +81,7 @@ RETURNING id";
 /// It runs plain statements and never `BEGIN`: inside an apply's transaction it
 /// is rolled back with it, and outside one it is a statement of its own, atomic
 /// as any is. (The ledger is created first when it is not there, under
-/// [`ensure_tables`](super::ensure_tables)'s savepoint.)
+/// [`ensure_tables`](super::ensure_tables)'s unit.)
 pub fn record(c: &Connection, snapshot: &StateSnapshot) -> Result<i64, LedgerError> {
     record_within(c, snapshot, BUSY_WAIT)
 }
@@ -160,6 +161,7 @@ fn delete_all_but(c: &Connection, keep: u32, wait: Duration) -> Result<u64, Ledg
     if !is_initialized(c)? {
         return Err(LedgerError::NotInitialized);
     }
+    refuse_untrusted(c, wait)?;
     let ids: Vec<i64> = c
         .query(
             &format!("SELECT id FROM {STATE_TABLE} ORDER BY id DESC"),

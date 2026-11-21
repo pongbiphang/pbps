@@ -175,11 +175,28 @@ fn an_index_filter_and_a_view_body_keep_the_comment_the_engine_kept() {
 }
 
 #[test]
-fn the_ledger_and_the_engines_own_tables_are_not_the_files_schema_and_are_not_a_warning() {
-    let (_, pulled) = read_sql(
-        "CREATE TABLE __pbps_state(a); CREATE TABLE __pbps_lock(a); \
-         CREATE TABLE s(id integer PRIMARY KEY AUTOINCREMENT); INSERT INTO s DEFAULT VALUES",
-    );
+fn the_real_ledger_and_the_engines_own_tables_are_not_the_files_schema_and_are_not_a_warning() {
+    let mut fresh = Fresh::memory();
+    fresh
+        .connection()
+        .execute_batch(
+            "CREATE TABLE s(id integer PRIMARY KEY AUTOINCREMENT); INSERT INTO s DEFAULT VALUES",
+        )
+        .expect("a table");
+    // The ledger this tool makes, with the `sqlite_sequence` its `AUTOINCREMENT`
+    // adds, and not a stand-in for it.
+    crate::state::ensure_tables(fresh.connection()).expect("the ledger");
+    crate::state::record(
+        fresh.connection(),
+        &pbps_model::StateSnapshot::new(
+            pbps_model::StateKind::Apply,
+            pbps_model::Schema::default(),
+            pbps_model::IdsFile::default(),
+            "op",
+        ),
+    )
+    .expect("an entry");
+    let pulled = read(&mut fresh);
     let names: Vec<_> = pulled
         .schema
         .tables
@@ -187,9 +204,59 @@ fn the_ledger_and_the_engines_own_tables_are_not_the_files_schema_and_are_not_a_
         .map(|n| n.name.as_str())
         .collect();
     assert_eq!(names, ["s"]);
-    // `sqlite_sequence` exists now and is nobody's table; AUTOINCREMENT is the
-    // only thing said.
+    // `sqlite_sequence` is nobody's table; AUTOINCREMENT of `s` is the only thing
+    // said, and the ledger adds neither a warning, a limit nor a notice.
     assert!(!warned(&pulled, "sqlite_sequence") && !warned(&pulled, "__pbps"));
     assert!(warned(&pulled, "AUTOINCREMENT"));
     assert_eq!(limits(&pulled, "s").len(), 1);
+    assert!(pulled.unmanaged_modules.is_empty() && pulled.catalog_notices.is_empty());
+    assert!(
+        crate::state::ledger_problems(fresh.connection())
+            .expect("asked")
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_trigger_on_a_ledger_table_is_seen_by_the_reader_and_by_the_check() {
+    let mut fresh = Fresh::memory();
+    crate::state::ensure_tables(fresh.connection()).expect("the ledger");
+    fresh
+        .connection()
+        .execute_batch(
+            "CREATE TRIGGER g BEFORE INSERT ON __pbps_state BEGIN SELECT RAISE(IGNORE); END",
+        )
+        .expect("a trigger");
+    // The reader inventories it, as it does a trigger of the file's own.
+    let pulled = read(&mut fresh);
+    assert_eq!(pulled.unmanaged_modules.len(), 1);
+    assert!(warned(&pulled, "trigger `g` on `__pbps_state`"));
+    // And the check names it in its own words, which is what refuses the write.
+    let found = crate::state::ledger_problems(fresh.connection()).expect("asked");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].contains("`g` is a trigger on `__pbps_state`"),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_user_table_in_a_ledger_name_is_skipped_by_the_reader_and_found_by_the_check() {
+    let (mut fresh, pulled) = read_sql("CREATE TABLE __pbps_lock(a int); CREATE TABLE t(a int)");
+    // The reader skips a table of a ledger name by name, so nothing of it is read
+    // or warned: the check is the only place it is seen.
+    let names: Vec<_> = pulled
+        .schema
+        .tables
+        .keys()
+        .map(|n| n.name.as_str())
+        .collect();
+    assert_eq!(names, ["t"]);
+    assert!(!warned(&pulled, "__pbps_lock"));
+    let found = crate::state::ledger_problems(fresh.connection()).expect("asked");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].contains("`__pbps_lock` is not defined"),
+        "{found:?}"
+    );
 }

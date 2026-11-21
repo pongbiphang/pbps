@@ -183,14 +183,33 @@ fn the_ledger_creates_once_and_is_initialized_afterwards() {
 fn a_ledger_name_in_another_case_is_the_ledger_and_is_not_created_twice() {
     let mut fresh = Fresh::memory();
     let c = fresh.connection();
-    c.execute_batch("CREATE TABLE __PBPS_STATE (x)")
-        .expect("ddl");
+    c.execute_batch(&format!(
+        "CREATE TABLE main.{}",
+        RECIPE[0].body.replacen("__pbps_state", "__PBPS_STATE", 1)
+    ))
+    .expect("ddl");
     assert!(is_initialized(c).expect("asked"));
-    ensure_tables(c).expect("nothing to create");
+    // Its text is not the recipe's (the name is written in another case), so the
+    // integrity check refuses it, and the missing tables are not made beside it.
+    let refused = ensure_tables(c).expect_err("not the ledger this tool creates");
+    assert!(matches!(refused, DbError::Refused(_)), "{refused:?}");
+    assert!(
+        refused
+            .to_string()
+            .contains("`__PBPS_STATE` is not defined"),
+        "{refused}"
+    );
     assert_eq!(
         number(
             c,
             "SELECT count(*) FROM sqlite_schema WHERE name = '__pbps_state' COLLATE NOCASE"
+        ),
+        1
+    );
+    assert_eq!(
+        number(
+            c,
+            "SELECT count(*) FROM sqlite_schema WHERE name LIKE '\\_\\_pbps%' ESCAPE '\\'"
         ),
         1
     );
@@ -236,13 +255,12 @@ fn an_object_that_is_not_a_table_in_the_ledgers_name_is_refused_not_skipped() {
             "{what}"
         );
     }
-    // Negative: an ordinary table of the name is the ledger.
+    // Negative: an ordinary table of the name is not refused as a stranger of
+    // another kind; whether it is the ledger is the integrity check's question
+    // (`problems`), and it is refused there only for its text.
     let mut fresh = Fresh::memory();
-    fresh
-        .connection()
-        .execute_batch("CREATE TABLE __pbps_state (x)")
-        .expect("ddl");
-    ensure_tables(fresh.connection()).expect("a table is accepted");
+    ensure_tables(fresh.connection()).expect("the ledger this tool creates is accepted");
+    ensure_tables(fresh.connection()).expect("and again");
 }
 
 #[test]
@@ -302,6 +320,67 @@ fn a_unit_that_fails_leaves_nothing_and_one_that_succeeds_commits() {
         number(c, "SELECT count(*) FROM sqlite_schema WHERE name = 'b'"),
         1
     );
+}
+
+#[test]
+fn a_unit_that_reads_before_it_writes_waits_for_another_writer() {
+    // The shape that was refused at once: the unit holds a read lock when it asks
+    // for the write lock, and another connection is writing.
+    super::in_both_journal_modes(|fresh, _| {
+        fresh
+            .connection()
+            .execute_batch("CREATE TABLE seen (x)")
+            .expect("made");
+        let path = fresh.path().to_path_buf();
+        let (held, wait_for_it) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let other =
+                pbps_db::sqlite::Connection::open(&path, pbps_db::sqlite::OpenMode::ExistingOnly)
+                    .expect("opens");
+            other
+                .execute_batch("BEGIN IMMEDIATE; CREATE TABLE theirs (x)")
+                .expect("holds the write lock");
+            held.send(()).expect("told");
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            other.execute_batch("COMMIT").expect("commits");
+        });
+        wait_for_it.recv().expect("the writer holds the lock");
+        let c = fresh.connection();
+        c.set_busy_timeout(std::time::Duration::from_secs(20))
+            .expect("set");
+        in_a_unit(c, || {
+            c.query("SELECT count(*) FROM seen", &[])?;
+            c.execute_batch("CREATE TABLE ours (x)")
+        })
+        .expect("the unit waited for the writer and then wrote");
+        writer.join().expect("joined");
+        assert!(!c.in_transaction());
+        assert_eq!(
+            number(
+                c,
+                "SELECT count(*) FROM sqlite_schema WHERE name IN ('ours', 'theirs')"
+            ),
+            2
+        );
+    });
+}
+
+#[test]
+fn a_unit_does_not_wait_longer_than_the_connection_allows() {
+    // Negative: the wait is the caller's, and a writer that stays is still an error.
+    super::in_both_journal_modes(|fresh, second| {
+        second
+            .execute_batch("BEGIN IMMEDIATE; CREATE TABLE theirs (x)")
+            .expect("holds the write lock");
+        let c = fresh.connection();
+        c.set_busy_timeout(std::time::Duration::from_millis(50))
+            .expect("set");
+        let refused = in_a_unit(c, || c.execute_batch("CREATE TABLE ours (x)"))
+            .expect_err("the writer never left");
+        assert!(crate::state::busy::is_busy(&refused), "{refused:?}");
+        assert!(!c.in_transaction(), "no transaction is left open");
+        second.execute_batch("ROLLBACK").expect("undone");
+    });
 }
 
 #[test]
