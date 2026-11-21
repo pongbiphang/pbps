@@ -34,16 +34,18 @@
 //! change to its bookkeeping, while a project's own `app.__pbps_state` remains
 //! visible to both the catalog and validation.
 
+use std::sync::LazyLock;
+
 use pbps_db::ledger::flow::{
-    self, ClipUnit, ProjectedRow, RowLimit, entry_from_row, missing, number, optional_text,
-    ordinary_params, projected_row, projected_row_unmigrated, stored_entry_from_row, text,
+    self, ClipUnit, LedgerSpec, ProjectedRow, Recoverable, RowLimit, Savepoint, missing, number,
+    ordinary_params, projected_row, projected_row_unmigrated, text,
 };
 use pbps_db::ledger::{
     LOCK_TABLE_NAME, LedgerEntry, LedgerError, LockInfo, STATE_TABLE_NAME, TimelineEntry,
     TimelineState, ids_to_prune,
 };
 use pbps_db::{Conn, DbError, Param, Row};
-use pbps_model::{StateKind, StateSnapshot, Unreadable};
+use pbps_model::{StateSnapshot, Unreadable};
 
 /// The schema this engine's ledger lives in. See the module header.
 pub const LEDGER_SCHEMA: &str = "public";
@@ -219,6 +221,29 @@ fn select_history() -> String {
     )
 }
 
+/// One entry by its id: the three columns [`select_latest`] returns.
+fn select_by_id() -> String {
+    format!(
+        "SELECT id, {}, state_json FROM ONLY {STATE_TABLE} WHERE id = $1",
+        rendered("applied_at")
+    )
+}
+
+/// The newest row of one kind that carries one plan checksum; both are bound.
+const SELECT_APPLIED_PLAN: &str = "SELECT id FROM ONLY public.__pbps_state WHERE kind = $1 AND plan_checksum = $2 ORDER BY id DESC LIMIT 1";
+
+/// The newest row at or below an id whose kind is one of `kinds` bound
+/// values. Built from the count alone, like [`select_legacy_state_json`].
+fn select_deployed_revision(kinds: usize) -> String {
+    let slots = (0..kinds)
+        .map(|i| format!("${}", i + 2))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT id, git_sha FROM ONLY public.__pbps_state WHERE id <= $1 AND kind IN ({slots}) ORDER BY id DESC LIMIT 1"
+    )
+}
+
 /// The timeline reads the projected columns — including the five issue #103
 /// added — and never `state_json`: a row this build cannot read, or may not
 /// read, is still a row, and getting that without ever asking for
@@ -380,66 +405,32 @@ fn ledger_is_there() -> String {
     )
 }
 
-/// A savepoint held around one statement whose failure this code expects to
-/// handle.
+/// This engine's ledger, as the shared flow reads it (DEC-2988.1).
 ///
-/// **On this engine a failed statement aborts the whole transaction**, so every
-/// `Err(e) if ... => Ok(...)` arm below is a claim that the connection is still
-/// usable — and without something to rewind to, that claim is false inside a
-/// transaction: the caller's next statement is `25P02` and its `COMMIT` becomes
-/// a `ROLLBACK`. The ledger is read and written inside the apply's own
-/// transaction (DECISIONS 147), so the callers are real ones.
+/// Built once and not written as a plain `static`: the statements that return
+/// a time are built from [`rendered`].
 ///
-/// Taken by **trying** it: measured, `SAVEPOINT` outside a transaction block is
-/// `25P01` and harms nothing, so one round trip both establishes the savepoint
-/// and answers whether this call is in a transaction at all — where a separate
-/// probe would cost the same round trip and tell it less. Outside a transaction
-/// there is nothing to protect and nothing is taken.
-struct Recoverable {
-    inside_a_transaction: bool,
-}
-
-impl Recoverable {
-    async fn take(conn: &mut Conn) -> Result<Self, DbError> {
-        match conn.execute(SAVEPOINT).await {
-            Ok(()) => Ok(Recoverable {
-                inside_a_transaction: true,
-            }),
-            Err(e) if is_outside_a_transaction(&e) => Ok(Recoverable {
-                inside_a_transaction: false,
-            }),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// The statement did what was wanted: end the savepoint and leave the
-    /// caller's transaction exactly as deep as it was.
-    async fn release(self, conn: &mut Conn) -> Result<(), DbError> {
-        if self.inside_a_transaction {
-            conn.execute(RELEASE_SAVEPOINT).await?;
-        }
-        Ok(())
-    }
-
-    /// The statement failed and this code is handling that failure: put the
-    /// transaction back where it was, so that "handled" means what it says.
-    async fn rewind(self, conn: &mut Conn) -> Result<(), DbError> {
-        if self.inside_a_transaction {
-            conn.execute(ROLLBACK_TO_SAVEPOINT).await?;
-        }
-        // ROLLBACK TO keeps the marker; release it to restore the caller's
-        // original depth and expose any older savepoint of the same name.
-        self.release(conn).await
-    }
-
-    /// The same, for a failure that is **not** being handled: the caller is
-    /// about to be given the error, and this only leaves it able to run the
-    /// diagnostics it wants to print. Its own failure is dropped, so it cannot
-    /// replace the error that caused it.
-    async fn rewind_quietly(self, conn: &mut Conn) {
-        let _ = self.rewind(conn).await;
-    }
-}
+/// It supplies a savepoint because **on this engine a failed statement aborts
+/// the whole transaction**: see [`Recoverable`], which every tolerated failure
+/// here and in the shared flow is handled under.
+static LEDGER: LazyLock<LedgerSpec> = LazyLock::new(|| LedgerSpec {
+    probe_state: PROBE_STATE.into(),
+    select_latest: select_latest().into(),
+    select_by_id: select_by_id().into(),
+    select_history: select_history().into(),
+    select_applied_plan: SELECT_APPLIED_PLAN.into(),
+    select_deployed_revision,
+    select_lock: select_lock().into(),
+    row_limit: ROW_LIMIT,
+    missing_table: UNDEFINED_TABLE,
+    savepoint: Some(Savepoint {
+        take: SAVEPOINT,
+        release: RELEASE_SAVEPOINT,
+        rewind: ROLLBACK_TO_SAVEPOINT,
+        outside_a_transaction: NO_ACTIVE_TRANSACTION,
+    }),
+    session_lookup,
+});
 
 /// How many of the two tables the catalog holds.
 async fn ledger_present(conn: &mut Conn) -> Result<i64, DbError> {
@@ -469,7 +460,7 @@ async fn ledger_present(conn: &mut Conn) -> Result<i64, DbError> {
 /// cope; here that state is unreachable.
 pub async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
     if ledger_present(conn).await? != 2 {
-        let guard = Recoverable::take(conn).await?;
+        let guard = Recoverable::take(conn, &LEDGER).await?;
         let created = conn
             .execute(&format!("{CREATE_STATE};\n{CREATE_LOCK};"))
             .await;
@@ -1198,7 +1189,7 @@ async fn migrate_timeline_columns(conn: &mut Conn) -> Result<(), DbError> {
     if timeline_columns_present(conn).await? {
         return Ok(());
     }
-    let guard = Recoverable::take(conn).await?;
+    let guard = Recoverable::take(conn, &LEDGER).await?;
     match conn.execute(ADD_TIMELINE_COLUMNS).await {
         Ok(()) => {
             guard.release(conn).await?;
@@ -1222,7 +1213,7 @@ async fn migration_ownership_missing(conn: &mut Conn) -> Option<bool> {
     // the catalog establishes its absence; a failed diagnostic must retain
     // the original migration error and leave the caller's transaction usable
     // (DEC-463.1).
-    let guard = Recoverable::take(conn).await.ok()?;
+    let guard = Recoverable::take(conn, &LEDGER).await.ok()?;
     let result = conn
         .query(
             "SELECT NOT pg_catalog.pg_has_role(current_user, c.relowner, 'USAGE') AS missing
@@ -1267,10 +1258,6 @@ const RELEASE_SAVEPOINT: &str = "RELEASE SAVEPOINT pbps_ensure_tables";
 /// no savepoint to take and nothing an error here could abort.
 const NO_ACTIVE_TRANSACTION: &str = "25P01";
 
-fn is_outside_a_transaction(e: &DbError) -> bool {
-    e.server_error_code().as_deref() == Some(NO_ACTIVE_TRANSACTION)
-}
-
 /// Whether this database has a ledger at all.
 ///
 /// Every read has to ask first: querying a table that does not exist fails with
@@ -1301,21 +1288,7 @@ pub async fn is_initialized(conn: &mut Conn) -> Result<bool, DbError> {
     // is no ledger — is an error, and an error inside a transaction takes the
     // transaction with it. See [`Recoverable`]. Every reader below goes through
     // here, so this is where the four of them get that protection.
-    let guard = Recoverable::take(conn).await?;
-    match conn.query(PROBE_STATE).await {
-        Ok(_) => {
-            guard.release(conn).await?;
-            Ok(true)
-        }
-        Err(e) if is_missing_table(&e) => {
-            guard.rewind(conn).await?;
-            Ok(false)
-        }
-        Err(e) => {
-            guard.rewind_quietly(conn).await;
-            Err(e)
-        }
-    }
+    flow::is_initialized(conn, &LEDGER).await
 }
 
 /// The newest state, which is the environment's current baseline.
@@ -1325,11 +1298,7 @@ pub async fn is_initialized(conn: &mut Conn) -> Result<bool, DbError> {
 /// no ledger at all. The two need different remedies, so they are different
 /// answers.
 pub async fn latest(conn: &mut Conn) -> Result<Option<LedgerEntry>, LedgerError> {
-    if !is_initialized(conn).await? {
-        return Err(LedgerError::NotInitialized);
-    }
-    let rows = conn.query(&select_latest()).await?;
-    rows.first().map(entry_from_row).transpose()
+    flow::latest(conn, &LEDGER).await
 }
 
 /// Commit evidence at or before the snapshot the caller already observed.
@@ -1338,32 +1307,13 @@ pub async fn deployed_revision(
     conn: &mut Conn,
     observed_id: i64,
 ) -> Result<Option<pbps_db::ledger::StateRevision>, LedgerError> {
-    let allowed: Vec<_> = StateKind::ALL
-        .iter()
-        .copied()
-        .filter(|kind| kind.establishes_schema())
-        .collect();
-    let kinds = (0..allowed.len())
-        .map(|i| format!("${}", i + 2))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut params: Vec<Param<'_>> = vec![observed_id.into()];
-    params.extend(allowed.iter().map(|kind| Param::from(kind.as_str())));
-    let rows = conn.query_with(&format!("SELECT id, git_sha FROM ONLY public.__pbps_state WHERE id <= $1 AND kind IN ({kinds}) ORDER BY id DESC LIMIT 1"), &params).await?;
-    rows.first()
-        .map(|row| {
-            Ok(pbps_db::ledger::StateRevision {
-                id: number(row, "id")?,
-                git_sha: optional_text(row, "git_sha")?.map(pbps_model::Text::from),
-            })
-        })
-        .transpose()
+    flow::deployed_revision(conn, &LEDGER, observed_id).await
 }
 
 /// A retained successful apply is the evidence for an expand, not a baseline
 /// or another report that happens to name the same checksum (DEC-2402.1).
 pub async fn has_applied_plan(conn: &mut Conn, checksum: &str) -> Result<bool, LedgerError> {
-    Ok(!conn.query_with("SELECT id FROM ONLY public.__pbps_state WHERE kind = $1 AND plan_checksum = $2 ORDER BY id DESC LIMIT 1", &[StateKind::Apply.as_str().into(), checksum.into()]).await?.is_empty())
+    flow::has_applied_plan(conn, &LEDGER, checksum).await
 }
 
 /// A selected historical entry, or the newest when no id is supplied.
@@ -1372,23 +1322,7 @@ pub async fn entry(
     conn: &mut Conn,
     id: Option<i64>,
 ) -> Result<Option<pbps_db::ledger::StoredEntry>, LedgerError> {
-    if !is_initialized(conn).await? {
-        return Err(LedgerError::NotInitialized);
-    }
-    let rows = match id {
-        Some(id) => {
-            conn.query_with(
-                &format!(
-                    "SELECT id, {}, state_json FROM ONLY {STATE_TABLE} WHERE id = $1",
-                    rendered("applied_at")
-                ),
-                &[id.into()],
-            )
-            .await?
-        }
-        None => conn.query(&select_latest()).await?,
-    };
-    rows.first().map(stored_entry_from_row).transpose()
+    flow::entry(conn, &LEDGER, id).await
 }
 
 /// The most recent `limit` entries, newest first.
@@ -1396,13 +1330,7 @@ pub async fn entry(
 /// Every one of them has to be readable: a caller asking for entries wants the
 /// states, and half a state is not one. [`timeline`] is the other question.
 pub async fn history(conn: &mut Conn, limit: u32) -> Result<Vec<LedgerEntry>, LedgerError> {
-    if !is_initialized(conn).await? {
-        return Err(LedgerError::NotInitialized);
-    }
-    let rows = conn
-        .query_with(&select_history(), &[ROW_LIMIT.param(limit)])
-        .await?;
-    rows.iter().map(entry_from_row).collect()
+    flow::history(conn, &LEDGER, limit).await
 }
 
 /// The most recent `limit` rows as a timeline, newest first.
@@ -1467,7 +1395,7 @@ pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>,
         // statement aborts a caller's open transaction, and returning `Ok`
         // over an aborted transaction turns its next statement into `25P02`
         // and its `COMMIT` into a silent rollback (#361). See [`Recoverable`].
-        let guard = Recoverable::take(conn).await?;
+        let guard = Recoverable::take(conn, &LEDGER).await?;
         let answer = conn.query_with(&sql, &params).await;
         match &answer {
             Ok(_) => guard.release(conn).await?,
@@ -1725,7 +1653,7 @@ pub async fn unlock(conn: &mut Conn) -> Result<bool, DbError> {
     // would. An absent lock table has no problems, so it still answers "not
     // held" below.
     refuse_an_untrusted_ledger(conn).await?;
-    let guard = Recoverable::take(conn).await?;
+    let guard = Recoverable::take(conn, &LEDGER).await?;
     match conn.execute_with(DELETE_LOCK, &[]).await {
         Ok(n) => {
             guard.release(conn).await?;
@@ -1753,32 +1681,7 @@ pub async fn unlock(conn: &mut Conn) -> Result<bool, DbError> {
 /// differently, and "I could not look" must never be flattened into "nothing
 /// there".
 pub async fn lock_holder(conn: &mut Conn) -> Result<Option<LockInfo>, DbError> {
-    let guard = Recoverable::take(conn).await?;
-    let rows = match conn.query(&select_lock()).await {
-        Ok(rows) => {
-            guard.release(conn).await?;
-            rows
-        }
-        Err(e) if is_missing_table(&e) => {
-            guard.rewind(conn).await?;
-            return Ok(None);
-        }
-        Err(e) => {
-            guard.rewind_quietly(conn).await;
-            return Err(e);
-        }
-    };
-    match rows.first() {
-        Some(row) => {
-            let locked_by = text(row, "locked_by")?;
-            Ok(Some(LockInfo {
-                session_lookup: session_lookup(&locked_by),
-                locked_by,
-                locked_at: text(row, "locked_at")?,
-            }))
-        }
-        None => Ok(None),
-    }
+    flow::lock_holder(conn, &LEDGER).await
 }
 
 #[cfg(test)]
@@ -1842,8 +1745,9 @@ mod tests {
 
     /// Every statement this module can send, in one list, so that a rule
     /// asserted about "the SQL here" cannot quietly stop covering a statement
-    /// somebody adds. Three of them are built rather than written, which is
-    /// why the list holds `String`s.
+    /// somebody adds. The ones the shared flow sends come from the spec's own
+    /// list, which names every field; the rest are listed here. Some are
+    /// built rather than written, which is why the list holds `String`s.
     fn state_statements() -> Vec<String> {
         [
             CREATE_STATE,
@@ -1852,17 +1756,15 @@ mod tests {
             INSERT_STATE_NOT_STAGED,
             SELECT_IDS,
             DELETE_UP_TO,
-            PROBE_STATE,
         ]
         .into_iter()
         .map(str::to_owned)
         .chain([
-            select_latest(),
-            select_history(),
             select_timeline(),
             select_timeline_unmigrated(),
             select_legacy_state_json(3),
         ])
+        .chain(LEDGER.statements().state)
         .collect()
     }
 
@@ -1870,8 +1772,64 @@ mod tests {
         [CREATE_LOCK, INSERT_LOCK, DELETE_LOCK]
             .into_iter()
             .map(str::to_owned)
-            .chain([select_lock()])
+            .chain(LEDGER.statements().lock)
             .collect()
+    }
+
+    /// The spec hands the shared flow this module's own statements and codes,
+    /// and each of its statements binds exactly the values the flow sends:
+    /// a slot too few is a refused query, a slot too many reads a value that
+    /// was never bound.
+    #[test]
+    fn the_spec_carries_this_engines_statements_and_binds_every_value() {
+        assert_eq!(LEDGER.probe_state, PROBE_STATE);
+        assert_eq!(LEDGER.select_latest, select_latest());
+        assert_eq!(LEDGER.select_history, select_history());
+        assert_eq!(LEDGER.select_lock, select_lock());
+        assert_eq!(LEDGER.missing_table, "42P01");
+        assert_eq!(LEDGER.row_limit, RowLimit::I64);
+        let savepoint = LEDGER.savepoint.expect("a failed statement aborts here");
+        assert_eq!(savepoint.outside_a_transaction, "25P01");
+        for sql in [savepoint.take, savepoint.release, savepoint.rewind] {
+            assert!(sql.ends_with("SAVEPOINT pbps_ensure_tables"), "{sql}");
+        }
+
+        assert_eq!(slots(&LEDGER.probe_state), 0);
+        assert_eq!(slots(&LEDGER.select_latest), 0);
+        assert_eq!(slots(&LEDGER.select_lock), 0);
+        assert_eq!(slots(&LEDGER.select_by_id), 1);
+        assert_eq!(slots(&LEDGER.select_history), 1);
+        assert_eq!(slots(&LEDGER.select_applied_plan), 2);
+        assert_eq!(
+            (LEDGER.select_deployed_revision)(3),
+            format!(
+                "SELECT id, git_sha FROM ONLY {STATE_TABLE} WHERE id <= $1 AND kind IN ($2, $3, $4) \
+                 ORDER BY id DESC LIMIT 1"
+            )
+        );
+        assert_eq!(slots(&(LEDGER.select_deployed_revision)(1)), 2);
+        // No value is written into a statement: the only quoted text in any
+        // of them is the timestamp pattern.
+        for sql in LEDGER.statements().state {
+            assert!(!sql.replace(TIMESTAMP_PATTERN, "").contains('\''), "{sql}");
+        }
+    }
+
+    /// How many distinct `$n` a statement binds, which must be `$1..=$n`.
+    fn slots(sql: &str) -> usize {
+        let count = (1..=20).take_while(|n| has_slot(sql, *n)).count();
+        assert!(
+            (count + 1..=20).all(|n| !has_slot(sql, n)),
+            "the slots of this statement are not contiguous: {sql}"
+        );
+        count
+    }
+
+    /// `$1` is not found inside `$10`.
+    fn has_slot(sql: &str, n: usize) -> bool {
+        let slot = format!("${n}");
+        sql.match_indices(&slot)
+            .any(|(at, _)| !sql[at + slot.len()..].starts_with(|c: char| c.is_ascii_digit()))
     }
 
     fn every_statement() -> Vec<String> {
@@ -2006,6 +1964,7 @@ mod tests {
     fn every_timestamp_is_rendered_by_a_pattern_that_no_setting_moves() {
         for sql in [
             select_latest(),
+            select_by_id(),
             select_history(),
             select_timeline(),
             select_timeline_unmigrated(),
