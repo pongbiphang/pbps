@@ -971,6 +971,7 @@
         "exclude2448_partitions::a_rebuild_keeps_the_record_of_a_partitions_retired_own_exclusion",
         "exclude2448_partitions::a_rebuilds_parent_exclusion_calling_a_function_is_judged_before_it_runs_on_18",
         "exclude2448_partitions::an_undeclared_own_exclusion_the_parents_new_one_would_take_is_named_before_anything_runs",
+        "exclude2448_partitions::a_standing_own_exclusion_the_plan_replaces_is_dropped_before_the_parents_new_one_on_18",
         "exclude2448_partitions::a_partition_of_a_parent_with_an_exclusion_is_detached_and_its_clone_becomes_its_own",
         "partition_trigger1811::a_trigger_on_the_default_partition_added_with_a_new_partition_applies_and_reads_back",
         "partition_trigger1811::parent_and_member_triggers_apply_with_a_new_partition_and_read_back",

@@ -7977,6 +7977,131 @@ mod tests {
         assert_eq!(cs, before);
     }
 
+    /// A partition's own exclusion that the plan drops or replaces, and that a parent's new
+    /// one could take, is removed before the parent's add, wherever the passes before left
+    /// them: the engine refuses the drop of a constraint the parent's add made an inherited
+    /// clone (measured on 18.7). The drop half of a redefinition counts, and the add half does
+    /// not. Negatives: an own of another shape, another table's, and one already ahead keep
+    /// their place.
+    #[test]
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn a_partitions_own_exclusion_the_plan_removes_goes_ahead_of_the_parents_add() {
+        let (mut s, _) = declared();
+        let ev = TableName::new("app", "ev");
+        let ev_1 = TableName::new("app", "ev_1");
+        let other = TableName::new("app", "zz");
+        s.tables.insert(
+            ev.clone(),
+            Table {
+                partition_by: Some(pbps_model::PartitionBy {
+                    external: false,
+                    columns: vec!["k".into()],
+                    strategy: Default::default(),
+                }),
+                ..Table::default()
+            },
+        );
+        s.tables.insert(
+            ev_1.clone(),
+            Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: ev.clone(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: Default::default(),
+                }),
+                ..Table::default()
+            },
+        );
+        s.tables.insert(other.clone(), Table::default());
+        let exclusion = |operator: &str| {
+            Box::new(pbps_model::ExclusionConstraint {
+                method: pbps_model::IndexMethod::Gist,
+                keys: vec![pbps_model::ExclusionKey {
+                    key: pbps_model::IndexColumn::column("k"),
+                    operator: pbps_model::OperatorRef::symbol(operator).unwrap(),
+                }],
+                include: Vec::new(),
+                filter: None,
+                storage_parameters: Default::default(),
+                timing: pbps_model::ExclusionTiming::Immediate,
+            })
+        };
+        let set = |table: &TableName, name: &str, from, to| {
+            Change::Constraint(ConstraintChange::SetExclusion {
+                table: table.clone(),
+                name: name.into(),
+                from,
+                to,
+            })
+        };
+        let add = |table: &TableName, name: &str, operator: &str| {
+            set(table, name, None, Some(exclusion(operator)))
+        };
+        let remove = |table: &TableName, name: &str, operator: &str| {
+            set(table, name, Some(exclusion(operator)), None)
+        };
+        let names = |cs: &ChangeSet| -> Vec<String> {
+            cs.changes
+                .iter()
+                .map(|p| match &p.change {
+                    Change::Constraint(ConstraintChange::SetExclusion {
+                        table,
+                        name,
+                        from,
+                        ..
+                    }) => format!(
+                        "{}{}.{}",
+                        if from.is_some() { "-" } else { "+" },
+                        table.shown(),
+                        name.shown()
+                    ),
+                    other => other.subject(),
+                })
+                .collect()
+        };
+        let ahead =
+            |cs: &mut ChangeSet, s: &Schema, d: &dyn crate::certified_fixture::FixtureEmission| {
+                crate::test_planning(cs, |plan| {
+                    pbps_diff::order::deployment::before_its_partitions_indexes(plan, s, d)
+                })
+            };
+        // A drop the passes before left behind the parent's add comes first.
+        let mut cs = plan(vec![add(&ev, "parent", "="), remove(&ev_1, "own", "=")]);
+        ahead(&mut cs, &s, pg().as_ref()).unwrap();
+        assert_eq!(names(&cs), ["-app.ev_1.own", "+app.ev.parent"]);
+        // Settled again, nothing moves.
+        let settled = cs.clone();
+        ahead(&mut cs, &s, pg().as_ref()).unwrap();
+        assert_eq!(cs, settled);
+        // A redefinition under one name: its drop half goes first, its add half (another
+        // shape, which the parent's could not take) keeps its place after the parent's.
+        let mut cs = plan(vec![
+            add(&ev, "parent", "="),
+            remove(&ev_1, "own", "="),
+            add(&ev_1, "own", "&&"),
+        ]);
+        ahead(&mut cs, &s, pg().as_ref()).unwrap();
+        assert_eq!(
+            names(&cs),
+            ["-app.ev_1.own", "+app.ev.parent", "+app.ev_1.own"]
+        );
+        // Negative: an own of another shape, and a drop on a table that is no partition of
+        // the parent, keep their place.
+        let mut cs = plan(vec![
+            add(&ev, "parent", "="),
+            remove(&ev_1, "own", "&&"),
+            remove(&other, "zz", "="),
+        ]);
+        let before = cs.clone();
+        ahead(&mut cs, &s, pg().as_ref()).unwrap();
+        assert_eq!(cs, before);
+        // Negative: already ahead, nothing moves.
+        let mut cs = plan(vec![remove(&ev_1, "own", "="), add(&ev, "parent", "=")]);
+        let before = cs.clone();
+        ahead(&mut cs, &s, pg().as_ref()).unwrap();
+        assert_eq!(cs, before);
+    }
+
     /// A parent's new index goes ahead of every partition index it could take
     /// as its clone, wherever the passes before left them (#1745 review): the
     /// partition's index sinks to right after it (DEC-1967.2), with what rests

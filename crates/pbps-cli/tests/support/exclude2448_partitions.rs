@@ -1407,3 +1407,86 @@ fn an_undeclared_own_exclusion_the_parents_new_one_would_take_is_named_before_an
     );
     settled(&d, connection);
 }
+
+/// A partition's own exclusion that the parent's new one would take, replaced by another that
+/// it would not, with the parent's added in the same plan: the own's drop runs before the
+/// parent's add, which the engine needs (`cannot drop inherited constraint` otherwise,
+/// measured on 18.7), so the plan applies and the next one is empty. The own kept as declared
+/// is refused by name instead, and nothing runs (DEC-2448.7).
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_standing_own_exclusion_the_plan_replaces_is_dropped_before_the_parents_new_one_on_18() {
+    let _ = server();
+    let url = std::env::var("PBPS_TEST_PG_DB").expect("PBPS_TEST_PG_DB");
+    let own = OwnDatabase::new(&url, "exclude-own-replaced");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "{TREE}; ALTER TABLE app.ev_1 ADD CONSTRAINT ev_1_own EXCLUDE USING btree \
+             (k WITH =, v WITH =)"
+        ),
+    );
+    let d = adopt("exclude-own-replaced", connection);
+    let path = d.dir.join("schema/app.ev.yml");
+    let held = std::fs::read_to_string(&path).unwrap();
+    assert!(held.contains("ev_1_own:"), "{held}");
+
+    // Negative: the own kept as declared, beside the parent's new one, is refused by name.
+    std::fs::write(&path, format!("{held}{SLOT}")).unwrap();
+    let refused = d.run(&["plan", "--db", connection]);
+    assert_ne!(code(&refused), 0, "{}", said(&refused));
+    assert!(
+        said(&refused).contains("is its parent's `one_per_slot`"),
+        "{}",
+        said(&refused)
+    );
+    assert_eq!(
+        parent_constraints(connection, "one_per_slot"),
+        0,
+        "nothing ran"
+    );
+
+    // The own replaced by one that differs (by its `include`), and the parent's added.
+    let replaced = held.replacen(
+        "ev_1_own:\n        method: btree\n",
+        "ev_1_wide:\n        method: btree\n        include: [note]\n",
+        1,
+    );
+    assert_ne!(replaced, held, "{held}");
+    std::fs::write(&path, format!("{replaced}{SLOT}")).unwrap();
+    succeeds(d.run(&[
+        "drop-exclusion",
+        "app.ev_1",
+        "ev_1_own",
+        "--reason",
+        "the wider one replaces it",
+    ]));
+    d.commit();
+    let (plan, script) = plan_sql(&d, connection);
+    assert!(
+        script.find("DROP CONSTRAINT \"ev_1_own\"").unwrap()
+            < script.find("ADD CONSTRAINT \"one_per_slot\"").unwrap(),
+        "{script}"
+    );
+    succeeds(approved_apply(&d, connection, &plan, BOTH));
+    assert_eq!(parent_constraints(connection, "one_per_slot"), 1);
+    assert_eq!(clones(connection), 2, "a clone on each partition");
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_constraint WHERE contype = 'x' \
+             AND conrelid = 'app.ev_1'::regclass"
+        ),
+        2,
+        "the wider own beside the clone"
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_constraint WHERE conname = 'ev_1_own'"
+        ),
+        0
+    );
+    settled(&d, connection);
+}

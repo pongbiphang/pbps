@@ -10207,7 +10207,10 @@ backed by an unattached index); only a parent's is 18's.
   a created partition's exclusions are the separate changes after its `CREATE` (DEC-2448.3). A
   parent's new exclusion is refused over every own the parent's would adopt, whether the own stood before
   the plan or the plan adds it, consistent with the declaration rule above; the same-plan order the
-  engine allows is #2992's.
+  engine allows is #2992's. An own the plan drops or replaces is not refused: `before_its_partitions_indexes`
+  gives the parent's add an edge from each removal of an own it would adopt, so the drop runs first (the
+  engine refuses it as `cannot drop inherited constraint` after the add, measured on 18.7); a partition
+  index's drop is class 2 like the exclusion's and stays as it was.
   The attach shape refuses a table's own that the parent's takes, naming the remedy (drop it in an earlier
   plan), keeps every other, and compares it with the declaration.
 - **Detach.** `DetachedKind::Exclusion` names the clone by its parent's constraint, found through
