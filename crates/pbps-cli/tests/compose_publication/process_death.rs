@@ -128,8 +128,12 @@ fn child_report_within(
         }
         std::thread::sleep(Duration::from_millis(5));
     };
-    // The child reports right after it connects; the same guard covers it.
-    connection.set_read_timeout(Some(guard)).unwrap();
+    // The child reports right after it connects. The read gets what is left
+    // of the one guard, not a second one. A zero timeout is an error.
+    let left = guard.saturating_sub(started.elapsed());
+    connection
+        .set_read_timeout(Some(left.max(Duration::from_millis(1))))
+        .unwrap();
     let mut line = String::new();
     if BufReader::new(connection).read_line(&mut line).is_err() {
         hung(child);
@@ -263,6 +267,23 @@ fn a_child_that_connects_but_never_reports_is_killed_once_the_guard_passes() {
         "probe: child missed its synchronized boundary"
     );
     assert!(!child.try_wait().unwrap().unwrap().success());
+}
+
+#[test]
+fn one_guard_bounds_the_connection_and_the_report_together() {
+    // Connects at 3 s of a 4 s guard and stays silent: the helper gives up at
+    // about 4 s. A second full guard for the read would end at 7 s or later.
+    // The bound sits far from both, so a loaded machine does not decide it.
+    let started = Instant::now();
+    let silent = Some((Duration::from_secs(3), None));
+    let (result, _) = probe("exec sleep 600", silent, Duration::from_secs(4));
+    assert_eq!(
+        result.unwrap_err(),
+        "probe: child missed its synchronized boundary"
+    );
+    let took = started.elapsed();
+    assert!(took >= Duration::from_secs(4), "{took:?}");
+    assert!(took < Duration::from_millis(6500), "{took:?}");
 }
 
 fn receipt(f: &Fixture, id: &str) -> serde_json::Value {
