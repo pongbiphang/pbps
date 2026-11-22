@@ -1561,7 +1561,7 @@ pub(crate) fn carried_destinations(
 /// history, and the occupant. Ordered as the `sys.objects` walk orders the
 /// plan, so an object the plan drops or renames away first frees the name, as
 /// it does at plan time (#1501 review).
-pub(super) fn blocking_history_occupants<'a>(
+pub(crate) fn blocking_history_occupants<'a>(
     cs: &pbps_model::ChangeSet,
     held: &'a [pbps_mssql::catalog::NameOccupant],
 ) -> Vec<(TableName, TableName, &'a pbps_mssql::catalog::NameOccupant)> {
@@ -1629,19 +1629,18 @@ pub(crate) async fn refuse_taken_history_names<D: crate::engine::ApplySession>(
     if names.is_empty() {
         return Ok(());
     }
-    let Some(held) = session.history_name_occupants(conn, &names).await? else {
-        return Ok(());
-    };
-    let taken: Vec<String> = blocking_history_occupants(cs, &held)
+    let taken: Vec<String> = session
+        .taken_history_names(conn, cs, &names)
+        .await?
         .into_iter()
-        .map(|(table, history, o)| {
+        .map(|o| {
             format!(
                 "{table} names {history} as its history table, and the database already has {} \
                  `{}`",
                 o.kind,
                 o.name.shown(),
-                table = table.shown(),
-                history = history.shown()
+                table = o.table.shown(),
+                history = o.history.shown()
             )
         })
         .collect();

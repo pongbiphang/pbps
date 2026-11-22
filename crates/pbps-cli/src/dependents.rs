@@ -107,9 +107,44 @@ use pbps_model::resolver::OrderReason;
 use pbps_model::{Change, ChangeSet, ModuleId, ModuleKind, Partitions, Schema, TableName};
 #[cfg(test)]
 use pbps_model::{ColumnRef, IdsFile, ModuleDeps, PlannedChange};
-use pbps_pg::catalog::KeyNameHolder;
 #[cfg(test)]
 use pbps_pg::modules::{Dependent, Holds, Part};
+
+/// A name in a schema that an unnamed primary key's index cannot take
+/// (#1645): a relation's of any kind, a composite type's included, or a
+/// constraint's in that schema, on any of its tables. Measured on 16 and 18:
+/// either makes the engine number the key's index (`_pkey1`), and a
+/// constraint of that name in another schema, an enum or a domain does not.
+///
+/// The engine that reads them converts its own rows into this record; the
+/// replay below judges only these fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeyNameHolder {
+    pub name: TableName,
+    /// The table an index or a constraint belongs to, or whose column owns a
+    /// sequence, which moves and goes with it (measured on 16 and 18, #1729
+    /// review); `None` for any other relation, a table among them.
+    pub owner: Option<TableName>,
+    /// Whether it is a primary key's index or constraint.
+    pub primary_key: bool,
+    /// Whether it is a constraint rather than a relation: a check and an
+    /// index of one name on one table are two holders, and dropping one
+    /// leaves the other.
+    pub constraint: bool,
+    /// The trigger whose `pg_constraint` row it is (`contype = 't'`), by the
+    /// trigger's own name, which `DROP TRIGGER` frees it with (measured on 16
+    /// and 18, #1738). The row is named after the trigger when it is created,
+    /// but `ALTER TRIGGER ... RENAME` renames only the trigger, and an
+    /// ordinary trigger may then take the row's name (measured, #1752
+    /// review). An ordinary trigger has no row and holds no name.
+    pub trigger: Option<String>,
+    /// A clone's parent trigger, from `tgparentid`. Its drop frees this row
+    /// even when the partition is in another schema (DEC-2101.1).
+    pub parent_trigger: Option<ModuleId>,
+    /// Whether this constraint trigger is a row trigger on a partitioned
+    /// table, producing companions when partitions arrive (DEC-2101.1).
+    pub clones_to_partitions: bool,
+}
 
 /// Every module this plan drops, rebuilt or not, in plan order: an
 /// `AlterModule` (emitted as a drop and a create in one step) and a

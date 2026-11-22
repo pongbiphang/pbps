@@ -33,6 +33,29 @@ pub(crate) struct PlanState {
     admission: RoutineAdmission,
 }
 
+impl From<pbps_pg::catalog::KeyNameHolder> for crate::dependents::KeyNameHolder {
+    fn from(held: pbps_pg::catalog::KeyNameHolder) -> Self {
+        let pbps_pg::catalog::KeyNameHolder {
+            name,
+            owner,
+            primary_key,
+            constraint,
+            trigger,
+            parent_trigger,
+            clones_to_partitions,
+        } = held;
+        Self {
+            name,
+            owner,
+            primary_key,
+            constraint,
+            trigger,
+            parent_trigger,
+            clones_to_partitions,
+        }
+    }
+}
+
 impl AsRef<RoutineAdmission> for PlanState {
     fn as_ref(&self) -> &RoutineAdmission {
         &self.admission
@@ -549,12 +572,15 @@ pub(crate) async fn account_for_module_dependents<
     // names, or the expression (#1576).
     // Which name each unnamed key's index takes depends on what holds its
     // candidates now (#1645).
-    let holders =
+    let holders: Vec<crate::dependents::KeyNameHolder> =
         pbps_pg::catalog::key_name_holders(conn, &crate::dependents::key_name_prefixes(&changes))
             .await
             .map_err(|e| {
                 anyhow::anyhow!("module_dependents (PostgreSQL): reading what holds key names: {e}")
-            })?;
+            })?
+            .into_iter()
+            .map(Into::into)
+            .collect();
     let mut later = Vec::new();
     for name in crate::dependents::names_a_later_relation(
         &changes,
@@ -2276,10 +2302,13 @@ impl PlanSession for pbps_pg::Postgres {
         &self,
         conn: &mut Conn,
         prefixes: &[(String, String)],
-    ) -> anyhow::Result<Vec<pbps_pg::catalog::KeyNameHolder>> {
-        pbps_pg::catalog::key_name_holders(conn, prefixes)
+    ) -> anyhow::Result<Vec<crate::dependents::KeyNameHolder>> {
+        Ok(pbps_pg::catalog::key_name_holders(conn, prefixes)
             .await
-            .map_err(|e| anyhow::anyhow!("reading what holds key names: {e}"))
+            .map_err(|e| anyhow::anyhow!("reading what holds key names: {e}"))?
+            .into_iter()
+            .map(Into::into)
+            .collect())
     }
     async fn later_name_resolves(
         &self,
