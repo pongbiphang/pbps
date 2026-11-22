@@ -239,6 +239,32 @@ class Move(Tree):
         self.assertEqual(ssd.move_map(PARENT, self.plan, self.root, REL, "HEAD"), ["gamma: 44-46 -> third"])
         self.assertEqual(len(ssd.move_map(PARENT, self.plan)), 6, "without a base ref every planned item is listed")
 
+    def test_the_map_tells_a_type_from_its_impl_when_they_move_in_different_rounds(self) -> None:
+        # An earlier move took the struct and left its impl in the parent.
+        self.apply()
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "first move")
+        second = self.module("second")
+        held = ssd.cut_items(second.read_text())
+        impl = next(x for x in held if x.display == "impl Pair")
+        text = second.read_text()
+        second.write_text(text[: impl.start] + text[impl.stop :])
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "the impl is back in the parent")
+        rows = ssd.move_map(PARENT, self.plan, self.root, REL, "HEAD")
+        self.assertEqual(rows, ["impl Pair: 31-35 -> second"], "the impl is listed though its type moved before")
+        # The reverse: everything a name covers moved before, and the base file
+        # (the parent after that move) has none of it. Not an error, not a row.
+        second.write_text(text)
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "the impl is in the module again")
+        after = (self.root / REL).read_text()
+        self.assertEqual(ssd.move_map(after, self.plan, self.root, REL, "HEAD"), [])
+        # Negative: a name nothing holds, before or now, is still an error.
+        self.write_plan({**PLAN, "second": [*PLAN["second"], "NOPE"]})
+        with self.assertRaisesRegex(ssd.SplitError, "NOPE"):
+            ssd.move_map(after, self.plan, self.root, REL, "HEAD")
+
     def test_an_import_only_a_test_file_reads_is_gated_to_the_test_build(self) -> None:
         self.apply()
         parent = self.src.read_text()

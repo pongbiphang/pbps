@@ -803,23 +803,26 @@ def move_map(
     base_text: str, plan_path: Path, root: Path | None = None, parent_rel: str = DEFAULT_FILE, base_ref: str | None = None
 ) -> list[str]:
     """With `base_ref`, an item that the modules already held at that commit is
-    an earlier PR's move and is not listed."""
+    an earlier PR's move and is not listed.
+
+    Earlier moves are told apart item by item and not by the plan's name: one
+    name covers a type and its impls, and they may move in different PRs."""
     modules, _, _, _ = load_plan(plan_path)
     items = cut_items(base_text)
-    earlier: set[str] = set()
+    earlier: list[Item] = []
     if root is not None and base_ref:
         mod_dir = Path(parent_rel).with_suffix("")
         for mod in modules:
             body = _git_show(root, base_ref, f"{mod_dir}/{mod}.rs")
             if body is not None:
-                earlier |= {x.display or x.name for x in cut_items(body) if not x.glue}
+                earlier += [x for x in cut_items(body) if not x.glue]
+    moved_before = {x.display or x.name for x in earlier}
     rows = []
     for mod, names in modules.items():
         for name in names:
-            if name in earlier:
-                continue
-            hits = [it for it in items if _matches(it, name)]
-            if not hits:
+            found = [it for it in items if _matches(it, name)]
+            hits = [it for it in found if (it.display or it.name) not in moved_before]
+            if not found and not any(_matches(x, name) for x in earlier):
                 raise SplitError(f"the plan names `{name}` and the base file has no such item")
             rows += [(it.start, f"{it.display or name}: {line_of(base_text, it.start)}-{line_of(base_text, it.stop)} -> {mod}") for it in hits]
     return [r for _, r in sorted(rows)]
