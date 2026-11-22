@@ -6861,6 +6861,87 @@ fn a_hidden_role_is_not_recorded_as_missing() {
     drop_test_login(&server, &login);
 }
 
+/// A recording asks about the missing tables before the missing roles. With a
+/// table and a role both hidden from the login, the refusal an operator reads
+/// names the table, and the role is not reached: one grant at a time, in the
+/// order the remedy has always been given.
+/// Negative: with the table visible again, the same commands refuse for the
+/// role, so the role's question is still asked.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_hidden_table_is_refused_before_a_hidden_role() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "hidden_both");
+    let login = format!("pbps_flow_hidden_both_{}", std::process::id());
+    // Not a secret: this login exists for one test inside a throwaway container.
+    let password = "pbpsLeastPrivilege!1";
+    on_server(
+        &server,
+        &format!(
+            "IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
+             CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"
+        ),
+    );
+    on_server(
+        own.connection(),
+        &format!(
+            "EXEC(N'CREATE SCHEMA other;'); CREATE TABLE other.t (id int); \
+             CREATE TABLE dbo.keep (id int); CREATE ROLE hidden_r; \
+             CREATE USER [{login}] FOR LOGIN [{login}]; \
+             GRANT VIEW DEFINITION, SELECT, INSERT, UPDATE, DELETE, ALTER, REFERENCES \
+                 ON SCHEMA::dbo TO [{login}]; \
+             GRANT CREATE TABLE, VIEW DEFINITION TO [{login}]; \
+             GRANT SELECT ON sys.sql_expression_dependencies TO [{login}]; \
+             DENY VIEW DEFINITION ON SCHEMA::other TO [{login}]; \
+             DENY VIEW DEFINITION ON ROLE::hidden_r TO [{login}];"
+        ),
+    );
+    let d = Demo::new("hidden-both");
+    let o = d.run(&["pull", "--db", own.connection()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    d.commit();
+    let o = d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let as_login = with_key(
+        &with_key(own.connection(), "User Id", &login),
+        "Password",
+        password,
+    );
+    let commands = || {
+        [
+            vec!["baseline", "--db", &as_login, "--reason", "as the login"],
+            vec!["snapshot", "--db", &as_login, "--force"],
+        ]
+    };
+
+    for args in commands() {
+        let o = d.run(&args);
+        assert_ne!(code(&o), 0, "{args:?}: {}", stdout(&o));
+        assert!(
+            stderr(&o).contains("cannot record other.t as missing")
+                && !stderr(&o).contains("cannot record role(s)"),
+            "{args:?}: {}",
+            stderr(&o)
+        );
+    }
+
+    // Negative: the table is visible again, and the role's question is asked.
+    on_server(
+        own.connection(),
+        &format!("REVOKE VIEW DEFINITION ON SCHEMA::other FROM [{login}];"),
+    );
+    for args in commands() {
+        let o = d.run(&args);
+        assert_ne!(code(&o), 0, "{args:?}: {}", stdout(&o));
+        assert!(
+            stderr(&o).contains("cannot record role(s) hidden_r as missing"),
+            "{args:?}: {}",
+            stderr(&o)
+        );
+    }
+    on_server(&server, &format!("DROP LOGIN [{login}];"));
+}
+
 /// #1192: metadata visibility filters `sys.objects`, so a sequence this login
 /// is denied `VIEW DEFINITION` on returns no row and used to read as a free
 /// name. A connected plan that cannot prove the schema it creates into fully

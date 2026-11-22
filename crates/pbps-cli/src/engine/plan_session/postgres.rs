@@ -6,6 +6,7 @@
 //! through the free functions here, so each body is written once.
 
 use super::*;
+use anyhow::Context as _;
 
 /// PostgreSQL's own wording, kept as it was, not the default's.
 pub(super) const DEPENDENCIES_REFUSAL: &str =
@@ -2091,5 +2092,30 @@ impl PlanSession for pbps_pg::Postgres {
         // rehearsal found in that package (DEC-2447.12).
         pbps_pg::type_refs::provider_proof(type_pins, extension_pins, extension_changes)?;
         pbps_pg::class_pins::proof(provider_pins, extension_pins, extension_changes)
+    }
+    async fn maintained_partitions(
+        &self,
+        conn: &mut Conn,
+    ) -> anyhow::Result<Vec<MaintainedParent>> {
+        let Some(schema) = pbps_pg::partman::schema(conn).await? else {
+            return Ok(Vec::new());
+        };
+        let maintained = pbps_pg::partman::maintained(conn, &schema)
+            .await
+            .with_context(|| {
+                format!(
+                    "pg_partman is installed in schema `{schema}`, and its `part_config` cannot \
+                     be read as this role, so pull cannot tell which parents' partitions it \
+                     makes; grant USAGE on schema `{schema}` and SELECT on \
+                     `{schema}.part_config`, then pull again"
+                )
+            })?;
+        Ok(maintained
+            .into_iter()
+            .map(|m| MaintainedParent {
+                parent: m.parent,
+                template: m.template,
+            })
+            .collect())
     }
 }

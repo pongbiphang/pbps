@@ -228,6 +228,15 @@ pub(crate) struct ExtensionSeals {
     pub drops: Vec<pbps_model::ExtensionDropPin>,
 }
 
+/// One partitioned parent another tool maintains, and the template table that
+/// tool keeps beside its own catalog (#1533, DEC-1533.1). The engine's own type
+/// stops at the position that read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MaintainedParent {
+    pub parent: TableName,
+    pub template: Option<TableName>,
+}
+
 /// The engine's steps of a connected plan, at the positions of the pipeline.
 ///
 /// The methods are listed in the order the pipeline calls them. See the module
@@ -837,6 +846,20 @@ pub(crate) trait PlanSession: crate::emission::Engine {
             extension_changes,
         )
     }
+
+    /// The partitioned parents another tool maintains, which `pull` and
+    /// `init --from` declare with external partitions (#1533, DEC-1533.1).
+    /// Not a step of the planning pipeline: one read connection, no lock and no
+    /// write, so it takes no [`Self::State`].
+    ///
+    /// An engine without such a tool installed answers an empty list. A tool
+    /// that is installed and whose catalog cannot be read is this method's
+    /// error, in words that say what to grant: it is not "no parent is
+    /// maintained", and neutral code cannot tell the two apart from a list.
+    /// Required, so an engine that has not been asked is not taken for one that
+    /// has nothing to report.
+    async fn maintained_partitions(&self, conn: &mut Conn)
+    -> anyhow::Result<Vec<MaintainedParent>>;
 }
 
 /// The order the `connected_checks` rows of a plan are printed and saved in,

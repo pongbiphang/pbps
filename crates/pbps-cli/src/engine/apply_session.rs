@@ -6,7 +6,8 @@
 //! The service selects the concrete dialect with with_plan_dialect! before
 //! opening one default state per attempt. Existing connected adapters remain
 //! available to staged apply and bootstrap until their own routes move.
-//! Staged apply now uses the positions; bootstrap and planning retain adapters.
+//! Staged apply, snapshot and baseline use the positions; bootstrap and planning
+//! retain adapters.
 use super::*;
 use crate::pins::{Approved, Check};
 use anyhow::Context as _;
@@ -489,6 +490,63 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         conn: &mut Conn,
         after: &Schema,
     ) -> anyhow::Result<()>;
+    /// What the database holds, for a recording that takes missing objects out
+    /// of the state (#1600, #1606): proves the tables the catalog read did not
+    /// return are absent and not hidden, then returns the roles it proves
+    /// absent. Neutral code narrows the held identities with the returned
+    /// roles afterwards.
+    ///
+    /// The tables come first, as the recordings asked them: a refusal about a
+    /// table is the one an operator reads when both a table and a role are
+    /// hidden from the login.
+    async fn recording_absence(
+        &self,
+        conn: &mut Conn,
+        missing: &[TableName],
+        missing_roles: &[pbps_model::RoleName],
+    ) -> anyhow::Result<Vec<pbps_model::RoleName>> {
+        prove_tables_absent(conn, missing).await?;
+        absent_roles(conn, missing_roles).await
+    }
+    /// The temporary CHECKs a staged attach left on its tables, which
+    /// `baseline` takes out before it takes the database as it stands (#1638,
+    /// DEC-1638.1).
+    ///
+    /// Only under the exact name a table's identity in the project's ids file
+    /// gives: never by a prefix. Not from the ledger: `baseline` is the remedy
+    /// for an entry this build cannot read (DECISIONS 203), and a run that dies
+    /// between the `ADD` and the `VALIDATE`'s checkpoint records nothing, so no
+    /// entry's kind or ids can be asked first. No declared constraint can hold
+    /// the name, the database cannot be read while a `NOT VALID` one stands, and
+    /// a validated one is pbps's own.
+    ///
+    /// Required: whether an engine's staged plans write such a CHECK is a fact
+    /// about the engine, and an empty answer from an engine that was never
+    /// asked would let `baseline` read a database with one standing.
+    async fn standing_scan_checks(
+        &self,
+        conn: &mut Conn,
+        ids: &IdsFile,
+    ) -> anyhow::Result<Vec<pbps_dialect::ScanCheck>>;
+    /// Drops `checks`, inside the transaction `baseline` records in (#2127).
+    /// Neutral code decides there is something to drop and names each for the
+    /// record.
+    async fn drop_scan_checks(
+        &self,
+        conn: &mut Conn,
+        checks: &[pbps_dialect::ScanCheck],
+    ) -> anyhow::Result<()>;
+    /// The opaque catalog evidence `baseline` asks before it hands a held
+    /// partition over (DEC-1852.1, ADR-0018): whether the engine records one
+    /// at all, and what it read. Neutral code keeps the refusal, and keeps the
+    /// retained parent-and-bound refusal when the answer is `None`.
+    ///
+    /// Required, for the reason of [`Self::standing_scan_checks`]: `None` is
+    /// the engine's statement that it records no such evidence.
+    async fn handover_catalog(
+        &self,
+        conn: &mut Conn,
+    ) -> Result<Option<pbps_model::baseline_evidence::BaselineCatalog>, DbError>;
     async fn removed_name_matches(
         &self,
         conn: &mut Conn,

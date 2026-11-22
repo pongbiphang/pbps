@@ -2,6 +2,7 @@
 //! `snapshot`, `baseline`, `prune` and `unlock`.
 
 use super::*;
+use crate::engine::ApplySession as _;
 
 /// No `From` conversion: every fallible verify step must choose its own ID,
 /// so a successful connection cannot relabel a later read failure (DEC-1804.1).
@@ -391,8 +392,12 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
             // What the database holds, not every uid the ids file names: a
             // missing table or role recorded as held is one the next plan
             // never creates (#1600, #1606).
-            crate::engine::prove_tables_absent(&mut conn, &scoped.missing).await?;
-            let gone = crate::engine::absent_roles(&mut conn, &scoped.missing_roles).await?;
+            let selected = crate::engine::apply_session::selected(conn.driver());
+            let gone = pbps_cli::with_plan_dialect!(&selected, |session| {
+                session
+                    .recording_absence(&mut conn, &scoped.missing, &scoped.missing_roles)
+                    .await?
+            });
             let held = ids
                 .without(&scoped.missing)
                 .without_roles(&gone)
@@ -591,7 +596,10 @@ pub fn cmd_baseline(
             // the newest staged checkpoint still recorded it, and `apply
             // --resume` refused that drift (#2127). Without one to remove,
             // the read is the snapshot it always was.
-            let checks = crate::engine::standing_scan_checks(&mut conn, &ids).await?;
+            let selected = crate::engine::apply_session::selected(conn.driver());
+            let checks = pbps_cli::with_plan_dialect!(&selected, |session| {
+                session.standing_scan_checks(&mut conn, &ids).await?
+            });
             let read = if checks.is_empty() {
                 crate::engine::Read::Snapshot
             } else {
@@ -601,7 +609,17 @@ pub fn cmd_baseline(
                 crate::engine::Read::InsideOwnTransaction
             };
             let body = async {
-                let removed = crate::engine::drop_scan_checks(&mut conn, &checks).await?;
+                // Without a standing CHECK there is nothing to drop and no
+                // transaction: the read above is the snapshot it always was.
+                if !checks.is_empty() {
+                    pbps_cli::with_plan_dialect!(&selected, |session| {
+                        session.drop_scan_checks(&mut conn, &checks).await?
+                    });
+                }
+                let removed: Vec<String> = checks
+                    .iter()
+                    .map(crate::engine::scan_check_removal_note)
+                    .collect();
                 let scoped = managed_state(
                     &mut conn,
                     &ids,
@@ -634,7 +652,9 @@ pub fn cmd_baseline(
                 let dropped = tables_a_drop_intent_names(&ids);
                 if !dropped.is_empty() && !scoped.external.is_empty() {
                     let previous = crate::engine::latest(&mut conn).await;
-                    let catalog = crate::engine::baseline_catalog(&mut conn).await?;
+                    let catalog = pbps_cli::with_plan_dialect!(&selected, |session| {
+                        session.handover_catalog(&mut conn).await?
+                    });
                     refuse_handing_over_held_partitions(
                         &dropped,
                         &ids,
@@ -646,8 +666,11 @@ pub fn cmd_baseline(
                 }
 
                 // What the database holds, as `snapshot` records it (#1600, #1606).
-                crate::engine::prove_tables_absent(&mut conn, &scoped.missing).await?;
-                let gone = crate::engine::absent_roles(&mut conn, &scoped.missing_roles).await?;
+                let gone = pbps_cli::with_plan_dialect!(&selected, |session| {
+                    session
+                        .recording_absence(&mut conn, &scoped.missing, &scoped.missing_roles)
+                        .await?
+                });
                 let held = ids
                     .without(&scoped.missing)
                     .without_roles(&gone)
