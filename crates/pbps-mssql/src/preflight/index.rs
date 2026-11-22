@@ -40,13 +40,14 @@ pub(super) fn preflight<'v, 'p: 'v>(
             let Some(rows) = rows else {
                 return Ok(skip(change, "the planned index values or predicate cannot be evaluated before apply", unchecked));
             };
-            Ok(vec![duplicate_probe(
-                &format!("(\n{rows}\n) AS r"),
+            Ok(vec![count_probes::duplicates(
+                &COUNTS,
+                &count_probes::relation(&rows),
                 &collated_keys(names, table, &columns)?,
                 &format!("rows that would collide under the new unique index {name}",
 name = name.shown(),
 ),
-            )?])
+            )])
         }
         // The unique ones are counted above; a plain index refuses nothing.
         IndexChange::AddIndex { .. } | IndexChange::DropIndex { .. } | // This dialect never produces one and `emit` refuses it; a probe

@@ -33,6 +33,7 @@ use std::cell::LazyCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 
+use pbps_dialect::count_probes::{self, CountSql, Gone, UniqueNulls};
 use pbps_dialect::plan_rows::{Event, PlanFacts, Removal, RowWrites, View, WrittenCell};
 use pbps_dialect::{DialectError, Preflight, Probe, Unchecked};
 #[cfg(test)]
@@ -1492,16 +1493,28 @@ fn rows_after(
     Ok(Some(format!("SELECT {} WHERE 1 = 0", empty.join(", "))))
 }
 
-/// `r.k0 .. r.kn`: the columns [`rows_after`] names its relation's with.
-fn keys(n: usize) -> Vec<String> {
-    (0..n).map(|i| format!("r.k{i}")).collect()
-}
+/// How this engine spells the count statements of [`count_probes`]
+/// (DEC-2988.2).
+const COUNTS: CountSql = CountSql {
+    rows: "COUNT(*)",
+    grouped_rows: "ISNULL(SUM(c), 0)",
+    count: "COUNT(*)",
+    // Also what a constant reads as where this plan is the one adding the
+    // column (`AsStored::reads`). Measured: `NULL IS NULL` counts every row and
+    // `(N'yy') IS NULL` counts none, which is what those two additions leave
+    // behind (DECISIONS 171).
+    is_null: "IS NULL",
+    // `GROUP BY` treats NULLs as equal, which is also how this engine's
+    // `UNIQUE` treats them, so the count matches what the engine will refuse.
+    unique_nulls: UniqueNulls::Equal,
+};
 
-/// [`keys`], each grouped under the collation its column will have when the
-/// key is rebuilt, where this plan changes it (#1175). Measured on 17.0,
-/// `GROUP BY c COLLATE Latin1_General_CI_AS` puts `abc` and `ABC` in one group
-/// and `COLLATE Latin1_General_CS_AS` in two — so the count is the rows the
-/// rebuilt key will refuse (1505), not the ones the current collation does.
+/// [`count_probes::keys`], each grouped under the collation its column will
+/// have when the key is rebuilt, where this plan changes it (#1175). Measured
+/// on 17.0, `GROUP BY c COLLATE Latin1_General_CI_AS` puts `abc` and `ABC` in
+/// one group and `COLLATE Latin1_General_CS_AS` in two — so the count is the
+/// rows the rebuilt key will refuse (1505), not the ones the current collation
+/// does.
 fn collated_keys(
     names: &AsStored,
     table: &TableName,
@@ -1509,7 +1522,7 @@ fn collated_keys(
 ) -> Result<Vec<String>, DialectError> {
     columns
         .iter()
-        .zip(keys(columns.len()))
+        .zip(count_probes::keys(columns.len()))
         .map(|(column, key)| {
             Ok(match names.recollated.get(&table.column(column)) {
                 Some(Some(to)) => format!("{key}{}", crate::emit::collate_clause(Some(to))?),
@@ -1559,44 +1572,6 @@ fn schema_probe(role: &pbps_model::RoleName, schema: &str) -> Probe {
             name = literal(schema)
         ),
     )
-}
-
-/// `column` names it as the plan does — for the message a human reads — and
-/// `stored` as the database does, for the query.
-/// `reads` is how a row already in the table reads in this column — usually
-/// the quoted column name, but a constant where this plan is the one adding it
-/// (`AsStored::reads`). Measured: `NULL IS NULL` counts every row and
-/// `(N'yy') IS NULL` counts none, which is what those two additions leave
-/// behind (DECISIONS 171).
-fn null_probe(column: &ColumnRef, from: &str, reads: &str) -> Result<Probe, DialectError> {
-    Ok(Probe::new(
-        format!(
-            "existing NULLs in {column}, which NOT NULL would reject",
-            column = column.shown()
-        ),
-        format!("SELECT COUNT(*) AS n FROM {from} WHERE {reads} IS NULL;"),
-    ))
-}
-
-/// `from` is the relation the constraint's statement will meet and `columns`
-/// are its key expressions within it — for a key a plan adds, the derived
-/// table [`rows_after`] builds from the preceding changes (DECISIONS 175).
-fn duplicate_probe(
-    from: &str,
-    columns: &[String],
-    description: &str,
-) -> Result<Probe, DialectError> {
-    let list = columns.join(", ");
-    Ok(Probe::new(
-        description,
-        // The rows, not the groups: "3 duplicate groups" makes an operator do
-        // arithmetic before they know how much data is involved. `GROUP BY`
-        // treats NULLs as equal, which is also how SQL Server's UNIQUE treats
-        // them, so the count matches what the engine will refuse.
-        format!(
-            "SELECT ISNULL(SUM(c), 0) AS n FROM (\n    SELECT COUNT(*) AS c FROM {from}\n     GROUP BY {list} HAVING COUNT(*) > 1) AS dup;"
-        ),
-    ))
 }
 
 fn character_to_non_unicode(from: &ColumnType, to: &ColumnType) -> Result<bool, DialectError> {
@@ -2702,6 +2677,59 @@ mod tests {
         assert!(sql[0].contains("HAVING COUNT(*) > 1"), "{sql:?}");
         // The rows, not the groups.
         assert!(sql[0].contains("SUM(c)"), "{sql:?}");
+    }
+
+    /// `COUNTS`' answer to the one question that is a rule and not a spelling,
+    /// read off the statement a key's probe ends in. A unique key here takes
+    /// two NULLs for the same value, as `GROUP BY` does, so a count that left
+    /// the rows with a NULL out would pass a plan the engine refuses.
+    #[test]
+    fn a_unique_key_counts_the_rows_with_a_null_in_it() {
+        let sql = sql_of(&Change::Constraint(ConstraintChange::AddUnique {
+            table: tname("dbo.customer"),
+            name: "uq_customer_email".into(),
+            constraint: UniqueConstraint {
+                columns: vec!["email".into(), "tenant".into()],
+                storage_parameters: Default::default(),
+                filegroup: None,
+            },
+            clustered: false,
+        }));
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(
+            sql[0].ends_with(") AS r\n     GROUP BY r.k0, r.k1 HAVING COUNT(*) > 1) AS dup;"),
+            "{sql:?}"
+        );
+        assert!(!sql[0].contains("IS NOT NULL"), "{sql:?}");
+        // The answer is the rows of the groups, and zero for no group: `SUM`
+        // over none is NULL, which is not a count.
+        assert!(
+            sql[0].starts_with("SELECT ISNULL(SUM(c), 0) AS n FROM ("),
+            "{sql:?}"
+        );
+        // A primary key counts the same way after asking for its NULLs.
+        let sql = sql_of(&Change::Constraint(ConstraintChange::SetPrimaryKey {
+            table: tname("dbo.customer"),
+            from: None,
+            to: Some(PrimaryKey {
+                name: Some("pk_customer".into()),
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+                filegroup: None,
+            }),
+            nonclustered: false,
+        }));
+        assert_eq!(sql.len(), 2, "{sql:?}");
+        assert!(sql[0].ends_with(") AS r WHERE r.k0 IS NULL;"), "{sql:?}");
+        assert!(
+            sql[1].ends_with(") AS r\n     GROUP BY r.k0 HAVING COUNT(*) > 1) AS dup;"),
+            "{sql:?}"
+        );
+        // No statement asks with the other engine's spelling.
+        for one in &sql {
+            assert!(!one.contains("DISTINCT"), "{sql:?}");
+            assert!(!one.contains("COALESCE"), "{sql:?}");
+        }
     }
 
     #[test]

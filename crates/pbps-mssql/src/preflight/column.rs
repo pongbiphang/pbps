@@ -81,11 +81,12 @@ pub(super) fn preflight<'v, 'p: 'v>(
                     unchecked,
                 ));
             };
-            Ok(vec![null_probe(
+            Ok(vec![count_probes::nulls(
+                &COUNTS,
                 column,
-                &format!("(\n{rows}\n) AS r"),
+                &count_probes::relation(&rows),
                 "r.k0",
-            )?])
+            )])
         }
         ColumnChange::AlterColumnType {
             column,
@@ -107,11 +108,12 @@ pub(super) fn preflight<'v, 'p: 'v>(
             // A type change folds a nullability change into itself (§12), so it
             // has to carry that change's probe too.
             if *from_nullable && !*to_nullable {
-                out.push(null_probe(
+                out.push(count_probes::nulls(
+                    &COUNTS,
                     column,
                     &qualified(&stored.table)?,
                     &quote(stored.name.raw())?,
-                )?);
+                ));
             }
             // A `timestamp` on either end is asked nothing. The engine refuses
             // the statement whatever the rows hold (4928 out of the type, 4927

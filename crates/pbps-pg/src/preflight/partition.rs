@@ -37,7 +37,8 @@ pub(super) fn preflight<'v, 'p: 'v>(
                 return Ok(skip(change, "the column is added by this plan", unchecked));
             }
             match names.column(&column) {
-                Some(stored) => Ok(vec![null_probe(
+                Some(stored) => Ok(vec![count_probes::nulls(
+                    &COUNTS,
                     &column,
                     &qualified(&stored.table)?,
                     &quote(stored.name.raw())?,

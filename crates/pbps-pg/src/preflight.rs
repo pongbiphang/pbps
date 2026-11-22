@@ -147,6 +147,7 @@ use std::cell::LazyCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 
+use pbps_dialect::count_probes::{self, CountSql, Gone, UniqueNulls};
 use pbps_dialect::plan_rows::{Event, PlanFacts, Removal, RowWrites, View, WrittenCell};
 use pbps_dialect::{Dialect, DialectError, Preflight, Probe, Unchecked};
 #[cfg(test)]
@@ -173,6 +174,29 @@ use crate::quote;
 fn saturated_count(expression: &str) -> String {
     format!("LEAST({expression}, {})::int", i32::MAX)
 }
+
+/// How this engine spells the count statements of [`count_probes`]
+/// (DEC-2988.2).
+const COUNTS: CountSql = CountSql {
+    // [`saturated_count`] of each, written out because a constant cannot call
+    // it. `the_count_spelling_is_the_saturated_one` holds the two together.
+    rows: "LEAST(count(*), 2147483647)::int",
+    grouped_rows: "LEAST(COALESCE(sum(c), 0), 2147483647)::int",
+    count: "count(*)",
+    // The spelling this engine's probe had before the statements were shared.
+    // No reason for it over `IS NULL` is recorded; the text is kept as it was.
+    is_null: "IS NOT DISTINCT FROM NULL",
+    // **Rows with a NULL in any column of the key are left out, and that is
+    // this engine's rule rather than tidiness.** A unique constraint here is
+    // `NULLS DISTINCT` unless it says otherwise, and nothing this dialect emits
+    // says otherwise — measured on 18.6, two rows holding NULL are accepted,
+    // and so are two rows holding `(1, NULL)` under a two-column key. `GROUP
+    // BY` is the opposite: it treats NULLs as equal, so the count it gives for
+    // those very rows is two. Ported straight from the SQL Server probe, where
+    // `UNIQUE` does treat NULLs as equal, this refused a plan the engine
+    // accepts — which is the worse of the two directions to be wrong in.
+    unique_nulls: UniqueNulls::Distinct,
+};
 
 /// The columns of the foreign key the generated statement is being built for,
 /// with their names on the child side (`c`) and the parent side (`rc`).
@@ -3041,11 +3065,6 @@ fn backfill_of(added: &AddedColumn) -> Option<String> {
     }
 }
 
-/// `r.k0 .. r.kn`: the columns [`rows_after`] names its relation's with.
-fn keys(n: usize) -> Vec<String> {
-    (0..n).map(|i| format!("r.k{i}")).collect()
-}
-
 /// Selected physical inputs are read once each, without PostgreSQL recursion.
 fn scalar_read(sources: &[ColumnRef]) -> Result<(String, String), DialectError> {
     let branches = sources
@@ -3062,50 +3081,6 @@ fn scalar_read(sources: &[ColumnRef]) -> Result<(String, String), DialectError> 
         format!("({}) AS contribution", branches.join(" UNION ALL ")),
         "v".into(),
     ))
-}
-
-/// The NULLs a `NOT NULL` would reject.
-///
-/// `from` is the relation the statement will meet and `reads` is how a row in
-/// it reads in this column — the quoted column name, or an expression where
-/// this plan is the one deciding what is there.
-fn null_probe(column: &ColumnRef, from: &str, reads: &str) -> Probe {
-    Probe::new(
-        format!(
-            "existing NULLs in {column}, which NOT NULL would reject",
-            column = column.shown()
-        ),
-        format!(
-            "SELECT {} AS n FROM {from} WHERE {reads} IS NOT DISTINCT FROM NULL;",
-            saturated_count("count(*)")
-        ),
-    )
-}
-
-/// The rows that would collide under a new unique constraint or unique index.
-///
-/// **Rows with a NULL in any column of the key are left out, and that is this
-/// engine's rule rather than tidiness.** A unique constraint here is `NULLS
-/// DISTINCT` unless it says otherwise, and nothing this dialect emits says
-/// otherwise — measured on 18.6, two rows holding NULL are accepted, and so are
-/// two rows holding `(1, NULL)` under a two-column key. `GROUP BY` is the
-/// opposite: it treats NULLs as equal, so the count it gives for those very
-/// rows is two. Ported straight from the SQL Server probe, where `UNIQUE` does
-/// treat NULLs as equal, this refused a plan the engine accepts — which is the
-/// worse of the two directions to be wrong in.
-fn duplicate_probe(from: &str, columns: &[String], description: &str) -> Probe {
-    let list = columns.join(", ");
-    let present: Vec<String> = columns.iter().map(|c| format!("{c} IS NOT NULL")).collect();
-    Probe::new(
-        description,
-        // The rows, not the groups: "3 duplicate groups" makes an operator do
-        // arithmetic before they know how much data is involved.
-        format!(
-            "SELECT {} AS n FROM (\n    SELECT count(*) AS c FROM {from}\n     WHERE {}\n     GROUP BY {list} HAVING count(*) > 1) AS dup;",
-            saturated_count("COALESCE(sum(c), 0)"),
-            present.join(" AND ")
-        ),
-    )
 }
 
 /// Whether a change's probe would read a generated column this plan
@@ -3333,17 +3308,14 @@ fn orphan_probe(
         join.push(format!("q.k{i}{mark} = r.k{i}"));
     }
 
-    // A row with any NULL in the key is exempt from the constraint — this
-    // engine's default is `MATCH SIMPLE`, measured: a child holding
-    // `(99, NULL)` is accepted by a two-column key whose parent has no `99` at
-    // all. Excluding those rows is the rule, not leniency.
-    let present: Vec<String> = (0..constraint.columns.len())
-        .map(|i| format!("r.k{i} IS NOT NULL"))
-        .collect();
+    // A row with any NULL in the key is exempt from the constraint, which
+    // [`count_probes::orphaned`] leaves out — this engine's default is `MATCH
+    // SIMPLE`, measured: a child holding `(99, NULL)` is accepted by a
+    // two-column key whose parent has no `99` at all.
     let term = format!(
-        "(SELECT count(*) FROM (\n{child}\n) AS r\n WHERE {}\n   AND NOT EXISTS (SELECT 1 FROM (\n{parent}\n) AS q WHERE {}))",
-        present.join("\n   AND "),
-        join.join(" AND ")
+        "(SELECT {} {})",
+        COUNTS.count,
+        count_probes::orphaned(&child, &parent, constraint.columns.len(), &join)
     );
     Ok(vec![Probe::new(
         format!(
@@ -5167,6 +5139,83 @@ mod tests {
     use plan_fixture::FixturePreflight as _;
 
     use super::*;
+
+    /// A constant cannot call `saturated_count`, so `COUNTS` writes its two
+    /// answers out. Written apart, a change to the clamp would reach every
+    /// statement built with the function and not these.
+    #[test]
+    fn the_count_spelling_is_the_saturated_one() {
+        assert_eq!(COUNTS.rows, saturated_count(COUNTS.count));
+        assert_eq!(COUNTS.grouped_rows, saturated_count("COALESCE(sum(c), 0)"));
+        assert_ne!(COUNTS.count, COUNTS.rows, "a group's count is not clamped");
+    }
+
+    /// `COUNTS`' answer to the one question that is a rule and not a spelling,
+    /// read off the statement a key's probe ends in. A unique key here takes
+    /// two NULLs for different rows, so a count that grouped them would refuse
+    /// a plan the engine accepts.
+    #[test]
+    fn a_unique_key_counts_no_row_with_a_null_in_it() {
+        let unique = Change::Constraint(ConstraintChange::AddUnique {
+            table: "app.customer".parse().unwrap(),
+            name: "uq_customer_email".into(),
+            constraint: pbps_model::UniqueConstraint {
+                columns: vec!["email".into(), "tenant".into()],
+                storage_parameters: Default::default(),
+                filegroup: None,
+            },
+            clustered: false,
+        });
+        let sql: Vec<String> = probes(&set(vec![unique]))
+            .into_iter()
+            .map(|p| p.sql)
+            .collect();
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(
+            sql[0].contains(
+                ") AS r\n     WHERE r.k0 IS NOT NULL AND r.k1 IS NOT NULL\n     GROUP BY r.k0, r.k1 HAVING count(*) > 1"
+            ),
+            "{sql:?}"
+        );
+        // The answer is the rows of the groups, clamped, and zero for no group.
+        // The statement sits inside the wrapper that asks whether this session
+        // could complete it, so it is found and not anchored.
+        assert!(
+            sql[0].contains(
+                "(\nSELECT LEAST(COALESCE(sum(c), 0), 2147483647)::int AS n FROM (\n    SELECT count(*) AS c FROM ("
+            ),
+            "{sql:?}"
+        );
+        // A primary key counts the same way. Its columns are `NOT NULL` by
+        // then, which the first statement asks, in this engine's spelling.
+        let key = Change::Constraint(ConstraintChange::SetPrimaryKey {
+            table: "app.customer".parse().unwrap(),
+            from: None,
+            to: Some(pbps_model::PrimaryKey {
+                name: None,
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+                filegroup: None,
+            }),
+            nonclustered: false,
+        });
+        let sql: Vec<String> = probes(&set(vec![key])).into_iter().map(|p| p.sql).collect();
+        assert_eq!(sql.len(), 2, "{sql:?}");
+        assert!(
+            sql[0].contains(") AS r WHERE r.k0 IS NOT DISTINCT FROM NULL\n) AS probe(n)"),
+            "{sql:?}"
+        );
+        assert!(
+            sql[1].contains("\n     WHERE r.k0 IS NOT NULL\n     GROUP BY r.k0 "),
+            "{sql:?}"
+        );
+        // No statement asks with the other engine's spelling.
+        for one in &sql {
+            assert!(!one.contains("IS NULL"), "{sql:?}");
+            assert!(!one.contains("ISNULL"), "{sql:?}");
+        }
+    }
+
     fn probes(changes: &ChangeSet) -> Vec<Probe> {
         preflight(changes).probes
     }
