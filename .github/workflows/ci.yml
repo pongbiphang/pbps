@@ -610,8 +610,12 @@ jobs:
         env:
           POSTGRES_PASSWORD: "Pbps!Ci12345"
           POSTGRES_DB: pbps_test
+        # Every host port this workflow publishes is below 32768: a port in
+        # the runner's ephemeral range can be held by one of its own outgoing
+        # connections when Docker binds it, and the job dies before a step
+        # runs (#3034). `scripts/live_test_runners_test.py` holds the rule.
         ports:
-          - 54320:5432
+          - 15432:5432
         # TCP excludes the socket-only initialization server (#1471).
         options: >-
           --health-cmd "pg_isready -h 127.0.0.1 -U postgres -d pbps_test"
@@ -635,7 +639,7 @@ jobs:
           POSTGRES_PASSWORD: "Pbps!Ci12345"
           POSTGRES_DB: pbps_test
         ports:
-          - 54321:5432
+          - 15433:5432
         options: >-
           --health-cmd "pg_isready -h 127.0.0.1 -U postgres -d pbps_test"
           --health-interval 5s
@@ -651,16 +655,16 @@ jobs:
           POSTGRES_PASSWORD: "Pbps!Ci12345"
           POSTGRES_DB: pbps_test
         ports:
-          - 54322:5432
+          - 15434:5432
         options: >-
           --health-cmd "pg_isready -h 127.0.0.1 -U postgres -d pbps_test"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
     env:
-      PBPS_TEST_PG_DB: "host=localhost port=54320 user=postgres password=Pbps!Ci12345 dbname=pbps_test sslmode=disable"
-      PBPS_TEST_PG_OLD_DB: "host=localhost port=54321 user=postgres password=Pbps!Ci12345 dbname=pbps_test sslmode=disable"
-      PBPS_TEST_PG_SCRATCH_DB: "host=localhost port=54322 user=postgres password=Pbps!Ci12345 dbname=pbps_test sslmode=disable"
+      PBPS_TEST_PG_DB: "host=localhost port=15432 user=postgres password=Pbps!Ci12345 dbname=pbps_test sslmode=disable"
+      PBPS_TEST_PG_OLD_DB: "host=localhost port=15433 user=postgres password=Pbps!Ci12345 dbname=pbps_test sslmode=disable"
+      PBPS_TEST_PG_SCRATCH_DB: "host=localhost port=15434 user=postgres password=Pbps!Ci12345 dbname=pbps_test sslmode=disable"
       # The images a Docker scratch starts from (#1674): the services' own
       # digests, which the runner pulled to start them, so the default
       # `pull: never` finds them.
@@ -805,7 +809,7 @@ jobs:
           POSTGRES_PASSWORD: "Pbps!Ci12345"
           POSTGRES_DB: pbps_test
         ports:
-          - 54320:5432
+          - 15432:5432
         # TCP excludes the socket-only initialization server (#1471).
         options: >-
           --health-cmd "pg_isready -h 127.0.0.1 -U postgres -d pbps_test"
@@ -827,7 +831,7 @@ jobs:
         run: cargo build --locked -p pbps-cli --bin pbps --target-dir "$RUNNER_TEMP/pbps-ui-build"
       - name: Shipped viewer in Chromium
         env:
-          PBPS_TEST_UI_PG_URL: "postgresql://postgres:Pbps!Ci12345@127.0.0.1:54320/pbps_test?sslmode=disable"
+          PBPS_TEST_UI_PG_URL: "postgresql://postgres:Pbps!Ci12345@127.0.0.1:15432/pbps_test?sslmode=disable"
         run: |
           PBPS_TEST_UI_BIN="$RUNNER_TEMP/pbps-ui-build/debug/pbps" \
             python3 scripts/ui-browser.py --install-deps
