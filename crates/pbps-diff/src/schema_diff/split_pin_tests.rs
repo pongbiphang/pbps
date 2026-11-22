@@ -1582,6 +1582,7 @@ fn a_lineage_refusal_ends_the_call_before_any_later_phase_reports() {
                 operator: "leon".into(),
                 types: Default::default(),
                 conversions: Default::default(),
+                exclusions: Default::default(),
             },
         );
     };
