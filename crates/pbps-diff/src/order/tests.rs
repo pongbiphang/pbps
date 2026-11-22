@@ -194,6 +194,47 @@ fn an_add_column_before_its_create_table_is_refused_by_the_requirement_it_misses
     );
 }
 
+/// A key into a table the project does not declare (DEC-2993.1): its own
+/// facts are stated and ordered, and nothing is said of the table it points at.
+#[test]
+fn a_key_into_an_undeclared_table_is_ordered_by_its_other_facts() {
+    let mut plan = create_then_add_column();
+    plan.logical
+        .push(p(Change::Constraint(ConstraintChange::AddForeignKey {
+            table: t("t"),
+            name: "fk".into(),
+            constraint: Box::new(ForeignKey {
+                columns: vec!["c".into()],
+                references_table: t("far"),
+                references_columns: vec!["id".into()],
+                on_delete: ReferentialAction::default(),
+                on_update: ReferentialAction::default(),
+            }),
+        })));
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let none = ModuleDeps::new();
+    assert_eq!(
+        run(&ops, &fx, &baseline, &[0, 1, 2], &none, Checks::ALL),
+        [],
+        "the order the differ makes is accepted"
+    );
+    let tables = fx[2]
+        .requires
+        .iter()
+        .filter(|r| matches!(r, Requirement::Exists(ObjectKey::Table(_))))
+        .count();
+    assert_eq!(tables, 1, "only the key's own table is required to exist");
+    let violations = run(&ops, &fx, &baseline, &[0, 2, 1], &none, Checks::ALL);
+    assert!(
+        violations.iter().any(|v| matches!(
+            v,
+            Violation::Unmet { requirement: Requirement::Exists(ObjectKey::Column(_)), operation }
+                if operation.source() == 2
+        )),
+        "the key still waits for its own column: {violations:?}"
+    );
+}
+
 #[test]
 fn two_dropped_tables_with_the_referenced_one_first_are_refused_by_the_baseline_s_key() {
     let plan = two_dropped_tables();

@@ -286,19 +286,92 @@ struct Cx<'a> {
     fx: Effects,
 }
 
+/// What the models answer to "who holds this name?" when the question could
+/// be asked. The error stays inside the two answers that are no fault of the
+/// reader, so a site that has to refuse can return the original refusal.
+///
+/// Absent, empty and unreadable are three different things (AGENTS.md), and
+/// a lookup that returns `Option` merges them. Only the first two are answers;
+/// an unreadable name (`Names`, `Outside`, `Rebuild`) is never one, and
+/// [`door`] returns it as an `Err` for every site alike (DEC-2993.1).
+enum Answer<T> {
+    /// The name is held at the asked moment.
+    Held(T),
+    /// The project does not declare the name: a package's, the cluster's or a
+    /// view's. Not evidence about the plan.
+    Undeclared(OwnerError),
+    /// The project declares the name and nobody holds it at that moment.
+    Vacant(OwnerError),
+}
+
+impl<T> Answer<T> {
+    /// The rule for the object a step changes: it has to be held, and any
+    /// other answer is the original refusal. A step that cannot say which
+    /// object it changes has no facts worth stating.
+    fn subject(self) -> Result<T, OwnerError> {
+        match self {
+            Answer::Held(held) => Ok(held),
+            Answer::Undeclared(why) | Answer::Vacant(why) => Err(why),
+        }
+    }
+
+    /// The rule for an object a step only points at. An undeclared name
+    /// states nothing about itself and keeps the step's other facts: the plan
+    /// cannot order against what it does not declare. A vacant one is a
+    /// declared name that nobody holds at that moment, which is a refusal
+    /// unless the site has a stated reason to read it otherwise; such a site
+    /// matches on [`Answer`] itself and writes that reason.
+    fn reference(self) -> Result<Option<T>, OwnerError> {
+        match self {
+            Answer::Held(held) => Ok(Some(held)),
+            Answer::Undeclared(_) => Ok(None),
+            Answer::Vacant(why) => Err(why),
+        }
+    }
+}
+
+/// Sorts what a lookup said into the three answers. The one place an error
+/// is read: every lookup of a name goes through here, so no site can turn an
+/// unreadable name into "nothing there".
+fn door<T>(found: Result<T, OwnerError>) -> Result<Answer<T>, OwnerError> {
+    match found {
+        Ok(held) => Ok(Answer::Held(held)),
+        Err(why @ OwnerError::Unmanaged { .. }) => Ok(Answer::Undeclared(why)),
+        Err(why @ OwnerError::Vacant { .. }) => Ok(Answer::Vacant(why)),
+        Err(
+            why @ (OwnerError::Names { .. }
+            | OwnerError::Outside { .. }
+            | OwnerError::Rebuild { .. }),
+        ) => Err(why),
+    }
+}
+
 impl<'a> Cx<'a> {
-    fn table(&self, name: &TableName) -> Result<Recorded, OwnerError> {
-        self.owners.table(name, self.spelling).map(Recorded)
+    /// A table, at the moment the name belongs to. Most names belong to the
+    /// step's own moment ([`Cx::table`]); one that comes from the desired
+    /// state asks for `Spelling::Final`.
+    fn table_at(
+        &self,
+        name: &TableName,
+        spelling: Spelling,
+    ) -> Result<Answer<Recorded>, OwnerError> {
+        door(self.owners.table(name, spelling).map(Recorded))
     }
 
-    fn column(&self, column: &ColumnRef) -> Result<ColumnKey, OwnerError> {
-        self.owners
-            .column(column, self.spelling)
-            .map(|uid| ColumnKey::Recorded(Recorded(uid)))
+    fn table(&self, name: &TableName) -> Result<Answer<Recorded>, OwnerError> {
+        self.table_at(name, self.spelling)
     }
 
-    fn role(&self, name: &crate::RoleName) -> Result<Recorded, OwnerError> {
-        self.owners.role(name, self.spelling).map(Recorded)
+    fn column(&self, column: &ColumnRef) -> Result<Answer<ColumnKey>, OwnerError> {
+        door(
+            self.owners
+                .column(column, self.spelling)
+                .map(|uid| ColumnKey::Recorded(Recorded(uid))),
+        )
+    }
+
+    fn role(&self, name: &crate::RoleName) -> Result<Answer<Recorded>, OwnerError> {
+        door(self.owners.role(name, self.spelling).map(Recorded))
     }
 
     /// A name as the baseline spells it. A name the identity file holds no
@@ -435,7 +508,7 @@ pub fn effects(
             .into_iter()
             .map(Requirement::Holds),
     );
-    cx.binding_facts();
+    cx.binding_facts()?;
     Ok(cx.fx)
 }
 
@@ -584,7 +657,7 @@ impl Cx<'_> {
         }
     }
 
-    fn binding_facts(&mut self) {
+    fn binding_facts(&mut self) -> Result<(), OwnerError> {
         for resource in self
             .fx
             .creates
@@ -625,17 +698,23 @@ impl Cx<'_> {
                         self.final_of(table)
                             .and_then(|(_, t)| t.foreign_keys.get(name))
                     };
-                    fk.and_then(|fk| {
-                        if let Change::Table(TableChange::CreateTable { uid, name, .. }) =
-                            self.op.change()
-                            && fk.references_table == *name
-                        {
-                            // A same-name replacement's self-reference binds the
-                            // created UID, never the previous name's occupant.
-                            return Some(Recorded(uid.clone()));
+                    match fk {
+                        None => None,
+                        Some(fk) => {
+                            if let Change::Table(TableChange::CreateTable { uid, name, .. }) =
+                                self.op.change()
+                                && fk.references_table == *name
+                            {
+                                // A same-name replacement's self-reference binds the
+                                // created UID, never the previous name's occupant.
+                                Some(Recorded(uid.clone()))
+                            } else {
+                                // A key into a table the project does not declare binds
+                                // nothing: that is no fact, not a refusal.
+                                self.table(&fk.references_table)?.reference()?
+                            }
                         }
-                        self.table(&fk.references_table).ok()
-                    })
+                    }
                 }
             };
             if let Some(target) = target {
@@ -649,6 +728,7 @@ impl Cx<'_> {
                 }
             }
         }
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -777,7 +857,7 @@ impl Cx<'_> {
                     },
                 ..
             }) => {
-                let owner = self.table(&column.table)?;
+                let owner = self.table(&column.table)?.subject()?;
                 self.exists(ObjectKey::Table(owner.clone()));
                 let key = ColumnKey::Recorded(Recorded(column_uid.clone()));
                 self.rewrites(Resource::Object(
@@ -818,8 +898,9 @@ impl Cx<'_> {
                 ..
             }) => {
                 let owner = Recorded(uid.clone());
-                if let Some(of) = &table.partition_of {
-                    let parent = self.table(&of.parent)?;
+                if let Some(of) = &table.partition_of
+                    && let Some(parent) = self.table(&of.parent)?.reference()?
+                {
                     // The parent's columns and defaults are not required: a
                     // partition created first is reached by the parent's own
                     // `ADD COLUMN` and `SET DEFAULT`, which recurse, and one
@@ -828,17 +909,21 @@ impl Cx<'_> {
                     self.exists(ObjectKey::Table(parent));
                 }
                 for fk in table.foreign_keys.values() {
-                    if fk.references_table != *name {
-                        let referenced = self.table(&fk.references_table)?;
+                    if fk.references_table != *name
+                        && let Some(referenced) = self.table(&fk.references_table)?.reference()?
+                    {
                         self.exists(ObjectKey::Table(referenced));
                     }
                 }
                 if let Some(default) = beside_default {
                     // The DEFAULT partition's rows of the new range move
-                    // into the new table.
-                    let default = self.table(default)?;
-                    self.exists(ObjectKey::Table(default.clone()));
-                    self.rewrites(Resource::Column(ObjectKey::Table(default)));
+                    // into the new table. The new table is created whatever
+                    // the default partition is, so that stays stated when the
+                    // project does not declare the partition.
+                    if let Some(default) = self.table(default)?.reference()? {
+                        self.exists(ObjectKey::Table(default.clone()));
+                        self.rewrites(Resource::Column(ObjectKey::Table(default)));
+                    }
                     self.creates(Resource::Column(ObjectKey::Table(owner)));
                 }
             }
@@ -847,8 +932,9 @@ impl Cx<'_> {
             }) => {
                 let owner = Recorded(uid.clone());
                 self.removes(Resource::Column(ObjectKey::Table(owner.clone())));
-                if let Some(parent) = detach_from {
-                    let parent = self.table(parent)?;
+                if let Some(parent) = detach_from
+                    && let Some(parent) = self.table(parent)?.reference()?
+                {
                     self.exists(ObjectKey::Table(parent));
                 }
                 self.takes_its_contents(&owner);
@@ -862,8 +948,9 @@ impl Cx<'_> {
             }) => {
                 let owner = Recorded(uid.clone());
                 self.exists(ObjectKey::Table(owner.clone()));
-                let parent = self.table(parent)?;
-                self.exists(ObjectKey::Table(parent));
+                if let Some(parent) = self.table(parent)?.reference()? {
+                    self.exists(ObjectKey::Table(parent));
+                }
                 // The partition's own entries on its parent's columns are the
                 // parent's once attached: the writes an attach makes there
                 // are what its own alterations are ordered against
@@ -888,7 +975,7 @@ impl Cx<'_> {
             Change::Column(ColumnChange::AddColumn {
                 uid, table, name, ..
             }) => {
-                let owner = self.table(table)?;
+                let owner = self.table(table)?.subject()?;
                 self.exists(ObjectKey::Table(owner.clone()));
                 let column = ColumnKey::Recorded(Recorded(uid.clone()));
                 self.creates(Resource::Column(ObjectKey::Column(column.clone())));
@@ -896,7 +983,7 @@ impl Cx<'_> {
                 let _ = name;
             }
             Change::Column(ColumnChange::DropColumn { uid, column }) => {
-                let owner = self.table(&column.table)?;
+                let owner = self.table(&column.table)?.subject()?;
                 self.exists(ObjectKey::Table(owner.clone()));
                 let key = ColumnKey::Recorded(Recorded(uid.clone()));
                 self.removes(Resource::Column(ObjectKey::Column(key.clone())));
@@ -918,7 +1005,7 @@ impl Cx<'_> {
                 self.requires_dependents_of_column_gone(&owner, column.name.raw());
             }
             Change::Column(ColumnChange::RenameColumn { uid, table, .. }) => {
-                let owner = self.table(table)?;
+                let owner = self.table(table)?.subject()?;
                 self.exists(ObjectKey::Table(owner));
                 let key = ObjectKey::Column(ColumnKey::Recorded(Recorded(uid.clone())));
                 self.exists(key.clone());
@@ -931,7 +1018,7 @@ impl Cx<'_> {
                 to_nullable,
                 ..
             }) => {
-                let owner = self.table(&column.table)?;
+                let owner = self.table(&column.table)?.subject()?;
                 self.exists(ObjectKey::Table(owner.clone()));
                 let key = ColumnKey::Recorded(Recorded(uid.clone()));
                 self.rewrites(Resource::Object(
@@ -959,7 +1046,7 @@ impl Cx<'_> {
                 to_nullable,
                 ..
             }) => {
-                let owner = self.table(&column.table)?;
+                let owner = self.table(&column.table)?.subject()?;
                 self.exists(ObjectKey::Table(owner));
                 let key = ColumnKey::Recorded(Recorded(uid.clone()));
                 self.exists(ObjectKey::Column(key.clone()));
@@ -968,7 +1055,7 @@ impl Cx<'_> {
             Change::Column(ColumnChange::AlterColumnDefault {
                 uid, column, to, ..
             }) => {
-                let owner = self.table(&column.table)?;
+                let owner = self.table(&column.table)?.subject()?;
                 self.exists(ObjectKey::Table(owner));
                 let column = ObjectKey::Column(ColumnKey::Recorded(Recorded(uid.clone())));
                 if to.is_some() {
@@ -982,7 +1069,7 @@ impl Cx<'_> {
                 }
             }
             Change::Column(ColumnChange::AlterColumnExpression { uid, column, .. }) => {
-                let owner = self.table(&column.table)?;
+                let owner = self.table(&column.table)?.subject()?;
                 self.exists(ObjectKey::Table(owner.clone()));
                 let key = ColumnKey::Recorded(Recorded(uid.clone()));
                 self.exists(ObjectKey::Column(key.clone()));
@@ -1003,7 +1090,7 @@ impl Cx<'_> {
                 to,
                 ..
             }) => {
-                let owner = self.table(&column.table)?;
+                let owner = self.table(&column.table)?.subject()?;
                 self.exists(ObjectKey::Table(owner.clone()));
                 let key = ColumnKey::Recorded(Recorded(uid.clone()));
                 // A source put on, or kept through a retype, follows the
@@ -1053,7 +1140,7 @@ impl Cx<'_> {
             }
             Change::Column(ColumnChange::AddComputedColumn { table, .. })
             | Change::Column(ColumnChange::DropComputedColumn { table, .. }) => {
-                let owner = self.table(table)?;
+                let owner = self.table(table)?.subject()?;
                 self.exists(ObjectKey::Table(owner.clone()));
                 if let Change::Column(ColumnChange::DropComputedColumn { name, .. }) = op.change() {
                     self.requires_computed_dependents_gone(&owner, name.raw());
@@ -1064,7 +1151,7 @@ impl Cx<'_> {
                 }
             }
             Change::Column(ColumnChange::SetColumnDeprecated { uid, column, .. }) => {
-                let owner = self.table(&column.table)?;
+                let owner = self.table(&column.table)?.subject()?;
                 self.exists(ObjectKey::Table(owner));
                 let key = ObjectKey::Column(ColumnKey::Recorded(Recorded(uid.clone())));
                 // Metadata only: nothing reads a column's deprecation, so it
@@ -1187,7 +1274,7 @@ impl Cx<'_> {
                 // recursion writes the same value in either order
                 // (DEC-1954.9).
                 if to.is_some() {
-                    self.after_parent(parent, column.raw(), ParentAttribute::Default);
+                    self.after_parent(parent, column.raw(), ParentAttribute::Default)?;
                 }
                 // A partition declares no column: its entry is spelled by its
                 // parent's column, so the parent's rename moves the name this
@@ -1197,8 +1284,8 @@ impl Cx<'_> {
                 // that sets one is spelled by the name the column ends with.
                 // The release reads the base incarnation, not `Exists`, so
                 // that the parent's retype does not order it (DEC-1168.1).
-                if let Ok(uid) = self.owners.column(&parent.column(column), self.spelling) {
-                    let key = ObjectKey::Column(ColumnKey::Recorded(Recorded(uid)));
+                if let Some(key) = self.column(&parent.column(column))?.reference()? {
+                    let key = ObjectKey::Column(key);
                     if to.is_none() && fallback.is_none() {
                         self.requires(Requirement::Is(key, Incarnation::Base));
                     } else {
@@ -1223,7 +1310,7 @@ impl Cx<'_> {
                     && let Some(of) = &own.partition_of
                 {
                     let parent = of.parent.clone();
-                    self.after_parent(&parent, column.raw(), ParentAttribute::NotNull);
+                    self.after_parent(&parent, column.raw(), ParentAttribute::NotNull)?;
                 }
                 if *not_null {
                     // The partition's own rows, with whatever a create beside
@@ -1232,14 +1319,14 @@ impl Cx<'_> {
                 }
             }
             Change::Index(IndexChange::SetIndexStorageParameters { table, target, .. }) => {
-                let owner = self.table(table)?;
+                let owner = self.table(table)?.subject()?;
                 self.exists(ObjectKey::Table(owner.clone()));
                 self.exists(Self::part(&owner, PartKey::from(target)));
             }
             Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table, from, to, ..
             }) => {
-                let owner = self.table(table)?;
+                let owner = self.table(table)?.subject()?;
                 self.exists(ObjectKey::Table(owner.clone()));
                 if from.is_some()
                     && let Some(old) = from
@@ -1250,56 +1337,59 @@ impl Cx<'_> {
                 if let Some(new) = to {
                     self.requires_valid_data(&owner);
                     for c in &new.columns {
-                        self.requires_column(table, c.raw(), true);
+                        self.requires_column(table, c.raw(), true)?;
                     }
                 }
             }
             Change::Constraint(ConstraintChange::AddUnique {
                 table, constraint, ..
             }) => {
-                let owner = self.table(table)?;
+                let owner = self.table(table)?.subject()?;
                 self.exists(ObjectKey::Table(owner.clone()));
                 self.requires_valid_data(&owner);
                 for c in &constraint.columns {
-                    self.requires_column(table, c.raw(), false);
+                    self.requires_column(table, c.raw(), false)?;
                 }
             }
             Change::Constraint(ConstraintChange::DropUnique { table, name }) => {
-                let owner = self.table(table)?;
+                let owner = self.table(table)?.subject()?;
                 self.exists(ObjectKey::Table(owner.clone()));
                 self.releases_constraint(&owner, PartKey::Unique(name.clone()));
             }
             Change::Constraint(ConstraintChange::AddForeignKey {
                 table, constraint, ..
             }) => {
-                let owner = self.table(table)?;
+                let owner = self.table(table)?.subject()?;
                 self.exists(ObjectKey::Table(owner.clone()));
                 self.requires_valid_data(&owner);
                 for c in &constraint.columns {
-                    self.requires_column(table, c.raw(), false);
+                    self.requires_column(table, c.raw(), false)?;
                 }
-                let referenced = self.table(&constraint.references_table)?;
-                self.exists(ObjectKey::Table(referenced.clone()));
-                // It validates the child's values against the referenced
-                // rows, so it follows every write of them too (#1998).
-                if referenced != owner {
-                    self.requires_valid_data(&referenced);
-                }
-                for c in &constraint.references_columns {
-                    self.requires_column(&constraint.references_table, c.raw(), false);
-                }
-                // The key it references, as the plan leaves it.
-                if let Some((_, target)) = self.final_of(&referenced)
-                    && let Some(part) = key_of(target, &constraint.references_columns)
-                {
-                    self.requires(Requirement::Is(
-                        Self::part(&referenced, part),
-                        Incarnation::Final,
-                    ));
+                // A table the project does not declare is no one's to order
+                // against: the key is still ordered by its own table's facts.
+                if let Some(referenced) = self.table(&constraint.references_table)?.reference()? {
+                    self.exists(ObjectKey::Table(referenced.clone()));
+                    // It validates the child's values against the referenced
+                    // rows, so it follows every write of them too (#1998).
+                    if referenced != owner {
+                        self.requires_valid_data(&referenced);
+                    }
+                    for c in &constraint.references_columns {
+                        self.requires_column(&constraint.references_table, c.raw(), false)?;
+                    }
+                    // The key it references, as the plan leaves it.
+                    if let Some((_, target)) = self.final_of(&referenced)
+                        && let Some(part) = key_of(target, &constraint.references_columns)
+                    {
+                        self.requires(Requirement::Is(
+                            Self::part(&referenced, part),
+                            Incarnation::Final,
+                        ));
+                    }
                 }
             }
             Change::Constraint(ConstraintChange::DropForeignKey { table, name }) => {
-                let owner = self.table(table)?;
+                let owner = self.table(table)?.subject()?;
                 self.exists(ObjectKey::Table(owner.clone()));
                 self.releases_constraint(&owner, PartKey::ForeignKey(name.clone()));
                 // The key it references stands until the foreign key is
@@ -1318,7 +1408,7 @@ impl Cx<'_> {
             }
             Change::Policy(PolicyChange::CreatePolicy { table, .. })
             | Change::Policy(PolicyChange::DropPolicy { table, .. }) => {
-                let owner = self.table(table)?;
+                let owner = self.table(table)?.subject()?;
                 self.exists(ObjectKey::Table(owner));
             }
             Change::Policy(PolicyChange::SetRowSecurity { uid, .. }) => {
@@ -1344,7 +1434,7 @@ impl Cx<'_> {
                 from,
                 to,
             }) => {
-                let owner = self.table(table)?;
+                let owner = self.table(table)?.subject()?;
                 self.exists(ObjectKey::Table(owner.clone()));
                 if from.is_some() {
                     self.releases_constraint(&owner, PartKey::Exclusion(name.clone()));
@@ -1354,42 +1444,42 @@ impl Cx<'_> {
                     self.requires_valid_data(&owner);
                     for key in constraint.keys.iter().map(|k| &k.key.key) {
                         if let IndexKey::Column(c) = key {
-                            self.requires_column(table, c.raw(), false);
+                            self.requires_column(table, c.raw(), false)?;
                         }
                     }
                     for c in &constraint.include {
-                        self.requires_column(table, c.raw(), false);
+                        self.requires_column(table, c.raw(), false)?;
                     }
                 }
             }
             Change::Constraint(ConstraintChange::AddCheck { table, .. }) => {
-                let owner = self.table(table)?;
+                let owner = self.table(table)?.subject()?;
                 self.exists(ObjectKey::Table(owner.clone()));
                 self.requires_valid_data(&owner);
             }
             Change::Constraint(ConstraintChange::DropCheck { table, name }) => {
-                let owner = self.table(table)?;
+                let owner = self.table(table)?.subject()?;
                 self.exists(ObjectKey::Table(owner.clone()));
                 self.releases_constraint(&owner, PartKey::Check(name.clone()));
             }
             Change::Index(IndexChange::DropIndex { table, name }) => {
-                let owner = self.table(table)?;
+                let owner = self.table(table)?.subject()?;
                 self.exists(ObjectKey::Table(owner.clone()));
                 self.releases_constraint(&owner, PartKey::Index(name.clone()));
             }
             Change::Index(IndexChange::AddIndex { table, index, .. }) => {
-                let owner = self.table(table)?;
+                let owner = self.table(table)?.subject()?;
                 self.exists(ObjectKey::Table(owner.clone()));
                 if index.unique {
                     self.requires_valid_data(&owner);
                 }
                 for key in index.columns.iter().map(|c| &c.key) {
                     if let IndexKey::Column(c) = key {
-                        self.requires_column(table, c.raw(), false);
+                        self.requires_column(table, c.raw(), false)?;
                     }
                 }
                 for c in &index.include {
-                    self.requires_column(table, c.raw(), false);
+                    self.requires_column(table, c.raw(), false)?;
                 }
                 // A partitioned parent's index, built after a partition's
                 // own of its shape, would take that one as its clone: the
@@ -1397,9 +1487,14 @@ impl Cx<'_> {
                 // indexes it could take is a question of shape, so every
                 // index the parent ends with is waited for; one that stands
                 // throughout, or a parent that is not rebuilt, draws no edge.
+                //
+                // The parent is named by the desired state (`own` is the
+                // table as the plan leaves it), so it is asked at that
+                // boundary and not at the step's own moment, where the plan
+                // may not hold the name yet (DEC-2993.1).
                 if let Some((_, own)) = self.final_of(&owner)
                     && let Some(of) = &own.partition_of
-                    && let Ok(parent) = self.table(&of.parent)
+                    && let Some(parent) = self.table_at(&of.parent, Spelling::Final)?.reference()?
                     && let Some((_, parent_table)) = self.final_of(&parent)
                 {
                     for name in parent_table.indexes.keys() {
@@ -1419,26 +1514,26 @@ impl Cx<'_> {
                 types,
                 ..
             }) => {
-                let owner = self.table(table)?;
+                let owner = self.table(table)?.subject()?;
                 self.row_basics(&owner, table, key);
                 let mut written = vec![key_column.raw()];
                 written.extend(row.columns().map(|(c, _)| c.raw()));
                 written.extend(defaults.keys().map(ColumnName::raw));
-                self.row_writes(table, &owner, &written);
+                self.row_writes(table, &owner, &written)?;
                 // The statement's postcondition holds every column in
                 // `types` to what the insert left in it, NULL for a column
                 // the row and the defaults leave out, so it names those
                 // columns too: one the plan adds goes first (#2079).
                 for c in types.keys().map(ColumnName::raw) {
                     if !written.contains(&c)
-                        && let Ok(column) = self.column(&table.column(c))
+                        && let Some(column) = self.column(&table.column(c))?.reference()?
                     {
                         self.exists(ObjectKey::Column(column));
                     }
                 }
                 for (c, expression) in defaults {
                     let _ = expression;
-                    if let Ok(column) = self.column(&table.column(c.raw())) {
+                    if let Some(column) = self.column(&table.column(c.raw()))?.reference()? {
                         self.requires(Requirement::Is(
                             ObjectKey::Default(column),
                             Incarnation::Final,
@@ -1446,7 +1541,7 @@ impl Cx<'_> {
                     }
                 }
                 self.row_meets_constraints(&owner, table, &written);
-                self.row_leaves_no_required_column(&owner, table, &written);
+                self.row_leaves_no_required_column(&owner, table, &written)?;
                 self.row_parents(&owner, true, false);
                 self.row_cycle(&owner);
                 for (c, v) in row.columns() {
@@ -1477,10 +1572,10 @@ impl Cx<'_> {
                 unchanged,
                 ..
             }) => {
-                let owner = self.table(table)?;
+                let owner = self.table(table)?.subject()?;
                 self.row_basics(&owner, table, key);
                 let written: Vec<&str> = columns.keys().map(ColumnName::raw).collect();
-                self.row_writes(table, &owner, &written);
+                self.row_writes(table, &owner, &written)?;
                 // The statement holds the row to the cells it leaves alone
                 // and finds it by its key, before and after it runs, so it
                 // names those columns too: a rename of one goes first
@@ -1491,7 +1586,7 @@ impl Cx<'_> {
                     .chain([key_column.raw()])
                 {
                     if !written.contains(&c)
-                        && let Ok(column) = self.column(&table.column(c))
+                        && let Some(column) = self.column(&table.column(c))?.reference()?
                     {
                         self.exists(ObjectKey::Column(column));
                     }
@@ -1508,7 +1603,9 @@ impl Cx<'_> {
                         // leaves, as an insert that omits the column does
                         // (#1998).
                         crate::Cell::Default(_) => {
-                            if let Ok(column) = self.column(&table.column(c.raw())) {
+                            if let Some(column) =
+                                self.column(&table.column(c.raw()))?.reference()?
+                            {
                                 self.requires(Requirement::Is(
                                     ObjectKey::Default(column),
                                     Incarnation::Final,
@@ -1541,14 +1638,14 @@ impl Cx<'_> {
                 row,
                 ..
             }) => {
-                let owner = self.table(table)?;
+                let owner = self.table(table)?.subject()?;
                 self.row_basics(&owner, table, key);
                 let written: Vec<&str> = row.keys().map(ColumnName::raw).collect();
-                self.row_writes(table, &owner, &written);
+                self.row_writes(table, &owner, &written)?;
                 // The statement finds the row by its key, which a payload
                 // leaves out, so a rename of that column goes first.
                 if !written.contains(&key_column.raw())
-                    && let Ok(column) = self.column(&table.column(key_column))
+                    && let Some(column) = self.column(&table.column(key_column))?.reference()?
                 {
                     self.exists(ObjectKey::Column(column));
                 }
@@ -1565,7 +1662,7 @@ impl Cx<'_> {
             }
             Change::Row(RowChange::SetDataMode { table, .. })
             | Change::Row(RowChange::SetEnsureKeys { table, .. }) => {
-                let owner = self.table(table)?;
+                let owner = self.table(table)?.subject()?;
                 self.exists(ObjectKey::Table(owner.clone()));
                 self.requires(Requirement::Reads(ObjectKey::Table(owner)));
             }
@@ -1573,7 +1670,7 @@ impl Cx<'_> {
             // table of that name and states nothing; the view is text-derived.
             Change::Module(ModuleChange::CreateModule { id, .. }) => {
                 if let Some(on) = id.attached_to()
-                    && let Ok(owner) = self.table(on)
+                    && let Some(owner) = self.table(on)?.reference()?
                 {
                     self.exists(ObjectKey::Table(owner));
                 }
@@ -1667,11 +1764,12 @@ impl Cx<'_> {
                 }
                 // An index that blocks the removal is dropped first (DEC-2447.14).
                 for (table, name) in index_releases {
-                    let owner = self.table(table)?;
-                    self.requires(Requirement::Absent(Self::part(
-                        &owner,
-                        PartKey::Index(name.clone()),
-                    )));
+                    if let Some(owner) = self.table(table)?.reference()? {
+                        self.requires(Requirement::Absent(Self::part(
+                            &owner,
+                            PartKey::Index(name.clone()),
+                        )));
+                    }
                 }
             }
             Change::Role(RoleChange::RenameRole { uid, .. }) => {
@@ -1707,10 +1805,10 @@ impl Cx<'_> {
     ) -> Result<(), OwnerError> {
         // A principal no identity file records is the cluster's: no
         // requirement the plan could satisfy.
-        if let Ok(role) = self.role(role) {
+        if let Some(role) = self.role(role)?.reference()? {
             self.exists(ObjectKey::Role(role));
         }
-        if let Some(target) = self.target(target) {
+        if let Some(target) = self.target(target)? {
             if gives {
                 self.requires(Requirement::Is(target, Incarnation::Final));
             } else if matches!(&target, ObjectKey::Module(id) if self.before.schema.modules.contains_key(id))
@@ -1729,13 +1827,13 @@ impl Cx<'_> {
     }
 
     /// The object a grant is on, when the plan's names say what it is.
-    fn target(&self, target: &GrantTarget) -> Option<ObjectKey> {
-        match target {
+    fn target(&self, target: &GrantTarget) -> Result<Option<ObjectKey>, OwnerError> {
+        Ok(match target {
             GrantTarget::Object(name) => {
                 if self.after.schema.tables.contains_key(name)
                     || self.before.schema.tables.contains_key(name)
                 {
-                    self.table(name).ok().map(ObjectKey::Table)
+                    self.table(name)?.reference()?.map(ObjectKey::Table)
                 } else {
                     Some(ObjectKey::Module(crate::ModuleId::Named(name.clone())))
                 }
@@ -1743,38 +1841,73 @@ impl Cx<'_> {
             GrantTarget::Routine(routine) => {
                 Some(ObjectKey::Module(crate::ModuleId::Routine(routine.clone())))
             }
-            GrantTarget::Sequence(c) => self.table(&c.table).ok().map(ObjectKey::Table),
+            GrantTarget::Sequence(c) => self.table(&c.table)?.reference()?.map(ObjectKey::Table),
             GrantTarget::Schema(_) => None,
-        }
+        })
     }
 
     /// A column the step needs. A `strict` one must also be NOT NULL where it
     /// ends (a primary key's), so the tightening that makes it so goes first;
     /// a column the plan creates has no producer of its NOT NULL here and
     /// adds nothing.
-    fn requires_column(&mut self, table: &TableName, column: &str, strict: bool) {
-        let Ok(key) = self.column(&table.column(column)) else {
+    fn requires_column(
+        &mut self,
+        table: &TableName,
+        column: &str,
+        strict: bool,
+    ) -> Result<(), OwnerError> {
+        let key = match self.column(&table.column(column))? {
+            Answer::Held(key) => key,
             // A SQL Server computed column has no column uid, only its part
             // of the table: an index or key over one needs that part (#1998).
-            if let Ok(owner) = self.table(table)
-                && [self.final_of(&owner), self.base_of(&owner)]
-                    .into_iter()
-                    .flatten()
-                    .any(|(_, t)| t.computed.contains_key(column))
-            {
-                self.exists(Self::part(&owner, PartKey::Computed(column.into())));
+            // Which answer it gets as a column depends on its history. One
+            // that was never an ordinary column is undeclared; one that
+            // replaces an ordinary column of the same name has that column's
+            // address history, which is vacant once the ordinary column is
+            // dropped. Both are looked for among the table's computed
+            // columns, and only then are they read as the answers they are
+            // (DEC-2993.1).
+            Answer::Undeclared(_) => {
+                if let Some(part) = self.computed_part(table, column)? {
+                    self.exists(part);
+                }
+                return Ok(());
             }
-            return;
+            Answer::Vacant(why) => {
+                let Some(part) = self.computed_part(table, column)? else {
+                    return Err(why);
+                };
+                self.exists(part);
+                return Ok(());
+            }
         };
         self.exists(ObjectKey::Column(key.clone()));
         if strict
-            && let Ok(owner) = self.table(table)
+            && let Some(owner) = self.table(table)?.reference()?
             && let Some((_, will)) = self.final_of(&owner)
             && let Some((_, now)) = self.names_of(&key)
             && will.columns.get(&now).is_some_and(|c| !c.nullable)
         {
             self.exists(Self::not_null(key));
         }
+        Ok(())
+    }
+
+    /// The part of a table that a computed column is, when the plan's
+    /// declarations on either side hold one under this name.
+    fn computed_part(
+        &self,
+        table: &TableName,
+        column: &str,
+    ) -> Result<Option<ObjectKey>, OwnerError> {
+        let Some(owner) = self.table(table)?.reference()? else {
+            return Ok(None);
+        };
+        let computed = [self.final_of(&owner), self.base_of(&owner)]
+            .into_iter()
+            .flatten()
+            .any(|(_, t)| t.computed.contains_key(column));
+        Ok(computed.then(|| Self::part(&owner, PartKey::Computed(column.into()))))
     }
 
     /// The NOT NULL of each column of the identity's target, where the plan
@@ -1875,16 +2008,21 @@ impl Cx<'_> {
     /// A partition's own entry on a parent's column follows what the plan
     /// does to the parent's: its default or NOT NULL as the plan leaves it,
     /// or gone.
-    fn after_parent(&mut self, parent: &TableName, column: &str, attribute: ParentAttribute) {
-        let Ok(key) = self.column(&parent.column(column)) else {
-            return;
+    fn after_parent(
+        &mut self,
+        parent: &TableName,
+        column: &str,
+        attribute: ParentAttribute,
+    ) -> Result<(), OwnerError> {
+        let Some(key) = self.column(&parent.column(column))?.reference()? else {
+            return Ok(());
         };
-        let (Ok(owner), true) = (self.table(parent), true) else {
-            return;
+        let Some(owner) = self.table(parent)?.reference()? else {
+            return Ok(());
         };
         let (Some((_, was)), Some((_, will))) = (self.base_of(&owner), self.final_of(&owner))
         else {
-            return;
+            return Ok(());
         };
         // The column under each side's own name: the parent may rename it, and
         // the step spells the name it ends with.
@@ -1893,7 +2031,7 @@ impl Cx<'_> {
             .unwrap_or_else(|| (column.into(), column.into()));
         let (Some(was), Some(will)) = (was.columns.get(&was_name), will.columns.get(&will_name))
         else {
-            return;
+            return Ok(());
         };
         match attribute {
             ParentAttribute::Default => {
@@ -1913,6 +2051,7 @@ impl Cx<'_> {
                 }
             }
         }
+        Ok(())
     }
 
     /// A partition's entries on its parent's columns end when it leaves, so
@@ -2366,9 +2505,9 @@ impl Cx<'_> {
         owner: &Recorded,
         table: &TableName,
         written: &[&str],
-    ) {
+    ) -> Result<(), OwnerError> {
         let Some((base_name, was)) = self.base_of(owner) else {
-            return;
+            return Ok(());
         };
         // A trigger on the table may fill the column before the row is
         // checked, and whether it does is the engine's to say: the release
@@ -2399,12 +2538,13 @@ impl Cx<'_> {
                         .is_some_and(|will| will.kind == was.kind)
             })
         {
-            return;
+            return Ok(());
         }
-        let written: Vec<ColumnKey> = written
-            .iter()
-            .filter_map(|c| self.column(&table.column(*c)).ok())
-            .collect();
+        let mut written_keys: Vec<ColumnKey> = Vec::new();
+        for c in written {
+            written_keys.extend(self.column(&table.column(*c))?.reference()?);
+        }
+        let written = written_keys;
         // A column the plan gives a numbering source, a default or a
         // generation is filled by the engine once that change has run,
         // which the insert follows already (#2175 review): only a column
@@ -2430,16 +2570,23 @@ impl Cx<'_> {
                 self.requires(Requirement::Absent(Self::not_null(key)));
             }
         }
+        Ok(())
     }
 
-    fn row_writes(&mut self, table: &TableName, owner: &Recorded, written: &[&str]) {
+    fn row_writes(
+        &mut self,
+        table: &TableName,
+        owner: &Recorded,
+        written: &[&str],
+    ) -> Result<(), OwnerError> {
         self.rewrites(Resource::Column(ObjectKey::Table(owner.clone())));
         for c in written {
-            if let Ok(key) = self.column(&table.column(*c)) {
+            if let Some(key) = self.column(&table.column(*c))?.reference()? {
                 self.exists(ObjectKey::Column(key.clone()));
                 self.rewrites(Resource::Column(ObjectKey::Column(key)));
             }
         }
+        Ok(())
     }
 
     /// A row meets the constraints the plan leaves it under, so those it takes
@@ -3023,3 +3170,6 @@ pub fn base_table_named<'a>(
         owner: Recorded(uid),
     })
 }
+
+#[cfg(test)]
+mod tests;

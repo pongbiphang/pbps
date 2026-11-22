@@ -461,6 +461,24 @@ evidence states: a surface's bindings and the grants its binding steps need
 is what the code reports for the kind, and `ordering_audit` refuses a
 difference, so a new kind or a new effect updates both (DEC-1954.1).
 
+Every name an effect reads is asked through one door, which sorts the owners'
+reply into three answers and lets nothing else through (DEC-2993.1). A name is
+**held** at the asked moment, **undeclared** (the project does not declare it:
+a package's, the cluster's or a view's) or **vacant** (declared, and nobody
+holds it then). A name that cannot be read at all (two holders, a position
+outside the plan, a rebuild that is not available) is never an answer: it is
+the step's refusal at every site, and an unreadable name never reads as
+"nothing there". A site takes the answers by the name's role. The table a step
+changes (its subject) must be held, and any other answer is the original
+refusal. A name the step only points at (a referenced table, a column it
+reads, a role) states its fact when held, states nothing when undeclared and
+keeps the step's other facts, and refuses when vacant unless the site writes a
+reason that it means something. The one such reason is a SQL Server computed
+column, which has no column uid and is looked for among the table's computed
+parts before its ordinary-column answer is read. A name that comes from the
+desired state, such as the parent of a partition that gets an index, is asked
+at the desired state and not at the step's moment.
+
 Names are stated the same way, apart from the effects, because a name is an
 address and not an identity. `pbps_model::operation::names` reports, for each
 operation, the names it claims and releases. `pbps_dialect::slots::names`
