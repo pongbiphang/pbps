@@ -82,9 +82,13 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         // Nothing binds a saved plan to a server: asked again here (#1502).
         self.refuse_unsupported_temporal(conn, changes).await
     }
-    async fn baseline_collation(&self, conn: &mut Conn) -> Result<Option<String>, DbError> {
-        database_collation(conn).await
-    }
+    /// The connected database's default collation, where the engine's model has
+    /// column collations (#1175); `None` where it has none.
+    ///
+    /// Required: `None` is the engine's statement that its columns have no
+    /// collation to compare, and an answer from an engine that was never asked
+    /// would let a declaration be compared as if the database had none.
+    async fn baseline_collation(&self, conn: &mut Conn) -> Result<Option<String>, DbError>;
     fn baseline_grants(
         &self,
         plan: &pbps_model::SavedPlan,
@@ -108,15 +112,25 @@ pub(crate) trait ApplySession: crate::emission::Engine {
     fn rename_notes(&self, driver: Driver, report: &ImpactReport) -> Vec<String> {
         impact_notes(driver, report)
     }
+    /// The columns a drop's row requirement reads of `table`, once the engine
+    /// has bound and vetted `predicate`. Required: a requirement the engine did
+    /// not judge must not read as one that reads no column.
     async fn requirement(
         &self,
         conn: &mut Conn,
         admission: &RoutineAdmission,
         table: &TableName,
         predicate: &str,
-    ) -> anyhow::Result<BTreeSet<pbps_model::ColumnName>> {
-        vet_drop_requirement(conn, admission, table, predicate).await
-    }
+    ) -> anyhow::Result<BTreeSet<pbps_model::ColumnName>>;
+    /// Holds a statement that carries a drop guard to the requirement the plan
+    /// recorded for it, just before it runs. A statement without a guard is
+    /// let through. Required, for the reason of [`Self::requirement`].
+    async fn check_drop_requirement(
+        &self,
+        conn: &mut Conn,
+        admission: &RoutineAdmission,
+        statement: &pbps_dialect::Statement,
+    ) -> Result<(), DbError>;
     async fn table_sites(
         &self,
         conn: &mut Conn,
@@ -257,7 +271,7 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         plan: Option<&pbps_model::SavedPlan>,
     ) -> anyhow::Result<()> {
         self.check_data_write(conn, admission, stmt, guard).await?;
-        before_statement(conn, admission, stmt, plan).await
+        before_statement(self, conn, admission, stmt, plan).await
     }
     #[allow(clippy::too_many_arguments)]
     async fn before_staged_statement(
@@ -537,6 +551,12 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         ids: &IdsFile,
         unrevocable: &[pbps_db::catalog::Unrevocable],
     ) -> anyhow::Result<()>;
+    /// Refuses the cluster roles a bootstrap's plan names that the cluster no
+    /// longer has. Bootstrap can build database roles, but a cluster role must
+    /// already exist and still exist when its successful snapshot is recorded.
+    /// Required: an engine that was never asked must not read as one whose
+    /// roles are all the database's own.
+    fn refuse_missing_cluster_roles(&self, missing: &[pbps_model::RoleName]) -> anyhow::Result<()>;
     /// Refuses a `SECURITY DEFINER` routine the plan wrote that is not in the
     /// engine's safe form (#322), read back inside the transaction that wrote
     /// it. Apart from the module-rebuild and external-role questions
@@ -767,6 +787,19 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         trusted: &BTreeSet<pbps_model::RoleName>,
         within: pbps_db::TransactionOwner,
     ) -> anyhow::Result<()>;
+    /// The problems with the package state a scratch baseline would assume, one
+    /// sentence each (empty when it holds exactly what `required` names). A
+    /// scratch baseline may assume only package state the scratch actually
+    /// holds. Neutral code refuses with all of them, joined.
+    ///
+    /// Required: whether an engine has packages at all is a fact about it, and
+    /// an empty answer from an engine that was never asked would let a scratch
+    /// stand in for a target whose packages it does not hold.
+    async fn extension_prerequisites(
+        &self,
+        conn: &mut Conn,
+        required: &BTreeMap<pbps_model::ObjectLocalName, pbps_model::Extension>,
+    ) -> anyhow::Result<Vec<String>>;
     /// Reads the potential path of every pinned type, including unchanged
     /// columns, as the roots of the routines a type's input would run. Required,
     /// for the reason of [`Self::replay_type_pins`].
@@ -789,13 +822,16 @@ pub(crate) fn selected(driver: Driver) -> crate::emission::SelectedDialect {
 
 // Bootstrap keeps its trusted-only admission, and staged keeps its own hooks.
 // These adapters preserve the statement annotations' original reachability.
-pub(crate) async fn before_statement(
+pub(crate) async fn before_statement<S: ApplySession>(
+    session: &S,
     conn: &mut Conn,
     admission: &RoutineAdmission,
     stmt: &pbps_dialect::Statement,
     plan: Option<&pbps_model::SavedPlan>,
 ) -> anyhow::Result<()> {
-    crate::engine::check_drop_requirement(conn, admission, stmt).await?;
+    session
+        .check_drop_requirement(conn, admission, stmt)
+        .await?;
     // The routines a table expression calls are judged just before the statement
     // that introduces it, with what the plan created earlier in place (DEC-2563.4).
     if let Some(change) = &stmt.introduces {

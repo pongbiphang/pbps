@@ -203,6 +203,55 @@ impl ApplySession for pbps_mssql::Mssql {
         // at plan time exists to prevent (ADR-0003).
         Ok(plan_session::mssql::edition_verdict(conn, &plan.changes).await?)
     }
+    async fn baseline_collation(&self, conn: &mut Conn) -> Result<Option<String>, DbError> {
+        pbps_mssql::catalog::database_collation(conn)
+            .await
+            .map(Some)
+    }
+    async fn requirement(
+        &self,
+        conn: &mut Conn,
+        _admission: &RoutineAdmission,
+        table: &TableName,
+        predicate: &str,
+    ) -> anyhow::Result<BTreeSet<pbps_model::ColumnName>> {
+        Box::pin(pbps_mssql::drop_requirements::vet(conn, table, predicate))
+            .await
+            .map_err(anyhow::Error::msg)
+    }
+    async fn check_drop_requirement(
+        &self,
+        conn: &mut Conn,
+        _admission: &RoutineAdmission,
+        statement: &pbps_dialect::Statement,
+    ) -> Result<(), DbError> {
+        let Some(guard) = &statement.drop_guard else {
+            return Ok(());
+        };
+        Box::pin(pbps_mssql::drop_requirements::check(conn, guard))
+            .await
+            .map_err(DbError::Refused)
+    }
+    /// Missing database roles are created by the SQL Server typed plan, and no
+    /// role of this engine belongs to a cluster.
+    fn refuse_missing_cluster_roles(
+        &self,
+        _missing: &[pbps_model::RoleName],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// SQL Server has no packages: nothing is required of an empty set, and a
+    /// declared one is refused by name rather than read as satisfied.
+    async fn extension_prerequisites(
+        &self,
+        _conn: &mut Conn,
+        required: &BTreeMap<pbps_model::ObjectLocalName, pbps_model::Extension>,
+    ) -> anyhow::Result<Vec<String>> {
+        if required.is_empty() {
+            return Ok(Vec::new());
+        }
+        anyhow::bail!("PostgreSQL extension prerequisites are unsupported on SQL Server")
+    }
     async fn role_drop_facts(
         &self,
         conn: &mut Conn,

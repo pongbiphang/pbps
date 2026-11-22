@@ -33,14 +33,18 @@ pub(crate) fn warn_unasked(unasked: &[String]) {
 /// plans, compares and records that schema from here on, never the one it
 /// passed in — a plan written from the declared text would restate, on every
 /// plan after, a value the table already holds.
-pub(crate) async fn refuse_misspelt(
+pub(crate) async fn refuse_misspelt<S: crate::engine::PlanSession>(
+    session: &S,
     conn: &mut Conn,
     schema: &Schema,
     at: &pbps_db::catalog::CatalogNames,
     unasked: &mut Vec<String>,
-    type_routines_need_review: bool,
 ) -> anyhow::Result<Schema> {
-    let found = crate::engine::misspelt(conn, schema, at, type_routines_need_review).await;
+    // A fresh state: no type-routine review has run, so no routine is waiting
+    // on the probe's answer.
+    let found = session
+        .misspelt(&S::State::default(), conn, schema, at)
+        .await;
     refuse_misspelt_read(found, schema, unasked)
 }
 
@@ -446,12 +450,13 @@ pub(super) fn wrongly_spelt(
 /// revoked and granted again by every plan after; `DBO.customer` is created
 /// as `dbo.customer` and then falls outside the managed set the state
 /// records by name.
-pub(crate) async fn refuse_wrongly_spelt_schemas(
+pub(crate) async fn refuse_wrongly_spelt_schemas<S: crate::engine::PlanSession>(
+    session: &S,
     conn: &mut Conn,
     schema: &Schema,
 ) -> anyhow::Result<()> {
     let wanted = schemas_wanted(schema);
-    let spelled = crate::engine::schema_spellings(conn, &wanted).await;
+    let spelled = session.schema_spellings(conn, &wanted).await;
     refuse_wrongly_spelt(spelled, schema)
 }
 

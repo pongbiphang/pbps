@@ -1158,7 +1158,8 @@ pub(super) async fn plan_db_selected(
             // who owns a securable, not a consequence of a drop. Said here,
             // before anything runs — a staged apply would otherwise commit
             // every DROP MEMBER and then fail on the DROP ROLE.
-            let owned = crate::engine::role_owned_securables(&mut conn)
+            let owned = dialect
+                .role_owned_securables(&mut conn)
                 .await
                 .context("cannot read what the roles own")?;
             for p in &cs.changes {

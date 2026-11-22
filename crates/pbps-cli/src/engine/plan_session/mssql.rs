@@ -909,6 +909,18 @@ impl PlanSession for pbps_mssql::Mssql {
         pbps_mssql::catalog::schema_spellings(conn, names).await
     }
 
+    /// Nothing in SQL Server's pure steps depends on what the server reports.
+    async fn planning_dialect(&self, _conn: &mut Conn) -> anyhow::Result<Self> {
+        Ok(*self)
+    }
+
+    async fn role_owned_securables(
+        &self,
+        conn: &mut Conn,
+    ) -> anyhow::Result<BTreeMap<pbps_model::RoleName, Vec<String>>> {
+        Ok(pbps_mssql::catalog::role_owned_securables(conn).await?)
+    }
+
     async fn refuse_unknown_collations(
         &self,
         conn: &mut Conn,
@@ -1157,7 +1169,7 @@ impl PlanSession for pbps_mssql::Mssql {
     ) -> anyhow::Result<()> {
         // SQL Server vets the requirement a drop is guarded by. It records no
         // conversion's expression and binds no table expression this way.
-        vet_drop_requirements(conn, &state.admission, names).await
+        vet_drop_requirements(self, conn, &state.admission, names).await
     }
 
     /// SQL Server has neither enums nor domains, so no row is stranded.

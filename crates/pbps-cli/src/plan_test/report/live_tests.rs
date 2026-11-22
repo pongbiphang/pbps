@@ -1,6 +1,6 @@
 use super::*;
 use crate::deploy::test_run::boxed_future;
-use crate::engine::owned_test_of;
+use crate::engine::{ApplySession as _, owned_test_of};
 use crate::plan_test::{
     Revision, execution::Control, revision::Assembled, session::HopContext, session::Session,
 };
@@ -125,12 +125,13 @@ async fn guarded_drop(session: &Session<'_>, input: &Assembled) -> anyhow::Resul
     });
     let mut conn = crate::db::connect(session.target()).await?;
     conn.execute("BEGIN").await?;
-    let result = crate::engine::check_drop_requirement(
-        &mut conn,
-        &pbps_dialect::routines::RoutineAdmission::default(),
-        &statement,
-    )
-    .await;
+    let result = pbps_pg::Postgres::new()
+        .check_drop_requirement(
+            &mut conn,
+            &pbps_dialect::routines::RoutineAdmission::default(),
+            &statement,
+        )
+        .await;
     conn.execute("ROLLBACK").await?;
     let error = result.err().context("the violating row permitted a drop")?;
     ensure!(

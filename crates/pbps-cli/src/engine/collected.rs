@@ -197,7 +197,7 @@ pub(crate) async fn refuse_roles_absent_from_cluster(
     match conn.driver() {
         Driver::Postgres => {
             let absent = pbps_pg::roles::missing_roles(conn, &named.iter().collect()).await?;
-            refuse_missing_cluster_roles(conn.driver(), &absent)
+            pbps_pg::Postgres::new().refuse_missing_cluster_roles(&absent)
         }
         Driver::Mssql => Ok(()),
     }

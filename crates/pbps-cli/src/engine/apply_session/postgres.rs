@@ -267,6 +267,61 @@ impl ApplySession for pbps_pg::Postgres {
         plan_session::postgres::refuse_published_unlogged(conn, &plan.changes, &plan.ids).await?;
         Ok(plan_session::postgres::edition_verdict())
     }
+    /// PostgreSQL declares no column collation (`validate` refuses the field),
+    /// so there is no default to compare.
+    async fn baseline_collation(&self, _conn: &mut Conn) -> Result<Option<String>, DbError> {
+        Ok(None)
+    }
+    async fn requirement(
+        &self,
+        conn: &mut Conn,
+        admission: &RoutineAdmission,
+        table: &TableName,
+        predicate: &str,
+    ) -> anyhow::Result<BTreeSet<pbps_model::ColumnName>> {
+        pbps_pg::input_path::vet_requirement(
+            conn,
+            admission,
+            pbps_db::TransactionOwner::OwnTransaction,
+            table,
+            predicate,
+        )
+        .await
+        .map_err(anyhow::Error::msg)
+    }
+    async fn check_drop_requirement(
+        &self,
+        conn: &mut Conn,
+        admission: &RoutineAdmission,
+        statement: &pbps_dialect::Statement,
+    ) -> Result<(), DbError> {
+        let Some(guard) = &statement.drop_guard else {
+            return Ok(());
+        };
+        pbps_pg::drop_requirements::check(conn, admission, guard)
+            .await
+            .map_err(DbError::Refused)
+    }
+    fn refuse_missing_cluster_roles(&self, missing: &[pbps_model::RoleName]) -> anyhow::Result<()> {
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "{}",
+                missing
+                    .iter()
+                    .map(|name| pbps_pg::roles::refuse_missing(name).to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+        Ok(())
+    }
+    async fn extension_prerequisites(
+        &self,
+        conn: &mut Conn,
+        required: &BTreeMap<pbps_model::ObjectLocalName, pbps_model::Extension>,
+    ) -> anyhow::Result<Vec<String>> {
+        Ok(pbps_pg::resolver::scratch::extension_prerequisites(conn, required).await?)
+    }
     async fn role_drop_facts(
         &self,
         _conn: &mut Conn,

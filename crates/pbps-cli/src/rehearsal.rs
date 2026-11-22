@@ -13,6 +13,7 @@
 
 pub mod connected;
 
+use crate::engine::ApplySession as _;
 use anyhow::Context as _;
 
 use pbps_db::Conn;
@@ -380,7 +381,11 @@ pub async fn rehearse_in<D: pbps_cli::resolver::server::PlanningDialect>(
             ExtensionPhase::Drop => {}
         }
     }
-    crate::engine::require_scratch_extensions(conn, &standing).await?;
+    let selected = crate::engine::apply_session::selected(conn.driver());
+    let problems = pbps_cli::with_plan_dialect!(&selected, |session| {
+        session.extension_prerequisites(conn, &standing).await?
+    });
+    anyhow::ensure!(problems.is_empty(), "{}", problems.join("; "));
     if !created.is_empty() {
         let problems = pbps_cli::resolver::extension_requirements::<D>(conn, &created).await?;
         anyhow::ensure!(problems.is_empty(), "{}", problems.join("; "));
@@ -406,14 +411,17 @@ pub async fn rehearse_in<D: pbps_cli::resolver::server::PlanningDialect>(
     // spelt the old way here too (DECISIONS 148).
     let declared = if base.asks_spelling() {
         let mut unasked = Vec::new();
-        let refused = crate::deploy::refuse_misspelt(
-            conn,
-            declared,
-            &crate::deploy::catalogued_as(declared, declared_ids, base.ids()),
-            &mut unasked,
-            false, // SQL Server-only; PostgreSQL is refused before connecting.
-        )
-        .await;
+        // SQL Server only: PostgreSQL is refused before connecting.
+        let refused = pbps_cli::with_plan_dialect!(&selected, |session| {
+            crate::deploy::refuse_misspelt(
+                session,
+                conn,
+                declared,
+                &crate::deploy::catalogued_as(declared, declared_ids, base.ids()),
+                &mut unasked,
+            )
+            .await
+        });
         // Before the refusal, beside it, as the plan prints them (DEC-1726.1).
         crate::deploy::warn_unasked(&unasked);
         // What the rows are compared against: a date or time as the engine reads
@@ -660,12 +668,17 @@ async fn run_statements(
     // A scratch holds no declared role and reviews nothing: what runs there is
     // judged as the target's apply will judge it.
     let admission = pbps_dialect::routines::RoutineAdmission::default();
+    let selected = crate::engine::apply_session::selected(conn.driver());
     for (i, statement) in statements.iter().enumerate() {
-        let executed =
-            match crate::engine::check_drop_requirement(conn, &admission, statement).await {
-                Ok(()) => conn.execute(&statement.sql).await,
-                Err(error) => Err(error),
-            };
+        let checked = pbps_cli::with_plan_dialect!(&selected, |session| {
+            session
+                .check_drop_requirement(conn, &admission, statement)
+                .await
+        });
+        let executed = match checked {
+            Ok(()) => conn.execute(&statement.sql).await,
+            Err(error) => Err(error),
+        };
         if let Err(e) = executed {
             if let Some(framing) = &framing {
                 // Its own error must not replace the statement's.

@@ -127,24 +127,6 @@ pub(crate) use plan_session::{
     SupportReads, SupportRows, in_contract_order,
 };
 
-/// A scratch baseline may assume only package state the scratch actually holds.
-pub async fn require_scratch_extensions(
-    conn: &mut Conn,
-    required: &BTreeMap<pbps_model::ObjectLocalName, pbps_model::Extension>,
-) -> anyhow::Result<()> {
-    let problems = match conn.driver() {
-        Driver::Postgres => {
-            pbps_pg::resolver::scratch::extension_prerequisites(conn, required).await?
-        }
-        Driver::Mssql if required.is_empty() => Vec::new(),
-        Driver::Mssql => {
-            anyhow::bail!("PostgreSQL extension prerequisites are unsupported on SQL Server")
-        }
-    };
-    anyhow::ensure!(problems.is_empty(), "{}", problems.join("; "));
-    Ok(())
-}
-
 /// Execute one staged DDL statement, including recovery owned by its engine.
 pub async fn execute_staged_statement(
     conn: &mut Conn,
@@ -166,7 +148,8 @@ pub async fn vet_table_expressions(
     pbps_pg::table_expressions::vet_change(conn, admission, within, moment, change).await
 }
 
-pub async fn vet_drop_requirements(
+pub async fn vet_drop_requirements<S: ApplySession>(
+    session: &S,
     conn: &mut Conn,
     admission: &pbps_dialect::routines::RoutineAdmission,
     names: &pbps_model::plan_names::PlanNames<'_>,
@@ -183,53 +166,14 @@ pub async fn vet_drop_requirements(
                 anyhow::anyhow!("the requirement's table identity has no stored target")
             })?;
         for requirement in guard.requirements.values() {
-            let columns =
-                vet_drop_requirement(conn, admission, table, &requirement.predicate).await?;
+            let columns = session
+                .requirement(conn, admission, table, &requirement.predicate)
+                .await?;
             pbps_diff::drop_requirements::check_columns(guard, index, names, &columns)
                 .map_err(anyhow::Error::msg)?;
         }
     }
     Ok(())
-}
-
-pub async fn vet_drop_requirement(
-    conn: &mut Conn,
-    admission: &pbps_dialect::routines::RoutineAdmission,
-    table: &TableName,
-    predicate: &str,
-) -> anyhow::Result<BTreeSet<pbps_model::ColumnName>> {
-    match conn.driver() {
-        Driver::Postgres => pbps_pg::input_path::vet_requirement(
-            conn,
-            admission,
-            pbps_db::TransactionOwner::OwnTransaction,
-            table,
-            predicate,
-        )
-        .await
-        .map_err(anyhow::Error::msg),
-        Driver::Mssql => Box::pin(pbps_mssql::drop_requirements::vet(conn, table, predicate))
-            .await
-            .map_err(anyhow::Error::msg),
-    }
-}
-
-pub async fn check_drop_requirement(
-    conn: &mut Conn,
-    admission: &pbps_dialect::routines::RoutineAdmission,
-    statement: &pbps_dialect::Statement,
-) -> Result<(), DbError> {
-    let Some(guard) = &statement.drop_guard else {
-        return Ok(());
-    };
-    match conn.driver() {
-        Driver::Postgres => pbps_pg::drop_requirements::check(conn, admission, guard)
-            .await
-            .map_err(DbError::Refused),
-        Driver::Mssql => Box::pin(pbps_mssql::drop_requirements::check(conn, guard))
-            .await
-            .map_err(DbError::Refused),
-    }
 }
 
 /// Catalog estimates are advisory. Failure to measure is an unavailable
@@ -543,17 +487,6 @@ pub async fn introspect(conn: &mut Conn, read: Read) -> Result<Pulled, DbError> 
     of(conn.driver()).introspect(conn, read).await
 }
 
-/// The connected database's default collation, where the engine's model has
-/// column collations (#1175); `None` on PostgreSQL.
-pub async fn database_collation(conn: &mut Conn) -> Result<Option<String>, DbError> {
-    match conn.driver() {
-        Driver::Mssql => pbps_mssql::catalog::database_collation(conn)
-            .await
-            .map(Some),
-        Driver::Postgres => Ok(None),
-    }
-}
-
 /// One advisory per declared filegroup, for a plan made without a database
 /// (#2813, DEC-2813.1). The name is accepted as a name: whether the target
 /// holds it is a fact about a database, and `plan --db` or `bootstrap` refuses
@@ -627,34 +560,6 @@ pub async fn read_rows(
     of(conn.driver())
         .read_rows(conn, schema, scopes, read)
         .await
-}
-
-/// Every declared value the engine would not read back as written, and every
-/// pair of declared keys it reads as one row (DECISIONS 101, 106).
-pub async fn misspelt(
-    conn: &mut Conn,
-    schema: &Schema,
-    at: &CatalogNames,
-    type_routines_need_review: bool,
-) -> Result<Spellings, RowsError> {
-    match conn.driver() {
-        Driver::Mssql => pbps_mssql::catalog::misspelt(conn, schema, at).await,
-        Driver::Postgres => {
-            pbps_pg::catalog::misspelt(conn, schema, at, type_routines_need_review).await
-        }
-    }
-}
-
-/// How the database spells each declared schema name, or `None` where it has
-/// no schema of that name (DECISIONS 142).
-pub async fn schema_spellings(
-    conn: &mut Conn,
-    names: &BTreeSet<String>,
-) -> Result<BTreeMap<String, Option<String>>, DbError> {
-    match conn.driver() {
-        Driver::Mssql => pbps_mssql::catalog::schema_spellings(conn, names).await,
-        Driver::Postgres => pbps_pg::catalog::schema_spellings(conn, names).await,
-    }
 }
 
 /// Why the four role questions below refuse on PostgreSQL rather than answer.
@@ -960,17 +865,6 @@ fn absence_unproven(missing: &[TableName], error: DbError) -> anyhow::Error {
          schemas, so a table hidden from this one is not taken for one that is gone",
         names.join(", ")
     ))
-}
-
-/// Every securable each user-defined role owns, which the engine will not
-/// drop the role over.
-pub async fn role_owned_securables(
-    conn: &mut Conn,
-) -> anyhow::Result<BTreeMap<pbps_model::RoleName, Vec<String>>> {
-    match conn.driver() {
-        Driver::Mssql => Ok(pbps_mssql::catalog::role_owned_securables(conn).await?),
-        Driver::Postgres => Err(roles_are_the_clusters("reading what the roles own")),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1921,31 +1815,6 @@ pub fn impact_notes(driver: Driver, report: &ImpactReport) -> Vec<String> {
     (profile::profile(driver).impact_notes)(report)
 }
 
-/// Bootstrap can build database roles, but cluster roles must already exist
-/// and still exist when its successful snapshot is recorded.
-pub fn refuse_missing_cluster_roles(
-    driver: Driver,
-    missing: &[pbps_model::RoleName],
-) -> anyhow::Result<()> {
-    match driver {
-        // Missing database roles are created by the SQL Server typed plan.
-        Driver::Mssql => Ok(()),
-        Driver::Postgres => {
-            if !missing.is_empty() {
-                anyhow::bail!(
-                    "{}",
-                    missing
-                        .iter()
-                        .map(|name| pbps_pg::roles::refuse_missing(name).to_string())
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                );
-            }
-            Ok(())
-        }
-    }
-}
-
 /// Cluster-owned identities move before pbps plans their database grants.
 /// SQL Server moves its database roles through the typed statements instead.
 pub struct ExternalRoleRenames {
@@ -2086,19 +1955,6 @@ pub async fn account_for_module_dependents<
 pub async fn planning_dialect(conn: &mut Conn) -> anyhow::Result<pbps_pg::Postgres> {
     Ok(pbps_pg::Postgres::new()
         .with_server_version(pbps_pg::roles::server_version_num(conn).await?))
-}
-
-/// Preserve the concrete selected engine while observing the same capability.
-pub async fn planning_dialect_for<D: crate::emission::Engine>(
-    conn: &mut Conn,
-    dialect: &D,
-) -> anyhow::Result<D> {
-    Ok(match conn.driver() {
-        Driver::Postgres => {
-            dialect.with_planning_version(pbps_pg::roles::server_version_num(conn).await?)
-        }
-        Driver::Mssql => dialect.clone(),
-    })
 }
 
 /// Whether a literal [`crate::dependents::names_a_later_relation`] read as a
@@ -3748,7 +3604,8 @@ mod tests {
             let names: BTreeSet<String> = ["public".to_owned(), "no_such_schema_here".to_owned()]
                 .into_iter()
                 .collect();
-            let spelled = schema_spellings(&mut conn, &names)
+            let spelled = pbps_pg::Postgres::new()
+                .schema_spellings(&mut conn, &names)
                 .await
                 .expect("spellings");
             assert_eq!(spelled["public"], Some("public".to_owned()));
@@ -3772,7 +3629,7 @@ mod tests {
             let alike = session.alike_role_names(&mut conn, &["a", "A"]).await;
             let holding = session.principal_name_holders(&mut conn, &["a"], &[]).await;
             let members = session.role_drop_facts(&mut conn).await;
-            let owned = role_owned_securables(&mut conn).await;
+            let owned = session.role_owned_securables(&mut conn).await;
             for (what, message) in [
                 ("names_alike", alike.err().map(|e| e.to_string())),
                 ("principals_holding", holding.err().map(|e| e.to_string())),
