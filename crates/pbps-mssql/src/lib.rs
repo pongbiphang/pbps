@@ -464,7 +464,7 @@ impl Dialect for Mssql {
                 };
                 if let Some((schema, function)) = function {
                     for (name, table) in &before.schema.tables {
-                        let Some(base) = base_table_named(owners, before, name) else {
+                        let Some(base) = base_table_named(owners, before, name)? else {
                             continue;
                         };
                         for (column, computed) in &table.computed {

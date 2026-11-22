@@ -18,6 +18,7 @@
 //! several (review of #1346), and a PostgreSQL array type is not a slot at all
 //! (#1503). They reach the order only through the catalog, as occupants.
 
+use super::effects::door;
 use super::{ColumnKey, ObjectKey, Operation, OwnerError, Owners, PartKey, Recorded, Spelling};
 use crate::ColumnChange;
 use crate::ConstraintChange;
@@ -107,6 +108,17 @@ impl Nx<'_> {
         self.owners
             .table(name, self.op.origin().spelling())
             .map(Recorded)
+    }
+
+    /// A table a name only points at (DEC-2993.2): one the project does not
+    /// declare is nobody's scope, and any other failure is the refusal.
+    fn table_reference(&self, name: &TableName) -> Result<Option<Recorded>, OwnerError> {
+        door(
+            self.owners
+                .table(name, self.op.origin().spelling())
+                .map(Recorded),
+        )?
+        .reference()
     }
 
     fn claim(&mut self, address: Address, holder: ObjectKey) {
@@ -246,11 +258,11 @@ fn whole_table(name: &TableName, owner: &Recorded, table: &Table, policies: bool
 /// schema, a trigger by its name on its table. `None` for a trigger on a table
 /// the identity file does not record, which is nobody's scope.
 fn module_address(
-    table: impl Fn(&TableName) -> Option<Recorded>,
+    table: impl Fn(&TableName) -> Result<Option<Recorded>, OwnerError>,
     id: &ModuleId,
     kind: ModuleKind,
-) -> Option<Address> {
-    Some(match id {
+) -> Result<Option<Address>, OwnerError> {
+    Ok(Some(match id {
         ModuleId::Named(name) => Address {
             kind: NameKind::Module(kind),
             schema: name.schema.clone(),
@@ -268,11 +280,14 @@ fn module_address(
         ModuleId::Trigger { on, name } => Address {
             kind: NameKind::Module(kind),
             schema: on.schema.clone(),
-            table: Some(ObjectKey::Table(table(on)?)),
+            table: Some(ObjectKey::Table(match table(on)? {
+                Some(owner) => owner,
+                None => return Ok(None),
+            })),
             name: name.clone(),
             signature: None,
         },
-    })
+    }))
 }
 
 /// What `op` claims and releases.
@@ -368,7 +383,9 @@ pub fn names(
                 nx.names.claims.push(named);
             }
             for (column, _) in &table.columns {
-                if let Ok(column_uid) = owners.column(&name.column(column), Spelling::Final) {
+                if let Some(column_uid) =
+                    door(owners.column(&name.column(column), Spelling::Final))?.reference()?
+                {
                     nx.claim(
                         Address {
                             kind: NameKind::Column,
@@ -622,12 +639,12 @@ pub fn names(
             )?;
         }
         Change::Module(ModuleChange::CreateModule { id, module }) => {
-            if let Some(address) = module_address(|t| nx.table(t).ok(), id, module.kind) {
+            if let Some(address) = module_address(|t| nx.table_reference(t), id, module.kind)? {
                 nx.claim(address, ObjectKey::Module(id.clone()));
             }
         }
         Change::Module(ModuleChange::DropModule { id, kind }) => {
-            if let Some(address) = module_address(|t| nx.table(t).ok(), id, *kind) {
+            if let Some(address) = module_address(|t| nx.table_reference(t), id, *kind)? {
                 nx.release(address, ObjectKey::Module(id.clone()));
             }
         }
@@ -720,12 +737,17 @@ fn extension_address(name: &crate::ObjectLocalName) -> Address {
 }
 
 /// Every name the baseline holds, with its holder: what stands before the
-/// first step. A name the identity file records no owner for is nobody's.
-pub fn baseline_names(owners: &dyn Owners, before: super::Snapshot<'_>) -> Vec<Named> {
-    let table = |name: &TableName| owners.table(name, Spelling::Base).ok().map(Recorded);
+/// first step. A name the project does not declare is nobody's; one the models
+/// cannot read is the original refusal, not a name nobody holds (DEC-2993.2).
+pub fn baseline_names(
+    owners: &dyn Owners,
+    before: super::Snapshot<'_>,
+) -> Result<Vec<Named>, OwnerError> {
+    let table =
+        |name: &TableName| door(owners.table(name, Spelling::Base).map(Recorded))?.reference();
     let mut out = Vec::new();
     for name in before.schema.types.keys() {
-        if let Ok(uid) = owners.managed_type(name, Spelling::Base) {
+        if let Some(uid) = door(owners.managed_type(name, Spelling::Base))?.reference()? {
             out.push(Named {
                 address: type_address(name),
                 holder: ObjectKey::Type(Recorded(uid)),
@@ -741,12 +763,14 @@ pub fn baseline_names(owners: &dyn Owners, before: super::Snapshot<'_>) -> Vec<N
         }
     }
     for (name, t) in &before.schema.tables {
-        let Some(owner) = table(name) else {
+        let Some(owner) = table(name)? else {
             continue;
         };
         out.extend(whole_table(name, &owner, t, true));
         for column in t.columns.keys() {
-            if let Ok(uid) = owners.column(&name.column(column), Spelling::Base) {
+            if let Some(uid) =
+                door(owners.column(&name.column(column), Spelling::Base))?.reference()?
+            {
                 out.push(Named {
                     address: Address {
                         kind: NameKind::Column,
@@ -761,7 +785,7 @@ pub fn baseline_names(owners: &dyn Owners, before: super::Snapshot<'_>) -> Vec<N
         }
     }
     for (id, module) in &before.schema.modules {
-        if let Some(address) = module_address(table, id, module.kind) {
+        if let Some(address) = module_address(table, id, module.kind)? {
             out.push(Named {
                 address,
                 holder: ObjectKey::Module(id.clone()),
@@ -769,7 +793,7 @@ pub fn baseline_names(owners: &dyn Owners, before: super::Snapshot<'_>) -> Vec<N
         }
     }
     for role in before.schema.roles.keys() {
-        if let Ok(uid) = owners.role(role, Spelling::Base) {
+        if let Some(uid) = door(owners.role(role, Spelling::Base))?.reference()? {
             out.push(Named {
                 address: role_address(role),
                 holder: ObjectKey::Role(Recorded(uid)),
@@ -784,7 +808,7 @@ pub fn baseline_names(owners: &dyn Owners, before: super::Snapshot<'_>) -> Vec<N
             });
         }
     }
-    out
+    Ok(out)
 }
 
 /// Shared input addresses for explicit intermediate operations. Ordinary plans
@@ -1005,10 +1029,14 @@ mod tests {
     fn a_routine_claim_and_release_use_the_same_raw_signature() {
         let part = "x\n\\\u{200b}";
         let id: ModuleId = format!("app.{part}(s.\"{part}\")").parse().unwrap();
-        let claim = module_address(|_| None, &id, ModuleKind::Function).unwrap();
+        let claim = module_address(|_| Ok(None), &id, ModuleKind::Function)
+            .unwrap()
+            .unwrap();
         // A catalog/serialized identity is the other side of the slot lookup.
         let parsed: ModuleId = id.raw().to_string().parse().unwrap();
-        let release = module_address(|_| None, &parsed, ModuleKind::Function).unwrap();
+        let release = module_address(|_| Ok(None), &parsed, ModuleKind::Function)
+            .unwrap()
+            .unwrap();
         assert_eq!(claim, release);
         assert_eq!(
             claim.signature.as_deref(),
@@ -1021,7 +1049,9 @@ mod tests {
         let sibling: ModuleId = format!("app.{part}(text)").parse().unwrap();
         assert_ne!(
             claim,
-            module_address(|_| None, &sibling, ModuleKind::Function).unwrap()
+            module_address(|_| Ok(None), &sibling, ModuleKind::Function)
+                .unwrap()
+                .unwrap()
         );
     }
 }

@@ -219,7 +219,7 @@ fn one_split_origin_orders_source_temp_and_backup_reads_through_shared_slots() {
     let violations = order::verify::verify(ops.as_slice(), &fx, &baseline, &Default::default());
     assert!(violations.is_empty(), "{violations:?}");
     let (violations, skipped) =
-        order::slots::verify(ops.as_slice(), &slots, &dialect, None, &owners, before);
+        order::slots::verify(ops.as_slice(), &slots, &dialect, None, &owners, before).unwrap();
     assert!(
         violations.is_empty() && skipped.is_empty(),
         "{violations:?} / {skipped:?}"
@@ -273,7 +273,8 @@ fn one_split_origin_orders_source_temp_and_backup_reads_through_shared_slots() {
             None,
             &owners,
             before,
-        );
+        )
+        .unwrap();
         assert!(
             violations
                 .iter()

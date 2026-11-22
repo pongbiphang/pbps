@@ -692,7 +692,7 @@ impl NameFacts {
             Some(&slots),
             &owners,
             before,
-        )
+        )?
         .0
         {
             if let pbps_diff::order::slots::SlotViolation::Contested { slot, .. }

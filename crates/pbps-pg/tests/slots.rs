@@ -191,11 +191,7 @@ fn a_constraint_trigger_releases_its_own_and_its_clones_constraint_slots() {
         assert_eq!(count(&removed.releases), if constraint { 2 } else { 0 });
         assert_eq!(count(&created.claims), if constraint { 2 } else { 0 });
         assert_eq!(
-            count(&pbps_dialect::slots::baseline_names(
-                &Postgres::new(),
-                &owners,
-                before
-            )),
+            count(&pbps_dialect::slots::baseline_names(&Postgres::new(), &owners, before).unwrap()),
             if constraint { 2 } else { 0 }
         );
     }
@@ -244,7 +240,8 @@ fn a_constraint_trigger_releases_its_own_and_its_clones_constraint_slots() {
             None,
             &owners,
             before,
-        );
+        )
+        .unwrap();
         assert_eq!(
             violations
                 .iter()
@@ -267,6 +264,7 @@ fn a_constraint_trigger_releases_its_own_and_its_clones_constraint_slots() {
                     &owners,
                     before
                 )
+                .unwrap()
                 .0
                 .is_empty()
             );
@@ -399,7 +397,8 @@ fn an_arriving_partition_claims_a_constraint_clone_only_until_its_parent_release
                 None,
                 &owners,
                 base,
-            );
+            )
+            .unwrap();
             if was && will && check == "audit" {
                 assert!(
                     violations

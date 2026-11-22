@@ -147,6 +147,7 @@ fn check(
         &owners,
         before,
     )
+    .unwrap()
     .0
 }
 
@@ -280,7 +281,8 @@ fn a_table_to_type_handoff_is_an_existing_slot_edge_and_the_reverse_is_rejected(
         &owners,
         before,
         &pbps_pg::Postgres::new(),
-    );
+    )
+    .unwrap();
     assert!(
         slots::edges(&slots, Some(&facts), &carried)
             .iter()

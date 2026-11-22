@@ -859,7 +859,8 @@ fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
             Some(&facts),
             &owners,
             before,
-        );
+        )
+        .unwrap();
         assert_eq!(violations.is_empty(), release < claim);
         let released = [holder].into();
         let mut vacant = enriched.clone();

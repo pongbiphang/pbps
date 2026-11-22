@@ -665,6 +665,7 @@ fn refuse_type_slots(
         &owners,
         before,
     )
+    .map_err(|error| Refusal(error.to_string()))?
     .0
     {
         if let crate::order::slots::SlotViolation::Contested { slot, .. }
