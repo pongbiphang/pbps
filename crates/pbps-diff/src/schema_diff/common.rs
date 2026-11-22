@@ -114,3 +114,10 @@ pub(super) fn change_in_words(change: &Change) -> String {
 pub(super) fn defaults_differ(before: Option<&String>, after: Option<&String>) -> bool {
     before != after
 }
+
+/// Both sides' identity files, indexed once per diff for the passes that look
+/// up per table or per column (#1870).
+pub(super) struct Indexes<'a> {
+    pub(super) base: pbps_model::IdsIndex<'a>,
+    pub(super) declared: pbps_model::IdsIndex<'a>,
+}

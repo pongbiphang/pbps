@@ -16,7 +16,7 @@ branch's own edits. It is removed by the last PR of #3003.
 
 The plan (`split_schema_diff.plan.json`) maps a module name to item names. The
 reserved keys `_docs` (the `//!` line of each module), `_pub_super` and
-`_no_reexport` (see below) are not modules. A name in the plan that the tree does not have is an
+`_no_reexport` and `_not_read` (see below) are not modules. A name in the plan that the tree does not have is an
 error, never a skip.
 
 A module name `group/part` is a module one level down: the file
@@ -66,7 +66,15 @@ Visibility, the one edit an item gets:
   through their `use super::*;`. A name that only a test file uses gets a
   `#[cfg(test)]` import, so the build without tests has no unused import.
 - A struct field or an inherent impl method cannot be found by name, so the
-  plan lists them in `_pub_super` as `Type.field` and `Type::method`.
+  plan lists them in `_pub_super` as `Type.field` and `Type::method`. A plain
+  item name there widens a private item that nothing outside names, such as a
+  type that a widened function returns; it is not imported, as the parent
+  never names it.
+- A word is not always the item: a local binding or a field of the same name
+  makes the item look read from outside, so it is widened and imported without
+  use. The plan lists such an item in `_not_read` and the script leaves that
+  name out of what it counts as read outside. An item that is read by that name
+  after all is then private to its module and the build says so.
 - A `pub(crate)` item that nothing outside the file reads has no re-export (it
   would be an unused import); the plan lists it in `_no_reexport`, and inside
   the file it is imported as a private item is: not at all, plainly, or only
@@ -102,7 +110,7 @@ from pathlib import Path
 
 DEFAULT_FILE = "crates/pbps-diff/src/schema_diff.rs"
 DEFAULT_PLAN = Path(__file__).with_suffix(".plan.json")
-RESERVED = ("_docs", "_pub_super", "_no_reexport")
+RESERVED = ("_docs", "_pub_super", "_no_reexport", "_not_read")
 PUB_SUPER = ["pub", "(", "super", ")"]
 _MODULE_NAME = r"[a-z][a-z0-9_]*"
 
@@ -482,10 +490,11 @@ def line_of(text: str, offset: int) -> int:
 # ----------------------------------------------------------------- plan
 
 
-def load_plan(path: Path) -> tuple[dict[str, list[str]], dict[str, str], list[str], list[str]]:
+def load_plan(path: Path) -> tuple[dict[str, list[str]], dict[str, str], list[str], list[str], set[str]]:
     raw = json.loads(path.read_text())
     docs, pub_super = raw.get("_docs", {}), raw.get("_pub_super", [])
     no_reexport = raw.get("_no_reexport", [])
+    not_read = set(raw.get("_not_read", []))
     modules = {k: v for k, v in raw.items() if k not in RESERVED}
     seen: dict[str, str] = {}
     for mod, names in modules.items():
@@ -500,7 +509,9 @@ def load_plan(path: Path) -> tuple[dict[str, list[str]], dict[str, str], list[st
             if name in seen:
                 raise SplitError(f"plan: `{name}` is listed for `{seen[name]}` and for `{mod}`")
             seen[name] = mod
-    return modules, docs, pub_super, no_reexport
+    if unplanned := sorted(not_read - set(seen)):
+        raise SplitError(f"plan: `_not_read` names {unplanned}, which no module lists")
+    return modules, docs, pub_super, no_reexport, not_read
 
 
 def _top(mod: str) -> str:
@@ -588,7 +599,7 @@ def _managed(item: Item, modules: set[str]) -> bool:
 
 def apply(root: Path, parent_rel: str, plan_path: Path) -> list[str]:
     """Plan the whole move, then write; returns what was written."""
-    modules, docs, pub_super, no_reexport = load_plan(plan_path)
+    modules, docs, pub_super, no_reexport, not_read = load_plan(plan_path)
     parent_path = root / parent_rel
     mod_dir = parent_path.with_suffix("")
     text = parent_path.read_text()
@@ -629,12 +640,12 @@ def apply(root: Path, parent_rel: str, plan_path: Path) -> list[str]:
     parent_decls = [it for it in rest if it.kind == "mod_decl"]
     tests = [mod_dir / f"{it.name}.rs" for it in parent_decls if it.is_test_gated()]
 
-    kept_code = _idents([it for it in rest if not it.glue])
+    kept_code = _idents([it for it in rest if not it.glue]) - not_read
     kept = set(kept_code)
     for path in tests:
         if path.is_file():
-            kept |= _file_idents(path)
-    per_module = {mod: _idents(cut_items(body)) for mod, body in composed.items()}
+            kept |= _file_idents(path) - not_read
+    per_module = {mod: _idents(cut_items(body)) - not_read for mod, body in composed.items()}
     final: dict[str, str] = {}
     read_in_file: set[tuple[str, str]] = set()
     for mod in modules:
@@ -708,6 +719,8 @@ def _parent_glue(
                 if (mod, it.name) not in read_in_file:
                     continue
             private = it.vis == _super_vis(mod) or it.name in no_reexport
+            if private and (mod, it.name) not in read_in_file:
+                continue  # widened for a signature, named by nobody outside
             shown = "" if private else it.vis + " "
             gate = "#[cfg(test)]\n" if private and (mod, it.name) in test_only else ""
             uses.append(f"{gate}{shown}use {mod.replace('/', '::')}::{it.name};")
@@ -907,7 +920,7 @@ def move_map(
     plan's name or by how an item is shown: one name covers a type and its
     impls, a type may have several `impl` blocks that are shown alike, and any
     of them may move in a different PR."""
-    modules, _, _, _ = load_plan(plan_path)
+    modules = load_plan(plan_path)[0]
     items = cut_items(base_text)
     earlier: list[tuple[str, Item]] = []
     if root is not None and base_ref:

@@ -307,7 +307,7 @@ text must say so, and the operator can still choose separate plans.
 
 The differ sorts every planned change by, in order:
 
-1. **Class**, `order_key` in `crates/pbps-diff/src/schema_diff.rs`:
+1. **Class**, `order_key` in `crates/pbps-diff/src/schema_diff/sort/keys.rs`:
 
    | Class | Changes |
    |---|---|
@@ -331,8 +331,9 @@ The differ sorts every planned change by, in order:
    | 17 | `SetDataMode`, `SetEnsureKeys` |
    | 18 | `DropType`, `DropSearch`, `DropExtension`: after every module the plan drops and every package they require is gone (DEC-2447.8); a domain before its base and a package before the packages it requires, by the reverse depth rank |
 
-2. **A rank inside the class**, `sort_class` and `dependency_rank` in the same
-   file:
+2. **A rank inside the class**, `sort_class` in
+   `crates/pbps-diff/src/schema_diff/sort/facts.rs` and `dependency_rank` in
+   `crates/pbps-diff/src/schema_diff/sort/keys.rs`:
    - a drop that frees a name a rename claims goes before the rename (DECISIONS
      474), and a generated column's drop goes first among them (DEC-1168.1);
    - a generated column is dropped before the ordinary columns of class 5, and

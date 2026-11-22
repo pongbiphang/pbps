@@ -18,8 +18,13 @@
     "rows": "Rows: the row changes of a table and the facts about them.",
     "search": "Text search objects: what a plan creates, alters and drops, and the order they depend in.",
     "sequences": "Standalone sequences.",
+    "sort": "The sort of a plan: the facts it reads, the key each change takes and what follows it.",
+    "sort/facts": "The facts the sort reads, each computed once from the plan, and the sort key and class built on them.",
+    "sort/finish": "What follows the sort: the rename and column order, the drop requirements, the risks and the label uses.",
+    "sort/keys": "The coarse order of a change: its dependency rank, its class order and the ranks of the objects it waits on.",
     "table_props": "Table-level properties: storage parameters, replica identity, filegroups, and the foreign-key graph a persistence switch reads.",
-    "types": "The differences between two declarations of one type."
+    "tables": "The tables phase: the tables only one side holds, and each table both sides hold, compared and attached or detached.",
+    "types": "The types phase, and the differences between two declarations of one type."
   },
   "_pub_super": [
     "ForeignKeyGraph::of",
@@ -29,12 +34,28 @@
     "Attached.table",
     "Attached.defaultless",
     "Attached.displaced",
-    "Attached.released"
+    "Attached.released",
+    "Indexes.base",
+    "Indexes.declared",
+    "TableFacts.index",
+    "TableFacts.renames",
+    "TableFacts.standing",
+    "SortFacts",
+    "SortFacts::key"
   ],
   "_no_reexport": ["dropped_search"],
+  "_not_read": ["depth", "Rename"],
   "error": ["DiffError", "last_column_reason"],
-  "types": ["type_differences"],
+  "types": ["type_differences", "diff_types"],
+  "tables": [
+    "standing_default",
+    "TableFacts",
+    "diff_tables",
+    "TableCtx",
+    "diff_surviving_table"
+  ],
   "common": [
+    "Indexes",
     "columns_of",
     "partition_columns_by_uid",
     "renames_of",
@@ -66,7 +87,9 @@
     "trigger_changes_hands",
     "ModuleDelta",
     "module_delta",
-    "diff_modules"
+    "diff_modules",
+    "rebind_modules",
+    "module_ranks"
   ],
   "restoration": ["table_by_uid", "ordinary_default", "restoration_comparison"],
   "roles": ["member_depth", "diff_roles", "revoke_public_execution"],
@@ -125,5 +148,42 @@
     "refuse_partition_changes",
     "refuse_parent_index",
     "parent_column"
-  ]
+  ],
+  "sort/facts": [
+    "attach_parents_and_data_rank",
+    "column_name_claims",
+    "rename_chain_depths",
+    "Rename",
+    "reaches",
+    "depth",
+    "generated_columns_in_base",
+    "row_change_tables",
+    "columns_held_back",
+    "columns_whose_bounds_go_first",
+    "sequence_release_ranks",
+    "late_attach_ranks",
+    "persistence_fk_graph",
+    "parent_columns_moved",
+    "parents_with_column_changes",
+    "defaults_moved_out_of",
+    "domain_type_ranks",
+    "package_floor_of",
+    "built_domain",
+    "searches_in_the_plan",
+    "search_ranks",
+    "domain_floor_behind_searches",
+    "SortFacts",
+    "sort_facts"
+  ],
+  "sort/keys": [
+    "rank_of_tables",
+    "rank_of",
+    "dependency_rank",
+    "COLUMN_ALTERATIONS",
+    "ROW_DELETIONS",
+    "domain_sets_default",
+    "rebuild_subject",
+    "order_key"
+  ],
+  "sort/finish": ["finish_sort"]
 }

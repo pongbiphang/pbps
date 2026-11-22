@@ -359,6 +359,66 @@ class Move(Tree):
         with self.assertRaisesRegex(ssd.SplitError, "NOPE"):
             self.apply()
 
+    def test_a_listed_item_nobody_names_outside_is_widened_and_not_imported(self) -> None:
+        # A widened function may return it; the parent never writes its name.
+        self.src.write_text(PARENT.replace("alpha(\"x\", '{')", "1"))
+        self.base = self.src.read_text()
+        self.write_plan({**PLAN, "_pub_super": [*PLAN["_pub_super"], "alpha"]})
+        self.apply()
+        self.assertIn("pub(super) fn alpha", self.module("first").read_text())
+        self.assertNotIn("alpha", self.src.read_text().replace("fn alpha", ""))
+        self.assertEqual(self.check(), [])
+        self.assertEqual(self.apply(), [], "a second run changes nothing")
+
+    def test_a_name_read_outside_is_still_imported_when_listed_in_pub_super(self) -> None:
+        self.write_plan({**PLAN, "_pub_super": [*PLAN["_pub_super"], "alpha"]})
+        self.apply()
+        self.assertIn("\nuse first::alpha;", self.src.read_text())  # beta, in the parent, calls it
+
+    def test_a_word_that_is_only_a_local_binding_is_not_a_read(self) -> None:
+        binding = PARENT.replace("alpha(\"x\", '{').len() as u8", "{ let alpha = 1u8; alpha }")
+        self.src.write_text(binding)
+        self.base = binding
+        self.apply()  # the word makes `alpha` look read outside
+        self.assertIn("\nuse first::alpha;", self.src.read_text())
+        self.assertIn("pub(super) fn alpha", self.module("first").read_text())
+        self.src.write_text(binding)
+        for path in self.dir.glob("[a-z]*.rs"):
+            if path.name != "tests.rs":
+                path.unlink()
+        self.write_plan({**PLAN, "_not_read": ["alpha"]})
+        self.apply()
+        self.assertNotIn("pub(super) fn alpha", self.module("first").read_text())
+        self.assertNotIn("use first::alpha;", self.src.read_text())
+        self.assertEqual(self.check(), [])
+        self.assertEqual(self.apply(), [], "a second run changes nothing")
+
+    def test_a_binding_in_another_module_is_not_a_read_either(self) -> None:
+        binding = PARENT.replace("alpha(\"x\", '{').len() as u8", "{ let alpha = 1u8; alpha }")
+        self.src.write_text(binding)
+        self.base = binding
+        plan = {**PLAN, "second": [*PLAN["second"], "beta"]}
+        self.write_plan(plan)
+        self.apply()
+        self.assertIn("pub(super) fn alpha", self.module("first").read_text())  # the sibling's binding counts
+        self.src.write_text(binding)
+        for path in self.dir.glob("[a-z]*.rs"):
+            if path.name != "tests.rs":
+                path.unlink()
+        self.write_plan({**plan, "_not_read": ["alpha"]})
+        self.apply()
+        self.assertNotIn("pub(super) fn alpha", self.module("first").read_text())
+        self.assertEqual(self.check(), [])
+
+    def test_not_read_names_must_be_items_the_plan_moves(self) -> None:
+        self.write_plan({**PLAN, "_not_read": ["beta"]})  # a real item, but the plan leaves it in the parent
+        with self.assertRaisesRegex(ssd.SplitError, "_not_read.*beta"):
+            self.apply()
+        self.write_plan({**PLAN, "_not_read": ["NOPE"]})
+        with self.assertRaisesRegex(ssd.SplitError, "_not_read.*NOPE"):
+            self.apply()
+        self.assertFalse(self.module("first").exists(), "nothing is written when the run fails")
+
     def test_it_reads_the_tree_and_no_line_numbers(self) -> None:
         # The same items at other places, with other lines between them.
         text = PARENT.replace("const LIMIT: usize = 3;\n\n", "")
