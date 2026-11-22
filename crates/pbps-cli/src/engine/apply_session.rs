@@ -34,6 +34,21 @@ pub(crate) struct SealedPrerequisites {
     pub input_roots: BTreeSet<i64>,
 }
 
+/// A history-table name a plan creates that the database already holds under
+/// something else, which the engine would take as the history rather than
+/// refuse (#1176).
+pub(crate) struct TakenHistoryName {
+    /// The system-versioned table that names it.
+    pub table: TableName,
+    /// The name as the plan spells it.
+    pub history: TableName,
+    /// What holds it, as the engine's catalog names the kind.
+    pub kind: String,
+    /// The name as the catalog spells it, which the database's collation may
+    /// match to `history` without being equal to it.
+    pub name: TableName,
+}
+
 /// Evidence lives for this attempt, while closing verification is always fresh.
 #[derive(Default)]
 pub(crate) struct Transaction {
@@ -259,14 +274,19 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         self.replay_type_pins(conn, plan, trusted, at.within())
             .await
     }
+    /// Reads the routines `roots` name, with their sources, where `at` says who
+    /// owns the transaction the read runs in: the routines a plan's type input
+    /// paths would run, to compare with what the plan pinned (DEC-2181.2).
+    ///
+    /// Required: an engine that pins no routine refuses by name. An empty read
+    /// from one never asked would let a pin check pass over routines nothing
+    /// read.
     async fn selected_rows(
         &self,
         conn: &mut Conn,
         at: Check<'_>,
         roots: &[i64],
-    ) -> Result<(pbps_dialect::routines::Read, Vec<pbps_model::TypeRoutine>), DbError> {
-        pbps_pg::pins::selected(conn, at.within(), roots).await
-    }
+    ) -> Result<(pbps_dialect::routines::Read, Vec<pbps_model::TypeRoutine>), DbError>;
     /// Reads the routines a plan pins against replacement (DEC-319.1), where
     /// `at` says who owns the transaction the read runs in. `None` is the
     /// engine's statement that it pins no routine, which a caller reads as
@@ -335,16 +355,7 @@ pub(crate) trait ApplySession: crate::emission::Engine {
                 // Judged by the plan's own admission before the statement
                 // runs, with what the earlier steps created in place.
                 let admission = approved.admission();
-                pbps_pg::table_expressions::vet_change(
-                    conn,
-                    &admission,
-                    pbps_db::TransactionOwner::CallersTransaction,
-                    pbps_pg::table_expressions::Moment::Statement,
-                    change,
-                )
-                .await
-                .and_then(pbps_pg::table_expressions::Vetted::admitted)
-                .map_err(anyhow::Error::msg)?;
+                self.vet_introduced(conn, &admission, change).await?;
             }
         }
         Ok(())
@@ -373,12 +384,12 @@ pub(crate) trait ApplySession: crate::emission::Engine {
             }
             Execution::StagedGuardedDdl { previous } => {
                 self.verify_retained(state, conn, previous).await?;
-                after_statement(conn, admission, stmt, plan, changes, executed).await?;
+                after_statement(self, conn, admission, stmt, plan, changes, executed).await?;
                 self.refuse_unsafe_definers(conn, &written_routines(changes), Absent::NotYetCreated)
                     .await
             }
             Execution::Transactional => {
-                after_statement(conn, admission, stmt, plan, changes, executed).await
+                after_statement(self, conn, admission, stmt, plan, changes, executed).await
             }
         }
     }
@@ -392,37 +403,55 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         Ok(())
     }
     /// Recover validation after a staged step's caller has rolled its transaction back.
+    ///
+    /// `None` is the engine's statement that the statement left no validation
+    /// to recover. Required: an answer from an engine that was never asked
+    /// would leave a failed validation unexplained.
     async fn recover_failed_validation(
         &self,
         conn: &mut Conn,
         statement: &pbps_dialect::Statement,
-    ) -> Option<String> {
-        let check = statement
-            .scan_check
-            .as_ref()
-            .filter(|check| check.step == pbps_dialect::ScanCheckStep::Validate)?;
-        match conn.driver() {
-            // SQL Server does not emit a staged attach's temporary CHECK.
-            Driver::Mssql => None,
-            Driver::Postgres => Some(pbps_pg::staged::recover_failed_validation(conn, check).await),
-        }
-    }
+    ) -> Option<String>;
+    /// Reads the physical defaults of the declared types the plan pins into this
+    /// attempt's evidence, where `owner` says who owns the transaction the read
+    /// runs in.
+    ///
+    /// Required: whether an engine declares types at all is a fact about it,
+    /// and an answer from an engine that was never asked would leave a declared
+    /// type's default to be compared as if the database had none.
     async fn capture_physical_defaults(
         &self,
         state: &mut Self::State,
         conn: &mut Conn,
         plan: &pbps_model::SavedPlan,
         owner: pbps_db::TransactionOwner,
-    ) -> anyhow::Result<()> {
-        self.state(state).defaults = pbps_pg::type_refs::declared::capture_defaults(
-            conn,
-            &plan.declared_type_pins,
-            &plan.changes,
-            owner,
-        )
-        .await?;
-        Ok(())
-    }
+    ) -> anyhow::Result<()>;
+    /// Judges the code a table expression calls, just before the statement that
+    /// introduces it, with what the plan created earlier in place, inside the
+    /// caller's transaction (DEC-2563.4). A refusal carries the fix.
+    ///
+    /// Required: an engine that was never asked must not read as one whose
+    /// statements introduce no expression to judge.
+    async fn vet_introduced(
+        &self,
+        conn: &mut Conn,
+        admission: &RoutineAdmission,
+        change: &pbps_model::Change,
+    ) -> anyhow::Result<()>;
+    /// Compares the declared type a statement left with what the catalog holds,
+    /// inside the transaction that ran it: `pins` are what the plan pinned and
+    /// `executed` the statements that ran before it.
+    ///
+    /// Required, for the reason of [`Self::vet_introduced`].
+    async fn vet_declared_type(
+        &self,
+        conn: &mut Conn,
+        statement: &pbps_dialect::DeclaredTypeStatement,
+        admission: &RoutineAdmission,
+        pins: &[pbps_model::DeclaredTypePin],
+        changes: &ChangeSet,
+        executed: &[pbps_dialect::Statement],
+    ) -> anyhow::Result<()>;
     async fn hold_retained(
         &self,
         state: &mut Self::State,
@@ -595,15 +624,17 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         routines: &[(pbps_model::ModuleId, pbps_model::ModuleKind)],
         absent: Absent,
     ) -> anyhow::Result<()>;
-    /// The objects the database already holds under the history-table names a
-    /// plan would create (#1176): `None` when the engine has no system-versioned
-    /// table, so no name can be taken. Neutral code keeps the refusal.
-    /// Required, so an engine never asked is not read as one with no occupant.
-    async fn history_name_occupants(
+    /// The history-table names `names`, which `changes` create (#1176), that the
+    /// database still holds when the plan creates them: empty when the engine
+    /// has no system-versioned table, so no name can be taken. Neutral code
+    /// keeps the refusal. Required, so an engine never asked is not read as one
+    /// with no occupant.
+    async fn taken_history_names(
         &self,
         conn: &mut Conn,
+        changes: &ChangeSet,
         names: &[TableName],
-    ) -> anyhow::Result<Option<Vec<pbps_mssql::catalog::NameOccupant>>>;
+    ) -> anyhow::Result<Vec<TakenHistoryName>>;
     /// What a plan over generated columns needs of this server and of the
     /// columns already there, asked before anything is written (DEC-1168.1).
     ///
@@ -876,16 +907,7 @@ pub(crate) async fn before_statement<S: ApplySession>(
     // The routines a table expression calls are judged just before the statement
     // that introduces it, with what the plan created earlier in place (DEC-2563.4).
     if let Some(change) = &stmt.introduces {
-        pbps_pg::table_expressions::vet_change(
-            conn,
-            admission,
-            pbps_db::TransactionOwner::CallersTransaction,
-            pbps_pg::table_expressions::Moment::Statement,
-            change,
-        )
-        .await
-        .and_then(pbps_pg::table_expressions::Vetted::admitted)
-        .map_err(anyhow::Error::msg)?;
+        session.vet_introduced(conn, admission, change).await?;
     }
     // A drop is vetted before it runs: what it would delete is judged while
     // it can still be refused, not after (DEC-2447.8).
@@ -896,7 +918,8 @@ pub(crate) async fn before_statement<S: ApplySession>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn after_statement(
+pub(crate) async fn after_statement<S: ApplySession>(
+    session: &S,
     conn: &mut Conn,
     admission: &RoutineAdmission,
     stmt: &pbps_dialect::Statement,
@@ -905,15 +928,16 @@ pub(crate) async fn after_statement(
     executed: &[pbps_dialect::Statement],
 ) -> anyhow::Result<()> {
     if let Some(type_statement) = &stmt.declared_type {
-        pbps_pg::type_refs::declared::vet(
-            conn,
-            type_statement,
-            admission,
-            plan.map_or(&[][..], |p| p.declared_type_pins.as_slice()),
-            changes,
-            executed,
-        )
-        .await?;
+        session
+            .vet_declared_type(
+                conn,
+                type_statement,
+                admission,
+                plan.map_or(&[][..], |p| p.declared_type_pins.as_slice()),
+                changes,
+                executed,
+            )
+            .await?;
     }
     if let Some(extension) = &stmt.extension {
         crate::deploy::vet_after_extension(conn, extension, plan).await?;

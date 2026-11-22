@@ -14,6 +14,47 @@ impl ApplySession for pbps_mssql::Mssql {
     ) -> Option<&'s dyn pbps_dialect::RetainedComparison> {
         None
     }
+    /// SQL Server does not emit a staged attach's temporary CHECK.
+    async fn recover_failed_validation(
+        &self,
+        _conn: &mut Conn,
+        _statement: &pbps_dialect::Statement,
+    ) -> Option<String> {
+        None
+    }
+    /// SQL Server declares no type, so no physical default is read and the
+    /// transaction keeps its empty defaults.
+    async fn capture_physical_defaults(
+        &self,
+        _state: &mut Self::State,
+        _conn: &mut Conn,
+        _plan: &pbps_model::SavedPlan,
+        _owner: pbps_db::TransactionOwner,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// SQL Server binds no table expression this way (see
+    /// [`ApplySession::table_sites`]), so none of its statements introduces one.
+    async fn vet_introduced(
+        &self,
+        _conn: &mut Conn,
+        _admission: &RoutineAdmission,
+        _change: &pbps_model::Change,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// SQL Server declares no type, so no statement leaves one to compare.
+    async fn vet_declared_type(
+        &self,
+        _conn: &mut Conn,
+        _statement: &pbps_dialect::DeclaredTypeStatement,
+        _admission: &RoutineAdmission,
+        _pins: &[pbps_model::DeclaredTypePin],
+        _changes: &ChangeSet,
+        _executed: &[pbps_dialect::Statement],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn hold_retained(
         &self,
         _state: &mut Self::State,
@@ -145,15 +186,25 @@ impl ApplySession for pbps_mssql::Mssql {
     }
     /// SQL Server takes an existing table whose columns match as the history,
     /// rows and all, where any other `CREATE` would be refused (measured on
-    /// 17.0), so it is asked.
-    async fn history_name_occupants(
+    /// 17.0), so it is asked. The occupants are read from `sys.objects` and
+    /// walked in the order the plan runs, so an object the plan drops or renames
+    /// away first frees its name.
+    async fn taken_history_names(
         &self,
         conn: &mut Conn,
+        changes: &ChangeSet,
         names: &[TableName],
-    ) -> anyhow::Result<Option<Vec<pbps_mssql::catalog::NameOccupant>>> {
-        Ok(Some(
-            pbps_mssql::catalog::object_name_occupants(conn, names, &[]).await?,
-        ))
+    ) -> anyhow::Result<Vec<TakenHistoryName>> {
+        let held = pbps_mssql::catalog::object_name_occupants(conn, names, &[]).await?;
+        Ok(crate::deploy::blocking_history_occupants(changes, &held)
+            .into_iter()
+            .map(|(table, history, occupant)| TakenHistoryName {
+                table,
+                history,
+                kind: occupant.kind.clone(),
+                name: occupant.name.clone(),
+            })
+            .collect())
     }
     fn rebuild_mode(&self, changes: &ChangeSet, staged: bool) -> anyhow::Result<()> {
         plan_session::mssql::require_transactional_rebuilds(changes, staged)
@@ -225,6 +276,19 @@ impl ApplySession for pbps_mssql::Mssql {
         _at: Check<'_>,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+    /// SQL Server pins no routine (DEC-319.1), so no plan of its own holds
+    /// routines to read back.
+    async fn selected_rows(
+        &self,
+        _conn: &mut Conn,
+        _at: Check<'_>,
+        _roots: &[i64],
+    ) -> Result<(pbps_dialect::routines::Read, Vec<pbps_model::TypeRoutine>), DbError> {
+        Err(DbError::Refused(
+            "SQL Server pins no routine, so there is none to read for a plan's type input paths"
+                .to_owned(),
+        ))
     }
     /// SQL Server pins no routine (DEC-319.1).
     async fn replaceable_rows(

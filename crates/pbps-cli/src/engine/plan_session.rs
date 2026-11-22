@@ -895,7 +895,7 @@ pub(crate) trait PlanSession: crate::emission::Engine {
         &self,
         _conn: &mut Conn,
         _prefixes: &[(String, String)],
-    ) -> anyhow::Result<Vec<pbps_pg::catalog::KeyNameHolder>> {
+    ) -> anyhow::Result<Vec<crate::dependents::KeyNameHolder>> {
         defaults::later_relation_question(self.name())
     }
 

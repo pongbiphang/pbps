@@ -24,6 +24,67 @@ impl ApplySession for pbps_pg::Postgres {
             .as_ref()
             .map(|verified| verified as &dyn pbps_dialect::RetainedComparison)
     }
+    /// A staged attach's temporary CHECK is validated in a step of its own; when
+    /// that step fails, what the rolled-back transaction held is read again to
+    /// say why.
+    async fn recover_failed_validation(
+        &self,
+        conn: &mut Conn,
+        statement: &pbps_dialect::Statement,
+    ) -> Option<String> {
+        let check = statement
+            .scan_check
+            .as_ref()
+            .filter(|check| check.step == pbps_dialect::ScanCheckStep::Validate)?;
+        Some(pbps_pg::staged::recover_failed_validation(conn, check).await)
+    }
+    async fn capture_physical_defaults(
+        &self,
+        state: &mut Self::State,
+        conn: &mut Conn,
+        plan: &pbps_model::SavedPlan,
+        owner: pbps_db::TransactionOwner,
+    ) -> anyhow::Result<()> {
+        self.state(state).defaults = pbps_pg::type_refs::declared::capture_defaults(
+            conn,
+            &plan.declared_type_pins,
+            &plan.changes,
+            owner,
+        )
+        .await?;
+        Ok(())
+    }
+    async fn vet_introduced(
+        &self,
+        conn: &mut Conn,
+        admission: &RoutineAdmission,
+        change: &pbps_model::Change,
+    ) -> anyhow::Result<()> {
+        pbps_pg::table_expressions::vet_change(
+            conn,
+            admission,
+            pbps_db::TransactionOwner::CallersTransaction,
+            pbps_pg::table_expressions::Moment::Statement,
+            change,
+        )
+        .await
+        .and_then(pbps_pg::table_expressions::Vetted::admitted)
+        .map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+    async fn vet_declared_type(
+        &self,
+        conn: &mut Conn,
+        statement: &pbps_dialect::DeclaredTypeStatement,
+        admission: &RoutineAdmission,
+        pins: &[pbps_model::DeclaredTypePin],
+        changes: &ChangeSet,
+        executed: &[pbps_dialect::Statement],
+    ) -> anyhow::Result<()> {
+        pbps_pg::type_refs::declared::vet(conn, statement, admission, pins, changes, executed)
+            .await?;
+        Ok(())
+    }
     /// Retention is a connected engine guard, never a second plan emitter.
     async fn hold_retained(
         &self,
@@ -202,12 +263,13 @@ impl ApplySession for pbps_pg::Postgres {
         Ok(())
     }
     /// PostgreSQL has no system-versioned table, so no history name can be taken.
-    async fn history_name_occupants(
+    async fn taken_history_names(
         &self,
         _conn: &mut Conn,
+        _changes: &ChangeSet,
         _names: &[TableName],
-    ) -> anyhow::Result<Option<Vec<pbps_mssql::catalog::NameOccupant>>> {
-        Ok(None)
+    ) -> anyhow::Result<Vec<TakenHistoryName>> {
+        Ok(Vec::new())
     }
     fn rebuild_mode(&self, changes: &ChangeSet, staged: bool) -> anyhow::Result<()> {
         plan_session::postgres::require_transactional_rebuilds(changes, staged)
@@ -333,6 +395,15 @@ impl ApplySession for pbps_pg::Postgres {
         )
         .await?;
         Ok(())
+    }
+    /// The routines are read from `pg_proc`.
+    async fn selected_rows(
+        &self,
+        conn: &mut Conn,
+        at: Check<'_>,
+        roots: &[i64],
+    ) -> Result<(pbps_dialect::routines::Read, Vec<pbps_model::TypeRoutine>), DbError> {
+        pbps_pg::pins::selected(conn, at.within(), roots).await
     }
     /// The routines are read from `pg_proc`.
     async fn replaceable_rows(
