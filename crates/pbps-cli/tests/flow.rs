@@ -24867,6 +24867,71 @@ fn data_work_preserves_cli_audit_and_json_boundaries() {
     data_work::cli_boundaries(false);
 }
 
+#[path = "support/live_diff.rs"]
+mod live_diff;
+
+/// `pbps diff` (#3028). A module of its own, so that one ownership rule
+/// covers every live case in it.
+mod live_diff_mssql {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs live mssql"]
+    fn a_matching_database_is_no_difference_and_nothing_is_written() {
+        live_diff::a_matching_database_has_no_difference_and_gains_nothing(
+            &std::env::var("PBPS_TEST_DB").unwrap(),
+            false,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live mssql"]
+    fn a_missing_column_is_one_added_column() {
+        live_diff::a_missing_column_is_one_added_column(
+            &std::env::var("PBPS_TEST_DB").unwrap(),
+            false,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live mssql"]
+    fn what_was_not_compared_is_listed_and_is_no_difference() {
+        live_diff::what_was_not_compared_is_listed_and_is_no_difference(
+            &std::env::var("PBPS_TEST_DB").unwrap(),
+            false,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live mssql"]
+    fn names_are_all_it_pairs_by_so_a_rename_is_a_drop_and_a_create() {
+        live_diff::a_rename_is_a_drop_and_a_create(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+    }
+
+    #[test]
+    #[ignore = "needs live mssql"]
+    fn a_respelled_text_is_reported_apart_from_the_changes() {
+        live_diff::a_respelled_text_is_a_text_difference_until_pulled(
+            &std::env::var("PBPS_TEST_DB").unwrap(),
+            false,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live mssql"]
+    fn a_ledger_does_not_change_the_answer() {
+        live_diff::a_ledger_does_not_change_the_answer(
+            &std::env::var("PBPS_TEST_DB").unwrap(),
+            false,
+        );
+    }
+
+    #[test]
+    fn without_a_database_it_is_unanswerable_and_writes_nothing() {
+        live_diff::without_a_database(false);
+    }
+}
+
 #[path = "support/consumer_contracts.rs"]
 mod consumer_contracts;
 

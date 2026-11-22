@@ -36930,6 +36930,68 @@ fn data_work_preserves_cli_audit_and_json_boundaries() {
     data_work::cli_boundaries(true);
 }
 
+#[path = "support/live_diff.rs"]
+mod live_diff;
+
+/// `pbps diff` (#3028). A module of its own, so that one ownership rule
+/// covers every live case in it.
+mod live_diff_pg {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs live postgres"]
+    fn a_matching_database_is_no_difference_and_nothing_is_written() {
+        for server in [server(), old_server()] {
+            live_diff::a_matching_database_has_no_difference_and_gains_nothing(&server, true);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs live postgres"]
+    fn a_missing_column_is_one_added_column() {
+        for server in [server(), old_server()] {
+            live_diff::a_missing_column_is_one_added_column(&server, true);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs live postgres"]
+    fn what_was_not_compared_is_listed_and_is_no_difference() {
+        for server in [server(), old_server()] {
+            live_diff::what_was_not_compared_is_listed_and_is_no_difference(&server, true);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs live postgres"]
+    fn names_are_all_it_pairs_by_so_a_rename_is_a_drop_and_a_create() {
+        for server in [server(), old_server()] {
+            live_diff::a_rename_is_a_drop_and_a_create(&server, true);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs live postgres"]
+    fn a_respelled_text_is_reported_apart_from_the_changes() {
+        for server in [server(), old_server()] {
+            live_diff::a_respelled_text_is_a_text_difference_until_pulled(&server, true);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs live postgres"]
+    fn a_ledger_does_not_change_the_answer() {
+        for server in [server(), old_server()] {
+            live_diff::a_ledger_does_not_change_the_answer(&server, true);
+        }
+    }
+
+    #[test]
+    fn without_a_database_it_is_unanswerable_and_writes_nothing() {
+        live_diff::without_a_database(true);
+    }
+}
+
 #[path = "support/consumer_contracts.rs"]
 mod consumer_contracts;
 

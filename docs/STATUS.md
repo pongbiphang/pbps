@@ -233,7 +233,8 @@ and the sync `plan` performs are DEC-2600.1 and DEC-2600.6 to DEC-2600.10.
 Connected (each takes `--db <connection string or SQLite path>` or `--env <name>`): `pull`
 (`--force` / `--data` / `--partitions-external`), `plan --db` (`--staged` / `--resolve-with` / `--assert` / `--no-rehearse`), `apply` (`--plan` /
 `--checksum` / `--allow` / `--staged` /
-`--resume`), `verify` (`--format json`), `snapshot` (`--force`), `baseline`
+`--resume`), `verify` (`--format json`), `diff` (`--format json`; no ledger,
+DEC-3028.1), `snapshot` (`--force`), `baseline`
 (`--reason`), `bootstrap` (`--sql` / `--create`), `state list` (`--limit` / `--format json`),
 `state show <id>`, `state diff <id> [<id>]`, `state export <id>` (`--force`),
 `state prune` (`--keep`), `unlock`, `status` (`--format json`). The historical

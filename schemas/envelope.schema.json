@@ -41,6 +41,9 @@
     },
     {
       "$ref": "#/$defs/envelope.state-export"
+    },
+    {
+      "$ref": "#/$defs/envelope.diff"
     }
   ],
   "$defs": {
@@ -3887,6 +3890,117 @@
           "anyOf": [
             {
               "$ref": "#/$defs/ExportData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "description": "What a read-only command produced.\n\nGeneric over the payload so a command with one — `verify`'s drift report,\n`status`'s environment rows — carries it without inventing a second\nenvelope. Commands with nothing but diagnostics use [`Report::plain`].",
+      "type": "object"
+    },
+    "LiveDiffData": {
+      "description": "What `--format json` carries under `data`.",
+      "type": "object",
+      "properties": {
+        "environment": {
+          "type": "string"
+        },
+        "changes": {
+          "description": "What would make the database hold the declarations, in a plan's\ndirection. Structure only: a text is equal here wherever its object\nexists on both sides."
+        },
+        "text_differences": {
+          "description": "The texts the database stores under another spelling than the\ndeclarations, or with another meaning; this command cannot tell which.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TextDifference"
+          }
+        },
+        "unexpressible": {
+          "description": "Differences that are established and that no change can carry.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "not_compared": {
+          "description": "What the read left out of a managed object. Never a difference: the\nrest of the object was compared without it.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "unmanaged": {
+          "description": "What the database holds outside the declarations and the identity file.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "environment",
+        "changes",
+        "text_differences",
+        "unexpressible",
+        "not_compared",
+        "unmanaged"
+      ]
+    },
+    "TextDifference": {
+      "description": "One text the declarations and the database spell differently.",
+      "type": "object",
+      "properties": {
+        "object": {
+          "description": "What the text belongs to, as the report prints it.",
+          "type": "string"
+        },
+        "declared": {
+          "type": "string"
+        },
+        "stored": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "object",
+        "declared",
+        "stored"
+      ]
+    },
+    "envelope.diff": {
+      "required": [
+        "schema_version",
+        "tool_version",
+        "command",
+        "result",
+        "findings"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "tool_version": {
+          "type": "string"
+        },
+        "command": {
+          "const": "diff"
+        },
+        "result": {
+          "description": "Derived from the findings rather than set by the caller, so it cannot\ncome to disagree with them — except for [`Outcome::Unanswerable`], which\nno finding can imply and which the command marks explicitly with\n[`Report::unanswerable`].",
+          "$ref": "#/$defs/Outcome"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Finding"
+          }
+        },
+        "data": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LiveDiffData"
             },
             {
               "type": "null"

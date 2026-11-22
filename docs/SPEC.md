@@ -3029,6 +3029,7 @@ full state.
 | `pbps pull` | Reverse-generate YAML declarations from an existing database (a new user's first step). `--data <table>` also declares that table's rows as `exact` reference data; `--partitions-external <parent>` declares that parent's partitions `external`, which pg_partman's parents are without it (DEC-1533.1) |
 | `pbps plan --db` | Compute an applyable plan against the target environment as queried (the deployment layer, see 7.3). `--staged` produces a staged plan for one logical change (ADR-0003) |
 | `pbps verify` | The drift check: the live database against `__pbps_state`. `--format json` emits the typed drift diff, and found drift fires the `on_drift` hook (see 9.4) |
+| `pbps diff` | The declarations against the live database, with no ledger: read-only, objects paired by name, the typed changes and the text differences. Never an applyable plan (see below, DEC-3028.1) |
 | `pbps apply --plan plan.json --checksum ... --allow ...` | Apply exactly the plan checksum approved at the deployment gate. `--staged` runs a staged plan statement by statement outside a transaction, recording each completion; `--staged --resume` continues one that stopped |
 | `pbps snapshot` | Query the database and write a new `__pbps_state` |
 | `pbps baseline --reason ...` | Reset the state baseline; operator provenance follows §8.1 |
@@ -3072,6 +3073,33 @@ environment to lay the divergences out, deciding per environment whether to
 "plan / apply it into agreement with the declarations" or "this environment's
 difference is right, fold it back into the declarations". Onboarding is done when
 every environment has been `snapshot`ted and drifts by nothing.
+
+**`pbps diff` is that comparison** (DEC-3028.1). It reads the declarations and
+the database's catalog and nothing else: it needs no ledger, creates none,
+records nothing and writes no file, so it answers for a database pbps has
+never deployed and answers the same for one it has. The direction is `plan`'s:
+the changes that would bring the database to the declarations.
+
+- **Names pair the objects.** There is no recorded identity to pair by, so a
+  table or column under another name is a drop and a create, and the report
+  says the comparison is by name whenever its changes could be one rename.
+  It asks no rename question and writes no identity.
+- **The scope is the declared names and the names in the identity files.** An
+  object outside it is listed as unmanaged and not compared, under the
+  project's `unmanaged:` policy as `verify` applies it.
+- **Two lists.** The *changes* are computed with the declared text wherever an
+  object stands on both sides, so an engine's respelling of a check, a default
+  or a view body is not a drop and an add. The *text differences* list every
+  such text that differs, with both spellings. The texts are not judged
+  equivalent: a database built by `pull` has none, and one built by hand has
+  one per text the engine rewrote. Either list makes the result `findings`.
+- **What the reader left out is said and is no difference.** A part of a
+  managed object the model cannot hold is listed after the changes as
+  `diff.not-compared`; a database that otherwise matches still exits 0.
+- **Not compared at all:** roles, grants, row security and declared rows.
+
+It takes no option that writes SQL or a plan. Deploying is still `plan --db`
+and `apply` against a recorded baseline (14.3).
 
 A subsequent `pull --force` replaces declarations while preserving existing
 exact-name identities and tombstones. New names receive new identities. If a
@@ -4621,6 +4649,16 @@ duplicate human prose on stderr. Operational failures remain `unanswerable`
 and exit `1`. Human output keeps its existing diagnostics.
 Changes the differ cannot express retain one `change.unexpressible` finding per
 reason in both offline and connected JSON, remaining `unanswerable` with exit `1`.
+
+`diff` (§9.2) uses the envelope with a `command: "diff"` branch. A change
+(`diff.differs`), a text difference (`diff.text-differences`), a difference no
+change expresses (`change.unexpressible`) and an unmanaged object under
+`unmanaged: error` (`diff.unmanaged-refused`) are `findings` (exit `2`).
+`diff.not-compared`, `diff.names-only` and `diff.unmanaged` inform and never
+change the result. Declarations that do not load, an unreadable identity file,
+an unreachable database (`environment.unreachable`) and a catalog that cannot
+be read (`environment.unreadable`) are `unanswerable` (exit `1`): exit `2`
+here means "differs", so a comparison that was not made cannot use it.
 
 For a selected resolver (§9.3.2), a required question it leaves unresolved,
 an observed incompatibility or a known unsupported resolution case
