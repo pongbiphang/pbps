@@ -23,6 +23,7 @@ use pbps_dialect::Dialect;
 use pbps_model::{ModuleId, ModuleKind, Role, Schema};
 
 use crate::declaration_file;
+use crate::engine::PlanSession as _;
 
 /// Catalog presence cannot select code packages for management (DEC-2447.3).
 /// Read declarations as well as identities: a hand-authored package is explicit
@@ -222,7 +223,7 @@ pub(crate) async fn hand_over_external_partitions(
 
     // No engine branch here: SQL Server has no partitioned table in this
     // model, so a named parent is refused below as one pull does not keep,
-    // and the engine seam answers that no pg_partman is installed.
+    // and the maintenance inventory answers that nothing is maintained.
     let parent = |schema: &Schema, name: &pbps_model::TableName| {
         schema
             .tables
@@ -241,38 +242,30 @@ pub(crate) async fn hand_over_external_partitions(
         }
         external.insert(name.clone(), "named with --partitions-external".to_owned());
     }
-    if let Some(schema) = crate::engine::partman_schema(conn).await? {
-        let maintained = crate::engine::partman_maintained(conn, &schema)
-            .await
-            .with_context(|| {
-                format!(
-                    "pg_partman is installed in schema `{schema}`, and its `part_config` cannot \
-                     be read as this role, so pull cannot tell which parents' partitions it \
-                     makes; grant USAGE on schema `{schema}` and SELECT on \
-                     `{schema}.part_config`, then pull again"
-                )
-            })?;
-        for m in maintained {
-            if let Some(template) = &m.template
-                && pulled.schema.tables.remove(template).is_some()
-            {
-                pulled.onboarding_notices.push(format!(
-                    "table `{template}` was left out: it is pg_partman's template for `{}`",
-                    m.parent.shown(),
-                    template = template.shown()
-                ));
-            }
-            if parent(&pulled.schema, &m.parent) {
-                external
-                    .entry(m.parent.clone())
-                    .or_insert_with(|| "pg_partman maintains it".to_owned());
-            } else {
-                pulled.warnings.push(format!(
-                    "pg_partman maintains `{}`, which this pull does not keep as a \
-                     partitioned parent; its partitions are not declared external",
-                    m.parent.shown()
-                ));
-            }
+    let selected = crate::engine::apply_session::selected(conn.driver());
+    let maintained = pbps_cli::with_plan_dialect!(&selected, |session| {
+        session.maintained_partitions(conn).await?
+    });
+    for m in maintained {
+        if let Some(template) = &m.template
+            && pulled.schema.tables.remove(template).is_some()
+        {
+            pulled.onboarding_notices.push(format!(
+                "table `{template}` was left out: it is pg_partman's template for `{}`",
+                m.parent.shown(),
+                template = template.shown()
+            ));
+        }
+        if parent(&pulled.schema, &m.parent) {
+            external
+                .entry(m.parent.clone())
+                .or_insert_with(|| "pg_partman maintains it".to_owned());
+        } else {
+            pulled.warnings.push(format!(
+                "pg_partman maintains `{}`, which this pull does not keep as a \
+                 partitioned parent; its partitions are not declared external",
+                m.parent.shown()
+            ));
         }
     }
     let mut refused = Vec::new();

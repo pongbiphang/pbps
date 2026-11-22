@@ -1215,6 +1215,14 @@ impl PlanSession for pbps_mssql::Mssql {
     ) -> anyhow::Result<DomainCode> {
         Ok(DomainCode::NotAsked)
     }
+    /// SQL Server has no tool that creates partitions for a parent, and no
+    /// partitioned table in this model.
+    async fn maintained_partitions(
+        &self,
+        _conn: &mut Conn,
+    ) -> anyhow::Result<Vec<MaintainedParent>> {
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(test)]

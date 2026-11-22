@@ -63,6 +63,26 @@ impl ApplySession for pbps_pg::Postgres {
         };
         Ok(())
     }
+    async fn standing_scan_checks(
+        &self,
+        conn: &mut Conn,
+        ids: &IdsFile,
+    ) -> anyhow::Result<Vec<pbps_dialect::ScanCheck>> {
+        Ok(pbps_pg::staged::standing_scan_checks(conn, &ids.tables).await?)
+    }
+    async fn drop_scan_checks(
+        &self,
+        conn: &mut Conn,
+        checks: &[pbps_dialect::ScanCheck],
+    ) -> anyhow::Result<()> {
+        Ok(pbps_pg::staged::drop_scan_checks(conn, checks).await?)
+    }
+    async fn handover_catalog(
+        &self,
+        conn: &mut Conn,
+    ) -> Result<Option<pbps_model::baseline_evidence::BaselineCatalog>, DbError> {
+        pbps_pg::catalog::baseline_catalog(conn).await
+    }
     fn rebuild_mode(&self, changes: &ChangeSet, staged: bool) -> anyhow::Result<()> {
         require_transactional_rebuilds(Driver::Postgres, changes, staged)
     }

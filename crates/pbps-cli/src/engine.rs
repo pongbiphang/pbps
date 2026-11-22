@@ -283,42 +283,9 @@ pub async fn is_initialized(conn: &mut Conn) -> Result<bool, DbError> {
     of(conn.driver()).is_initialized(conn).await
 }
 
-/// The temporary CHECKs a staged attach left on its tables, which `baseline`
-/// takes out before it takes the database as it stands (#1638, DEC-1638.1).
-///
-/// Only under the exact name a table's identity in the project's ids file
-/// gives: never by a prefix. Not from the ledger: `baseline` is the remedy
-/// for an entry this build cannot read (DECISIONS 203), and a run that dies
-/// between the `ADD` and the `VALIDATE`'s checkpoint records nothing, so no
-/// entry's kind or ids can be asked first. No declared constraint can hold
-/// the name, the database cannot be read while a `NOT VALID` one stands, and
-/// a validated one is pbps's own. SQL Server's staged plans write none.
-pub async fn standing_scan_checks(
-    conn: &mut Conn,
-    ids: &pbps_model::IdsFile,
-) -> anyhow::Result<Vec<pbps_dialect::ScanCheck>> {
-    Ok(match conn.driver() {
-        Driver::Mssql => Vec::new(),
-        Driver::Postgres => pbps_pg::staged::standing_scan_checks(conn, &ids.tables).await?,
-    })
-}
-
-/// Drops `checks`, inside the transaction `baseline` records in (#2127), and
-/// names each for the record.
-pub async fn drop_scan_checks(
-    conn: &mut Conn,
-    checks: &[pbps_dialect::ScanCheck],
-) -> anyhow::Result<Vec<String>> {
-    if checks.is_empty() {
-        return Ok(Vec::new());
-    }
-    pbps_pg::staged::drop_scan_checks(conn, checks).await?;
-    Ok(checks.iter().map(scan_check_removal_note).collect())
-}
-
 // This value is recorded inside opaque StateSnapshot.reason and participates in
 // its original length/truncation check. Preserve the data; stdout shows it once.
-fn scan_check_removal_note(check: &pbps_dialect::ScanCheck) -> String {
+pub(crate) fn scan_check_removal_note(check: &pbps_dialect::ScanCheck) -> String {
     format!(
         "the staged attach's temporary CHECK `{}` on `{}`",
         check.name.raw(),
@@ -350,16 +317,6 @@ pub async fn entry(
 
 pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>, LedgerError> {
     of(conn.driver()).timeline(conn, limit).await
-}
-
-/// The opaque evidence reader is reachable only through this connected seam.
-pub async fn baseline_catalog(
-    conn: &mut Conn,
-) -> Result<Option<pbps_model::baseline_evidence::BaselineCatalog>, DbError> {
-    match conn.driver() {
-        Driver::Mssql => Ok(None),
-        Driver::Postgres => pbps_pg::catalog::baseline_catalog(conn).await,
-    }
 }
 
 pub async fn record(conn: &mut Conn, snapshot: &StateSnapshot) -> Result<i64, LedgerError> {
@@ -623,27 +580,6 @@ pub async fn database_collation(conn: &mut Conn) -> Result<Option<String>, DbErr
             .await
             .map(Some),
         Driver::Postgres => Ok(None),
-    }
-}
-
-/// The schema pg_partman is installed in, if it is (#1533). SQL Server has
-/// no such tool, and no partitioned table in this model.
-pub async fn partman_schema(conn: &mut Conn) -> Result<Option<String>, DbError> {
-    match conn.driver() {
-        Driver::Mssql => Ok(None),
-        Driver::Postgres => pbps_pg::partman::schema(conn).await,
-    }
-}
-
-/// The parents pg_partman's catalog in `schema` names (#1533). Reached only
-/// through [`partman_schema`], which answers `None` on SQL Server.
-pub async fn partman_maintained(
-    conn: &mut Conn,
-    schema: &str,
-) -> Result<Vec<pbps_pg::partman::Maintained>, DbError> {
-    match conn.driver() {
-        Driver::Mssql => Ok(Vec::new()),
-        Driver::Postgres => pbps_pg::partman::maintained(conn, schema).await,
     }
 }
 
