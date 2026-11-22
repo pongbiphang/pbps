@@ -34,6 +34,7 @@ use pbps_model::escape::Escaped;
 use super::busy::{self, BUSY_WAIT};
 use super::ddl::{RECIPE, Recipe};
 use crate::ident;
+use crate::pragma::{self, foreign_key_list};
 
 /// How many characters of a stored definition a finding quotes on each side of
 /// the first difference: enough to recognise the change, not a second `CREATE`.
@@ -99,23 +100,6 @@ pub(super) fn stranger(name: &str, kind: &str) -> String {
     )
 }
 
-/// A table name as the argument of a pragma statement, which takes no bound
-/// parameter. [`ident::quote`] refuses the empty name, which SQLite accepts for
-/// a table and the pragma reads (measured), so it is written out here: a table
-/// of that name must not hide a key. A NUL ends the statement, so a name with
-/// one is an error and never a question about some other table.
-fn pragma_name(name: &str) -> Result<String, DbError> {
-    if name.is_empty() {
-        return Ok("\"\"".to_owned());
-    }
-    ident::quote(name).map_err(|_| {
-        DbError::BadRow(format!(
-            "the table name `{}` cannot be written into a statement",
-            Escaped(name)
-        ))
-    })
-}
-
 fn problems(c: &Connection) -> Result<Vec<String>, DbError> {
     let names: Vec<&str> = RECIPE.iter().map(|r| r.name).collect();
     let slots = (1..=names.len())
@@ -177,11 +161,8 @@ fn problems(c: &Connection) -> Result<Vec<String>, DbError> {
     for child in &children {
         let child = child.text(0)?;
         let mut onto = BTreeSet::new();
-        for key in c.query(
-            &format!("PRAGMA main.foreign_key_list({})", pragma_name(child)?),
-            &[],
-        )? {
-            let parent = key.text(2)?;
+        for key in pragma::foreign_keys(c, child)? {
+            let parent = key.text(foreign_key_list::TABLE)?;
             if RECIPE.iter().any(|r| ident::same(r.name, parent)) {
                 onto.insert(parent.to_owned());
             }

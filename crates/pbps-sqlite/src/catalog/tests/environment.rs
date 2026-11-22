@@ -4,7 +4,7 @@
 
 use pbps_db::DbError;
 use pbps_db::sqlite::{Connection, OpenMode};
-use pbps_model::{ModuleId, ObjectName};
+use pbps_model::{ModuleId, ObjectName, TableName};
 
 use super::super::{assemble, introspect, introspect_within_transaction, read_raw};
 use super::{limits, read, read_sql, table, warned};
@@ -232,61 +232,121 @@ fn absent_empty_and_unreadable_are_three_answers() {
     assert!(read_raw(fresh.connection()).expect("reads").tables.len() == 1);
 }
 
-/// What reading a database set up by `sql` says, as a refusal.
-fn refusal(sql: &str) -> String {
-    let mut fresh = Fresh::memory();
-    fresh.connection().execute_batch(sql).expect("setup");
-    match introspect(fresh.connection()) {
-        Err(DbError::Refused(m)) => m,
-        other => panic!(
-            "{sql}: expected a refusal, got {:?}",
-            other.map(|p| p.warnings)
-        ),
-    }
-}
+/// A schema with a key, an index, a default and a view: something for every
+/// catalog pragma to say.
+const BESIDE_NAMESAKES: &str = "\
+    CREATE TABLE p(id integer PRIMARY KEY, u text UNIQUE); \
+    CREATE TABLE t(a int DEFAULT 7, b text NOT NULL, p_id integer REFERENCES p, \
+        PRIMARY KEY (b, a)) WITHOUT ROWID; \
+    CREATE INDEX t_a ON t(a DESC) WHERE a IS NOT NULL; \
+    CREATE VIEW v AS SELECT a FROM t";
+
+/// An object of each catalog function's name, shaped like the function and
+/// holding a row that is not the catalog's: what `FROM pragma_x` would answer
+/// (measured: the object's rows, and no error).
+const NAMESAKES: &str = "\
+    CREATE TABLE pragma_table_list(schema text, name text, type text, ncol int, wr int, \
+        strict int); \
+    INSERT INTO pragma_table_list VALUES ('main', 'ghost', 'table', 1, 0, 0); \
+    CREATE TABLE pragma_table_xinfo(cid int, name text, type text, \"notnull\" int, \
+        dflt_value text, pk int, hidden int); \
+    INSERT INTO pragma_table_xinfo VALUES (0, 'ghost', 'int', 0, NULL, 0, 0); \
+    CREATE VIEW pragma_index_list AS SELECT 0 AS seq, 'ghost' AS name, 1 AS \"unique\", \
+        'c' AS origin, 0 AS partial; \
+    CREATE TABLE pragma_foreign_key_list(id int, seq int, \"table\" text, \"from\" text, \
+        \"to\" text, on_update text, on_delete text, match text); \
+    INSERT INTO pragma_foreign_key_list VALUES (0, 0, 'ghost', 'a', NULL, 'x', 'x', 'x'); \
+    CREATE TABLE pragma_database_list(seq int, name text, file text); \
+    INSERT INTO pragma_database_list VALUES (7, 'ghost', '')";
 
 #[test]
-fn an_object_named_like_a_pragma_function_refuses_the_read_and_is_named() {
-    // Each of these takes the place of the catalog function in `FROM pragma_x`
-    // (measured: the rows of the user's table are answered, with no error).
-    for (sql, named) in [
+fn an_object_named_like_a_pragma_function_is_read_as_itself_and_changes_nothing_else() {
+    let (_, plain) = read_sql(BESIDE_NAMESAKES);
+    // Not vacuous: the schema has what the namesakes would answer for.
+    let t = table(&plain, "t");
+    assert!(t.columns.len() == 3 && !t.foreign_keys.is_empty() && !t.indexes.is_empty());
+    let view = |name: &str| ModuleId::Named(ObjectName::new("main", name));
+    assert!(plain.schema.modules.contains_key(&view("v")));
+
+    // In `main` they are four tables and a view more, and nothing else moves.
+    let (_, beside) = read_sql(&format!("{BESIDE_NAMESAKES}; {NAMESAKES}"));
+    let mut without = beside.schema.clone();
+    for name in [
+        "pragma_table_list",
+        "pragma_table_xinfo",
+        "pragma_foreign_key_list",
+        "pragma_database_list",
+    ] {
+        let own = without
+            .tables
+            .remove(&TableName::new("main", name))
+            .unwrap_or_else(|| panic!("`{name}` is a table like any other"));
+        assert!(own.columns.contains_key("name") || own.columns.contains_key("table"));
+    }
+    assert_eq!(table(&beside, "pragma_table_xinfo").columns.len(), 7);
+    assert!(without.modules.remove(&view("pragma_index_list")).is_some());
+    assert_eq!(without, plain.schema);
+    assert_eq!(beside.warnings, plain.warnings);
+
+    // In `temp`, in an attached database and in another case they take the
+    // function's place as well, and the read of `main` is what it was.
+    let temp = NAMESAKES
+        .replace("CREATE TABLE ", "CREATE TEMP TABLE ")
+        .replace("CREATE VIEW ", "CREATE TEMP VIEW ");
+    let attached = format!(
+        "ATTACH DATABASE ':memory:' AS \"o\"\"x\"; {}",
+        NAMESAKES
+            .replace("CREATE TABLE ", "CREATE TABLE \"o\"\"x\".")
+            .replace("CREATE VIEW ", "CREATE VIEW \"o\"\"x\".")
+            .replace("INSERT INTO ", "INSERT INTO \"o\"\"x\".")
+    );
+    for (namesakes, said) in [
         (
-            "CREATE TABLE pragma_table_list(schema, name, type)",
-            "`pragma_table_list` in `main`",
+            temp.as_str(),
+            "the table `pragma_table_list` is in the temporary database",
         ),
         (
-            "CREATE TEMP TABLE pragma_table_list(schema, name, type)",
-            "`pragma_table_list` in `temp`",
-        ),
-        (
-            "CREATE VIEW pragma_table_xinfo AS SELECT 1 AS a",
-            "`pragma_table_xinfo` in `main`",
-        ),
-        (
-            "CREATE TABLE \"PRAGMA_Table_List\"(a)",
-            "`PRAGMA_Table_List` in `main`",
-        ),
-        (
-            "ATTACH DATABASE ':memory:' AS \"o\"\"x\"; CREATE TABLE \"o\"\"x\".pragma_table_list(a)",
-            "`pragma_table_list` in `o\"x`",
+            attached.as_str(),
+            "the table `pragma_table_list` is in the attached `o\"x` database",
         ),
     ] {
-        let message = refusal(sql);
-        assert!(message.contains(named), "{sql}: {message}");
-        assert!(message.contains("rename or drop it"), "{message}");
+        let (_, pulled) = read_sql(&format!("{BESIDE_NAMESAKES}; {namesakes}"));
+        assert_eq!(pulled.schema, plain.schema, "{namesakes}");
+        assert!(warned(&pulled, said), "{said}: {:#?}", pulled.warnings);
     }
+    let (_, mixed) = read_sql(&format!(
+        "{BESIDE_NAMESAKES}; {}",
+        NAMESAKES.replace("pragma_", "PRAGMA_")
+    ));
+    assert_eq!(table(&mixed, "t"), table(&plain, "t"));
+    assert_eq!(table(&mixed, "PRAGMA_table_xinfo").columns.len(), 7);
+    assert!(
+        mixed
+            .schema
+            .modules
+            .contains_key(&view("PRAGMA_index_list"))
+    );
 }
 
 #[test]
-fn a_name_that_only_looks_like_a_pragma_function_reads_normally() {
-    // Negative: the prefix is `pragma_` at the start, and only a table or view
-    // can take a function's place.
-    let (_, pulled) = read_sql(
-        "CREATE TABLE pragmatic(a int); CREATE TABLE xpragma_table_list(a int); \
-         CREATE TABLE pragma(a int); CREATE TABLE t(a int); CREATE INDEX pragma_i ON t(a); \
-         ATTACH DATABASE ':memory:' AS o; CREATE TABLE o.other(a)",
-    );
-    for name in ["pragmatic", "xpragma_table_list", "pragma", "t"] {
-        table(&pulled, name);
+fn the_rows_of_a_namesake_are_never_taken_for_the_catalogs() {
+    // Negative: what the namesakes hold is data. No table, column, index, key
+    // or database `ghost` is read from it, wherever the namesake is.
+    let temp = NAMESAKES
+        .replace("CREATE TABLE ", "CREATE TEMP TABLE ")
+        .replace("CREATE VIEW ", "CREATE TEMP VIEW ");
+    for namesakes in [NAMESAKES, temp.as_str()] {
+        let (_, pulled) = read_sql(&format!("{BESIDE_NAMESAKES}; {namesakes}"));
+        // (The view of that name is text, which says `ghost` itself.)
+        let tables = format!("{:?}", pulled.schema.tables);
+        assert!(!tables.contains("ghost"), "{namesakes}: {tables}");
+        assert!(!warned(&pulled, "ghost"), "{:#?}", pulled.warnings);
+        // And a table with nothing of its own is still read with nothing: the
+        // namesake's column, index and key rows are not given to it.
+        let p = table(&pulled, "p");
+        assert!(p.columns.len() == 2 && p.foreign_keys.is_empty());
     }
+    // A database that holds only namesakes is not an empty one.
+    let (_, only) = read_sql(NAMESAKES);
+    assert_eq!(only.schema.tables.len(), 4);
 }

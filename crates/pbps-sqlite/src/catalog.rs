@@ -1,5 +1,5 @@
-//! The catalog reader (item 4 of #2950): `sqlite_schema` and the `pragma_*`
-//! functions for structure, then a tokenizer for what exists only in the stored
+//! The catalog reader (item 4 of #2950): `sqlite_schema` and the catalog
+//! pragmas for structure, then a tokenizer for what exists only in the stored
 //! `CREATE` text (CHECK, partial index predicates, constraint names, view
 //! bodies). Text it does not fully recognise is refused, never compared.
 //!
@@ -14,9 +14,14 @@
 //! databases are not the file's schema. A NULL is read as absent and a value of
 //! another type as an error, and an object the catalog lists but cannot be
 //! read is an error: an unreadable or hidden object never reads as nothing
-//! there. A view's columns are never read (`pragma_table_xinfo` of a view that
+//! there. A view's columns are never read (`PRAGMA table_xinfo` of a view that
 //! names what is gone fails, and a rollback after it can leave the schema
 //! cache unreliable).
+//!
+//! The pragmas are asked as statements ([`crate::pragma`], DEC-2994.1): a table
+//! or view named like a pragma's table-valued function answers in the function's
+//! place, and nothing answers in a statement's, so such a database is read like
+//! any other, those objects included.
 
 use pbps_db::DbError;
 use pbps_db::catalog::Pulled;
@@ -32,9 +37,10 @@ pub(crate) mod text;
 pub(crate) use assemble::assemble;
 use facts::Facts;
 
+use crate::pragma::{self, database_list, table_list};
 use crate::{READ, ident, names};
 
-/// The first release with `pragma_table_list`, which the reader needs.
+/// The first release with `PRAGMA table_list`, which the reader needs.
 pub(crate) const NEEDED: Version = Version::new(3, 37, 0);
 
 /// A table and everything the pragmas say about it.
@@ -84,53 +90,14 @@ fn unreadable(what: &str, name: &str) -> DbError {
     ))
 }
 
-/// `FROM pragma_table_list` resolves to a user table or view of that name first,
-/// in `main`, `temp` or an attached database (measured), and answers its rows
-/// as the catalog's with no error; the statement form is never shadowed. The
-/// reader cannot tell the two apart, so such an object refuses the read.
-pub(crate) fn refuse_shadowed_pragma_functions(c: &Connection) -> Result<(), DbError> {
-    let mut schemas = vec!["main".to_owned(), "temp".to_owned()];
-    for r in c.query("PRAGMA database_list", &[])? {
-        let name = r.text(1)?;
-        if name != "main" && name != "temp" {
-            schemas.push(name.to_owned());
-        }
-    }
-    let mut shadows = Vec::new();
-    for schema in schemas {
-        let sql = format!(
-            "SELECT name FROM \"{}\".sqlite_schema WHERE type IN ('table', 'view')",
-            schema.replace('"', "\"\"")
-        );
-        for r in c.query(&sql, &[])? {
-            let name = r.text(0)?;
-            if name
-                .as_bytes()
-                .get(..7)
-                .is_some_and(|p| p.eq_ignore_ascii_case(b"pragma_"))
-            {
-                shadows.push(format!("`{}` in `{}`", Escaped(name), Escaped(&schema)));
-            }
-        }
-    }
-    if shadows.is_empty() {
-        return Ok(());
-    }
-    Err(DbError::Refused(format!(
-        "a table or view named like a pragma function ({}) takes its place in a query, so the catalog functions of that name cannot be told from it; rename or drop it",
-        shadows.join(", ")
-    )))
-}
-
 /// Runs the queries. Sorted by name, whatever order the engine answers in.
 pub(crate) fn read_raw(c: &Connection) -> Result<RawCatalog, DbError> {
     let version = c.version()?;
     if version < NEEDED {
         return Err(DbError::Refused(format!(
-            "reading a SQLite catalog needs {NEEDED} or later (`pragma_table_list`); this library is {version}"
+            "reading a SQLite catalog needs {NEEDED} or later (`PRAGMA table_list`); this library is {version}"
         )));
     }
-    refuse_shadowed_pragma_functions(c)?;
     let mut raw = RawCatalog::default();
     // The stored text of every object, by kind and name. A NULL is an object
     // with no text (an automatic index); it is kept apart from an empty one.
@@ -149,11 +116,11 @@ pub(crate) fn read_raw(c: &Connection) -> Result<RawCatalog, DbError> {
             .and_then(|(_, _, _, sql)| sql.clone())
     };
     let mut listed: Vec<String> = Vec::new();
-    for r in c.query(
-        "SELECT name, type FROM pragma_table_list WHERE schema = 'main' ORDER BY name",
-        &[],
-    )? {
-        let (name, kind) = (r.text(0)?.to_owned(), r.text(1)?.to_owned());
+    for r in pragma::by_name(pragma::tables(c)?, table_list::NAME)? {
+        let (name, kind) = (
+            r.text(table_list::NAME)?.to_owned(),
+            r.text(table_list::KIND)?.to_owned(),
+        );
         listed.push(name.clone());
         // `sqlite_*` is SQLite's, and a shadow table belongs to its virtual one.
         // Only a table can be the ledger's: a view under one of its names is
@@ -216,21 +183,28 @@ pub(crate) fn read_raw(c: &Connection) -> Result<RawCatalog, DbError> {
             _ => {}
         }
     }
-    for r in c.query(
-        "SELECT name FROM pragma_database_list WHERE name NOT IN ('main', 'temp') ORDER BY name",
-        &[],
-    )? {
-        raw.attached.push(r.text(0)?.to_owned());
+    for r in pragma::by_name(pragma::databases(c)?, database_list::NAME)? {
+        let name = r.text(database_list::NAME)?;
+        if name != "main" && name != "temp" {
+            raw.attached.push(name.to_owned());
+        }
     }
     // Not the file's schema, and said by name rather than left unsaid. Indexes
-    // and triggers are listed for `temp` only: `pragma_table_list` has none, and
+    // and triggers are listed for `temp` only: `PRAGMA table_list` has none, and
     // an attached database's would need a catalog query per database.
-    for r in c.query(
-        "SELECT schema, type, name FROM pragma_table_list WHERE schema <> 'main' ORDER BY schema, name",
-        &[],
-    )? {
-        let (schema, kind, name) = (r.text(0)?, r.text(1)?, r.text(2)?);
-        if kind != "shadow" && !ident::has_reserved_prefix(name) {
+    let everywhere = pragma::sorted(pragma::tables_everywhere(c)?, |r| {
+        Ok((
+            r.text(table_list::SCHEMA)?.to_owned(),
+            r.text(table_list::NAME)?.to_owned(),
+        ))
+    })?;
+    for r in &everywhere {
+        let (schema, kind, name) = (
+            r.text(table_list::SCHEMA)?,
+            r.text(table_list::KIND)?,
+            r.text(table_list::NAME)?,
+        );
+        if schema != "main" && kind != "shadow" && !ident::has_reserved_prefix(name) {
             raw.elsewhere
                 .push((schema.to_owned(), kind.to_owned(), name.to_owned()));
         }

@@ -151,7 +151,7 @@ fn library_lines(library: Version, changes: &ChangeSet) -> Vec<String> {
     let mut found = Vec::new();
     if library < catalog::NEEDED {
         found.push(format!(
-            "reading a SQLite catalog needs {} (`pragma_table_list`), and this library is {library}",
+            "reading a SQLite catalog needs {} (`PRAGMA table_list`), and this library is {library}",
             catalog::NEEDED
         ));
     }

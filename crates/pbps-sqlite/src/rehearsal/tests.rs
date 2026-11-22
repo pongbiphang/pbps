@@ -383,19 +383,48 @@ fn a_plan_that_replaces_a_tables_only_column_runs_and_converges() {
 }
 
 #[test]
-fn a_table_named_like_a_pragma_function_refuses_the_resolution() {
-    let mut db = file("CREATE TABLE t(a integer); CREATE VIEW v AS SELECT a FROM t");
-    let copy = scratch(db.connection(), SCRATCH_LIMIT).expect("copied");
-    assert!(resolution(&copy).expect("asked").is_empty());
-    // An empty namesake would answer "no views, no tables": everything resolves.
-    copy.execute_batch("DROP TABLE t; CREATE TABLE pragma_table_list(schema, name, type)")
-        .expect("the engine takes it");
-    let refused = resolution(&copy).expect_err("not asked of a namesake");
-    assert!(matches!(refused, DbError::Refused(_)), "{refused:?}");
-    assert!(
-        refused.to_string().contains("pragma_table_list"),
-        "{refused}"
+fn an_object_named_like_a_pragma_function_hides_nothing_from_the_resolution() {
+    let mut db = file(
+        "CREATE TABLE t(a integer); CREATE VIEW v AS SELECT a FROM t; \
+         CREATE TABLE p(x PRIMARY KEY); CREATE TABLE c(y REFERENCES p(x))",
     );
+    let copy = scratch(db.connection(), SCRATCH_LIMIT).expect("copied");
+    let before = resolution(&copy).expect("asked");
+    assert!(before.is_empty(), "{:?}", before.failing());
+    // Empty namesakes answer `FROM pragma_x` with "no views, no tables, no
+    // keys", under which everything resolves.
+    copy.execute_batch(
+        "CREATE TABLE pragma_table_list(schema, name, type); \
+         CREATE TABLE pragma_table_xinfo(cid, name, dflt_value, hidden); \
+         CREATE TEMP TABLE pragma_foreign_key_list(id, \"table\", \"from\", \"to\"); \
+         PRAGMA foreign_keys = OFF; DROP TABLE t; DROP TABLE p; PRAGMA foreign_keys = ON",
+    )
+    .expect("the engine takes it");
+    let after = resolution(&copy).expect("asked beside the namesakes");
+    let new = after.new_since(&before, &Renamed::default());
+    assert_eq!(new.len(), 2, "{new:?}");
+    assert!(
+        new.iter()
+            .any(|line| line.contains("view `v`") && line.contains("no such table")),
+        "{new:?}"
+    );
+    assert!(
+        new.iter()
+            .any(|line| line.contains("foreign keys of `c`") && line.contains("no such table")),
+        "{new:?}"
+    );
+    // Negative: the namesakes are whole themselves and are no finding.
+    let whole = scratch(db.connection(), SCRATCH_LIMIT).expect("copied");
+    let before = resolution(&whole).expect("asked");
+    whole
+        .execute_batch(
+            "CREATE TABLE pragma_table_list(schema, name, type); \
+             CREATE VIEW pragma_table_xinfo AS SELECT 1 AS cid",
+        )
+        .expect("the engine takes it");
+    let after = resolution(&whole).expect("asked");
+    assert!(after.new_since(&before, &Renamed::default()).is_empty());
+    assert!(after.is_empty(), "{:?}", after.failing());
 }
 
 #[test]

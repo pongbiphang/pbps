@@ -112,7 +112,7 @@ fn a_library_older_than_a_forms_arrival_is_one_line_naming_the_form_and_both_ver
         // The reader's own floor is below every form's, and below this one.
         let found: Vec<_> = found
             .into_iter()
-            .filter(|line| !line.contains("pragma_table_list"))
+            .filter(|line| !line.contains("PRAGMA table_list"))
             .collect();
         assert_eq!(found.len(), 1, "{form:?}: {found:?}");
         assert!(found[0].contains(form.words()), "{found:?}");
@@ -121,7 +121,7 @@ fn a_library_older_than_a_forms_arrival_is_one_line_naming_the_form_and_both_ver
         // At the arrival it is clean, but for the reader's own floor.
         let at: Vec<_> = library_lines(form.arrival(), &changes)
             .into_iter()
-            .filter(|line| !line.contains("pragma_table_list"))
+            .filter(|line| !line.contains("PRAGMA table_list"))
             .collect();
         assert!(at.is_empty(), "{form:?}: {at:?}");
     }
@@ -135,7 +135,7 @@ fn a_form_used_twice_is_one_line_and_a_plan_with_no_form_asks_nothing_of_the_lib
     // Negative: no in-place form, so only the reader's floor can speak.
     let none = plan([add_column_change()]);
     assert!(library_lines(Version::new(3, 40, 0), &none).is_empty());
-    assert!(library_lines(Version::new(3, 0, 0), &none)[0].contains("pragma_table_list"));
+    assert!(library_lines(Version::new(3, 0, 0), &none)[0].contains("PRAGMA table_list"));
 }
 
 #[test]

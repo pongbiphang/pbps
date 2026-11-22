@@ -8,17 +8,21 @@
 //! the text. A table on which they disagree is not read (the text was not
 //! understood), never read from one side.
 //!
-//! A NULL is read as absent and a value of another type as an error: every
-//! nullable column is selected with its own `IS NULL`, so no unreadable value
-//! can read as "nothing there".
+//! A NULL is read as absent and a value of another type as an error, so no
+//! unreadable value can read as "nothing there". The pragmas are asked as
+//! statements ([`crate::pragma`]), which no table or view of the database can
+//! answer in place of.
+
+use std::cmp::Reverse;
 
 use pbps_db::DbError;
-use pbps_db::sqlite::{Connection, Record, Value};
+use pbps_db::sqlite::{Connection, Record};
 
 use super::text::{Constraint, IndexText, Kind, Marker, Place, Reaction, TableText, Target};
 use crate::ident;
+use crate::pragma::{self, foreign_key_list, index_list, index_xinfo, table_list, table_xinfo};
 
-/// One column, as `pragma_table_xinfo` reports it.
+/// One column, as `PRAGMA table_xinfo` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Col {
     pub name: String,
@@ -32,7 +36,7 @@ pub(crate) struct Col {
     pub hidden: i64,
 }
 
-/// One column of one foreign key, as `pragma_foreign_key_list` reports it.
+/// One column of one foreign key, as `PRAGMA foreign_key_list` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ForeignRow {
     pub id: i64,
@@ -77,81 +81,77 @@ fn text(row: &Record, i: usize) -> Result<String, DbError> {
     row.text(i).map(str::to_owned)
 }
 
-/// A nullable text column, selected as `x IS NULL, COALESCE(x, '')`: the flag
-/// at `i`, the value at `i + 1`.
+/// A nullable text column: NULL is `None`, and a value of another type an error.
 fn nullable(row: &Record, i: usize) -> Result<Option<String>, DbError> {
-    Ok(if int(row, i)? == 1 {
-        None
-    } else {
-        Some(text(row, i + 1)?)
-    })
+    Ok(row.optional_text(i)?.map(str::to_owned))
 }
 
 /// Reads the pragmas for one table of `main`. `None` is a table that is not
 /// there, which is not a table with no columns, no keys and no flags: it is
 /// asked first, by the name as SQLite compares names (ASCII case folded), so a
 /// table found under another spelling of its name keeps its flags.
+///
+/// The orders are the ones the comparison with the text relies on: columns by
+/// `cid`, indexes by name, an index's keys by `seqno`, and foreign keys by `id`
+/// descending and then `seq`.
 pub(crate) fn read(c: &Connection, table: &str) -> Result<Option<Facts>, DbError> {
-    let arg = [Value::Text(table.to_owned())];
-    let flags = c.query(
-        "SELECT wr, strict FROM pragma_table_list WHERE schema = 'main' AND name = ?1 COLLATE NOCASE",
-        &arg,
-    )?;
+    let flags = pragma::table(c, table)?;
     let Some(row) = flags.first() else {
         return Ok(None);
     };
-    let (without_rowid, strict) = (int(row, 0)? == 1, int(row, 1)? == 1);
+    let (without_rowid, strict) = (
+        int(row, table_list::WITHOUT_ROWID)? == 1,
+        int(row, table_list::STRICT)? == 1,
+    );
     let mut columns = Vec::new();
-    for r in c.query(
-        "SELECT name, type, \"notnull\", dflt_value IS NULL, COALESCE(dflt_value, ''), pk, hidden \
-         FROM pragma_table_xinfo(?1, 'main') ORDER BY cid",
-        &arg,
-    )? {
+    for r in pragma::sorted(pragma::columns(c, table)?, |r| int(r, table_xinfo::CID))? {
         columns.push(Col {
-            name: text(&r, 0)?,
-            ty: text(&r, 1)?,
-            not_null: int(&r, 2)? == 1,
-            default: nullable(&r, 3)?,
-            pk: int(&r, 5)?,
-            hidden: int(&r, 6)?,
+            name: text(&r, table_xinfo::NAME)?,
+            ty: text(&r, table_xinfo::TYPE)?,
+            not_null: int(&r, table_xinfo::NOT_NULL)? == 1,
+            default: nullable(&r, table_xinfo::DEFAULT)?,
+            pk: int(&r, table_xinfo::PK)?,
+            hidden: int(&r, table_xinfo::HIDDEN)?,
         });
     }
     let mut indexes = Vec::new();
-    for r in c.query(
-        "SELECT name, \"unique\", origin, partial FROM pragma_index_list(?1, 'main') ORDER BY name",
-        &arg,
-    )? {
-        let name = text(&r, 0)?;
+    for r in pragma::by_name(pragma::indexes(c, table)?, index_list::NAME)? {
+        let name = text(&r, index_list::NAME)?;
         let mut keys = Vec::new();
-        for k in c.query(
-            "SELECT name IS NULL, COALESCE(name, ''), \"desc\", coll FROM pragma_index_xinfo(?1, 'main') \
-             WHERE key = 1 ORDER BY seqno",
-            &[Value::Text(name.clone())],
-        )? {
-            keys.push((nullable(&k, 0)?, int(&k, 2)? == 1, text(&k, 3)?));
+        for k in pragma::sorted(pragma::index_columns(c, &name)?, |k| {
+            int(k, index_xinfo::SEQNO)
+        })? {
+            if int(&k, index_xinfo::KEY)? == 1 {
+                keys.push((
+                    nullable(&k, index_xinfo::NAME)?,
+                    int(&k, index_xinfo::DESC)? == 1,
+                    text(&k, index_xinfo::COLLATION)?,
+                ));
+            }
         }
         indexes.push(IndexRow {
             name,
-            unique: int(&r, 1)? == 1,
-            origin: text(&r, 2)?,
-            partial: int(&r, 3)? == 1,
+            unique: int(&r, index_list::UNIQUE)? == 1,
+            origin: text(&r, index_list::ORIGIN)?,
+            partial: int(&r, index_list::PARTIAL)? == 1,
             keys,
         });
     }
     let mut foreign = Vec::new();
-    for r in c.query(
-        "SELECT id, seq, \"table\", \"from\", \"to\" IS NULL, COALESCE(\"to\", ''), on_update, on_delete \
-         FROM pragma_foreign_key_list(?1, 'main') ORDER BY id DESC, seq",
-        &arg,
-    )? {
+    for r in pragma::sorted(pragma::foreign_keys(c, table)?, |r| {
+        Ok((
+            Reverse(int(r, foreign_key_list::ID)?),
+            int(r, foreign_key_list::SEQ)?,
+        ))
+    })? {
         foreign.push(ForeignRow {
-            id: int(&r, 0)?,
-            seq: int(&r, 1)?,
-            table: text(&r, 2)?,
-            from: text(&r, 3)?,
-            to: nullable(&r, 4)?,
-            on_update: text(&r, 6)?,
-            on_delete: text(&r, 7)?,
+            id: int(&r, foreign_key_list::ID)?,
+            seq: int(&r, foreign_key_list::SEQ)?,
+            table: text(&r, foreign_key_list::TABLE)?,
+            from: text(&r, foreign_key_list::FROM)?,
+            to: nullable(&r, foreign_key_list::TO)?,
+            on_update: text(&r, foreign_key_list::ON_UPDATE)?,
+            on_delete: text(&r, foreign_key_list::ON_DELETE)?,
         });
     }
     Ok(Some(Facts {
