@@ -299,9 +299,9 @@ pub(super) fn reject_non_transactional(
 /// to write it left the environment changed with nothing saying so.
 ///
 /// [`finish_transaction`] is what closes it, on both paths.
-pub(super) async fn execute_transaction_body(
+pub(super) async fn execute_transaction_body<D: crate::engine::ApplySession>(
     conn: &mut Conn,
-    dialect: &dyn Dialect,
+    dialect: &D,
     statements: &crate::emission::LoweredPlan,
     type_pins: &crate::engine::Prerequisites,
     changes: &pbps_model::ChangeSet,
@@ -310,10 +310,22 @@ pub(super) async fn execute_transaction_body(
     conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
         .await
         .context("cannot open a transaction")?;
-    crate::engine::recheck_type_prerequisites(conn, type_pins, changes, trusted, true).await?;
+    let within = pbps_db::TransactionOwner::CallersTransaction;
+    dialect
+        .recheck_prerequisites(conn, type_pins, changes, trusted, within)
+        .await?;
+    // One state for the body: under `Execution::Transactional` the hooks read
+    // the default evidence and write none, so it is the state each statement
+    // got when it was made afresh.
+    let mut state = D::State::default();
     for position in 0..statements.len() {
-        crate::engine::recheck_type_prerequisites(conn, type_pins, changes, trusted, true).await?;
-        execute_statement(conn, statements, position, None, changes, trusted, None).await?;
+        dialect
+            .recheck_prerequisites(conn, type_pins, changes, trusted, within)
+            .await?;
+        execute_statement_with_session(
+            dialect, conn, statements, position, &mut state, None, changes, trusted, None,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -341,28 +353,6 @@ pub(super) async fn execute_statements<D: crate::engine::ApplySession>(
         .await?;
     }
     Ok(())
-}
-
-// Bootstrap checks prerequisites between statements without turning the
-// certified collection into a raw slice that another caller could execute.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn execute_statement(
-    conn: &mut Conn,
-    statements: &crate::emission::LoweredPlan,
-    position: usize,
-    reviewed: Option<&crate::pins::Approved<'_>>,
-    changes: &pbps_model::ChangeSet,
-    trusted: &BTreeSet<pbps_model::RoleName>,
-    progress: Option<&services::Progress>,
-) -> anyhow::Result<()> {
-    let selected = crate::engine::apply_session::selected(conn.driver());
-    pbps_cli::with_plan_dialect!(&selected, |session| {
-        let mut state = Default::default();
-        execute_statement_with_session(
-            session, conn, statements, position, &mut state, reviewed, changes, trusted, progress,
-        )
-        .await
-    })
 }
 
 #[allow(clippy::too_many_arguments)]

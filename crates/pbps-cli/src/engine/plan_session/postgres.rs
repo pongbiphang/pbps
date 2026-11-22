@@ -61,6 +61,22 @@ pub(in crate::engine) async fn seal_type_pins(
     })
 }
 
+/// The sealing and the read of the routines each sealed type's input path
+/// would run, as one step: planning keeps whether any needs review, bootstrap
+/// refuses them. The roots are read twice, as the pipeline always read them:
+/// once inside the seal, whose failure refuses, and again here for the answer.
+pub(in crate::engine) async fn seal_with_input_roots(
+    conn: &mut Conn,
+    declared: &Schema,
+    changes: &ChangeSet,
+    trusted: &BTreeSet<pbps_model::RoleName>,
+    pin_routines: bool,
+) -> anyhow::Result<(Prerequisites, BTreeSet<i64>)> {
+    let pins = seal_type_pins(conn, &[declared], changes, trusted, pin_routines).await?;
+    let roots = type_input_routines(conn, &pins.types, trusted, pin_routines, false).await?;
+    Ok((pins, roots))
+}
+
 pub(in crate::engine) async fn seal_plan_type_pins(
     conn: &mut Conn,
     base: pbps_diff::Side<'_>,
@@ -1137,7 +1153,36 @@ pub(in crate::engine) async fn generation_support(
     })
 }
 
-/// The PostgreSQL body of `owned_targets`, which apply and bootstrap also call.
+/// Check the permissions this deployment will grant, not every permission in
+/// its recorded snapshot. A removal must not be refused for a grant it no
+/// longer issues. The server version is checked again on apply because a
+/// saved plan can travel between environments (DECISIONS 429).
+/// A declared grant whose grantee already owns its target (#261).
+///
+/// # Why this is a refusal and not a plan
+///
+/// The `GRANT` cannot change what the role holds. Measured on 18.6: an owner
+/// already holds every privilege on its own object with a `NULL` ACL, and
+/// granting one back only forces the engine to write the *whole* default set
+/// down — `relacl` becomes exactly `acldefault(r, owner)`, and a second grant
+/// changes nothing again. The pull then skips that entry, because the owner's
+/// is the zero point rather than a grant (DECISIONS 371), so the role reads
+/// back as holding nothing there and the differ emits the same `GRANT` on
+/// every plan. The apply runs it and its closing read refuses, having not
+/// achieved what it asked for.
+///
+/// Recording the owner's entry as grants instead is the deadlock 371 exists
+/// to prevent: a declaration naming one permission would be short of the
+/// other seven, and every plan would revoke what ownership provides. So the
+/// declaration is refused, with the line to delete.
+///
+/// # Why it is scoped to the declaration
+///
+/// A managed role that owns objects and is granted nothing on them is an
+/// ordinary, plannable project. Only the grant is impossible, and only that
+/// is refused.
+// The complement is intentionally every change that does not create a
+// securable a grant can name.
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(in crate::engine) fn owned_targets(
     changes: &ChangeSet,
@@ -1277,7 +1322,20 @@ pub(in crate::engine) fn owned_targets(
     })
 }
 
-/// The PostgreSQL body of `unrevocable_grants`, which apply also calls.
+/// Refuse a plan that revokes a grant no `REVOKE` from this connection could
+/// take away (#251).
+///
+/// Asked of the plan rather than of the read, and that is the whole point.
+/// The grants are ordinary ones: a declaration that *keeps* one is satisfied
+/// by the database exactly as it stands, and dropping them from the pull
+/// instead refused every connected command over the database — `baseline`
+/// included — for a plan that emits no statement at all.
+///
+/// The other direction has nothing downstream to catch it. A `REVOKE` whose
+/// grantor the engine does not select reports success with the entry still
+/// standing, and the apply's read-back does not notice: measured, it exited 0
+/// and recorded the narrowing as converged (#700). So this is the only place
+/// that answer can be given, and it is given before a statement runs.
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(in crate::engine) fn unrevocable_grants(
     changes: &ChangeSet,
@@ -1429,18 +1487,10 @@ impl PlanSession for pbps_pg::Postgres {
         trusted: &BTreeSet<pbps_model::RoleName>,
         pin_routines: bool,
     ) -> anyhow::Result<()> {
-        let initial = seal_type_pins(
-            conn,
-            &[declared],
-            &Default::default(),
-            trusted,
-            pin_routines,
-        )
-        .await?;
-        state.type_routines_need_review =
-            !type_input_routines(conn, &initial.types, trusted, pin_routines, false)
-                .await?
-                .is_empty();
+        let (_, roots) =
+            seal_with_input_roots(conn, declared, &Default::default(), trusted, pin_routines)
+                .await?;
+        state.type_routines_need_review = !roots.is_empty();
         Ok(())
     }
 
@@ -2092,6 +2142,22 @@ impl PlanSession for pbps_pg::Postgres {
         // rehearsal found in that package (DEC-2447.12).
         pbps_pg::type_refs::provider_proof(type_pins, extension_pins, extension_changes)?;
         pbps_pg::class_pins::proof(provider_pins, extension_pins, extension_changes)
+    }
+    async fn key_name_holders(
+        &self,
+        conn: &mut Conn,
+        prefixes: &[(String, String)],
+    ) -> anyhow::Result<Vec<pbps_pg::catalog::KeyNameHolder>> {
+        pbps_pg::catalog::key_name_holders(conn, prefixes)
+            .await
+            .map_err(|e| anyhow::anyhow!("reading what holds key names: {e}"))
+    }
+    async fn later_name_resolves(
+        &self,
+        conn: &mut Conn,
+        name: &crate::dependents::LaterName,
+    ) -> anyhow::Result<bool> {
+        resolves_now(conn, name).await
     }
     async fn maintained_partitions(
         &self,

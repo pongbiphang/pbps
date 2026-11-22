@@ -847,6 +847,36 @@ pub(crate) trait PlanSession: crate::emission::Engine {
         )
     }
 
+    /// What holds the names the unnamed keys of `prefixes` could take, in the
+    /// key's schema and in any schema a later partition may be in (#1619,
+    /// #1645). Bootstrap asks it of the target before it writes a script, to
+    /// judge a literal that names a relation created only after it; the
+    /// schedule of a connected plan asks the same of the same catalog. Neutral
+    /// code judges the answer.
+    ///
+    /// Refuses when the engine has no step for it: an answer of "nothing holds
+    /// them" from an engine that was never asked would let an index be named
+    /// after a name the database already holds.
+    async fn key_name_holders(
+        &self,
+        _conn: &mut Conn,
+        _prefixes: &[(String, String)],
+    ) -> anyhow::Result<Vec<pbps_pg::catalog::KeyNameHolder>> {
+        defaults::later_relation_question(self.name())
+    }
+
+    /// Whether a literal read as naming a later relation already resolves to
+    /// one on the target, searching its schemas in order as the write path
+    /// would (#1589). Refuses when the engine has no step for it, for the
+    /// reason of [`Self::key_name_holders`].
+    async fn later_name_resolves(
+        &self,
+        _conn: &mut Conn,
+        _name: &crate::dependents::LaterName,
+    ) -> anyhow::Result<bool> {
+        defaults::later_relation_question(self.name())
+    }
+
     /// The partitioned parents another tool maintains, which `pull` and
     /// `init --from` declare with external partitions (#1533, DEC-1533.1).
     /// Not a step of the planning pipeline: one read connection, no lock and no
@@ -994,6 +1024,15 @@ pub(crate) mod defaults {
             "pin_type_routines is not supported by {engine}: it has no step that reads type input routines"
         );
         Ok(false)
+    }
+
+    /// Only PostgreSQL names an unnamed key's index after what its schema
+    /// holds, and resolves a literal along a search path.
+    pub(crate) fn later_relation_question<T>(engine: &str) -> anyhow::Result<T> {
+        anyhow::bail!(
+            "{engine} has no step that asks what holds key names or whether a relation already \
+             resolves on the target"
+        )
     }
 
     pub(crate) fn external_role_renames(
@@ -1735,6 +1774,18 @@ mod tests {
         let message = refusal(defaults::dependencies(THIRD, &declared));
         assert!(message.contains(THIRD), "{message}");
         assert!(message.contains("cross-database dependencies"), "{message}");
+    }
+
+    #[test]
+    fn the_later_relation_questions_are_refused_naming_the_engine_not_answered_empty() {
+        // An engine that was never asked must not read as one where nothing
+        // holds a key name and every literal resolves: both answers would let
+        // a bootstrap script pass a check nobody ran.
+        let holders = refusal(defaults::later_relation_question::<Vec<()>>(THIRD));
+        assert!(holders.contains(THIRD), "{holders}");
+        assert!(holders.contains("key names"), "{holders}");
+        let resolves = refusal(defaults::later_relation_question::<bool>(THIRD));
+        assert!(resolves.contains("already resolves"), "{resolves}");
     }
 
     #[test]

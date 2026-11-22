@@ -83,6 +83,132 @@ impl ApplySession for pbps_pg::Postgres {
     ) -> Result<Option<pbps_model::baseline_evidence::BaselineCatalog>, DbError> {
         pbps_pg::catalog::baseline_catalog(conn).await
     }
+    async fn recording_absence(
+        &self,
+        _conn: &mut Conn,
+        _missing: &[TableName],
+        _missing_roles: &[pbps_model::RoleName],
+    ) -> anyhow::Result<Vec<pbps_model::RoleName>> {
+        // A role reads every row of `pg_class`, so no table is hidden from it. A
+        // missing role is the cluster's, which a plan refuses rather than
+        // creates, so taking its uid out of the state would change no plan.
+        Ok(Vec::new())
+    }
+    async fn seal_prerequisites(
+        &self,
+        conn: &mut Conn,
+        declared: &Schema,
+        changes: &ChangeSet,
+        trusted: &BTreeSet<pbps_model::RoleName>,
+        pin_routines: bool,
+    ) -> anyhow::Result<SealedPrerequisites> {
+        let (pins, input_roots) = plan_session::postgres::seal_with_input_roots(
+            conn,
+            declared,
+            changes,
+            trusted,
+            pin_routines,
+        )
+        .await?;
+        Ok(SealedPrerequisites { pins, input_roots })
+    }
+    async fn recheck_prerequisites(
+        &self,
+        conn: &mut Conn,
+        expected: &Prerequisites,
+        changes: &ChangeSet,
+        trusted: &BTreeSet<pbps_model::RoleName>,
+        within: pbps_db::TransactionOwner,
+    ) -> anyhow::Result<()> {
+        pbps_pg::type_refs::check(conn, within, &expected.types, &[], changes).await?;
+        pbps_pg::class_pins::check(conn, within, &expected.providers, changes).await?;
+        plan_session::postgres::type_input_routines(
+            conn,
+            &expected.types,
+            trusted,
+            false,
+            matches!(within, pbps_db::TransactionOwner::CallersTransaction),
+        )
+        .await?;
+        Ok(())
+    }
+    async fn permission_support(
+        &self,
+        conn: &mut Conn,
+        changes: &ChangeSet,
+        ids: &IdsFile,
+    ) -> anyhow::Result<()> {
+        plan_session::postgres::permission_support(conn, changes, ids)
+            .await
+            .map(|_| ())
+    }
+    /// PostgreSQL has no system-versioned table.
+    async fn refuse_unsupported_temporal(
+        &self,
+        _conn: &mut Conn,
+        _changes: &ChangeSet,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn owned_targets(
+        &self,
+        changes: &ChangeSet,
+        ids: &IdsFile,
+        owners: &BTreeMap<pbps_model::GrantTarget, pbps_model::RoleName>,
+        session_role: &pbps_model::RoleName,
+    ) -> anyhow::Result<()> {
+        plan_session::postgres::owned_targets(changes, ids, owners, session_role).map(|_| ())
+    }
+    fn unrevocable_grants(
+        &self,
+        changes: &ChangeSet,
+        ids: &IdsFile,
+        unrevocable: &[pbps_db::catalog::Unrevocable],
+    ) -> anyhow::Result<()> {
+        plan_session::postgres::unrevocable_grants(changes, ids, unrevocable).map(|_| ())
+    }
+    async fn refuse_unsafe_definers(
+        &self,
+        conn: &mut Conn,
+        routines: &[(pbps_model::ModuleId, pbps_model::ModuleKind)],
+        absent: Absent,
+    ) -> anyhow::Result<()> {
+        use pbps_pg::modules::DefinerPath;
+        if routines.is_empty() {
+            return Ok(());
+        }
+        let mut unsafe_ = Vec::new();
+        for (id, kind) in routines {
+            match pbps_pg::modules::definer_path(conn, id, *kind).await? {
+                DefinerPath::Safe => {}
+                DefinerPath::Absent if absent == Absent::NotYetCreated => {}
+                DefinerPath::Absent => anyhow::bail!(
+                    "{id}: this plan writes the routine, and the catalog holds no routine by \
+                     that identity after its statements ran",
+                    id = id.shown()
+                ),
+                DefinerPath::Unsafe(why) => unsafe_.push(format!("{id}: {why}", id = id.shown())),
+            }
+        }
+        if !unsafe_.is_empty() {
+            anyhow::bail!(
+                "a SECURITY DEFINER routine this plan writes is not in PostgreSQL's safe form:\n  {}\n\
+                 Give each one `SET search_path = <its schemas>, pg_temp` in its declaration, with \
+                 pg_temp last, and plan again (DEC-322.1). Nothing has been applied; the \
+                 transaction was rolled back.",
+                unsafe_.join("\n  ")
+            );
+        }
+        Ok(())
+    }
+    /// PostgreSQL has no system-versioned table, so no history name can be taken.
+    async fn history_name_occupants(
+        &self,
+        _conn: &mut Conn,
+        _names: &[TableName],
+    ) -> anyhow::Result<Option<Vec<pbps_mssql::catalog::NameOccupant>>> {
+        Ok(None)
+    }
     fn rebuild_mode(&self, changes: &ChangeSet, staged: bool) -> anyhow::Result<()> {
         require_transactional_rebuilds(Driver::Postgres, changes, staged)
     }

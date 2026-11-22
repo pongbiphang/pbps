@@ -1597,7 +1597,8 @@ pub(super) fn blocking_history_occupants<'a>(
 /// to the engine: given an existing table whose columns match, SQL Server
 /// takes it as the history, rows, layout and all, where any other `CREATE`
 /// would be refused (measured on 17.0).
-pub(crate) async fn refuse_taken_history_names(
+pub(crate) async fn refuse_taken_history_names<D: crate::engine::ApplySession>(
+    session: &D,
     conn: &mut Conn,
     cs: &pbps_model::ChangeSet,
     label: &str,
@@ -1627,7 +1628,7 @@ pub(crate) async fn refuse_taken_history_names(
     if names.is_empty() {
         return Ok(());
     }
-    let Some(held) = crate::engine::history_name_occupants(conn, &names).await? else {
+    let Some(held) = session.history_name_occupants(conn, &names).await? else {
         return Ok(());
     };
     let taken: Vec<String> = blocking_history_occupants(cs, &held)
