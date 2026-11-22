@@ -24,6 +24,18 @@ pub(in crate::engine) fn seal_type_pins(
     }
 }
 
+/// The sealing, then the read it feeds: the order of the two refusals is the
+/// order of the two steps. The roots are empty or refused, because the engine
+/// has no input routine to read.
+pub(in crate::engine) fn seal_with_input_roots(
+    trusted: &BTreeSet<pbps_model::RoleName>,
+    pin_routines: bool,
+) -> anyhow::Result<(Prerequisites, BTreeSet<i64>)> {
+    let pins = seal_type_pins(trusted)?;
+    let roots = type_input_routines(&pins.types, pin_routines)?;
+    Ok((pins, roots))
+}
+
 pub(in crate::engine) fn type_input_routines(
     pins: &[pbps_model::TypePin],
     pin_routines: bool,
@@ -836,10 +848,7 @@ impl PlanSession for pbps_mssql::Mssql {
         trusted: &BTreeSet<pbps_model::RoleName>,
         pin_routines: bool,
     ) -> anyhow::Result<()> {
-        // The sealing step, then the routine read it feeds: the order of the
-        // two refusals is the order of the two steps.
-        let pins = seal_type_pins(trusted)?;
-        type_input_routines(&pins.types, pin_routines)?;
+        seal_with_input_roots(trusted, pin_routines)?;
         Ok(())
     }
 

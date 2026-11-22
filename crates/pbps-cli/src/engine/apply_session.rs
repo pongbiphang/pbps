@@ -5,9 +5,8 @@
 //! a pin reader receives the original Check, never a guessed closing phase.
 //! The service selects the concrete dialect with with_plan_dialect! before
 //! opening one default state per attempt. Existing connected adapters remain
-//! available to staged apply and bootstrap until their own routes move.
-//! Staged apply, snapshot and baseline use the positions; bootstrap and planning
-//! retain adapters.
+//! available to planning until its own route moves.
+//! Staged apply, snapshot, baseline and bootstrap use the positions.
 use super::*;
 use crate::pins::{Approved, Check};
 use anyhow::Context as _;
@@ -23,6 +22,16 @@ pub(crate) enum Execution<'a> {
     Transactional,
     StagedGuardedDdl { previous: &'a Schema },
     StagedRow,
+}
+
+/// What a bootstrap's sealing step read of the prerequisites its declarations
+/// rely on: the pins to replay, and the roots of the routines a declared type's
+/// input path would run. Facts only: whether a root is refused is neutral code's
+/// decision, because bootstrap's gate is stronger than planning's, which defers
+/// the same roots to review.
+pub(crate) struct SealedPrerequisites {
+    pub pins: Prerequisites,
+    pub input_roots: BTreeSet<i64>,
 }
 
 /// Evidence lives for this attempt, while closing verification is always fresh.
@@ -57,7 +66,8 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         conn: &mut Conn,
         plan: &pbps_model::SavedPlan,
     ) -> anyhow::Result<()> {
-        permission_support(conn, &plan.changes, &plan.ids).await?;
+        self.permission_support(conn, &plan.changes, &plan.ids)
+            .await?;
         generation_support(conn, &plan.changes, &plan.ids).await?;
         Ok(())
     }
@@ -67,9 +77,9 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         changes: &ChangeSet,
         label: &str,
     ) -> anyhow::Result<()> {
-        crate::deploy::refuse_taken_history_names(conn, changes, label).await?;
+        crate::deploy::refuse_taken_history_names(self, conn, changes, label).await?;
         // Nothing binds a saved plan to a server: asked again here (#1502).
-        refuse_unsupported_temporal(conn, changes).await
+        self.refuse_unsupported_temporal(conn, changes).await
     }
     async fn external_roles(
         &self,
@@ -84,13 +94,11 @@ pub(crate) trait ApplySession: crate::emission::Engine {
     }
     fn baseline_grants(
         &self,
-        driver: Driver,
         plan: &pbps_model::SavedPlan,
         scoped: &pbps_diff::Scoped,
         unrevocable: &[pbps_db::catalog::Unrevocable],
     ) -> anyhow::Result<()> {
-        owned_targets(
-            driver,
+        self.owned_targets(
             &plan.changes,
             &plan.ids,
             &scoped.owners,
@@ -101,7 +109,7 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         // made as the owner and applied as a least-privilege deployer otherwise
         // passes the baseline and fails at its `REVOKE`, after earlier statements
         // of a staged run are already committed.
-        unrevocable_grants(driver, &plan.changes, &plan.ids, unrevocable)?;
+        self.unrevocable_grants(&plan.changes, &plan.ids, unrevocable)?;
         Ok(())
     }
     async fn drop_blockers(
@@ -253,7 +261,8 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         original_ids: &IdsFile,
     ) -> anyhow::Result<()> {
         check_module_rebuilds(conn, &plan.changes, true).await?;
-        refuse_unsafe_definers(conn, &written_routines(&plan.changes), Absent::Refused).await?;
+        self.refuse_unsafe_definers(conn, &written_routines(&plan.changes), Absent::Refused)
+            .await?;
         self.external_roles(conn, original_ids, &plan.ids).await?;
         Ok(())
     }
@@ -425,7 +434,7 @@ pub(crate) trait ApplySession: crate::emission::Engine {
             Execution::StagedGuardedDdl { previous } => {
                 self.verify_retained(state, conn, previous).await?;
                 after_statement(conn, admission, stmt, plan, changes, executed).await?;
-                refuse_unsafe_definers(conn, &written_routines(changes), Absent::NotYetCreated)
+                self.refuse_unsafe_definers(conn, &written_routines(changes), Absent::NotYetCreated)
                     .await
             }
             Execution::Transactional => {
@@ -499,15 +508,17 @@ pub(crate) trait ApplySession: crate::emission::Engine {
     /// The tables come first, as the recordings asked them: a refusal about a
     /// table is the one an operator reads when both a table and a role are
     /// hidden from the login.
+    ///
+    /// Required, and not one shared body: the two engines share nothing but the
+    /// order. Whether a missing object can be hidden from the login is a fact
+    /// about the engine's catalog views, and an answer from an engine that was
+    /// never asked would record a hidden table as one that is gone.
     async fn recording_absence(
         &self,
         conn: &mut Conn,
         missing: &[TableName],
         missing_roles: &[pbps_model::RoleName],
-    ) -> anyhow::Result<Vec<pbps_model::RoleName>> {
-        prove_tables_absent(conn, missing).await?;
-        absent_roles(conn, missing_roles).await
-    }
+    ) -> anyhow::Result<Vec<pbps_model::RoleName>>;
     /// The temporary CHECKs a staged attach left on its tables, which
     /// `baseline` takes out before it takes the database as it stands (#1638,
     /// DEC-1638.1).
@@ -547,6 +558,98 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         &self,
         conn: &mut Conn,
     ) -> Result<Option<pbps_model::baseline_evidence::BaselineCatalog>, DbError>;
+    /// Seals the type and provider prerequisites of `declared` and reads the
+    /// roots of the routines a declared type's input path would run, as
+    /// bootstrap does at its probe and on its execution connection. One
+    /// implementation for the sealing and the read, so the two cannot disagree
+    /// about what was sealed; the returned facts are bootstrap's to refuse.
+    ///
+    /// Required: whether an engine has type prerequisites at all is a fact about
+    /// it, and an empty answer from an engine that was never asked would let a
+    /// bootstrap build over types nothing sealed.
+    async fn seal_prerequisites(
+        &self,
+        conn: &mut Conn,
+        declared: &Schema,
+        changes: &ChangeSet,
+        trusted: &BTreeSet<pbps_model::RoleName>,
+        pin_routines: bool,
+    ) -> anyhow::Result<SealedPrerequisites>;
+    /// Reads the prerequisites again and refuses what changed since `expected`
+    /// was sealed: before the transaction begins, when it opens, before every
+    /// statement and before the recording. `within` says who owns the
+    /// transaction the reads run in.
+    ///
+    /// Required, for the reason of [`Self::seal_prerequisites`].
+    async fn recheck_prerequisites(
+        &self,
+        conn: &mut Conn,
+        expected: &Prerequisites,
+        changes: &ChangeSet,
+        trusted: &BTreeSet<pbps_model::RoleName>,
+        within: pbps_db::TransactionOwner,
+    ) -> anyhow::Result<()>;
+    /// Refuses a plan the server's version or the deployer's ownership cannot
+    /// carry (a permission the server lacks, a row-security table the deployer
+    /// does not own), before the first statement. Asked alone by bootstrap and
+    /// beside the generation support by a saved plan's connection.
+    ///
+    /// Required: an engine that was never asked must not read as one that has
+    /// nothing to refuse.
+    async fn permission_support(
+        &self,
+        conn: &mut Conn,
+        changes: &ChangeSet,
+        ids: &IdsFile,
+    ) -> anyhow::Result<()>;
+    /// Refuses what this server cannot take of a system-versioned table, before
+    /// the first statement (#1502). A plan with nothing of the kind asks
+    /// nothing. Required, for the reason of [`Self::permission_support`].
+    async fn refuse_unsupported_temporal(
+        &self,
+        conn: &mut Conn,
+        changes: &ChangeSet,
+    ) -> anyhow::Result<()>;
+    /// Refuses a grant on what the connected role will own (#261), which the
+    /// engine writes only as the owner's default entry. Apart from
+    /// [`Self::unrevocable_grants`] because bootstrap asks only this one: it
+    /// revokes nothing. Required, for the reason of [`Self::permission_support`].
+    fn owned_targets(
+        &self,
+        changes: &ChangeSet,
+        ids: &IdsFile,
+        owners: &BTreeMap<pbps_model::GrantTarget, pbps_model::RoleName>,
+        session_role: &pbps_model::RoleName,
+    ) -> anyhow::Result<()>;
+    /// Refuses a plan that revokes a grant no `REVOKE` from this connection
+    /// could take away (#251). Required, for the reason of
+    /// [`Self::permission_support`].
+    fn unrevocable_grants(
+        &self,
+        changes: &ChangeSet,
+        ids: &IdsFile,
+        unrevocable: &[pbps_db::catalog::Unrevocable],
+    ) -> anyhow::Result<()>;
+    /// Refuses a `SECURITY DEFINER` routine the plan wrote that is not in the
+    /// engine's safe form (#322), read back inside the transaction that wrote
+    /// it. Apart from the module-rebuild and external-role questions
+    /// [`Self::after_statements`] asks beside it, because bootstrap asks only
+    /// this one. Required, for the reason of [`Self::permission_support`].
+    async fn refuse_unsafe_definers(
+        &self,
+        conn: &mut Conn,
+        routines: &[(pbps_model::ModuleId, pbps_model::ModuleKind)],
+        absent: Absent,
+    ) -> anyhow::Result<()>;
+    /// The objects the database already holds under the history-table names a
+    /// plan would create (#1176): `None` when the engine has no system-versioned
+    /// table, so no name can be taken. Neutral code keeps the refusal.
+    /// Required, so an engine never asked is not read as one with no occupant.
+    async fn history_name_occupants(
+        &self,
+        conn: &mut Conn,
+        names: &[TableName],
+    ) -> anyhow::Result<Option<Vec<pbps_mssql::catalog::NameOccupant>>>;
     async fn removed_name_matches(
         &self,
         conn: &mut Conn,

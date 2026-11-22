@@ -2,6 +2,7 @@
 //! refusals.
 
 use super::*;
+use crate::engine::{ApplySession as _, PlanSession as _};
 
 /// `pbps bootstrap` — build the whole schema from the declarations.
 ///
@@ -53,36 +54,31 @@ pub(super) fn refuse_invalid_declarations(
 }
 
 // Immediate bootstrap has no reviewed source artifact, including before its
-// spelling probes. Recheck before execution too (DEC-2181.2).
-pub(super) async fn bootstrap_type_pins(
+// spelling probes. Recheck before execution too (DEC-2181.2). The session
+// seals and reads; refusing the routines whose input path a type would run is
+// bootstrap's own gate, stronger than planning's, which defers them to review.
+pub(super) async fn bootstrap_type_pins<D: crate::engine::ApplySession>(
+    session: &D,
     conn: &mut Conn,
     schema: &Schema,
     changes: &pbps_model::ChangeSet,
     project: &Project,
 ) -> anyhow::Result<crate::engine::Prerequisites> {
-    let pins = crate::engine::seal_type_pins(
-        conn,
-        &[schema],
-        changes,
-        &project.config.trusted_roles,
-        project.config.pin_type_routines,
-    )
-    .await?;
-    if !crate::engine::type_input_routines(
-        conn,
-        &pins.types,
-        &project.config.trusted_roles,
-        project.config.pin_type_routines,
-        false,
-    )
-    .await?
-    .is_empty()
-    {
+    let sealed = session
+        .seal_prerequisites(
+            conn,
+            schema,
+            changes,
+            &project.config.trusted_roles,
+            project.config.pin_type_routines,
+        )
+        .await?;
+    if !sealed.input_roots.is_empty() {
         bail!(
             "immediate bootstrap cannot run type routines without a reviewed saved plan; baseline an empty target, then plan, review and apply (DEC-2181.2)"
         );
     }
-    Ok(pins)
+    Ok(sealed.pins)
 }
 
 /// A missing uid makes the differ skip an object that the declaration record
@@ -363,8 +359,14 @@ pub(super) async fn bootstrap_async(
             loaded.schema = Box::pin(async {
                 let mut conn = db::connect(target).await?;
                 dialect = crate::engine::planning_dialect_for(&mut conn, &dialect).await?;
-                bootstrap_type_pins(&mut conn, &loaded.schema, &Default::default(), project)
-                    .await?;
+                bootstrap_type_pins(
+                    &dialect,
+                    &mut conn,
+                    &loaded.schema,
+                    &Default::default(),
+                    project,
+                )
+                .await?;
                 let mut unasked = Vec::new();
                 let refused = refuse_misspelt(
                     &mut conn,
@@ -483,9 +485,7 @@ pub(super) async fn bootstrap_async(
                 {
                     Box::pin(async {
                         let mut conn = db::connect(target).await?;
-                        let holders = pbps_pg::catalog::key_name_holders(&mut conn, &prefixes)
-                            .await
-                            .map_err(|e| anyhow::anyhow!("reading what holds key names: {e}"))?;
+                        let holders = dialect.key_name_holders(&mut conn, &prefixes).await?;
                         for name in crate::dependents::names_a_later_relation(
                             &cs,
                             dialect.as_ref(),
@@ -493,7 +493,7 @@ pub(super) async fn bootstrap_async(
                             &Schema::default(),
                         ) {
                             if name.searched.is_empty()
-                                || !crate::engine::resolves_now(&mut conn, &name).await?
+                                || !dialect.later_name_resolves(&mut conn, &name).await?
                             {
                                 refused.push(name);
                             }
@@ -558,23 +558,24 @@ pub(super) async fn bootstrap_async(
         Box::pin(async {
             let mut conn = db::connect(target).await?;
             let bootstrap_pins =
-                bootstrap_type_pins(&mut conn, &loaded.schema, &cs, project).await?;
+                bootstrap_type_pins(&dialect, &mut conn, &loaded.schema, &cs, project).await?;
             // A collation the server lacks is refused here, by name, rather than
             // by the `CREATE TABLE` that names it after the ones before it ran
             // (#1175).
-            crate::engine::refuse_unknown_collations(&mut conn, &loaded.schema).await?;
+            dialect
+                .refuse_unknown_collations(&mut conn, &loaded.schema)
+                .await?;
             // A filegroup the server lacks, likewise (#2813).
-            crate::engine::refuse_unknown_filegroups(&mut conn, &loaded.schema).await?;
+            dialect
+                .refuse_unknown_filegroups(&mut conn, &loaded.schema)
+                .await?;
             // A key to a declared history under another spelling (#1625).
-            crate::engine::refuse_history_references_alike(
-                &mut conn,
-                &loaded.schema,
-                dialect.as_ref(),
-            )
-            .await?;
+            dialect
+                .refuse_history_references_alike(&mut conn, &loaded.schema)
+                .await?;
             // A history retention or a cascading key the server lacks (#1502).
-            crate::engine::refuse_unsupported_temporal(&mut conn, &cs).await?;
-            crate::engine::permission_support(&mut conn, &cs, &ids).await?;
+            dialect.refuse_unsupported_temporal(&mut conn, &cs).await?;
+            dialect.permission_support(&mut conn, &cs, &ids).await?;
             crate::engine::lock(&mut conn, operator).await?;
             let mut transaction_attempted = false;
             let result = async {
@@ -616,8 +617,7 @@ pub(super) async fn bootstrap_async(
                 // declared grant against what it built. Unrefused it reports
                 // success and records a snapshot that does not hold the grant
                 // (#261).
-                crate::engine::owned_targets(
-                    conn.driver(),
+                dialect.owned_targets(
                     &cs,
                     &ids,
                     &existing.scoped.owners,
@@ -638,7 +638,7 @@ pub(super) async fn bootstrap_async(
                 // A history name already taken: SQL Server takes an existing
                 // table whose columns match as the history, with its rows,
                 // instead of refusing (measured on 17.0, #1176).
-                refuse_taken_history_names(&mut conn, &cs, &target.label).await?;
+                refuse_taken_history_names(&dialect, &mut conn, &cs, &target.label).await?;
 
                 refuse_extension_prerequisite_drift(
                     &existing.scoped.schema,
@@ -655,18 +655,19 @@ pub(super) async fn bootstrap_async(
                     &target.label,
                 )?;
 
-                crate::engine::recheck_type_prerequisites(
-                    &mut conn,
-                    &bootstrap_pins,
-                    &cs,
-                    &project.config.trusted_roles,
-                    false,
-                )
-                .await?;
+                dialect
+                    .recheck_prerequisites(
+                        &mut conn,
+                        &bootstrap_pins,
+                        &cs,
+                        &project.config.trusted_roles,
+                        pbps_db::TransactionOwner::OwnTransaction,
+                    )
+                    .await?;
                 transaction_attempted = true;
                 execute_transaction_body(
                     &mut conn,
-                    dialect.as_ref(),
+                    &dialect,
                     &statements,
                     &bootstrap_pins,
                     &cs,
@@ -675,12 +676,13 @@ pub(super) async fn bootstrap_async(
                 .await?;
                 // Bootstrap creates routines as `apply` does, so the same form is
                 // required of a definer among them (#322).
-                crate::engine::refuse_unsafe_definers(
-                    &mut conn,
-                    &crate::engine::written_routines(&cs),
-                    crate::engine::Absent::Refused,
-                )
-                .await?;
+                dialect
+                    .refuse_unsafe_definers(
+                        &mut conn,
+                        &crate::engine::written_routines(&cs),
+                        crate::engine::Absent::Refused,
+                    )
+                    .await?;
 
                 // Read-back and the success ledger row are part of the same
                 // transaction as the DDL. If either fails, the database is still
@@ -727,21 +729,23 @@ pub(super) async fn bootstrap_async(
                 // Only the uids of what this build made. The ids file may name
                 // tables, types and roles these declarations do not hold; recording
                 // those as held would make the next plan skip them (#1600, #1606).
-                crate::engine::prove_tables_absent(&mut conn, &built.missing).await?;
-                let gone = crate::engine::absent_roles(&mut conn, &built.missing_roles).await?;
+                let gone = dialect
+                    .recording_absence(&mut conn, &built.missing, &built.missing_roles)
+                    .await?;
                 let mut held = ids
                     .without(&built.missing)
                     .without_roles(&gone)
                     .without_types(&built.missing_types);
                 held.extensions.clone_from(&prerequisite_ids.extensions);
-                crate::engine::recheck_type_prerequisites(
-                    &mut conn,
-                    &bootstrap_pins,
-                    &cs,
-                    &project.config.trusted_roles,
-                    true,
-                )
-                .await?;
+                dialect
+                    .recheck_prerequisites(
+                        &mut conn,
+                        &bootstrap_pins,
+                        &cs,
+                        &project.config.trusted_roles,
+                        pbps_db::TransactionOwner::CallersTransaction,
+                    )
+                    .await?;
                 let snapshot = with_provenance(
                     project.root(),
                     bootstrap_record(built, held, &loaded, operator)?,

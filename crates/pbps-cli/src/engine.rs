@@ -583,25 +583,6 @@ pub async fn database_collation(conn: &mut Conn) -> Result<Option<String>, DbErr
     }
 }
 
-/// Refuses a declared column collation the target does not have (#1175), by
-/// name and before any statement runs. PostgreSQL declares none: `validate`
-/// refuses the field there.
-pub async fn refuse_unknown_collations(conn: &mut Conn, schema: &Schema) -> anyhow::Result<()> {
-    match conn.driver() {
-        Driver::Mssql => plan_session::mssql::refuse_unknown_collations(conn, schema).await,
-        Driver::Postgres => Ok(()),
-    }
-}
-
-/// Refuses a declared filegroup the target cannot place an object on
-/// (#2813). PostgreSQL declares none: `validate` refuses the field there.
-pub async fn refuse_unknown_filegroups(conn: &mut Conn, schema: &Schema) -> anyhow::Result<()> {
-    match conn.driver() {
-        Driver::Mssql => plan_session::mssql::refuse_unknown_filegroups(conn, schema).await,
-        Driver::Postgres => Ok(()),
-    }
-}
-
 /// One advisory per declared filegroup, for a plan made without a database
 /// (#2813, DEC-2813.1). The name is accepted as a name: whether the target
 /// holds it is a fact about a database, and `plan --db` or `bootstrap` refuses
@@ -630,56 +611,8 @@ pub fn unchecked_filegroups(schema: &Schema) -> Vec<String> {
         .collect()
 }
 
-/// Refuses a foreign key to a declared history the database reads as one
-/// name with it (#1625). Offline the check compares names as written
-/// (`check_history_references`), since the collation is the server's
-/// (DEC-1243.1); on a case-insensitive database a key to `dbo.t_history`
-/// references the history `dbo.T_History`, and the engine refuses its
-/// `ADD FOREIGN KEY` (13565) once the statements before it have run. The
-/// database answers which spellings are one, as for every other name a plan
-/// compares (`object_names_alike`). PostgreSQL has no system-versioned
-/// table.
-pub async fn refuse_history_references_alike(
-    conn: &mut Conn,
-    schema: &Schema,
-    dialect: &dyn pbps_dialect::Dialect,
-) -> anyhow::Result<()> {
-    match conn.driver() {
-        Driver::Mssql => {
-            plan_session::mssql::refuse_history_references_alike(conn, schema, dialect).await
-        }
-        Driver::Postgres => Ok(()),
-    }
-}
-
-/// Refuses what this server cannot take of a system-versioned table, before
-/// the first statement (#1502): SQL Server 2016 has no history retention and
-/// no cascading key from a system-versioned table, and refuses either only
-/// once the statements before it have run. A plan with neither asks nothing.
-pub async fn refuse_unsupported_temporal(
-    conn: &mut Conn,
-    changes: &ChangeSet,
-) -> anyhow::Result<()> {
-    match temporal_refusal(&unsupported_temporal(conn, changes).await?) {
-        Some(refusal) => Err(anyhow::anyhow!(refusal)),
-        None => Ok(()),
-    }
-}
-
-/// What [`refuse_unsupported_temporal`] refuses, each named: the answer to
-/// the capability question, apart from a failure to ask it. `plan --db`
-/// reports the answer as a finding and the failure as unanswerable (#1630).
-pub async fn unsupported_temporal(
-    conn: &mut Conn,
-    changes: &ChangeSet,
-) -> anyhow::Result<Vec<String>> {
-    if conn.driver() != Driver::Mssql {
-        return Ok(Vec::new());
-    }
-    plan_session::mssql::unsupported_temporal(conn, changes).await
-}
-
-/// The refusal [`unsupported_temporal`]'s problems make, if there are any.
+/// The refusal the problems of the capability question make, if there are any
+/// (`ApplySession::refuse_unsupported_temporal` and `plan --db` both end on it).
 pub fn temporal_refusal(problems: &[String]) -> Option<String> {
     (!problems.is_empty()).then(|| {
         format!(
@@ -689,11 +622,11 @@ pub fn temporal_refusal(problems: &[String]) -> Option<String> {
     })
 }
 
-/// Ends a connected plan on what [`unsupported_temporal`] answered, if it
+/// Ends a connected plan on what the capability question answered, if it
 /// refused anything. The question was asked and answered, so a JSON plan
 /// reports the refusal as a finding with exit 2, like the online edition's
 /// (DECISIONS 485, #574), rather than as `plan.failed` with exit 1 (#1630).
-/// A failure to ask never reaches here: it is `unsupported_temporal`'s error.
+/// A failure to ask never reaches here: it is the question's own error.
 pub fn refuse_answered_temporal(
     problems: &[String],
     json: bool,
@@ -1073,26 +1006,7 @@ fn object_slots(
     }
 }
 
-/// Proves the tables a catalog read did not return are absent, not hidden,
-/// before a state records them as missing (#1600). On SQL Server `sys.tables`
-/// is filtered by metadata visibility, so a table under an effective `DENY
-/// VIEW DEFINITION`, or in a schema this login cannot view, returns no row
-/// and reads as missing. Recorded as missing, its uid would leave the state
-/// and the table the managed set, silently. The proof is DEC-1192.1's. A
-/// PostgreSQL role reads every row of `pg_class`, so nothing there is hidden.
-pub async fn prove_tables_absent(conn: &mut Conn, missing: &[TableName]) -> anyhow::Result<()> {
-    if conn.driver() != Driver::Mssql || missing.is_empty() {
-        return Ok(());
-    }
-    let mut schemas: Vec<String> = missing.iter().map(|t| t.schema.clone()).collect();
-    schemas.sort();
-    schemas.dedup();
-    pbps_mssql::catalog::prove_schemas_visible(conn, &schemas)
-        .await
-        .map_err(|e| absence_unproven(missing, e))
-}
-
-/// Why [`prove_tables_absent`] refused. The source error is kept as one,
+/// Why the SQL Server absence proof refused. The source error is kept as one,
 /// never interpolated: a driver frame has to reach `ledger_safe_reason`
 /// intact to be redacted, and a failed bootstrap records this (DECISIONS 455,
 /// #1605 review).
@@ -1106,39 +1020,6 @@ fn absence_unproven(missing: &[TableName], error: DbError) -> anyhow::Error {
          schemas, so a table hidden from this one is not taken for one that is gone",
         names.join(", ")
     ))
-}
-
-/// The roles a recording may take out of the state: those the catalog read
-/// did not return and the database proves it lacks (#1606). On SQL Server
-/// `sys.database_principals` is filtered by metadata visibility, so a role
-/// hidden from this login reads as missing; recorded as missing, its uid
-/// would leave the state and the next plan create a role that exists. A name
-/// the database still resolves refuses the command by name instead
-/// (DEC-1606.1).
-///
-/// PostgreSQL's roles are the cluster's, which a plan refuses rather than
-/// creates (`refuse_missing_cluster_roles`), so a missing one is kept as
-/// before: taking its uid out would change no plan.
-pub async fn absent_roles(
-    conn: &mut Conn,
-    missing: &[pbps_model::RoleName],
-) -> anyhow::Result<Vec<pbps_model::RoleName>> {
-    if conn.driver() != Driver::Mssql || missing.is_empty() {
-        return Ok(Vec::new());
-    }
-    let held = pbps_mssql::catalog::held_principals(conn, missing).await?;
-    if !held.is_empty() {
-        anyhow::bail!(
-            "cannot record role(s) {} as missing: the database holds a principal by that name \
-             this login cannot see; record the state with a login that can see it, so a role \
-             hidden from this one is not taken for one that is gone",
-            held.iter()
-                .map(|name| name.shown().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    Ok(missing.to_vec())
 }
 
 /// Which requested names occur in an already captured table inventory.
@@ -1323,79 +1204,6 @@ fn refuse_drop_reports(
         );
     }
     Ok(())
-}
-
-/// Check the permissions this deployment will grant, not every permission in
-/// its recorded snapshot. A removal must not be refused for a grant it no
-/// longer issues. The server version is checked again on apply because a
-/// saved plan can travel between environments (DECISIONS 429).
-/// A declared grant whose grantee already owns its target (#261).
-///
-/// # Why this is a refusal and not a plan
-///
-/// The `GRANT` cannot change what the role holds. Measured on 18.6: an owner
-/// already holds every privilege on its own object with a `NULL` ACL, and
-/// granting one back only forces the engine to write the *whole* default set
-/// down — `relacl` becomes exactly `acldefault(r, owner)`, and a second grant
-/// changes nothing again. The pull then skips that entry, because the owner's
-/// is the zero point rather than a grant (DECISIONS 371), so the role reads
-/// back as holding nothing there and the differ emits the same `GRANT` on
-/// every plan. The apply runs it and its closing read refuses, having not
-/// achieved what it asked for.
-///
-/// Recording the owner's entry as grants instead is the deadlock 371 exists
-/// to prevent: a declaration naming one permission would be short of the
-/// other seven, and every plan would revoke what ownership provides. So the
-/// declaration is refused, with the line to delete.
-///
-/// # Why it is scoped to the declaration
-///
-/// A managed role that owns objects and is granted nothing on them is an
-/// ordinary, plannable project. Only the grant is impossible, and only that
-/// is refused.
-// The complement is intentionally every change that does not create a
-// securable a grant can name.
-#[allow(clippy::wildcard_enum_match_arm)]
-pub fn owned_targets(
-    driver: Driver,
-    changes: &ChangeSet,
-    ids: &pbps_model::IdsFile,
-    owners: &std::collections::BTreeMap<pbps_model::GrantTarget, pbps_model::RoleName>,
-    session_role: &pbps_model::RoleName,
-) -> anyhow::Result<ConnectedCheck> {
-    match driver {
-        Driver::Mssql => Ok(plan_session::mssql::owned_targets()),
-        Driver::Postgres => {
-            plan_session::postgres::owned_targets(changes, ids, owners, session_role)
-        }
-    }
-}
-
-/// Refuse a plan that revokes a grant no `REVOKE` from this connection could
-/// take away (#251).
-///
-/// Asked of the plan rather than of the read, and that is the whole point.
-/// The grants are ordinary ones: a declaration that *keeps* one is satisfied
-/// by the database exactly as it stands, and dropping them from the pull
-/// instead refused every connected command over the database — `baseline`
-/// included — for a plan that emits no statement at all.
-///
-/// The other direction has nothing downstream to catch it. A `REVOKE` whose
-/// grantor the engine does not select reports success with the entry still
-/// standing, and the apply's read-back does not notice: measured, it exited 0
-/// and recorded the narrowing as converged (#700). So this is the only place
-/// that answer can be given, and it is given before a statement runs.
-#[allow(clippy::wildcard_enum_match_arm)]
-pub fn unrevocable_grants(
-    driver: Driver,
-    changes: &ChangeSet,
-    ids: &pbps_model::IdsFile,
-    unrevocable: &[pbps_db::catalog::Unrevocable],
-) -> anyhow::Result<ConnectedCheck> {
-    match driver {
-        Driver::Mssql => Ok(plan_session::mssql::unrevocable_grants()),
-        Driver::Postgres => plan_session::postgres::unrevocable_grants(changes, ids, unrevocable),
-    }
 }
 
 /// Grants on modules and schemas retain their catalog identity; only an
@@ -2126,17 +1934,6 @@ async fn refuse_missing_policy_roles(conn: &mut Conn, changes: &ChangeSet) -> an
     Ok(())
 }
 
-pub async fn permission_support(
-    conn: &mut Conn,
-    changes: &ChangeSet,
-    ids: &IdsFile,
-) -> anyhow::Result<ConnectedCheck> {
-    match conn.driver() {
-        Driver::Mssql => Ok(plan_session::mssql::permission_support()),
-        Driver::Postgres => plan_session::postgres::permission_support(conn, changes, ids).await,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // `doctor`: what the connected account may do
 // ---------------------------------------------------------------------------
@@ -2432,47 +2229,6 @@ pub enum Absent {
     Refused,
     /// A staged step before the one that creates it.
     NotYetCreated,
-}
-
-/// Refuses a `SECURITY DEFINER` routine this plan created or replaced that
-/// does not set `search_path` with `pg_temp` last (#322, DEC-322.1).
-///
-/// Runs inside the transaction that wrote the routines, after the statements,
-/// so that the refusal rolls them back. It reads the stored `proconfig`, which
-/// is what the engine will use when the routine is called, rather than
-/// guessing from the declaration's text.
-pub async fn refuse_unsafe_definers(
-    conn: &mut Conn,
-    routines: &[(pbps_model::ModuleId, pbps_model::ModuleKind)],
-    absent: Absent,
-) -> anyhow::Result<()> {
-    use pbps_pg::modules::DefinerPath;
-    if conn.driver() != Driver::Postgres || routines.is_empty() {
-        return Ok(());
-    }
-    let mut unsafe_ = Vec::new();
-    for (id, kind) in routines {
-        match pbps_pg::modules::definer_path(conn, id, *kind).await? {
-            DefinerPath::Safe => {}
-            DefinerPath::Absent if absent == Absent::NotYetCreated => {}
-            DefinerPath::Absent => anyhow::bail!(
-                "{id}: this plan writes the routine, and the catalog holds no routine by that \
-                 identity after its statements ran",
-                id = id.shown()
-            ),
-            DefinerPath::Unsafe(why) => unsafe_.push(format!("{id}: {why}", id = id.shown())),
-        }
-    }
-    if !unsafe_.is_empty() {
-        anyhow::bail!(
-            "a SECURITY DEFINER routine this plan writes is not in PostgreSQL's safe form:\n  {}\n\
-             Give each one `SET search_path = <its schemas>, pg_temp` in its declaration, with \
-             pg_temp last, and plan again (DEC-322.1). Nothing has been applied; the \
-             transaction was rolled back.",
-            unsafe_.join("\n  ")
-        );
-    }
-    Ok(())
 }
 
 /// PostgreSQL rebuilds must keep their locks, checks and DDL in one
@@ -4696,14 +4452,18 @@ mod plan_name_tests {
             permission: Permission::Usage,
             why: "the exact sequence grantor cannot be selected".into(),
         };
-        assert!(unrevocable_grants(Driver::Postgres, &changes, &ids, &[found.clone()]).is_err());
+        assert!(
+            plan_session::postgres::unrevocable_grants(&changes, &ids, &[found.clone()]).is_err()
+        );
         found.target = "sequence::app.original_table.other".parse().unwrap();
-        assert!(unrevocable_grants(Driver::Postgres, &changes, &ids, &[found.clone()]).is_ok());
+        assert!(
+            plan_session::postgres::unrevocable_grants(&changes, &ids, &[found.clone()]).is_ok()
+        );
         found.target = "sequence::app.original_table.original_column"
             .parse()
             .unwrap();
         found.permission = Permission::Select;
-        assert!(unrevocable_grants(Driver::Postgres, &changes, &ids, &[found]).is_ok());
+        assert!(plan_session::postgres::unrevocable_grants(&changes, &ids, &[found]).is_ok());
     }
 
     #[test]
@@ -4722,12 +4482,16 @@ mod plan_name_tests {
             permission: Permission::SerialSequences,
             why: "the sequence grantor cannot be selected".into(),
         };
-        assert!(unrevocable_grants(Driver::Postgres, &changes, &ids, &[found.clone()]).is_err());
+        assert!(
+            plan_session::postgres::unrevocable_grants(&changes, &ids, &[found.clone()]).is_err()
+        );
         found.permission = Permission::Usage;
-        assert!(unrevocable_grants(Driver::Postgres, &changes, &ids, &[found.clone()]).is_ok());
+        assert!(
+            plan_session::postgres::unrevocable_grants(&changes, &ids, &[found.clone()]).is_ok()
+        );
         found.permission = Permission::SerialSequences;
         found.target = "app.unmanaged".parse().unwrap();
-        assert!(unrevocable_grants(Driver::Postgres, &changes, &ids, &[found]).is_ok());
+        assert!(plan_session::postgres::unrevocable_grants(&changes, &ids, &[found]).is_ok());
     }
 
     #[test]
@@ -4744,8 +4508,7 @@ mod plan_name_tests {
             })));
         let owners = [(stored.clone(), "owner".into())].into();
         assert!(
-            owned_targets(
-                Driver::Postgres,
+            plan_session::postgres::owned_targets(
                 &changes,
                 &ids,
                 &owners,
@@ -4754,8 +4517,7 @@ mod plan_name_tests {
             .is_err()
         );
         assert!(
-            owned_targets(
-                Driver::Postgres,
+            plan_session::postgres::owned_targets(
                 &changes,
                 &ids,
                 &BTreeMap::new(),
@@ -4776,8 +4538,8 @@ mod plan_name_tests {
             permission: Permission::Select,
             why: "the session cannot revoke the stored grant".into(),
         };
-        assert!(unrevocable_grants(Driver::Postgres, &changes, &ids, &[found]).is_err());
-        assert!(unrevocable_grants(Driver::Postgres, &changes, &ids, &[]).is_ok());
+        assert!(plan_session::postgres::unrevocable_grants(&changes, &ids, &[found]).is_err());
+        assert!(plan_session::postgres::unrevocable_grants(&changes, &ids, &[]).is_ok());
     }
 }
 
@@ -4876,23 +4638,6 @@ async fn refuse_policy_dependents<D: ?Sized>(
 pub struct Prerequisites {
     pub types: Vec<pbps_model::TypePin>,
     pub providers: Vec<pbps_model::ProviderPin>,
-}
-
-/// Read prerequisites before probes can rely on a referenced type.
-pub async fn seal_type_pins(
-    conn: &mut Conn,
-    schemas: &[&Schema],
-    changes: &ChangeSet,
-    trusted: &BTreeSet<pbps_model::RoleName>,
-    pin_routines: bool,
-) -> anyhow::Result<Prerequisites> {
-    match conn.driver() {
-        Driver::Postgres => {
-            plan_session::postgres::seal_type_pins(conn, schemas, changes, trusted, pin_routines)
-                .await
-        }
-        Driver::Mssql => plan_session::mssql::seal_type_pins(trusted),
-    }
 }
 
 /// Requirements already classified as external cannot borrow a lifecycle name.
@@ -4995,31 +4740,6 @@ pub async fn type_input_routines(
         }
         Driver::Mssql => plan_session::mssql::type_input_routines(pins, pin_routines),
     }
-}
-
-/// Keep bootstrap's prerequisite reads valid through execution and recording.
-pub async fn recheck_type_prerequisites(
-    conn: &mut Conn,
-    expected: &Prerequisites,
-    changes: &ChangeSet,
-    trusted: &BTreeSet<pbps_model::RoleName>,
-    inside: bool,
-) -> anyhow::Result<()> {
-    match conn.driver() {
-        Driver::Postgres => {
-            let within = if inside {
-                pbps_db::TransactionOwner::CallersTransaction
-            } else {
-                pbps_db::TransactionOwner::OwnTransaction
-            };
-            pbps_pg::type_refs::check(conn, within, &expected.types, &[], changes).await?;
-            pbps_pg::class_pins::check(conn, within, &expected.providers, changes).await?;
-            type_input_routines(conn, &expected.types, trusted, false, inside).await?;
-        }
-        Driver::Mssql if expected.types.is_empty() && expected.providers.is_empty() => {}
-        Driver::Mssql => anyhow::bail!("SQL Server does not support type references"),
-    }
-    Ok(())
 }
 
 /// Column references in a recorded or declared schema.

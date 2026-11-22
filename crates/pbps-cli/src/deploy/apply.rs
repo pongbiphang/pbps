@@ -353,7 +353,7 @@ pub(super) async fn apply_under_lock<D: crate::engine::ApplySession>(
     // OWNER TO` the grantee after planning reaches here as a clean baseline.
     // The same question `plan` asked, of the database as it stands now
     // (#692): a grant to a target's owner is a no-op no `REVOKE` undoes.
-    dialect.baseline_grants(conn.driver(), plan, &scoped, &unrevocable)?;
+    dialect.baseline_grants(plan, &scoped, &unrevocable)?;
 
     // Before the probes, which run declared expressions and so the routines
     // they call (DEC-319.1). Every module the plan holds at any point of its

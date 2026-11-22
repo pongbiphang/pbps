@@ -160,7 +160,7 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
         // And ownership, which is beside the checksum for the same reason
         // (#692), and whether this connection can revoke what is left to
         // revoke (#1057).
-        dialect.baseline_grants(conn.driver(), plan, &scoped, &unrevocable)?;
+        dialect.baseline_grants(plan, &scoped, &unrevocable)?;
         // The role a `DROP ROLE` will meet is the role as the plan left it:
         // the members whose `DROP MEMBER` has not run yet, and nothing
         // owned. Membership and ownership are outside the checksum on
@@ -258,7 +258,7 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
         refuse_unexpressible(&scoped, &target.label, "apply again")?;
         // Ownership and revocability, as in the transactional apply (#692,
         // #1057).
-        dialect.baseline_grants(conn.driver(), plan, &scoped, &unrevocable)?;
+        dialect.baseline_grants(plan, &scoped, &unrevocable)?;
         // Before the probes, as in the transactional apply (DEC-319.1).
         crate::pins::check_with_session(
             dialect,

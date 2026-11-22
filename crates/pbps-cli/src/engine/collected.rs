@@ -135,25 +135,6 @@ pub(crate) async fn recheck_enum_rebuild_census(
     }
 }
 
-/// The objects the database already holds under the history-table names a plan
-/// would create (#1176).
-///
-/// SQL Server takes an existing table whose columns match as the history,
-/// rows, layout and all, where any other `CREATE` would be refused (measured
-/// on 17.0), so it is asked. PostgreSQL has no system-versioned tables and
-/// answers `None`.
-pub(crate) async fn history_name_occupants(
-    conn: &mut Conn,
-    names: &[TableName],
-) -> anyhow::Result<Option<Vec<pbps_mssql::catalog::NameOccupant>>> {
-    match conn.driver() {
-        Driver::Mssql => Ok(Some(
-            pbps_mssql::catalog::object_name_occupants(conn, names, &[]).await?,
-        )),
-        Driver::Postgres => Ok(None),
-    }
-}
-
 /// Judges the expressions the plan gives a table before any probe evaluates
 /// them, and answers whether one was left unjudged.
 ///
