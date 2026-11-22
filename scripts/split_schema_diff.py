@@ -19,6 +19,21 @@ reserved keys `_docs` (the `//!` line of each module), `_pub_super` and
 `_no_reexport` (see below) are not modules. A name in the plan that the tree does not have is an
 error, never a skip.
 
+A module name `group/part` is a module one level down: the file
+`schema_diff/group/part.rs`, declared by `schema_diff/group.rs` (the repository
+writes `foo.rs` beside `foo/`, not `foo/mod.rs`). The plan gives `group` a line
+in `_docs` and no item list; a flat module of that name is an error, and so is
+a name nested deeper. The script owns `group.rs`: it holds the `//!` line and
+one `pub(super) mod part;` line per planned part, and nothing else (a file that
+holds an item is an error). The parent file declares `mod group;` and imports
+`group::part::item`, so the parent stays the one place every module reaches
+the others through, as for a flat module: a nested module opens with
+`use super::super::*;`, which is the parent's namespace, its imports included.
+No re-export through `group.rs` is needed, and no sibling imports another by
+path. The price is the visibility of a private item that anything else reads:
+the parent and the sibling modules sit one level above the item's `group`, so
+it gets `pub(in super::super)` where a flat module's gets `pub(super)`.
+
 How an item is named (the name the plan lists):
 
     fn name, struct Name, enum Name, union Name, trait Name, const NAME,
@@ -43,9 +58,10 @@ Visibility, the one edit an item gets:
 - An already `pub` or `pub(crate)` item keeps its visibility and is re-exported
   from the parent by a named `pub use` / `pub(crate) use`, so no path outside
   the file changes.
-- A private item gets `pub(super)` exactly when its name occurs as a word (not
-  after a `.`) outside its new module: in the parent's remaining items, in
-  another module, or in a test file the parent declares. The parent then
+- A private item gets `pub(super)` (`pub(in super::super)` in a nested module)
+  exactly when its name occurs as a word (not after a `.`) outside its new
+  module: in the parent's remaining items, in another module (a sibling in the
+  same group included), or in a test file the parent declares. The parent then
   imports it by name, which is how every other module and the tests reach it
   through their `use super::*;`. A name that only a test file uses gets a
   `#[cfg(test)]` import, so the build without tests has no unused import.
@@ -62,12 +78,14 @@ Visibility, the one edit an item gets:
 The check (`--check BASE_FILE`, a saved copy of the file before the move) lexes
 both trees, cuts them into items and requires: every base item appears exactly
 once in the new tree; its tokens equal the base item's after deleting an
-inserted `pub(super)` at an item head, a struct-field head or an impl-method
-head, and an inserted trailing `,` before the `)` of a signature; items left
-in the parent and items of each module keep their order; no extra item exists;
-the `use`/`mod` lines are the only other difference and are printed. With
-`--base-ref REF` the modules and test files as they were at REF count too (a
-later PR's check), and the test files must be byte-identical to REF's.
+inserted `pub(super)` (or `pub(in super::super)`) at an item head, a
+struct-field head or an impl-method head, and an inserted trailing `,` before
+the `)` of a signature; items left in the parent and items of each module keep
+their order; no extra item exists; the `use`/`mod` lines are the only other
+difference and are printed. The modules are found by following the `mod` lines,
+a group's included. With `--base-ref REF` the modules and test files as they
+were at REF count too (a later PR's check), and the test files must be
+byte-identical to REF's.
 """
 
 from __future__ import annotations
@@ -77,6 +95,7 @@ import json
 import re
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -84,6 +103,7 @@ DEFAULT_FILE = "crates/pbps-diff/src/schema_diff.rs"
 DEFAULT_PLAN = Path(__file__).with_suffix(".plan.json")
 RESERVED = ("_docs", "_pub_super", "_no_reexport")
 PUB_SUPER = ["pub", "(", "super", ")"]
+_MODULE_NAME = r"[a-z][a-z0-9_]*"
 
 
 class SplitError(Exception):
@@ -300,7 +320,8 @@ def _parse_item(text: str, toks: list[Tok], pairs: dict[int, int], lead: int, he
     if toks[k].text == "pub":
         k += 1
         if toks[k].text == "(":
-            vis = "pub(" + "".join(t.text for t in toks[k + 1 : pairs[k]]) + ")"
+            inner = [t.text for t in toks[k + 1 : pairs[k]]]
+            vis = "pub(" + ("in " + "".join(inner[1:]) if inner[:1] == ["in"] else "".join(inner)) + ")"
             k = pairs[k] + 1
         else:
             vis = "pub"
@@ -467,15 +488,37 @@ def load_plan(path: Path) -> tuple[dict[str, list[str]], dict[str, str], list[st
     modules = {k: v for k, v in raw.items() if k not in RESERVED}
     seen: dict[str, str] = {}
     for mod, names in modules.items():
-        if not re.fullmatch(r"[a-z][a-z0-9_]*", mod):
-            raise SplitError(f"plan: `{mod}` is not a module name")
-        if mod not in docs:
-            raise SplitError(f"plan: module `{mod}` has no line in `_docs`")
+        if not re.fullmatch(f"{_MODULE_NAME}(/{_MODULE_NAME})?", mod):
+            raise SplitError(f"plan: `{mod}` is not a module name (a group holds modules one level down only)")
+        for need in dict.fromkeys([_top(mod), mod]):
+            if need not in docs:
+                raise SplitError(f"plan: module `{need}` has no line in `_docs`")
+        if "/" in mod and _top(mod) in modules:
+            raise SplitError(f"plan: `{_top(mod)}` is a module with items and also the group of `{mod}`")
         for name in names:
             if name in seen:
                 raise SplitError(f"plan: `{name}` is listed for `{seen[name]}` and for `{mod}`")
             seen[name] = mod
     return modules, docs, pub_super, no_reexport
+
+
+def _top(mod: str) -> str:
+    """The module the parent declares: `group` for `group/part`."""
+    return mod.split("/")[0]
+
+
+def _groups(modules: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Each group's parts, sorted; a flat module is not a group."""
+    out: dict[str, list[str]] = {}
+    for mod in modules:
+        if "/" in mod:
+            out.setdefault(_top(mod), []).append(mod.split("/")[1])
+    return {g: sorted(parts) for g, parts in out.items()}
+
+
+def _super_vis(mod: str) -> str:
+    """The narrowest visibility that reaches the parent file from `mod`."""
+    return "pub(in " + "::".join(["super"] * (mod.count("/") + 1)) + ")" if "/" in mod else "pub(super)"
 
 
 def _matches(item: Item, name: str) -> bool:
@@ -507,12 +550,16 @@ def _file_idents(path: Path) -> set[str]:
 
 
 def _header(mod: str, docs: dict[str, str]) -> str:
-    return f"//! {docs[mod]}\n\nuse super::*;\n"
+    return f"//! {docs[mod]}\n\nuse {'super::' * (mod.count('/') + 1)}*;\n"
 
 
-def _with_visibility(text: str, used_outside: set[str], forced: list[str]) -> str:
-    """Insert `pub(super) ` at the head of each private item used outside the
-    module, and at each listed field or method."""
+def _group_file(group: str, parts: list[str], docs: dict[str, str]) -> str:
+    return f"//! {docs[group]}\n\n" + "".join(f"pub(super) mod {part};\n" for part in parts)
+
+
+def _with_visibility(text: str, used_outside: set[str], forced: list[str], vis: str = "pub(super)") -> str:
+    """Insert `pub(super) ` (`vis`) at the head of each private item used
+    outside the module, and at each listed field or method."""
     edits: list[int] = []
     for it in cut_items(text):
         if it.glue or it.kind == "impl":
@@ -526,7 +573,7 @@ def _with_visibility(text: str, used_outside: set[str], forced: list[str]) -> st
     toks = tokenize(text)
     for h in sorted(set(edits), reverse=True):
         off = toks[h].start
-        text = text[:off] + "pub(super) " + text[off:]
+        text = text[:off] + vis + " " + text[off:]
     return text
 
 
@@ -591,7 +638,7 @@ def apply(root: Path, parent_rel: str, plan_path: Path) -> list[str]:
     read_in_file: set[tuple[str, str]] = set()
     for mod in modules:
         outside = set(kept).union(*(ids for other, ids in per_module.items() if other != mod))
-        final[mod] = _with_visibility(composed[mod], outside, pub_super)
+        final[mod] = _with_visibility(composed[mod], outside, pub_super, _super_vis(mod))
         read_in_file |= {(mod, name) for name in outside}
     # a name only a test file reads needs its import only in the test build
     test_only = {
@@ -606,10 +653,19 @@ def apply(root: Path, parent_rel: str, plan_path: Path) -> list[str]:
         path = mod_dir / f"{mod}.rs"
         if existing[mod] != body:
             written.append((path, body))
+    for group, parts in _groups(modules).items():
+        path = mod_dir / f"{group}.rs"
+        body = _group_file(group, parts, docs)
+        if path.is_file():
+            if held := [it for it in cut_items(path.read_text()) if not it.glue]:
+                raise SplitError(f"`{path.name}` is the group of {parts} and holds the item `{held[0].display or held[0].name}`")
+            if path.read_text() == body:
+                continue
+        written.append((path, body))
     if parent_text != text:
         written.append((parent_path, parent_text))
-    mod_dir.mkdir(exist_ok=True)
     for path, body in written:
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body)
     return [str(p.relative_to(root)) for p, _ in written]
 
@@ -625,11 +681,12 @@ def _parent_glue(
 ) -> str:
     """Replace the managed `mod` and import lines by those the modules need."""
     names = set(modules)
+    tops = {_top(m) for m in names}
     for it in reversed(rest):
-        if _managed(it, names):
+        if _managed(it, tops):
             parent_text = parent_text[: it.start] + parent_text[next_start(it, len(parent_text)) :]
     rest = cut_items(parent_text)
-    mods = [f"mod {m};" for m in sorted(names)]
+    mods = [f"mod {m};" for m in sorted(tops)]
     uses = []
     unexported = set(no_reexport)
     for mod in sorted(names):
@@ -644,10 +701,10 @@ def _parent_glue(
                 # a private item would be: not at all, plainly, or for tests.
                 if (mod, it.name) not in read_in_file:
                     continue
-            private = it.vis == "pub(super)" or it.name in no_reexport
+            private = it.vis == _super_vis(mod) or it.name in no_reexport
             shown = "" if private else it.vis + " "
             gate = "#[cfg(test)]\n" if private and (mod, it.name) in test_only else ""
-            uses.append(f"{gate}{shown}use {mod}::{it.name};")
+            uses.append(f"{gate}{shown}use {mod.replace('/', '::')}::{it.name};")
     if unexported:
         raise SplitError(f"`_no_reexport` names {sorted(unexported)}, which no module holds as a visible item")
     uses.sort(key=lambda line: line[line.index("use ") + 4 :])
@@ -671,6 +728,19 @@ def _git_show(root: Path, ref: str, rel: str) -> str | None:
     return r.stdout if r.returncode == 0 else None
 
 
+def _inserted_visibility(n: list[str], j: int) -> int:
+    """How many tokens of an inserted `pub(super)` or `pub(in super::super)`
+    start at `n[j]`; 0 when none does."""
+    if n[j : j + 4] == PUB_SUPER:
+        return 4
+    if n[j : j + 4] != ["pub", "(", "in", "super"]:
+        return 0
+    k = j + 4
+    while n[k : k + 3] == [":", ":", "super"]:
+        k += 3
+    return k + 1 - j if n[k : k + 1] == [")"] else 0
+
+
 def _align(base: Item, new: Item) -> str | None:
     """None when `new` is `base` plus allowed insertions; else where they differ."""
     b, n = base.tokens(), new.tokens()
@@ -680,8 +750,8 @@ def _align(base: Item, new: Item) -> str | None:
     while i < len(b) or j < len(n):
         if i < len(b) and j < len(n) and b[i] == n[j]:
             i, j = i + 1, j + 1
-        elif j in heads and n[j : j + 4] == PUB_SUPER:
-            j += 4
+        elif j in heads and (size := _inserted_visibility(n, j)):
+            j += size
         elif j + 1 in closers and n[j] == "," and i < len(b) and b[i] == ")":
             j += 1
         else:
@@ -700,6 +770,23 @@ def _shown(item: Item) -> str:
     return " ".join(item.text[item.toks[first].start : item.stop].split())
 
 
+def _declared_modules(read: Callable[[Path], str | None], mod_dir: Path, items: list[Item], prefix: str = "") -> list[tuple[str, Path, list[Item] | None]]:
+    """(name, file, its items or None when the file is missing) of every module
+    the `mod` lines of `items` declare, and of the modules those declare in turn:
+    `group/part` for the part of a group. `read` gives a file's text or None."""
+    out: list[tuple[str, Path, list[Item] | None]] = []
+    for it in items:
+        if it.kind != "mod_decl" or it.is_test_gated():
+            continue
+        path, name = mod_dir / f"{it.name}.rs", prefix + it.name
+        body = read(path)
+        held = None if body is None else cut_items(body)
+        out.append((name, path, held))
+        if held is not None:
+            out += _declared_modules(read, mod_dir / it.name, held, name + "/")
+    return out
+
+
 def check(root: Path, parent_rel: str, base_text: str, base_ref: str | None = None) -> tuple[list[str], list[str]]:
     """(problems, report lines)."""
     problems: list[str] = []
@@ -714,27 +801,25 @@ def check(root: Path, parent_rel: str, base_text: str, base_ref: str | None = No
         ("parent", (1, i), it) for i, it in enumerate(base_items) if not it.glue
     ]
     if base_ref:
-        for it in base_items:
-            if it.kind == "mod_decl" and not it.is_test_gated():
-                body = _git_show(root, base_ref, f"{mod_dir.relative_to(root)}/{it.name}.rs")
-                if body is not None:
-                    base += [(it.name, (0, i), x) for i, x in enumerate(cut_items(body)) if not x.glue]
+
+        def at_ref(path: Path) -> str | None:
+            return _git_show(root, base_ref, str(path.relative_to(root)))
+
+        for name, _, its in _declared_modules(at_ref, mod_dir, base_items):
+            base += [(name, (0, i), x) for i, x in enumerate(its or []) if not x.glue]
     new: list[tuple[str, int, Item]] = [("parent", i, it) for i, it in enumerate(new_items) if not it.glue]
     module_glue: dict[str, list[Item]] = {}
-    test_files = []
-    for it in new_items:
-        if it.kind != "mod_decl":
+    test_files = [mod_dir / f"{it.name}.rs" for it in new_items if it.kind == "mod_decl" and it.is_test_gated()]
+
+    def on_disk(path: Path) -> str | None:
+        return path.read_text() if path.is_file() else None
+
+    for name, path, its in _declared_modules(on_disk, mod_dir, new_items):
+        if its is None:
+            problems.append(f"`mod {name.split('/')[-1]};` has no file {path.relative_to(root)}")
             continue
-        path = mod_dir / f"{it.name}.rs"
-        if it.is_test_gated():
-            test_files.append(path)
-            continue
-        if not path.is_file():
-            problems.append(f"`mod {it.name};` has no file {path.relative_to(root)}")
-            continue
-        its = cut_items(path.read_text())
-        module_glue[it.name] = [x for x in its if x.glue]
-        new += [(it.name, i, x) for i, x in enumerate(its) if not x.glue]
+        module_glue[name] = [x for x in its if x.glue]
+        new += [(name, i, x) for i, x in enumerate(its) if not x.glue]
 
     by_key: dict[str, list] = {}
     for entry in base:

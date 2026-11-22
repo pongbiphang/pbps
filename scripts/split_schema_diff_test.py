@@ -83,6 +83,16 @@ PLAN = {
     "second": ["Pair", "LIMIT"],
 }
 
+# The same items in a group: `beta` calls `alpha` across the two parts, the parent's
+# `gamma` builds a `Pair`, and `tests.rs` reads `LIMIT`.
+NESTED = {
+    "_docs": {"group": "The group.", "group/one": "The first part.", "group/two": "The second part."},
+    "_pub_super": ["Pair.left", "Pair::sum"],
+    "group/one": ["Boom", "alpha"],
+    "group/two": ["Pair", "LIMIT", "beta"],
+}
+WIDE = "pub(in super::super)"
+
 
 def git(root: Path, *args: str) -> None:
     subprocess.run(
@@ -360,6 +370,131 @@ class Move(Tree):
         self.assertIn("pub(super) const LIMIT", self.module("second").read_text())
 
 
+class Nested(Tree):
+    """A module one level down: `group/one` is `group/one.rs`, declared by `group.rs`."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.write_plan(NESTED)
+
+    def test_a_nested_key_writes_the_group_file_and_each_part(self) -> None:
+        written = {f"crates/pbps-diff/src/schema_diff/{p}" for p in ("group.rs", "group/one.rs", "group/two.rs")} | {REL}
+        self.assertEqual(set(self.apply()), written)
+        self.assertEqual(self.module("group").read_text(), "//! The group.\n\npub(super) mod one;\npub(super) mod two;\n")
+        self.assertTrue(self.module("group/one").read_text().startswith("//! The first part.\n\nuse super::super::*;\n\n"))
+        parent = self.src.read_text()
+        self.assertIn("mod group;\n", parent)
+        self.assertNotIn("mod one;", parent)
+        self.assertIn("pub use group::one::Boom;", parent)
+        self.assertEqual(self.check(), [])
+
+    def test_a_private_item_read_outside_its_part_reaches_the_parent_wide_enough(self) -> None:
+        self.apply()
+        one, two, parent = (self.module("group/one").read_text(), self.module("group/two").read_text(), self.src.read_text())
+        self.assertIn(f"{WIDE} fn alpha", one)  # beta, in the sibling part, calls it
+        self.assertIn("\nuse group::one::alpha;", parent)
+        self.assertNotIn("#[cfg(test)]\nuse group::one::alpha;", parent)  # not a test-only import
+        self.assertIn(f"{WIDE} struct Pair", two)  # gamma, in the parent, builds it
+        self.assertIn(f"    {WIDE} left: u8,", two)
+        self.assertIn(f"    {WIDE} fn sum", two)
+        self.assertNotIn("pub(super)", one + two)
+        self.assertEqual(self.check(), [])
+
+    def test_a_nested_item_only_a_test_file_reads_is_imported_for_the_test_build(self) -> None:
+        self.apply()
+        self.assertIn(f"{WIDE} const LIMIT", self.module("group/two").read_text())
+        self.assertIn("#[cfg(test)]\nuse group::two::LIMIT;", self.src.read_text())
+
+    def test_a_nested_item_nobody_reads_outside_stays_private_and_unimported(self) -> None:
+        self.apply()
+        self.assertIn("\nfn beta", self.module("group/two").read_text())
+        self.assertNotIn("beta", self.src.read_text().replace("fn beta", ""))
+
+    def test_a_second_run_changes_nothing(self) -> None:
+        self.apply()
+        files = [self.src, *self.dir.rglob("*.rs")]
+        before = {p: p.read_bytes() for p in files}
+        self.assertEqual(self.apply(), [])
+        self.assertEqual(before, {p: p.read_bytes() for p in [self.src, *self.dir.rglob("*.rs")]})
+
+    def test_a_later_plan_appends_to_a_part_and_the_check_reads_the_parts_at_the_base_ref(self) -> None:
+        self.apply()
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "first move")
+        base = self.src.read_text()
+        self.write_plan({**NESTED, "group/one": ["Boom", "alpha", "gamma"]})
+        self.apply()
+        self.assertIn("fn gamma", self.module("group/one").read_text())
+        self.assertEqual(self.check(base, "HEAD"), [])
+        self.assertEqual(self.apply(), [])
+
+    def test_the_map_names_the_part(self) -> None:
+        self.assertIn("Boom: 5-14 -> group/one", ssd.move_map(PARENT, self.plan))
+
+    def test_a_group_cannot_also_be_a_module_with_items(self) -> None:
+        self.write_plan({**NESTED, "group": ["gamma"]})
+        with self.assertRaisesRegex(ssd.SplitError, "group.*group/one"):
+            self.apply()
+        self.assertFalse(self.module("group/one").exists(), "nothing is written when the run fails")
+
+    def test_a_group_or_part_without_a_doc_line_is_an_error(self) -> None:
+        docs = NESTED["_docs"]
+        self.write_plan({**NESTED, "_docs": {k: v for k, v in docs.items() if k != "group"}})
+        with self.assertRaisesRegex(ssd.SplitError, "`group`.*_docs"):
+            self.apply()
+        self.write_plan({**NESTED, "_docs": {k: v for k, v in docs.items() if k != "group/two"}})
+        with self.assertRaisesRegex(ssd.SplitError, "`group/two`.*_docs"):
+            self.apply()
+
+    def test_a_name_nested_deeper_is_an_error(self) -> None:
+        self.write_plan({**NESTED, "group/one/deep": ["gamma"], "_docs": {**NESTED["_docs"], "group/one/deep": "Deep."}})
+        with self.assertRaisesRegex(ssd.SplitError, "group/one/deep"):
+            self.apply()
+
+    def test_a_name_the_tree_does_not_have_is_an_error_and_writes_no_group_file(self) -> None:
+        self.write_plan({**NESTED, "group/two": ["Pair", "NOPE"]})
+        with self.assertRaisesRegex(ssd.SplitError, "NOPE"):
+            self.apply()
+        self.assertFalse(self.module("group").exists())
+        self.assertFalse((self.dir / "group").exists())
+
+    def test_a_group_file_that_holds_an_item_is_not_overwritten(self) -> None:
+        self.module("group").write_text("//! Mine.\n\nfn stray() {}\n")
+        with self.assertRaisesRegex(ssd.SplitError, "group.rs.*stray"):
+            self.apply()
+        self.assertIn("fn stray", self.module("group").read_text())
+
+    def test_a_pub_super_in_a_nested_item_body_is_still_refused(self) -> None:
+        self.apply()
+        self.edit(self.module("group/two"), "self.left + self.right", f"self.left + {WIDE} self.right")
+        self.assertRefused(self.check(), "differs from the base")
+
+    def test_a_token_changed_in_a_nested_item_is_refused(self) -> None:
+        self.apply()
+        self.edit(self.module("group/two"), "self.left + self.right", "self.left - self.right")
+        self.assertRefused(self.check(), "differs from the base", "impl Pair")
+
+    def test_an_item_missing_from_a_nested_part_is_refused(self) -> None:
+        self.apply()
+        self.edit(self.module("group/one"), self.item_text(self.module("group/one"), "alpha"), "")
+        self.assertRefused(self.check(), "alpha", "missing")
+
+    def test_a_declared_part_without_a_file_is_refused(self) -> None:
+        self.apply()
+        self.module("group/two").unlink()
+        self.assertRefused(self.check(), "has no file")
+
+    def test_the_order_inside_a_nested_part_is_checked(self) -> None:
+        self.apply()
+        self.swap(self.module("group/two"), "Pair", "LIMIT")
+        self.assertRefused(self.check(), "order changed in module `group/two`")
+
+    def test_an_item_that_stands_in_the_parent_and_in_a_part_is_refused(self) -> None:
+        self.apply()
+        self.src.write_text(self.src.read_text() + "\n" + self.item_text(self.module("group/one"), "alpha") + "\n")
+        self.assertRefused(self.check(), "present 2 times", "alpha")
+
+
 class Refusals(Tree):
     """Each way a move can go wrong must make the check fail."""
 
@@ -509,6 +644,10 @@ class Lexer(unittest.TestCase):
         self.assertTrue(first.source.startswith("// one"))
         self.assertTrue(first.source.endswith("struct S;"))
         self.assertEqual((first.kind, first.name, first.vis), ("struct", "S", "pub"))
+
+    def test_a_visibility_path_is_read_with_its_in_keyword(self) -> None:
+        text = "pub(in super::super) fn f() {}\npub(crate) fn g() {}\npub(super) fn h() {}\n"
+        self.assertEqual([i.vis for i in self.items(text)], ["pub(in super::super)", "pub(crate)", "pub(super)"])
 
     def test_how_an_item_is_named(self) -> None:
         text = (
