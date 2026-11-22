@@ -265,6 +265,16 @@ class Move(Tree):
         with self.assertRaisesRegex(ssd.SplitError, "NOPE"):
             ssd.move_map(after, self.plan, self.root, REL, "HEAD")
 
+    def test_the_map_tells_two_impl_blocks_of_one_type_apart(self) -> None:
+        # Both are shown as `impl Pair`; one moved before, the other is new.
+        self.apply()
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "first move")
+        parent = (self.root / REL).read_text() + "\nimpl Pair {\n    fn other(&self) -> u8 {\n        2\n    }\n}\n"
+        rows = ssd.move_map(parent, self.plan, self.root, REL, "HEAD")
+        self.assertEqual(len(rows), 1, rows)
+        self.assertTrue(rows[0].startswith("impl Pair: ") and rows[0].endswith(" -> second"), rows)
+
     def test_an_import_only_a_test_file_reads_is_gated_to_the_test_build(self) -> None:
         self.apply()
         parent = self.src.read_text()
