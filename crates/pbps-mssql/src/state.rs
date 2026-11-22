@@ -16,15 +16,10 @@
 
 use std::borrow::Cow;
 
-use pbps_db::ledger::flow::{
-    self, ClipUnit, LedgerSpec, ProjectedRow, RowLimit, ordinary_params, projected_row,
-    projected_row_unmigrated,
-};
-use pbps_db::ledger::{
-    LedgerEntry, LedgerError, LockInfo, TimelineEntry, TimelineState, ids_to_prune,
-};
-use pbps_db::{Conn, DbError, Param};
-use pbps_model::{StateSnapshot, Unreadable};
+use pbps_db::ledger::flow::{self, ClipUnit, HeldLock, LedgerSpec, LedgerSteps, RowLimit};
+use pbps_db::ledger::{LedgerEntry, LedgerError, LockInfo, TimelineEntry};
+use pbps_db::{Conn, DbError};
+use pbps_model::StateSnapshot;
 
 use crate::catalog::get;
 
@@ -445,12 +440,46 @@ static LEDGER: LedgerSpec = LedgerSpec {
     select_history: Cow::Borrowed(SELECT_HISTORY),
     select_applied_plan: Cow::Borrowed(SELECT_APPLIED_PLAN),
     select_deployed_revision,
+    select_timeline: Cow::Borrowed(SELECT_TIMELINE),
+    select_timeline_unmigrated: Cow::Borrowed(SELECT_TIMELINE_UNMIGRATED),
+    select_legacy_state_json,
+    insert_state_staged: Cow::Borrowed(INSERT_STATE_STAGED),
+    insert_state_not_staged: Cow::Borrowed(INSERT_STATE_NOT_STAGED),
+    select_ids: Cow::Borrowed(SELECT_IDS),
+    delete_up_to: Cow::Borrowed(DELETE_UP_TO),
     select_lock: Cow::Borrowed(SELECT_LOCK),
+    insert_lock: Cow::Borrowed(INSERT_LOCK),
+    delete_lock: Cow::Borrowed(DELETE_LOCK),
+    session_application_name: Cow::Borrowed(SESSION_APPLICATION_NAME),
     row_limit: ROW_LIMIT,
+    max_parameters: crate::doctor::MAX_PARAMETERS,
+    operator_clip: (ClipUnit::Utf16Units, pbps_db::OPERATOR_CHARS),
+    // A plain `INSERT` of the one row: a held lock is the primary key's
+    // refusal, and the transaction outlives it, so the holder can be read
+    // after the failure.
+    held_lock: HeldLock::FailsTheInsert,
     missing_table: INVALID_OBJECT_NAME,
+    select_denied: SELECT_DENIED_ON_COLUMN,
     savepoint: None,
     session_lookup,
 };
+
+/// The steps of the shared flow that are this engine's own work.
+struct Steps;
+
+impl LedgerSteps for Steps {
+    async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
+        ensure_tables(conn).await
+    }
+
+    async fn refuse_untrusted(conn: &mut Conn) -> Result<(), DbError> {
+        refuse_misspelt_ledger(conn).await
+    }
+
+    async fn timeline_columns_present(conn: &mut Conn) -> Result<bool, DbError> {
+        timeline_columns_present(conn).await
+    }
+}
 
 /// Whether this database has a ledger at all.
 ///
@@ -462,7 +491,7 @@ static LEDGER: LedgerSpec = LedgerSpec {
 /// # Why the statement is attempted rather than the catalog asked
 ///
 /// This asked `OBJECT_ID(N'dbo.__pbps_state', N'U') IS NULL`, and it was wrong
-/// for exactly the reason [`is_missing_table`] gives about the lock table:
+/// for exactly the reason [`INVALID_OBJECT_NAME`] gives about the lock table:
 /// measured against the pinned server, a principal with no permission on an
 /// existing `__pbps_state` gets NULL from `OBJECT_ID` and 0 from
 /// `HAS_PERMS_BY_NAME`, the same answers an absent table gives. So "not
@@ -532,109 +561,7 @@ pub async fn history(conn: &mut Conn, limit: u32) -> Result<Vec<LedgerEntry>, Le
 /// property its sharp test pins: a fully-migrated ledger whose `state_json`
 /// this login may not see still answers `state list`.
 pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>, LedgerError> {
-    if !is_initialized(conn).await? {
-        return Err(LedgerError::NotInitialized);
-    }
-    // `state list` is a read and must not require `ALTER` to run, so it
-    // cannot call `ensure_tables` to make an unmigrated ledger's columns
-    // appear — it asks the shape instead, with a probe that needs nothing
-    // wider than an ordinary read already needs, and sends the query that
-    // matches (round-1 review finding on #103's own PR: `timeline` is the
-    // only reader of `dbo.__pbps_state`'s shape, and both branches meet at
-    // `legacy_ids` below whichever one ran).
-    let projected: Vec<ProjectedRow> = if timeline_columns_present(conn).await? {
-        let rows = conn
-            .query_with(SELECT_TIMELINE, &[ROW_LIMIT.param(limit)])
-            .await?;
-        rows.iter().map(projected_row).collect::<Result<_, _>>()?
-    } else {
-        let rows = conn
-            .query_with(SELECT_TIMELINE_UNMIGRATED, &[ROW_LIMIT.param(limit)])
-            .await?;
-        rows.iter()
-            .map(projected_row_unmigrated)
-            .collect::<Result<_, _>>()?
-    };
-
-    let legacy_ids: Vec<i64> = projected
-        .iter()
-        .filter(|r| r.state.is_none())
-        .map(|r| r.id)
-        .collect();
-    let mut legacy: std::collections::HashMap<i64, Result<TimelineState, Unreadable>> =
-        std::collections::HashMap::new();
-    // In pieces of at most `crate::doctor::MAX_PARAMETERS` ids, not one
-    // statement for every legacy id: this query binds one parameter per id,
-    // and until a deployer has run a deployment after upgrading, every row
-    // is legacy, so a long-lived ledger's ordinary `state list` is exactly
-    // the case that could reach the server's own ceiling in a single
-    // request (a round-1 review finding on #103's own PR — the pre-#103
-    // query needed only its `@P1` limit parameter and had no such ceiling).
-    for chunk in legacy_ids.chunks(crate::doctor::MAX_PARAMETERS) {
-        let sql = select_legacy_state_json(chunk.len());
-        let params: Vec<Param<'_>> = chunk.iter().map(|&id| id.into()).collect();
-        match conn.query_with(&sql, &params).await {
-            Ok(rows) => {
-                for row in &rows {
-                    let id: i64 = get(row, "id")?;
-                    let state_json: &str = get(row, "state_json")?;
-                    // `read_json`, the same reader the pre-migration
-                    // `timeline_from_row` used: version before shape, and the
-                    // failure carried rather than returned (DECISIONS 222).
-                    let state = StateSnapshot::read_json(state_json)
-                        .map(|s| TimelineState::from_snapshot(&s));
-                    legacy.insert(id, state);
-                }
-            }
-            // Denied specifically, never a hard failure of the whole call:
-            // this is the fallback query, run only for rows a fresh ledger
-            // never has, and DECISIONS 218's promise — a row this build
-            // cannot read is carried, not thrown — extends to a row this
-            // build was refused, not only one it could not parse (DECISIONS
-            // 433). Every legacy id in this chunk shares one answer, because
-            // a column-level DENY is not sensitive to which row is read; a
-            // later chunk still asks for itself; a `DENY` on the table does
-            // not change between one statement and the next.
-            Err(e) if is_select_denied(&e) => {
-                let denied = Err(Unreadable::Denied(e.to_string()));
-                for id in chunk {
-                    legacy.insert(*id, denied.clone());
-                }
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-
-    Ok(projected
-        .into_iter()
-        .map(|r| TimelineEntry {
-            id: r.id,
-            applied_at: r.applied_at,
-            kind: r.kind,
-            git_sha: r.git_sha.map(pbps_model::Text::from),
-            plan_checksum: r.plan_checksum,
-            operator: r.operator,
-            reason: r.reason.map(pbps_model::Text::from),
-            state: match r.state {
-                // A version this build does not read, refused before the
-                // JSON fallback ever runs — see [`ProjectedRow`]'s doc
-                // comment on why this is neither `Some(Ok(_))` nor `None`.
-                Some(Err(e)) => Err(e),
-                Some(Ok(state)) => Ok(state),
-                // The fallback query answered for every id it was asked
-                // about; a legacy id missing from its answer means the row
-                // left the ledger between the two queries (a concurrent
-                // `state prune`), not that it was ever malformed or denied.
-                None => legacy.remove(&r.id).unwrap_or_else(|| {
-                    Err(Unreadable::Malformed(
-                        "this row's state_json could not be re-read; it may have been \
-                         pruned while the timeline was being read"
-                            .to_owned(),
-                    ))
-                }),
-            },
-        })
-        .collect())
+    flow::timeline::<Steps>(conn, &LEDGER, limit).await
 }
 
 /// Appends one state to the ledger and returns its id.
@@ -644,88 +571,27 @@ pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>,
 /// and a caller able to set them independently could make them lie. The five
 /// issue #103 added follow the same rule (DECISIONS 435).
 pub async fn record(conn: &mut Conn, snapshot: &StateSnapshot) -> Result<i64, LedgerError> {
-    snapshot
-        .validate_data_work()
-        .map_err(|e| LedgerError::BadEntry {
-            id: 0,
-            message: e.to_string(),
-        })?;
-    ensure_tables(conn).await?;
-    let snapshot =
-        &*flow::bounded_operator(snapshot, ClipUnit::Utf16Units, pbps_db::OPERATOR_CHARS);
-    let state_json = serde_json::to_string(snapshot).map_err(|e| LedgerError::BadEntry {
-        id: 0,
-        message: format!("the snapshot could not be serialized: {e}"),
-    })?;
-
-    let (params, staged) = ordinary_params(snapshot, &state_json);
-    // `staged_completed`/`staged_total` cannot be bound as NULL through
-    // `Param` — it has no nullable-integer variant, and adding one would mean
-    // updating the binder `pbps_db::Param` matches in *both* drivers for two
-    // columns that are NULL on precisely the rows that are not staged. Two
-    // static statements, chosen by whether this snapshot has staged progress
-    // at all, cost nothing `no_statement_interpolates_a_value` would catch —
-    // neither text is built from a value — and need no new binder variant.
-    let sql = if staged {
-        INSERT_STATE_STAGED
-    } else {
-        INSERT_STATE_NOT_STAGED
-    };
-    let rows = conn.query_with(sql, &params).await?;
-    match rows.first() {
-        Some(row) => Ok(get(row, "id")?),
-        None => Err(LedgerError::Db(DbError::BadRow(
-            "the ledger insert returned no id".into(),
-        ))),
-    }
+    flow::record::<Steps>(conn, &LEDGER, snapshot).await
 }
 
 /// Deletes all but the `keep` newest entries; returns how many went.
 pub async fn prune(conn: &mut Conn, keep: u32) -> Result<u64, LedgerError> {
-    if !is_initialized(conn).await? {
-        return Err(LedgerError::NotInitialized);
-    }
-    refuse_misspelt_ledger(conn).await?;
-    let ids: Vec<i64> = conn
-        .query(SELECT_IDS)
-        .await?
-        .iter()
-        .map(|row| get::<i64>(row, "id"))
-        .collect::<Result<_, _>>()?;
-
-    // The policy is decided in `pbps-db` and tested without a server; all that
-    // is left here is the delete. Because ids come from an IDENTITY and the list
-    // is newest-first, the prunable set is always a contiguous tail, so one
-    // `<=` covers it exactly.
-    let doomed = ids_to_prune(&ids, keep);
-    let Some(highest) = doomed.first().copied() else {
-        return Ok(0);
-    };
-    Ok(conn.execute_with(DELETE_UP_TO, &[highest.into()]).await?)
+    flow::prune::<Steps>(conn, &LEDGER, keep).await
 }
 
 /// Takes the apply lock, or reports who already holds it.
+///
+/// The insert is the gate, not a read before it: a check-then-insert would
+/// let two pipelines through the check together. The read only happens after
+/// the insert has already failed, and then only to name the holder.
 pub async fn lock(conn: &mut Conn, holder: &str) -> Result<(), LedgerError> {
-    ensure_tables(conn).await?;
-    // The insert is the gate, not the preceding read: a check-then-insert would
-    // let two pipelines through the check together. The read only happens after
-    // the insert has already failed, and then only to name the holder.
-    match conn.execute_with(INSERT_LOCK, &[holder.into()]).await {
-        Ok(_) => Ok(()),
-        Err(e) => match lock_holder(conn).await? {
-            Some(info) => Err(LedgerError::Locked(info)),
-            None => Err(LedgerError::Db(e)),
-        },
-    }
+    flow::lock::<Steps>(conn, &LEDGER, holder).await
 }
 
 /// SQL Server's "Invalid object name": the table this statement names is not
 /// there. **Not** the code for one that is there and may not be read — that is
 /// 229, "permission was denied", and keeping the two apart is the whole point
 /// of asking by error number.
-const INVALID_OBJECT_NAME: &str = "208";
-
-/// Whether a failure means "that table does not exist".
 ///
 /// # Why the statement is attempted rather than the catalog asked
 ///
@@ -741,9 +607,7 @@ const INVALID_OBJECT_NAME: &str = "208";
 /// server, it answers **0** both for an absent table and for one hidden this
 /// way. The statement itself is the only thing that does: 208 for absent, 229
 /// for denied, and every other failure stays a failure.
-fn is_missing_table(e: &DbError) -> bool {
-    e.server_error_code().as_deref() == Some(INVALID_OBJECT_NAME)
-}
+const INVALID_OBJECT_NAME: &str = "208";
 
 /// SQL Server's "SELECT permission was denied on the column", **measured**
 /// against the pinned server: Msg 230. Table-level denial is 229, the code
@@ -753,36 +617,19 @@ fn is_missing_table(e: &DbError) -> bool {
 /// nothing else on the ledger, the shape issue #103's sharp test builds.
 const SELECT_DENIED_ON_COLUMN: &str = "230";
 
-fn is_select_denied(e: &DbError) -> bool {
-    e.server_error_code().as_deref() == Some(SELECT_DENIED_ON_COLUMN)
-}
-
 /// Releases the lock. `false` means it was not held.
 pub async fn unlock(conn: &mut Conn) -> Result<bool, DbError> {
-    // The *lock* table, not the state table. Guarding on `is_initialized` meant
-    // a database whose `__pbps_state` had been dropped by hand reported "not
-    // held" and left a live lock in place — with no command able to clear it.
-    //
-    // A lock table spelled otherwise is refused first (#894): the DELETE would
-    // remove a row from the project's own table.
-    refuse_misspelt_ledger(conn).await?;
-    match conn.execute_with(DELETE_LOCK, &[]).await {
-        Ok(n) => Ok(n > 0),
-        Err(e) if is_missing_table(&e) => Ok(false),
-        Err(e) => Err(e),
-    }
+    flow::unlock::<Steps>(conn, &LEDGER).await
 }
 
 /// The application name this session carries, as the server holds it, so the
 /// lock records the name `sys.dm_exec_sessions.program_name` will show
 /// (#1188).
 pub async fn session_application_name(conn: &mut Conn) -> Result<String, DbError> {
-    let rows = conn.query("SELECT APP_NAME() AS name;").await?;
-    let row = rows
-        .first()
-        .ok_or_else(|| DbError::BadRow("APP_NAME() returned no row".into()))?;
-    Ok(get::<&str>(row, "name")?.to_owned())
+    flow::session_application_name(conn, &LEDGER).await
 }
+
+const SESSION_APPLICATION_NAME: &str = "SELECT APP_NAME() AS name;";
 
 /// How an operator finds a lock holder's sessions here, from what
 /// `locked_by` recorded; `None` when it recorded no application name.
@@ -812,7 +659,7 @@ pub fn session_lookup(locked_by: &str) -> Option<String> {
 /// holding a lock that does not exist. That is deliberately *not* the same as
 /// the table being unreadable, which stays an error — callers report the two
 /// differently, and "I could not look" must never be flattened into "nothing
-/// there". See [`is_missing_table`] for why that distinction cannot be made by
+/// there". See [`INVALID_OBJECT_NAME`] for why that distinction cannot be made by
 /// asking the catalog first.
 pub async fn lock_holder(conn: &mut Conn) -> Result<Option<LockInfo>, DbError> {
     flow::lock_holder(conn, &LEDGER).await
@@ -821,6 +668,7 @@ pub async fn lock_holder(conn: &mut Conn) -> Result<Option<LockInfo>, DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_db::Param;
 
     #[test]
     fn only_permission_migration_failures_recommend_obtaining_rights() {
@@ -915,25 +763,10 @@ mod tests {
     fn the_statements_name_the_documented_tables() {
         assert_eq!(STATE_TABLE, format!("{LEDGER_SCHEMA}.{STATE_TABLE_NAME}"));
         assert_eq!(LOCK_TABLE, format!("{LEDGER_SCHEMA}.{LOCK_TABLE_NAME}"));
-        for sql in [
-            CREATE_STATE,
-            ADD_TIMELINE_COLUMNS,
-            TIMELINE_COLUMNS_PROBE,
-            SELECT_LATEST,
-            SELECT_HISTORY,
-            SELECT_TIMELINE,
-            SELECT_TIMELINE_UNMIGRATED,
-            INSERT_STATE_STAGED,
-            INSERT_STATE_NOT_STAGED,
-            SELECT_IDS,
-            DELETE_UP_TO,
-        ] {
+        for sql in [CREATE_STATE, ADD_TIMELINE_COLUMNS, TIMELINE_COLUMNS_PROBE] {
             assert!(sql.contains("__pbps_state"), "{sql}");
         }
-        assert!(select_legacy_state_json(2).contains("__pbps_state"));
-        for sql in [CREATE_LOCK, SELECT_LOCK, INSERT_LOCK, DELETE_LOCK] {
-            assert!(sql.contains("__pbps_lock"), "{sql}");
-        }
+        assert!(CREATE_LOCK.contains("__pbps_lock"));
         // What the shared flow sends comes from the spec's own list, which
         // names every field: a statement added there is covered here.
         let spec = LEDGER.statements();
@@ -957,8 +790,22 @@ mod tests {
         assert_eq!(LEDGER.select_latest, SELECT_LATEST);
         assert_eq!(LEDGER.select_history, SELECT_HISTORY);
         assert_eq!(LEDGER.select_lock, SELECT_LOCK);
+        assert_eq!(LEDGER.select_timeline, SELECT_TIMELINE);
+        assert_eq!(
+            LEDGER.select_timeline_unmigrated,
+            SELECT_TIMELINE_UNMIGRATED
+        );
+        assert_eq!(LEDGER.insert_state_staged, INSERT_STATE_STAGED);
+        assert_eq!(LEDGER.insert_state_not_staged, INSERT_STATE_NOT_STAGED);
+        assert_eq!(LEDGER.select_ids, SELECT_IDS);
+        assert_eq!(LEDGER.delete_up_to, DELETE_UP_TO);
+        assert_eq!(LEDGER.insert_lock, INSERT_LOCK);
+        assert_eq!(LEDGER.delete_lock, DELETE_LOCK);
         assert_eq!(LEDGER.missing_table, "208");
+        assert_eq!(LEDGER.select_denied, "230");
         assert_eq!(LEDGER.row_limit, RowLimit::SaturatingI32);
+        assert_eq!(LEDGER.max_parameters, crate::doctor::MAX_PARAMETERS);
+        assert_eq!(LEDGER.operator_clip, (ClipUnit::Utf16Units, 128));
         assert!(
             LEDGER.savepoint.is_none(),
             "a failed statement leaves the transaction usable here"
@@ -978,11 +825,34 @@ mod tests {
             )
         );
         assert_eq!(slots(&(LEDGER.select_deployed_revision)(1)), 2);
+        assert_eq!(slots(&LEDGER.select_timeline), 1);
+        assert_eq!(slots(&LEDGER.select_timeline_unmigrated), 1);
+        assert_eq!(slots(&(LEDGER.select_legacy_state_json)(3)), 3);
+        assert_eq!(slots(&LEDGER.insert_state_staged), 11);
+        assert_eq!(slots(&LEDGER.insert_state_not_staged), 9);
+        assert_eq!(slots(&LEDGER.select_ids), 0);
+        assert_eq!(slots(&LEDGER.delete_up_to), 1);
+        assert_eq!(slots(&LEDGER.insert_lock), 1);
+        assert_eq!(slots(&LEDGER.delete_lock), 0);
+        assert_eq!(slots(&LEDGER.session_application_name), 0);
         // No value is written into a statement: none of them quotes anything.
         let spec = LEDGER.statements();
         for sql in spec.state.iter().chain(&spec.lock) {
             assert!(!sql.contains('\''), "{sql}");
         }
+    }
+
+    /// The flow reads a held lock where the insert reports it. Here the
+    /// insert has nothing that steps aside, so a held lock is the key's
+    /// refusal — and a spec that said otherwise would return that refusal as
+    /// a failure with no holder named.
+    #[test]
+    fn a_held_lock_is_read_where_this_insert_reports_it() {
+        assert_eq!(
+            LEDGER.insert_lock,
+            "INSERT INTO dbo.__pbps_lock (id, locked_by) VALUES (1, @P1);"
+        );
+        assert_eq!(LEDGER.held_lock, HeldLock::FailsTheInsert);
     }
 
     /// How many distinct `@Pn` a statement binds, which must be `@P1..=@Pn`.
