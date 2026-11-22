@@ -648,3 +648,38 @@ fn a_rename_that_has_not_run_records_the_object_under_its_old_name() {
     );
     assert_eq!(recorded.search, previous.search);
 }
+
+/// A configuration that maps a dictionary the plan renames keeps its record under the new
+/// spelling, which is how the read-back spells it (a record at the old name would read as
+/// drift of a configuration nobody touched). Negatives: a configuration over another
+/// dictionary is carried as it was, and with no rename in the plan the record stays as it was.
+#[test]
+fn a_configuration_over_a_renamed_dictionary_is_recorded_under_the_new_spelling() {
+    let config = |dictionary: &str| SearchObject::Config {
+        parser: "pg_catalog.\"default\"".parse().unwrap(),
+        mappings: [("word".to_owned(), vec![dictionary.parse().unwrap()])].into(),
+    };
+    let key = |name: &str| SearchRef::new(SearchKind::Config, name.parse().unwrap());
+    let held = |over: &str, other: &str| {
+        let mut schema = Schema::default();
+        schema.search.insert(key("app.docs"), config(over));
+        schema.search.insert(key("app.apart"), config(other));
+        schema
+    };
+    let previous = held("app.old", "app.elsewhere");
+    let read_back = held("app.new", "app.elsewhere");
+    let mut ids = IdsFile::default();
+    for name in ["app.docs", "app.apart"] {
+        ids.search.insert(Uid::generate(UidKind::Search), key(name));
+    }
+    let recorded =
+        read_back
+            .clone()
+            .as_recorded_after_apply(&previous, &renaming("app.old", "app.new"), &ids);
+    assert_eq!(recorded.search[&key("app.docs")], config("app.new"));
+    assert_eq!(recorded.search[&key("app.apart")], config("app.elsewhere"));
+    let unplanned = read_back
+        .clone()
+        .as_recorded_after_apply(&previous, &nothing_planned(), &ids);
+    assert_eq!(unplanned.search[&key("app.docs")], config("app.old"));
+}

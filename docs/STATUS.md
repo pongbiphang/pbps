@@ -539,7 +539,7 @@ How each kind is handled today:
 | Extensions, as declared and versioned objects | named by census | #2447; census [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
 | `gist` indexes (held, DEC-2448.2) and `EXCLUDE` constraints (read, declare, add, drop, replace and retire held, DEC-2448.3, DEC-2448.4; teardown and restoration across rebuilds held, DEC-2448.5; a partitioned parent's on PostgreSQL 18 held, DEC-2448.6; a partition's own, and the detach and rebuild of a tree that holds a parent's, held, DEC-2448.7) | partly held | #2448 |
 | Standalone sequences (read, declared and pulled, DEC-2721.1; their current value is never schema; create, drop, alter and rename next) | partly held | #2721 |
-| Text search configurations and dictionaries (a user's, over the built-in parser and templates, are held and pulled, DEC-2728.1; create and drop planned, DEC-2728.2; mappings and options altered in place when nothing stale stands on them, DEC-2728.3; rename next) | partly held | #2728 |
+| Text search configurations and dictionaries (a user's, over the built-in parser and templates, are held and pulled, DEC-2728.1; create and drop planned, DEC-2728.2; mappings and options altered in place when nothing stale stands on them, DEC-2728.3; renamed in place within its schema, DEC-2728.5) | partly held | #2728 |
 <!-- /generated:postgres-planned -->
 
 ### Silent today (bugs)

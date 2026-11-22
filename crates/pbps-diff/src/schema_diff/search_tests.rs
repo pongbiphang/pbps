@@ -536,3 +536,404 @@ fn a_dictionary_is_dropped_after_the_configuration_that_stopped_mapping_it() {
     let plan = run(&held(None, None), &both).unwrap();
     assert_eq!(kinds(plan.changes()), ["drop docs", "drop old"]);
 }
+
+fn thesaurus(sub: &str) -> SearchObject {
+    SearchObject::Dictionary {
+        template: "pg_catalog.thesaurus".parse().unwrap(),
+        options: [
+            ("dictfile".to_owned(), "terms".to_owned()),
+            ("dictionary".to_owned(), sub.to_owned()),
+        ]
+        .into(),
+    }
+}
+
+fn holding(objects: &[(&str, SearchObject)]) -> Schema {
+    let mut schema = Schema::default();
+    for (key, object) in objects {
+        schema.search.insert(name(key), object.clone());
+    }
+    schema
+}
+
+/// What a plan of `declared` over `base` is, with the recorded identities the renames in
+/// `moves` (old, new) carry across: each pair is an intent, as `renamed_from:` writes one.
+fn renaming(
+    base: &Schema,
+    declared: &Schema,
+    moves: &[(&str, &str)],
+    target_read: bool,
+) -> Result<ChangeSet, Vec<DiffError>> {
+    renaming_from(
+        base,
+        &crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids,
+        declared,
+        moves,
+        target_read,
+    )
+}
+
+fn renaming_from(
+    base: &Schema,
+    base_ids: &IdsFile,
+    declared: &Schema,
+    moves: &[(&str, &str)],
+    target_read: bool,
+) -> Result<ChangeSet, Vec<DiffError>> {
+    let intents: Vec<Intent> = moves
+        .iter()
+        .map(|(from, to)| Intent::RenameSearch {
+            from: name(from),
+            to: name(to),
+        })
+        .collect();
+    let declared_ids = crate::resolve(declared, base_ids, &intents, &ctx())
+        .unwrap()
+        .ids;
+    plan_against((base, base_ids), (declared, &declared_ids), target_read)
+}
+
+fn renames(changes: &ChangeSet) -> Vec<(String, String)> {
+    changes
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::Search(SearchChange::RenameSearch { from, to, .. }) => {
+                Some((from.raw().to_string(), to.raw().to_string()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A recorded identity found under a new name, equal in everything else, is one lone
+/// rename of either kind, offline and against the target alike, and it stays that object
+/// (the uid is the old one). Negatives: the same declarations with no rename recorded plan
+/// nothing, and a rename never plans a create or a drop beside it.
+#[test]
+fn an_equal_object_under_a_new_name_plans_one_rename_and_nothing_else() {
+    for (old, new, object) in [
+        ("dictionary app.words", "dictionary app.terms", words()),
+        (
+            "config app.docs",
+            "config app.notes",
+            mapping("pg_catalog.simple"),
+        ),
+    ] {
+        let base = holding(&[(old, object.clone())]);
+        let declared = holding(&[(new, object.clone())]);
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        for target_read in [false, true] {
+            let plan =
+                renaming_from(&base, &base_ids, &declared, &[(old, new)], target_read).unwrap();
+            assert_eq!(
+                renames(&plan),
+                [(name(old).raw().to_string(), name(new).raw().to_string())]
+            );
+            assert_eq!(plan.changes.len(), 1, "{plan:?}");
+            if let Change::Search(SearchChange::RenameSearch {
+                uid, definition, ..
+            }) = &plan.changes[0].change
+            {
+                assert_eq!(Some(uid), base_ids.search_uid(&name(old)));
+                assert_eq!(**definition, object);
+            }
+        }
+        let same = renaming(&base, &base, &[], true).unwrap();
+        assert!(same.changes.is_empty(), "{same:?}");
+    }
+}
+
+/// A configuration over a dictionary the plan renames is the same configuration: the
+/// engine keeps a mapping by the dictionary's oid, so the plan is the dictionary's rename
+/// alone. Negatives: a real mapping change beside it is planned, its `before` spelling the
+/// dictionary the new way, and a configuration still naming the old spelling is refused by
+/// name, since that name stops resolving.
+#[test]
+fn a_configuration_over_a_renamed_dictionary_plans_only_the_rename() {
+    let base = holding(&[
+        ("dictionary app.words", words()),
+        ("config app.docs", mapping("app.words")),
+    ]);
+    let moved = holding(&[
+        ("dictionary app.terms", words()),
+        ("config app.docs", mapping("app.terms")),
+    ]);
+    let pair = [("dictionary app.words", "dictionary app.terms")];
+    for target_read in [false, true] {
+        let plan = renaming(&base, &moved, &pair, target_read).unwrap();
+        assert_eq!(plan.changes.len(), 1, "{plan:?}");
+        assert_eq!(renames(&plan).len(), 1);
+    }
+    // Negative: a mapping that really changes is altered, from the remapped spelling.
+    let mut changed = moved.clone();
+    changed.search.insert(
+        name("config app.docs"),
+        SearchObject::Config {
+            parser: "pg_catalog.\"default\"".parse().unwrap(),
+            mappings: [("word".to_owned(), vec!["app.terms".parse().unwrap()])].into(),
+        },
+    );
+    let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let intents = [Intent::RenameSearch {
+        from: name(pair[0].0),
+        to: name(pair[0].1),
+    }];
+    let declared_ids = crate::resolve(&changed, &base_ids, &intents, &ctx())
+        .unwrap()
+        .ids;
+    let docs = name("config app.docs");
+    let plan = diff(
+        Side {
+            schema: &base,
+            ids: &base_ids,
+        },
+        Side {
+            schema: &changed,
+            ids: &declared_ids,
+        },
+        &MinimalDialect,
+        &Hints {
+            target_read: true,
+            search_dependents: [(docs, Default::default())].into(),
+            ..Hints::default()
+        },
+    )
+    .unwrap();
+    let altered: Vec<_> = plan
+        .changes()
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::Search(SearchChange::AlterSearchMapping { before, .. }) => {
+                Some(before.dictionaries())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(altered, [[name("dictionary app.terms")].into()]);
+    assert_eq!(renames(plan.changes()).len(), 1);
+    // Negative: the old spelling no longer resolves once the plan has run.
+    let stale = holding(&[
+        ("dictionary app.terms", words()),
+        ("config app.docs", mapping("app.words")),
+    ]);
+    let refused = renaming(&base, &stale, &pair, true).unwrap_err();
+    assert!(
+        refused.iter().any(|e| {
+            let said = e.to_string();
+            said.contains("app.docs") && said.contains("renames") && said.contains("app.terms")
+        }),
+        "{refused:?}"
+    );
+}
+
+/// What a rename is refused for, each by the object's name and with its remedy: a change
+/// of definition beside it, a move to another schema, and a thesaurus that names the
+/// dictionary in its option, which the engine keeps as text. Negatives: a thesaurus the
+/// plan drops, or one that names another dictionary, does not stop it.
+#[test]
+fn a_rename_beside_a_change_a_schema_move_or_a_thesaurus_naming_it_is_refused_by_name() {
+    let base = holding(&[("dictionary app.words", words())]);
+    let pair = [("dictionary app.words", "dictionary app.terms")];
+    let mut options = words();
+    if let SearchObject::Dictionary { options, .. } = &mut options {
+        options.insert("accept".to_owned(), "false".to_owned());
+    }
+    let refused = |declared: &Schema, moves: &[(&str, &str)], from: &Schema, needle: &str| {
+        let errors = renaming(from, declared, moves, true).unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.to_string().contains(needle)),
+            "{needle}: {errors:?}"
+        );
+    };
+    refused(
+        &holding(&[("dictionary app.terms", options)]),
+        &pair,
+        &base,
+        "also changes",
+    );
+    refused(
+        &holding(&[("dictionary other.terms", words())]),
+        &[("dictionary app.words", "dictionary other.terms")],
+        &base,
+        "schema",
+    );
+    let naming = holding(&[
+        ("dictionary app.words", words()),
+        ("dictionary app.synonyms", thesaurus("app.words")),
+    ]);
+    let moved = holding(&[
+        ("dictionary app.terms", words()),
+        ("dictionary app.synonyms", thesaurus("app.words")),
+    ]);
+    refused(&moved, &pair, &naming, "app.synonyms");
+    // The thesaurus declared with the new spelling is an alteration of its option the engine
+    // would take, but the rename stays refused by name: its option is text, not an edge.
+    let respelled = holding(&[
+        ("dictionary app.terms", words()),
+        ("dictionary app.synonyms", thesaurus("app.terms")),
+    ]);
+    refused(&respelled, &pair, &naming, "its `dictionary` option");
+    // Negative: another dictionary named is no obstacle.
+    let elsewhere = holding(&[
+        ("dictionary app.words", words()),
+        ("dictionary app.synonyms", thesaurus("app.other")),
+    ]);
+    let moved = holding(&[
+        ("dictionary app.terms", words()),
+        ("dictionary app.synonyms", thesaurus("app.other")),
+    ]);
+    assert_eq!(
+        renames(&renaming(&elsewhere, &moved, &pair, true).unwrap()).len(),
+        1
+    );
+    // Negative: the thesaurus the plan drops is gone before anything reads it.
+    let base_ids = crate::resolve(&naming, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let gone = holding(&[("dictionary app.terms", words())]);
+    let intents = [
+        Intent::RenameSearch {
+            from: name(pair[0].0),
+            to: name(pair[0].1),
+        },
+        Intent::DropSearch {
+            name: name("dictionary app.synonyms"),
+            reason: pbps_model::Reason::new("retired").unwrap(),
+        },
+    ];
+    let declared_ids = crate::resolve(&gone, &base_ids, &intents, &ctx())
+        .unwrap()
+        .ids;
+    let plan = plan_against((&naming, &base_ids), (&gone, &declared_ids), true).unwrap();
+    assert_eq!(renames(&plan).len(), 1, "{plan:?}");
+}
+
+/// Two recorded renames that exchange two names are no order of `RENAME TO` the engine
+/// accepts, and are refused by name. Negative: a chain recorded in the ids runs, the free
+/// target first.
+#[test]
+fn a_swap_in_the_recorded_identities_is_refused_and_a_chain_runs_in_order() {
+    let object = |text: &str| (text.to_owned(), words());
+    let (a, b, c) = (
+        object("dictionary app.a"),
+        object("dictionary app.b"),
+        object("dictionary app.c"),
+    );
+    let ids = |pairs: &[(&str, &str)]| {
+        let mut ids = IdsFile::default();
+        for (uid, held) in pairs {
+            ids.search.insert(uid.parse().unwrap(), name(held));
+        }
+        ids
+    };
+    let base_ids = ids(&[
+        ("s_aaaaaa", "dictionary app.a"),
+        ("s_aaaaab", "dictionary app.b"),
+    ]);
+    let base = holding(&[(&a.0, a.1.clone()), (&b.0, b.1.clone())]);
+    let swapped = ids(&[
+        ("s_aaaaaa", "dictionary app.b"),
+        ("s_aaaaab", "dictionary app.a"),
+    ]);
+    let errors = plan_against((&base, &base_ids), (&base, &swapped), true).unwrap_err();
+    assert!(
+        errors.iter().any(|e| {
+            let said = e.to_string();
+            said.contains("app.a") && said.contains("cycle")
+        }),
+        "{errors:?}"
+    );
+    // Negative: `a` -> `b` and `b` -> `c`: each target is free once the other has gone.
+    let chained = ids(&[
+        ("s_aaaaaa", "dictionary app.b"),
+        ("s_aaaaab", "dictionary app.c"),
+    ]);
+    let declared = holding(&[(&b.0, b.1.clone()), (&c.0, c.1.clone())]);
+    let plan = plan_against((&base, &base_ids), (&declared, &chained), true).unwrap();
+    assert_eq!(renames(&plan).len(), 2, "{plan:?}");
+    let at = positions(&plan, &["dictionary app.b", "dictionary app.a"]);
+    assert!(at[0] < at[1], "the rename out of `b` runs first: {plan:?}");
+}
+
+/// A name the plan vacates by a rename is free for a new object, which is created after
+/// the rename, and a configuration over the renamed dictionary is created after it too.
+/// The ids file already holds the rename and the new object's identity here, as a commit
+/// of the declarations leaves them before the plan runs. Negatives: the new object under
+/// another identity with no rename is still "declared again", and the same name of the
+/// other kind is unrelated and orders nothing.
+#[test]
+fn a_vacated_name_is_reused_after_the_rename_and_a_new_mapping_follows_the_new_name() {
+    let base = holding(&[("dictionary app.words", words())]);
+    let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let old = base_ids
+        .search_uid(&name("dictionary app.words"))
+        .unwrap()
+        .clone();
+    let declared_ids = |extra: &[(&str, &str)]| {
+        let mut ids = IdsFile::default();
+        ids.search.insert(old.clone(), name("dictionary app.terms"));
+        for (uid, held) in extra {
+            ids.search.insert(uid.parse().unwrap(), name(held));
+        }
+        ids
+    };
+    let declared = holding(&[
+        ("dictionary app.terms", words()),
+        ("dictionary app.words", words()),
+        ("config app.docs", mapping("app.terms")),
+    ]);
+    let ids = declared_ids(&[
+        ("s_zzzzzz", "dictionary app.words"),
+        ("s_zzzzzy", "config app.docs"),
+    ]);
+    for target_read in [false, true] {
+        let plan = plan_against((&base, &base_ids), (&declared, &ids), target_read).unwrap();
+        let rename_at = plan
+            .changes
+            .iter()
+            .position(|p| matches!(p.change, Change::Search(SearchChange::RenameSearch { .. })))
+            .unwrap();
+        let creates: Vec<_> = plan
+            .changes
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| matches!(p.change, Change::Search(SearchChange::CreateSearch { .. })))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(creates.len(), 2, "{plan:?}");
+        assert!(creates.iter().all(|c| rename_at < *c), "{plan:?}");
+    }
+    // Negative: the same name under a new identity and no rename is retired and declared
+    // again, as before.
+    let again = holding(&[("dictionary app.words", words())]);
+    let mut other = IdsFile::default();
+    other
+        .search
+        .insert("s_zzzzzz".parse().unwrap(), name("dictionary app.words"));
+    let refused = plan_against((&base, &base_ids), (&again, &other), true).unwrap_err();
+    assert!(
+        refused
+            .iter()
+            .any(|e| e.to_string().contains("declared again")),
+        "{refused:?}"
+    );
+    // Negative: a configuration under the vacated spelling is another address and a lone
+    // rename still plans around it.
+    let other_kind = holding(&[
+        ("dictionary app.terms", words()),
+        ("config app.words", mapping("app.terms")),
+    ]);
+    let ids = declared_ids(&[("s_zzzzzz", "config app.words")]);
+    let plan = plan_against((&base, &base_ids), (&other_kind, &ids), true).unwrap();
+    assert_eq!(renames(&plan).len(), 1, "{plan:?}");
+}

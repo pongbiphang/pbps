@@ -267,7 +267,8 @@ fn text_search_objects_are_created_and_dropped_by_identity_and_a_new_template_is
             |c| matches!(c, Change::Search(SearchChange::DropSearch { name, .. }) if name.name.name() == "theirs")
         )
     );
-    // A standing difference, a missing identity and a rename are refused by name.
+    // A standing difference and a missing identity are refused by name, and a rename is
+    // planned as one (DEC-2728.5).
     declared
         .search
         .insert(same.clone(), dictionary("pg_catalog.synonym"));
@@ -299,14 +300,15 @@ fn text_search_objects_are_created_and_dropped_by_identity_and_a_new_template_is
         .search
         .insert(renamed.clone(), dictionary("pg_catalog.simple"));
     declared_ids.search.insert(uid.clone(), renamed);
-    let (changes, errs) = diffed(&base, &base_ids, &declared, &declared_ids);
+    let (changes, _) = diffed(&base, &base_ids, &declared, &declared_ids);
     assert!(
-        errs.iter()
-            .any(|m| m.contains("app.renamed") && m.contains("renaming one")),
-        "{errs:?}"
+        changes.iter().any(|c| matches!(c,
+            Change::Search(SearchChange::RenameSearch { uid: u, from, to, .. })
+                if u == &uid && from == &same && to.name.name() == "renamed")),
+        "{changes:?}"
     );
     assert!(!changes.iter().any(
-        |c| matches!(c, Change::Search(SearchChange::CreateSearch { name, .. }) if name.name.name() == "renamed")
+        |c| matches!(c, Change::Search(SearchChange::CreateSearch { name, .. } | SearchChange::DropSearch { name, .. }) if name.name.name() == "renamed" || name == &same)
     ));
     // Two kinds of one name are two objects: the configuration is absent though the
     // dictionary of that name is held.

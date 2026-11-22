@@ -693,6 +693,35 @@ fn search_ranks(
     (search_rank, drop_search_rank)
 }
 
+/// How far each renamed search object's new name sits down a chain of renames of this plan
+/// (`a` to `b`, `b` to `c`): the rename out of a name runs before the one into it, since the
+/// engine refuses `RENAME TO` onto a name that is taken (DEC-2728.5). A rename's target is
+/// never a created or altered name of the plan, so the sort key reads this where it reads the
+/// depth of those, and a cycle (refused where the renames are planned) ends at the count.
+fn search_rename_depths(planned: &[PlannedChange]) -> BTreeMap<pbps_model::SearchRef, isize> {
+    let moves: BTreeMap<&pbps_model::SearchRef, &pbps_model::SearchRef> = planned
+        .iter()
+        .filter_map(|p| {
+            if let Change::Search(SearchChange::RenameSearch { from, to, .. }) = &p.change {
+                Some((from, to))
+            } else {
+                None
+            }
+        })
+        .collect();
+    moves
+        .values()
+        .map(|to| {
+            let (mut depth, mut at) = (0, *to);
+            while let Some(next) = moves.get(at).filter(|_| depth < moves.len() as isize) {
+                depth += 1;
+                at = next;
+            }
+            ((*to).clone(), depth)
+        })
+        .collect()
+}
+
 /// The rank the created domains that name a created search object sort behind, 0
 /// for a plan whose domains name none: the sort key adds it to their rank.
 #[allow(clippy::let_and_return)] // The block moved as it was; it ends in the binding it returns.
@@ -1208,10 +1237,12 @@ impl SortFacts<'_> {
             } else if let Change::Search(
                 SearchChange::CreateSearch { name, .. }
                 | SearchChange::AlterSearchMapping { name, .. }
-                | SearchChange::AlterSearchDictionary { name, .. },
+                | SearchChange::AlterSearchDictionary { name, .. }
+                | SearchChange::RenameSearch { to: name, .. },
             ) = &p.change
             {
-                // Behind the packages and the dictionaries of this plan it maps.
+                // Behind the packages and the dictionaries of this plan it maps, and a
+                // rename behind the rename out of the name it takes.
                 self.search_rank.get(name).copied().unwrap_or(0)
             } else if let Change::Search(SearchChange::DropSearch { name, .. }) = &p.change {
                 -self.drop_search_rank.get(name).copied().unwrap_or(0)
@@ -1302,13 +1333,14 @@ pub(in super::super) fn sort_facts<'a>(
     let extension_rank = crate::extensions::depths(planned.iter().map(|p| &p.change));
     let package_floor = package_floor_of(&planned, &extension_rank);
     let (created_search, altered_search) = searches_in_the_plan(&planned);
-    let (search_rank, drop_search_rank) = search_ranks(
+    let (mut search_rank, drop_search_rank) = search_ranks(
         base,
         declared,
         package_floor,
         &created_search,
         &altered_search,
     );
+    search_rank.extend(search_rename_depths(&planned));
     let domain_floor =
         domain_floor_behind_searches(&planned, dialect, &created_search, &search_rank);
     (

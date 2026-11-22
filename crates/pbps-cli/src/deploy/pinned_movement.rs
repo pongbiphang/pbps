@@ -281,6 +281,25 @@ fn refuse_unpinned_search(
     at_close: bool,
     label: &str,
 ) -> anyhow::Result<()> {
+    // A configuration over a dictionary the plan renames reads the old spelling until the
+    // rename has run and the new one after it, and the alteration's definitions are written
+    // for the new one: the read is respelled the way the rename respells it (DEC-2728.5).
+    let renames: std::collections::BTreeMap<_, _> = changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let pbps_model::Change::Search(pbps_model::SearchChange::RenameSearch {
+                from,
+                to,
+                ..
+            }) = &p.change
+            {
+                Some((from.clone(), to.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
     for p in &changes.changes {
         if let pbps_model::Change::Search(
             pbps_model::SearchChange::AlterSearchMapping {
@@ -297,11 +316,12 @@ fn refuse_unpinned_search(
             },
         ) = &p.change
         {
-            let now = held.search.get(name);
+            let now = held.search.get(name).map(|d| d.respelled(&renames));
             let passes = before.alteration_chain(after);
             let stands = now
+                .as_ref()
                 .is_some_and(|d| d == before.as_ref() || d == after.as_ref() || passes.contains(d));
-            if !stands || (at_close && now != Some(after.as_ref())) {
+            if !stands || (at_close && now.as_ref() != Some(after.as_ref())) {
                 bail!(
                     "{} does not match what its plan promised during {label}",
                     name.shown()

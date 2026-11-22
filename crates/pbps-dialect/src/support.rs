@@ -223,7 +223,7 @@ pub const RECORDS: &[Record] = &[
             label: "Text search configurations and dictionaries (a user's, over the built-in \
                     parser and templates, are held and pulled, DEC-2728.1; create and drop \
                     planned, DEC-2728.2; mappings and options altered in place when nothing stale \
-                    stands on them, DEC-2728.3; rename next)",
+                    stands on them, DEC-2728.3; renamed in place within its schema, DEC-2728.5)",
             today: "partly held",
             tracking: "#2728",
         }),

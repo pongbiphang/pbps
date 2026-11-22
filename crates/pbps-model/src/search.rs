@@ -171,6 +171,25 @@ impl SearchObject {
         }
     }
 
+    /// This object with the dictionaries `renames` moved (old reference to new) spelled their
+    /// new way: what a configuration's mappings read once the plan has renamed a dictionary.
+    /// The engine keeps a mapping by the dictionary's oid, so a rename changes how the mapping
+    /// is spelled and nothing it does (DEC-2728.5). A name is respelled once, so two renames
+    /// that exchange or chain names never apply twice.
+    #[must_use]
+    pub fn respelled(&self, renames: &BTreeMap<SearchRef, SearchRef>) -> Self {
+        let mut object = self.clone();
+        if let Self::Config { mappings, .. } = &mut object {
+            for name in mappings.values_mut().flatten() {
+                let used = SearchRef::new(SearchKind::Dictionary, name.clone());
+                if let Some(moved) = renames.get(&used) {
+                    *name = moved.name.clone();
+                }
+            }
+        }
+        object
+    }
+
     /// The dictionaries this object uses, each once, as references: what must stand
     /// before it is created and be gone before they are dropped. A configuration uses the
     /// ones it maps; a dictionary uses the one its `dictionary` option names (a thesaurus's
