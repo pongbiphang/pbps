@@ -1230,13 +1230,19 @@ fn resolve_search_renames(
         .filter(|name| !known.contains_key(*name))
         .collect();
 
+    // The engine's `RENAME TO` keeps the kind and the schema (DEC-2728.5), so a pair across
+    // either is no rename: it claims nothing here and is left for the unused-intent sweep,
+    // and no identity records a move that no plan can run.
+    let in_place = |from: &pbps_model::SearchRef, to: &pbps_model::SearchRef| {
+        from.kind == to.kind && from.name.schema() == to.name.schema()
+    };
     let claims: Vec<Claim<'_, &pbps_model::SearchRef>> = intents
         .iter()
         .filter_map(|intent| {
             let Intent::RenameSearch { from, to } = intent else {
                 return None;
             };
-            (from.kind == to.kind && disappeared.contains(from) && appeared.contains(to)).then_some(
+            (in_place(from, to) && disappeared.contains(from) && appeared.contains(to)).then_some(
                 Claim {
                     intent,
                     source: from,
@@ -1257,7 +1263,7 @@ fn resolve_search_renames(
         let Intent::RenameSearch { from, to } = intent else {
             continue;
         };
-        if from.kind != to.kind {
+        if !in_place(from, to) {
             continue;
         }
         let current_decision = i >= annotation_count;
@@ -1281,7 +1287,7 @@ fn resolve_search_renames(
 
     for (i, intent) in intents.iter().enumerate() {
         if let Intent::RenameSearch { from, to } = intent
-            && from.kind == to.kind
+            && in_place(from, to)
             && disappeared.contains(from)
             && appeared.contains(to)
         {
@@ -3406,6 +3412,37 @@ mod search_rename_tests {
             &context(),
         )
         .unwrap();
+    }
+
+    /// A rename across schemas is no rename either: `RENAME TO` keeps the schema (DEC-2728.5),
+    /// so the identity must not record a move no plan can run. Negative: the same names in one
+    /// schema resolve and move the identity.
+    #[test]
+    fn a_rename_across_schemas_records_no_identity_and_is_reported_as_an_unused_intent() {
+        let ids = recorded(&["dictionary app.old"]);
+        let across = rename("dictionary app.old", "dictionary other.new");
+        let refused = resolve(
+            &declared(&["dictionary other.new"]),
+            &ids,
+            std::slice::from_ref(&across),
+            &context(),
+        )
+        .unwrap_err();
+        assert!(
+            refused.contains(&Blocker::UnusedIntent { intent: across }),
+            "{refused:?}"
+        );
+        let resolved = resolve(
+            &declared(&["dictionary app.new"]),
+            &ids,
+            &[rename("dictionary app.old", "dictionary app.new")],
+            &context(),
+        )
+        .unwrap();
+        assert_eq!(
+            uid_of(&resolved.ids, "dictionary app.new"),
+            uid_of(&ids, "dictionary app.old")
+        );
     }
 
     #[test]

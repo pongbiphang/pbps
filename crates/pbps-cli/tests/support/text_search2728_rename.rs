@@ -499,7 +499,10 @@ fn a_swap_a_chain_a_move_and_a_change_are_refused_and_a_vacated_name_is_reused_i
             ),
         );
         let text = said_by_plan(&d);
-        assert!(text.contains("moves from schema app to other"), "{text}");
+        assert!(
+            text.contains("a text search rename keeps its kind and its schema"),
+            "{text}"
+        );
         // A rename together with a change of the object.
         reset(&d);
         undeclare(&d, files[0]);

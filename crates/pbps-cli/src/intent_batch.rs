@@ -189,14 +189,21 @@ fn parse_pair(flag: &str, first: &str, second: &str) -> anyhow::Result<Intent> {
             name: first.to_owned().into(),
             reason: second.parse()?,
         },
-        // Search identity is never inferred, and the engine's rename keeps the kind: a pair of
-        // two kinds is no rename, so it is refused here by both names (DEC-2728.5).
+        // Search identity is never inferred, and the engine's rename keeps the kind and the
+        // schema: a pair of two kinds or two schemas is no rename, so it is refused here by
+        // both names (DEC-2728.5), before an identity could record a move no plan runs.
         RENAME_SEARCH_FLAG => {
             let from: pbps_model::SearchRef = first.parse().map_err(anyhow::Error::msg)?;
             let to: pbps_model::SearchRef = second.parse().map_err(anyhow::Error::msg)?;
             ensure!(
                 from.kind == to.kind,
                 "a rename keeps the kind: {} cannot become {}",
+                from.shown(),
+                to.shown()
+            );
+            ensure!(
+                from.name.schema() == to.name.schema(),
+                "a rename keeps the schema: {} cannot become {}",
                 from.shown(),
                 to.shown()
             );
@@ -445,10 +452,11 @@ mod tests {
         );
     }
 
-    /// `--rename-search` reads two names of one kind. Negatives: a pair of two kinds, an
-    /// unprefixed name and a missing value are refused; the report spells the flag the same way.
+    /// `--rename-search` reads two names of one kind in one schema. Negatives: a pair of two
+    /// kinds or two schemas, an unprefixed name and a missing value are refused; the report
+    /// spells the flag the same way.
     #[test]
-    fn a_search_rename_batch_pair_keeps_one_kind() {
+    fn a_search_rename_batch_pair_keeps_one_kind_and_one_schema() {
         let parsed = parse_pair(RENAME_SEARCH_FLAG, "config app.old", "config app.new").unwrap();
         assert_eq!(
             parsed,
@@ -459,6 +467,7 @@ mod tests {
         );
         for (from, to) in [
             ("config app.old", "dictionary app.new"),
+            ("dictionary app.old", "dictionary other.new"),
             ("app.old", "config app.new"),
             ("config app.old", "app.new"),
         ] {

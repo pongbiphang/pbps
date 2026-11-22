@@ -1047,6 +1047,19 @@ fn one_blocker(b: &Blocker) -> String {
             name = name.shown(),
             table = table.shown(),
         ),
+        // A text search rename across kinds or schemas is well formed but no rename: the
+        // engine's `RENAME TO` keeps both (DEC-2728.5), so say that rather than "a typo".
+        Blocker::UnusedIntent {
+            intent: Intent::RenameSearch { from, to },
+        } if from.kind != to.kind || from.name.schema() != to.name.schema() => format!(
+            "  a text search rename keeps its kind and its schema, so {from} cannot become {to}:\n    {}\n\n    declare the object under a new name in the same schema, or drop it and create the other one in two plans\n",
+            intent(&Intent::RenameSearch {
+                from: from.clone(),
+                to: to.clone(),
+            }),
+            from = from.shown(),
+            to = to.shown(),
+        ),
         Blocker::UnusedIntent { intent: i } => {
             format!(
                 "  this intent matches nothing in either the declarations or the identity file, likely a typo:\n    {}\n\n    correct the names where this intent was supplied: edit its declaration annotation, fix and rerun the command, or retry with a corrected prompt answer\n",
@@ -3465,6 +3478,34 @@ mod tests {
         );
         assert!(text.contains("pbps rename"), "{text}");
         assert!(text.contains("renamed_from"), "{text}");
+    }
+
+    /// A text search rename across schemas or kinds says the engine keeps both rather than
+    /// calling it a typo (DEC-2728.5). Negative: a search rename in one schema and kind that
+    /// matches nothing keeps the generic wording.
+    #[test]
+    fn a_search_rename_across_schemas_or_kinds_says_why_it_is_no_rename() {
+        let unused = |from: &str, to: &str| {
+            one_blocker(&Blocker::UnusedIntent {
+                intent: Intent::RenameSearch {
+                    from: from.parse().unwrap(),
+                    to: to.parse().unwrap(),
+                },
+            })
+        };
+        for (from, to) in [
+            ("dictionary app.old", "dictionary other.new"),
+            ("config app.old", "dictionary app.new"),
+        ] {
+            let text = unused(from, to);
+            assert!(
+                text.contains("a text search rename keeps its kind and its schema"),
+                "{text}"
+            );
+            assert!(!text.contains("likely a typo"), "{text}");
+        }
+        let text = unused("dictionary app.old", "dictionary app.new");
+        assert!(text.contains("likely a typo"), "{text}");
     }
 
     /// An occupied rename target gets a precise finding rather than the
