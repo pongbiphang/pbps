@@ -52,7 +52,10 @@ Visibility, the one edit an item gets:
 - A struct field or an inherent impl method cannot be found by name, so the
   plan lists them in `_pub_super` as `Type.field` and `Type::method`.
 - A `pub(crate)` item that nothing outside the file reads has no re-export (it
-  would be an unused import); the plan lists it in `_no_reexport`. A name there
+  would be an unused import); the plan lists it in `_no_reexport`, and inside
+  the file it is imported as a private item is: not at all, plainly, or only
+  in the test build. The script cannot see who reads an item from another
+  file, so a `pub(crate)` item not listed there is always re-exported. A name there
   must be a `pub(crate)` item the plan moves, and the entry goes when something
   starts to read the item from another file.
 
@@ -585,9 +588,11 @@ def apply(root: Path, parent_rel: str, plan_path: Path) -> list[str]:
             kept |= _file_idents(path)
     per_module = {mod: _idents(cut_items(body)) for mod, body in composed.items()}
     final: dict[str, str] = {}
+    read_in_file: set[tuple[str, str]] = set()
     for mod in modules:
         outside = set(kept).union(*(ids for other, ids in per_module.items() if other != mod))
         final[mod] = _with_visibility(composed[mod], outside, pub_super)
+        read_in_file |= {(mod, name) for name in outside}
     # a name only a test file reads needs its import only in the test build
     test_only = {
         (mod, name)
@@ -595,7 +600,7 @@ def apply(root: Path, parent_rel: str, plan_path: Path) -> list[str]:
         for name in kept - set(kept_code).union(*(ids for other, ids in per_module.items() if other != mod))
     }
 
-    parent_text = _parent_glue(parent_text, rest, modules, final, test_only, no_reexport)
+    parent_text = _parent_glue(parent_text, rest, modules, final, test_only, no_reexport, read_in_file)
     written = []
     for mod, body in final.items():
         path = mod_dir / f"{mod}.rs"
@@ -616,6 +621,7 @@ def _parent_glue(
     final: dict[str, str],
     test_only: set[tuple[str, str]],
     no_reexport: list[str],
+    read_in_file: set[tuple[str, str]],
 ) -> str:
     """Replace the managed `mod` and import lines by those the modules need."""
     names = set(modules)
@@ -634,9 +640,13 @@ def _parent_glue(
                 if it.vis != "pub(crate)":
                     raise SplitError(f"`_no_reexport` names `{it.name}`, which is not `pub(crate)`")
                 unexported.discard(it.name)
-                continue
-            shown = "" if it.vis == "pub(super)" else it.vis + " "
-            gate = "#[cfg(test)]\n" if it.vis == "pub(super)" and (mod, it.name) in test_only else ""
+                # No file outside reads it, so inside the file it is imported as
+                # a private item would be: not at all, plainly, or for tests.
+                if (mod, it.name) not in read_in_file:
+                    continue
+            private = it.vis == "pub(super)" or it.name in no_reexport
+            shown = "" if private else it.vis + " "
+            gate = "#[cfg(test)]\n" if private and (mod, it.name) in test_only else ""
             uses.append(f"{gate}{shown}use {mod}::{it.name};")
     if unexported:
         raise SplitError(f"`_no_reexport` names {sorted(unexported)}, which no module holds as a visible item")

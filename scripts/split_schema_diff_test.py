@@ -313,6 +313,34 @@ class Move(Tree):
         self.assertIn("pub(crate) fn hidden", self.module("first").read_text())
         self.assertEqual(self.check(), [])
 
+    def test_a_no_reexport_item_is_imported_as_a_private_one_would_be(self) -> None:
+        hidden = "pub(crate) fn hidden() -> u8 {\n    2\n}\n\n"
+        plan = {**PLAN, "first": ["Boom", "alpha", "hidden"], "_no_reexport": ["hidden"]}
+        # Only a test file reads it: the import is for the test build alone.
+        self.src.write_text(PARENT.replace("fn gamma()", hidden + "fn gamma()"))
+        self.base = self.src.read_text()
+        (self.dir / "tests.rs").write_text(TESTS + "\nfn uses_hidden() -> u8 {\n    hidden()\n}\n")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "a test reads it")
+        self.write_plan(plan)
+        self.apply()
+        parent = self.src.read_text()
+        self.assertIn("#[cfg(test)]\nuse first::hidden;", parent)
+        self.assertNotIn("pub(crate) use first::hidden;", parent)
+        self.assertEqual(self.check(), [])
+        self.assertEqual(self.apply(), [], "a second run changes nothing")
+        # The parent's own code reads it: a plain import, not a gated one.
+        for path in self.dir.glob("[a-z]*.rs"):
+            if path.name != "tests.rs":
+                path.unlink()
+        self.src.write_text(self.base.replace("let t = (a, b);", "let t = (a, b + hidden());"))
+        self.base = self.src.read_text()
+        self.apply()
+        parent = self.src.read_text()
+        self.assertIn("\nuse first::hidden;", parent)
+        self.assertNotIn("#[cfg(test)]\nuse first::hidden;", parent)
+        self.assertEqual(self.check(), [])
+
     def test_no_reexport_names_must_be_pub_crate_items_the_plan_moves(self) -> None:
         self.write_plan({**PLAN, "_no_reexport": ["alpha"]})  # private, so pub(super): not pub(crate)
         with self.assertRaisesRegex(ssd.SplitError, "alpha.*pub\\(crate\\)"):
