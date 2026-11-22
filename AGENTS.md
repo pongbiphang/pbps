@@ -52,7 +52,8 @@ Read before changing things:
 - Work in a git worktree, never in the main checkout. Remove the worktree after
   merge.
 - Record the issue and the hot files it will change (format versions,
-  `schema_diff.rs`, `plan.rs`, decision topic files) on the coordination board
+  `schema_diff.rs` and the modules under `schema_diff/`, `plan.rs`, decision
+  topic files) on the coordination board
   (`~/pbps-workers/board.md`) before starting. Do not start an issue whose hot
   files overlap one in progress; ask the coordinating session (DEC-2415.1).
 - Use one branch per issue, cut from `origin/master`, named
