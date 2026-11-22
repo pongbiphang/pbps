@@ -30,11 +30,12 @@
 use std::time::Duration;
 
 use pbps_db::DbError;
-use pbps_db::sqlite::Connection;
+use pbps_db::sqlite::{Connection, Record};
 use pbps_model::escape::Escaped;
 use pbps_model::{Change, ChangeSet, ColumnChange, TableChange};
 
 use crate::lexis;
+use crate::pragma::{self, foreign_key_list, table_list, table_xinfo};
 use crate::state::{BUSY_WAIT, waiting};
 
 /// The most a copy may take, in bytes: 512 MiB. A larger database is refused, and
@@ -231,21 +232,16 @@ pub struct Resolution(Vec<Unresolved>);
 /// Selects from every view, evaluates every column default, compiles a write to
 /// everything that has a trigger and checks each table's foreign keys, on
 /// `scratch`. Nothing is written. An engine refusal is a finding, not an
-/// error: it is the thing being asked. `Refused` when an object named like a
-/// pragma function stands where the catalog's own is asked.
+/// error: it is the thing being asked.
+///
+/// What there is to ask of is read with the catalog's pragmas as statements
+/// ([`crate::pragma`]): a table named like a pragma's function would answer a
+/// `SELECT` from it in its place, and an empty one would read as "no views, no
+/// tables", so everything resolves.
 pub fn resolution(scratch: &Connection) -> Result<Resolution, DbError> {
-    // The questions below select from the catalog's table-valued functions, and
-    // a table of such a name answers in their place with no error: asked of the
-    // reader's own check, so a wrong answer cannot be read as "all resolves".
-    crate::catalog::refuse_shadowed_pragma_functions(scratch)?;
     let mut found = Vec::new();
-    let views = scratch.query(
-        "SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'view' ORDER BY name",
-        &[],
-    )?;
     let mut broken_views: Vec<String> = Vec::new();
-    for view in &views {
-        let name = view.text(0)?;
+    for name in &listed(scratch, "view")? {
         let sql = format!("SELECT * FROM main.{} LIMIT 0", quote(name));
         if let Err(error) = scratch.query(&sql, &[]) {
             found.push(failed(
@@ -259,39 +255,30 @@ pub fn resolution(scratch: &Connection) -> Result<Resolution, DbError> {
     }
     // A virtual table's columns are not asked of (its module may be missing), nor
     // a shadow table's; a generated column has no default.
-    let defaults = scratch.query(
-        "SELECT t.name, x.name, x.dflt_value FROM pragma_table_list AS t, \
-         pragma_table_xinfo(t.name, 'main') AS x WHERE t.schema = 'main' AND t.type = 'table' \
-         AND x.hidden = 0 AND x.dflt_value IS NOT NULL ORDER BY t.name, x.cid",
-        &[],
-    )?;
-    for column in &defaults {
-        let (table, name, default) = (column.text(0)?, column.text(1)?, column.text(2)?);
-        // A line feed before the closing parenthesis, so a default that ends in a
-        // `--` comment does not swallow it.
-        if let Err(error) = scratch.query(&format!("SELECT ({default}\n)"), &[]) {
-            found.push(failed(
-                "default",
-                format!("{table}.{name}"),
-                vec![About::Column(table.to_owned(), name.to_owned())],
-                &error,
-            ));
+    for table in &listed(scratch, "table")? {
+        for column in &visible_columns(scratch, table)? {
+            let name = column.text(table_xinfo::NAME)?;
+            let Some(default) = column.optional_text(table_xinfo::DEFAULT)? else {
+                continue;
+            };
+            // A line feed before the closing parenthesis, so a default that ends
+            // in a `--` comment does not swallow it.
+            if let Err(error) = scratch.query(&format!("SELECT ({default}\n)"), &[]) {
+                found.push(failed(
+                    "default",
+                    format!("{table}.{name}"),
+                    vec![About::Column(table.clone(), name.to_owned())],
+                    &error,
+                ));
+            }
         }
     }
     triggers(scratch, &broken_views, &mut found)?;
     // Asked table by table: a key the engine cannot check (a parent column that
     // is no key) fails the whole pragma, and one answer for the database would
     // hide a second such table behind the first.
-    let tables = scratch.query(
-        "SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'table' ORDER BY name",
-        &[],
-    )?;
-    for table in &tables {
-        let table = table.text(0)?;
-        let keys = scratch.query(
-            &format!("PRAGMA main.foreign_key_list({})", quote(table)),
-            &[],
-        )?;
+    for table in &listed(scratch, "table")? {
+        let keys = pragma::foreign_keys(scratch, table)?;
         if keys.is_empty() {
             continue;
         }
@@ -337,12 +324,12 @@ pub fn resolution(scratch: &Connection) -> Result<Resolution, DbError> {
                 for (id, rows) in counts {
                     let (mut parent, mut from, mut to) = (String::new(), Vec::new(), Vec::new());
                     for key in &keys {
-                        if key.integer(0)? == id {
-                            key.text(2)?.clone_into(&mut parent);
-                            from.push(key.text(3)?.to_owned());
+                        if key.integer(foreign_key_list::ID)? == id {
+                            key.text(foreign_key_list::TABLE)?.clone_into(&mut parent);
+                            from.push(key.text(foreign_key_list::FROM)?.to_owned());
                             // Absent when the key names no parent column (the
                             // parent's primary key is meant).
-                            to.extend(key.optional_text(4)?.map(str::to_owned));
+                            to.extend(key.optional_text(foreign_key_list::TO)?.map(str::to_owned));
                         }
                     }
                     let mut about =
@@ -419,13 +406,9 @@ fn triggers(
         }
         if asks("update") && !broken {
             // Every column is set to itself, so a trigger `OF` any column fires.
-            let columns = scratch.query(
-                "SELECT name FROM pragma_table_xinfo(?1, 'main') WHERE hidden = 0 ORDER BY cid",
-                &[pbps_db::sqlite::Value::Text(owner.to_owned())],
-            )?;
             let mut sets = Vec::new();
-            for column in &columns {
-                let name = quote(column.text(0)?);
+            for column in &visible_columns(scratch, owner)? {
+                let name = quote(column.text(table_xinfo::NAME)?);
                 sets.push(format!("{name} = {name}"));
             }
             if !sets.is_empty() {
@@ -511,6 +494,31 @@ fn failed(what: &'static str, name: String, about: Vec<About>, error: &DbError) 
         about,
         detail: Detail::Failed(error.to_string()),
     }
+}
+
+/// The names `main` lists under one kind (`table` or `view`), in name order.
+fn listed(scratch: &Connection, kind: &str) -> Result<Vec<String>, DbError> {
+    let mut names = Vec::new();
+    for row in pragma::by_name(pragma::tables(scratch)?, table_list::NAME)? {
+        if row.text(table_list::KIND)? == kind {
+            names.push(row.text(table_list::NAME)?.to_owned());
+        }
+    }
+    Ok(names)
+}
+
+/// The columns of a table or view of `main` that a statement can name (not a
+/// generated one, nor one hidden to a virtual table), in the table's order.
+fn visible_columns(scratch: &Connection, of: &str) -> Result<Vec<Record>, DbError> {
+    let mut kept = Vec::new();
+    for column in pragma::sorted(pragma::columns(scratch, of)?, |column| {
+        column.integer(table_xinfo::CID)
+    })? {
+        if column.integer(table_xinfo::HIDDEN)? == 0 {
+            kept.push(column);
+        }
+    }
+    Ok(kept)
 }
 
 fn quote(name: &str) -> String {

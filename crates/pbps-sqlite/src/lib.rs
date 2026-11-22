@@ -46,6 +46,7 @@ pub mod keywords;
 pub mod lexis;
 pub mod names;
 pub mod ordering;
+mod pragma;
 pub mod preflight;
 pub mod rehearsal;
 pub mod state;
