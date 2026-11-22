@@ -133,7 +133,7 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         opening: Opening<'_>,
     ) -> anyhow::Result<()> {
         let admission = opening.approved.admission();
-        rebuild_window(
+        self.rebuild_window(
             conn,
             &admission,
             pbps_diff::Side {
@@ -152,22 +152,25 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         .await?;
         self.external_roles(conn, opening.original_ids, &plan.ids)
             .await?;
-        check_module_dependents(conn, plan, opening.scoped, &plan.ids, opening.recorded_ids)
+        self.check_module_dependents(conn, plan, opening.scoped, &plan.ids, opening.recorded_ids)
             .await?;
-        check_module_rebuilds(conn, &plan.changes, false).await?;
+        self.check_module_rebuilds(conn, &plan.changes, false)
+            .await?;
         recheck_enum_rebuild_census(conn, &plan.changes, opening.recorded_ids, false).await?;
-        check_domain_alterations(conn, &plan.changes, opening.recorded_ids).await?;
+        self.check_domain_alterations(conn, &plan.changes, opening.recorded_ids)
+            .await?;
         crate::deploy::recheck_extension_creates(conn, plan).await?;
         self.drop_blockers(conn, plan, opening.scoped, opening.recorded_ids)
             .await?;
-        self.state(state).data_guard = prepare_data_writes(
-            conn,
-            &opening.approved.admission(),
-            &plan.changes,
-            opening.baseline,
-            &plan.ids,
-        )
-        .await?;
+        self.state(state).data_guard = self
+            .prepare_data_writes(
+                conn,
+                &opening.approved.admission(),
+                &plan.changes,
+                opening.baseline,
+                &plan.ids,
+            )
+            .await?;
         Ok(())
     }
     async fn after_statements(
@@ -176,7 +179,8 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         plan: &pbps_model::SavedPlan,
         original_ids: &IdsFile,
     ) -> anyhow::Result<()> {
-        check_module_rebuilds(conn, &plan.changes, true).await?;
+        self.check_module_rebuilds(conn, &plan.changes, true)
+            .await?;
         self.refuse_unsafe_definers(conn, &written_routines(&plan.changes), Absent::Refused)
             .await?;
         self.external_roles(conn, original_ids, &plan.ids).await?;
@@ -198,7 +202,8 @@ pub(crate) trait ApplySession: crate::emission::Engine {
     ) -> anyhow::Result<()> {
         recheck_enum_rebuild_census(conn, &plan.changes, stored, resuming).await?;
         if !resuming {
-            check_domain_alterations(conn, &plan.changes, stored).await?;
+            self.check_domain_alterations(conn, &plan.changes, stored)
+                .await?;
             // Every statement starts from a target that still allows it: a resume
             // only re-asks for the packages whose statement has not run.
             crate::deploy::recheck_extension_creates(conn, plan).await?;
@@ -219,29 +224,14 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         approved: &Approved<'_>,
         at: Check<'_>,
     ) -> anyhow::Result<()> {
-        check_type_pins(
-            conn,
-            approved.plan,
-            &approved.project.config.trusted_roles,
-            &approved.managed.references,
-            matches!(at.within(), pbps_db::TransactionOwner::CallersTransaction),
-        )
-        .await
-    }
-    async fn reviewed_input_roots(
-        &self,
-        conn: &mut Conn,
-        approved: &Approved<'_>,
-        at: Check<'_>,
-    ) -> anyhow::Result<BTreeSet<i64>> {
-        type_input_routines(
-            conn,
-            &approved.plan.type_pins,
-            &approved.project.config.trusted_roles,
-            approved.plan.pin_type_routines,
-            matches!(at.within(), pbps_db::TransactionOwner::CallersTransaction),
-        )
-        .await
+        let plan = approved.plan;
+        let trusted = &approved.project.config.trusted_roles;
+        if &plan.trusted_roles != trusted {
+            anyhow::bail!("trusted_roles changed since planning; plan again against the database");
+        }
+        require_type_pins(&plan.type_pins, &approved.managed.references)?;
+        self.replay_type_pins(conn, plan, trusted, at.within())
+            .await
     }
     async fn selected_rows(
         &self,
@@ -266,7 +256,8 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         guard: &DataWriteGuard,
         plan: Option<&pbps_model::SavedPlan>,
     ) -> anyhow::Result<()> {
-        before_statement(conn, admission, stmt, guard, plan).await
+        self.check_data_write(conn, admission, stmt, guard).await?;
+        before_statement(conn, admission, stmt, plan).await
     }
     #[allow(clippy::too_many_arguments)]
     async fn before_staged_statement(
@@ -283,9 +274,11 @@ pub(crate) trait ApplySession: crate::emission::Engine {
             // The plan's own admission, so a routine its review pinned is
             // admitted here as it was at the start (DEC-2563.9).
             let admission = approved.admission();
-            let guard =
-                prepare_data_writes(conn, &admission, &plan.changes, baseline, &plan.ids).await?;
-            check_data_write(conn, &admission, stmt, &guard).await?;
+            let guard = self
+                .prepare_data_writes(conn, &admission, &plan.changes, baseline, &plan.ids)
+                .await?;
+            self.check_data_write(conn, &admission, stmt, &guard)
+                .await?;
         } else {
             self.hold_retained(
                 state,
@@ -302,10 +295,11 @@ pub(crate) trait ApplySession: crate::emission::Engine {
                 // the lock the guard takes, judged by the plan's own
                 // admission (DEC-2563.9).
                 let admission = approved.admission();
-                let guard =
-                    prepare_data_writes(conn, &admission, &plan.changes, baseline, &plan.ids)
-                        .await?;
-                check_data_write(conn, &admission, stmt, &guard).await?;
+                let guard = self
+                    .prepare_data_writes(conn, &admission, &plan.changes, baseline, &plan.ids)
+                    .await?;
+                self.check_data_write(conn, &admission, stmt, &guard)
+                    .await?;
             }
             if let Some(change) = &stmt.introduces {
                 // Judged by the plan's own admission before the statement
@@ -398,9 +392,6 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         )
         .await?;
         Ok(())
-    }
-    async fn settle_writes(&self, conn: &mut Conn) -> anyhow::Result<bool> {
-        settle_data_writes(conn).await
     }
     async fn hold_retained(
         &self,
@@ -666,6 +657,125 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         wanted: &[TableName],
         observed: &[TableName],
     ) -> anyhow::Result<Vec<TableName>>;
+    /// Holds the source of each partitioned-table rebuild still and recertifies,
+    /// before the first statement, that the shape and the dependency closure the
+    /// plan was made over are the ones now there. Required: an engine that was
+    /// never asked must not read as one with no window to hold.
+    async fn rebuild_window(
+        &self,
+        conn: &mut Conn,
+        admission: &RoutineAdmission,
+        before: pbps_diff::Side<'_>,
+        changes: &ChangeSet,
+    ) -> anyhow::Result<()>;
+    /// Called inside the transaction before the `DROP` and after the `CREATE` of
+    /// a rebuilt module. Required: an engine that was never asked must not read
+    /// as one whose replacement keeps its catalog state.
+    async fn check_module_rebuilds(
+        &self,
+        conn: &mut Conn,
+        changes: &ChangeSet,
+        after: bool,
+    ) -> anyhow::Result<ConnectedCheck>;
+    /// What a tightened domain validates, and a refusal where the engine would
+    /// refuse (DEC-1635.8). `None` when no domain in the plan gains a check or
+    /// `NOT NULL`, so a plan without one reports nothing new, and `None` from an
+    /// engine with no domain.
+    async fn check_domain_alterations(
+        &self,
+        conn: &mut Conn,
+        changes: &ChangeSet,
+        stored: &IdsFile,
+    ) -> anyhow::Result<Option<ConnectedCheck>>;
+    /// The apply's half of #314: the saved plan must still remove, before each
+    /// module's drop, everything that depends on that module now. A dependent
+    /// created after planning is one the approver never saw; the plan is refused
+    /// rather than extended, and planning again shows it.
+    ///
+    /// `stored` is the database as the plan's baseline found it, which says
+    /// which table is whose partition (DEC-1699.1).
+    async fn check_module_dependents<D: ?Sized>(
+        &self,
+        conn: &mut Conn,
+        plan: &(dyn pbps_diff::order::PlanView<D> + 'static),
+        stored: &Schema,
+        ids: &IdsFile,
+        stored_ids: &IdsFile,
+    ) -> anyhow::Result<()> {
+        let changes = pbps_dialect::PlanPayload::changes(plan);
+        let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
+        self.refuse_policy_dependents(conn, plan, ids, stored)
+            .await?;
+        self.check_module_dependency_facts(conn, changes, names, stored, stored_ids)
+            .await
+    }
+    /// Apply validates the approved order against fresh catalog bindings. It
+    /// never schedules a newly discovered dependent into the saved plan.
+    /// Required, for the reason of [`Self::check_module_rebuilds`].
+    async fn refuse_policy_dependents<D: ?Sized>(
+        &self,
+        conn: &mut Conn,
+        plan: &(dyn pbps_diff::order::PlanView<D> + 'static),
+        ids: &IdsFile,
+        managed: &Schema,
+    ) -> anyhow::Result<()>;
+    /// Reads every dependent of every module the plan drops, inside the caller's
+    /// transaction, and refuses the ones the plan does not remove first. Apart
+    /// from [`Self::refuse_policy_dependents`] because the check reads only
+    /// these facts. Required, for the reason of [`Self::check_module_rebuilds`].
+    async fn check_module_dependency_facts(
+        &self,
+        conn: &mut Conn,
+        changes: &ChangeSet,
+        names: pbps_model::plan_names::PlanNames<'_>,
+        stored: &Schema,
+        stored_ids: &IdsFile,
+    ) -> anyhow::Result<()>;
+    /// Authenticates the data-write triggers in the caller's open transaction;
+    /// what it holds is evidence for [`Self::check_data_write`]. Required: an
+    /// engine that was never asked must not read as one with no trigger.
+    async fn prepare_data_writes(
+        &self,
+        conn: &mut Conn,
+        admission: &RoutineAdmission,
+        changes: &ChangeSet,
+        baseline: &StateSnapshot,
+        planned_ids: &IdsFile,
+    ) -> anyhow::Result<DataWriteGuard>;
+    /// Refuses a row write or a rewrite a trigger the guard did not
+    /// authenticate would run. Required, for the reason of
+    /// [`Self::prepare_data_writes`].
+    async fn check_data_write(
+        &self,
+        conn: &mut Conn,
+        admission: &RoutineAdmission,
+        statement: &pbps_dialect::Statement,
+        guard: &DataWriteGuard,
+    ) -> anyhow::Result<()>;
+    /// Whether deferred work was flushed and its effects need a managed-state
+    /// check. Required, for the reason of [`Self::prepare_data_writes`].
+    async fn settle_writes(&self, conn: &mut Conn) -> anyhow::Result<bool>;
+    /// Refuses changed type prerequisites before replay proceeds; neutral code
+    /// has already refused a changed `trusted_roles` and a type without a pin.
+    /// `within` says who owns the transaction the reads run in. Required: an
+    /// engine that was never asked must not read as one whose plan carries no
+    /// type prerequisite.
+    async fn replay_type_pins(
+        &self,
+        conn: &mut Conn,
+        plan: &pbps_model::SavedPlan,
+        trusted: &BTreeSet<pbps_model::RoleName>,
+        within: pbps_db::TransactionOwner,
+    ) -> anyhow::Result<()>;
+    /// Reads the potential path of every pinned type, including unchanged
+    /// columns, as the roots of the routines a type's input would run. Required,
+    /// for the reason of [`Self::replay_type_pins`].
+    async fn reviewed_input_roots(
+        &self,
+        conn: &mut Conn,
+        approved: &Approved<'_>,
+        at: Check<'_>,
+    ) -> anyhow::Result<BTreeSet<i64>>;
 }
 
 /// Preserved adapters have only a connection; the apply service already has
@@ -683,10 +793,8 @@ pub(crate) async fn before_statement(
     conn: &mut Conn,
     admission: &RoutineAdmission,
     stmt: &pbps_dialect::Statement,
-    guard: &DataWriteGuard,
     plan: Option<&pbps_model::SavedPlan>,
 ) -> anyhow::Result<()> {
-    crate::engine::check_data_write(conn, admission, stmt, guard).await?;
     crate::engine::check_drop_requirement(conn, admission, stmt).await?;
     // The routines a table expression calls are judged just before the statement
     // that introduces it, with what the plan created earlier in place (DEC-2563.4).

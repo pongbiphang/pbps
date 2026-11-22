@@ -257,6 +257,104 @@ impl ApplySession for pbps_mssql::Mssql {
     ) -> anyhow::Result<Vec<TableName>> {
         Ok(pbps_mssql::catalog::matching_table_names(conn, wanted, observed).await?)
     }
+    /// The lock-and-recertify window belongs to PostgreSQL's rebuild, which
+    /// reads a dependency closure from its catalog; this engine has none.
+    async fn rebuild_window(
+        &self,
+        _conn: &mut Conn,
+        _admission: &RoutineAdmission,
+        _before: pbps_diff::Side<'_>,
+        _changes: &ChangeSet,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// SQL Server's `CREATE OR ALTER` preserves this state without a rebuild.
+    async fn check_module_rebuilds(
+        &self,
+        _conn: &mut Conn,
+        _changes: &ChangeSet,
+        _after: bool,
+    ) -> anyhow::Result<ConnectedCheck> {
+        Ok(plan_session::mssql::check_module_rebuilds())
+    }
+    /// SQL Server has no domain.
+    async fn check_domain_alterations(
+        &self,
+        _conn: &mut Conn,
+        _changes: &ChangeSet,
+        _stored: &IdsFile,
+    ) -> anyhow::Result<Option<ConnectedCheck>> {
+        Ok(None)
+    }
+    /// Policy dependents are read from PostgreSQL's catalog bindings; this
+    /// engine has no read of them to ask.
+    async fn refuse_policy_dependents<D: ?Sized>(
+        &self,
+        _conn: &mut Conn,
+        _plan: &(dyn pbps_diff::order::PlanView<D> + 'static),
+        _ids: &IdsFile,
+        _managed: &Schema,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn check_module_dependency_facts(
+        &self,
+        conn: &mut Conn,
+        changes: &ChangeSet,
+        names: pbps_model::plan_names::PlanNames<'_>,
+        stored: &Schema,
+        stored_ids: &IdsFile,
+    ) -> anyhow::Result<()> {
+        let found = plan_session::mssql::module_dependents(conn, changes).await?;
+        refuse_unaccounted_dependents("SQL Server", changes, &found, names, stored, stored_ids)
+    }
+    /// SQL Server keeps its existing reference-data execution policy.
+    async fn prepare_data_writes(
+        &self,
+        _conn: &mut Conn,
+        _admission: &RoutineAdmission,
+        _changes: &ChangeSet,
+        _baseline: &StateSnapshot,
+        _planned_ids: &IdsFile,
+    ) -> anyhow::Result<DataWriteGuard> {
+        Ok(DataWriteGuard::default())
+    }
+    async fn check_data_write(
+        &self,
+        _conn: &mut Conn,
+        _admission: &RoutineAdmission,
+        _statement: &pbps_dialect::Statement,
+        _guard: &DataWriteGuard,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn settle_writes(&self, _conn: &mut Conn) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    async fn replay_type_pins(
+        &self,
+        _conn: &mut Conn,
+        plan: &pbps_model::SavedPlan,
+        trusted: &BTreeSet<pbps_model::RoleName>,
+        _within: pbps_db::TransactionOwner,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            plan.type_pins.is_empty() && plan.provider_pins.is_empty() && trusted.is_empty(),
+            "this SQL Server plan carries PostgreSQL type prerequisites"
+        );
+        Ok(())
+    }
+    async fn reviewed_input_roots(
+        &self,
+        _conn: &mut Conn,
+        approved: &Approved<'_>,
+        _at: Check<'_>,
+    ) -> anyhow::Result<BTreeSet<i64>> {
+        plan_session::mssql::type_input_routines(
+            &approved.plan.type_pins,
+            approved.plan.pin_type_routines,
+        )
+    }
 }
 
 /// Proves the tables a catalog read did not return are absent, not hidden,

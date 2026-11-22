@@ -19,7 +19,7 @@
 //! and the plan is refused rather than extended.
 //!
 //! Pure over the dependents already read, so the ordering is testable without
-//! an engine; the reads are `engine::module_dependents`'.
+//! an engine; the reads are each engine's `module_dependents`.
 
 #[cfg(test)]
 use pbps_diff::order::PlanningPlan;

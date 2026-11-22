@@ -307,6 +307,32 @@ pub(in crate::engine) async fn account_for_module_dependents<
     ))
 }
 
+/// Every dependent of every module this plan drops, read inside the caller's
+/// transaction. SQL Server captures DEFAULT holders only for explicit routine
+/// drops (DEC-2455.1).
+pub(in crate::engine) async fn module_dependents(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+) -> anyhow::Result<BTreeMap<pbps_model::ModuleId, Vec<pbps_pg::modules::Dependent>>> {
+    // CREATE OR ALTER does not drop a routine; only explicit teardown does.
+    let roots = changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let pbps_model::Change::Module(pbps_model::ModuleChange::DropModule {
+                id,
+                kind: pbps_model::ModuleKind::Function,
+            }) = &p.change
+            {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(pbps_mssql::catalog::module_default_dependents(conn, &roots).await?)
+}
+
 /// Predicts existing table, column and key `DROP` dependencies in the caller's
 /// transaction (issue 254); apply asks it again (`ApplySession::drop_blockers`).
 pub(in crate::engine) async fn check_drop_blockers(
@@ -1205,8 +1231,10 @@ impl PlanSession for pbps_mssql::Mssql {
             types: type_pins,
             providers: provider_pins,
         } = seal_type_pins(&project.config.trusted_roles)?;
+        let input_roots = type_input_routines(&type_pins, project.config.pin_type_routines)?;
         let reviewed =
-            crate::pins::seal_selected(conn, project, target, &type_pins, &state.admission).await?;
+            crate::pins::seal_selected(conn, project, target, input_roots, &state.admission)
+                .await?;
         let routine_pins = crate::pins::seal(conn, project, target, managed).await?;
         Ok(SealedFacts {
             type_pins,

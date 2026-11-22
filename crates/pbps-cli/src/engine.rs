@@ -1033,20 +1033,6 @@ pub(in crate::engine) fn tightens_a_domain(changes: &ChangeSet) -> bool {
     })
 }
 
-/// What a tightened domain validates, and a refusal where the engine would
-/// refuse (DEC-1635.8). `None` when no domain in the plan gains a check or
-/// NOT NULL, so a plan without one reports nothing new.
-pub async fn check_domain_alterations(
-    conn: &mut Conn,
-    changes: &ChangeSet,
-    stored: &pbps_model::IdsFile,
-) -> anyhow::Result<Option<ConnectedCheck>> {
-    if conn.driver() != Driver::Postgres {
-        return Ok(None);
-    }
-    plan_session::postgres::check_domain_alterations(conn, changes, stored).await
-}
-
 fn refuse_drop_reports(
     engine: &str,
     reports: &[pbps_db::impact::DropReport],
@@ -2030,55 +2016,6 @@ pub enum Absent {
     NotYetCreated,
 }
 
-/// Called inside the transaction before the DROP and after the CREATE.
-/// SQL Server's CREATE OR ALTER preserves this state without a rebuild.
-pub async fn check_module_rebuilds(
-    conn: &mut Conn,
-    changes: &ChangeSet,
-    after: bool,
-) -> anyhow::Result<ConnectedCheck> {
-    match conn.driver() {
-        Driver::Mssql => Ok(plan_session::mssql::check_module_rebuilds()),
-        Driver::Postgres => {
-            plan_session::postgres::check_module_rebuilds(conn, changes, after).await
-        }
-    }
-}
-
-/// Every dependent of every module this plan drops, read inside the caller's
-/// transaction (`modules::dependents` refuses outside one). SQL Server captures
-/// DEFAULT holders only for explicit routine drops (DEC-2455.1).
-async fn module_dependents(
-    conn: &mut Conn,
-    changes: &ChangeSet,
-) -> anyhow::Result<BTreeMap<pbps_model::ModuleId, Vec<pbps_pg::modules::Dependent>>> {
-    let mut found = BTreeMap::new();
-    if conn.driver() == Driver::Mssql {
-        // CREATE OR ALTER does not drop a routine; only explicit teardown does.
-        let roots = changes
-            .changes
-            .iter()
-            .filter_map(|p| {
-                if let pbps_model::Change::Module(pbps_model::ModuleChange::DropModule {
-                    id,
-                    kind: pbps_model::ModuleKind::Function,
-                }) = &p.change
-                {
-                    Some(id.clone())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        return Ok(pbps_mssql::catalog::module_default_dependents(conn, &roots).await?);
-    }
-    for (id, kind) in crate::dependents::dropped_modules(changes) {
-        let deps = pbps_pg::modules::dependents(conn, &id, kind).await?;
-        found.insert(id, deps);
-    }
-    Ok(found)
-}
-
 /// The planner's half of #314: reads what depends on every module this plan
 /// drops and puts each dependent on the right side of that drop, in the plan
 /// the approver sees (`dependents::weave`, which the schedule runs over the
@@ -2182,26 +2119,6 @@ pub(crate) async fn resolves_now(
     Ok(false)
 }
 
-/// The apply's half of #314: the saved plan must still remove, before each
-/// module's drop, everything that depends on that module now. A dependent
-/// created after planning is one the approver never saw; the plan is refused
-/// rather than extended, and planning again shows it.
-///
-/// `stored` is the database as the plan's baseline found it, which says
-/// which table is whose partition (DEC-1699.1).
-pub async fn check_module_dependents<D: ?Sized>(
-    conn: &mut Conn,
-    plan: &(dyn pbps_diff::order::PlanView<D> + 'static),
-    stored: &pbps_model::Schema,
-    ids: &pbps_model::IdsFile,
-    stored_ids: &pbps_model::IdsFile,
-) -> anyhow::Result<()> {
-    let changes = pbps_dialect::PlanPayload::changes(plan);
-    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
-    refuse_policy_dependents(conn, plan, ids, stored).await?;
-    check_module_dependency_facts(conn, changes, names, stored, stored_ids).await
-}
-
 #[cfg(test)]
 pub async fn check_module_dependents_fixture(
     conn: &mut Conn,
@@ -2218,17 +2135,25 @@ pub async fn check_module_dependents_fixture(
         let found = policy_dependents(conn, changes, ids, stored).await?;
         pbps_diff::order::row_security::check_releases(changes, ids, &found)?;
     }
-    check_module_dependency_facts(conn, changes, names, stored, stored_ids).await
+    let selected = apply_session::selected(conn.driver());
+    pbps_cli::with_plan_dialect!(&selected, |session| {
+        session
+            .check_module_dependency_facts(conn, changes, names, stored, stored_ids)
+            .await
+    })
 }
 
-async fn check_module_dependency_facts(
-    conn: &mut Conn,
+/// What the saved plan must still remove before each module's drop, given the
+/// dependents the engine just read: the one refusal both engines share, said in
+/// the engine's name.
+fn refuse_unaccounted_dependents(
+    engine: &str,
     changes: &ChangeSet,
+    found: &BTreeMap<pbps_model::ModuleId, Vec<pbps_pg::modules::Dependent>>,
     names: pbps_model::plan_names::PlanNames<'_>,
     stored: &pbps_model::Schema,
     stored_ids: &pbps_model::IdsFile,
 ) -> anyhow::Result<()> {
-    let found = module_dependents(conn, changes).await?;
     // Match the planner's final relation first; each dependency lookup then
     // spells both ends at the statement's boundary (DEC-1875.1).
     let partitions = crate::dependents::standing_partitions(stored, changes).at(
@@ -2237,17 +2162,12 @@ async fn check_module_dependency_facts(
         pbps_model::plan_names::At::End,
     );
     let sources = pbps_model::physical_sources::PhysicalSources::of(names, stored, stored_ids)?;
-    let left = crate::dependents::unaccounted(changes, &found, &partitions, &sources);
+    let left = crate::dependents::unaccounted(changes, found, &partitions, &sources);
     if !left.is_empty() {
         anyhow::bail!(
-            "module_dependents ({}): the database now holds dependents this plan does not \
+            "module_dependents ({engine}): the database now holds dependents this plan does not \
              remove before dropping what they depend on, so the engine would refuse the drop:\n  {}\n\
              Plan again, so the plan accounts for them where the approver can see it.",
-            if conn.driver() == Driver::Mssql {
-                "SQL Server"
-            } else {
-                "PostgreSQL"
-            },
             left.join("\n  ")
         );
     }
@@ -2258,65 +2178,6 @@ async fn check_module_dependency_facts(
 #[derive(Default)]
 pub struct DataWriteGuard {
     postgres: Option<pbps_pg::data_triggers::Guard>,
-}
-
-pub async fn prepare_data_writes(
-    conn: &mut Conn,
-    admission: &pbps_dialect::routines::RoutineAdmission,
-    changes: &ChangeSet,
-    baseline: &StateSnapshot,
-    planned_ids: &pbps_model::IdsFile,
-) -> anyhow::Result<DataWriteGuard> {
-    match conn.driver() {
-        // SQL Server keeps its existing reference-data execution policy.
-        Driver::Mssql => Ok(DataWriteGuard::default()),
-        Driver::Postgres => {
-            plan_session::postgres::prepare_data_writes(
-                conn,
-                admission,
-                changes,
-                baseline,
-                planned_ids,
-            )
-            .await
-        }
-    }
-}
-
-/// Whether deferred work was flushed and its effects need a managed-state check.
-pub async fn settle_data_writes(conn: &mut Conn) -> anyhow::Result<bool> {
-    match conn.driver() {
-        Driver::Postgres => {
-            pbps_pg::data_triggers::settle(conn).await?;
-            Ok(true)
-        }
-        Driver::Mssql => Ok(false),
-    }
-}
-
-pub async fn check_data_write(
-    conn: &mut Conn,
-    admission: &pbps_dialect::routines::RoutineAdmission,
-    statement: &pbps_dialect::Statement,
-    guard: &DataWriteGuard,
-) -> anyhow::Result<()> {
-    let Some(write) = statement.row_write.as_ref().or(statement.rewrites.as_ref()) else {
-        return Ok(());
-    };
-    match conn.driver() {
-        Driver::Mssql => Ok(()),
-        Driver::Postgres => {
-            let empty = pbps_pg::data_triggers::Guard::default();
-            pbps_pg::data_triggers::check(
-                conn,
-                admission,
-                write,
-                guard.postgres.as_ref().unwrap_or(&empty),
-            )
-            .await?;
-            Ok(())
-        }
-    }
 }
 
 /// Artifact readers route by the engine named in the saved file, without a
@@ -4401,22 +4262,6 @@ async fn policy_dependents(
     Ok(found)
 }
 
-/// Apply validates the approved order against fresh catalog bindings. It
-/// never schedules a newly discovered dependent into the saved plan.
-async fn refuse_policy_dependents<D: ?Sized>(
-    conn: &mut Conn,
-    plan: &(dyn pbps_diff::order::PlanView<D> + 'static),
-    ids: &pbps_model::IdsFile,
-    managed: &pbps_model::Schema,
-) -> anyhow::Result<()> {
-    if conn.driver() == Driver::Postgres {
-        let changes = pbps_dialect::PlanPayload::changes(plan);
-        let found = policy_dependents(conn, changes, ids, managed).await?;
-        crate::row_security::check_policy_releases(plan, ids, &found)?;
-    }
-    Ok(())
-}
-
 /// What a plan relies on that a package provides, sealed together: the type
 /// pins the saved plan carries, and the pins of the other provider-owned
 /// objects (DEC-2447.13). `providers` is empty until a kind that uses it lands,
@@ -4469,63 +4314,6 @@ mod type_pin_identity_tests {
         };
         assert!(require_type_pins(&[other], &required).is_err());
         require_type_pins(&[], &BTreeSet::new()).unwrap();
-    }
-}
-
-/// Refuse changed type prerequisites and owner trust before replay proceeds.
-pub async fn check_type_pins(
-    conn: &mut Conn,
-    plan: &pbps_model::SavedPlan,
-    trusted: &BTreeSet<pbps_model::RoleName>,
-    required: &BTreeSet<pbps_model::TypeRef>,
-    within_transaction: bool,
-) -> anyhow::Result<()> {
-    if &plan.trusted_roles != trusted {
-        anyhow::bail!("trusted_roles changed since planning; plan again against the database");
-    }
-    require_type_pins(&plan.type_pins, required)?;
-    match conn.driver() {
-        Driver::Postgres => {
-            let within = if within_transaction {
-                pbps_db::TransactionOwner::CallersTransaction
-            } else {
-                pbps_db::TransactionOwner::OwnTransaction
-            };
-            pbps_pg::type_refs::trusted_roles(conn, trusted).await?;
-            pbps_pg::type_refs::check(
-                conn,
-                within,
-                &plan.type_pins,
-                &plan.declared_type_pins,
-                &plan.changes,
-            )
-            .await?;
-            pbps_pg::class_pins::check(conn, within, &plan.provider_pins, &plan.changes).await?;
-        }
-        Driver::Mssql
-            if plan.type_pins.is_empty() && plan.provider_pins.is_empty() && trusted.is_empty() => {
-        }
-        Driver::Mssql => {
-            anyhow::bail!("this SQL Server plan carries PostgreSQL type prerequisites")
-        }
-    }
-    Ok(())
-}
-
-/// Read the potential path of every pinned type, including unchanged columns.
-pub async fn type_input_routines(
-    conn: &mut Conn,
-    pins: &[pbps_model::TypePin],
-    trusted: &BTreeSet<pbps_model::RoleName>,
-    pin_routines: bool,
-    inside: bool,
-) -> anyhow::Result<BTreeSet<i64>> {
-    match conn.driver() {
-        Driver::Postgres => {
-            plan_session::postgres::type_input_routines(conn, pins, trusted, pin_routines, inside)
-                .await
-        }
-        Driver::Mssql => plan_session::mssql::type_input_routines(pins, pin_routines),
     }
 }
 
@@ -4583,18 +4371,6 @@ pub async fn installation_ids(conn: &mut Conn, ids: &IdsFile) -> anyhow::Result<
         ids,
         previous.as_ref().map(|e| &e.snapshot),
     )?)
-}
-
-pub async fn rebuild_window(
-    conn: &mut Conn,
-    admission: &pbps_dialect::routines::RoutineAdmission,
-    before: pbps_diff::Side<'_>,
-    changes: &ChangeSet,
-) -> anyhow::Result<()> {
-    if conn.driver() == Driver::Postgres {
-        pbps_pg::rebuild::window(conn, admission, before, changes).await?;
-    }
-    Ok(())
 }
 
 pub type RebuildVerification = pbps_pg::rebuild::Verification;
