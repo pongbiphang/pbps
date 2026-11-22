@@ -439,11 +439,14 @@ async fn exercise(
                         pk.name = Some(name.clone());
                         name
                     }
-                    Definition::Index(_) | Definition::Unique(_) => match &part {
-                        IndexPart::Index(name) | IndexPart::Unique(name) => name.clone(),
-                        // Refused on a partitioned table, so never a part of one.
-                        IndexPart::PrimaryKey | IndexPart::Exclusion(_) => unreachable!(),
-                    },
+                    Definition::Index(_) | Definition::Unique(_) | Definition::Exclusion(_) => {
+                        match &part {
+                            IndexPart::Index(name)
+                            | IndexPart::Unique(name)
+                            | IndexPart::Exclusion(name) => name.clone(),
+                            IndexPart::PrimaryKey => unreachable!(),
+                        }
+                    }
                 };
                 Ok(BuildPartitionedIndex {
                     parent: RebuildRelation {
@@ -618,6 +621,7 @@ async fn final_contract(
             let unique = match &recipe.definition {
                 Definition::Index(i) => i.unique,
                 Definition::PrimaryKey(_) | Definition::Unique(_) => true,
+                Definition::Exclusion(_) => false,
             };
             for (uid, name, leaf) in std::iter::once((&recipe.parent.uid, &recipe.name, false))
                 .chain(recipe.clones.iter().map(|c| (&c.leaf.uid, &c.name, true)))
@@ -631,13 +635,13 @@ async fn final_contract(
                 };
                 let constraint_parent = if leaf {
                     format!(
-                        "(SELECT oid FROM pg_constraint WHERE conindid=to_regclass({}) AND contype IN('p','u'))",
+                        "(SELECT oid FROM pg_constraint WHERE conindid=to_regclass({}) AND contype IN('p','u','x'))",
                         literal(&parent_index)
                     )
                 } else {
                     "0".into()
                 };
-                assert_eq!(value(conn,&format!("SELECT to_jsonb(i.indrelid=to_regclass({}) AND i.indisunique={unique} AND i.indisprimary={primary} AND i.indisvalid AND i.indisready AND COALESCE(h.inhparent,0)={index_parent} AND ((k.oid IS NOT NULL)={key}) AND (NOT {key} OR (k.conparentid={constraint_parent} AND k.conrelid=i.indrelid)))::text AS v FROM pg_index i LEFT JOIN pg_inherits h ON h.inhrelid=i.indexrelid LEFT JOIN pg_constraint k ON k.conindid=i.indexrelid AND k.contype IN('p','u') AND k.conrelid=i.indrelid WHERE i.indexrelid=to_regclass({})",literal(&qualified(table).unwrap()),literal(&index))).await,json!(true));
+                assert_eq!(value(conn,&format!("SELECT to_jsonb(i.indrelid=to_regclass({}) AND i.indisunique={unique} AND i.indisprimary={primary} AND i.indisvalid AND i.indisready AND COALESCE(h.inhparent,0)={index_parent} AND ((k.oid IS NOT NULL)={key}) AND (NOT {key} OR (k.conparentid={constraint_parent} AND k.conrelid=i.indrelid)))::text AS v FROM pg_index i LEFT JOIN pg_inherits h ON h.inhrelid=i.indexrelid LEFT JOIN pg_constraint k ON k.conindid=i.indexrelid AND k.contype IN('p','u','x') AND k.conrelid=i.indrelid WHERE i.indexrelid=to_regclass({})",literal(&qualified(table).unwrap()),literal(&index))).await,json!(true));
             }
         }
         if let Change::Partition(PartitionChange::AnalyzeTableTree(tree)) = op.change() {

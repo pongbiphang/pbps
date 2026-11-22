@@ -194,6 +194,13 @@ fn explicit_index_recipes_own_all_clones_and_refuse_ambiguous_owners() {
             storage_parameters: Default::default(),
             filegroup: None,
         }),
+        // A parent's exclusion (DEC-2448.7): named as a key is, a part of its own kind.
+        PartitionIndexDefinition::Exclusion(
+            serde_json::from_str(
+                r#"{"method":"btree","keys":[{"key":{"name":"k"},"operator":"="}]}"#,
+            )
+            .unwrap(),
+        ),
         PartitionIndexDefinition::PrimaryKey(PrimaryKey {
             name: Some(recipe.name.clone()),
             columns: vec!["k".into()],
@@ -202,6 +209,10 @@ fn explicit_index_recipes_own_all_clones_and_refuse_ambiguous_owners() {
         }),
     ] {
         recipe.definition = definition;
+        assert_eq!(
+            matches!(recipe.definition, PartitionIndexDefinition::Exclusion(_)),
+            recipe.part() == IndexPart::Exclusion(recipe.name.clone())
+        );
         let ops = Operations::expanded(
             1,
             [(
@@ -220,6 +231,14 @@ fn explicit_index_recipes_own_all_clones_and_refuse_ambiguous_owners() {
         )));
         let named = names(op, &owners, before).unwrap();
         assert_eq!(named.claims.len(), 1 + recipe.clones.len());
+        // An index is named in the schema's relations, a key and an exclusion also as the
+        // constraint they back.
+        let kind = if matches!(recipe.definition, PartitionIndexDefinition::Index(_)) {
+            NameKind::Index
+        } else {
+            NameKind::Key
+        };
+        assert!(named.claims.iter().all(|n| n.address.kind == kind));
         assert!(
             named
                 .claims
@@ -302,4 +321,66 @@ fn a_composed_rebuilds_base_spelling_is_what_the_environment_holds() {
         .with_rebuild_addresses(&root, &desired, &[])
         .is_err()
     );
+}
+
+/// DEC-2448.4: the retirements an approval keeps for withdraw() are validated like the top-level
+/// ones. A record `validate` accepted here would be put back at top level by a withdrawal and
+/// refused there, which blocks the withdrawal.
+#[test]
+fn a_rebuilds_kept_retirements_are_validated_like_the_top_level_ones() {
+    let (root, _, desired, _) = fixture::approval();
+    let parent = root.intent.source_root().unwrap().clone();
+    let source_uid = root.intent.source.tables.keys().next().unwrap().clone();
+    let retired = || ExclusionRetirement {
+        was: "{\"method\":\"gist\"}".into(),
+        reason: "enforced elsewhere".into(),
+        operator: "leon".into(),
+        dropped_at: "2026-11-15".into(),
+    };
+    let keep = |ids: &mut IdsFile, uid: &Uid, record: ExclusionRetirement| {
+        ids.rebuilds
+            .get_mut(&parent)
+            .unwrap()
+            .exclusions
+            .insert(uid.clone(), [("kept".into(), record)].into());
+    };
+    // Valid kept retirements under a source table validate.
+    let mut ok = desired.clone();
+    keep(&mut ok, &source_uid, retired());
+    ok.validate().unwrap();
+    // Negative: a blank field in any of the four.
+    for blank in 0..4 {
+        let mut r = retired();
+        match blank {
+            0 => r.was = " ".into(),
+            1 => r.reason = "\t".into(),
+            2 => r.operator = String::new(),
+            _ => r.dropped_at = "\n".into(),
+        }
+        let mut bad = desired.clone();
+        keep(&mut bad, &source_uid, r);
+        assert!(
+            matches!(
+                bad.validate(),
+                Err(pbps_model::ids::IdsError::InvalidRebuild { .. })
+            ),
+            "blank field {blank}"
+        );
+    }
+    // Negative: a uid that is no table of the source.
+    let mut foreign = desired.clone();
+    let stranger = root
+        .intent
+        .replacement
+        .tables
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    assert!(!root.intent.source.tables.contains_key(&stranger));
+    keep(&mut foreign, &stranger, retired());
+    assert!(matches!(
+        foreign.validate(),
+        Err(pbps_model::ids::IdsError::InvalidRebuild { .. })
+    ));
 }

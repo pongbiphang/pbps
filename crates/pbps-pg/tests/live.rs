@@ -8746,6 +8746,66 @@ async fn a_detach_takes_the_parent_before_the_partition() {
     drop_schema(&mut a, &s).await;
 }
 
+/// A detach names the clone of a parent's exclusion by the parent's constraint, as it names a
+/// unique constraint's, so the plan can tell which engine name the rename vacates (DEC-2448.7,
+/// measured on 18.6; the pinned server). Negative: a partition's own exclusion is no clone, and
+/// a parent that holds none gives none. A plain index's clone is read beside it.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL 18; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_detach_reads_an_exclusions_clone_through_its_parents_constraint() {
+    let s = emit_schema("detach_excl");
+    let mut a = connect().await;
+    fresh(&mut a, &s).await;
+    a.execute(&format!(
+        "CREATE TABLE {s}.ev (k integer NOT NULL, v integer NOT NULL) PARTITION BY RANGE (k);
+         ALTER TABLE {s}.ev ADD CONSTRAINT ev_slot EXCLUDE USING btree (k WITH =, v WITH =);
+         CREATE INDEX ev_v ON {s}.ev (v);
+         CREATE TABLE {s}.ev_1 PARTITION OF {s}.ev FOR VALUES FROM (0) TO (10);
+         ALTER TABLE {s}.ev_1 ADD CONSTRAINT ev_1_own EXCLUDE USING btree (v WITH =);
+         CREATE TABLE {s}.plain (k integer NOT NULL) PARTITION BY RANGE (k);
+         CREATE TABLE {s}.plain_1 PARTITION OF {s}.plain FOR VALUES FROM (0) TO (10);"
+    ))
+    .await
+    .expect("the tree");
+    let clones = pbps_pg::catalog::detach_clone_names(
+        &mut a,
+        &TableName::new(&s, "ev_1"),
+        &TableName::new(&s, "ev"),
+    )
+    .await
+    .expect("the clones");
+    let found: Vec<_> = clones
+        .iter()
+        .map(|c| (c.kind, c.parent.raw().to_owned(), c.name.name.clone()))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (
+                pbps_model::DetachedKind::Exclusion,
+                "ev_slot".to_owned(),
+                "ev_1_k_v_excl".to_owned()
+            ),
+            // A plain index's clone has no constraint behind it, and is still read.
+            (
+                pbps_model::DetachedKind::Index,
+                "ev_v".to_owned(),
+                "ev_1_v_idx".to_owned()
+            ),
+        ],
+        "the clones, and not the partition's own"
+    );
+    let none = pbps_pg::catalog::detach_clone_names(
+        &mut a,
+        &TableName::new(&s, "plain_1"),
+        &TableName::new(&s, "plain"),
+    )
+    .await
+    .expect("none");
+    assert!(none.is_empty(), "{none:?}");
+    drop_schema(&mut a, &s).await;
+}
+
 /// A detach calls no operator a user of the table's schema could add (#1544).
 /// The batch runs on that schema's path, and an operator matching its
 /// arguments exactly is chosen over a built-in that needs a cast even with

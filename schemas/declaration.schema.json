@@ -1392,6 +1392,13 @@
             "$ref": "#/$defs/IndexDto"
           }
         },
+        "exclude": {
+          "description": "The partition's own exclusion constraints (#2448), written as a table's. The parent's\nreach it as clones without being written here, and one the engine would take for the\nparent's clone (same method, keys, operators, `include` and `where`) is refused.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ExclusionDto"
+          }
+        },
         "foreign_keys": {
           "description": "The partition's own foreign keys (#1632); the parent's reach it as\nclones without being written here, and one equal to a parent's is\nrefused, since the engine may take it for the parent's clone.",
           "type": "object",

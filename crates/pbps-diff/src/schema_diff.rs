@@ -1392,6 +1392,23 @@ fn diff_surviving_table<D: Dialect + ?Sized>(
                     &mut changes,
                     &mut errs,
                 );
+                // Its own exclusions, those the parent's did not take (DEC-2448.7),
+                // as the base held them: a retirement is asked of the table's
+                // original definition, as for a standing table.
+                let retired = |key: &pbps_model::ObjectLocalName| {
+                    base_table
+                        .exclude
+                        .get(key)
+                        .is_some_and(|held| declared.ids.exclusion_retired(uid, key, held))
+                };
+                diff_exclusions(
+                    declared_name,
+                    &renames.apply(&table, base_name),
+                    declared_table,
+                    &retired,
+                    &mut changes,
+                    &mut errs,
+                );
                 diff_storage_parameters(uid, declared_name, &table, declared_table, &mut changes);
                 if table.unlogged != declared_table.unlogged {
                     changes.push(Change::TableProperty(
@@ -3161,21 +3178,6 @@ fn detached_names(
 ) -> Result<Vec<DetachedName>, Vec<String>> {
     let mut names = Vec::new();
     let mut what = Vec::new();
-    // Its clone of the parent's exclusion becomes its own on a detach, under a name
-    // the engine chose (measured on 18.6), and no recipe names it yet (DEC-2448.6).
-    if !parent.exclude.is_empty() {
-        what.push(format!(
-            "its parent holds exclusion constraint(s) {}, whose clone a detach would keep as \
-             an own constraint under the engine's name; detaching a partition of such a parent \
-             is not supported yet (DEC-2448.6, #2448)",
-            parent
-                .exclude
-                .keys()
-                .map(|n| format!("`{}`", n.shown()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
     // Its own are matched by name before the parent's by definition: a
     // detach renames only what it gave the partition, so an own check or
     // index declared under another name, or changed, is a change this plan
@@ -3232,6 +3234,18 @@ fn detached_names(
         } else {
             what.push(format!(
                 "its own foreign key `{name}` is not declared as it stands",
+                name = name.shown(),
+            ));
+        }
+    }
+    // Its own exclusions, as its own indexes (DEC-2448.7): a detach keeps them under their
+    // names beside the parent's clone, which it makes local.
+    for (name, own) in &partition.exclude {
+        if declared.exclude.get(name) == Some(own) {
+            declared.exclude.remove(name);
+        } else {
+            what.push(format!(
+                "its own exclusion constraint `{name}` is not declared as it stands",
                 name = name.shown(),
             ));
         }
@@ -3339,6 +3353,16 @@ fn detached_names(
         &mut names,
         &mut what,
     );
+    // Its clone of the parent's exclusion becomes its own on a detach, under the name the
+    // engine gave it, which the plan renames to the declared one (measured on 18.6).
+    matched(
+        DetachedKind::Exclusion,
+        "exclusion constraint",
+        &parent.exclude,
+        &declared.exclude,
+        &mut names,
+        &mut what,
+    );
     // Everything else is the parent's too, the partitioning aside.
     let rest = |t: &Table| Table {
         columns: Default::default(),
@@ -3347,6 +3371,7 @@ fn detached_names(
         foreign_keys: Default::default(),
         checks: Default::default(),
         indexes: Default::default(),
+        exclude: Default::default(),
         partition_by: None,
         partition_of: None,
         description: None,
@@ -3757,6 +3782,24 @@ fn attached(
         .filter(|(_, fk)| !parent.foreign_keys.values().any(|p| p == *fk))
         .map(|(name, fk)| (name.clone(), fk.clone()))
         .collect();
+    // An own exclusion the parent's can take is taken as its clone on `ATTACH`, keeping its
+    // name, and then goes with the parent's (measured on 18.6, DEC-2448.7): the attached
+    // partition would not hold what the declaration says it owns. Any other stays its own.
+    for (name, own) in &table.exclude {
+        if let Some((parents, _)) = parent
+            .exclude
+            .iter()
+            .find(|(_, p)| adopts_exclusion(p, own))
+        {
+            what.push(format!(
+                "its exclusion constraint `{name}` is its parent's `{parents}` in shape, which the \
+                 engine takes as the parent's clone when it attaches; drop it in an earlier plan \
+                 and let the attach build the clone",
+                name = name.shown(),
+                parents = parents.shown(),
+            ));
+        }
+    }
     let mut checks = table.checks.clone();
     for (name, p) in &parent_spelled.checks {
         checks.remove(name);
@@ -3911,6 +3954,7 @@ fn attached(
         foreign_keys: Default::default(),
         checks: Default::default(),
         indexes: Default::default(),
+        exclude: Default::default(),
         replica_identity: None,
         storage_parameters: Default::default(),
         unlogged: false,
@@ -3947,6 +3991,7 @@ fn attached(
         table: Table {
             checks,
             indexes,
+            exclude: table.exclude.clone(),
             foreign_keys: own_foreign_keys,
             storage_parameters: table.storage_parameters.clone(),
             unlogged: table.unlogged,
@@ -4253,6 +4298,13 @@ fn refuse_partition_changes(
                 | Change::Constraint(ConstraintChange::DropCheck { .. })
                 | Change::Constraint(ConstraintChange::AddForeignKey { .. })
                 | Change::Constraint(ConstraintChange::DropForeignKey { .. })
+                // Its own exclusion, as its own index (DEC-2448.7): a drop and an add, or a
+                // parameter edit of the index behind it, which `ALTER INDEX` takes on a leaf.
+                | Change::Constraint(ConstraintChange::SetExclusion { .. })
+                | Change::Index(IndexChange::SetIndexStorageParameters {
+                    target: IndexPart::Exclusion(_),
+                    ..
+                })
                 | Change::Partition(PartitionChange::SetPartitionDefault { .. })
                 | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
                 | Change::Policy(_)
@@ -4536,6 +4588,17 @@ fn refuse_parent_index(
                 .is_some_and(|of| of.parent == *table)
         })
     };
+    // The partition as the base held it, if it did: what a parent's new index can adopt is
+    // what stood before the plan.
+    let held_before = |partition: &TableName| {
+        declared
+            .ids
+            .tables
+            .iter()
+            .find(|(_, name)| *name == partition)
+            .and_then(|(uid, _)| base.ids.tables.get(uid))
+            .and_then(|name| base.schema.tables.get(name))
+    };
     // A key holds every partition-key column, or the engine refuses it, as
     // it does a unique index (#1689).
     let missing_key = |columns: &[ColumnName]| {
@@ -4584,6 +4647,12 @@ fn refuse_parent_index(
                 name = name.shown(),
             ));
         }
+        // Every declared own the parent's would adopt, whether it stood before the plan or
+        // is added by it: the declaration rule (`validate_partition`, DEC-2448.7) already
+        // refuses an own of the parent's shape, because the state it declares is one the
+        // engine reaches only by order. An index is different (below): its same-plan own is
+        // legal. The same-plan order the engine allows is #2992's. A redefined own (a drop
+        // and an add under one name) is the declared one, so it is refused as well.
         let adopted: Vec<String> = partitions()
             .flat_map(|(partition, t)| {
                 t.exclude
@@ -4652,13 +4721,7 @@ fn refuse_parent_index(
     // compared as renamed and kept, not dropped (#1737 review).
     let adopted: Vec<String> = partitions()
         .flat_map(|(partition, t)| {
-            let before = declared
-                .ids
-                .tables
-                .iter()
-                .find(|(_, name)| *name == partition)
-                .and_then(|(uid, _)| base.ids.tables.get(uid))
-                .and_then(|name| base.schema.tables.get(name));
+            let before = held_before(partition);
             t.indexes
                 .iter()
                 .filter(move |(own, _)| {

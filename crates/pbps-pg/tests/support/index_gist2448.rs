@@ -497,3 +497,123 @@ async fn an_array_of_a_collatable_element_takes_a_key_collation_and_reads_back()
         db.finish().await;
     }
 }
+
+/// A rebuild recipe's leaf builds evaluate the parent's declared key expressions and predicate,
+/// which the apply-time vet judged as bound on the parent's `search_path` (#2989). With a leaf
+/// in another schema, a statement on the leaf's own path would bind an unqualified call to a
+/// routine of that schema that nothing vetted, and run it as the deployer. Measured on 16 and
+/// 18: the decoy `lf.ok`, which raises, is never called; the leaf's index binds `app.ok`, so
+/// the ATTACH finds the definitions equal. A qualified call and a same-schema leaf, which had
+/// no decoy to find, build as before.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_recipes_leaf_builds_bind_the_parents_routine_not_one_of_the_leafs_schema() {
+    let _live = super::live_ledger().await;
+    let routine = |schema: &str, body: &str| {
+        format!(
+            "CREATE FUNCTION {schema}.ok(x int) RETURNS int LANGUAGE plpgsql IMMUTABLE \
+             SET search_path = pg_catalog, pg_temp AS $f$ BEGIN {body} END $f$"
+        )
+    };
+    for variable in SERVERS {
+        let exclusions = variable == "PBPS_TEST_PG_DB";
+        for (case, leaf_schema, call) in [
+            ("cross", "lf", "ok(v)"),
+            ("qualified", "lf", "app.ok(v)"),
+            ("same", "app", "ok(v)"),
+        ] {
+            let mut db = Private::on(variable, case).await;
+            db.run(&routine("app", "RETURN x;")).await;
+            if leaf_schema != "app" {
+                db.run("CREATE SCHEMA lf").await;
+                db.run(&routine(
+                    "lf",
+                    "RAISE EXCEPTION 'the decoy lf.ok was called';",
+                ))
+                .await;
+            }
+            let expression = serde_json::json!({ "expression": call });
+            let mut definitions = vec![
+                (
+                    "ix",
+                    serde_json::json!({"index":{"columns":[expression.clone()]}}),
+                ),
+                (
+                    "pr",
+                    serde_json::json!({"index":{"columns":[{"name":"v"}],"filter":format!("{call} > 0")}}),
+                ),
+            ];
+            if exclusions {
+                definitions.push((
+                    "ex",
+                    serde_json::json!({"exclusion":{
+                        "method":"btree",
+                        "keys":[
+                            {"key":{"name":"k"},"operator":"="},
+                            {"key":expression,"operator":"="}
+                        ],
+                        "include":[],
+                        "storage_parameters":{},
+                        "timing":"immediate"
+                    }}),
+                ));
+            }
+            for (tag, definition) in definitions {
+                let parent = format!("p_{tag}");
+                let leaf = format!("{parent}1");
+                db.run(&format!(
+                    "CREATE TABLE app.{parent} (k int NOT NULL, v int NOT NULL) PARTITION BY RANGE (k); \
+                     CREATE TABLE {leaf_schema}.{leaf} PARTITION OF app.{parent} FOR VALUES FROM (0) TO (100); \
+                     INSERT INTO app.{parent} VALUES (1, 10), (2, 20)"
+                ))
+                .await;
+                let recipe: pbps_model::BuildPartitionedIndex =
+                    serde_json::from_value(serde_json::json!({
+                        "parent": {"uid": "t_aaaaaa", "name": format!("app.{parent}")},
+                        "name": format!("{parent}_i"),
+                        "definition": definition,
+                        "clones": [{
+                            "leaf": {"uid": "t_bbbbbb", "name": format!("{leaf_schema}.{leaf}")},
+                            "name": format!("{leaf}_i"),
+                        }],
+                    }))
+                    .unwrap();
+                // Every statement of the recipe runs: a decoy call, or a refused ATTACH, panics.
+                db.apply(&Change::Index(IndexChange::BuildPartitionedIndex(
+                    Box::new(recipe),
+                )))
+                .await;
+                let on_leaf = |routine: &str| {
+                    format!(
+                        "SELECT count(*)::text FROM pg_depend d \
+                         WHERE d.refobjid = '{routine}(integer)'::regprocedure \
+                           AND d.objid IN (SELECT oid FROM pg_class WHERE relname = '{leaf}_i' \
+                                           UNION SELECT oid FROM pg_constraint WHERE conname = '{leaf}_i')"
+                    )
+                };
+                let bound = text(db.conn(), &on_leaf("app.ok")).await;
+                assert_ne!(bound, "0", "{case} {tag}: the leaf's build binds app.ok");
+                if leaf_schema != "app" {
+                    assert_eq!(
+                        text(db.conn(), &on_leaf("lf.ok")).await,
+                        "0",
+                        "{case} {tag}: the leaf's build never binds the decoy"
+                    );
+                }
+                assert_eq!(
+                    text(
+                        db.conn(),
+                        &format!(
+                            "SELECT count(*)::text FROM pg_inherits i \
+                             JOIN pg_class c ON c.oid = i.inhrelid \
+                             WHERE c.relname = '{leaf}_i'"
+                        )
+                    )
+                    .await,
+                    "1",
+                    "{case} {tag}: the leaf's index is attached"
+                );
+            }
+        }
+    }
+}

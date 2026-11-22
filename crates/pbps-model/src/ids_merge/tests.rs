@@ -352,3 +352,99 @@ fn retirements_of_different_constraints_merge_and_the_same_one_differently_confl
     };
     assert!(t.exclusions.is_empty());
 }
+
+fn with_partition_exclusions(mut f: TreeFile, child: &str, records: &[(&str, &str)]) -> TreeFile {
+    let Body::Table(t) = &mut f.body else {
+        unreachable!()
+    };
+    t.partition_exclusions = vec![(
+        uid(child),
+        records
+            .iter()
+            .map(|(name, reason)| ((*name).to_owned(), retirement(reason)))
+            .collect(),
+    )];
+    f
+}
+
+/// DEC-2448.7: a partition child's retirements sit in its parent's file by the child's uid, so
+/// two branches retiring a constraint of two different children both keep theirs, and two
+/// retiring one of the same child with different reasons conflict under the child's uid.
+/// Negative: a record one side deleted and the other left alone is gone.
+#[test]
+fn retirements_of_two_partitions_merge_and_one_partition_retired_two_ways_conflicts() {
+    let none = YamlView::default();
+    let base = base();
+    let ours = with_partition_exclusions(base.clone(), "t_bbbbb1", &[("a", "r")]);
+    let theirs = with_partition_exclusions(base.clone(), "t_bbbbb2", &[("a", "r")]);
+    let merged = merge(Some(&base), Some(&ours), Some(&theirs), &none)
+        .unwrap()
+        .unwrap();
+    let Body::Table(t) = &merged.body else {
+        unreachable!()
+    };
+    let children: Vec<_> = t
+        .partition_exclusions
+        .iter()
+        .map(|(u, _)| u.to_string())
+        .collect();
+    assert_eq!(children, ["t_bbbbb1", "t_bbbbb2"]);
+    let theirs = with_partition_exclusions(base.clone(), "t_bbbbb1", &[("a", "another reason")]);
+    let conflicts = merge(Some(&base), Some(&ours), Some(&theirs), &none).unwrap_err();
+    assert_eq!(conflicts[0].section, "partition_exclusions");
+    assert_eq!(conflicts[0].uid, uid("t_bbbbb1"));
+    let merged = merge(Some(&ours), Some(&base), Some(&ours), &none)
+        .unwrap()
+        .unwrap();
+    let Body::Table(t) = &merged.body else {
+        unreachable!()
+    };
+    assert!(t.partition_exclusions.is_empty());
+}
+
+/// DEC-2448.7: the record is one per (child, constraint name), as a table's own are per
+/// name, so two branches retiring different constraints of one child both keep theirs.
+/// Negative: the same constraint of the same child retired two ways conflicts, named by
+/// the child, and a record one side deleted while the other kept a sibling stays gone.
+#[test]
+fn retirements_of_different_constraints_of_one_partition_both_survive_the_merge() {
+    let none = YamlView::default();
+    let base = base();
+    let ours = with_partition_exclusions(base.clone(), "t_bbbbb1", &[("a", "r")]);
+    let theirs = with_partition_exclusions(base.clone(), "t_bbbbb1", &[("b", "r")]);
+    let merged = merge(Some(&base), Some(&ours), Some(&theirs), &none)
+        .unwrap()
+        .unwrap();
+    let Body::Table(t) = &merged.body else {
+        unreachable!()
+    };
+    assert_eq!(t.partition_exclusions.len(), 1);
+    assert_eq!(t.partition_exclusions[0].0, uid("t_bbbbb1"));
+    let names: Vec<_> = t.partition_exclusions[0]
+        .1
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(names, ["a", "b"]);
+    // The same (child, name) with different records conflicts under the child.
+    let theirs = with_partition_exclusions(base.clone(), "t_bbbbb1", &[("a", "other"), ("b", "r")]);
+    let conflicts = merge(Some(&base), Some(&ours), Some(&theirs), &none).unwrap_err();
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].section, "partition_exclusions");
+    assert_eq!(conflicts[0].uid, uid("t_bbbbb1"));
+    // One side deleted `a` from the base that held both; the other kept both.
+    let both = with_partition_exclusions(base.clone(), "t_bbbbb1", &[("a", "r"), ("b", "r")]);
+    let only_b = with_partition_exclusions(base.clone(), "t_bbbbb1", &[("b", "r")]);
+    let merged = merge(Some(&both), Some(&only_b), Some(&both), &none)
+        .unwrap()
+        .unwrap();
+    let Body::Table(t) = &merged.body else {
+        unreachable!()
+    };
+    let names: Vec<_> = t.partition_exclusions[0]
+        .1
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(names, ["b"]);
+}

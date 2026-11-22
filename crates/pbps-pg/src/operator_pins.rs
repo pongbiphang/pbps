@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 
 use pbps_db::{Conn, DbError};
 use pbps_model::ConstraintChange;
+use pbps_model::IndexChange;
 use pbps_model::TableChange;
 use pbps_model::{
     Change, ChangeSet, ProviderKind, ProviderMember, ProviderPin, Schema, Table, TypeProvider,
@@ -84,6 +85,14 @@ fn named_by(changes: &ChangeSet) -> BTreeSet<Wanted> {
             }
             Change::Table(TableChange::CreateTable { name, table, .. }) => {
                 uses_in_table(name, table, &mut out)
+            }
+            // A parent's exclusion, built through the rebuild recipe (DEC-2448.7).
+            Change::Index(IndexChange::BuildPartitionedIndex(build)) => {
+                if let pbps_model::PartitionIndexDefinition::Exclusion(x) = &build.definition {
+                    let mut one = Table::default();
+                    one.exclude.insert(build.name.clone(), x.clone());
+                    uses_in_table(&build.parent.name, &one, &mut out);
+                }
             }
             _ => {}
         }
@@ -289,6 +298,41 @@ mod tests {
         assert_eq!(named(set(None, Some(Box::new(both.clone())))), ["ext.%"]);
         assert!(named(set(None, Some(Box::new(exclusion(&[None]))))).is_empty());
         assert!(named(set(Some(Box::new(both.clone())), None)).is_empty());
+        // A parent's exclusion built by a rebuild's recipe names its operators as an added one
+        // does (DEC-2448.7); a recipe of another kind names none.
+        let relation = |uid: &str, name: &str| pbps_model::RebuildRelation {
+            uid: uid.parse().unwrap(),
+            name: name.parse().unwrap(),
+        };
+        let recipe = |definition| {
+            Change::Index(IndexChange::BuildPartitionedIndex(Box::new(
+                pbps_model::BuildPartitionedIndex {
+                    parent: relation("t_000001", "app.docs"),
+                    name: "no_dup".into(),
+                    definition,
+                    clones: vec![pbps_model::PartitionIndexClone {
+                        leaf: relation("t_000002", "app.docs_1"),
+                        name: "docs_1_excl".into(),
+                    }],
+                },
+            )))
+        };
+        assert_eq!(
+            named(recipe(pbps_model::PartitionIndexDefinition::Exclusion(
+                both.clone()
+            ))),
+            ["ext.%"]
+        );
+        assert!(
+            named(recipe(pbps_model::PartitionIndexDefinition::Unique(
+                pbps_model::UniqueConstraint {
+                    columns: vec!["k".into()],
+                    storage_parameters: Default::default(),
+                    filegroup: None,
+                }
+            )))
+            .is_empty()
+        );
         let mut created = Table::default();
         created.exclude.insert("no_dup".into(), both);
         assert_eq!(

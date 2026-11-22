@@ -304,7 +304,8 @@ pub fn names(
             let kind = match r.definition {
                 crate::PartitionIndexDefinition::Index(_) => NameKind::Index,
                 crate::PartitionIndexDefinition::PrimaryKey(_)
-                | crate::PartitionIndexDefinition::Unique(_) => NameKind::Key,
+                | crate::PartitionIndexDefinition::Unique(_)
+                | crate::PartitionIndexDefinition::Exclusion(_) => NameKind::Key,
             };
             for (relation, name) in std::iter::once((&r.parent, &r.name))
                 .chain(r.clones.iter().map(|c| (&c.leaf, &c.name)))
@@ -424,6 +425,8 @@ pub fn names(
                     }
                     DetachedKind::Check => (NameKind::Constraint, PartKey::Check(name.clone())),
                     DetachedKind::Index => (NameKind::Index, PartKey::Index(name.clone())),
+                    // An index-backed constraint, named as a unique constraint is.
+                    DetachedKind::Exclusion => (NameKind::Key, PartKey::Exclusion(name.clone())),
                 };
                 nx.part(true, table, kind, key, name.raw())?;
             }

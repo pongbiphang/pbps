@@ -159,6 +159,7 @@ pub(super) fn index_names_created(change: &pbps_model::Change) -> Vec<TableName>
                     n.kind,
                     pbps_model::DetachedKind::PrimaryKey
                         | pbps_model::DetachedKind::Unique
+                        | pbps_model::DetachedKind::Exclusion
                         | pbps_model::DetachedKind::Index
                 )
             })

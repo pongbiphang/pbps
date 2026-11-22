@@ -1041,6 +1041,31 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     (c.name.clone().into(), pbps_model::Column::new(ty))
                 })
                 .collect();
+            // Its own exclusion constraints (DEC-2448.7): the query reads no clone
+            // (`conparentid`), and one the engine took from the parent on `ATTACH` is a
+            // clone, so each constraint here is the partition's own. They are read as a
+            // table's are, with the columns lent, and keep their backing index out of
+            // the index pass below.
+            for constraint in constraints_by_table
+                .get(&raw_table.oid)
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .filter(|c| c.kind == 'x')
+            {
+                if add_constraint(constraint, &parts, &lookups, &mut table, &mut pulled) {
+                    surviving.extend(constraint.index_oid);
+                    let options = raw
+                        .indexes
+                        .iter()
+                        .find(|i| Some(i.oid) == constraint.index_oid)
+                        .map_or(&[][..], |i| i.reloptions.as_slice());
+                    let what = format!("constraint `{}`", constraint.name.shown());
+                    if let Some(x) = table.exclude.get_mut(&constraint.name) {
+                        x.storage_parameters =
+                            index_parameters(x.method, options, &what, &mut unread);
+                    }
+                }
+            }
             for index in indexes_by_table
                 .get(&raw_table.oid)
                 .map_or(&[][..], Vec::as_slice)
@@ -8571,6 +8596,85 @@ mod tests {
                 x.deferred = deferred;
             });
             assert_eq!(only(&pulled).exclude["t_x"].timing, expected);
+        }
+    }
+
+    /// A partition's own exclusion constraint is read as a table's, with its parent's columns
+    /// lent, and is not also an index of its own; its parameters are the partition's. A clone
+    /// the engine made of its parent's (and one it took from the partition on `ATTACH`) is a
+    /// row with a `conparentid`, which the constraints query never reads (DEC-2448.7).
+    /// Negatives: one left out for its doubts is left out of the partition as of a table.
+    #[test]
+    fn a_partitions_own_exclusion_is_read_with_its_parents_columns_and_a_clone_is_not() {
+        let build = |tweak: &dyn Fn(&mut RawConstraint, &mut RawIndex)| {
+            let mut parent = table(1, "t");
+            parent.partition_key = Some(vec!["a".to_owned()]);
+            let mut leaf = table(2, "p1");
+            leaf.partition_of = Some((1, "DEFAULT".to_owned()));
+            let mut x = constraint(2, "p1_own", 'x');
+            x.index_oid = Some(50);
+            x.exclusion_op_schemas = vec!["pg_catalog".into()];
+            x.exclusion_op_names = vec!["=".into()];
+            x.exclusion_op_extensions = vec![String::new()];
+            x.exclusion_op_count = 1;
+            x.definition = "EXCLUDE USING btree (...)".into();
+            let mut ix = index(50, 2, "p1_own");
+            ix.exclusion = true;
+            ix.columns = vec![1];
+            ix.reloptions = vec!["fillfactor=70".to_owned()];
+            tweak(&mut x, &mut ix);
+            assemble(&RawCatalog {
+                tables: vec![parent, leaf],
+                columns: vec![
+                    col(1, 1, "a", "integer"),
+                    col(1, 2, "b", "integer"),
+                    col(2, 1, "a", "integer"),
+                    col(2, 2, "b", "integer"),
+                ],
+                constraints: vec![x],
+                indexes: vec![ix],
+                ..RawCatalog::default()
+            })
+        };
+        let held = build(&|_, _| {});
+        let leaf = &held.schema.tables[&TableName::new("app", "p1")];
+        assert!(held.warnings.is_empty(), "{:?}", held.warnings);
+        assert_eq!(leaf.exclude.len(), 1, "{:?}", held.warnings);
+        let own = &leaf.exclude["p1_own"];
+        assert_eq!(own.keys[0].operator.raw().to_string(), "=");
+        assert_eq!(own.storage_parameters["fillfactor"], "70");
+        assert!(leaf.indexes.is_empty(), "not also an index of its own");
+        assert!(leaf.columns.is_empty(), "its columns stay its parent's");
+        assert!(
+            held.schema.tables[&TableName::new("app", "t")]
+                .exclude
+                .is_empty()
+        );
+        // An index that does not back an exclusion is left out of the partition, as of a table.
+        let doubtful = build(&|_, ix| ix.exclusion = false);
+        let leaf = &doubtful.schema.tables[&TableName::new("app", "p1")];
+        assert!(leaf.exclude.is_empty());
+        assert!(
+            doubtful
+                .warnings
+                .iter()
+                .any(|w| w.contains("is not a validated exclusion constraint")),
+            "{:?}",
+            doubtful.warnings
+        );
+        // A constraint not validated, or one of no operator, is left out by name as well.
+        for tweak in [
+            &(|x: &mut RawConstraint, _: &mut RawIndex| x.validated = false)
+                as &dyn Fn(&mut RawConstraint, &mut RawIndex),
+            &|x, _| x.exclusion_op_count = 0,
+        ] {
+            let left_out = build(tweak);
+            assert!(
+                left_out.schema.tables[&TableName::new("app", "p1")]
+                    .exclude
+                    .is_empty()
+            );
+            assert!(!left_out.warnings.is_empty());
         }
     }
 

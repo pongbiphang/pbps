@@ -200,6 +200,9 @@ pub enum PartitionIndexDefinition {
     Index(crate::Index),
     PrimaryKey(crate::PrimaryKey),
     Unique(crate::UniqueConstraint),
+    /// A parent's exclusion (PostgreSQL 18): built on the parent alone and attached to
+    /// each leaf's own build, as a unique constraint is (DEC-2448.7).
+    Exclusion(crate::ExclusionConstraint),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
@@ -215,6 +218,9 @@ impl BuildPartitionedIndex {
             PartitionIndexDefinition::Index(_) => crate::IndexPart::Index(self.name.clone()),
             PartitionIndexDefinition::PrimaryKey(_) => crate::IndexPart::PrimaryKey,
             PartitionIndexDefinition::Unique(_) => crate::IndexPart::Unique(self.name.clone()),
+            PartitionIndexDefinition::Exclusion(_) => {
+                crate::IndexPart::Exclusion(self.name.clone())
+            }
         }
     }
 
@@ -245,6 +251,14 @@ impl BuildPartitionedIndex {
                     name,
                     constraint: key.clone(),
                     clustered: false,
+                })
+            }
+            PartitionIndexDefinition::Exclusion(x) => {
+                crate::Change::Constraint(crate::ConstraintChange::SetExclusion {
+                    table,
+                    name,
+                    from: None,
+                    to: Some(Box::new(x.clone())),
                 })
             }
         }

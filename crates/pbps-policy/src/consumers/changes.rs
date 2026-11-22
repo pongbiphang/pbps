@@ -143,8 +143,10 @@ pub(super) fn classify(
         Change::Index(IndexChange::BuildPartitionedIndex(index)) => {
             let unique = match &index.definition {
                 pbps_model::PartitionIndexDefinition::Index(i) => i.unique,
+                // An exclusion checks the rows the tree holds, as a unique key does.
                 pbps_model::PartitionIndexDefinition::PrimaryKey(_)
-                | pbps_model::PartitionIndexDefinition::Unique(_) => true,
+                | pbps_model::PartitionIndexDefinition::Unique(_)
+                | pbps_model::PartitionIndexDefinition::Exclusion(_) => true,
             };
             write(write_hit && unique && !unchanged(&p.change, table))
         }

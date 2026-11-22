@@ -3320,6 +3320,271 @@ fn a_standing_parents_exclusion_is_added_replaced_and_dropped_under_the_engines_
     assert!(cs.risks().contains(&RiskClass::Destructive));
 }
 
+/// A standing partition's own exclusion is its own change, as its own index is (DEC-2448.7):
+/// added by one change, an option-only edit in place (`ALTER INDEX` takes it on a leaf,
+/// unlike a partitioned parent's), a different definition a drop and an add, and a drop
+/// needs the record under the partition's own uid. Negatives: the parent's uid is no
+/// authority for it, and a parent's changes meeting a partition move are still refused.
+#[test]
+fn a_standing_partitions_own_exclusion_is_added_edited_replaced_and_dropped_as_its_own() {
+    let leaf: TableName = "app.booking_1".parse().unwrap();
+    let own = || exclusion("int4range(b, c)", "&&");
+    let none = partitioned_booking(&[], &[]);
+    let held = partitioned_booking(&[], &[("mine", own())]);
+    let cs = exclusion_plan(&none, &held, &[]).unwrap();
+    assert_eq!(kinds(&cs), ["SetExclusion"]);
+    assert!(cs.risks().contains(&RiskClass::Constraint));
+    // An option-only edit is the in-place `ALTER INDEX` on the exclusion's index.
+    let mut tuned = own();
+    tuned
+        .storage_parameters
+        .insert("fillfactor".into(), "70".into());
+    let cs = exclusion_plan(&held, &partitioned_booking(&[], &[("mine", tuned)]), &[]).unwrap();
+    assert_eq!(kinds(&cs), ["SetIndexStorageParameters"]);
+    assert!(matches!(
+        &cs.changes[0].change,
+        Change::Index(IndexChange::SetIndexStorageParameters {
+            target: IndexPart::Exclusion(name),
+            ..
+        }) if name.raw() == "mine"
+    ));
+    // Another definition is a drop and an add under the name.
+    let mut other = own();
+    other.include = vec!["id".into()];
+    let cs = exclusion_plan(&held, &partitioned_booking(&[], &[("mine", other)]), &[]).unwrap();
+    assert_eq!(kinds(&cs), ["SetExclusion", "SetExclusion"]);
+    // A drop needs the record under the partition's uid, which the parent's is not.
+    let said = exclusion_plan(&held, &none, &[]).unwrap_err().join("\n");
+    assert!(
+        said.contains("pbps drop-exclusion app.booking_1 mine --reason"),
+        "{said}"
+    );
+    let record = |on: &str| {
+        let record = retirement(own().canonical_text());
+        let on: TableName = on.parse().unwrap();
+        exclusion_plan_with(&held, &none, move |ids, _| {
+            let uid = ids.table_uid(&on).unwrap().clone();
+            ids.exclusions
+                .entry(uid)
+                .or_default()
+                .insert("mine".into(), record);
+        })
+    };
+    assert!(
+        record("app.booking").is_err(),
+        "the parent's record is no authority"
+    );
+    let cs = record(leaf.raw().to_string().as_str()).unwrap();
+    assert_eq!(kinds(&cs), ["SetExclusion"]);
+    assert!(cs.risks().contains(&RiskClass::Destructive));
+}
+
+/// A parent's new exclusion is refused over every own exclusion it would adopt, whether
+/// the own stood before the plan or the plan adds it, as the declaration rule refuses the
+/// same pair (DEC-2448.7; the same-plan order the engine allows is #2992's). Negatives: an
+/// own that differs (by `INCLUDE`) is not refused, and a plan that leaves the own out of
+/// the declaration has nothing left to take.
+#[test]
+fn a_parents_new_exclusion_refuses_every_own_it_would_take_and_not_one_that_differs() {
+    let none = partitioned_booking(&[], &[]);
+    let both = partitioned_booking(
+        &[("x", parent_exclusion())],
+        &[("mine", parent_exclusion())],
+    );
+    // The own the plan adds to a standing partition: refused by name.
+    let said = exclusion_plan(&none, &both, &[]).unwrap_err().join("\n");
+    assert!(
+        said.contains("which can take app.booking_1's `mine`"),
+        "{said}"
+    );
+    // The own standing already: refused the same.
+    let standing = partitioned_booking(&[], &[("mine", parent_exclusion())]);
+    let said = exclusion_plan(&standing, &both, &[])
+        .unwrap_err()
+        .join("\n");
+    assert!(
+        said.contains("which can take app.booking_1's `mine`"),
+        "{said}"
+    );
+    // Negative: an own that differs is the partition's own, added beside the parent's.
+    let mut differs = parent_exclusion();
+    differs.include = vec!["id".into()];
+    let other = partitioned_booking(&[("x", parent_exclusion())], &[("mine", differs)]);
+    let cs = exclusion_plan(&none, &other, &[]).unwrap();
+    assert_eq!(kinds(&cs), ["SetExclusion", "SetExclusion"]);
+    // Negative: the standing own left out of the declaration is dropped, leaving nothing to take.
+    let cs = exclusion_plan_with(
+        &standing,
+        &partitioned_booking(&[("x", parent_exclusion())], &[]),
+        |ids, _| {
+            let leaf = ids
+                .table_uid(&"app.booking_1".parse().unwrap())
+                .unwrap()
+                .clone();
+            ids.exclusions.entry(leaf).or_default().insert(
+                "mine".into(),
+                retirement(parent_exclusion().canonical_text()),
+            );
+        },
+    )
+    .unwrap();
+    assert_eq!(kinds(&cs).len(), 2, "{:?}", kinds(&cs));
+}
+
+/// A standing partition's own exclusion that a parent's new one would take, and that the
+/// plan drops or replaces, is dropped before the parent's add: the engine refuses the drop
+/// of a constraint the parent's add already made a clone (`cannot drop inherited
+/// constraint`, measured on 18.7), and the drop alone runs first. A drop is a
+/// `SetExclusion` in the class of the add, so only the ordering pass puts it first
+/// (DEC-2448.7). Negative: an adoptable own the declaration keeps is still refused by name.
+#[test]
+fn a_standing_own_exclusion_the_plan_drops_or_replaces_goes_before_the_parents_add() {
+    let leaf: TableName = "app.booking_1".parse().unwrap();
+    let mut differs = parent_exclusion();
+    differs.include = vec!["id".into()];
+    let standing = partitioned_booking(&[], &[("mine", parent_exclusion())]);
+    // Where the parent's add and the leaf's drop of `mine` sit in a plan.
+    let at = |cs: &ChangeSet| {
+        let find = |table: &TableName, drop: bool| {
+            cs.changes.iter().position(|p| {
+                matches!(&p.change, Change::Constraint(ConstraintChange::SetExclusion {
+                    table: t, from, to, ..
+                }) if t == table && from.is_some() == drop && to.is_some() != drop)
+            })
+        };
+        let parent: TableName = "app.booking".parse().unwrap();
+        (find(&leaf, true), find(&parent, false))
+    };
+    // Dropped under its own name, another one added under a new name.
+    let declared = partitioned_booking(&[("x", parent_exclusion())], &[("other", differs.clone())]);
+    let cs = exclusion_plan_with(&standing, &declared, |ids, _| {
+        let uid = ids.table_uid(&leaf).unwrap().clone();
+        ids.exclusions.entry(uid).or_default().insert(
+            "mine".into(),
+            retirement(parent_exclusion().canonical_text()),
+        );
+    })
+    .unwrap();
+    let (dropped, added) = at(&cs);
+    assert!(
+        dropped.unwrap() < added.unwrap(),
+        "the leaf's drop runs before the parent's add: {:?}",
+        kinds(&cs)
+    );
+    // Redefined under its own name to a shape the parent's does not take.
+    let declared = partitioned_booking(&[("x", parent_exclusion())], &[("mine", differs)]);
+    let cs = exclusion_plan(&standing, &declared, &[]).unwrap();
+    let (dropped, added) = at(&cs);
+    assert!(
+        dropped.unwrap() < added.unwrap(),
+        "the leaf's redefinition drops before the parent's add: {:?}",
+        kinds(&cs)
+    );
+    // Negative: an adoptable own the declaration keeps is refused by name, not ordered.
+    let declared = partitioned_booking(
+        &[("x", parent_exclusion())],
+        &[("mine", parent_exclusion())],
+    );
+    let said = exclusion_plan(&standing, &declared, &[])
+        .unwrap_err()
+        .join("\n");
+    assert!(
+        said.contains("which can take app.booking_1's `mine`"),
+        "{said}"
+    );
+}
+
+/// An ordinary table attached as a partition: its own exclusion the parent's would take
+/// is refused by name (the engine makes it the parent's clone on `ATTACH`, so it would
+/// vanish with the parent's), and one that differs stays the partition's own and is
+/// compared with what the declaration says of it (DEC-2448.7).
+#[test]
+fn an_attached_tables_own_exclusion_is_kept_unless_the_parents_would_take_it() {
+    use pbps_model::{PartitionBound, PartitionOf};
+    let booking_table: TableName = "app.booking".parse().unwrap();
+    let late: TableName = "app.late".parse().unwrap();
+    let base = |own: pbps_model::ExclusionConstraint| {
+        let mut s = partitioned_booking(&[("x", parent_exclusion())], &[]);
+        let mut t = s.tables[&booking_table].clone();
+        t.partition_by = None;
+        t.exclude.clear();
+        t.exclude.insert("late_own".into(), own);
+        s.tables.insert(late.clone(), t);
+        s
+    };
+    let declared = |own: Option<pbps_model::ExclusionConstraint>| {
+        let mut s = partitioned_booking(&[("x", parent_exclusion())], &[]);
+        let mut t = Table {
+            partition_of: Some(PartitionOf {
+                parent: booking_table.clone(),
+                bound: PartitionBound::Range {
+                    from: vec![pbps_model::BoundDatum::Value("10".into())],
+                    to: vec![pbps_model::BoundDatum::Value("20".into())],
+                },
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        };
+        if let Some(own) = own {
+            t.exclude.insert("late_own".into(), own);
+        }
+        s.tables.insert(late.clone(), t);
+        s
+    };
+    let plan = |base: &Schema, declared: &Schema| {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(declared, &base_ids, &[], &ctx())
+            .unwrap()
+            .ids;
+        diff(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+    };
+    // The parent's would take it: refused by name, before anything is planned.
+    let said = plan(&base(parent_exclusion()), &declared(None))
+        .map(|p| kinds(p.changes()))
+        .unwrap_err()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        said.contains("its exclusion constraint `late_own` is its parent's `x` in shape"),
+        "{said}"
+    );
+    // One that differs stays its own: attached with no change to it, and compared with
+    // the declaration as for any partition (an own left out is a drop needing a record).
+    let mut differs = parent_exclusion();
+    differs.include = vec!["id".into()];
+    let attached = plan(&base(differs.clone()), &declared(Some(differs.clone())))
+        .unwrap()
+        .changes()
+        .clone();
+    assert_eq!(kinds(&attached), ["AttachPartition"]);
+    let said = plan(&base(differs), &declared(None))
+        .map(|p| kinds(p.changes()))
+        .unwrap_err()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        said.contains("pbps drop-exclusion app.late late_own --reason"),
+        "{said}"
+    );
+}
+
 /// The engine's silent loss of a guarantee under a column change is refused
 /// by name: a drop of a key column is allowed only where the same plan drops
 /// the constraint; a retype is allowed and states the constraint's drop and
@@ -8291,11 +8556,12 @@ fn an_ordinary_table_declared_as_a_partition_is_attached() {
 }
 
 /// A detach keeps the partition's clone of its parent's exclusion as an own constraint
-/// under the engine's name (measured on 18.6), which no recipe names yet: a partition of
-/// a parent that holds one is not detached (DEC-2448.6, #2448). Negative: the same detach
-/// of a parent with none is planned.
+/// under the engine's name (measured on 18.6), which the plan renames to the declared
+/// one as for a unique constraint (DEC-2448.7): the declaration must hold it by
+/// definition, and the partition's own exclusion as it stands. Negatives: the clone
+/// missing from the declaration, one that differs, and an own exclusion not declared.
 #[test]
-fn a_partition_of_a_parent_with_an_exclusion_is_not_detached() {
+fn a_partition_of_a_parent_with_an_exclusion_is_detached_with_its_clone_named() {
     let mut parent = booking(&[])
         .tables
         .remove(&"app.booking".parse::<TableName>().unwrap())
@@ -8313,19 +8579,58 @@ fn a_partition_of_a_parent_with_an_exclusion_is_not_detached() {
         }),
         ..Default::default()
     };
-    let declared = Table {
+    let plain = Table {
         partition_by: None,
         ..parent.clone()
     };
-    let detach =
-        |parent: &Table| detached_names(parent, &partition, &declared, &MinimalDialect, false);
-    assert!(detach(&parent).is_ok());
+    assert_eq!(
+        detached_names(&parent, &partition, &plain, &MinimalDialect, false),
+        Ok(Vec::new())
+    );
     parent.exclude.insert("x".into(), parent_exclusion());
-    let said = detach(&parent).unwrap_err().join("\n");
+    let detach = |partition: &Table, declared: &Table| {
+        detached_names(&parent, partition, declared, &MinimalDialect, false)
+    };
+    let mut kept = plain.clone();
+    kept.exclude.insert("kept".into(), parent_exclusion());
+    assert_eq!(
+        detach(&partition, &kept).unwrap(),
+        vec![DetachedName {
+            kind: DetachedKind::Exclusion,
+            parent: "x".into(),
+            name: Some("kept".into()),
+        }]
+    );
+    // The clone is missing from the declaration, or it is another definition.
+    let said = detach(&partition, &plain).unwrap_err().join("\n");
     assert!(
-        said.contains("holds exclusion constraint(s) `x`") && said.contains("#2448"),
+        said.contains("its parent's exclusion constraint `x` is missing"),
         "{said}"
     );
+    let mut other = plain.clone();
+    let mut changed = parent_exclusion();
+    changed.include = vec!["note".into()];
+    other.exclude.insert("kept".into(), changed);
+    let said = detach(&partition, &other).unwrap_err().join("\n");
+    assert!(
+        said.contains("exclusion constraint `kept` is not its parent's"),
+        "{said}"
+    );
+    // The partition's own stays under its name and must be declared as it stands.
+    let mut owning = partition.clone();
+    owning
+        .exclude
+        .insert("own".into(), exclusion("int4range(b, c)", "&&"));
+    let mut both = kept.clone();
+    assert!(
+        detach(&owning, &both)
+            .unwrap_err()
+            .join("\n")
+            .contains("its own exclusion constraint `own` is not declared as it stands")
+    );
+    both.exclude
+        .insert("own".into(), exclusion("int4range(b, c)", "&&"));
+    assert_eq!(detach(&owning, &both).unwrap().len(), 1);
 }
 
 /// A partition declared as an ordinary table of its parent's shape is

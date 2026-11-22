@@ -129,13 +129,21 @@ fn named_by(changes: &ChangeSet) -> BTreeSet<Wanted> {
                 uses_in_table(table, &one, &mut out);
             }
             Change::Index(IndexChange::BuildPartitionedIndex(build)) => {
-                if let pbps_model::PartitionIndexDefinition::Index(index) = &build.definition {
-                    uses_in_keys(
+                match &build.definition {
+                    pbps_model::PartitionIndexDefinition::Index(index) => uses_in_keys(
                         &index.columns,
                         index.method.as_str(),
                         (String::new(), &Table::default()),
                         &mut out,
-                    );
+                    ),
+                    // A parent's exclusion names its keys' classes as one added alone does.
+                    pbps_model::PartitionIndexDefinition::Exclusion(x) => {
+                        let mut one = Table::default();
+                        one.exclude.insert(build.name.clone(), x.clone());
+                        uses_in_table(&build.parent.name, &one, &mut out);
+                    }
+                    pbps_model::PartitionIndexDefinition::PrimaryKey(_)
+                    | pbps_model::PartitionIndexDefinition::Unique(_) => {}
                 }
             }
             _ => {}
@@ -464,7 +472,45 @@ mod tests {
             ("gist", "ext", "gist_trgm_ops")
         );
         assert!(named_by(&set(None, Some(Box::new(exclusion(&[None]))))).is_empty());
-        assert!(named_by(&set(Some(Box::new(added)), None)).is_empty());
+        assert!(named_by(&set(Some(Box::new(added.clone())), None)).is_empty());
+        // A parent's exclusion built by a rebuild's recipe names its classes the same way
+        // (DEC-2448.7); a recipe of another kind names none.
+        let relation = |uid: &str, name: &str| pbps_model::RebuildRelation {
+            uid: uid.parse().unwrap(),
+            name: name.parse().unwrap(),
+        };
+        let recipe = |definition| ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(Change::Index(
+                pbps_model::IndexChange::BuildPartitionedIndex(Box::new(
+                    pbps_model::BuildPartitionedIndex {
+                        parent: relation("t_000001", "app.docs"),
+                        name: "no_similar".into(),
+                        definition,
+                        clones: vec![pbps_model::PartitionIndexClone {
+                            leaf: relation("t_000002", "app.docs_1"),
+                            name: "docs_1_excl".into(),
+                        }],
+                    },
+                )),
+            ))],
+        };
+        assert_eq!(
+            named_by(&recipe(pbps_model::PartitionIndexDefinition::Exclusion(
+                added
+            )))
+            .len(),
+            1
+        );
+        assert!(
+            named_by(&recipe(pbps_model::PartitionIndexDefinition::Unique(
+                pbps_model::UniqueConstraint {
+                    columns: vec!["k".into()],
+                    storage_parameters: Default::default(),
+                    filegroup: None,
+                }
+            )))
+            .is_empty()
+        );
     }
 
     #[test]

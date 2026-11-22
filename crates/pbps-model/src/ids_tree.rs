@@ -125,7 +125,14 @@ pub struct TableBody {
     /// constraint's name: the table is the file, so its uid is not repeated
     /// (DEC-2448.4).
     pub exclusions: Vec<(String, ExclusionRetirement)>,
+    /// The exclusion constraints a human retired from a partition child of this table, by
+    /// the child's uid and then the constraint's name: a partition has no file of its own,
+    /// so the record sits with the parent that declares it, as a move does (DEC-2448.7).
+    pub partition_exclusions: PartitionExclusions,
 }
+
+/// A partition child's retired exclusion constraints, by the child's uid then the constraint's name.
+pub type PartitionExclusions = Vec<(Uid, BTreeMap<String, ExclusionRetirement>)>;
 
 /// One parsed file: the object it identifies, what it holds, and, for a
 /// dropped object, the tombstone that stays in the file.
@@ -271,6 +278,15 @@ pub fn render(file: &TreeFile) -> String {
                 keyed.iter().map(|(key, r)| (key.as_ref(), *r)),
             ));
         }
+        if !t.partition_exclusions.is_empty() {
+            let keyed: Vec<_> = flat_partition_exclusions(&t.partition_exclusions)
+                .map(|(child, name, r)| (partition_exclusion_key(child, name), r))
+                .collect();
+            top.push(section_keyed(
+                "partition_exclusions",
+                keyed.iter().map(|(key, r)| (key.as_str(), *r)),
+            ));
+        }
     }
     format!("{{\n{}\n}}\n", top.join(",\n"))
 }
@@ -356,6 +372,7 @@ struct Raw {
     conversions: Option<Section<Conversion>>,
     rebuilds: Option<Section<Rebuild>>,
     exclusions: Option<Section<ExclusionRetirement>>,
+    partition_exclusions: Option<Section<ExclusionRetirement>>,
 }
 
 fn malformed(path: &str, message: impl Into<String>) -> TreeError {
@@ -478,6 +495,65 @@ fn by_name<V>(
         .collect()
 }
 
+/// One line per (child, constraint) of a `partition_exclusions` section, so two
+/// independent retirements on one child sit on different lines and a text merge
+/// keeps both (DEC-2448.7). The key is the child's uid, a `/`, then the name as
+/// [`name_key`] writes it; a uid holds no `/`, so the first one splits them.
+fn partition_exclusion_key(child: &Uid, name: &str) -> String {
+    format!("{child}/{}", name_key(name))
+}
+
+/// A table's partition retirements, one (child, name, record) at a time.
+pub(crate) fn flat_partition_exclusions(
+    all: &PartitionExclusions,
+) -> impl Iterator<Item = (&Uid, &str, &ExclusionRetirement)> {
+    all.iter()
+        .flat_map(|(child, named)| named.iter().map(move |(name, r)| (child, name.as_str(), r)))
+}
+
+/// The reverse of [`flat_partition_exclusions`]: entries grouped by child, in
+/// the child's order and then the name's.
+pub(crate) fn group_partition_exclusions(
+    flat: impl IntoIterator<Item = ((Uid, String), ExclusionRetirement)>,
+) -> PartitionExclusions {
+    let mut grouped: BTreeMap<Uid, BTreeMap<String, ExclusionRetirement>> = BTreeMap::new();
+    for ((child, name), r) in flat {
+        grouped.entry(child).or_default().insert(name, r);
+    }
+    grouped.into_iter().collect()
+}
+
+/// Unwraps a `partition_exclusions` section, which is keyed by a child's uid
+/// and a name together, with the checks [`by_name`] makes of the sentinel and of
+/// duplicates, and the uid reader's of the child's uid.
+fn by_child_and_name(
+    path: &str,
+    name: &'static str,
+    section: Option<Section<ExclusionRetirement>>,
+) -> Result<PartitionExclusions, TreeError> {
+    // A uid starts with a kind letter, so `by_name` leaves a whole key alone
+    // (it refuses only a key starting with `_`) and the split is this one's.
+    let flat = by_name(path, name, section)?
+        .into_iter()
+        .map(|(key, r)| {
+            let (child, rest) = key
+                .split_once('/')
+                .ok_or_else(|| malformed(path, format!("`{key}` is not `<uid>/<name>`")))?;
+            let child: Uid = child
+                .parse()
+                .map_err(|e| malformed(path, format!("`{key}`: {e}")))?;
+            if child.kind() != UidKind::Table {
+                return Err(TreeError::KindMismatch {
+                    path: path.to_owned(),
+                    uid: child,
+                });
+            }
+            Ok(((child, key_name(path, name, rest.to_owned())?), r))
+        })
+        .collect::<Result<Vec<_>, TreeError>>()?;
+    Ok(group_partition_exclusions(flat))
+}
+
 /// What an entry of the identity tree must be, said the same way by every reader
 /// (the working tree, a revision, git's index): a regular file named `*.json`.
 /// `parse` does not look at names, so each reader asks this first, and a
@@ -523,6 +599,11 @@ pub fn parse(path: &str, text: &str) -> Result<TreeFile, TreeError> {
             conversions: keyed(path, "conversions", raw.conversions, UidKind::Column, false)?,
             rebuilds: keyed(path, "rebuilds", raw.rebuilds, UidKind::Table, false)?,
             exclusions: by_name(path, "exclusions", raw.exclusions)?,
+            partition_exclusions: by_child_and_name(
+                path,
+                "partition_exclusions",
+                raw.partition_exclusions,
+            )?,
         })
     } else {
         if raw.columns.is_some()
@@ -531,6 +612,7 @@ pub fn parse(path: &str, text: &str) -> Result<TreeFile, TreeError> {
             || raw.conversions.is_some()
             || raw.rebuilds.is_some()
             || raw.exclusions.is_some()
+            || raw.partition_exclusions.is_some()
         {
             return Err(malformed(path, "only a table file has sections"));
         }
@@ -581,7 +663,8 @@ fn check(path: &str, file: &TreeFile) -> Result<(), TreeError> {
             && partitions.is_empty()
             && t.moves.is_empty()
             && t.conversions.is_empty()
-            && t.exclusions.is_empty())
+            && t.exclusions.is_empty()
+            && t.partition_exclusions.is_empty())
     {
         return Err(TreeError::DroppedWithLive {
             path: path.to_owned(),
@@ -596,6 +679,13 @@ fn check(path: &str, file: &TreeFile) -> Result<(), TreeError> {
         .find(|(u, _)| u != &file.uid && !partitions.contains(u))
     {
         return Err(misplaced("moves", uid));
+    }
+    if let Some((uid, _)) = t
+        .partition_exclusions
+        .iter()
+        .find(|(u, _)| !partitions.contains(u))
+    {
+        return Err(misplaced("partition_exclusions", uid));
     }
     // The record is keyed by the source parent; the file is the replacement's.
     if let Some((uid, _)) = t
@@ -672,7 +762,13 @@ fn check_names(path: &str, file: &TreeFile) -> Result<(), TreeError> {
                     Rec::Dead(tomb) => nonempty(&tomb.was)?,
                 }
             }
-            for (name, _) in &t.exclusions {
+            // A partition's retirements are keyed by name as the table's own are, so a
+            // blank one is refused alike rather than read as an empty local name.
+            for name in t.exclusions.iter().map(|(name, _)| name).chain(
+                t.partition_exclusions
+                    .iter()
+                    .flat_map(|(_, named)| named.keys()),
+            ) {
                 nonempty(name)?;
             }
         }
@@ -763,6 +859,16 @@ pub fn assemble(files: &BTreeMap<String, String>) -> Result<IdsFile, TreeError> 
                 for (uid, r) in &t.rebuilds {
                     claim("rebuilds", uid, path)?;
                     ids.rebuilds.insert(uid.clone(), r.clone());
+                }
+                for (uid, named) in &t.partition_exclusions {
+                    claim("partition_exclusions", uid, path)?;
+                    ids.exclusions.insert(
+                        uid.clone(),
+                        named
+                            .iter()
+                            .map(|(name, r)| (ObjectLocalName::new(name.as_str()), r.clone()))
+                            .collect(),
+                    );
                 }
                 // The file's own uid owns every record in its section, so
                 // another file cannot claim the same table's records.
@@ -987,9 +1093,24 @@ pub fn split(ids: &IdsFile, placement: &Placement) -> Result<BTreeMap<String, St
     }
 
     let mut exclusions: BTreeMap<Uid, Vec<(String, ExclusionRetirement)>> = BTreeMap::new();
+    let mut partition_exclusions: BTreeMap<Uid, PartitionExclusions> = BTreeMap::new();
     for (uid, named) in &ids.exclusions {
-        // A partition has no file of its own, and an exclusion on one is
-        // refused (DEC-2448.3), so the owner is always a table that has one.
+        // A partition has no file of its own, so its retirements sit with the parent that
+        // declares it (DEC-2448.7); any other owner is a table that has one.
+        if let Some(parent) = placement.children.get(uid) {
+            table_file(parent, &mut files)?;
+            partition_exclusions
+                .entry(parent.clone())
+                .or_default()
+                .push((
+                    uid.clone(),
+                    named
+                        .iter()
+                        .map(|(name, r)| (name.raw().to_owned(), r.clone()))
+                        .collect(),
+                ));
+            continue;
+        }
         table_file(uid, &mut files)?;
         exclusions.insert(
             uid.clone(),
@@ -1021,6 +1142,8 @@ pub fn split(ids: &IdsFile, placement: &Placement) -> Result<BTreeMap<String, St
             t.conversions = ordered(conversions.remove(&uid).unwrap_or_default(), None);
             t.rebuilds = ordered(rebuilds.remove(&uid).unwrap_or_default(), None);
             t.exclusions = exclusions.remove(&uid).unwrap_or_default();
+            t.partition_exclusions =
+                ordered(partition_exclusions.remove(&uid).unwrap_or_default(), None);
         }
         check(path, &file)?;
         out.insert(path.clone(), render(&file));

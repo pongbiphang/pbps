@@ -91,6 +91,7 @@ pub(crate) fn sample() -> (IdsFile, Placement) {
             operator: "leon".into(),
             types: BTreeMap::new(),
             conversions: BTreeMap::new(),
+            exclusions: BTreeMap::new(),
         },
     );
     f.exclusions.insert(
@@ -102,6 +103,20 @@ pub(crate) fn sample() -> (IdsFile, Placement) {
                 reason: "the service enforces it".into(),
                 operator: "leon".into(),
                 dropped_at: "2026-11-15".into(),
+            },
+        )]
+        .into(),
+    );
+    // A live partition child's own, which the file of its parent carries (DEC-2448.7).
+    f.exclusions.insert(
+        uid("t_bbbbb1"),
+        [(
+            ObjectLocalName::new("no_overlap"),
+            ExclusionRetirement {
+                was: "{\"method\":\"btree\"}".into(),
+                reason: "the leaf's own".into(),
+                operator: "leon".into(),
+                dropped_at: "2026-11-20".into(),
             },
         )]
         .into(),
@@ -307,7 +322,7 @@ fn an_exclusion_retirement_is_keyed_by_name_in_its_tables_file() {
     assert!(customer.contains("\"exclusions\": {\n\n    \"no_overlap\": {\"was\": "));
     assert!(customer.find("\"conversions\"").unwrap() < customer.find("\"exclusions\"").unwrap());
     // No other file holds it, and the table's uid is not repeated in the section.
-    assert!(!t["app/events.json"].contains("exclusions"));
+    assert!(!t["app/events.json"].contains("\"exclusions\""));
     assert!(!customer.contains("\"t_aaaaaa\": {\"was\""));
 }
 
@@ -411,19 +426,143 @@ fn an_exclusion_key_with_a_single_leading_underscore_is_refused() {
 }
 
 #[test]
-fn an_exclusion_retirement_for_a_partition_has_no_file_and_is_refused_on_split() {
-    // A partition child has a uid but no file of its own, and an exclusion on one
-    // is refused (DEC-2448.3), so a record for one cannot be placed.
+fn a_partitions_exclusion_retirement_sits_in_its_parents_file_and_round_trips() {
+    // A partition child has a uid but no file of its own, so the record is keyed by the
+    // child's uid in the parent's file, and the parent's own `exclusions` stays apart.
+    let (ids, p) = sample();
+    let t = split(&ids, &p).unwrap();
+    assert!(t["app/events.json"].contains("\"partition_exclusions\""));
+    assert!(t["app/events.json"].contains("\"t_bbbbb1/no_overlap\": {"));
+    assert!(!t["app/events.json"].contains("\"exclusions\":"));
+    assert!(!t["dbo/customer.json"].contains("partition_exclusions"));
+    assert_eq!(assemble(&t).unwrap(), ids);
+    // Negative: a table with none carries no section.
+    assert!(!t["dbo/legacy.json"].contains("partition_exclusions"));
+}
+
+#[test]
+fn a_partitions_exclusion_retirement_outside_its_parents_partitions_is_refused() {
+    // The uid must be a live partition child of the file's table: another table's,
+    // or a retired child's, is misplaced rather than read as a record of this one.
+    let t = tree();
+    let stray = edit(
+        &t["app/events.json"],
+        "\"t_bbbbb1/no_overlap\": {",
+        "\"t_aaaaaa/no_overlap\": {",
+    );
+    assert!(matches!(
+        refuses("app/events.json", stray),
+        TreeError::Misplaced {
+            section: "partition_exclusions",
+            ..
+        }
+    ));
+    let retired = edit(
+        &t["app/events.json"],
+        "\"t_bbbbb1/no_overlap\": {",
+        "\"t_bbbbb2/no_overlap\": {",
+    );
+    assert!(matches!(
+        refuses("app/events.json", retired),
+        TreeError::Misplaced {
+            section: "partition_exclusions",
+            ..
+        }
+    ));
+    // Negative: a record for a partition nobody placed under a parent has no file to go to.
+    let (ids, mut p) = sample();
+    p.children.remove(&uid("t_bbbbb1"));
+    assert!(matches!(split(&ids, &p), Err(TreeError::NoPath { .. })));
+}
+
+#[test]
+fn a_partitions_exclusion_retirement_with_a_blank_name_is_refused_like_a_tables() {
+    // The nested name is converted to a local name on assembly, so it needs the same
+    // check as a name in `exclusions`, or an empty one would reach the plan.
+    let t = tree();
+    let blank = edit(
+        &t["app/events.json"],
+        "\"t_bbbbb1/no_overlap\": {",
+        "\"t_bbbbb1/\": {",
+    );
+    assert!(matches!(
+        refuses("app/events.json", blank),
+        TreeError::BadName { .. }
+    ));
+    // Negative: a valid name is read as it was.
+    let (ids, p) = sample();
+    assert_eq!(assemble(&split(&ids, &p).unwrap()).unwrap(), ids);
+}
+
+#[test]
+fn a_partitions_retirements_sit_one_to_a_line_so_a_text_merge_keeps_both() {
+    // Two constraints of one child are two lines, not one nested object, or a git
+    // merge of two branches that each retire one would conflict on the shared line.
+    // A name that starts with `_` is written as a name section writes it.
     let (mut ids, p) = sample();
-    ids.exclusions.insert(
-        uid("t_bbbbb1"),
+    let record = ids.exclusions[&uid("t_bbbbb1")]["no_overlap"].clone();
+    for name in ["another", "_hidden"] {
+        ids.exclusions
+            .get_mut(&uid("t_bbbbb1"))
+            .unwrap()
+            .insert(ObjectLocalName::new(name), record.clone());
+    }
+    let t = split(&ids, &p).unwrap();
+    let events = &t["app/events.json"];
+    for key in [
+        "t_bbbbb1/another",
+        "t_bbbbb1/no_overlap",
+        "t_bbbbb1/__hidden",
+    ] {
+        let lines = events
+            .lines()
+            .filter(|l| l.trim_start().starts_with(&format!("\"{key}\": {{")))
+            .count();
+        assert_eq!(lines, 1, "{key}");
+    }
+    assert_eq!(assemble(&t).unwrap(), ids);
+    // Negative: a key with no `/`, one whose uid is no table's, and one that
+    // starts with a single `_` are refused rather than guessed at.
+    for bad in ["t_bbbbb1", "c_aaaaa1/no_overlap", "t_bbbbb1/_hidden"] {
+        let broken = edit(
+            &t["app/events.json"],
+            "\"t_bbbbb1/another\": {",
+            &format!("\"{bad}\": {{"),
+        );
+        assert!(
+            matches!(
+                refuses("app/events.json", broken),
+                TreeError::Malformed { .. } | TreeError::KindMismatch { .. }
+            ),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn a_rebuilds_kept_retirements_round_trip_and_are_absent_when_none() {
+    // The approval keeps the retirements of a source table with no namesake (DEC-2448.4), as part
+    // of its record, so the rebuilds section needs no layout of its own for them.
+    let (mut ids, p) = sample();
+    let plain = split(&ids, &p).unwrap();
+    assert!(!plain["dbo/orders.json"].contains("\"exclusions\""));
+    let record = ids.rebuilds.get_mut(&uid("t_dddddd")).unwrap();
+    record.exclusions.insert(
+        uid("t_dddddd"),
         [(
-            ObjectLocalName::new("x"),
-            ids.exclusions[&uid("t_aaaaaa")]["no_overlap"].clone(),
+            ObjectLocalName::new("kept"),
+            ExclusionRetirement {
+                was: "{\"method\":\"gist\"}".into(),
+                reason: "enforced elsewhere".into(),
+                operator: "leon".into(),
+                dropped_at: "2026-11-15".into(),
+            },
         )]
         .into(),
     );
-    assert!(matches!(split(&ids, &p), Err(TreeError::NoPath { .. })));
+    let kept = split(&ids, &p).unwrap();
+    assert!(kept["dbo/orders.json"].contains("\"exclusions\": {\"t_dddddd\": {\"kept\""));
+    assert_eq!(assemble(&kept).unwrap(), ids);
 }
 
 #[test]
@@ -435,6 +574,7 @@ fn optional_sections_are_absent_when_empty() {
         "conversions",
         "rebuilds",
         "exclusions",
+        "partition_exclusions",
     ] {
         assert!(!t["dbo/legacy.json"].contains(key), "{key}");
     }

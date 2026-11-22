@@ -117,6 +117,11 @@ impl Change {
                         kind: crate::Part::Unique,
                         name: r.name.raw(),
                     },
+                    crate::PartitionIndexDefinition::Exclusion(_) => Part::Named {
+                        table: &r.parent.name,
+                        kind: crate::Part::Exclusion,
+                        name: r.name.raw(),
+                    },
                 },
                 Effect::Created,
             )],
