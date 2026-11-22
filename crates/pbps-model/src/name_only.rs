@@ -271,12 +271,16 @@ impl NameOnly {
             .collect();
         // And a configuration that maps a dictionary the plan renamed keeps the record it had,
         // under the dictionary's new spelling: the read-back spells it that way, and a record
-        // left at the old name would read as drift.
+        // left at the old name would read as drift. Only a rename that has run respells: at a
+        // staged checkpoint before the dictionary's rename the engine still spells the mapping
+        // the old way, and a record of the new spelling would refuse the resume as drift.
         let moved: BTreeMap<SearchRef, SearchRef> = applied
             .changes
             .iter()
             .filter_map(|planned| {
-                if let Change::Search(SearchChange::RenameSearch { from, to, .. }) = &planned.change
+                if let Change::Search(SearchChange::RenameSearch { uid, from, to, .. }) =
+                    &planned.change
+                    && live.search.get(uid) == Some(to)
                 {
                     Some((from.clone(), to.clone()))
                 } else {

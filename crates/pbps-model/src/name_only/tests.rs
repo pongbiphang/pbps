@@ -713,7 +713,8 @@ fn a_chain_of_renames_records_each_name_with_the_definition_of_the_identity_that
 /// A configuration that maps a dictionary the plan renames keeps its record under the new
 /// spelling, which is how the read-back spells it (a record at the old name would read as
 /// drift of a configuration nobody touched). Negatives: a configuration over another
-/// dictionary is carried as it was, and with no rename in the plan the record stays as it was.
+/// dictionary is carried as it was, a staged checkpoint before the dictionary's rename keeps
+/// the old spelling, and with no rename in the plan the record stays as it was.
 #[test]
 fn a_configuration_over_a_renamed_dictionary_is_recorded_under_the_new_spelling() {
     let config = |dictionary: &str| SearchObject::Config {
@@ -733,13 +734,26 @@ fn a_configuration_over_a_renamed_dictionary_is_recorded_under_the_new_spelling(
     for name in ["app.docs", "app.apart"] {
         ids.search.insert(Uid::generate(UidKind::Search), key(name));
     }
-    let recorded = read_back.clone().as_recorded_after_apply(
-        &previous,
-        &renaming_each(&[("app.old", "app.new", &Uid::generate(UidKind::Search))]),
-        &ids,
-    );
+    let dictionary = Uid::generate(UidKind::Search);
+    let plan = renaming_each(&[("app.old", "app.new", &dictionary)]);
+    let at = |name: &str| {
+        let mut ids = ids.clone();
+        ids.search.insert(
+            dictionary.clone(),
+            SearchRef::new(SearchKind::Dictionary, name.parse().unwrap()),
+        );
+        ids
+    };
+    let recorded = read_back
+        .clone()
+        .as_recorded_after_apply(&previous, &plan, &at("app.new"));
     assert_eq!(recorded.search[&key("app.docs")], config("app.new"));
     assert_eq!(recorded.search[&key("app.apart")], config("app.elsewhere"));
+    // A staged checkpoint before the dictionary's rename: the engine still spells the
+    // mapping the old way, so the record does too, and the resume reads no drift.
+    let checkpoint =
+        held("app.old", "app.elsewhere").as_recorded_after_apply(&previous, &plan, &at("app.old"));
+    assert_eq!(checkpoint.search[&key("app.docs")], config("app.old"));
     let unplanned = read_back
         .clone()
         .as_recorded_after_apply(&previous, &nothing_planned(), &ids);
