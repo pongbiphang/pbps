@@ -518,7 +518,25 @@ os._exit(0)
                     ports.extend(int(env[port]) for _, port, _, _ in SHARDS.FIXTURES[suite])
         self.assertEqual(len(ports), len(set(ports)))
         self.assertTrue(all(port < 32768 for port in ports))
-        self.assertTrue(set(ports).isdisjoint({14330, 14331, 14332, 54320, 54321, 54322}))
+        self.assertTrue(set(ports).isdisjoint(
+            {14330, 14331, 14332, 15432, 15433, 15434, 54320, 54321, 54322}))
+
+    def test_the_workflow_publishes_no_host_port_in_the_ephemeral_range(self):
+        # A published port the runner's own outgoing connections can take makes
+        # Docker fail to bind it, and the job ends before any step runs (#3034).
+        # 32768 is where Linux's default ephemeral range starts.
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        published = [int(port) for pair in re.findall(
+            r"^\s*-\s+(\d+):\d+\s*$|\s-p\s+(?:[\d.]+:)?(\d+):\d+", workflow, re.M)
+            for port in pair if port]
+        self.assertIn(14330, published)
+        self.assertIn(15432, published)
+        self.assertEqual([port for port in published if port >= 32768], [])
+        # Each address a job is given names a port the workflow publishes.
+        named = [int(port) for port in re.findall(
+            r"(?:localhost,|port=|127\.0\.0\.1:)(\d{4,5})\b", workflow)]
+        self.assertTrue(named)
+        self.assertEqual(sorted(set(named) - set(published)), [])
 
     def test_ephemeral_overlap_names_each_fixture_and_refuses_before_launch(self):
         for suite in SHARDS.RUNNERS:
