@@ -112,7 +112,14 @@ async fn refuse_absent_roles(
     conn: &mut Conn,
     named: &std::collections::BTreeSet<pbps_model::RoleName>,
 ) -> anyhow::Result<()> {
-    crate::engine::refuse_roles_absent_from_cluster(conn, named).await
+    use crate::engine::ApplySession as _;
+    let selected = crate::engine::apply_session::selected(conn.driver());
+    pbps_cli::with_plan_dialect!(&selected, |session| {
+        // SQL Server's roles and users are the database's own, so its session
+        // finds none absent and has no cluster to ask (DEC-2379.3).
+        let absent = session.absent_cluster_roles(conn, named).await?;
+        session.refuse_missing_cluster_roles(&absent)
+    })
 }
 
 /// Runs the rehearsal on the entry's scratch, which is released before this
@@ -171,11 +178,16 @@ pub async fn run<D: crate::emission::Engine + pbps_cli::resolver::server::Planni
         anyhow::Error::new(crate::Unexpressible(errors))
             .context("the declarations' bootstrap cannot be formed")
     })?;
-    // PostgreSQL's scratch compiles the base's statements in the plan order.
-    // SQL Server's compiles the target's own namespace through the engine's
-    // creation trials, which take the bootstrap of the base to build (a
-    // default or computed column may call a function the base also holds).
-    let base_bootstrap = crate::engine::scratch_base_bootstrap(driver, plan)?;
+    // PostgreSQL's scratch compiles the base's statements in the plan order, so
+    // it needs no bootstrap of the base. SQL Server's compiles the target's own
+    // namespace through the engine's creation trials, which take the bootstrap
+    // of the base to build (a default or computed column may call a function
+    // the base also holds).
+    let base_bootstrap = if crate::engine::scratch_compiles_base_namespace(driver) {
+        Some(base_bootstrap(plan)?)
+    } else {
+        None
+    };
     let binding = pbps_cli::resolver::server::BindingRequest {
         dependencies: plan.dependencies,
         bootstrap: base_bootstrap.as_ref().unwrap_or(&bootstrap),

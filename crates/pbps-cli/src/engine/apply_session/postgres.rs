@@ -272,6 +272,76 @@ impl ApplySession for pbps_pg::Postgres {
     async fn baseline_collation(&self, _conn: &mut Conn) -> Result<Option<String>, DbError> {
         Ok(None)
     }
+    async fn table_sites(
+        &self,
+        conn: &mut Conn,
+        admission: &RoutineAdmission,
+        changes: &[pbps_model::PlannedChange],
+    ) -> bool {
+        let mut table_unjudged = false;
+        for planned in changes {
+            match vet_table_expressions(
+                conn,
+                admission,
+                pbps_db::TransactionOwner::OwnTransaction,
+                pbps_pg::table_expressions::Moment::Early,
+                &planned.change,
+            )
+            .await
+            {
+                Ok(pbps_pg::table_expressions::Vetted::Admitted) => {}
+                // Not judged, however it came about: refused, or unbound here.
+                Ok(pbps_pg::table_expressions::Vetted::Unjudged(_)) | Err(_) => {
+                    table_unjudged |= pbps_pg::table_expressions::probed(&planned.change);
+                }
+            }
+        }
+        table_unjudged
+    }
+    /// PostgreSQL requires a pin for every declared type and compares each with
+    /// the database.
+    async fn declared_type_replay(
+        &self,
+        conn: &mut Conn,
+        approved: &Approved<'_>,
+        at: Check<'_>,
+    ) -> anyhow::Result<()> {
+        let Approved {
+            project,
+            plan,
+            managed,
+            ..
+        } = *approved;
+        crate::pins::require_declared_types(
+            &managed.declared_types,
+            &plan.declared_type_pins,
+            &plan.changes,
+        )?;
+        pbps_pg::type_refs::declared::check(
+            conn,
+            &plan.declared_type_pins,
+            &crate::pins::applying(project, plan),
+            at.within(),
+            matches!(
+                at,
+                Check::BeforeRecording { .. }
+                    | Check::BeforeCommit { .. }
+                    | Check::BeforeClosing { .. }
+            ),
+            &plan.changes,
+            at.executed(),
+        )
+        .await?;
+        Ok(())
+    }
+    /// The routines are read from `pg_proc`.
+    async fn replaceable_rows(
+        &self,
+        conn: &mut Conn,
+        at: Check<'_>,
+    ) -> Result<Option<pbps_dialect::routines::Read>, DbError> {
+        pbps_pg::pins::read(conn, at.within()).await.map(Some)
+    }
     async fn requirement(
         &self,
         conn: &mut Conn,
@@ -301,6 +371,14 @@ impl ApplySession for pbps_pg::Postgres {
         pbps_pg::drop_requirements::check(conn, admission, guard)
             .await
             .map_err(DbError::Refused)
+    }
+    /// PostgreSQL's roles belong to the cluster, so they are asked.
+    async fn absent_cluster_roles(
+        &self,
+        conn: &mut Conn,
+        named: &BTreeSet<pbps_model::RoleName>,
+    ) -> anyhow::Result<Vec<pbps_model::RoleName>> {
+        Ok(pbps_pg::roles::missing_roles(conn, &named.iter().collect()).await?)
     }
     fn refuse_missing_cluster_roles(&self, missing: &[pbps_model::RoleName]) -> anyhow::Result<()> {
         if !missing.is_empty() {
@@ -390,6 +468,26 @@ impl ApplySession for pbps_pg::Postgres {
         after: bool,
     ) -> anyhow::Result<ConnectedCheck> {
         plan_session::postgres::check_module_rebuilds(conn, changes, after).await
+    }
+    async fn check_enum_rebuild_census(
+        &self,
+        conn: &mut Conn,
+        changes: &ChangeSet,
+        stored: &IdsFile,
+        resuming: bool,
+    ) -> anyhow::Result<()> {
+        if !changes.changes.iter().any(|p| {
+            matches!(
+                p.change,
+                pbps_model::Change::TypeValue(pbps_model::TypeValueChange::EnumRebuild { .. })
+            )
+        }) {
+            return Ok(());
+        }
+        pbps_pg::type_rebuild::census(conn, changes, None, stored, resuming)
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("{e}"))
     }
     async fn check_domain_alterations(
         &self,

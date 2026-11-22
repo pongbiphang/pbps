@@ -9,12 +9,15 @@
 //! answer for every field, and the compiler lists what it owes. [`profile`] is
 //! the single `match` on the driver for this class of question.
 //!
-//! The readers keep their names and signatures in [`super`] and [`super::collected`],
-//! and their doc comments say what the fact means; the comments here say why
-//! the engines differ. The connected operations are not here: they are the
-//! methods of `pbps_db::engine::Engine` ([`super::of`]), which cannot carry
-//! these facts because several of them name types of `pbps-diff` and this
-//! crate, which `pbps-db` cannot.
+//! The readers keep their names and signatures in [`super`], and their doc
+//! comments say what the fact means; the comments here say why the engines
+//! differ. A fact only one session reads is not a field: it is that session's
+//! own answer, in the engine's own body.
+//!
+//! The connected operations are not here: they are the methods of
+//! `pbps_db::engine::Engine` ([`super::of`]), which cannot carry these facts
+//! because several of them name types of `pbps-diff` and this crate, which
+//! `pbps-db` cannot.
 
 use super::*;
 
@@ -23,12 +26,6 @@ use super::*;
 /// A plain value where the fact is a constant, and a `fn` pointer only where
 /// the fact needs an argument to answer.
 pub(crate) struct Profile {
-    /// Read by [`computed_column_screen`].
-    pub computed_column_screen: pbps_diff::Screen,
-    /// Whether [`counts_rows_an_enum_retype_strands`] looks at the plan at all.
-    pub counts_stranded_rows_at_plan_time: bool,
-    /// Read by [`vets_declared_domain_code`].
-    pub vets_declared_domain_code: bool,
     /// Why drafting a resolver's externals file is refused for this engine, or
     /// `None` where it has a binding adapter. Read by
     /// [`refuse_externals_draft_unsupported`].
@@ -40,8 +37,7 @@ pub(crate) struct Profile {
     /// Whether the resolver's scratch can land on the instance it rehearses, so
     /// that [`same_instance_consent`] has a choice to report.
     pub scratch_may_share_the_instance: bool,
-    /// The name an unavailable cost report gives this engine
-    /// ([`operational_cost`]).
+    /// The name an unavailable cost report gives this engine.
     pub cost_report_engine: &'static str,
     /// Read by [`truncate_reason`].
     pub truncate_reason: fn(&str) -> String,
@@ -84,11 +80,6 @@ pub(crate) const fn profile(driver: Driver) -> &'static Profile {
 }
 
 static MSSQL: Profile = Profile {
-    computed_column_screen: pbps_diff::Screen::Catalog,
-    // SQL Server has neither enums nor domains.
-    counts_stranded_rows_at_plan_time: false,
-    // SQL Server has no domains.
-    vets_declared_domain_code: false,
     externals_draft_refusal: Some(
         "`pbps resolver externals` reads a PostgreSQL target; SQL Server has no binding \
          adapter yet (#619, #620)",
@@ -110,9 +101,6 @@ static MSSQL: Profile = Profile {
 };
 
 static POSTGRES: Profile = Profile {
-    computed_column_screen: pbps_diff::Screen::Text,
-    counts_stranded_rows_at_plan_time: true,
-    vets_declared_domain_code: true,
     externals_draft_refusal: None,
     scratch_compiles_base_namespace: false,
     target_identity_unread: crate::resolution::identity_unread,
@@ -286,8 +274,10 @@ mod tests {
     #[test]
     fn the_two_profiles_differ_on_the_facts_that_are_meant_to_differ() {
         let (ms, pg) = (profile(Driver::Mssql), profile(Driver::Postgres));
-        assert_ne!(ms.computed_column_screen, pg.computed_column_screen);
-        assert_ne!(ms.vets_declared_domain_code, pg.vets_declared_domain_code);
+        assert_ne!(
+            pbps_mssql::Mssql.computed_column_screen(),
+            pbps_pg::Postgres::new().computed_column_screen()
+        );
         assert_ne!(
             ms.scratch_compiles_base_namespace,
             pg.scratch_compiles_base_namespace
@@ -304,11 +294,6 @@ mod tests {
     fn each_reader_returns_what_its_profile_field_says_for_both_drivers() {
         for driver in DRIVERS {
             let facts = profile(driver);
-            assert_eq!(computed_column_screen(driver), facts.computed_column_screen);
-            assert_eq!(
-                vets_declared_domain_code(driver),
-                facts.vets_declared_domain_code
-            );
             assert_eq!(
                 scratch_compiles_base_namespace(driver),
                 facts.scratch_compiles_base_namespace
@@ -347,15 +332,6 @@ mod tests {
         for driver in DRIVERS {
             assert!(!needs_readback_revalidation(driver, Read::Snapshot));
         }
-    }
-
-    #[test]
-    fn an_engine_without_enums_counts_no_rows_for_an_enum_retype() {
-        let nothing = ChangeSet::default();
-        for driver in DRIVERS {
-            assert!(!counts_rows_an_enum_retype_strands(driver, &nothing));
-        }
-        assert!(!profile(Driver::Mssql).counts_stranded_rows_at_plan_time);
     }
 
     #[test]

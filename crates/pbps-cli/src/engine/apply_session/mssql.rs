@@ -208,6 +208,32 @@ impl ApplySession for pbps_mssql::Mssql {
             .await
             .map(Some)
     }
+    /// SQL Server binds no table expression this way, so none is left unjudged.
+    async fn table_sites(
+        &self,
+        _conn: &mut Conn,
+        _admission: &RoutineAdmission,
+        _changes: &[pbps_model::PlannedChange],
+    ) -> bool {
+        false
+    }
+    /// SQL Server has no declared-type pin, so there is nothing to check.
+    async fn declared_type_replay(
+        &self,
+        _conn: &mut Conn,
+        _approved: &Approved<'_>,
+        _at: Check<'_>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// SQL Server pins no routine (DEC-319.1).
+    async fn replaceable_rows(
+        &self,
+        _conn: &mut Conn,
+        _at: Check<'_>,
+    ) -> Result<Option<pbps_dialect::routines::Read>, DbError> {
+        Ok(None)
+    }
     async fn requirement(
         &self,
         conn: &mut Conn,
@@ -239,6 +265,15 @@ impl ApplySession for pbps_mssql::Mssql {
         _missing: &[pbps_model::RoleName],
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+    /// SQL Server's roles and users are the database's own, so there is no
+    /// cluster to ask (DEC-2379.3).
+    async fn absent_cluster_roles(
+        &self,
+        _conn: &mut Conn,
+        _named: &BTreeSet<pbps_model::RoleName>,
+    ) -> anyhow::Result<Vec<pbps_model::RoleName>> {
+        Ok(Vec::new())
     }
     /// SQL Server has no packages: nothing is required of an empty set, and a
     /// declared one is refused by name rather than read as satisfied.
@@ -325,6 +360,16 @@ impl ApplySession for pbps_mssql::Mssql {
         _after: bool,
     ) -> anyhow::Result<ConnectedCheck> {
         Ok(plan_session::mssql::check_module_rebuilds())
+    }
+    /// SQL Server has no enum to rebuild.
+    async fn check_enum_rebuild_census(
+        &self,
+        _conn: &mut Conn,
+        _changes: &ChangeSet,
+        _stored: &IdsFile,
+        _resuming: bool,
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
     /// SQL Server has no domain.
     async fn check_domain_alterations(
