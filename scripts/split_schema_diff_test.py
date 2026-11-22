@@ -230,6 +230,125 @@ class Move(Tree):
         self.assertIn("impl Pair: 31-35 -> second", rows)
         self.assertEqual(len(rows), 5)
 
+    def test_the_map_leaves_out_what_an_earlier_move_already_holds(self) -> None:
+        self.apply()
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "first move")
+        later = {**PLAN, "_docs": {**PLAN["_docs"], "third": "The third."}, "third": ["gamma"]}
+        self.write_plan(later)
+        self.assertEqual(ssd.move_map(PARENT, self.plan, self.root, REL, "HEAD"), ["gamma: 44-46 -> third"])
+        self.assertEqual(len(ssd.move_map(PARENT, self.plan)), 6, "without a base ref every planned item is listed")
+
+    def test_the_map_tells_a_type_from_its_impl_when_they_move_in_different_rounds(self) -> None:
+        # An earlier move took the struct and left its impl in the parent.
+        self.apply()
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "first move")
+        second = self.module("second")
+        held = ssd.cut_items(second.read_text())
+        impl = next(x for x in held if x.display == "impl Pair")
+        text = second.read_text()
+        second.write_text(text[: impl.start] + text[impl.stop :])
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "the impl is back in the parent")
+        rows = ssd.move_map(PARENT, self.plan, self.root, REL, "HEAD")
+        self.assertEqual(rows, ["impl Pair: 31-35 -> second"], "the impl is listed though its type moved before")
+        # The reverse: everything a name covers moved before, and the base file
+        # (the parent after that move) has none of it. Not an error, not a row.
+        second.write_text(text)
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "the impl is in the module again")
+        after = (self.root / REL).read_text()
+        self.assertEqual(ssd.move_map(after, self.plan, self.root, REL, "HEAD"), [])
+        # Negative: a name nothing holds, before or now, is still an error.
+        self.write_plan({**PLAN, "second": [*PLAN["second"], "NOPE"]})
+        with self.assertRaisesRegex(ssd.SplitError, "NOPE"):
+            ssd.move_map(after, self.plan, self.root, REL, "HEAD")
+
+    def test_the_map_tells_two_impl_blocks_of_one_type_apart(self) -> None:
+        # Both are shown as `impl Pair`; one moved before, the other is new.
+        self.apply()
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "first move")
+        parent = (self.root / REL).read_text() + "\nimpl Pair {\n    fn other(&self) -> u8 {\n        2\n    }\n}\n"
+        rows = ssd.move_map(parent, self.plan, self.root, REL, "HEAD")
+        self.assertEqual(len(rows), 1, rows)
+        self.assertTrue(rows[0].startswith("impl Pair: ") and rows[0].endswith(" -> second"), rows)
+
+    def test_an_import_only_a_test_file_reads_is_gated_to_the_test_build(self) -> None:
+        self.apply()
+        parent = self.src.read_text()
+        self.assertIn("#[cfg(test)]\nuse second::LIMIT;", parent)  # only tests.rs names it
+        self.assertNotIn("#[cfg(test)]\nuse first::alpha;", parent)  # beta, in the parent, uses it
+        self.assertIn("\nuse first::alpha;", parent)
+        self.assertEqual(self.check(), [])
+        self.assertEqual(self.apply(), [], "a second run changes nothing")
+
+    def test_a_name_a_test_and_another_module_both_read_is_not_gated(self) -> None:
+        later = {**PLAN, "_docs": {**PLAN["_docs"], "third": "The third."}, "third": ["beta"]}
+        self.write_plan(later)
+        (self.dir / "tests.rs").write_text(TESTS + "\nfn uses_alpha() {\n    alpha(\"a\", 'b');\n}\n")
+        self.apply()
+        # the parent no longer calls `alpha`: tests and module `third` do, and the latter is non-test code
+        parent = self.src.read_text()
+        self.assertIn("use first::alpha;", parent)
+        self.assertNotIn("#[cfg(test)]\nuse first::alpha;", parent)
+
+    def test_a_pub_crate_item_listed_in_no_reexport_has_no_re_export(self) -> None:
+        hidden = "pub(crate) fn hidden() -> u8 {\n    2\n}\n\n"
+        self.src.write_text(PARENT.replace("fn gamma()", hidden + "fn gamma()"))
+        self.base = self.src.read_text()
+        plan = {**PLAN, "first": ["Boom", "alpha", "hidden"]}
+        self.write_plan(plan)
+        self.apply()
+        self.assertIn("pub(crate) use first::hidden;", self.src.read_text())
+        self.assertEqual(self.check(), [])
+        self.src.write_text(self.base)
+        for path in self.dir.glob("[a-z]*.rs"):
+            if path.name != "tests.rs":
+                path.unlink()
+        self.write_plan({**plan, "_no_reexport": ["hidden"]})
+        self.apply()
+        self.assertNotIn("hidden", self.src.read_text().replace("fn hidden", ""))
+        self.assertIn("pub(crate) fn hidden", self.module("first").read_text())
+        self.assertEqual(self.check(), [])
+
+    def test_a_no_reexport_item_is_imported_as_a_private_one_would_be(self) -> None:
+        hidden = "pub(crate) fn hidden() -> u8 {\n    2\n}\n\n"
+        plan = {**PLAN, "first": ["Boom", "alpha", "hidden"], "_no_reexport": ["hidden"]}
+        # Only a test file reads it: the import is for the test build alone.
+        self.src.write_text(PARENT.replace("fn gamma()", hidden + "fn gamma()"))
+        self.base = self.src.read_text()
+        (self.dir / "tests.rs").write_text(TESTS + "\nfn uses_hidden() -> u8 {\n    hidden()\n}\n")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "a test reads it")
+        self.write_plan(plan)
+        self.apply()
+        parent = self.src.read_text()
+        self.assertIn("#[cfg(test)]\nuse first::hidden;", parent)
+        self.assertNotIn("pub(crate) use first::hidden;", parent)
+        self.assertEqual(self.check(), [])
+        self.assertEqual(self.apply(), [], "a second run changes nothing")
+        # The parent's own code reads it: a plain import, not a gated one.
+        for path in self.dir.glob("[a-z]*.rs"):
+            if path.name != "tests.rs":
+                path.unlink()
+        self.src.write_text(self.base.replace("let t = (a, b);", "let t = (a, b + hidden());"))
+        self.base = self.src.read_text()
+        self.apply()
+        parent = self.src.read_text()
+        self.assertIn("\nuse first::hidden;", parent)
+        self.assertNotIn("#[cfg(test)]\nuse first::hidden;", parent)
+        self.assertEqual(self.check(), [])
+
+    def test_no_reexport_names_must_be_pub_crate_items_the_plan_moves(self) -> None:
+        self.write_plan({**PLAN, "_no_reexport": ["alpha"]})  # private, so pub(super): not pub(crate)
+        with self.assertRaisesRegex(ssd.SplitError, "alpha.*pub\\(crate\\)"):
+            self.apply()
+        self.write_plan({**PLAN, "_no_reexport": ["NOPE"]})
+        with self.assertRaisesRegex(ssd.SplitError, "NOPE"):
+            self.apply()
+
     def test_it_reads_the_tree_and_no_line_numbers(self) -> None:
         # The same items at other places, with other lines between them.
         text = PARENT.replace("const LIMIT: usize = 3;\n\n", "")

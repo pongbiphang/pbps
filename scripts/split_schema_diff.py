@@ -6,6 +6,8 @@
     scripts/split_schema_diff.py                    apply the plan to the tree
     scripts/split_schema_diff.py --check BASE_FILE  the move check
     scripts/split_schema_diff.py --map [BASE_FILE]  old line range -> module
+                                                    (--base-ref REF: leave out what
+                                                    REF's modules already held)
 
 Why a script and not a line-range plan: other branches edit this file while the
 split lands. The script reads the tree it is given and never a line number, so
@@ -13,8 +15,8 @@ a branch re-runs it on its own tip and the three-way merge sees only that
 branch's own edits. It is removed by the last PR of #3003.
 
 The plan (`split_schema_diff.plan.json`) maps a module name to item names. The
-reserved keys `_docs` (the `//!` line of each module) and `_pub_super` (see
-below) are not modules. A name in the plan that the tree does not have is an
+reserved keys `_docs` (the `//!` line of each module), `_pub_super` and
+`_no_reexport` (see below) are not modules. A name in the plan that the tree does not have is an
 error, never a skip.
 
 How an item is named (the name the plan lists):
@@ -45,9 +47,17 @@ Visibility, the one edit an item gets:
   after a `.`) outside its new module: in the parent's remaining items, in
   another module, or in a test file the parent declares. The parent then
   imports it by name, which is how every other module and the tests reach it
-  through their `use super::*;`.
+  through their `use super::*;`. A name that only a test file uses gets a
+  `#[cfg(test)]` import, so the build without tests has no unused import.
 - A struct field or an inherent impl method cannot be found by name, so the
   plan lists them in `_pub_super` as `Type.field` and `Type::method`.
+- A `pub(crate)` item that nothing outside the file reads has no re-export (it
+  would be an unused import); the plan lists it in `_no_reexport`, and inside
+  the file it is imported as a private item is: not at all, plainly, or only
+  in the test build. The script cannot see who reads an item from another
+  file, so a `pub(crate)` item not listed there is always re-exported. A name there
+  must be a `pub(crate)` item the plan moves, and the entry goes when something
+  starts to read the item from another file.
 
 The check (`--check BASE_FILE`, a saved copy of the file before the move) lexes
 both trees, cuts them into items and requires: every base item appears exactly
@@ -72,7 +82,7 @@ from pathlib import Path
 
 DEFAULT_FILE = "crates/pbps-diff/src/schema_diff.rs"
 DEFAULT_PLAN = Path(__file__).with_suffix(".plan.json")
-RESERVED = ("_docs", "_pub_super")
+RESERVED = ("_docs", "_pub_super", "_no_reexport")
 PUB_SUPER = ["pub", "(", "super", ")"]
 
 
@@ -450,9 +460,10 @@ def line_of(text: str, offset: int) -> int:
 # ----------------------------------------------------------------- plan
 
 
-def load_plan(path: Path) -> tuple[dict[str, list[str]], dict[str, str], list[str]]:
+def load_plan(path: Path) -> tuple[dict[str, list[str]], dict[str, str], list[str], list[str]]:
     raw = json.loads(path.read_text())
     docs, pub_super = raw.get("_docs", {}), raw.get("_pub_super", [])
+    no_reexport = raw.get("_no_reexport", [])
     modules = {k: v for k, v in raw.items() if k not in RESERVED}
     seen: dict[str, str] = {}
     for mod, names in modules.items():
@@ -464,7 +475,7 @@ def load_plan(path: Path) -> tuple[dict[str, list[str]], dict[str, str], list[st
             if name in seen:
                 raise SplitError(f"plan: `{name}` is listed for `{seen[name]}` and for `{mod}`")
             seen[name] = mod
-    return modules, docs, pub_super
+    return modules, docs, pub_super, no_reexport
 
 
 def _matches(item: Item, name: str) -> bool:
@@ -529,7 +540,7 @@ def _managed(item: Item, modules: set[str]) -> bool:
 
 def apply(root: Path, parent_rel: str, plan_path: Path) -> list[str]:
     """Plan the whole move, then write; returns what was written."""
-    modules, docs, pub_super = load_plan(plan_path)
+    modules, docs, pub_super, no_reexport = load_plan(plan_path)
     parent_path = root / parent_rel
     mod_dir = parent_path.with_suffix("")
     text = parent_path.read_text()
@@ -570,17 +581,26 @@ def apply(root: Path, parent_rel: str, plan_path: Path) -> list[str]:
     parent_decls = [it for it in rest if it.kind == "mod_decl"]
     tests = [mod_dir / f"{it.name}.rs" for it in parent_decls if it.is_test_gated()]
 
-    kept = _idents([it for it in rest if not it.glue])
+    kept_code = _idents([it for it in rest if not it.glue])
+    kept = set(kept_code)
     for path in tests:
         if path.is_file():
             kept |= _file_idents(path)
     per_module = {mod: _idents(cut_items(body)) for mod, body in composed.items()}
     final: dict[str, str] = {}
+    read_in_file: set[tuple[str, str]] = set()
     for mod in modules:
         outside = set(kept).union(*(ids for other, ids in per_module.items() if other != mod))
         final[mod] = _with_visibility(composed[mod], outside, pub_super)
+        read_in_file |= {(mod, name) for name in outside}
+    # a name only a test file reads needs its import only in the test build
+    test_only = {
+        (mod, name)
+        for mod in modules
+        for name in kept - set(kept_code).union(*(ids for other, ids in per_module.items() if other != mod))
+    }
 
-    parent_text = _parent_glue(parent_text, rest, modules, final)
+    parent_text = _parent_glue(parent_text, rest, modules, final, test_only, no_reexport, read_in_file)
     written = []
     for mod, body in final.items():
         path = mod_dir / f"{mod}.rs"
@@ -594,7 +614,15 @@ def apply(root: Path, parent_rel: str, plan_path: Path) -> list[str]:
     return [str(p.relative_to(root)) for p, _ in written]
 
 
-def _parent_glue(parent_text: str, rest: list[Item], modules: dict[str, list[str]], final: dict[str, str]) -> str:
+def _parent_glue(
+    parent_text: str,
+    rest: list[Item],
+    modules: dict[str, list[str]],
+    final: dict[str, str],
+    test_only: set[tuple[str, str]],
+    no_reexport: list[str],
+    read_in_file: set[tuple[str, str]],
+) -> str:
     """Replace the managed `mod` and import lines by those the modules need."""
     names = set(modules)
     for it in reversed(rest):
@@ -603,12 +631,25 @@ def _parent_glue(parent_text: str, rest: list[Item], modules: dict[str, list[str
     rest = cut_items(parent_text)
     mods = [f"mod {m};" for m in sorted(names)]
     uses = []
+    unexported = set(no_reexport)
     for mod in sorted(names):
         for it in cut_items(final[mod]):
             if it.glue or it.kind == "impl" or it.vis is None:
                 continue
-            shown = "" if it.vis == "pub(super)" else it.vis + " "
-            uses.append(f"{shown}use {mod}::{it.name};")
+            if it.name in unexported:
+                if it.vis != "pub(crate)":
+                    raise SplitError(f"`_no_reexport` names `{it.name}`, which is not `pub(crate)`")
+                unexported.discard(it.name)
+                # No file outside reads it, so inside the file it is imported as
+                # a private item would be: not at all, plainly, or for tests.
+                if (mod, it.name) not in read_in_file:
+                    continue
+            private = it.vis == "pub(super)" or it.name in no_reexport
+            shown = "" if private else it.vis + " "
+            gate = "#[cfg(test)]\n" if private and (mod, it.name) in test_only else ""
+            uses.append(f"{gate}{shown}use {mod}::{it.name};")
+    if unexported:
+        raise SplitError(f"`_no_reexport` names {sorted(unexported)}, which no module holds as a visible item")
     uses.sort(key=lambda line: line[line.index("use ") + 4 :])
     block = "\n".join(mods) + ("\n\n" + "\n".join(uses) if uses else "")
     last_use = None
@@ -654,8 +695,9 @@ def _glue_texts(items: list[Item]) -> list[str]:
 
 
 def _shown(item: Item) -> str:
-    """The line as written, without the comments above it."""
-    return " ".join(item.text[item.toks[item.head].start : item.stop].split())
+    """The line as written, attributes included, without the comments above it."""
+    first = next(k for k in range(item.lead, item.head + 1) if item.toks[k].kind not in ("com", "doc"))
+    return " ".join(item.text[item.toks[first].start : item.stop].split())
 
 
 def check(root: Path, parent_rel: str, base_text: str, base_ref: str | None = None) -> tuple[list[str], list[str]]:
@@ -767,14 +809,35 @@ def check(root: Path, parent_rel: str, base_text: str, base_ref: str | None = No
 # ----------------------------------------------------------------- map
 
 
-def move_map(base_text: str, plan_path: Path) -> list[str]:
-    modules, _, _ = load_plan(plan_path)
+def move_map(
+    base_text: str, plan_path: Path, root: Path | None = None, parent_rel: str = DEFAULT_FILE, base_ref: str | None = None
+) -> list[str]:
+    """With `base_ref`, an item that the modules already held at that commit is
+    an earlier PR's move and is not listed.
+
+    Earlier moves are told apart item by item, by their tokens, and not by the
+    plan's name or by how an item is shown: one name covers a type and its
+    impls, a type may have several `impl` blocks that are shown alike, and any
+    of them may move in a different PR."""
+    modules, _, _, _ = load_plan(plan_path)
     items = cut_items(base_text)
+    earlier: list[Item] = []
+    if root is not None and base_ref:
+        mod_dir = Path(parent_rel).with_suffix("")
+        for mod in modules:
+            body = _git_show(root, base_ref, f"{mod_dir}/{mod}.rs")
+            if body is not None:
+                earlier += [x for x in cut_items(body) if not x.glue]
+
+    def moved_before(it: Item) -> bool:
+        return any((x.display or x.name) == (it.display or it.name) and _align(it, x) is None for x in earlier)
+
     rows = []
     for mod, names in modules.items():
         for name in names:
-            hits = [it for it in items if _matches(it, name)]
-            if not hits:
+            found = [it for it in items if _matches(it, name)]
+            hits = [it for it in found if not moved_before(it)]
+            if not found and not any(_matches(x, name) for x in earlier):
                 raise SplitError(f"the plan names `{name}` and the base file has no such item")
             rows += [(it.start, f"{it.display or name}: {line_of(base_text, it.start)}-{line_of(base_text, it.stop)} -> {mod}") for it in hits]
     return [r for _, r in sorted(rows)]
@@ -786,7 +849,7 @@ def main() -> int:
     ap.add_argument("--file", default=DEFAULT_FILE, help=f"the file to cut, relative to the root (default {DEFAULT_FILE})")
     ap.add_argument("--plan", type=Path, default=DEFAULT_PLAN)
     ap.add_argument("--check", metavar="BASE_FILE", type=Path)
-    ap.add_argument("--base-ref", metavar="REF", help="with --check: the commit whose modules and test files are the base")
+    ap.add_argument("--base-ref", metavar="REF", help="with --check: the commit whose modules and test files are the base; with --map: the commit whose moves are not listed")
     ap.add_argument("--map", nargs="?", const="", metavar="BASE_FILE")
     args = ap.parse_args()
     root = args.root.resolve()
@@ -799,7 +862,7 @@ def main() -> int:
             return 1 if problems else 0
         if args.map is not None:
             base = Path(args.map) if args.map else root / args.file
-            print("\n".join(move_map(base.read_text(), args.plan)))
+            print("\n".join(move_map(base.read_text(), args.plan, root, args.file, args.base_ref)))
             return 0
         written = apply(root, args.file, args.plan)
         print("\n".join(f"wrote {w}" for w in written) or "nothing to change")

@@ -1,17 +1,29 @@
 {
   "_docs": {
+    "columns": "Column changes of a table that stays.",
     "common": "Small helpers that more than one kind of object needs.",
     "computed": "Computed columns, and the refusals for changes that reach them.",
+    "constraints": "Constraints and indexes: the diff of keys, checks and index definitions, and what makes one adopt another.",
+    "dependents": "What a retyped or re-keyed column drags with it: foreign keys, indexes and the tightening splits.",
     "error": "The errors the differ reports.",
+    "exclusions": "Exclusion constraints: their diff, the hazards a change carries, and when one adopts another.",
     "modules": "Views, routines and triggers: what changes hands and what changes.",
     "numbering": "Numbering sources (identities and sequences) and the order they release in.",
     "restoration": "The comparison schema a restoration is diffed against.",
     "roles": "Roles, memberships and grants.",
     "rows": "Rows: the row changes of a table and the facts about them.",
+    "search": "Text search objects: what a plan creates, alters and drops, and the order they depend in.",
     "sequences": "Standalone sequences.",
+    "table_props": "Table-level properties: storage parameters, replica identity, filegroups, and the foreign-key graph a persistence switch reads.",
     "types": "The differences between two declarations of one type."
   },
-  "_pub_super": [],
+  "_pub_super": [
+    "ForeignKeyGraph::of",
+    "ForeignKeyGraph::depth",
+    "ForeignKeyGraph::same_component",
+    "ForeignKeyGraph::deepest"
+  ],
+  "_no_reexport": ["dropped_search"],
   "error": ["DiffError", "last_column_reason"],
   "types": ["type_differences"],
   "common": [
@@ -55,5 +67,43 @@
     "refuse_temporal_changes",
     "refuse_computed_dependencies",
     "diff_computed"
+  ],
+  "constraints": [
+    "adopts",
+    "by_name",
+    "ParameterEdit",
+    "parameter_edit",
+    "diff_constraints",
+    "diff_constraints_by"
+  ],
+  "exclusions": [
+    "holds_key_with_equality",
+    "adopts_exclusion",
+    "diff_exclusions",
+    "exclusion_hazards",
+    "exclusion_change_of",
+    "exclusion_names"
+  ],
+  "table_props": [
+    "ForeignKeyGraph",
+    "unlink_cycles_around_persistence_switches",
+    "diff_storage_parameters",
+    "diff_replica_identity",
+    "diff_filegroups"
+  ],
+  "columns": ["diff_columns"],
+  "dependents": [
+    "recreate_referenced_foreign_keys",
+    "rebind_foreign_keys_to_a_new_occupant",
+    "clear_external_partitions_after_loosening",
+    "split_tightenings_from_retypes",
+    "refuse_unjoinable_foreign_keys",
+    "recreate_retyped_dependents"
+  ],
+  "search": [
+    "dropped_search",
+    "released_search",
+    "diff_search",
+    "search_depth"
   ]
 }
