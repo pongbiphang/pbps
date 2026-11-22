@@ -131,14 +131,22 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         admission: &RoutineAdmission,
         statement: &pbps_dialect::Statement,
     ) -> Result<(), DbError>;
+    /// Judges the expressions the plan gives a table before any probe evaluates
+    /// them, and answers whether one was left unjudged.
+    ///
+    /// An expression that is not admitted yet, or cannot be bound before the
+    /// plan creates what it uses, is left to the check just before its
+    /// statement; the probes that would run it are skipped, not run unjudged.
+    ///
+    /// Required: `false` is the engine's statement that it leaves none unjudged,
+    /// and an answer from an engine that was never asked would run the probes
+    /// over an expression nothing judged.
     async fn table_sites(
         &self,
         conn: &mut Conn,
         admission: &RoutineAdmission,
         changes: &[pbps_model::PlannedChange],
-    ) -> bool {
-        table_expressions_left_unjudged(conn, admission, changes).await
-    }
+    ) -> bool;
     async fn transaction_opened(
         &self,
         state: &mut Self::State,
@@ -170,7 +178,8 @@ pub(crate) trait ApplySession: crate::emission::Engine {
             .await?;
         self.check_module_rebuilds(conn, &plan.changes, false)
             .await?;
-        recheck_enum_rebuild_census(conn, &plan.changes, opening.recorded_ids, false).await?;
+        self.check_enum_rebuild_census(conn, &plan.changes, opening.recorded_ids, false)
+            .await?;
         self.check_domain_alterations(conn, &plan.changes, opening.recorded_ids)
             .await?;
         crate::deploy::recheck_extension_creates(conn, plan).await?;
@@ -214,7 +223,8 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         stored: &IdsFile,
         resuming: bool,
     ) -> anyhow::Result<()> {
-        recheck_enum_rebuild_census(conn, &plan.changes, stored, resuming).await?;
+        self.check_enum_rebuild_census(conn, &plan.changes, stored, resuming)
+            .await?;
         if !resuming {
             self.check_domain_alterations(conn, &plan.changes, stored)
                 .await?;
@@ -224,14 +234,16 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         }
         Ok(())
     }
+    /// Checks the declared types a plan relies on against the pins it holds.
+    ///
+    /// Required: an engine that was never asked must not read as one whose
+    /// declared types need no pin.
     async fn declared_type_replay(
         &self,
         conn: &mut Conn,
         approved: &Approved<'_>,
         at: Check<'_>,
-    ) -> anyhow::Result<()> {
-        check_declared_type_pins(conn, approved.project, approved.plan, approved.managed, at).await
-    }
+    ) -> anyhow::Result<()>;
     async fn external_catalog(
         &self,
         conn: &mut Conn,
@@ -255,13 +267,17 @@ pub(crate) trait ApplySession: crate::emission::Engine {
     ) -> Result<(pbps_dialect::routines::Read, Vec<pbps_model::TypeRoutine>), DbError> {
         pbps_pg::pins::selected(conn, at.within(), roots).await
     }
+    /// Reads the routines a plan pins against replacement (DEC-319.1), where
+    /// `at` says who owns the transaction the read runs in. `None` is the
+    /// engine's statement that it pins no routine, which a caller reads as
+    /// "nothing to check".
+    ///
+    /// Required, for the reason of [`Self::baseline_collation`].
     async fn replaceable_rows(
         &self,
         conn: &mut Conn,
         at: Check<'_>,
-    ) -> Result<Option<pbps_dialect::routines::Read>, DbError> {
-        read_pinned_routines(conn, at.within()).await
-    }
+    ) -> Result<Option<pbps_dialect::routines::Read>, DbError>;
     async fn before_transactional_statement(
         &self,
         conn: &mut Conn,
@@ -551,6 +567,17 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         ids: &IdsFile,
         unrevocable: &[pbps_db::catalog::Unrevocable],
     ) -> anyhow::Result<()>;
+    /// Which of `named` the engine's cluster no longer has, in the order the
+    /// names come. The refusal that prints them is
+    /// [`Self::refuse_missing_cluster_roles`].
+    ///
+    /// Required: an engine whose roles belong to a cluster must ask it, and an
+    /// empty answer from one never asked would read as "every role exists".
+    async fn absent_cluster_roles(
+        &self,
+        conn: &mut Conn,
+        named: &BTreeSet<pbps_model::RoleName>,
+    ) -> anyhow::Result<Vec<pbps_model::RoleName>>;
     /// Refuses the cluster roles a bootstrap's plan names that the cluster no
     /// longer has. Bootstrap can build database roles, but a cluster role must
     /// already exist and still exist when its successful snapshot is recorded.
@@ -697,6 +724,20 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         changes: &ChangeSet,
         after: bool,
     ) -> anyhow::Result<ConnectedCheck>;
+    /// Recounts, where the plan runs, the dependents of the enums it rebuilds: a
+    /// dependent that appeared on an enum after the plan was made is refused by
+    /// name before the first statement (DEC-1635.7). Inside the apply's own
+    /// transaction, after the lock.
+    ///
+    /// Required: an engine that was never asked must not read as one with no enum
+    /// to rebuild.
+    async fn check_enum_rebuild_census(
+        &self,
+        conn: &mut Conn,
+        changes: &ChangeSet,
+        stored: &IdsFile,
+        resuming: bool,
+    ) -> anyhow::Result<()>;
     /// What a tightened domain validates, and a refusal where the engine would
     /// refuse (DEC-1635.8). `None` when no domain in the plan gains a check or
     /// `NOT NULL`, so a plan without one reports nothing new, and `None` from an

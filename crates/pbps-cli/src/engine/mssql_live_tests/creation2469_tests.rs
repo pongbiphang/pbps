@@ -1,5 +1,6 @@
 use super::*;
 use crate::computed_order::annotations_tests::fixture;
+use crate::engine::plan_session::mssql::refuse_added_computed_calls;
 
 #[tokio::test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB"]

@@ -102,10 +102,6 @@ mod of_tests {
     }
 }
 
-// Choices of engine that the commands used to make for themselves, gathered
-// here so that this file stays the one place that names an engine (#2798).
-mod collected;
-pub(crate) use collected::*;
 // What each engine is where the answer is a value, not a connected operation:
 // one `Profile` per engine, read by the functions below that need no connection
 // (#2798).
@@ -118,10 +114,12 @@ pub(crate) use owned_test::OwnedTest;
 pub(crate) mod apply_session;
 pub(crate) use apply_session::ApplySession;
 mod plan_session;
-// The PostgreSQL drop-blocker read, for the live test that asks it of a bare
-// change set; apply and planning reach it through their sessions.
+// The PostgreSQL bodies that live tests ask of a bare change set; apply and
+// planning reach them through their sessions.
 #[cfg(test)]
-pub(crate) use plan_session::postgres::check_drop_blockers;
+pub(crate) use plan_session::postgres::{
+    account_for_module_dependents, check_drop_blockers, check_module_dependents_fixture,
+};
 pub(crate) use plan_session::{
     DeclaredTypes, DomainCode, ExtensionSeals, Frame, PlanSession, SealedFacts, ServerLimits,
     SupportReads, SupportRows, in_contract_order,
@@ -174,20 +172,6 @@ pub async fn vet_drop_requirements<S: ApplySession>(
         }
     }
     Ok(())
-}
-
-/// Catalog estimates are advisory. Failure to measure is an unavailable
-/// answer, not a reason to refuse a valid plan (ADR-0012 §3, DECISIONS 430).
-#[cfg(test)]
-pub async fn operational_cost(
-    conn: &mut Conn,
-    cs: &ChangeSet,
-    ids: &IdsFile,
-) -> crate::cost::CostReport {
-    match conn.driver() {
-        Driver::Postgres => plan_session::postgres::operational_cost(conn, cs, ids).await,
-        Driver::Mssql => plan_session::mssql::operational_cost(conn, cs, ids).await,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -466,6 +450,84 @@ pub fn ledger_safe_reason(error: &anyhow::Error) -> String {
 /// cut is the engine's too.
 pub fn truncate_reason(driver: Driver, text: &str) -> String {
     (profile::profile(driver).truncate_reason)(text)
+}
+
+/// Refuses drafting a resolver's externals file from a target whose engine
+/// has no binding adapter.
+///
+/// PostgreSQL has one; SQL Server does not yet (#619, #620).
+pub(crate) fn refuse_externals_draft_unsupported(driver: Driver) -> anyhow::Result<()> {
+    match profile::profile(driver).externals_draft_refusal {
+        None => Ok(()),
+        Some(refusal) => anyhow::bail!(refusal),
+    }
+}
+
+/// Whether the rehearsal's scratch session has already compiled the namespace
+/// of the base by the time the plan is lowered.
+///
+/// SQL Server's does, with the engine's trials; what is left of it is who may
+/// do what. PostgreSQL's compiles the base's statements later, from the
+/// lowering.
+///
+/// It is also what decides whether the scratch is handed a bootstrap of the
+/// base: the trials are what take one, so a scratch without them needs none.
+pub(crate) fn scratch_compiles_base_namespace(driver: Driver) -> bool {
+    profile::profile(driver).scratch_compiles_base_namespace
+}
+
+/// How a target's refused or failed read of its engine lineage identity is
+/// reported.
+///
+/// PostgreSQL's refusal is the deployment role's to fix and names the grant;
+/// SQL Server's `family_guid` read has no such remedy and is unanswerable.
+pub(crate) fn target_identity_unread(driver: Driver, error: DbError) -> crate::resolution::Refused {
+    (profile::profile(driver).target_identity_unread)(error)
+}
+
+/// Whether the resolver's scratch may share the target's instance, which
+/// omission never grants consent to; inapplicability stays distinct from
+/// refusal.
+///
+/// SQL Server's scratch can land on the instance it rehearses; PostgreSQL's
+/// scratch is a cluster of its own, so the question does not apply.
+pub(crate) fn same_instance_consent(
+    driver: Driver,
+    profile: &pbps_config::resolver::ResolverProfile,
+) -> pbps_model::resolver::SameInstance {
+    use pbps_config::resolver::ResolverProfile;
+    if !self::profile::profile(driver).scratch_may_share_the_instance {
+        return pbps_model::resolver::SameInstance::NotApplicable;
+    }
+    let choice = match profile {
+        ResolverProfile::Server { same_instance, .. } => same_instance.unwrap_or_default(),
+        ResolverProfile::Docker { .. } => pbps_config::resolver::SameInstance::Refuse,
+    };
+    match choice {
+        pbps_config::resolver::SameInstance::Refuse => pbps_model::resolver::SameInstance::Refused,
+        pbps_config::resolver::SameInstance::Allow => pbps_model::resolver::SameInstance::Allowed,
+    }
+}
+
+/// Reads what the target assertions are held against: the planning target's
+/// own identity, which an assertion login must match.
+///
+/// An engine's error stops planning with the same finding for every engine,
+/// and an engine without assertions is refused by name (#2798).
+pub(crate) async fn read_assertion_target(
+    planning: &mut Conn,
+) -> Result<Box<dyn pbps_db::engine::AssertionTarget>, crate::plan_assert::Stop> {
+    use crate::plan_assert::stop;
+    use pbps_db::engine::TargetAssertions;
+    let engine = of(planning.driver());
+    match engine
+        .read_assertion_target(planning)
+        .await
+        .map_err(|e| stop("the planning target", e))?
+    {
+        TargetAssertions::Supported(target) => Ok(target),
+        TargetAssertions::Unsupported => Err(crate::plan_assert::unsupported(engine.name())),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -777,47 +839,6 @@ fn computed_catalog_table(
     names
         .stored(table, pbps_model::plan_names::At::Before(at))
         .unwrap_or_else(|| table.clone())
-}
-
-/// Refuses a SQL Server computed column this plan adds, new or again, whose
-/// expression calls a function the plan creates, alters or drops, comparing
-/// the names under the database's collation (#1459, DEC-1459.1). Only the
-/// collation is asked, not `sys.sql_expression_dependencies`, which has no
-/// edge for an expression not yet stored, so no grant beyond reading names.
-#[cfg(test)]
-pub async fn refuse_added_computed_calls<S>(
-    conn: &mut Conn,
-    cs: &pbps_diff::order::PlanningPlan<S>,
-    declared: &pbps_model::Schema,
-) -> anyhow::Result<()> {
-    if conn.driver() != Driver::Mssql {
-        return Ok(());
-    }
-    plan_session::mssql::refuse_added_computed_calls(conn, cs, declared).await
-}
-
-/// Orders this plan's column and table renames on SQL Server from what the
-/// catalog holds and how its collation compares names, and refuses a name a
-/// change claims that another `sys.objects` entry holds when it runs (#1077,
-/// #1366): it reads the names the plan
-/// creates or moves things to, and the children of the tables it changes,
-/// so the plan's own moves can be walked. The last pass to reorder the plan:
-/// called after every other one, so what it settles is what is saved.
-#[cfg(test)]
-pub(crate) async fn order_created_object_names<S: Clone>(
-    conn: &mut Conn,
-    cs: &mut PlanningPlan<S>,
-    label: &str,
-    precedence: &[(pbps_model::Change, pbps_model::Change)],
-    declared: &crate::dependents::schedule::Declarations<'_>,
-) -> anyhow::Result<Option<pbps_dialect::slots::CatalogFacts>> {
-    if conn.driver() != Driver::Mssql {
-        return Ok(None);
-    }
-    Ok(Some(
-        plan_session::mssql::order_created_object_names(conn, cs, label, precedence, declared)
-            .await?,
-    ))
 }
 
 /// What the `sys.objects` reads found, as name slots for the slot replay
@@ -1885,70 +1906,6 @@ pub enum Absent {
     NotYetCreated,
 }
 
-/// The planner's half of #314: reads what depends on every module this plan
-/// drops and puts each dependent on the right side of that drop, in the plan
-/// the approver sees (`dependents::weave`, which the schedule runs over the
-/// dependents just read, ahead of the passes that read no catalog,
-/// DEC-1955.1). Called inside the planning transaction, before
-/// `check_module_rebuilds`, so that a view the plan now drops and recreates is
-/// held to the same bar as one the declarations edit.
-///
-/// It is where a connected plan is scheduled, on either engine: SQL Server
-/// supplies DEFAULT holders for explicit routine drops, along with the members
-/// of the roles it drops, `role_members`, which the caller read when needed.
-///
-/// `rediff` plans the same revision again with the given unchanged modules
-/// rebuilt (`pbps_diff::diff_rebuilding`): a module dependent the plan does
-/// not touch has to be rebuilt around the module under it, and a rebuild is
-/// its grants and its `PUBLIC` execute as well as its two statements, which
-/// only the differ's own passes write.
-// The eighth argument is the role members the caller read: the schedule
-// takes every fact in one call (#1955).
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-pub async fn account_for_module_dependents<
-    S: pbps_diff::order::RouteState<D>,
-    D: crate::emission::Engine,
->(
-    conn: &mut Conn,
-    changes: PlanningPlan<S>,
-    declared: &pbps_model::Schema,
-    sources: crate::dependents::Sources<'_>,
-    deps: &pbps_model::object_ref::Annotations,
-    role_members: Option<&crate::dependents::schedule::RoleMembers>,
-    dialect: &D,
-    rediff: &dyn Fn(&BTreeSet<pbps_model::ModuleId>) -> anyhow::Result<PlanningPlan<S>>,
-) -> anyhow::Result<(PlanningPlan<S::Output>, ConnectedCheck)> {
-    match conn.driver() {
-        Driver::Postgres => {
-            plan_session::postgres::account_for_module_dependents(
-                conn,
-                changes,
-                declared,
-                sources,
-                deps,
-                role_members,
-                dialect,
-                rediff,
-            )
-            .await
-        }
-        Driver::Mssql => {
-            plan_session::mssql::account_for_module_dependents(
-                conn,
-                changes,
-                declared,
-                sources,
-                deps,
-                role_members,
-                dialect,
-                rediff,
-            )
-            .await
-        }
-    }
-}
-
 /// The connection's immutable planning capability, before any expansion.
 /// Offline callers retain their ordinary unknown-capability dialect.
 #[cfg(test)]
@@ -1973,30 +1930,6 @@ pub(crate) async fn resolves_now(
         }
     }
     Ok(false)
-}
-
-#[cfg(test)]
-pub async fn check_module_dependents_fixture(
-    conn: &mut Conn,
-    input: &PlanningPlan,
-    stored: &pbps_model::Schema,
-    ids: &pbps_model::IdsFile,
-    stored_ids: &pbps_model::IdsFile,
-) -> anyhow::Result<()> {
-    // Adverse logical snapshots omit execution decisions deliberately. Observe
-    // the same catalog checks without certifying or repairing their payload.
-    let changes = input.changes();
-    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
-    if conn.driver() == Driver::Postgres {
-        let found = policy_dependents(conn, changes, ids, stored).await?;
-        pbps_diff::order::row_security::check_releases(changes, ids, &found)?;
-    }
-    let selected = apply_session::selected(conn.driver());
-    pbps_cli::with_plan_dialect!(&selected, |session| {
-        session
-            .check_module_dependency_facts(conn, changes, names, stored, stored_ids)
-            .await
-    })
 }
 
 /// What the saved plan must still remove before each module's drop, given the
@@ -3686,7 +3619,7 @@ mod tests {
                 columns: [("c_aaaaaa".parse().unwrap(), "public.t.v".parse().unwrap())].into(),
                 ..Default::default()
             };
-            let report = operational_cost(&mut conn, &cs, &ids).await;
+            let report = plan_session::postgres::operational_cost(&mut conn, &cs, &ids).await;
             conn.execute("ROLLBACK").await.unwrap();
             let value = serde_json::to_value(&report).unwrap();
             assert_eq!(value["status"], "available");

@@ -261,10 +261,11 @@ pub(in crate::engine) fn reconcile_cluster_roles() -> ConnectedCheck {
     }
 }
 
-/// The SQL Server body of `engine::account_for_module_dependents`: DEFAULT
-/// holders for explicit routine drops, which is all that SQL Server's `CREATE
-/// OR ALTER` leaves to schedule, along with the members of the roles the plan
-/// drops. It never plans again, so it has no use for `_rediff`.
+/// The planner's half of #314 on SQL Server, where a connected plan is
+/// scheduled: DEFAULT holders for explicit routine drops, which is all that
+/// SQL Server's `CREATE OR ALTER` leaves to schedule, along with the members
+/// of the roles the plan drops. It never plans again, so it has no use for
+/// `_rediff`.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::engine) async fn account_for_module_dependents<
     S: pbps_diff::order::RouteState<D>,
@@ -531,7 +532,11 @@ pub(in crate::engine) async fn order_computed_by_edges<S: Clone>(
     ))
 }
 
-/// The SQL Server body of `engine::refuse_added_computed_calls`.
+/// Refuses a SQL Server computed column this plan adds, new or again, whose
+/// expression calls a function the plan creates, alters or drops, comparing
+/// the names under the database's collation (#1459, DEC-1459.1). Only the
+/// collation is asked, not `sys.sql_expression_dependencies`, which has no
+/// edge for an expression not yet stored, so no grant beyond reading names.
 pub(in crate::engine) async fn refuse_added_computed_calls<S>(
     conn: &mut Conn,
     cs: &pbps_diff::order::PlanningPlan<S>,
@@ -559,7 +564,13 @@ pub(in crate::engine) async fn refuse_added_computed_calls<S>(
         .map_err(|why| anyhow::anyhow!("computed_dependencies (SQL Server): {why}"))
 }
 
-/// The SQL Server body of `engine::order_created_object_names`.
+/// Orders this plan's column and table renames on SQL Server from what the
+/// catalog holds and how its collation compares names, and refuses a name a
+/// change claims that another `sys.objects` entry holds when it runs (#1077,
+/// #1366): it reads the names the plan creates or moves things to, and the
+/// children of the tables it changes, so the plan's own moves can be walked.
+/// The last pass to reorder the plan: called after every other one, so what it
+/// settles is what is saved.
 pub(in crate::engine) async fn order_created_object_names<S: Clone>(
     conn: &mut Conn,
     cs: &mut PlanningPlan<S>,
@@ -681,7 +692,8 @@ pub(in crate::engine) async fn role_members(
     Ok(pbps_mssql::catalog::role_members(conn).await?)
 }
 
-/// The SQL Server body of `operational_cost`.
+/// Catalog estimates are advisory. Failure to measure is an unavailable
+/// answer, not a reason to refuse a valid plan (ADR-0012 §3, DECISIONS 430).
 pub(in crate::engine) async fn operational_cost(
     conn: &mut Conn,
     cs: &ChangeSet,
@@ -972,8 +984,10 @@ impl PlanSession for pbps_mssql::Mssql {
         Ok(())
     }
 
+    /// SQL Server's are judged by the catalog's edges
+    /// (`order_computed_by_edges`), under the database's collation.
     fn computed_column_screen(&self) -> pbps_diff::Screen {
-        computed_column_screen(Driver::Mssql)
+        pbps_diff::Screen::Catalog
     }
 
     /// Reads the `NOT VALID` checks of the domains standing in the database.
@@ -1227,6 +1241,14 @@ impl PlanSession for pbps_mssql::Mssql {
         operational_cost(conn, changes, ids).await
     }
 
+    /// SQL Server pins no routine (DEC-319.1).
+    async fn pinned_routines(
+        &self,
+        _conn: &mut Conn,
+    ) -> Result<Option<pbps_dialect::routines::Read>, DbError> {
+        Ok(None)
+    }
+
     async fn seal_plan_facts(
         &self,
         state: &PlanState,
@@ -1247,7 +1269,7 @@ impl PlanSession for pbps_mssql::Mssql {
         let reviewed =
             crate::pins::seal_selected(conn, project, target, input_roots, &state.admission)
                 .await?;
-        let routine_pins = crate::pins::seal(conn, project, target, managed).await?;
+        let routine_pins = crate::pins::seal(self, conn, project, target, managed).await?;
         Ok(SealedFacts {
             type_pins,
             provider_pins,

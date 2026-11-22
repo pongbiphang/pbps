@@ -1,6 +1,7 @@
 //! Connected function-call equality, through the real final-name pass (#2221).
 
 use super::*;
+use crate::engine::plan_session::mssql::order_created_object_names;
 use pbps_dialect::slots::{Namespace, SlotKey};
 use pbps_diff::order::{self, Baseline};
 use pbps_model::ModuleChange;
@@ -90,7 +91,6 @@ async fn module_only_callers_use_catalog_collation_and_reversed_order_is_refused
         // runs; its existing object-name comparison must still cover calls.
         let facts = order_created_object_names(&mut conn, &mut plan, "test", &[], &declarations)
             .await
-            .unwrap()
             .unwrap();
         let key = |name: &str| SlotKey {
             namespace: Namespace::Relations("app".into()),

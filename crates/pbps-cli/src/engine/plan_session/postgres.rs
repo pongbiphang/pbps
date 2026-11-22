@@ -479,7 +479,7 @@ pub(in crate::engine) async fn expand_table_rebuild<
 // The eighth argument is the role members the caller read: the schedule
 // takes every fact in one call (#1955).
 #[allow(clippy::too_many_arguments)]
-pub(in crate::engine) async fn account_for_module_dependents<
+pub(crate) async fn account_for_module_dependents<
     S: pbps_diff::order::RouteState<D>,
     D: crate::emission::Engine,
 >(
@@ -961,7 +961,8 @@ pub(in crate::engine) fn require_transactional_rebuilds(
     })
 }
 
-/// The PostgreSQL body of `operational_cost`.
+/// Catalog estimates are advisory. Failure to measure is an unavailable
+/// answer, not a reason to refuse a valid plan (ADR-0012 §3, DECISIONS 430).
 pub(in crate::engine) async fn operational_cost(
     conn: &mut Conn,
     cs: &ChangeSet,
@@ -1025,6 +1026,29 @@ pub(in crate::engine) async fn operational_cost(
         engine: "postgres",
         changes,
     }
+}
+
+/// The checks of apply's module-dependent refusal over a bare change set:
+/// the policy releases and the dependents the plan does not remove.
+///
+/// Adverse logical snapshots omit execution decisions deliberately, so this
+/// observes the same catalog checks without certifying or repairing the plan's
+/// payload.
+#[cfg(test)]
+pub(crate) async fn check_module_dependents_fixture(
+    conn: &mut Conn,
+    input: &PlanningPlan,
+    stored: &pbps_model::Schema,
+    ids: &pbps_model::IdsFile,
+    stored_ids: &pbps_model::IdsFile,
+) -> anyhow::Result<()> {
+    let changes = input.changes();
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
+    let found = policy_dependents(conn, changes, ids, stored).await?;
+    pbps_diff::order::row_security::check_releases(changes, ids, &found)?;
+    pbps_pg::Postgres::new()
+        .check_module_dependency_facts(conn, changes, names, stored, stored_ids)
+        .await
 }
 
 /// The PostgreSQL body of `permission_support`, which apply and bootstrap also call.
@@ -1721,8 +1745,10 @@ impl PlanSession for pbps_pg::Postgres {
         Ok(())
     }
 
+    /// PostgreSQL has no computed-column edges to read, so its are judged by
+    /// the text screen (#1460).
     fn computed_column_screen(&self) -> pbps_diff::Screen {
-        computed_column_screen(Driver::Postgres)
+        pbps_diff::Screen::Text
     }
 
     /// Asks the resolver's scratch to compare the expressions a plan retains,
@@ -2025,7 +2051,7 @@ impl PlanSession for pbps_pg::Postgres {
         // narrower base cannot hold, are counted now, by the same probes the
         // apply runs, so the plan is refused by name and with a count before
         // anything is written (DEC-1635.7, DEC-1635.9).
-        if !counts_rows_an_enum_retype_strands(Driver::Postgres, changes) {
+        if !enum_retype_strands_rows(changes) {
             return Ok(None);
         }
         let names = pbps_model::plan_names::PlanNames::of(&changes.changes, frame.written.ids)?;
@@ -2092,6 +2118,16 @@ impl PlanSession for pbps_pg::Postgres {
         operational_cost(conn, changes, ids).await
     }
 
+    /// The routines are read from `pg_proc`.
+    async fn pinned_routines(
+        &self,
+        conn: &mut Conn,
+    ) -> Result<Option<pbps_dialect::routines::Read>, DbError> {
+        pbps_pg::pins::read(conn, pbps_db::TransactionOwner::OwnTransaction)
+            .await
+            .map(Some)
+    }
+
     async fn seal_plan_facts(
         &self,
         state: &PlanState,
@@ -2131,7 +2167,7 @@ impl PlanSession for pbps_pg::Postgres {
         // Last, so that the routines are sealed as close to the gate as the
         // plan can get them. The managed set is the one `apply` rebuilds from
         // the ledger and the plan: what was recorded, and what is declared.
-        let routine_pins = crate::pins::seal(conn, project, target, managed).await?;
+        let routine_pins = crate::pins::seal(self, conn, project, target, managed).await?;
         Ok(SealedFacts {
             type_pins,
             provider_pins,
@@ -2150,9 +2186,9 @@ impl PlanSession for pbps_pg::Postgres {
         changes: &ChangeSet,
     ) -> anyhow::Result<DomainCode> {
         use crate::resolution::domain::{Verdict, needed, vet};
-        let Some(entry) =
-            scratch.filter(|_| vets_declared_domain_code(Driver::Postgres) && needed(changes))
-        else {
+        // The declared domain `CHECK` and `DEFAULT` code is vetted on the
+        // resolver's scratch before the plan is sealed: PostgreSQL has domains.
+        let Some(entry) = scratch.filter(|_| needed(changes)) else {
             return Ok(DomainCode::NotAsked);
         };
         Ok(match vet(entry, conn, target, project, desired).await {

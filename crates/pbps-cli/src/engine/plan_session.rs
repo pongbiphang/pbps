@@ -741,6 +741,18 @@ pub(crate) trait PlanSession: crate::emission::Engine {
         }
     }
 
+    /// Reads the routines a plan pins against replacement (DEC-319.1), in a
+    /// transaction of its own. `None` is the engine's statement that it pins no
+    /// routine, which [`crate::pins::seal`] reads as "nothing to seal".
+    ///
+    /// Required: whether an engine's roles can replace a routine is a fact about
+    /// it, and an answer from an engine that was never asked would seal a plan
+    /// over routines nothing pinned.
+    async fn pinned_routines(
+        &self,
+        conn: &mut Conn,
+    ) -> Result<Option<pbps_dialect::routines::Read>, DbError>;
+
     /// Seals what the plan is pinned to besides its changes: the types and
     /// classes it references, the routines the review admitted, and the
     /// routines outside the managed set a role short of a superuser can
@@ -781,7 +793,7 @@ pub(crate) trait PlanSession: crate::emission::Engine {
             self.site_admission(state),
         )
         .await?;
-        let routine_pins = crate::pins::seal(conn, project, target, managed).await?;
+        let routine_pins = crate::pins::seal(self, conn, project, target, managed).await?;
         Ok(SealedFacts {
             type_pins: Vec::new(),
             provider_pins: Vec::new(),
@@ -953,6 +965,21 @@ pub(crate) fn in_contract_order(mut rows: Vec<ConnectedCheck>) -> Vec<ConnectedC
     };
     rows.sort_by_key(rank);
     rows
+}
+
+/// Whether the plan retypes an enum so that rows could be stranded: a cast that
+/// changes the labels' meaning, or a relabel that removes one. The selection
+/// the plan-time probes are asked for, shared with the default of
+/// [`PlanSession::probe_stranded_rows`].
+pub(in crate::engine) fn enum_retype_strands_rows(changes: &ChangeSet) -> bool {
+    changes.changes.iter().any(|p| {
+        matches!(&p.change, pbps_model::Change::TypeValue(pbps_model::TypeValueChange::EnumRebuild {
+            step: pbps_model::EnumRebuildStep::Retype { values, .. }, ..
+        }) if match values.as_ref() {
+            pbps_model::ValueChange::Cast { from, to, .. } => from != to,
+            pbps_model::ValueChange::Relabel { removed } => !removed.is_empty(),
+        })
+    })
 }
 
 /// The tables and modules a plan touches that a SQL Server expression edge can

@@ -217,16 +217,17 @@ pub fn admission(project: &Project) -> RoutineAdmission {
 /// A non-empty set needs the environment's key. Without one the plan is
 /// refused rather than written unpinned, because an unpinned plan is the
 /// window this exists to close.
-pub async fn seal(
+pub(crate) async fn seal<S: crate::engine::PlanSession>(
+    session: &S,
     conn: &mut Conn,
     project: &Project,
     target: &Target,
     managed: &BTreeSet<ModuleId>,
 ) -> anyhow::Result<Option<RoutinePins>> {
-    let Some(read) =
-        crate::engine::read_pinned_routines(conn, pbps_db::TransactionOwner::OwnTransaction)
-            .await
-            .context("could not read the routines this plan pins (DEC-319.1)")?
+    let Some(read) = session
+        .pinned_routines(conn)
+        .await
+        .context("could not read the routines this plan pins (DEC-319.1)")?
     else {
         return Ok(None);
     };
